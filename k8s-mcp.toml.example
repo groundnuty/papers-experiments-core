@@ -1,0 +1,10 @@
+# kubernetes-mcp-server config. Copy to k8s-mcp.toml and adjust.
+# Pin the toolsets — enabling all 8 groups loads 60+ tool schemas.
+read_only = true
+toolsets  = ["config", "core"]
+
+# Never expose Secret objects through the MCP surface.
+[[denied_resources]]
+group   = ""
+version = "v1"
+kind    = "Secret"

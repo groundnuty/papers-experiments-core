@@ -1,0 +1,311 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "effortLevel": "xhigh",
+  "enableAllProjectMcpServers": false,
+  "enabledMcpjsonServers": [
+    "fetch",
+    "dblp",
+    "arxiv",
+    "openalex",
+    "papers",
+    "zotero",
+    "arxivlatex",
+    "kubernetes",
+    "db",
+    "prometheus"
+  ],
+  "enabledPlugins": {
+    "claude-code-setup@claude-plugins-official": true,
+    "commit-commands@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
+    "hookify@claude-plugins-official": true,
+    "session-report@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true
+  },
+  "env": {
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"
+  },
+  "extraKnownMarketplaces": {
+    "agentic-plugins": {
+      "source": {
+        "repo": "groundnuty/agentic-plugins",
+        "source": "github"
+      }
+    }
+  },
+  "hooks": {
+    "ConfigChange": [
+      {
+        "hooks": [
+          {
+            "command": "printf '%s\\t%s\\t%s\\n' \"$(date -u +%FT%TZ)\" \"$(git config user.email 2>/dev/null || echo -)\" \"${CLAUDE_HOOK_FILE:-?}\" >> \"$CLAUDE_PROJECT_DIR/.claude/audit.log\"",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "sh -c 'mkdir -p \"$CLAUDE_PROJECT_DIR/.claude/session-reports\"; TS=$(date -u +%Y%m%dT%H%M%SZ); [ -n \"$CLAUDE_TRANSCRIPT_PATH\" ] && cp \"$CLAUDE_TRANSCRIPT_PATH\" \"$CLAUDE_PROJECT_DIR/.claude/session-reports/${TS}-precompact-transcript.jsonl\" 2>/dev/null; { echo \"# Pre-compact $TS\"; git -C \"$CLAUDE_PROJECT_DIR\" status -sb; echo; git -C \"$CLAUDE_PROJECT_DIR\" log --oneline -10; } > \"$CLAUDE_PROJECT_DIR/.claude/session-reports/${TS}-precompact-gitstate.md\"; echo \"[PreCompact] Context compaction imminent. Transcript archived at .claude/session-reports/${TS}-precompact-transcript.jsonl - run /compact-prepare to save what this session learned before history is compressed.\" >&2'",
+            "timeout": 30000,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "command": "sh -c 'mkdir -p \"$CLAUDE_PROJECT_DIR/.claude/session-reports\"; TS=$(date -u +%Y%m%dT%H%M%SZ); { echo \"# Session end $TS\"; git -C \"$CLAUDE_PROJECT_DIR\" status -sb; echo; git -C \"$CLAUDE_PROJECT_DIR\" log --oneline -10; } > \"$CLAUDE_PROJECT_DIR/.claude/session-reports/${TS}-session-end.md\"'",
+            "timeout": 10000,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "echo \"Branch: $(git branch --show-current 2>/dev/null || echo detached). Recent: $(git log --oneline -3 2>/dev/null || echo no-commits)\"",
+            "timeout": 5000,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  },
+  "marketplaces": {
+    "claude-plugins-official": {
+      "repo": "anthropics/claude-plugins-official",
+      "source": "github"
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
+      "mcp__claude_ai_Gmail__*",
+      "mcp__claude_ai_PubMed__*",
+      "mcp__claude_ai_bioRxiv__*",
+      "mcp__claude_ai_Scholar_Gateway__*",
+      "mcp__claude_ai_Asana__*",
+      "mcp__claude_ai_Atlassian__*",
+      "mcp__claude_ai_Box__*",
+      "mcp__claude_ai_Canva__*",
+      "mcp__claude_ai_Consensus__*",
+      "mcp__claude_ai_Figma__*",
+      "mcp__claude_ai_HubSpot__*",
+      "mcp__claude_ai_Intercom__*",
+      "mcp__claude_ai_Linear__*",
+      "mcp__claude_ai_Notion__*",
+      "mcp__claude_ai_monday_com__*",
+      "mcp__claude_ai_alphaXiv__*",
+      "mcp__plugin_context7_context7__*",
+      "ListMcpResourcesTool",
+      "ReadMcpResourceTool",
+      "mcp__fetch__*",
+      "mcp__kubernetes__*",
+      "mcp__db__*",
+      "mcp__prometheus__*"
+    ],
+    "deny": [
+      "Bash(sudo *)",
+      "Bash(rm -rf /)",
+      "Bash(docker push *)",
+      "Bash(git push --force*)",
+      "Bash(git push * --force*)",
+      "Bash(git push -f)",
+      "Bash(git push -f *)",
+      "Bash(git push * -f)",
+      "Bash(git push * -f *)",
+      "Bash(git commit --no-verify *)",
+      "Bash(git commit -n *)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean -f*)",
+      "Bash(git clean -df*)",
+      "Bash(git clean -xf*)",
+      "Bash(git clean --force*)",
+      "Bash(git checkout -- .)",
+      "Bash(git restore .)",
+      "Bash(git clean -xdf*)",
+      "Bash(git clean -dxf*)",
+      "Bash(git clean -xfd*)",
+      "Bash(git clean * -f*)",
+      "Bash(git clean * --force*)",
+      "Bash(git checkout .)",
+      "Bash(git reset * --hard*)",
+      "Bash(git restore --worktree .)",
+      "Bash(git restore -W .)",
+      "Bash(git restore --staged --worktree .)",
+      "Bash(git restore --worktree --staged .)",
+      "Bash(git restore -SW .)",
+      "Bash(git restore -WS .)",
+      "Bash(git push * +*)",
+      "Bash(git checkout * -- .)",
+      "Bash(git checkout -- . *)",
+      "Bash(git checkout * -- . *)",
+      "Bash(git checkout . *)",
+      "Bash(git commit * --no-verify*)",
+      "Bash(git -c * push --force*)",
+      "Bash(git -c * push * --force*)",
+      "Bash(git -C * push --force*)",
+      "Bash(git -C * push * --force*)",
+      "Bash(git -C * reset --hard*)",
+      "Bash(git -C * clean -f*)",
+      "Read(~/.ssh/id_*)",
+      "Read(~/.ssh/*.pem)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.kube/**)",
+      "Read(~/.config/gcloud/**)",
+      "Read(~/.npmrc)",
+      "Read(~/.pypirc)",
+      "Read(~/.docker/config.json)",
+      "Read(~/.netrc)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.bash_history)",
+      "Read(~/.zsh_history)",
+      "Edit(~/.claude.json)",
+      "Edit(~/.claude/settings.json)",
+      "Edit(~/.ssh/**)",
+      "Edit(~/.aws/**)",
+      "Edit(~/.gnupg/**)",
+      "Edit(~/.kube/**)",
+      "Edit(~/.config/gcloud/**)",
+      "Edit(~/.gitconfig)",
+      "Edit(~/.npmrc)",
+      "Edit(~/.pypirc)",
+      "Edit(~/.docker/config.json)",
+      "Edit(~/.netrc)",
+      "Edit(~/.config/gh/**)",
+      "Edit(~/.bashrc)",
+      "Edit(~/.zshrc)",
+      "Edit(~/.profile)",
+      "Edit(~/.bash_profile)",
+      "Edit(~/.zprofile)",
+      "Edit(~/.zshenv)",
+      "mcp__papers__download_scihub",
+      "mcp__papers__download_with_fallback",
+      "Bash(gpg --export-secret*)",
+      "Bash(gpg * --export-secret*)",
+      "Bash(gpg2 --export-secret*)",
+      "Bash(gpg2 * --export-secret*)",
+      "Bash(gpgsm --export-secret*)",
+      "Bash(gpgsm * --export-secret*)"
+    ]
+  },
+  "promptCacheTtl": "1h",
+  "sandbox": {
+    "allowUnsandboxedCommands": true,
+    "autoAllowBashIfSandboxed": true,
+    "credentials": {
+      "files": [
+        {
+          "mode": "deny",
+          "path": "~/.ssh"
+        },
+        {
+          "mode": "deny",
+          "path": "~/.aws"
+        },
+        {
+          "mode": "deny",
+          "path": "~/.gnupg"
+        },
+        {
+          "mode": "deny",
+          "path": "~/.kube"
+        },
+        {
+          "mode": "deny",
+          "path": "~/.config/gcloud"
+        },
+        {
+          "mode": "deny",
+          "path": "~/.config/gh"
+        },
+        {
+          "mode": "deny",
+          "path": "~/.netrc"
+        },
+        {
+          "mode": "deny",
+          "path": "~/.npmrc"
+        },
+        {
+          "mode": "deny",
+          "path": "~/.pypirc"
+        },
+        {
+          "mode": "deny",
+          "path": "~/.docker/config.json"
+        }
+      ]
+    },
+    "enableWeakerNestedSandbox": true,
+    "enabled": true,
+    "excludedCommands": [
+      "ssh:*",
+      "scp:*",
+      "rsync:*",
+      "devbox:*",
+      "git add:*",
+      "git commit:*",
+      "git tag:*",
+      "helm:*",
+      "kubectl:*",
+      "kustomize:*",
+      "terraform:*",
+      "docker:*",
+      "podman:*"
+    ],
+    "filesystem": {
+      "allowWrite": [
+        "~/.claude/projects",
+        "~/.cache/devbox",
+        "~/.local/share/devbox",
+        "~/.nix-profile",
+        "/nix",
+        "~/.cache/uv",
+        "~/.local/share/uv"
+      ],
+      "denyRead": [
+        "~/.aws",
+        "~/.kube",
+        "~/.config/gcloud",
+        "~/.ssh/id_*",
+        "~/.ssh/*.pem"
+      ],
+      "denyWrite": [
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "~/.ssh",
+        "~/.aws",
+        "~/.bashrc",
+        "~/.zshrc"
+      ]
+    },
+    "network": {
+      "allowedDomains": [
+        "*"
+      ],
+      "deniedDomains": []
+    }
+  },
+  "subagentPromptCacheTtl": "1h",
+  "verbose": true
+}

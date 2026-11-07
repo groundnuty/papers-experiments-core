@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "_readme": "Copy to .mcp.json; enable a server by renaming its '//<name>-uncomment' key to '<name>' ('//...' keys are inert docs; the file is valid JSON as-is). Servers run OUTSIDE the Bash sandbox. Allow entries for these exact key names are pre-shipped — DO NOT RENAME the keys. Use ${ENV_VAR} references instead of inline secrets; .mcp.json is gitignored but belts and braces.",
+
+    "//fetch": "Verbatim page text with paging. 1 tool. Anthropic, MIT. CAUTION (upstream): can reach local/internal IPs (SSRF).",
+    "//fetch-uncomment": { "command": "uvx", "args": ["mcp-server-fetch==2026.8.18"] },
+
+    "//kubernetes": "Red Hat kubernetes-mcp-server: Go-native (no kubectl binary), read-only by flag, Secret-denylist via config. Create k8s-mcp.toml from k8s-mcp.toml.example first, and point KUBECONFIG at a dedicated read-only viewer context — the template's own controls deny ~/.kube reads for good reason.",
+    "//kubernetes-uncomment": {
+      "command": "npx",
+      "args": ["-y", "kubernetes-mcp-server@0.0.67", "--read-only", "--config", "./k8s-mcp.toml"],
+      "env": { "KUBECONFIG": "${K8S_MCP_KUBECONFIG}" }
+    },
+
+    "//db": "Bytebase dbhub: Postgres/MySQL/MariaDB/SQL Server/SQLite behind 3 tools. Scoped package — bare npm 'dbhub' is DIFFERENT software. Set DB_DSN in your environment; never inline credentials.",
+    "//db-uncomment": { "command": "npx", "args": ["-y", "@bytebase/dbhub@1.3.1", "--dsn", "${DB_DSN}"] },
+
+    "//prometheus": "Read-only PromQL. 6 tools.",
+    "//prometheus-uncomment": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-e", "PROMETHEUS_URL", "ghcr.io/pab1it0/prometheus-mcp-server:1.6.2"],
+      "env": { "PROMETHEUS_URL": "${PROMETHEUS_URL}" }
+    }
+  }
+}
