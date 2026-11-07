@@ -183,7 +183,7 @@ The papers' AI-use disclosure needs the same trail: the earlier harnesses were w
 
 ### The study-token list
 
-The plain list of study names (conditions, datasets, models, hosts, spaces, providers, users; categories in the [inventory appendix](inventory.md#appendix-study-tokens)) is kept **outside this repository**, because the repository is public. It lives at a path outside any repository, named by `EXPCORE_STUDY_TOKENS`; the study-token test reads it from there when present. The study-token map that sanitises imports ([provenance](#provenance-of-extracted-code)) lives beside it. A separate private repository for both (for example `papers-experiments-core-private`) is proposed to the maintainer; no study's repository holds them, because the list spans every study and includes hosts and an admin principal.
+The plain list of study names (conditions, datasets, models, hosts, spaces, providers, users; categories in the [inventory appendix](inventory.md#appendix-study-tokens)) is kept **outside this repository**, because the repository is public. It lives in the CCGrid study repository, which is private (the team's project, not this repository), as `core-tokens/study_tokens.txt`; the study-token map that sanitises imports ([provenance](#provenance-of-extracted-code)) lives beside it as `core-tokens/sanitise_map.toml`. Both move to the private CCGrid experiments repository once it exists. The study-token test reads the list from the path in `EXPCORE_STUDY_TOKENS` when present, so the location can change without a code change.
 
 The repository commits only `tests/data/study_tokens.sha256`, one hash per line. A study regenerates it with:
 
@@ -224,6 +224,6 @@ Settled in the review of #6 (7 Nov):
 1. **Malformed tool-call arguments (L01):** report-and-continue is the default: the call is not executed, the model gets the error, and the raw arguments are recorded. Ending the attempt is the declared alternative. Executing with `{}` is not offered at all. Malformed calls are counted per run as a recorded metric.
 2. **Error outputs and the cap (L06):** capped like any output, with the error class first; the full raw error stays in the record, with a truncation flag on what the model saw. The cap value is part of the configuration hash, so two conditions in one contrast cannot differ in it unnoticed.
 3. **Streaming:** not in v0.1; B17 keeps what a port must preserve.
-4. **Plain token list:** outside any repository until a private repository is decided ([above](#the-study-token-list)).
+4. **Plain token list and sanitising map:** in the private CCGrid study repository's `core-tokens/`, moving to the private CCGrid experiments repository once it exists; the test finds them through `EXPCORE_STUDY_TOKENS` ([above](#the-study-token-list)).
 5. **Package names:** `expcore` and `expcore_onedata`, one distribution with an `[onedata]` extra.
 6. **Requests incorporated:** scorers read the platform axis only from run-end instrument snapshots ([plugin interfaces](#plugin-interfaces)); contrasts between named conditions and the estimator as a preregistration parameter ([factor schema](#run-identity-the-factor-schema)); scorers return named numeric outcomes, missing when not computed; the release boundary above.
