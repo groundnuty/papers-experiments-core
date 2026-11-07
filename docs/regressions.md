@@ -176,7 +176,7 @@ Groups: [B model backends](#b-model-backends) · [L loop and tools](#l-agent-loo
 
 **P06. One model table.** *Learned:* ICSA keeps it in three shapes with three naming schemes (`config/models.toml`, `icsa/campaign/config.py:16-39`, `config/harness.toml:55-76`, bridged by `config.py:131-141`); ICSOC kept three (`scored_sweep_driver.py:181-183`). *Test:* every model named anywhere in configuration resolves to exactly one table entry.
 
-**P07. A replication package is not a code source.** *Learned:* this inventory: ICSA's anonymised build changed behaviour (see [`inventory.md`](inventory.md#icsa-replication-package-versus-the-code-that-ran)). *Test:* each extracted module's import commit, minus its provenance header, has the blob id the header names, and that blob is the file at the named source commit ([`architecture.md`](architecture.md#provenance-of-extracted-code)).
+**P07. A replication package is not a code source.** *Learned:* this inventory: ICSA's anonymised build changed behaviour (see [`inventory.md`](inventory.md#icsa-replication-package-versus-the-code-that-ran)). *Test:* applying the private study-token map to the source blob named in a module's provenance header reproduces the module's import commit, minus the header; every pushed commit passes the study-token check ([`architecture.md`](architecture.md#provenance-of-extracted-code)).
 
 ## S. Statistics and cause coding
 

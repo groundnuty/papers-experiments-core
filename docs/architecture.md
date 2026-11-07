@@ -157,22 +157,26 @@ Every module that starts from earlier study code begins with a header naming whe
 
 ```python
 # Provenance:
-#   source: icsa-2027-experiments @ 6fc798cf6ef1, icsa/harness/capping.py, blob 3f2a…
+#   source: icsa-2027-experiments @ 6fc798cf6ef1, icsa/harness/capping.py, blob <source blob id>
+#   import: sanitised with study-token map <sha256 of the private map>
 #   merged: www-2027-experiments @ 46a5828d, harness/agent/tools.py:121-141
 #   changes: see git history of this file from its import commit
 ```
 
-Extraction is reproducible through git rather than through prose:
-1. The **import commit** adds the source file verbatim, with only the provenance header prepended, and names the source blob (the git blob id of the file at the named commit).
-2. Every later change, including merged material, is a separate commit, so `git log -p` of the module is the exact transformation from source to current code.
+This repository is public and nothing is ever force-pushed, so whatever a commit contains stays visible. Source files hold private names (for example ICSA's `icsa/harness/slot_users.py:29-34`), so no commit may contain a source file verbatim. Extraction is reproducible through git and a private map instead:
 
-A module written fresh says `# Provenance: new`. A test fails if a module under `src/` has neither header. Sources are named by repository and commit, never by URL, so no token-bearing remote is copied. A maintainer-only test, skipped when the source repositories are absent, checks P07: the module's import commit, minus the header, has the blob id the header names, and that blob is the file at the named source commit. ICSA's anonymised replication package is never a source.
+1. **Sanitise privately.** Apply the study-token map, kept with the plain token list outside this repository, to the source file. The map replaces whole identifiers and literal components (the same candidate extractor as the [token check](#the-study-token-list)), never substrings inside other words, which is how ICSA's package broke code ([inventory](inventory.md#icsa-replication-package-versus-the-code-that-ran)).
+2. **Import commit.** Commit the sanitised file with the provenance header, naming the source blob (the git blob id of the file at the source commit) and the hash of the map. Constants that sanitising turns into placeholders become configuration lookups in later commits.
+3. **Later commits.** Every further change, including merged material, is its own commit, so `git log -p` of the module is the exact public transformation from the import.
+4. **Gate every commit, not only the tip.** A pre-push hook and CI run the study-token check and the leak scan over each new commit, because a leak in any commit of a public history is permanent.
+
+A module written fresh says `# Provenance: new`. A test fails if a module under `src/` has neither header. Sources are named by repository and commit, never by URL, so no token-bearing remote is copied. A maintainer-only test, run where the source repositories and the private map are present, checks P07: applying the map to the named source blob reproduces the import commit's file, minus the header. ICSA's anonymised replication package is never a source.
 
 The papers' AI-use disclosure needs the same trail: the earlier harnesses were written by coding agents, and the source commits carry that attribution, so the header links each module to it.
 
 ### The study-token list
 
-The plain list of study names (conditions, datasets, models, hosts, spaces, providers, users; categories in the [inventory appendix](inventory.md#appendix-study-tokens)) is kept **outside this repository**, because the repository is public. Proposed location: the maintainer's private CCGrid study repository, next to the 7 Nov reviews; the study-token test reads it from the path in `EXPCORE_STUDY_TOKENS` when present.
+The plain list of study names (conditions, datasets, models, hosts, spaces, providers, users; categories in the [inventory appendix](inventory.md#appendix-study-tokens)) is kept **outside this repository**, because the repository is public. Proposed location: the maintainer's private CCGrid study repository, next to the 7 Nov reviews; the study-token test reads it from the path in `EXPCORE_STUDY_TOKENS` when present. The study-token map that sanitises imports ([provenance](#provenance-of-extracted-code)) lives beside it.
 
 The repository commits only `tests/data/study_tokens.sha256`, one hash per line. A study regenerates it with:
 
