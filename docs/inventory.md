@@ -6,37 +6,37 @@ Which implementation of each component becomes the core, decided from the code o
 
 One chosen source per component, or **new** or **drop**. "Merge from" lists what a non-chosen study contributes, each item tied to a regression entry or a named feature. Layer: **core** is the generic package, **platform** the Onedata layer, **study** stays in the study's repository.
 
-| # | Component | Layer | Chosen source | Merge from |
-|---|---|---|---|---|
-| 1 | [Agent loop](#1-agent-loop) | core | ICSA `icsa/harness/loop.py` | WWW `harness/agent/loop.py`: closed outcome vocabulary, injected clock and sleep, harness-defect and skipped-call handling (L08, L09) |
-| 2 | [Model backends](#2-model-backends) | core | ICSA `icsa/harness/adapters.py` | WWW `harness/agent/providers.py`: jitter and `Retry-After`, context-overflow table, fingerprint capture, credential stripping (B01, B13, B06, B15); PPAM: vendor extras (B14) |
-| 2b | [Model table and served-model check](#2b-model-table-and-served-model-check) | core | ICSA `icsa/servedsettings.py` and `icsa/harness/config.py` (`ModelSpec`) | WWW served-model and fingerprint check (B06); ICSOC admission probe (B07) |
-| 3 | [Output capping](#3-output-capping) | core | ICSA `icsa/harness/capping.py` | WWW `harness/agent/tools.py`: cap pinned by the tools hash, raw result kept (L06, L07) |
-| 4 | [MCP client and server launch](#4-mcp-client-and-server-launch-with-allow-lists) | core (client, manifest, allow-list); platform (Onedata launch, tokens) | ICSA `icsa/harness/knowledge.py`, `icsa/knowledge/{launch,pin,manifest,tokencheck}.py` | PPAM allow-list test (L13) |
-| 5 | [Prompt templating](#5-prompt-templating) | core | ICSA `icsa/harness/prompt.py`, widened to any number of named slots | WWW `harness/agent/prompts.py`: content-addressed prompt blocks with recorded hashes |
-| 6 | [Sandbox and data paths](#6-sandbox-and-data-paths) | core (interface); platform (implementation) | ICSA `icsa/sandbox/`, `icsa/harness/sandbox_api.py` | none |
-| 7 | [Recording, transcripts, replay](#7-recording-transcripts-and-replay) | core | WWW `harness/agent/{record,replay,replay_check}.py` | ICSA partial transcript on infrastructure failure (R09) and `StubAdapter`; ICSOC validation before write (R02) |
-| 8a | [Scheduling and concurrency](#8a-scheduling-and-concurrency) | core | ICSA `icsa/campaign/scheduler.py` (generic kernel only) | WWW seeded order stable under plan growth (C08) |
-| 8b | [Store and resume](#8b-store-and-resume) | core | ICSA `icsa/campaign/store.py` | WWW manifest fingerprint refusing a resume into another experiment (C06) |
-| 8c | [Budgets and cost gates](#8c-budgets-and-cost-gates) | core | ICSA `icsa/campaign/{attempt_bounds,gate}.py` | WWW per-turn cost estimate (`harness/agent/cost.py`) |
-| 8d | [Leases on shared mutable resources](#8d-leases-on-shared-mutable-resources) | core (lease); platform (Onedata slot users) | ICSA `icsa/harness/{slot_lease,reservation}.py` | none |
-| 8e | [Manifests and export](#8e-manifests-and-export) | core | ICSA `icsa/campaign/{manifest,export}.py` | WWW input hash over every analysed record (R04) |
-| 9 | [Run records and identity](#9-run-records-and-identity) | core | **new**: factor schema | ICSA `RunRecord` generic fields; WWW schema-version discipline (R01, R02) |
-| 10 | [Scoring helpers](#10-scoring-helpers) | core (interface, helpers); study (scorers) | **new**: two-axis, three-valued result interface | PPAM `OracleResult` axes; ICSOC `lenses/a3b.py` NotDetermined verdict; ICSA `scoring/{parser_version,cost}.py`; WWW scorer digest (P05) |
-| 11 | [Cause coding](#11-cause-coding) | core | ICSA `icsa/causes/{kappa,sampling,batch}.py` | none |
-| 12 | [Statistics](#12-statistics) | core | ICSA `icsa/analysis/{contrasts,config,sim}.py`, `secondary.py` power simulation | WWW NaN rules, exact multiplicity levels, known-answer test (S05, S06, P05) |
-| 13 | [Provenance and code stamping](#13-provenance-and-code-stamping) | core | ICSA `icsa/codestamp.py` | WWW code identity over code and data paths (P02) |
-| 14 | [Replication-package tooling](#14-replication-package-tooling) | core | ICSA `tools/artifact/` | ICSOC-pkg `make check` shape (K07); WWW deterministic archives (K06) |
-| 15 | [Infrastructure versus agent failures](#15-infrastructure-versus-agent-failures) | core | ICSA `icsa/harness/errors.py`, `icsa/campaign/errors.py` | WWW retry-exhaustion and deadline rules (B02, B03), confirmed model-level faults (C22) |
-| 16 | [Onedata platform layer](#16-onedata-platform-layer) | platform | ICSA `icsa/scripted/{provision,placement,mplus,s2ranges,metrics}.py`, `icsa/harness/{health,real_sandbox,slot_users}.py` | ICSOC verifier and waits (O07, O08, O10, O11); PPAM transfer-visibility wait (O07) |
-| 17 | [Day-0 checks](#17-day-0-checks) | platform | ICSA `day0/` and `tools/newhost/check.sh` | none |
-| 18 | [Snapshot cut and fetch](#18-snapshot-cut-and-fetch) | core | ICSA-snap `snapshot/{fetch,cut,codecheck,guard,stamp}.py` | none |
-| 19 | [Operator tooling](#19-operator-tooling) | core | ICSA `icsa/campaign/{operator_queue,release}.py` | none |
-| 20 | [Secrets hygiene in records](#20-secrets-hygiene-in-records) | core | WWW `harness/agent/record.py` redaction | ICSA token values never recorded (R12) |
-| — | Claude Agent SDK backends (PPAM, ICSOC) | — | **drop** | The SDK loses the raw trace (ICSA `docs/harness.md:23-24`); ICSA replaced it with the Messages API. |
-| — | ICSA executor glue `icsa/harness/run.py` | — | **drop** | Replaced by the plugin interfaces; it holds 7 of the core-to-study imports. |
-| — | ICSA `campaign/boverride.py` (845 lines) | — | **drop** | Exists only to patch hard-coded federation constants in memory (O12). |
-| — | ICSA `campaign/budget.py`, `progress.py` | — | **drop** | One-campaign plans and alarms; the reusable kernels are in rows 8c and 19. |
+| # | Component | Layer | Chosen source | Merge from | Release |
+|---|---|---|---|---|---|
+| 1 | [Agent loop](#1-agent-loop) | core | ICSA `icsa/harness/loop.py` | WWW `harness/agent/loop.py`: closed outcome vocabulary, injected clock and sleep, harness-defect and skipped-call handling (L08, L09) | v0.1 |
+| 2 | [Model backends](#2-model-backends) | core | ICSA `icsa/harness/adapters.py` | WWW `harness/agent/providers.py`: jitter and `Retry-After`, context-overflow table, fingerprint capture, credential stripping (B01, B13, B06, B15); PPAM: vendor extras (B14) | v0.1 (streaming v0.2) |
+| 2b | [Model table and served-model check](#2b-model-table-and-served-model-check) | core | ICSA `icsa/servedsettings.py` and `icsa/harness/config.py` (`ModelSpec`) | WWW served-model and fingerprint check (B06); ICSOC admission probe (B07) | v0.1 |
+| 3 | [Output capping](#3-output-capping) | core | ICSA `icsa/harness/capping.py` | WWW `harness/agent/tools.py`: cap pinned by the tools hash, raw result kept (L06, L07) | v0.1 |
+| 4 | [MCP client and server launch](#4-mcp-client-and-server-launch-with-allow-lists) | core (client, manifest, allow-list); platform (Onedata launch, tokens) | ICSA `icsa/harness/knowledge.py`, `icsa/knowledge/{launch,pin,manifest,tokencheck}.py` | PPAM allow-list test (L13) | v0.1 |
+| 5 | [Prompt templating](#5-prompt-templating) | core | ICSA `icsa/harness/prompt.py`, widened to any number of named slots | WWW `harness/agent/prompts.py`: content-addressed prompt blocks with recorded hashes | v0.1 |
+| 6 | [Sandbox and data paths](#6-sandbox-and-data-paths) | core (interface); platform (implementation) | ICSA `icsa/sandbox/`, `icsa/harness/sandbox_api.py` | none | v0.1 |
+| 7 | [Recording, transcripts, replay](#7-recording-transcripts-and-replay) | core | WWW `harness/agent/{record,replay,replay_check}.py` | ICSA partial transcript on infrastructure failure (R09) and `StubAdapter`; ICSOC validation before write (R02) | v0.1 |
+| 8a | [Scheduling and concurrency](#8a-scheduling-and-concurrency) | core | ICSA `icsa/campaign/scheduler.py` (generic kernel only) | WWW seeded order stable under plan growth (C08) | v0.1 (one host; two-host v0.2) |
+| 8b | [Store and resume](#8b-store-and-resume) | core | ICSA `icsa/campaign/store.py` | WWW manifest fingerprint refusing a resume into another experiment (C06) | v0.1 |
+| 8c | [Budgets and cost gates](#8c-budgets-and-cost-gates) | core | ICSA `icsa/campaign/{attempt_bounds,gate}.py` | WWW per-turn cost estimate (`harness/agent/cost.py`) | v0.1 |
+| 8d | [Leases on shared mutable resources](#8d-leases-on-shared-mutable-resources) | core (lease); platform (Onedata slot users) | ICSA `icsa/harness/{slot_lease,reservation}.py` | none | v0.1 |
+| 8e | [Manifests and export](#8e-manifests-and-export) | core | ICSA `icsa/campaign/{manifest,export}.py` | WWW input hash over every analysed record (R04) | v0.1 |
+| 9 | [Run records and identity](#9-run-records-and-identity) | core | **new**: factor schema | ICSA `RunRecord` generic fields; WWW schema-version discipline (R01, R02) | v0.1 |
+| 10 | [Scoring helpers](#10-scoring-helpers) | core (interface, helpers); study (scorers) | **new**: record-only scorer interface: two axes, three-valued verdict, named numeric outcomes | PPAM `OracleResult` axes; ICSOC `lenses/a3b.py` NotDetermined verdict; ICSA `scoring/{parser_version,cost}.py`; WWW scorer digest (P05) | v0.1 |
+| 11 | [Cause coding](#11-cause-coding) | core | ICSA `icsa/causes/{kappa,sampling,batch}.py` | none | v0.2 |
+| 12 | [Statistics](#12-statistics) | core | ICSA `icsa/analysis/{contrasts,config,sim}.py`, `secondary.py` power simulation | WWW NaN rules, exact multiplicity levels, known-answer test (S05, S06, P05) | v0.1 (first estimator) |
+| 13 | [Provenance and code stamping](#13-provenance-and-code-stamping) | core | ICSA `icsa/codestamp.py` | WWW code identity over code and data paths (P02) | v0.1 |
+| 14 | [Replication-package tooling](#14-replication-package-tooling) | core | ICSA `tools/artifact/` | ICSOC-pkg `make check` shape (K07); WWW deterministic archives (K06) | v0.1: inclusion list, checksums, `make check`; v0.2: scanner, canaries, anonymisation |
+| 15 | [Infrastructure versus agent failures](#15-infrastructure-versus-agent-failures) | core | ICSA `icsa/harness/errors.py`, `icsa/campaign/errors.py` | WWW retry-exhaustion and deadline rules (B02, B03), confirmed model-level faults (C22) | v0.1 |
+| 16 | [Onedata platform layer](#16-onedata-platform-layer) | platform | ICSA `icsa/scripted/{provision,placement,mplus,s2ranges,metrics}.py`, `icsa/harness/{health,real_sandbox,slot_users}.py` | ICSOC verifier and waits (O07, O08, O10, O11); PPAM transfer-visibility wait (O07) | v0.1 |
+| 17 | [Day-0 checks](#17-day-0-checks) | platform | ICSA `day0/` and `tools/newhost/check.sh` | none | v0.1 |
+| 18 | [Snapshot cut and fetch](#18-snapshot-cut-and-fetch) | core | ICSA-snap `snapshot/{fetch,cut,codecheck,guard,stamp}.py` | none | v0.2 |
+| 19 | [Operator tooling](#19-operator-tooling) | core | ICSA `icsa/campaign/{operator_queue,release}.py` | none | v0.2 |
+| 20 | [Secrets hygiene in records](#20-secrets-hygiene-in-records) | core | WWW `harness/agent/record.py` redaction | ICSA token values never recorded (R12) | v0.1 |
+| — | Claude Agent SDK backends (PPAM, ICSOC) | — | **drop** | The SDK loses the raw trace (ICSA `docs/harness.md:23-24`); ICSA replaced it with the Messages API. | — |
+| — | ICSA executor glue `icsa/harness/run.py` | — | **drop** | Replaced by the plugin interfaces; it holds 7 of the core-to-study imports. | — |
+| — | ICSA `campaign/boverride.py` (845 lines) | — | **drop** | Exists only to patch hard-coded federation constants in memory (O12). | — |
+| — | ICSA `campaign/budget.py`, `progress.py` | — | **drop** | One-campaign plans and alarms; the reusable kernels are in rows 8c and 19. | — |
 
 Not extracted, by design (study instruments or study analyses): ICSA `instruments/`, `inspection/` (blind code inspection; its code-cell re-execution is a study instrument), `faults/`, `dossier/`, `pipeline/`, `oracle_analysis.py`; ICSOC `a4_gate.py`, `a2_judge.py`, `lenses/`; WWW `harness/checks/`, `checkloop/`, `faults/`, `qgen*/`, `baselines/`, `sib.py`; PPAM `scenarios.py` and the scenario oracles. Fault injection (ICSOC `netem.py`, `provider_restart.py`) is a candidate platform instrument after v0.1.
 
@@ -255,7 +255,7 @@ The flock lease with quarantine and dead-holder reaping is generic: "one credent
 | WWW | `harness/score/` | 1,381 lines; about 290 tests | RDF-term scoring | P05 | merge from (P05) |
 | ICSA | `icsa/scoring/` (`parser_version.py`, `cost.py`, `import_errors.py`, `events.py` generic; rest study) | 938 lines; 144 tests | heatwave mask parser and extents | R10, R13 | merge from (helpers) |
 
-**New:** a scorer interface whose result has two axes (what the agent did; what the platform's state shows) and a three-valued verdict, so an unobservable outcome is never scored as a failure.
+**New:** a scorer interface that reads only the record and returns two axes (what the agent did; what the platform's state shows, from run-end instrument snapshots), a three-valued verdict, so an unobservable outcome is never scored as a failure, and named numeric outcomes for the contrasts, missing when not computed.
 
 ### 11. Cause coding
 

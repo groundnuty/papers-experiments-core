@@ -2,7 +2,7 @@
 
 Decision record for the reusable experiment core (#1), proposed in #2. Each decision gives its reason and points at the inventory row or regression entry it rests on: [`inventory.md`](inventory.md) chooses the source of each component, [`regressions.md`](regressions.md) lists the failure modes the core must keep handled.
 
-Status: **proposed**, awaiting review on #2. Nothing is extracted before it is accepted.
+Status: **accepted** in the review of #6 (7 Nov), with the review's requests incorporated ([decisions on review](#decisions-on-review)).
 
 ## Layers and package layout
 
@@ -53,10 +53,12 @@ A study implements these and registers them in `study.toml`; the platform implem
 | `Platform` | platform | `sandbox(condition)`, `tool_servers(condition)`, `health()`, infrastructure kinds it may raise, probes | ICSA's `real_sandbox.py`, `knowledge/launch.py`, `health.py` called directly by the harness |
 | `Sandbox` | platform (local stand-in in core) | `start`, `exec`, `collect`, `stop`, `metadata`; one `ExecResult` type | `sandbox_api.SandboxLike` with its two diverging `ExecResult`s |
 | `ToolProvider` | core (MCP), platform or study | tools the agent sees for a condition, with schemas and an executor | ICSA's built-in `python` tool and WWW's in-process SPARQL tools |
-| `Scorer` | study | a pure function of a record returning two axes (what the agent did; what the platform's state shows) and a verdict of fulfilled, violated or not determined | PPAM's `OracleResult`, ICSOC's `lenses/a3b.py`, ICSA's `ScoredRow` ([inventory row 10](inventory.md#10-scoring-helpers)) |
-| `Instrument` | study or platform | hooks at run start and end that write into the record under their own namespace | ICSA's study fields in `RunRecord.extras` and the sandbox metadata the runner parses (`runner.py:163-243`) |
+| `Scorer` | study | a pure function of a record returning two axes (what the agent did; what the platform's state shows), a verdict of fulfilled, violated or not determined, and named numeric outcomes (for example share of the required extent consumed, F1, bytes moved, tokens); it reads only the record | PPAM's `OracleResult`, ICSOC's `lenses/a3b.py`, ICSA's `ScoredRow` ([inventory row 10](inventory.md#10-scoring-helpers)) |
+| `Instrument` | study or platform | hooks at run start and end that write into the record under their own namespace; platform probes (file distribution, transfer records, bytes per provider pair) are instruments and write their snapshot at run end | ICSA's study fields in `RunRecord.extras` and the sandbox metadata the runner parses (`runner.py:163-243`) |
 
-Scorers run on records only, so re-scoring never needs a model or the platform (R13). An instrument that needs live state records what it read, so replay can serve it.
+Scorers read the record and nothing else. In particular, the platform axis of a score comes from the run-end snapshots that platform instruments wrote into the record; no scorer queries the live platform. Re-scoring therefore never needs a model or the platform (R13), and a score computed an hour later equals one computed at run end. An instrument that needs live state records what it read, so replay can serve it.
+
+Outcomes are what the analysis consumes; the verdict alone cannot carry a contrast. An outcome a scorer could not compute is missing (`None`), never zero, and a "not determined" verdict leaves every outcome that depends on the unobserved state missing (R10, S05).
 
 ## Run identity: the factor schema
 
@@ -84,7 +86,12 @@ tools = "read"
 - `task`, `model` and `seed` are built in; every other factor is declared.
 - A **run key** is the factor values in the declared order, joined canonically; its SHA-256 names files and store rows. Keys are unique (R11) and two conditions never share one (C18).
 - A **condition** assigns every declared factor except `task`, `model` and `seed`, and maps to platform settings ([tokens](#tokens-and-permissions)). Conditions that differ in one factor only can run side by side in one campaign.
-- **Contrasts** name the factor that varies and the cluster (for example a region attribute of the task); pairing is on every other factor. ICSA's contrasts hard-coded option within layout (`analysis/contrasts.py:70`).
+- **Contrasts** come in two forms, both clustered by a task attribute (for example a region):
+  - *factor contrasts* name the factor that varies; pairing is on every other factor;
+  - *named-condition contrasts* compare condition A with condition B, paired on task, model and seed. They serve designs that are chains rather than full crosses, such as ICSA's option chain, where adjacent conditions differ in one thing but the set is not a factorial.
+
+  The Holm family is declared over named contrasts in `preregistration.toml`. ICSA's contrasts hard-coded option within layout (`analysis/contrasts.py:70`).
+- **The estimator is a preregistration parameter.** Each contrast names its outcome and its estimator (for example a Wilcoxon signed-rank test with a cluster-bootstrap interval). The contrast interface and the records carry no assumption about the estimator, so another one (a permutation test, a mixed model for binary outcomes) can be added later without changing either. ICSA's kernel provides the first estimator.
 - The store keeps the run key, the factor values as JSON, and indexed columns generated from the declared factors.
 
 ## Records and replay
@@ -120,7 +127,7 @@ TOML files in the study's repository, validated at load with messages that name 
 | `models.toml` | **the single model table**: key, backend, API id, reported-name aliases, sampling, output limit, reasoning echo field, status | Each model is named once; caps and concurrency refer to these keys (P06). Status `frozen` gates study runs (B08). |
 | `campaign.toml` | caps per concurrency unit, attempt limits, budgets and prices, order seed | The campaign's endpoint and URL are the ones execution uses (C14). |
 | `platform.toml` | zone, providers, spaces, each agent site's local provider, the expected support set, tool-server settings | No platform name appears in code (O12); the agent is pinned to its local provider (O03); health checks the declared support set (O04). |
-| `preregistration.toml` | contrast family, outcomes, cluster attribute, alpha, bootstrap replicates, power settings | Its hash goes into every analysis manifest (P04). |
+| `preregistration.toml` | named contrasts with their outcome, estimator and cluster attribute; the Holm family; alpha, bootstrap replicates, power settings | Its hash goes into every analysis manifest (P04). |
 
 Secrets are referenced by environment variable or file path, never written in configuration, and checked at startup. Every configuration file's hash is recorded in the campaign manifest; resuming with a different hash is refused (C06).
 
@@ -176,7 +183,7 @@ The papers' AI-use disclosure needs the same trail: the earlier harnesses were w
 
 ### The study-token list
 
-The plain list of study names (conditions, datasets, models, hosts, spaces, providers, users; categories in the [inventory appendix](inventory.md#appendix-study-tokens)) is kept **outside this repository**, because the repository is public. Proposed location: the maintainer's private CCGrid study repository, next to the 7 Nov reviews; the study-token test reads it from the path in `EXPCORE_STUDY_TOKENS` when present. The study-token map that sanitises imports ([provenance](#provenance-of-extracted-code)) lives beside it.
+The plain list of study names (conditions, datasets, models, hosts, spaces, providers, users; categories in the [inventory appendix](inventory.md#appendix-study-tokens)) is kept **outside this repository**, because the repository is public. It lives at a path outside any repository, named by `EXPCORE_STUDY_TOKENS`; the study-token test reads it from there when present. The study-token map that sanitises imports ([provenance](#provenance-of-extracted-code)) lives beside it. A separate private repository for both (for example `papers-experiments-core-private`) is proposed to the maintainer; no study's repository holds them, because the list spans every study and includes hosts and an admin principal.
 
 The repository commits only `tests/data/study_tokens.sha256`, one hash per line. A study regenerates it with:
 
@@ -195,10 +202,28 @@ The test hashes every candidate and fails on a match, with fixtures for URLs, pa
 
 Any study's own code, study-specific instruments (for example ICSA's analysed-extent tracer), and analyses for a paper ([#1](https://github.com/groundnuty/papers-experiments-core/issues/1)). The inventory lists what is deliberately not extracted.
 
-## Open questions for review
+## Release boundary
 
-1. **Malformed tool-call arguments:** default to ICSA's report-and-continue, with WWW's end-the-attempt as the declared alternative (L01)?
-2. **Error outputs and the cap:** cap errors like any output (ICSA) or never cut them (WWW) (L06)? Proposed: cap them, with the error class first.
-3. **Streaming transport:** not in v0.1; B17 records what a port must keep. Acceptable for the first consumer?
-4. **Plain token-list location:** is the private CCGrid study repository the right home?
-5. **Package names:** `expcore` and `expcore_onedata`, in one distribution with an `[onedata]` extra?
+v0.1 holds what a study needs to run end to end; the rest follows in v0.2. Each row of the inventory's [decision summary](inventory.md#decision-summary) carries its release.
+
+| v0.1 | v0.2 |
+|---|---|
+| agent loop, model backends (non-streaming), model table and served-model check, output capping, MCP client and allow-lists, prompts | streaming transport (B17) |
+| records, replay and the replay check; secrets hygiene | snapshot cut and fetch (C21) |
+| campaign kernel: factor schema, manifest, store and resume, scheduling on one host, leases, budgets, export | two-host execution; operator tooling; confirmed model-level faults (C22) |
+| infrastructure versus agent failures | cause coding (sampling, kappa) |
+| statistics kernel: named contrasts, the first estimator, Holm, cluster bootstrap, power simulation | further estimators |
+| provenance headers, code stamp, study-token test | |
+| replication packages: inclusion list, checksums, `make check` (needed by #5's release) | replication packages: scanner, canaries, anonymisation |
+| platform: federation configuration, tokens on both planes, sandbox and data paths, tool-server launch, provisioning, probes, health, day-0 checks (#4) | fault injection |
+
+## Decisions on review
+
+Settled in the review of #6 (7 Nov):
+
+1. **Malformed tool-call arguments (L01):** report-and-continue is the default: the call is not executed, the model gets the error, and the raw arguments are recorded. Ending the attempt is the declared alternative. Executing with `{}` is not offered at all. Malformed calls are counted per run as a recorded metric.
+2. **Error outputs and the cap (L06):** capped like any output, with the error class first; the full raw error stays in the record, with a truncation flag on what the model saw. The cap value is part of the configuration hash, so two conditions in one contrast cannot differ in it unnoticed.
+3. **Streaming:** not in v0.1; B17 keeps what a port must preserve.
+4. **Plain token list:** outside any repository until a private repository is decided ([above](#the-study-token-list)).
+5. **Package names:** `expcore` and `expcore_onedata`, one distribution with an `[onedata]` extra.
+6. **Requests incorporated:** scorers read the platform axis only from run-end instrument snapshots ([plugin interfaces](#plugin-interfaces)); contrasts between named conditions and the estimator as a preregistration parameter ([factor schema](#run-identity-the-factor-schema)); scorers return named numeric outcomes, missing when not computed; the release boundary above.
