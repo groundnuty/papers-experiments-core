@@ -54,7 +54,7 @@ Groups: [B model backends](#b-model-backends) · [L loop and tools](#l-agent-loo
 
 **B16. Incompatible per-model rules are refused before any request.** *Learned:* WWW `loop.py:346-351, 971-998` (echo with reasoning-channel recovery; caps below the notice length). *Test:* each incompatible combination raises at configuration.
 
-**B17. Streamed replies must be complete.** When streaming is used: a reply counts only with the end marker, a finish reason and the final usage chunk; an error event after HTTP 200 is transient; a call without id or name, or a token count that rises with no characters, is rejected and retried; a quiet stream is cut by a whole-request watchdog. *Learned:* WWW `providers.py:1308-1396, 1605-1805` (bec52d27, 1b7b7ec8, 79a3d49c; 19 Oct). Applies when a streaming transport is ported (see [`architecture.md`](architecture.md#model-backends)). *Test:* WWW `tests/test_agent_streaming.py` cases.
+**B17. Streamed replies must be complete.** When streaming is used: a reply counts only with the end marker, a finish reason and the final usage chunk; an error event after HTTP 200 is transient; a call without id or name, or a token count that rises with no characters, is rejected and retried; a quiet stream is cut by a whole-request watchdog. *Learned:* WWW `providers.py:1308-1396, 1605-1805` (bec52d27, 1b7b7ec8, 79a3d49c; 19 Oct). Applies when a streaming transport is ported (see [`architecture.md`](architecture.md#open-questions-for-review), question 3). *Test:* WWW `tests/test_agent_streaming.py` cases.
 
 ## L. Agent loop and tools
 
