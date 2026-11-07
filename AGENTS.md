@@ -213,15 +213,36 @@ Code-centric work — writing and refactoring code. Language-agnostic baseline.
 
 ## Project overview
 
-<!-- 1-2 sentences: what this project is and who it serves. -->
+A versioned Python package (`expcore`, with the Onedata platform layer `expcore_onedata`) that LLM-agent studies on federated research data import instead of rewriting their harness. The epic is issue #1; the accepted design is `docs/architecture.md`, the component sources are in `docs/inventory.md`, and the failure modes every release must keep handled are in `docs/regressions.md`.
 
 ## Build, test, run
 
-<!-- Exact commands. If using devbox: `devbox run -- make check`. -->
+No code yet; issue #3 adds the package and its test command.
 
 ## Conventions
 
-<!-- Stack, the conventions the rules above don't cover, where new code, tests and docs go. -->
+**How work arrives and ships**
+- A coordinating Claude session writes specifications as GitHub issues and pings this repository's coding session over the Claude Code message channel. Reply on the issue or PR, and ping back when a PR is ready.
+- Changes reach `main` only through a pull request. The one exception was the initial template scaffold.
+- **Codex review before every PR**, with model `gpt-6-astra`:
+  - Run it outside the sandbox, because it writes to `~/.codex`.
+  - `codex review --base main` refuses custom instructions, so review with `codex exec -m gpt-6-astra -s read-only --output-last-message <out.md> - < <prompt.md>`, and have the prompt start by running `git diff main...HEAD`.
+  - Re-run it on the fix commits until a round finds nothing new.
+- Merging needs the coordinating session's review and the user's go-ahead.
+
+**Subagents**
+- Pin `model: "sonnet"` for coding and mechanical extraction.
+- Use `model: "opus"` only for architecture or evidence work where judgment dominates.
+
+**Sandbox**
+- `codex`, `gh` (stored login) and `git push` over SSH run only outside the sandbox.
+- The sandbox mounts some paths as character devices (shell dotfiles, `.claude/agents`, …). They are listed in `.git/info/exclude`; stage explicit paths and never `git add -A`.
+
+**Public repository**
+- This repository is public, and its history is never rewritten.
+- Never commit hostnames, IP addresses or ranges, Onedata space, provider or user names, credentials, or local home paths.
+- Study names are checked by hash. The plain list and the sanitising map live in a private repository, found through `EXPCORE_STUDY_TOKENS` (see `docs/architecture.md`, "The study-token list").
+- Code extracted from earlier studies is imported sanitised, never verbatim ("Provenance of extracted code").
 
 ## Do-not-touch zones
 
