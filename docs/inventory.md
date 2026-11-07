@@ -100,7 +100,7 @@ Each table has one row per study. "Handles" lists the regression entries the cod
 
 | Study | Where | Size, tests | Study-specific | Handles | Verdict |
 |---|---|---|---|---|---|
-| PPAM | `benchmark/llm_adapters/openai_compat.py:96-261`; `claude_agent_sdk.py:140-271` | 297 + 315 lines; 11 adapter tests | none in the loop; tools called in-process through FastMCP (`openai_compat.py:269`), never over the wire | B04, B12, L11; lacks L01, B02 | drop |
+| PPAM | `benchmark/llm_adapters/openai_compat.py:96-261`; `claude_agent_sdk.py:140-271` | 297 + 315 lines; 11 adapter tests | none in the loop; tools called in-process through FastMCP (`openai_compat.py:269`), never over the wire | B04, L11; B12 partly (records `finish_reason` but takes a `length`-cut reply as final, `openai_compat.py:218-220`); lacks L01, B02 | drop |
 | ICSOC | `harness/panel.py:217-714` (one loop per leg) | 863 lines; no unit tests (live smoke only) | MCP server name and binary path (`panel.py:69-74, 108`) | L11; lacks B01, B04, B12, L01 | drop |
 | WWW | `harness/agent/loop.py`, `looping.py`, `engine_flags.py` | 1,179 + 68 + 59 lines; about 150 tests | SPARQL tool names, frozen scorer import (`loop.py:306-334`), checker phase (`1089-1091`), refusal word list (`194-197`) | L02, L04, L07–L10, B13, B16; ends the attempt on L01 | merge from |
 | ICSA | `icsa/harness/loop.py`; `runner.py` (`execute_run` 284-517) | 265 + 517 lines; 75 + 20 tests | `icsa.records` types (`loop.py:17`); a free `python` tool built in (`26-32`); kill categories of ICSA's sandbox (`128-144`); 7 study imports in `runner.py` | L01, L03–L05, L12, B12, R09 | **source** |
@@ -111,9 +111,9 @@ ICSA's loop is small, tested and provider-neutral; its study ties are the record
 
 | Study | Where | Size, tests | Study-specific | Handles | Verdict |
 |---|---|---|---|---|---|
-| PPAM | `openai_compat.py`; `claude_agent_sdk.py` | 297 + 315 lines; 11 tests | upstream provider pin (`benchmark/panel.py:133-150`) | B01 (no 5xx), B04, B12, B14 | merge from (B14) |
+| PPAM | `openai_compat.py`; `claude_agent_sdk.py` | 297 + 315 lines; 11 tests | upstream provider pin (`benchmark/panel.py:133-150`) | B01 (no 5xx), B04, B14; B12 partly (see row 1) | merge from (B14) |
 | ICSOC | `panel.py:249-426` (OpenAI-compatible), `507-714` (Agent SDK) | within 863 lines; no unit tests | model ids (`panel.py:91-106`) | none of B01, B04, B12, B14 | drop |
-| WWW | `harness/agent/providers.py` | 1,862 lines; about 150 tests | default model ids, gateway URL and key variables (`1401, 1439-1463`), per-model leak and reasoning rules (`384-390, 521-545`) | B01–B03, B06 (fingerprint), B10, B13, B15, B17 | merge from |
+| WWW | `harness/agent/providers.py` | 1,862 lines; about 150 tests | default model ids, gateway URL and key variables (`1401, 1439-1463`), per-model leak and reasoning rules (`384-390, 521-545`) | B01 (but jitter can undercut `Retry-After`, `providers.py:819-823`), B02, B03, B06 (fingerprint), B10, B13, B15, B17 | merge from |
 | ICSA | `icsa/harness/adapters.py` (`ModelAdapter` 74-80, OpenAI-compatible 112-271, Anthropic 274-410, `StubAdapter` 413-461); `slots.py` | 461 + 83 lines; 24 + 10 tests | backend names for the HPC endpoints and the gateway (`adapters.py:116`, `slots.py:21`) | B01 (no jitter), B02–B05, B09–B12 | **source** |
 
 ICSA's pair of adapters behind one protocol, plus a stub, is the base. WWW's transport is more thorough (streaming guards, watchdog), and its retry policy adds jitter and `Retry-After`. Streaming is not ported in v0.1; B17 records what a port must keep.

@@ -93,6 +93,7 @@ tools = "read"
 - identity: run key, factor values, attempt number;
 - route: backend, model, base URL without credentials, SDK versions, settings actually sent (B15);
 - prompt: template and rendered hashes, slot values, tool manifest hash (L06);
+- agent configuration as resolved for this run, not as a hash: turn, wall-time, token and output caps, the malformed-call policy (L01), reasoning echo and other per-model rules, retry policy; replay reads these values from the record, and a table maps each older schema version to the defaults then in force (WWW `replay.py:352-371`);
 - code stamp and core version (P01, P02);
 - transcript: per turn the neutral message, the native provider message, stop reason, usage (`None` when unreported, R10), served model and fingerprint (B06), retries with their errors, the echoed-request digest (R06);
 - tool calls: arguments, raw arguments when malformed (L01), the exact text the model saw, the raw result, status, timings;
@@ -125,12 +126,19 @@ Secrets are referenced by environment variable or file path, never written in co
 
 ## Tokens and permissions
 
-Two tokens per run, never the same one.
+Two planes per run, each with its own principal and its own token, never shared.
 
-- **Data-path token.** Always read-only, whatever the condition: minted with read-only and path caveats scoped to the study's space, examined before use with refusal on any failure, enforced again by the data gate and by a read-only mount. These are ICSA's six enforcement points ([inventory](inventory.md#read-only-enforcement-in-icsa)), kept fail-closed (O05). The MCP server's own token policy is not one of them, because it keeps write tools when examination fails.
-- **Tool-server token.** Its rights are declared per condition: `read`, or read plus named write rights such as `qos` and `replication`. It is minted separately, its lifetime derived from the run's time cap (O06), and its value never recorded (R12).
+| | Data path | Tool server (knowledge plane) |
+|---|---|---|
+| Principal | the run's leased platform user (C19) | a separate leased platform user per run, distinct from the data-path user |
+| Platform privileges | exactly view and read on the study's space, read back direct and effective, refused otherwise | exactly the privileges the condition declares: view and read, plus named write rights such as QoS management or replication scheduling |
+| Token caveats | read-only and path-scoped to the space | path-scoped to the space; read-only when the condition declares no write right, otherwise without it |
+| Examination before use | fail-closed: refused unless the caveats are exactly the data-path set (ICSA `tokencheck.py:40-60`) | fail-closed: refused unless the caveats and the principal's effective privileges equal the condition's declared set, no more and no less |
+| Further enforcement | data gate allows only read calls; read-only mount and root filesystem | server-side tool allow-list per condition; frozen manifest |
 
-Tool exposure is declared per condition as an allow-list; the server enforces it, the client checks the server's manifest against a frozen copy per condition, and an extra or missing tool fails the start (L13). Two conditions that differ only in tool exposure, or only in token rights, run side by side in one campaign. An equality check (ICSA `knowledge/equality.py`) confirms the agent sees exactly the declared difference.
+ICSA's six enforcement points ([inventory](inventory.md#read-only-enforcement-in-icsa)) all apply to the data path and stay fail-closed (O05); they are parameterised by plane, so the tool-server plane is checked against its own declared set rather than against "read-only". The MCP server's own token policy is not an enforcement point, because it keeps write tools when examination fails. Both tokens get lifetimes derived from the run's time cap (O06); neither value is ever recorded (R12). The agent's own data path stays read-only in every condition, including those that grant the tool server write rights.
+
+Tool exposure is declared per condition as an allow-list; the server enforces it, the client checks the server's manifest against a frozen copy per condition, and an extra or missing tool fails the start (L13). Two conditions that differ only in tool exposure, or only in tool-server rights, run side by side in one campaign: each run leases its own principals, so no privilege set is shared. An equality check (ICSA `knowledge/equality.py`) confirms the agent sees exactly the declared difference.
 
 Resources a run mutates or must not share, such as a run's platform user, a writable tool-server token, or a provider whose state the run changes, are held under exclusive leases (C19). Concurrency caps count leases as well as running attempts.
 
@@ -149,12 +157,16 @@ Every module that starts from earlier study code begins with a header naming whe
 
 ```python
 # Provenance:
-#   source: icsa-2027-experiments @ 6fc798cf6ef1, icsa/harness/capping.py
+#   source: icsa-2027-experiments @ 6fc798cf6ef1, icsa/harness/capping.py, blob 3f2a…
 #   merged: www-2027-experiments @ 46a5828d, harness/agent/tools.py:121-141
-#   changes: notice text parameterised; cap recorded in the tool description
+#   changes: see git history of this file from its import commit
 ```
 
-A module written fresh says `# Provenance: new`. A test fails if a module under `src/` has neither. Sources are named by repository and commit, never by URL, so no token-bearing remote is copied. A maintainer-only test, skipped when the source repositories are absent, checks that each `source` file at the named commit exists. ICSA's anonymised replication package is never a source (P07).
+Extraction is reproducible through git rather than through prose:
+1. The **import commit** adds the source file verbatim, with only the provenance header prepended, and names the source blob (the git blob id of the file at the named commit).
+2. Every later change, including merged material, is a separate commit, so `git log -p` of the module is the exact transformation from source to current code.
+
+A module written fresh says `# Provenance: new`. A test fails if a module under `src/` has neither header. Sources are named by repository and commit, never by URL, so no token-bearing remote is copied. A maintainer-only test, skipped when the source repositories are absent, checks P07: the module's import commit, minus the header, has the blob id the header names, and that blob is the file at the named source commit. ICSA's anonymised replication package is never a source.
 
 The papers' AI-use disclosure needs the same trail: the earlier harnesses were written by coding agents, and the source commits carry that attribution, so the header links each module to it.
 
@@ -168,7 +180,12 @@ The repository commits only `tests/data/study_tokens.sha256`, one hash per line.
 uv run python -m expcore.provenance.study_tokens hash "$EXPCORE_STUDY_TOKENS" > tests/data/study_tokens.sha256
 ```
 
-Each token is normalised (Unicode NFKC, case-folded, surrounding whitespace removed) and hashed as SHA-256 of `expcore-study-token-v1:` followed by the token. The test hashes every identifier, string literal and comment word (including dotted and hyphenated runs) in `src/` and fails on a match. Tokens shorter than four characters, such as single-letter option names, match only as a whole string literal or identifier, to avoid false positives. The hashes keep the names out of casual reading; a determined reader can still confirm a guessed name, so the list must not hold anything secret.
+Each token is normalised (Unicode NFKC, case-folded, surrounding whitespace removed) and hashed as SHA-256 of `expcore-study-token-v1:` followed by the token. Generation and checking share one candidate extractor, so a listed token is found wherever it is embedded:
+1. Take every identifier, string literal and comment in `src/`.
+2. Split each into maximal runs of letters, digits and `_ . -`; this separates URL schemes, paths, ports, queries and assignments.
+3. From each run, emit every contiguous sequence of its components (split at `_`, `.` and `-`), re-joined with the separators it had. A hostname inside a URL, a space name inside a path and a name inside a composed identifier all become candidates.
+
+The test hashes every candidate and fails on a match, with fixtures for URLs, paths and composed names. Tokens shorter than four characters, such as single-letter option names, match only as a whole string literal or identifier, to avoid false positives. The hashes keep the names out of casual reading; a determined reader can still confirm a guessed name, so the list must not hold anything secret.
 
 ## Out of scope
 
