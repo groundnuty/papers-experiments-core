@@ -152,7 +152,7 @@ Groups: [B model backends](#b-model-backends) · [L loop and tools](#l-agent-loo
 
 **C17. An unexpected worker exception stops dispatch loudly.** *Learned:* ICSA `scheduler.py:2160-2169`. *Test:* a raising worker stops dispatch and leaves its run for recovery.
 
-**C18. Two conditions never share attempt keys.** *Learned:* WWW A/B arms of one route model skipped each other's attempts (`results/forge-tolerances-20261021/README.md:152-154`). *Test:* two conditions with the same model produce disjoint run keys.
+**C18. Two conditions never share attempt keys.** *Learned:* WWW A/B arms of one route model skipped each other's attempts (the 21 Oct tolerances result README, lines 152-154). *Test:* two conditions with the same model produce disjoint run keys.
 
 **C19. Leases on shared mutable resources fail safe.** A dead holder's key is not re-granted until its sandbox is shown gone; an unproven teardown quarantines the resource; with every resource quarantined the run is unstarted, using no attempt; a file lock does not cross hosts, so a key leased on two hosts is refused; an unreadable reservation reads as held. *Learned:* ICSA `icsa/harness/slot_lease.py:55-58, 112-146, 208-215, 280-319`, `reservation.py:15-16, 105-132` (1c525365, 1 Nov; f1c242a8, 3 Nov). *Test:* each case with a fake resource and a fake reaper.
 
