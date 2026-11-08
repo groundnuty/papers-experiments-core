@@ -5,10 +5,24 @@ import tomllib
 
 import pytest
 
+from expcore.campaign.factors import FactorSchema
 from expcore.config.loading import ConfigError
 from expcore.stats.pairing import ContrastSpec
 from expcore.stats.power import PowerSettings
-from expcore.stats.prereg import BootstrapSettings, Preregistration, load, parse
+from expcore.stats.prereg import BootstrapSettings, Preregistration, parse
+from expcore.stats.prereg import load as load_checked
+
+SCHEMA = FactorSchema(
+    {"gate": ["open", "shut"]},
+    ["task", "gate", "model", "seed"],
+    {"cond-a": {"gate": "open"}, "cond-b": {"gate": "shut"}},
+)
+
+
+def load(path):
+    """Load a preregistration against the schema above."""
+    return load_checked(path, SCHEMA)
+
 
 BASE = """\
 alpha = 0.05
@@ -93,7 +107,7 @@ def test_p04_the_hash_of_the_file_goes_into_the_manifest(tmp_path):
     path = write(tmp_path)
     prereg = load(path)
     assert prereg.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
-    assert prereg.manifest() == {"preregistration_sha256": prereg.sha256}
+    assert prereg.manifest() == {"preregistration_sha256": prereg.sha256, "factor_schema_sha256": SCHEMA.digest}
 
 
 def test_p04_an_edit_of_the_file_changes_the_hash(tmp_path):
@@ -108,7 +122,10 @@ def test_p04_an_override_produces_a_hash_ending_in_override(tmp_path):
     prereg = load(write(tmp_path))
     smaller = prereg.with_override(bootstrap=BootstrapSettings(replicates=20, seed=1))
     assert smaller.sha256 == prereg.sha256 + "+override"
-    assert smaller.manifest() == {"preregistration_sha256": prereg.sha256 + "+override"}
+    assert smaller.manifest() == {
+        "preregistration_sha256": prereg.sha256 + "+override",
+        "factor_schema_sha256": SCHEMA.digest,
+    }
     assert smaller.bootstrap.replicates == 20
     assert smaller.alpha == prereg.alpha
     assert prereg.bootstrap.replicates == 500  # the original is untouched
@@ -225,5 +242,69 @@ def test_a_missing_file_bad_toml_and_bad_bytes_are_refused_by_name(tmp_path):
 
 def test_parse_takes_a_mapping_and_the_hash_it_is_given():
     """The same validation serves a mapping that did not come from a file, and the caller supplies the hash."""
-    prereg = parse(tomllib.loads(BASE), "inline", "f" * 64)
+    prereg = parse(tomllib.loads(BASE), "inline", "f" * 64, SCHEMA)
     assert (prereg.source, prereg.sha256) == ("inline", "f" * 64)
+
+
+CHAIN = FactorSchema(
+    {"stage": ["one", "two", "three"]},
+    ["task", "stage", "model", "seed"],
+    {"chain-one": {"stage": "one"}, "chain-two": {"stage": "two"}, "chain-three": {"stage": "three"}},
+    tasks={"chain-two": ["task-a", "task-b"], "chain-three": ["task-c"]},
+    file="study.toml",
+)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "key", "fragment"),
+    [
+        (
+            'conditions = ["cond-a", "cond-b"]',
+            'conditions = ["cond-a", "cond-z"]',
+            "conditions",
+            "unknown condition 'cond-z'",
+        ),
+        ('factor = "gate"', 'factor = "tempo"', "factor", "unknown factor 'tempo'"),
+        ('factor = "gate"', 'factor = "model"', "factor", "'model' is built in"),
+        ('levels = ["open", "shut"]', 'levels = ["open", "ajar"]', "levels", "unknown level 'ajar' of 'gate'"),
+    ],
+)
+def test_a_contrast_naming_what_the_factor_schema_lacks_is_refused_at_load(tmp_path, old, new, key, fragment):
+    """The arms of a contrast must exist in the schema; the message names the file, the contrast and the key."""
+    path = write(tmp_path, edited(old, new))
+    with pytest.raises(ConfigError) as caught:
+        load(path)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: [contrasts.")
+    assert f"key {key!r}" in message
+    assert fragment in message
+
+
+def test_the_message_for_an_unknown_condition_lists_the_conditions_of_the_schema_file(tmp_path):
+    """The author sees which conditions exist, and in which file they were declared."""
+    text = edited('conditions = ["cond-a", "cond-b"]', 'conditions = ["chain-one", "cond-z"]')
+    with pytest.raises(ConfigError, match=r"the conditions of study.toml are: chain-one, chain-two, chain-three"):
+        load_checked(write(tmp_path, text), CHAIN)
+
+
+def test_two_conditions_that_run_on_no_task_in_common_are_refused_at_load(tmp_path):
+    """A chain design lists the tasks of an arm; two arms with disjoint lists could never be paired."""
+    text = edited('conditions = ["cond-a", "cond-b"]', 'conditions = ["chain-two", "chain-three"]')
+    with pytest.raises(ConfigError, match="'chain-two' and 'chain-three' run on no task in common"):
+        load_checked(write(tmp_path, text), CHAIN)
+
+
+def test_conditions_with_overlapping_or_unlisted_tasks_load(tmp_path):
+    """An arm without a task list runs on every task, so it overlaps with any list."""
+    for pair in ('["chain-one", "chain-three"]', '["chain-one", "chain-two"]', '["chain-two", "chain-one"]'):
+        text = edited('conditions = ["cond-a", "cond-b"]', f"conditions = {pair}")
+        text = text.replace('factor = "gate"\nlevels = ["open", "shut"]', 'factor = "stage"\nlevels = ["one", "two"]')
+        assert load_checked(write(tmp_path, text), CHAIN).contrasts["a-vs-b"].conditions is not None
+
+
+def test_the_manifest_names_the_factor_schema_the_contrasts_were_checked_against(tmp_path):
+    """Another schema is another digest in the output."""
+    text = edited('conditions = ["cond-a", "cond-b"]', 'conditions = ["chain-one", "chain-two"]')
+    text = text.replace('factor = "gate"\nlevels = ["open", "shut"]', 'factor = "stage"\nlevels = ["one", "two"]')
+    prereg = load_checked(write(tmp_path, text), CHAIN)
+    assert prereg.manifest()["factor_schema_sha256"] == CHAIN.digest != SCHEMA.digest

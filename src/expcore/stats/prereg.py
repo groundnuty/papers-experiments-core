@@ -4,7 +4,8 @@
 #   changes: see git history of this file from its import commit
 """Loading preregistration.toml: named contrasts, the Holm family, alpha, the bootstrap and the power settings.
 
-The file is validated when it is loaded, with messages that name the file and the key, and the SHA-256 of its bytes
+The file is validated when it is loaded, against the campaign's factor schema (the conditions and factors its
+contrasts name must exist there), with messages that name the file and the key, and the SHA-256 of its bytes
 goes into every output manifest (P04). A copy made for a test marks that hash `+override`, so an output computed from
 changed settings cannot pass for one computed from the file.
 
@@ -26,13 +27,13 @@ changed settings cannot pass for one computed from the file.
     [estimators.wilcoxon_cluster_bootstrap]   # optional parameters of a registered estimator
     method = "auto"
 
-    [contrasts.a-vs-b]         # named-condition form
+    [contrasts.a-vs-b]         # named-condition form: two conditions of the factor schema
     conditions = ["cond-a", "cond-b"]
     outcome = "score"
     estimator = "wilcoxon_cluster_bootstrap"
     cluster = "group"          # the task attribute that is the unit of inference
 
-    [contrasts.gate-effect]    # factor form: pairs on every other factor
+    [contrasts.gate-effect]    # factor form: a declared factor of the schema and two of its levels
     factor = "gate"
     levels = ["open", "shut"]
     outcome = "score"
@@ -50,6 +51,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.factors import BUILTIN_FACTORS, FactorSchema
 from expcore.config.loading import ConfigError, Section
 from expcore.stats import estimators
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
@@ -83,6 +85,7 @@ class Preregistration:
     holm_family: tuple[str, ...]
     power: PowerSettings | None = None
     estimator_params: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
+    schema_digest: str | None = None  # the factor schema the contrasts were validated against
 
     def with_override(self, **changes: Any) -> Preregistration:
         """Return a copy with fields replaced, for tests and never for production; its hash ends in `+override` (P04)."""
@@ -92,8 +95,15 @@ class Preregistration:
         return dataclasses.replace(self, sha256=marked, **changes)
 
     def manifest(self) -> dict[str, str]:
-        """The entries every output manifest carries: the hash of the preregistration it was computed under (P04)."""
-        return {"preregistration_sha256": self.sha256}
+        """The entries every output manifest carries: the hash of the preregistration it was computed under (P04).
+
+        When the preregistration was validated against a factor schema, the schema's digest goes with it, so an output
+        says which conditions and factors its contrasts were checked against.
+        """
+        entries = {"preregistration_sha256": self.sha256}
+        if self.schema_digest is not None:
+            entries["factor_schema_sha256"] = self.schema_digest
+        return entries
 
     def estimator_settings(self, spec: ContrastSpec) -> EstimatorSettings:
         """The settings one contrast's estimator receives.
@@ -110,8 +120,8 @@ class Preregistration:
         )
 
 
-def load(path: str | Path) -> Preregistration:
-    """Read and validate a preregistration file; raise ConfigError naming the file and the key."""
+def load(path: str | Path, schema: FactorSchema) -> Preregistration:
+    """Read a preregistration file and validate it against the factor schema; raise ConfigError naming file and key."""
     file = Path(path)
     try:
         data = file.read_bytes()
@@ -125,22 +135,22 @@ def load(path: str | Path) -> Preregistration:
         raise ConfigError(f"{file}: not valid UTF-8") from None
     except tomllib.TOMLDecodeError as error:
         raise ConfigError(f"{file}: not valid TOML: {error}") from None
-    return parse(raw, str(file), hashlib.sha256(data).hexdigest())
+    return parse(raw, str(file), hashlib.sha256(data).hexdigest(), schema)
 
 
-def parse(raw: Mapping[str, Any], source: str, sha256: str) -> Preregistration:
-    """Validate parsed TOML and build the preregistration; `source` names the file in messages."""
+def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema) -> Preregistration:
+    """Validate parsed TOML against the factor schema and build the preregistration; `source` names the file."""
     root = Section(raw, source, "top level")
     root.reject_unknown(_TOP_KEYS)
     alpha = _fraction(root, "alpha")
     bootstrap = _bootstrap(_table_section(root, "bootstrap"))
-    contrasts = {name: _contrast(source, name, table) for name, table in _tables(root, "contrasts").items()}
+    contrasts = {name: _contrast(source, name, table, schema) for name, table in _tables(root, "contrasts").items()}
     if not contrasts:
         raise root.fail("contrasts", "must declare at least one contrast")
     family = _family(root, contrasts)
     power = _power(_table_section(root, "power")) if "power" in raw else None
     params = {name: _estimator_params(source, name, table) for name, table in _tables(root, "estimators").items()}
-    return Preregistration(source, sha256, alpha, bootstrap, contrasts, family, power, params)
+    return Preregistration(source, sha256, alpha, bootstrap, contrasts, family, power, params, schema.digest)
 
 
 def _table_section(root: Section, key: str) -> Section:
@@ -244,8 +254,8 @@ def _arms(section: Section, key: str) -> tuple[str, str]:
     return arms[0], arms[1]
 
 
-def _contrast(source: str, name: str, table: Mapping[str, Any]) -> ContrastSpec:
-    """Read one [contrasts.<name>] table in either form."""
+def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema) -> ContrastSpec:
+    """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
     section.reject_unknown(_CONTRAST_KEYS)
     outcome, estimator, cluster = section.string("outcome"), section.string("estimator"), section.string("cluster")
@@ -257,14 +267,46 @@ def _contrast(source: str, name: str, table: Mapping[str, Any]) -> ContrastSpec:
         for extra in ("factor", "levels"):
             if extra in table:
                 raise section.fail(extra, "belongs to the factor form; this contrast names conditions")
-        return ContrastSpec(name, outcome, estimator, cluster, conditions=_arms(section, "conditions"))
+        conditions = _arms(section, "conditions")
+        _check_conditions(section, conditions, schema)
+        return ContrastSpec(name, outcome, estimator, cluster, conditions=conditions)
     if "factor" not in table:
         raise section.fail("conditions", "is required unless the contrast gives a factor with its levels")
     if "levels" not in table:
         raise section.fail("levels", "is required with a factor")
-    return ContrastSpec(
-        name, outcome, estimator, cluster, factor=section.string("factor"), levels=_arms(section, "levels")
-    )
+    factor, levels = section.string("factor"), _arms(section, "levels")
+    _check_factor(section, factor, levels, schema)
+    return ContrastSpec(name, outcome, estimator, cluster, factor=factor, levels=levels)
+
+
+def _check_conditions(section: Section, conditions: tuple[str, str], schema: FactorSchema) -> None:
+    """Require both conditions to be conditions of the schema, and to share at least one task."""
+    for condition in conditions:
+        if condition not in schema.conditions:
+            raise section.fail(
+                "conditions",
+                f"names unknown condition {condition!r}; the conditions of {schema.file} are: "
+                f"{', '.join(schema.conditions)}",
+            )
+    first, second = (schema.condition_tasks[c] for c in conditions)
+    if first is not None and second is not None and not set(first) & set(second):
+        raise section.fail("conditions", f"{conditions[0]!r} and {conditions[1]!r} run on no task in common")
+
+
+def _check_factor(section: Section, factor: str, levels: tuple[str, str], schema: FactorSchema) -> None:
+    """Require a declared factor of the schema and two of its levels."""
+    if factor in BUILTIN_FACTORS:
+        raise section.fail("factor", f"{factor!r} is built in; a factor contrast varies a declared factor")
+    if factor not in schema.declared:
+        raise section.fail(
+            "factor", f"names unknown factor {factor!r}; the factors of {schema.file} are: {', '.join(schema.declared)}"
+        )
+    for level in levels:
+        if level not in schema.declared[factor]:
+            raise section.fail(
+                "levels",
+                f"names unknown level {level!r} of {factor!r}; its levels are: {', '.join(schema.declared[factor])}",
+            )
 
 
 def _family(root: Section, contrasts: Mapping[str, ContrastSpec]) -> tuple[str, ...]:

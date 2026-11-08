@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from stats_support import both_arms, make_row
 
+from expcore.campaign.factors import FactorSchema
 from expcore.stats import estimators
 from expcore.stats.analysis import analyse, pilot_power, power_study, run_contrast
 from expcore.stats.estimators import EstimatorResult
@@ -57,13 +58,28 @@ CONDITIONS = {
     "open-y": {"gate": "open", "mode": "y"},
     "shut-y": {"gate": "shut", "mode": "y"},
 }
+SCHEMA = FactorSchema(
+    {"gate": ["open", "shut"], "mode": ["x", "y"]}, ["task", "gate", "mode", "model", "seed"], CONDITIONS
+)
 RATE = {"open-x": 0.7, "shut-x": 0.5, "open-y": 0.7, "shut-y": 0.5}  # the gate adds 0.2; the mode adds nothing
+
+
+ARMS = FactorSchema(
+    {"arm": ["a", "b", "x", "y"]},
+    ["task", "arm", "model", "seed"],
+    {f"cond-{arm}": {"arm": arm} for arm in "abxy"},
+)
+
+
+def manifest(sha):
+    """The manifest entries of a preregistration with this hash, checked against the SCHEMA above."""
+    return {"preregistration_sha256": sha, "factor_schema_sha256": SCHEMA.digest}
 
 
 @pytest.fixture
 def prereg():
     """The preregistration above, parsed from a mapping with a fixed hash."""
-    return parse(tomllib.loads(TEXT), "inline", "a" * 64)
+    return parse(tomllib.loads(TEXT), "inline", "a" * 64, SCHEMA)
 
 
 @pytest.fixture(scope="module")
@@ -106,9 +122,9 @@ def test_holm_runs_over_the_declared_family_with_the_exact_levels(prereg, plante
 def test_p04_the_result_carries_the_hash_of_the_preregistration_it_was_computed_under(prereg, planted):
     """P04: the manifest entry is the preregistration hash, and an override shows in it."""
     _, rows = planted
-    assert analyse(rows, prereg).manifest == {"preregistration_sha256": "a" * 64}
+    assert analyse(rows, prereg).manifest == manifest("a" * 64)
     small = prereg.with_override(alpha=0.01)
-    assert analyse(rows, small).manifest == {"preregistration_sha256": "a" * 64 + "+override"}
+    assert analyse(rows, small).manifest == manifest("a" * 64 + "+override")
     assert analyse(rows, small).alpha == 0.01
 
 
@@ -135,7 +151,7 @@ def test_s02_an_untestable_contrast_keeps_its_place_in_the_family():
     text += 'estimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"\n\n'
     text += '[contrasts.no-data]\nconditions = ["cond-x", "cond-y"]\noutcome = "score"\n'
     text += 'estimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"\n'
-    family = parse(tomllib.loads(text), "inline", "c" * 64)
+    family = parse(tomllib.loads(text), "inline", "c" * 64, ARMS)
     rows = []
     for i in range(6):  # six clusters, all positive and distinct: two-sided exact p = 2 / 2**6 = 0.03125
         rows += both_arms(f"t{i}", "model-a", 1, 0.9 - 0.01 * i, 0.5, cluster=f"c{i}")
@@ -183,7 +199,7 @@ def test_the_contrast_interface_and_the_result_assume_no_estimator(prereg, plant
 
     _, rows = planted
     text = TEXT.replace('estimator = "wilcoxon_cluster_bootstrap"', 'estimator = "sign_share"', 1)
-    other = parse(tomllib.loads(text), "inline", "b" * 64)
+    other = parse(tomllib.loads(text), "inline", "b" * 64, SCHEMA)
     result = analyse(rows, other)
     assert result.contrast("gate-effect").estimator == "sign_share"
     assert result.contrast("gate-effect").p_value == 0.0
@@ -217,7 +233,7 @@ def test_pilot_power_pairs_the_pilot_rows_and_uses_the_preregistered_settings(pr
     assert {(row["n_clusters"], row["delta"]) for row in table} == {(20, 0.1)}
     assert all(0.0 <= row["power"] <= 1.0 for row in table)
     assert len(pilot_power(rows, prereg).rows) == 3 * 2
-    assert result.manifest == {"preregistration_sha256": "a" * 64}  # P04
+    assert result.manifest == manifest("a" * 64)  # P04
 
 
 def test_pilot_power_refuses_what_it_cannot_run(prereg, planted):
@@ -233,7 +249,7 @@ def test_the_power_study_runs_on_the_preregistered_settings_and_the_family_size(
     """The grid, the targets, the seed and the number of simulations come from the file; alpha is divided by m = 3."""
     result = power_study(prereg)
     table = result.rows
-    assert result.manifest == {"preregistration_sha256": "a" * 64}  # P04: the power table carries the hash too
+    assert result.manifest == manifest("a" * 64)  # P04: the power table carries the hash too
     assert [(row["sd"], row["alpha_level"]) for row in table] == [(0.1, "alpha"), (0.1, "alpha_over_contrasts")]
     assert table[1]["alpha"] == pytest.approx(0.05 / 3)
     assert {(row["n_clusters"], row["delta"]) for row in table} == {(20, 0.1)}
@@ -241,6 +257,6 @@ def test_the_power_study_runs_on_the_preregistered_settings_and_the_family_size(
     assert all(math.isnan(row["power"]) for row in power_study(prereg, simulate=False).rows)
     changed = prereg.with_override(power=dataclasses.replace(prereg.power, target_difference=0.3))
     assert power_study(changed).rows[0]["power"] > table[0]["power"]
-    assert power_study(changed).manifest == {"preregistration_sha256": "a" * 64 + "+override"}
+    assert power_study(changed).manifest == manifest("a" * 64 + "+override")
     with pytest.raises(ValueError, match=r"inline: has no \[power\] section"):
         power_study(prereg.with_override(power=None))
