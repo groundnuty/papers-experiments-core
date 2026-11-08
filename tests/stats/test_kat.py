@@ -1,5 +1,7 @@
 """P05: the known-answer test of the inference code, and the proof that it notices a change."""
 
+import dataclasses
+import inspect
 import itertools
 import math
 import types
@@ -111,7 +113,8 @@ def test_p05_an_estimator_that_raises_is_reported_with_its_case_and_the_others_s
     monkeypatch.setitem(estimators._REGISTRY, estimators.WILCOXON, estimators._Entry(broken, lambda params: None))
     problems = kat.run()
     assert any("raised RuntimeError: boom" in p for p in problems)
-    assert len([p for p in problems if "raised RuntimeError" in p]) == len(kat.WILCOXON_CASES)
+    crashed = [p for p in problems if "raised RuntimeError" in p]
+    assert len(crashed) == len(kat.WILCOXON_CASES) + len(kat.INTERVAL_CASES[estimators.WILCOXON])
     assert not any(p.startswith("holm") for p in problems)
 
 
@@ -131,3 +134,133 @@ def test_p05_the_normal_approximation_case_is_the_closed_form():
     """P05: z = (10 - 5) / 2.5 = 2, so p = 2 * (1 - Phi(2)) = erfc(2 / sqrt 2)."""
     case = next(c for c in kat.WILCOXON_CASES if c.params.get("method") == "approx")
     assert case.p_value == pytest.approx(math.erfc(2 / math.sqrt(2)), abs=1e-15)
+
+
+def collapsing(estimator):
+    """Wrap an estimator so that its interval is the point estimate: the fault the hand-worked answers cannot see."""
+
+    def wrapped(paired, settings):
+        result = estimator(paired, settings)
+        return dataclasses.replace(result, ci_low=result.estimate, ci_high=result.estimate)
+
+    return wrapped
+
+
+def wrapping_the_registered_estimator(monkeypatch, wrapper):
+    """Replace the registered Wilcoxon estimator by `wrapper(real estimator)`, in a copy of the registry."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    entry = estimators._REGISTRY[estimators.WILCOXON]
+    monkeypatch.setitem(
+        estimators._REGISTRY, estimators.WILCOXON, dataclasses.replace(entry, function=wrapper(entry.function))
+    )
+
+
+def case_names(problems):
+    """The case labels of a list of problems."""
+    return {problem.split(":")[0] for problem in problems}
+
+
+VARYING_CASES = {
+    f"wilcoxon_cluster_bootstrap / {name}"
+    for name in (
+        "five positive differences",
+        "zero dropped",
+        "one negative difference",
+        "ties",
+        "two models, one cell missing",
+        "twelve clusters, one negative",
+        "nine clusters, two models, gaps",
+    )
+}
+
+
+def test_p05_where_the_differences_vary_the_interval_has_width_around_the_estimate():
+    """P05: ci_low < estimate < ci_high on every case with varying differences, and a point where they are equal."""
+    for case in kat.WILCOXON_CASES:
+        matrix = np.array(case.matrix, dtype=float)
+        paired = estimators.PairedDifferences(
+            tuple(f"grp-{i}" for i in range(len(matrix))), tuple(f"model-{j}" for j in range(matrix.shape[1])), matrix
+        )
+        result = estimators.get(estimators.WILCOXON)(
+            paired, estimators.EstimatorSettings(200, 0.95, (1, 2), case.params)
+        )
+        spread = contrasts.cluster_means(matrix)
+        if np.nanmax(spread) > np.nanmin(spread):
+            assert result.ci_low < result.estimate < result.ci_high, case.name
+        else:
+            assert result.ci_low == result.estimate == result.ci_high, case.name
+
+
+def test_p05_an_estimator_whose_interval_collapses_onto_its_estimate_fails_the_known_answers(monkeypatch):
+    """P05: a wrapper that sets ci_low = ci_high = estimate is reported, case by case, and verify() raises."""
+    assert kat.run() == []
+    wrapping_the_registered_estimator(monkeypatch, collapsing)
+    problems = kat.run()
+    assert problems
+    assert case_names(problems) >= VARYING_CASES
+    assert any("has no width around the estimate" in problem for problem in problems)
+    assert any("frozen interval" in problem for problem in problems)
+    with pytest.raises(kat.KnownAnswerError, match="has no width around the estimate"):
+        kat.verify()
+
+
+def test_p05_the_width_rule_alone_catches_the_collapse_in_every_case_with_varying_differences(monkeypatch):
+    """P05: without the frozen endpoints the property still fails the wrapper, and only where differences vary."""
+    monkeypatch.setattr(kat, "INTERVAL_CASES", {})
+    wrapping_the_registered_estimator(monkeypatch, collapsing)
+    problems = kat.run()
+    assert case_names(problems) == {
+        "wilcoxon_cluster_bootstrap / five positive differences",
+        "wilcoxon_cluster_bootstrap / zero dropped",
+        "wilcoxon_cluster_bootstrap / one negative difference",
+        "wilcoxon_cluster_bootstrap / ties",
+        "wilcoxon_cluster_bootstrap / two models, one cell missing",
+    }
+    assert all("has no width around the estimate" in problem for problem in problems)
+
+
+def test_p05_a_change_of_the_seeded_bootstrap_fails_the_frozen_endpoints_and_nothing_else(monkeypatch):
+    """P05: a bootstrap drawing other clusters keeps its width and encloses the estimate; the frozen values see it."""
+    monkeypatch.setattr(
+        contrasts,
+        "draw_clusters",
+        lambda rng, replicates, n: np.random.default_rng(99).integers(0, n, size=(replicates, n)),
+    )
+    problems = kat.run()
+    assert case_names(problems) == {
+        "wilcoxon_cluster_bootstrap / twelve clusters, one negative",
+        "wilcoxon_cluster_bootstrap / nine clusters, two models, gaps",
+    }
+    assert all("frozen interval" in problem for problem in problems)
+    with pytest.raises(kat.KnownAnswerError, match="frozen interval"):
+        kat.verify()
+
+
+def narrowing(estimator):
+    """Wrap an estimator so that its interval keeps its centre and loses a hundredth of its width on each side."""
+
+    def wrapped(paired, settings):
+        result = estimator(paired, settings)
+        shrink = 0.01 * (result.ci_high - result.ci_low)
+        return dataclasses.replace(result, ci_low=result.ci_low + shrink, ci_high=result.ci_high - shrink)
+
+    return wrapped
+
+
+def test_p05_a_slightly_narrower_interval_is_caught_by_the_frozen_endpoints(monkeypatch):
+    """P05: the endpoints are compared to 1e-12, so a one percent change of the interval is a failure."""
+    wrapping_the_registered_estimator(monkeypatch, narrowing)
+    assert case_names(kat.run()) == {
+        "wilcoxon_cluster_bootstrap / twelve clusters, one negative",
+        "wilcoxon_cluster_bootstrap / nine clusters, two models, gaps",
+    }
+
+
+def test_p05_the_frozen_intervals_are_two_inputs_with_a_comment_on_how_they_were_made():
+    """P05: the frozen cases are the two named inputs, and the source says they came from the reviewed code."""
+    assert [case.name for case in kat.INTERVAL_CASES[estimators.WILCOXON]] == [
+        "twelve clusters, one negative",
+        "nine clusters, two models, gaps",
+    ]
+    source = inspect.getsource(kat)
+    assert "Frozen from the reviewed implementation, not derived by hand" in source
