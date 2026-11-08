@@ -9,11 +9,11 @@ import pytest
 from stats_support import both_arms, make_row
 
 from expcore.campaign.factors import FactorSchema
-from expcore.stats import estimators
-from expcore.stats.analysis import analyse, pilot_power, power_study, run_contrast
+from expcore.stats import estimators, power
+from expcore.stats.analysis import CONCLUSIONS, analyse, pilot_power, power_study, run_contrast
 from expcore.stats.estimators import EstimatorResult
-from expcore.stats.pairing import ContrastSpec
-from expcore.stats.prereg import parse
+from expcore.stats.pairing import ContrastSpec, pair_rows
+from expcore.stats.prereg import name_digest, parse
 from expcore.stats.rows import Row
 from expcore.stats.sim import OutcomeSpec, SimSpec, simulate
 
@@ -135,7 +135,12 @@ def test_a_contrast_gives_the_same_result_whichever_contrasts_run_with_it(prereg
     alone = prereg.with_override(
         contrasts={"gate-effect": prereg.contrasts["gate-effect"]}, holm_family=("gate-effect",)
     )
-    assert analyse(rows, alone).contrast("gate-effect") == analyse(rows, prereg).contrast("gate-effect")
+    one, many = analyse(rows, alone).contrast("gate-effect"), analyse(rows, prereg).contrast("gate-effect")
+    # the minimum detectable effect is judged at alpha over the family size, so it is the one field that may differ
+    assert dataclasses.replace(one, minimum_detectable_effect=None) == dataclasses.replace(
+        many, minimum_detectable_effect=None
+    )
+    assert one.minimum_detectable_effect < many.minimum_detectable_effect
 
 
 def test_the_same_rows_and_preregistration_give_the_same_result_in_any_row_order(prereg, planted):
@@ -371,3 +376,256 @@ def test_the_family_keeps_every_contrast_when_one_of_them_drops_tasks(chain):
     result = analyse(chain_rows(), chain)
     assert [d.name for d in result.holm] == ["one-vs-two", "two-vs-three"]
     assert sorted(d.level for d in result.holm) == pytest.approx([0.05 / 2, 0.05])
+
+
+# --- conclusions: difference, not_detected, equivalent, and the minimum detectable effect ----------------------------
+
+ARM_CONDITIONS = {f"cond-{arm}": {"arm": arm} for arm in "pqr"}
+ARM_SCHEMA = FactorSchema({"arm": ["p", "q", "r"]}, ["task", "arm", "model", "seed"], ARM_CONDITIONS)
+ARM_MEANS = {"cond-p": 0.6, "cond-q": 0.4, "cond-r": 0.4}  # p differs from q by 0.2; q and r are the same
+CONCLUSION_TEXT = """\
+alpha = 0.05
+holm_family = ["p-vs-q", "q-vs-r"]
+
+[bootstrap]
+replicates = 400
+seed = 3
+
+[power]
+seed = 4
+n_simulations = 300
+target_clusters = 20
+target_difference = 0.1
+sd_grid = [0.1]
+
+[contrasts.p-vs-q]
+conditions = ["cond-p", "cond-q"]
+outcome = "rate"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+
+[contrasts.q-vs-r]
+conditions = ["cond-q", "cond-r"]
+outcome = "rate"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+
+[contrasts.q-vs-r-margin]
+conditions = ["cond-q", "cond-r"]
+outcome = "rate"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+equivalence_margin = 0.15
+
+[contrasts.q-vs-r-tiny-margin]
+conditions = ["cond-q", "cond-r"]
+outcome = "rate"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+equivalence_margin = 0.002
+
+[contrasts.p-vs-q-wide-margin]
+conditions = ["cond-p", "cond-q"]
+outcome = "rate"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+equivalence_margin = 0.5
+"""
+
+
+@pytest.fixture(scope="module")
+def concluded():
+    """The preregistration above run on simulated rows, with the preregistration itself."""
+    prereg = parse(tomllib.loads(CONCLUSION_TEXT), "inline", "e" * 64, ARM_SCHEMA)
+    spec = SimSpec(
+        ARM_CONDITIONS,
+        {"rate": OutcomeSpec("proportion", ARM_MEANS)},
+        n_clusters=30,
+        tasks_per_cluster=2,
+        seeds=(1, 2),
+    )
+    return prereg, analyse(simulate(spec, np.random.default_rng(77)), prereg)
+
+
+def test_a_significant_result_is_a_difference(concluded):
+    """The planted 0.2 is rejected by Holm, and without a margin nothing makes it equivalent."""
+    _, result = concluded
+    found = result.contrast("p-vs-q")
+    assert (found.significant, found.in_family) == (True, True)
+    assert (found.equivalence_margin, found.equivalence_interval, found.equivalent) == (None, None, False)
+    assert found.conclusion == "difference"
+
+
+def test_a_non_significant_result_without_a_margin_is_not_detected_never_no_difference(concluded):
+    """The same two arms with no planted effect: the test does not reject, and the result says only that."""
+    _, result = concluded
+    null = result.contrast("q-vs-r")
+    assert null.significant is False
+    assert null.p_value > 0.05
+    assert (null.equivalence_margin, null.equivalence_interval, null.equivalent) == (None, None, False)
+    assert null.conclusion == "not_detected"
+
+
+def test_with_a_margin_an_interval_inside_it_is_equivalent(concluded):
+    """The 1 - 2 alpha interval of the null contrast lies inside plus or minus 0.15, so it is equivalent."""
+    _, result = concluded
+    equivalent = result.contrast("q-vs-r-margin")
+    low, high = equivalent.equivalence_interval
+    assert -0.15 <= low <= high <= 0.15
+    assert equivalent.equivalent is True
+    assert equivalent.conclusion == "equivalent"
+    assert equivalent.equivalence_margin == 0.15
+
+
+def test_the_equivalence_interval_is_at_one_minus_two_alpha_not_at_the_reporting_level(concluded):
+    """With alpha 0.05 the interval is the 90 per cent one, narrower than the 95 per cent interval of the result."""
+    _, result = concluded
+    contrast = result.contrast("q-vs-r-margin")
+    low, high = contrast.equivalence_interval
+    assert high - low < contrast.ci_high - contrast.ci_low
+    assert contrast.ci_low < low
+    assert high < contrast.ci_high
+
+
+def test_a_margin_the_interval_is_too_wide_for_is_not_detected(concluded):
+    """A margin was declared, but the interval does not fit in it, so equivalence is not shown."""
+    _, result = concluded
+    wide = result.contrast("q-vs-r-tiny-margin")
+    low, high = wide.equivalence_interval
+    assert not (low >= -0.002 and high <= 0.002)
+    assert wide.equivalent is False
+    assert wide.significant is False
+    assert wide.conclusion == "not_detected"
+
+
+def test_equivalence_takes_precedence_over_a_significant_difference_inside_the_margin(concluded):
+    """A significant effect shown to be inside the preregistered margin is reported as equivalent, test unchanged."""
+    _, result = concluded
+    both = result.contrast("p-vs-q-wide-margin")
+    assert both.significant is True
+    assert both.equivalent is True
+    assert both.conclusion == "equivalent"
+
+
+def test_a_contrast_outside_the_family_is_judged_by_its_raw_p_value(concluded):
+    """Nothing adjusts for a contrast outside the Holm family, and the result says so."""
+    _, result = concluded
+    outside = result.contrast("p-vs-q-wide-margin")
+    assert outside.in_family is False
+    assert outside.significant is (outside.p_value <= result.alpha)
+    assert result.contrast("p-vs-q").in_family is True
+
+
+def test_every_conclusion_is_one_of_the_three_words(concluded):
+    """The vocabulary is closed."""
+    _, result = concluded
+    assert {c.conclusion for c in result.contrasts} <= set(CONCLUSIONS)
+    assert set(CONCLUSIONS) == {"difference", "not_detected", "equivalent"}
+
+
+def test_a_family_member_is_significant_by_holm_not_by_its_raw_p_value():
+    """p = 0.03125 is below alpha, but Holm in a family of two asks 0.025, so the conclusion is not_detected."""
+    text = CONCLUSION_TEXT.replace('["p-vs-q", "q-vs-r"]', '["with-data", "no-data"]')
+    text = text[: text.index("[contrasts.p-vs-q]")]
+    for name, pair in (("with-data", '"cond-p", "cond-q"'), ("no-data", '"cond-q", "cond-r"')):
+        text += f'[contrasts.{name}]\nconditions = [{pair}]\noutcome = "score"\n'
+        text += 'estimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"\n\n'
+    prereg = parse(tomllib.loads(text), "inline", "f" * 64, ARM_SCHEMA)
+    rows = []
+    for i in range(6):  # six clusters, all positive and distinct: two-sided exact p = 2 / 2**6 = 0.03125
+        rows += [
+            make_row(f"t{i}", "model-a", 1, 0.9 - 0.01 * i, condition="cond-p", cluster=f"c{i}", arm="p"),
+            make_row(f"t{i}", "model-a", 1, 0.5, condition="cond-q", cluster=f"c{i}", arm="q"),
+        ]
+    result = analyse(rows, prereg)
+    found = result.contrast("with-data")
+    assert found.p_value == pytest.approx(0.03125)
+    assert found.p_value < 0.05
+    assert (found.significant, found.conclusion) == (False, "not_detected")
+    assert result.contrast("no-data").conclusion == "not_detected"  # no pair at all: NaN is never significant
+
+
+def test_the_equivalence_interval_comes_from_the_estimator_at_the_level_it_is_asked_for(prereg, planted, monkeypatch):
+    """No estimator is assumed: each is asked once at the reporting level and once at 1 - 2 alpha."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    levels = []
+
+    @estimators.register("fixed_width")
+    def fixed_width(paired, settings):
+        levels.append(settings.level)
+        half = 1 - settings.level  # a wider interval at a higher level, whatever the data
+        return EstimatorResult(0.0, 0.5, -half, half, len(paired.clusters))
+
+    text = TEXT.replace('estimator = "wilcoxon_cluster_bootstrap"', 'estimator = "fixed_width"', 1)
+    text = text.replace('cluster = "group"', 'cluster = "group"\nequivalence_margin = 0.06', 1)
+    other = parse(tomllib.loads(text), "inline", "b" * 64, SCHEMA)
+    _, rows = planted
+    result = analyse(rows, other).contrast("gate-effect")
+    assert levels == [0.95, 0.9]  # the reporting level, then 1 - 2 alpha with alpha = 0.05
+    assert result.equivalence_interval == pytest.approx((-0.1, 0.1))
+    assert result.conclusion == "not_detected"  # the interval at 0.9 is +-0.1, outside the margin 0.06
+    tighter = dataclasses.replace(other.contrasts["gate-effect"], equivalence_margin=0.11)
+    assert run_contrast(rows, tighter, other).conclusion == "equivalent"
+
+
+def test_the_minimum_detectable_effect_is_computed_at_the_runs_cluster_count_from_the_power_settings(concluded):
+    """A family member is judged at alpha over the family size, any other contrast at alpha."""
+    _, result = concluded
+    member = result.contrast("p-vs-q")
+    outside = result.contrast("q-vs-r-margin")
+    for contrast in (member, outside):
+        assert contrast.n_clusters == 30
+        assert contrast.minimum_detectable_effect > 0
+    assert member.minimum_detectable_effect < 0.2  # the planted 0.2 was detected
+
+
+def test_the_minimum_detectable_effect_is_the_power_modules_for_the_contrasts_own_sd_and_cluster_count(concluded):
+    """The value is the one the power module gives for the contrast's cluster differences, seeded by its name."""
+    prereg, result = concluded
+    spec = prereg.contrasts["p-vs-q"]
+    rows = simulate(
+        SimSpec(
+            ARM_CONDITIONS,
+            {"rate": OutcomeSpec("proportion", ARM_MEANS)},
+            n_clusters=30,
+            tasks_per_cluster=2,
+            seeds=(1, 2),
+        ),
+        np.random.default_rng(77),
+    )
+    differences = pair_rows(rows, spec).differences.cluster_differences
+    expected = power.minimum_detectable_effect(
+        power.pilot_cluster_sd(differences),
+        30,
+        0.05 / 2,
+        prereg.power,
+        np.random.default_rng([prereg.power.seed, name_digest("p-vs-q")]),
+    )
+    assert result.contrast("p-vs-q").minimum_detectable_effect == expected
+
+
+def test_without_power_settings_there_is_no_minimum_detectable_effect(concluded):
+    """None, not NaN and not 0: nothing was asked for."""
+    prereg, _ = concluded
+    rows = simulate(
+        SimSpec(ARM_CONDITIONS, {"rate": OutcomeSpec("proportion", ARM_MEANS)}, n_clusters=8, seeds=(1,)),
+        np.random.default_rng(1),
+    )
+    result = analyse(rows, prereg.with_override(power=None))
+    assert all(c.minimum_detectable_effect is None for c in result.contrasts)
+
+
+def test_the_minimum_detectable_effect_is_nan_when_the_clusters_are_too_few_or_do_not_vary(concluded):
+    """Five clusters cannot reach p below 0.0625, and identical cluster differences have no SD to scale by."""
+    prereg, _ = concluded
+    few = simulate(
+        SimSpec(ARM_CONDITIONS, {"rate": OutcomeSpec("proportion", ARM_MEANS)}, n_clusters=5, seeds=(1,)),
+        np.random.default_rng(2),
+    )
+    assert math.isnan(analyse(few, prereg).contrast("p-vs-q").minimum_detectable_effect)
+    flat = [
+        make_row(f"t{i}", "model-a", 1, score, condition=f"cond-{arm}", cluster=f"c{i}", outcome="rate", arm=arm)
+        for i in range(8)
+        for arm, score in (("p", 0.7), ("q", 0.5))
+    ]
+    assert math.isnan(analyse(flat, prereg).contrast("p-vs-q").minimum_detectable_effect)
