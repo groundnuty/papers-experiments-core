@@ -1,356 +1,230 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/analysis/contrasts.py, blob 075305b68276374c1f62e3439eb94b4979491f68
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""Aggregation, paired region-level tests, Holm, cluster bootstrap (#14).
+#   merged: www-2027-experiments @ 46a5828d, harness/analysis/stats.py:7-13, 43
+#   merged: www-2027-experiments @ 46a5828d, harness/analysis/multiplicity.py:86-88
+#   changes: see git history of this file from its import commit
+"""Inference kernel for paired cluster contrasts: the snapped Wilcoxon test, the cluster bootstrap and Holm.
 
-Stages (each a plain mean): seeds -> instance -> region x model -> region.
-A contrast A-B is paired at the (instance, model) cell *before* averaging up,
-so a cell missing in one option drops out of that contrast only. The region is
-the unit of inference. All options pass through the same code.
+The kernel works on a matrix of paired differences, one row per cluster and one column per model, NaN where a cell
+has no pair. The cluster is the unit of inference. Pairing and aggregation happen before the kernel (see pairing);
+the registered estimators and the declared contrasts sit above it (see estimators and analysis). Nothing here knows
+an outcome, a factor or a design.
+
+Rules kept here, each with a regression test:
+- S01: float noise is snapped before the rank test, so differences equal in arithmetic tie.
+- S02, S06: Holm keeps the declared family, and its decisions compare the raw p-value with an exact level.
+- S03: an empty or all-zero set of differences has defined values, and dropped zeros are counted.
+- S04: one cluster resample is shared by all models.
+- S05: an undefined resample is NaN, never 0, and never supports a hypothesis.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import math
-import warnings
+from collections.abc import Sequence
 
 import numpy as np
-import pandas as pd
-from dataset_76.analysis.config import Config
 from scipy import stats
+
+DEFAULT_SNAP_DECIMALS = 12
+# A draw within this distance of the boundary is a tie and does not support the alternative; it only absorbs
+# floating-point rounding (0.53 - 0.50 is 0.0300...03).
+TIE_TOLERANCE = 1e-9
+# An interval needs at least this share of its replicates defined; the same rule serves every bootstrap interval.
+MIN_DEFINED_SHARE = 0.5
+WILCOXON_METHODS = ("auto", "exact", "approx")
+
+
+def snap(values, decimals: int = DEFAULT_SNAP_DECIMALS) -> np.ndarray:
+    """Round to `decimals` places so that float noise cannot split values that are equal in arithmetic (S01).
+
+    The grid is far below the data's own grid, so it merges the noise a chain of means leaves (about 1e-16
+    relative: 0.1 + 0.2 against 0.3) and never two values that really differ. A dry run on real data moved a
+    p-value from 1.12e-5 to 6.09e-6 when equal differences ranked apart. -0.0 becomes 0.0.
+    """
+    return np.round(np.asarray(values, dtype=float), decimals) + 0.0
+
+
+def _masked_mean(matrix: np.ndarray, axis: int) -> np.ndarray:
+    """Mean over the defined cells along an axis; NaN, never 0, where no cell is defined (S05)."""
+    defined = ~np.isnan(matrix)
+    total = np.where(defined, matrix, 0.0).sum(axis=axis)
+    count = defined.sum(axis=axis)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(count > 0, total / count, np.nan)
+
+
+def cluster_means(matrix: np.ndarray) -> np.ndarray:
+    """Cluster-level differences: the equal-weight mean over the models with a paired cell. Shape (..., R, M) to (..., R)."""
+    return _masked_mean(np.asarray(matrix, dtype=float), axis=-1)
+
+
+def model_means(matrix: np.ndarray) -> np.ndarray:
+    """Per-model differences: the mean over the clusters with a paired cell. Shape (..., R, M) to (..., M)."""
+    return _masked_mean(np.asarray(matrix, dtype=float), axis=-2)
 
 
 @dataclasses.dataclass(frozen=True)
-class Outcome:
-    name: str
-    column: str
-    primary: bool  # one of the pre-registered primary outcomes (coverage counts as two)
-    scale: str  # "proportion" or "log2"
-    smallest: str | None  # "proportion", "cost" or None (no pre-registered smallest effect)
+class Bootstrap:
+    """The point values and every replicate of a cluster bootstrap, with the cluster draws that produced them."""
+
+    point: float
+    point_per_model: np.ndarray  # (M,)
+    overall: np.ndarray  # (B,) mean over the drawn clusters of their cluster-level difference
+    per_model: np.ndarray  # (B, M) NaN where a model has no defined cell among the drawn clusters
+    indices: np.ndarray  # (B, R) the drawn cluster rows, one draw per replicate shared by all models
 
 
-OUTCOMES = [
-    Outcome("omission", "omit", True, "proportion", "proportion"),
-    # coverage is two outcomes, never combined: each is its own Holm family per layout
-    Outcome("coverage_baseline", "coverage_baseline", True, "proportion", "proportion"),
-    Outcome("coverage_target", "coverage_target", True, "proportion", "proportion"),
-    Outcome("event_f1", "event_f1", True, "proportion", None),
-    Outcome("tokens", "log2_tokens", True, "log2", "cost"),
-    Outcome("undisclosed", "undis", False, "proportion", None),
-    Outcome("end_to_end", "end_to_end", False, "proportion", None),
-    Outcome("false_alarm", "false_alarm", False, "proportion", None),
-]
-OUTCOME = {o.name: o for o in OUTCOMES}
+def draw_clusters(rng: np.random.Generator, replicates: int, n_clusters: int) -> np.ndarray:
+    """Draw `replicates` samples of `n_clusters` cluster rows with replacement."""
+    return rng.integers(0, n_clusters, size=(replicates, n_clusters))
 
 
-def grid_decimals(cfg: Config) -> int:
-    """Decimal places of the rounding grid, from `inference.zero_tolerance` (1e-12 -> 12)."""
-    return int(round(-math.log10(float(cfg["inference"]["zero_tolerance"]))))
+def resample(matrix: np.ndarray, indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return (overall, per-model) statistics of every replicate for the given cluster draws.
 
-
-def snap(x, cfg: Config) -> np.ndarray:
-    """Round to 12 decimal places (science, #14, 19:11Z): far below the data's own grid, so it merges the float noise the chain of
-    means leaves (about 1e-16 relative: 0.1 + 0.2 against 0.3) and never two values that really differ (omission and coverage sit on
-    grids of 1/1050 or coarser at region level; a coverage share's own grid is above 1e-9). Every Wilcoxon input and every comparison
-    with the smallest effect goes through it. -0.0 becomes 0.0."""
-    return np.round(np.asarray(x, dtype=float), grid_decimals(cfg)) + 0.0
-
-
-# Instance domain of the outcomes that exist on only one kind of instance. Out-of-domain
-# instances are not part of that outcome at all: not undefined, not dropped, not imputed.
-DOMAIN = {
-    "event_f1": lambda d: ~d["event_free"].astype(bool),  # events to match
-    "false_alarm": lambda d: d["event_free"].astype(bool),
-}  # event-free instances only
-
-
-def instance_values(
-    df: pd.DataFrame, column: str, defined_only: bool = True, impute: float | None = None
-) -> pd.DataFrame:
-    """Seeds -> instance: mean over the seeds whose denominator is defined.
-
-    An instance with no defined seed is *undefined* for the outcome: dropped
-    (`defined_only`, default), kept with value NaN (`defined_only=False`, so the
-    design is still visible), or set to `impute` (sensitivity analysis: 1 and 0).
+    The same draw indexes the rows of every model's column, so a replicate never mixes two resamples of the clusters
+    (S04). A model with no defined cell among the drawn clusters is NaN in that replicate (S05).
     """
-    keys = ["option", "layout", "model", "instance_id", "region_id"]
-    if column in DOMAIN:
-        df = df[DOMAIN[column](df)]
-    g = df.groupby(keys, as_index=False, sort=True)[column].mean()  # NaN where no seed defined
-    g = g.rename(columns={column: "value"})
-    if impute is not None:
-        g["value"] = g["value"].fillna(impute)
-    elif defined_only:
-        g = g.dropna(subset=["value"]).reset_index(drop=True)
-    return g
+    matrix = np.asarray(matrix, dtype=float)
+    return cluster_means(matrix)[indices].mean(axis=1), model_means(matrix[indices])
 
 
-def candidate_regions(inst: pd.DataFrame, a: str, b: str, layout: str) -> list:
-    """Regions present in the design for this layout in either arm (defined or not)."""
-    m = (inst["layout"] == layout) & inst["option"].isin([a, b])
-    return sorted(inst.loc[m, "region_id"].unique())
+def cluster_bootstrap(matrix: np.ndarray, replicates: int, rng: np.random.Generator) -> Bootstrap:
+    """Cluster bootstrap of the matrix: one resample of the clusters, shared by all models (S04).
 
-
-def paired_matrix(inst: pd.DataFrame, a: str, b: str, layout: str, pair: str = "region"):
-    """Region x model matrix of mean paired differences A-B.
-
-    pair="region" (the protocol rule): each arm's region value is the mean of the
-    instances defined in that arm (per model); the difference is taken between arms.
-    A region with no defined instance in either arm (for every model) is dropped.
-    pair="instance" (pagination cell): the arms are first paired at the (instance, model)
-    cell, so only instances defined in both arms count.
-    Returns (matrix, regions, models) with all-NaN regions and models removed.
+    The overall statistic is the mean over clusters of the cluster-level difference, exactly the quantity the rank
+    test sees. A per-model statistic is the mean over clusters of that model's column.
     """
-    lay = inst["layout"].to_numpy() == layout
-    opt = inst["option"].to_numpy()[lay]
-    mod = inst["model"].to_numpy(dtype=object)[lay]
-    ins = inst["instance_id"].to_numpy(dtype=object)[lay]
-    reg = inst["region_id"].to_numpy(dtype=object)[lay]
-    val = inst["value"].to_numpy(float)[lay]
-    models = np.sort(np.unique(mod))
-    insts, first = np.unique(ins, return_index=True)
-    regions = np.sort(np.unique(reg))
-    reg_of = reg[first]
-    member = (reg_of[None, :] == regions[:, None]).astype(float)  # (R, I)
-
-    def dense(o):
-        v = np.full((len(models), len(insts)), np.nan)
-        m = opt == o
-        v[np.searchsorted(models, mod[m]), np.searchsorted(insts, ins[m])] = val[m]
-        return v
-
-    def region_mean(v):  # (M, I) -> (M, R), mean of defined instances
-        ok = ~np.isnan(v)
-        num = np.where(ok, v, 0.0) @ member.T
-        cnt = ok.astype(float) @ member.T
-        with np.errstate(invalid="ignore", divide="ignore"):
-            return np.where(cnt > 0, num / cnt, np.nan)
-
-    va, vb = dense(a), dense(b)
-    if pair == "instance":
-        d = va - vb
-        mat = region_mean(d).T
-    elif pair == "region":
-        mat = (region_mean(va) - region_mean(vb)).T
-    else:
-        raise ValueError(pair)
-    if not mat.size:
-        return mat[:0, :0], [], []
-    keep_r, keep_m = ~np.all(np.isnan(mat), axis=1), ~np.all(np.isnan(mat), axis=0)
-    return mat[np.ix_(keep_r, keep_m)], list(regions[keep_r]), list(models[keep_m])
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        raise ValueError("the bootstrap needs a matrix with at least one cluster row")
+    if replicates < 1:
+        raise ValueError(f"the bootstrap needs at least one replicate, got {replicates}")
+    if np.isnan(matrix).all(axis=1).any():
+        raise ValueError("a cluster with no paired cell cannot be resampled; drop it before the bootstrap")
+    indices = draw_clusters(rng, replicates, matrix.shape[0])
+    overall, per_model = resample(matrix, indices)
+    return Bootstrap(float(cluster_means(matrix).mean()), model_means(matrix), overall, per_model, indices)
 
 
-def paired_region_model(inst: pd.DataFrame, a: str, b: str, layout: str, pair: str = "region") -> pd.DataFrame:
-    """Long form of `paired_matrix` (columns region_id, model, diff), cells without data dropped."""
-    mat, regions, models = paired_matrix(inst, a, b, layout, pair)
-    if not len(regions):
-        return pd.DataFrame(columns=["region_id", "model", "diff"])
-    df = pd.DataFrame(mat, index=regions, columns=models).rename_axis(index="region_id", columns="model")
-    return df.stack().rename("diff").reset_index()
+def percentile_interval(draws, level: float) -> tuple[float, float, int]:
+    """Return (low, high, defined): the percentile interval over the defined replicates.
 
-
-def _matrix(rm: pd.DataFrame) -> tuple[np.ndarray, list[str], list[str]]:
-    piv = rm.pivot(index="region_id", columns="model", values="diff").sort_index()
-    return piv.to_numpy(float), list(piv.index), list(piv.columns)
-
-
-def _equal_model_mean(mat: np.ndarray) -> np.ndarray:
-    """Per-resample statistic: mean over regions per model, then over models. mat: (..., R, M)."""
-    mask = ~np.isnan(mat)
-    num = np.where(mask, mat, 0.0).sum(axis=-2)
-    den = mask.sum(axis=-2)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        per_model = np.where(den > 0, num / den, np.nan)
-    return per_model  # (..., M)
-
-
-def region_means(mat: np.ndarray) -> np.ndarray:
-    """Region-level difference: equal-weight mean over the models with a paired cell."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanmean(mat, axis=-1)
-
-
-def cluster_bootstrap(mat: np.ndarray, B: int, level: float, rng: np.random.Generator):
-    """Region-cluster bootstrap. One region resample is shared by all models.
-
-    Overall statistic = mean over regions of the region-level difference (exactly the
-    quantity the Wilcoxon test sees). Per-model statistics = mean over regions of that
-    model's column. Returns overall (point, lo, hi) and per-model arrays (point, lo, hi).
+    Undefined replicates (NaN) are left out and counted by the caller as `len(draws) - defined`. The interval is NaN
+    when fewer than half the replicates are defined (S05); the same rule gives the kappa interval.
     """
-    R, M = mat.shape
-    reg = region_means(mat)  # (R,)
-    point = float(np.mean(reg))
-    idx = rng.integers(0, R, size=(B, R))
-    overall = reg[idx].mean(axis=1)
-    point_pm = _equal_model_mean(mat)
-    pm = _equal_model_mean(mat[idx])  # (B, M)
-    q = [(1 - level) / 2 * 100, (1 + level) / 2 * 100]
-    lo, hi = np.percentile(overall, q)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        mlo, mhi = np.nanpercentile(pm, q, axis=0)
-    return (point, lo, hi), (point_pm, mlo, mhi)
+    draws = np.asarray(draws, dtype=float)
+    defined = draws[~np.isnan(draws)]
+    if defined.size == 0 or defined.size < draws.size * MIN_DEFINED_SHARE:
+        return math.nan, math.nan, int(defined.size)
+    low, high = np.percentile(defined, [(1 - level) / 2 * 100, (1 + level) / 2 * 100])
+    return float(low), float(high), int(defined.size)
 
 
-def _wilcoxon_input(diffs: np.ndarray, cfg: Config) -> np.ndarray:
-    """The differences scipy sees: untestable regions (NaN) removed, float noise snapped to zero.
+def supports(draws, theta0: float = 0.0, tolerance: float = TIE_TOLERANCE) -> np.ndarray:
+    """Tell which resampled values support theta > theta0.
 
-    A region difference that is zero in arithmetic (T and D agree) comes out of the chain of means
-    as +-1e-17 about two times in three; scipy would rank that noise as the smallest signed rank
-    instead of dropping it as a zero. Differences below `inference.zero_tolerance` (1e-12; the
-    smallest real difference of any outcome is orders of magnitude larger) are therefore exact zeros.
-    The rest are rounded to the same grid (`snap`): differences that are equal in arithmetic reach scipy as
-    equal, so they tie, whatever order the means were summed in (#14 dry run: p moved 1.12e-5 -> 6.09e-6).
+    A value within the tolerance of the boundary is a tie, and an undefined value (NaN) never supports (S05).
     """
-    d = diffs[~np.isnan(diffs)]
-    return snap(np.where(np.abs(d) < float(cfg["inference"]["zero_tolerance"]), 0.0, d), cfg)
+    values = np.asarray(draws, dtype=float)
+    with np.errstate(invalid="ignore"):
+        return values > theta0 + tolerance
 
 
-def zeros_dropped(diffs: np.ndarray, cfg: Config) -> int:
-    """How many region differences are zero and so dropped by the Wilcoxon test.
+def one_sided_bootstrap_p(draws, theta0: float = 0.0, tolerance: float = TIE_TOLERANCE) -> float:
+    """One-sided bootstrap p-value for theta > theta0: (1 + number of draws not supporting) / (B + 1).
 
-    Counted on the array `wilcoxon_p` hands to scipy, with scipy's own test (`d == 0`). Only
-    zero_method "wilcox" drops them; "pratt" and "zsplit" keep them, so those report 0.
+    Ties and undefined draws count as not supporting, so a replicate that could not be computed can only raise p.
     """
-    if cfg["inference"]["wilcoxon_zero_method"] != "wilcox":
-        return 0
-    return int((_wilcoxon_input(diffs, cfg) == 0).sum())
+    values = np.asarray(draws, dtype=float)
+    if values.size == 0:
+        return math.nan
+    return float((1 + values.size - supports(values, theta0, tolerance).sum()) / (values.size + 1))
 
 
-def wilcoxon_p(diffs: np.ndarray, cfg: Config) -> float:
-    d = _wilcoxon_input(diffs, cfg)
+def wilcoxon_input(differences, decimals: int = DEFAULT_SNAP_DECIMALS) -> np.ndarray:
+    """The differences the rank test sees: undefined clusters (NaN) removed, float noise snapped (S01).
+
+    A cluster difference that is zero in arithmetic comes out of a chain of means as +-1e-17 about two times in three,
+    and the test would rank that noise as the smallest signed rank instead of dropping it as a zero. Differences
+    below 10**-decimals are therefore exact zeros, and the rest are rounded to the same grid, so differences equal in
+    arithmetic reach the test as equal and tie, whatever order the means were summed in.
+    """
+    values = np.asarray(differences, dtype=float)
+    values = values[~np.isnan(values)]
+    return snap(np.where(np.abs(values) < 10.0**-decimals, 0.0, values), decimals)
+
+
+def zeros_dropped(differences, decimals: int = DEFAULT_SNAP_DECIMALS) -> int:
+    """How many cluster differences are zero and so dropped by the Wilcoxon test (S03).
+
+    Counted on the array `wilcoxon_p` hands to scipy, with scipy's own test (`d == 0`).
+    """
+    return int((wilcoxon_input(differences, decimals) == 0).sum())
+
+
+def wilcoxon_p(differences, decimals: int = DEFAULT_SNAP_DECIMALS, method: str = "auto") -> float:
+    """Two-sided Wilcoxon signed-rank p-value of the cluster differences, zeros dropped.
+
+    No difference left to test gives NaN. Differences that are all zero give 1.0, no evidence of a difference
+    (scipy would raise) (S03).
+    """
+    if method not in WILCOXON_METHODS:
+        raise ValueError(f"unknown Wilcoxon method {method!r}; expected one of {', '.join(WILCOXON_METHODS)}")
+    d = wilcoxon_input(differences, decimals)
     if d.size == 0:
-        return float("nan")
+        return math.nan
     if np.all(d == 0):
-        return 1.0  # no evidence of a difference; scipy would raise
-    inf = cfg["inference"]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return float(stats.wilcoxon(d, zero_method=inf["wilcoxon_zero_method"], method=inf["wilcoxon_method"]).pvalue)
+        return 1.0
+    return float(stats.wilcoxon(d, zero_method="wilcox", method=method).pvalue)
 
 
-def holm(p: pd.Series) -> pd.Series:
-    """Holm step-down adjusted p over one pre-registered family.
+def level(alpha: float, weight: int, total: int) -> float:
+    """A multiplicity level, alpha * weight / total, multiplied first (S06).
 
-    The family keeps its full size: an untestable contrast (NaN) counts as p = 1 in the
-    adjustment, so it cannot shrink the family and make the others look more significant.
-    Its own adjusted value stays NaN. Written out (not statsmodels.multipletests, which
-    calls gc.collect on every call); the tests check it against statsmodels.
+    Every level and every comparison uses this one expression, so a p-value computed as the same expression sits
+    exactly on its level instead of one rounding away from it.
     """
-    out = pd.Series(np.nan, index=p.index)
-    if p.notna().sum() == 0:
-        return out
-    v = p.fillna(1.0).to_numpy(float)
-    order = np.argsort(v, kind="stable")
-    m = len(v)
-    adj = np.maximum.accumulate((m - np.arange(m)) * v[order])
-    res = np.empty(m)
-    res[order] = np.minimum(adj, 1.0)
-    out[:] = np.where(p.isna().to_numpy(), np.nan, res)
-    return out
+    return alpha * weight / total
 
 
-def contrast_one(
-    inst: pd.DataFrame,
-    a: str,
-    b: str,
-    layout: str,
-    outcome: Outcome,
-    cfg: Config,
-    bootstrap: bool = True,
-    rng: np.random.Generator | None = None,
-    pair: str = "region",
-):
-    """One contrast on one outcome and layout. Returns (summary dict, per-model DataFrame)."""
-    mat, regions, models = paired_matrix(inst, a, b, layout, pair)
-    row = {"outcome": outcome.name, "layout": layout, "contrast": f"{a}-{b}", "option_a": a, "option_b": b}
-    row["n_regions_dropped"] = len(candidate_regions(inst, a, b, layout)) - len(regions)
-    if not regions:
-        row.update(n_regions=0, n_models=0, n_zero_dropped=0, effect=np.nan, ci_lo=np.nan, ci_hi=np.nan, p_raw=np.nan)
-        return row, pd.DataFrame()
-    region_diff = region_means(mat)
-    pm_point = _equal_model_mean(mat)
-    point = float(np.mean(region_diff))
-    row.update(
-        n_regions=len(regions),
-        n_models=len(models),
-        effect=point,
-        n_zero_dropped=zeros_dropped(region_diff, cfg),  # zero region differences the Wilcoxon test drops
-        p_raw=wilcoxon_p(region_diff, cfg),
-    )
-    permodel = pd.DataFrame(
-        {"outcome": outcome.name, "layout": layout, "contrast": f"{a}-{b}", "model": models, "effect": pm_point}
-    )
-    if bootstrap:
-        bs = cfg["bootstrap"]
-        rng = rng or np.random.default_rng(bs["seed"])
-        (pt, lo, hi), (_, mlo, mhi) = cluster_bootstrap(mat, int(bs["B"]), float(bs["ci_level"]), rng)
-        row.update(effect=float(pt), ci_lo=float(lo), ci_hi=float(hi))
-        permodel["ci_lo"], permodel["ci_hi"] = mlo, mhi
-    else:
-        row.update(ci_lo=np.nan, ci_hi=np.nan)
-    permodel["direction"] = np.sign(permodel["effect"]).astype("Int64")
-    return row, permodel
+@dataclasses.dataclass(frozen=True)
+class HolmResult:
+    """Holm's step-down procedure over one declared family, in the order the p-values were given."""
+
+    adjusted: tuple[float, ...]  # Holm-adjusted p for reports; NaN where the test had no p-value
+    levels: tuple[float, ...]  # the level each p-value is compared with at its step
+    reject: tuple[bool, ...]  # decided by comparing the raw p-value with its level, p <= level
 
 
-def _decorate(tab: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Holm within outcome x layout, effect on the reporting scale, 'counts for the guide'."""
-    eff = cfg["effects"]
-    tab["p_holm"] = tab.groupby(["outcome", "layout"], group_keys=False)["p_raw"].apply(holm)
-    tab["significant"] = np.where(tab["p_holm"].isna(), np.nan, (tab["p_holm"] < cfg.alpha).astype(float))
-    sm = []
-    for _, r in tab.iterrows():
-        k = OUTCOME[r["outcome"]].smallest
-        sm.append(
-            {
-                "proportion": eff["smallest_effect_proportion"],
-                "cost": float(np.log2(eff["smallest_effect_cost_factor"])),
-                None: np.nan,
-            }[k]
-        )
-    tab["smallest_effect"] = sm
-    undefined = tab["smallest_effect"].isna() | tab["effect"].isna() | tab["p_holm"].isna()
-    # "at least" the smallest effect (registration, as science ruled on #14, 19:11Z): |effect| >= 0.10, or |log2 ratio| >= 1 for cost,
-    # both sides rounded to the same grid as the tests' inputs, so an effect exactly at the smallest effect counts whatever its float noise
-    at_least = (snap(tab["effect"].abs(), cfg) >= snap(tab["smallest_effect"], cfg)).astype(float)
-    tab["at_least_smallest"] = np.where(tab["smallest_effect"].isna() | tab["effect"].isna(), np.nan, at_least)
-    tab["counts_for_guide"] = np.where(
-        undefined, np.nan, ((tab["p_holm"] < cfg.alpha) & (at_least == 1.0)).astype(float)
-    )
-    is_tok = tab["outcome"] == "tokens"
-    for c in ("effect", "ci_lo", "ci_hi"):
-        tab[f"{c}_ratio"] = np.where(is_tok, 2.0 ** tab[c], np.nan)
-    return tab
+def holm(p_values: Sequence[float | None], alpha: float) -> HolmResult:
+    """Holm step-down over one pre-registered family.
 
+    The family keeps its full size: a missing or NaN p-value (an untestable contrast) counts as p = 1 and stays in
+    the family, so it cannot shrink m and make the others look more significant. It never rejects, and its adjusted
+    value stays NaN (S02).
 
-def contrast_tables(
-    df: pd.DataFrame,
-    cfg: Config,
-    outcomes: list[str] | None = None,
-    bootstrap: bool = True,
-    value_override: dict[str, str] | None = None,
-    impute: float | None = None,
-):
-    """All option contrasts x layouts x outcomes. Returns (summary, per-model) DataFrames.
-
-    `value_override` maps an outcome name to another column of `df` (used by the
-    bounds, which swap the omission column).
+    Rejection compares the raw p-value with `level(alpha, 1, m - step)` using `<=`, so a p-value exactly on its level
+    is rejected as declared. The adjusted p-values are for reporting; at the boundary a float product can land one
+    rounding above alpha, which is why they do not decide (S06).
     """
-    outs = [OUTCOME[n] for n in (outcomes or [o.name for o in OUTCOMES])]
-    rng = np.random.default_rng(cfg["bootstrap"]["seed"])
-    rows, pms = [], []
-    main = df[df.option.isin(cfg.options)]
-    for o in outs:
-        col = (value_override or {}).get(o.name, o.column)
-        inst = instance_values(main, col, defined_only=False, impute=impute)
-        for layout in cfg.layouts:
-            for a, b in cfg.contrasts:
-                r, pm = contrast_one(inst, a, b, layout, o, cfg, bootstrap, rng)
-                rows.append(r)
-                pms.append(pm)
-    tab = _decorate(pd.DataFrame(rows), cfg)
-    tab["primary"] = tab["outcome"].map(lambda n: OUTCOME[n].primary)
-    pm = pd.concat([p for p in pms if len(p)], ignore_index=True) if any(len(p) for p in pms) else pd.DataFrame()
-    return tab, pm
+    if not 0.0 < alpha < 1.0:
+        raise ValueError(f"alpha must be strictly between 0 and 1, got {alpha}")
+    missing = [p is None or math.isnan(p) for p in p_values]
+    values = [1.0 if gone else float(p) for p, gone in zip(p_values, missing, strict=True)]
+    if any(not 0.0 <= v <= 1.0 for v in values):
+        raise ValueError("p-values must lie in [0, 1]")
+    m = len(values)
+    order = sorted(range(m), key=lambda i: (values[i], i))  # stable: ties keep the declared order
+    levels, adjusted, reject = [math.nan] * m, [math.nan] * m, [False] * m
+    stepping, running = True, 0.0
+    for step, i in enumerate(order):
+        levels[i] = level(alpha, 1, m - step)
+        running = max(running, (m - step) * values[i])
+        adjusted[i] = math.nan if missing[i] else min(running, 1.0)
+        stepping = stepping and not missing[i] and values[i] <= levels[i]
+        reject[i] = stepping
+    return HolmResult(tuple(adjusted), tuple(levels), tuple(reject))
