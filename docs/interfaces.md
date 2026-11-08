@@ -164,7 +164,7 @@ class RunRequest:
 Core guarantees:
 - The gates (health, harness stop, budget, unit pause) were passed, the lease the platform declared for the run is held for the whole attempt, and the timer is not started: the loop starts it. The attempt has a row (`running`) before the executor is called, so a kill leaves a run that the next start settles (C04).
 - `InfraError` raised by the executor is recorded as infrastructure of its kind; any other exception as a harness defect (C10). The result is written as a marker, then to the store in one transaction.
-- The record's treatment kinds must equal the condition's, and its treatment flag the store's own decision from the outcome, the kinds and the completed turns (`AttemptResult.model_turns`, `recorded_treatment`, both set by `result_from_record`), or the store refuses the result (C01).
+- The record's treatment kinds must equal the condition's, and its treatment flag the store's own decision from the outcome, the kinds and the completed turns (`AttemptResult.model_turns`, `recorded_treatment` and `first_turn_rule`, all set by `result_from_record` from the record and its schema version), or the store refuses the result (C01). Record schema 2 added the first-turn rule and no field; schema-1 records and schema-1 outcome markers stay readable and are decided without it.
 
 Implementer must guarantee:
 - Return the record `record_run` produced, and **write it to `request.run_dir`** (`record.write(request.run_dir)`) before returning: the core reads, checks and exports records from disk and does not write them for you.

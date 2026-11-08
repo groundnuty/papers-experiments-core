@@ -46,6 +46,14 @@ def recover(store: Store, now: str, max_attempts: int) -> Recovery:
             orphans.append(row["id"])
             continue
         store.event(now, "recovered_committed", None, f"{row['run_key']}: attempt {row['id']} from its marker")
+        if result.legacy_marker:
+            store.event(
+                now,
+                "legacy_marker",
+                None,
+                f"{row['run_key']}: attempt {row['id']} from a schema-1 marker, which has no model-turn count; "
+                "the version-1 treatment rule (the declared kind alone) applied",
+            )
         committed += 1
     interrupted = store.transact(lambda: _interrupt(store, orphans, now))
     requeued = store.transact(lambda: _requeue_harness_errors(store, now))
