@@ -10,7 +10,8 @@ are the same text: no clock, no path and no random number enters it.
   (or the word "exploratory") beside the conclusion, and the conclusion words already encode the decision:
   `difference`, `trivial_difference`, `equivalent`, `not_detected`. Failing to detect a difference is not a finding of
   none, and the report says so under the table.
-- Per condition it shows the runs analysed and the median dispatch position of their attempts, so a reader can see
+- Per condition it shows the runs analysed and the median dispatch position of those of their attempts that have one
+  (a database older than the dispatch column has none), so a reader can see
   whether one condition's runs came late, and per condition and infrastructure kind the attempts set aside and the
   attempts scored as treatment.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
@@ -154,8 +155,9 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
     lines = [
         "## Conditions",
         "",
-        "Median dispatch position is the median place of the analysed attempts in the campaign's dispatch sequence;",
-        "a condition whose runs came late has a higher one.",
+        "Median dispatch position is the median place, in the campaign's dispatch sequence, of the analysed attempts",
+        "that have one (a database older than the dispatch column has none); a condition whose runs came late has a",
+        "higher one.",
         "",
         *_table(["Condition", "Runs analysed", "Runs left out", "Median dispatch position"], rows),
         "",
@@ -187,8 +189,8 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
 
 _COUNT_DEFINITIONS = [
     "- *Set aside*: attempts that ended as an infrastructure failure of a kind the condition does not declare as "
-    "treatment, or that were discarded for an outage. Counted over every run of the campaign (analysed, pending or "
-    "exhausted, including an exhausted run's last attempt), except runs a partial analysis leaves out.",
+    "treatment, or that were discarded for an outage. Counted over every run of the campaign whatever its status "
+    "(an exhausted run's last attempt included), except runs a partial analysis leaves out.",
     "- *Scored as treatment*: attempts that ended as an infrastructure failure of a kind the condition declares as "
     "treatment; each is its run's final, scored attempt. Runs a partial analysis leaves out are not included.",
     "- *Left out*: the set-aside and treatment attempts of runs a partial analysis leaves out, and only those.",

@@ -288,6 +288,6 @@ def test_c09_set_aside_counts_are_described_as_covering_every_run_not_only_the_a
     )
     report = render(analysis(contrast("primary", "difference")), data)
     assert "Set aside (all runs)" in report
-    assert "Counted over every run of the campaign (analysed, pending or exhausted" in report
+    assert "Counted over every run of the campaign whatever its status" in report
     assert "- *Left out*: the set-aside and treatment attempts of runs a partial analysis leaves out" in report
     assert "every attempt failed on infrastructure" not in report
