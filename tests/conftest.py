@@ -1,10 +1,14 @@
 """Shared fixtures: a throwaway git repository that ignores the developer's own git configuration."""
 
 import os
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+from expcore.provenance.study_tokens import render_hash_file
 
 
 class Repo:
@@ -49,3 +53,27 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Repo:
     root.mkdir()
     subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
     return Repo(root)
+
+
+@pytest.fixture
+def bin_dir(tmp_path: Path) -> Path:
+    """A directory holding a stand-in for `uv run --frozen python ...` that runs the current interpreter."""
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    stub = directory / "uv"
+    stub.write_text(f'#!/bin/sh\nshift 3\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    return directory
+
+
+@pytest.fixture
+def pushed(repo):
+    """A repository with a clean commit, a leaking one and a fixing one, plus the hash file the scripts read."""
+    repo.write("tests/data/study_tokens.sha256", render_hash_file(["secret-space"]))
+    repo.write("src/ok.py", "x = 1\n")
+    first = repo.commit("clean")
+    repo.write("src/leak.py", 'name = "secret-space"\n')
+    second = repo.commit("leak")
+    (repo.path / "src" / "leak.py").unlink()
+    third = repo.commit("fix")
+    return repo, first, second, third

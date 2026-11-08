@@ -99,3 +99,11 @@ def test_check_commits_rejects_option_like_and_unknown_revisions(history, hash_f
     assert st.main([*base, "nonexistent-rev"]) == 2
     assert st.main([*base, "--", "--all"]) == 2
     assert capsys.readouterr().err.count("error:") == 2
+
+
+def test_history_flag_makes_a_bare_revision_stand_for_its_whole_ancestry(history, hash_file):
+    repo, first, _, third = history
+    base = ["check-commits", "--hashes", str(hash_file), "--repo", str(repo.path)]
+    assert st.main([*base, third]) == 0
+    assert st.main([*base, "--history", third]) == 1
+    assert st.main([*base, "--history", first]) == 0

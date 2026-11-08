@@ -26,13 +26,16 @@ def run_git(repo: Path, *args: str) -> bytes:
     return result.stdout
 
 
-def resolve_commits(repo: Path, revs: Sequence[str]) -> list[str]:
-    """Expand ranges (A..B) to their commits, oldest first; a bare revision names just that commit."""
+def resolve_commits(repo: Path, revs: Sequence[str], *, history: bool = False) -> list[str]:
+    """Expand ranges (A..B) to their commits, oldest first; a bare revision names just that commit.
+
+    With history=True a bare revision stands for itself and all its ancestors.
+    """
     commits: list[str] = []
     for rev in revs:
         if rev.startswith("-"):
             raise GitError(f"revision {rev!r} looks like an option")
-        if ".." in rev:
+        if ".." in rev or history:
             out = run_git(repo, "rev-list", "--reverse", "--end-of-options", rev)
         else:
             out = run_git(repo, "rev-parse", "--verify", "--end-of-options", f"{rev}^{{commit}}")

@@ -20,15 +20,11 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen
       - run: make check
-      - name: Study-token check over every pushed commit
-        if: github.event_name == 'push'
+      - name: Study-token check over every commit this event adds
         env:
+          EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
-        run: |
-          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            range="$SHA"
-          else
-            range="$BEFORE..$SHA"
-          fi
-          uv run python -m expcore.provenance.study_tokens check-commits "$range"
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/ci-check-commits

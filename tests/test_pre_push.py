@@ -1,42 +1,12 @@
 """The pre-push hook checks every commit being pushed, driven here with git's stdin protocol and a stub uv."""
 
 import os
-import stat
 import subprocess
-import sys
 from pathlib import Path
-
-import pytest
-
-from expcore.provenance.study_tokens import render_hash_file
 
 HOOK = Path(__file__).resolve().parents[1] / "scripts" / "pre-push"
 ZERO = "0" * 40
 TOKEN = "secret-space"
-
-
-@pytest.fixture
-def bin_dir(tmp_path: Path) -> Path:
-    """A directory holding a stand-in for `uv run --frozen python ...` that runs the current interpreter."""
-    directory = tmp_path / "bin"
-    directory.mkdir()
-    stub = directory / "uv"
-    stub.write_text(f'#!/bin/sh\nshift 3\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
-    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
-    return directory
-
-
-@pytest.fixture
-def pushed(repo):
-    """A repository with a clean commit, a leaking one and a fixing one, plus the hash file the hook reads."""
-    repo.write("tests/data/study_tokens.sha256", render_hash_file([TOKEN]))
-    repo.write("src/ok.py", "x = 1\n")
-    first = repo.commit("clean")
-    repo.write("src/leak.py", f'name = "{TOKEN}"\n')
-    second = repo.commit("leak")
-    (repo.path / "src" / "leak.py").unlink()
-    third = repo.commit("fix")
-    return repo, first, second, third
 
 
 def run_hook(repo, bin_dir: Path, lines: str) -> subprocess.CompletedProcess:
@@ -64,13 +34,24 @@ def test_an_update_of_clean_commits_is_allowed(pushed, bin_dir):
     assert done.returncode == 0, done.stderr
 
 
-def test_a_new_branch_checks_only_what_the_remote_does_not_have(pushed, bin_dir):
+def test_a_new_ref_checks_its_whole_history(pushed, bin_dir):
+    repo, _, _, third = pushed
+    done = run_hook(repo, bin_dir, f"refs/heads/topic {third} refs/heads/topic {ZERO}\n")
+    assert done.returncode == 1
+    assert "src/leak.py:1 string" in done.stdout
+
+
+def test_a_stale_tracking_ref_is_never_trusted(pushed, bin_dir):
     repo, _, second, third = pushed
-    everything = run_hook(repo, bin_dir, f"refs/heads/topic {third} refs/heads/topic {ZERO}\n")
-    assert everything.returncode == 1
-    repo.git("update-ref", "refs/remotes/origin/main", second)
-    only_new = run_hook(repo, bin_dir, f"refs/heads/topic {third} refs/heads/topic {ZERO}\n")
-    assert only_new.returncode == 0, only_new.stderr
+    repo.git("update-ref", "refs/remotes/origin/main", second)  # claims the leaking commit is already published
+    done = run_hook(repo, bin_dir, f"refs/heads/topic {third} refs/heads/topic {ZERO}\n")
+    assert done.returncode == 1
+
+
+def test_a_new_ref_with_a_clean_history_is_allowed(pushed, bin_dir):
+    repo, first, _, _ = pushed
+    done = run_hook(repo, bin_dir, f"refs/heads/topic {first} refs/heads/topic {ZERO}\n")
+    assert done.returncode == 0, done.stderr
 
 
 def test_deleting_a_remote_ref_pushes_no_commits(pushed, bin_dir):

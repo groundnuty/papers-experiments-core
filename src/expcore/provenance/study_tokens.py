@@ -275,11 +275,16 @@ def _wanted(path: Path, root: Path) -> bool:
 
 
 def check_commits(
-    repo: Path, revs: Sequence[str], hashes: Hashes, roots: tuple[str, ...] = COMMIT_ROOTS
+    repo: Path,
+    revs: Sequence[str],
+    hashes: Hashes,
+    roots: tuple[str, ...] = COMMIT_ROOTS,
+    *,
+    history: bool = False,
 ) -> list[tuple[str, Finding]]:
     """Scan every file each commit added or modified under the roots, at that commit's content."""
     results: list[tuple[str, Finding]] = []
-    for sha in resolve_commits(repo, revs):
+    for sha in resolve_commits(repo, revs, history=history):
         for path in changed_files(repo, sha):
             text = _decode(read_blob(repo, sha, path)) if path.startswith(roots) else None
             if text is not None:
@@ -335,7 +340,7 @@ def _cmd_check_commits(args: argparse.Namespace) -> int:
     hashes = _load_for_cli(args.hashes)
     if hashes is None:
         return EXIT_OK
-    results = check_commits(args.repo, args.revs, hashes)
+    results = check_commits(args.repo, args.revs, hashes, history=args.history)
     return _report([f"{sha[:12]} {finding}" for sha, finding in results])
 
 
@@ -353,6 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     commits = sub.add_parser("check-commits", help="scan src/ and examples/ in each commit of the given ranges or shas")
     commits.add_argument("--hashes", type=Path, default=None, help=f"hash file (default: {DEFAULT_HASHES})")
     commits.add_argument("--repo", type=Path, default=Path.cwd(), help="repository (default: current directory)")
+    commits.add_argument("--history", action="store_true", help="a bare REV stands for its whole history")
     commits.add_argument("revs", nargs="+", metavar="REV", help="A..B range or a single commit")
     commits.set_defaults(run=_cmd_check_commits)
     return parser

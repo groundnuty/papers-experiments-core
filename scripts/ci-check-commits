@@ -1,0 +1,38 @@
+#!/bin/sh
+# CI: run the study-token check over every commit this event adds to the repository.
+# A leak in any commit of a public history is permanent, so the tip alone is not enough.
+#
+# Environment: EVENT (push or pull_request); BEFORE and SHA for a push; BASE_SHA and HEAD_SHA for a
+# pull request. History must be present (fetch-depth: 0).
+set -eu
+
+zero=0000000000000000000000000000000000000000
+main_ref=refs/remotes/origin/main
+
+check() {
+    uv run --frozen python -m expcore.provenance.study_tokens check-commits "$@"
+}
+
+case "${EVENT:?EVENT is required}" in
+push)
+    sha="${SHA:?SHA is required}"
+    if [ "${BEFORE:?BEFORE is required}" != "$zero" ]; then
+        check "$BEFORE..$sha"
+    elif git rev-parse --verify --quiet "$main_ref^{commit}" >/dev/null &&
+        ! git merge-base --is-ancestor "$sha" "$main_ref"; then
+        # A new branch: what the default branch does not have.
+        check "$main_ref..$sha"
+    else
+        # No default branch to compare with, or the pushed commit is already part of it
+        # (the first push of main itself): check the whole history.
+        check --history "$sha"
+    fi
+    ;;
+pull_request)
+    check "${BASE_SHA:?BASE_SHA is required}..${HEAD_SHA:?HEAD_SHA is required}"
+    ;;
+*)
+    echo "ci-check-commits: unsupported event '$EVENT'" >&2
+    exit 2
+    ;;
+esac
