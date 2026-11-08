@@ -148,20 +148,25 @@ def test_users_of_a_lease_that_was_released_or_belongs_to_another_group_is_refus
 
 
 class SpyJournal(TokenJournal):
-    """A journal that notes how many tokens the federation had minted when each line was written."""
+    """A journal that notes how many tokens the federation had minted when each line was written, and can be made to
+    fail on an exact line, as a process that dies after minting would."""
 
-    def __init__(self, directory, fake):
+    def __init__(self, directory, fake, *, crash_on_exact=False):
         super().__init__(directory)
-        self.fake, self.minted_at_write = fake, []
+        self.fake, self.crash_on_exact = fake, crash_on_exact
+        self.minted_at_write, self.kinds = [], []
 
-    def record(self, slot, plane, expires_at):
+    def record(self, slot, plane, expires_at, *, mint=None, provisional=False):
+        if self.crash_on_exact and not provisional:
+            raise SystemExit("the process died after minting")
         self.minted_at_write.append(len([r for r in self.fake.requests if r.path.endswith("/tokens/temporary")]))
-        super().record(slot, plane, expires_at)
+        self.kinds.append("provisional" if provisional else "exact")
+        super().record(slot, plane, expires_at, mint=mint, provisional=provisional)
 
 
 def test_tokens_of_a_leased_slot_are_minted_on_its_two_users_and_their_end_is_journalled(slots, client, tmp_path, fake):
-    """C19: each plane's token is minted by that plane's slot user; once both are minted the journal learns the later
-    of their examined expiries, in one line written after minting."""
+    """C19: each plane's token is minted by that plane's slot user. A provisional line is written before anything is
+    minted, and once both are minted the exact line holds the later of their examined expiries and settles it."""
     config, loaded = slots
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
@@ -173,9 +178,36 @@ def test_tokens_of_a_leased_slot_are_minted_on_its_two_users_and_their_end_is_jo
     assert tokens.data_path.subject == slot.data_path.user_id
     assert tokens.tool_server is not None
     assert tokens.tool_server.subject == slot.tool_server.user_id
+    assert journal.kinds == ["provisional", "exact"]
+    assert journal.minted_at_write == [0, 2]  # the provisional line before any token, the exact one after both
     assert journal.latest_expiry(lease.key) == max(tokens.data_path.expires_at, tokens.tool_server.expires_at)
-    assert journal.minted_at_write == [2]  # one line, after both tokens were minted
     assert tokens.data_path.reveal() not in (tmp_path / "leases" / "tokens.jsonl").read_text()
+
+
+def test_c19_a_crash_after_minting_leaves_the_provisional_worst_case_and_the_slot_stays_held(
+    slots, client, tmp_path, fake
+):
+    """C19: the process dies after the tokens exist and before their exact line is written. The journal holds only the
+    provisional line, whose end is the clock before minting plus the longest lifetime plus the time a mint may take;
+    the slot is held until that end plus the margin, which is later than the tokens' own end."""
+    config, loaded = slots
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = SpyJournal(tmp_path / "leases", fake, crash_on_exact=True)
+    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    with pytest.raises(SystemExit):
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
+    assert len([r for r in fake.requests if r.path.endswith("/tokens/temporary")]) == 2  # both tokens exist
+    window = token_window(CEILING_S, config.tokens)
+    provisional = NOW + window.max_ttl_s + config.tokens.mint_headroom_s
+    assert journal.kinds == ["provisional"]
+    assert TokenJournal(tmp_path / "leases").latest_expiry(lease.key) == provisional
+    assert provisional > NOW + window.mint_ttl_s  # later than the end a token asked for can have, with no delay
+    probes = [(provisional + SAFETY_MARGIN_S - 1, False), (provisional + SAFETY_MARGIN_S, False)]
+    probes.append((provisional + SAFETY_MARGIN_S + 1, True))
+    for moment, freed in probes:
+        probe = SlotProbe(TokenJournal(tmp_path / "leases"), clock=lambda moment=moment: moment)
+        assert probe.resource_gone(lease.key, {}) is freed
 
 
 def test_c19_the_journalled_end_is_the_tokens_actual_end_even_when_the_privilege_reads_take_time(
@@ -241,6 +273,29 @@ def test_a_ceiling_the_window_refuses_journals_and_mints_nothing(slots, client, 
         minter.mint(lease, ceiling_s=float("inf"), condition="read")
     assert journal.latest_expiry(lease.key) is None
     assert not [r for r in fake.requests if r.path.endswith("/tokens/temporary")]
+
+
+def test_c19_an_exact_line_settles_the_provisional_line_of_its_mint_and_only_that_one(tmp_path):
+    """C19: the exact line of a mint replaces its provisional line; another mint's provisional line, a provisional
+    line nothing settled and every exact line still count, and the slot's end is the latest of those."""
+    journal = TokenJournal(tmp_path)
+    journal.record("one", "provisional", NOW + 900, mint="m1", provisional=True)
+    assert journal.latest_expiry("one") == NOW + 900
+    journal.record("one", "data_path", NOW + 700, mint="m1")
+    assert journal.latest_expiry("one") == NOW + 700  # settled: the exact end stands for the mint
+    journal.record("one", "provisional", NOW + 650, mint="m2", provisional=True)
+    assert journal.latest_expiry("one") == NOW + 700  # an earlier exact line is never lowered
+    journal.record("one", "provisional", NOW + 1200, mint="m3", provisional=True)
+    assert journal.latest_expiry("one") == NOW + 1200  # a mint that never settled stands at its worst case
+    assert journal.latest_expiry("two") is None
+
+
+def test_c19_a_provisional_line_without_its_mint_id_keeps_the_slot_quarantined(tmp_path):
+    """C19: a provisional line that cannot say which mint it belongs to cannot be settled, so it cannot be read."""
+    (tmp_path / "tokens.jsonl").write_text(
+        '{"slot": "one", "plane": "provisional", "expires_at": 1.0, "provisional": true}\n', encoding="utf-8"
+    )
+    assert SlotProbe(TokenJournal(tmp_path), clock=lambda: NOW).resource_gone("one", {}) is False
 
 
 def test_a_slot_is_not_free_until_its_tokens_have_ended(tmp_path):

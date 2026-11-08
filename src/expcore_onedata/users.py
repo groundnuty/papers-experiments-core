@@ -24,21 +24,29 @@ and `lease_keys` (`Slots.keys_of`), and the scheduler takes, holds and releases 
 which two users the run has.
 
 **A slot is free again only when its tokens have ended.** No token is ever revoked, so a token minted for a slot stays
-good until its lifetime ends, and a run that died may have left a sandbox using it. `SlotTokens.mint` writes the actual
-end of the tokens it minted (never a token) to a journal beside the leases: the later of the two planes' examined
-expiries, written after minting, because the privilege reads before each mint take time and a bound taken before them
-would end too soon. `SlotProbe.resource_gone` answers True for a slot only once the clock is past every journalled end
-plus a safety margin (the clocks of this host and of Onezone are not the same) and, when the platform supplies one, its
-sandbox probe also shows the run's resources gone. Anything it cannot read keeps the slot quarantined (the core's rule:
-only True frees a key). A mint that fails after it may have made a token (the token is dropped, not revoked) journals
-the longest end any token of that call could have, read after the failure; a crash between a mint and its journal line
-leaves a token the journal does not know, which no later reading can recover.
+good until its lifetime ends, and a run that died may have left a sandbox using it. `SlotTokens.mint` writes two kinds
+of line (never a token) to a journal beside the leases:
+- before it mints, a **provisional** line with the worst-case end of any token of that mint: the clock, plus the longest
+  lifetime the window allows (`max_ttl_s`), plus the time a mint may take (`[tokens] mint_headroom_s`, the allowance for
+  the seconds between issuing a token and examining it);
+- after both tokens are minted and examined, an **exact** line with the later of their examined expiries, which settles
+  the provisional line of that mint. The privilege reads before each mint take time, so no bound taken before them can
+  stand for the exact end.
+
+`SlotProbe.resource_gone` answers True for a slot only once the clock is past the slot's journalled end plus a safety
+margin (the clocks of this host and of Onezone are not the same) and, when the platform supplies one, its sandbox probe
+also shows the run's resources gone. The slot's end is the latest of its exact lines and of its provisional lines that
+no exact line settled, so a crash between a mint and its exact line leaves the provisional worst case, and the slot is
+never freed early. A line that cannot be read keeps the slot quarantined (the core's rule: only True frees a key). A
+mint that fails may have left a token that was minted and dropped; its provisional line stays unsettled, and the longest
+end any token of that call could have, counted from the failure, is journalled as well.
 
 Users are created by the operator, not by this layer: there is no unscoped user creation or deletion here. The privileges
 a slot's users hold are checked, direct and effective, before every token is minted (`tokens.py`).
 """
 
 import json
+import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -144,28 +152,53 @@ def load_slots(
 
 
 class TokenJournal:
-    """Append-only record of when each slot's tokens end: the slot, the plane and the expiry, never a token."""
+    """Append-only record of when each slot's tokens end: the slot, the plane and the expiry, never a token.
+
+    A line is exact unless it is marked provisional. A provisional line carries the id of its mint, and an exact line
+    with the same id settles it; one that nothing settled still counts, as the worst case of a mint that did not finish.
+    """
 
     def __init__(self, directory: Path | str) -> None:
         self._path = Path(directory) / JOURNAL
 
-    def record(self, slot: str, plane: str, expires_at: float) -> None:
+    def record(
+        self, slot: str, plane: str, expires_at: float, *, mint: str | None = None, provisional: bool = False
+    ) -> None:
         """Append one line, flushed at once, so a crash after it cannot lose the expiry."""
+        line: dict[str, Any] = {"slot": slot, "plane": plane, "expires_at": expires_at}
+        if mint is not None:
+            line["mint"] = mint
+        if provisional:
+            line["provisional"] = True
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"slot": slot, "plane": plane, "expires_at": expires_at}) + "\n")
+            handle.write(json.dumps(line) + "\n")
             handle.flush()
 
     def latest_expiry(self, slot: str) -> float | None:
-        """Return the latest expiry journalled for a slot, or None when none was; raise if the journal is unreadable."""
+        """Return the latest end journalled for a slot, or None when none was; raise if the journal is unreadable.
+
+        That is the latest of the slot's exact lines and of its provisional lines that no exact line settled.
+        """
         if not self._path.exists():
             return None
-        times = []
+        exact: list[float] = []
+        open_lines: dict[str, float] = {}
+        settled: set[str] = set()
         for text in self._path.read_text(encoding="utf-8").splitlines():
-            if text.strip():
-                line = json.loads(text)
-                if line["slot"] == slot:
-                    times.append(float(line["expires_at"]))
+            if not text.strip():
+                continue
+            line = json.loads(text)
+            if line["slot"] != slot:
+                continue
+            expires_at = float(line["expires_at"])
+            if line.get("provisional") is True:
+                open_lines[line["mint"]] = expires_at  # a provisional line without its mint id is unreadable
+                continue
+            exact.append(expires_at)
+            if "mint" in line:
+                settled.add(line["mint"])
+        times = exact + [t for mint, t in open_lines.items() if mint not in settled]
         return max(times) if times else None
 
 
@@ -219,13 +252,17 @@ class SlotTokens:
     ) -> RunTokens:
         """Mint the data path's token and, for a condition with a tool server, the tool server's, on the slot's users.
 
-        When both are minted and examined, the later of their examined expiries is journalled, after minting and before
-        the tokens are returned. A ceiling the window refuses (O06) mints and journals nothing. Any other failure may
-        have left a token that was minted and dropped; its end is not known, so the longest end a token of this call
-        can have, counted from the moment of the failure, is journalled before the failure propagates.
+        A ceiling the window refuses (O06) mints and journals nothing. Otherwise a provisional line with the worst-case
+        end is journalled before anything is minted. When both tokens are minted and examined, the later of their
+        examined expiries is journalled as the exact line that settles it, before the tokens are returned. A failure
+        may have left a token that was minted and dropped; its end is not known, so the longest end a token of this
+        call can have, counted from the moment of the failure, is journalled too, and the provisional line stays.
         """
         slot = self._slots.users_of(lease)
         window = token_window(ceiling_s, self._config.tokens)
+        mint = secrets.token_hex(8)
+        worst_case = self._clock() + window.max_ttl_s + self._config.tokens.mint_headroom_s
+        self._journal.record(slot.name, "provisional", worst_case, mint=mint, provisional=True)
         try:
             tokens = self._issuer.mint_run_tokens(
                 data=slot.data_path,
@@ -237,5 +274,5 @@ class SlotTokens:
             self._journal.record(slot.name, "unproven", self._clock() + max(window.mint_ttl_s, window.max_ttl_s))
             raise
         latest = max((t for t in (tokens.data_path, tokens.tool_server) if t is not None), key=lambda t: t.expires_at)
-        self._journal.record(slot.name, latest.plane.value, latest.expires_at)
+        self._journal.record(slot.name, latest.plane.value, latest.expires_at, mint=mint)
         return tokens
