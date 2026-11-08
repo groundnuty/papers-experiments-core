@@ -139,7 +139,14 @@ class AttemptRunner:
         key, model = row["run_key"], factors["model"]
         try:
             lease = asyncio.run(
-                p.leases.acquire_under(timer, group, run_key=key, timeout_s=p.settings.lease_timeout_s, cancel=p.stop)
+                p.leases.acquire_under(
+                    timer,
+                    group,
+                    run_key=key,
+                    timeout_s=p.settings.lease_timeout_s,
+                    cancel=p.stop,
+                    unit=p.endpoints[model].unit,
+                )
             )
         except LeaseCancelled as refusal:  # the campaign is ending: not a hold on the group, just a run not started
             p.store.event(p.stamp(), "run_unstarted", model, f"{key}: no lease, the campaign is ending: {refusal}")

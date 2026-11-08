@@ -1,5 +1,6 @@
 """The gates around an attempt, through the scheduler: harness stops, health, budgets, units, identity, leases."""
 
+import json
 import os
 
 import pytest
@@ -330,9 +331,72 @@ def test_c19_a_quarantined_lease_counts_against_the_cap_of_its_unit(tmp_path):
         assert row is None  # the unit is full: its quarantined sandbox may still be running
         assert waiting
         assert len(executor.requests) == 1
-        assert scheduler._quarantined_per_unit() == {"unit-m1": 1}
+        assert scheduler._live_per_unit() == {"unit-m1": 1}
         probe.gone_keys.add("k1")  # the teardown is shown
         clock.now += 61
         row, _ = scheduler.next_dispatch()
         assert row is not None
         assert pool.held_back() == 0
+
+
+def release_the_process(pool):
+    """Drop the file locks of a pool whose process 'died': a kill frees them, and leaves every note as it was."""
+    for lease, _, _ in list(pool._quarantined.values()):
+        lease._handle.close()
+
+
+def test_c19_a_resource_that_may_still_be_live_after_a_restart_counts_against_the_cap_of_its_unit(tmp_path):
+    """C19: cap 1 and two keys; the dispatcher dies with the first run's sandbox unproven. After the restart that key
+    is a dead holder's, held back, and its unit is still full, so the run does not start on the other key."""
+    probe, clock = Probe(), Clock()
+    first = LeasePool(
+        tmp_path / "leases", lambda g: ["k1", "k2"], probe, owner="dispatcher-1", clock=clock, quarantine_retry_s=60
+    )
+    settings = settings_for(workers=5, unit_caps={"unit-m1": 1})
+    with build(
+        tmp_path / "c", executor=FakeExecutor(), leases=first, lease_group=lambda f: "g", settings=settings, plan=SMALL
+    ) as scheduler:
+        assert scheduler.run(max_dispatch=1).dispatched == 1
+        assert first.held_back() == 1
+        assert scheduler._live_per_unit() == {"unit-m1": 1}  # before the restart: the quarantined lease
+    note = json.loads((tmp_path / "leases" / "k1.lock").read_text())
+    assert note["unit"] == "unit-m1"  # the note records the unit, which is how the restart knows it
+    release_the_process(first)
+    after = Probe(gone_owners={"dispatcher-1"})  # the holder is dead; its sandbox is not shown gone
+    second = LeasePool(
+        tmp_path / "leases", lambda g: ["k1", "k2"], after, owner="dispatcher-2", clock=clock, quarantine_retry_s=60
+    )
+    executor = FakeExecutor()
+    with build(
+        tmp_path / "c", executor=executor, leases=second, lease_group=lambda f: "g", settings=settings, plan=SMALL
+    ) as scheduler:
+        assert second.held_back() == 0  # nothing is quarantined here: it is a dead holder's key now
+        assert second.may_be_live() == ["unit-m1"]
+        assert scheduler._live_per_unit() == {"unit-m1": 1}
+        row, waiting = scheduler.next_dispatch()
+        assert row is None  # key k2 is free, but the unit's cap of 1 is taken by the surviving resource
+        assert waiting
+        clock.now += 100  # past the retry period, still not shown gone: it goes on counting
+        assert scheduler.next_dispatch()[0] is None
+        assert scheduler._live_per_unit() == {"unit-m1": 1}
+        assert executor.requests == []
+        after.gone_keys.add("k1")  # the teardown is shown
+        clock.now += 100
+        row, _ = scheduler.next_dispatch()
+        assert row is not None
+        assert second.may_be_live() == []
+        assert scheduler.run().statuses == {"done": 3}
+
+
+def test_c19_a_dead_holders_key_whose_note_cannot_be_read_counts_against_every_unit(tmp_path):
+    """C19: an unreadable note names no unit, so the key whose resource may be live fails safe and fills each cap."""
+    directory = tmp_path / "leases"
+    directory.mkdir()
+    (directory / "k1.lock").write_text('{"owner": "holder-1", "uni', encoding="utf-8")
+    pool = LeasePool(directory, lambda g: ["k1", "k2"], Probe(), owner="me", clock=Clock())
+    settings = settings_for(workers=5, unit_caps={"unit-m1": 1})
+    with build(
+        tmp_path / "c", executor=FakeExecutor(), leases=pool, lease_group=lambda f: "g", settings=settings, plan=SMALL
+    ) as scheduler:
+        assert pool.may_be_live() == [None]
+        assert scheduler.next_dispatch()[0] is None

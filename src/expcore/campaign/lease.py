@@ -24,6 +24,12 @@ declares them; nothing here knows what a key is). A lease is an exclusive `flock
   cannot be read, can then only be a holder that died between taking the key and writing it, or mid-write: it is
   indeterminate and the key needs the same proof, never "a key never used".
 
+Every key whose resource **may still be live** is counted against the cap of the **unit** whose run held it, so that a
+surviving sandbox on one key cannot let a run of the same unit start on another: a quarantined lease, a key held back
+for a dead holder, and one whose note cannot be read (its unit is then unknown, and counts against every unit). The note
+records the unit (`acquire(..., unit=)`), so the count survives a restart; `may_be_live` lists them, and they stay
+counted until the proof comes, whatever the retry period (`settle_quarantines` asks again when it is due).
+
 A teardown that cannot be proven **quarantines** the resource: the lease stays held, its use ends, and the key goes
 to nobody until the teardown is proven (`LeasePool.settle_quarantines` asks the proof). When every key of a group is
 quarantined, `acquire` raises `AllQuarantined` before waiting: the run is left unstarted and uses no attempt.
@@ -190,10 +196,19 @@ class Lease:
     """One held key. `start` and `end` are epoch seconds bracketing the use of the resource: `start` is taken once the
     key is held (after any wait), `end` when the use ends (release, or the quarantine that keeps the key)."""
 
-    def __init__(self, handle: Any, key: str, group: str, run_key: str | None, wait_s: float, start: float):
+    def __init__(
+        self,
+        handle: Any,
+        key: str,
+        group: str,
+        run_key: str | None,
+        wait_s: float,
+        start: float,
+        unit: str | None = None,
+    ):
         self._handle = handle
         self._mutex = threading.Lock()
-        self.key, self.group, self.run_key = key, group, run_key
+        self.key, self.group, self.run_key, self.unit = key, group, run_key, unit
         self.wait_s, self.start, self.end = wait_s, start, None
         self.quarantined = False
 
@@ -248,8 +263,15 @@ class Lease:
             self.release()
 
     def record(self) -> dict[str, Any]:
-        """Return the lease as a record keeps it: key, group, the seconds waited for it, start and end (None while held)."""
-        return {"key": self.key, "group": self.group, "wait_s": self.wait_s, "start": self.start, "end": self.end}
+        """Return the lease as a record keeps it: key, group, unit, seconds waited for it, start and end (None if held)."""
+        return {
+            "key": self.key,
+            "group": self.group,
+            "unit": self.unit,
+            "wait_s": self.wait_s,
+            "start": self.start,
+            "end": self.end,
+        }
 
 
 def _write_note(handle: Any, note: Mapping[str, Any]) -> None:
@@ -293,6 +315,7 @@ class LeasePool:
         self._dead_retry_s, self._quarantine_retry_s = dead_retry_s, quarantine_retry_s
         self._mutex = threading.Lock()
         self._dead_retry: dict[str, float] = {}  # key -> the clock time before which it is not looked at again
+        self._live: dict[str, str | None] = {}  # key -> unit of the dead holder whose resource is not shown gone
         self._quarantined: dict[str, tuple[Lease, Callable[[], bool], float]] = {}  # key -> lease, proof, next look
 
     # --- keys -----------------------------------------------------------------------------------------------------
@@ -317,10 +340,15 @@ class LeasePool:
         with self._mutex:
             return len(self._quarantined)
 
-    def held_back_runs(self) -> list[str | None]:
-        """Return the run each quarantined lease was taken for (None where none was named), one entry per lease."""
+    def may_be_live(self) -> list[str | None]:
+        """Return the unit of every key whose resource may still be live, one entry per key; None: the unit is unknown.
+
+        Those are the quarantined leases here and the keys held back for a dead holder whose resource has not been
+        shown gone (read from the holder's note, so after a restart too). Each counts against the cap of its unit until
+        the proof comes, not only until the next retry.
+        """
         with self._mutex:
-            return [lease.run_key for lease, _, _ in self._quarantined.values()]
+            return [lease.unit for lease, _, _ in self._quarantined.values()] + list(self._live.values())
 
     # --- granting -------------------------------------------------------------------------------------------------
 
@@ -375,9 +403,10 @@ class LeasePool:
 
         The kernel drops a dead process's lock at once, but its resource may go on being used. So a key whose note does
         not say it was released goes to nobody until `resource_gone` answers True: when the holder is shown gone, when
-        its liveness cannot be determined, and when the note is empty (in a file that was there before) or unreadable. A
-        holder the probe shows alive does not hold the lock it let go of; nothing is left to reap. `fresh` says that this
-        acquisition created the lock file, so an empty note is a key never used.
+        its liveness cannot be determined, and when the note is empty or unreadable (a lock file is created with a
+        note, so an empty one is a holder that died while writing). A holder the probe shows alive does not hold the
+        lock it let go of; nothing is left to reap. Until the proof the key is in `may_be_live`, with the unit its
+        note names.
         """
         handle.seek(0)
         text = handle.read()
@@ -389,9 +418,11 @@ class LeasePool:
             except ValueError:
                 note = {}  # unreadable: a holder that died mid-write is a dead holder that must be shown gone
         if "released" in note:
+            self._settled(key)
             return True
         owner = note.get("owner")
         if owner and self._holder_alive(str(owner)):
+            self._settled(key)
             return True
         now = self._clock()
         with self._mutex:
@@ -402,11 +433,14 @@ class LeasePool:
         except Exception:
             log.exception("looking for the resource of the dead holder of %s", key)
             gone = False
+        unit = note.get("unit")
         with self._mutex:
             if gone:
                 self._dead_retry.pop(key, None)
+                self._live.pop(key, None)
             else:
                 self._dead_retry[key] = now + self._dead_retry_s
+                self._live[key] = unit if isinstance(unit, str) else None
         if gone:
             try:
                 _write_note(handle, {"released": time.time(), "key": key, "reaped_owner": owner})
@@ -418,6 +452,12 @@ class LeasePool:
         )
         return gone
 
+    def _settled(self, key: str) -> None:
+        """Forget a key that was held back: its note says it was released, or its holder is alive."""
+        with self._mutex:
+            self._dead_retry.pop(key, None)
+            self._live.pop(key, None)
+
     def _try_key(self, key: str) -> Any:
         handle = self._flock(key)
         if handle is None:
@@ -427,9 +467,9 @@ class LeasePool:
             return None
         return handle
 
-    def _grant(self, handle: Any, key: str, group: str, run_key: str | None, wait_s: float) -> Lease:
+    def _grant(self, handle: Any, key: str, group: str, run_key: str | None, wait_s: float, unit: str | None) -> Lease:
         start = time.time()
-        note = {"owner": self._owner, "pid": os.getpid(), "run_key": run_key, "since": start, "key": key}
+        note = {"owner": self._owner, "pid": os.getpid(), "run_key": run_key, "since": start, "key": key, "unit": unit}
         try:
             _write_note(handle, note)
         except BaseException:
@@ -438,10 +478,13 @@ class LeasePool:
             with contextlib.suppress(OSError):
                 handle.close()
             raise
-        return Lease(handle, key, group, run_key, wait_s, start)
+        return Lease(handle, key, group, run_key, wait_s, start, unit)
 
-    def try_acquire(self, group: str, run_key: str | None = None) -> Lease | None:
+    def try_acquire(self, group: str, run_key: str | None = None, unit: str | None = None) -> Lease | None:
         """Take a free key of the group now, or return None when every one is busy.
+
+        `unit` is the concurrency unit of the run; it goes into the note, so the key counts against that unit's cap for
+        as long as its resource may be live, a restart included.
 
         Raises NoResources when the group has no key and AllQuarantined when none can come free without a proof.
         """
@@ -452,7 +495,7 @@ class LeasePool:
                     continue
             handle = self._try_key(key)
             if handle is not None:
-                return self._grant(handle, key, group, run_key, 0.0)
+                return self._grant(handle, key, group, run_key, 0.0, unit)
         if set(keys) <= self.unusable():
             raise AllQuarantined(f"no usable key in group {group!r}: all {len(keys)} are quarantined or held back")
         return None
@@ -470,6 +513,7 @@ class LeasePool:
         run_key: str | None = None,
         timeout_s: float | None = None,
         cancel: threading.Event | None = None,
+        unit: str | None = None,
     ) -> Lease:
         """Take a free key of the group, waiting while there is none, and log the wait.
 
@@ -483,7 +527,7 @@ class LeasePool:
         contended = False
         try:
             while True:
-                lease = self.try_acquire(group, run_key)
+                lease = self.try_acquire(group, run_key, unit)
                 if lease is not None:
                     lease.wait_s = self._clock() - began
                     if contended or lease.wait_s >= WAIT_LOG_MIN_S:
@@ -521,6 +565,7 @@ class LeasePool:
         run_key: str | None = None,
         timeout_s: float | None = None,
         cancel: threading.Event | None = None,
+        unit: str | None = None,
     ) -> Lease:
         """Take a key inside `infrastructure_wait("lease_queue")` of a timer or a call context, off the event loop.
 
@@ -529,7 +574,7 @@ class LeasePool:
         """
         async with waits.infrastructure_wait("lease_queue"):
             return await asyncio.to_thread(
-                lambda: self.acquire(group, run_key=run_key, timeout_s=timeout_s, cancel=cancel)
+                lambda: self.acquire(group, run_key=run_key, timeout_s=timeout_s, cancel=cancel, unit=unit)
             )
 
     def finish(self, lease: Lease) -> bool:
@@ -589,7 +634,22 @@ class LeasePool:
                 lease._free()
                 freed.append(key)
                 _append_line(self.dir / QUARANTINE_LOG, {"ev": "free", "key": key, "end": time.time()})
+        self._settle_live(now)
         return freed
+
+    def _settle_live(self, now: float) -> None:
+        """Ask again the proof for each key held back for a dead holder whose retry is due, so it stops counting once
+        its resource is shown gone even when no run is trying to take it. A key someone else holds is left as it is."""
+        with self._mutex:
+            due = [key for key in self._live if self._dead_retry.get(key, 0.0) <= now]
+        for key in due:
+            handle = self._flock(key)
+            if handle is None:
+                continue
+            try:
+                self._dead_holder_cleared(key, handle)
+            finally:
+                handle.close()
 
     def sweep_dead_holders(self, groups: Iterable[str]) -> list[str]:
         """Look at every key of the groups for a dead holder's leftovers, at a campaign's start and again while any is

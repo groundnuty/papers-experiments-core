@@ -296,6 +296,42 @@ def test_c19_runs_that_first_use_the_same_keys_at_once_never_mistake_a_file_bein
         assert not [p for p in directory.iterdir() if p.name.endswith(".new")]  # no scratch file is left
 
 
+def test_c19_the_note_records_the_unit_and_a_quarantined_lease_is_live_under_it(tmp_path):
+    """C19: the unit the run belongs to is in the note and on the lease; a quarantined lease may be live under it."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1", "k2"), clock=clock)
+    lease = leases.acquire("g", run_key="run-a", unit="unit-a")
+    assert lease.unit == "unit-a"
+    assert lease.record()["unit"] == "unit-a"
+    assert json.loads((tmp_path / "leases" / f"{lease.key}.lock").read_text())["unit"] == "unit-a"
+    assert leases.may_be_live() == []  # held and in use, not in doubt
+    leases.finish(lease)  # the probe cannot show the teardown
+    assert leases.may_be_live() == ["unit-a"]
+
+
+def test_c19_a_dead_holders_key_is_live_under_the_unit_of_its_note_until_the_resource_is_shown_gone(tmp_path):
+    """C19: the dead holder's unit is read from its note after a restart, and the key counts until the proof comes,
+    through the retry period, and the pool asks again by itself when it is due."""
+    directory = tmp_path / "leases"
+    directory.mkdir()
+    note = {"owner": "holder-1", "pid": 1, "run_key": "run-a", "key": "k1", "unit": "unit-a"}
+    (directory / "k1.lock").write_text(json.dumps(note), encoding="utf-8")
+    probe, clock = Probe(gone_owners={"holder-1"}), Clock()
+    leases = pool(tmp_path, keys=("k1",), probe=probe, clock=clock)
+    assert leases.sweep_dead_holders(["g"]) == ["k1"]
+    assert leases.may_be_live() == ["unit-a"]
+    clock.now += 100  # the retry period is over: the key is not unusable, but it is not shown gone either
+    assert leases.unusable() == set()
+    assert leases.may_be_live() == ["unit-a"]
+    assert leases.settle_quarantines() == []
+    assert len(probe.asked) == 2  # settle asked the proof again, on its own
+    probe.gone_keys.add("k1")
+    clock.now += 100
+    leases.settle_quarantines()
+    assert leases.may_be_live() == []
+    assert "released" in json.loads((directory / "k1.lock").read_text())
+
+
 def test_c19_an_empty_or_released_note_needs_no_proof(tmp_path):
     """C19: a key never used, and one its last holder released, go to the next run without asking the probe."""
     probe = Probe()
