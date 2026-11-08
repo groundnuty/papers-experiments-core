@@ -37,8 +37,8 @@ class Repo:
 
 
 @pytest.fixture
-def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Repo:
-    """Create an empty repository whose git calls ignore global and system configuration."""
+def make_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Return a function creating named empty repositories whose git calls ignore global and system configuration."""
     for key, value in {
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_SYSTEM": os.devnull,
@@ -49,10 +49,20 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Repo:
         "GIT_COMMITTER_EMAIL": "author@example.invalid",
     }.items():
         monkeypatch.setenv(key, value)
-    root = tmp_path / "repo"
-    root.mkdir()
-    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
-    return Repo(root)
+
+    def create(name: str) -> Repo:
+        root = tmp_path / name
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        return Repo(root)
+
+    return create
+
+
+@pytest.fixture
+def repo(make_repo) -> Repo:
+    """Create one empty repository."""
+    return make_repo("repo")
 
 
 @pytest.fixture
