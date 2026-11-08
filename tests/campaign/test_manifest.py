@@ -159,6 +159,7 @@ def test_c06_a_changed_condition_or_factor_level_or_order_is_refused():
 
 
 def test_c06_the_refusal_names_the_path_and_shows_a_short_value_only():
+    """C06: a refusal says which input differs and never prints a long value."""
     schema = make_schema()
     comparison = compare_fingerprints(
         make_fingerprint(schema), make_fingerprint(schema, caps={"attempt_limit": 4, "time_cap_s": 600})
