@@ -36,7 +36,7 @@ from expcore.provenance.scanner import (
 from expcore.provenance.study_tokens import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK
 
 _STRING_PARTS_RE = re.compile(r"(?s)^([A-Za-z]*)('''|\"\"\"|'|\")(.*)\2$")
-_ESCAPE_RE = re.compile(r"\\N\{[^}]*\}|\\(?s:.)")
+_ESCAPE_RE = re.compile(r"\\(?:N\{[^}]*\}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|x[0-9A-Fa-f]{2}|[0-7]{1,3}|(?s:.))")
 _PREFIX_RE = re.compile(r"[A-Za-z]*")
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,40}")
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?")
@@ -49,7 +49,7 @@ class SanitiseError(RuntimeError):
 
 
 def _mask_escapes(text: str) -> str:
-    """Blank out `\\N{...}` spans and the character after each backslash, keeping every offset."""
+    """Blank out each whole escape sequence (named, \\u, \\U, \\x, octal, or backslash plus one character)."""
     return _ESCAPE_RE.sub(lambda m: " " * len(m.group()), text)
 
 

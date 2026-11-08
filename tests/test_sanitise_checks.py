@@ -1,5 +1,7 @@
 """Sanitiser safeguards: escape syntax, Unicode boundaries, the post-check, argument validation and CRLF."""
 
+import ast
+
 import pytest
 
 from expcore.provenance import sanitise as sn
@@ -213,3 +215,68 @@ def test_an_lf_import_keeps_lf_headers(map_file, tmp_path):
     dest = tmp_path / "mod.py"
     assert run_import(map_file, src, dest) == 0
     assert b"\r" not in dest.read_bytes()
+
+
+# --- merged literals the rewriting cannot see -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "x = f\"{'secret-' 'space'}\"\n",
+        'x = "secret-" f"space{1}"\n',
+        'x = f"{1}secret-" "space"\n',
+    ],
+)
+def test_the_post_check_refuses_literals_the_parser_merges(source, entries, map_file, tmp_path):
+    assert sn.sanitise_python(source, entries) == source  # no single token holds the whole name
+    with pytest.raises(sn.SanitiseError, match=r"mod\.py: 1 study-token finding\(s\) remain after sanitising"):
+        sn.sanitise_checked(source, entries, filename="mod.py")
+    src = tmp_path / "orig.py"
+    src.write_text(source, encoding="utf-8")
+    dest = tmp_path / "out.py"
+    assert run_import(map_file, src, dest) == 2
+    assert not dest.exists()
+
+
+# --- whole escape sequences -----------------------------------------------------------------------------------------
+
+HEX_MAP = b"""version = 1
+
+[[entry]]
+token = "abcd"
+replacement = "ef12"
+category = "word"
+"""
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'x = "\\uabcd"\n',
+        'x = "\\U0000abcd"\n',
+        'x = "\\xabcd"\n',
+        'x = "\\N{LATIN SMALL LETTER A}bcd"\n',
+        'x = f"\\uabcd{y}"\n',
+        'x = f"{y}\\xabcd"\n',
+        "x = '\\uabcd' + '\\uABCD'\n",
+    ],
+)
+def test_escape_sequences_are_masked_whole_and_their_digits_never_rewritten(source):
+    entries = parse_map(HEX_MAP, "hex.toml").entries
+    assert sn.sanitise_python(source, entries) == source
+
+
+def test_text_after_a_whole_escape_is_still_rewritten_and_the_value_stays_valid():
+    entries = parse_map(HEX_MAP, "hex.toml").entries
+    cases = {
+        'x = "\\uabcd abcd"\n': 'x = "\\uabcd ef12"\n',
+        'x = "\\U0000abcd abcd"\n': 'x = "\\U0000abcd ef12"\n',
+        'x = "\\101abcd"\n': 'x = "\\101ef12"\n',
+        'x = "\\x41 abcd"\n': 'x = "\\x41 ef12"\n',
+        'x = "abcd"\n': 'x = "ef12"\n',
+    }
+    for source, expected in cases.items():
+        assert sn.sanitise_python(source, entries) == expected
+    result = sn.sanitise_python('x = "\\uabcd abcd"\n', entries)
+    assert ast.literal_eval(result.removeprefix("x = ").strip()) == "\uabcd ef12"  # the escape keeps its meaning
