@@ -503,3 +503,78 @@ def test_c03_the_outcome_kind_and_the_outage_kind_are_kept_apart_on_a_discarded_
         "endpoint",
         "sandbox",
     )
+
+
+def test_c20_the_check_and_the_alter_of_a_migration_run_in_one_write_transaction(tmp_path, monkeypatch):
+    """C20: adds that each migration step checks and alters inside a transaction, not around one."""
+    seen = []
+    original = Store._add_column
+
+    def spy(self, table, column, declaration):
+        seen.append((column, self.db.in_transaction))
+        original(self, table, column, declaration)
+
+    monkeypatch.setattr(Store, "_add_column", spy)
+    open_store(tmp_path)
+    assert seen == [(column, True) for _, column, _ in _ADDED_COLUMNS]
+
+
+def test_c20_many_openers_of_one_new_database_all_succeed_and_it_ends_with_every_column(tmp_path):
+    """C20: adds the race itself: connections to one file that open together each apply a step once or find it done."""
+    count, failures = 8, []
+    for attempt in range(6):  # the old check-then-alter lost the race in about two rounds of five
+        barrier, stores = threading.Barrier(count), []
+
+        def opener(directory=tmp_path / f"round{attempt}", barrier=barrier, stores=stores):
+            barrier.wait()
+            try:
+                stores.append(open_store(directory))
+            except Exception as error:  # the test reports whatever an opener raised
+                failures.append(error)
+
+        threads = [threading.Thread(target=opener) for _ in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert failures == []
+        assert len(stores) == count
+        assert {c for _, c, _ in _ADDED_COLUMNS} <= set(columns(stores[0], "attempts"))
+
+
+def test_c20_a_duplicate_column_from_a_concurrent_opener_counts_as_applied_once_the_column_is_seen(
+    tmp_path, monkeypatch
+):
+    """C20: adds that a stale view of the columns, which makes ALTER report a duplicate, is not an error."""
+    open_store(tmp_path).close()  # the columns are all there now
+    stale = []
+    real = Store._columns
+
+    def first_call_is_stale(self, table):
+        if not stale:
+            stale.append(table)
+            return []
+        return real(self, table)
+
+    altered = []
+    original = Store._add_column
+
+    def counting(self, table, column, declaration):
+        altered.append(column)
+        original(self, table, column, declaration)
+
+    monkeypatch.setattr(Store, "_columns", first_call_is_stale)
+    monkeypatch.setattr(Store, "_add_column", counting)
+    open_store(tmp_path)  # does not raise
+    assert altered == [_ADDED_COLUMNS[0][1]]  # the one ALTER that met the duplicate
+
+
+def test_c20_a_duplicate_column_error_with_the_column_still_missing_is_raised(tmp_path, monkeypatch):
+    """C20: adds that the duplicate error is excused only after the column is seen to exist."""
+
+    def refuses(self, table, column, declaration):
+        raise sqlite3.OperationalError(f"duplicate column name: {column}")
+
+    monkeypatch.setattr(Store, "_add_column", refuses)
+    with pytest.raises(sqlite3.OperationalError, match="duplicate column name"):
+        open_store(tmp_path)

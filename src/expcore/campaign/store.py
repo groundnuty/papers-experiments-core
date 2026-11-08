@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, kind TEXT, model TEXT, detail TEXT);
 """
 # Columns added after the first schema. Every database, new or old, gets them through the same path: one ALTER TABLE
-# per column, each a transaction of its own.
+# per column, each checked and applied in a write transaction of its own.
 _ADDED_COLUMNS = (
     ("attempts", "cache_creation_tokens", "INTEGER"),  # a part of input_tokens
     ("attempts", "cache_read_tokens", "INTEGER"),  # a part of input_tokens
@@ -109,8 +109,7 @@ class Store:
             self.db.execute(f"CREATE INDEX IF NOT EXISTS runs_{column} ON runs({column})")
         self.db.executescript(_FIXED_SQL)
         for table, column, declaration in _ADDED_COLUMNS:
-            if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
-                self._add_column(table, column, declaration)
+            self._migrate(table, column, declaration)
 
     def _runs_sql(self) -> str:
         """Return the CREATE TABLE statement of `runs`, with one generated column per factor in identity order."""
@@ -128,8 +127,31 @@ class Store:
             f"  {generated})"
         )
 
+    def _columns(self, table: str) -> list[str]:
+        """Return the names of a table's columns, generated ones apart."""
+        return [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]
+
+    def _migrate(self, table: str, column: str, declaration: str) -> None:
+        """Add one column if it is missing, checking and altering in one write transaction (C20).
+
+        Two processes may open a database at once. Under BEGIN IMMEDIATE the second waits for the first, then finds the
+        column there. A "duplicate column" error from a concurrent opener is taken as applied only after the column is
+        seen to exist; any other failure, or a duplicate error with the column still missing, is raised.
+        """
+
+        def go() -> None:
+            if column not in self._columns(table):
+                self._add_column(table, column, declaration)
+
+        try:
+            self.transact(go)
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" in str(error) and column in self._columns(table):
+                return
+            raise
+
     def _add_column(self, table: str, column: str, declaration: str) -> None:
-        """Add one column; each call is a transaction of its own (C20)."""
+        """Add one column; call inside a transaction (C20)."""
         self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def close(self) -> None:
