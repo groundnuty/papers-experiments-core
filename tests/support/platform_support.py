@@ -33,6 +33,44 @@ SUPPORT_DIR = Path(__file__).resolve().parent
 FAKE_TOOL_SERVER = str(SUPPORT_DIR / "fake_onedata_mcp.py")
 
 
+AGENT_IMAGE_ID = "sha256:" + "a" * 64
+GATE_IMAGE_ID = "sha256:" + "b" * 64
+ONECLIENT_IMAGE_ID = "sha256:" + "c" * 64
+POOL = "10.77.0.0/24"
+MOUNT_PATH = "/data"
+LEVELS = {"mounted": "mount", "via-gate": "rest", "isolated": "none"}  # invented levels of a data_path factor
+
+
+def sandbox_data() -> dict[str, Any]:
+    """The default `[sandbox]` document: invented images and levels, a small pool, and two leasable users."""
+    return {
+        "work_root": "work",
+        "name_prefix": "sbx",
+        "label_namespace": "org.test",
+        "agent_uid": 10001,
+        "python": "python",
+        "sudo": ["sudo", "-n"],
+        "images": {
+            "agent": {"name": "agent:1", "id": AGENT_IMAGE_ID},
+            "gate": {"name": "gate:1", "id": GATE_IMAGE_ID},
+            "oneclient": {"name": "mounter:1", "id": ONECLIENT_IMAGE_ID},
+        },
+        "network": {"pools": [POOL], "prefix": 28, "max_attempts": 64},
+        "limits": {
+            "cpus": 2.0,
+            "memory_bytes": 1 << 30,
+            "pids": 256,
+            "nofile": 1024,
+            "tmp_bytes": 1 << 26,
+            "shm_bytes": 1 << 26,
+            "work_disk_bytes": 1 << 28,
+        },
+        "mount": {"path": MOUNT_PATH, "tls": "verify"},
+        "data_paths": dict(LEVELS),
+        "users": {"login-data": "u-data", "login-data2": "u-data2"},
+    }
+
+
 def platform_data(tmp_path: Path) -> dict[str, Any]:
     """Return the default platform document as a dictionary; the manifests it names exist (empty unless frozen)."""
     for name in ("read", "manage"):
@@ -66,6 +104,7 @@ def platform_document(tmp_path: Path) -> dict[str, Any]:
             "toolserver": {"username": TOOLS.username, "user_id": TOOLS.user_id},
             "service": {"username": SVC.username, "user_id": SVC.user_id},
         },
+        "sandbox": sandbox_data(),
         "toolserver": {
             "command": sys.executable,
             "args": [FAKE_TOOL_SERVER],

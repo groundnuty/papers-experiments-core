@@ -1,25 +1,29 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/sandbox/netpool.py, blob 67c5ce2d1adecb72abd5dc7fe9f3a643bbfb36d4
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""Sandbox networks from a dedicated address range, and the networks a killed process left behind.
+#   changes: see the history of this file from its import commit
+"""Sandbox networks from a dedicated address range, and the networks a killed process left behind (O14).
 
-Docker's default address pools give this host about 30 networks in all, and every sandbox needs one: a few leaked
-sandboxes and a campaign at concurrency 16 exhaust them ("all predefined address pools have been fully subnetted", 1 Nov).
-So each sandbox network gets an explicit /28 from a dedicated range (default 10.200.0.0/13: 32,768 networks, checked
-against this host's routes and addresses on 1 Nov; set `STUDY_VAR_89` or `SandboxConfig.subnet_pool` to change it).
-Explicit subnets never draw on Docker's default pools.
+Docker's default address pools give a host about 30 networks in all, and every sandbox needs one: a few leaked
+sandboxes and a campaign at concurrency 16 exhaust them ("all predefined address pools have been fully subnetted").
+So each sandbox network gets an explicit small subnet from the pools `[sandbox.network]` names, each a network in strict
+mode (checked when the file is loaded) and each checked against the host's routes before use. Explicit subnets never
+draw on Docker's default pools.
 
 Concurrent starts in different processes: each takes candidates in a random rotation of the range, skipping subnets
 already in use, and lets Docker refuse an overlap (the daemon checks it atomically); a refusal moves on to the next
-candidate, at most `MAX_ATTEMPTS` times.
+candidate, at most `max_attempts` times.
 
-Exit paths: `Sandbox.stop` removes the network and every container it started or tried to start (normal end, an
-exception, a failed start). A process killed outright cannot; so its networks and containers carry three labels, the
-sandbox marker, the owner (boot id, PID namespace, pid and process start time) and the run directory, and
-`reap_orphans` removes the containers and networks whose owner is provably gone: in this boot and this PID namespace
-with no such process, or from an earlier boot (an M sandbox's sidecar and agent in the ordered teardown, see teardown.py). An owner it cannot judge (another namespace, an unreadable /proc) is
-left alone, and so is anything without all three labels. It deletes no files: a killed run's directory and loop mounts
-stay until its owner's lane removes them.
+Exit paths: `stop` of a sandbox removes the network and every container it started or tried to start (normal end, an
+exception, a failed start). A process killed outright cannot; so its networks and containers carry four labels, the
+sandbox marker, the owner (boot id, PID namespace, pid and process start time), the run directory and the lease key,
+and `reap_orphans` removes the containers and networks whose owner is provably gone: in this boot and this PID
+namespace with no such process, or from an earlier boot (a mount sandbox's sidecar and agent in the ordered teardown,
+see teardown.py). An owner it cannot judge (another namespace, an unreadable /proc) is left alone, and so is anything
+without all of the first three labels. It deletes no files: a killed run's directory and loop mounts stay until its
+owner's lane removes them.
+
+Every host effect goes through the `HostOps` passed in; the process facts (boot id, start time, liveness) too.
 """
 
 from __future__ import annotations
@@ -29,121 +33,145 @@ import json
 import os
 import random
 import re
-import subprocess
 import threading
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
-from . import hostops as H
+from expcore_onedata.sandbox.api import SandboxError
+from expcore_onedata.sandbox.hostops import HostOps, strict_networks
 
 _REAP_LOCK = (
     threading.Lock()
-)  # an M orphan's ordered teardown takes tens of seconds; starts run from several worker threads
+)  # a mount orphan's ordered teardown takes tens of seconds; starts run from several threads
 
-POOL_ENV = "STUDY_VAR_89"
-DEFAULT_POOL = "10.16.0.0/13"
-PREFIX = 28  # 16 addresses: the gate and the agent need two
+DEFAULT_PREFIX = 28  # 16 addresses: the gate and the agent need two
 MAX_ATTEMPTS = 64
-LABEL, OWNER, DIR = "org.dataset_76.sandbox", "org.dataset_76.owner", "org.dataset_76.dir"
 OVERLAP = "Pool overlaps"
 
 
-def default_pool() -> str:
-    return os.environ.get(POOL_ENV, DEFAULT_POOL)
+@dataclass(frozen=True)
+class Labels:
+    """The docker labels that mark a resource as one process's sandbox, in the deployment's label namespace."""
+
+    namespace: str
+
+    @property
+    def sandbox(self) -> str:
+        return f"{self.namespace}.sandbox"
+
+    @property
+    def owner(self) -> str:
+        return f"{self.namespace}.owner"
+
+    @property
+    def dir(self) -> str:
+        return f"{self.namespace}.dir"
+
+    @property
+    def lease(self) -> str:
+        return f"{self.namespace}.lease"
+
+    def args(self, host: HostOps, sandbox_dir: Path, lease_key: str | None = None) -> list[str]:
+        """`docker run` / `docker network create` arguments that mark a resource as this process's sandbox."""
+        pairs = [(self.sandbox, "1"), (self.owner, owner_id(host)), (self.dir, str(sandbox_dir))]
+        if lease_key is not None:
+            pairs.append((self.lease, lease_key))
+        return [arg for key, value in pairs for arg in ("--label", f"{key}={value}")]
+
+    def filters(self) -> list[str]:
+        """`--filter` arguments that select resources carrying the first three labels."""
+        return [
+            "--filter",
+            f"label={self.sandbox}=1",
+            "--filter",
+            f"label={self.owner}",
+            "--filter",
+            f"label={self.dir}",
+        ]
 
 
 # ------------------------------------------------------------------------------------------------ owners
-def _start_time(pid: int) -> str | None:
+def _start_time(host: HostOps, pid: int) -> str | None:
     """The process's start time in clock ticks since boot (/proc/<pid>/stat field 22): with the pid, it names one
     process, so a reused pid is not mistaken for the owner. None if there is no such process; an unreadable entry
     raises (unknown is not dead)."""
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
+        stat = host.read_text(f"/proc/{pid}/stat")
     except FileNotFoundError:
-        return None
-    except ProcessLookupError:
         return None
     return stat.rsplit(")", 1)[1].split()[19]  # fields after the command name start at field 3
 
 
-def _boot_id() -> str:
-    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+def _boot_id(host: HostOps) -> str:
+    return host.read_text("/proc/sys/kernel/random/boot_id").strip()
 
 
-def _pid_ns() -> str:
-    return os.readlink("/proc/self/ns/pid").strip("pid:[]")
+def _pid_ns(host: HostOps) -> str:
+    return host.readlink("/proc/self/ns/pid").strip("pid:[]")
 
 
-def owner_id(pid: int | None = None) -> str:
+def owner_id(host: HostOps, pid: int | None = None) -> str:
+    """The identity of a process, stable for its life and never reused: boot, PID namespace, pid, start time."""
     pid = os.getpid() if pid is None else pid
-    st = _start_time(pid)
+    st = _start_time(host, pid)
     if st is None:
-        raise H.SandboxError(f"no process {pid}")
-    return f"{_boot_id()}/{_pid_ns()}/{pid}/{st}"
+        raise SandboxError(f"no process {pid}")
+    return f"{_boot_id(host)}/{_pid_ns(host)}/{pid}/{st}"
 
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
 
-def _no_such_process(pid: int) -> bool:
-    """Absent from /proc is not proof (hidepid hides other users' processes): only the kernel's ESRCH is."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False  # it exists, as someone else's
-    return False
-
-
-def owner_gone(owner: str) -> bool:
+def owner_gone(host: HostOps, owner: str) -> bool:
     """True only when the owner is provably gone: an earlier boot, or this boot and PID namespace with no process of
-    that pid (ESRCH) or one with another start time. False for a live owner, another namespace, a malformed label, an
-    unreadable or hidden /proc entry."""
+    that pid (the kernel's ESRCH) or one with another start time. False for a live owner, another namespace, a malformed
+    label, an unreadable or hidden /proc entry."""
     m = re.fullmatch(rf"({_UUID})/(\d+)/(\d+)/(\d+)", owner or "")
     if not m:
         return False
     boot, ns, pid, start = m.groups()
     try:
-        if boot != _boot_id():
+        if boot != _boot_id(host):
             return True  # no process outlives a reboot
-        if ns != _pid_ns():
+        if ns != _pid_ns(host):
             return False  # its pids are not ours to look up
-        seen = _start_time(int(pid))
+        seen = _start_time(host, int(pid))
         if seen is None:
-            return _no_such_process(int(pid))
+            return host.process_alive(int(pid)) is False  # absent from /proc is not proof: only ESRCH is
         return seen != start
     except OSError:
         return False
 
 
-def owner_alive(owner: str) -> bool:
-    return not owner_gone(owner)
-
-
-def labels(sandbox_dir: Path) -> list[str]:
-    """`docker run` / `docker network create` arguments that mark a resource as this process's sandbox."""
-    return ["--label", f"{LABEL}=1", "--label", f"{OWNER}={owner_id()}", "--label", f"{DIR}={sandbox_dir}"]
+def owner_alive(host: HostOps, owner: str) -> bool:
+    return not owner_gone(host, owner)
 
 
 # ------------------------------------------------------------------------------------------------ subnets
-def subnets(pool: str, prefix: int = PREFIX) -> list[ipaddress.IPv4Network]:
-    return list(ipaddress.ip_network(pool).subnets(new_prefix=prefix))
+def subnets(pools: Sequence[str], prefix: int = DEFAULT_PREFIX) -> list[ipaddress.IPv4Network]:
+    """Every subnet of the given size in the pools (each a strict network)."""
+    return [sub for net in strict_networks(pools) for sub in net.subnets(new_prefix=prefix)]
 
 
-def docker_bridges() -> set[str]:
+def _json(text: str) -> list:
+    try:
+        data = json.loads(text or "null")
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def docker_bridges(host: HostOps) -> set[str]:
     """The host interfaces of Docker's bridge networks: their routes are Docker's, which refuses overlaps among them."""
-    ids = H.docker("network", "ls", "-q", "--filter", "driver=bridge", check=False).stdout.split()
+    ids = host.docker("network", "ls", "-q", "--filter", "driver=bridge", check=False).stdout.split()
     if not ids:
         return set()
-    out = H.docker(
-        "network", "inspect", "-f", '{{.Id}} {{index .Options "com.docker.network.bridge.name"}}', *ids, check=False
-    ).stdout
-    names = set()
-    for line in out.splitlines():
-        parts = line.split()
-        if parts:
-            names.add(parts[1] if len(parts) > 1 and parts[1] != "<no" else "br-" + parts[0][:12])
-    return names
+    info = _json(host.docker("network", "inspect", *ids, check=False).stdout)
+    return {
+        (n.get("Options") or {}).get("com.docker.network.bridge.name") or "br-" + str(n.get("Id", ""))[:12]
+        for n in info
+    }
 
 
 def route_overlaps(pool: str, route_text: str, ignore_devs: set[str] = frozenset()) -> list[str]:
@@ -171,25 +199,26 @@ def route_overlaps(pool: str, route_text: str, ignore_devs: set[str] = frozenset
     return hits
 
 
-def check_pool(pool: str) -> None:
+def check_pool(host: HostOps, pool: str) -> None:
     """Refuse a range that this host already routes: sandbox networks inside it would shadow real destinations."""
-    out = subprocess.run(["ip", "-4", "route", "show", "table", "all"], capture_output=True, text=True, timeout=30)
+    out = host.run(["ip", "-4", "route", "show", "table", "all"], 30)
     if out.returncode != 0:
-        raise H.SandboxError(f"cannot read the host's routes to check the subnet pool: {out.stderr.strip()[:200]}")
+        raise SandboxError(f"cannot read the host's routes to check the subnet pool: {out.stderr.strip()[:200]}")
     # our own sandbox networks add no host route (inhibit_ipv4), so any overlap is someone else's
-    hits = route_overlaps(pool, out.stdout, docker_bridges())
+    hits = route_overlaps(pool, out.stdout, docker_bridges(host))
     if hits:
-        raise H.SandboxError(f"subnet pool {pool} overlaps this host's routes: {hits[:3]}; set {POOL_ENV}")
+        raise SandboxError(
+            f"a subnet pool overlaps this host's routes ({len(hits)} found); set [sandbox.network] pools"
+        )
 
 
-def used_subnets() -> list[ipaddress.IPv4Network]:
-    ids = H.docker("network", "ls", "-q", check=False).stdout.split()
+def used_subnets(host: HostOps) -> list[ipaddress.IPv4Network]:
+    ids = host.docker("network", "ls", "-q", check=False).stdout.split()
     if not ids:
         return []
-    out = H.docker("network", "inspect", "-f", "{{json .IPAM.Config}}", *ids, check=False).stdout
     used = []
-    for line in out.splitlines():
-        for cfg in json.loads(line or "null") or []:
+    for net in _json(host.docker("network", "inspect", *ids, check=False).stdout):
+        for cfg in (net.get("IPAM") or {}).get("Config") or []:
             try:
                 n = ipaddress.ip_network(cfg.get("Subnet", ""), strict=False)
             except ValueError:
@@ -200,90 +229,81 @@ def used_subnets() -> list[ipaddress.IPv4Network]:
 
 
 def create(
+    host: HostOps,
     name: str,
     *,
-    pool: str | None = None,
-    prefix: int = PREFIX,
+    pools: Sequence[str],
+    prefix: int = DEFAULT_PREFIX,
     attempts: int = MAX_ATTEMPTS,
     extra: list[str] | None = None,
     rng: random.Random | None = None,
 ) -> tuple[str, int]:
-    """Create the internal network `name` on a free /`prefix` of the pool: (subnet, attempts used).
+    """Create the internal network `name` on a free /`prefix` of the pools: (subnet, attempts used).
 
     Raises SandboxError when no candidate was accepted within `attempts`; nothing is left behind then."""
-    pool = pool or default_pool()
-    check_pool(pool)
-    cands = subnets(pool, prefix)
+    for pool in pools:
+        check_pool(host, pool)
+    cands = subnets(pools, prefix)
     start = (rng or random.SystemRandom()).randrange(len(cands))
-    used = used_subnets()
+    used = used_subnets(host)
     tried = 0
     for k in range(len(cands)):
         cand = cands[(start + k) % len(cands)]
         if any(cand.overlaps(u) for u in used):
             continue
         tried += 1
-        r = H.docker(
-            "network",
-            "create",
-            "--internal",
-            "--opt",
-            "com.docker.network.bridge.inhibit_ipv4=true",
-            "--subnet",
-            str(cand),
-            *(extra or []),
-            name,
+        r = host.docker(
+            *("network", "create", "--internal", "--opt", "com.docker.network.bridge.inhibit_ipv4=true"),
+            *("--subnet", str(cand), *(extra or []), name),
             check=False,
         )
         if r.returncode == 0:
             return str(cand), tried
         if OVERLAP not in r.stderr:
-            raise H.SandboxError(f"docker network create {name} failed: {r.stderr.strip()[:300]}")
+            raise SandboxError(f"docker network create {name} failed: {r.stderr.strip()[:300]}")
         used.append(cand)  # taken meanwhile by another process: the next candidate
         if tried >= attempts:
             break
-    raise H.SandboxError(f"no free /{prefix} in {pool} for {name} after {tried} attempts")
+    raise SandboxError(f"no free /{prefix} in the pools for {name} after {tried} attempts")
 
 
 # ------------------------------------------------------------------------------------------------ orphans
-def reap_orphans() -> dict:
+def reap_orphans(host: HostOps, labels: Labels) -> dict:
     """Remove the containers and networks of sandboxes whose owner is provably gone (`owner_gone`). Only resources
     carrying all three labels are considered; containers first, so that the network can go."""
-    out = {"containers": [], "networks": [], "held": []}
+    out: dict = {"containers": [], "networks": [], "held": []}
     if not _REAP_LOCK.acquire(blocking=False):  # a concurrent start is reaping: this one need not wait on it
         return {**out, "skipped": "another thread of this process is reaping"}
     try:
-        return _reap_locked(out)
+        return _reap_locked(host, labels, out)
     finally:
         _REAP_LOCK.release()
 
 
-def _reap_locked(out: dict) -> dict:
-    full = ["--filter", f"label={LABEL}=1", "--filter", f"label={OWNER}", "--filter", f"label={DIR}"]
-    ps = H.docker("ps", "-a", *full, "--format", '{{.ID}}\t{{.Names}}\t{{.Label "' + OWNER + '"}}', check=False)
-    if (
-        ps.returncode != 0
-    ):  # a docker that did not answer lists nothing: that is not "none left", and the caller that must know sees `skipped`
+def _reap_locked(host: HostOps, labels: Labels, out: dict) -> dict:
+    ps = host.docker("ps", "-a", "-q", *labels.filters(), check=False)
+    if ps.returncode != 0:  # a docker that did not answer lists nothing: that is not "none left"
         return {**out, "skipped": f"docker ps failed ({ps.returncode}): {str(ps.stderr).strip()[:200]}"}
-    rows = ps.stdout
     gone = []
-    for line in rows.splitlines():
-        cid, name, owner = (line.split("\t") + ["", ""])[:3]
-        if cid and owner_gone(owner):
-            gone.append((cid, name))
-    # an M sandbox's sidecar may still hold a live FUSE mount: the readers stop, the mount goes, then the sidecar and the
-    # agent (teardown.fuse_first); a sandbox whose mount could not be released is left running, never SIGKILLed with it
-    from . import teardown
+    ids = ps.stdout.split()
+    for info in _json(host.docker("inspect", *ids, check=False).stdout) if ids else []:
+        owner = ((info.get("Config") or {}).get("Labels") or {}).get(labels.owner, "")
+        if info.get("Id") and owner_gone(host, owner):
+            gone.append((info["Id"], str(info.get("Name", "")).lstrip("/")))
+    # a mount sandbox's sidecar may still hold a live FUSE mount: the readers stop, the mount goes, then the sidecar and
+    # the agent (teardown.fuse_first); a sandbox whose mount could not be released is left running, never SIGKILLed with it
+    from expcore_onedata.sandbox import teardown
 
-    held = teardown.fuse_first([n for _, n in gone])
+    held = teardown.fuse_first(host, [name for _, name in gone])
     for cid, name in gone:
         if name in held:
             out["held"].append(name)
-        elif H.docker("rm", "-f", cid, check=False).returncode == 0:
+        elif host.docker("rm", "-f", cid, check=False).returncode == 0:
             out["containers"].append(cid)
-    nets = H.docker("network", "ls", "-q", *full, check=False).stdout.split()
-    for nid in nets:
-        info = H.docker("network", "inspect", "-f", '{{.Name}}\t{{index .Labels "' + OWNER + '"}}', nid, check=False)
-        name, _, owner = info.stdout.strip().partition("\t")
-        if name and owner_gone(owner) and H.docker("network", "rm", nid, check=False).returncode == 0:
+    net_ids = host.docker("network", "ls", "-q", *labels.filters(), check=False).stdout.split()
+    for net in _json(host.docker("network", "inspect", *net_ids, check=False).stdout) if net_ids else []:
+        owner = (net.get("Labels") or {}).get(labels.owner, "")
+        name = net.get("Name", "")
+        if name and owner_gone(host, owner) and host.docker("network", "rm", name, check=False).returncode == 0:
             out["networks"].append(name)
     return out

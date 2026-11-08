@@ -1,9 +1,9 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/sandbox/teardown.py, blob 9bd9d7eb81887f42865ed074642b06928be56a58
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""Ordered teardown of a sandbox that holds a oneclient FUSE mount (M, M+), for every path that ends one.
+"""Ordered teardown of a sandbox that holds a oneclient FUSE mount (a mount data path), for every path that ends one (O15).
 
-Why: the VM froze on 1 Nov at 23:48Z while docker was killing an M sandbox's agent container (`docker rm -f` at 23:47:59Z,
+Why: the VM froze on 1 Nov at 23:48Z while docker was killing a mount sandbox's agent container (`docker rm -f` at 23:47:59Z,
 "failed to exit within 10s", the direct SIGKILL at 23:48:09Z, then nothing in the kernel log). The old `Sandbox.stop`
 removed the agent container while the sidecar's FUSE mount was still bound into it (rslave), then SIGKILLed the sidecar,
 and unmounted last. Science's order (#2, 2 Nov 00:33Z): stop the reader, unmount (lazily if it must), then the sidecar,
@@ -42,6 +42,7 @@ sandbox or a failed abort closes the dispatch gate. The stuck tasks themselves a
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as dt
 import json
@@ -51,9 +52,24 @@ import re
 import time
 from pathlib import Path
 
-from . import hostops as H
+from expcore_onedata.sandbox import hostops
+from expcore_onedata.sandbox.hostops import HostOps
 
 log = logging.getLogger(__name__)
+
+
+def _sudo(host: HostOps, *argv: str, timeout_s: float):
+    """Run a privileged command within a time bound; its exit code is the caller's to read."""
+    return host.run(list(argv), timeout_s, sudo=True)
+
+
+def _read(host: HostOps, path: Path | str) -> str | None:
+    """A host file's text; None when it cannot be read (unknown, never empty)."""
+    try:
+        return host.read_text(path)
+    except OSError:
+        return None
+
 
 PROC = Path("/proc")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -97,7 +113,7 @@ class _StepLog:
         if path is not None:
             try:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
-                self._fh = open(path, "a")
+                self._fh = open(path, "a")  # noqa: SIM115 -- held open for the life of the teardown, closed in close()
             except OSError as e:
                 self.ctx = {**ctx, "log_file_error": repr(e)[:200]}
 
@@ -136,17 +152,15 @@ class _StepLog:
 
     def close(self) -> None:
         if self._fh is not None:
-            try:
+            with contextlib.suppress(OSError):
                 self._fh.close()
-            except OSError:
-                pass
 
 
 # ------------------------------------------------------------------------------------------------ processes
-def _stat(pid: int) -> dict | None:
+def _stat(host: HostOps, pid: int) -> dict | None:
     """State, parent, command name and start time of a process (/proc/<pid>/stat); None when it is gone or a zombie."""
     try:
-        s = (PROC / str(pid) / "stat").read_text()
+        s = host.read_text(PROC / str(pid) / "stat")
     except (OSError, ValueError):
         return None
     rest = s[s.rfind(")") + 2 :].split()
@@ -161,96 +175,97 @@ def _stat(pid: int) -> dict | None:
     }
 
 
-def _wchan(pid: int, waits: Waits) -> str | None:
+def _wchan(host: HostOps, pid: int, waits: Waits) -> str | None:
     """The wait channel, None when unknown. Without ptrace access the kernel answers "0" (the agent runs as another uid:
     measured on dockerd here, "0" without sudo and "futex_wait_queue" with), so "0" is read again through sudo."""
     path = PROC / str(pid) / "wchan"
     try:
-        v = path.read_text().strip()
+        v = host.read_text(path).strip()
     except OSError:
         v = ""
     if v and v != "0":
         return v
-    r = H.sudo_bounded("cat", str(path), timeout_s=waits.probe_s)
+    r = _sudo(host, "cat", str(path), timeout_s=waits.probe_s)
     v = r.stdout.strip() if r.returncode == 0 else ""
     return v if v and v != "0" else None
 
 
-def _inspect(name: str, waits: Waits) -> dict | None:
+def _inspect(host: HostOps, name: str, waits: Waits) -> dict | None:
     """{"pid", "id", "running"} of a container; None when docker says it does not exist; {"unknown": True, ...} when docker
     cannot say (daemon trouble, a timeout): it may be running with its copy of the mount, so it is not treated as absent."""
-    r = H.run_bounded(["docker", "inspect", "-f", "{{.State.Pid}}|{{.Id}}|{{.State.Running}}", name], waits.command_s)
-    parts = r.stdout.strip().split("|")
-    if r.returncode != 0 or len(parts) != 3 or not parts[0].isdigit():
+    r = host.docker("inspect", name, check=False, timeout=waits.command_s)
+    info = hostops.inspect_from(r)
+    if info is None:
         if r.returncode == 1 and re.search(
             r"no such (object|container)", r.stderr.lower()
         ):  # not "no such file": a missing docker socket
             return None
         return {"pid": 0, "id": "", "running": None, "unknown": True}
-    return {"pid": int(parts[0]), "id": parts[1], "running": parts[2] == "true"}
+    state = info.get("State") or {}
+    return {"pid": int(state.get("Pid") or 0), "id": str(info.get("Id", "")), "running": bool(state.get("Running"))}
 
 
-def _cgroup_procs(cid: str) -> list[int] | None:
+def _cgroup_procs(host: HostOps, cid: str) -> list[int] | None:
     for cand in (CGROUP_ROOT / "system.slice" / f"docker-{cid}.scope", CGROUP_ROOT / "docker" / cid):
         try:
-            return [int(x) for x in (cand / "cgroup.procs").read_text().split()]
+            return [int(x) for x in host.read_text(cand / "cgroup.procs").split()]
         except (OSError, ValueError):
             continue
     return None
 
 
-def _readers(agent: dict) -> list[dict] | None:
+def _readers(host: HostOps, agent: dict) -> list[dict] | None:
     """The agent container's processes except its init and the init's `sleep infinity` (keeping those keeps the container,
     and with it its mount namespace, alive until step 4). None when the container's cgroup cannot be read."""
-    procs = _cgroup_procs(agent["id"])
+    procs = _cgroup_procs(host, agent["id"])
     if procs is None:
         return None
     out = []
     for pid in procs:
-        st = _stat(pid)
+        st = _stat(host, pid)
         if st is None or pid == agent["pid"] or (st["ppid"] == agent["pid"] and st["comm"] == "sleep"):
             continue
         out.append(st)
     return out
 
 
-def _alive(procs: list[dict]) -> list[dict]:
+def _alive(host: HostOps, procs: list[dict]) -> list[dict]:
     """The ones still alive (same pid AND start time: a reused pid is not a survivor)."""
     out = []
     for p in procs:
-        st = _stat(p["pid"])
+        st = _stat(host, p["pid"])
         if st is not None and st["start"] == p["start"]:
             out.append(st)
     return out
 
 
-def _brief(procs: list[dict], waits: Waits) -> list[dict]:
+def _brief(host: HostOps, procs: list[dict], waits: Waits) -> list[dict]:
     """For the log; the wait channel of the first few in D (it takes a sudo each, so it is read here, not while polling)."""
     out, asked = [], 0
     for p in procs[:32]:
         e = {k: p[k] for k in ("pid", "comm", "state")}
         if p["state"] == "D" and asked < 8:
             asked += 1
-            e["wchan"] = _wchan(p["pid"], waits)
+            e["wchan"] = _wchan(host, p["pid"], waits)
         out.append(e)
     return out
 
 
-def _wait_gone(procs: list[dict], seconds: float, poll: float) -> list[dict]:
+def _wait_gone(host: HostOps, procs: list[dict], seconds: float, poll: float) -> list[dict]:
     deadline = time.monotonic() + seconds
     while True:
-        left = _alive(procs)
+        left = _alive(host, procs)
         if not left or time.monotonic() >= deadline:
             return left
         time.sleep(poll)
 
 
-def _stop_readers(agent: dict | None, waits: Waits, L: _StepLog) -> list[dict]:
+def _stop_readers(host: HostOps, agent: dict | None, waits: Waits, L: _StepLog) -> list[dict]:
     """Step 1. Returns the readers it signalled (the survivors are checked again later)."""
     if agent is None or not agent["running"] or agent["pid"] <= 0:
         L("readers", outcome="skipped", detail="no running agent container")
         return []
-    procs = _readers(agent)
+    procs = _readers(host, agent)
     if procs is None:
         L("readers", outcome="unknown", detail="the agent container's cgroup could not be read: readers not signalled")
         return []
@@ -258,19 +273,26 @@ def _stop_readers(agent: dict | None, waits: Waits, L: _StepLog) -> list[dict]:
         L("readers", outcome="none", detail="no process besides init and its sleep")
         return []
     pids = [str(p["pid"]) for p in procs]
-    r = H.sudo_bounded("kill", "-s", "TERM", *pids, timeout_s=waits.command_s)
-    left = _wait_gone(procs, waits.reader_term_s, waits.poll_s)
-    L("readers", signal="TERM", signalled=len(procs), rc=r.returncode, left=len(left), left_procs=_brief(left, waits))
+    r = _sudo(host, "kill", "-s", "TERM", *pids, timeout_s=waits.command_s)
+    left = _wait_gone(host, procs, waits.reader_term_s, waits.poll_s)
+    L(
+        "readers",
+        signal="TERM",
+        signalled=len(procs),
+        rc=r.returncode,
+        left=len(left),
+        left_procs=_brief(host, left, waits),
+    )
     if left:
-        r = H.sudo_bounded("kill", "-s", "KILL", *[str(p["pid"]) for p in left], timeout_s=waits.command_s)
-        left = _wait_gone(left, waits.reader_kill_s, waits.poll_s)
+        r = _sudo(host, "kill", "-s", "KILL", *[str(p["pid"]) for p in left], timeout_s=waits.command_s)
+        left = _wait_gone(host, left, waits.reader_kill_s, waits.poll_s)
         L(
             "readers",
             signal="KILL",
             rc=r.returncode,
             left=len(left),
             d_state=sum(p["state"] == "D" for p in left),
-            left_procs=_brief(left, waits),
+            left_procs=_brief(host, left, waits),
         )
     return procs
 
@@ -283,10 +305,10 @@ def host_path(mountpoint: Path | str) -> str:
     return os.path.join(os.path.realpath(p.parent), p.name)
 
 
-def _fuse_at(mp: str, waits: Waits) -> list[dict] | None:
+def _fuse_at(host: HostOps, mp: str, waits: Waits) -> list[dict] | None:
     """The FUSE mounts at `mp` in the host's mountinfo; None when it cannot be read in time (unknown, never "none")."""
-    mi = H.read_text_bounded(PROC / "self" / "mountinfo", waits.probe_s)
-    return None if mi is None else [m for m in H.fuse_mounts(mi) if m["mountpoint"] == mp]
+    mi = _read(host, PROC / "self" / "mountinfo")
+    return None if mi is None else [m for m in hostops.fuse_mounts(mi) if m["mountpoint"] == mp]
 
 
 def _conn(dev: str) -> str | None:
@@ -295,16 +317,16 @@ def _conn(dev: str) -> str | None:
     return minor if major == "0" and minor.isdigit() else None
 
 
-def _waiting(devs: list[str], waits: Waits) -> dict:
+def _waiting(host: HostOps, devs: list[str], waits: Waits) -> dict:
     out = {}
     for d in devs:
         n = _conn(d)
-        r = H.sudo_bounded("cat", str(FUSECTL / n / "waiting"), timeout_s=waits.probe_s) if n else None
+        r = _sudo(host, "cat", str(FUSECTL / n / "waiting"), timeout_s=waits.probe_s) if n else None
         out[d] = int(r.stdout.strip()) if r is not None and r.returncode == 0 and r.stdout.strip().isdigit() else None
     return out
 
 
-def _abort(devs: list[str], waits: Waits) -> dict:
+def _abort(host: HostOps, devs: list[str], waits: Waits) -> dict:
     """Abort each FUSE connection (every request ends with an error; the mount is dead). A connection whose fusectl entry
     is already gone counts as ended."""
     out = {}
@@ -313,15 +335,15 @@ def _abort(devs: list[str], waits: Waits) -> dict:
         if n is None:
             out[d] = "unknown device"
             continue
-        if not (FUSECTL / n).exists():
+        if not host.exists(FUSECTL / n):
             out[d] = "gone"
             continue
-        r = H.sudo_bounded("sh", "-c", f"echo 1 > {FUSECTL / n / 'abort'}", timeout_s=waits.command_s)
+        r = _sudo(host, "sh", "-c", f"echo 1 > {FUSECTL / n / 'abort'}", timeout_s=waits.command_s)
         out[d] = "aborted" if r.returncode == 0 else f"failed rc {r.returncode}: {r.stderr.strip()[:120]}"
     return out
 
 
-def _unmount_host(mp: str, fuse0: list[dict] | None, waits: Waits, L: _StepLog) -> bool:
+def _unmount_host(host: HostOps, mp: str, fuse0: list[dict] | None, waits: Waits, L: _StepLog) -> bool:
     """Step 2 at the host's mount point. True when no FUSE mount is left there (or a lazy unmount succeeded while the
     mount table could not be read)."""
     if fuse0 == []:
@@ -329,9 +351,9 @@ def _unmount_host(mp: str, fuse0: list[dict] | None, waits: Waits, L: _StepLog) 
         return True
     deadline, attempts, r = time.monotonic() + waits.unmount_s, 0, None
     while True:
-        r = H.sudo_bounded("fusermount", "-u", mp, timeout_s=waits.command_s)
+        r = _sudo(host, "fusermount", "-u", mp, timeout_s=waits.command_s)
         attempts += 1
-        now = _fuse_at(mp, waits)
+        now = _fuse_at(host, mp, waits)
         if now == [] or (now is None and r.returncode == 0):
             L("unmount", outcome="unmounted", method="fusermount -u", attempts=attempts, verified=now == [])
             return True
@@ -347,8 +369,8 @@ def _unmount_host(mp: str, fuse0: list[dict] | None, waits: Waits, L: _StepLog) 
         stderr=r.stderr.strip()[-200:],
     )
     for method, cmd in (("fusermount -uz", ["fusermount", "-uz", mp]), ("umount -l", ["umount", "-l", mp])):
-        r = H.sudo_bounded(*cmd, timeout_s=waits.command_s)
-        now = _fuse_at(mp, waits)
+        r = _sudo(host, *cmd, timeout_s=waits.command_s)
+        now = _fuse_at(host, mp, waits)
         if now == [] or (now is None and r.returncode == 0):
             L("unmount", outcome="detached", method=method, rc=r.returncode, verified=now == [])
             return True
@@ -363,23 +385,23 @@ def _unmount_host(mp: str, fuse0: list[dict] | None, waits: Waits, L: _StepLog) 
     return False
 
 
-def _ns_copies(pid: int, waits: Waits) -> list[dict] | None:
+def _ns_copies(host: HostOps, pid: int, waits: Waits) -> list[dict] | None:
     """The FUSE mounts in a container's own mount namespace; None when they cannot be read. Each is this sandbox's: the
     agent has no FUSE of its own (no capabilities, no /dev/fuse), and the sidecar mounts one thing."""
-    r = H.sudo_bounded("cat", str(PROC / str(pid) / "mountinfo"), timeout_s=waits.probe_s)
-    return None if r.returncode != 0 else H.fuse_mounts(r.stdout)
+    r = _sudo(host, "cat", str(PROC / str(pid) / "mountinfo"), timeout_s=waits.probe_s)
+    return None if r.returncode != 0 else hostops.fuse_mounts(r.stdout)
 
 
-def _unmount_namespaces(targets: list[tuple[str, int]], waits: Waits, L: _StepLog) -> bool:
+def _unmount_namespaces(host: HostOps, targets: list[tuple[str, int]], waits: Waits, L: _StepLog) -> bool:
     """Step 2, in the agent's and the sidecar's own mount namespaces: the host's view looks the same whether or not the
     unmount reached them, and it does not reach the agent's (module docstring). True when no copy of the mount is known to be
     left. `-p` as well as `-m`: umount reads /proc/self/mountinfo, and in the container's /proc that resolves only from inside
     its PID namespace (with `-m` alone: "umount failed: No such file or directory", measured on the VM)."""
     clean = True
     for who, pid in targets:
-        copies = _ns_copies(pid, waits)
+        copies = _ns_copies(host, pid, waits)
         if copies is None:  # unknown is not clean, unless the process and so its namespace have gone
-            gone = _stat(pid) is None
+            gone = _stat(host, pid) is None
             L(
                 "unmount_ns",
                 who=who,
@@ -393,11 +415,11 @@ def _unmount_namespaces(targets: list[tuple[str, int]], waits: Waits, L: _StepLo
             continue
         r = None
         for m in copies:
-            r = H.sudo_bounded(
-                "nsenter", "-t", str(pid), "-m", "-p", "umount", "-l", m["mountpoint"], timeout_s=waits.command_s
+            r = _sudo(
+                host, "nsenter", "-t", str(pid), "-m", "-p", "umount", "-l", m["mountpoint"], timeout_s=waits.command_s
             )
-        again = _ns_copies(pid, waits)
-        ok = again == [] or (again is None and _stat(pid) is None)
+        again = _ns_copies(host, pid, waits)
+        ok = again == [] or (again is None and _stat(host, pid) is None)
         L(
             "unmount_ns",
             who=who,
@@ -413,6 +435,7 @@ def _unmount_namespaces(targets: list[tuple[str, int]], waits: Waits, L: _StepLo
 
 # ------------------------------------------------------------------------------------------------ the sequence
 def ordered_fuse_teardown(
+    host: HostOps,
     agent: str | None,
     sidecar: str,
     mountpoint: Path | str,
@@ -430,15 +453,16 @@ def ordered_fuse_teardown(
     errors: list[str] = []
     removed: list[str] = []
     try:
-        ai = _inspect(agent, waits) if agent else None
-        si = _inspect(sidecar, waits)
-        fuse0 = _fuse_at(mp, waits)
+        ai = _inspect(host, agent, waits) if agent else None
+        si = _inspect(host, sidecar, waits)
+        fuse0 = _fuse_at(host, mp, waits)
         targets = [(w, i["pid"]) for w, i in (("agent", ai), ("sidecar", si)) if i and i["running"] and i["pid"] > 0]
         unknown = [w for w, i in (("agent", ai), ("sidecar", si)) if i and i.get("unknown")]
         # the connections to end if it comes to that: from the namespaces too, because a retry after an earlier attempt
         # detached the host's copy sees none on the host while a copy may still live in a container
         devs = sorted(
-            {m["dev"] for m in fuse0 or []} | {m["dev"] for _, pid in targets for m in _ns_copies(pid, waits) or []}
+            {m["dev"] for m in fuse0 or []}
+            | {m["dev"] for _, pid in targets for m in _ns_copies(host, pid, waits) or []}
         )
         L(
             "begin",
@@ -450,23 +474,23 @@ def ordered_fuse_teardown(
             sidecar_running=si and si["running"],
             fuse_mounts=None if fuse0 is None else len(fuse0),
             fuse_devs=devs,
-            fuse_waiting=_waiting(devs, waits),
+            fuse_waiting=_waiting(host, devs, waits),
             containers_unknown=unknown,
         )
 
-        # 1. the readers: first any other container that binds the mount (an M control: its reader is its init, so the container goes as a whole)
+        # 1. the readers: first any other container that binds the mount (a control container: its reader is its init, so the container goes as a whole)
         for name in extra_readers:
-            r = H.run_bounded(["docker", "stop", "-t", "2", name], 2 + waits.command_s)
-            after = _inspect(name, waits)
+            r = host.docker("stop", "-t", "2", name, check=False, timeout=2 + waits.command_s)
+            after = _inspect(host, name, waits)
             L("readers", who=name, action="docker stop", rc=r.returncode, running_after=after and after["running"])
             if after is not None and after["running"] is not False:
                 unknown.append(name)
-        readers = _stop_readers(ai, waits, L)
+        readers = _stop_readers(host, ai, waits, L)
 
         # 2. the unmount: the host's mount point, then the containers' own namespaces
-        unmounted = _unmount_host(mp, fuse0, waits, L)
+        unmounted = _unmount_host(host, mp, fuse0, waits, L)
         if unmounted and targets:
-            unmounted = _unmount_namespaces(targets, waits, L)
+            unmounted = _unmount_namespaces(host, targets, waits, L)
         if unknown:  # docker could not say whether these run: a copy of the mount may be live in one, as with an unreadable namespace
             L(
                 "unmount_ns",
@@ -475,7 +499,7 @@ def ordered_fuse_teardown(
                 detail="docker could not say whether the container is running",
             )
             unmounted = False
-        left = _alive(readers)
+        left = _alive(host, readers)
         stuck = [p for p in left if p["state"] == "D"]
         why = (["the mount could not be unmounted"] if not unmounted else []) + (
             [f"{len(stuck)} reader(s) still in D state after the unmount deadline"] if stuck else []
@@ -485,15 +509,15 @@ def ordered_fuse_teardown(
                 "readers_stuck_d",
                 count=len(stuck),
                 pids=[p["pid"] for p in stuck],
-                left_procs=_brief(stuck, waits),
-                fuse_waiting=_waiting(devs, waits),
+                left_procs=_brief(host, stuck, waits),
+                fuse_waiting=_waiting(host, devs, waits),
                 unmounted=unmounted,
             )
         aborted = False
         if why:  # the last resort, before the sidecar's stop; sudo here is NOPASSWD: ALL, and a failure is recorded
-            res = _abort(devs, waits)
+            res = _abort(host, devs, waits)
             aborted = bool(res) and all(v in ("aborted", "gone") for v in res.values())
-            left = _wait_gone(left, waits.after_abort_s, waits.poll_s) if aborted else _alive(readers)
+            left = _wait_gone(host, left, waits.after_abort_s, waits.poll_s) if aborted else _alive(host, readers)
             L.event(
                 "abort",
                 reason="; ".join(why),
@@ -501,7 +525,7 @@ def ordered_fuse_teardown(
                 ok=aborted,
                 readers_left=len(left),
                 d_state=sum(p["state"] == "D" for p in left),
-                left_procs=_brief(left, waits),
+                left_procs=_brief(host, left, waits),
             )
         if not (unmounted or aborted):
             errors.append(
@@ -511,12 +535,17 @@ def ordered_fuse_teardown(
             return TeardownResult(False, removed, errors, L.records)
 
         # 3. the sidecar: a graceful stop, so oneclient closes /dev/fuse itself
-        w = _waiting(devs, waits)
-        r = H.run_bounded(
-            ["docker", "stop", "-t", str(waits.sidecar_stop_s), sidecar], waits.sidecar_stop_s + waits.command_s
+        w = _waiting(host, devs, waits)
+        r = host.docker(
+            "stop",
+            "-t",
+            str(waits.sidecar_stop_s),
+            sidecar,
+            check=False,
+            timeout=waits.sidecar_stop_s + waits.command_s,
         )
-        after = _inspect(sidecar, waits)
-        left = _alive(readers)
+        after = _inspect(host, sidecar, waits)
+        left = _alive(host, readers)
         L(
             "sidecar",
             action="docker stop",
@@ -526,10 +555,10 @@ def ordered_fuse_teardown(
             sidecar_running_after=after and after["running"],
             readers_left=len(left),
             d_state=sum(p["state"] == "D" for p in left),
-            left_procs=_brief(left, waits),
+            left_procs=_brief(host, left, waits),
         )
         if devs and (left or (after and after["running"])):
-            res = _abort(devs, waits)
+            res = _abort(host, devs, waits)
             L.event(
                 "abort",
                 reason="readers left or the sidecar still running after its stop",
@@ -537,7 +566,7 @@ def ordered_fuse_teardown(
                 ok=bool(res) and all(v in ("aborted", "gone") for v in res.values()),
             )
         try:
-            H.remove_container(sidecar)
+            hostops.remove_container(host, sidecar)
             removed.append(sidecar)
             L("sidecar", action="removed")
         except Exception as e:
@@ -546,16 +575,16 @@ def ordered_fuse_teardown(
 
         # 4. the agent container, last
         if agent:
-            left = _alive(readers)
+            left = _alive(host, readers)
             L(
                 "agent",
                 action="remove",
                 readers_left=len(left),
                 d_state=sum(p["state"] == "D" for p in left),
-                left_procs=_brief(left, waits),
+                left_procs=_brief(host, left, waits),
             )
             try:
-                H.remove_container(agent)
+                hostops.remove_container(host, agent)
                 removed.append(agent)
                 L("agent", action="removed")
             except Exception as e:
@@ -567,7 +596,7 @@ def ordered_fuse_teardown(
         L.close()
 
 
-def fuse_first(names: list[str], *, waits: Waits | None = None, log_dir: Path | None = None) -> set[str]:
+def fuse_first(host: HostOps, names: list[str], *, waits: Waits | None = None, log_dir: Path | None = None) -> set[str]:
     """For a cleanup that removes containers by name without knowing the order (the orphan reaper, a lane's leftovers):
     run the ordered teardown for every oneclient sidecar among `names` (with its agent container, `<sidecar minus
     -oneclient>`) BEFORE the caller removes anything. Returns the names the caller must NOT remove: the sandboxes whose
@@ -576,24 +605,17 @@ def fuse_first(names: list[str], *, waits: Waits | None = None, log_dir: Path | 
     held: set[str] = set()
     for side in [n for n in names if n.endswith(SIDECAR_SUFFIX)]:
         agent = side[: -len(SIDECAR_SUFFIX)]
-        r = H.run_bounded(
-            [
-                "docker",
-                "inspect",
-                "-f",
-                '{{range .Mounts}}{{if eq .Destination "' + SIDECAR_MOUNT + '"}}{{.Source}}{{end}}{{end}}',
-                side,
-            ],
-            waits.command_s,
+        info = hostops.inspect(host, side, timeout=waits.command_s)
+        src = next(
+            (m.get("Source", "") for m in (info or {}).get("Mounts") or [] if m.get("Destination") == SIDECAR_MOUNT), ""
         )
-        src = r.stdout.strip() if r.returncode == 0 else ""
         if not src:
             log.error("teardown: the mount point of %s could not be found: it and %s are left running", side, agent)
             held |= {side, agent}
             continue
         run_dir = Path(src).parent
         lp = (Path(log_dir) if log_dir is not None else run_dir.parent / TEARDOWN_LOG_DIR) / f"{run_dir.name}.jsonl"
-        res = ordered_fuse_teardown(agent, side, Path(src), waits=waits, log_path=lp)
+        res = ordered_fuse_teardown(host, agent, side, Path(src), waits=waits, log_path=lp)
         if not res.fuse_safe:
             held |= {side, agent}
     return held
