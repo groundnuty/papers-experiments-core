@@ -50,12 +50,23 @@ def _is_importer(node: ast.AST, names: set[str]) -> bool:
     return isinstance(node, ast.Attribute) and node.attr in _DYNAMIC_IMPORTERS
 
 
+def _constant_string(node: ast.AST | None) -> str | None:
+    """Return the value of a string constant, else None."""
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
 def _module_argument(call: ast.Call) -> str | None:
-    """Return the module name given as a string constant, positionally or as name=, else None."""
-    argument = call.args[0] if call.args else next((k.value for k in call.keywords if k.arg == "name"), None)
-    if isinstance(argument, ast.Constant) and isinstance(argument.value, str) and not argument.value.startswith("."):
-        return argument.value
-    return None
+    """Return the module a dynamic import names, string constants only, as a name whose first part is its root.
+
+    A relative name (".x") is resolved against the package argument, positional or package=; with no usable package
+    argument it cannot name another layer and is not reported.
+    """
+    keywords = {k.arg: k.value for k in call.keywords}
+    name = _constant_string(call.args[0] if call.args else keywords.get("name"))
+    if name is None or not name.startswith("."):
+        return name
+    package = _constant_string(call.args[1] if len(call.args) > 1 else keywords.get("package"))
+    return package or None
 
 
 def imported_roots(source: str) -> set[str]:
@@ -121,6 +132,11 @@ def test_every_module_respects_the_boundary(package):
         "from importlib import import_module\nload = import_module\nagain = load\nagain(name='requests')\n",
         "from builtins import __import__ as imp\nimp('requests')\n",
         "import importlib\nimportlib.import_module('requests', package='expcore')\n",
+        "import importlib\nimportlib.import_module('.x', 'expcore_onedata')\n",
+        "import importlib\nimportlib.import_module('.x', package='expcore_onedata')\n",
+        "import importlib\nimportlib.import_module(name='..x', package='expcore_onedata.sandbox')\n",
+        "from importlib import import_module as load\nload('.x', 'requests')\n",
+        "import importlib as il\nil.import_module('.x.y', package='requests.sessions')\n",
     ],
 )
 def test_planted_import_fails_inside_expcore(source):
@@ -139,6 +155,9 @@ def test_planted_import_fails_inside_expcore(source):
         "from .sibling import thing\n",
         "import importlib\nimportlib.import_module('json')\n",
         "import importlib\nimportlib.import_module('.sibling', package='expcore')\n",
+        "import importlib\nimportlib.import_module('.sibling', 'expcore.loop')\n",
+        "import importlib\nimportlib.import_module('.sibling')\n",
+        "import importlib\nimportlib.import_module('.sibling', package=name_from_somewhere)\n",
         "import importlib\nimportlib.import_module(name='json')\n",
         "from importlib import import_module as load\nload('expcore.loop')\n",
         "import importlib as il\nil.import_module(name='os.path')\n",
