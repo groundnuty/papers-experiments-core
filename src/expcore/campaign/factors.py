@@ -30,7 +30,11 @@ looks healthy would remove the effect being measured. Under such a condition an 
 of a listed kind is a scored final attempt: the store marks it as treatment, never runs it again and does not charge
 it against the infrastructure limit. Other kinds under the same condition are set aside and run again as usual. The
 kinds are checked against the registry in `expcore.errors` (the core's kinds and any a platform registered), and
-the declaration is part of the schema, so changing it between a start and a resume is refused (C06).
+the declaration is part of the schema, so changing it between a start and a resume is refused (C06). A kind the
+registry marks as not treatable (`tool_plane_integrity` and any a platform registered so) is refused when the
+schema is loaded, naming the file and the key: a run that failed an integrity check of the harness says nothing about
+the manipulation, so it can never be scored as the condition's fault. The scheduler refuses, at its start, a health
+or identity kind a condition declares as treatment for the same reason (`refused_treatment`).
 
 A condition may also name the tasks it runs on:
 
@@ -56,7 +60,7 @@ from typing import Any
 from urllib.parse import quote
 
 from expcore.config.loading import Section, load_toml
-from expcore.errors import infra_kinds
+from expcore.errors import infra_kinds, is_treatable, untreatable_kinds
 
 BUILTIN_FACTORS = ("task", "model", "seed")
 TREATMENT_KEY = "infrastructure_is_treatment"
@@ -215,11 +219,30 @@ class FactorSchema:
                         TREATMENT_KEY,
                         f"names unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}",
                     )
+                if not is_treatable(kind):
+                    raise where.fail(
+                        TREATMENT_KEY,
+                        f"names infrastructure kind {kind!r}, which can never be a treatment: "
+                        f"{untreatable_kinds()[kind]}",
+                    )
             repeated = sorted({k for k in kinds if kinds.count(k) > 1})
             if repeated:
                 raise where.fail(TREATMENT_KEY, f"repeats {', '.join(map(repr, repeated))}")
             out[name] = tuple(sorted(kinds))
         return out
+
+    def refused_treatment(self, kinds: Mapping[str, str]) -> tuple[str, str] | None:
+        """Return the first (condition, kind) whose declared treatment is one of `kinds`, or None.
+
+        `kinds` maps a kind to the reason it cannot be a treatment here. The registry's untreatable kinds are
+        refused when the schema is built; a campaign adds the kinds it charges its own failures to (the scheduler's
+        health and identity kinds), which are untreatable for that campaign.
+        """
+        for condition, declared in self.treatment_kinds.items():
+            for kind in declared:
+                if kind in kinds:
+                    return condition, kind
+        return None
 
     def _check_condition_tasks(self, declared: Mapping[str, Sequence[str]]) -> dict[str, tuple[str, ...] | None]:
         """Check each condition's task list; return it by condition, None where the condition runs on every task."""
