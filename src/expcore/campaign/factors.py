@@ -290,6 +290,14 @@ class FactorSchema:
             raise PlanError(f"run key {key.text!r} is on a task that condition {condition!r} does not run")
         return condition
 
+    def treatment_kinds_of(self, key: RunKey) -> tuple[str, ...]:
+        """Return the infrastructure kinds declared as treatment by the condition of a run key.
+
+        The campaign passes these to `build_record` and `record_attempt`, so the record and the store agree on which
+        infrastructure failures are scored.
+        """
+        return self.treatment_kinds[self.condition_of(key)]
+
     def condition_of(self, key: RunKey) -> str:
         """Return the name of the condition a key belongs to; refuse a key whose levels fit none."""
         return self.condition_named(key.factors, key.text)

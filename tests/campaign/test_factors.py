@@ -387,3 +387,12 @@ def test_c06_the_task_lists_are_part_of_the_schema_s_identity_whatever_their_ord
     assert chain_schema(("task-a", "task-b")).digest != make_schema().digest
     assert chain_schema(("task-a", "task-b")).digest != chain_schema(("task-a",)).digest
     assert chain_schema(("task-a", "task-b")).digest == chain_schema(("task-b", "task-a")).digest
+
+
+def test_c06_the_conditions_treatment_kinds_are_found_from_a_run_key(registry):
+    """C06: adds the lookup the campaign passes to the record, from a run key to its condition's declared kinds."""
+    schema = treatment_schema(("sandbox", "endpoint"))
+    declared = schema.key("api-none", "task-a", "m1", 1)
+    other = schema.key("mount-read", "task-a", "m1", 1)
+    assert schema.treatment_kinds_of(declared) == ("endpoint", "sandbox")
+    assert schema.treatment_kinds_of(other) == ()
