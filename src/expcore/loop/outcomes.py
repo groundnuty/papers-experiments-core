@@ -8,6 +8,8 @@ The vocabulary is closed so a typo never reaches a record and the analysis can e
 - `finished`: the model answered without a tool call, or a call to a terminal tool succeeded.
 - `turn_cap`, `time_cap`, `token_cap`, `output_cap`: a cap ended it. These are the agent's own outcomes.
 - `malformed_end`: the model sent malformed tool-call arguments and the run's policy ends the attempt (L01).
+- `leaked_tool_call`: a reply with no tool call wrote a call to an offered tool as text or in its reasoning, and the
+  call was not executed (L10). The agent's own ending, scored like any other.
 - `error`: the model or endpoint failed in a way that is the attempt's own (a context overflow, a plain 400).
 - `infrastructure`: the endpoint, the sandbox or a tool server failed; carries the kind from `expcore.errors`
   unchanged (C02). The attempt is set aside and re-run, never scored.
@@ -30,6 +32,7 @@ OUTCOMES = (
     "token_cap",
     "output_cap",
     "malformed_end",
+    "leaked_tool_call",
     "harness_defect",
     "error",
     "infrastructure",

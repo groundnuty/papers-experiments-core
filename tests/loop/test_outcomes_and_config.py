@@ -14,7 +14,7 @@ LIMITS = Limits(
 )
 
 
-def test_the_vocabulary_is_the_nine_endings():
+def test_the_vocabulary_is_the_ten_endings():
     assert OUTCOMES == (
         "finished",
         "turn_cap",
@@ -22,6 +22,7 @@ def test_the_vocabulary_is_the_nine_endings():
         "token_cap",
         "output_cap",
         "malformed_end",
+        "leaked_tool_call",
         "harness_defect",
         "error",
         "infrastructure",

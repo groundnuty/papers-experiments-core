@@ -25,6 +25,7 @@ from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.loop.config import AgentConfig, config_sha256_of
+from expcore.loop.leaks import leaked_tool
 from expcore.loop.outcomes import Outcome, harness_defect_of
 from expcore.loop.records import LoopResult, ToolCallRecord, TurnRecord
 from expcore.loop.timer import AgentTimer, Tick
@@ -135,6 +136,9 @@ class _Run:
             self._guard_budget(turn)  # a reply that reaches the budget executes none of its calls
             if not calls:
                 self.final_text = turn.text  # "" is an empty reply; None, left alone, means there was no reply (L11)
+                leak = self._leak(turn)
+                if leak is not None:
+                    raise _End(leak)
                 raise _End(Outcome("finished", "the model answered without a tool call"))
             if self.rounds + 1 > self.config.limits.max_tool_rounds:  # rounds are counted, not calls (L03)
                 self._skip_all(turn, "cap")
@@ -143,6 +147,17 @@ class _Run:
             if self.config.malformed_policy == "end" and any(c.parse_error for c in calls):
                 self._end_on_malformed(turn)
             await self._round(turn)
+
+    def _leak(self, turn: ModelTurn) -> Outcome | None:
+        """The ending for a tool-free reply that holds a call to an offered tool as text, in its reply or its
+        reasoning; the call is not run and the model is not asked again (L10)."""
+        for channel, text in (("text", turn.text), ("reasoning", turn.reasoning)):
+            tool = leaked_tool(text, self.toolbox.names)
+            if tool is not None:
+                return Outcome(
+                    "leaked_tool_call", f"the reply's {channel} holds a call to {tool!r} written out; it was not run"
+                )
+        return None
 
     def _guard_budget(self, turn: ModelTurn | None = None) -> None:
         """End the attempt as a token cap once the tokens used reach the budget; the budget is exhausted at the budget,
