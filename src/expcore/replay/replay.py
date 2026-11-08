@@ -88,7 +88,7 @@ def _check_inputs(record: RunRecord, box: ToolBox) -> None:
         entry = record.prompt[part]
         if sha256_of(entry["text"]) != entry["sha256"]:
             raise ReplayDivergence(f"prompt.{part}.sha256", "the prompt text does not have the recorded hash")
-    check_rendering(record)
+    check_rendering(record, box.cap_chars)
     if box.manifest_sha256 != record.prompt["tools_sha256"]:
         raise ReplayDivergence("prompt.tools_sha256", "the tools rebuilt from the record do not have the recorded hash")
 

@@ -16,6 +16,30 @@ from __future__ import annotations
 TRUNCATION_NOTICE = "\n[output truncated: {dropped} of {total} characters dropped by the harness cap]"
 
 
+def cap_plan(total: int, cap_chars: int) -> tuple[int, str]:
+    """Return how a text of `total` characters is capped to `cap_chars`: the characters kept, and the notice after them.
+
+    The cut and the notice follow from the two lengths alone, so replay can recompute them from a recorded length
+    without the text. The notice is empty when the cap is smaller than the notice: the text is then cut plain.
+    """
+    keep = cap_chars
+    for _ in range(8):  # the notice's length depends on the digits of `dropped`; settle on a fixed point
+        notice = TRUNCATION_NOTICE.format(dropped=total - keep, total=total)
+        new_keep = cap_chars - len(notice)
+        if new_keep < 0:
+            return cap_chars, ""  # cap smaller than the notice: plain cut
+        if new_keep == keep:
+            break
+        keep = new_keep
+    notice = TRUNCATION_NOTICE.format(dropped=total - keep, total=total)
+    while keep + len(notice) > cap_chars and keep > 0:
+        keep -= 1
+        notice = TRUNCATION_NOTICE.format(dropped=total - keep, total=total)
+    if keep + len(notice) > cap_chars:  # never deliver more than the cap, whatever the digits of the counts did
+        return cap_chars, ""
+    return keep, notice
+
+
 def cap_text(text: str, cap_chars: int) -> tuple[str, bool]:
     """Cap `text` to at most `cap_chars` characters, notice included.
 
@@ -24,23 +48,8 @@ def cap_text(text: str, cap_chars: int) -> tuple[str, bool]:
     total = len(text)
     if total <= cap_chars:
         return text, False
-    keep = cap_chars
-    for _ in range(8):  # the notice's length depends on the digits of `dropped`; settle on a fixed point
-        notice = TRUNCATION_NOTICE.format(dropped=total - keep, total=total)
-        new_keep = cap_chars - len(notice)
-        if new_keep < 0:
-            return text[:cap_chars], True  # cap smaller than the notice: plain cut
-        if new_keep == keep:
-            break
-        keep = new_keep
-    notice = TRUNCATION_NOTICE.format(dropped=total - keep, total=total)
-    out = text[:keep] + notice
-    while len(out) > cap_chars and keep > 0:
-        keep -= 1
-        out = text[:keep] + TRUNCATION_NOTICE.format(dropped=total - keep, total=total)
-    if len(out) > cap_chars:  # never deliver more than the cap, whatever the digits of the counts did
-        return text[:cap_chars], True
-    return out, True
+    keep, notice = cap_plan(total, cap_chars)
+    return text[:keep] + notice, True
 
 
 def render_error(error_class: str, message: str) -> str:

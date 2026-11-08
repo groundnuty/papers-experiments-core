@@ -243,8 +243,8 @@ class ReplayToolBox(ToolBox):
     The cap and the error text are computed from the characters of the result, and redaction changed them: a secret
     and its replacement are not the same length. For such a call (`rendering_verified` false in the record) the box
     still has the provider serve it, so the call's identity and arguments are checked, but it returns the recorded
-    shown text, raw text, error class and truncation flag as they are. Every other call is rendered, and the cap is
-    recomputed, as the loop did.
+    shown text, raw text, its length, error class and truncation flag as they are. Every other call is rendered, and
+    the cap is recomputed, as the loop did.
     """
 
     def __init__(self, providers: Sequence[ToolProvider], *, cap_chars: int, recorded: Sequence[dict[str, Any]]):
@@ -261,6 +261,7 @@ class ReplayToolBox(ToolBox):
             run,
             result=ToolResult(call, recorded["text"], run.result.is_error),
             raw_text=recorded["raw_text"],
+            raw_chars=recorded["raw_chars"],
             truncated=recorded["truncated"],
             error_class=recorded["error_class"],
         )

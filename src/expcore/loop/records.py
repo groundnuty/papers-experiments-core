@@ -48,6 +48,7 @@ class ToolCallRecord:
     status: str  # one of TOOL_STATUSES
     text: str  # exactly what the model saw, after the cap
     raw_text: str  # the full result or error before the cap
+    raw_chars: int  # the length of raw_text before redaction; not a secret, and lets replay check a cut
     truncated: bool  # the harness cap cut what the model saw (L06); not the source's own limit, see source_truncated
     error_class: str | None = None
     raw_arguments: str | None = None  # the model's own text, kept when it did not parse

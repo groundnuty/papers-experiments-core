@@ -192,11 +192,20 @@ def test_R03_a_result_the_loop_renders_differently_from_what_the_model_saw_is_a_
 
 
 def test_R03_a_raw_result_that_no_longer_caps_to_the_stored_text_is_a_divergence():
-    """R03: the cap is applied again on replay, so a changed raw result shows."""
+    """R03: the cap is applied again on replay, so a changed raw result of the recorded length shows."""
+    data = record_of()
+    index = next(i for i, c in enumerate(data["tool_calls"]) if c["truncated"])
+    data["tool_calls"][index]["raw_text"] = "Z" * data["tool_calls"][index]["raw_chars"]
+    diverges(data, f"tool_calls[{index}].text")
+
+
+def test_R03_a_raw_result_of_another_length_than_recorded_is_a_divergence_naming_the_call():
+    """R03: the raw text redaction did not touch has exactly raw_chars characters, so a shortened one shows at once."""
     data = record_of()
     index = next(i for i, c in enumerate(data["tool_calls"]) if c["truncated"])
     data["tool_calls"][index]["raw_text"] = "short now"
-    diverges(data, f"tool_calls[{index}].text")
+    found = diverges(data, f"tool_calls[{index}].raw_chars")
+    assert data["tool_calls"][index]["call_id"] in str(found)
 
 
 def test_R03_recorded_model_steps_left_unused_are_a_divergence():

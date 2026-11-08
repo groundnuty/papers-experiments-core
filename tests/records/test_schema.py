@@ -123,6 +123,7 @@ def test_a_tool_call_status_outside_the_closed_list_is_refused():
                 "status": "weird",
                 "text": "",
                 "raw_text": "",
+                "raw_chars": 0,
                 "truncated": False,
                 "error_class": None,
                 "raw_arguments": None,

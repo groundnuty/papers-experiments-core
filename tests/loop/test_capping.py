@@ -2,7 +2,7 @@
 
 import pytest
 
-from expcore.loop.capping import TRUNCATION_NOTICE, cap_error, cap_text, describe_cap, render_error
+from expcore.loop.capping import TRUNCATION_NOTICE, cap_error, cap_plan, cap_text, describe_cap, render_error
 
 
 def test_l06_text_within_the_cap_is_delivered_whole():
@@ -37,6 +37,14 @@ def test_l06_a_cap_smaller_than_the_notice_is_a_plain_cut():
     """L06: when the notice cannot fit, the text is cut at the cap and still flagged."""
     delivered, truncated = cap_text("z" * 500, 20)
     assert (delivered, truncated) == ("z" * 20, True)
+
+
+@pytest.mark.parametrize(("total", "cap"), [(101, 100), (531, 200), (10_000, 8000), (200, 90), (500, 20)])
+def test_l06_the_cut_and_the_notice_follow_from_the_two_lengths_alone(total, cap):
+    """L06: replay recomputes the notice of a cut call from its recorded length, without the text."""
+    text = "w" * total
+    keep, notice = cap_plan(total, cap)
+    assert cap_text(text, cap)[0] == text[:keep] + notice
 
 
 def test_l06_an_error_is_capped_with_its_class_first():

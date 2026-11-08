@@ -40,6 +40,7 @@ class ToolRun:
     result: ToolResult  # text after the cap, as the backend delivers it
     status: str  # ok, error, malformed or skipped
     raw_text: str  # the full result or error, before the cap
+    raw_chars: int  # the length of raw_text, counted where the cap runs, before any redaction
     truncated: bool
     error_class: str | None
     ends_attempt: bool  # a successful call of a terminal tool
@@ -73,6 +74,7 @@ class ToolRun:
             status=status or self.status,
             text=self.result.text,
             raw_text=self.raw_text,
+            raw_chars=self.raw_chars,
             truncated=self.truncated,
             error_class=self.error_class,
             raw_arguments=call.raw_arguments if call.parse_error else None,
@@ -143,7 +145,7 @@ class ToolBox:
         """Build the run of a call that ends as an error result."""
         raw = render_error(error_class, message)
         text, truncated = cap_error(error_class, message, self.cap_chars)
-        return ToolRun(ToolResult(call, text, True), status, raw, truncated, error_class, False)
+        return ToolRun(ToolResult(call, text, True), status, raw, len(raw), truncated, error_class, False)
 
     def skipped(self, call: ToolCall, reason: str = "ended") -> ToolRun:
         """Answer a call that did not run to the end (L09). `reason` is a key of SKIP_REASONS; the text starts with
@@ -184,6 +186,7 @@ class ToolBox:
                 run.result,
                 "error",
                 run.raw_text,
+                run.raw_chars,
                 run.truncated,
                 error_class,
                 False,
@@ -194,6 +197,7 @@ class ToolBox:
             ToolResult(call, text, False),
             "ok",
             output.text,
+            len(output.text),
             truncated,
             None,
             spec.terminal,

@@ -100,6 +100,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "status": (str,),
         "text": (str,),
         "raw_text": (str,),
+        "raw_chars": (int,),
         "truncated": (bool,),
         "error_class": (str, NONE),
         "raw_arguments": (str, NONE),
@@ -355,6 +356,8 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
     for i, entry in enumerate(body["tool_calls"]):
         if entry["status"] not in TOOL_STATUSES:
             raise RecordError(f"tool_calls[{i}].status: {entry['status']!r} is not one of {TOOL_STATUSES}")
+        if entry["raw_chars"] < 0:
+            raise RecordError(f"tool_calls[{i}].raw_chars: {entry['raw_chars']} is not a length")
         _check_waited(entry["infra_wait_by_kind"], f"tool_calls[{i}].infra_wait_by_kind")
     for i, reading in enumerate(body["clock"]):
         ok = isinstance(reading, list) and len(reading) == 2 and isinstance(reading[0], str) and _fits(reading[1], NUM)
