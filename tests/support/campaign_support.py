@@ -148,13 +148,29 @@ def open_in_rounds(base: str, rounds: int, barrier, results) -> None:
         results.put((index, report))
 
 
+_TEMPLATES: dict[str, bytes] = {}  # plan -> the bytes of a closed database holding it
+
+
 def planned_store(tmp_path: Path, **plan):
-    """Open a store holding the runs of a small plan; return the store, the schema and the manifest."""
+    """Open a store holding the runs of a small plan; return the store, the schema and the manifest.
+
+    Creating a database costs a dozen fsyncs, so the first call for a plan builds it and later calls copy the closed
+    file: the store they open is the same, and a test that opens many does not wait on the disk each time.
+    """
     schema = make_schema()
-    store = open_store(tmp_path, schema)
     manifest = make_manifest(schema, **plan)
-    store.sync_manifest(manifest.rows)
-    return store, schema, manifest
+    name = repr(sorted(plan.items()))
+    if name not in _TEMPLATES:
+        built = open_store(tmp_path, schema, name="template.db")
+        built.sync_manifest(manifest.rows)
+        built.close()
+        _TEMPLATES[name] = (tmp_path / "template.db").read_bytes()
+        (tmp_path / "template.db").unlink()
+        for leftover in tmp_path.glob("template.db-*"):
+            leftover.unlink()
+    tmp_path.mkdir(parents=True, exist_ok=True)  # a test may name a directory that does not exist yet
+    (tmp_path / "campaign.db").write_bytes(_TEMPLATES[name])
+    return open_store(tmp_path, schema), schema, manifest
 
 
 def run_one(store: Store, key: str, result: AttemptResult, max_attempts: int = 3, run_dir: str = "") -> str:

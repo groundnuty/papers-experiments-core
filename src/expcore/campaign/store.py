@@ -109,6 +109,7 @@ class Store:
         self.path = path
         self.schema = schema
         self._lock = threading.RLock()
+        self._writing = False  # a write transaction of this store is open on the thread that holds the lock
         self.db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=lock_timeout_s)
         self.db.row_factory = sqlite3.Row
         try:
@@ -217,9 +218,16 @@ class Store:
     # --- transactions and reads ---------------------------------------------------------------------------------
 
     def transact(self, fn: Callable[[], Any]) -> Any:
-        """Run `fn` inside BEGIN IMMEDIATE: commit what it returns, roll back whatever it raises."""
+        """Run `fn` inside BEGIN IMMEDIATE: commit what it returns, roll back whatever it raises.
+
+        Called while this thread's own write transaction is open (from the `also` step of `finish_attempt`, say), `fn`
+        joins it: it commits or rolls back with the caller's steps, so they stand or fall together.
+        """
         with self._lock:
+            if self._writing:
+                return fn()
             self.db.execute("BEGIN IMMEDIATE")
+            self._writing = True
             try:
                 result = fn()
                 self.db.execute("COMMIT")
@@ -227,6 +235,8 @@ class Store:
             except BaseException:
                 self.db.execute("ROLLBACK")
                 raise
+            finally:
+                self._writing = False
 
     def q(self, sql: str, args: Iterable[Any] = ()) -> list[sqlite3.Row]:
         """Run a read and return all rows."""
@@ -410,8 +420,14 @@ class Store:
         """Return the attempts now marked running."""
         return self.q("SELECT id, run_key, run_dir FROM attempts WHERE state='running' ORDER BY id")
 
-    def finish_attempt(self, attempt_id: int, result: AttemptResult, max_attempts: int) -> str:
+    def finish_attempt(
+        self, attempt_id: int, result: AttemptResult, max_attempts: int, *, also: Callable[[], None] | None = None
+    ) -> str:
         """Record how an attempt ended and move its run on, in one transaction; return the run's new status.
+
+        `also` runs in the same transaction once the run is moved on: what must not be lost between the result and a
+        kill, such as the harness-error stop and the unit's accounting that the result causes (C04, C10, C15). If it
+        raises, the result is not recorded either and the attempt stays running.
 
         The state, the charge and the treatment mark follow from the cause and the run's condition (`classify`). A run is
         done on an agent outcome or a treatment fault, exhausted when its charged attempts reach `max_attempts`, set
@@ -465,6 +481,8 @@ class Store:
             )
             status = self._status_after(row["run_key"], state, max_attempts)
             self.db.execute("UPDATE runs SET status=? WHERE run_key=?", (status, row["run_key"]))
+            if also is not None:
+                also()
             return status
 
         return self.transact(go)
