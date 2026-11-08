@@ -32,6 +32,7 @@ class TurnRecord:
     served_model: str | None = None
     system_fingerprint: str | None = None
     retries: tuple[dict[str, Any], ...] = ()
+    waits_left_open: int = 0  # waits on infrastructure the request left open; the loop closed them when it returned
 
 
 @dataclass
@@ -54,6 +55,7 @@ class ToolCallRecord:
     ended_s: float | None = None
     detail: str = ""  # why a call was skipped or crashed
     source_truncated: bool | None = None  # the data source hit its own row or size limit, as the provider said (L07)
+    waits_left_open: int = 0  # waits on infrastructure the call left open; the loop closed them when it ended (L04)
     terminal: bool = False  # the tool is a terminal one: a successful call ended the attempt (L09)
 
     def __post_init__(self) -> None:

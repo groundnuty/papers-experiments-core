@@ -56,6 +56,7 @@ class ToolRun:
         status: str | None = None,
         detail: str = "",
         waited_s: float = 0.0,
+        waits_left_open: int = 0,
         terminal: bool = False,
     ) -> ToolCallRecord:
         """The record of this call: what the model sent, what it saw, and the full raw result.
@@ -79,6 +80,7 @@ class ToolRun:
             ended_s=ended_s,
             detail=detail,
             source_truncated=self.source_truncated,
+            waits_left_open=waits_left_open,
             terminal=terminal,
         )
 

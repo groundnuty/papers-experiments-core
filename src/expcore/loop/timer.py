@@ -13,13 +13,16 @@ When the loop cuts a call it begins the cleanup: from the moment of the cut, the
 stop is the harness's own (`cleanup_s`) and is never added to the agent's time. So the agent's time, the waits and
 the cleanup always add up to the elapsed time.
 
+Waits belong to their call: when a call ends the loop closes any wait it left open (`close_open_waits`), at that
+moment and as infrastructure time, and the call's record says how many it was.
+
 Every clock reading is logged with a label, the live waits' and the cleanup's included. A replay serves the readings
 back in order instead of reading a clock.
 """
 
 import time
-from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 
 
@@ -63,8 +66,9 @@ class AgentTimer:
         self.ceiling_s = ceiling_s
         self._clock = clock
         self._start: float | None = None
-        self._wait_depth = 0  # open waits; the agent's clock runs only at zero
+        self._open_waits: set[_Wait] = set()  # the agent's clock runs only while there is none
         self._wait_since: float | None = None  # when the first open wait began
+        self._listeners: list[Callable[[], None]] = []  # told when a wait opens or closes the pause
         self._infra_wait_s = 0.0  # closed waits
         self._cleanup_from: float | None = None  # when the cleanup after a cut began, while it lasts
         self._cleanup_s = 0.0
@@ -106,34 +110,48 @@ class AgentTimer:
 
         This is what a provider reaches through its call context, and a model backend can use it directly. Waits may
         nest or overlap; the clock is paused for their union. Before the run starts, or after a cut has begun its
-        cleanup, it measures nothing.
+        cleanup, it measures nothing. A wait still open when its call ends is closed by the loop (`close_open_waits`).
         """
-        return self._wait()
+        return _Wait(self)
 
-    @asynccontextmanager
-    async def _wait(self) -> AsyncIterator[None]:
-        counted = self._enter_wait()
-        try:
-            yield
-        finally:
-            if counted:
-                self._exit_wait()
-
-    def _enter_wait(self) -> bool:
+    def _open_wait(self, wait: "_Wait") -> None:
         if self._start is None or self._over:
-            return False
-        if self._wait_depth == 0:
-            self._wait_since = self.read("wait_start")
-        self._wait_depth += 1
-        return True
-
-    def _exit_wait(self) -> None:
-        if self._over or self._wait_depth == 0:  # a cut closed every wait at the cut
             return
-        self._wait_depth -= 1
-        if self._wait_depth == 0 and self._wait_since is not None:
+        self._open_waits.add(wait)
+        if len(self._open_waits) == 1:
+            self._wait_since = self.read("wait_start")
+            self._notify()
+
+    def _close_wait(self, wait: "_Wait") -> None:
+        if wait not in self._open_waits:  # never opened, or closed already by the end of its call or by a cut
+            return
+        self._open_waits.discard(wait)
+        if not self._open_waits and self._wait_since is not None:
             self._infra_wait_s += self.read("wait_end") - self._wait_since
             self._wait_since = None
+            self._notify()
+
+    def close_open_waits(self) -> int:
+        """Close every wait still open, now, and return how many there were. The time they were open is infrastructure
+        time, since the provider declared it so, and the agent's clock runs again. The loop does this when a call ends,
+        so a wait is scoped to its call; the one that closes it later finds it closed and does nothing."""
+        left = len(self._open_waits)
+        if left and self._wait_since is not None:
+            self._open_waits.clear()
+            self._infra_wait_s += self.read("wait_end") - self._wait_since
+            self._wait_since = None
+        return left
+
+    def on_wait_change(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Call `listener` whenever a wait pauses or resumes the agent's clock; return the function that removes it.
+
+        The loop's watcher uses it to look again, since a pause moves the moment the agent's cap would be reached."""
+        self._listeners.append(listener)
+        return lambda: self._listeners.remove(listener) if listener in self._listeners else None
+
+    def _notify(self) -> None:
+        for listener in list(self._listeners):
+            listener()
 
     # --- the cleanup after a cut ----------------------------------------------------------------------------------
 
@@ -145,7 +163,8 @@ class AgentTimer:
         self._over = True
         if self._wait_since is not None:
             self._infra_wait_s += tick.now - self._wait_since
-            self._wait_since, self._wait_depth = None, 0
+            self._wait_since = None
+        self._open_waits.clear()
         self._cleanup_from = tick.now
 
     def end_cleanup(self) -> None:
@@ -177,7 +196,7 @@ class AgentTimer:
             self.time_cap_s - agent,
             self.ceiling_s is not None and elapsed >= self.ceiling_s,
             None if self.ceiling_s is None else self.ceiling_s - elapsed,
-            self._wait_depth > 0,
+            bool(self._open_waits),
         )
 
     def time_left(self) -> float | None:
@@ -200,3 +219,16 @@ class WaitContext:
     def infrastructure_wait(self) -> AbstractAsyncContextManager[None]:
         """Pause the agent's clock while the returned context manager is open (L04)."""
         return self._timer.infrastructure_wait()
+
+
+class _Wait:
+    """One wait on infrastructure: an async context manager that pauses the agent's clock while it is open."""
+
+    def __init__(self, timer: AgentTimer):
+        self._timer = timer
+
+    async def __aenter__(self) -> None:
+        self._timer._open_wait(self)
+
+    async def __aexit__(self, *exc: object) -> None:
+        self._timer._close_wait(self)

@@ -107,6 +107,7 @@ class _Run:
         self.malformed_events: list[dict[str, Any]] = []
         self.final_text: str | None = None
         self.outcome: Outcome | None = None
+        self._request_waits_left_open = 0  # waits the last model request left open, for its turn record
 
     async def execute(self) -> LoopResult:
         """Run the loop to its ending."""
@@ -203,6 +204,8 @@ class _Run:
                 raise _End(self._defect("the model backend", exc)) from None
             # A provider error the retry layer passes on unchanged (a plain 400, a 404): the attempt's own ending.
             raise _End(Outcome("error", f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__)) from None
+        finally:
+            self._request_waits_left_open = self.timer.close_open_waits()  # a wait belongs to its request
 
     def _note(self, turn: ModelTurn) -> None:
         """Count the reply's tokens (a missing count adds nothing and marks the totals incomplete, B10) and record it."""
@@ -222,6 +225,7 @@ class _Run:
                 served_model=turn.served_model,
                 system_fingerprint=turn.system_fingerprint,
                 retries=turn.retries,
+                waits_left_open=self._request_waits_left_open,
             )
         )
 
@@ -298,8 +302,9 @@ class _Run:
             return self._failed(index, call, tick, f"{type(exc).__name__}: {exc}", waited0), self._defect(
                 f"tool {call.name!r}", exc
             )
+        left = self.timer.close_open_waits()  # a wait belongs to its call: one left open ends with the call (L04)
         after = self.timer.check("after_tool")
-        self._log(index, call, run, self.rounds, tick, after, waited_s=self._waited(waited0))
+        self._log(index, call, run, self.rounds, tick, after, waited_s=self._waited(waited0), waits_left_open=left)
         if run.ends_attempt:
             over = time_ending(after, self.config, self.timer.infra_wait_s)  # a late result is not accepted (L04)
             if over is not None:
@@ -315,9 +320,19 @@ class _Run:
     def _failed(self, index: int, call: ToolCall, tick: Tick, detail: str, waited0: float) -> ToolRun:
         """Log a call whose provider raised, and answer it as skipped so its reply stays whole."""
         run = self.toolbox.skipped(call, "failed")
+        left = self.timer.close_open_waits()
         after = self.timer.check("after_tool")
         self._log(
-            index, call, run, self.rounds, tick, after, status="failed", detail=detail, waited_s=self._waited(waited0)
+            index,
+            call,
+            run,
+            self.rounds,
+            tick,
+            after,
+            status="failed",
+            detail=detail,
+            waited_s=self._waited(waited0),
+            waits_left_open=left,
         )
         return run
 
@@ -344,6 +359,7 @@ class _Run:
         status: str | None = None,
         detail: str = "",
         waited_s: float = 0.0,
+        waits_left_open: int = 0,
     ) -> None:
         """Append the record of one call: what the model sent, what it saw, and the full raw result."""
         self.calls.append(
@@ -356,6 +372,7 @@ class _Run:
                 status=status,
                 detail=detail,
                 waited_s=waited_s,
+                waits_left_open=waits_left_open,
                 terminal=self.toolbox.is_terminal(call.name),
             )
         )
@@ -371,6 +388,7 @@ class _Run:
     def _result(self) -> LoopResult:
         """Assemble the result: everything the attempt did, whatever ended it."""
         assert self.outcome is not None  # execute() sets it on every path
+        self.timer.close_open_waits()  # whatever path ended the attempt, no wait is left open in the totals
         end = self.timer.check("end") if self.timer.started else None
         info = self.backend.info()
         usage = info.get("usage_seen") or {}

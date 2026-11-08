@@ -46,28 +46,41 @@ class Watcher:
     async def run[T](self, work: Awaitable[T], tick: Tick) -> T:
         """Await `work`, started right after the reading `tick`; raise `Cut` when a limit passes first.
 
-        Whichever way this ends, both child tasks have been cancelled and awaited before it returns or raises, so none
-        is left pending and a cancelled call has had its chance to clean up.
+        The watch looks again whenever a wait on infrastructure opens or closes, because that moves the moment the
+        agent's cap would be reached. Whichever way this ends, every child task has been cancelled and awaited before
+        it returns or raises, so none is left pending and a cancelled call has had its chance to clean up.
         """
+        changed = asyncio.Event()  # set when a wait opens or closes the pause of the agent's clock
+        stop_listening = self._timer.on_wait_change(changed.set)
         job = asyncio.ensure_future(work)
         sleeper = asyncio.ensure_future(self._sleep(tick.watch_s))  # asked for before the work starts
+        nudge = asyncio.ensure_future(changed.wait())
+        spent: list[asyncio.Future] = []  # sleepers replaced before they ended
         try:
             while True:
-                await asyncio.wait({job, sleeper}, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait({job, sleeper, nudge}, return_when=asyncio.FIRST_COMPLETED)
                 if job.done():
                     return job.result()
-                sleeper.result()
+                if sleeper.done():
+                    sleeper.result()
+                changed.clear()  # before the reading, so a change after it wakes the next look
                 now = self._timer.check("watch")
                 if now.remaining_s <= 0 or now.ceiling_passed:
                     self._timer.begin_cleanup(now)
                     raise Cut(now)
+                if not sleeper.done():
+                    sleeper.cancel()
+                    spent.append(sleeper)
+                if nudge.done():
+                    nudge = asyncio.ensure_future(changed.wait())
                 sleeper = asyncio.ensure_future(self._sleep(now.watch_s))
         except asyncio.CancelledError:
             if not self._timer.cleaning:  # cancelled from outside: stopping the call is cleanup too
                 self._timer.begin_cleanup(self._timer.check("cancelled"))
             raise
         finally:
-            await self._reap(job, sleeper)
+            stop_listening()
+            await self._reap(job, sleeper, nudge, *spent)
 
     async def _reap(self, *tasks: asyncio.Future) -> None:
         """Cancel the tasks and wait, up to the cleanup deadline, until they have stopped; give up on any that has not.
