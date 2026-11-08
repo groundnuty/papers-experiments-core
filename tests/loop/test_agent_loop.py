@@ -6,7 +6,7 @@ import json
 import pytest
 from loop_support import FakeProvider, ScriptedBackend, call, malformed, turn
 
-from expcore.loop.agent_loop import run_agent
+from expcore.loop.agent_loop import _Run, run_agent
 from expcore.loop.records import TOOL_STATUSES
 from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import StubAdapter
@@ -190,6 +190,50 @@ def test_a_token_budget_ends_the_attempt_as_token_cap(run):
     result = run(backend, [FakeProvider(ECHO)], token_budget=1000)
     assert result.outcome.name == "token_cap"
     assert result.tokens_used == 1150
+
+
+def test_a_reply_that_reaches_the_token_budget_exactly_executes_none_of_its_calls(run):
+    """The budget is exhausted at the budget, not past it: 15 of 15 tokens ends the attempt before the tool runs."""
+    provider = FakeProvider(ECHO)
+    backend = ScriptedBackend([turn(call("call_one", "echo"), input_tokens=10, output_tokens=5), "never reached"])
+    result = run(backend, [provider], token_budget=15)
+    assert result.outcome.name == "token_cap"
+    assert result.tokens_used == 15
+    assert provider.calls == []
+    assert [t.status for t in result.tool_calls] == ["skipped"]
+
+
+def test_a_reply_one_token_under_the_budget_is_still_acted_on(run):
+    provider = FakeProvider(ECHO)
+    backend = ScriptedBackend(
+        [
+            turn(call("call_one", "echo"), input_tokens=10, output_tokens=5),
+            turn(input_tokens=1, output_tokens=0, text="x"),
+        ]
+    )
+    result = run(backend, [provider], token_budget=16)
+    assert len(provider.calls) == 1
+    assert result.outcome.name == "token_cap"  # the second reply reaches 16 exactly
+    assert result.tokens_used == 16
+
+
+def test_no_model_request_is_made_when_the_budget_is_already_used_up(make_config, clock):
+    """Checked before each request, not only after each reply: with the count at the budget the backend is not asked."""
+    config = make_config(token_budget=100)
+    requests = []
+
+    class Counts(StubAdapter):
+        async def step(self):
+            requests.append(1)
+            return await super().step()
+
+    box = ToolBox([FakeProvider(ECHO)], cap_chars=config.limits.output_cap_chars)
+    state = _Run(Counts(["never"]), box, "s", "u", config, config.timer(clock), asyncio.sleep)
+    state.tokens = 100  # as if earlier replies had used the whole budget
+    result = asyncio.run(state.execute())
+    assert result.outcome.name == "token_cap"
+    assert requests == []
+    assert result.turns == []
 
 
 def test_b12_a_reply_cut_at_the_output_limit_is_an_output_cap_even_over_budget(run):

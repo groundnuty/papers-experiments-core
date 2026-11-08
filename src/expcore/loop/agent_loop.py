@@ -122,6 +122,7 @@ class _Run:
         while True:
             tick = self.timer.check("before_model")
             self._guard(tick)
+            self._guard_budget()  # no request is made once the budget is used up
             turn = await self._step(tick)
             self._note(turn)
             self._count_malformed(turn)  # before any cap check: a capped round is still the round the model asked for
@@ -131,9 +132,7 @@ class _Run:
             ):  # a reply cut at the output limit is no answer, whatever the budget (B12)
                 self.final_text = turn.text
                 raise _End(Outcome("output_cap", f"the final reply stopped at the output limit ({turn.stop_reason})"))
-            if self.tokens > self.config.limits.token_budget:
-                self._skip_all(turn, "cap")
-                raise _End(Outcome("token_cap", f"{self.tokens} tokens used, budget {self.config.limits.token_budget}"))
+            self._guard_budget(turn)  # a reply that reaches the budget executes none of its calls
             if not calls:
                 self.final_text = turn.text  # "" is an empty reply; None, left alone, means there was no reply (L11)
                 raise _End(Outcome("finished", "the model answered without a tool call"))
@@ -144,6 +143,15 @@ class _Run:
             if self.config.malformed_policy == "end" and any(c.parse_error for c in calls):
                 self._end_on_malformed(turn)
             await self._round(turn)
+
+    def _guard_budget(self, turn: ModelTurn | None = None) -> None:
+        """End the attempt as a token cap once the tokens used reach the budget; the budget is exhausted at the budget,
+        not past it. A reply that did so has its calls logged as skipped."""
+        budget = self.config.limits.token_budget
+        if self.tokens >= budget:
+            if turn is not None:
+                self._skip_all(turn, "cap")
+            raise _End(Outcome("token_cap", f"{self.tokens} tokens used, budget {budget}"))
 
     def _guard(self, tick: Tick) -> None:
         """End the attempt when the agent's time is used up (checked first), or the whole-time ceiling is passed."""
