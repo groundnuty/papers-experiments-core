@@ -406,6 +406,27 @@ class LeasePool:
         async with waits.infrastructure_wait("lease_queue"):
             return await asyncio.to_thread(lambda: self.acquire(group, run_key=run_key, timeout_s=timeout_s))
 
+    def finish(self, lease: Lease) -> bool:
+        """End a lease after its run: free the key if the probe shows what the run started gone, else quarantine it.
+
+        An unproven teardown keeps the key held until the probe can show it (C19). Return True when the key was freed.
+        """
+        note = {"key": lease.key, "run_key": lease.run_key, "group": lease.group}
+
+        def gone() -> bool:
+            return bool(self._probe.resource_gone(lease.key, note))
+
+        try:
+            shown = gone()
+        except Exception:
+            log.exception("looking for the resource behind %s", lease.key)
+            shown = False
+        if shown:
+            lease.release()
+            return True
+        self.quarantine(lease, gone)
+        return False
+
     # --- quarantine -----------------------------------------------------------------------------------------------
 
     def quarantine(self, lease: Lease, proven: Callable[[], bool]) -> None:

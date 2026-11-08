@@ -8,6 +8,7 @@ import sys
 import textwrap
 
 import pytest
+from lease_support import Clock, Probe
 
 from expcore.campaign.lease import (
     DEAD_LOG,
@@ -20,39 +21,6 @@ from expcore.campaign.lease import (
     process_owner,
 )
 from expcore.loop.timer import AgentTimer
-
-
-class Clock:
-    """A clock that only moves when told to; `sleep` moves it and runs an optional hook."""
-
-    def __init__(self):
-        self.now = 1000.0
-        self.on_sleep = None
-        self.sleeps = 0
-
-    def __call__(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.sleeps += 1
-        self.now += seconds
-        if self.on_sleep is not None:
-            self.on_sleep()
-
-
-class Probe:
-    """Answers what a platform would: which holders are gone and which resources are shown gone."""
-
-    def __init__(self, gone_owners=(), gone_keys=()):
-        self.gone_owners, self.gone_keys = set(gone_owners), set(gone_keys)
-        self.asked: list[tuple[str, dict]] = []
-
-    def holder_gone(self, owner):
-        return owner in self.gone_owners
-
-    def resource_gone(self, key, note):
-        self.asked.append((key, dict(note)))
-        return key in self.gone_keys
 
 
 def pool(tmp_path, keys=("k1", "k2"), probe=None, clock=None, owner="me", **options):
@@ -303,3 +271,43 @@ def test_c19_the_owner_of_this_process_is_not_gone_and_a_reused_pid_is(tmp_path)
     assert process_gone("another-boot:1:1")
     assert not process_gone("not an owner")
     assert not process_gone("pid:not-a-number")
+
+
+def test_c19_a_lease_is_freed_after_its_run_only_when_the_probe_shows_the_resource_gone(tmp_path):
+    """C19: an unproven teardown quarantines the key at the end of the run; a proof frees it later."""
+    clock = Clock()
+    probe = Probe()
+    leases = pool(tmp_path, keys=("k1",), probe=probe, clock=clock, quarantine_retry_s=60)
+    lease = leases.try_acquire("g", "run-a")
+    assert leases.finish(lease) is False  # the probe cannot show it gone
+    assert lease.quarantined
+    assert leases.held_back() == 1
+    assert probe.asked[-1][0] == "k1"
+    assert probe.asked[-1][1]["run_key"] == "run-a"
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g", "run-b")
+    probe.gone_keys.add("k1")
+    clock.now += 61
+    assert leases.settle_quarantines() == ["k1"]
+    assert leases.try_acquire("g", "run-b") is not None
+
+
+def test_c19_a_lease_whose_resource_is_shown_gone_is_released_at_once(tmp_path):
+    """C19: the probe shows the teardown done, so the key is free for the next run."""
+    leases = pool(tmp_path, keys=("k1",), probe=Probe(gone_keys={"k1"}))
+    lease = leases.try_acquire("g", "run-a")
+    assert leases.finish(lease) is True
+    assert not lease.held
+    assert leases.try_acquire("g", "run-b") is not None
+
+
+def test_c19_a_probe_that_raises_while_a_run_ends_leaves_the_key_quarantined(tmp_path):
+    """C19: a failed look is not a proof."""
+
+    class Broken(Probe):
+        def resource_gone(self, key, note):
+            raise OSError("cannot look")
+
+    leases = pool(tmp_path, keys=("k1",), probe=Broken())
+    assert leases.finish(leases.try_acquire("g", "run-a")) is False
+    assert leases.held_back() == 1
