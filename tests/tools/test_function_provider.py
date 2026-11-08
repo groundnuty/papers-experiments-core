@@ -6,7 +6,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from loop_support import FakeClock
 
+from expcore.loop.timer import AgentTimer, WaitContext
 from expcore.plugin import ToolOutput, ToolProvider, ToolSpec
 from expcore.tools.function_provider import FunctionProvider
 
@@ -27,7 +29,7 @@ def test_a_function_result_becomes_a_tool_output():
 
 
 def test_a_function_may_return_a_full_tool_output():
-    failing = ToolOutput("no", is_error=True, error_class="Nope", infra_wait_s=2.0)
+    failing = ToolOutput("no", is_error=True, error_class="Nope")
     assert execute(provider(f=lambda args, timeout_s: failing), "f") == failing
 
 
@@ -203,3 +205,56 @@ def test_l15_a_call_cancelled_before_its_thread_starts_never_runs_its_function()
     assert ran == []
     assert p.abandoned_total == 0
     assert p.threads_possibly_running() == []
+
+
+# --- waits on infrastructure are marked through the call context (L04) -----------------------------------------------
+
+
+def started_timer():
+    clock = FakeClock()
+    timer = AgentTimer(100, clock=clock)
+    timer.start()
+    return clock, timer
+
+
+def test_l04_a_coroutine_function_that_takes_ctx_marks_its_wait_and_the_harness_measures_it():
+    """L04: the context reaches the function, and the agent's clock is paused for as long as the wait is open."""
+    clock, timer = started_timer()
+
+    async def store(args, ctx):
+        async with ctx.infrastructure_wait():
+            clock.advance(40)
+        clock.advance(2)
+        return "ok"
+
+    p = provider(store=store)
+    out = asyncio.run(p.execute("store", {}, timeout_s=5.0, ctx=WaitContext(timer)))
+    assert out == ToolOutput("ok")
+    assert (timer.infra_wait_s, timer.check("t").agent_s) == (40, 2)
+
+
+def test_l04_a_plain_function_in_a_thread_marks_its_wait_with_a_plain_with():
+    """L04: the thread gets a stand-in for the context; the wait is opened and closed on the event loop."""
+    clock, timer = started_timer()
+
+    def store(args, timeout_s, ctx):
+        with ctx.infrastructure_wait():
+            clock.advance(40)
+        clock.advance(2)
+        return "ok"
+
+    p = provider(store=store)
+    out = asyncio.run(p.execute("store", {}, timeout_s=5.0, ctx=WaitContext(timer)))
+    assert out == ToolOutput("ok")
+    assert (timer.infra_wait_s, timer.check("t").agent_s) == (40, 2)
+
+
+def test_a_function_that_does_not_take_ctx_is_not_handed_one():
+    seen = []
+
+    def plain(args, timeout_s):
+        seen.append("called")
+        return "ok"
+
+    assert execute(provider(plain=plain), "plain") == ToolOutput("ok")
+    assert seen == ["called"]

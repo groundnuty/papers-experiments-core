@@ -104,7 +104,7 @@ tools = "read"
 - code stamp and core version (P01, P02);
 - transcript: per turn the neutral message, the native provider message, stop reason, usage (`None` when unreported, R10), served model and fingerprint (B06), retries with their errors, the echoed-request digest (R06);
 - tool calls: arguments, raw arguments when malformed (L01), the exact text the model saw, the raw result, status, timings, and two truncation flags kept apart: the harness cap's (L06) and the data source's own row or size limit, as the provider reports it (L07);
-- clock readings at every point the loop reads the clock;
+- clock readings at every point the loop reads the clock, the boundaries of waits on infrastructure (measured live through the call context, L04) and the loop's looks at a running call included; the agent's time, the waits and `cleanup_s` (harness time spent stopping a cut call, never charged to the agent) add up to the elapsed time;
 - outcome from a closed vocabulary, and infrastructure kind when it applies (C02);
 - instrument outputs, each under its own namespace;
 - scores, kept apart and recomputable.

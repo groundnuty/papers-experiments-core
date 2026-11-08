@@ -14,15 +14,95 @@ from expcore.plugin import ToolOutput
 # --- the timer ----------------------------------------------------------------------------------------------------
 
 
-def test_the_timer_charges_elapsed_time_minus_waits_on_infrastructure():
+def test_the_timer_pauses_the_agents_clock_while_a_wait_on_infrastructure_is_open():
+    """L04: the wait is measured as it happens; inside it the agent's time stands still, after it the time runs on."""
     clock = FakeClock()
     timer = AgentTimer(100, clock=clock)
     timer.start()
-    clock.advance(60)
-    timer.add_infra_wait(50)
-    tick = timer.check("t")
-    assert (tick.elapsed_s, tick.agent_s, tick.remaining_s) == (60, 10, 90)
-    assert timer.time_left() == 90
+
+    async def go():
+        clock.advance(10)
+        async with timer.infrastructure_wait():
+            clock.advance(50)
+            during = timer.check("during")
+        clock.advance(5)
+        return during, timer.check("after")
+
+    during, after = asyncio.run(go())
+    assert (during.elapsed_s, during.agent_s, during.remaining_s, during.paused) == (60, 10, 90, True)
+    assert (after.elapsed_s, after.agent_s, after.remaining_s, after.paused) == (65, 15, 85, False)
+    assert timer.infra_wait_s == 50
+    assert timer.time_left() == 85
+
+
+def test_overlapping_waits_pause_the_clock_for_their_union_and_not_their_sum():
+    clock = FakeClock()
+    timer = AgentTimer(100, clock=clock)
+    timer.start()
+
+    async def go():
+        async with timer.infrastructure_wait():
+            clock.advance(10)
+            async with timer.infrastructure_wait():
+                clock.advance(10)
+            clock.advance(10)
+
+    asyncio.run(go())
+    assert timer.infra_wait_s == 30
+    assert timer.check("t").agent_s == 0
+
+
+def test_a_wait_marked_before_the_run_starts_measures_nothing():
+    timer = AgentTimer(100, clock=FakeClock())
+
+    async def go():
+        async with timer.infrastructure_wait():
+            pass
+
+    asyncio.run(go())
+    assert (timer.infra_wait_s, timer.readings) == (0, [])
+
+
+def test_a_cut_ends_the_open_wait_at_the_cut_and_the_time_after_it_is_cleanup_not_the_agents():
+    """L04: the wait still open at the cut ends there; the time cleaning up is kept apart, and the figures add up."""
+    clock = FakeClock()
+    timer = AgentTimer(100, clock=clock)
+    timer.start()
+
+    async def go():
+        clock.advance(20)
+        wait = timer.infrastructure_wait()
+        await wait.__aenter__()
+        clock.advance(30)
+        cut = timer.check("cut")
+        timer.begin_cleanup(cut)
+        assert timer.cleaning
+        clock.advance(7)  # the cancelled call takes this long to stop
+        await wait.__aexit__(None, None, None)  # it unwinds its wait during cleanup: not counted again
+        timer.end_cleanup()
+        return timer.check("end")
+
+    end = asyncio.run(go())
+    assert (timer.infra_wait_s, timer.cleanup_s, timer.cleaning) == (30, 7, False)
+    assert (end.elapsed_s, end.agent_s) == (57, 20)
+    assert end.agent_s + timer.infra_wait_s + timer.cleanup_s == end.elapsed_s
+
+
+def test_the_ceiling_left_and_the_next_look_follow_the_pause():
+    """L04: while the agent's clock is paused only the ceiling can end a call; otherwise the nearer of the two."""
+    clock = FakeClock()
+    timer = AgentTimer(100, clock=clock, ceiling_s=300)
+    timer.start()
+    clock.advance(40)
+    running = timer.check("running")
+    assert (running.ceiling_left_s, running.watch_s) == (260, 60)
+
+    async def go():
+        async with timer.infrastructure_wait():
+            return timer.check("paused")
+
+    paused = asyncio.run(go())
+    assert (paused.paused, paused.watch_s) == (True, 260)
 
 
 def test_the_timer_logs_every_reading_and_is_not_started_twice():
@@ -125,15 +205,9 @@ def test_the_cap_must_be_positive():
 
 
 def test_a_result_within_the_cap_is_returned_whole_and_unflagged():
-    box = ToolBox([FakeProvider({"echo": lambda a: ToolOutput("fine", infra_wait_s=1.5)})], cap_chars=100)
+    box = ToolBox([FakeProvider({"echo": lambda a: ToolOutput("fine")})], cap_chars=100)
     run = run_call(box, ToolCall("c", "echo", {}))
-    assert (run.status, run.result.text, run.raw_text, run.truncated, run.infra_wait_s) == (
-        "ok",
-        "fine",
-        "fine",
-        False,
-        1.5,
-    )
+    assert (run.status, run.result.text, run.raw_text, run.truncated) == ("ok", "fine", "fine", False)
 
 
 def test_an_error_run_has_the_class_first_and_the_provider_is_not_called_for_a_bad_call():

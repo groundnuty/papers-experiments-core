@@ -49,7 +49,7 @@ class ToolCallRecord:
     truncated: bool  # the harness cap cut what the model saw (L06); not the source's own limit, see source_truncated
     error_class: str | None = None
     raw_arguments: str | None = None  # the model's own text, kept when it did not parse
-    infra_wait_s: float = 0.0
+    infra_wait_s: float = 0.0  # the time the call spent in waits on infrastructure, as the harness measured it
     started_s: float | None = None  # seconds since the run started; None when the call never started
     ended_s: float | None = None
     detail: str = ""  # why a call was skipped or crashed
@@ -79,7 +79,7 @@ class LoopResult:
     malformed_events: list[dict[str, Any]]
     tokens_used: int
     usage_incomplete: bool  # an abandoned request, or a reply without usage: the totals are a lower bound
-    agent_s: float  # the time charged to the agent
+    agent_s: float  # the time charged to the agent: elapsed, less waits on infrastructure and less cleanup
     elapsed_s: float
     infra_wait_s: float
     clock_readings: list[tuple[str, float]]
@@ -88,6 +88,9 @@ class LoopResult:
     tool_manifest_sha256: str
     config_sha256: str
     config: dict[str, Any] = field(default_factory=dict)  # the configuration's values plus `terminal_tools`
+    cleanup_s: float = 0.0  # harness time spent stopping a call after a cut; never part of agent_s
+    cleanup_timed_out: bool = False  # the cut call did not stop within the cleanup deadline and was given up on
+    abandoned_threads: int = 0  # worker threads of cancelled calls that may still be running when the attempt ended
 
     @property
     def malformed_rounds(self) -> int:

@@ -26,7 +26,7 @@ from mcp.client.stdio import stdio_client
 from mcp.types import CONNECTION_CLOSED, INTERNAL_ERROR
 
 from expcore.errors import InfraError
-from expcore.plugin import ToolOutput, ToolSpec
+from expcore.plugin import NO_WAITS, CallContext, ToolOutput, ToolSpec
 from expcore.tools.manifest import FrozenManifest, ManifestError, canonical, list_all_tools, mismatches
 
 DEFAULT_START_TIMEOUT_S = 120.0
@@ -127,8 +127,14 @@ class McpToolProvider:
         """Return the server's tools, which equal the frozen manifest."""
         return list(self._specs)
 
-    async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float) -> ToolOutput:
-        """Call a tool. The run's own time bound (the loop's) is the call's only limit (L05)."""
+    async def execute(
+        self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext = NO_WAITS
+    ) -> ToolOutput:
+        """Call a tool. The run's own time bound (the loop's) is the call's only limit (L05).
+
+        The round trip to the server is the tool's own time and is charged to the agent: the client marks no wait on
+        infrastructure, since the core cannot tell which part of a server's time a study counts as one.
+        """
         if self._session is None:
             raise RuntimeError("the tool provider is not started; use it as an async context manager")
         try:

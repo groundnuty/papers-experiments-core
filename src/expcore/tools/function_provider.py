@@ -12,20 +12,30 @@ but the function goes on in its thread until it returns, and the default executo
 is expected to bound itself with it (L05); registering a plain function that cannot take the keyword is refused. A
 call cancelled while its thread was running is recorded on the provider (`threads_possibly_running`,
 `abandoned_total`), and the provider never waits for the thread: the cancelled call returns at once.
+
+A function that waits on infrastructure declares a `ctx` parameter and wraps each wait in `ctx.infrastructure_wait()`,
+so the harness pauses the agent's clock for it (L04). A coroutine function gets the call context itself and uses
+`async with`. A plain function runs in a thread and gets a stand-in that is used with a plain `with`; it marks the
+wait on the event loop, so the harness still measures it live.
 """
 
 import asyncio
+import concurrent.futures
+import contextlib
 import inspect
 import threading
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from expcore.plugin import ToolOutput, ToolSpec
+from expcore.plugin import NO_WAITS, CallContext, ToolOutput, ToolSpec
 
-# A coroutine function takes the call's arguments. Any other function takes them and the keyword `timeout_s`.
+# A coroutine function takes the call's arguments. Any other function takes them and the keyword `timeout_s`. Either
+# may also take the keyword `ctx`, the call context, to mark its waits on infrastructure.
 ToolFunction = Callable[..., "str | ToolOutput | Awaitable[str | ToolOutput]"]
 _TIMEOUT_KEYWORD = "timeout_s"
+_CONTEXT_KEYWORD = "ctx"
+_THREAD_CALL_LIMIT_S = 5.0  # how long a worker thread waits for the event loop to mark a wait before it goes on
 _KEYWORD_KINDS = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
 
 
@@ -49,6 +59,45 @@ def _require_timeout_keyword(tool: str, function: ToolFunction) -> None:
     ):
         return
     raise ValueError(f"tool {tool!r}: {_label(function)} does not accept {_TIMEOUT_KEYWORD}; {rule}")
+
+
+def _takes_context(function: ToolFunction) -> bool:
+    """Tell whether a function declares the `ctx` keyword and so wants the call context."""
+    try:
+        named = inspect.signature(function).parameters.get(_CONTEXT_KEYWORD)
+    except (TypeError, ValueError):
+        return False
+    return named is not None and named.kind in _KEYWORD_KINDS
+
+
+class _ThreadWaits:
+    """The call context for a plain function in a worker thread: `with ctx.infrastructure_wait():` marks a wait.
+
+    The wait is opened and closed on the event loop, where the harness's clock lives, and the thread waits for each to
+    be done. If the loop is gone or does not answer, the thread goes on and the wait is simply not measured.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, ctx: CallContext):
+        self._loop, self._ctx = loop, ctx
+
+    @contextlib.contextmanager
+    def infrastructure_wait(self) -> Iterator[None]:
+        wait = self._ctx.infrastructure_wait()
+        opened = self._on_loop(wait.__aenter__())
+        try:
+            yield
+        finally:
+            if opened:
+                self._on_loop(wait.__aexit__(None, None, None))
+
+    def _on_loop(self, coroutine: Coroutine[Any, Any, Any]) -> bool:
+        try:
+            asyncio.run_coroutine_threadsafe(coroutine, self._loop).result(timeout=_THREAD_CALL_LIMIT_S)
+        except (RuntimeError, concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
+            if inspect.iscoroutine(coroutine):
+                coroutine.close()
+            return False
+        return True
 
 
 @dataclass
@@ -94,24 +143,37 @@ class FunctionProvider:
         self._abandoned = [call for call in self._abandoned if call.state == "running"]
         return [call.name for call in self._abandoned]
 
-    async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float) -> ToolOutput:
+    async def execute(
+        self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext = NO_WAITS
+    ) -> ToolOutput:
         """Run the function: a coroutine function on the loop, any other function in a worker thread (L15).
 
         A cancelled call returns at once and does not wait for its thread (the thread cannot be killed); see
         `threads_possibly_running`.
         """
         function = self._functions[name]
+        extra = {_CONTEXT_KEYWORD: ctx} if _takes_context(function) else {}
         if inspect.iscoroutinefunction(function):
-            result = await function(arguments)
+            result = await function(arguments, **extra)
         else:
-            result = await self._in_thread(name, function, arguments, timeout_s)
+            result = await self._in_thread(name, function, arguments, timeout_s, ctx, extra)
             if inspect.isawaitable(result):  # a plain function that returned a coroutine: the loop is the place for it
                 result = await result
         return result if isinstance(result, ToolOutput) else ToolOutput(str(result))
 
-    async def _in_thread(self, name: str, function: ToolFunction, arguments: dict[str, Any], timeout_s: float) -> Any:
+    async def _in_thread(
+        self,
+        name: str,
+        function: ToolFunction,
+        arguments: dict[str, Any],
+        timeout_s: float,
+        ctx: CallContext,
+        extra: dict[str, Any],
+    ) -> Any:
         """Run a plain function in a worker thread and wait for it, or for this task's cancellation."""
         call = _Call(name)
+        if extra:
+            extra = {_CONTEXT_KEYWORD: _ThreadWaits(asyncio.get_running_loop(), ctx)}
 
         def work() -> Any:
             with call.lock:
@@ -119,7 +181,7 @@ class FunctionProvider:
                     return None
                 call.state = "running"
             try:
-                return function(arguments, timeout_s=timeout_s)
+                return function(arguments, timeout_s=timeout_s, **extra)
             finally:
                 with call.lock:
                     call.state = "done"

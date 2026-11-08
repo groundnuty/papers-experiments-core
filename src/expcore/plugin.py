@@ -6,9 +6,9 @@ client) and a wrapper for plain functions; a platform or a study supplies any ot
 tool: the core has no built-in tool of its own.
 """
 
-import math
 import re
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -42,8 +42,8 @@ class ToolOutput:
     """What a provider returns for one call.
 
     `text` is the full result, or for an error the message. An error names its `error_class`, which the model
-    sees first. `infra_wait_s` is the time the call spent waiting on infrastructure (a store, a gate, a slot, a
-    lock, output validation); the loop does not charge it to the agent's time cap (L04).
+    sees first. Time spent waiting on infrastructure is not reported here: the provider wraps each such wait in
+    `ctx.infrastructure_wait()` while it happens, and the harness measures it (L04).
 
     `source_truncated` is for the data source's own limit (L07): True when the source hit its row or size limit, so
     the result may be cut by the source; False when the provider checked and it was not; None when the provider says
@@ -53,18 +53,40 @@ class ToolOutput:
     text: str
     is_error: bool = False
     error_class: str | None = None
-    infra_wait_s: float = 0.0
     source_truncated: bool | None = None
 
     def __post_init__(self) -> None:
-        """Refuse an error class on a result that is not an error, a wait that is negative or not a number, and a
-        source flag that is not a boolean."""
+        """Refuse an error class on a result that is not an error, and a source flag that is not a boolean."""
         if self.error_class is not None and not self.is_error:
             raise ValueError("error_class is only for a result with is_error set")
-        if not math.isfinite(self.infra_wait_s) or self.infra_wait_s < 0:
-            raise ValueError(f"infra_wait_s must be a finite number of seconds, not negative: {self.infra_wait_s!r}")
         if self.source_truncated is not None and not isinstance(self.source_truncated, bool):
             raise ValueError(f"source_truncated must be True, False or None, not {self.source_truncated!r}")
+
+
+@runtime_checkable
+class CallContext(Protocol):
+    """What the harness hands a provider with one call: the way to say that the call is waiting on infrastructure.
+
+    `async with ctx.infrastructure_wait():` wraps a wait on a store, a gate, a slot, a lock or output validation. The
+    harness pauses the agent's clock while any such wait is open and measures it as it happens, so a wait is never
+    charged to the agent and never has to be reported afterwards (L04). Waits may nest or overlap. A wait still open
+    when the harness cuts the call ends at the cut; the time the call then takes to stop is the harness's own.
+    """
+
+    def infrastructure_wait(self) -> AbstractAsyncContextManager[None]:
+        """Return an async context manager that pauses the agent's clock for as long as it is open."""
+        ...
+
+
+class _NoWaits:
+    """A call context with no clock behind it, for a provider run outside the loop: waits are not measured."""
+
+    @asynccontextmanager
+    async def infrastructure_wait(self) -> AsyncIterator[None]:
+        yield
+
+
+NO_WAITS: CallContext = _NoWaits()
 
 
 @runtime_checkable
@@ -77,14 +99,18 @@ class ToolProvider(Protocol):
     loop records as a harness defect and sets the attempt aside (L08).
 
     Work that blocks must not run on the event loop: a provider wraps it in `asyncio.to_thread` (L15). A running
-    thread cannot be killed, so the function in it must bound itself with `timeout_s`, and a provider whose call is
-    cancelled must say that the thread may still be running, without waiting for it (`FunctionProvider` does).
+    thread cannot be killed, and the core does not try: the function in it must bound itself with `timeout_s`, and a
+    provider whose call is cancelled must say that the thread may still be running, without waiting for it
+    (`FunctionProvider` does, and refuses new calls until the thread returns). A provider that can leave work running
+    this way may offer `abandoned_threads() -> int`; the loop result records the count.
+
+    Every wait on infrastructure is wrapped in `ctx.infrastructure_wait()` (see `CallContext`).
     """
 
     def tools(self) -> Sequence[ToolSpec]:
         """Return the tools this provider offers; the list does not change during a run."""
         ...
 
-    async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float) -> ToolOutput:
-        """Run one call. `timeout_s` is the run's remaining time: the call has no other limit (L05)."""
+    async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
+        """Run one call. `timeout_s` is the agent's time left: the call has no other limit (L05). `ctx` marks waits."""
         ...

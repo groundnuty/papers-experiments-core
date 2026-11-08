@@ -1,8 +1,10 @@
 """The tool provider interface: what a spec and an output may hold, and that a plain double satisfies the protocol."""
 
+import asyncio
+
 import pytest
 
-from expcore.plugin import ToolOutput, ToolProvider, ToolSpec
+from expcore.plugin import NO_WAITS, CallContext, ToolOutput, ToolProvider, ToolSpec
 
 
 @pytest.mark.parametrize("name", ["", "has space", "dot.name", "x" * 65, "naïve"])
@@ -28,10 +30,19 @@ def test_an_error_class_needs_an_error():
     assert ToolOutput("bad", is_error=True, error_class="Oops").error_class == "Oops"
 
 
-@pytest.mark.parametrize("wait", [-1.0, float("nan"), float("inf")])
-def test_an_infrastructure_wait_must_be_a_non_negative_number(wait):
-    with pytest.raises(ValueError, match="infra_wait_s"):
-        ToolOutput("x", infra_wait_s=wait)
+def test_a_tool_output_takes_no_reported_wait_any_more():
+    """L04: waits on infrastructure are measured live through the call context, never reported afterwards."""
+    with pytest.raises(TypeError):
+        ToolOutput("x", infra_wait_s=1.0)  # type: ignore[call-arg]
+
+
+def test_a_call_context_can_be_used_outside_the_loop_and_measures_nothing():
+    async def go():
+        async with NO_WAITS.infrastructure_wait():
+            return "done"
+
+    assert isinstance(NO_WAITS, CallContext)
+    assert asyncio.run(go()) == "done"
 
 
 def test_l07_the_source_flag_is_unset_by_default_and_must_be_a_boolean_when_given():
@@ -46,7 +57,7 @@ def test_a_class_with_the_two_methods_is_a_provider_without_inheriting():
         def tools(self):
             return [ToolSpec("t", "d")]
 
-        async def execute(self, name, arguments, *, timeout_s):
+        async def execute(self, name, arguments, *, timeout_s, ctx):
             return ToolOutput("ok")
 
     assert isinstance(Mine(), ToolProvider)

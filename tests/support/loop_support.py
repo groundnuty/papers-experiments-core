@@ -1,12 +1,13 @@
 """Helpers for the loop tests: a controllable clock and sleep, fake tool providers, a scripted model. No network."""
 
 import asyncio
+import inspect
 import json
 from collections.abc import Callable
 from typing import Any
 
 from expcore.models.adapters import ModelTurn, StubAdapter, ToolCall
-from expcore.plugin import ToolOutput, ToolSpec
+from expcore.plugin import NO_WAITS, ToolOutput, ToolSpec
 
 
 class FakeClock:
@@ -54,6 +55,13 @@ async def at_once(seconds: float) -> None:
     await asyncio.sleep(0)
 
 
+def _takes_ctx(handler: Callable[..., Any]) -> bool:
+    try:
+        return "ctx" in inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 class FakeProvider:
     """A tool provider with scripted handlers. Records every call with the timeout it was given."""
 
@@ -74,9 +82,11 @@ class FakeProvider:
             for name in self.handlers
         ]
 
-    async def execute(self, name, arguments, *, timeout_s):
+    async def execute(self, name, arguments, *, timeout_s, ctx=NO_WAITS):
+        """Run the handler; one that takes a `ctx` parameter is handed the call context, to mark waits."""
         self.calls.append((name, arguments, timeout_s))
-        result = self.handlers[name](arguments)
+        handler = self.handlers[name]
+        result = handler(arguments, ctx=ctx) if _takes_ctx(handler) else handler(arguments)
         if asyncio.iscoroutine(result):
             result = await result
         return result if isinstance(result, ToolOutput) else ToolOutput(str(result))

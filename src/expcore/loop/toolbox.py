@@ -20,7 +20,7 @@ from expcore.loop.arguments import argument_problems
 from expcore.loop.capping import cap_error, cap_text, describe_cap, render_error
 from expcore.loop.records import ToolCallRecord
 from expcore.models.adapters import ToolCall, ToolResult
-from expcore.plugin import ToolProvider, ToolSpec
+from expcore.plugin import NO_WAITS, CallContext, ToolProvider, ToolSpec
 
 SKIPPED_CLASS = "skipped"
 SKIP_REASONS = {
@@ -42,7 +42,6 @@ class ToolRun:
     raw_text: str  # the full result or error, before the cap
     truncated: bool
     error_class: str | None
-    infra_wait_s: float
     ends_attempt: bool  # a successful call of a terminal tool
     source_truncated: bool | None = None  # the data source's own limit was hit, as the provider says (L07)
 
@@ -56,6 +55,7 @@ class ToolRun:
         ended_s: float | None,
         status: str | None = None,
         detail: str = "",
+        waited_s: float = 0.0,
         terminal: bool = False,
     ) -> ToolCallRecord:
         """The record of this call: what the model sent, what it saw, and the full raw result.
@@ -74,7 +74,7 @@ class ToolRun:
             truncated=self.truncated,
             error_class=self.error_class,
             raw_arguments=call.raw_arguments if call.parse_error else None,
-            infra_wait_s=self.infra_wait_s,
+            infra_wait_s=waited_s,
             started_s=started_s,
             ended_s=ended_s,
             detail=detail,
@@ -116,6 +116,11 @@ class ToolBox:
         """The names of the terminal tools, sorted: a successful call to one ends the attempt."""
         return [name for name in sorted(self._specs) if self._specs[name].terminal]
 
+    def abandoned_threads(self) -> int:
+        """How many threads that calls were cancelled out of may still be running, from the providers that say (L15)."""
+        distinct = {id(provider): provider for provider in self._providers.values()}.values()
+        return sum(p.abandoned_threads() for p in distinct if callable(getattr(p, "abandoned_threads", None)))
+
     def is_terminal(self, name: str) -> bool:
         """Tell whether the named tool is terminal; False for a name that is not a tool."""
         spec = self._specs.get(name)
@@ -134,7 +139,7 @@ class ToolBox:
         """Build the run of a call that ends as an error result."""
         raw = render_error(error_class, message)
         text, truncated = cap_error(error_class, message, self.cap_chars)
-        return ToolRun(ToolResult(call, text, True), status, raw, truncated, error_class, 0.0, False)
+        return ToolRun(ToolResult(call, text, True), status, raw, truncated, error_class, False)
 
     def skipped(self, call: ToolCall, reason: str = "ended") -> ToolRun:
         """Answer a call that did not run to the end (L09). `reason` is a key of SKIP_REASONS; the text starts with
@@ -146,8 +151,9 @@ class ToolBox:
         message = f"{call.parse_error or 'arguments are not valid JSON'}. {MALFORMED_NOTICE}"
         return self._error_run(call, "malformed", "MalformedArguments", message)
 
-    async def run(self, call: ToolCall, *, timeout_s: float) -> ToolRun:
-        """Run one call and return its outcome. `timeout_s` is the run's remaining time, passed on unchanged (L05).
+    async def run(self, call: ToolCall, *, timeout_s: float, ctx: CallContext = NO_WAITS) -> ToolRun:
+        """Run one call and return its outcome. `timeout_s` is the run's remaining time, passed on unchanged (L05), and
+        `ctx` is the call context through which the provider marks its waits on infrastructure (L04).
 
         The provider is handed a deep copy of the arguments; the call keeps the original for the record. An exception
         from the provider is not caught: `InfraError` and defects reach the loop, which decides.
@@ -166,7 +172,7 @@ class ToolBox:
         # The provider gets its own copy: what it does to the arguments (pops a key, edits a nested value) must not
         # change what the record says the model sent.
         provided = copy.deepcopy(call.arguments)
-        output = await self._providers[call.name].execute(call.name, provided, timeout_s=timeout_s)
+        output = await self._providers[call.name].execute(call.name, provided, timeout_s=timeout_s, ctx=ctx)
         if output.is_error:
             error_class = output.error_class or "ToolError"
             run = self._error_run(call, "error", error_class, output.text)
@@ -176,7 +182,6 @@ class ToolBox:
                 run.raw_text,
                 run.truncated,
                 error_class,
-                output.infra_wait_s,
                 False,
                 output.source_truncated,
             )
@@ -187,7 +192,6 @@ class ToolBox:
             output.text,
             truncated,
             None,
-            output.infra_wait_s,
             spec.terminal,
             output.source_truncated,
         )

@@ -9,7 +9,8 @@ call, a terminal tool succeeds, or a cap or a failure ends the attempt.
 
 One model call per round and every tool call of a round executed in order, with the results appended together; the
 tool box and the model backend come from their own modules. Added to that base: a closed outcome vocabulary, the
-injected clock and sleep, the time charged to the agent only (L04), calls answered as skipped after a call that ends
+injected clock and sleep, the time charged to the agent only (L04: waits on infrastructure are measured live and
+the agent's clock pauses in them; a call is cut when the agent's time or the ceiling is used up), calls answered as skipped after a call that ends
 the attempt (L09), and a crash in harness, backend or tool code recorded as a harness defect (L08): only the errors the
 model layer raises on purpose (infrastructure, an abandoned request, a context overflow, a provider error status) map
 to their own endings.
@@ -25,12 +26,13 @@ from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.loop.config import AgentConfig, config_sha256_of
-from expcore.loop.endings import cannot_start, model_cut, time_ending, tool_cut
+from expcore.loop.endings import cannot_start, cut_ending, time_ending
 from expcore.loop.leaks import leaked_tool
 from expcore.loop.outcomes import Outcome, harness_defect_of
 from expcore.loop.records import LoopResult, ToolCallRecord, TurnRecord
-from expcore.loop.timer import AgentTimer, Tick
+from expcore.loop.timer import AgentTimer, Tick, WaitContext
 from expcore.loop.toolbox import ToolBox, ToolRun
+from expcore.loop.watch import Cut, Watcher
 from expcore.models.adapters import ModelBackend, ModelTurn, ToolCall
 from expcore.models.retry import classify
 
@@ -43,10 +45,6 @@ class _End(Exception):
     def __init__(self, outcome: Outcome):
         super().__init__(outcome.name)
         self.outcome = outcome
-
-
-class _Bound(Exception):
-    """Internal: a call was cut because its time bound passed."""
 
 
 async def run_agent(
@@ -94,7 +92,8 @@ class _Run:
         sleep: Callable[[float], Awaitable[None]],
     ):
         self.backend, self.toolbox, self.system, self.user = backend, toolbox, system, user
-        self.config, self.timer, self._sleep = config, timer, sleep
+        self.config, self.timer = config, timer
+        self.watcher = Watcher(timer, sleep)
         self.turns: list[TurnRecord] = []
         self.calls: list[ToolCallRecord] = []
         self.rounds = 0
@@ -175,35 +174,15 @@ class _Run:
         if over is not None:
             raise _End(over)
 
-    async def _bounded[T](self, work: Awaitable[T], limit_s: float) -> T:
-        """Await work, but cancel it and raise `_Bound` when the injected sleep for `limit_s` seconds ends first.
-
-        Whichever way this ends, including an outside cancellation of the loop, both child tasks are cancelled and
-        awaited before it returns or raises, so none is left pending and a cancelled call has noted that it was
-        abandoned.
-        """
-        job = asyncio.ensure_future(work)
-        clock = asyncio.ensure_future(self._sleep(max(limit_s, 0.0)))
-        try:
-            await asyncio.wait({job, clock}, return_when=asyncio.FIRST_COMPLETED)
-            if job.done():
-                return job.result()
-            raise _Bound
-        finally:
-            for task in (job, clock):
-                task.cancel()
-            await asyncio.gather(job, clock, return_exceptions=True)
-
     # --- model calls ----------------------------------------------------------------------------------------------
 
     async def _step(self, tick: Tick) -> ModelTurn:
-        """Ask the model for its next reply, bounded by the agent's time left or the ceiling left, whichever ends
-        first (L04)."""
+        """Ask the model for its next reply, cut when the agent's time or the ceiling is used up (L04)."""
         try:
-            return await self._bounded(self.backend.step(), tick.bound_s)
-        except _Bound:
+            return await self.watcher.run(self.backend.step(), tick)
+        except Cut as cut:
             self.usage_incomplete = True  # the request in flight was given up: its usage is unknown
-            raise _End(model_cut(tick, self.config)) from None
+            raise _End(cut_ending("the model call", cut.tick, self.config)) from None
         except RequestAbandoned:
             self.usage_incomplete = True  # accepted, then slow, never resent (B03)
             raise _End(
@@ -297,41 +276,45 @@ class _Run:
         if late or tick.ceiling_passed:
             stop = cannot_start(tick, self.config, too_late=late)
             return self._skip(index, call, "time"), stop
+        waited0 = self.timer.infra_wait_s
         try:
-            # The provider is told the agent's time left, but a wait on infrastructure is reported only when the call
-            # returns, so the call may run until the ceiling (L04, L05).
-            bound = tick.remaining_s if tick.ceiling_left_s is None else tick.ceiling_left_s
-            run = await self._bounded(self.toolbox.run(call, timeout_s=tick.remaining_s), bound)
-        except _Bound:
-            after = self.timer.check("after_tool")
-            cut = self.toolbox.skipped(call, "cut")
-            self._log(index, call, cut, self.rounds, tick, after, status="cut")
-            return cut, tool_cut(call.name, after, self.config)
+            # The provider is told the agent's time left and marks its waits on infrastructure through the context; the
+            # loop cuts the call if the agent's time, which leaves those waits out, or the ceiling is used up (L04, L05).
+            ctx = WaitContext(self.timer)
+            run = await self.watcher.run(self.toolbox.run(call, timeout_s=tick.remaining_s, ctx=ctx), tick)
+        except Cut as cut:
+            cut_run = self.toolbox.skipped(call, "cut")
+            self._log(index, call, cut_run, self.rounds, tick, cut.tick, status="cut", waited_s=self._waited(waited0))
+            return cut_run, cut_ending(f"tool {call.name!r}", cut.tick, self.config)
         except InfraError as exc:
-            return self._failed(index, call, tick, f"infrastructure: {exc.kind}"), Outcome(
+            return self._failed(index, call, tick, f"infrastructure: {exc.kind}", waited0), Outcome(
                 "infrastructure", exc.detail, infra_kind=exc.kind
             )
         except Exception as exc:
-            return self._failed(index, call, tick, f"{type(exc).__name__}: {exc}"), self._defect(
+            return self._failed(index, call, tick, f"{type(exc).__name__}: {exc}", waited0), self._defect(
                 f"tool {call.name!r}", exc
             )
-        self.timer.add_infra_wait(run.infra_wait_s)  # waits on infrastructure are not the agent's time (L04)
         after = self.timer.check("after_tool")
-        self._log(index, call, run, self.rounds, tick, after)
+        self._log(index, call, run, self.rounds, tick, after, waited_s=self._waited(waited0))
         if run.ends_attempt:
-            over = time_ending(
-                after, self.config, self.timer.infra_wait_s
-            )  # a result that arrives after the agent's cap is not accepted (L04)
+            over = time_ending(after, self.config, self.timer.infra_wait_s)  # a late result is not accepted (L04)
             if over is not None:
                 detail = f"the terminal tool {call.name!r} returned, but {over.detail}"
                 return run, Outcome(over.name, detail, infra_kind=over.infra_kind)
             return run, Outcome("finished", f"a call to the terminal tool {call.name!r} succeeded")
         return run, None
 
-    def _failed(self, index: int, call: ToolCall, tick: Tick, detail: str) -> ToolRun:
+    def _waited(self, before: float) -> float:
+        """The time the call just made spent waiting on infrastructure: the timer's total now, less what it was."""
+        return self.timer.infra_wait_s - before
+
+    def _failed(self, index: int, call: ToolCall, tick: Tick, detail: str, waited0: float) -> ToolRun:
         """Log a call whose provider raised, and answer it as skipped so its reply stays whole."""
         run = self.toolbox.skipped(call, "failed")
-        self._log(index, call, run, self.rounds, tick, self.timer.check("after_tool"), status="failed", detail=detail)
+        after = self.timer.check("after_tool")
+        self._log(
+            index, call, run, self.rounds, tick, after, status="failed", detail=detail, waited_s=self._waited(waited0)
+        )
         return run
 
     def _skip(self, index: int, call: ToolCall, reason: str) -> ToolRun:
@@ -356,6 +339,7 @@ class _Run:
         *,
         status: str | None = None,
         detail: str = "",
+        waited_s: float = 0.0,
     ) -> None:
         """Append the record of one call: what the model sent, what it saw, and the full raw result."""
         self.calls.append(
@@ -367,6 +351,7 @@ class _Run:
                 ended_s=self.timer.since_start(ended.now) if ended else None,
                 status=status,
                 detail=detail,
+                waited_s=waited_s,
                 terminal=self.toolbox.is_terminal(call.name),
             )
         )
@@ -401,6 +386,9 @@ class _Run:
             agent_s=end.agent_s if end else 0.0,
             elapsed_s=end.elapsed_s if end else 0.0,
             infra_wait_s=self.timer.infra_wait_s,
+            cleanup_s=self.timer.cleanup_s,
+            cleanup_timed_out=self.timer.cleanup_timed_out,
+            abandoned_threads=self.toolbox.abandoned_threads(),
             clock_readings=list(self.timer.readings),
             transcript=self.backend.transcript(),
             backend_info=info,
