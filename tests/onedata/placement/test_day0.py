@@ -160,6 +160,59 @@ def test_read_only_enforcement_fails_when_a_write_is_accepted_and_the_write_is_r
     assert [n.name for n in fake.nodes.values() if n.name.startswith("day0-")] == []
 
 
+def attribute_reads(fake):
+    """The reads of the scratch directory itself: a GET of its entry that is not the gate's read of its path."""
+    return [r for r in fake.requests if r.method == "GET" and "/fid-" in r.path and not r.query]
+
+
+def read_only_rows(context):
+    entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
+    return entry, entry.facts["providers"].values()
+
+
+def test_o11_a_delete_that_answers_204_but_leaves_the_directory_is_not_cleaned(context, fake):
+    """O11: the accepted write's directory is deleted as the admin and then read; a DELETE that answers 204 and
+    removes nothing leaves it there, so cleaned is False with a reason, and the check is failed whatever else."""
+    fake.enforce_readonly = False  # the write is accepted, which creates a directory
+    fake.ignore_deletes = True  # and the delete answers 204 without removing it
+    entry, rows = read_only_rows(context)
+    assert entry.ok is False
+    assert {row["cleaned"] for row in rows} == {False}
+    assert all("still there" in row["cleanup_reason"] for row in rows)
+    assert [n for n in fake.nodes.values() if n.name.startswith("day0-")]  # it really is left
+
+
+def test_o11_a_delete_that_fails_is_not_cleaned_and_says_why(context, fake):
+    """O11: a refused or failed delete is cleaned False with its own reason."""
+    fake.enforce_readonly = False
+    fake.fail_deletes = True
+    _, rows = read_only_rows(context)
+    assert {row["cleaned"] for row in rows} == {False}
+    assert all(row["cleanup_reason"] for row in rows)
+
+
+def test_o11_cleaned_is_true_only_when_the_provider_answers_not_found_on_consecutive_reads(context, fake, ticker):
+    """O11: after a DELETE the entry is read; two 404s in a row confirm it gone, within a bounded number of reads."""
+    fake.enforce_readonly = False
+    entry, rows = read_only_rows(context)
+    assert entry.ok is False  # the write was accepted
+    assert {row["cleaned"] for row in rows} == {True}
+    assert all("cleanup_reason" not in row for row in rows)
+    assert len(attribute_reads(fake)) == 2 * len(list(rows))  # two confirming reads per provider, none more
+
+
+def test_o11_the_reads_that_confirm_absence_are_bounded(context, fake, ticker):
+    """O11: a directory that never goes is read a bounded number of times, with pauses, and then given up on."""
+    fake.enforce_readonly = False
+    fake.ignore_deletes = True
+    read_only_rows(context)
+    from expcore_onedata.day0.mutating import ABSENCE_POLL_S, ABSENCE_POLLS
+
+    providers = 2
+    assert len(attribute_reads(fake)) == ABSENCE_POLLS * providers
+    assert ticker.slept.count(ABSENCE_POLL_S) == (ABSENCE_POLLS - 1) * providers
+
+
 def test_o11_the_round_trip_places_confirms_reads_back_evicts_and_cleans_up(context, fake):
     """O11: the scratch file is placed by reads, confirmed, read back, evicted and removed, and removal is verified."""
     entry = by_name(run_checks(context(allow_mutation=True), ["round_trip"]))["round_trip"]

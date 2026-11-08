@@ -26,6 +26,9 @@ from expcore_onedata.tokens import data_path_spec
 
 SCRATCH_BYTES = 8192
 REFUSALS = (401, 403)
+ABSENCE_POLLS = 6  # reads of a deleted entry before its absence is given up on
+ABSENCE_POLL_S = 1.0
+CONSECUTIVE_ABSENT = 2  # reads in a row that must answer "not found" (O07)
 NEEDS_CONSENT = "needs mutation consent (EXPCORE_LIVE_MUTATE=1), so nothing was sent"
 
 
@@ -37,6 +40,33 @@ def _scratch_name() -> str:
 def _content() -> bytes:
     """Deterministic bytes in which every aligned 4-byte word differs, so a misplaced range changes the hash."""
     return b"".join(i.to_bytes(4, "big") for i in range(SCRATCH_BYTES // 4))
+
+
+def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, Any]:
+    """Delete an entry as the admin and return `cleaned`, true only when its absence was then confirmed (O11).
+
+    A DELETE that answers 204 proves nothing: the entry is read until the provider answers "not found" on consecutive
+    polls, within a bounded number of polls. Any other outcome is `cleaned` False with a `cleanup_reason`.
+    """
+    try:
+        ctx.client.mutate("DELETE", f"/data/{entry_id}", provider=provider)
+    except PlatformError:
+        return {"cleaned": False, "cleanup_reason": "the delete was refused or failed"}
+    absent, reason = 0, "the entry could not be read to confirm that it is gone"
+    for poll in range(ABSENCE_POLLS):
+        if poll:
+            ctx.sleep(ABSENCE_POLL_S)
+        try:
+            ctx.client.get(f"/data/{entry_id}", provider=provider)
+            absent, reason = 0, "the entry was still there after the delete"
+        except PlatformError as error:
+            if error.status != consistency.NOT_FOUND:
+                absent, reason = 0, "the entry could not be read to confirm that it is gone"
+                continue
+            absent, reason = absent + 1, "the entry was not found on a read, but not on consecutive reads"
+            if absent >= CONSECUTIVE_ABSENT:
+                return {"cleaned": True}
+    return {"cleaned": False, "cleanup_reason": reason}
 
 
 @register("read_only", "Read-only enforcement on each data path", mutates=True)
@@ -71,12 +101,8 @@ def read_only(ctx: Context) -> Result:
         except PlatformError as error:
             rows[name] = {"enforced": None, "error": "the space root could not be read", "status": error.status}
         finally:
-            if created:  # the write was accepted: remove what it made, as the admin, and say whether that worked
-                try:
-                    ctx.client.mutate("DELETE", f"/data/{created}", provider=name)
-                    rows[name]["cleaned"] = True
-                except PlatformError:
-                    rows[name]["cleaned"] = False
+            if created:  # the write was accepted: remove what it made, as the admin, and show that it is gone
+                rows[name].update(_remove_and_verify(ctx, name, created))
     if any(row["enforced"] is False for row in rows.values()):
         return failed("a write made with the read-only data-path token was ACCEPTED", providers=rows)
     if any(row["enforced"] is None for row in rows.values()):
