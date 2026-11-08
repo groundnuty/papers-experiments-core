@@ -122,6 +122,23 @@ def test_l01_a_malformed_call_is_counted_even_when_a_cap_ends_the_round(run):
     assert result.malformed_calls == 1
 
 
+def test_a_provider_that_edits_its_arguments_does_not_change_what_the_record_says_the_model_sent(run):
+    """The provider gets a deep copy: a handler that pops a key and edits a nested list leaves the logged call whole."""
+
+    def edits(args):
+        args["nested"]["items"].append("added")
+        return args.pop("x")
+
+    sent = {"x": "a", "nested": {"items": ["one"]}}
+    backend = StubAdapter([[("edit", sent)], "done"])
+    provider = FakeProvider({"edit": edits})
+    result = run(backend, [provider])
+    assert result.tool_calls[0].text == "a"
+    assert result.tool_calls[0].arguments == {"x": "a", "nested": {"items": ["one"]}}
+    assert provider.calls[0][1] == {"nested": {"items": ["one", "added"]}}  # the provider's own copy was changed
+    assert json.loads(result.transcript[2]["tool_calls"][0]["function"]["arguments"]) == sent
+
+
 def test_l02_an_unknown_tool_is_an_error_result_listing_the_tools(run):
     """L02: an unknown name returns an error that lists the tools; the run goes on."""
     backend = StubAdapter([[("nope", {})], "done"])

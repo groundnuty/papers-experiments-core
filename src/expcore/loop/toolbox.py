@@ -9,6 +9,7 @@ the model sees, errors included, goes through the same character cap (L06). The 
 caller, next to a flag saying whether the cap cut what the model saw.
 """
 
+import copy
 import hashlib
 import json
 from collections.abc import Sequence
@@ -97,7 +98,8 @@ class ToolBox:
     async def run(self, call: ToolCall, *, timeout_s: float) -> ToolRun:
         """Run one call and return its outcome. `timeout_s` is the run's remaining time, passed on unchanged (L05).
 
-        An exception from the provider is not caught: `InfraError` and defects reach the loop, which decides.
+        The provider is handed a deep copy of the arguments; the call keeps the original for the record. An exception
+        from the provider is not caught: `InfraError` and defects reach the loop, which decides.
         """
         if call.parse_error:
             return self.malformed(call)
@@ -110,7 +112,10 @@ class ToolBox:
         problems = argument_problems(call.arguments, spec.input_schema)
         if problems:
             return self._error_run(call, "error", "InvalidArguments", "; ".join(problems))
-        output = await self._providers[call.name].execute(call.name, call.arguments, timeout_s=timeout_s)
+        # The provider gets its own copy: what it does to the arguments (pops a key, edits a nested value) must not
+        # change what the record says the model sent.
+        provided = copy.deepcopy(call.arguments)
+        output = await self._providers[call.name].execute(call.name, provided, timeout_s=timeout_s)
         if output.is_error:
             error_class = output.error_class or "ToolError"
             run = self._error_run(call, "error", error_class, output.text)
