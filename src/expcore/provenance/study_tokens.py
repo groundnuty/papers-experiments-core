@@ -1,6 +1,8 @@
 # Provenance: new
 """Study-token hashing and the check that no commit of this public repository contains a study's name.
 
+A commit is checked in its files and in its message: both are published with the repository.
+
 The plain token list stays private. The repository holds only SHA-256 hashes, and every finding reports a
 hash prefix, never the text that matched, because CI logs are public. Hashing and candidate extraction live in
 `candidates` and `hashfile`, scanning in `scanner`; this module finds the files to scan and is the command line.
@@ -27,7 +29,14 @@ from expcore.provenance.candidates import (
     normalise,
     token_hash,
 )
-from expcore.provenance.gitobjects import GitError, changed_files, read_blob, resolve_commits, run_git
+from expcore.provenance.gitobjects import (
+    GitError,
+    changed_files,
+    commit_message,
+    read_blob,
+    resolve_commits,
+    run_git,
+)
 from expcore.provenance.hashfile import (
     Hashes,
     hashes_from_tokens,
@@ -36,7 +45,7 @@ from expcore.provenance.hashfile import (
     parse_plain_list,
     render_hash_file,
 )
-from expcore.provenance.scanner import Finding, scan_source
+from expcore.provenance.scanner import Finding, scan_message, scan_source
 
 __all__ = [
     "MAX_CANDIDATE_CHARS",
@@ -56,6 +65,7 @@ __all__ = [
     "parse_plain_list",
     "render_hash_file",
     "repository_files",
+    "scan_message",
     "scan_paths",
     "scan_source",
     "token_hash",
@@ -130,9 +140,14 @@ def scan_paths(paths: Iterable[Path], hashes: Hashes) -> list[Finding]:
 def check_commits(
     repo: Path, revs: Sequence[str], hashes: Hashes, *, history: bool = False
 ) -> list[tuple[str, Finding]]:
-    """Scan every file each commit added or modified, at that commit's content."""
+    """Scan every file each commit added or modified, at that commit's content, and each commit's full message.
+
+    A message is prose: it is checked against the `all`-scope hashes only. Its findings come first, with the path
+    `<commit message>`.
+    """
     results: list[tuple[str, Finding]] = []
     for sha in resolve_commits(repo, revs, history=history):
+        results.extend((sha, f) for f in scan_message(commit_message(repo, sha), hashes))
         for path in changed_files(repo, sha):
             if path not in EXCLUDED_PATHS:
                 results.extend((sha, f) for f in _scan_bytes(path, read_blob(repo, sha, path), hashes))

@@ -1,5 +1,5 @@
 # Provenance: new
-"""Small wrappers over the git command line: blob ids, commit ranges, and file content at a commit."""
+"""Small wrappers over the git command line: blob ids, commit ranges, file content and messages of a commit."""
 
 import hashlib
 import os
@@ -59,3 +59,9 @@ def changed_files(repo: Path, sha: str) -> list[str]:
 def read_blob(repo: Path, sha: str, path: str) -> bytes:
     """Return a file's bytes as committed in the given commit."""
     return run_git(repo, "cat-file", "blob", f"{sha}:{path}")
+
+
+def commit_message(repo: Path, sha: str) -> str:
+    """Return a commit's full message (subject and body, with trailers), decoded as UTF-8 with bad bytes replaced."""
+    raw = run_git(repo, "show", "--no-patch", "--format=%B", "--end-of-options", sha)
+    return raw.decode("utf-8", errors="replace")

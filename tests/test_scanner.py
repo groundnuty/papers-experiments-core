@@ -258,3 +258,20 @@ def test_an_invalid_escape_in_a_literal_does_not_stop_the_scan(hashes):
 def test_a_lone_surrogate_in_a_literal_is_scanned_without_error(hashes):
     source = 'x = f"{1}\\ud800"\ny = "\\udfff"\n'
     assert st.scan_source("src/a.py", source, hashes) == []
+
+
+# --- commit messages --------------------------------------------------------------------------------------------------
+
+
+def test_a_commit_message_is_scanned_as_prose_with_its_own_label_and_kind(hashes):
+    text = f"subject\n\n{HOST} and {NAME}\n"
+    found = st.scan_message(text, hashes)
+    assert [(f.path, f.line, f.kind, f.hash_prefix) for f in found] == [
+        ("<commit message>", 3, "message", st.token_hash(NAME)[:12])
+    ]
+    assert str(found[0]) == f"<commit message>:3 message {st.token_hash(NAME)[:12]}"
+
+
+def test_a_whole_line_token_in_a_commit_message_is_found(hashes):
+    assert [(f.line, f.kind) for f in st.scan_message(f"subject\n\n  {NAME}  \n", hashes)] == [(3, "message")]
+    assert st.scan_message("", hashes) == []
