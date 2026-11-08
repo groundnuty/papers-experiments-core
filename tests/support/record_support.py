@@ -56,6 +56,7 @@ def hand_made(**overrides: Any) -> RunRecord:
         "run_key": IDENTITY.run_key,
         "factors": dict(IDENTITY.factors),
         "attempt": 1,
+        "treatment_kinds": [],
         "route": {"backend": "stub", "settings": {sha("settings"): {}}, "settings_sent_sha256": sha("settings")},
         "prompt": {
             "system": {"text": system, "sha256": sha(system), "template_sha256": None, "slots": None},
@@ -71,7 +72,14 @@ def hand_made(**overrides: Any) -> RunRecord:
         "failed_request": None,
         "tool_calls": [],
         "clock": [["start", 1000.0], ["before_model", 1000.0], ["end", 1000.5]],
-        "outcome": {"name": "finished", "detail": "done", "infra_kind": None, "error_type": None, "defect": None},
+        "outcome": {
+            "name": "finished",
+            "detail": "done",
+            "infra_kind": None,
+            "error_type": None,
+            "defect": None,
+            "treatment": False,
+        },
         "totals": {
             "rounds": 0,
             "malformed_calls": 0,

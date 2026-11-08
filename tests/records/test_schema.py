@@ -263,3 +263,55 @@ def test_L04_a_wait_that_was_declared_and_lasted_no_time_is_valid_and_a_negative
     data["totals"]["infra_wait_by_kind"] = {"sandbox_lifecycle": -0.5}
     with pytest.raises(RecordError, match="seconds waited are given per kind"):
         validate(data)
+
+
+def infra_data(kinds, flag, kind="endpoint"):
+    """The JSON of a record that ended as infrastructure of a kind, with declared treatment kinds and a flag."""
+    changed = copy.deepcopy(data(treatment_kinds=list(kinds)))
+    changed["outcome"].update(name="infrastructure", detail="HTTP 503", infra_kind=kind, treatment=flag)
+    return changed
+
+
+def test_R02_the_treatment_flag_must_be_what_the_outcome_and_the_declared_kinds_make_it():
+    """R02: adds that a flag set against its own record, either way, is refused at load."""
+    assert validate(infra_data(["endpoint"], True)) == CURRENT
+    assert validate(infra_data([], False)) == CURRENT
+    assert validate(infra_data(["sandbox"], False)) == CURRENT
+    with pytest.raises(
+        RecordError, match=r"outcome\.treatment: is False but the outcome and treatment_kinds make it True"
+    ):
+        validate(infra_data(["endpoint"], False))
+    with pytest.raises(
+        RecordError, match=r"outcome\.treatment: is True but the outcome and treatment_kinds make it False"
+    ):
+        validate(infra_data([], True))
+    with pytest.raises(RecordError, match=r"outcome\.treatment: is True but .* make it False"):
+        validate(data(outcome={**data()["outcome"], "treatment": True}))  # a finished outcome is never treatment
+
+
+@pytest.mark.parametrize(
+    ("kinds", "match"),
+    [
+        ("endpoint", "record.treatment_kinds: expected list, got str"),
+        ([1], "a list of infrastructure kinds"),
+        (["wifi"], "unknown infrastructure kind 'wifi'"),
+        (["sandbox", "endpoint"], "written sorted, each once"),
+        (["endpoint", "endpoint"], "written sorted, each once"),
+    ],
+)
+def test_R02_the_declared_treatment_kinds_are_a_sorted_list_of_registered_kinds(kinds, match):
+    """R02: adds the checks on the identity field that the flag is derived from."""
+    with pytest.raises(RecordError, match=match):
+        validate(data(treatment_kinds=kinds))
+
+
+def test_R02_a_record_without_the_treatment_fields_is_refused():
+    """R02: adds that both new fields of version 1 are required, so a record lacking them is not a record."""
+    without = copy.deepcopy(data())
+    del without["treatment_kinds"]
+    with pytest.raises(RecordError, match=r"missing field.*treatment_kinds"):
+        validate(without)
+    without = copy.deepcopy(data())
+    del without["outcome"]["treatment"]
+    with pytest.raises(RecordError, match=r"missing field.*treatment"):
+        validate(without)

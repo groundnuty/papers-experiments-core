@@ -5,7 +5,7 @@
 """The run record: one JSON file per attempt, written atomically and read back byte for byte (R01).
 
 A record holds what is needed to audit, re-score and replay an attempt offline: who it was (run key, factor values,
-attempt), the route and the settings each request carried, the prompts and tools the model was given, the agent
+attempt, and the infrastructure kinds its condition declares as treatment), the route and the settings each request carried, the prompts and tools the model was given, the agent
 configuration as resolved for the run, the code stamp, the transcript turn by turn with the neutral and the native
 message, every tool call with the exact text shown and the raw result, the clock readings, the outcome, the instrument
 outputs under their namespaces, and the scores, kept apart. The sections and their fields are in `schema.py`.
@@ -57,6 +57,7 @@ class RunRecord:
     run_key: str
     factors: dict[str, Any]
     attempt: int
+    treatment_kinds: list[str]
     route: dict[str, Any]
     prompt: dict[str, Any]
     tools: list[dict[str, Any]]
@@ -82,8 +83,12 @@ class RunRecord:
 
     @property
     def set_aside(self) -> bool:
-        """Tell whether the attempt is set aside and re-run instead of scored: a partial record (R09)."""
-        return self.outcome["name"] in SET_ASIDE_OUTCOMES
+        """Tell whether the attempt is set aside and re-run instead of scored: a partial record (R09).
+
+        An infrastructure outcome of a kind the attempt's condition declares as its treatment is a scored final
+        attempt, so it is not set aside: the record carries the declared kinds and the flag, and the store agrees.
+        """
+        return self.outcome["name"] in SET_ASIDE_OUTCOMES and not self.outcome["treatment"]
 
     def with_instrument(self, namespace: str, data: dict[str, Any]) -> "RunRecord":
         """Return a copy that also holds an instrument's output under its namespace."""

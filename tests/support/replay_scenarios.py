@@ -312,6 +312,14 @@ SCENARIOS: dict[str, tuple[Callable[[], RunRecord], str]] = {
         ),
         "infrastructure",
     ),
+    "infra_treatment": (
+        lambda: record_run(
+            [[("echo", {"x": "1"})], InfraError("endpoint", "HTTP 503 after 8 retries")],
+            HANDLERS,
+            record_options={"treatment_kinds": ["endpoint"]},
+        ),
+        "infrastructure",
+    ),
     "infra_tool": (_tool_infra, "infrastructure"),
     "tool_crash": (_tool_crash, "harness_defect"),
     "abandoned_worker": (_abandoned_worker, "finished"),

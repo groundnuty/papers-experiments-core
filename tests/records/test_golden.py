@@ -34,6 +34,7 @@ def test_R02_the_golden_record_holds_exactly_the_fields_of_version_one():
         "run_key",
         "factors",
         "attempt",
+        "treatment_kinds",
         "route",
         "prompt",
         "tools",
