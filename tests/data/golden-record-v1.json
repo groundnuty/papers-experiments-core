@@ -1,0 +1,797 @@
+{
+ "schema_version": "expcore-record/1",
+ "run_key": "task=task-a|model=model-a|seed=0",
+ "factors": {
+  "task": "task-a",
+  "model": "model-a",
+  "seed": 0
+ },
+ "attempt": 1,
+ "route": {
+  "backend": "stub",
+  "model": "stub",
+  "base_url": null,
+  "seed": 0,
+  "seed_honoured": false,
+  "synthetic_tokens": true,
+  "settings_sent_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "settings": {
+   "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a": {}
+  }
+ },
+ "prompt": {
+  "system": {
+   "text": "be brief",
+   "sha256": "b0d336336bae9756708102764ccc977778d8c408df38d7050d69f9e4d22c9a43",
+   "template_sha256": null,
+   "slots": null
+  },
+  "user": {
+   "text": "use the key [redacted] to look up rows",
+   "sha256": "bc41cfcdd2b585733e2d8fc2ce1339c742b410bedef7152276277540b3e26e34",
+   "template_sha256": null,
+   "slots": null
+  },
+  "tools_sha256": "78bcc73576cd7be551c5eeab9d76856f2f2790f216ef95d530eea29aeb2e6a42"
+ },
+ "tools": [
+  {
+   "name": "echo",
+   "description": "The echo tool.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "x": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "x"
+    ]
+   },
+   "terminal": false
+  },
+  {
+   "name": "fail",
+   "description": "The fail tool.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "x": {
+      "type": "string"
+     }
+    }
+   },
+   "terminal": false
+  },
+  {
+   "name": "submit",
+   "description": "The submit tool.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "x": {
+      "type": "string"
+     }
+    }
+   },
+   "terminal": true
+  },
+  {
+   "name": "rows",
+   "description": "The rows tool.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "x": {
+      "type": "string"
+     }
+    }
+   },
+   "terminal": false
+  }
+ ],
+ "agent_config": {
+  "limits": {
+   "max_tool_rounds": 10,
+   "time_cap_s": 300.0,
+   "token_budget": 100000,
+   "output_cap_chars": 200,
+   "max_output_tokens": 4096
+  },
+  "malformed_policy": "report",
+  "ceiling_s": 900.0,
+  "ceiling_kind": "ceiling",
+  "min_call_s": 1.0,
+  "ceiling_factor": 3.0,
+  "cleanup_deadline_s": 10.0,
+  "terminal_tools": [
+   "submit"
+  ]
+ },
+ "agent_config_sha256": "a4eaff6fcb8d30949139e2cc5fbb96f7bc4b635eeae61728026890f944395a9a",
+ "code": {
+  "commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "dirty": false,
+  "source": "git",
+  "stale": false,
+  "why": null,
+  "tree_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+ },
+ "core_version": "0.1.0",
+ "transcript": [
+  {
+   "index": 0,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_1_0",
+      "name": "echo",
+      "arguments": {
+       "x": "a"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     },
+     {
+      "id": "call_1_1",
+      "name": "fail",
+      "arguments": {},
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1_0",
+      "type": "function",
+      "function": {
+       "name": "echo",
+       "arguments": "{\"x\": \"a\"}"
+      }
+     },
+     {
+      "id": "call_1_1",
+      "type": "function",
+      "function": {
+       "name": "fail",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_1_0",
+     "content": "echoed a"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1_1",
+     "content": "NotFound: no such thing"
+    }
+   ],
+   "request_sha256": "d5f286ae457da6b430aecfedcbd41469f1a6713ad49f409b068d10b4ebce1ab4",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 15,
+    "output_tokens": 4,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  },
+  {
+   "index": 1,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_2_0",
+      "name": "echo",
+      "arguments": {
+       "x": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_2_0",
+      "type": "function",
+      "function": {
+       "name": "echo",
+       "arguments": "{\"x\": \"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_2_0",
+     "content": "echoed zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n[output truncated: 376 of 507 characters dropped by the harness cap]"
+    }
+   ],
+   "request_sha256": "512db10088d1c9ffd1da090866faffae896a03145c1d446e94fa1607b03dc93c",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 26,
+    "output_tokens": 128,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  },
+  {
+   "index": 2,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_3_0",
+      "name": "nosuch",
+      "arguments": {},
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_3_0",
+      "type": "function",
+      "function": {
+       "name": "nosuch",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_3_0",
+     "content": "UnknownTool: there is no tool named 'nosuch'; the tools are: echo, fail, rows, submit"
+    }
+   ],
+   "request_sha256": "ca80ed0f3070f4747609cf6dca44921729a7edfbdceb38b6edbb0623312167c9",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 204,
+    "output_tokens": 1,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  },
+  {
+   "index": 3,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_4_0",
+      "name": "echo",
+      "arguments": {},
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_4_0",
+      "type": "function",
+      "function": {
+       "name": "echo",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_4_0",
+     "content": "InvalidArguments: arguments: missing required argument 'x'"
+    }
+   ],
+   "request_sha256": "565a3e34a647a66c127d7efb7ef6002721f7ee2bd8b454b5f662c11cde21d663",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 226,
+    "output_tokens": 1,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  },
+  {
+   "index": 4,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_5_0",
+      "name": "rows",
+      "arguments": {},
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_5_0",
+      "type": "function",
+      "function": {
+       "name": "rows",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_5_0",
+     "content": "row 1 [redacted]\nrow 2"
+    }
+   ],
+   "request_sha256": "65b72c410e2e79589fbb1eac3a8c09a9cef94b013b180d90b8eb64ea1fd1bcdc",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 241,
+    "output_tokens": 1,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  },
+  {
+   "index": 5,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_6_0",
+      "name": "submit",
+      "arguments": {
+       "x": "final"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     },
+     {
+      "id": "call_6_1",
+      "name": "echo",
+      "arguments": {
+       "x": "after the end"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_6_0",
+      "type": "function",
+      "function": {
+       "name": "submit",
+       "arguments": "{\"x\": \"final\"}"
+      }
+     },
+     {
+      "id": "call_6_1",
+      "type": "function",
+      "function": {
+       "name": "echo",
+       "arguments": "{\"x\": \"after the end\"}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_6_0",
+     "content": "submitted final"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_6_1",
+     "content": "skipped: not executed: the attempt ended at an earlier call in this turn"
+    }
+   ],
+   "request_sha256": "67921bc28dc891b5ec4db72bc7a4e092e5a8877adb7e1d49b2ba0e7885c723e7",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 251,
+    "output_tokens": 10,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  }
+ ],
+ "failed_request": null,
+ "tool_calls": [
+  {
+   "turn": 0,
+   "round": 1,
+   "call_id": "call_1_0",
+   "name": "echo",
+   "arguments": {
+    "x": "a"
+   },
+   "status": "ok",
+   "text": "echoed a",
+   "raw_text": "echoed a",
+   "truncated": false,
+   "error_class": null,
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  },
+  {
+   "turn": 0,
+   "round": 1,
+   "call_id": "call_1_1",
+   "name": "fail",
+   "arguments": {},
+   "status": "error",
+   "text": "NotFound: no such thing",
+   "raw_text": "NotFound: no such thing",
+   "truncated": false,
+   "error_class": "NotFound",
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": false,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  },
+  {
+   "turn": 1,
+   "round": 2,
+   "call_id": "call_2_0",
+   "name": "echo",
+   "arguments": {
+    "x": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+   },
+   "status": "ok",
+   "text": "echoed zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n[output truncated: 376 of 507 characters dropped by the harness cap]",
+   "raw_text": "echoed zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+   "truncated": true,
+   "error_class": null,
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  },
+  {
+   "turn": 2,
+   "round": 3,
+   "call_id": "call_3_0",
+   "name": "nosuch",
+   "arguments": {},
+   "status": "error",
+   "text": "UnknownTool: there is no tool named 'nosuch'; the tools are: echo, fail, rows, submit",
+   "raw_text": "UnknownTool: there is no tool named 'nosuch'; the tools are: echo, fail, rows, submit",
+   "truncated": false,
+   "error_class": "UnknownTool",
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  },
+  {
+   "turn": 3,
+   "round": 4,
+   "call_id": "call_4_0",
+   "name": "echo",
+   "arguments": {},
+   "status": "error",
+   "text": "InvalidArguments: arguments: missing required argument 'x'",
+   "raw_text": "InvalidArguments: arguments: missing required argument 'x'",
+   "truncated": false,
+   "error_class": "InvalidArguments",
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  },
+  {
+   "turn": 4,
+   "round": 5,
+   "call_id": "call_5_0",
+   "name": "rows",
+   "arguments": {},
+   "status": "ok",
+   "text": "row 1 [redacted]\nrow 2",
+   "raw_text": "row 1 [redacted]\nrow 2",
+   "truncated": false,
+   "error_class": null,
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": true,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": false
+  },
+  {
+   "turn": 5,
+   "round": 6,
+   "call_id": "call_6_0",
+   "name": "submit",
+   "arguments": {
+    "x": "final"
+   },
+   "status": "ok",
+   "text": "submitted final",
+   "raw_text": "submitted final",
+   "truncated": false,
+   "error_class": null,
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": true,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  },
+  {
+   "turn": 5,
+   "round": 6,
+   "call_id": "call_6_1",
+   "name": "echo",
+   "arguments": {
+    "x": "after the end"
+   },
+   "status": "skipped",
+   "text": "skipped: not executed: the attempt ended at an earlier call in this turn",
+   "raw_text": "skipped: not executed: the attempt ended at an earlier call in this turn",
+   "truncated": false,
+   "error_class": "skipped",
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": null,
+   "ended_s": null,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  }
+ ],
+ "clock": [
+  [
+   "start",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "end",
+   1000.0
+  ]
+ ],
+ "outcome": {
+  "name": "finished",
+  "detail": "a call to the terminal tool 'submit' succeeded",
+  "infra_kind": null,
+  "error_type": null,
+  "defect": null
+ },
+ "totals": {
+  "rounds": 6,
+  "malformed_calls": 0,
+  "malformed_events": [],
+  "tokens_used": 1108,
+  "usage_incomplete": false,
+  "agent_s": 0.0,
+  "elapsed_s": 0.0,
+  "infra_wait_s": 0.0,
+  "infra_wait_by_kind": {},
+  "cleanup_s": 0.0,
+  "cleanup_timed_out": false,
+  "abandoned_threads": 0,
+  "final_text": null
+ },
+ "instruments": {},
+ "scores": {},
+ "redacted_paths": [
+  "prompt.user.text",
+  "tool_calls[5].raw_text",
+  "tool_calls[5].text",
+  "transcript[4].tool_messages[0].content"
+ ]
+}
