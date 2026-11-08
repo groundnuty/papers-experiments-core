@@ -187,6 +187,32 @@ def test_o08_a_block_map_without_a_blocks_field_is_a_failed_probe_with_a_reason_
     assert snapshot["pairs"] is None
 
 
+def test_o08_resolving_a_tracked_file_does_not_retry_a_real_404_from_the_space_root(probes, seeded, ticker):
+    """O08: a 404 from the space root, then a 200 on a second request, is a failed probe. The provisioner's wait for a
+    new space root would have asked again after a pause and succeeded, inside one attempt."""
+    seeded.root_enoent_polls = 1
+    probes.start({})
+    assert len(calls_for(seeded, "/spaces/")) == 1
+    assert ticker.slept == []  # no wait of the space-root kind
+    snapshot = probes.finish()
+    before = snapshot["files"]["data"]["providers"]["alpha"]["before"]
+    assert before["probe_ok"] is False
+    assert before["status"] == 404
+    assert snapshot["ok"] is False
+    assert snapshot["files"]["data"]["providers"]["alpha"]["after"]["probe_ok"] is True  # the next reading is its own
+
+
+def test_o08_a_reset_inside_the_resolution_is_retried_and_counted_in_the_probes_attempts(probes, seeded, ticker):
+    """O08: the only retry of a resolution is the probe's own, of a network reset, and the entry's attempts say how
+    many requests of that kind it took."""
+    probes.start({})
+    seeded.resets.append(["/children", 2])
+    snapshot = probes.finish()
+    assert snapshot["files"]["data"]["entry"]["probe_ok"] is True
+    assert snapshot["files"]["data"]["entry"]["attempts"] == 3
+    assert len(ticker.slept) == 2
+
+
 def test_a_snapshot_without_a_start_has_no_before_and_no_pairs(probes, seeded):
     """Without the reading at the start nothing can be said about growth: the snapshot is incomplete, not zero."""
     snapshot = probes.finish()

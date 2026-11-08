@@ -211,11 +211,19 @@ class Provisioner:
             raise Refused("the provider's id is unknown: declare it in platform.toml or resolve it from the space view")
         return self._ids[name]
 
-    def root(self) -> str:
-        """Return the space's root directory id on the data provider, waiting out a root that does not exist yet."""
+    def root(self, *, wait: bool = True) -> str:
+        """Return the space's root directory id on the data provider.
+
+        With `wait` (provisioning) a root that answers "no such file" is waited out, within bounds (O07). Without it (an
+        instrument's read, O08) there is one request and no wait: a real answer, a 404 included, is raised as it came.
+        """
         if self._root is None:
             self._root = consistency.space_root(
-                self._client, self._settings.holder, self._config.space.id, sleep=self._sleep
+                self._client,
+                self._settings.holder,
+                self._config.space.id,
+                **({} if wait else {"tries": 1}),
+                sleep=self._sleep,
             )
         return self._root
 
@@ -263,9 +271,12 @@ class Provisioner:
                 raise PlatformError("a listing is not on its last page but names no next page")
             params = {**params, "token": token}
 
-    def resolve(self, path: str, provider: str | None = None) -> Entry:
-        """Walk a space-relative path down from the root and return its entry; raise KeyError naming the part missing."""
-        node = Entry(self.root(), "", 0, "DIR")
+    def resolve(self, path: str, provider: str | None = None, *, wait: bool = True) -> Entry:
+        """Walk a space-relative path down from the root and return its entry; raise KeyError naming the part missing.
+
+        `wait` is as for `root`: an instrument passes False so that no real answer is retried inside its read.
+        """
+        node = Entry(self.root(wait=wait), "", 0, "DIR")
         for part in safe_path(path):
             found = self.children(node.file_id, provider).get(part)
             if found is None:

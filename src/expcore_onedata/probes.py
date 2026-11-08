@@ -178,11 +178,15 @@ class PlatformProbes:
         return run_probe(read, attempts=settings.probe_attempts, backoff_s=settings.probe_backoff_s, sleep=self._sleep)
 
     def _file_id(self, path: str) -> ProbeResult:
-        """Resolve a path to its entry; a path that is no longer there is a failed probe, not an exception."""
+        """Resolve a path to its entry; a path that is no longer there is a failed probe, not an exception.
+
+        The read does not wait: the provisioner's wait for a new space root would retry a real 404 inside one attempt,
+        out of sight of the probe (O08). The only retry is the probe's own, of a network reset, and it is counted.
+        """
 
         def read() -> Any:
             try:
-                return self._provisioner.resolve(path)
+                return self._provisioner.resolve(path, wait=False)
             except KeyError:
                 raise PlatformError("the tracked file is not in the space", status=404) from None
 
