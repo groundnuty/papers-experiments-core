@@ -301,8 +301,12 @@ def require_current_check(
     allow_dirty: bool = False,
     required_recompute: Sequence[str] = (),
     schemas: Sequence[SchemaVersion] = SCHEMAS,
+    rerun_command: str | None = None,
 ) -> dict[str, Any]:
     """Return the batch's stored check when it passed and is current; else raise BatchNotVerified saying why (R04).
+
+    Every refusal ends by naming the command that makes the check again: this module's own by default, or
+    `rerun_command` when the caller is a command line of its own (for example `python -m expcore check BATCH`).
 
     Refused: no check; a check of another check schema or of other record schemas than the ones in use; a check with
     failures; inputs added, removed or changed since; a check made under another commit or tree hash than `code`, the
@@ -311,7 +315,7 @@ def require_current_check(
     or whose hook disagreed with a record (R05).
     """
     root = Path(batch)
-    rerun = f"run `python -m expcore.replay.check {root}` first"
+    rerun = f"run `{rerun_command or f'python -m expcore.replay.check {root}'}` first"
     check = _read_check(root, rerun)
     if check.get("schema") != CHECK_SCHEMA:
         raise BatchNotVerified(f"{root}: check schema {check.get('schema')!r}, not {CHECK_SCHEMA!r}; {rerun}")

@@ -70,6 +70,19 @@ def test_R04_a_batch_that_loads_round_trips_and_replays_passes_and_is_accepted(c
     assert require_current_check(checked, code=CODE)["inputs_sha256"] == check["inputs_sha256"]
 
 
+def test_R04_a_refusal_names_the_command_that_makes_the_check_again_the_callers_own_when_it_has_one(tmp_path, checked):
+    """R04: adds that a command line of its own is named in the refusal instead of this module's."""
+    unchecked = tmp_path / "unchecked"
+    unchecked.mkdir()
+    by_default = refused(unchecked, "no replay-check.json")
+    assert "python -m expcore.replay.check" in str(by_default)
+    named = refused(unchecked, "no replay-check.json", rerun_command="python -m expcore check BATCH")
+    assert str(named).endswith("run `python -m expcore check BATCH` first")
+    first_record(checked).write_text("{}", encoding="utf-8")
+    changed = refused(checked, "inputs changed", rerun_command="python -m expcore check BATCH")
+    assert str(changed).endswith("run `python -m expcore check BATCH` first")
+
+
 def test_R04_the_check_holds_the_code_identity_and_the_hash_of_every_input_by_relative_path(checked):
     """R04: the identity is the code stamp's, and each input is named by its path in the batch."""
     check = stored_check(checked)
