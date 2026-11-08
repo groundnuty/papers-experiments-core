@@ -268,22 +268,22 @@ class Store:
         A different one raises PinMismatch unless `repin` is set (an explicit operator decision), which replaces it
         and logs an event. Returns the value in force.
         """
+        return self.transact(lambda: self.pin_within(key, value, now, repin))
 
-        def go() -> str:
-            current = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-            if current is None:
-                self.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (key, value, now))
-            elif current["value"] != value:
-                if not repin:
-                    raise PinMismatch(key, current["value"], value)
-                self.db.execute("UPDATE meta SET value=?, set_utc=? WHERE key=?", (value, now, key))
-                self.db.execute(
-                    "INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)",
-                    (now, "repin", None, f"{key}: {current['value']} -> {value} (operator flag)"),
-                )
-            return value
-
-        return self.transact(go)
+    def pin_within(self, key: str, value: str, now: str, repin: bool = False) -> str:
+        """Do what `pin` does inside a transaction the caller has begun, so several pins and checks stand or fall together."""
+        current = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if current is None:
+            self.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (key, value, now))
+        elif current["value"] != value:
+            if not repin:
+                raise PinMismatch(key, current["value"], value)
+            self.db.execute("UPDATE meta SET value=?, set_utc=? WHERE key=?", (value, now, key))
+            self.db.execute(
+                "INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)",
+                (now, "repin", None, f"{key}: {current['value']} -> {value} (operator flag)"),
+            )
+        return value
 
     def event(self, ts: str, kind: str, model: str | None, detail: str) -> None:
         """Append one event."""
