@@ -3,7 +3,8 @@
 
 No other module of the platform layer holds a provider, space, host or user name; each looks the value up in the
 `PlatformConfig` this module loads. Loading validates everything and names the file and the key in every message. A
-message never echoes a value, so a mistake in a URL or a token source cannot print the federation's names.
+message never echoes a value: a mistake in a URL or a token source cannot print the federation's names, and a table
+of named entries is named by position (`providers[2]`, `conditions[0]`) and never by the name it is filed under.
 
 ```toml
 [zone]                          # Onezone
@@ -188,11 +189,10 @@ class PlatformConfig:
         return self.providers[self.support.local]
 
     def condition(self, name: str) -> Condition:
-        """Return a condition of the tool server; raise ConfigError naming it when there is none."""
+        """Return a condition of the tool server; raise ConfigError, without naming it, when there is none."""
         server = self.toolserver
         if server is None or name not in server.conditions:
-            known = ", ".join(sorted(server.conditions)) if server else "none"
-            raise ConfigError(f"{self.file}: [toolserver.conditions]: no condition {name!r}; known: {known}")
+            raise ConfigError(f"{self.file}: [toolserver.conditions]: the condition asked for is not declared")
         return server.conditions[name]
 
 
@@ -211,11 +211,19 @@ def _url(section: Section, key: str) -> str:
     return value.rstrip("/")
 
 
-def _name(section: Section, key: str, value: str, what: str) -> str:
-    """Check a name the file uses for something."""
+def _name(section: Section, key: str | None, value: str, what: str) -> str:
+    """Check a name the file uses for something; the message never holds the name."""
     if not NAME.fullmatch(value):
         raise section.fail(key, f"{what} must be letters, digits, '_' and '-', starting with a letter")
     return value
+
+
+def _entry(table: Section, index: int, name: str) -> Section:
+    """Return one named entry of a table of named tables, known in messages by its position and never by its name."""
+    value = table.data[name]
+    if not isinstance(value, Mapping):
+        raise table.fail(None, f"entry {index} must be a table")
+    return Section(value, table.file, f"{table.where}[{index}]")
 
 
 def _number(section: Section, key: str, default: float, *, minimum: float, integer: bool = False) -> float:
@@ -264,9 +272,9 @@ def _providers(root: Section) -> dict[str, Provider]:
     if not table.data:
         raise table.fail(None, "must declare at least one provider")
     out: dict[str, Provider] = {}
-    for name in table.data:
-        entry = table.section(name)
-        _name(table, name, name, "a provider name")
+    for index, name in enumerate(table.data):
+        entry = _entry(table, index, name)
+        _name(entry, None, name, "its name")
         entry.reject_unknown(("url", "id"))
         out[name] = Provider(name, _url(entry, "url"), entry.string("id"))
     ids = [provider.id for provider in out.values()]
@@ -374,7 +382,8 @@ def _check_fixed_users(
 
 
 def _condition(name: str, section: Section, base: Path) -> Condition:
-    """Read one condition: allow-list, rights, manifest."""
+    """Read one condition: allow-list, rights, manifest. `section` is known in messages by its position."""
+    _name(section, None, name, "its name")
     section.reject_unknown(("allow", "rights", "manifest"))
     allow, rights = section.strings("allow"), section.strings("rights")
     if not allow or len(set(allow)) != len(allow):
@@ -406,10 +415,7 @@ def _toolserver(section: Section, base: Path) -> ToolServer:
         commit,
         _boolean(section, "insecure_tls"),
         MappingProxyType(
-            {
-                n: _condition(_name(conditions, n, n, "a condition name"), conditions.section(n), base)
-                for n in conditions.data
-            }
+            {n: _condition(n, _entry(conditions, index, n), base) for index, n in enumerate(conditions.data)}
         ),
     )
 

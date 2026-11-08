@@ -26,7 +26,8 @@ The other halves of O09 (refuse to evict the data provider's own copy, tear down
 files left revokes nothing) belong to provisioning and the sandbox (step 4b); they call `mutate`.
 
 A failure raises `PlatformError` with the status and Onedata's error id only. The message never holds a URL, a body or a
-header, so neither a token nor a federation name reaches a log or a record through it.
+header, and names a provider by its position (`providers[1]`), so neither a token nor a federation name reaches a log
+or a record through it.
 
 Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S7]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
@@ -148,12 +149,17 @@ class OnezoneClient:
         return f"OnezoneClient(zone={self._config.zone.name!r})"
 
     def _base(self, provider: str | None) -> tuple[str, str]:
-        """Return the base URL and the label used in messages: Onezone, or one declared provider."""
+        """Return the base URL and the label used in messages: `zone`, or `providers[i]` for the i-th declared one.
+
+        The label is a role or a position in the file, never the provider's name, so a message holds no federation name.
+        """
         if provider is None:
             return self._config.zone.url + API_ZONE, "zone"
         if provider not in self._config.providers:
             raise OutOfScope("the request names a provider that is not declared")
-        return self._config.providers[provider].url + API_PROVIDER, f"provider {provider}"
+        return self._config.providers[
+            provider
+        ].url + API_PROVIDER, f"providers[{list(self._config.providers).index(provider)}]"
 
     def _send(
         self, method: str, path: str, *, provider: str | None, headers: Mapping[str, str], json: Any = None

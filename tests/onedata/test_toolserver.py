@@ -12,6 +12,7 @@ from mcp import StdioServerParameters
 from platform_support import CEILING_S, DATA, FAKE_TOOL_SERVER, MANAGE, NOW, TOOLS, write_platform
 from record_support import make_config
 
+from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import check_wait_kind
 from expcore.tools.manifest import FrozenManifest, ManifestError, live_manifest
@@ -212,10 +213,12 @@ def test_a_federation_that_cannot_examine_the_token_is_infrastructure_of_kind_kn
     assert token.reveal() not in str(caught.value)
 
 
-def test_a_condition_the_file_does_not_have_is_named(world, tmp_path):
+def test_a_condition_the_file_does_not_have_is_refused_without_naming_it_or_the_known_ones(world, tmp_path):
     config, issuer, launcher = world
-    with pytest.raises(Exception, match="no condition 'nope'"):
+    with pytest.raises(ConfigError, match="condition asked for is not declared") as caught:
         start(launcher, RecordingContext(), "nope", read_token(issuer, config), tmp_path)
+    assert "nope" not in str(caught.value)
+    assert "manage" not in str(caught.value)
 
 
 def test_the_allow_list_and_the_other_managed_settings_cannot_be_set_by_the_caller(world):

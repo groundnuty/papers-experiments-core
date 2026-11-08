@@ -137,13 +137,17 @@ def test_o12_a_bad_file_names_the_file_and_the_key_and_echoes_no_value(name, tmp
         assert private not in message
 
 
-def test_o12_the_tool_server_section_is_optional_and_a_missing_condition_is_named(tmp_path, monkeypatch):
-    """O12: a platform without a tool server loads; asking it for a condition names the file and the condition."""
+def test_o12_the_tool_server_section_is_optional_and_a_missing_condition_is_refused_without_its_name(
+    tmp_path, monkeypatch
+):
+    """O12: a platform without a tool server loads; asking it for a condition names the file and the table, not the
+    condition, so a study's condition names never reach a message."""
     monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
     config = load(tmp_path, lambda d: d.pop("toolserver"))
     assert config.toolserver is None
-    with pytest.raises(ConfigError, match=r"platform\.toml.*'read'"):
+    with pytest.raises(ConfigError, match=r"platform\.toml.*\[toolserver\.conditions\]") as caught:
         config.condition("read")
+    assert "read" not in str(caught.value).replace(str(tmp_path), "")
 
 
 def test_a_write_right_is_one_of_the_closed_set():
