@@ -1,0 +1,216 @@
+"""Re-scoring (R13): scorers run on saved records with no network, and the record keeps each scorer's version."""
+
+import dataclasses
+import json
+import socket
+
+import pytest
+from replay_scenarios import SCENARIOS
+
+from expcore.records.record import RunRecord, decode, load_record
+from expcore.records.rescore import rescore, rescore_files, scorer_name, scorer_version
+from expcore.records.schema import RecordError
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """Re-scoring needs no model and no platform: any attempt to open a connection fails the test."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("re-scoring opened a network connection")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
+
+
+class TurnCount:
+    """A scorer that reads only the record."""
+
+    name = "turns"
+    version = "1.2"
+
+    def score(self, record: RunRecord):
+        return {
+            "verdict": "fulfilled",
+            "outcomes": {"turns": len(record.transcript), "rounds": record.totals["rounds"]},
+        }
+
+
+def untouched(record: RunRecord):
+    """A scorer that is a plain function, with no declared version."""
+    return {"verdict": "not_determined", "outcomes": {"bytes_moved": None}}
+
+
+@pytest.fixture
+def corpus(tmp_path):
+    """Saved records, as a corpus to re-score: a finished attempt and one set aside."""
+    root = tmp_path / "corpus"
+    for name in ("tools", "infra_turn_three"):
+        dataclasses.replace(SCENARIOS[name][0](), run_key=f"run-{name}").write(root)
+    return root
+
+
+def test_R13_a_record_is_re_scored_offline_and_the_scorers_version_is_recorded():
+    """R13: the result and the version are in the record under the scorer's name, with no network."""
+    record = SCENARIOS["tools"][0]()
+    scored = rescore(record, [TurnCount()])
+    assert scored.scores == {
+        "turns": {"version": "1.2", "result": {"verdict": "fulfilled", "outcomes": {"turns": 6, "rounds": 6}}}
+    }
+    assert record.scores == {}
+    assert RunRecord.from_json(decode(scored.dumps())) == scored
+
+
+def test_R13_re_scoring_a_fixture_corpus_needs_no_network_and_records_the_version(corpus):
+    """R13: every record of a saved corpus is re-scored in place; the infrastructure failure stays unscored."""
+    written = rescore_files(corpus, [TurnCount()])
+    assert len(written) == 2
+    by_key = {r.run_key: r for r in (load_record(p) for p in written)}
+    assert by_key["run-tools"].scores["turns"]["version"] == "1.2"
+    assert by_key["run-infra_turn_three"].scores == {}
+
+
+def test_R13_a_changed_scorer_re_scores_the_saved_records_and_the_new_version_replaces_the_old(corpus, tmp_path):
+    """R13: scorer changes re-score saved records without model calls; the record names the version that scored it."""
+    rescore_files(corpus, [TurnCount()])
+
+    class Newer(TurnCount):
+        version = "2.0"
+
+        def score(self, record):
+            return {"verdict": "violated", "outcomes": {"turns": None}}
+
+    out = tmp_path / "rescored"
+    paths = rescore_files(corpus, [Newer()], out_dir=out)
+    scored = next(load_record(p) for p in paths if "tools" in load_record(p).run_key)
+    assert scored.scores["turns"] == {"version": "2.0", "result": {"verdict": "violated", "outcomes": {"turns": None}}}
+    stored = next(load_record(p) for p in sorted(corpus.glob("*.json")) if "tools" in load_record(p).run_key)
+    assert stored.scores["turns"]["version"] == "1.2"
+
+
+def test_R13_a_plain_function_is_versioned_by_a_hash_of_its_source():
+    """R13: with no declared version (and no git to ask), the content hash of the scorer's file stands in."""
+    version = scorer_version(untouched)
+    assert version.startswith("sha256:")
+    assert len(version) == len("sha256:") + 64
+    assert scorer_name(untouched) == "untouched"
+    scored = rescore(SCENARIOS["tools"][0](), [untouched])
+    assert scored.scores["untouched"]["version"] == version
+    assert scored.scores["untouched"]["result"]["outcomes"] == {"bytes_moved": None}
+    assert json.loads(scored.dumps())["scores"]["untouched"]["result"]["outcomes"]["bytes_moved"] is None
+
+
+def test_R13_the_entries_of_scorers_that_did_not_run_are_kept():
+    first = rescore(SCENARIOS["tools"][0](), [TurnCount()])
+    both = rescore(first, [untouched])
+    assert sorted(both.scores) == ["turns", "untouched"]
+
+
+def test_a_scorer_gets_a_copy_so_it_cannot_change_the_record():
+    record = SCENARIOS["tools"][0]()
+    before = record.dumps()
+
+    def meddler(rec):
+        rec.totals["rounds"] = 99
+        rec.transcript.clear()
+        return {"verdict": "fulfilled"}
+
+    rescore(record, [meddler])
+    assert record.dumps() == before
+
+
+def test_R13_an_attempt_that_is_set_aside_is_never_scored():
+    """R13: an infrastructure failure or a harness defect stays unscored, as the run left it."""
+    for name in ("infra_turn_three", "tool_crash"):
+        record = SCENARIOS[name][0]()
+        assert rescore(record, [TurnCount()]) is record
+
+
+def test_two_scorers_with_one_name_are_refused():
+    with pytest.raises(RecordError, match="two scorers are named 'turns'"):
+        rescore(SCENARIOS["tools"][0](), [TurnCount(), TurnCount()])
+
+
+def test_a_scorer_without_a_name_is_refused():
+    with pytest.raises(RecordError, match="has no name"):
+        scorer_name(object())
+
+
+def written_files(root):
+    return {p.name: p.read_bytes() for p in sorted(root.iterdir())}
+
+
+def test_R13_only_run_records_are_re_scored_a_check_and_a_manifest_are_left_alone(corpus):
+    """R13: a file without the record schema marker is not a run record, whatever it is named."""
+    (corpus / "replay-check.json").write_text(json.dumps({"schema": "replay-check/1", "inputs": {}}), encoding="utf-8")
+    (corpus / "manifest.json").write_text(json.dumps({"cells": 3}), encoding="utf-8")
+    (corpus / "list.json").write_text("[1, 2]", encoding="utf-8")
+    (corpus / "notes.json").write_text("not json at all", encoding="utf-8")
+    before = written_files(corpus)
+    written = rescore_files(corpus, [TurnCount()])
+    after = written_files(corpus)
+    assert len(written) == 2
+    for name in ("replay-check.json", "manifest.json", "list.json", "notes.json"):
+        assert after[name] == before[name]
+
+
+def test_R13_a_file_named_like_a_record_that_is_not_one_stops_the_run(corpus):
+    """R13: a corrupt record or one without the marker is an error, not a file to skip."""
+    name = "a" * 64 + ".1.json"
+    (corpus / name).write_text("{truncated", encoding="utf-8")
+    with pytest.raises(RecordError, match=name):
+        rescore_files(corpus, [TurnCount()])
+    (corpus / name).write_text("{}", encoding="utf-8")
+    with pytest.raises(RecordError, match="holds no record schema marker"):
+        rescore_files(corpus, [TurnCount()])
+
+
+def test_R13_every_record_is_validated_and_scored_before_any_is_rewritten(corpus):
+    """R13: two phases; a record that cannot be loaded leaves every file as it was."""
+    path = next(p for p in corpus.glob("*.json") if json.loads(p.read_text(encoding="utf-8"))["run_key"] == "run-tools")
+    broken = json.loads(path.read_text(encoding="utf-8"))
+    broken["run_key"] = "run-broken"
+    broken["outcome"]["name"] = "exploded"
+    (corpus / ("b" * 64 + ".1.json")).write_text(json.dumps(broken), encoding="utf-8")
+    before = written_files(corpus)
+    with pytest.raises(RecordError, match="unknown outcome"):
+        rescore_files(corpus, [TurnCount()])
+    assert written_files(corpus) == before
+
+
+def test_R13_a_scorer_that_fails_on_the_last_record_leaves_every_file_as_it_was(corpus):
+    """R13: the failure comes before the first write, however late in the corpus the bad record is."""
+    for name in ("malformed", "turn_cap"):
+        dataclasses.replace(SCENARIOS[name][0](), run_key=f"run-{name}").write(corpus)
+    before = written_files(corpus)
+
+    def fussy(record):
+        if record.run_key == "run-turn_cap":
+            raise ValueError("cannot score this one")
+        return {"verdict": "fulfilled"}
+
+    with pytest.raises(ValueError, match="cannot score"):
+        rescore_files(corpus, [fussy])
+    assert written_files(corpus) == before
+
+
+def test_R13_a_result_that_cannot_be_written_stops_the_run_before_any_write(corpus):
+    """R13: a score of NaN cannot be written as JSON; it is found while the records are still unchanged."""
+    before = written_files(corpus)
+
+    def nan_scorer(record):
+        return {"verdict": "fulfilled", "outcomes": {"share": float("nan")}}
+
+    with pytest.raises(RecordError, match="cannot be written as JSON"):
+        rescore_files(corpus, [nan_scorer])
+    assert written_files(corpus) == before
+
+
+def test_R13_a_treatment_attempt_is_scored_like_any_other_scored_attempt():
+    """R13: adds that an infrastructure outcome of a declared kind is not set aside, so the scorers run on it."""
+    record = SCENARIOS["infra_treatment"][0]()
+    assert record.set_aside is False
+    scored = rescore(record, [TurnCount()])
+    assert scored is not record
+    assert scored.scores["turns"]["result"]["outcomes"]["turns"] == len(record.transcript)
+    assert scored.outcome == record.outcome

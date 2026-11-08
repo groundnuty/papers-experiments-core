@@ -1,0 +1,264 @@
+"""Pairing: named-condition and factor contrasts, aggregation per cluster, and what is dropped and counted."""
+
+import math
+import random
+
+import numpy as np
+import pytest
+from stats_support import both_arms, by_factor, make_row, named
+
+from expcore.stats.pairing import ContrastSpec, pair_rows
+from expcore.stats.rows import Row
+
+
+def bad_row(outcomes, attributes):
+    """A row for condition cond-a with the given outcomes and task attributes, as it would be if it got past `Row`.
+
+    A row refuses a non-number, NaN or an infinity when it is built, but its outcomes are a plain dict that an edit can
+    still change, so pairing checks the values it reads as well. The outcomes are put in after construction.
+    """
+    factors = {"task": "task-a", "model": "model-a", "seed": 1}
+    row = Row("task=task-a|model=model-a|seed=1|condition=cond-a", "cond-a", factors, {}, attributes)
+    row.outcomes.update(outcomes)
+    return row
+
+
+def basic_rows():
+    """Two clusters by two models; the hand-computed matrix is [[0.15, nan], [0.4, 0.0]]."""
+    rows = []
+    rows += both_arms("task-a", "model-a", 1, 0.9, 0.5)  # difference 0.4
+    rows += both_arms("task-a", "model-a", 2, 0.7, 0.5)  # 0.2, so (task-a, model-a) is the mean 0.3
+    rows += both_arms("task-b", "model-a", 1, 0.5, 0.5)  # 0.0, so (grp-a, model-a) is the mean of 0.3 and 0.0
+    rows += both_arms("task-c", "model-a", 1, 0.6, 0.2, cluster="grp-b")  # 0.4
+    rows += both_arms("task-c", "model-b", 1, 0.3, 0.3, cluster="grp-b")  # 0.0
+    return rows
+
+
+def test_a_named_condition_contrast_pairs_on_task_model_and_seed():
+    """Differences A - B are aggregated seeds to (task, model), then tasks to (cluster, model)."""
+    pairing = pair_rows(basic_rows(), named())
+    assert pairing.differences.clusters == ("grp-a", "grp-b")
+    assert pairing.differences.models == ("model-a", "model-b")
+    assert pairing.differences.matrix == pytest.approx(np.array([[0.15, math.nan], [0.4, 0.0]]), nan_ok=True)
+    assert (pairing.n_pairs, pairing.n_pairs_missing, pairing.n_unpaired, pairing.n_clusters_dropped) == (5, 0, 0, 0)
+
+
+def test_the_result_does_not_depend_on_the_order_of_the_rows():
+    """Pairing is a function of the set of rows."""
+    rows = basic_rows()
+    shuffled = random.Random(3).sample(rows, len(rows))
+    first, second = pair_rows(rows, named()), pair_rows(shuffled, named())
+    assert first.differences.clusters == second.differences.clusters
+    np.testing.assert_array_equal(first.differences.matrix, second.differences.matrix)  # NaN cells match as well
+
+
+def test_a_named_condition_contrast_ignores_other_conditions_and_other_factors():
+    """Rows of a third condition do not enter, and the named form pairs across any other declared factor."""
+    rows = both_arms("task-a", "model-a", 1, 0.6, 0.2, gate="open")
+    rows.append(make_row("task-a", "model-a", 1, 0.99, condition="cond-c", gate="open"))
+    other = [
+        make_row("task-b", "model-a", 1, 0.9, condition="cond-a", gate="open"),
+        make_row("task-b", "model-a", 1, 0.5, condition="cond-b", gate="shut"),
+    ]
+    pairing = pair_rows(rows + other, named())
+    assert pairing.differences.matrix == pytest.approx(np.array([[0.4]]))  # (0.4 for task-a and 0.4 for task-b)
+    assert pairing.n_pairs == 2
+
+
+def test_the_contrast_is_a_minus_b():
+    """Swapping the arms changes the sign and nothing else."""
+    forward = pair_rows(basic_rows(), named()).differences.matrix
+    backward = pair_rows(basic_rows(), named(a="cond-b", b="cond-a")).differences.matrix
+    assert backward == pytest.approx(-forward, nan_ok=True)
+
+
+def test_a_factor_contrast_pairs_on_every_other_factor():
+    """Open against shut is paired within each level of the other factor, never across it."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.8, gate="open", mode="x"),
+        make_row("task-a", "model-a", 1, 0.5, gate="shut", mode="x"),
+        make_row("task-a", "model-a", 1, 0.6, gate="open", mode="y"),
+        make_row("task-a", "model-a", 1, 0.5, gate="shut", mode="y"),
+        make_row("task-a", "model-a", 1, 0.9, gate="open", mode="z"),  # no shut counterpart at mode z
+        make_row("task-a", "model-a", 1, 0.1, gate="shut", mode="w"),  # nor does this one have an open one
+    ]
+    pairing = pair_rows(rows, by_factor())
+    assert pairing.differences.matrix == pytest.approx(np.array([[0.2]]))  # mean of 0.3 and 0.1
+    assert (pairing.n_pairs, pairing.n_unpaired) == (2, 2)
+
+
+def test_a_factor_contrast_needs_no_condition_and_ignores_levels_it_does_not_name():
+    """The factor form reads the factor values; a third level is left out of the A - B pairs."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.8, gate="open"),
+        make_row("task-a", "model-a", 1, 0.5, gate="shut"),
+        make_row("task-a", "model-a", 1, 0.0, gate="half"),
+    ]
+    assert pair_rows(rows, by_factor()).differences.matrix == pytest.approx(np.array([[0.3]]))
+    assert pair_rows(rows, by_factor(levels=("open", "half"))).differences.matrix == pytest.approx(np.array([[0.8]]))
+
+
+def test_s03_clusters_without_a_pair_are_dropped_and_counted():
+    """S03: clusters undefined in either arm are dropped and counted, whether unpaired or all missing."""
+    rows = basic_rows()
+    rows.append(
+        make_row("task-d", "model-a", 1, 0.9, condition="cond-a", cluster="grp-c")
+    )  # grp-c has an A row and no B row
+    rows += both_arms("task-e", "model-a", 1, None, 0.3, cluster="grp-d")  # grp-d has a pair whose A outcome is missing
+    pairing = pair_rows(rows, named())
+    assert pairing.differences.clusters == ("grp-a", "grp-b")
+    assert pairing.n_clusters_dropped == 2
+    assert pairing.n_unpaired == 1
+    assert pairing.n_pairs_missing == 1
+
+
+def test_r10_a_missing_outcome_is_excluded_from_its_pair_and_never_read_as_zero():
+    """R10: None is missing; the pair is dropped and counted, and the mean is not pulled toward 0."""
+    rows = both_arms("task-a", "model-a", 1, None, 0.2) + both_arms("task-a", "model-a", 2, 0.5, 0.2)
+    pairing = pair_rows(rows, named())
+    assert pairing.differences.matrix == pytest.approx(np.array([[0.3]]))  # a zero for the missing A would give 0.05
+    assert (pairing.n_pairs, pairing.n_pairs_missing) == (1, 1)
+
+
+def test_r10_a_missing_outcome_on_the_b_side_and_a_nan_that_got_past_the_row_are_missing_too():
+    """R10: missing on either side counts, and pairing still reads a NaN edited into a row as missing, like None."""
+    nan_row = both_arms("task-a", "model-a", 2, 0.5, 0.2)
+    nan_row[0].outcomes["score"] = math.nan  # a row refuses NaN when built; this is an edit after the fact
+    rows = both_arms("task-a", "model-a", 1, 0.9, None) + nan_row + both_arms("task-a", "model-a", 3, 0.6, 0.2)
+    pairing = pair_rows(rows, named())
+    assert pairing.differences.matrix == pytest.approx(np.array([[0.4]]))
+    assert (pairing.n_pairs, pairing.n_pairs_missing) == (1, 2)
+
+
+def test_s05_an_outcome_that_is_missing_everywhere_leaves_no_cluster_not_a_zero_effect():
+    """S05: with every outcome missing there is nothing to estimate, so the matrix is empty rather than zero."""
+    pairing = pair_rows(
+        both_arms("task-a", "model-a", 1, None, None) + both_arms("task-b", "model-a", 1, None, 0.1), named()
+    )
+    assert pairing.differences.matrix.shape == (0, 0)
+    assert pairing.n_clusters_dropped == 1
+    assert pairing.n_pairs_missing == 2
+
+
+def test_a_seed_is_compared_as_text_so_1_and_the_string_1_are_one_seed():
+    """The run key writes the seed canonically; an int and its decimal string name the same pair."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.9, condition="cond-a"),
+        make_row("task-a", "model-a", "1", 0.4, condition="cond-b"),
+    ]
+    assert pair_rows(rows, named()).n_pairs == 1
+
+
+def test_two_rows_with_one_run_key_in_an_arm_are_refused():
+    """Run keys are unique; a repeated attempt is not averaged away."""
+    rows = [*both_arms("task-a", "model-a", 1, 0.9, 0.5), make_row("task-a", "model-a", 1, 0.8, condition="cond-a")]
+    with pytest.raises(
+        ValueError, match=r"share one run key \(run 'task=task-a\|model=model-a\|seed=1\|condition=cond-a'\)"
+    ):
+        pair_rows(rows, named())
+
+
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        (bad_row({}, {"group": "grp-a"}), "has no outcome 'score'"),
+        (bad_row({"score": 0.1}, {}), "has no cluster attribute 'group'"),
+        (bad_row({"score": True}, {"group": "grp-a"}), "must be a number or None"),
+        (bad_row({"score": "0.1"}, {"group": "grp-a"}), "must be a number or None"),
+        (bad_row({"score": math.inf}, {"group": "grp-a"}), "is infinite"),
+    ],
+)
+def test_a_malformed_row_is_refused_and_named(row, message):
+    """Validate at the boundary: the message names the contrast and the run, and never echoes an outcome."""
+    rows = [row, make_row("task-a", "model-a", 1, 0.5, condition="cond-b")]
+    with pytest.raises(ValueError, match=message) as caught:
+        pair_rows(rows, named())
+    assert "'a-vs-b'" in str(caught.value)
+    assert "run 'task=task-a|model=model-a|seed=1" in str(caught.value)
+
+
+def test_a_factor_contrast_refuses_a_row_without_the_factor():
+    """The varying factor must be declared on every row the contrast reads."""
+    with pytest.raises(ValueError, match="has no factor 'gate'"):
+        pair_rows([make_row("task-a", "model-a", 1, 0.5)], by_factor())
+
+
+def test_a_task_in_two_clusters_is_refused():
+    """The unit of inference is unambiguous: one task, one cluster."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5) + both_arms("task-a", "model-a", 2, 0.9, 0.5, cluster="grp-b")
+    with pytest.raises(ValueError, match="task 'task-a' belongs to two clusters"):
+        pair_rows(rows, named())
+
+
+def test_a_spec_has_exactly_one_form_with_two_different_arms():
+    """A contrast is two conditions or a factor with two levels, and never the same arm twice."""
+    with pytest.raises(ValueError, match="not both"):
+        ContrastSpec("x", "score", "est", "group", conditions=("a", "b"), factor="gate", levels=("open", "shut"))
+    with pytest.raises(ValueError, match="give two conditions, or a factor with two levels"):
+        ContrastSpec("x", "score", "est", "group", factor="gate")
+    with pytest.raises(ValueError, match="two different names"):
+        ContrastSpec("x", "score", "est", "group", conditions=("a", "a"))
+    with pytest.raises(ValueError, match="two different names"):
+        ContrastSpec("x", "score", "est", "group", factor="gate", levels=("open", "open"))
+
+
+def test_a_task_one_arm_did_not_run_is_dropped_named_and_counted_and_its_runs_are_unpaired():
+    """A condition that runs on some tasks only: the tasks missing in either arm leave the contrast, by name."""
+    rows = [
+        *both_arms("task-a", "model-a", 1, 0.9, 0.5, cluster="grp-a"),
+        make_row("task-b", "model-a", 1, 0.8, condition="cond-a", cluster="grp-a"),  # task-b has no B run
+        make_row("task-b", "model-a", 2, 0.8, condition="cond-a", cluster="grp-a"),
+        make_row("task-c", "model-a", 1, 0.2, condition="cond-b", cluster="grp-b"),  # task-c has no A run
+        *both_arms("task-d", "model-a", 1, 0.7, 0.4, cluster="grp-b"),
+    ]
+    pairing = pair_rows(rows, named())
+    assert pairing.tasks_dropped == ("task-b", "task-c")
+    assert pairing.n_tasks_dropped == 2
+    assert pairing.n_unpaired == 3  # the three runs on the dropped tasks
+    assert pairing.differences.matrix == pytest.approx(np.array([[0.4], [0.3]]))  # only task-a and task-d count
+
+
+def test_a_cluster_whose_tasks_are_all_dropped_is_dropped_with_them():
+    """The clusters of the dropped tasks are counted as dropped when nothing else keeps them."""
+    rows = [
+        *both_arms("task-a", "model-a", 1, 0.9, 0.5, cluster="grp-a"),
+        make_row("task-b", "model-a", 1, 0.8, condition="cond-a", cluster="grp-b"),
+        make_row("task-c", "model-a", 1, 0.8, condition="cond-a", cluster="grp-b"),
+    ]
+    pairing = pair_rows(rows, named())
+    assert pairing.differences.clusters == ("grp-a",)
+    assert pairing.n_clusters_dropped == 1
+    assert pairing.tasks_dropped == ("task-b", "task-c")
+
+
+def test_no_task_is_dropped_when_both_arms_run_the_same_ones_even_with_runs_missing():
+    """A run missing on a task both arms ran is an unpaired run, not a dropped task."""
+    rows = [*both_arms("task-a", "model-a", 1, 0.9, 0.5), make_row("task-a", "model-a", 2, 0.4, condition="cond-a")]
+    pairing = pair_rows(rows, named())
+    assert (pairing.tasks_dropped, pairing.n_unpaired) == ((), 1)
+
+
+def test_a_factor_contrast_drops_tasks_the_same_way():
+    """The count is by arm, whichever way the arms are named."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.8, gate="open"),
+        make_row("task-a", "model-a", 1, 0.5, gate="shut"),
+        make_row("task-b", "model-a", 1, 0.8, gate="open"),
+    ]
+    assert pair_rows(rows, by_factor()).tasks_dropped == ("task-b",)
+
+
+@pytest.mark.parametrize("margin", [0, -0.1, math.inf, math.nan, "wide", True])
+def test_a_spec_refuses_an_equivalence_margin_that_is_not_a_positive_finite_number(margin):
+    """The margin is checked where the contrast is built, whoever builds it."""
+    with pytest.raises(ValueError, match="equivalence margin must be a positive finite number"):
+        ContrastSpec("x", "score", "est", "group", conditions=("a", "b"), equivalence_margin=margin)
+
+
+def test_a_spec_keeps_a_valid_margin_and_defaults_to_none():
+    """No margin unless one is declared."""
+    assert ContrastSpec("x", "score", "est", "group", conditions=("a", "b")).equivalence_margin is None
+    assert (
+        ContrastSpec("x", "score", "est", "group", conditions=("a", "b"), equivalence_margin=0.1).equivalence_margin
+        == 0.1
+    )

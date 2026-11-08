@@ -1,0 +1,368 @@
+"""Health that cannot be read is unhealthy; an outage holds all dispatch for one attempt (C11)."""
+
+import json
+import threading
+import time
+
+import pytest
+from campaign_support import LATER, NOW, planned_store
+
+from expcore.campaign.healthgate import (
+    FOUND,
+    GO,
+    HOLD,
+    META,
+    Health,
+    HealthGate,
+    alarms,
+    fact,
+    parse,
+    read_health,
+)
+
+
+class Check:
+    """A health check that answers from a list, then keeps the last answer; it counts its calls."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        answer = self.answers[0] if len(self.answers) == 1 else self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def gate_for(tmp_path, check, **options):
+    store, _, _ = planned_store(tmp_path)
+    clock = iter(f"2026-01-01T00:{minute:02d}:00Z" for minute in range(1, 60))
+    gate = HealthGate(store, check, lambda: next(clock), **options)
+    gate.load()
+    return gate, store
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [OSError("cannot reach"), None, "healthy", True, (1, "x"), ("yes", "x"), (True,), [True, "a", "b"]],
+)
+def test_c11_a_check_that_cannot_be_read_is_unhealthy(answer):
+    """C11: a check that raises, or answers something that is not (ok, detail), is a failed check and never a pass."""
+    health = read_health(Check(answer))
+    assert health.ok is False
+    assert health.detail
+
+
+def test_c11_a_check_that_answers_properly_is_taken_at_its_word():
+    """C11: a Health, or a pair with a real boolean, is read as given."""
+    assert read_health(Check(Health(True, "fine"))) == Health(True, "fine")
+    assert read_health(Check((False, "down"))) == Health(False, "down")
+
+
+def test_c11_a_failed_check_holds_all_dispatch_for_one_attempt_per_outage(tmp_path):
+    """C11: the first failed check closes the gate and charges its run; every other run is held, none is charged."""
+    check = Check(Health(False, "platform unreachable"))
+    gate, store = gate_for(tmp_path, check)
+    first = gate.before_run("run-a")
+    assert (first.verdict, first.detail) == (FOUND, "platform unreachable")
+    assert gate.closed
+    calls = check.calls
+    assert gate.before_run("run-b").verdict == HOLD  # held without even a check
+    assert check.calls == calls
+    [outage] = parse(store.get_meta(META))
+    assert (outage["end_utc"], outage["first_detail"]) == (None, "platform unreachable")
+    assert [e["kind"] for e in store.q("SELECT kind FROM events")] == ["health_gate_closed"]
+
+
+@pytest.mark.parametrize("mine", [Health(False, "mine failed too"), Health(True, "mine passed")])
+def test_c11_a_run_whose_check_returns_after_another_run_closed_the_gate_is_held_not_charged(tmp_path, mine):
+    """C11: a check, failing or passing, that returns after another run closed the gate starts and charges nothing."""
+    holder = {}
+
+    def racing():
+        holder["gate"]._close("run-other", "the other run's check failed first")
+        return mine
+
+    gate, _ = gate_for(tmp_path, racing)
+    holder["gate"] = gate
+    assert gate.before_run("run-a").verdict == HOLD
+    assert len(parse(gate.store.get_meta(META))) == 1  # one outage, found by the other run
+
+
+def test_c11_unreadable_state_blocks_dispatch_until_a_check_passes(tmp_path):
+    """C11: the dispatcher's own check keeps the gate closed while it fails, and the first pass opens it."""
+    check = Check(Health(False, "down"), Health(False, "still down"), Health(False, "still down"), Health(True, "up"))
+    gate, store = gate_for(tmp_path, check)
+    assert gate.before_run("run-a").verdict == FOUND
+    assert gate.poll() is False
+    assert gate.closed
+    assert gate.poll() is False
+    assert gate.poll() is True
+    assert not gate.closed
+    assert gate.before_run("run-b").verdict == GO
+    [outage] = parse(store.get_meta(META))
+    assert (outage["how"], outage["checks"], outage["last_detail"]) == ("check_passed", 3, "up")
+    assert "health_gate_opened" in [e["kind"] for e in store.q("SELECT kind FROM events")]
+
+
+def test_c11_a_closed_gate_survives_a_restart_and_is_checked_at_once(tmp_path):
+    """C11: a gate closed when the last process ended is closed again; the restart is counted and charges nothing."""
+    store, _, _ = planned_store(tmp_path)
+    clock = lambda: NOW  # noqa: E731
+    first = HealthGate(store, Check(Health(False, "down")), clock)
+    first.load()
+    assert first.before_run("run-a").verdict == FOUND
+    second = HealthGate(store, Check(Health(True, "up")), clock)
+    second.load()
+    assert second.closed
+    assert second.check_now
+    assert parse(store.get_meta(META))[0]["restarts"] == 1
+    assert "health_gate_restored" in [e["kind"] for e in store.q("SELECT kind FROM events")]
+    assert second.poll() is True
+
+
+def test_c11_an_unreadable_gate_state_at_restart_opens_closed(tmp_path):
+    """C11: a record that cannot be read reads as closed, until a check passes."""
+    store, _, _ = planned_store(tmp_path)
+    store.put_meta(META, "{this is not an outage list", NOW)
+    gate = HealthGate(store, Check(Health(True, "up")), lambda: LATER)
+    gate.load()
+    assert gate.closed
+    assert gate.before_run("run-a").verdict == HOLD
+    assert "health_gate_record_unreadable" in [e["kind"] for e in store.q("SELECT kind FROM events")]
+    assert gate.poll() is True
+    assert not gate.closed
+    assert parse(store.get_meta(META))[0]["first_detail"] == "the stored outage record was unreadable"
+
+
+def test_c11_a_check_that_does_not_answer_in_time_reads_as_down_and_its_late_answer_is_dropped(tmp_path):
+    """C11: a hung check is down; no second check starts while it is out; its late pass never opens the gate."""
+    release = threading.Event()
+
+    def hung():
+        release.wait(10)
+        return Health(True, "late")
+
+    gate, _ = gate_for(tmp_path, Check(Health(False, "down")), timeout_s=0.1)
+    gate.before_run("run-a")
+    gate.check = hung
+    assert gate.poll() is False  # timed out
+    assert gate.closed
+    assert "did not answer within" in parse(gate.store.get_meta(META))[0]["last_detail"]
+    assert gate.poll() is False  # the first is still out
+    assert "still not answered" in parse(gate.store.get_meta(META))[0]["last_detail"]
+    release.set()
+
+
+class Hang:
+    """A health check that does not answer until it is let go; it counts the calls that reached it."""
+
+    def __init__(self, then=None):
+        self.release, self.then, self.calls = threading.Event(), then or Health(True, "late"), 0
+
+    def __call__(self):
+        self.calls += 1
+        self.release.wait(30)
+        return self.then
+
+
+def test_c11_a_pre_run_check_that_hangs_reads_as_down_after_the_timeout_and_charges_the_one_attempt(tmp_path):
+    """C11: the pre-run callback runs in a worker thread with the timeout: a hang is a failed check, not a hung run."""
+    hang = Hang()
+    gate, _ = gate_for(tmp_path, hang, timeout_s=0.1)
+    began = time.monotonic()
+    verdict = gate.before_run("run-a")
+    assert time.monotonic() - began < 5
+    assert verdict.verdict == FOUND  # unhealthy: the gate closes and this run is the outage's one attempt
+    assert "did not answer within" in verdict.detail
+    assert gate.closed
+    hang.release.set()
+
+
+def test_c11_a_post_run_check_that_hangs_reads_as_down_after_the_timeout(tmp_path):
+    """C11: the post-run callback is bounded too, and a timeout is unhealthy, never a pass."""
+    hang = Hang()
+    gate, _ = gate_for(tmp_path, hang, timeout_s=0.1)
+    began = time.monotonic()
+    health, outage = gate.after_run()
+    assert time.monotonic() - began < 5
+    assert not health.ok
+    assert "did not answer within" in health.detail
+    assert outage is None  # the gate was open, so this check does not close it
+    hang.release.set()
+
+
+def test_c11_a_hung_check_blocks_the_next_ones_from_starting_and_reads_as_down(tmp_path):
+    """C11: while a check that outlived its time is out no second one starts behind it; once it answers they do."""
+    hang = Hang()
+    gate, _ = gate_for(tmp_path, hang, timeout_s=0.1)
+    gate.after_run()
+    health, _ = gate.after_run()
+    assert not health.ok
+    assert "still not answered" in health.detail
+    assert hang.calls == 1
+    hang.release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not gate.after_run()[0].ok:
+        time.sleep(0.02)
+    assert gate.after_run()[0].ok
+
+
+def test_c11_ending_the_campaign_stops_the_wait_for_a_hanging_pre_run_check_and_charges_nothing(tmp_path):
+    """C11: a pre-run check that hangs never blocks a shutdown; one cut short holds the run and closes no gate."""
+    hang = Hang()
+    gate, store = gate_for(tmp_path, hang, timeout_s=60)
+    stop = threading.Event()
+    gate.start(stop)
+    threading.Timer(0.1, stop.set).start()
+    began = time.monotonic()
+    verdict = gate.before_run("run-a")
+    assert time.monotonic() - began < 5
+    assert verdict.verdict == HOLD
+    assert not gate.closed
+    assert parse(store.get_meta(META)) in ([], None)  # no outage was recorded
+    assert gate.before_run("run-b").verdict == HOLD  # and nothing new is asked once the campaign is ending
+    assert hang.calls == 1
+    hang.release.set()
+    gate.join()
+
+
+def test_c11_a_post_run_check_is_not_cut_short_by_the_end_of_the_campaign(tmp_path):
+    """C11 and C07: a finished result is judged by the answer, so a shutdown does not relabel it; the timeout may."""
+    slow = Hang(Health(True, "up"))
+    gate, _ = gate_for(tmp_path, slow, timeout_s=10)
+    stop = threading.Event()
+    gate.start(stop)
+    stop.set()
+    threading.Timer(0.2, slow.release.set).start()
+    health, outage = gate.after_run()
+    assert health == Health(True, "up")  # it waited for the answer although the campaign was already ending
+    assert outage is None
+    hung = Hang()
+    gate2, _ = gate_for(tmp_path / "second", hung, timeout_s=0.1)
+    gate2.start(stop)
+    began = time.monotonic()
+    assert not gate2.after_run()[0].ok  # a hang is still bounded by the timeout, and reads as down
+    assert time.monotonic() - began < 5
+    hung.release.set()
+    gate.join()
+    gate2.join()
+
+
+class FirstHangs:
+    """A health check whose first call hangs until it is let go and whose later calls answer healthy at once."""
+
+    def __init__(self):
+        self.release, self.calls = threading.Event(), 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls == 1:
+            self.release.wait(30)
+        return Health(True, "up")
+
+
+def test_c11_a_pre_run_check_cancelled_at_shutdown_does_not_turn_another_workers_post_run_check_unhealthy(tmp_path):
+    """C11 and C07: worker A's successful post-run check stays healthy when shutdown cancels worker B's pre-run check:
+    a cancelled wait is abandoned, not hung, and says nothing of another check's answer."""
+    check = FirstHangs()
+    gate, _ = gate_for(tmp_path, check, timeout_s=60)
+    stop = threading.Event()
+    gate.start(stop)
+    threading.Timer(0.1, stop.set).start()
+    assert gate.before_run("run-b").verdict == HOLD  # B is cancelled by the end of the campaign, its callback still out
+    health, outage = gate.after_run()  # A's result is judged by A's own answer
+    assert health == Health(True, "up")
+    assert outage is None
+    assert check.calls == 2
+    check.release.set()
+    gate.join()
+
+
+def test_c11_a_cancelled_check_counts_as_hung_once_its_own_timeout_has_elapsed(tmp_path):
+    """C11: abandoned is not hung until the callback's own time is up; then it blocks the next ones like any hang."""
+    check = FirstHangs()
+    gate, _ = gate_for(tmp_path, check, timeout_s=0.3)
+    stop = threading.Event()
+    gate.start(stop)
+    threading.Timer(0.05, stop.set).start()
+    assert gate.before_run("run-b").verdict == HOLD
+    time.sleep(0.4)  # the abandoned callback's own timeout has passed and it still has not answered
+    health, _ = gate.after_run()
+    assert not health.ok
+    assert "still not answered" in health.detail
+    assert check.calls == 1  # and no second callback was started behind it
+    check.release.set()
+    gate.join()
+
+
+def test_c11_checks_of_several_workers_run_at_once_and_none_reads_as_still_out(tmp_path):
+    """C11: a slow check that is within its time does not make the check of another worker fail."""
+    check = Hang(Health(True, "up"))
+    gate, _ = gate_for(tmp_path, check, timeout_s=10)
+    verdicts = []
+    workers = [threading.Thread(target=lambda: verdicts.append(gate.before_run("run"))) for _ in range(3)]
+    for worker in workers:
+        worker.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and check.calls < 3:
+        time.sleep(0.01)
+    check.release.set()
+    for worker in workers:
+        worker.join(10)
+    assert check.calls == 3
+    assert [v.verdict for v in verdicts] == [GO, GO, GO]
+
+
+def test_c11_the_gates_own_thread_opens_it_on_the_first_passing_check(tmp_path):
+    """C11: while the gate is closed the dispatcher checks every period itself and tells the caller when it opens."""
+    gate, _ = gate_for(tmp_path, Check(Health(False, "down"), Health(True, "up")), recheck_s=0.01)
+    gate.before_run("run-a")
+    opened, stop = threading.Event(), threading.Event()
+    gate.start(stop, opened.set)
+    try:
+        assert opened.wait(10)
+    finally:
+        stop.set()
+        gate.join()
+    assert not gate.closed
+
+
+def test_c11_a_failed_post_run_check_is_the_outages_only_when_the_gate_is_closed_as_it_returns(tmp_path):
+    """C11: ordered by the instant the check returns: closed then, it is the outage's and is counted in its record."""
+    gate, store = gate_for(tmp_path, Check(Health(True, "up")))
+    health, outage = gate.after_run()
+    assert health.ok
+    assert outage is None
+    gate.check = Check(Health(False, "down"))
+    health, outage = gate.after_run()
+    assert not health.ok
+    assert outage is None  # the gate was still open: this check does not close it
+    assert gate.before_run("run-a").verdict == FOUND
+    _, outage = gate.after_run()
+    assert outage is not None
+    gate.note_discard(outage, 100, 20)
+    gate.note_discard(outage, None, None)
+    [record] = parse(store.get_meta(META))
+    assert (record["discarded"], record["discarded_usage_unknown"]) == (2, 1)
+    assert (record["discarded_input_tokens"], record["discarded_output_tokens"]) == (100, 20)
+
+
+def test_c11_the_status_names_a_closed_gate_and_an_unreadable_record():
+    """C11: the alarm says the gate is closed, and an unreadable record is unknown, never 'no outage'."""
+    unreadable = fact("{broken")
+    assert unreadable == {"readable": False, "outages": None, "open": None}
+    assert "unreadable" in alarms(unreadable, 30)[0]
+    closed = fact(json.dumps({"outages": [{"start_utc": NOW, "end_utc": None, "checks": 2, "last_detail": "down"}]}))
+    assert "HEALTH GATE CLOSED since" in alarms(closed, 30)[0]
+    assert alarms(fact(None), 30) == []
+    assert alarms(fact(json.dumps({"outages": [{"start_utc": NOW, "end_utc": LATER}]})), 30) == []
+
+
+def test_c11_the_limits_are_checked(tmp_path):
+    """C11: a period or timeout that cannot work is refused."""
+    store, _, _ = planned_store(tmp_path)
+    with pytest.raises(ValueError, match="positive"):
+        HealthGate(store, Check(Health(True, "up")), lambda: NOW, recheck_s=0)

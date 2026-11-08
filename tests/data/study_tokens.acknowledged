@@ -1,0 +1,11 @@
+# Findings in commits that are already pushed and cannot be rewritten, accepted one by one.
+# Line format: <full 40-hex commit id> <path>:<line> <hash prefix, 12 hex>
+# Only check-commits on historical commits honours this file: the working-tree check ignores it, and an
+# entry naming the current commit is refused; a redacted path cannot be acknowledged. Never write the matched text here.
+#
+# An early test fixture used a real short name; later commits replaced it with an invented one.
+cce4dec3b00d666f375eab59a5d8686ec378566e tests/test_check_commits.py:11 01d3ff1052a5
+cce4dec3b00d666f375eab59a5d8686ec378566e tests/test_study_tokens.py:15 01d3ff1052a5
+cce4dec3b00d666f375eab59a5d8686ec378566e tests/test_study_tokens.py:106 01d3ff1052a5
+cce4dec3b00d666f375eab59a5d8686ec378566e tests/test_study_tokens.py:110 01d3ff1052a5
+76390b346c47f9e435701467a9c3abe398b007d4 tests/test_check_commits.py:11 01d3ff1052a5

@@ -100,11 +100,11 @@ tools = "read"
 - identity: run key, factor values, attempt number;
 - route: backend, model, base URL without credentials, SDK versions, settings actually sent (B15);
 - prompt: template and rendered hashes, slot values, tool manifest hash (L06);
-- agent configuration as resolved for this run, not as a hash: turn, wall-time, token and output caps, the malformed-call policy (L01), reasoning echo and other per-model rules, retry policy; replay reads these values from the record, and a table maps each older schema version to the defaults then in force (WWW `replay.py:352-371`);
+- agent configuration as resolved for this run, not as a hash: turn, wall-time, token and output caps, the whole-time ceiling and the infrastructure kind it ends as (L04), the minimum time to start a tool call (L05), the terminal tools (L09), the malformed-call policy (L01), reasoning echo and other per-model rules, retry policy; replay reads these values from the record, and a table maps each older schema version to the defaults then in force (WWW `replay.py:352-371`);
 - code stamp and core version (P01, P02);
 - transcript: per turn the neutral message, the native provider message, stop reason, usage (`None` when unreported, R10), served model and fingerprint (B06), retries with their errors, the echoed-request digest (R06);
-- tool calls: arguments, raw arguments when malformed (L01), the exact text the model saw, the raw result, status, timings;
-- clock readings at every point the loop reads the clock;
+- tool calls: arguments, raw arguments when malformed (L01), the exact text the model saw, the raw result, status, timings, and two truncation flags kept apart: the harness cap's (L06) and the data source's own row or size limit, as the provider reports it (L07);
+- clock readings at every point the loop reads the clock, the boundaries of waits on infrastructure (measured live through the call context, L04) and the loop's looks at a running call included; the agent's time, the waits and `cleanup_s` (harness time spent stopping a cut call, never charged to the agent) add up to the elapsed time;
 - outcome from a closed vocabulary, and infrastructure kind when it applies (C02);
 - instrument outputs, each under its own namespace;
 - scores, kept apart and recomputable.
@@ -143,7 +143,7 @@ Two planes per run, each with its own principal and its own token, never shared.
 | Examination before use | fail-closed: refused unless the caveats are exactly the data-path set (ICSA `tokencheck.py:40-60`) | fail-closed: refused unless the caveats and the principal's effective privileges equal the condition's declared set, no more and no less |
 | Further enforcement | data gate allows only read calls; read-only mount and root filesystem | server-side tool allow-list per condition; frozen manifest |
 
-ICSA's six enforcement points ([inventory](inventory.md#read-only-enforcement-in-icsa)) all apply to the data path and stay fail-closed (O05); they are parameterised by plane, so the tool-server plane is checked against its own declared set rather than against "read-only". The MCP server's own token policy is not an enforcement point, because it keeps write tools when examination fails. Both tokens get lifetimes derived from the run's time cap (O06); neither value is ever recorded (R12). The agent's own data path stays read-only in every condition, including those that grant the tool server write rights.
+ICSA's six enforcement points ([inventory](inventory.md#read-only-enforcement-in-icsa)) all apply to the data path and stay fail-closed (O05); they are parameterised by plane, so the tool-server plane is checked against its own declared set rather than against "read-only". The MCP server's own token policy is not an enforcement point, because it keeps write tools when examination fails. Both tokens get lifetimes derived from the run's time cap (O06); neither value is ever recorded (R12). A minted token sits in no environment variable, so redaction cannot find it unless told: the platform layer registers every token it mints with `expcore.records.redact.register_secret` before the token is used. The agent's own data path stays read-only in every condition, including those that grant the tool server write rights.
 
 Tool exposure is declared per condition as an allow-list; the server enforces it, the client checks the server's manifest against a frozen copy per condition, and an extra or missing tool fails the start (L13). Two conditions that differ only in tool exposure, or only in tool-server rights, run side by side in one campaign: each run leases its own principals, so no privilege set is shared. An equality check (ICSA `knowledge/equality.py`) confirms the agent sees exactly the declared difference.
 
@@ -196,7 +196,11 @@ Each token is normalised (Unicode NFKC, case-folded, surrounding whitespace remo
 2. Split each into maximal runs of letters, digits and `_ . -`; this separates URL schemes, paths, ports, queries and assignments.
 3. From each run, emit every contiguous sequence of its components (split at `_`, `.` and `-`), re-joined with the separators it had. A hostname inside a URL, a space name inside a path and a name inside a composed identifier all become candidates.
 
-The test hashes every candidate and fails on a match, with fixtures for URLs, paths and composed names. Tokens shorter than four characters, such as single-letter option names, match only as a whole string literal or identifier, to avoid false positives. The hashes keep the names out of casual reading; a determined reader can still confirm a guessed name, so the list must not hold anything secret.
+The check hashes every candidate in every tracked file, and in each file's path, and fails on a match; findings print only a hash prefix, and a matching path is redacted. Tokens shorter than four characters match only as a whole string literal or identifier, to avoid false positives. Each hash carries a scope taken from the token's category:
+- **code** (conditions, data states, tasks, datasets, models, repositories): names a study chose, which code must not hard-code but prose may mention;
+- **all** (hosts, addresses, spaces, providers, users, environment variables): private everywhere.
+
+Prose (Markdown anywhere, and everything under `docs/`) is checked against `all` hashes only. `make check` runs the check over the working tree, and CI runs it over every commit of a push or pull request. A missing or empty hash file fails both, so deleting it cannot switch the check off. The hashes keep the names out of casual reading; a determined reader can still confirm a guessed name, so the list must not hold anything secret.
 
 ## Out of scope
 

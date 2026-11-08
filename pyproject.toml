@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "papers-experiments-core"
+version = "0.1.0.dev0"
+description = "Reusable core for agentic experiment studies: loop, records, campaigns, statistics and provenance tooling."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=2.6.0",
+    "httpx>=0.28.1",
+    "mcp>=2.3.0",
+    "numpy>=2.5.4",
+    "openai>=3.46.0",
+    "scipy>=1.18.1",
+]
+
+[project.optional-dependencies]
+onedata = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/expcore", "src/expcore_onedata"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --import-mode=importlib"
+# Helper modules shared by several test files live here, outside any package, and are imported by plain name.
+pythonpath = ["tests/support"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+# Template tooling under .claude/ is not this project's code.
+extend-exclude = [".claude"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# The source line of a sanitised import's provenance header (repository, 40-character commit, path, 40-character
+# blob) has a fixed format and is longer than the line limit. Each imported module is listed here; the formatter
+# still wraps its code at the limit.
+"src/expcore/errors.py" = ["E501"]
+"src/expcore/models/adapters.py" = ["E501"]
+"src/expcore/models/served.py" = ["E501"]
+"src/expcore/provenance/codestamp.py" = ["E501"]
+"src/expcore/config/models.py" = ["E501"]
+"src/expcore/loop/agent_loop.py" = ["E501"]
+"src/expcore/loop/capping.py" = ["E501"]
+"src/expcore/prompt/templates.py" = ["E501"]
+"src/expcore/tools/mcp_client.py" = ["E501"]
+"src/expcore/tools/manifest.py" = ["E501"]
+"src/expcore/records/record.py" = ["E501"]
+"src/expcore/replay/replay.py" = ["E501"]
+"src/expcore/replay/check.py" = ["E501"]
+"src/expcore/campaign/manifest.py" = ["E501"]
+"src/expcore/campaign/store.py" = ["E501"]
+"src/expcore/campaign/export.py" = ["E501"]
+"src/expcore/stats/contrasts.py" = ["E501"]
+"src/expcore/stats/prereg.py" = ["E501"]
+"src/expcore/stats/sim.py" = ["E501"]
+"src/expcore/stats/power.py" = ["E501"]
+"src/expcore/coding/kappa.py" = ["E501"]
+"src/expcore/campaign/scheduler.py" = ["E501"]
+"src/expcore/campaign/gate.py" = ["E501"]
+"src/expcore/campaign/attempt_bounds.py" = ["E501"]
+"src/expcore/campaign/healthgate.py" = ["E501"]
+"src/expcore/campaign/harness_stop.py" = ["E501"]
+"src/expcore/campaign/release.py" = ["E501"]
+"src/expcore/campaign/lease.py" = ["E501"]
+"src/expcore/campaign/reservation.py" = ["E501"]
