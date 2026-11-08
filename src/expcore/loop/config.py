@@ -102,7 +102,9 @@ class AgentConfig:
         elif not (math.isfinite(self.ceiling_s) and cap <= self.ceiling_s):
             problems.append("ceiling_s must be finite and not below time_cap_s")
         elif factor is not None and not math.isclose(self.ceiling_s, cap * factor):
-            problems.append("give ceiling_s or ceiling_factor, not two that disagree")
+            problems.append(
+                "ceiling_s and ceiling_factor disagree: give one (a copy with another time cap passes ceiling_s=None)"
+            )
         return problems
 
     def timer(self, clock: Callable[[], float] = time.monotonic) -> AgentTimer:
@@ -114,5 +116,9 @@ class AgentConfig:
         return dataclasses.asdict(self)
 
     def config_sha256(self) -> str:
-        """Return the SHA-256 of the canonical form of every value; any cap that differs gives a different hash."""
+        """Return the SHA-256 of the canonical form of every value; any cap that differs gives a different hash.
+
+        A run's result hashes the record it keeps, which adds the terminal tools: that hash is
+        `config_sha256_of(result.config)`, not this one.
+        """
         return config_sha256_of(self.as_dict())
