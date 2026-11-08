@@ -42,6 +42,7 @@ def test_a_changed_input_schema_is_a_difference():
 
 
 def test_l13_mismatches_name_extra_and_missing_tools():
+    """L13: an extra tool and a missing tool are each a mismatch that names the tool."""
     frozen = frozen_of(tool("a"), tool("b"))
     assert mismatches([tool("a"), tool("b")], frozen) == []
     problems = mismatches([tool("a"), tool("x")], frozen)
@@ -50,6 +51,7 @@ def test_l13_mismatches_name_extra_and_missing_tools():
 
 
 def test_l13_the_allow_list_must_equal_what_the_server_shows():
+    """L13: an allow-list name the server lacks, and a tool shown outside the allow-list, both fail."""
     frozen = frozen_of(tool("a"), tool("b"))
     live = [tool("a"), tool("b")]
     assert mismatches(live, frozen, ["a", "b"]) == []

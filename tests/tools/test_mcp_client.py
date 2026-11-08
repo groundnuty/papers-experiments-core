@@ -140,6 +140,7 @@ def test_l14_a_server_that_never_answers_fails_the_start_within_the_bound_and_le
 
 
 def test_l14_a_command_that_cannot_be_launched_is_a_broken_server(frozen):
+    """L14: a server that cannot even be spawned fails the start as knowledge infrastructure."""
     error = start_fails(McpToolProvider("/nonexistent/server-binary", [], frozen=frozen))
     assert isinstance(error, InfraError)
     assert error.kind == "knowledge"

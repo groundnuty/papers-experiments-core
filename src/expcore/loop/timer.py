@@ -1,5 +1,6 @@
 # Provenance: new
 #   merged: www-2027-experiments @ 46a5828d, harness/agent/loop.py:933-936
+#   merged: www-2027-experiments @ 46a5828d, harness/agent/loop.py:636-651
 """The run's clock: injected, recorded at every reading, and charging the agent only for its own time (L04).
 
 The agent's time is the elapsed time minus the time its tool calls spent waiting on infrastructure. The wall cap
