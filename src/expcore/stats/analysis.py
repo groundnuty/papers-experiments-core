@@ -32,6 +32,7 @@ from expcore.stats import estimators, power
 from expcore.stats.estimators import ModelEstimate, PairedDifferences
 from expcore.stats.pairing import ContrastSpec, pair_rows
 from expcore.stats.prereg import Preregistration, name_digest
+from expcore.stats.rejection import rejects
 from expcore.stats.rows import Row
 
 CONCLUSIONS = ("difference", "not_detected", "equivalent")
@@ -154,7 +155,7 @@ def run_contrast(
     estimate = estimators.get(spec.estimator)(pairing.differences, prereg.estimator_settings(spec))
     in_family = spec.name in prereg.holm_family
     if significant is None:
-        significant = bool(estimate.p_value <= prereg.alpha)  # False for a NaN p-value
+        significant = bool(rejects(estimate.p_value, prereg.alpha))  # False for a NaN p-value
     interval, equivalent = _equivalence(spec, prereg, pairing.differences)
     return ContrastResult(
         name=spec.name,

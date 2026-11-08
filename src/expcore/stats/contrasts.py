@@ -28,6 +28,8 @@ from collections.abc import Sequence
 import numpy as np
 from scipy import stats
 
+from expcore.stats.rejection import rejects
+
 DEFAULT_SNAP_DECIMALS = 12
 # A draw within this distance of the boundary is a tie and does not support the alternative; it only absorbs
 # floating-point rounding (0.53 - 0.50 is 0.0300...03).
@@ -197,7 +199,7 @@ class HolmResult:
 
     adjusted: tuple[float, ...]  # Holm-adjusted p for reports; NaN where the test had no p-value
     levels: tuple[float, ...]  # the level each p-value is compared with at its step
-    reject: tuple[bool, ...]  # decided by comparing the raw p-value with its level, p <= level
+    reject: tuple[bool, ...]  # decided by comparing the raw p-value with its level, p <= level (see rejects)
 
 
 def holm(p_values: Sequence[float | None], alpha: float) -> HolmResult:
@@ -225,6 +227,6 @@ def holm(p_values: Sequence[float | None], alpha: float) -> HolmResult:
         levels[i] = level(alpha, 1, m - step)
         running = max(running, (m - step) * values[i])
         adjusted[i] = math.nan if missing[i] else min(running, 1.0)
-        stepping = stepping and not missing[i] and values[i] <= levels[i]
+        stepping = stepping and not missing[i] and bool(rejects(values[i], levels[i]))
         reject[i] = stepping
     return HolmResult(tuple(adjusted), tuple(levels), tuple(reject))

@@ -19,6 +19,8 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 from scipy import stats
 
+from expcore.stats.rejection import rejects
+
 
 @dataclasses.dataclass(frozen=True)
 class PowerSettings:
@@ -38,7 +40,8 @@ def power_sim(
     """Power of the paired Wilcoxon signed-rank test, by simulation.
 
     Cluster-level paired differences are drawn from N(delta, sd^2), n clusters per study, `n_sim` studies. The share
-    of studies with a two-sided p-value below alpha is the power. Zero differences are dropped, as in the pipeline.
+    of studies with a two-sided p-value at most alpha is the power (see `rejects`, S06). Zero differences are dropped,
+    as in the pipeline.
     """
     if not (math.isfinite(sd) and sd > 0):
         raise ValueError(f"sd must be a positive number, got {sd}")
@@ -47,7 +50,7 @@ def power_sim(
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be strictly between 0 and 1, got {alpha}")
     draws = rng.normal(delta, sd, size=(n_sim, n))
-    hits = sum(stats.wilcoxon(row, zero_method="wilcox", method=method).pvalue < alpha for row in draws)
+    hits = sum(bool(rejects(stats.wilcoxon(row, zero_method="wilcox", method=method).pvalue, alpha)) for row in draws)
     return hits / n_sim
 
 
@@ -99,7 +102,9 @@ def minimum_detectable_effect(
     Cluster differences are drawn from N(delta, sd^2), `settings.n_simulations` studies of n clusters sharing one set
     of standard normal draws, and delta is found by bisection between 0 and 8 sd to a precision of sd / 1000. The
     result is NaN when even 8 sd does not reach the target power, which is when n is too small for a two-sided test at
-    this alpha to ever reject (five clusters cannot reach p below 0.0625). It scales with sd, since the test sees ranks.
+    this alpha to ever reject (five clusters cannot get a p-value under 0.0625, so they reject only at alpha 0.0625 or
+    more). A study rejects when its p-value is at most alpha (see `rejects`, S06). It scales with sd, since the test
+    sees ranks.
     """
     if not (math.isfinite(sd) and sd > 0):
         raise ValueError(f"sd must be a positive number, got {sd}")
@@ -110,7 +115,7 @@ def minimum_detectable_effect(
     noise = rng.standard_normal((settings.n_simulations, n))
 
     def power(delta: float) -> float:
-        return float((signed_rank_p_values(delta + sd * noise) < alpha).mean())
+        return float(rejects(signed_rank_p_values(delta + sd * noise), alpha).mean())
 
     low, high = 0.0, 8.0 * sd
     if power(high) < settings.target_power:

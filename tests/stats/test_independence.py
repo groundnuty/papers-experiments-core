@@ -66,9 +66,9 @@ def test_s09_the_simulator_imports_numpy_and_the_row_shape_only():
 
 
 def test_s09_the_power_study_imports_numpy_and_scipy_only():
-    """S09: the power functions reach no module of the package apart from the empty package files."""
+    """S09: the power functions reach no module of the package but the empty package files and the shared rule."""
     internal, outside = closure("expcore.stats.power")
-    assert internal == {"expcore", "expcore.stats", "expcore.stats.power"}
+    assert internal == {"expcore", "expcore.stats", "expcore.stats.power", "expcore.stats.rejection"}
     assert outside == {"numpy", "scipy"}
 
 
@@ -76,6 +76,13 @@ def test_s09_the_row_shape_and_the_package_files_import_nothing_outside_the_stan
     """S09: what both independent modules share is plain data, so the pipeline cannot reach them through it."""
     internal, outside = closure("expcore.stats.rows")
     assert internal == {"expcore", "expcore.stats", "expcore.stats.rows"}
+    assert outside == set()
+
+
+def test_s06_s09_the_rejection_rule_the_power_study_shares_with_the_pipeline_imports_nothing():
+    """S06, S09: the one comparison that decides a rejection is a leaf, so sharing it opens no path to the pipeline."""
+    internal, outside = closure("expcore.stats.rejection")
+    assert internal == {"expcore", "expcore.stats", "expcore.stats.rejection"}
     assert outside == set()
 
 

@@ -27,6 +27,16 @@ def test_power_is_zero_when_the_smallest_attainable_p_value_exceeds_alpha():
     assert power_sim(sd=0.01, n=5, delta=1.0, alpha=0.1, n_sim=50, rng=rng, method="exact") == 1.0
 
 
+def test_s06_a_p_value_equal_to_alpha_is_a_rejection_in_the_power_and_in_the_minimum_detectable_effect():
+    """S06: five positive clusters give p = 2 / 2**5 = 0.0625 exactly, which alpha = 0.0625 rejects, as Holm does."""
+    rng = np.random.default_rng(1)
+    assert power_sim(sd=0.01, n=5, delta=1.0, alpha=0.0625, n_sim=50, rng=rng, method="exact") == 1.0
+    settings = PowerSettings(1, 200, 5, 0.1, (0.1,))
+    mde = minimum_detectable_effect(1.0, 5, 0.0625, settings, np.random.default_rng(7))
+    assert math.isfinite(mde)
+    assert 0.0 < mde < 8.0
+
+
 def test_power_is_near_alpha_without_an_effect_and_near_one_with_a_large_one():
     """The simulated test holds its level at delta = 0 and detects a difference of two standard deviations."""
     rng = np.random.default_rng(2)
