@@ -227,7 +227,9 @@ def _check_estimator(name: str, case: EstimatorCase, problems: list[str]) -> Non
     label = f"{name} / {case.name}"
     matrix = np.array(case.matrix, dtype=float)
     paired = PairedDifferences(
-        tuple(f"c{i + 1}" for i in range(matrix.shape[0])), tuple(f"m{j + 1}" for j in range(matrix.shape[1])), matrix
+        tuple(f"grp-{'abcdefghij'[i]}" for i in range(matrix.shape[0])),
+        tuple(f"model-{'abcdefgh'[j]}" for j in range(matrix.shape[1])),
+        matrix,
     )
     settings = EstimatorSettings(replicates=200, level=0.95, seed=(1, 2), params=case.params)
     result = estimators.get(name)(paired, settings)
