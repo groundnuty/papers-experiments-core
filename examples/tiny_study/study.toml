@@ -1,0 +1,48 @@
+# A complete minimal study. Every name here belongs to this example; the core knows none of them.
+
+[study]
+name = "tiny-study"
+plugin = "plugin.py"
+# What the code identity covers: the configuration and the code and data the plugin reads.
+code = ["study.toml", "models.toml", "campaign.toml", "preregistration.toml", "plugin.py", "prompt.txt"]
+
+# Two declared factors. `task`, `model` and `seed` are built in.
+[factors.access]
+levels = ["direct", "relay"]
+
+[factors.tools]
+levels = ["basic", "extended"]
+
+[identity]
+order = ["task", "access", "tools", "model", "seed"]
+
+# Three named conditions; each assigns every declared factor.
+[conditions.baseline]
+access = "direct"
+tools = "basic"
+
+# Restricted to a subset of the tasks: a contrast with this condition drops the task it did not run.
+[conditions.extended]
+access = "direct"
+tools = "extended"
+tasks = ["lake", "river", "hill"]
+
+# The condition's manipulation is the tool server failing, so a run that ends in that infrastructure failure is a
+# scored final attempt and is never run again.
+[conditions.relay-down]
+access = "relay"
+tools = "basic"
+infrastructure_is_treatment = ["knowledge"]
+
+# Four tasks. Every key of a task is a text attribute; the preregistration clusters by `region`.
+[tasks.lake]
+region = "north"
+
+[tasks.river]
+region = "north"
+
+[tasks.hill]
+region = "south"
+
+[tasks.dune]
+region = "south"

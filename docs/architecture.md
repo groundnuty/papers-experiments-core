@@ -56,6 +56,8 @@ A study implements these and registers them in `study.toml`; the platform implem
 | `Scorer` | study | a pure function of a record returning two axes (what the agent did; what the platform's state shows), a verdict of fulfilled, violated or not determined, and named numeric outcomes (for example share of the required extent consumed, F1, bytes moved, tokens); it reads only the record | PPAM's `OracleResult`, ICSOC's `lenses/a3b.py`, ICSA's `ScoredRow` ([inventory row 10](inventory.md#10-scoring-helpers)) |
 | `Instrument` | study or platform | hooks at run start and end that write into the record under their own namespace; platform probes (file distribution, transfer records, bytes per provider pair) are instruments and write their snapshot at run end | ICSA's study fields in `RunRecord.extras` and the sandbox metadata the runner parses (`runner.py:163-243`) |
 
+The exact signatures as the code has them, what the core and the implementer each guarantee, and the closed vocabularies are in [`interfaces.md`](interfaces.md).
+
 Scorers read the record and nothing else. In particular, the platform axis of a score comes from the run-end snapshots that platform instruments wrote into the record; no scorer queries the live platform. Re-scoring therefore never needs a model or the platform (R13), and a score computed an hour later equals one computed at run end. An instrument that needs live state records what it read, so replay can serve it.
 
 Outcomes are what the analysis consumes; the verdict alone cannot carry a contrast. An outcome a scorer could not compute is missing (`None`), never zero, and a "not determined" verdict leaves every outcome that depends on the unobserved state missing (R10, S05).

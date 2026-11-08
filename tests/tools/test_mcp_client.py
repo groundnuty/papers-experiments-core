@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 
+import anyio
 import pytest
 from mcp import MCPError, StdioServerParameters
 from mcp.types import CONNECTION_CLOSED, INTERNAL_ERROR, INVALID_PARAMS
@@ -23,20 +24,18 @@ from expcore.tools.mcp_client import McpToolProvider
 SERVER = str(Path(__file__).resolve().parents[1] / "support" / "fake_mcp_server.py")
 
 
-def launch(tools="echo,add", *, suffix="", hang=False, pidfile=None):
+def launch(tools="echo,add", *, suffix="", hang=False):
     """The command and arguments of the fake server, with its server-side allow-list."""
     args = [SERVER, "--tools", tools]
     if suffix:
         args += ["--suffix", suffix]
     if hang:
         args.append("--hang")
-    if pidfile:
-        args += ["--pidfile", str(pidfile)]
     return sys.executable, args
 
 
 def provider(frozen, tools="echo,add", **kwargs):
-    command, args = launch(tools, **{k: kwargs.pop(k) for k in ("suffix", "hang", "pidfile") if k in kwargs})
+    command, args = launch(tools, **{k: kwargs.pop(k) for k in ("suffix", "hang") if k in kwargs})
     kwargs.setdefault("allowed_tools", [t for t in tools.split(",") if t])
     return McpToolProvider(command, args, frozen=frozen, **kwargs)
 
@@ -119,24 +118,71 @@ def test_l13_the_client_does_not_filter_a_server_that_shows_more_than_the_allow_
     assert any("outside the allow-list: ['add']" in p for p in error.problems)
 
 
-def test_l14_a_server_that_never_answers_fails_the_start_within_the_bound_and_leaves_no_child(frozen, tmp_path):
-    """L14: a server that never speaks is broken: the start fails as knowledge infrastructure within the timeout."""
-    pidfile = tmp_path / "pid"
+def wait_for(condition, *, what: str, deadline_s: float = 60.0) -> None:
+    """Poll until `condition()` is true; fail naming `what` after a bound that no loaded machine should reach."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.05)
+    pytest.fail(f"{what} did not happen within {deadline_s:g} s")
+
+
+def test_l14_a_server_that_answers_starts_within_a_generous_bound(frozen):
+    """L14: the success path. The bound is generous (60 s) on a fast server, so a slow disk cannot fail the start."""
+
+    async def go():
+        async with provider(frozen, start_timeout_s=60.0) as p:
+            return [s.name for s in p.tools()]
+
+    assert asyncio.run(go()) == ["add", "echo"]
+
+
+@pytest.fixture
+def spawned(monkeypatch) -> list[int]:
+    """The pid of every process the MCP client spawns, taken from the launcher's own process handle.
+
+    The pid is known the moment the process exists, whatever the child has got round to doing, so a test that asserts
+    the child's end does not wait for a loaded machine to let the child write a file first.
+    """
+    pids: list[int] = []
+    launch_process = anyio.open_process
+
+    async def spy(*args, **kwargs):
+        process = await launch_process(*args, **kwargs)
+        pids.append(process.pid)
+        return process
+
+    monkeypatch.setattr(anyio, "open_process", spy)
+    return pids
+
+
+def test_l14_a_server_that_never_answers_fails_the_start_at_the_bound_and_leaves_no_child(frozen, spawned):
+    """L14: a server that never speaks is broken: the start fails as knowledge infrastructure at its timeout.
+
+    The server sleeps for an hour, so a start that returns at all was cut by the bound. The bound is never honoured
+    early (the lower limit), and the upper limit is loose by tens of seconds: the test does not depend on how fast
+    the machine is, only on the bound being enforced rather than the hour being waited out. The child it started is
+    found by the pid the launcher reports, and must be gone.
+    """
+    bound_s = 1.0
     started = time.monotonic()
-    error = start_fails(provider(frozen, hang=True, pidfile=pidfile, start_timeout_s=1.0))
-    assert time.monotonic() - started < 15
+    error = start_fails(provider(frozen, hang=True, start_timeout_s=bound_s))
+    elapsed = time.monotonic() - started
+    assert bound_s <= elapsed < bound_s + 30
     assert isinstance(error, InfraError)
     assert error.kind == "knowledge"
     assert "did not start within 1 s" in error.detail
-    pid = int(pidfile.read_text())
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
+    assert len(spawned) == 1, "the client was expected to launch the server through anyio.open_process"
+
+    def gone() -> bool:
         try:
-            os.kill(pid, 0)
+            os.kill(spawned[0], 0)
         except ProcessLookupError:
-            return
-        time.sleep(0.1)
-    pytest.fail("the child process of the failed start is still running")
+            return True
+        return False
+
+    wait_for(gone, what="the exit of the failed start's child process")
 
 
 def test_l14_a_command_that_cannot_be_launched_is_a_broken_server(frozen):

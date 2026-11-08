@@ -158,7 +158,7 @@ Groups: [B model backends](#b-model-backends) · [L loop and tools](#l-agent-loo
 
 **C20. Store schema changes are crash-safe.** Add columns one at a time; read-modify-write shared metadata under `BEGIN IMMEDIATE`. *Learned:* ICSA `store.py:80-83, 111-122`. *Test:* a kill between two migrations reopens and finishes.
 
-**C21. A snapshot of a live store is consistent.** Copy with `VACUUM INTO` over a read-only connection and check integrity; a pulled run directory counts only with a marker matching its attempt; the snapshot code must equal the campaign's. *Learned:* ICSA-snap `snapshot/fetch.py:5-16`, `snapshot/codecheck.py:1-12`. *Test:* a partial pull is refused; a code mismatch is refused.
+**C21. A snapshot of a live store is consistent.** Copy with SQLite's online backup API over a read-only connection (not `VACUUM INTO`, which fails on generated columns in older SQLite) and check integrity; a pulled run directory counts only with a marker matching its attempt; the snapshot code must equal the campaign's. *Learned:* ICSA-snap `snapshot/fetch.py:5-16`, `snapshot/codecheck.py:1-12`. *Test:* a partial pull is refused; a code mismatch is refused.
 
 **C22. Model-level infrastructure faults are confirmed before relabelling.** A trigger only holds a model; a frozen probe confirms the fault. *Learned:* WWW `harness/agent/infra_fault.py:1-80`, `fault_probe.py:1-35` (96 attempts of one model excluded; 5f817def, 21 Oct). Follows in v0.2 ([release boundary](architecture.md#release-boundary)). *Test:* WWW `tests/test_infra_fault.py`.
 

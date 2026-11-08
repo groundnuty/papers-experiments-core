@@ -1,0 +1,31 @@
+# The plan and the limits of the campaign: which models and seeds, the loop's caps, the scheduler's caps, the budget.
+
+order_seed = 20260101
+seeds = [1]
+models = ["alpha-stub", "beta-stub"]
+
+# The loop's caps for every run. A run that uses more than four tool rounds ends as a turn cap.
+[agent]
+max_tool_rounds = 4
+time_cap_s = 30
+token_budget = 20000
+output_cap_chars = 500
+max_output_tokens = 256
+
+[scheduler]
+max_attempts = 3
+workers = 1
+retry_delay_s = 0
+poll_interval_s = 0.05
+recheck_s = 1
+health_timeout_s = 5
+lease_timeout_s = 30
+
+# Runs in flight at once per unit; a model's unit is its own key unless [endpoints] says otherwise.
+[scheduler.unit_caps]
+alpha-stub = 1
+beta-stub = 1
+
+# Without a budget runs are not held for cost.
+[budget]
+max_usd = 5.0

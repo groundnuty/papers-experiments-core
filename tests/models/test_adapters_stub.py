@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from expcore.errors import InfraError
-from expcore.models.adapters import ModelTurn, StubAdapter, ToolResult
+from expcore.models.adapters import ModelTurn, StubAdapter, ToolCall, ToolResult
 
 
 def step(backend):
@@ -75,3 +75,22 @@ def test_a_turn_defaults_leave_unreported_fields_none_and_a_non_limit_stop_is_no
     assert (turn.input_tokens, turn.output_tokens, turn.served_model, turn.retries) == (None, None, None, ())
     assert not turn.hit_output_limit
     assert ModelTurn("t", [], 1, 1, None, 0.1).hit_output_limit is False
+
+
+def test_a_ready_made_turn_is_returned_as_it_is_and_a_malformed_call_enters_the_history_as_raw_text():
+    bad = ToolCall("call_1", "lookup", {}, "arguments are not valid JSON (Expecting value)", '{"a":')
+    turn = ModelTurn("", [bad], 10, 5, "tool_calls", 0.0)
+    stub = StubAdapter([turn, "done"])
+    stub.begin("", "task", [])
+    assert step(stub) is turn
+    message = stub.transcript()[-1]
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"_raw": "{\\"a\\":"}'
+    assert step(stub).text == "done"
+
+
+def test_use_replaces_the_script_and_starts_it_again():
+    stub = StubAdapter(["first"])
+    stub.begin("", "task", [])
+    assert step(stub).text == "first"
+    stub.use(["second", "third"])
+    assert [step(stub).text, step(stub).text, step(stub).text] == ["second", "third", "done"]

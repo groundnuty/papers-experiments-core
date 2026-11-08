@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.attempts import (
+    LEASE_OUTCOMES,
     AttemptRefused,
     BegunAttempt,
     PinMismatch,
@@ -73,12 +74,17 @@ _ADDED_COLUMNS = (
     ("attempts", "usage_complete", "INTEGER NOT NULL DEFAULT 1"),  # 0: the totals are known to be short
     ("attempts", "treatment", "INTEGER NOT NULL DEFAULT 0"),  # 1: a fault that is the condition's treatment
     ("attempts", "outage_kind", "TEXT"),  # the kind of an outage that overlapped the attempt; apart from infra_kind
+    ("attempts", "dispatch_seq", "INTEGER"),  # place in the campaign's dispatch sequence; grows with every attempt
+    ("attempts", "lease_wait_s", "REAL"),  # seconds waited for the lease the attempt ran under; NULL: none or unknown
+    ("attempts", "lease_outcome", "TEXT"),  # how the lease was obtained (attempts.LEASE_OUTCOMES); NULL: unknown
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
 # database has it there.
 _BACKFILLS = {
     "outage_kind": "UPDATE attempts SET outage_kind = infra_kind WHERE state = 'outage_discarded' AND outage_kind IS NULL",
+    # Before `dispatch_seq` existed the order the attempts began in was the order of their ids.
+    "dispatch_seq": "UPDATE attempts SET dispatch_seq = id WHERE dispatch_seq IS NULL",
 }
 
 
@@ -390,12 +396,26 @@ class Store:
         """Return the attempts of a run that count against the attempt limit."""
         return self.q("SELECT COALESCE(SUM(charged),0) c FROM attempts WHERE run_key=?", (run_key,))[0]["c"]
 
-    def begin_attempt(self, run_key: str, started: str, pid: int, run_dir: str) -> BegunAttempt:
+    def begin_attempt(
+        self,
+        run_key: str,
+        started: str,
+        pid: int,
+        run_dir: str,
+        *,
+        lease_wait_s: float | None = None,
+        lease_outcome: str = "none",
+    ) -> BegunAttempt:
         """Insert the 'running' row before the run starts; refuse in the transaction a run that is not pending.
 
         The attempt number is one more than the run's charged attempts, so an interrupted or uncharged attempt is
-        run again under the number it had.
+        run again under the number it had. The row also takes the next place in the campaign's dispatch sequence (one
+        more than the largest so far, in the same write transaction, so it grows with every attempt and a restart
+        carries on from where the dead process stopped) and the lease it runs under: how long it waited for it and
+        how it was obtained (`LEASE_OUTCOMES`).
         """
+        if lease_outcome not in LEASE_OUTCOMES:
+            raise ValueError(f"lease_outcome {lease_outcome!r} must be one of: {', '.join(LEASE_OUTCOMES)}")
 
         def go() -> BegunAttempt:
             run = self.db.execute("SELECT status FROM runs WHERE run_key=?", (run_key,)).fetchone()
@@ -408,11 +428,13 @@ class Store:
             number = self.db.execute(
                 "SELECT COALESCE(SUM(charged),0)+1 FROM attempts WHERE run_key=?", (run_key,)
             ).fetchone()[0]
+            sequence = self.db.execute("SELECT COALESCE(MAX(dispatch_seq),0)+1 FROM attempts").fetchone()[0]
             cursor = self.db.execute(
-                "INSERT INTO attempts(run_key,attempt,state,started_utc,pid,run_dir) VALUES(?,?,?,?,?,?)",
-                (run_key, number, "running", started, pid, run_dir),
+                "INSERT INTO attempts(run_key,attempt,state,started_utc,pid,run_dir,dispatch_seq,lease_wait_s,"
+                "lease_outcome) VALUES(?,?,?,?,?,?,?,?,?)",
+                (run_key, number, "running", started, pid, run_dir, sequence, lease_wait_s, lease_outcome),
             )
-            return BegunAttempt(int(cursor.lastrowid), number)
+            return BegunAttempt(int(cursor.lastrowid), number, int(sequence))
 
         return self.transact(go)
 
