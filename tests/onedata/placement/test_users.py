@@ -4,14 +4,14 @@ import os
 
 import pytest
 from placement_support import with_placement
-from platform_support import BASELINE, CEILING_S, CREDENTIALS_DIR, NOW, write_platform
+from platform_support import BASELINE, CEILING_S, CREDENTIALS_DIR, MANAGE, NOW, write_platform
 
 from expcore.campaign.lease import LeasePool
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
 from expcore_onedata.tokencheck import TokenRefused
-from expcore_onedata.tokens import TokenIssuer
-from expcore_onedata.users import GROUP, SlotProbe, SlotTokens, TokenJournal, load_slots
+from expcore_onedata.tokens import TokenIssuer, token_window
+from expcore_onedata.users import GROUP, SAFETY_MARGIN_S, SlotProbe, SlotTokens, TokenJournal, load_slots
 
 LOGINS = {  # login name -> (password, user id)
     "slot-one-data": ("pw-1d", "u-1d"),
@@ -147,12 +147,25 @@ def test_users_of_a_lease_that_was_released_or_belongs_to_another_group_is_refus
         loaded.users_of(held)
 
 
-def test_tokens_of_a_leased_slot_are_minted_on_its_two_users_and_their_end_is_journalled(slots, client, tmp_path):
-    """Each plane's token is minted by that plane's slot user; the journal learns the latest end before minting."""
+class SpyJournal(TokenJournal):
+    """A journal that notes how many tokens the federation had minted when each line was written."""
+
+    def __init__(self, directory, fake):
+        super().__init__(directory)
+        self.fake, self.minted_at_write = fake, []
+
+    def record(self, slot, plane, expires_at):
+        self.minted_at_write.append(len([r for r in self.fake.requests if r.path.endswith("/tokens/temporary")]))
+        super().record(slot, plane, expires_at)
+
+
+def test_tokens_of_a_leased_slot_are_minted_on_its_two_users_and_their_end_is_journalled(slots, client, tmp_path, fake):
+    """C19: each plane's token is minted by that plane's slot user; once both are minted the journal learns the later
+    of their examined expiries, in one line written after minting."""
     config, loaded = slots
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
-    journal = TokenJournal(tmp_path / "leases")
+    journal = SpyJournal(tmp_path / "leases", fake)
     tokens = SlotTokens(
         TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW
     ).mint(lease, ceiling_s=CEILING_S, condition="read")
@@ -160,10 +173,62 @@ def test_tokens_of_a_leased_slot_are_minted_on_its_two_users_and_their_end_is_jo
     assert tokens.data_path.subject == slot.data_path.user_id
     assert tokens.tool_server is not None
     assert tokens.tool_server.subject == slot.tool_server.user_id
-    latest = journal.latest_expiry(lease.key)
-    assert latest is not None
-    assert latest >= tokens.data_path.expires_at  # the bound covers the longest the token can live
+    assert journal.latest_expiry(lease.key) == max(tokens.data_path.expires_at, tokens.tool_server.expires_at)
+    assert journal.minted_at_write == [2]  # one line, after both tokens were minted
     assert tokens.data_path.reveal() not in (tmp_path / "leases" / "tokens.jsonl").read_text()
+
+
+def test_c19_the_journalled_end_is_the_tokens_actual_end_even_when_the_privilege_reads_take_time(
+    slots, client, tmp_path, monkeypatch
+):
+    """C19 with O06: the clocks advance during the privilege reads before each mint, so the tokens end later than any
+    bound taken before minting. The journal holds the later plane's actual expiry, and the slot is free only past it
+    plus the margin."""
+    config, loaded = slots
+    now = [NOW]
+    reads = client.get
+
+    def slow_read(path, *args, **kwargs):
+        if path.endswith("/privileges"):
+            now[0] += 100.0  # a privilege read that takes 100 s
+        return reads(path, *args, **kwargs)
+
+    monkeypatch.setattr(client, "get", slow_read)
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = TokenJournal(tmp_path / "leases")
+    tokens = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: now[0]), config, loaded, journal, clock=lambda: now[0]
+    ).mint(lease, ceiling_s=CEILING_S, condition="read")
+    assert tokens.tool_server is not None
+    bound_before_minting = NOW + token_window(CEILING_S, config.tokens).max_ttl_s
+    assert tokens.tool_server.expires_at > bound_before_minting  # the old bound would have ended before the token
+    ended = journal.latest_expiry(lease.key)
+    assert ended == tokens.tool_server.expires_at > tokens.data_path.expires_at
+    probe_at = [ended + SAFETY_MARGIN_S - 1, ended + SAFETY_MARGIN_S, ended + SAFETY_MARGIN_S + 1]
+    freed = []
+    for moment in probe_at:
+        now[0] = moment
+        freed.append(SlotProbe(journal, clock=lambda: now[0]).resource_gone(lease.key, {}))
+    assert freed == [False, False, True]
+
+
+def test_c19_a_mint_that_fails_after_a_token_exists_journals_a_bound_that_covers_it(
+    slots, client, tmp_path, slot_federation
+):
+    """C19: the tool-server user holds other rights than the condition declares, so the mint is refused after the
+    data path's token was minted (and dropped, not revoked). The slot is not free before that token ends."""
+    config, loaded = slots
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    slot_federation.grant(loaded.users_of(lease).tool_server.user_id, MANAGE)
+    journal = TokenJournal(tmp_path / "leases")
+    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    with pytest.raises(TokenRefused):
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
+    window = token_window(CEILING_S, config.tokens)
+    assert journal.latest_expiry(lease.key) >= NOW + window.mint_ttl_s  # the data path's token lives until then
+    assert SlotProbe(journal, clock=lambda: NOW + window.mint_ttl_s).resource_gone(lease.key, {}) is False
 
 
 def test_a_ceiling_the_window_refuses_journals_and_mints_nothing(slots, client, tmp_path, fake):
@@ -179,15 +244,33 @@ def test_a_ceiling_the_window_refuses_journals_and_mints_nothing(slots, client, 
 
 
 def test_a_slot_is_not_free_until_its_tokens_have_ended(tmp_path):
-    """C19 with O06: no token is revoked, so a dead holder's slot stays quarantined until the journalled end passes."""
+    """C19 with O06: no token is revoked, so a dead holder's slot stays quarantined until the journalled end and the
+    safety margin have passed; exactly at the margin it is still held."""
     journal = TokenJournal(tmp_path)
     journal.record("one", "bound", NOW + 700)
     now = [NOW + 100]
-    probe = SlotProbe(journal, clock=lambda: now[0])
+    probe = SlotProbe(journal, clock=lambda: now[0], margin_s=30)
     assert probe.resource_gone("one", {}) is False
-    now[0] = NOW + 701
+    now[0] = NOW + 701  # past the end, inside the margin
+    assert probe.resource_gone("one", {}) is False
+    now[0] = NOW + 730
+    assert probe.resource_gone("one", {}) is False
+    now[0] = NOW + 731
     assert probe.resource_gone("one", {}) is True
     assert probe.resource_gone("two", {}) is True  # no token was ever minted for this slot
+
+
+def test_the_safety_margin_defaults_to_a_positive_number_and_refuses_a_negative_or_unusable_one(tmp_path):
+    """C19: a slot is never freed at the very second its tokens end; a margin that is not a finite number of seconds
+    is refused."""
+    journal = TokenJournal(tmp_path)
+    journal.record("one", "bound", NOW)
+    assert SAFETY_MARGIN_S > 0
+    assert SlotProbe(journal, clock=lambda: NOW + SAFETY_MARGIN_S - 1).resource_gone("one", {}) is False
+    assert SlotProbe(journal, clock=lambda: NOW + SAFETY_MARGIN_S + 1).resource_gone("one", {}) is True
+    for bad in (-1, float("inf"), float("nan"), True, "60"):
+        with pytest.raises(ValueError, match="safety margin"):
+            SlotProbe(journal, margin_s=bad)
 
 
 def test_a_slot_whose_journal_cannot_be_read_stays_quarantined(tmp_path):

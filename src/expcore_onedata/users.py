@@ -24,10 +24,15 @@ and `lease_keys` (`Slots.keys_of`), and the scheduler takes, holds and releases 
 which two users the run has.
 
 **A slot is free again only when its tokens have ended.** No token is ever revoked, so a token minted for a slot stays
-good until its lifetime ends, and a run that died may have left a sandbox using it. `SlotTokens.mint` writes the latest
-end its tokens can have (never a token) to a journal beside the leases, and `SlotProbe.resource_gone` answers True for a
-slot only once every journalled end has passed and, when the platform supplies one, its sandbox probe also shows the run's resources
-gone. Anything it cannot read keeps the slot quarantined (the core's rule: only True frees a key).
+good until its lifetime ends, and a run that died may have left a sandbox using it. `SlotTokens.mint` writes the actual
+end of the tokens it minted (never a token) to a journal beside the leases: the later of the two planes' examined
+expiries, written after minting, because the privilege reads before each mint take time and a bound taken before them
+would end too soon. `SlotProbe.resource_gone` answers True for a slot only once the clock is past every journalled end
+plus a safety margin (the clocks of this host and of Onezone are not the same) and, when the platform supplies one, its
+sandbox probe also shows the run's resources gone. Anything it cannot read keeps the slot quarantined (the core's rule:
+only True frees a key). A mint that fails after it may have made a token (the token is dropped, not revoked) journals
+the longest end any token of that call could have, read after the failure; a crash between a mint and its journal line
+leaves a token the journal does not know, which no later reading can recover.
 
 Users are created by the operator, not by this layer: there is no unscoped user creation or deletion here. The privileges
 a slot's users hold are checked, direct and effective, before every token is minted (`tokens.py`).
@@ -48,6 +53,7 @@ from expcore_onedata.tokens import RunTokens, TokenIssuer, token_window
 
 GROUP = "platform_users"
 JOURNAL = "tokens.jsonl"
+SAFETY_MARGIN_S = 60.0  # seconds past a journalled end before a slot counts as free: clock skew and whole-second expiry
 
 
 @dataclass(frozen=True)
@@ -144,7 +150,7 @@ class TokenJournal:
         self._path = Path(directory) / JOURNAL
 
     def record(self, slot: str, plane: str, expires_at: float) -> None:
-        """Append one line; flushed before the token is handed out, so a crash cannot lose an expiry."""
+        """Append one line, flushed at once, so a crash after it cannot lose the expiry."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"slot": slot, "plane": plane, "expires_at": expires_at}) + "\n")
@@ -172,26 +178,30 @@ class SlotProbe:
         *,
         sandbox_gone: Callable[[str, Mapping[str, Any]], bool] | None = None,
         clock: Callable[[], float] = time.time,
+        margin_s: float = SAFETY_MARGIN_S,
     ) -> None:
-        self._journal, self._sandbox_gone, self._clock = journal, sandbox_gone, clock
+        if isinstance(margin_s, bool) or not isinstance(margin_s, int | float) or not 0 <= margin_s < float("inf"):
+            raise ValueError("the safety margin must be a finite number of seconds, zero or more")
+        self._journal, self._sandbox_gone, self._clock, self._margin_s = journal, sandbox_gone, clock, margin_s
 
     def holder_gone(self, owner: str) -> bool | None:
         """Tell whether the process that held a slot is gone, as the core tells it."""
         return process_gone(owner)
 
     def resource_gone(self, key: str, note: Mapping[str, Any]) -> bool:
-        """Return True only when every token minted for the slot has expired and the sandbox probe, if any, agrees."""
+        """Return True only when the clock is past every token's journalled end plus the margin, and the sandbox probe,
+        if any, agrees."""
         try:
             expiry = self._journal.latest_expiry(key)
         except (OSError, ValueError, KeyError):
             return False  # an unreadable journal cannot show the tokens ended
-        if expiry is not None and self._clock() <= expiry:
+        if expiry is not None and self._clock() <= expiry + self._margin_s:
             return False
         return self._sandbox_gone is None or self._sandbox_gone(key, note) is True
 
 
 class SlotTokens:
-    """Mints the tokens of both planes for a leased slot, journalling when they will have ended before it mints."""
+    """Mints the tokens of both planes for a leased slot, and journals when they end once they are minted."""
 
     def __init__(
         self,
@@ -209,16 +219,23 @@ class SlotTokens:
     ) -> RunTokens:
         """Mint the data path's token and, for a condition with a tool server, the tool server's, on the slot's users.
 
-        The latest moment either token can still be good (now plus the longest lifetime the window allows) is journalled
-        first, so a crash between minting and journalling cannot leave a token the journal does not know. A ceiling the
-        window refuses (O06) journals and mints nothing.
+        When both are minted and examined, the later of their examined expiries is journalled, after minting and before
+        the tokens are returned. A ceiling the window refuses (O06) mints and journals nothing. Any other failure may
+        have left a token that was minted and dropped; its end is not known, so the longest end a token of this call
+        can have, counted from the moment of the failure, is journalled before the failure propagates.
         """
         slot = self._slots.users_of(lease)
         window = token_window(ceiling_s, self._config.tokens)
-        self._journal.record(slot.name, "bound", self._clock() + window.max_ttl_s)
-        return self._issuer.mint_run_tokens(
-            data=slot.data_path,
-            ceiling_s=ceiling_s,
-            interface=interface,
-            tool_server=(slot.tool_server, condition) if condition is not None else None,
-        )
+        try:
+            tokens = self._issuer.mint_run_tokens(
+                data=slot.data_path,
+                ceiling_s=ceiling_s,
+                interface=interface,
+                tool_server=(slot.tool_server, condition) if condition is not None else None,
+            )
+        except BaseException:  # a token may exist whatever stopped the mint; the failure itself is re-raised below
+            self._journal.record(slot.name, "unproven", self._clock() + max(window.mint_ttl_s, window.max_ttl_s))
+            raise
+        latest = max((t for t in (tokens.data_path, tokens.tool_server) if t is not None), key=lambda t: t.expires_at)
+        self._journal.record(slot.name, latest.plane.value, latest.expires_at)
+        return tokens
