@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 from scipy import stats
 
+from expcore.stats import contrasts
 from expcore.stats.contrasts import (
+    _p_at_rank_sum,
     cluster_bootstrap,
     cluster_means,
     holm,
@@ -19,6 +21,7 @@ from expcore.stats.contrasts import (
     supports,
     wilcoxon_input,
     wilcoxon_p,
+    wilcoxon_p_studies,
     zeros_dropped,
 )
 
@@ -74,6 +77,58 @@ def test_wilcoxon_refuses_an_unknown_method():
     """S03: a method name that scipy would reinterpret is refused by name."""
     with pytest.raises(ValueError, match="unknown Wilcoxon method 'pratt'"):
         wilcoxon_p([0.1, 0.2], method="pratt")
+
+
+@pytest.mark.parametrize(
+    ("n", "method"), [(5, "exact"), (5, "approx"), (12, "auto"), (30, "exact"), (30, "approx"), (60, "auto")]
+)
+def test_s06_s09_the_p_values_of_many_studies_are_the_wilcoxon_p_of_each_one(n, method):
+    """S06, S09: the simulation's batch p-values are `wilcoxon_p` itself, whichever method the analysis is set to."""
+    draws = np.random.default_rng(n).normal(0.4, 1.0, size=(80, n))
+    expected = [wilcoxon_p(row, method=method) for row in draws]
+    assert list(wilcoxon_p_studies(draws, method=method)) == expected
+
+
+def test_s06_s09_studies_with_a_zero_a_tie_or_an_undefined_cluster_go_through_the_wilcoxon_p_itself():
+    """S06, S09: the rank-sum shortcut is only for studies without them; the others get the full function."""
+    studies = np.array(
+        [
+            [0.3, 0.1, 0.5, 0.2, 0.4],
+            [0.1, 0.1, 0.3, -0.2, 0.5],  # a tie
+            [0.0, 0.2, 0.3, 0.4, 0.5],  # a zero
+            [math.nan, 0.1, 0.2, 0.3, 0.4],  # an undefined cluster
+            [0.0, 1e-17, -1e-17, 0.0, 0.0],  # all zero after snapping
+            [0.1 + 0.2, 0.3, 0.5, 0.7, 0.9],  # a tie only after snapping (S01)
+        ]
+    )
+    for method in ("exact", "approx", "auto"):
+        got = wilcoxon_p_studies(studies, method=method)
+        expected = np.array([wilcoxon_p(row, method=method) for row in studies])
+        assert np.array_equal(got, expected, equal_nan=True), method
+
+
+def test_s06_s09_many_studies_cost_one_wilcoxon_p_per_distinct_sum_of_positive_ranks(monkeypatch):
+    """S06, S09: 300 studies of five clusters have at most 16 rank sums, so the real function runs at most 16 times."""
+    calls = []
+
+    def counting(differences, decimals=12, method="auto"):
+        calls.append(1)
+        return wilcoxon_p(differences, decimals, method)
+
+    _p_at_rank_sum.cache_clear()
+    monkeypatch.setattr(contrasts, "wilcoxon_p", counting)
+    draws = np.random.default_rng(1).normal(0.3, 1.0, size=(300, 5))
+    got = wilcoxon_p_studies(draws, method="exact")
+    monkeypatch.undo()
+    _p_at_rank_sum.cache_clear()
+    assert 1 <= len(calls) <= 16
+    assert list(got) == [wilcoxon_p(row, method="exact") for row in draws]
+
+
+def test_wilcoxon_p_studies_refuses_a_wrong_shape():
+    """A (studies x clusters) array is required."""
+    with pytest.raises(ValueError, match="studies x clusters"):
+        wilcoxon_p_studies([0.1, 0.2, 0.3])
 
 
 def test_s04_one_resample_of_the_clusters_is_shared_by_all_models():

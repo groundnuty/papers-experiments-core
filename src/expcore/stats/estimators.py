@@ -8,6 +8,11 @@ permutation test, a mixed model for binary outcomes) is added with `register` wi
 An estimator is a function `(PairedDifferences, EstimatorSettings) -> EstimatorResult`. It must be a pure function
 of its arguments: the settings carry the bootstrap seed as entropy, so a call twice with equal settings returns equal
 results whatever ran in between.
+
+An estimator may also register its p-value as a function of many studies' cluster differences at once, `(studies,
+params) -> p-values`. The minimum detectable effect is then simulated with that function and the contrast's own
+parameters, not with a stand-in test (S06, S09). It must return for each study exactly the p-value the estimator
+reports for those differences; an estimator that registers none has no such simulation.
 """
 
 from __future__ import annotations
@@ -109,10 +114,14 @@ class ParamError(ValueError):
         self.message = message
 
 
+PValuesFunction = Callable[[np.ndarray, Mapping[str, Any]], np.ndarray]  # (studies x clusters), params -> p per study
+
+
 @dataclass(frozen=True)
 class _Entry:
     function: Estimator
     check_params: Callable[[Mapping[str, Any]], None]
+    p_values: PValuesFunction | None = None
 
 
 _REGISTRY: dict[str, _Entry] = {}
@@ -124,15 +133,25 @@ def _no_params(params: Mapping[str, Any]) -> None:
         raise ParamError(key, "this estimator takes no parameters")
 
 
-def register(name: str, *, check_params: Callable[[Mapping[str, Any]], None] | None = None):
-    """Register the decorated function under `name`; `check_params` raises ParamError for a bad parameter table."""
+def register(
+    name: str,
+    *,
+    check_params: Callable[[Mapping[str, Any]], None] | None = None,
+    p_values: PValuesFunction | None = None,
+):
+    """Register the decorated function under `name`.
+
+    `check_params` raises ParamError for a bad parameter table. `p_values`, when given, is the estimator's p-value
+    for a whole (studies x clusters) array of cluster differences under a parameter table; row by row it must equal
+    the p-value the estimator itself reports for those differences.
+    """
     if not _NAME_RE.fullmatch(name):
         raise ValueError(f"estimator name {name!r} must be lower-case letters, digits and underscores")
 
     def decorate(function: Estimator) -> Estimator:
         if name in _REGISTRY:
             raise ValueError(f"estimator {name!r} is already registered")
-        _REGISTRY[name] = _Entry(function, check_params or _no_params)
+        _REGISTRY[name] = _Entry(function, check_params or _no_params, p_values)
         return function
 
     return decorate
@@ -156,6 +175,20 @@ def check_params(name: str, params: Mapping[str, Any]) -> None:
     _REGISTRY[name].check_params(params)
 
 
+def p_values_function(name: str, params: Mapping[str, Any]) -> Callable[[np.ndarray], np.ndarray] | None:
+    """The p-values the estimator `name` reports under `params`, as a function of many studies' cluster differences.
+
+    None when the estimator registered no such function. Raises UnknownEstimator or ParamError as `check_params`
+    does, so a parameter that the analysis would refuse is refused here too.
+    """
+    check_params(name, params)
+    function = _REGISTRY[name].p_values
+    if function is None:
+        return None
+    frozen = dict(params)
+    return lambda studies: function(studies, frozen)
+
+
 WILCOXON = "wilcoxon_cluster_bootstrap"
 _WILCOXON_DEFAULTS: dict[str, Any] = {"snap_decimals": kernel.DEFAULT_SNAP_DECIMALS, "method": "auto"}
 
@@ -177,7 +210,14 @@ def _undefined(n_clusters: int = 0) -> EstimatorResult:
     return EstimatorResult(nan, nan, nan, nan, n_clusters, (), {"zero_dropped": 0})
 
 
-@register(WILCOXON, check_params=_check_wilcoxon_params)
+def _wilcoxon_p_values(studies: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+    """The Wilcoxon p-value of each study (row) of cluster differences, under the estimator's parameters."""
+    merged = {**_WILCOXON_DEFAULTS, **params}
+    _check_wilcoxon_params(merged)
+    return kernel.wilcoxon_p_studies(studies, merged["snap_decimals"], merged["method"])
+
+
+@register(WILCOXON, check_params=_check_wilcoxon_params, p_values=_wilcoxon_p_values)
 def wilcoxon_cluster_bootstrap(paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult:
     """Wilcoxon signed-rank test on the cluster differences, with a cluster-bootstrap percentile interval.
 

@@ -22,6 +22,7 @@ Rules kept here, each with a regression test:
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from collections.abc import Sequence
 
@@ -147,6 +148,12 @@ def one_sided_bootstrap_p(draws, theta0: float = 0.0, tolerance: float = TIE_TOL
     return float((1 + values.size - supports(values, theta0, tolerance).sum()) / (values.size + 1))
 
 
+def _snap_differences(values, decimals: int) -> np.ndarray:
+    """Float noise snapped away from differences of any shape: tiny values are exact zeros, the rest are rounded."""
+    values = np.asarray(values, dtype=float)
+    return snap(np.where(np.abs(values) < 10.0**-decimals, 0.0, values), decimals)
+
+
 def wilcoxon_input(differences, decimals: int = DEFAULT_SNAP_DECIMALS) -> np.ndarray:
     """The differences the rank test sees: undefined clusters (NaN) removed, float noise snapped (S01).
 
@@ -156,8 +163,7 @@ def wilcoxon_input(differences, decimals: int = DEFAULT_SNAP_DECIMALS) -> np.nda
     arithmetic reach the test as equal and tie, whatever order the means were summed in.
     """
     values = np.asarray(differences, dtype=float)
-    values = values[~np.isnan(values)]
-    return snap(np.where(np.abs(values) < 10.0**-decimals, 0.0, values), decimals)
+    return _snap_differences(values[~np.isnan(values)], decimals)
 
 
 def zeros_dropped(differences, decimals: int = DEFAULT_SNAP_DECIMALS) -> int:
@@ -182,6 +188,55 @@ def wilcoxon_p(differences, decimals: int = DEFAULT_SNAP_DECIMALS, method: str =
     if np.all(d == 0):
         return 1.0
     return float(stats.wilcoxon(d, zero_method="wilcox", method=method).pvalue)
+
+
+@functools.cache
+def _p_at_rank_sum(n: int, rank_sum: int, decimals: int, method: str) -> float:
+    """`wilcoxon_p` of n differences whose magnitudes are distinct and whose positive ranks add up to `rank_sum`.
+
+    Such differences have a p-value that depends on that sum alone (the ranks are 1..n whatever the magnitudes), so
+    the representative below, the ranks themselves with the signs that give the sum, stands for all of them. The
+    greedy choice from the largest rank reaches every sum from 0 to n(n+1)/2.
+    """
+    signed = np.empty(n)
+    remaining = rank_sum
+    for rank in range(n, 0, -1):
+        positive = rank <= remaining
+        signed[rank - 1] = rank if positive else -rank
+        remaining -= rank if positive else 0
+    return wilcoxon_p(signed, decimals, method)
+
+
+def wilcoxon_p_studies(studies, decimals: int = DEFAULT_SNAP_DECIMALS, method: str = "auto") -> np.ndarray:
+    """`wilcoxon_p` of every row of a (studies x clusters) array: the same function, evaluated once per rank pattern.
+
+    A study whose snapped differences hold no zero and no two equal magnitudes (what draws from a continuous
+    distribution give) takes its p-value from `_p_at_rank_sum`, one call of `wilcoxon_p` for each distinct sum of
+    positive ranks instead of one for each study, which is what makes a simulation of thousands of studies affordable.
+    Any other study, with a zero, a tie or an undefined cluster, goes through `wilcoxon_p` itself.
+    """
+    values = np.asarray(studies, dtype=float)
+    if values.ndim != 2:
+        raise ValueError("studies must be a (studies x clusters) array")
+    n = values.shape[1]
+    snapped = _snap_differences(values, decimals)
+    magnitudes = np.abs(snapped)
+    with np.errstate(invalid="ignore"):  # a NaN in a row makes the row irregular, whatever these give for it
+        irregular = np.isnan(magnitudes).any(axis=1) | (magnitudes == 0).any(axis=1)
+        irregular |= (np.diff(np.sort(magnitudes, axis=1), axis=1) == 0).any(axis=1)
+    if n == 0:
+        irregular[:] = True
+    p_values = np.empty(values.shape[0])
+    for index in np.flatnonzero(irregular):
+        p_values[index] = wilcoxon_p(values[index], decimals, method)
+    regular = ~irregular
+    if regular.any():
+        ranks = np.argsort(np.argsort(magnitudes[regular], axis=1), axis=1) + 1
+        sums = (ranks * (snapped[regular] > 0)).sum(axis=1)
+        distinct, inverse = np.unique(sums, return_inverse=True)
+        table = np.array([_p_at_rank_sum(n, int(total), decimals, method) for total in distinct])
+        p_values[regular] = table[inverse]
+    return p_values
 
 
 def level(alpha: float, weight: int, total: int) -> float:

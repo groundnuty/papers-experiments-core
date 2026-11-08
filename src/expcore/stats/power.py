@@ -14,7 +14,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 from scipy import stats
@@ -94,8 +94,16 @@ def signed_rank_p_values(samples: np.ndarray) -> np.ndarray:
     return np.minimum(1.0, 2.0 * stats.norm.cdf((smaller + 0.5 - mean) / sd))
 
 
+PValueFunction = Callable[[np.ndarray], np.ndarray]  # a (studies x clusters) array to one two-sided p-value per study
+
+
 def minimum_detectable_effect(
-    sd: float, n: int, alpha: float, settings: PowerSettings, rng: np.random.Generator
+    sd: float,
+    n: int,
+    alpha: float,
+    settings: PowerSettings,
+    rng: np.random.Generator,
+    p_values: PValueFunction | None = None,
 ) -> float:
     """The smallest difference the signed-rank test detects at `settings.target_power` with n clusters, by simulation.
 
@@ -105,6 +113,10 @@ def minimum_detectable_effect(
     this alpha to ever reject (five clusters cannot get a p-value under 0.0625, so they reject only at alpha 0.0625 or
     more). A study rejects when its p-value is at most alpha (see `rejects`, S06). It scales with sd, since the test
     sees ranks.
+
+    `p_values` is the test the studies are judged by; by default the vectorised exact signed-rank test. A caller that
+    has a test with parameters of its own (the normal approximation, a snapping grid) passes the function it analyses
+    with, so the effect found is the one that test can detect (S06). This module takes the function and imports none.
     """
     if not (math.isfinite(sd) and sd > 0):
         raise ValueError(f"sd must be a positive number, got {sd}")
@@ -114,8 +126,10 @@ def minimum_detectable_effect(
         raise ValueError(f"alpha must be strictly between 0 and 1, got {alpha}")
     noise = rng.standard_normal((settings.n_simulations, n))
 
+    test = p_values if p_values is not None else signed_rank_p_values
+
     def power(delta: float) -> float:
-        return float(rejects(signed_rank_p_values(delta + sd * noise), alpha).mean())
+        return float(rejects(np.asarray(test(delta + sd * noise), dtype=float), alpha).mean())
 
     low, high = 0.0, 8.0 * sd
     if power(high) < settings.target_power:

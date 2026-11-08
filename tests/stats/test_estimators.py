@@ -200,3 +200,34 @@ def test_paired_differences_are_checked_copied_and_read_only():
         PairedDifferences(("grp-a", "grp-b"), ("model-a", "model-b"), np.array([[0.1, math.nan], [math.nan, math.nan]]))
     with pytest.raises(ValueError, match="at least one paired cell"):
         PairedDifferences(("grp-a", "grp-b"), ("model-a", "model-b"), np.array([[0.1, math.nan], [0.2, math.nan]]))
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{}, {"method": "exact"}, {"method": "approx"}, {"snap_decimals": 3}, {"method": "approx", "snap_decimals": 3}],
+)
+def test_s06_s09_the_registered_p_values_are_the_estimators_own_under_its_parameters(params):
+    """S06, S09: the p-value the power study simulates with is the one the estimator reports, parameters included."""
+    studies = np.round(np.random.default_rng(4).normal(0.3, 0.2, size=(40, 6)), 3)
+    studies[5, :] = 0.0  # all zero
+    studies[6, 0] = 0.0  # a zero
+    function = estimators.p_values_function(WILCOXON, params)
+    expected = [estimators.get(WILCOXON)(paired(study.reshape(-1, 1)), settings(**params)).p_value for study in studies]
+    assert np.array_equal(function(studies), expected, equal_nan=True)
+
+
+def test_s06_the_registered_p_values_follow_the_method_parameter():
+    """S06: five distinct positive differences give p = 0.0625 exactly and 0.0431 by the normal approximation."""
+    study = np.array([[0.1, 0.2, 0.3, 0.4, 0.5]])
+    assert estimators.p_values_function(WILCOXON, {"method": "exact"})(study) == pytest.approx([0.0625])
+    assert estimators.p_values_function(WILCOXON, {"method": "approx"})(study) == pytest.approx([0.04311444678])
+
+
+def test_an_estimator_without_a_p_values_function_has_none_and_a_bad_parameter_is_refused(scratch_registry):
+    """The hook is optional; asking for it checks the parameter table as the analysis does."""
+    estimators.register("mean_only_hookless")(lambda paired, settings: None)
+    assert estimators.p_values_function("mean_only_hookless", {}) is None
+    with pytest.raises(ParamError, match="method"):
+        estimators.p_values_function(WILCOXON, {"method": "pratt"})
+    with pytest.raises(UnknownEstimator, match="unknown estimator 'bayes'"):
+        estimators.p_values_function("bayes", {})

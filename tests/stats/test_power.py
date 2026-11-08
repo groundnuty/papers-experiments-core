@@ -197,6 +197,26 @@ def test_the_minimum_detectable_effect_is_nan_when_the_test_can_never_reject():
     assert not math.isnan(minimum_detectable_effect(1.0, 6, 0.05, settings, np.random.default_rng(7)))
 
 
+def test_s06_s09_the_minimum_detectable_effect_is_judged_by_the_p_value_function_it_is_given():
+    """S06, S09: five clusters never reach p <= 0.05 by the exact test, but do by the normal approximation (0.043)."""
+    settings = PowerSettings(1, 100, 5, 0.1, (0.1,))
+
+    def approximate(samples):
+        return np.array([stats.wilcoxon(row, method="approx").pvalue for row in samples])
+
+    assert math.isnan(minimum_detectable_effect(1.0, 5, 0.05, settings, np.random.default_rng(7)))
+    assert math.isfinite(minimum_detectable_effect(1.0, 5, 0.05, settings, np.random.default_rng(7), approximate))
+    never = minimum_detectable_effect(1.0, 25, 0.05, settings, np.random.default_rng(7), lambda s: np.ones(len(s)))
+    assert math.isnan(never)  # a test that never rejects detects nothing, however many clusters
+
+
+def test_s06_the_default_p_value_function_is_the_vectorised_exact_test():
+    """S06: leaving the function out is the same as passing `signed_rank_p_values`."""
+    settings = PowerSettings(1, 100, 5, 0.1, (0.1,))
+    default = minimum_detectable_effect(1.0, 12, 0.05, settings, np.random.default_rng(3))
+    assert default == minimum_detectable_effect(1.0, 12, 0.05, settings, np.random.default_rng(3), signed_rank_p_values)
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

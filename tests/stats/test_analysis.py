@@ -580,7 +580,11 @@ def test_the_minimum_detectable_effect_is_computed_at_the_runs_cluster_count_fro
 
 
 def test_the_minimum_detectable_effect_is_the_power_modules_for_the_contrasts_own_sd_and_cluster_count(concluded):
-    """The value is the one the power module gives for the contrast's cluster differences, seeded by its name."""
+    """The value is the one the power module gives for the contrast's cluster differences, seeded by its name.
+
+    At the default method and 30 clusters the analysis's Wilcoxon test is the exact one, so the power module's own
+    vectorised exact test and the contrast's p-value function agree and the two routes give the same figure.
+    """
     prereg, result = concluded
     spec = prereg.contrasts["p-vs-q"]
     rows = simulate(
@@ -629,3 +633,82 @@ def test_the_minimum_detectable_effect_is_nan_when_the_clusters_are_too_few_or_d
         for arm, score in (("p", 0.7), ("q", 0.5))
     ]
     assert math.isnan(analyse(flat, prereg).contrast("p-vs-q").minimum_detectable_effect)
+
+
+FIVE_CLUSTERS_TEXT = """\
+alpha = 0.05
+holm_family = ["p-vs-q"]
+
+[bootstrap]
+replicates = 100
+seed = 3
+
+[power]
+seed = 4
+n_simulations = 200
+target_clusters = 20
+target_difference = 0.1
+sd_grid = [0.1]
+
+[estimators.wilcoxon_cluster_bootstrap]
+method = "METHOD"
+
+[contrasts.p-vs-q]
+conditions = ["cond-p", "cond-q"]
+outcome = "rate"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+"""
+
+
+def five_distinct_positive_clusters():
+    """Five clusters whose paired differences are 0.40, 0.39, 0.38, 0.37 and 0.36: all positive and distinct."""
+    rows = []
+    for i in range(5):
+        rows += [
+            make_row(
+                f"t{i}", "model-a", 1, 0.9 - 0.01 * i, condition="cond-p", cluster=f"c{i}", outcome="rate", arm="p"
+            ),
+            make_row(f"t{i}", "model-a", 1, 0.5, condition="cond-q", cluster=f"c{i}", outcome="rate", arm="q"),
+        ]
+    return rows
+
+
+def test_s06_s09_the_minimum_detectable_effect_uses_the_preregistered_wilcoxon_method():
+    """S06, S09: five clusters at alpha 0.05 reject by the normal approximation (p = 0.043), never by the exact test."""
+    rows = five_distinct_positive_clusters()
+    found = {}
+    for method in ("approx", "exact"):
+        prereg = parse(tomllib.loads(FIVE_CLUSTERS_TEXT.replace("METHOD", method)), "inline", "f" * 64, ARM_SCHEMA)
+        found[method] = analyse(rows, prereg).contrast("p-vs-q")
+    assert found["approx"].p_value == pytest.approx(0.043114446783)
+    assert found["exact"].p_value == pytest.approx(0.0625)
+    assert math.isfinite(found["approx"].minimum_detectable_effect)
+    assert found["approx"].minimum_detectable_effect > 0
+    assert math.isnan(found["exact"].minimum_detectable_effect)
+    assert found["approx"].significant is True  # the analysis itself rejects at this p-value, as the simulation does
+    assert found["exact"].significant is False
+
+
+def test_s06_s09_the_minimum_detectable_effect_follows_the_override_of_the_estimator_parameters():
+    """S06, S09: the same rows, a different preregistered method, a different figure; the default is exact at n = 5."""
+    rows = five_distinct_positive_clusters()
+    text = FIVE_CLUSTERS_TEXT.replace('[estimators.wilcoxon_cluster_bootstrap]\nmethod = "METHOD"\n\n', "")
+    prereg = parse(tomllib.loads(text), "inline", "f" * 64, ARM_SCHEMA)
+    assert math.isnan(analyse(rows, prereg).contrast("p-vs-q").minimum_detectable_effect)  # auto is exact at n = 5
+    approximate = prereg.with_override(estimator_params={"wilcoxon_cluster_bootstrap": {"method": "approx"}})
+    assert math.isfinite(analyse(rows, approximate).contrast("p-vs-q").minimum_detectable_effect)
+
+
+def test_s09_an_estimator_without_a_p_values_function_has_no_minimum_detectable_effect(prereg, planted, monkeypatch):
+    """S09: no stand-in test is simulated for an estimator that cannot say how it computes its p-value."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    estimators.register("sign_share")(
+        lambda paired, settings: EstimatorResult(0.1, 0.5, math.nan, math.nan, len(paired.clusters))
+    )
+    _, rows = planted
+    text = TEXT.replace('estimator = "wilcoxon_cluster_bootstrap"', 'estimator = "sign_share"', 1)
+    other = parse(tomllib.loads(text), "inline", "b" * 64, SCHEMA)
+    result = analyse(rows, other)
+    assert math.isnan(result.contrast("gate-effect").minimum_detectable_effect)
+    assert result.contrast("open-vs-shut-at-x").minimum_detectable_effect > 0

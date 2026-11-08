@@ -129,18 +129,26 @@ def _minimum_detectable_effect(
 ) -> float | None:
     """The smallest effect the contrast's cluster count could detect, from its own between-cluster SD.
 
-    The level is alpha divided by the size of the Holm family for a member, the level of the first step that it must
-    clear in the worst case, and alpha for any other contrast. NaN when the SD is undefined or zero, or when the
-    count of clusters is too small for the test to reach the target power at that level.
+    Rejection in the simulation is decided by the p-value function and the parameters the contrast's estimator
+    analyses with (a preregistered Wilcoxon `method`, for one), so the effect found is one the analysis itself can
+    reject (S06, S09). The level is alpha divided by the size of the Holm family for a member and alpha for any other
+    contrast. Dividing is conservative: it is the level of the first step of Holm's procedure, the hardest to clear,
+    and a member whose p-value ranks later is judged at a larger level and detects less than this. NaN when the SD is
+    undefined or zero, when the estimator registered no p-values function to simulate with, or when the count of
+    clusters is too small for the test to reach the target power at that level.
     """
     if prereg.power is None:
         return None
     sd = power.pilot_cluster_sd(differences.cluster_differences)
     if not (math.isfinite(sd) and sd > 0):
         return math.nan
+    p_values = estimators.p_values_function(spec.estimator, prereg.estimator_settings(spec).params)
+    if p_values is None:
+        return math.nan
     level = prereg.alpha / len(prereg.holm_family) if in_family else prereg.alpha
     rng = np.random.default_rng([prereg.power.seed, name_digest(spec.name)])
-    return power.minimum_detectable_effect(sd, len(differences.clusters), level, prereg.power, rng)
+
+    return power.minimum_detectable_effect(sd, len(differences.clusters), level, prereg.power, rng, p_values)
 
 
 def run_contrast(
