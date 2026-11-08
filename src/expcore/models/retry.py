@@ -280,10 +280,10 @@ class Retrier:
         if left is not None and wait > left:
             seconds = max(left, 0.0)
             raise InfraError(
-                "endpoint", f"{_describe(info)}; {seconds:.0f} s left in the run, no time to retry"
+                "endpoint", f"{describe(info)}; {seconds:.0f} s left in the run, no time to retry"
             ) from exc
         if retries_made >= self.policy.max_retries:
-            raise InfraError("endpoint", f"{_describe(info)} after {retries_made} retries") from exc
+            raise InfraError("endpoint", f"{describe(info)} after {retries_made} retries") from exc
 
     def _record(self, info: ErrorInfo, wait: float, retries_made: int) -> dict[str, Any]:
         """Count one retry and return its event, with the error that caused it."""
@@ -301,7 +301,7 @@ class Retrier:
         return event
 
 
-def _describe(info: ErrorInfo) -> str:
+def describe(info: ErrorInfo) -> str:
     """Name an error for a detail line: class, status and a short message."""
     status = f" HTTP {info.status}" if info.status is not None else ""
     text = f": {info.message}" if info.message else ""
