@@ -31,12 +31,14 @@ Empty lists are valid and must be written out: `read_export` rejects a file with
 import collections
 import json
 import os
+import sqlite3
 import tempfile
+from collections.abc import Iterable
+from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from expcore.campaign.factors import RunKey
-from expcore.campaign.store import Store
+from expcore.campaign.factors import FactorSchema, RunKey
 from expcore.errors import infra_kinds
 
 FORMAT = "campaign-export-1"
@@ -55,11 +57,24 @@ _DISCARDED_STATES = ("infra_fail", "outage_discarded", "interrupted", "harness_e
 _USAGE_SUMS = ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens", "wall_s")
 
 
+class RunState(Protocol):
+    """What the export reads of a campaign: the schema and read-only queries in one snapshot.
+
+    A `Store` answers it, and so does a `StoreSnapshot`, the copy of a store whose bytes the replay check hashed.
+    """
+
+    schema: FactorSchema
+
+    def q(self, sql: str, args: Iterable[Any] = ()) -> list[sqlite3.Row]: ...
+
+    def snapshot(self) -> AbstractContextManager[None]: ...
+
+
 class ExportError(RuntimeError):
     """An export file is unreadable or incomplete, or the store holds a state the export cannot place."""
 
 
-def _identity(store: Store, row: Any) -> dict[str, Any]:
+def _identity(store: RunState, row: Any) -> dict[str, Any]:
     """Name a run by its key, digest, condition and factor values."""
     factors = json.loads(row["factors"])
     key = RunKey(store.schema.order, tuple(factors[name] for name in store.schema.order))
@@ -71,7 +86,7 @@ def _identity(store: Store, row: Any) -> dict[str, Any]:
     }
 
 
-def export_run_state(store: Store) -> dict[str, Any]:
+def export_run_state(store: RunState) -> dict[str, Any]:
     """Return the run state for the analysis, read in one snapshot so a running campaign cannot split it."""
     with store.snapshot():
         runs = store.q("SELECT * FROM runs ORDER BY seq")
@@ -226,7 +241,7 @@ def _infrastructure_by_condition(
     ]
 
 
-def write_export(store: Store, path: Path) -> dict[str, Any]:
+def write_export(store: RunState, path: Path) -> dict[str, Any]:
     """Write the export atomically and return it.
 
     The data goes to a temporary file of its own in the destination's directory (named by `tempfile.mkstemp`, so two
@@ -238,6 +253,12 @@ def write_export(store: Store, path: Path) -> dict[str, Any]:
     needs to share it copies it or changes its mode on purpose.
     """
     data = export_run_state(store)
+    write_export_data(data, path)
+    return data
+
+
+def write_export_data(data: dict[str, Any], path: Path) -> None:
+    """Write an export that was already built, atomically and owner-only, as `write_export` does."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     temporary = Path(name)
@@ -250,7 +271,6 @@ def write_export(store: Store, path: Path) -> dict[str, Any]:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
-    return data
 
 
 def read_export(path: Path) -> dict[str, Any]:
