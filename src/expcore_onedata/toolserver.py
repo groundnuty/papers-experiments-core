@@ -16,6 +16,20 @@ token minted for another condition's rights, and a principal whose privileges ch
 cannot start the plane: the caveats of two conditions that both write are the same, so only the privileges tell them
 apart.
 
+What the launcher can and cannot prevent. The privileges of the principal can change between the launch-time reread and
+the spawn, and again while the run goes on; a client cannot prevent that, so the design detects it:
+(a) the principal is a dedicated leased platform user (C19) whose privileges only this harness changes, so a change is
+    not expected in the first place;
+(b) the launch-time check stays, and refuses a start on any difference;
+(c) at teardown, after the server has stopped, the launcher reads the principal's direct and effective privileges again
+    and examines the token again. A difference from the condition's declared rights means the run's tool plane was not
+    what was declared, so the launcher records a `tool_plane_rights_changed` event through the sink it was given and
+    raises `InfraError` of kind `knowledge` (the core's kind for a tool server), which sets the run aside as
+    infrastructure. A teardown that cannot re-verify the plane (an outage of Onezone, a token that no longer examines
+    cleanly) is set aside the same way, without the event, because unknown is not a pass. The token's remaining life is
+    not held to the run's minimum then, because the run is over; it only has to be unexpired.
+The event and the error name the condition by its position (`conditions[i]`), never by its name.
+
 Waits. The only infrastructure wait kind this module uses is `toolserver_lifecycle`, around the start (the pre-checks
 and the spawn) and around the stop. What the agent triggers through the tools, a federation operation or a read of data,
 is the agent's own time and is never an infrastructure wait. Health polling before dispatch is the scheduler's
@@ -27,9 +41,10 @@ executor has before the loop starts.
 
 import asyncio
 import contextlib
+import dataclasses
 import os
 import sys
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
@@ -37,10 +52,16 @@ from expcore.tools.mcp_client import McpToolProvider
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, ToolServer
 from expcore_onedata.pin import verify_configured
-from expcore_onedata.tokencheck import ExaminationFailed
+from expcore_onedata.tokencheck import ExaminationFailed, PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, token_window, tool_server_spec
 
 WAIT_KIND = "toolserver_lifecycle"
+INFRA_KIND = "knowledge"  # the core's kind for a tool server that failed
+EVENT_RIGHTS_CHANGED = "tool_plane_rights_changed"
+
+# Where the launcher records an event: called with the event's kind and a detail that holds no configured name, token or
+# id. The campaign binds it to its event log (with the time and the model); a test collects the pairs.
+EventSink = Callable[[str, str], None]
 
 # The settings of the published tool server (its environment), not names of any federation.
 ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
@@ -104,12 +125,46 @@ def _is_outage(error: Exception) -> bool:
     return isinstance(error, PlatformError) and (error.status is None or error.status >= 500)
 
 
-class ToolServerLauncher:
-    """Starts the tool server of a condition for a run and stops it again."""
+def _recheck(
+    issuer: TokenIssuer, config: PlatformConfig, condition: Condition, token: MintedToken, ceiling_s: float
+) -> None:
+    """The checks at teardown: the token examined again and the principal's privileges read again, against the
+    condition's exact set. The run is over, so the token only has to be unexpired, not to outlast a run."""
+    spec = tool_server_spec(config.space.id, condition)
+    window = dataclasses.replace(token_window(ceiling_s, config.tokens), min_ttl_s=0)
+    issuer.examine(token.reveal(), spec, token.subject, window)
+    issuer.check_user(spec, token.subject)
 
-    def __init__(self, config: PlatformConfig, issuer: TokenIssuer) -> None:
+
+class ToolServerLauncher:
+    """Starts the tool server of a condition for a run, stops it again, and checks at the end that its plane held.
+
+    `events` receives the `tool_plane_rights_changed` event (kind and detail) when the check at teardown finds the
+    principal's privileges changed; it is required so that the event cannot go unrecorded by an omission.
+    """
+
+    def __init__(self, config: PlatformConfig, issuer: TokenIssuer, *, events: EventSink) -> None:
         self._config = config
         self._issuer = issuer
+        self._events = events
+
+    async def _verify_plane(self, condition: str, chosen: Condition, token: MintedToken, ceiling_s: float) -> None:
+        """Re-verify the tool plane after the server stopped; raise InfraError of kind knowledge unless it held."""
+        label = self._config.condition_label(condition)
+        try:
+            await asyncio.to_thread(_recheck, self._issuer, self._config, chosen, token, ceiling_s)
+        except PrivilegesMismatch as changed:
+            detail = f"{label}: the tool plane's rights changed during the run: {changed}"
+            error = InfraError(INFRA_KIND, detail)
+            try:
+                self._events(EVENT_RIGHTS_CHANGED, detail)
+            except Exception as sink_error:  # the run is set aside whether or not the event could be written
+                raise error from sink_error
+            raise error from None
+        except TokenRefused as refused:
+            outage = isinstance(refused, ExaminationFailed) and _is_outage(refused.error)
+            what = "could not be reached" if outage else "no longer passes its examination"
+            raise InfraError(INFRA_KIND, f"{label}: the tool plane {what} at teardown: {refused}") from None
 
     @contextlib.asynccontextmanager
     async def launch(
@@ -127,6 +182,10 @@ class ToolServerLauncher:
         while the token is examined or the principal's privileges are read is infrastructure of kind `knowledge`; a
         token or principal it refuses is a `TokenRefused`. `ceiling_s` is the same value the token was minted for, so a
         token that cannot last the run is refused here.
+
+        On leaving, after the server has stopped, the principal's privileges and the token are checked again: a
+        change from the condition's declared rights records `tool_plane_rights_changed` and raises `InfraError` of kind
+        `knowledge`, which replaces any exception of the run's body, because the run is set aside whatever it did.
         """
         server, chosen = _server(self._config), self._config.condition(condition)
         env = server_environment(self._config, chosen, token, extra_env)
@@ -153,4 +212,7 @@ class ToolServerLauncher:
             yield provider
         finally:
             async with ctx.infrastructure_wait(WAIT_KIND):
-                await provider.__aexit__(*sys.exc_info())
+                try:
+                    await provider.__aexit__(*sys.exc_info())
+                finally:
+                    await self._verify_plane(condition, chosen, token, ceiling_s)

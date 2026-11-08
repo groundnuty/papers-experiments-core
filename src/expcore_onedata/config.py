@@ -197,6 +197,11 @@ class PlatformConfig:
         order = list(self.providers)
         return ", ".join(self.provider_label(n) for n in sorted(set(names), key=order.index))
 
+    def condition_label(self, name: str) -> str:
+        """Name a declared condition for a message by its position in the file, `conditions[i]`, never by its name."""
+        order = list(self.toolserver.conditions) if self.toolserver else []
+        return f"conditions[{order.index(name)}]"
+
     def condition(self, name: str) -> Condition:
         """Return a condition of the tool server; raise ConfigError, without naming it, when there is none."""
         server = self.toolserver

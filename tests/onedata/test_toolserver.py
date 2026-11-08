@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import re
 import shutil
 import sys
 import time
@@ -12,6 +13,8 @@ from mcp import StdioServerParameters
 from platform_support import BASELINE, CEILING_S, DATA, FAKE_TOOL_SERVER, MANAGE, NOW, TOOLS, write_platform
 from record_support import make_config
 
+from expcore.campaign.attempts import classify
+from expcore.campaign.executor import failure_result
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import check_wait_kind
@@ -20,7 +23,7 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.pin import PinError
 from expcore_onedata.tokencheck import TokenRefused
-from expcore_onedata.tokens import Plane, TokenIssuer, data_path_spec, tool_server_spec
+from expcore_onedata.tokens import Plane, TokenIssuer, data_path_spec, token_window, tool_server_spec
 from expcore_onedata.toolserver import (
     ENV_PROVIDER_HOST,
     ENV_PROVIDER_TOKEN,
@@ -58,6 +61,18 @@ def freeze(path, tools):
     path.write_text(FrozenManifest.from_live(asyncio.run(live_manifest(params))).dump(), encoding="utf-8")
 
 
+class Events(list):
+    """The event sink of a launcher in a test: it collects the (kind, detail) pairs it is called with."""
+
+    def __call__(self, kind, detail):
+        self.append((kind, detail))
+
+
+@pytest.fixture
+def events():
+    return Events()
+
+
 @pytest.fixture(scope="module")
 def frozen_manifests(tmp_path_factory):
     """Freeze each condition's manifest once for the module, because starting a server for it takes seconds."""
@@ -74,13 +89,13 @@ def use_frozen(tmp_path, directory):
 
 
 @pytest.fixture
-def world(tmp_path, fake, frozen_manifests):
+def world(tmp_path, fake, frozen_manifests, events):
     """A configuration whose conditions have real frozen manifests, with its client, issuer and launcher."""
     use_frozen(tmp_path, frozen_manifests)
     config = load_platform(write_platform(tmp_path))
     client = OnezoneClient(config, http=fake.client_http())
     issuer = TokenIssuer(client, config, clock=lambda: NOW)
-    return config, issuer, ToolServerLauncher(config, issuer)
+    return config, issuer, ToolServerLauncher(config, issuer, events=events)
 
 
 def read_token(issuer, config):
@@ -160,7 +175,7 @@ def test_the_wait_around_the_stop_is_entered_when_the_body_fails(world, tmp_path
     assert len(ctx.events) == 4
 
 
-def test_l13_a_server_that_exposes_a_tool_outside_the_frozen_manifest_fails_the_start(world, tmp_path):
+def test_l13_a_server_that_exposes_a_tool_outside_the_frozen_manifest_fails_the_start(world, tmp_path, events):
     """L13: the client checks the server's tools against the frozen manifest of the condition; the start fails."""
     config, issuer, _ = world
     # The read condition's server shows echo and add; point it at the manifest frozen with a third tool.
@@ -169,7 +184,7 @@ def test_l13_a_server_that_exposes_a_tool_outside_the_frozen_manifest_fails_the_
             tmp_path, lambda d: d["toolserver"]["conditions"]["read"].update(manifest="manage.manifest.json")
         )
     )
-    launcher = ToolServerLauncher(drifted, issuer)
+    launcher = ToolServerLauncher(drifted, issuer, events=events)
     with pytest.raises(ManifestError, match="fail"):
         start(launcher, RecordingContext(), "read", read_token(issuer, config), tmp_path, record=False)
 
@@ -215,13 +230,13 @@ def with_replication_condition(data):
 
 
 @pytest.fixture
-def three_conditions(tmp_path, fake, frozen_manifests):
+def three_conditions(tmp_path, fake, frozen_manifests, events):
     """A launcher over a configuration with the read, manage and replicate conditions, and the issuer it mints with."""
     use_frozen(tmp_path, frozen_manifests)
     config = load_platform(write_platform(tmp_path, with_replication_condition))
     client = OnezoneClient(config, http=fake.client_http())
     issuer = TokenIssuer(client, config, clock=lambda: NOW)
-    return config, issuer, ToolServerLauncher(config, issuer)
+    return config, issuer, ToolServerLauncher(config, issuer, events=events)
 
 
 def test_o05_o06_a_token_minted_for_one_conditions_rights_does_not_start_another_conditions_server(
@@ -268,19 +283,19 @@ def test_o05_o06_a_change_of_privileges_between_minting_and_launch_does_not_star
     assert not (tmp_path / "seen.json").exists()
 
 
-def test_o05_o06_the_privileges_are_read_before_the_spawn_and_after_the_token_is_examined(world, fake, tmp_path):
-    """O05, O06: the launch reads the token's examination and then the principal's two privilege lists, all before the
-    server starts, as admin reads."""
+def test_o05_o06_the_plane_is_checked_before_the_spawn_and_again_after_the_stop(world, fake, tmp_path):
+    """O05, O06: the launch reads the token's examination and then the principal's two privilege lists before the
+    server starts, as admin reads, and the same three at teardown, so a run that held reads the plane twice."""
     config, issuer, launcher = world
     token = read_token(issuer, config)
     before = len(fake.requests)
     start(launcher, RecordingContext(), "read", token, tmp_path)
-    launch_paths = [(r.method, r.path) for r in fake.requests[before:]]
-    assert launch_paths == [
+    one_check = [
         ("POST", "/api/v3/onezone/tokens/examine"),
         ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/users/{TOOLS.user_id}/privileges"),
         ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/effective_users/{TOOLS.user_id}/privileges"),
     ]
+    assert [(r.method, r.path) for r in fake.requests[before:]] == one_check * 2
     assert {r.token for r in fake.requests[before:]} == {fake.ADMIN}
 
 
@@ -312,6 +327,130 @@ def test_a_federation_that_cannot_answer_the_privilege_read_is_infrastructure_of
     assert caught.value.kind == "knowledge"
     assert token.reveal() not in str(caught.value)
     assert not (tmp_path / "seen.json").exists()
+
+
+def run_with(launcher, ctx, condition, token, between, *, ceiling_s=CEILING_S, body=None):
+    """Launch, let `between` happen while the server runs, call a tool once (or run `body`), and leave."""
+
+    async def go():
+        async with launcher.launch(ctx, condition, token, ceiling_s=ceiling_s) as provider:
+            between()
+            if body is not None:
+                body()
+            await provider.execute("echo", {"text": "hi"}, timeout_s=10, ctx=ctx)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("direct", "effective", "reason"),
+    [
+        (MANAGE, MANAGE, "has also space_manage_qos"),
+        (["space_view"], ["space_view"], "lacks space_read_data"),
+        (BASELINE, [*BASELINE, "space_write_data"], r"effective.*has also space_write_data"),
+    ],
+    ids=["granted", "revoked", "effective only"],
+)
+def test_o05_o06_a_change_of_privileges_between_launch_and_teardown_sets_the_run_aside(
+    direct, effective, reason, world, fake, events
+):
+    """O05, O06: a grant after the launch-time check cannot be prevented, so it is detected at teardown. The run ends as
+    infrastructure of the tool-server kind, a `tool_plane_rights_changed` event is recorded, and the attempt is
+    classified as set aside, however the body went."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    ctx = RecordingContext()
+    with pytest.raises(InfraError, match="rights changed during the run") as caught:
+        run_with(launcher, ctx, "read", token, lambda: fake.grant(TOOLS.user_id, direct, effective))
+    assert caught.value.kind == "knowledge"
+    assert re.search(reason, str(caught.value))
+    assert [kind for kind, _ in events] == ["tool_plane_rights_changed"]
+    assert events[0][1] == caught.value.detail
+    assert events[0][1].startswith("conditions[0]:")
+    assert "read" not in events[0][1].replace("space_read_data", "")
+    assert token.reveal() not in str(caught.value)
+    assert ctx.events[-2:] == [("open", WAIT_KIND), ("close", WAIT_KIND)]  # the teardown check is inside the wait
+    outcome = failure_result(caught.value, ended_utc="2026-01-01T00:00:00Z", wall_s=1.0)
+    assert outcome.outcome.name == "infrastructure"
+    assert outcome.outcome.infra_kind == "knowledge"
+    assert classify(outcome).state == "infra_fail"
+
+
+def test_o05_o06_a_plane_that_held_records_no_event_and_raises_nothing(world, events):
+    """O05, O06: with no change the teardown check passes silently."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    run_with(launcher, RecordingContext(), "read", token, lambda: None)
+    assert events == []
+
+
+def test_o05_o06_a_change_is_detected_after_a_failure_of_the_body_too(world, fake, events):
+    """O05, O06: a run that crashed in its body while the rights changed is set aside as infrastructure, not as a
+    defect of its own code; a crash with no change keeps its own exception and records nothing."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+
+    def crash():
+        raise RuntimeError("the run failed")
+
+    with pytest.raises(RuntimeError, match="the run failed"):
+        run_with(launcher, RecordingContext(), "read", token, crash)
+    assert events == []
+    with pytest.raises(InfraError, match="rights changed during the run") as caught:
+        run_with(launcher, RecordingContext(), "read", token, lambda: fake.grant(TOOLS.user_id, MANAGE), body=crash)
+    assert caught.value.kind == "knowledge"
+    assert [kind for kind, _ in events] == ["tool_plane_rights_changed"]
+
+
+def test_o05_o06_the_run_is_set_aside_even_when_the_event_cannot_be_written(world, fake):
+    """O05, O06: a sink that fails does not hide the change; the InfraError is raised from the sink's failure."""
+    config, issuer, _ = world
+
+    def broken(kind, detail):
+        raise OSError("the event log is full")
+
+    launcher = ToolServerLauncher(config, issuer, events=broken)
+    with pytest.raises(InfraError, match="rights changed during the run") as caught:
+        run_with(
+            launcher, RecordingContext(), "read", read_token(issuer, config), lambda: fake.grant(TOOLS.user_id, MANAGE)
+        )
+    assert isinstance(caught.value.__cause__, OSError)
+
+
+def test_o05_o06_a_plane_that_cannot_be_re_verified_at_teardown_is_set_aside_without_the_rights_event(
+    world, fake, events, monkeypatch
+):
+    """O05, O06: unknown is not a pass. An outage while the privileges are read at teardown, or a token Onezone no
+    longer knows, sets the run aside as infrastructure, but claims no change of rights."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    reads = fake._admin_route
+    outage = lambda method, route, sent: fake._error(503, "x") if method == "GET" else reads(method, route, sent)  # noqa: E731
+    with pytest.raises(InfraError, match="could not be reached at teardown") as caught:
+        run_with(launcher, RecordingContext(), "read", token, lambda: monkeypatch.setattr(fake, "_admin_route", outage))
+    assert caught.value.kind == "knowledge"
+    monkeypatch.setattr(fake, "_admin_route", reads)
+    with pytest.raises(InfraError, match="no longer passes its examination") as caught:
+        run_with(launcher, RecordingContext(), "read", token, fake.issued.clear)
+    assert caught.value.kind == "knowledge"
+    assert events == []
+
+
+def test_o06_the_token_at_teardown_only_has_to_be_unexpired(three_conditions, tmp_path):
+    """O06: the run is over at teardown, so the token's remaining life is no longer held to the run's minimum (it
+    would fail the launch-time window) but an expired token is still a plane that cannot be verified."""
+    config, issuer, _ = three_conditions
+    now = [NOW]
+    ticking = TokenIssuer(issuer._client, config, clock=lambda: now[0])
+    token = ticking.mint(tool_server_spec(config.space.id, config.condition("read")), TOOLS, ceiling_s=CEILING_S)
+    window = token_window(CEILING_S, config.tokens)
+    launcher = ToolServerLauncher(config, ticking, events=lambda kind, detail: None)
+    run_with(launcher, RecordingContext(), "read", token, lambda: now.__setitem__(0, token.expires_at - 10))
+    assert token.expires_at - (token.expires_at - 10) < window.min_ttl_s  # it would not pass the launch-time window
+    now[0] = NOW
+    with pytest.raises(InfraError, match="no longer passes its examination") as caught:
+        run_with(launcher, RecordingContext(), "read", token, lambda: now.__setitem__(0, token.expires_at + 1))
+    assert caught.value.kind == "knowledge"
 
 
 def test_a_federation_that_cannot_examine_the_token_is_infrastructure_of_kind_knowledge(world, fake, tmp_path):
@@ -355,7 +494,7 @@ def test_insecure_tls_is_a_setting_of_the_file(tmp_path, fake, frozen_manifests)
     assert server_environment(config, config.condition("read"), token)["ONEDATA_ALLOW_INSECURE_TLS"] == "true"
 
 
-def test_a_pinned_checkout_is_verified_before_the_spawn(world, make_repo, tmp_path):
+def test_a_pinned_checkout_is_verified_before_the_spawn(world, make_repo, tmp_path, events):
     """The configured checkout must be at the pinned commit with no local change, or nothing is spawned (pin.py)."""
     config, issuer, _ = world
     clone = make_repo("server")
@@ -366,7 +505,7 @@ def test_a_pinned_checkout_is_verified_before_the_spawn(world, make_repo, tmp_pa
         data["toolserver"].update(clone=str(clone.path), commit=commit)
 
     pinned = load_platform(write_platform(tmp_path, pin))
-    launcher = ToolServerLauncher(pinned, issuer)
+    launcher = ToolServerLauncher(pinned, issuer, events=events)
     start(launcher, RecordingContext(), "read", read_token(issuer, config), tmp_path)  # clean and at the commit
     (tmp_path / "seen.json").unlink()
     clone.write("server.py", "print(2)\n")  # a local change
