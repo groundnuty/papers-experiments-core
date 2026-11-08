@@ -13,6 +13,8 @@ are the same text: no clock, no path and no random number enters it.
 - Per condition it shows the runs analysed and the median dispatch position of their attempts, so a reader can see
   whether one condition's runs came late, and per condition and infrastructure kind the attempts set aside and the
   attempts scored as treatment.
+- A partial analysis says so under "Provenance": the attempts still running when the replay check was made, and the
+  runs left out because no replayed record covers their final attempt.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp
   and the core version.
 """
@@ -127,14 +129,17 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
     return [*lines, ""]
 
 
-def _conditions(export: Mapping[str, Any]) -> list[str]:
+def _conditions(export: Mapping[str, Any], excluded: Sequence[str]) -> list[str]:
     analysed: dict[str, list[int]] = defaultdict(list)
     counts: dict[str, int] = defaultdict(int)
     for entry in export["analysed_attempts"]:
+        if entry["run_key"] in excluded:
+            continue
         counts[entry["condition"]] += 1
         if entry.get("dispatch_seq") is not None:
             analysed[entry["condition"]].append(entry["dispatch_seq"])
-    names = sorted({*counts, *(e["condition"] for e in export["exhausted_runs"] + export["unfinished_runs"])})
+    left = export["exhausted_runs"] + export["unfinished_runs"]
+    names = sorted({*counts, *(e["condition"] for e in left)})
     rows = [
         [
             name,
@@ -180,6 +185,12 @@ def summary_lines(result: AnalysisResult) -> list[str]:
     return lines
 
 
+def _listed(names: Sequence[str], limit: int = 10) -> str:
+    """The first names of a list, and how many more there are."""
+    shown = ", ".join(f"`{n}`" for n in names[:limit])
+    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
 def render_report(
     result: AnalysisResult,
     export: Mapping[str, Any],
@@ -188,14 +199,19 @@ def render_report(
     code: Mapping[str, Any],
     core_version: str | None,
     interval_level: float | None = None,
+    running_at_check: int = 0,
+    excluded_runs: Sequence[str] = (),
 ) -> str:
     """Render the report as Markdown.
 
     `code` is the code identity (`provenance.codestamp.version`), `interval_level` the level of the contrasts'
-    intervals when the preregistration states one. The text ends with a newline.
+    intervals when the preregistration states one. `running_at_check` and `excluded_runs` describe a partial analysis:
+    attempts still running when the replay check was made, and the run keys left out because no replayed record covers
+    their final attempt. The text ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
     planned = export["planned_runs"]
+    analysed = sum(1 for e in export["analysed_attempts"] if e["run_key"] not in excluded_runs)
     lines = [
         f"# Report: {study}",
         "",
@@ -208,9 +224,15 @@ def render_report(
     lines += [
         f"- Code: commit `{code.get('commit')}`, tree `{code.get('tree_sha256')}` ({state})",
         f"- Core version: {core_version or UNKNOWN}",
-        f"- Runs: {planned} planned, {len(export['analysed_attempts'])} analysed, "
+        f"- Runs: {planned} planned, {analysed} analysed, "
         f"{len(export['exhausted_runs'])} exhausted (every attempt failed on infrastructure), "
         f"{len(export['unfinished_runs'])} unfinished",
-        "",
     ]
-    return "\n".join(lines + _contrasts(result, interval_level) + _conditions(export))
+    if running_at_check or excluded_runs:
+        lines.append(
+            f"- **Partial analysis**: {running_at_check} attempt(s) were still running when the replay check was made, "
+            f"and {len(excluded_runs)} run(s) are left out because no replayed record covers their final attempt"
+            + (f" ({_listed(excluded_runs)})" if excluded_runs else "")
+        )
+    lines.append("")
+    return "\n".join(lines + _contrasts(result, interval_level) + _conditions(export, excluded_runs))

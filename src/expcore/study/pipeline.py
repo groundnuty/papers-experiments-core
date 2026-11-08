@@ -8,10 +8,13 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 - `run_study` opens or resumes the campaign and runs the scheduler. Its code identity is computed once, from the study
   directory and the scope study.toml names, and every record carries it.
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
-  records: the check hashes them and does not replay them.
-- `analyse_study` refuses unless the batch has a current passing check (R04, R05), and then reads the export, scores the
-  records in memory (a record is never written after its check, since that would change its hash) and runs the
-  preregistered analysis.
+  records: the check hashes them and does not replay them. It also copies the campaign store into the batch
+  (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
+  store with attempts still running unless `partial`, which the check records.
+- `analyse_study` refuses unless the batch has a current passing check (R04, R05). It then uses only bytes the check
+  verified (`study.verified`): the snapshot and the replayed records, each read once and compared with the check's
+  hash, cross-validated against each other. It exports from the snapshot, scores the records in memory (a record is
+  never written after its check, since that would change its hash) and runs the preregistered analysis.
 """
 
 import dataclasses
@@ -25,22 +28,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.export import write_export
+from expcore.campaign.export import export_run_state, write_export_data
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import build_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
-from expcore.campaign.store import Store
+from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
 from expcore.models.route import sdk_version
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
 from expcore.records.build import CORE_DISTRIBUTION
-from expcore.records.record import RunRecord, load_record, record_filename
+from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore
 from expcore.replay.check import BatchNotVerified, require_current_check, verify_batch, write_check
 from expcore.stats.analysis import AnalysisResult, analyse
 from expcore.stats.rows import Row
 from expcore.study.config import StudyConfig, find_study_root, load_study
 from expcore.study.plugin import StudyContext, StudyPlugin, load_plugin
+from expcore.study.verified import Unverified, load_verified
 
 OUT_DIR = "out"
 RUNS_DIR = "runs"
@@ -49,6 +53,7 @@ EXPORT_FILE = "export.json"
 SCORES_FILE = "scores.json"
 ANALYSIS_FILE = "analysis.json"
 REPORT_FILE = "report.md"
+SNAPSHOT_KEY = "snapshot"  # the key of the check that says what its snapshot of the store held
 
 
 class Refused(RuntimeError):
@@ -66,6 +71,8 @@ class StudyAnalysis:
     scores: Mapping[str, Any]
     rows: tuple[Row, ...]
     result: AnalysisResult
+    running_at_check: int = 0  # attempts the check's snapshot held as still running (a partial analysis)
+    excluded: tuple[str, ...] = ()  # run keys left out because no replayed record covers their final attempt
 
 
 def out_dir(study: StudyConfig) -> Path:
@@ -137,16 +144,27 @@ def check_batch(
     study_root: str | os.PathLike[str] | None = None,
     allow_dirty: bool = False,
     code_root: str | os.PathLike[str] | None = None,
+    partial: bool = False,
 ) -> dict[str, Any]:
-    """Run the replay check over a batch of records, store it beside them and return it.
+    """Copy the campaign store into the batch, run the replay check over it, store the check and return it.
 
     The study is the one at `study_root`, or the nearest directory above the batch that holds a study.toml; its scope
-    decides which code the check covers.
+    decides which code the check covers. The snapshot of the store is hashed with the records, so the analysis can use
+    it instead of the live store. A store with attempts still running is refused unless `partial`; the check records
+    how many were running and that a partial snapshot was asked for.
     """
     study = load_study(find_study_root(study_root if study_root is not None else batch))
     code = require_known("replay check", code_root or study.root, study.scope, allow_dirty=allow_dirty)
-    check = verify_batch(batch, code=code, hashed_only=[MARKER_PATTERN])
-    write_check(batch, check)
+    directory = Path(batch)
+    if not directory.is_dir():
+        raise Refused(f"{directory}: no batch of records here; run the study first")
+    try:
+        running = take_snapshot(out_dir(study) / STATE_FILE, directory / SNAPSHOT_FILE, allow_running=partial)
+    except SnapshotError as error:
+        raise Refused(str(error)) from None
+    check = verify_batch(directory, code=code, hashed_only=[MARKER_PATTERN, SNAPSHOT_FILE])
+    check[SNAPSHOT_KEY] = {"file": SNAPSHOT_FILE, "attempts_running": running, "partial": partial}
+    write_check(directory, check)
     return check
 
 
@@ -178,12 +196,6 @@ def _finite(value: Any) -> Any:
     return value
 
 
-def _record_of(batch: Path, entry: Mapping[str, Any]) -> RunRecord:
-    """Load the record of an analysed attempt. The path is rebuilt from the batch, so a moved study still finds it."""
-    where = batch / entry["digest"] / Path(entry["run_dir"]).name
-    return load_record(where / record_filename(entry["run_key"], entry["attempt"]))
-
-
 def _outcomes_of(record: RunRecord) -> dict[str, float | None]:
     """The named numeric outcomes of every scorer of a scored record; two scorers may not give one name."""
     merged: dict[str, float | None] = {}
@@ -199,38 +211,61 @@ def _outcomes_of(record: RunRecord) -> dict[str, float | None]:
 
 
 def analyse_study(
-    path: str | os.PathLike[str], *, allow_dirty: bool = False, code_root: str | os.PathLike[str] | None = None
+    path: str | os.PathLike[str],
+    *,
+    allow_dirty: bool = False,
+    code_root: str | os.PathLike[str] | None = None,
+    partial: bool = False,
 ) -> StudyAnalysis:
     """Export the campaign, score its records and run the preregistered analysis; refuse without a current check.
 
-    Nothing is written into the batch. The export is written to `out/export.json`.
+    Only bytes the check verified are used: the snapshot of the store and the replayed records, each read once and
+    compared with the check's hash (`study.verified`). Nothing is written into the batch. The export is written to
+    `out/export.json`. With `partial`, attempts still running at the check are tolerated and a final attempt that no
+    replayed record covers is left out of the analysis and named in the result.
     """
     study = load_study(path)
     out = out_dir(study)
     batch = out / RUNS_DIR
-    if not (out / STATE_FILE).is_file():
+    if not batch.is_dir():
         raise Refused(f"{out}: no campaign here; run the study first")
     code = code_version(code_root or study.root, study.scope)
     try:
-        require_current_check(
+        check = require_current_check(
             batch, code=code, allow_dirty=allow_dirty, rerun_command=f"python -m expcore check {batch}"
         )
-    except BatchNotVerified as error:
+        verified = load_verified(batch, check, study.schema, partial=partial)
+    except (BatchNotVerified, Unverified) as error:
         raise Refused(f"refusing to analyse: {error}") from None
     plugin = load_plugin(StudyContext(study, code))
-    store = Store(out / STATE_FILE, study.schema)
     try:
-        export = write_export(store, out / EXPORT_FILE)
+        export = export_run_state(verified.snapshot)
     finally:
-        store.close()
+        verified.snapshot.close()
+    write_export_data(export, out / EXPORT_FILE)
     rows, scores = [], {}
     for entry in export["analysed_attempts"]:
-        scored = rescore(_record_of(batch, entry), plugin.scorers)
+        if entry["run_key"] in verified.excluded:
+            continue
+        record = verified.record_for(entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
+        if record is None:  # load_verified guarantees one for every attempt it did not exclude
+            raise Refused(f"refusing to analyse: no verified record for {entry['run_key']}")
+        scored = rescore(record, plugin.scorers)
         scores[entry["run_key"]] = scored.scores
         task = study.tasks[str(entry["factors"]["task"])]
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))
     result = analyse(rows, study.prereg)
-    return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result)
+    return StudyAnalysis(
+        study,
+        code,
+        sdk_version(CORE_DISTRIBUTION),
+        export,
+        scores,
+        tuple(rows),
+        result,
+        verified.running_at_check,
+        verified.excluded,
+    )
 
 
 def write_analysis(analysis: StudyAnalysis) -> list[Path]:

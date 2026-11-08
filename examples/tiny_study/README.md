@@ -25,8 +25,8 @@ uv run python -m expcore report examples/tiny_study --allow-dirty
 ```
 
 - `run` opens the campaign or resumes it, so killing the command and running it again finishes the plan. It exits 3 if runs are left pending (held by the budget or a stop).
-- `check` replays every record offline and stores the result beside them.
-- `analyze` refuses unless the check is current, then writes `export.json`, `scores.json` and `analysis.json` under `out/`.
+- `check` replays every record offline, copies the campaign store beside them, and stores the result with a hash of each. It refuses a campaign with attempts still running unless `--partial`.
+- `analyze` refuses unless the check is current, then uses only what the check verified (the copy of the store and the replayed records, never the live store) and writes `export.json`, `scores.json` and `analysis.json` under `out/`. With `--partial` it tolerates attempts that were still running and leaves out a final attempt no replayed record covers, and says so in the report.
 - `report` writes `out/report.md`: every contrast with its estimate, interval, raw and Holm-adjusted p-value and its conclusion, the exploratory contrast apart, the infrastructure failures by condition, and the preregistration hash, the code stamp and the core version.
 
 `--allow-dirty` accepts uncommitted changes in the code the records are stamped with. Leave it out when the study is committed: the code identity is the commit plus a hash of the files named in `[study] code`, and a clean one is what a published result should carry. A copy made without git needs a stamp instead: `expcore.provenance.codestamp.write_stamp(directory, <commit>, scope)` writes `.code-stamp.json`.

@@ -57,10 +57,10 @@ def export(**changes):
         "exhausted_runs": [],
         "unfinished_runs": [],
         "analysed_attempts": [
-            {"condition": "cond-a", "dispatch_seq": 1},
-            {"condition": "cond-a", "dispatch_seq": 4},
-            {"condition": "cond-b", "dispatch_seq": 2},
-            {"condition": "cond-b", "dispatch_seq": 3},
+            {"run_key": "k1", "condition": "cond-a", "dispatch_seq": 1},
+            {"run_key": "k4", "condition": "cond-a", "dispatch_seq": 4},
+            {"run_key": "k2", "condition": "cond-b", "dispatch_seq": 2},
+            {"run_key": "k3", "condition": "cond-b", "dispatch_seq": 3},
         ],
         "infrastructure_by_condition": [],
     }
@@ -166,8 +166,11 @@ def test_each_condition_has_its_runs_and_the_median_dispatch_position_of_its_att
     assert "| cond-a | 2 | 2.5 |" in conditions
     assert "| cond-b | 2 | 2.5 |" in conditions
     late = export(
-        analysed_attempts=[{"condition": "late", "dispatch_seq": s} for s in (7, 9, 30)]
-        + [{"condition": "early", "dispatch_seq": 1}, {"condition": "legacy", "dispatch_seq": None}]
+        analysed_attempts=[{"run_key": f"l{s}", "condition": "late", "dispatch_seq": s} for s in (7, 9, 30)]
+        + [
+            {"run_key": "early-run", "condition": "early", "dispatch_seq": 1},
+            {"run_key": "g0", "condition": "legacy", "dispatch_seq": None},
+        ]
     )
     conditions = render(analysis(contrast("primary", "difference")), late).split("## Conditions")[1]
     assert "| late | 3 | 9 |" in conditions
@@ -207,3 +210,20 @@ def test_the_same_inputs_give_the_same_text_and_a_conclusion_outside_the_vocabul
     bad = dataclasses.replace(contrast("primary", "difference"), conclusion="no_difference")
     with pytest.raises(ValueError, match="no_difference"):
         render(analysis(bad))
+
+
+def test_a_partial_analysis_says_how_many_attempts_were_running_and_which_runs_it_left_out():
+    result = analysis(contrast("primary", "difference"))
+    report = render(result, running_at_check=2, excluded_runs=["k4"])
+    assert "**Partial analysis**: 2 attempt(s) were still running when the replay check was made" in report
+    assert "1 run(s) are left out because no replayed record covers their final attempt (`k4`)" in report
+    assert "3 analysed" in report  # k4 is not counted
+    assert "| cond-a | 1 | 1 |" in report  # nor in its condition, nor in its median
+    assert "Partial analysis" not in render(result)
+
+
+def test_a_long_list_of_left_out_runs_is_cut_and_counted():
+    names = [f"run-{n:02d}" for n in range(14)]
+    report = render(analysis(contrast("primary", "difference")), excluded_runs=names)
+    assert "`run-09` and 4 more" in report
+    assert "`run-10`" not in report

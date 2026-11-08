@@ -2,7 +2,8 @@
 """The command line: `python -m expcore run | check | analyze | report`. A thin shell; the logic is in the packages.
 
     run STUDY       load the configuration, open or resume the campaign, run the scheduler
-    check BATCH     the replay check over a batch of records (the study is found above the batch)
+    check BATCH     the replay check over a batch of records (the study is found above the batch), with a copy of
+                    the campaign store that the analysis reads instead of the live one
     analyze STUDY   refuse without a current replay check; then export, scores and the preregistered analysis
     report STUDY    the same refusal; then write out/report.md
 
@@ -20,7 +21,7 @@ from expcore.campaign.factors import PlanError
 from expcore.campaign.scheduler import CampaignLocked
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import CodeVersionUnknown
-from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE
+from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified
 from expcore.report import render_report, summary_lines
 from expcore.study.pipeline import (
     REPORT_FILE,
@@ -34,7 +35,7 @@ from expcore.study.pipeline import (
 )
 
 EXIT_PENDING = 3
-_REFUSALS = (Refused, ConfigError, CodeVersionUnknown, ResumeRefused, CampaignLocked, PlanError)
+_REFUSALS = (Refused, ConfigError, CodeVersionUnknown, ResumeRefused, CampaignLocked, PlanError, BatchNotVerified)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(target, type=Path, help=text)
         command.add_argument("--allow-dirty", action="store_true", help="accept code with uncommitted changes")
         command.add_argument("--code-root", type=Path, help="where the code identity is read from (default: STUDY)")
+        if name != "run":
+            command.add_argument(
+                "--partial",
+                action="store_true",
+                help="accept a campaign with attempts still running, and leave out attempts no replayed record covers",
+            )
         if name == "check":
             command.add_argument("--study", type=Path, help="the study directory (default: the one above the batch)")
     return parser
@@ -69,7 +76,13 @@ def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None
 
 
 def _check(args: argparse.Namespace) -> int:
-    check = check_batch(args.batch, study_root=args.study, allow_dirty=args.allow_dirty, code_root=args.code_root)
+    check = check_batch(
+        args.batch,
+        study_root=args.study,
+        allow_dirty=args.allow_dirty,
+        code_root=args.code_root,
+        partial=args.partial,
+    )
     for failure in check["failures"]:
         print(f"FAIL {failure['file']} [{failure['stage']}] {failure['error']}")
     print(f"{check['n_ok']} of {check['n_records']} records passed")
@@ -77,7 +90,7 @@ def _check(args: argparse.Namespace) -> int:
 
 
 def _analysis(args: argparse.Namespace) -> StudyAnalysis:
-    return analyse_study(args.study, allow_dirty=args.allow_dirty, code_root=args.code_root)
+    return analyse_study(args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, partial=args.partial)
 
 
 def _analyze(args: argparse.Namespace) -> int:
@@ -98,6 +111,8 @@ def _report(args: argparse.Namespace) -> int:
         code=analysis.code,
         core_version=analysis.core_version,
         interval_level=analysis.study.prereg.bootstrap.ci_level,
+        running_at_check=analysis.running_at_check,
+        excluded_runs=analysis.excluded,
     )
     target = out_dir(analysis.study) / REPORT_FILE
     target.write_text(text, encoding="utf-8")

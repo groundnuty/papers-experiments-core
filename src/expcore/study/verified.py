@@ -1,0 +1,153 @@
+# Provenance: new
+"""The bytes of a batch that the replay check verified, and nothing else: what an analysis may use.
+
+`require_current_check` compares the files on disk with the check's hashes at one moment. An analysis that opens the
+files afterwards could read others, so this module reads each file once, compares the SHA-256 of the bytes in hand with
+the check's, and parses those bytes. It also cross-validates the records against the snapshot of the campaign store
+that the check holds:
+
+- the check lists the records it replayed (`replayed`), and every record the analysis uses is in that list;
+- every record maps to an attempt of the snapshot, by run key, attempt number and the directory of the try;
+- every attempt the analysis would score (state `done`, which includes a scored treatment failure) has such a record,
+  and agrees with it on the run key, the attempt, the outcome and the treatment flag.
+
+Any mismatch is refused, naming it. With `partial`, an attempt that no replayed record covers is left out of the
+analysis instead, and the report says so, and attempts still running at the check are tolerated.
+"""
+
+import hashlib
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from expcore.campaign.factors import FactorSchema
+from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, StoreSnapshot
+from expcore.records.record import RunRecord, decode, record_filename
+from expcore.records.schema import RecordError
+
+
+class Unverified(RuntimeError):
+    """Something the analysis would use is not what the replay check verified; the message names it."""
+
+
+@dataclass(frozen=True)
+class VerifiedBatch:
+    """What the analysis may use: the snapshot of the store, the records by path, and what is left out and why."""
+
+    snapshot: StoreSnapshot
+    records: Mapping[str, RunRecord]  # by path relative to the batch, parsed from the bytes the check hashed
+    running_at_check: int = 0  # attempts the snapshot holds as still running
+    excluded: tuple[str, ...] = field(default_factory=tuple)  # run keys whose final attempt no replayed record covers
+
+    def record_for(self, digest: str, try_name: str, run_key: str, attempt: int) -> RunRecord | None:
+        """The verified record of an attempt, or None when no replayed record is there."""
+        return self.records.get(record_path(digest, try_name, run_key, attempt))
+
+
+def record_path(digest: str, try_name: str, run_key: str, attempt: int) -> str:
+    """Where an attempt's record lies in the batch: <run digest>/<try directory>/<record file>."""
+    return f"{digest}/{try_name}/{record_filename(run_key, attempt)}"
+
+
+def _read_verified(batch: Path, rel: str, expected: str) -> bytes:
+    """Read a file once and return its bytes if they are the ones the check hashed."""
+    try:
+        raw = (batch / rel).read_bytes()
+    except OSError as error:
+        raise Unverified(f"{rel}: cannot be read ({type(error).__name__}) although the replay check lists it") from None
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise Unverified(f"{rel}: changed after the replay check read it; the analysis uses only the bytes it verified")
+    return raw
+
+
+def _replayed_set(check: Mapping[str, Any]) -> set[str]:
+    replayed, hashed, inputs = check.get("replayed"), check.get("hashed_only"), check.get("inputs")
+    if not (isinstance(replayed, list) and isinstance(hashed, list) and isinstance(inputs, dict)):
+        raise Unverified(
+            "the replay check does not list the records it replayed; make it again with `python -m expcore check`"
+        )
+    if set(replayed) & set(hashed) or set(replayed) | set(hashed) != set(inputs):
+        raise Unverified("the replay check's lists of replayed and hashed-only inputs do not add up to its inputs")
+    return set(replayed)
+
+
+def _load_snapshot(batch: Path, check: Mapping[str, Any], schema: FactorSchema) -> StoreSnapshot:
+    if SNAPSHOT_FILE not in (check.get("hashed_only") or []):
+        raise Unverified(
+            f"the replay check holds no snapshot of the campaign ({SNAPSHOT_FILE}); "
+            "make it with `python -m expcore check`"
+        )
+    raw = _read_verified(batch, SNAPSHOT_FILE, check["inputs"][SNAPSHOT_FILE])
+    try:
+        return StoreSnapshot(raw, schema)
+    except SnapshotError as error:
+        raise Unverified(f"{SNAPSHOT_FILE}: {error}") from None
+
+
+def _parse(rel: str, raw: bytes) -> RunRecord:
+    try:
+        record = RunRecord.from_json(decode(raw))
+    except RecordError as error:
+        raise Unverified(f"{rel}: not a record although the replay check replayed it ({error})") from None
+    parts = rel.split("/")
+    if len(parts) != 3 or parts[2] != record.filename or parts[0] != record.filename.split(".")[0]:
+        raise Unverified(f"{rel}: lies where no record of {record.run_key!r} attempt {record.attempt} belongs")
+    return record
+
+
+def _attempts(snapshot: StoreSnapshot) -> list[Any]:
+    return snapshot.q(
+        "SELECT a.id, a.run_key, a.attempt, a.state, a.termination, a.treatment, a.run_dir, r.digest "
+        "FROM attempts a JOIN runs r ON r.run_key = a.run_key ORDER BY a.id"
+    )
+
+
+def _agree(row: Any, record: RunRecord, rel: str) -> None:
+    """A scored attempt and its record must say the same of the run, the attempt, the outcome and the treatment flag."""
+    said = {
+        "run key": (row["run_key"], record.run_key),
+        "attempt": (row["attempt"], record.attempt),
+        "outcome": (row["termination"], record.outcome["name"]),
+        "treatment flag": (bool(row["treatment"]), bool(record.outcome["treatment"])),
+    }
+    for what, (store, held) in said.items():
+        if store != held:
+            raise Unverified(f"{rel}: the campaign snapshot has {what} {store!r}, the record has {held!r}")
+
+
+def load_verified(
+    batch: Path, check: Mapping[str, Any], schema: FactorSchema, *, partial: bool = False
+) -> VerifiedBatch:
+    """Read the snapshot and the replayed records once each, verify them against `check`, and cross-validate them.
+
+    `check` is the stored check that `require_current_check` accepted. Raises `Unverified` naming the first thing that
+    does not agree. With `partial` an attempt that is still running, or whose final attempt has no replayed record, does
+    not refuse; the second is left out and listed in `excluded`.
+    """
+    replayed = _replayed_set(check)
+    snapshot = _load_snapshot(batch, check, schema)
+    records = {rel: _parse(rel, _read_verified(batch, rel, check["inputs"][rel])) for rel in sorted(replayed)}
+    attempts = _attempts(snapshot)
+    expected = {record_path(a["digest"], Path(a["run_dir"]).name, a["run_key"], a["attempt"]): a for a in attempts}
+    running = sum(1 for a in attempts if a["state"] == "running")
+    if running and not partial:
+        raise Unverified(
+            f"the replay check was made while {running} attempt(s) were still running; analysing it needs --partial"
+        )
+    for rel, record in records.items():
+        row = expected.get(rel)
+        if row is None:
+            raise Unverified(f"{rel}: no attempt of the campaign snapshot has this record")
+        if row["state"] == "done":
+            _agree(row, record, rel)
+    excluded = []
+    for rel, row in expected.items():
+        if row["state"] == "done" and rel not in records:
+            if not partial:
+                raise Unverified(
+                    f"{rel}: attempt {row['attempt']} of run {row['run_key']!r} is final in the campaign snapshot but "
+                    "no replayed record covers it; pass --partial to leave it out"
+                )
+            excluded.append(row["run_key"])
+    return VerifiedBatch(snapshot, records, running, tuple(sorted(set(excluded))))

@@ -46,6 +46,8 @@ The implementer must guarantee: `build` has no side effects beyond constructing 
 
 The command line is `python -m expcore run|check|analyze|report` ([`cli.py`](../src/expcore/cli.py)). Output goes under `<study>/out/`.
 
+What the analysis may use. `check` replays every record and also copies the campaign store into the batch (`campaign-snapshot.sqlite`, made with `VACUUM INTO` over a read-only connection and integrity-checked) and hashes the copy with the records. It lists the records it replayed (`replayed`) and refuses a run record named by a hashed-only pattern, so a check cannot replay nothing and still vouch for the records beside it. It refuses a store with attempts still running unless `--partial`, which the check records. `analyze` and `report` then use only those bytes: the snapshot, never the live store, and the replayed records, each read once and compared with the check's hash. They cross-validate the two: every record maps to an attempt of the snapshot, and every attempt scored (state `done`, a scored treatment failure included) has a replayed record that agrees with it on run key, attempt, outcome and treatment flag. Any mismatch is refused, naming it. With `--partial`, attempts still running at the check are tolerated, a final attempt no replayed record covers is left out, and the report names it.
+
 ## ModelBackend
 
 `expcore.models.adapters.ModelBackend`; built by the core, never by the executor.
