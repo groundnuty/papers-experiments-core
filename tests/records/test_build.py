@@ -250,3 +250,28 @@ def test_a_tool_that_returns_an_error_result_is_kept_as_the_class_and_the_raw_me
         "NotFound",
         "NotFound: no such file",
     )
+
+
+def test_the_core_version_defaults_to_the_installed_one_and_the_stamp_is_kept_as_given():
+    """The record names the version of the core it ran on; an explicit one wins."""
+    from expcore.models.route import sdk_version
+
+    def run(**kwargs):
+        return asyncio.run(
+            record_attempt(
+                StubAdapter(["done"]),
+                [FakeProvider(ECHO)],
+                "s",
+                "u",
+                make_config(),
+                IDENTITY,
+                code=CODE,
+                clock=FakeClock(),
+                sleep=never,
+                **kwargs,
+            )
+        )
+
+    assert run().core_version == sdk_version("papers-experiments-core")
+    assert run(core_version="9.9").core_version == "9.9"
+    assert run().code == CODE

@@ -25,6 +25,7 @@ from expcore.loop.records import LoopResult
 from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import ModelBackend
+from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
 from expcore.prompt.templates import RenderedPrompt, sha256_of
 from expcore.records.digest import digest, plain
@@ -32,6 +33,7 @@ from expcore.records.record import RunRecord
 from expcore.records.recording import Captured, RecordingBackend
 from expcore.records.schema import CURRENT, RecordError
 
+CORE_DISTRIBUTION = "papers-experiments-core"
 CONTEXT_OVERFLOW = "ContextOverflow"
 INFRA_PREFIX = "infrastructure: "
 
@@ -265,8 +267,9 @@ async def record_attempt(
     """Run one attempt through the loop, recording it, and return its record.
 
     The tool box takes its cap from the configuration, so the record's configuration describes what the model saw.
-    `code` is the code identity, for example `expcore.provenance.codestamp.version(root, scope)`. The caller builds
-    the backend (passing it `timer.time_left` when it uses the loop's time) and closes it.
+    `code` is the code identity, for example `expcore.provenance.codestamp.version(root, scope)`, and `core_version`
+    defaults to the installed version of the core. The caller builds the backend (passing it `timer.time_left` when
+    it uses the loop's time) and closes it.
     """
     recording = RecordingBackend(backend)
     box = ToolBox(list(providers), cap_chars=config.limits.output_cap_chars)
@@ -283,5 +286,5 @@ async def record_attempt(
         user=prompts[1],
         specs=specs,
         code=code,
-        core_version=core_version,
+        core_version=core_version if core_version is not None else sdk_version(CORE_DISTRIBUTION),
     )
