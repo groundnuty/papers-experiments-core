@@ -312,3 +312,27 @@ def test_c19_a_run_left_unstarted_after_waiting_for_a_lease_says_how_long_it_wai
         assert "after waiting 10.0 s" in rows[0]["detail"]
         assert executor.requests == []  # nothing started, no attempt used
     other.release()
+
+
+def test_c19_a_quarantined_lease_counts_against_the_cap_of_its_unit(tmp_path):
+    """C19: cap 1 and two keys: while the first run's sandbox is unproven, a second run on the unit does not start."""
+    probe, clock = Probe(), Clock()
+    pool = lease_pool(tmp_path, probe, clock)
+    executor = FakeExecutor()
+    settings = settings_for(workers=5, unit_caps={"unit-m1": 1})  # the global cap is not what limits here
+    with build(
+        tmp_path / "c", executor=executor, leases=pool, lease_group=lambda f: "g", settings=settings, plan=SMALL
+    ) as scheduler:
+        assert scheduler.run(max_dispatch=1).dispatched == 1
+        assert pool.held_back() == 1  # one key is quarantined, the other is free
+        assert pool.unusable() == {"k1"}
+        row, waiting = scheduler.next_dispatch()
+        assert row is None  # the unit is full: its quarantined sandbox may still be running
+        assert waiting
+        assert len(executor.requests) == 1
+        assert scheduler._quarantined_per_unit() == {"unit-m1": 1}
+        probe.gone_keys.add("k1")  # the teardown is shown
+        clock.now += 61
+        row, _ = scheduler.next_dispatch()
+        assert row is not None
+        assert pool.held_back() == 0

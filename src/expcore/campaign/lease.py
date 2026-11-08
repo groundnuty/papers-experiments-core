@@ -306,6 +306,11 @@ class LeasePool:
         with self._mutex:
             return len(self._quarantined)
 
+    def held_back_runs(self) -> list[str | None]:
+        """Return the run each quarantined lease was taken for (None where none was named), one entry per lease."""
+        with self._mutex:
+            return [lease.run_key for lease, _, _ in self._quarantined.values()]
+
     # --- granting -------------------------------------------------------------------------------------------------
 
     def _lock_path(self, key: str) -> Path:

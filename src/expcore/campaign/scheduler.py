@@ -19,7 +19,8 @@ options with the dispatch. This is the generic kernel and nothing else:
 
 There are no study names, layouts or options here, and no slots: a **unit** is any key the platform names for what runs
 share (an endpoint, a provider), and caps count runs in flight per unit, plus leases held back by quarantine and the
-sandboxes of reserved processes beside the campaign.
+sandboxes of reserved processes beside the campaign. A quarantined lease is a sandbox that may still be running, so it
+counts against the cap of the unit its run belongs to as well as against the global one (C19).
 """
 
 import asyncio
@@ -267,6 +268,20 @@ class Scheduler:
         reserved = self.reservations.reserved_count() if self.reservations is not None else 0
         return len(self._inflight) + held + reserved
 
+    def _quarantined_per_unit(self) -> dict[str, int]:
+        """Count the quarantined leases by the unit of the run each was taken for: they are sandboxes that may still run."""
+        if self.leases is None or self.store is None:
+            return {}
+        counts: dict[str, int] = {}
+        for key in self.leases.held_back_runs():
+            rows = (
+                self.store.q(f"SELECT {column_for('model')} AS model FROM runs WHERE run_key=?", (key,)) if key else []
+            )
+            if rows and rows[0]["model"] in self.endpoints:
+                unit = self.endpoints[rows[0]["model"]].unit
+                counts[unit] = counts.get(unit, 0) + 1
+        return counts
+
     def _all_hold(self, stopped_all: bool) -> Hold | None:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
         if stopped_all:
@@ -323,6 +338,7 @@ class Scheduler:
         stopped, stopped_all = self.stops.stopped()
         budget = None if self.budget is None else self.budget.assess([m for m, _ in self._inflight.values()], now)
         in_use = self._in_use()
+        held_in_unit = self._quarantined_per_unit()
         waiting = False
         all_hold = self._all_hold(stopped_all)
         self.holds.note(ALL, all_hold)
@@ -345,7 +361,8 @@ class Scheduler:
                 waiting = waiting or hold.temporary
                 continue
             cap = self.settings.unit_caps.get(unit)
-            full = cap is not None and sum(1 for _, u in self._inflight.values() if u == unit) >= cap
+            running = sum(1 for _, u in self._inflight.values() if u == unit) + held_in_unit.get(unit, 0)
+            full = cap is not None and running >= cap
             if in_use >= self.settings.workers or full:
                 waiting = True
                 continue
