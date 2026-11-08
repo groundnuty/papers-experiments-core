@@ -39,3 +39,13 @@ extend-exclude = [".claude"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# The source line of a sanitised import's provenance header (repository, 40-character commit, path, 40-character
+# blob) has a fixed format and is longer than the line limit. Each imported module is listed here; the formatter
+# still wraps its code at the limit.
+"src/expcore/errors.py" = ["E501"]
+"src/expcore/models/adapters.py" = ["E501"]
+"src/expcore/models/served.py" = ["E501"]
+"src/expcore/provenance/codestamp.py" = ["E501"]
+"src/expcore/config/models.py" = ["E501"]
