@@ -84,6 +84,13 @@ def test_the_study_space_resolves_to_its_declared_name(config, client):
     assert client.space_name(config.space.id) == config.space.name  # the name the mutation gate checks the prefixes of
 
 
+def test_a_file_resolves_to_its_space_through_its_path_attribute(config, client):
+    # covers: GET /data/{id}
+    provider = config.support.providers[0]
+    root = client.get(f"/spaces/{config.space.id}", provider=provider)["fileId"]
+    assert client.file_space_name(root, provider) == config.space.name  # the name a mutation by file id is gated on
+
+
 def test_discovery_finds_the_space_and_the_declared_local_provider(config, issuer, client):
     # covers: POST /tokens/infer_access_token_scope
     user = service_user(config)

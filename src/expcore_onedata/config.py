@@ -453,7 +453,19 @@ def load_platform(
     digest = hashlib.sha256(file.read_bytes()).hexdigest()
     root = Section(load_toml(file), file, "platform.toml")
     root.reject_unknown(
-        ("zone", "providers", "space", "support", "credentials", "tokens", "principals", "toolserver", "sandbox")
+        (
+            "zone",
+            "providers",
+            "space",
+            "support",
+            "credentials",
+            "tokens",
+            "principals",
+            "toolserver",
+            "sandbox",
+            "placement",  # read by placement_config.load_placement
+            "slots",  # read by users.load_slots
+        )
     )
     zone = root.section("zone")
     zone.reject_unknown(("name", "url"))

@@ -1,336 +1,535 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/scripted/provision.py, blob 1969c9f03ed263e249b7cba8ec4ee353d329ef03
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""Spaces this lane owns, on the federation: create, upload, verify, replicate, evict, tear down.
+#   merged: icsa-2027-experiments @ 6fc798cf, day0/scripts/odsafe.py:1-17,33-55 (a teardown that finds files left changes nothing)
+#   merged: icsa-2027-experiments @ 6fc798cf, day0/scripts/odclean.py:237 (DELETE of a file by its id)
+#   changes: see git history of this file from its import commit
+"""Study data in the space: create, replicate, evict, confirm and tear down, scoped to the configured prefixes (O01, O09).
 
-Production safety: only `study_space_prefix_2_*` and `study_space_prefix_4_*` spaces are created or changed (refused otherwise); every
-change goes to the change log next to the results. Never restarts or reconfigures anything. A transfer's reported status
-is never taken as evidence (dataset_77 onedata-issues 0003, 0006): placement always comes from the block map.
+`Provisioner` is the only writer of study data. Every request that can change state goes through
+`OnezoneClient.mutate` (or `read_range`) with the space's name, so a name outside `[space] prefixes` sends nothing, and
+before it first acts the provisioner reads the space's live name from Onezone and refuses one that differs from the
+configured name or lies outside the prefixes. On top of that gate:
+
+- **Placement is what the block map says** (O01). A replication job that reports `completed` is a report; `replicate`
+  returns only when `GET /data/{id}/distribution` on the receiving provider covers the whole file on consecutive polls,
+  and raises `NotPlaced` with the shortfall otherwise. An eviction is confirmed the same way, by the block map showing
+  the provider holding nothing of the file.
+- **The data provider's own copy is never evicted** (O09): a request to evict from the provider `[placement] holder`
+  names is refused before anything is sent, by name and by id.
+- **Teardown removes only what the change log says this provisioner created** (O09). A file is deleted by its logged id;
+  a directory only when nothing but logged, already deleted entries was in it; anything else is reported as left, and
+  the report's `ok` is False. Nothing outside the log is touched, and no token or user is revoked.
+- **The waits are bounded** (O07, `consistency.py`) and happen before or after a run, never in the agent's time.
+
+The change log is a JSON-lines file: one line per creation and per deletion with the path, the id and the time. It holds
+no token and no credential.
 """
-from __future__ import annotations
 
-import concurrent.futures as cf
-import hashlib
-import sys
-import threading
+import json
 import time
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any
+from urllib.parse import quote
 
-import requests
+from expcore_onedata import consistency
+from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
+from expcore_onedata.config import PlatformConfig
+from expcore_onedata.federation import SpaceView, is_declared
+from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncovered
+from expcore_onedata.rangemap import PlacementSettings, safe_path
 
-from . import placement as P
-
-OWN_PREFIXES = ("study_space_prefix_2_", "study_space_prefix_4_", "study_space_prefix_6_")
-CHUNK = 64 << 20
-# A stalled block (science, #34, 2 Nov 11:37Z). fr's op_worker can stop taking a write for 60 to 300 s, on either path. `requests` applies its connect timeout to
-# writes, so the pair below sets both. The write's limit covers the whole 64 MiB block, so this needs a path well above 9 Mbit/s per stream: fr's is, and the WAN
-# anchor's (2 to 15 Mbit/s) is not, so it is M+'s setup that asks for this (`stall_retry`).
-BLOCK_TRIES = 5
-BLOCK_STALL_S = 60.0
-BLOCK_READ_S = 300.0
-S1_DIR, S2_DIR, S2_NAME = "dataset_15", "dataset_16", "dataset-2.nc"
-TERMINAL = ("completed", "failed", "cancelled", "skipped")
+LISTING_LIMIT = 1000
+LISTING_ATTRIBUTES = ["name", "file_id", "size", "type"]  # Onedata 25 names attributes in snake case
+SHORT_FILES_SHOWN = 50
 
 
-def check_own(name: str) -> None:
-    if not name.startswith(OWN_PREFIXES):
-        raise ValueError(f"refusing to act on space {name!r}: this lane owns only {OWN_PREFIXES}")
+class ProvisionError(RuntimeError):
+    """Provisioning refused or could not confirm what it did; the message holds no id, URL or name of the federation."""
 
 
-def check_space(o, provider: str, space_id: str, root_id: str, recorded: dict[str, str]) -> str:
-    """Before acting on a space named by a file: its live name is one of this lane's, its root is the one recorded, and
-    each recorded id (relative path -> id) is what a listing down from that root finds. Documented calls only: a
-    file's attributes carry no space id (checked on fr), and the id's own encoding is the provider's internal format."""
-    name = o.oz("GET", f"/spaces/{space_id}").json().get("name", "")
-    check_own(name)
-    if o.space_root(provider, space_id) != root_id:
-        raise ValueError(f"{name}: the recorded root is not this space's root")
-    for rel, fid in recorded.items():
-        node = root_id
-        for part in rel.strip("/").split("/"):
-            entry = children(o, provider, node).get(part)
-            if entry is None:
-                raise ValueError(f"{name}: no {rel!r} under the space root")
-            node = entry["fileId"]
-        if node != fid:
-            raise ValueError(f"{name}: the recorded id of {rel!r} is not the one in the space")
-    return name
+class Refused(ProvisionError):
+    """A request was refused before anything was sent: outside the prefixes, or against the data provider's own copy."""
 
 
-def read_manifest(path: Path | str) -> dict[str, str]:
-    """`<sha256>  <name>` lines (#3): name -> digest."""
-    out = {}
-    for line in Path(path).read_text().splitlines():
-        digest, name = line.split("  ", 1)
-        out[name] = digest
-    return out
+class NotPlaced(ProvisionError):
+    """The block map does not show what a transfer or a read was meant to place."""
+
+    def __init__(self, message: str, report: "PlacementReport | None" = None) -> None:
+        super().__init__(message)
+        self.report = report
 
 
-def children(o, provider: str, dir_id: str) -> dict[str, dict]:
-    """All entries of a directory, following pagination to the end."""
-    out: dict[str, dict] = {}
-    token = None
-    while True:
-        # Onedata 25 names attributes in snake case (`fileId` is refused with 400 badValueNotAllowed, checked on fr)
-        params = {"limit": 1000, "attribute": ["name", "file_id", "size", "type"]}
-        if token:
-            params["token"] = token
-        j = o.op(provider, "GET", f"/data/{dir_id}/children", params=params).json()
-        for c in j["children"]:
-            fid = c.get("file_id") or c.get("fileId")
-            if not fid or c.get("size") is None:
-                raise RuntimeError(f"listing entry without file id or size: {sorted(c)}")
-            out[c["name"]] = {"name": c["name"], "fileId": fid, "size": int(c["size"]), "type": c.get("type")}
-        if j.get("isLast", True):
-            return out
-        token = j.get("nextPageToken")
-        if not token:
-            raise RuntimeError("listing: not the last page but no nextPageToken")
+@dataclass(frozen=True)
+class Entry:
+    """A file or directory as a listing shows it."""
+
+    file_id: str
+    name: str
+    size: int
+    kind: str
 
 
-class BlockStalls:
-    """What the upload hit, for the setup's record. Several files upload at once."""
+@dataclass(frozen=True)
+class PlacementReport:
+    """How much of what was wanted a provider holds, by its block map."""
 
-    def __init__(self):
-        self._mu, self.events = threading.Lock(), []
+    files: int
+    held_bytes: int
+    files_short: int
+    bytes_short: int
+    short_file_ids: tuple[str, ...]
 
-    def add(self, name: str, off: int, seconds: float, what: str) -> None:
-        with self._mu:
-            self.events.append({"file": name, "offset": off, "seconds": round(seconds, 1), "what": what})
+    @property
+    def fully_placed(self) -> bool:
+        """True when nothing is short and at least one file was asked about."""
+        return self.files > 0 and self.files_short == 0
 
-    def summary(self) -> dict:
-        with self._mu:
-            return {"stalled_blocks": len({(e["file"], e["offset"]) for e in self.events}), "stalls": len(self.events),
-                    "stall_seconds": round(sum(e["seconds"] for e in self.events), 1), "stall_events": self.events[:50]}
+    def to_json(self) -> dict[str, Any]:
+        """Return the report as plain JSON."""
+        return {
+            "files": self.files,
+            "held_bytes": self.held_bytes,
+            "files_short": self.files_short,
+            "bytes_short": self.bytes_short,
+            "short_file_ids": list(self.short_file_ids),
+            "fully_placed": self.fully_placed,
+        }
 
 
-def _put_block(o, provider: str, fid: str, name: str, off: int, buf: bytes, stalls: BlockStalls) -> None:
-    """One block. A stalled one goes again on a new connection, up to BLOCK_TRIES: the same bytes at the same offset, so a late write of the stalled one changes
-    nothing, and the hash check after the upload still decides whether the file is right. One that does not recover stops the setup."""
-    for attempt in range(1, BLOCK_TRIES + 1):
-        t0 = time.time()
+@dataclass(frozen=True)
+class Confirmation:
+    """The outcome of waiting for the block map to show a placement: the last report and how the polls went."""
+
+    placed: bool
+    report: PlacementReport
+    polls: int
+    seconds: float
+
+
+@dataclass(frozen=True)
+class TeardownReport:
+    """What a teardown deleted and what it found left: each leftover with its path and the reason."""
+
+    deleted: tuple[str, ...] = ()
+    left: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+
+    @property
+    def ok(self) -> bool:
+        """True when everything the log says was created is gone."""
+        return not self.left
+
+    def raise_if_left(self) -> None:
+        """Raise ProvisionError naming how many entries remain, so a caller cannot read leftovers as success."""
+        if self.left:
+            raise ProvisionError(f"teardown left {len(self.left)} entr(ies) behind; see the report")
+
+
+def resolve_provider_ids(config: PlatformConfig, view: SpaceView | None = None) -> dict[str, str]:
+    """Map each declared provider's name to the id Onezone gives it: the declared id, else the one reported by host."""
+    ids: dict[str, str] = {}
+    for provider in config.providers.values():
+        if provider.id is not None:
+            ids[provider.name] = provider.id
+            continue
+        for reported in view.providers if view else ():
+            if is_declared(provider, reported):
+                ids[provider.name] = reported.id
+    return ids
+
+
+def _quote(identifier: str) -> str:
+    """Quote an opaque id for a path segment."""
+    return quote(identifier, safe="")
+
+
+def listing_entry(item: Any) -> Entry:
+    """Read one entry of a children listing; refuse one without an id, a size or a name."""
+    fid = item.get("file_id") or item.get("fileId") if isinstance(item, dict) else None
+    if not fid or not isinstance(item.get("name"), str) or item.get("size") is None:
+        raise PlatformError("a listing entry has no file id, name or size")
+    return Entry(str(fid), item["name"], int(item["size"]), str(item.get("type") or ""))
+
+
+class Provisioner:
+    """Creates, places and removes study data in the configured space, and confirms each step by the block map."""
+
+    def __init__(
+        self,
+        client: OnezoneClient,
+        config: PlatformConfig,
+        settings: PlacementSettings,
+        *,
+        provider_ids: Mapping[str, str],
+        log: Path | str,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if settings.holder not in config.providers:
+            raise ProvisionError("the data provider named in the settings is not a declared provider")
+        self._client, self._config, self._settings = client, config, settings
+        self._ids = dict(provider_ids)
+        self._log = Path(log)
+        self._clock, self._sleep = clock, sleep
+        self._verified_name: str | None = None
+        self._root: str | None = None
+
+    @property
+    def settings(self) -> PlacementSettings:
+        """The bounds and the data provider this provisioner works to."""
+        return self._settings
+
+    # -- scope -----------------------------------------------------------------
+    def verify_space(self) -> str:
+        """Read the space's live name and refuse one that differs from the configuration or lies outside the prefixes.
+
+        The name is Onezone's, read by the client (`space_name`, once per client). The client's own gate refuses every
+        mutation whose target space lies outside the prefixes; this adds that the space is the configured one.
+        """
         try:
-            o.op(provider, "PUT", f"/data/{fid}/content", params={"offset": off}, data=buf, timeout=(BLOCK_STALL_S, BLOCK_READ_S),
-                 headers={"content-type": "application/octet-stream"}, **({"new_connection": True} if attempt > 1 else {}))
-            return
-        except (requests.ConnectionError, requests.Timeout) as e:
-            stalls.add(name, off, time.time() - t0, type(e).__name__)
-    raise RuntimeError(f"{name}: the block at offset {off} stalled {BLOCK_TRIES} times; it did not recover on a new connection")
+            name = self._client.space_name(self._config.space.id)
+        except OutOfScope:
+            raise Refused("the configured space is unknown to Onezone; nothing was changed") from None
+        if not name.startswith(self._config.space.prefixes):
+            raise Refused("the space's live name is outside the configured prefixes; nothing was changed")
+        if name != self._config.space.name:
+            raise Refused("the space's live name is not the configured one; nothing was changed")
+        self._verified_name = name
+        return name
 
+    def _verified(self) -> None:
+        """Verify the space once, before this provisioner first changes anything."""
+        if self._verified_name is None:
+            self.verify_space()
 
-def put_file(o, provider: str, parent: str, path: Path, existing: dict[str, dict], stalls: BlockStalls | None = None) -> bool:
-    """One file, in 64 MiB blocks, as #3 uploaded them; a file already there with the right size is left alone. With `stalls`, a stalled block goes again."""
-    size = path.stat().st_size
-    cur = existing.get(path.name)
-    if cur is not None:
-        if int(cur["size"]) == size:
-            return False
-        raise RuntimeError(f"{path.name} exists with another size; refusing to overwrite")
-    fid = o.op(provider, "POST", f"/data/{parent}/children", params={"name": path.name, "type": "REG"}).json()["fileId"]
-    with open(path, "rb") as f:
-        off = 0
-        while off < size:
-            buf = f.read(CHUNK)
-            if stalls is not None:
-                _put_block(o, provider, fid, path.name, off, buf, stalls)
-            else:
-                o.op(provider, "PUT", f"/data/{fid}/content", params={"offset": off}, data=buf, timeout=900,
-                     headers={"content-type": "application/octet-stream"})
-            off += len(buf)
-    got = int(o.op(provider, "GET", f"/data/{fid}").json()["size"])
-    if got != size:
-        raise RuntimeError(f"{path.name}: size after upload {got} != {size}")
-    return True
+    def provider_id(self, name: str) -> str:
+        """Return a declared provider's Onezone id, or refuse when it is unknown."""
+        if name not in self._config.providers:
+            raise Refused("the provider is not declared")
+        if name not in self._ids:
+            raise Refused("the provider's id is unknown: declare it in platform.toml or resolve it from the space view")
+        return self._ids[name]
 
+    def root(self) -> str:
+        """Return the space's root directory id on the data provider, waiting out a root that does not exist yet."""
+        if self._root is None:
+            self._root = consistency.space_root(
+                self._client, self._settings.holder, self._config.space.id, sleep=self._sleep
+            )
+        return self._root
 
-def upload_dataset(o, provider: str, root_id: str, s1_dir: Path, s2_file: Path, *, workers: int = 8, stall_retry: bool = False) -> dict:
-    """s1z/ and s2z/dataset-2.nc under the space root. Resumes: present files of the right size are skipped."""
-    top = children(o, provider, root_id)
-    def mkdir(name: str) -> str:
-        if name in top:
-            return top[name]["fileId"]
-        return o.op(provider, "POST", f"/data/{root_id}/children", params={"name": name, "type": "DIR"}).json()["fileId"]
-    task_a, task_b = mkdir(S1_DIR), mkdir(S2_DIR)
-    ex1, ex2 = children(o, provider, task_a), children(o, provider, task_b)
-    files = sorted(Path(s1_dir).glob("*.nc"))
-    t0 = time.time()
-    stalls = BlockStalls() if stall_retry else None
-    with cf.ThreadPoolExecutor(workers) as pool:
-        wrote = sum(pool.map(lambda p: put_file(o, provider, task_a, p, ex1, stalls), files))
-    task_s = time.time()
-    w2 = put_file(o, provider, task_b, Path(s2_file), ex2, stalls)
-    return {"s1_written": wrote, "s1_present": len(files) - wrote, "s1_seconds": round(task_s - t0, 1),
-            "s2_written": w2, "s2_seconds": round(time.time() - task_s, 1), "s1_dir_id": task_a, "s2_dir_id": task_b, **(stalls.summary() if stalls else {})}
+    # -- the change log --------------------------------------------------------
+    def _write(self, action: str, **fields: Any) -> None:
+        """Append one line to the change log; fail loudly, since an unlogged creation could never be torn down."""
+        self._log.parent.mkdir(parents=True, exist_ok=True)
+        line = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "action": action, **fields}
+        with open(self._log, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(line, sort_keys=True) + "\n")
+            handle.flush()
 
+    def logged(self) -> list[dict[str, Any]]:
+        """Return the creations the log holds that no later deletion line cancels, oldest first."""
+        if not self._log.exists():
+            return []
+        created: dict[str, dict[str, Any]] = {}
+        for text in self._log.read_text(encoding="utf-8").splitlines():
+            if not text.strip():
+                continue
+            line = json.loads(text)
+            if line.get("action") == "create":
+                created[line["id"]] = line
+            elif line.get("action") == "delete":
+                created.pop(line["id"], None)
+        return list(created.values())
 
-def sha_remote(o, provider: str, fid: str, size: int) -> str:
-    h = hashlib.sha256()
-    for off in range(0, size, CHUNK):
-        r = o.op(provider, "GET", f"/data/{fid}/content", timeout=900, expect=(200, 206),
-                 headers={"Range": f"bytes={off}-{min(off + CHUNK, size) - 1}"})
-        h.update(r.content)
-    return h.hexdigest()
+    # -- listing and creation --------------------------------------------------
+    def children(self, directory_id: str, provider: str | None = None) -> dict[str, Entry]:
+        """Return every entry of a directory by name, following the pages to the end."""
+        provider = provider or self._settings.holder
+        entries: dict[str, Entry] = {}
+        params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
+        while True:
+            page = self._client.get(f"/data/{_quote(directory_id)}/children", provider=provider, params=params)
+            if not isinstance(page, dict) or not isinstance(page.get("children"), list):
+                raise PlatformError("a listing answer holds no 'children'")
+            for item in page["children"]:
+                entry = listing_entry(item)
+                entries[entry.name] = entry
+            if page.get("isLast", True):
+                return entries
+            token = page.get("nextPageToken")
+            if not token:
+                raise PlatformError("a listing is not on its last page but names no next page")
+            params = {**params, "token": token}
 
+    def resolve(self, path: str, provider: str | None = None) -> Entry:
+        """Walk a space-relative path down from the root and return its entry; raise KeyError naming the part missing."""
+        node = Entry(self.root(), "", 0, "DIR")
+        for part in safe_path(path):
+            found = self.children(node.file_id, provider).get(part)
+            if found is None:
+                raise KeyError(f"no entry {part!r} on the way down the path")
+            node = found
+        return node
 
-def verify_files(o, provider: str, entries: dict[str, dict], manifest: dict[str, str], *, workers: int = 8,
-                 retries: int = 2) -> dict:
-    """Download and hash each listed file from the provider, against #3's digests. A retried read is counted."""
-    retried = [0]
+    def make_dir(self, path: str) -> str:
+        """Create every directory of a path that is missing, log each creation, and return the last one's id."""
+        parent = self.root()
+        for part in safe_path(path):
+            existing = self.children(parent).get(part)
+            if existing is not None:
+                if existing.kind != "DIR":
+                    raise ProvisionError("a part of the path exists and is not a directory")
+                parent = existing.file_id
+                continue
+            parent = self._create(parent, part, "DIR", path)
+        return parent
 
-    def one(name: str) -> tuple[str, str]:
-        c = entries[name]
-        for attempt in range(retries + 1):
+    def _create(self, parent_id: str, name: str, kind: str, path: str) -> str:
+        self._verified()
+        answer = self._client.mutate(
+            "POST",
+            f"/data/{_quote(parent_id)}/children",
+            provider=self._settings.holder,
+            params={"name": name, "type": kind},
+        )
+        file_id = answer.get("fileId") if isinstance(answer, dict) else None
+        if not isinstance(file_id, str) or not file_id:
+            raise PlatformError("a creation answer holds no file id")
+        self._write("create", id=file_id, kind=kind, path=path)
+        return file_id
+
+    def put_file(self, path: str, data: bytes) -> str:
+        """Create a file with this content on the data provider, in blocks, and verify its size; return its id.
+
+        A file already there is refused, since replacing it would break the rule that teardown touches only what the
+        log says was created.
+        """
+        *directory, name = safe_path(path)
+        parent = self.make_dir("/".join(directory)) if directory else self.root()
+        if name in self.children(parent):
+            raise ProvisionError("the file already exists; this provisioner will not overwrite or adopt it")
+        file_id = self._create(parent, name, "REG", path)
+        self._verified()
+        for offset in range(0, len(data), self._settings.chunk_bytes):
+            self._client.mutate(
+                "PUT",
+                f"/data/{_quote(file_id)}/content",
+                provider=self._settings.holder,
+                params={"offset": offset},
+                content=data[offset : offset + self._settings.chunk_bytes],
+                timeout_s=self._settings.request_timeout_s,
+            )
+        size = self._client.get(f"/data/{_quote(file_id)}", provider=self._settings.holder).get("size")
+        if size != len(data):
+            raise ProvisionError("the size read back after an upload is not the size uploaded")
+        return file_id
+
+    # -- block maps ------------------------------------------------------------
+    def blocks(self, file_id: str, provider: str, *, reader: str | None = None) -> list[Range]:
+        """Return the blocks a provider holds of a file, read from the block map as the `reader` provider sees it."""
+        answer = self._client.get(f"/data/{_quote(file_id)}/distribution", provider=reader or provider)
+        try:
+            return provider_blocks(answer, self.provider_id(provider))
+        except ValueError as error:
+            raise PlatformError(f"the block map is unreadable ({error})") from None
+
+    def placement_report(self, provider: str, wanted: Mapping[str, list[Range]]) -> PlacementReport:
+        """For file id -> ranges that `provider` must hold: how many bytes it holds of them and what is missing."""
+        held = 0
+        short: dict[str, int] = {}
+        for file_id, ranges in wanted.items():
+            blocks = self.blocks(file_id, provider)
+            held += held_bytes(blocks)
+            gaps = uncovered(blocks, ranges)
+            if gaps:
+                short[file_id] = sum(length for _, length in gaps)
+        return PlacementReport(
+            len(wanted), held, len(short), sum(short.values()), tuple(sorted(short))[:SHORT_FILES_SHOWN]
+        )
+
+    def read_through(self, provider: str, file_id: str, offset: int, length: int) -> int:
+        """Read a range of a file through a provider, which fetches what it lacks; return the bytes read.
+
+        This is a range read and never a transfer job (O02). It is gated like a mutation, because it changes the
+        provider's block map.
+        """
+        self._verified()
+        data = self._client.read_range(
+            f"/data/{_quote(file_id)}/content",
+            provider=provider,
+            offset=offset,
+            length=length,
+            timeout_s=self._settings.request_timeout_s,
+        )
+        return len(data)
+
+    def holds(self, provider: str, file_ids: Iterable[str]) -> int:
+        """Return how many bytes `provider` holds of these files together, by the block map."""
+        return sum(held_bytes(self.blocks(fid, provider)) for fid in file_ids)
+
+    def confirm_placed(self, provider: str, wanted: Mapping[str, list[Range]]) -> Confirmation:
+        """Wait, within the bound, for the block map to show every wanted range on `provider` on consecutive polls."""
+        began = self._clock()
+        result = consistency.converge(
+            lambda: self.placement_report(provider, wanted),
+            lambda report: report.fully_placed,
+            timeout_s=self._settings.settle_timeout_s,
+            poll_s=self._settings.poll_s,
+            consecutive=self._settings.consecutive_polls,
+            clock=self._clock,
+            sleep=self._sleep,
+        )
+        report = result.value if result.value is not None else PlacementReport(len(wanted), 0, len(wanted), 0, ())
+        return Confirmation(result.converged, report, len(result.checks), round(self._clock() - began, 3))
+
+    def require_empty(self, provider: str, file_ids: list[str]) -> Confirmation:
+        """Wait for `provider` to hold nothing of these files, by consecutive block-map polls; raise NotPlaced if not."""
+        result = consistency.converge(
+            lambda: self.holds(provider, file_ids),
+            lambda held: held == 0,
+            timeout_s=self._settings.settle_timeout_s,
+            poll_s=self._settings.poll_s,
+            consecutive=self._settings.consecutive_polls,
+            clock=self._clock,
+            sleep=self._sleep,
+        )
+        report = PlacementReport(len(file_ids), int(result.value or 0), 0, 0, ())
+        if not result.converged:
+            raise NotPlaced(f"the provider still holds {report.held_bytes} B of the files after the bound", report)
+        return Confirmation(True, report, len(result.checks), 0.0)
+
+    # -- transfers -------------------------------------------------------------
+    def _schedule(self, kind: str, file_id: str, provider: str) -> str:
+        field_name = "replicatingProviderId" if kind == "replication" else "evictingProviderId"
+        self._verified()
+        answer = self._client.mutate(
+            "POST",
+            "/transfers",
+            provider=provider,
+            json={"type": kind, field_name: self.provider_id(provider), "dataSourceType": "file", "fileId": file_id},
+        )
+        tid = answer.get("transferId") if isinstance(answer, dict) else None
+        if not isinstance(tid, str) or not tid:
+            raise PlatformError("a transfer answer holds no transfer id")
+        self._write("transfer", id=tid, kind=kind, file=file_id)
+        return tid
+
+    def replicate(self, path: str, to_provider: str) -> dict[str, Any]:
+        """Replicate a whole file to a provider and return a record once its block map there covers the file (O01).
+
+        The transfer's own state is recorded and never believed: when the job reports `completed` and the map does not
+        cover the file, this raises `NotPlaced`.
+        """
+        self._verified()
+        entry = self.resolve(path)
+        if entry.size < 1:
+            raise ProvisionError("an empty file has nothing to place")
+        wanted = {entry.file_id: [(0, entry.size)]}
+        began = self._clock()
+        tid = self._schedule("replication", entry.file_id, to_provider)
+        done = consistency.require_ended(
+            consistency.wait_transfers(
+                self._client,
+                to_provider,
+                [tid],
+                timeout_s=self._settings.transfer_timeout_s,
+                poll_s=self._settings.poll_s,
+                clock=self._clock,
+                sleep=self._sleep,
+            ),
+            "replication",
+        )
+        confirmation = self.confirm_placed(to_provider, wanted)
+        if not confirmation.placed:
+            raise NotPlaced(
+                f"the transfer reported {done.states()} but the block map does not cover the file "
+                f"({confirmation.report.bytes_short} B short)",
+                confirmation.report,
+            )
+        return {
+            "transfer_states": done.states(),
+            "placement": confirmation.report.to_json(),
+            "seconds": round(self._clock() - began, 3),
+        }
+
+    def evict(self, path: str, from_provider: str) -> dict[str, Any]:
+        """Evict a file from a provider and return a record once its block map there is empty; never from the holder."""
+        if from_provider == self._settings.holder or (
+            from_provider in self._ids and self._ids[from_provider] == self._ids.get(self._settings.holder)
+        ):
+            raise Refused("refusing to evict the data provider's own copy; nothing was sent")
+        self._verified()
+        entry = self.resolve(path)
+        tid = self._schedule("eviction", entry.file_id, from_provider)
+        done = consistency.require_ended(
+            consistency.wait_transfers(
+                self._client,
+                from_provider,
+                [tid],
+                timeout_s=self._settings.transfer_timeout_s,
+                poll_s=self._settings.poll_s,
+                clock=self._clock,
+                sleep=self._sleep,
+            ),
+            "eviction",
+        )
+        confirmation = self.require_empty(from_provider, [entry.file_id])
+        return {"transfer_states": done.states(), "empty": confirmation.placed}
+
+    # -- teardown --------------------------------------------------------------
+    def _gone(self, file_id: str) -> bool:
+        """Tell whether the data provider has no such entry; any answer but a 404 is "no" for a read that worked."""
+        try:
+            self._client.get(f"/data/{_quote(file_id)}", provider=self._settings.holder)
+        except PlatformError as error:
+            if error.status == consistency.NOT_FOUND:
+                return True
+            raise
+        return False
+
+    def teardown(self) -> TeardownReport:
+        """Delete exactly the entries the log says were created, newest first, and report anything left (O09)."""
+        self._verified()
+        deleted: list[str] = []
+        left: list[dict[str, Any]] = []
+        removed: set[str] = set()
+        for line in reversed(self.logged()):
+            fid = line["id"]
+            if line["kind"] == "DIR":
+                strangers = [e for e in self.children(fid).values() if e.file_id not in removed]
+                if strangers:
+                    left.append({"path": line["path"], "reason": "holds entries this provisioner did not create"})
+                    continue
             try:
-                return name, sha_remote(o, provider, c["fileId"], int(c["size"]))
-            except Exception:  # noqa: BLE001 - a dropped read is retried and counted; a third failure propagates
-                retried[0] += 1
-                if attempt == retries:
-                    raise
-                time.sleep(2)
-        raise AssertionError
+                self._client.mutate("DELETE", f"/data/{_quote(fid)}", provider=self._settings.holder)
+            except PlatformError as error:
+                if error.status != consistency.NOT_FOUND:
+                    left.append({"path": line["path"], "reason": "the delete was refused or failed"})
+                    continue
+            self._write("delete", id=fid, path=line["path"])
+            removed.add(fid)
+            deleted.append(fid)
+        for fid in deleted:
+            result = consistency.converge(
+                lambda fid=fid: self._gone(fid),
+                bool,
+                timeout_s=self._settings.settle_timeout_s,
+                poll_s=self._settings.poll_s,
+                consecutive=self._settings.consecutive_polls,
+                clock=self._clock,
+                sleep=self._sleep,
+            )
+            if not result.converged:
+                left.append({"path": self._path_of(fid), "reason": "still listed after its delete"})
+        return TeardownReport(tuple(deleted), tuple(left))
 
-    names = sorted(entries)
-    t0 = time.time()
-    with cf.ThreadPoolExecutor(workers) as pool:
-        got = dict(pool.map(one, names))
-    bad = sorted(n for n in names if got[n] != manifest.get(n))
-    return {"files_checked": len(names), "mismatches": bad, "ok": not bad and bool(names), "seconds": round(time.time() - t0, 1),
-            "retried_reads": retried[0]}
-
-
-# ------------------------------------------------------------------------------------- transfers
-def schedule_replication(o, on_provider: str, file_id: str, to_provider_id: str) -> str:
-    r = o.op(on_provider, "POST", "/transfers", json={"type": "replication", "replicatingProviderId": to_provider_id,
-                                                      "dataSourceType": "file", "fileId": file_id}, expect=(201,))
-    return r.json()["transferId"]
-
-
-def schedule_eviction(o, on_provider: str, file_id: str, from_provider_id: str, *, holder_id: str) -> str:
-    """Evict from `from_provider_id`. The provider holding the source data must never be the target."""
-    if from_provider_id == holder_id:
-        raise ValueError("refusing to evict the data provider's own copy")
-    r = o.op(on_provider, "POST", "/transfers", json={"type": "eviction", "evictingProviderId": from_provider_id,
-                                                      "dataSourceType": "file", "fileId": file_id}, expect=(201,))
-    return r.json()["transferId"]
-
-
-def transfer_state(j: dict) -> str:
-    return j.get("transferStatus") or j.get("replicationStatus") or j.get("evictionStatus") or "unknown"
-
-
-def wait_transfers(o, on_provider: str, tids: Iterable[str], *, timeout_s: float, poll_s: float = 2.0,
-                   clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep) -> dict:
-    """Poll until each transfer reports a terminal state, or `timeout_s`. A report only: placement is checked apart."""
-    pending = set(tids)
-    final: dict[str, dict] = {}
-    t0 = clock()
-    while pending and clock() - t0 < timeout_s:
-        for tid in sorted(pending):
-            j = o.op(on_provider, "GET", f"/transfers/{tid}").json()
-            if transfer_state(j) in TERMINAL:
-                final[tid] = j
-                pending.discard(tid)
-        if pending:
-            sleep(poll_s)
-    states: dict[str, int] = {}
-    for j in final.values():
-        states[transfer_state(j)] = states.get(transfer_state(j), 0) + 1
-    return {"seconds": round(clock() - t0, 3), "states": states, "timed_out": sorted(pending),
-            "bytes_replicated": sum(int(j.get("bytesReplicated") or 0) for j in final.values()),
-            "files_replicated": sum(int(j.get("filesReplicated") or 0) for j in final.values()),
-            "files_evicted": sum(int(j.get("filesEvicted") or 0) for j in final.values()),
-            "files_failed": sum(int(j.get("filesFailed") or 0) for j in final.values())}
-
-
-def blocks_of(o, reader: str, file_id: str, provider_id: str) -> list[tuple[int, int]]:
-    return P.provider_blocks(o.op(reader, "GET", f"/data/{file_id}/distribution").json(), provider_id)
-
-
-def placement_report(o, reader: str, provider_id: str, wanted: dict[str, list[tuple[int, int]]],
-                     *, workers: int = 8) -> dict:
-    """For file id -> ranges that must be held by `provider_id`: what is missing, and how much it holds of them."""
-    def one(item):
-        fid, ranges = item
-        blocks = blocks_of(o, reader, fid, provider_id)
-        return fid, P.held_bytes(blocks), P.uncovered(blocks, ranges)
-
-    with cf.ThreadPoolExecutor(workers) as pool:
-        rows = list(pool.map(one, wanted.items()))
-    short = {fid: gaps for fid, _, gaps in rows if gaps}
-    return {"files": len(rows), "held_bytes": sum(h for _, h, _ in rows), "files_short": len(short),
-            "bytes_short": sum(ln for gaps in short.values() for _, ln in gaps),
-            "short_file_ids": sorted(short)[:50], "fully_placed": not short and bool(rows)}
-
-
-def holds_nothing(o, reader: str, provider_id: str, file_ids: Iterable[str], *, workers: int = 8) -> dict:
-    """The forbidden check's other half: the agent-site provider holds no block of these files."""
-    ids = list(file_ids)
-
-    def one(fid: str) -> int:
-        return P.held_bytes(blocks_of(o, reader, fid, provider_id))
-
-    with cf.ThreadPoolExecutor(workers) as pool:
-        held = list(pool.map(one, ids))
-    return {"files": len(ids), "held_bytes": sum(held), "files_holding": sum(1 for h in held if h), "empty": not any(held) and bool(ids)}
-
-
-# ------------------------------------------------------------------------------------- space lifecycle
-class AdminOD:
-    """`od.OD` that re-mints its admin token before it expires: M+ campaigns outlast one token. Host side only."""
-
-    def __init__(self, od_module, refresh_s: float = 3 * 3600):
-        self._od, self._refresh = od_module, refresh_s
-        self._o = od_module.OD()
-        self._born = time.time()
-
-    def __getattr__(self, name):
-        if time.time() - self._born > self._refresh:
-            self._o.token = self._od.mint_token()
-            self._born = time.time()
-        return getattr(self._o, name)
-
-
-def create_space(o, od_safe, name: str, providers: list[str], size_bytes: int) -> str:
-    """A new space of this lane, supported by exactly `providers`. Every step goes to the change log (day0's `od`)."""
-    check_own(name)
-    sid = od_safe.create_space_owned(o, name)
-    try:
-        for p in providers:
-            o.support(sid, p, size_bytes)
-            o.wait_supported(sid, p)
-    except BaseException:
-        # A space this process created and never asked any provider to support holds nothing anywhere: remove it, so a failure before the first support
-        # request does not leave an empty space whose id the caller never got. One whose support request was sent (even if it failed) is NOT touched
-        # here: it is refused by the teardown rule and stays for the operator; the space id is in the change log.
-        never = getattr(o, "never_supported", None)
-        if callable(never) and never(sid) is True:
-            ok, res = od_safe.safe_teardown(o, sid, providers)
-            print(f"setup failed before any support request; space {sid} ({name}) removed: ok={ok} {res}", file=sys.stderr, flush=True)
-        raise
-    return sid
-
-
-def space_root(o, provider: str, sid: str, *, tries: int = 30, wait_s: float = 2.0) -> str:
-    """Support is eventually consistent (dataset_77 0004): the root can answer late on a fresh space."""
-    for attempt in range(tries):
-        try:
-            return o.space_root(provider, sid)
-        except Exception:  # noqa: BLE001 - retried; the last failure propagates
-            if attempt == tries - 1:
-                raise
-            time.sleep(wait_s)
-    raise AssertionError
-
-
-def teardown(o, od_safe, sid: str, providers: list[str]) -> dict:
-    """Tear the space down by the operator's rule (2 Nov): `safe_teardown` deletes its files through Onedata and shows them gone (the root lists
-    empty, `/volumes/posix/<spaceId>` empty or missing on every supporting provider) before it revokes a support or deletes the space. A space
-    with files left, one already deleted, or one whose disk cannot be checked comes back `ok: False` with `results["refusal"]` (space id, provider,
-    size seen) and nothing revoked or deleted; the caller must not read it as torn down."""
-    r = o.oz("GET", f"/spaces/{sid}", expect=None)
-    name = r.json().get("name", "") if r.status_code == 200 else ""       # not 200: the guard in safe_teardown says why, and deletes nothing
-    if name:
-        check_own(name)
-    ok, res = od_safe.safe_teardown(o, sid, providers)
-    return {"ok": ok, "results": res, "name": name}
+    def _path_of(self, file_id: str) -> str:
+        """Return the logged path of an id."""
+        for text in self._log.read_text(encoding="utf-8").splitlines():
+            line = json.loads(text)
+            if line.get("id") == file_id and line.get("action") == "create":
+                return str(line["path"])
+        return "?"

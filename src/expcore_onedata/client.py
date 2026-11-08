@@ -6,6 +6,9 @@
 #   merged: [S5] onedata-mcp @ 0cc17ce, onedata_mcp/api/tokens.py:24-25, test/unit/api/test_tokens.py:20
 #   merged: [S6] icsa-2027-experiments @ 6fc798cf, icsa/sandbox/sandbox.py:494-505, icsa/harness/health.py:57-64
 #   merged: [S7] onedata-mcp @ 0cc17ce, onedata_mcp/api/spaces.py:90
+#   merged: [S8] icsa-2027-experiments @ 6fc798cf, icsa/scripted/provision.py:114-139,170-171,246-247
+#   merged: [S8] icsa-2027-experiments @ 6fc798cf, icsa/scripted/mplus.py:144-152
+#   merged: [S9] icsa-2027-experiments @ 6fc798cf, icsa/sandbox/mock_onedata.py:78-95
 """The one HTTP client of the platform layer, and the gate every mutation goes through (O09).
 
 Every request the layer sends leaves through `OnezoneClient`; no other module imports httpx (a test holds that). The
@@ -49,6 +52,16 @@ client test in a source sends it and reads the answer as this layer does.
 - `mint_own_token`: `POST /user/tokens/temporary` with `Authorization: Basic` of the user itself, body
   `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
 - Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
+- Step 4b2 sends to a provider (all confirmed by [S8], whose code sends them and reads the answers as the layer does):
+  `GET /spaces/{space}` (the key `fileId` is the space's root), `GET /data/{id}/children` (query `limit`, `attribute`,
+  `token`; answer `children`, `isLast`, `nextPageToken`), `POST /data/{parent}/children` (query `name`, `type`; answer
+  `fileId`), `PUT /data/{id}/content` (query `offset`, an octet-stream body), `GET /data/{id}`, `DELETE /data/{id}`,
+  `GET /data/{id}/distribution`, `POST /transfers` (body `type`, `fileId`, `replicatingProviderId` or
+  `evictingProviderId`) and `GET /transfers/{id}`. `read_range` is `GET /data/{id}/content` with a `Range` header,
+  answered with a 206 and a `Content-Range`.
+- `file_space_name`: `GET /data/{id}` with the query `attribute=path`, the answer key `path`, whose first segment is
+  the name of the space the file lies in. Unconfirmed against a real provider: [S9] is the earlier study's mock of what
+  the official client calls, and it answers `path` as `/{space name}/...`; see `UNVERIFIED_ENDPOINTS`.
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
@@ -85,6 +98,12 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "the whole call: no source reads a space's details; the answer's name field is what the mutation gate checks",
     ),
     (
+        "GET",
+        "/data/{id}",
+        "the `path` attribute: no source reads it from a real provider; the earlier study's mock [S9] answers it as"
+        " /{space name}/..., and the first segment is what the gate of a mutation by file id checks",
+    ),
+    (
         "POST",
         "/tokens/examine",
         "the shape of the answer's subject (an id under subject); the sources read id and caveats [S4]",
@@ -103,6 +122,8 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ),
 )
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+_FILE_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a file's object id: one plain path segment
 _SPACE_ID = re.compile(r"[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}")  # one plain path segment, never "." or ".."
 DEFAULT_TIMEOUT_S = 15.0
 
@@ -150,6 +171,29 @@ def _target_space_id(path: str) -> str:
     return parts[2]
 
 
+def _plain(path: str) -> list[str]:
+    """Split a mutation's path, refusing an escape, query or fragment the server could read as another path."""
+    if any(mark in path for mark in "%?#"):
+        raise OutOfScope("the request path of a mutation must be plain, without an escape, query or fragment")
+    return path.split("/")
+
+
+def _file_target(method: str, path: str, body: Any) -> str | None:
+    """Return the file id a request acts on, or None when its path names no file.
+
+    A file is named by `/data/{id}` or what is below it, or, for a transfer job, by the `fileId` in the body of a POST
+    to `/transfers`. Anything else (`/lookup-file-id/..`, `/replicas-id/..`, a transfer cancel) names none and is
+    refused by the caller, since nothing maps it to a space.
+    """
+    parts = _plain(path)
+    if len(parts) >= 3 and parts[1] == "data" and "" not in parts[2:-1]:
+        return parts[2] if _FILE_ID.fullmatch(parts[2]) else None
+    if method == "POST" and path == "/transfers" and isinstance(body, dict):
+        file_id = body.get("fileId")
+        return file_id if isinstance(file_id, str) and _FILE_ID.fullmatch(file_id) else None
+    return None
+
+
 class OnezoneClient:
     """Reads, token operations and scoped mutations against Onezone and the declared providers."""
 
@@ -171,6 +215,7 @@ class OnezoneClient:
         credential = admin_token if admin_token is not None else config.admin.read(environ)
         register_secret(credential)
         self._admin = {AUTH_HEADER: credential}
+        self._file_spaces: dict[tuple[str, str], str] = {}  # (provider, file id) -> its space's name, read once
 
     def close(self) -> None:
         """Close the connection pool when the client built it."""
@@ -192,14 +237,31 @@ class OnezoneClient:
             raise OutOfScope("the request names a provider that is not declared")
         return self._config.providers[provider].url + API_PROVIDER, self._config.provider_label(provider)
 
-    def _send(
-        self, method: str, path: str, *, provider: str | None, headers: Mapping[str, str], json: Any = None
-    ) -> Any:
-        """Send one request and return the decoded JSON; map every failure to a PlatformError without detail."""
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        provider: str | None,
+        headers: Mapping[str, str],
+        json: Any = None,
+        params: Mapping[str, Any] | None = None,
+        content: bytes | None = None,
+        timeout_s: float | None = None,
+    ) -> httpx.Response:
+        """Send one request and return the answer; a transport failure or a status of 400 or more is a PlatformError."""
         base, label = self._base(provider)
         url = base + _check_path(path)
         try:
-            response = self._http.request(method, url, headers=dict(headers), json=json, timeout=self._timeout_s)
+            response = self._http.request(
+                method,
+                url,
+                headers=dict(headers),
+                json=json,
+                params=dict(params) if params else None,
+                content=content,
+                timeout=timeout_s if timeout_s is not None else self._timeout_s,
+            )
         except httpx.HTTPError as error:
             raise PlatformError(f"{label}: {method} failed ({type(error).__name__})") from None
         if response.status_code >= 400:
@@ -209,20 +271,53 @@ class OnezoneClient:
                 status=response.status_code,
                 code=code,
             )
+        return response
+
+    def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        provider: str | None,
+        headers: Mapping[str, str],
+        json: Any = None,
+        params: Mapping[str, Any] | None = None,
+        content: bytes | None = None,
+        timeout_s: float | None = None,
+    ) -> Any:
+        """Send one request and return the decoded JSON; map every failure to a PlatformError without detail."""
+        response = self._request(
+            method,
+            path,
+            provider=provider,
+            headers=headers,
+            json=json,
+            params=params,
+            content=content,
+            timeout_s=timeout_s,
+        )
         if not response.content:
             return {}
         try:
             return response.json()
         except ValueError:
-            raise PlatformError(f"{label}: {method} answered something that is not JSON") from None
+            raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON") from None
 
-    def get(self, path: str, *, provider: str | None = None, token: str | None = None) -> Any:
+    def get(
+        self,
+        path: str,
+        *,
+        provider: str | None = None,
+        token: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        timeout_s: float | None = None,
+    ) -> Any:
         """GET a path of Onezone or of a declared provider, with the admin credential or as the token given.
 
-        The privilege reads of tokens.py are the layer's only callers in step 4a ([S3]).
+        The privilege reads of tokens.py and the listings, block maps and transfer records of step 4b2 are its callers.
         """
         headers = {AUTH_HEADER: token} if token is not None else self._admin
-        return self._send("GET", path, provider=provider, headers=headers)
+        return self._send("GET", path, provider=provider, headers=headers, params=params, timeout_s=timeout_s)
 
     def query(self, path: str, body: Mapping[str, Any]) -> Any:
         """POST to one of the endpoints that only read (`READING_POSTS`); any other path is refused."""
@@ -250,21 +345,115 @@ class OnezoneClient:
             raise OutOfScope("Onezone's answer for the target space holds no name, so it resolves to no space")
         return name
 
-    def mutate(self, method: str, path: str, *, provider: str | None = None, json: Any = None) -> Any:
+    def file_space_name(self, file_id: str, provider: str) -> str:
+        """Return the name of the space a file lies in, read once per file from its `path` attribute through a provider.
+
+        The first segment of the file's path is its space's name. A file the provider does not know, or an answer
+        without a path, raises OutOfScope; any other failure of the read raises PlatformError. Neither message holds the
+        id or a name. The read is unconfirmed against a real provider (`UNVERIFIED_ENDPOINTS`).
+        """
+        if not isinstance(file_id, str) or not _FILE_ID.fullmatch(file_id):
+            raise OutOfScope("the target file id is not a plain id, so it resolves to no space")
+        key = (provider, file_id)
+        if key not in self._file_spaces:
+            try:
+                answer = self._send(
+                    "GET", f"/data/{file_id}", provider=provider, headers=self._admin, params={"attribute": "path"}
+                )
+            except PlatformError as error:
+                if error.status == 404:
+                    raise OutOfScope("the target file is unknown to its provider, so it resolves to no space") from None
+                raise
+            path = answer.get("path") if isinstance(answer, dict) else None
+            name = path.split("/")[1] if isinstance(path, str) and path.startswith("/") else ""
+            if not name:
+                raise OutOfScope("the provider's answer for the target file holds no path, so it resolves to no space")
+            self._file_spaces[key] = name
+        return self._file_spaces[key]
+
+    def _target_name(self, method: str, path: str, provider: str | None, body: Any) -> str:
+        """Return the name of the space a request acts on: the space in its path, or the space of the file it names."""
+        parts = _plain(path)
+        if len(parts) >= 3 and parts[1] == "spaces":
+            return self.space_name(_target_space_id(path))
+        file_id = _file_target(method, path, body)
+        if file_id is None or provider is None:
+            raise OutOfScope("the mutation names no space and no file, so it resolves to no space; nothing was sent")
+        return self.file_space_name(file_id, provider)
+
+    def _require_study_space(self, name: str) -> None:
+        if not name.startswith(self._config.space.prefixes):
+            raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
+
+    def mutate(
+        self,
+        method: str,
+        path: str,
+        *,
+        provider: str | None = None,
+        json: Any = None,
+        params: Mapping[str, Any] | None = None,
+        content: bytes | None = None,
+        timeout_s: float | None = None,
+    ) -> Any:
         """Send a request that can change state; refuse it, before it is sent, unless it acts on a study space.
 
-        The target is the space id in the path, resolved to its name by a read on Onezone made for this mutation alone;
-        the caller names no space and no name, and no earlier answer is reused. The mutation is refused unless that name
-        starts with a configured prefix, and when the path lies under no space.
+        The target is the space id in the path, or the file the path or the body of a transfer job names. The space id
+        is resolved to a name by a read on Onezone made for this mutation alone; the caller names no space and no
+        name, and no earlier answer is reused. The mutation is refused unless that name starts with a configured
+        prefix, and when the request names no space and no file.
         """
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
         self._base(provider)  # an undeclared provider is refused before anything is read
-        name = self.space_name(_target_space_id(path))
-        if not name.startswith(self._config.space.prefixes):
-            raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
-        return self._send(method, path, provider=provider, headers=self._admin, json=json)
+        self._require_study_space(self._target_name(method, path, provider, json))
+        return self._send(
+            method,
+            path,
+            provider=provider,
+            headers=self._admin,
+            json=json,
+            params=params,
+            content=content,
+            timeout_s=timeout_s,
+        )
+
+    def read_range(
+        self, path: str, *, provider: str, offset: int, length: int, timeout_s: float | None = None
+    ) -> bytes:
+        """Read `length` bytes from `offset` of a file's content through a declared provider; return the bytes.
+
+        This is a read, but a read through a provider that lacks the bytes makes it fetch them: the file's block map on
+        that provider grows (on-the-fly replication). It changes state, so it passes the same gate as a mutation: the
+        path must be `/data/{id}/content`, and the file's space must have a name that starts with a configured prefix,
+        or nothing is sent. The answer must be a 206 whose `Content-Range` starts at `offset` and matches the body, and
+        the body must be `length` bytes unless the range ends at the end of the file; anything else is refused. [S8]
+        """
+        parts = _plain(path)
+        if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
+            raise OutOfScope("a range read is of /data/{id}/content only")
+        if offset < 0 or length < 1:
+            raise OutOfScope("a range read needs a non-negative offset and a positive length")
+        path = _check_path(path)
+        self._base(provider)
+        self._require_study_space(self._target_name("GET", path, provider, None))
+        headers = {**self._admin, "Range": f"bytes={offset}-{offset + length - 1}"}
+        response = self._request("GET", path, provider=provider, headers=headers, timeout_s=timeout_s)
+        label = self._base(provider)[1]
+        found = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+        if response.status_code != 206 or found is None:
+            raise PlatformError(f"{label}: a range read was not answered with a 206 and a Content-Range")
+        first, last, total = (int(found.group(i)) for i in (1, 2, 3))
+        body = response.content
+        if (
+            first != offset
+            or last - first + 1 != len(body)
+            or len(body) > length
+            or (len(body) < length and last + 1 != total)
+        ):
+            raise PlatformError(f"{label}: a range read was answered with another range than the one asked for")
+        return body
 
     def mint_own_token(self, principal: Principal, caveats: Sequence[Mapping[str, Any]]) -> str:
         """Mint a temporary access token for a user, as that user, with exactly these caveats; return the value.

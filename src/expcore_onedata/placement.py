@@ -1,67 +1,91 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/scripted/placement.py, blob 5b4173d17d74ec745cefca9176e8f0ab89bcd6b1
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""Block placement on a provider: `GET /data/{id}/distribution`, the only placement evidence M+ accepts.
+#   changes: see git history of this file from its import commit
+"""Block placement on a provider: `GET /data/{id}/distribution`, the only placement evidence the layer accepts (O01).
 
 A transfer's own status is not evidence: Onedata 25.0 reports `completed` for a replication that placed zero bytes and
-for an eviction that removed none (dataset_77 onedata-issues 0003, 0006). Every claim about where data is comes from the
-block map. Pure functions on the JSON, so they are unit-testable with hand-written maps.
+for an eviction that removed none. Every claim about where data is comes from the block map. These are pure functions
+on the JSON, so a unit test hands them a hand-written map. A range is `(offset, length)` in bytes and a provider's
+blocks are the ranges it holds.
 """
-from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+Range = tuple[int, int]
 
 
-def provider_blocks(distribution: dict, provider_id: str) -> list[tuple[int, int]]:
-    """Sorted (offset, length) blocks the provider holds of one file, from a `/distribution` answer.
+def provider_blocks(distribution: Mapping[str, Any], provider_id: str) -> list[Range]:
+    """Return the sorted `(offset, length)` blocks a provider holds of one file, from a `/distribution` answer.
 
-    A provider absent from the answer holds nothing. Blocks are `[offset, length]` per storage backend."""
-    per = (distribution.get("distributionPerProvider") or {}).get(provider_id) or {}
-    out: list[tuple[int, int]] = []
-    for st in (per.get("distributionPerStorageBackend") or {}).values():
-        for b in st.get("blocks") or []:
-            out.append((int(b[0]), int(b[1])))
+    A provider absent from the answer holds nothing. The blocks of every storage backend are joined. An answer that
+    does not have the documented shape raises ValueError, so a malformed map is never read as an empty one.
+    """
+    per_provider = distribution.get("distributionPerProvider")
+    if not isinstance(per_provider, Mapping):
+        raise ValueError("the distribution answer has no 'distributionPerProvider' table")
+    entry = per_provider.get(provider_id) or {}
+    backends = entry.get("distributionPerStorageBackend") if isinstance(entry, Mapping) else None
+    if backends is not None and not isinstance(backends, Mapping):
+        raise ValueError("the distribution answer's 'distributionPerStorageBackend' is not a table")
+    out: list[Range] = []
+    for backend in (backends or {}).values():
+        if not isinstance(backend, Mapping):
+            raise ValueError("the distribution answer's storage backend entry is not a table")
+        for block in backend.get("blocks") or []:
+            if not (isinstance(block, list | tuple) and len(block) == 2 and all(isinstance(n, int) for n in block)):
+                raise ValueError("the distribution answer holds a block that is not an [offset, length] pair")
+            out.append((block[0], block[1]))
     return sorted(out)
 
 
-def merged(blocks: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
-    """Overlapping or adjacent blocks merged, as half-open-by-length (offset, length)."""
-    res: list[list[int]] = []
-    for off, ln in sorted(blocks):
-        if ln <= 0:
+def merged(blocks: Iterable[Range]) -> list[Range]:
+    """Return the blocks with overlapping or adjacent ones joined and empty ones dropped."""
+    joined: list[list[int]] = []
+    for offset, length in sorted(blocks):
+        if length <= 0:
             continue
-        if res and off <= res[-1][0] + res[-1][1]:
-            res[-1][1] = max(res[-1][1], off + ln - res[-1][0])
+        if joined and offset <= joined[-1][0] + joined[-1][1]:
+            joined[-1][1] = max(joined[-1][1], offset + length - joined[-1][0])
         else:
-            res.append([off, ln])
-    return [(a, b) for a, b in res]
+            joined.append([offset, length])
+    return [(a, b) for a, b in joined]
 
 
-def held_bytes(blocks: Iterable[tuple[int, int]]) -> int:
-    return sum(ln for _, ln in merged(blocks))
+def held_bytes(blocks: Iterable[Range]) -> int:
+    """Return how many bytes the blocks hold, each byte once."""
+    return sum(length for _, length in merged(blocks))
 
 
-def uncovered(blocks: Iterable[tuple[int, int]], ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
-    """The parts of `ranges` (offset, length) the blocks do not hold; empty = fully placed."""
+def uncovered(blocks: Iterable[Range], ranges: Iterable[Range]) -> list[Range]:
+    """Return the parts of `ranges` the blocks do not hold; empty means fully placed."""
     held = merged(blocks)
-    gaps: list[tuple[int, int]] = []
-    for off, ln in merged(ranges):
-        pos, end = off, off + ln
-        for b_off, b_ln in held:
-            b_end = b_off + b_ln
-            if b_end <= pos:
+    gaps: list[Range] = []
+    for offset, length in merged(ranges):
+        position, end = offset, offset + length
+        for block_offset, block_length in held:
+            block_end = block_offset + block_length
+            if block_end <= position:
                 continue
-            if b_off >= end:
+            if block_offset >= end:
                 break
-            if b_off > pos:
-                gaps.append((pos, b_off - pos))
-            pos = max(pos, b_end)
-            if pos >= end:
+            if block_offset > position:
+                gaps.append((position, block_offset - position))
+            position = max(position, block_end)
+            if position >= end:
                 break
-        if pos < end:
-            gaps.append((pos, end - pos))
+        if position < end:
+            gaps.append((position, end - position))
     return gaps
 
 
-def file_fully_placed(blocks: Iterable[tuple[int, int]], size: int) -> bool:
+def covers(blocks: Iterable[Range], ranges: Iterable[Range]) -> bool:
+    """Tell whether the blocks hold every byte of every range, and at least one range was asked for."""
+    wanted = list(ranges)
+    return bool(merged(wanted)) and not uncovered(blocks, wanted)
+
+
+def file_fully_placed(blocks: Iterable[Range], size: int) -> bool:
+    """Tell whether the blocks hold the whole file; an empty file is placed by definition."""
     return not uncovered(blocks, [(0, size)]) if size > 0 else True
