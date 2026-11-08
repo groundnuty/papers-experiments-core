@@ -185,14 +185,15 @@ def require_examined(
     if found_subject != subject:
         raise TokenRefused("the token belongs to another principal than the one it was minted for")
     _check_shape(caveats, spec)
-    left = _check_values(caveats, spec) - now
+    expiry = _check_values(caveats, spec)
+    left = expiry - now
     if left <= 0:
         raise TokenRefused("the token has already expired")
     if left < min_ttl_s:
         raise TokenRefused(f"the token lives {left:.0f} s, shorter than the {min_ttl_s:.0f} s the run needs")
     if left > max_ttl_s:
         raise TokenRefused(f"the token lives {left:.0f} s, longer than the {max_ttl_s:.0f} s allowed")
-    return Examined(token_id, found_subject, now + left, tuple(sorted(c["type"] for c in caveats)))
+    return Examined(token_id, found_subject, expiry, tuple(sorted(c["type"] for c in caveats)))
 
 
 def _rights(values: Any, what: str) -> set[str]:

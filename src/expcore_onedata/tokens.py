@@ -78,6 +78,15 @@ class Secret:
     __str__ = __repr__
 
 
+class ExpiryMismatch(TokenRefused):
+    """A token's examined expiry is not the one it was minted with; `expires_at` is the one it has, which is when
+    the token, dropped but not revoked, stops working."""
+
+    def __init__(self, message: str, expires_at: float) -> None:
+        super().__init__(message)
+        self.expires_at = expires_at
+
+
 @dataclass(frozen=True)
 class MintedToken:
     """A token that passed examination, with what the examination established; the value is in `secret`."""
@@ -200,17 +209,26 @@ class TokenIssuer:
             now=self._clock(),
         )
 
-    def mint(self, spec: PlaneSpec, principal: Principal, *, ceiling_s: float) -> MintedToken:
+    def mint(
+        self, spec: PlaneSpec, principal: Principal, *, ceiling_s: float, valid_until: int | None = None
+    ) -> MintedToken:
         """Mint a plane's token as its principal, with the principal's own credential, and return it only if it passes.
+
+        The token's time caveat is `validUntil`, an absolute time in whole seconds. By default it is the clock at this
+        moment plus the window's lifetime, taken after the privileges are read. A caller that must know the expiry
+        before minting (a journal line that outlasts every token) passes `valid_until`: the token is minted with
+        exactly that, and refused with `ExpiryMismatch` if its examination shows another expiry.
 
         A token that fails examination is dropped and never returned. Nothing revokes it: no source revokes a token,
         and it ends with its lifetime, which derives from `ceiling_s` (O06).
         """
         window = token_window(ceiling_s, self._config.tokens)
         self.check_principal(spec, principal)
-        valid_until = int(self._clock()) + window.mint_ttl_s
-        value = self._client.mint_own_token(principal, spec.caveats.caveats(valid_until))
+        asked = valid_until if valid_until is not None else int(self._clock()) + window.mint_ttl_s
+        value = self._client.mint_own_token(principal, spec.caveats.caveats(asked))
         examined = self.examine(value, spec, principal.user_id, window)
+        if valid_until is not None and examined.valid_until != valid_until:
+            raise ExpiryMismatch("the token's expiry is not the one it was minted with", examined.valid_until)
         return MintedToken(spec.plane, principal.user_id, examined.token_id, examined.valid_until, Secret(value))
 
     def mint_run_tokens(
@@ -220,22 +238,28 @@ class TokenIssuer:
         ceiling_s: float,
         interface: str = "rest",
         tool_server: tuple[Principal, str] | None = None,
+        valid_until: int | None = None,
     ) -> RunTokens:
         """Mint the data path's token and, given `(principal, condition name)`, the tool server's, on separate users.
 
         The two users must differ by name and by id; the two tokens are checked to be different after minting. A
-        refusal returns neither.
+        refusal returns neither. With `valid_until` both tokens are minted with exactly that expiry (see `mint`).
         """
         space = self._config.space.id
         if tool_server is not None and (
             tool_server[0].username == data.username or tool_server[0].user_id == data.user_id
         ):
             raise TokenRefused("the two planes share a principal")
-        data_token = self.mint(data_path_spec(space, interface), data, ceiling_s=ceiling_s)
+        data_token = self.mint(data_path_spec(space, interface), data, ceiling_s=ceiling_s, valid_until=valid_until)
         if tool_server is None:
             return RunTokens(data_token, None)
         principal, condition = tool_server
-        tool = self.mint(tool_server_spec(space, self._config.condition(condition)), principal, ceiling_s=ceiling_s)
+        tool = self.mint(
+            tool_server_spec(space, self._config.condition(condition)),
+            principal,
+            ceiling_s=ceiling_s,
+            valid_until=valid_until,
+        )
         require_distinct(
             Examined(data_token.token_id, data_token.subject, data_token.expires_at, ()),
             Examined(tool.token_id, tool.subject, tool.expires_at, ()),

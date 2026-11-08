@@ -11,7 +11,7 @@ from expcore.campaign.lease import LeasePool
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
 from expcore_onedata.tokencheck import TokenRefused
-from expcore_onedata.tokens import TokenIssuer, token_window
+from expcore_onedata.tokens import ExpiryMismatch, TokenIssuer, token_window
 from expcore_onedata.users import GROUP, SAFETY_MARGIN_S, SlotProbe, SlotTokens, TokenJournal, load_slots
 
 LOGINS = {  # login name -> (password, user id)
@@ -185,12 +185,15 @@ def test_tokens_of_a_leased_slot_are_minted_on_its_two_users_and_their_end_is_jo
     assert tokens.data_path.reveal() not in (tmp_path / "leases" / "tokens.jsonl").read_text()
 
 
-def test_c19_a_crash_after_minting_leaves_the_provisional_worst_case_and_the_slot_stays_held(
-    slots, client, tmp_path, fake
-):
+def time_caveats(fake):
+    """The expiry in the time caveat of every token the federation has issued."""
+    return {c["validUntil"] for token in fake.issued.values() for c in token["caveats"] if c["type"] == "time"}
+
+
+def test_c19_a_crash_after_minting_leaves_the_provisional_end_and_the_slot_stays_held(slots, client, tmp_path, fake):
     """C19: the process dies after the tokens exist and before their exact line is written. The journal holds only the
-    provisional line, whose end is the clock before minting plus the longest lifetime plus the time a mint may take;
-    the slot is held until that end plus the margin, which is later than the tokens' own end."""
+    provisional line, whose end is the absolute expiry both tokens were minted with; the slot is held until that end
+    plus the margin."""
     config, loaded = slots
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
@@ -198,35 +201,40 @@ def test_c19_a_crash_after_minting_leaves_the_provisional_worst_case_and_the_slo
     minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
     with pytest.raises(SystemExit):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
-    assert len([r for r in fake.requests if r.path.endswith("/tokens/temporary")]) == 2  # both tokens exist
-    window = token_window(CEILING_S, config.tokens)
-    provisional = NOW + window.max_ttl_s + config.tokens.mint_headroom_s
+    assert len(fake.issued) == 2  # both tokens exist
+    provisional = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s
+    assert time_caveats(fake) == {provisional}
     assert journal.kinds == ["provisional"]
     assert TokenJournal(tmp_path / "leases").latest_expiry(lease.key) == provisional
-    assert provisional > NOW + window.mint_ttl_s  # later than the end a token asked for can have, with no delay
-    probes = [(provisional + SAFETY_MARGIN_S - 1, False), (provisional + SAFETY_MARGIN_S, False)]
-    probes.append((provisional + SAFETY_MARGIN_S + 1, True))
-    for moment, freed in probes:
+    for moment, freed in (
+        (provisional + SAFETY_MARGIN_S - 1, False),
+        (provisional + SAFETY_MARGIN_S, False),
+        (provisional + SAFETY_MARGIN_S + 1, True),
+    ):
         probe = SlotProbe(TokenJournal(tmp_path / "leases"), clock=lambda moment=moment: moment)
         assert probe.resource_gone(lease.key, {}) is freed
 
 
-def test_c19_the_journalled_end_is_the_tokens_actual_end_even_when_the_privilege_reads_take_time(
+def pause_before_each_mint(client, monkeypatch, now, seconds):
+    """Move the clock on by `seconds` just before each token request, as slow privilege reads would."""
+    mint = client.mint_own_token
+
+    def slow(principal, caveats):
+        now[0] += seconds
+        return mint(principal, caveats)
+
+    monkeypatch.setattr(client, "mint_own_token", slow)
+
+
+def test_c19_a_pause_before_the_mint_cannot_push_a_tokens_expiry_past_its_journal_line(
     slots, client, tmp_path, monkeypatch
 ):
-    """C19 with O06: the clocks advance during the privilege reads before each mint, so the tokens end later than any
-    bound taken before minting. The journal holds the later plane's actual expiry, and the slot is free only past it
-    plus the margin."""
+    """C19 with O06: the clock moves 100 s before each mint call. The expiry was computed once, before the journal
+    line, and both tokens are minted with exactly it, so each token's expiry equals the journalled one; the slot is
+    free only past it plus the margin."""
     config, loaded = slots
     now = [NOW]
-    reads = client.get
-
-    def slow_read(path, *args, **kwargs):
-        if path.endswith("/privileges"):
-            now[0] += 100.0  # a privilege read that takes 100 s
-        return reads(path, *args, **kwargs)
-
-    monkeypatch.setattr(client, "get", slow_read)
+    pause_before_each_mint(client, monkeypatch, now, 100.0)
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
@@ -234,19 +242,61 @@ def test_c19_the_journalled_end_is_the_tokens_actual_end_even_when_the_privilege
         TokenIssuer(client, config, clock=lambda: now[0]), config, loaded, journal, clock=lambda: now[0]
     ).mint(lease, ceiling_s=CEILING_S, condition="read")
     assert tokens.tool_server is not None
-    bound_before_minting = NOW + token_window(CEILING_S, config.tokens).max_ttl_s
-    assert tokens.tool_server.expires_at > bound_before_minting  # the old bound would have ended before the token
-    ended = journal.latest_expiry(lease.key)
-    assert ended == tokens.tool_server.expires_at > tokens.data_path.expires_at
-    probe_at = [ended + SAFETY_MARGIN_S - 1, ended + SAFETY_MARGIN_S, ended + SAFETY_MARGIN_S + 1]
+    journalled = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s
+    assert now[0] == NOW + 200.0  # the pauses happened
+    assert tokens.data_path.expires_at == tokens.tool_server.expires_at == journalled
+    assert journal.latest_expiry(lease.key) == journalled
     freed = []
-    for moment in probe_at:
+    for moment in (journalled + SAFETY_MARGIN_S - 1, journalled + SAFETY_MARGIN_S, journalled + SAFETY_MARGIN_S + 1):
         now[0] = moment
         freed.append(SlotProbe(journal, clock=lambda: now[0]).resource_gone(lease.key, {}))
     assert freed == [False, False, True]
 
 
-def test_c19_a_mint_that_fails_after_a_token_exists_journals_a_bound_that_covers_it(
+def test_c19_a_pause_so_long_that_a_token_would_be_too_short_refuses_it_and_the_journal_still_covers_it(
+    slots, client, tmp_path, monkeypatch, fake
+):
+    """C19: 200 s before each mint call leaves the second token less life than the run needs, so it is refused. Both
+    tokens exist, both end at the journalled expiry, and the journal holds it."""
+    config, loaded = slots
+    now = [NOW]
+    pause_before_each_mint(client, monkeypatch, now, 200.0)
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = TokenJournal(tmp_path / "leases")
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: now[0]), config, loaded, journal, clock=lambda: now[0]
+    )
+    with pytest.raises(TokenRefused, match="shorter"):
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
+    journalled = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s
+    assert len(fake.issued) == 2
+    assert time_caveats(fake) == {journalled}
+    assert journal.latest_expiry(lease.key) == journalled
+
+
+def test_c19_a_token_that_lives_longer_than_the_journalled_expiry_is_refused_and_its_expiry_recorded(
+    slots, client, tmp_path, slot_federation
+):
+    """C19: the platform hands back a token 50 s longer than asked for. It is refused and the expiry it has is
+    journalled, so the slot is held until that expiry plus the margin."""
+    config, loaded = slots
+    slot_federation.mint_hook = lambda user, caveats: [
+        {**c, "validUntil": c["validUntil"] + 50} if c["type"] == "time" else c for c in caveats
+    ]
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = TokenJournal(tmp_path / "leases")
+    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    with pytest.raises(ExpiryMismatch):
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
+    journalled = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s
+    assert journal.latest_expiry(lease.key) == journalled + 50
+    assert SlotProbe(journal, clock=lambda: journalled + 50 + SAFETY_MARGIN_S).resource_gone(lease.key, {}) is False
+    assert SlotProbe(journal, clock=lambda: journalled + 51 + SAFETY_MARGIN_S).resource_gone(lease.key, {}) is True
+
+
+def test_c19_a_mint_that_fails_after_a_token_exists_leaves_a_journal_line_that_covers_it(
     slots, client, tmp_path, slot_federation
 ):
     """C19: the tool-server user holds other rights than the condition declares, so the mint is refused after the
@@ -259,9 +309,10 @@ def test_c19_a_mint_that_fails_after_a_token_exists_journals_a_bound_that_covers
     minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
     with pytest.raises(TokenRefused):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
-    window = token_window(CEILING_S, config.tokens)
-    assert journal.latest_expiry(lease.key) >= NOW + window.mint_ttl_s  # the data path's token lives until then
-    assert SlotProbe(journal, clock=lambda: NOW + window.mint_ttl_s).resource_gone(lease.key, {}) is False
+    expiry = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s
+    assert time_caveats(slot_federation) == {expiry}  # the data path's token
+    assert journal.latest_expiry(lease.key) == expiry
+    assert SlotProbe(journal, clock=lambda: expiry + SAFETY_MARGIN_S).resource_gone(lease.key, {}) is False
 
 
 def test_a_ceiling_the_window_refuses_journals_and_mints_nothing(slots, client, tmp_path, fake):

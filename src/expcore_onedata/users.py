@@ -24,22 +24,21 @@ and `lease_keys` (`Slots.keys_of`), and the scheduler takes, holds and releases 
 which two users the run has.
 
 **A slot is free again only when its tokens have ended.** No token is ever revoked, so a token minted for a slot stays
-good until its lifetime ends, and a run that died may have left a sandbox using it. `SlotTokens.mint` writes two kinds
-of line (never a token) to a journal beside the leases:
-- before it mints, a **provisional** line with the worst-case end of any token of that mint: the clock, plus the longest
-  lifetime the window allows (`max_ttl_s`), plus the time a mint may take (`[tokens] mint_headroom_s`, the allowance for
-  the seconds between issuing a token and examining it);
-- after both tokens are minted and examined, an **exact** line with the later of their examined expiries, which settles
-  the provisional line of that mint. The privilege reads before each mint take time, so no bound taken before them can
-  stand for the exact end.
+good until its lifetime ends, and a run that died may have left a sandbox using it. `SlotTokens.mint` fixes the end of
+its tokens before it mints anything: `valid_until` is the clock plus the lifetime the window asks for, taken once. It is
+written to a journal beside the leases as a **provisional** line (durably: fsynced, with its directory when it created
+the file), and then both tokens are minted with exactly that absolute expiry as their time caveat, so no delay between
+the journal line and the mint (the privilege reads take time) can push a token past it. After each token is examined
+its expiry must still equal the journalled one; a token that differs is refused, dropped and recorded with the expiry it
+does have. When both are minted, an **exact** line with the same mint id settles the provisional one.
 
 `SlotProbe.resource_gone` answers True for a slot only once the clock is past the slot's journalled end plus a safety
 margin (the clocks of this host and of Onezone are not the same) and, when the platform supplies one, its sandbox probe
 also shows the run's resources gone. The slot's end is the latest of its exact lines and of its provisional lines that
-no exact line settled, so a crash between a mint and its exact line leaves the provisional worst case, and the slot is
-never freed early. A line that cannot be read keeps the slot quarantined (the core's rule: only True frees a key). A
-mint that fails may have left a token that was minted and dropped; its provisional line stays unsettled, and the longest
-end any token of that call could have, counted from the failure, is journalled as well.
+no exact line settled, so a crash between a mint and its exact line leaves the provisional end, which is already the
+tokens' own, and the slot is never freed early. A line that cannot be read keeps the slot quarantined (the core's rule:
+only True frees a key). A mint that fails leaves its provisional line in place, since a token minted and dropped ends no
+later than that line.
 
 Users are created by the operator, not by this layer: there is no unscoped user creation or deletion here. The privileges
 a slot's users hold are checked, direct and effective, before every token is minted (`tokens.py`).
@@ -58,7 +57,7 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.config import NAME, PlatformConfig
 from expcore_onedata.credentials import Principal
-from expcore_onedata.tokens import RunTokens, TokenIssuer, token_window
+from expcore_onedata.tokens import ExpiryMismatch, RunTokens, TokenIssuer, token_window
 
 GROUP = "platform_users"
 JOURNAL = "tokens.jsonl"
@@ -271,26 +270,26 @@ class SlotTokens:
     ) -> RunTokens:
         """Mint the data path's token and, for a condition with a tool server, the tool server's, on the slot's users.
 
-        A ceiling the window refuses (O06) mints and journals nothing. Otherwise a provisional line with the worst-case
-        end is journalled before anything is minted. When both tokens are minted and examined, the later of their
-        examined expiries is journalled as the exact line that settles it, before the tokens are returned. A failure
-        may have left a token that was minted and dropped; its end is not known, so the longest end a token of this
-        call can have, counted from the moment of the failure, is journalled too, and the provisional line stays.
+        A ceiling the window refuses (O06) mints and journals nothing. Otherwise the absolute expiry is computed once,
+        journalled as a provisional line (durably), and both tokens are minted with exactly that expiry. A token whose
+        examined expiry differs is refused and the expiry it has is journalled. When both pass, the exact line settles
+        the provisional one before the tokens are returned. Any other failure leaves the provisional line.
         """
         slot = self._slots.users_of(lease)
         window = token_window(ceiling_s, self._config.tokens)
         mint = secrets.token_hex(8)
-        worst_case = self._clock() + window.max_ttl_s + self._config.tokens.mint_headroom_s
-        self._journal.record(slot.name, "provisional", worst_case, mint=mint, provisional=True)
+        valid_until = int(self._clock()) + window.mint_ttl_s
+        self._journal.record(slot.name, "provisional", valid_until, mint=mint, provisional=True)
         try:
             tokens = self._issuer.mint_run_tokens(
                 data=slot.data_path,
                 ceiling_s=ceiling_s,
                 interface=interface,
                 tool_server=(slot.tool_server, condition) if condition is not None else None,
+                valid_until=valid_until,
             )
-        except BaseException:  # a token may exist whatever stopped the mint; the failure itself is re-raised below
-            self._journal.record(slot.name, "unproven", self._clock() + max(window.mint_ttl_s, window.max_ttl_s))
+        except ExpiryMismatch as refused:
+            self._journal.record(slot.name, "refused", refused.expires_at)  # the expiry the dropped token really has
             raise
         latest = max((t for t in (tokens.data_path, tokens.tool_server) if t is not None), key=lambda t: t.expires_at)
         self._journal.record(slot.name, latest.plane.value, latest.expires_at, mint=mint)
