@@ -16,24 +16,39 @@ ECHO = {"echo": lambda args: "echoed", "search": lambda args: "found"}
 LEAKS = {
     "bare object": '{"name": "echo", "arguments": {"x": "a"}}',
     "parameters instead of arguments": '{"name": "echo", "parameters": {"x": "a"}}',
-    "in a code fence": 'I will look it up.\n```json\n{"name": "echo", "arguments": {}}\n```\nDone.',
-    "in a tag": '<tool_call>{"name": "echo", "arguments": {"x": "a"}}</tool_call>',
-    "chat API shape with a string of arguments": json.dumps(
-        {"type": "function", "function": {"name": "echo", "arguments": json.dumps({"x": "a"})}}
-    ),
-    "in a list of calls": '{"tool_calls": [{"name": "echo", "arguments": {}}]}',
-    "under the key tool": '{"tool": "echo", "arguments": {}}',
-    "under the key tool_name": '{"tool_name": "echo", "parameters": {}}',
     "arguments first": '{"arguments": {"x": 1}, "name": "echo"}',
-    "after prose with other braces": 'Use {curly} braces? Then {"name": "echo", "arguments": {"x": {"y": [1]}}}',
+    "other keys beside the name and arguments": '{"id": "call_1", "name": "echo", "arguments": {}}',
+    "with whitespace around": '\n  {"name": "echo", "arguments": {}}  \n',
+    "in a code fence with a language": '```json\n{"name": "echo", "arguments": {"x": "a"}}\n```',
+    "in a code fence without a language": '```\n{"name": "echo", "arguments": {}}\n```',
+    "wrapped once as tool_call": '{"tool_call": {"name": "echo", "arguments": {}}}',
+    "wrapped once as function": '{"function": {"name": "echo", "parameters": {"x": "a"}}}',
+    "wrapped once as tool": '{"tool": {"name": "echo", "arguments": {}}}',
+    "a list of calls": '[{"name": "echo", "arguments": {}}, {"name": "search", "arguments": {"q": "a"}}]',
+    "a list of wrapped calls in a fence": '```json\n[{"function": {"name": "echo", "arguments": {}}}]\n```',
 }
 
 NOT_LEAKS = {
-    "domain JSON naming no tool": '{"name": "Alice", "arguments": {"verbose": true}}',
+    "an algorithm described in JSON, the tool name nested under it": json.dumps(
+        {"algorithm": {"name": "search", "parameters": {"depth": 3}}, "notes": "breadth first"}
+    ),
+    "domain JSON naming no offered tool": '{"name": "Alice", "arguments": {"verbose": true}}',
+    "a call nested in a list under another key": '{"tool_calls": [{"name": "echo", "arguments": {}}]}',
+    "a call wrapped twice": '{"tool_call": {"function": {"name": "echo", "arguments": {}}}}',
+    "a wrapper with another key beside it": '{"type": "function", "function": {"name": "echo", "arguments": {}}}',
+    "prose before the object": 'I will call it: {"name": "echo", "arguments": {}}',
+    "prose before a fenced block": 'Calling now:\n```json\n{"name": "echo", "arguments": {}}\n```',
+    "prose after a fenced block": '```json\n{"name": "echo", "arguments": {}}\n```\nDone.',
+    "two fenced blocks": "```json\n{call}\n```\n```json\n{call}\n```".replace(
+        "{call}", '{"name": "echo", "arguments": {}}'
+    ),
+    "a list with an element that is not a call": '[{"name": "echo", "arguments": {}}, {"name": "Alice"}]',
+    "an empty list": "[]",
     "a tool name with no arguments object": '{"name": "echo"}',
-    "arguments that are not an object": '{"name": "echo", "arguments": [1, 2]}',
-    "arguments that are plain text": '{"name": "echo", "arguments": "please"}',
+    "arguments that are a list": '{"name": "echo", "arguments": [1, 2]}',
+    "arguments that are a string": '{"name": "echo", "arguments": "{\\"x\\": 1}"}',
     "a tool name as an ordinary value": '{"query": "echo", "arguments": {}}',
+    "the name under another key": '{"tool": "echo", "arguments": {}}',
     "prose that mentions a tool": "I would call echo with the argument x, then search.",
     "JSON that does not parse": '{"name": "echo", "arguments": {',
     "an answer in JSON": '{"answer": "echo", "confidence": 0.9}',
@@ -43,14 +58,19 @@ NOT_LEAKS = {
 
 @pytest.mark.parametrize("text", LEAKS.values(), ids=LEAKS.keys())
 def test_l10_each_leak_shape_is_labelled(text):
-    """L10: a JSON object naming an offered tool with an arguments or parameters object is a leaked call."""
-    assert leaked_tool(text, TOOLS) == "echo"
+    """L10: a top-level envelope that calls an offered tool with an arguments or parameters object is a leak."""
+    assert leaked_tool(text, TOOLS) in TOOLS
 
 
 @pytest.mark.parametrize("text", NOT_LEAKS.values(), ids=NOT_LEAKS.keys())
-def test_l10_domain_json_that_names_no_offered_tool_is_not_a_leak(text):
-    """L10: JSON that names no offered tool with an arguments object is the model's content, not a call."""
+def test_l10_json_that_is_not_a_top_level_call_envelope_is_not_a_leak(text):
+    """L10: a tool name nested deeper in domain JSON, or anything around the envelope, is content, not a call."""
     assert leaked_tool(text, TOOLS) is None
+
+
+def test_l10_the_tool_named_is_the_one_returned():
+    assert leaked_tool(LEAKS["wrapped once as function"], TOOLS) == "echo"
+    assert leaked_tool('{"name": "search", "arguments": {}}', TOOLS) == "search"
 
 
 def test_l10_a_tool_that_is_not_offered_is_not_a_leak():
@@ -59,20 +79,19 @@ def test_l10_a_tool_that_is_not_offered_is_not_a_leak():
     assert leaked_tool(None, TOOLS) is None
 
 
-def test_l10_only_the_first_64_kib_are_scanned():
-    """L10: a call inside the window is found; the same call placed after it is not."""
-    call = LEAKS["bare object"]
-    inside = " " * (SCAN_LIMIT - len(call) - 10) + call
-    outside = " " * (SCAN_LIMIT + 10) + call
+def test_l10_only_a_text_within_64_kib_is_looked_at():
+    """L10: an envelope that fits the window is found; the same envelope grown past it is not looked at."""
+    inside = json.dumps({"name": "echo", "arguments": {"x": "a" * (SCAN_LIMIT - 100)}})
+    outside = json.dumps({"name": "echo", "arguments": {"x": "a" * (SCAN_LIMIT + 100)}})
     assert leaked_tool(inside, TOOLS) == "echo"
     assert leaked_tool(outside, TOOLS) is None
 
 
 def test_l10_a_hostile_reply_costs_a_bounded_scan():
-    """L10: thousands of unclosed objects around the tool name do not make the scan slow."""
-    hostile = '{"a":' * 12000 + '"echo"' + '{"b":' * 12000
+    """L10: JSON nested past what the parser takes is refused at once, not parsed for long."""
     started = time.monotonic()
-    assert leaked_tool(hostile, TOOLS) is None
+    assert leaked_tool("[" * 30000 + "]" * 30000, TOOLS) is None
+    assert leaked_tool('{"a":' * 12000, TOOLS) is None
     assert time.monotonic() - started < 2.0
 
 
@@ -96,9 +115,7 @@ def test_l10_a_leaked_call_in_the_text_ends_the_attempt_and_is_not_executed(run)
 
 def test_l10_a_leaked_call_in_the_reasoning_is_labelled_too(run):
     """L10: the reply's text is an ordinary sentence; the call is in the reasoning channel."""
-    leaking = ModelTurn(
-        "Done.", [], 10, 5, "stop", 0.0, reasoning=f"I should run {LEAKS['parameters instead of arguments']}"
-    )
+    leaking = ModelTurn("Done.", [], 10, 5, "stop", 0.0, reasoning=LEAKS["in a code fence with a language"])
     provider = FakeProvider(ECHO)
     result = run(ScriptedBackend([leaking]), [provider])
     assert result.outcome.name == "leaked_tool_call"
@@ -107,12 +124,31 @@ def test_l10_a_leaked_call_in_the_reasoning_is_labelled_too(run):
     assert result.turns[0].reasoning is not None
 
 
+def test_l10_reasoning_that_talks_about_a_call_in_prose_is_not_a_leak(run):
+    """L10: the reasoning thinks aloud about a call and quotes it; only a reasoning that is the call counts."""
+    thinking = ModelTurn(
+        "Done.", [], 10, 5, "stop", 0.0, reasoning=f"I could run {LEAKS['bare object']} but the answer is known."
+    )
+    result = run(ScriptedBackend([thinking]), [FakeProvider(ECHO)])
+    assert result.outcome.name == "finished"
+
+
 def test_l10_domain_json_in_the_final_answer_is_an_ordinary_finish(run):
     """L10: an answer that is JSON naming no offered tool finishes as usual."""
     answer = '{"name": "Alice", "arguments": {"verbose": true}}'
     result = run(Stub([answer]), [FakeProvider(ECHO)])
     assert result.outcome.name == "finished"
     assert result.final_text == answer
+
+
+def test_l10_an_algorithm_described_in_json_with_a_tool_name_nested_in_it_ends_as_finished(run):
+    """L10: the answer describes an algorithm whose step is named like an offered tool; it is not a call."""
+    answer = json.dumps({"algorithm": {"name": "search", "parameters": {"depth": 3}}, "notes": "breadth first"})
+    provider = FakeProvider(ECHO)
+    result = run(Stub([answer]), [provider])
+    assert result.outcome.name == "finished"
+    assert result.final_text == answer
+    assert provider.calls == []
 
 
 def test_l10_a_reply_with_a_real_call_is_not_scanned(run):
