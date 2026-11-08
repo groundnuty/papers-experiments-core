@@ -270,10 +270,12 @@ class Scheduler:
 
         A worker is never cut off: it ends its current attempt (a run waiting for a lease or a health check gives up at
         once, since it has started nothing), so its result is recorded before the store closes. A run is unfinished
-        only if the process dies, and the next open settles that (C04). The lock is released last: while any worker
-        can still write, no other dispatcher can start on the store (C07).
+        only if the process dies, and the next open settles that (C04). The wait is the attempt's own: a post-run health
+        check in it is bounded by `health_timeout_s`. The lock is released last: while any worker can still write, no
+        other dispatcher can start on the store (C07).
         """
         self.stop.set()
+        self._wake()
         self._wait_for_workers()
         gate = getattr(self, "gate", None)
         if gate is not None:

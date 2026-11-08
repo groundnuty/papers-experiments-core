@@ -34,10 +34,22 @@ def in_thread(fn):
     return thread
 
 
-def test_c07_a_second_dispatcher_cannot_take_the_lock_while_a_worker_is_mid_attempt_after_close_is_called(tmp_path):
-    """C07: close() signals the end and waits for the attempt in flight; then the store closes and the lock goes."""
+class Slow:
+    """A health check that takes a while to say the platform is up."""
+
+    def __call__(self):
+        time.sleep(0.15)
+        return Health(True, "up")
+
+
+@pytest.mark.parametrize("health", [None, Slow()], ids=["no health check", "a post-run health check in flight"])
+def test_c07_a_second_dispatcher_cannot_take_the_lock_while_a_worker_is_mid_attempt_after_close_is_called(
+    tmp_path, health
+):
+    """C07: close() signals the end and waits for the attempt in flight; then the store closes and the lock goes.
+    The attempt ends as it would have: a finished result is not relabelled as infrastructure by the shutdown."""
     blocked = Blocked()
-    first = build(tmp_path, executor=blocked.executor, plan=SMALL).open()
+    first = build(tmp_path, executor=blocked.executor, health=health, plan=SMALL).open()
     runner = in_thread(first.run)
     assert blocked.started.wait(10)
     closer = in_thread(first.close)

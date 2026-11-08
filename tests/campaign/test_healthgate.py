@@ -210,8 +210,8 @@ def test_c11_a_hung_check_blocks_the_next_ones_from_starting_and_reads_as_down(t
     assert gate.after_run()[0].ok
 
 
-def test_c11_ending_the_campaign_stops_the_wait_for_a_hanging_check_and_charges_nothing(tmp_path):
-    """C11: a check that hangs never blocks a shutdown; a pre-run check cut short holds the run, it closes no gate."""
+def test_c11_ending_the_campaign_stops_the_wait_for_a_hanging_pre_run_check_and_charges_nothing(tmp_path):
+    """C11: a pre-run check that hangs never blocks a shutdown; one cut short holds the run and closes no gate."""
     hang = Hang()
     gate, store = gate_for(tmp_path, hang, timeout_s=60)
     stop = threading.Event()
@@ -223,11 +223,32 @@ def test_c11_ending_the_campaign_stops_the_wait_for_a_hanging_check_and_charges_
     assert verdict.verdict == HOLD
     assert not gate.closed
     assert parse(store.get_meta(META)) in ([], None)  # no outage was recorded
-    health, outage = gate.after_run()  # the campaign is ending: unknown health reads as down
-    assert not health.ok
-    assert outage is None
+    assert gate.before_run("run-b").verdict == HOLD  # and nothing new is asked once the campaign is ending
+    assert hang.calls == 1
     hang.release.set()
     gate.join()
+
+
+def test_c11_a_post_run_check_is_not_cut_short_by_the_end_of_the_campaign(tmp_path):
+    """C11 and C07: a finished result is judged by the answer, so a shutdown does not relabel it; the timeout may."""
+    slow = Hang(Health(True, "up"))
+    gate, _ = gate_for(tmp_path, slow, timeout_s=10)
+    stop = threading.Event()
+    gate.start(stop)
+    stop.set()
+    threading.Timer(0.2, slow.release.set).start()
+    health, outage = gate.after_run()
+    assert health == Health(True, "up")  # it waited for the answer although the campaign was already ending
+    assert outage is None
+    hung = Hang()
+    gate2, _ = gate_for(tmp_path / "second", hung, timeout_s=0.1)
+    gate2.start(stop)
+    began = time.monotonic()
+    assert not gate2.after_run()[0].ok  # a hang is still bounded by the timeout, and reads as down
+    assert time.monotonic() - began < 5
+    hung.release.set()
+    gate.join()
+    gate2.join()
 
 
 def test_c11_checks_of_several_workers_run_at_once_and_none_reads_as_still_out(tmp_path):

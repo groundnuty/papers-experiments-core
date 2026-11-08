@@ -7,13 +7,13 @@
 A pre-run health check (a `HealthCheck` the platform supplies) runs before every attempt. One that fails, raises, times
 out or answers something that is not a `Health` counts as a failed check, never as a crash and never as a pass. **Every
 callback runs in a thread of its own** (the pre-run and post-run checks of the workers and the dispatcher's own), and
-the caller waits for it at most `timeout_s`: a check that hangs is unhealthy when the time is up, and ending the
-campaign stops the wait at once, so a hanging check never blocks a shutdown. A check that has outlived its time and not
-yet answered blocks the next ones from starting: they read unhealthy without a second thread piling up behind it. The
-first failed check **closes the gate**: no run starts until the dispatcher's own check, which it runs itself every
-`recheck_s` seconds, passes. **One attempt is charged per outage**, to the run that found it; any other run whose check
-fails while the gate is closed, or that finds it closed, is not charged and not recorded, and stays pending.
-
+the caller waits for it at most `timeout_s`: a check that hangs is unhealthy when the time is up, so no check can hold
+a worker for ever. Ending the campaign stops the wait of the checks that have started nothing, the pre-run check and the
+dispatcher's own, at once; a pre-run check cut short holds the run and charges nothing. A **post-run check is part of
+finishing the attempt**, which a shutdown waits for, so it is not cut short: it waits out its answer or its timeout, and
+a finished result is never relabelled as infrastructure because the campaign was ending. A check that has outlived its
+time and not yet answered blocks the next ones from starting: they read unhealthy without a second thread piling up
+behind it. The
 Each outage is one record in the store's meta `health_outages`, written when the gate closes, at every check and when
 it opens, so a restart in the outage restores it (`restarts` counts those) and the status lists it from the same record:
 
@@ -267,15 +267,15 @@ class HealthGate:
         return box["health"]
 
     def _read_at_gate(self) -> tuple[Health, dict[str, Any] | None]:
-        """Run a check and take the gate's state the instant it returns: the open outage's record or None.
+        """Run a post-run check and take the gate's state the instant it returns: the open outage's record or None.
 
         The check runs outside the lock, since it may take as long as its timeout. The gate is read with the answer in
-        hand, and the run is classified from that read, not from one made after other statements. A check the ending
-        campaign did not wait for reads as down: its health is unknown.
+        hand, and the run is classified from that read, not from one made after other statements. The wait is bounded by
+        the timeout alone: the end of the campaign does not cut it short, because the result it judges is finished and
+        must not be relabelled as infrastructure for want of an answer.
         """
-        health = self._ask(self._stop)
-        if health is None:
-            health = Health(False, "the campaign is ending: the health check was not waited for")
+        health = self._ask(None)
+        assert health is not None  # only an ending campaign gives no answer, and none is passed
         with self._lock:
             return health, self._open
 
