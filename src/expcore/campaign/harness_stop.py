@@ -1,128 +1,231 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/campaign/harness_stop.py, blob e36b086b771945e2048ed94663467b51c27a89ab
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""The harness-error stops (science, #34, 3 Nov 01:08Z). A harness error is a bug of ours, not an outcome; its run is pending again after the fix. What it stops:
+#   changes: see git history of this file from its import commit
+"""Harness errors stop dispatch, narrowly then widely (C10).
 
-- a MODEL: `harness_error_stop_after` (3) errors of one KIND on that model within `harness_error_window_s` (6 h);
-- ALL dispatch: one kind on `harness_error_models_stop` (3) different models, or `harness_error_option_stop` (5) errors of one kind on one option across models, in the window.
+A harness error is a crash in our own code on valid input. It is neither infrastructure nor an outcome: the attempt is
+kept as a `harness_error` attempt, charged to nobody, and the run goes back to pending from the same row and seed when
+the campaign next opens, after the fix (`expcore.campaign.recovery`). What the errors stop while the campaign runs:
 
-The kind is the exception's type name; a remote run reports every error as RemoteHarnessError with the real type first in its detail, so its kind is that inner type
-(store.harness_error_kind): two different inner types do not pool. The errors are not counted anywhere: they are the `harness_error` attempts in the store, with their
-own end times, so the 6 h window is read from store timestamps and a restart changes nothing. What is kept is a stop once it has fired (a window moving on never ends
-one) and the releases (`cleared`): a release ends the stops at their limit and the errors up to then stop counting for that kind on that model (or on all models).
+- a **model**: `stop_after` errors of one kind on that model within `window_s`;
+- **all dispatch**: one kind on `models_stop` different models within the window, the same bug seen across the plan.
 
-The release file lists names, one per line: a model's name ends that model's stop, the word ALL ends the all-stop. Each counts only if written after its stop and is used
-once (release.take_listed); a name with no stop in force is left alone."""
-from __future__ import annotations
+The kind is the exception's class name. The errors are not counted anywhere else: they are the `harness_error`
+attempts in the store, with their own end times, so the window is read from store timestamps and a restart changes
+nothing. What is kept is a stop once it has fired (a window moving on never ends one), and the releases (`cleared`):
+a release ends a stop, and the errors up to then stop counting for that kind on that model, or on all models.
 
-import dataclasses
+The release file lists names, one per line: a model's name ends that model's stop, the word `ALL` ends the all-stop.
+Each counts only if written after its stop and is used once (`release.take_listed`); a name with no stop in force is
+left alone. A record that cannot be read stops everything: the gate fails closed.
+"""
+
 import datetime as dt
 import json
-import math
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from .store import Store, harness_error_kind
+from expcore.campaign import release
+from expcore.campaign.store import Store, column_for
+from expcore.loop.outcomes import Outcome
 
 KEY = "harness_error_stops"
 ALL = "ALL"
-LEGACY = ("harness_error_stopped_epoch", "harness_error_counts")      # the one-count design this replaces: a stop in force under it is carried over once
+UNKNOWN_KIND = "unknown"
+
+
+@dataclass(frozen=True)
+class HarnessStopConfig:
+    """When harness errors stop dispatch, and where a release is written.
+
+    `stop_after` errors of one kind on one model, or one kind on `models_stop` models, both within `window_s` seconds.
+    """
+
+    stop_after: int = 3
+    models_stop: int = 3
+    window_s: float = 6 * 3600.0
+    release_file: Path | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse limits that cannot work."""
+        if self.stop_after < 1 or self.models_stop < 1:
+            raise ValueError("stop_after and models_stop must be at least 1")
+        if self.window_s <= 0:
+            raise ValueError("window_s must be positive")
+
+
+def kind_of(outcome: Outcome) -> str:
+    """Return the kind of a harness defect: the class name of its exception."""
+    return outcome.defect.exception if outcome.defect is not None else UNKNOWN_KIND
+
+
+def kind_of_detail(detail: str | None) -> str:
+    """Return the kind from an attempt's stored detail, which the store writes as `<exception> <stack hash>: <text>`."""
+    head = (detail or "").split(":", 1)[0].split()
+    return head[0] if head else UNKNOWN_KIND
 
 
 def _epoch(utc: str | None) -> float:
+    """Return a stored time as epoch seconds; one that cannot be read counts as now: toward the stop, never away."""
     try:
         return dt.datetime.fromisoformat(str(utc).replace("Z", "+00:00")).timestamp()
     except ValueError:
-        return time.time()            # an end time that cannot be read counts as now: toward the stop, never away from it
+        return time.time()
 
 
 def stored_errors(store: Store) -> list[dict[str, Any]]:
-    """Every harness-error attempt: when it ended, its kind, model, option and run."""
-    return [{"epoch": _epoch(r["e"]), "kind": harness_error_kind(r["d"]), "model": r["model"], "option": r["option"], "run_key": r["run_key"]}
-            for r in store.q("SELECT r.model, r.option, r.run_key, a.infra_detail d, a.ended_utc e FROM attempts a JOIN runs r USING(run_key) "
-                             "WHERE a.state='harness_error' ORDER BY a.id")]
+    """Return every harness-error attempt: when it ended, its kind, its model and its run."""
+    rows = store.q(
+        f"SELECT r.{column_for('model')} AS model, r.run_key, a.detail, a.ended_utc "
+        "FROM attempts a JOIN runs r USING(run_key) WHERE a.state='harness_error' ORDER BY a.id"
+    )
+    return [
+        {
+            "epoch": _epoch(r["ended_utc"]),
+            "kind": kind_of_detail(r["detail"]),
+            "model": r["model"],
+            "run_key": r["run_key"],
+        }
+        for r in rows
+    ]
 
 
-def counted(errors: list[dict[str, Any]], cleared: dict[str, float], upto: float, window_s: float) -> list[dict[str, Any]]:
-    """The errors that count at time `upto`: inside the window, and after any release that cleared their kind on their model or on all models."""
-    return [e for e in errors if e["epoch"] > upto - window_s
-            and e["epoch"] > max(cleared.get(f"{e['kind']}|{e['model']}", 0.0), cleared.get(f"{e['kind']}|*", 0.0), cleared.get("*|*", 0.0))]
-
-
-def fired(inwin: list[dict[str, Any]], kind: str, model: str, option: str, cfg: Any) -> tuple[str | None, str | None]:
-    """(a model-stop reason, an all-stop reason) for the error just added, from the counted errors of its kind."""
-    ek = [e for e in inwin if e["kind"] == kind]
-    n_model = sum(1 for e in ek if e["model"] == model)
-    models = sorted({e["model"] for e in ek})
-    n_opt = sum(1 for e in ek if e["option"] == option)
-    mstop = (f"{n_model} harness errors of kind {kind} on {model} within {cfg.harness_error_window_s / 3600:g} h" if n_model >= cfg.harness_error_stop_after else None)
-    if len(models) >= cfg.harness_error_models_stop:
-        return mstop, f"kind {kind} on {len(models)} models ({', '.join(models)}) within {cfg.harness_error_window_s / 3600:g} h"
-    if n_opt >= cfg.harness_error_option_stop:
-        return mstop, f"{n_opt} harness errors of kind {kind} on option {option} across models within {cfg.harness_error_window_s / 3600:g} h"
-    return mstop, None
+def counted(errors: list[dict], cleared: Mapping[str, float], upto: float, window_s: float) -> list[dict]:
+    """Return the errors that count at time `upto`: inside the window, and after any release that cleared their kind on
+    their model or on all models."""
+    return [
+        e
+        for e in errors
+        if e["epoch"] > upto - window_s
+        and e["epoch"]
+        > max(
+            cleared.get(f"{e['kind']}|{e['model']}", 0.0), cleared.get(f"{e['kind']}|*", 0.0), cleared.get("*|*", 0.0)
+        )
+    ]
 
 
 def empty() -> dict[str, Any]:
+    """Return the state with no stop in force."""
     return {"models": {}, "all": None, "cleared": {}}
 
 
-def load(store: Store) -> dict[str, Any]:
-    """The stops in force. A record that cannot be read stops everything (fail closed): {"unreadable": True}. No record is a campaign with no stop, except that one
-    left by the earlier one-count design (a stop epoch and a count at its limit) is carried over as an all-stop, once, so a restart with this code does not lift it."""
-    raw = store.get_meta(KEY)
+def parse(raw: str | None) -> dict[str, Any]:
+    """Return the stops in force. A record that cannot be read stops everything (fail closed): {"unreadable": True}."""
     if raw is None:
-        st = empty()
-        legacy_epoch = store.get_meta(LEGACY[0])
-        if legacy_epoch is not None:
-            try:
-                kinds = sorted(k for k, per in json.loads(store.get_meta(LEGACY[1]) or "{}").items() if sum(per.values()) >= 3)
-                st["all"] = {"kinds": kinds or ["*"], "epoch": float(legacy_epoch), "utc": None, "why": "carried over from the earlier harness-error stop"}
-            except (ValueError, TypeError, AttributeError):
-                st["all"] = {"kinds": ["*"], "epoch": time.time(), "utc": None, "why": "carried over from the earlier harness-error stop"}
-        return st
+        return empty()
     try:
-        d = json.loads(raw)
-        if not (isinstance(d, dict) and isinstance(d.get("models"), dict) and isinstance(d.get("cleared"), dict) and (d.get("all") is None or isinstance(d["all"], dict))):
-            raise ValueError
-        return d
+        data = json.loads(raw)
+        shaped = (
+            isinstance(data, dict)
+            and isinstance(data.get("models"), dict)
+            and isinstance(data.get("cleared"), dict)
+            and (data.get("all") is None or isinstance(data["all"], dict))
+        )
+        if not shaped:
+            raise ValueError("not a record of stops")
+        return data
     except ValueError:
         return {"unreadable": True, **empty()}
 
 
-def status(store: Store, cfg: Any, now: dt.datetime) -> dict[str, Any]:
-    """For the status: what counts in the window now, what is stopped, and every error ever, per kind and option (the report, not the stop's count)."""
-    st, errs = load(store), stored_errors(store)
-    inwin = counted(errs, st.get("cleared", {}), now.timestamp(), cfg.harness_error_window_s)
-    per: dict[str, dict[str, int]] = {}
-    for e in inwin:
-        per.setdefault(e["kind"], {})[e["model"]] = per.setdefault(e["kind"], {}).get(e["model"], 0) + 1
-    all_time_kind: dict[str, int] = {}
-    all_time_opt: dict[str, dict[str, int]] = {}
-    for e in errs:
-        all_time_kind[e["kind"]] = all_time_kind.get(e["kind"], 0) + 1
-        o = all_time_opt.setdefault(e["option"], {})
-        o[e["kind"]] = o.get(e["kind"], 0) + 1
-    return {"stop_after": cfg.harness_error_stop_after, "window_s": cfg.harness_error_window_s, "models_stop_after": cfg.harness_error_models_stop,
-            "option_stop_after": cfg.harness_error_option_stop, "in_window": per, "unreadable": bool(st.get("unreadable")),
-            "stopped_models": {m: {"kind": s.get("kind"), "utc": s.get("utc"), "why": s.get("why")} for m, s in sorted(st["models"].items())},
-            "all_stop": None if st["all"] is None else {k: st["all"].get(k) for k in ("kinds", "utc", "why")},
-            "all_time_by_kind": dict(sorted(all_time_kind.items())), "all_time_by_option": {o: dict(sorted(v.items())) for o, v in sorted(all_time_opt.items())}}
+class HarnessStops:
+    """The harness-error stops of one campaign, kept in the store's meta so that a restart keeps them."""
 
+    def __init__(self, store: Store, cfg: HarnessStopConfig):
+        self.store, self.cfg = store, cfg
 
-def alarms(h: dict[str, Any], cfg: Any) -> list[str]:
-    out = []
-    f = cfg.harness_error_release_file
-    if h["unreadable"]:
-        out.append(f"the harness-error record is unreadable: dispatch of ALL options is STOPPED (fail closed); resume by writing the word {ALL} in {f} after the campaign is restarted with the fix")
-    for m, s in h["stopped_models"].items():
-        out.append(f"HARNESS ERRORS: {s['why']}: dispatch of {m} is STOPPED, the other models go on (runs in flight finish; a bug of ours, the runs are pending again when the campaign "
-                   f"restarts with the fix); then resume {m} by writing its name on a line of {f} now: it ends this stop only, and one older than the stop does not count")
-    if h["all_stop"]:
-        out.append(f"HARNESS ERRORS: {h['all_stop']['why']}: dispatch of ALL options and models is STOPPED (runs in flight finish; the runs are pending again when the campaign restarts "
-                   f"with the fix); then resume by writing the word {ALL} on a line of {f} now: it ends this stop only, and one older than the stop does not count")
-    if h["in_window"] and not (h["stopped_models"] or h["all_stop"] or h["unreadable"]):
-        said = "; ".join(f"{k}: " + ", ".join(f"{m} {n}" for m, n in sorted(per.items())) for k, per in sorted(h["in_window"].items()))
-        out.append(f"harness errors in the last {h['window_s'] / 3600:g} h, by kind and model ({said}): each run is pending again when the campaign restarts with the fix; a model stops at "
-                   f"{h['stop_after']} of one kind, all dispatch at one kind on {h['models_stop_after']} models or {h['option_stop_after']} on one option")
-    return out
+    def load(self) -> dict[str, Any]:
+        """Return the stops in force now."""
+        return parse(self.store.get_meta(KEY))
+
+    def stopped(self) -> tuple[frozenset[str], bool]:
+        """Return the models stopped and whether all dispatch is: an unreadable record stops all."""
+        state = self.load()
+        return frozenset(state["models"]), state["all"] is not None or bool(state.get("unreadable"))
+
+    def note(self, model: str, kind: str, now: str) -> list[str]:
+        """Count the harness errors after one more on `model`, fire the stops that reach their limit, and return the
+        reasons of those that fired now. The error must be in the store already; a stop that has fired stays."""
+        errors = stored_errors(self.store)
+
+        def change(current: str | None) -> tuple[str | None, list[tuple[str, str | None, str]], list[str]]:
+            state = parse(current)
+            if state.get("unreadable"):
+                return None, [], []  # the record stays unreadable and everything stays stopped, until it is fixed
+            inwin = counted(errors, state["cleared"], _epoch(now), self.cfg.window_s)
+            ofkind = [e for e in inwin if e["kind"] == kind]
+            window_h = f"{self.cfg.window_s / 3600:g} h"
+            reasons: list[str] = []
+            events: list[tuple[str, str | None, str]] = []
+            n_model = sum(1 for e in ofkind if e["model"] == model)
+            if n_model >= self.cfg.stop_after and model not in state["models"]:
+                why = f"{n_model} harness errors of kind {kind} on {model} within {window_h}"
+                state["models"][model] = {"kind": kind, "utc": now, "epoch": _epoch(now), "why": why}
+                reasons.append(why)
+                events.append(("harness_error_stop", model, f"dispatch of {model} stops: {why}"))
+            spread = sorted({e["model"] for e in ofkind})
+            if len(spread) >= self.cfg.models_stop and state["all"] is None:
+                why = f"kind {kind} on {len(spread)} models ({', '.join(spread)}) within {window_h}"
+                state["all"] = {"kinds": [kind], "utc": now, "epoch": _epoch(now), "why": why}
+                reasons.append(why)
+                events.append(("harness_error_stop_all", None, f"dispatch of every model stops: {why}"))
+            return (json.dumps(state, sort_keys=True) if reasons else None), events, reasons
+
+        return self.store.update_meta(KEY, change, now)
+
+    def take_releases(self, now: str) -> dict[str, str]:
+        """Use up the release file for the stops in force; return {name: who and when} for those it ended.
+
+        A release counts only if written after its stop, and ends that stop only; the errors up to now stop counting for
+        it. With no file configured nothing is released.
+        """
+        path = self.cfg.release_file
+        if path is None:
+            return {}
+        state = self.load()
+        if state.get("unreadable"):
+            return {}  # a record nobody can read is not ended by a name in a file: fix it, restart
+        stops = {m: float(s["epoch"]) for m, s in state["models"].items()}
+        if state["all"] is not None:
+            stops[ALL] = float(state["all"]["epoch"])
+        taken = release.take_listed(path, stops)
+        if not taken:
+            return {}
+
+        def change(current: str | None) -> tuple[str | None, list[tuple[str, str | None, str]], dict[str, str]]:
+            now_state = parse(current)
+            if now_state.get("unreadable"):
+                return None, [], {}
+            events = []
+            for name, who in sorted(taken.items()):
+                if name == ALL:
+                    kinds = now_state["all"]["kinds"] if now_state["all"] else []
+                    for kind in kinds:
+                        now_state["cleared"][f"{kind}|*"] = _epoch(now)
+                    now_state["all"] = None
+                    events.append(("harness_error_released_all", None, f"the all-stop ended by {who}"))
+                else:
+                    kind = now_state["models"].pop(name, {}).get("kind", UNKNOWN_KIND)
+                    now_state["cleared"][f"{kind}|{name}"] = _epoch(now)
+                    events.append(("harness_error_released", name, f"the stop on {name} ended by {who}"))
+            return json.dumps(now_state, sort_keys=True), events, taken
+
+        return self.store.update_meta(KEY, change, now)
+
+    def status(self) -> dict[str, Any]:
+        """Return the stops in force and the errors that count now, for the status view."""
+        state = self.load()
+        inwin = counted(stored_errors(self.store), state.get("cleared", {}), time.time(), self.cfg.window_s)
+        per: dict[str, dict[str, int]] = {}
+        for e in inwin:
+            per.setdefault(e["kind"], {})[e["model"]] = per.setdefault(e["kind"], {}).get(e["model"], 0) + 1
+        return {
+            "unreadable": bool(state.get("unreadable")),
+            "stopped_models": {m: s.get("why") for m, s in sorted(state["models"].items())},
+            "all_stop": None if state["all"] is None else state["all"].get("why"),
+            "in_window": per,
+        }
