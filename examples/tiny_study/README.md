@@ -40,7 +40,7 @@ The script of each run is a pure function of its condition, task and model (`scr
 | most runs | look the fact up, give the answer with the terminal `submit` tool | `finished` |
 | `baseline` on `river` | one call with malformed arguments, then the model recovers | `finished`, one malformed call counted |
 | `baseline` on `hill` | looks things up for ever | `turn_cap` |
-| `relay-down` on `lake` | the tool server fails: `knowledge` infrastructure | scored as treatment, never run again |
+| `relay-down` on `lake` | the tool server fails after the first lookup: `knowledge` infrastructure | scored as treatment, never run again (a failure before the agent's first turn would be set aside and run again) |
 | `beta-stub` on a few runs | a wrong answer | `finished`, accuracy 0 |
 
 With four tasks in two regions, a contrast has two clusters, so no difference can reach significance here. The example shows the shape of the output, not a finding.

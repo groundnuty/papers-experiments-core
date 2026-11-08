@@ -20,7 +20,7 @@ from expcore.errors import infra_kinds
 from expcore.loop.outcomes import HarnessDefect, Outcome
 
 MARKER_NAME = "attempt-marker.json"
-MARKER_SCHEMA = 1
+MARKER_SCHEMA = 2  # 2: the result carries the model turns completed and the treatment flag its record carried
 _RESULT_FIELDS = (
     "ended_utc",
     "wall_s",
@@ -31,6 +31,8 @@ _RESULT_FIELDS = (
     "cache_read_tokens",
     "usage_complete",
     "treatment_kinds",
+    "model_turns",
+    "recorded_treatment",
 )
 
 
@@ -50,6 +52,12 @@ class AttemptResult:
     - `treatment_kinds`: the infrastructure kinds the attempt's record carried as its condition's treatment (the
       record's `treatment_kinds`; none by default). The store checks them against the condition's own declaration and
       refuses the result when they differ, so a record and the store cannot disagree about which failures are scored.
+    - `model_turns`: how many model turns the attempt completed, from its record's transcript; 0 when there is no
+      record (the executor raised, or nothing was run). An infrastructure outcome is treatment only after at least one
+      completed turn (`Outcome.is_treatment`): a failure before the agent's first turn is set aside whatever the
+      condition declares.
+    - `recorded_treatment`: the treatment flag the attempt's record carries, or None when there is no record. The store
+      refuses the result when its own decision differs, so the record and the store agree on which attempt is scored.
     """
 
     outcome: Outcome
@@ -62,9 +70,15 @@ class AttemptResult:
     cache_read_tokens: int | None = None
     usage_complete: bool = True
     treatment_kinds: tuple[str, ...] = ()
+    model_turns: int = 0
+    recorded_treatment: bool | None = None
 
     def __post_init__(self) -> None:
         """Refuse a kind outside the closed vocabulary, so a typo never reaches the store; keep the kinds sorted."""
+        if isinstance(self.model_turns, bool) or not isinstance(self.model_turns, int) or self.model_turns < 0:
+            raise ValueError("model_turns must be a count of completed turns, zero or more")
+        if self.recorded_treatment is not None and not isinstance(self.recorded_treatment, bool):
+            raise ValueError("recorded_treatment must be True, False or None")
         for kind in (*(() if self.outage_kind is None else (self.outage_kind,)), *self.treatment_kinds):
             if kind not in infra_kinds():
                 raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")

@@ -294,11 +294,12 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
         _check_keys(f"{where}.retries[{i}]", retry, RETRY_FIELDS, required=())
 
 
-def _check_outcome(outcome: dict, treatment_kinds: Any, where: str) -> None:
+def _check_outcome(outcome: dict, treatment_kinds: Any, completed_turns: int, where: str) -> None:
     """Build the outcome through the loop's own vocabulary check, so a name or kind outside it is refused here too.
 
-    The `treatment` flag must be what the outcome and the record's `treatment_kinds` make it: true exactly when the
-    outcome is infrastructure of a kind in the list. A record whose flag says otherwise contradicts itself (R02).
+    The `treatment` flag must be what the outcome, the record's `treatment_kinds` and its transcript make it: true
+    exactly when the outcome is infrastructure of a kind in the list that can be a treatment and the transcript holds
+    at least one completed turn. A record whose flag says otherwise contradicts itself (R02).
     """
     defect = outcome["defect"]
     if defect is not None:
@@ -307,13 +308,14 @@ def _check_outcome(outcome: dict, treatment_kinds: Any, where: str) -> None:
         held = None
         if defect is not None:
             held = HarnessDefect(defect["exception"], defect["stack_sha256"])
-        Outcome(outcome["name"], outcome["detail"], outcome["infra_kind"], outcome["error_type"], held)
+        built = Outcome(outcome["name"], outcome["detail"], outcome["infra_kind"], outcome["error_type"], held)
     except (KeyError, TypeError, ValueError) as exc:
         raise RecordError(f"{where}: {type(exc).__name__}: {exc}") from None
-    expected = outcome["name"] == "infrastructure" and outcome["infra_kind"] in treatment_kinds
+    expected = built.is_treatment(treatment_kinds, completed_turns)
     if outcome["treatment"] is not expected:
         raise RecordError(
-            f"{where}.treatment: is {outcome['treatment']} but the outcome and treatment_kinds make it {expected}"
+            f"{where}.treatment: is {outcome['treatment']} but the outcome, treatment_kinds and the {completed_turns} "
+            f"completed turn(s) make it {expected}"
         )
 
 
@@ -390,7 +392,7 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
             raise RecordError(f"clock[{i}]: expected [label, seconds]")
     _check_treatment_kinds(body["treatment_kinds"])
     check_section("outcome", body["outcome"], version, "outcome", schemas)
-    _check_outcome(body["outcome"], body["treatment_kinds"], "outcome")
+    _check_outcome(body["outcome"], body["treatment_kinds"], len(body["transcript"]), "outcome")
     check_section("totals", body["totals"], version, "totals", schemas)
     _check_waited(body["totals"]["infra_wait_by_kind"], "totals.infra_wait_by_kind")
     for i, event in enumerate(body["totals"]["malformed_events"]):

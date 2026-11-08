@@ -8,7 +8,10 @@ never charged. The charge is decided once, when the attempt finishes, and stored
 Treatment. A condition may declare infrastructure kinds that are its treatment (`FactorSchema.treatment_kinds`). An
 attempt that ends as infrastructure of such a kind, under that condition, is a scored final attempt: its state is
 'done', its run is done, `treatment` is set, and it is neither charged nor run again. Without the declaration, running
-again until the run looks healthy would remove the very fault the condition is meant to measure.
+again until the run looks healthy would remove the very fault the condition is meant to measure. Two things are never
+treatment: a kind the registry marks as not treatable (the schema refuses to declare one), and a failure before the
+agent's first turn, which happened before the agent met the condition (`Outcome.is_treatment`: at least one completed
+model turn is needed). Both are set aside and run again as any other infrastructure failure.
 """
 
 from collections.abc import Collection
@@ -78,12 +81,13 @@ def classify(result: AttemptResult, treatment_kinds: Collection[str] = ()) -> Cl
     """Return the state an attempt ends in, whether it is charged and whether it is treatment, by cause (C01, C03).
 
     An infrastructure outcome is never scored as the agent's: it is set aside and run again, unless its kind is one
-    the run's condition declares as its treatment, when it is a scored final attempt (see the module docstring). A
+    the run's condition declares as its treatment and the model completed a turn, when it is a scored final attempt
+    (see the module docstring). A
     crash in our own code is set aside and not charged. Any other outcome, a cap or an answer, is the agent's own and
     ends the run. An outage the caller flags on an attempt that did not end as infrastructure sets its result aside.
     """
     outcome = result.outcome
-    if outcome.name == "infrastructure" and outcome.infra_kind in treatment_kinds:
+    if outcome.is_treatment(treatment_kinds, result.model_turns):
         return Classified("done", False, True)
     if result.outage_kind is not None:
         return Classified("outage_discarded", False)

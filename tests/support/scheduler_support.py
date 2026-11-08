@@ -106,6 +106,8 @@ class FakeExecutor:
             raise ValueError("a crash in our own code")
         if kind == "infra":
             script = [InfraError(behaviour[1], "the endpoint failed")]
+        elif kind == "infra_after_turn":
+            script = [[("look", {})], InfraError(behaviour[1], "the endpoint failed")]
         elif kind == "heavy":
             script = [HEAVY]
         elif kind == "served":

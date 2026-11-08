@@ -102,7 +102,7 @@ def test_a_treatment_failure_is_final_and_scored_and_never_run_again_nor_a_unit_
     """The treatment rule: infrastructure of a declared kind under that condition is a scored final attempt."""
     schema = treatment_schema(("endpoint",), "api-none")
     treated = key_of(schema, "api-none")
-    executor = FakeExecutor({treated: [("infra", "endpoint")]})
+    executor = FakeExecutor({treated: [("infra_after_turn", "endpoint")]})
     settings = settings_for(unit_fail_threshold=1, identity_kind="knowledge")  # one counted failure pauses at once
     with build(tmp_path, schema=schema, executor=executor, settings=settings, plan=SMALL) as scheduler:
         summary = scheduler.run()
@@ -116,6 +116,24 @@ def test_a_treatment_failure_is_final_and_scored_and_never_run_again_nor_a_unit_
         assert request.treatment_kinds == ("endpoint",)
         assert not [e for e in event_kinds(store) if e.startswith("unit_")]  # the outage is the manipulation
         assert scheduler.units.status() == {}  # no failure was counted, so the unit has no state at all
+
+
+def test_c01_a_treatment_kind_failure_before_the_first_turn_is_set_aside_and_run_again(tmp_path):
+    """C01: the same declared kind, failing before the model's first turn, is not the manipulation: the attempt is set
+    aside and charged like any infrastructure failure, and the run goes again and finishes."""
+    schema = treatment_schema(("endpoint",), "api-none")
+    early = key_of(schema, "api-none")
+    executor = FakeExecutor({early: [("infra", "endpoint")]})
+    settings = settings_for(unit_fail_threshold=5, identity_kind="knowledge")
+    with build(tmp_path, schema=schema, executor=executor, settings=settings, plan=SMALL) as scheduler:
+        summary = scheduler.run()
+        store = scheduler.store
+        assert summary.statuses == {"done": 3}
+        assert attempts_of(store, early) == [("infra_fail", 1, 1), ("done", 0, 2)]
+        first = store.q("SELECT treatment, infra_kind FROM attempts WHERE run_key=? ORDER BY id", (early,))[0]
+        assert (first["treatment"], first["infra_kind"]) == (0, "endpoint")
+        assert executor.calls_of(early) == 2
+        assert executor.records[0].outcome["treatment"] is False  # the record agrees with the store
 
 
 def test_the_health_and_identity_kinds_may_not_be_a_treatment_kind(tmp_path):

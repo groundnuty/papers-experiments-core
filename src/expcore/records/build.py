@@ -102,11 +102,13 @@ def stable_call_detail(status: str, detail: str) -> str:
     return detail
 
 
-def outcome_entry(outcome: Outcome, treatment_kinds: Collection[str] = ()) -> dict[str, Any]:
+def outcome_entry(outcome: Outcome, treatment_kinds: Collection[str] = (), *, completed_turns: int) -> dict[str, Any]:
     """Return the outcome as the record keeps it.
 
     `treatment` is true exactly when the outcome is infrastructure of a kind the attempt's condition declares as its
-    treatment: then it is a scored final attempt and the record is not set aside.
+    treatment, the kind can be one, and the model completed at least one turn (`completed_turns`, the record's
+    transcript): then it is a scored final attempt and the record is not set aside. A failure before the first turn
+    is never treatment.
     """
     defect = outcome.defect
     return {
@@ -115,7 +117,7 @@ def outcome_entry(outcome: Outcome, treatment_kinds: Collection[str] = ()) -> di
         "infra_kind": outcome.infra_kind,
         "error_type": outcome.error_type,
         "defect": None if defect is None else {"exception": defect.exception, "stack_sha256": defect.stack_sha256},
-        "treatment": outcome.name == "infrastructure" and outcome.infra_kind in treatment_kinds,
+        "treatment": outcome.is_treatment(treatment_kinds, completed_turns),
     }
 
 
@@ -273,7 +275,8 @@ def build_record(
 
     `treatment_kinds` are the infrastructure kinds the attempt's condition declares as its treatment; the campaign
     passes `FactorSchema.treatment_kinds_of(key)`. They are kept in the record's identity, and the outcome's `treatment`
-    flag is derived from them: an infrastructure failure of a listed kind is a scored final attempt, not set aside.
+    flag is derived from them: an infrastructure failure of a listed kind, after the model completed a turn, is a scored
+    final attempt, not set aside.
 
     Secrets are redacted here, before any digest is taken: the digests the record pins (prompt texts, the
     conversation each request carried, the settings each sent, the configuration) are those of the redacted
@@ -322,7 +325,7 @@ def build_record(
         "failed_request": failed,
         "tool_calls": [call_entry(c) for c in result.tool_calls],
         "clock": [[label, value] for label, value in result.clock_readings],
-        "outcome": outcome_entry(result.outcome, kinds),
+        "outcome": outcome_entry(result.outcome, kinds, completed_turns=len(turns)),
         "totals": {
             "rounds": result.rounds,
             "malformed_calls": result.malformed_calls,

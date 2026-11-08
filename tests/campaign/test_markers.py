@@ -65,7 +65,7 @@ def test_a_marker_for_another_run_reads_as_none(tmp_path):
 @pytest.mark.parametrize(
     ("edit", "message"),
     [
-        (lambda body: body.update(schema=2), "unknown marker schema 2"),
+        (lambda body: body.update(schema=3), "unknown marker schema 3"),
         (lambda body: body["result"].update(surprise=1), "unknown result fields: surprise"),
         (lambda body: body["result"]["outcome"].update(name="won"), "unknown outcome 'won'"),
         (lambda body: body["result"].pop("wall_s"), "not a valid marker"),

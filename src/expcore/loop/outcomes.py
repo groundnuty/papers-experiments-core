@@ -12,7 +12,8 @@ The vocabulary is closed so a typo never reaches a record and the analysis can e
   call was not executed (L10). The agent's own ending, scored like any other.
 - `error`: the model or endpoint failed in a way that is the attempt's own (a context overflow, a plain 400).
 - `infrastructure`: the endpoint, the sandbox or a tool server failed; carries the kind from `expcore.errors`
-  unchanged (C02). The attempt is set aside and re-run, never scored.
+  unchanged (C02). The attempt is set aside and re-run, never scored, unless its condition declares the kind as its
+  treatment, the kind can be one, and the model completed at least one turn (`Outcome.is_treatment`).
 - `harness_defect`: a crash in harness or tool code on valid input (L08); carries a line-free stack hash. Set aside
   and re-run after the fix, never scored as the agent's failure.
 """
@@ -20,10 +21,11 @@ The vocabulary is closed so a typo never reaches a record and the analysis can e
 import hashlib
 import json
 import traceback
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 
-from expcore.errors import infra_kinds
+from expcore.errors import infra_kinds, is_treatable
 
 OUTCOMES = (
     "finished",
@@ -88,6 +90,22 @@ class Outcome:
     def set_aside(self) -> bool:
         """Tell whether the attempt is set aside and re-run instead of scored (infrastructure, harness defect)."""
         return self.name in SET_ASIDE_OUTCOMES
+
+    def is_treatment(self, treatment_kinds: Collection[str], completed_turns: int) -> bool:
+        """Tell whether the attempt is a scored final attempt because its condition's manipulation is this fault.
+
+        True only for an infrastructure outcome of a kind the condition declares as its treatment, that can be one
+        (`expcore.errors.is_treatable`), and only if the model completed at least one turn. A failure before the
+        agent's first turn happened to the harness before the agent met the condition, so it says nothing about the
+        manipulation and is set aside whatever the condition declares. The store, the record and the replay all
+        derive the flag through this method, so they cannot disagree.
+        """
+        return (
+            self.name == "infrastructure"
+            and completed_turns >= 1
+            and self.infra_kind in treatment_kinds
+            and is_treatable(self.infra_kind)
+        )
 
 
 def harness_defect_of(exc: BaseException) -> HarnessDefect:
