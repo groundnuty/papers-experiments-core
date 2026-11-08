@@ -111,7 +111,7 @@ def test_decode_escapes_helper():
 def test_an_fstring_without_replacement_fields_is_one_whole_literal(hashes):
     assert lines_and_kinds(st.scan_source("m.py", f'x = f"{SHORT}"\n', hashes)) == [(1, "string")]
     assert lines_and_kinds(st.scan_source("m.py", f"x = f'  {SHORT}  '\n", hashes)) == [(1, "string")]
-    assert lines_and_kinds(st.scan_source("m.py", 'x = f"\\x64e"\n', hashes)) == [(1, "string")]
+    assert lines_and_kinds(st.scan_source("m.py", 'x = f"\\x7aq"\n', hashes)) == [(1, "string")]
     assert lines_and_kinds(st.scan_source("m.py", 'x = rf"{{zq}}"\n', hashes)) == []
 
 
@@ -143,8 +143,8 @@ def test_adjacent_bytes_literals_are_checked_as_one_value(hashes):
 
 
 def test_a_short_token_split_over_adjacent_literals_is_a_whole_value(hashes):
-    assert lines_and_kinds(st.scan_source("m.py", 'x = ("d" "e")\n', hashes)) == [(1, "string")]
-    assert lines_and_kinds(st.scan_source("m.py", 'x = ("d" f"e")\n', hashes)) == [(1, "string")]
+    assert lines_and_kinds(st.scan_source("m.py", 'x = ("z" "q")\n', hashes)) == [(1, "string")]
+    assert lines_and_kinds(st.scan_source("m.py", 'x = ("z" f"q")\n', hashes)) == [(1, "string")]
 
 
 def test_a_comment_between_adjacent_literals_does_not_split_them(hashes):
