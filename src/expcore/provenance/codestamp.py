@@ -123,13 +123,19 @@ def is_sha(head: object) -> bool:
     return isinstance(head, str) and len(head) == _SHA_CHARS and not set(head) - _HEX
 
 
-def _git(repo: Path, *args: str) -> str | None:
-    """Run git in the repository; None when git cannot run or fails, never an empty string for a failure."""
+def _git(repo: Path, *args: str, raw: bool = False) -> str | None:
+    """Run git in the repository; None when git cannot run or fails, never an empty string for a failure.
+
+    The output is stripped of surrounding whitespace unless raw, which NUL-delimited listings need, because a file
+    name may start or end with a space.
+    """
     try:
         done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
-    return done.stdout.strip() if done.returncode == 0 else None
+    if done.returncode != 0:
+        return None
+    return done.stdout if raw else done.stdout.strip()
 
 
 def write_stamp(
@@ -174,7 +180,7 @@ def _untracked_hashed(root: Path, scope: CodeScope) -> list[str] | None:
     --untracked-files=no` stays silent about it, and so does a file a .gitignore names. Caches and the scope's
     `not_hashed` files are not in the hashed set, so they are in neither side.
     """
-    listing = _git(root, "ls-files", "-z")
+    listing = _git(root, "ls-files", "-z", raw=True)
     if listing is None:
         return None
     tracked = {name for name in listing.split("\0") if name}

@@ -331,3 +331,13 @@ def test_hashed_root_of_names_the_root_a_file_sits_in(tree):
     assert hashed_root_of(tree / "config.toml", tree, SCOPE) == "config.toml"
     assert hashed_root_of(tree / "notes.txt", tree, SCOPE) is None
     assert hashed_root_of("/somewhere/else.txt", tree, SCOPE) is None
+
+
+def test_p01_a_tracked_file_whose_name_starts_with_a_space_is_clean(repo):
+    """P01: the NUL-delimited listing is read unstripped, so a leading space in a name is not lost."""
+    (repo.path / " data.csv").write_text("a\n", encoding="utf-8")
+    repo.commit("a name with a leading space")
+    scope = CodeScope.of([" data.csv"])
+    found = version(repo.path, scope)
+    assert (found["dirty"], found["why"]) == (False, None)
+    assert require_known("study run", repo.path, scope)["dirty"] is False
