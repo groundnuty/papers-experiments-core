@@ -42,6 +42,23 @@ def test_taking_a_snapshot_leaves_the_store_as_it_was_and_no_scratch_file_behind
     assert sorted(p.name for p in tmp_path.iterdir() if "snapshot" in p.name) == [SNAPSHOT_FILE]
 
 
+def test_the_copy_has_the_stores_schema_and_is_one_self_contained_file(settled, tmp_path):
+    """The copy is made page by page, so it has the store's tables, generated columns included, on any SQLite; a store
+    in WAL mode (as the campaign's is) gives a copy that is not, which needs no -wal or -shm file beside it."""
+    store, _ = settled
+    assert store.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    destination = tmp_path / SNAPSHOT_FILE
+    take_snapshot(store.path, destination)
+    schema = "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+    copy = sqlite3.connect(destination)
+    try:
+        assert copy.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert copy.execute(schema).fetchall() == [tuple(row) for row in store.db.execute(schema)]
+    finally:
+        copy.close()
+    assert sorted(p.name for p in tmp_path.iterdir() if "snapshot" in p.name) == [SNAPSHOT_FILE]
+
+
 def test_the_snapshot_is_one_consistent_state_whatever_a_writer_has_open(settled, tmp_path):
     """A transaction another connection has not committed is not in the copy; the copy is not blocked by it."""
     store, keys = settled

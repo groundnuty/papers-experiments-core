@@ -6,8 +6,10 @@ it is a live SQLite file that a dispatcher may be writing. An analysis that read
 made after the check. So the check takes a consistent copy of the store into the batch and hashes it with the records,
 and the analysis reads that copy and nothing else.
 
-- `take_snapshot` copies the store with `VACUUM INTO` over a read-only connection, which sees one consistent state
-  of the database whatever a dispatcher is doing, checks the copy's integrity, and moves it into place atomically. It
+- `take_snapshot` copies the store with SQLite's online backup API over a read-only connection, in one step, which
+  sees one consistent state of the database whatever a dispatcher is doing, checks the copy's integrity, and moves it
+  into place atomically. The backup copies pages, so the copy has the same schema as the store whatever the SQLite
+  version (`VACUUM INTO` rebuilds the tables, and older versions fail on the runs table's generated columns). It
   refuses a store with attempts still running unless told that a partial snapshot is wanted, because a running
   attempt has no final state to analyse.
 - `StoreSnapshot` is a read-only view of such a copy, built from bytes that the caller has already hashed, so that
@@ -47,9 +49,11 @@ class AttemptsRunning(SnapshotError):
 def take_snapshot(source: Path, destination: Path, *, allow_running: bool = False) -> int:
     """Copy the store at `source` to `destination` and return how many attempts were running in the copy.
 
-    The copy is made beside `destination` under a scratch name, checked with `PRAGMA integrity_check`, flushed and
-    moved into place, so a reader sees the old file or the whole new one. With running attempts and no `allow_running`
-    nothing is left at `destination`: the scratch copy is removed and `AttemptsRunning` is raised.
+    The copy is made beside `destination` under a scratch name by the online backup API (all pages in one step, from a
+    read-only connection), put in the rollback-journal mode so that it is one self-contained file (a store in WAL mode
+    makes a copy that says WAL), checked with `PRAGMA integrity_check`, flushed and moved into place, so a reader sees
+    the old file or the whole new one. With running attempts and no `allow_running` nothing is left at `destination`:
+    the scratch copy is removed and `AttemptsRunning` is raised.
     """
     if not source.is_file():
         raise SnapshotError(f"{source}: no campaign store here; run the study first")
@@ -58,15 +62,16 @@ def take_snapshot(source: Path, destination: Path, *, allow_running: bool = Fals
     try:
         origin = sqlite3.connect(f"file:{quote(str(source))}?mode=ro", uri=True, timeout=_LOCK_TIMEOUT_S)
         try:
-            origin.execute("VACUUM INTO ?", (str(scratch),))
+            copy = sqlite3.connect(scratch)
+            try:
+                origin.backup(copy)  # pages=-1: one step, so one consistent state of the store
+                copy.execute("PRAGMA journal_mode = DELETE")
+                verdict = copy.execute("PRAGMA integrity_check").fetchall()
+                running = copy.execute("SELECT COUNT(*) FROM attempts WHERE state = 'running'").fetchone()[0]
+            finally:
+                copy.close()
         finally:
             origin.close()
-        copy = sqlite3.connect(scratch)
-        try:
-            verdict = copy.execute("PRAGMA integrity_check").fetchall()
-            running = copy.execute("SELECT COUNT(*) FROM attempts WHERE state = 'running'").fetchone()[0]
-        finally:
-            copy.close()
         if [tuple(row) for row in verdict] != [("ok",)]:
             raise SnapshotError(f"{source}: the copy of the store failed its integrity check")
         if running and not allow_running:
