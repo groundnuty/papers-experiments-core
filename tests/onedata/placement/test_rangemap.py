@@ -93,6 +93,20 @@ def test_a_bad_setting_is_refused(tmp_path, key, value, message):
         load(tmp_path, **{key: value})
 
 
+@pytest.mark.parametrize("value", [1, 0, -2, 2.0, True, "2"])
+def test_o07_one_poll_is_not_convergence_so_fewer_than_two_consecutive_polls_is_refused_at_load(tmp_path, value):
+    """O07: a block map is believed only when two polls in a row agree, so a configuration that asks for one poll (or
+    anything that is not an integer of two or more) is refused naming the key."""
+    with pytest.raises(ConfigError, match=r"key 'consecutive_polls'.*integer of at least 2"):
+        load(tmp_path, consecutive_polls=value)
+
+
+def test_o07_two_consecutive_polls_and_more_are_accepted(tmp_path):
+    """O07: the smallest accepted count is the default, two."""
+    assert load(tmp_path, consecutive_polls=2).settings.consecutive_polls == 2
+    assert load(tmp_path, consecutive_polls=5).settings.consecutive_polls == 5
+
+
 def test_safe_path_accepts_plain_relative_paths_only():
     assert safe_path("a/b.bin") == ("a", "b.bin")
     for bad in ("", "/a", "a/", "a//b", "a/../b", "./a", "a\\b"):

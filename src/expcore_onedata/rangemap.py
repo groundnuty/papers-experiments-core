@@ -17,7 +17,7 @@ map = "ranges.toml"             # optional: a file (relative to this one) of top
 poll_s = 2.0                    # seconds between polls of a transfer or a block map
 transfer_timeout_s = 3600       # the longest a transfer is waited for
 settle_timeout_s = 300          # the longest a block map is waited on to show a placement
-consecutive_polls = 2           # polls in a row that must agree before a placement is believed
+consecutive_polls = 2           # polls in a row that must agree before a placement is believed (2 or more, O07)
 request_timeout_s = 900         # one block-sized read or write
 chunk_bytes = 67108864          # the largest single read or write
 probe_attempts = 3              # tries at a read that fails with a network reset (O08)
@@ -214,7 +214,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         poll_s=_number(table, "poll_s", 2.0, minimum=0.001),
         transfer_timeout_s=_number(table, "transfer_timeout_s", 3600.0, minimum=0),
         settle_timeout_s=_number(table, "settle_timeout_s", 300.0, minimum=0),
-        consecutive_polls=_number(table, "consecutive_polls", 2, minimum=1, integer=True),
+        consecutive_polls=_number(table, "consecutive_polls", 2, minimum=2, integer=True),
         request_timeout_s=_number(table, "request_timeout_s", 900.0, minimum=1),
         chunk_bytes=_number(table, "chunk_bytes", 64 << 20, minimum=1, integer=True),
         probe_attempts=_number(table, "probe_attempts", 3, minimum=1, integer=True),
