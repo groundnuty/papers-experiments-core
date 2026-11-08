@@ -122,7 +122,8 @@ class AttemptRunner:
             lease = asyncio.run(p.leases.acquire_under(timer, group, run_key=key, timeout_s=p.settings.lease_timeout_s))
         except LeaseRefused as refusal:
             p.holds.note(f"lease:{group}", Hold("lease", f"{type(refusal).__name__}: {refusal}", temporary=True))
-            p.store.event(p.stamp(), "run_unstarted", model, f"{key}: no lease, no attempt used: {refusal}")
+            waited = f"after waiting {refusal.wait_s:.1f} s "
+            p.store.event(p.stamp(), "run_unstarted", model, f"{key}: no lease {waited}and no attempt used: {refusal}")
             return None, False
         p.holds.note(f"lease:{group}", None)
         if lease.wait_s >= LEASE_WAIT_NOTED_S:

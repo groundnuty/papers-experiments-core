@@ -292,3 +292,23 @@ def test_c19_an_unproven_teardown_quarantines_and_with_every_key_quarantined_the
         clock.now += 61
         assert scheduler.run().statuses == {"done": 3}
         assert attempts_of(scheduler.store, left[0]) == [("done", 0, 1)]
+
+
+def test_c19_a_run_left_unstarted_after_waiting_for_a_lease_says_how_long_it_waited(tmp_path):
+    """C19: the wait before a timeout is in the run_unstarted event, so throughput analysis loses no queue time."""
+    clock = Clock()
+    pool = LeasePool(
+        tmp_path / "leases", lambda group: ["k1"], Probe(), owner="dispatcher", clock=clock, sleep=clock.sleep
+    )
+    other = pool.try_acquire("g", "somebody-else")  # the only key is busy, and stays busy
+    executor = FakeExecutor()
+    settings = settings_for(lease_timeout_s=10.0)
+    with build(
+        tmp_path / "c", executor=executor, leases=pool, lease_group=lambda f: "g", settings=settings, plan=SMALL
+    ) as scheduler:
+        assert scheduler.run(max_dispatch=1).dispatched == 1
+        rows = scheduler.store.q("SELECT detail FROM events WHERE kind='run_unstarted'")
+        assert len(rows) == 1
+        assert "after waiting 10.0 s" in rows[0]["detail"]
+        assert executor.requests == []  # nothing started, no attempt used
+    other.release()

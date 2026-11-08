@@ -378,6 +378,68 @@ def test_c19_a_wait_is_logged_and_a_timeout_is_a_refusal(tmp_path):
         leases.acquire("g", run_key="run-c", timeout_s=5)
 
 
+def wait_lines(tmp_path):
+    return [json.loads(x) for x in (tmp_path / "leases" / WAIT_LOG).read_text().splitlines()]
+
+
+def test_c19_the_wait_is_recorded_on_the_lease_and_in_the_log_when_a_key_is_granted(tmp_path):
+    """C19: the measured wait is in Lease.record() and in waits.jsonl with the outcome and the key it ended with."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1",), clock=clock, poll_s=2.0)
+    holder = leases.try_acquire("g", "run-a")
+    assert holder.record()["wait_s"] == 0.0
+    clock.on_sleep = lambda: holder.release() if clock.sleeps == 3 else None
+    got = leases.acquire("g", run_key="run-b")
+    assert got.record()["wait_s"] == pytest.approx(6.0)
+    [line] = wait_lines(tmp_path)
+    assert (line["outcome"], line["key"], line["wait_s"], line["run_key"]) == ("granted", "k1", 6.0, "run-b")
+
+
+def test_c19_the_wait_before_a_timeout_is_recorded_on_the_refusal_and_in_the_log(tmp_path):
+    """C19: a run that waited and was then refused did not lose its queue time: the refusal and waits.jsonl carry it."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1",), clock=clock, poll_s=2.0)
+    holder = leases.try_acquire("g", "run-a")
+    with pytest.raises(LeaseTimeout) as refused:
+        leases.acquire("g", run_key="run-b", timeout_s=10)
+    assert refused.value.wait_s == pytest.approx(10.0)
+    [line] = wait_lines(tmp_path)
+    assert (line["outcome"], line["key"], line["wait_s"], line["run_key"]) == ("timeout", None, 10.0, "run-b")
+    assert holder.held
+
+
+def test_c19_the_wait_before_an_all_quarantined_refusal_is_recorded_too(tmp_path):
+    """C19: keys that were merely busy while the run waited, then all quarantined, leave the wait on the refusal."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1", "k2"), clock=clock, poll_s=2.0)
+    first, second = leases.try_acquire("g", "run-a"), leases.try_acquire("g", "run-b")
+
+    def both_unproven():
+        if clock.sleeps == 2:
+            leases.quarantine(first, lambda: False)
+            leases.quarantine(second, lambda: False)
+
+    clock.on_sleep = both_unproven
+    with pytest.raises(AllQuarantined) as refused:
+        leases.acquire("g", run_key="run-c")
+    assert refused.value.wait_s == pytest.approx(4.0)
+    [line] = wait_lines(tmp_path)
+    assert (line["outcome"], line["wait_s"], line["run_key"]) == ("all_quarantined", 4.0, "run-c")
+    with pytest.raises(AllQuarantined) as at_once:  # refused before any wait: a line of 0 s, not a gap in the log
+        leases.acquire("g", run_key="run-d")
+    assert at_once.value.wait_s == 0.0
+    assert wait_lines(tmp_path)[-1]["wait_s"] == 0.0
+
+
+def test_c19_a_group_without_a_key_is_logged_as_a_refusal_without_a_wait(tmp_path):
+    """C19: even the refusal that cannot wait leaves its line, so the log lists every run that was not started."""
+    leases = pool(tmp_path, keys=())
+    with pytest.raises(NoResources) as refused:
+        leases.acquire("g", run_key="run-a")
+    assert refused.value.wait_s == 0.0
+    assert wait_lines(tmp_path)[0]["outcome"] == "no_resources"
+
+
 def test_c19_waiting_for_a_lease_is_a_lease_queue_wait_on_the_timer_and_not_the_agents_time(tmp_path):
     """C19: a wait for a lease taken under a started timer is marked lease_queue, so the agent's clock does not run."""
     clock = Clock()

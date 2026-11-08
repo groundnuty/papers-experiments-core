@@ -28,11 +28,12 @@ to nobody until the teardown is proven (`LeasePool.settle_quarantines` asks the 
 quarantined, `acquire` raises `AllQuarantined` before waiting: the run is left unstarted and uses no attempt.
 
 There is no fallback to another group and none to a shared principal: with no free key the caller waits, and the wait
-is logged (`waits.jsonl`) with the run, because too few keys would otherwise silently lower the throughput. A wait for
-a lease is time spent on infrastructure, never the agent's: `acquire_under` runs it inside
-`infrastructure_wait("lease_queue")` of whichever timer or call context is handed in. The loop's clock starts only
-when the loop does, so a lease taken before `record_attempt` is outside the agent's time and outside the record's
-clock; a provider that takes its lease inside a call, through the call context, has the wait recorded per kind.
+is logged (`waits.jsonl`) with the run, because too few keys would otherwise silently lower the throughput. The wait is
+recorded on every path, a refusal and a timeout included, with its outcome: a run that waited ten minutes and was then
+left unstarted is ten minutes of queue time the analysis would otherwise lose. A wait for a lease is time spent on
+infrastructure, never the agent's: `acquire_under` runs it inside `infrastructure_wait("lease_queue")` of whichever
+timer or call context is handed in. The loop's clock starts only when the loop does, so a lease taken before
+`record_attempt` is outside the agent's time and outside the record's clock; a provider that takes its lease inside a call, through the call context, has the wait recorded per kind.
 """
 
 import asyncio
@@ -78,6 +79,9 @@ class LeaseTimeout(LeaseRefused):
 class AllQuarantined(LeaseRefused):
     """Every key of the group is quarantined or held back for a dead holder: a wait would end only when a teardown is
     proven, so the run is refused before anything starts."""
+
+
+_OUTCOMES = {NoResources: "no_resources", AllQuarantined: "all_quarantined", LeaseTimeout: "timeout"}
 
 
 class ResourceProbe(Protocol):
@@ -233,8 +237,8 @@ class Lease:
             self.release()
 
     def record(self) -> dict[str, Any]:
-        """Return the lease as a record keeps it: key, group, start and end (None while held)."""
-        return {"key": self.key, "group": self.group, "start": self.start, "end": self.end}
+        """Return the lease as a record keeps it: key, group, the seconds waited for it, start and end (None while held)."""
+        return {"key": self.key, "group": self.group, "wait_s": self.wait_s, "start": self.start, "end": self.end}
 
 
 def _write_note(handle: Any, note: Mapping[str, Any]) -> None:
@@ -427,29 +431,41 @@ class LeasePool:
         """Take a free key of the group, waiting while there is none, and log the wait.
 
         Raises NoResources, AllQuarantined (as soon as no key can come free without a teardown being proven, so a
-        run is not left waiting for ever) and LeaseTimeout.
+        run is not left waiting for ever) and LeaseTimeout. The seconds waited are measured on every path, so no queue
+        time is lost to the throughput analysis: they are `Lease.wait_s` for a lease, `LeaseRefused.wait_s` for a
+        refusal, and a line of `waits.jsonl` either way (a granted lease only when it waited or was contended).
         """
         began = self._clock()
         contended = False
-        while True:
-            lease = self.try_acquire(group, run_key)
-            if lease is not None:
-                lease.wait_s = self._clock() - began
-                if contended or lease.wait_s >= WAIT_LOG_MIN_S:
-                    _append_line(
-                        self.dir / WAIT_LOG,
-                        {
-                            "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "group": group,
-                            "run_key": run_key,
-                            "wait_s": round(lease.wait_s, 3),
-                        },
-                    )
-                return lease
-            contended = True
-            if timeout_s is not None and self._clock() - began >= timeout_s:
-                raise LeaseTimeout(f"no free key in group {group!r} after {timeout_s:g} s")
-            self._sleep(self._poll_s)
+        try:
+            while True:
+                lease = self.try_acquire(group, run_key)
+                if lease is not None:
+                    lease.wait_s = self._clock() - began
+                    if contended or lease.wait_s >= WAIT_LOG_MIN_S:
+                        self._log_wait(group, run_key, lease.wait_s, "granted", lease.key)
+                    return lease
+                contended = True
+                if timeout_s is not None and self._clock() - began >= timeout_s:
+                    raise LeaseTimeout(f"no free key in group {group!r} after {timeout_s:g} s")
+                self._sleep(self._poll_s)
+        except LeaseRefused as refusal:
+            refusal.wait_s = self._clock() - began
+            self._log_wait(group, run_key, refusal.wait_s, _OUTCOMES.get(type(refusal), "refused"), None)
+            raise
+
+    def _log_wait(self, group: str, run_key: str | None, wait_s: float, outcome: str, key: str | None) -> None:
+        _append_line(
+            self.dir / WAIT_LOG,
+            {
+                "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "group": group,
+                "run_key": run_key,
+                "wait_s": round(wait_s, 3),
+                "outcome": outcome,
+                "key": key,
+            },
+        )
 
     async def acquire_under(
         self, waits: WaitSource, group: str, *, run_key: str | None = None, timeout_s: float | None = None
