@@ -168,19 +168,23 @@ class _Run:
         return None
 
     async def _bounded[T](self, work: Awaitable[T], limit_s: float) -> T:
-        """Await work, but cancel it and raise `_Bound` when the injected sleep for `limit_s` seconds ends first."""
+        """Await work, but cancel it and raise `_Bound` when the injected sleep for `limit_s` seconds ends first.
+
+        Whichever way this ends, including an outside cancellation of the loop, both child tasks are cancelled and
+        awaited before it returns or raises, so none is left pending and a cancelled call has noted that it was
+        abandoned.
+        """
         job = asyncio.ensure_future(work)
         clock = asyncio.ensure_future(self._sleep(max(limit_s, 0.0)))
         try:
             await asyncio.wait({job, clock}, return_when=asyncio.FIRST_COMPLETED)
             if job.done():
                 return job.result()
-            job.cancel()
-            await asyncio.gather(job, return_exceptions=True)  # let the cancelled call note that it was abandoned
             raise _Bound
         finally:
             for task in (job, clock):
                 task.cancel()
+            await asyncio.gather(job, clock, return_exceptions=True)
 
     # --- model calls ----------------------------------------------------------------------------------------------
 
