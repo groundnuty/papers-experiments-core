@@ -4,7 +4,7 @@ import asyncio
 import dataclasses
 
 import pytest
-from loop_support import FakeClock, never
+from loop_support import ClockSleep, FakeClock, never
 
 from expcore.config.models import Limits
 from expcore.loop.agent_loop import run_agent
@@ -15,6 +15,12 @@ from expcore.loop.toolbox import ToolBox
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock()
+
+
+@pytest.fixture
+def sleeper(clock: FakeClock) -> ClockSleep:
+    """A sleep that ends when the fake clock reaches its bound, keeping each bound it was asked for."""
+    return ClockSleep(clock)
 
 
 @pytest.fixture

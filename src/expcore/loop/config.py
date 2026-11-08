@@ -19,7 +19,10 @@ from expcore.loop.timer import AgentTimer
 
 MALFORMED_POLICIES = ("report", "end")
 MIN_CALL_S = 1.0  # a tool call does not start with less time left than this (L05)
-TOOL_GRACE_S = 60.0  # how long past the run's remaining time the loop waits for a provider that ignores its timeout
+CEILING_FACTOR = (
+    3.0  # the whole-time ceiling is this many times the agent's time cap unless the run says otherwise (L04)
+)
+CEILING_KIND = "ceiling"  # the infrastructure kind of an attempt that passes the ceiling with the agent under its cap
 
 
 @dataclasses.dataclass(frozen=True)
@@ -29,14 +32,14 @@ class AgentConfig:
     - `limits`: the run's caps (rounds, agent time, tokens, characters per tool result, output tokens per reply).
     - `malformed_policy`: `report` tells the model its arguments were not valid JSON and goes on (the default);
       `end` ends the attempt as `malformed_end`. Running the tool with `{}` is not offered (L01).
-    - `ceiling_s` and `ceiling_kind`: an optional ceiling on the whole elapsed time, waits on infrastructure
-      included. Passing it while the agent is still under its own cap ends the attempt as infrastructure of that
-      kind; the agent's own cap decides first (L04).
+    - `ceiling_s`, `ceiling_factor` and `ceiling_kind`: the ceiling on the whole elapsed time, waits on infrastructure
+      included. There is always one, so a call that hangs on infrastructure cannot run for ever: it is `ceiling_s`
+      when given, else `ceiling_factor` times the time cap (3 by default), and never below the cap. Every model
+      request and tool call is bounded by what is left of it. A call still running when it passes, with the agent
+      under its own cap, ends the attempt as infrastructure of `ceiling_kind` (the core's `ceiling` by default);
+      the agent's own cap decides first (L04). Both fields are filled in on construction, so the record holds the
+      ceiling that was in force.
     - `min_call_s`: no tool call starts with less agent time than this left (L05).
-    - `tool_grace_s`: how long past the remaining time the loop waits for a provider that ignores the timeout it
-      was given. The agent is told nothing of it; it never shortens a call. With a ceiling set, a tool call is
-      bounded by the ceiling instead, so a provider that waits on infrastructure for longer than the grace needs
-      one: without it that wait is cut and counted as the agent's time.
     """
 
     limits: Limits
@@ -44,10 +47,10 @@ class AgentConfig:
     ceiling_s: float | None = None
     ceiling_kind: str | None = None
     min_call_s: float = MIN_CALL_S
-    tool_grace_s: float = TOOL_GRACE_S
+    ceiling_factor: float | None = None
 
     def __post_init__(self) -> None:
-        """Refuse caps that cannot work, an unknown policy, and a ceiling without the kind it ends as."""
+        """Refuse caps that cannot work and an unknown policy, and settle the ceiling and the kind it ends as."""
         problems = []
         limits = self.limits
         if limits.max_tool_rounds < 0 or limits.token_budget <= 0 or limits.output_cap_chars <= 0:
@@ -56,16 +59,39 @@ class AgentConfig:
             problems.append("time_cap_s must be a positive number of seconds")
         if self.malformed_policy not in MALFORMED_POLICIES:
             problems.append(f"malformed_policy must be one of {', '.join(MALFORMED_POLICIES)}")
-        if (self.ceiling_s is None) != (self.ceiling_kind is None):
-            problems.append("ceiling_s and ceiling_kind go together")
-        elif self.ceiling_s is not None and not limits.time_cap_s <= self.ceiling_s < math.inf:
-            problems.append("ceiling_s must be finite and not below time_cap_s")
-        if self.ceiling_kind is not None and self.ceiling_kind not in infra_kinds():
-            problems.append(f"ceiling_kind must be one of {', '.join(infra_kinds())}")
-        if self.min_call_s < 0 or self.tool_grace_s < 0:
-            problems.append("min_call_s and tool_grace_s must not be negative")
+        problems.extend(self._settle_ceiling())
+        if self.min_call_s < 0:
+            problems.append("min_call_s must not be negative")
         if problems:
             raise ValueError("agent configuration: " + "; ".join(problems))
+
+    def _settle_ceiling(self) -> list[str]:
+        """Fill in `ceiling_s`, `ceiling_factor` and `ceiling_kind` from what was given; return what is wrong.
+
+        Given neither of the first two, the factor is the default. Given both they must agree, which is what a copy
+        of a settled configuration holds. Given only `ceiling_s`, no factor is recorded.
+        """
+        problems = []
+        cap = self.limits.time_cap_s
+        kind = self.ceiling_kind if self.ceiling_kind is not None else CEILING_KIND
+        if kind not in infra_kinds():
+            problems.append(f"ceiling_kind must be one of {', '.join(infra_kinds())}")
+        object.__setattr__(self, "ceiling_kind", kind)
+        factor = self.ceiling_factor
+        if factor is not None and not (math.isfinite(factor) and factor >= 1):
+            problems.append("ceiling_factor must be a finite number, at least 1")
+            return problems
+        if not math.isfinite(cap) or cap <= 0:
+            return problems  # reported above; no ceiling can be derived from it
+        if self.ceiling_s is None:
+            factor = CEILING_FACTOR if factor is None else factor
+            object.__setattr__(self, "ceiling_factor", factor)
+            object.__setattr__(self, "ceiling_s", cap * factor)
+        elif not (math.isfinite(self.ceiling_s) and cap <= self.ceiling_s):
+            problems.append("ceiling_s must be finite and not below time_cap_s")
+        elif factor is not None and not math.isclose(self.ceiling_s, cap * factor):
+            problems.append("give ceiling_s or ceiling_factor, not two that disagree")
+        return problems
 
     def timer(self, clock: Callable[[], float] = time.monotonic) -> AgentTimer:
         """Return a timer holding this configuration's time cap and ceiling, reading the given clock."""

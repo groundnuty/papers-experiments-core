@@ -27,6 +27,28 @@ async def never(seconds: float) -> None:
     await asyncio.Event().wait()
 
 
+class ClockSleep:
+    """Stands in for asyncio.sleep on the fake clock: a bound passes when the fake clock reaches it.
+
+    A call that moves the clock past its bound is cut, and one that does not is never cut. The bound is read from the
+    clock when the sleep is asked for, before the bounded work starts, so work that moves the clock counts against it.
+    Every bound asked for is kept in `bounds`. A test that never moves the clock and never lets the work return would
+    wait for ever, so it uses `at_once` or `never` instead.
+    """
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+        self.bounds: list[float] = []
+
+    def __call__(self, seconds: float):
+        self.bounds.append(seconds)
+        return self._until(self.clock.now + seconds)
+
+    async def _until(self, deadline: float) -> None:
+        while self.clock.now < deadline:
+            await asyncio.sleep(0)
+
+
 async def at_once(seconds: float) -> None:
     """Stands in for asyncio.sleep: every bound passes as soon as the loop waits on it."""
     await asyncio.sleep(0)

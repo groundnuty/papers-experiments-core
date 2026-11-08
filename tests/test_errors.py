@@ -19,7 +19,7 @@ def _isolated_registry(monkeypatch):
     monkeypatch.setattr(errors, "_platform_kinds", {})
 
 
-@pytest.mark.parametrize("kind", ["endpoint", "key_rejected", "sandbox", "knowledge", "unattributed_kill"])
+@pytest.mark.parametrize("kind", ["endpoint", "key_rejected", "sandbox", "knowledge", "unattributed_kill", "ceiling"])
 def test_every_core_kind_is_accepted_and_keeps_its_own_name(kind):
     error = InfraError(kind, "detail")
     assert error.kind == kind
@@ -27,8 +27,8 @@ def test_every_core_kind_is_accepted_and_keeps_its_own_name(kind):
     assert str(error) == f"{kind}: detail"
 
 
-def test_the_core_vocabulary_is_exactly_the_five_kinds():
-    assert set(CORE_KINDS) == {"endpoint", "key_rejected", "sandbox", "knowledge", "unattributed_kill"}
+def test_the_core_vocabulary_is_exactly_the_six_kinds():
+    assert set(CORE_KINDS) == {"endpoint", "key_rejected", "sandbox", "knowledge", "unattributed_kill", "ceiling"}
     assert infra_kinds() == CORE_KINDS
 
 

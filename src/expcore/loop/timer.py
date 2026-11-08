@@ -25,6 +25,13 @@ class Tick:
     agent_s: float
     remaining_s: float  # the agent's time left under its cap; zero or less means the cap is reached
     ceiling_passed: bool
+    ceiling_left_s: float | None = None  # the whole-time ceiling minus the elapsed time; None without a ceiling
+
+    @property
+    def bound_s(self) -> float:
+        """How long a call that reports no wait on infrastructure may run: the agent's time left or the ceiling
+        left, whichever ends first (L04)."""
+        return self.remaining_s if self.ceiling_left_s is None else min(self.remaining_s, self.ceiling_left_s)
 
 
 class AgentTimer:
@@ -87,6 +94,7 @@ class AgentTimer:
             agent,
             self.time_cap_s - agent,
             self.ceiling_s is not None and elapsed >= self.ceiling_s,
+            None if self.ceiling_s is None else self.ceiling_s - elapsed,
         )
 
     def time_left(self) -> float | None:

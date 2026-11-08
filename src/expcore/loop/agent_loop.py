@@ -174,12 +174,13 @@ class _Run:
     # --- model calls ----------------------------------------------------------------------------------------------
 
     async def _step(self, tick: Tick) -> ModelTurn:
-        """Ask the model for its next reply, bounded by the agent's remaining time (L04)."""
+        """Ask the model for its next reply, bounded by the agent's time left or the ceiling left, whichever ends
+        first (L04)."""
         try:
-            return await self._bounded(self.backend.step(), tick.remaining_s)
+            return await self._bounded(self.backend.step(), tick.bound_s)
         except _Bound:
             self.usage_incomplete = True  # the request in flight was given up: its usage is unknown
-            raise _End(Outcome("time_cap", "the model call was cut at the agent's time cap")) from None
+            raise _End(self._model_cut(tick)) from None
         except RequestAbandoned:
             self.usage_incomplete = True  # accepted, then slow, never resent (B03)
             raise _End(
@@ -193,6 +194,15 @@ class _Run:
             raise _End(Outcome("error", str(exc), error_type="ContextOverflow")) from None
         except Exception as exc:
             raise _End(Outcome("error", f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__)) from None
+
+    def _model_cut(self, tick: Tick) -> Outcome:
+        """The ending for a model request cut at its bound. A request reports no waits, so the time it ran is the
+        agent's: the bound was the ceiling only when less of it was left than of the agent's own time, and the agent is
+        then still under its cap. When both ran out together the agent's cap decides."""
+        if tick.ceiling_left_s is not None and tick.ceiling_left_s < tick.remaining_s:
+            detail = f"the model call was still running at the ceiling of {self.config.ceiling_s:g} s"
+            return Outcome("infrastructure", detail, infra_kind=self.config.ceiling_kind)
+        return Outcome("time_cap", "the model call was cut at the agent's time cap")
 
     def _note(self, turn: ModelTurn) -> None:
         """Count the reply's tokens (a missing count adds nothing and marks the totals incomplete, B10) and record it."""
@@ -271,7 +281,10 @@ class _Run:
             stop = self._guard_outcome(tick, late)
             return self._skip(index, call, "time"), stop
         try:
-            run = await self._bounded(self.toolbox.run(call, timeout_s=tick.remaining_s), self._tool_bound(tick))
+            # The provider is told the agent's time left, but a wait on infrastructure is reported only when the call
+            # returns, so the call may run until the ceiling (L04, L05).
+            bound = tick.remaining_s if tick.ceiling_left_s is None else tick.ceiling_left_s
+            run = await self._bounded(self.toolbox.run(call, timeout_s=tick.remaining_s), bound)
         except _Bound:
             after = self.timer.check("after_tool")
             cut = self.toolbox.skipped(call, "cut")
@@ -291,20 +304,13 @@ class _Run:
             return run, Outcome("finished", f"a call to the terminal tool {call.name!r} succeeded")
         return run, None
 
-    def _tool_bound(self, tick: Tick) -> float:
-        """How long a tool call may take on the wall clock before it is cut.
-
-        With a ceiling on the whole elapsed time, a call may wait on infrastructure up to the ceiling: what it reports
-        as waiting is not the agent's time (L04). Without one the bound is the remaining time plus the declared grace,
-        so a provider that can wait longer than that on infrastructure needs a ceiling.
-        """
-        if self.config.ceiling_s is not None:
-            return self.config.ceiling_s - tick.elapsed_s
-        return tick.remaining_s + self.config.tool_grace_s
-
     def _cut_outcome(self, call: ToolCall, tick: Tick) -> Outcome:
-        """The ending for a call cut at its bound: the agent's time first, then the ceiling that was the bound."""
-        if self.config.ceiling_s is not None and tick.remaining_s > 0:
+        """The ending for a tool call cut at the ceiling, judged by the reading taken after the cut.
+
+        The agent's time first: a call that reported no wait on infrastructure has used the time it ran as its own, so
+        when that used up the cap the ending is a time cap. With the agent still under its cap the ceiling decides.
+        """
+        if tick.remaining_s > 0:
             detail = f"tool {call.name!r} was still running at the ceiling of {self.config.ceiling_s:g} s"
             return Outcome("infrastructure", detail, infra_kind=self.config.ceiling_kind)
         return Outcome("time_cap", f"tool {call.name!r} was still running at the agent's time cap")

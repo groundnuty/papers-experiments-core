@@ -18,15 +18,26 @@ def slow(clock, seconds, *, wait=0.0, text="done"):
     return handler
 
 
-def test_l04_a_slow_infrastructure_call_leaves_the_charged_time_under_the_cap(run, clock):
-    """L04: a call that waits 500 s on infrastructure, reported as such, leaves the charged time under the 300 s cap."""
+def test_l04_a_slow_infrastructure_call_leaves_the_charged_time_under_the_cap(run, clock, sleeper):
+    """L04: a call that waits 500 s on infrastructure, reported as such, leaves the charged time under the 300 s cap.
+
+    The sleep ends when the fake clock reaches the bound, so the test passes only if no bound was reached: each tool
+    call was allowed up to the ceiling, and the model request after the second was bounded by the ceiling left.
+    """
     provider = FakeProvider({"store": slow(clock, 500, wait=500)})
-    result = run(StubAdapter([[("store", {})], [("store", {})], "done"]), [provider], time_cap_s=300)
+    result = run(
+        StubAdapter([[("store", {})], [("store", {})], "done"]),
+        [provider],
+        sleep=sleeper,
+        time_cap_s=300,
+        ceiling_s=1200,
+    )
     assert result.outcome.name == "finished"
     assert result.infra_wait_s == 1000
     assert result.elapsed_s == 1000
     assert result.agent_s == 0
     assert [c[2] for c in provider.calls] == [300, 300]  # each call was given the whole of the agent's time
+    assert sleeper.bounds == [300, 1200, 300, 700, 200]  # the last request had 200 s of the ceiling left, not 300
 
 
 def test_l04_a_slow_call_that_reports_no_wait_is_the_agents_time(run, clock):
@@ -81,13 +92,16 @@ def test_l04_a_model_call_still_running_at_the_cap_is_cut_and_its_usage_is_unkno
     assert result.usage_incomplete is True
 
 
-def test_l04_a_tool_call_still_running_at_the_cap_is_cut_and_answered(run):
-    """L04: a provider that never returns is cut when its bound passes; the call is logged cut."""
+def test_l04_a_tool_call_that_runs_on_to_the_ceiling_without_reporting_a_wait_is_cut_as_the_agents_time(
+    run, clock, sleeper
+):
+    """L04: a provider that never returns and reports no wait has used the time as its own: cut, and a time cap."""
 
     async def hangs(args):
+        clock.advance(900)  # it ran until the default ceiling of three times the cap
         await asyncio.Event().wait()
 
-    result = run(StubAdapter([[("hang", {})]]), [FakeProvider({"hang": hangs})], sleep=at_once)
+    result = run(StubAdapter([[("hang", {})]]), [FakeProvider({"hang": hangs})], sleep=sleeper)
     assert result.outcome.name == "time_cap"
     assert result.tool_calls[0].status == "cut"
     assert len([m for m in result.transcript if m["role"] == "tool"]) == 1
@@ -100,8 +114,9 @@ def test_l05_the_timeout_passed_to_the_provider_is_the_deadline_minus_now(run, c
     assert [c[2] for c in provider.calls] == [300, 200]
 
 
-def test_l05_there_is_no_hidden_limit_beyond_the_remaining_time(run, clock):
-    """L05: the model call is bounded by the remaining time and a tool call by it plus only the declared grace."""
+def test_l05_there_is_no_hidden_limit_beyond_the_remaining_time_and_the_ceiling(run, clock):
+    """L05: a model request is bounded by the remaining time and a tool call by the ceiling, which is three times the
+    cap unless the run says otherwise; no other limit is added."""
     bounds: list[float] = []
 
     async def recording_sleep(seconds):
@@ -109,8 +124,56 @@ def test_l05_there_is_no_hidden_limit_beyond_the_remaining_time(run, clock):
         await asyncio.Event().wait()
 
     provider = FakeProvider({"slow": slow(clock, 100)})
-    run(StubAdapter([[("slow", {})], "done"]), [provider], sleep=recording_sleep, time_cap_s=300, tool_grace_s=7)
-    assert bounds == [300, 307, 200]  # model call, tool call, model call
+    run(StubAdapter([[("slow", {})], "done"]), [provider], sleep=recording_sleep, time_cap_s=300)
+    assert bounds == [300, 900, 200]  # model call, tool call, model call
+
+
+def test_l04_a_long_wait_on_infrastructure_is_not_cut_at_the_remaining_time_plus_a_grace(run, clock, sleeper):
+    """L04: with the default ceiling a call may wait 500 s on infrastructure under a 300 s cap, and the wait is not
+    charged to the agent; the bound it ran under is the ceiling left, 900 s."""
+    provider = FakeProvider({"store": slow(clock, 500, wait=500)})
+    result = run(StubAdapter([[("store", {})], "done"]), [provider], sleep=sleeper, time_cap_s=300)
+    assert result.outcome.name == "finished"
+    assert result.agent_s == 0
+    assert sleeper.bounds[1] == 900
+
+
+def test_l04_a_model_request_is_bounded_by_the_ceiling_left_when_that_is_less_than_the_agents_time(run, clock, sleeper):
+    """L04: after 700 s of waits the agent has all 300 s left but the ceiling only 200 s; the request gets 200 s."""
+    provider = FakeProvider({"store": slow(clock, 700, wait=700)})
+    run(StubAdapter([[("store", {})], "done"]), [provider], sleep=sleeper, time_cap_s=300)
+    assert sleeper.bounds == [300, 900, 200]
+
+
+def test_l04_a_model_request_cut_by_the_ceiling_with_the_agent_under_its_cap_is_infrastructure(run, clock):
+    """L04: the request was still running when the ceiling passed and the agent had time left: set aside, not a cap."""
+
+    class Hangs(StubAdapter):
+        async def step(self):
+            if self._i == 0:
+                return await super().step()
+            await asyncio.Event().wait()
+
+    provider = FakeProvider({"store": slow(clock, 700, wait=700)})
+    result = run(Hangs([[("store", {})]]), [provider], sleep=at_once, time_cap_s=300)
+    assert result.outcome.name == "infrastructure"
+    assert result.outcome.infra_kind == "ceiling"
+    assert result.outcome.set_aside is True
+    assert result.usage_incomplete is True
+
+
+def test_l04_a_model_request_cut_with_the_agents_time_and_the_ceiling_both_at_their_end_is_a_time_cap(run, clock):
+    """L04: the agent's own cap decides first when the request runs out both bounds at once."""
+
+    class Hangs(StubAdapter):
+        async def step(self):
+            if self._i == 0:
+                return await super().step()
+            await asyncio.Event().wait()
+
+    provider = FakeProvider({"store": slow(clock, 600, wait=600)})
+    result = run(Hangs([[("store", {})]]), [provider], sleep=at_once, time_cap_s=300)  # 300 s left of each
+    assert result.outcome.name == "time_cap"
 
 
 def test_l04_with_a_ceiling_a_tool_call_may_wait_on_infrastructure_up_to_the_ceiling(run, clock):
