@@ -106,6 +106,7 @@ def test_b10_input_tokens_are_uncached_plus_cache_write_plus_cache_read(make_spe
 def test_b10_cache_parts_the_reply_does_not_report_stay_none_and_do_not_change_the_total(
     make_spec, limits, message, fake_client
 ):
+    """B10: Cache parts the reply does not report stay none and do not change the total."""
     client = fake_client(message(usage={"input_tokens": 7, "output_tokens": 3}), api="anthropic")
     backend = adapter(make_spec(backend="anthropic"), limits, client)
     backend.begin("", "go", [])
@@ -130,6 +131,7 @@ def test_b10_a_reply_without_usage_is_infrastructure_and_counted_missing(make_sp
 def test_b10_a_reply_without_content_is_infrastructure_and_its_usage_still_counts(
     make_spec, limits, message, fake_client
 ):
+    """B10: A reply without content is infrastructure and its usage still counts."""
     reply = message(usage={"input_tokens": 500, "output_tokens": 1})
     reply.content = None
     client = fake_client(reply, api="anthropic")
@@ -141,6 +143,7 @@ def test_b10_a_reply_without_content_is_infrastructure_and_its_usage_still_count
 
 
 def test_b11_a_model_with_a_lower_maximum_sends_its_own_value(make_spec, limits, message, fake_client):
+    """B11: A model with a lower maximum sends its own value."""
     client = fake_client(message(), api="anthropic")
     backend = adapter(make_spec(backend="anthropic", max_output_tokens=2048), limits, client)
     backend.begin("", "go", [])
@@ -205,6 +208,7 @@ def test_b15_the_recorded_settings_come_from_the_request_and_the_url_loses_its_c
 
 
 def test_b01_a_529_overload_is_retried_and_recorded_on_the_turn(make_spec, limits, message, fake_client, make_error):
+    """B01: A 529 overload is retried and recorded on the turn."""
     client = fake_client(make_error(529, sdk=anthropic), make_error(429, sdk=anthropic), message(), api="anthropic")
     backend = adapter(make_spec(backend="anthropic"), limits, client)
     backend.begin("", "go", [])
@@ -214,6 +218,7 @@ def test_b01_a_529_overload_is_retried_and_recorded_on_the_turn(make_spec, limit
 
 
 def test_b02_retries_that_run_out_end_as_infrastructure_endpoint(make_spec, limits, fake_client, make_error):
+    """B02: Retries that run out end as infrastructure endpoint."""
     from expcore.config.models import ClientSettings
 
     client = fake_client(*[make_error(500, sdk=anthropic) for _ in range(4)], api="anthropic")
@@ -226,6 +231,7 @@ def test_b02_retries_that_run_out_end_as_infrastructure_endpoint(make_spec, limi
 
 
 def test_b03_a_read_timeout_is_abandoned_after_one_request(make_spec, limits, fake_client, make_timeout):
+    """B03: A read timeout is abandoned after one request."""
     client = fake_client(make_timeout(read=True, sdk=anthropic), api="anthropic")
     backend = adapter(make_spec(backend="anthropic"), limits, client)
     backend.begin("", "go", [])
@@ -237,6 +243,7 @@ def test_b03_a_read_timeout_is_abandoned_after_one_request(make_spec, limits, fa
 
 @pytest.mark.parametrize("status", [401, 403])
 def test_b09_a_rejected_key_gives_key_rejected_after_one_request(make_spec, limits, fake_client, make_error, status):
+    """B09: A rejected key gives key rejected after one request."""
     client = fake_client(make_error(status, message="invalid x-api-key sk-ant-0123", sdk=anthropic), api="anthropic")
     backend = adapter(make_spec(backend="anthropic"), limits, client)
     backend.begin("", "go", [])
@@ -248,6 +255,7 @@ def test_b09_a_rejected_key_gives_key_rejected_after_one_request(make_spec, limi
 
 
 def test_b13_a_prompt_too_long_is_a_context_overflow_and_not_retried(make_spec, limits, fake_client, make_error):
+    """B13: A prompt too long is a context overflow and not retried."""
     client = fake_client(
         make_error(400, message="prompt is too long: 250000 tokens > 200000", sdk=anthropic), api="anthropic"
     )
@@ -299,6 +307,7 @@ def test_probe_sends_one_token_without_the_vendor_extras_and_counts_no_usage(mak
 
 
 def test_b01_the_real_client_is_built_without_sdk_retries_and_with_a_read_timeout_past_the_time_cap(make_spec, limits):
+    """B01: The real client is built without sdk retries and with a read timeout past the time cap."""
     backend = AnthropicAdapter(make_spec(backend="anthropic"), 1, limits, api_key="test-key")
     client = backend._client
     assert client.max_retries == 0

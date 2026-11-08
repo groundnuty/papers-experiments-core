@@ -18,6 +18,7 @@ def test_b08_a_model_that_is_not_frozen_raises_before_anything_is_built_or_sent(
 
 
 def test_b08_a_pilot_may_ask_for_an_unfrozen_model(make_spec, limits, fake_client):
+    """B08: A pilot may ask for an unfrozen model."""
     backend = build_backend(
         make_spec(status="draft"), seed=1, limits=limits, client=fake_client(), require_frozen=False
     )

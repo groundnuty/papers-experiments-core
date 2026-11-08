@@ -72,6 +72,7 @@ def test_p03_caches_and_bytecode_leave_the_hash_unchanged(tree):
 
 
 def test_p03_the_hash_depends_on_content_path_and_set_of_files_only(tree):
+    """P03: The hash depends on content path and set of files only."""
     before = tree_hash(tree, SCOPE)
     (tree / "pkg" / "extra.py").write_text("x = 1\n", encoding="utf-8")
     added = tree_hash(tree, SCOPE)
@@ -90,6 +91,7 @@ def test_p02_editing_a_data_file_under_a_code_root_changes_the_identity(tree):
 
 
 def test_p02_a_single_file_root_counts_and_a_file_outside_the_roots_does_not(tree):
+    """P02: A single file root counts and a file outside the roots does not."""
     before = tree_hash(tree, SCOPE)
     (tree / "notes.txt").write_text("outside\n", encoding="utf-8")
     assert tree_hash(tree, SCOPE) == before
@@ -106,6 +108,7 @@ def test_the_exclusions_are_a_parameter_a_record_file_may_change_without_changin
 
 
 def test_p02_a_scope_that_covers_no_file_is_refused_because_it_would_pass_for_any_code(tree):
+    """P02: A scope that covers no file is refused because it would pass for any code."""
     with pytest.raises(CodeScopeError, match="would cover no code"):
         tree_hash(tree, CodeScope.of(["nowhere"]))
 
@@ -133,12 +136,14 @@ def test_p01_a_tree_with_neither_git_nor_stamp_is_unknown_and_dirty_and_refuses_
 
 
 def test_p01_the_refusal_is_an_ordinary_exception_not_an_exit_of_the_interpreter(tree):
+    """P01: The refusal is an ordinary exception not an exit of the interpreter."""
     with pytest.raises(RuntimeError):
         require_known("study run", tree, SCOPE)
     assert not issubclass(CodeVersionUnknown, SystemExit)
 
 
 def test_p01_an_unreadable_stamp_is_unknown(tree):
+    """P01: An unreadable stamp is unknown."""
     (tree / STAMP).write_text("{not json", encoding="utf-8")
     assert read_stamp(tree) is None
     assert version(tree, SCOPE)["commit"] == UNKNOWN
@@ -147,6 +152,7 @@ def test_p01_an_unreadable_stamp_is_unknown(tree):
 
 
 def test_p01_a_clean_checkout_names_its_head_and_is_not_dirty(checkout):
+    """P01: A clean checkout names its head and is not dirty."""
     found = version(checkout.path, SCOPE)
     assert (found["commit"], found["dirty"], found["source"], found["why"]) == (
         checkout.git("rev-parse", "HEAD"),
@@ -159,6 +165,7 @@ def test_p01_a_clean_checkout_names_its_head_and_is_not_dirty(checkout):
 
 
 def test_p01_uncommitted_changes_are_dirty_and_do_not_start_a_study_run_unless_allowed(checkout):
+    """P01: Uncommitted changes are dirty and do not start a study run unless allowed."""
     (checkout.path / "pkg" / "run.py").write_text("print('changed')\n", encoding="utf-8")
     found = version(checkout.path, SCOPE)
     assert (found["dirty"], found["why"]) == (True, "uncommitted changes")
@@ -179,6 +186,7 @@ def test_p01_a_git_status_that_fails_is_dirty_never_clean(checkout):
 
 
 def test_p02_a_data_file_edited_in_a_checkout_changes_the_recorded_tree_hash_and_fails_verification(checkout):
+    """P02: A data file edited in a checkout changes the recorded tree hash and fails verification."""
     before = version(checkout.path, SCOPE)
     commit, tree = before["commit"], before["tree_sha256"]
     assert verify_identity(checkout.path, SCOPE, commit, tree) == []
@@ -206,6 +214,7 @@ def test_a_stamp_stands_in_for_git_in_a_copied_tree_and_names_the_stamped_head(t
 
 
 def test_p02_a_stamp_is_re_verified_against_the_files_beside_it_and_a_data_edit_makes_it_stale(tree):
+    """P02: A stamp is re verified against the files beside it and a data edit makes it stale."""
     write_stamp(tree, SHA, SCOPE)
     (tree / "data" / "table.csv").write_text("a,b\n1,4\n", encoding="utf-8")
     found = version(tree, SCOPE)

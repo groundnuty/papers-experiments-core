@@ -79,6 +79,7 @@ def test_b01_every_transient_status_is_retried(make_error, sleeps, jitter, statu
 
 @pytest.mark.parametrize("status", [400, 404, 410, 422])
 def test_b01_other_statuses_are_not_retried(make_error, sleeps, jitter, status):
+    """B01: Other statuses are not retried."""
     send = Script(make_error(status))
     with pytest.raises(Exception, match="the provider said no"):
         run(retrier(sleeps, jitter), send)
@@ -88,6 +89,7 @@ def test_b01_other_statuses_are_not_retried(make_error, sleeps, jitter, status):
 def test_b01_timeouts_before_a_reply_and_connection_errors_are_retried(
     make_timeout, make_connection_error, sleeps, jitter, sdk
 ):
+    """B01: Timeouts before a reply and connection errors are retried."""
     send = Script(make_timeout(read=False, sdk=sdk), make_connection_error(sdk=sdk))
     reply, events = run(retrier(sleeps, jitter), send)
     assert reply == "answer"
@@ -95,6 +97,7 @@ def test_b01_timeouts_before_a_reply_and_connection_errors_are_retried(
 
 
 def test_b01_the_backoff_doubles_up_to_its_cap(make_error, sleeps, jitter):
+    """B01: The backoff doubles up to its cap."""
     send = Script(*[make_error(503) for _ in range(5)])
     run(retrier(sleeps, jitter, share=0.0), send)
     assert sleeps.waits == [1.0, 2.0, 4.0, 8.0, 10.0]
@@ -119,6 +122,7 @@ def test_b01_retry_after_is_not_capped_by_the_maximum_delay(jitter):
 
 
 def test_b01_the_policy_comes_from_the_client_settings():
+    """B01: The policy comes from the client settings."""
     policy = RetryPolicy.from_settings(
         ClientSettings(max_retries=3, retry_base_s=2.0, retry_max_s=30.0, retry_jitter=0.1)
     )
@@ -126,6 +130,7 @@ def test_b01_the_policy_comes_from_the_client_settings():
 
 
 def test_b01_retry_after_is_read_in_seconds_milliseconds_and_as_a_date(make_error):
+    """B01: Retry after is read in seconds milliseconds and as a date."""
     assert retry_after_seconds(make_error(429, headers={"Retry-After": "12"})) == 12.0
     assert retry_after_seconds(make_error(429, headers={"retry-after-ms": "1500", "retry-after": "9"})) == 1.5
     now = datetime(2026, 11, 8, 12, 0, 0, tzinfo=UTC)
@@ -135,10 +140,12 @@ def test_b01_retry_after_is_read_in_seconds_milliseconds_and_as_a_date(make_erro
 
 @pytest.mark.parametrize("value", ["soon", "-5", "nan", "inf", ""])
 def test_b01_an_unreadable_retry_after_is_ignored_not_trusted(make_error, value):
+    """B01: An unreadable retry after is ignored not trusted."""
     assert retry_after_seconds(make_error(429, headers={"retry-after": value})) is None
 
 
 def test_b01_no_header_and_no_response_give_none(make_error):
+    """B01: No header and no response give none."""
     assert retry_after_seconds(make_error(429)) is None
     assert retry_after_seconds(ValueError("no response")) is None
 
@@ -156,6 +163,7 @@ def test_b02_retries_that_run_out_are_infrastructure_of_kind_endpoint(make_error
 
 
 def test_b02_zero_retries_means_one_request(make_error, sleeps, jitter):
+    """B02: Zero retries means one request."""
     send = Script(make_error(500), make_error(500))
     with pytest.raises(InfraError, match="after 0 retries"):
         run(retrier(sleeps, jitter, policy=RetryPolicy(max_retries=0)), send)
@@ -201,6 +209,7 @@ def test_b03_the_runs_deadline_is_checked_before_the_retry_limit(make_error, sle
 
 
 def test_b03_a_wait_that_fits_the_run_is_taken(make_error, sleeps, jitter):
+    """B03: A wait that fits the run is taken."""
     send = Script(make_error(503))
     reply, _ = run(retrier(sleeps, jitter, time_left=lambda: 100.0), send)
     assert reply == "answer"
@@ -208,6 +217,8 @@ def test_b03_a_wait_that_fits_the_run_is_taken(make_error, sleeps, jitter):
 
 
 def test_b03_a_cancelled_request_is_recorded_as_abandoned_at_the_deadline(sleeps, jitter):
+    """B03: A cancelled request is recorded as abandoned at the deadline."""
+
     async def send():
         raise asyncio.CancelledError
 
@@ -244,6 +255,7 @@ def test_b13_every_tested_provider_wording_classifies_as_context_overflow(make_e
 
 
 def test_b13_the_error_code_and_a_413_alone_are_enough(make_error):
+    """B13: The error code and a 413 alone are enough."""
     by_code = classify(make_error(400, message="rejected", body={"error": {"code": "context_length_exceeded"}}))
     assert by_code is not None
     assert (by_code.kind, by_code.overflow) == ("context_overflow", "code")
@@ -253,6 +265,7 @@ def test_b13_the_error_code_and_a_413_alone_are_enough(make_error):
 
 
 def test_b13_the_same_words_with_another_status_are_not_an_overflow(make_error):
+    """B13: The same words with another status are not an overflow."""
     example = CONTEXT_OVERFLOW_PATTERNS[1][1]
     assert context_overflow_match(500, None, example) is None
     server = classify(make_error(500, message=example))

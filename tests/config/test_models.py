@@ -100,6 +100,7 @@ def test_p06_a_name_two_entries_share_is_refused_at_load_and_names_both(tmp_path
 
 
 def test_p06_an_alias_that_is_another_models_key_is_refused(tmp_path):
+    """P06: An alias that is another models key is refused."""
     path = write(
         tmp_path,
         """
@@ -115,6 +116,7 @@ def test_p06_an_alias_that_is_another_models_key_is_refused(tmp_path):
 
 
 def test_p06_a_table_built_in_memory_obeys_the_same_rule():
+    """P06: A table built in memory obeys the same rule."""
     one = ModelSpec(key="one", backend="stub", api_id="x", status="draft")
     two = ModelSpec(key="two", backend="stub", api_id="X", status="draft")
     with pytest.raises(ConfigError, match="each model is named once"):
@@ -122,6 +124,7 @@ def test_p06_a_table_built_in_memory_obeys_the_same_rule():
 
 
 def test_p06_an_unknown_name_is_refused_and_the_table_is_listed(tmp_path):
+    """P06: An unknown name is refused and the table is listed."""
     table = load_models(write(tmp_path, TABLE))
     with pytest.raises(ConfigError, match=r"unknown model 'gamma'; the table holds: alpha, beta, scripted"):
         table.resolve("gamma")
@@ -188,6 +191,7 @@ def test_b16_an_incompatible_combination_is_refused_at_configuration(overrides, 
 
 
 def test_b16_all_broken_rules_of_an_entry_are_reported_together():
+    """B16: All broken rules of an entry are reported together."""
     with pytest.raises(RuleViolation) as caught:
         spec(backend="anthropic", key_env="K", echo_reasoning_field="x", prompt_cache_ttl="2d", max_output_tokens=-1)
     assert len(caught.value.problems) == 3
@@ -195,6 +199,7 @@ def test_b16_all_broken_rules_of_an_entry_are_reported_together():
 
 
 def test_b16_a_bad_entry_in_a_file_names_the_file_and_the_key(tmp_path):
+    """B16: A bad entry in a file names the file and the key."""
     path = write(
         tmp_path,
         """

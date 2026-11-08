@@ -28,6 +28,7 @@ def test_b15_a_url_that_cannot_be_parsed_is_not_recorded_as_given():
 
 
 def test_b15_the_settings_sent_are_a_copy_of_the_request_without_the_conversation():
+    """B15: The settings sent are a copy of the request without the conversation."""
     request = {
         "model": "test-model",
         "temperature": 0.2,

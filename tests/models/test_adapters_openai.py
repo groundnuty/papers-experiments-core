@@ -119,6 +119,7 @@ def test_b04_with_echo_off_the_wire_has_neither_the_field_nor_the_internal_copy_
 
 
 def test_b04_the_reasoning_under_the_other_common_field_name_is_read_too(make_spec, limits, completion, fake_client):
+    """B04: The reasoning under the other common field name is read too."""
     client = fake_client(completion("a", reasoning="thoughts"))
     backend = adapter(make_spec(), limits, client)
     backend.begin("", "go", [])
@@ -153,6 +154,7 @@ def test_b10_a_200_without_usage_is_infrastructure_and_counts_as_missing_not_zer
 
 
 def test_b10_a_count_the_reply_leaves_out_is_none_on_the_turn(make_spec, limits, completion, fake_client):
+    """B10: A count the reply leaves out is none on the turn."""
     client = fake_client(completion(usage=(50, None)))
     backend = adapter(make_spec(), limits, client)
     backend.begin("", "go", [])
@@ -162,6 +164,7 @@ def test_b10_a_count_the_reply_leaves_out_is_none_on_the_turn(make_spec, limits,
 
 
 def test_b10_usage_adds_up_over_replies(make_spec, limits, completion, fake_client):
+    """B10: Usage adds up over replies."""
     client = fake_client(completion(usage=(10, 2)), completion(usage=(30, 4)))
     backend = adapter(make_spec(), limits, client)
     backend.begin("", "go", [])
@@ -181,6 +184,7 @@ def test_b11_a_model_with_a_lower_maximum_sends_its_own_value(make_spec, limits,
 
 
 def test_b11_the_study_value_wins_when_it_is_the_lower(make_spec, limits, completion, fake_client):
+    """B11: The study value wins when it is the lower."""
     client = fake_client(completion())
     backend = adapter(make_spec(max_output_tokens=100_000), limits, client)
     backend.begin("", "go", [])
@@ -306,6 +310,8 @@ def test_b03_a_read_timeout_is_abandoned_after_one_request_with_usage_unknown(
 
 
 def test_b03_the_run_deadline_cancelling_a_request_is_recorded_as_abandoned(make_spec, limits, fake_client):
+    """B03: The run deadline cancelling a request is recorded as abandoned."""
+
     async def hang(**kw):
         await asyncio.sleep(60)
 
@@ -348,6 +354,7 @@ def test_b13_a_context_overflow_is_raised_once_and_not_retried(make_spec, limits
 
 
 def test_b06_what_the_replies_reported_is_in_the_record(make_spec, limits, completion, fake_client):
+    """B06: What the replies reported is in the record."""
     client = fake_client(completion(model="test-model-20261001", fingerprint="fp-1", usage=(1, 1)))
     backend = adapter(make_spec(), limits, client)
     backend.begin("", "go", [])
