@@ -17,14 +17,15 @@ import copy
 import hashlib
 import inspect
 import os
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol
 
 from expcore.records.digest import plain
-from expcore.records.record import RunRecord, load_record
-from expcore.records.schema import RecordError
+from expcore.records.record import RunRecord, decode
+from expcore.records.schema import SCHEMA_PREFIX, RecordError
 
 
 class Scorer(Protocol):
@@ -81,13 +82,52 @@ def rescore(record: RunRecord, scorers: Iterable[Any]) -> RunRecord:
     return replace(record, scores={**record.scores, **fresh})
 
 
+_RECORD_NAME = re.compile(r"[0-9a-f]{64}\.\d+\.json")
+
+
+def _load_if_record(path: Path) -> RunRecord | None:
+    """Load a file as a run record, or return None when it is not one: a check, a manifest, any JSON without the
+    record schema marker. A file named like a record that cannot be read as one is an error, not something to skip."""
+    named_like_a_record = bool(_RECORD_NAME.fullmatch(path.name))
+    try:
+        data = decode(path.read_bytes())
+    except RecordError as exc:
+        if named_like_a_record:
+            raise RecordError(f"{path}: {exc}") from None
+        return None
+    marker = data.get("schema_version") if isinstance(data, dict) else None
+    if not (isinstance(marker, str) and marker.startswith(SCHEMA_PREFIX)):
+        if named_like_a_record:
+            raise RecordError(f"{path}: named like a record, but it holds no record schema marker")
+        return None
+    try:
+        return RunRecord.from_json(data)
+    except RecordError as exc:
+        raise RecordError(f"{path}: {exc}") from None
+
+
 def rescore_files(
     source: str | os.PathLike[str], scorers: Iterable[Any], *, out_dir: str | os.PathLike[str] | None = None
 ) -> list[Path]:
-    """Re-score every record file directly under a directory; write each back, atomically, into `out_dir` or in place.
+    """Re-score every run record directly under a directory; write each back, atomically, into `out_dir` or in place.
 
-    Each record is validated on load. Returns the paths written.
+    Only run records are touched: a file without the record schema marker (the replay check, a manifest) is left alone.
+    It happens in two phases. First every record is loaded, validated, scored, and rendered as it will be written, so a
+    record that is not valid, a scorer that fails on one, or a result that cannot be written stops the run before any
+    file is changed. Then the records are written, each atomically. Returns the paths written.
     """
     scorers = list(scorers)
     target = Path(out_dir) if out_dir is not None else Path(source)
-    return [rescore(load_record(path), scorers).write(target) for path in sorted(Path(source).glob("*.json"))]
+    planned: list[RunRecord] = []
+    for path in sorted(Path(source).glob("*.json")):
+        record = _load_if_record(path)
+        if record is None:
+            continue
+        scored = rescore(record, scorers)
+        scored.dumps()  # validates and redacts exactly as the write will, so a failure comes before the first write
+        planned.append(scored)
+    names = [r.filename for r in planned]
+    repeated = sorted({n for n in names if names.count(n) > 1})
+    if repeated:
+        raise RecordError(f"two files hold the same run key and attempt: {repeated}")
+    return [r.write(target) for r in planned]

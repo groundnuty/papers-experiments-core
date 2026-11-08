@@ -134,3 +134,73 @@ def test_two_scorers_with_one_name_are_refused():
 def test_a_scorer_without_a_name_is_refused():
     with pytest.raises(RecordError, match="has no name"):
         scorer_name(object())
+
+
+def written_files(root):
+    return {p.name: p.read_bytes() for p in sorted(root.iterdir())}
+
+
+def test_R13_only_run_records_are_re_scored_a_check_and_a_manifest_are_left_alone(corpus):
+    """R13: a file without the record schema marker is not a run record, whatever it is named."""
+    (corpus / "replay-check.json").write_text(json.dumps({"schema": "replay-check/1", "inputs": {}}), encoding="utf-8")
+    (corpus / "manifest.json").write_text(json.dumps({"cells": 3}), encoding="utf-8")
+    (corpus / "list.json").write_text("[1, 2]", encoding="utf-8")
+    (corpus / "notes.json").write_text("not json at all", encoding="utf-8")
+    before = written_files(corpus)
+    written = rescore_files(corpus, [TurnCount()])
+    after = written_files(corpus)
+    assert len(written) == 2
+    for name in ("replay-check.json", "manifest.json", "list.json", "notes.json"):
+        assert after[name] == before[name]
+
+
+def test_R13_a_file_named_like_a_record_that_is_not_one_stops_the_run(corpus):
+    """R13: a corrupt record or one without the marker is an error, not a file to skip."""
+    name = "a" * 64 + ".1.json"
+    (corpus / name).write_text("{truncated", encoding="utf-8")
+    with pytest.raises(RecordError, match=name):
+        rescore_files(corpus, [TurnCount()])
+    (corpus / name).write_text("{}", encoding="utf-8")
+    with pytest.raises(RecordError, match="holds no record schema marker"):
+        rescore_files(corpus, [TurnCount()])
+
+
+def test_R13_every_record_is_validated_and_scored_before_any_is_rewritten(corpus):
+    """R13: two phases; a record that cannot be loaded leaves every file as it was."""
+    path = next(p for p in corpus.glob("*.json") if json.loads(p.read_text(encoding="utf-8"))["run_key"] == "run-tools")
+    broken = json.loads(path.read_text(encoding="utf-8"))
+    broken["run_key"] = "run-broken"
+    broken["outcome"]["name"] = "exploded"
+    (corpus / ("b" * 64 + ".1.json")).write_text(json.dumps(broken), encoding="utf-8")
+    before = written_files(corpus)
+    with pytest.raises(RecordError, match="unknown outcome"):
+        rescore_files(corpus, [TurnCount()])
+    assert written_files(corpus) == before
+
+
+def test_R13_a_scorer_that_fails_on_the_last_record_leaves_every_file_as_it_was(corpus):
+    """R13: the failure comes before the first write, however late in the corpus the bad record is."""
+    for name in ("malformed", "turn_cap"):
+        dataclasses.replace(SCENARIOS[name][0](), run_key=f"run-{name}").write(corpus)
+    before = written_files(corpus)
+
+    def fussy(record):
+        if record.run_key == "run-turn_cap":
+            raise ValueError("cannot score this one")
+        return {"verdict": "fulfilled"}
+
+    with pytest.raises(ValueError, match="cannot score"):
+        rescore_files(corpus, [fussy])
+    assert written_files(corpus) == before
+
+
+def test_R13_a_result_that_cannot_be_written_stops_the_run_before_any_write(corpus):
+    """R13: a score of NaN cannot be written as JSON; it is found while the records are still unchanged."""
+    before = written_files(corpus)
+
+    def nan_scorer(record):
+        return {"verdict": "fulfilled", "outcomes": {"share": float("nan")}}
+
+    with pytest.raises(RecordError, match="cannot be written as JSON"):
+        rescore_files(corpus, [nan_scorer])
+    assert written_files(corpus) == before
