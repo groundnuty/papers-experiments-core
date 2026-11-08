@@ -258,3 +258,23 @@ def test_c10_the_derivation_does_not_mend_an_unreadable_record(tmp_path):
     assert stops.reconcile(LATER) == []
     assert stops.stopped()[1]
     assert store.get_meta(KEY) == "{broken"
+
+
+def test_c10_the_derivation_replays_by_completion_time_so_a_later_error_cannot_fall_into_an_earlier_window(tmp_path):
+    """C10: attempts that began in one order and ended in another: errors ending at 10 h, 1 h and 2 h with a 6 h
+    window are not three errors of one window, so no stop is invented."""
+    store, stops = setup(tmp_path, window_s=6 * 3600.0)
+    for index, ended in enumerate(("2026-01-01T10:00:00Z", "2026-01-01T01:00:00Z", "2026-01-01T02:00:00Z")):
+        stored_errors_without_notes(store, "m1", 1, start=index, ended=ended)
+    assert stops.reconcile("2026-01-01T11:00:00Z") == []
+    assert stops.stopped() == (frozenset(), False)
+
+
+def test_c10_the_derivation_fires_the_stop_at_the_third_error_to_end_whatever_order_the_attempts_began_in(tmp_path):
+    """C10: three errors ending within the window stop the model, and the stop begins when the last of them ended."""
+    store, stops = setup(tmp_path, window_s=6 * 3600.0)
+    for index, ended in enumerate(("2026-01-01T03:00:00Z", "2026-01-01T01:00:00Z", "2026-01-01T02:00:00Z")):
+        stored_errors_without_notes(store, "m1", 1, start=index, ended=ended)
+    [reason] = stops.reconcile("2026-01-01T11:00:00Z")
+    assert "3 harness errors of kind ValueError on m1" in reason
+    assert stops.load()["models"]["m1"]["utc"] == "2026-01-01T03:00:00Z"

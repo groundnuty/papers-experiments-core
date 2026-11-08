@@ -86,11 +86,12 @@ def _epoch(utc: str | None) -> float:
 def stored_errors(store: Store) -> list[dict[str, Any]]:
     """Return every harness-error attempt: when it ended, its kind, its model and its run."""
     rows = store.q(
-        f"SELECT r.{column_for('model')} AS model, r.run_key, a.detail, a.ended_utc "
+        f"SELECT a.id, r.{column_for('model')} AS model, r.run_key, a.detail, a.ended_utc "
         "FROM attempts a JOIN runs r USING(run_key) WHERE a.state='harness_error' ORDER BY a.id"
     )
     return [
         {
+            "id": r["id"],
             "epoch": _epoch(r["ended_utc"]),
             "utc": r["ended_utc"],
             "kind": kind_of_detail(r["detail"]),
@@ -197,13 +198,14 @@ class HarnessStops:
     def reconcile(self, now: str) -> list[str]:
         """Derive the stops from the stored harness-error attempts and fire those the record lacks; return their reasons.
 
-        The errors are replayed in the order they ended, each judged as `note` would have judged it when it was stored
-        (the errors before it, inside the window, after any release), so the stops, and the moments they began, are
+        The errors are replayed in the order they ended (the time each ended, then the attempt's number as a tiebreak,
+        never the order the attempts began), each judged as `note` would have judged it when it was stored (the errors
+        that ended before it, inside the window, after any release), so the stops, and the moments they began, are
         what an uninterrupted run would have recorded. A stop already in the record, or released since, is left as it
         is. Call it at every start, before dispatch, because a result committed from its marker at this start never
         went through `note`.
         """
-        errors = stored_errors(self.store)
+        errors = sorted(stored_errors(self.store), key=lambda e: (e["epoch"], e["id"]))
         if not errors:
             return []
 
