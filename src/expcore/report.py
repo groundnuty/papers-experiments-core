@@ -14,8 +14,8 @@ are the same text: no clock, no path and no random number enters it.
   whether one condition's runs came late, and per condition and infrastructure kind the attempts set aside and the
   attempts scored as treatment.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
-  attempt and reason) in a section of their own. Every count comes from the analysed population, as the export's
-  `analysed_attempts` defines it; what a partial analysis leaves out is shown in its own column.
+  attempt and reason) in a section of their own. Each count is defined by the attempt states the export selects, and
+  the report states that definition beside the table that shows it (see `_COUNT_DEFINITIONS`).
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp
   and the core version.
 """
@@ -178,14 +178,21 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
         lines += _table(header, rows)
         lines += [
             "",
-            "Set aside counts every attempt that was run again, over all runs of the campaign, finished or not, except",
-            "those a partial analysis leaves out: pending and exhausted runs count, because how often a condition is",
-            "set aside matters for balance whether or not its runs finish. Scored-as-treatment counts are of the",
-            "analysed runs. The attempts of runs a partial analysis leaves out are in the last column and in no other.",
+            *_COUNT_DEFINITIONS,
         ]
     else:
         lines += ["No infrastructure failure."]
     return [*lines, ""]
+
+
+_COUNT_DEFINITIONS = [
+    "- *Set aside*: attempts that ended as an infrastructure failure of a kind the condition does not declare as "
+    "treatment, or that were discarded for an outage. Counted over every run of the campaign (analysed, pending or "
+    "exhausted, including an exhausted run's last attempt), except runs a partial analysis leaves out.",
+    "- *Scored as treatment*: attempts that ended as an infrastructure failure of a kind the condition declares as "
+    "treatment; each is its run's final, scored attempt. Runs a partial analysis leaves out are not included.",
+    "- *Left out*: the set-aside and treatment attempts of runs a partial analysis leaves out, and only those.",
+]
 
 
 def summary_lines(result: AnalysisResult) -> list[str]:
@@ -235,8 +242,8 @@ def render_report(
 
     `code` is the code identity (`provenance.codestamp.version`), `interval_level` the level of the contrasts'
     intervals when the preregistration states one. A partial analysis is described by the export (`partial`,
-    `running_attempts`, `excluded_attempts`), and every count is of the runs the export lists as analysed. The text
-    ends with a newline.
+    `running_attempts`, `excluded_attempts`). Each count is defined by attempt states, as `_COUNT_DEFINITIONS` and
+    the runs line say. The text ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
     planned = export["planned_runs"]
@@ -254,7 +261,8 @@ def render_report(
         f"- Code: commit `{code.get('commit')}`, tree `{code.get('tree_sha256')}` ({state})",
         f"- Core version: {core_version or UNKNOWN}",
         f"- Runs: {planned} planned, {len(export['analysed_attempts'])} analysed, "
-        f"{len(export['exhausted_runs'])} exhausted (every attempt failed on infrastructure), "
+        f"{len(export['exhausted_runs'])} exhausted (charged infrastructure attempts reached the limit; no scored "
+        "attempt), "
         f"{len(export['unfinished_runs'])} unfinished, {len(left_out)} left out of the analysis",
         _partial_line(export),
         "",

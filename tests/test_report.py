@@ -195,9 +195,11 @@ def test_runs_that_were_not_analysed_are_counted_in_the_header():
     data = export(
         exhausted_runs=[{"condition": "cond-a"}], unfinished_runs=[{"condition": "cond-b"}, {"condition": "cond-b"}]
     )
-    assert "4 analysed, 1 exhausted (every attempt failed on infrastructure), 2 unfinished, 0 left out" in render(
-        analysis(contrast("primary", "difference")), data
+    expected = (
+        "4 analysed, 1 exhausted (charged infrastructure attempts reached the limit; no scored attempt), "
+        "2 unfinished, 0 left out"
     )
+    assert expected in render(analysis(contrast("primary", "difference")), data)
 
 
 def test_the_interval_level_is_named_when_given():
@@ -286,5 +288,6 @@ def test_c09_set_aside_counts_are_described_as_covering_every_run_not_only_the_a
     )
     report = render(analysis(contrast("primary", "difference")), data)
     assert "Set aside (all runs)" in report
-    assert "pending and exhausted runs count" in report
-    assert "Set aside and scored counts are of the analysed runs" not in report
+    assert "Counted over every run of the campaign (analysed, pending or exhausted" in report
+    assert "- *Left out*: the set-aside and treatment attempts of runs a partial analysis leaves out" in report
+    assert "every attempt failed on infrastructure" not in report
