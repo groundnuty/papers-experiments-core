@@ -5,6 +5,12 @@ from pathlib import Path
 
 from expcore.campaign.factors import FactorSchema, RunKey
 from expcore.campaign.manifest import Manifest, build_fingerprint, build_manifest
+from expcore.campaign.markers import AttemptResult
+from expcore.campaign.store import Store
+from expcore.loop.outcomes import HarnessDefect, Outcome
+
+NOW = "2026-01-01T00:00:00Z"
+LATER = "2026-01-01T00:10:00Z"
 
 STUDY_TOML = """\
 [factors.data_path]
@@ -78,3 +84,39 @@ def write_study(tmp_path: Path, text: str = STUDY_TOML) -> Path:
     path = tmp_path / "study.toml"
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def finished(**fields) -> AttemptResult:
+    """Return the result of an attempt the agent finished."""
+    return AttemptResult(Outcome("finished"), LATER, fields.pop("wall_s", 12.5), **fields)
+
+
+def infra(kind: str = "endpoint", detail: str = "HTTP 503 after 5 retries", **fields) -> AttemptResult:
+    """Return the result of an attempt that ended on an infrastructure failure of a kind."""
+    return AttemptResult(Outcome("infrastructure", detail, infra_kind=kind), LATER, 3.0, **fields)
+
+
+def defect(**fields) -> AttemptResult:
+    """Return the result of an attempt that crashed in our own code."""
+    outcome = Outcome("harness_defect", "boom", defect=HarnessDefect("ValueError", "a" * 64))
+    return AttemptResult(outcome, LATER, 1.0, **fields)
+
+
+def open_store(tmp_path: Path, schema: FactorSchema | None = None, name: str = "campaign.db") -> Store:
+    """Open a store in a temporary directory."""
+    return Store(tmp_path / name, schema or make_schema())
+
+
+def planned_store(tmp_path: Path, **plan):
+    """Open a store holding the runs of a small plan; return the store, the schema and the manifest."""
+    schema = make_schema()
+    store = open_store(tmp_path, schema)
+    manifest = make_manifest(schema, **plan)
+    store.sync_manifest(manifest.rows)
+    return store, schema, manifest
+
+
+def run_one(store: Store, key: str, result: AttemptResult, max_attempts: int = 3, run_dir: str = "") -> str:
+    """Begin an attempt of a run and finish it with a result; return the run's status."""
+    begun = store.begin_attempt(key, NOW, 1234, run_dir)
+    return store.finish_attempt(begun.id, result, max_attempts)
