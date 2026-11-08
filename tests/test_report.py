@@ -266,3 +266,25 @@ def test_a_complete_analysis_says_it_is_not_partial_and_leaves_nothing_out():
 def test_a_report_of_a_partial_analysis_and_one_of_a_complete_analysis_are_different_texts():
     result = analysis(contrast("primary", "difference"))
     assert render(result, partial_export()) != render(result)
+
+
+def test_c09_set_aside_counts_are_described_as_covering_every_run_not_only_the_analysed_ones():
+    """C09: a pending run's set-aside attempt is counted, and the table says the count covers every run, finished
+    or not, so it is not mistaken for part of the analysed population."""
+    data = export(
+        unfinished_runs=[{"run_key": "k5", "condition": "cond-a"}],
+        infrastructure_by_condition=[
+            {
+                "condition": "cond-a",
+                "kind": "endpoint",
+                "declared_treatment": False,
+                "set_aside": 1,
+                "treatment": 0,
+                "excluded": 0,
+            }
+        ],
+    )
+    report = render(analysis(contrast("primary", "difference")), data)
+    assert "Set aside (all runs)" in report
+    assert "pending and exhausted runs count" in report
+    assert "Set aside and scored counts are of the analysed runs" not in report

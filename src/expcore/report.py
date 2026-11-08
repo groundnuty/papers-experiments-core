@@ -174,12 +174,14 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
             ]
             for k in kinds
         ]
-        header = ["Condition", "Kind", "Declared treatment", "Set aside (run again)", "Scored as treatment", "Left out"]
+        header = ["Condition", "Kind", "Declared treatment", "Set aside (all runs)", "Scored as treatment", "Left out"]
         lines += _table(header, rows)
         lines += [
             "",
-            "Set aside and scored counts are of the analysed runs; the attempts of runs a partial analysis leaves out",
-            "are in the last column and in no other.",
+            "Set aside counts every attempt that was run again, over all runs of the campaign, finished or not, except",
+            "those a partial analysis leaves out: pending and exhausted runs count, because how often a condition is",
+            "set aside matters for balance whether or not its runs finish. Scored-as-treatment counts are of the",
+            "analysed runs. The attempts of runs a partial analysis leaves out are in the last column and in no other.",
         ]
     else:
         lines += ["No infrastructure failure."]
