@@ -30,6 +30,8 @@ packages = ["src/expcore", "src/expcore_onedata"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --import-mode=importlib"
+# Helper modules shared by several test files live here, outside any package, and are imported by plain name.
+pythonpath = ["tests/support"]
 
 [tool.ruff]
 line-length = 120
