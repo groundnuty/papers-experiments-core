@@ -277,6 +277,12 @@ class DockerHost:
 
 # ------------------------------------------------------------------------------------------------ mount tables
 _OCTAL = re.compile(r"\\([0-7]{3})")
+_MOUNTINFO_ID = re.compile(r"\d+")
+_MOUNTINFO_DEV = re.compile(r"\d+:\d+")
+
+
+class MountTableError(SandboxError):
+    """A mount table that is empty, cut off or not mountinfo at all: what it says is unknown, never "no mounts"."""
 
 
 def _unescape(field: str) -> str:
@@ -284,27 +290,57 @@ def _unescape(field: str) -> str:
     return _OCTAL.sub(lambda m: chr(int(m.group(1), 8)), field)
 
 
-def mounted_points(mountinfo: str) -> set[str]:
-    """Every mount point in a mountinfo table."""
-    out = set()
-    for line in mountinfo.splitlines():
-        fields = line.split()
-        if len(fields) > 4:
-            out.add(_unescape(fields[4]))
+def parse_mountinfo(mountinfo: str) -> list[dict[str, str]]:
+    """Every mount of a mountinfo table, strictly: `{"mountpoint", "dev", "root", "fstype", "source"}` each.
+
+    A table that cannot be shown whole is unknown, and a caller that reads "no mount of mine" from it would free a
+    resource that is still mounted (C19). So an empty table, any line that does not parse (an id and a parent, a
+    `major:minor`, a root, a mount point, the options, the `-` separator, the file system type and its source), or a
+    table without the root mount (the sanity marker: every real table has one, a cut-off one may not) raises
+    `MountTableError`.
+    """
+    if not mountinfo.strip():
+        raise MountTableError("the mount table is empty")
+    out = []
+    for number, line in enumerate(mountinfo.splitlines(), 1):
+        head, sep, tail = line.partition(" - ")
+        fields, rest = head.split(), tail.split()
+        ok = (
+            sep
+            and len(fields) >= 6
+            and len(rest) >= 2
+            and _MOUNTINFO_ID.fullmatch(fields[0])
+            and _MOUNTINFO_ID.fullmatch(fields[1])
+            and _MOUNTINFO_DEV.fullmatch(fields[2])
+        )
+        if not ok:
+            raise MountTableError(f"line {number} of the mount table does not parse")
+        out.append(
+            {
+                "mountpoint": _unescape(fields[4]),
+                "dev": fields[2],
+                "root": _unescape(fields[3]),
+                "fstype": rest[0],
+                "source": rest[1],
+            }
+        )
+    if not any(m["mountpoint"] == "/" for m in out):
+        raise MountTableError("the mount table has no root mount: it may be cut off")
     return out
+
+
+def mounted_points(mountinfo: str) -> set[str]:
+    """Every mount point in a mountinfo table; `MountTableError` when the table cannot be shown whole."""
+    return {m["mountpoint"] for m in parse_mountinfo(mountinfo)}
 
 
 def fuse_mounts(mountinfo: str) -> list[dict[str, str]]:
     """The FUSE mounts of a mountinfo table: `{"mountpoint", "dev", "source"}` each (`dev` is `major:minor`)."""
-    out = []
-    for line in mountinfo.splitlines():
-        head, sep, tail = line.partition(" - ")
-        fields, rest = head.split(), tail.split()
-        if sep and len(fields) > 4 and rest and rest[0].startswith("fuse"):
-            out.append(
-                {"mountpoint": _unescape(fields[4]), "dev": fields[2], "source": rest[1] if len(rest) > 1 else ""}
-            )
-    return out
+    return [
+        {"mountpoint": m["mountpoint"], "dev": m["dev"], "source": m["source"]}
+        for m in parse_mountinfo(mountinfo)
+        if m["fstype"].startswith("fuse")
+    ]
 
 
 def is_fuse_mounted(mountinfo: str, mountpoint: str) -> bool:

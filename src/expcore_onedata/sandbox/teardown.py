@@ -308,7 +308,10 @@ def host_path(mountpoint: Path | str) -> str:
 def _fuse_at(host: HostOps, mp: str, waits: Waits) -> list[dict] | None:
     """The FUSE mounts at `mp` in the host's mountinfo; None when it cannot be read in time (unknown, never "none")."""
     mi = _read(host, PROC / "self" / "mountinfo")
-    return None if mi is None else [m for m in hostops.fuse_mounts(mi) if m["mountpoint"] == mp]
+    try:
+        return None if mi is None else [m for m in hostops.fuse_mounts(mi) if m["mountpoint"] == mp]
+    except hostops.MountTableError:
+        return None  # a table that is empty, cut off or malformed says nothing: unknown, never "none"
 
 
 def _conn(dev: str) -> str | None:
@@ -389,7 +392,12 @@ def _ns_copies(host: HostOps, pid: int, waits: Waits) -> list[dict] | None:
     """The FUSE mounts in a container's own mount namespace; None when they cannot be read. Each is this sandbox's: the
     agent has no FUSE of its own (no capabilities, no /dev/fuse), and the sidecar mounts one thing."""
     r = _sudo(host, "cat", str(PROC / str(pid) / "mountinfo"), timeout_s=waits.probe_s)
-    return None if r.returncode != 0 else hostops.fuse_mounts(r.stdout)
+    if r.returncode != 0:
+        return None
+    try:
+        return hostops.fuse_mounts(r.stdout)
+    except hostops.MountTableError:
+        return None  # unknown, as when it cannot be read
 
 
 def _unmount_namespaces(host: HostOps, targets: list[tuple[str, int]], waits: Waits, L: _StepLog) -> bool:

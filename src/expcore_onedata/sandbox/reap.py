@@ -138,7 +138,7 @@ def _reap_one(host: HostOps, log_dir: Path, x: Path, outputs: Sequence[str]) -> 
             f.write(json.dumps(record | {"mounts": [str(m) for m in mounts_under(host, x)]}) + "\n")
             f.flush()
             os.fsync(f.fileno())
-    except (OSError, CollectFailed) as e:
+    except (OSError, SandboxError) as e:
         log.error("reap: a run directory was not collected, so its disks stay: %s", describe_error(e))
         return False
     try:

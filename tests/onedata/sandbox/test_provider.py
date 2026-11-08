@@ -251,6 +251,31 @@ def test_c19_a_probe_that_cannot_ask_fails_safe(stage, tmp_path):
     assert probe.resource_gone(KEY, {}) is False
 
 
+ROOT = "1 0 8:1 / / rw - ext4 /dev/root rw\n"
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "",  # nothing read
+        "\n",
+        "this is not a mount table\n",  # malformed
+        ROOT + "36 25 0:30 / /mnt rw\n",  # a line cut off before its separator
+        ROOT + "36 25 zero:30 / /mnt rw - ext4 src rw\n",  # a device that is not major:minor
+        ROOT + "36 25 0:30 / /mnt rw - ext4\n",  # no source
+        "36 25 0:30 / /mnt rw - ext4 src rw\n",  # well-formed lines, but no root mount: it may be cut off
+    ],
+    ids=["empty", "blank", "malformed", "cut-off", "bad-device", "no-source", "no-root"],
+)
+def test_c19_a_mount_table_that_cannot_be_shown_whole_is_not_proof(stage, tmp_path, table):
+    """C19: an empty, malformed or truncated mountinfo is unknown, so the probe does not say True."""
+    _, probe = probe_world(stage, tmp_path)
+    assert probe.resource_gone(KEY, {}) is True  # the control: the whole table, with the sandbox gone
+    original = stage.host.read_text
+    stage.host.read_text = lambda path: table if str(path) == "/proc/self/mountinfo" else original(path)
+    assert probe.resource_gone(KEY, {}) is False
+
+
 def test_c19_the_probe_asks_the_cores_check_whether_the_holder_is_gone(stage):
     """C19: The probe asks the cores check whether the holder is gone."""
     calls = []

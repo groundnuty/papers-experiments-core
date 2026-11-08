@@ -167,7 +167,7 @@ class FakeHost:
 
     # ---------------------------------------------------------------- HostOps: files and processes
     def mountinfo(self) -> str:
-        lines = []
+        lines = ["1 0 8:1 / / rw - ext4 /dev/root rw"]  # every real table has the root mount; the probe checks for it
         for n, (path, kind) in enumerate(self.mounts.items()):
             lines.append(f"{40 + n} 25 0:{100 + n} / {path} rw - {kind} source rw")
         return "\n".join(lines) + "\n"
