@@ -10,13 +10,11 @@ are the same text: no clock, no path and no random number enters it.
   (or the word "exploratory") beside the conclusion, and the conclusion words already encode the decision:
   `difference`, `trivial_difference`, `equivalent`, `not_detected`. Failing to detect a difference is not a finding of
   none, and the report says so under the table.
-- Per condition it shows the runs analysed and the median dispatch position of those of their attempts that have one
-  (a database older than the dispatch column has none), so a reader can see
-  whether one condition's runs came late, and per condition and infrastructure kind the attempts set aside and the
-  attempts scored as treatment.
+- Per condition it shows the runs analysed and a median dispatch position, so a reader can see whether one
+  condition's runs came late, and per condition and infrastructure kind the infrastructure failures.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
-  attempt and reason) in a section of their own. Each count is defined by the attempt states the export selects, and
-  the report states that definition beside the table that shows it (see `_COUNT_DEFINITIONS`).
+  attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
+  table that shows it.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp
   and the core version.
 """
@@ -155,9 +153,9 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
     lines = [
         "## Conditions",
         "",
-        "Median dispatch position is the median place, in the campaign's dispatch sequence, of the analysed attempts",
-        "that have one (a database older than the dispatch column has none); a condition whose runs came late has a",
-        "higher one.",
+        "Median dispatch position is the median place, in the campaign's dispatch sequence, of each analysed run's",
+        "scored attempt, where it has one (a database older than the dispatch column has none); a condition whose runs",
+        "came late has a higher one.",
         "",
         *_table(["Condition", "Runs analysed", "Runs left out", "Median dispatch position"], rows),
         "",
@@ -244,8 +242,8 @@ def render_report(
 
     `code` is the code identity (`provenance.codestamp.version`), `interval_level` the level of the contrasts'
     intervals when the preregistration states one. A partial analysis is described by the export (`partial`,
-    `running_attempts`, `excluded_attempts`). Each count is defined by attempt states, as `_COUNT_DEFINITIONS` and
-    the runs line say. The text ends with a newline.
+    `running_attempts`, `excluded_attempts`). What each number counts is stated in the report beside it. The
+    text ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
     planned = export["planned_runs"]
