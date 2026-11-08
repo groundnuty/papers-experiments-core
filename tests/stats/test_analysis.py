@@ -10,7 +10,7 @@ from stats_support import both_arms, make_row
 
 from expcore.campaign.factors import FactorSchema
 from expcore.stats import estimators, power
-from expcore.stats.analysis import CONCLUSIONS, analyse, pilot_power, power_study, run_contrast
+from expcore.stats.analysis import CONCLUSIONS, analyse, conclude, pilot_power, power_study, run_contrast
 from expcore.stats.estimators import EstimatorResult
 from expcore.stats.pairing import ContrastSpec, pair_rows
 from expcore.stats.prereg import name_digest, parse
@@ -378,7 +378,7 @@ def test_the_family_keeps_every_contrast_when_one_of_them_drops_tasks(chain):
     assert sorted(d.level for d in result.holm) == pytest.approx([0.05 / 2, 0.05])
 
 
-# --- conclusions: difference, not_detected, equivalent, and the minimum detectable effect ----------------------------
+# --- conclusions: difference, trivial_difference, equivalent, not_detected; the minimum detectable effect -----------
 
 ARM_CONDITIONS = {f"cond-{arm}": {"arm": arm} for arm in "pqr"}
 ARM_SCHEMA = FactorSchema({"arm": ["p", "q", "r"]}, ["task", "arm", "model", "seed"], ARM_CONDITIONS)
@@ -498,13 +498,29 @@ def test_a_margin_the_interval_is_too_wide_for_is_not_detected(concluded):
     assert wide.conclusion == "not_detected"
 
 
-def test_equivalence_takes_precedence_over_a_significant_difference_inside_the_margin(concluded):
-    """A significant effect shown to be inside the preregistered margin is reported as equivalent, test unchanged."""
+def test_a_significant_effect_inside_the_margin_is_a_trivial_difference_not_equivalent(concluded):
+    """A detected effect shown to be inside the preregistered margin keeps its own word; the test is unchanged."""
     _, result = concluded
     both = result.contrast("p-vs-q-wide-margin")
     assert both.significant is True
-    assert both.equivalent is True
-    assert both.conclusion == "equivalent"
+    assert both.equivalent is True  # the interval is inside the margin, which says nothing of the test
+    assert both.conclusion == "trivial_difference"
+
+
+def test_the_four_conclusions_follow_the_test_and_the_margin():
+    """Equivalent needs the test not to reject, and a significant effect is never reported as equivalent."""
+    assert conclude(significant=True, equivalent=False) == "difference"
+    assert conclude(significant=True, equivalent=True) == "trivial_difference"
+    assert conclude(significant=False, equivalent=True) == "equivalent"
+    assert conclude(significant=False, equivalent=False) == "not_detected"
+
+
+def test_a_table_of_conclusions_alone_cannot_hide_a_detected_effect(concluded):
+    """A conclusion names a detected effect (difference or trivial_difference) exactly when the test is significant."""
+    _, result = concluded
+    for contrast in result.contrasts:
+        assert (contrast.conclusion in ("difference", "trivial_difference")) is contrast.significant, contrast.name
+    assert {c.conclusion for c in result.contrasts} == set(CONCLUSIONS)  # the fixture shows all four words
 
 
 def test_a_contrast_outside_the_family_is_judged_by_its_raw_p_value(concluded):
@@ -516,11 +532,28 @@ def test_a_contrast_outside_the_family_is_judged_by_its_raw_p_value(concluded):
     assert result.contrast("p-vs-q").in_family is True
 
 
-def test_every_conclusion_is_one_of_the_three_words(concluded):
+def test_a_contrast_outside_the_family_is_labelled_exploratory(concluded):
+    """Outside the Holm family nothing controls multiplicity, so the result carries the label; a member does not."""
+    _, result = concluded
+    assert result.contrast("p-vs-q-wide-margin").exploratory is True
+    assert result.contrast("q-vs-r-margin").exploratory is True
+    assert result.contrast("p-vs-q").exploratory is False
+    assert result.contrast("q-vs-r").exploratory is False
+    assert all(c.exploratory is (not c.in_family) for c in result.contrasts)
+
+
+def test_the_exploratory_label_is_a_field_of_the_result_not_something_a_report_must_work_out(concluded):
+    """It is part of the result's data, so a table built from the fields cannot leave it out."""
+    _, result = concluded
+    assert "exploratory" in {field.name for field in dataclasses.fields(result.contrasts[0])}
+    assert dataclasses.asdict(result.contrast("q-vs-r-margin"))["exploratory"] is True
+
+
+def test_every_conclusion_is_one_of_the_four_words(concluded):
     """The vocabulary is closed."""
     _, result = concluded
     assert {c.conclusion for c in result.contrasts} <= set(CONCLUSIONS)
-    assert set(CONCLUSIONS) == {"difference", "not_detected", "equivalent"}
+    assert set(CONCLUSIONS) == {"difference", "trivial_difference", "equivalent", "not_detected"}
 
 
 def test_a_family_member_is_significant_by_holm_not_by_its_raw_p_value():

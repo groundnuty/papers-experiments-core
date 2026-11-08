@@ -6,15 +6,20 @@ an estimator: a contrast names one, the registry supplies it, and the result typ
 reports. A contrast that cannot be estimated keeps its place with NaN values, and a NaN p-value stays in the Holm
 family as p = 1 (S02).
 
-Each contrast ends in one of three conclusions, and never in "no difference":
-- "difference": the test is significant (a member of the Holm family by Holm's decision, any other contrast by its raw
-  p-value at alpha, since nothing adjusts for it) and equivalence does not hold;
-- "equivalent": the preregistration declares an `equivalence_margin` for the contrast and the cluster-bootstrap
-  interval at 1 - 2 alpha lies inside plus or minus the margin (the interval form of two one-sided tests at alpha). It
-  takes precedence over "difference": an effect shown to be smaller than the margin the study called negligible is
-  reported as equivalent, with `significant` still saying whether the test rejected;
+Each contrast ends in one of four conclusions, and never in "no difference". Two facts decide it: whether the test is
+significant (a member of the Holm family by Holm's decision, any other contrast by its raw p-value at alpha, since
+nothing adjusts for it), and whether the preregistration declares an `equivalence_margin` for the contrast and the
+cluster-bootstrap interval at 1 - 2 alpha lies inside plus or minus that margin (the interval form of two one-sided
+tests at alpha).
+- "difference": significant, and not inside the margin (or no margin is declared);
+- "trivial_difference": significant, and inside the margin. The effect is detected and smaller than the margin the
+  study called negligible; it has its own word so that a table of conclusions cannot hide a detected effect;
+- "equivalent": inside the margin, and not significant;
 - "not_detected": everything else, including a non-significant result without a margin and a margin whose interval is
   too wide. Failing to detect a difference is not evidence of none.
+
+A contrast outside the preregistered Holm family is `exploratory`: nothing controls its multiplicity, it is judged by
+its raw p-value at alpha, and every table or report that shows its conclusion shows that label with it.
 
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
 """
@@ -35,7 +40,7 @@ from expcore.stats.prereg import Preregistration, name_digest
 from expcore.stats.rejection import rejects
 from expcore.stats.rows import Row
 
-CONCLUSIONS = ("difference", "not_detected", "equivalent")
+CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,10 +66,13 @@ class ContrastResult:
     counts: Mapping[str, int]
     per_model: tuple[ModelEstimate, ...]
     in_family: bool  # a member of the Holm family; any other contrast has no multiplicity control
+    exploratory: bool  # outside the Holm family, so judged by its raw p-value at alpha; label it wherever it is shown
     significant: bool  # Holm's decision for a member of the family, the raw p-value at alpha for any other
     equivalence_margin: float | None  # as preregistered; None when the contrast has none
     equivalence_interval: tuple[float, float] | None  # the 1 - 2 alpha interval; None without a margin
-    equivalent: bool  # the interval lies inside plus or minus the margin; always False without one
+    equivalent: (
+        bool  # the interval lies inside plus or minus the margin; False without one; says nothing of `significant`
+    )
     conclusion: str  # one of CONCLUSIONS
     minimum_detectable_effect: float | None  # None without power settings, NaN when it cannot be reached
 
@@ -103,9 +111,9 @@ class AnalysisResult:
 
 
 def conclude(significant: bool, equivalent: bool) -> str:
-    """The conclusion: equivalent if shown within the margin, else difference if significant, else not detected."""
+    """The conclusion from the test and the margin: a significant effect inside the margin is a trivial difference."""
     if equivalent:
-        return "equivalent"
+        return "trivial_difference" if significant else "equivalent"
     return "difference" if significant else "not_detected"
 
 
@@ -132,10 +140,14 @@ def _minimum_detectable_effect(
     Rejection in the simulation is decided by the p-value function and the parameters the contrast's estimator
     analyses with (a preregistered Wilcoxon `method`, for one), so the effect found is one the analysis itself can
     reject (S06, S09). The level is alpha divided by the size of the Holm family for a member and alpha for any other
-    contrast. Dividing is conservative: it is the level of the first step of Holm's procedure, the hardest to clear,
-    and a member whose p-value ranks later is judged at a larger level and detects less than this. NaN when the SD is
-    undefined or zero, when the estimator registered no p-values function to simulate with, or when the count of
-    clusters is too small for the test to reach the target power at that level.
+    contrast.
+
+    That level is conservative for a member. Holm's step-down levels are alpha / m, alpha / (m - 1), ..., alpha, and
+    alpha / m is the first and hardest of them, so this figure overstates the effect needed for every member except
+    the one with the smallest p-value, which faces alpha / m itself; a member whose p-value ranks later is judged at a
+    larger level and detects less than this. NaN when the SD is undefined or zero, when the estimator registered no
+    p-values function to simulate with, or when the count of clusters is too small for the test to reach the target
+    power at that level.
     """
     if prereg.power is None:
         return None
@@ -185,6 +197,7 @@ def run_contrast(
         counts=dict(estimate.counts),
         per_model=estimate.per_model,
         in_family=in_family,
+        exploratory=not in_family,
         significant=significant,
         equivalence_margin=spec.equivalence_margin,
         equivalence_interval=interval,
