@@ -13,8 +13,9 @@ are the same text: no clock, no path and no random number enters it.
 - Per condition it shows the runs analysed and the median dispatch position of their attempts, so a reader can see
   whether one condition's runs came late, and per condition and infrastructure kind the attempts set aside and the
   attempts scored as treatment.
-- A partial analysis says so under "Provenance": the attempts still running when the replay check was made, and the
-  runs left out because no replayed record covers their final attempt.
+- The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
+  attempt and reason) in a section of their own. Every count comes from the analysed population, as the export's
+  `analysed_attempts` defines it; what a partial analysis leaves out is shown in its own column.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp
   and the core version.
 """
@@ -129,21 +130,23 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
     return [*lines, ""]
 
 
-def _conditions(export: Mapping[str, Any], excluded: Sequence[str]) -> list[str]:
+def _conditions(export: Mapping[str, Any]) -> list[str]:
     analysed: dict[str, list[int]] = defaultdict(list)
     counts: dict[str, int] = defaultdict(int)
+    left_out: dict[str, int] = defaultdict(int)
     for entry in export["analysed_attempts"]:
-        if entry["run_key"] in excluded:
-            continue
         counts[entry["condition"]] += 1
         if entry.get("dispatch_seq") is not None:
             analysed[entry["condition"]].append(entry["dispatch_seq"])
-    left = export["exhausted_runs"] + export["unfinished_runs"]
-    names = sorted({*counts, *(e["condition"] for e in left)})
+    for entry in export.get("excluded_attempts", []):
+        left_out[entry["condition"]] += 1
+    unscored = export["exhausted_runs"] + export["unfinished_runs"]
+    names = sorted({*counts, *left_out, *(e["condition"] for e in unscored)})
     rows = [
         [
             name,
             counts[name],
+            left_out[name],
             _num(statistics.median(analysed[name])) if analysed[name] else UNKNOWN,
         ]
         for name in names
@@ -154,18 +157,30 @@ def _conditions(export: Mapping[str, Any], excluded: Sequence[str]) -> list[str]
         "Median dispatch position is the median place of the analysed attempts in the campaign's dispatch sequence;",
         "a condition whose runs came late has a higher one.",
         "",
-        *_table(["Condition", "Runs analysed", "Median dispatch position"], rows),
+        *_table(["Condition", "Runs analysed", "Runs left out", "Median dispatch position"], rows),
         "",
     ]
     kinds = export["infrastructure_by_condition"]
     lines += ["### Infrastructure failures by condition and kind", ""]
     if kinds:
         rows = [
-            [k["condition"], k["kind"], "yes" if k["declared_treatment"] else "no", k["set_aside"], k["treatment"]]
+            [
+                k["condition"],
+                k["kind"],
+                "yes" if k["declared_treatment"] else "no",
+                k["set_aside"],
+                k["treatment"],
+                k.get("excluded", 0),
+            ]
             for k in kinds
         ]
-        header = ["Condition", "Kind", "Declared treatment", "Set aside (run again)", "Scored as treatment"]
+        header = ["Condition", "Kind", "Declared treatment", "Set aside (run again)", "Scored as treatment", "Left out"]
         lines += _table(header, rows)
+        lines += [
+            "",
+            "Set aside and scored counts are of the analysed runs; the attempts of runs a partial analysis leaves out",
+            "are in the last column and in no other.",
+        ]
     else:
         lines += ["No infrastructure failure."]
     return [*lines, ""]
@@ -185,10 +200,24 @@ def summary_lines(result: AnalysisResult) -> list[str]:
     return lines
 
 
-def _listed(names: Sequence[str], limit: int = 10) -> str:
-    """The first names of a list, and how many more there are."""
-    shown = ", ".join(f"`{n}`" for n in names[:limit])
-    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+def _partial_line(export: Mapping[str, Any]) -> str:
+    """Say whether the analysis is partial, and if it is, why."""
+    if not export.get("partial", False):
+        return "- Partial analysis: no"
+    return (
+        f"- **Partial analysis**: yes. {export.get('running_attempts', 0)} attempt(s) were still running when the "
+        f"replay check was made, and {len(export.get('excluded_attempts', []))} run(s) are left out of the analysis "
+        "(listed at the end)"
+    )
+
+
+def _left_out(excluded: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The attempts a partial analysis leaves out, with the reason, one row each."""
+    lines = ["## Attempts left out of the analysis", ""]
+    if not excluded:
+        return [*lines, "None.", ""]
+    rows = [[e["run_key"], e["attempt"], e["reason"]] for e in excluded]
+    return [*lines, *_table(["Run key", "Attempt", "Reason"], rows), ""]
 
 
 def render_report(
@@ -199,19 +228,17 @@ def render_report(
     code: Mapping[str, Any],
     core_version: str | None,
     interval_level: float | None = None,
-    running_at_check: int = 0,
-    excluded_runs: Sequence[str] = (),
 ) -> str:
     """Render the report as Markdown.
 
     `code` is the code identity (`provenance.codestamp.version`), `interval_level` the level of the contrasts'
-    intervals when the preregistration states one. `running_at_check` and `excluded_runs` describe a partial analysis:
-    attempts still running when the replay check was made, and the run keys left out because no replayed record covers
-    their final attempt. The text ends with a newline.
+    intervals when the preregistration states one. A partial analysis is described by the export (`partial`,
+    `running_attempts`, `excluded_attempts`), and every count is of the runs the export lists as analysed. The text
+    ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
     planned = export["planned_runs"]
-    analysed = sum(1 for e in export["analysed_attempts"] if e["run_key"] not in excluded_runs)
+    left_out = export.get("excluded_attempts", [])
     lines = [
         f"# Report: {study}",
         "",
@@ -224,15 +251,10 @@ def render_report(
     lines += [
         f"- Code: commit `{code.get('commit')}`, tree `{code.get('tree_sha256')}` ({state})",
         f"- Core version: {core_version or UNKNOWN}",
-        f"- Runs: {planned} planned, {analysed} analysed, "
+        f"- Runs: {planned} planned, {len(export['analysed_attempts'])} analysed, "
         f"{len(export['exhausted_runs'])} exhausted (every attempt failed on infrastructure), "
-        f"{len(export['unfinished_runs'])} unfinished",
+        f"{len(export['unfinished_runs'])} unfinished, {len(left_out)} left out of the analysis",
+        _partial_line(export),
+        "",
     ]
-    if running_at_check or excluded_runs:
-        lines.append(
-            f"- **Partial analysis**: {running_at_check} attempt(s) were still running when the replay check was made, "
-            f"and {len(excluded_runs)} run(s) are left out because no replayed record covers their final attempt"
-            + (f" ({_listed(excluded_runs)})" if excluded_runs else "")
-        )
-    lines.append("")
-    return "\n".join(lines + _contrasts(result, interval_level) + _conditions(export, excluded_runs))
+    return "\n".join(lines + _contrasts(result, interval_level) + _conditions(export) + _left_out(left_out))

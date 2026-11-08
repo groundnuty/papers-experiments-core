@@ -13,9 +13,11 @@ from pathlib import Path
 import pytest
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
+from expcore.campaign.export import read_export
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.replay.check import inputs_sha256
 from expcore.study import pipeline
+from expcore.study.verified import UNCOVERED
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
@@ -53,10 +55,24 @@ def stored_check(campaign: Campaign) -> dict:
     return json.loads((campaign.runs / "replay-check.json").read_text(encoding="utf-8"))
 
 
+def record_where(campaign: Campaign, attempt_id: str) -> Path:
+    """The record of the attempt whose id the SQL expression gives."""
+    row = campaign.sql(
+        f"SELECT a.attempt, a.run_dir, r.digest FROM attempts a JOIN runs r USING(run_key) WHERE a.id = ({attempt_id})"
+    )[0]
+    return campaign.runs / row["digest"] / Path(row["run_dir"]).name / f"{row['digest']}.{row['attempt']}.json"
+
+
 def some_record(campaign: Campaign) -> Path:
     """A record of a scored attempt: the first one the store lists as done."""
-    row = campaign.sql(RECORD_OF_FIRST)[0]
-    return campaign.runs / row["digest"] / Path(row["run_dir"]).name / f"{row['digest']}.{row['attempt']}.json"
+    return record_where(campaign, FIRST_SCORED)
+
+
+def table_row(report: str, heading: str, first_cell: str) -> list[str]:
+    """The cells of the row of a table under a heading of the report."""
+    section = report.split(heading, 1)[1].split("\n#", 1)[0]
+    line = next(line for line in section.splitlines() if line.startswith(f"| {first_cell} |"))
+    return [cell.strip() for cell in line.strip("|").split(" | ")]
 
 
 # --- the snapshot ----------------------------------------------------------------------------------------------------
@@ -69,6 +85,15 @@ def test_r04_the_check_holds_a_snapshot_of_the_store_as_a_hashed_input_that_is_n
     assert SNAPSHOT_FILE in check["inputs"]
     assert SNAPSHOT_FILE not in check["replayed"]
     assert len(check["replayed"]) == check["n_records"] == 22
+
+
+def test_a_complete_analysis_says_in_every_output_that_it_is_not_partial_and_leaves_nothing_out(finished):
+    for name in ("export.json", "analysis.json"):
+        saved = finished.read(name)
+        assert (saved["partial"], saved["excluded_attempts"]) == (False, [])
+    assert finished.read("export.json")["running_attempts"] == 0
+    assert "- Partial analysis: no" in finished.report
+    assert len(finished.read("export.json")["analysed_attempts"]) == 22
 
 
 def test_r04_the_analysis_reads_the_snapshot_and_never_the_live_store(copy, clean_environment, finished):
@@ -210,9 +235,33 @@ def test_r08_an_attempt_no_replayed_record_covers_is_refused_unless_partial_and_
     assert "no replayed record covers it; pass --partial" in errors
     assert cli(clean_environment, "report", str(copy.root), "--partial")[0] == 0
     report = (copy.root / "out" / "report.md").read_text(encoding="utf-8")
-    assert "**Partial analysis**: 0 attempt(s) were still running" in report
-    assert f"1 run(s) are left out because no replayed record covers their final attempt (`{key}`)" in report
+    assert "**Partial analysis**: yes. 0 attempt(s) were still running" in report
+    assert "1 run(s) are left out of the analysis" in report
     assert "21 analysed" in report
+    shown = key.replace("|", "\\|")  # a run key joins its factors with a bar, which a table cell escapes
+    assert table_row(report, "## Attempts left out of the analysis", shown)[1:] == ["1", UNCOVERED]
+    expected = [{"run_key": key, "attempt": 1, "reason": UNCOVERED}]
+    for name in ("export.json", "analysis.json"):  # every saved output says it, so any one of them is enough
+        saved = copy.read(name)
+        assert saved["partial"] is True
+        assert [{k: e[k] for k in ("run_key", "attempt", "reason")} for e in saved["excluded_attempts"]] == expected
+    exported = copy.read("export.json")
+    assert key not in [e["run_key"] for e in exported["analysed_attempts"]]
+    assert len(exported["analysed_attempts"]) == 21
+    assert read_export(copy.root / "out" / "export.json")["planned_runs"] == 22  # still accounts for every run
+
+
+def test_r08_a_treatment_failure_left_out_is_counted_apart_and_not_as_scored(copy, clean_environment):
+    """R08: the per-condition infrastructure table counts the analysed population; the left out have a column."""
+    treatment = "SELECT MIN(id) FROM attempts WHERE treatment = 1"
+    record_where(copy, treatment).unlink()
+    assert cli(clean_environment, "check", str(copy.runs))[0] == 0
+    assert cli(clean_environment, "report", str(copy.root), "--partial")[0] == 0
+    report = (copy.root / "out" / "report.md").read_text(encoding="utf-8")
+    assert table_row(report, "### Infrastructure failures", "relay-down")[1:] == ["knowledge", "yes", "0", "1", "1"]
+    (cell,) = [c for c in copy.read("export.json")["infrastructure_by_condition"] if c["kind"] == "knowledge"]
+    assert (cell["treatment"], cell["excluded"]) == (1, 1)
+    assert table_row(report, "## Conditions", "relay-down")[1:3] == ["7", "1"]  # analysed, left out
 
 
 def test_r08_a_record_that_belongs_to_no_attempt_of_the_snapshot_is_refused(copy, clean_environment):
@@ -264,6 +313,9 @@ def test_r04_partial_check_records_that_attempts_were_running_and_analysis_then_
     assert "still running; analysing it needs --partial" in errors
     assert cli(clean_environment, "report", str(running.root), "--partial")[0] == 0
     report = (running.root / "out" / "report.md").read_text(encoding="utf-8")
-    assert "**Partial analysis**: 1 attempt(s) were still running when the replay check was made" in report
+    assert "**Partial analysis**: yes. 1 attempt(s) were still running when the replay check was made" in report
     assert "21 analysed" in report
     assert "1 unfinished" in report
+    for name in ("export.json", "analysis.json"):
+        saved = running.read(name)
+        assert (saved["partial"], saved["running_attempts"], saved["excluded_attempts"]) == (True, 1, [])

@@ -163,8 +163,8 @@ def test_the_header_names_the_preregistration_hash_with_its_override_mark_the_co
 def test_each_condition_has_its_runs_and_the_median_dispatch_position_of_its_attempts():
     report = render(analysis(contrast("primary", "difference")))
     conditions = report.split("## Conditions")[1]
-    assert "| cond-a | 2 | 2.5 |" in conditions
-    assert "| cond-b | 2 | 2.5 |" in conditions
+    assert "| cond-a | 2 | 0 | 2.5 |" in conditions
+    assert "| cond-b | 2 | 0 | 2.5 |" in conditions
     late = export(
         analysed_attempts=[{"run_key": f"l{s}", "condition": "late", "dispatch_seq": s} for s in (7, 9, 30)]
         + [
@@ -173,9 +173,9 @@ def test_each_condition_has_its_runs_and_the_median_dispatch_position_of_its_att
         ]
     )
     conditions = render(analysis(contrast("primary", "difference")), late).split("## Conditions")[1]
-    assert "| late | 3 | 9 |" in conditions
-    assert "| early | 1 | 1 |" in conditions
-    assert "| legacy | 1 | n/a |" in conditions  # a position the database did not keep is unknown, not zero
+    assert "| late | 3 | 0 | 9 |" in conditions
+    assert "| early | 1 | 0 | 1 |" in conditions
+    assert "| legacy | 1 | 0 | n/a |" in conditions  # a position the database did not keep is unknown, not zero
 
 
 def test_set_aside_and_treatment_counts_are_listed_per_condition_and_kind():
@@ -186,8 +186,8 @@ def test_set_aside_and_treatment_counts_are_listed_per_condition_and_kind():
         ]
     )
     report = render(analysis(contrast("primary", "difference")), data)
-    assert "| cond-a | endpoint | no | 3 | 0 |" in report
-    assert "| cond-b | knowledge | yes | 1 | 2 |" in report
+    assert "| cond-a | endpoint | no | 3 | 0 | 0 |" in report
+    assert "| cond-b | knowledge | yes | 1 | 2 | 0 |" in report
     assert "No infrastructure failure." in render(analysis(contrast("primary", "difference")))
 
 
@@ -195,7 +195,7 @@ def test_runs_that_were_not_analysed_are_counted_in_the_header():
     data = export(
         exhausted_runs=[{"condition": "cond-a"}], unfinished_runs=[{"condition": "cond-b"}, {"condition": "cond-b"}]
     )
-    assert "4 analysed, 1 exhausted (every attempt failed on infrastructure), 2 unfinished" in render(
+    assert "4 analysed, 1 exhausted (every attempt failed on infrastructure), 2 unfinished, 0 left out" in render(
         analysis(contrast("primary", "difference")), data
     )
 
@@ -212,18 +212,57 @@ def test_the_same_inputs_give_the_same_text_and_a_conclusion_outside_the_vocabul
         render(analysis(bad))
 
 
-def test_a_partial_analysis_says_how_many_attempts_were_running_and_which_runs_it_left_out():
+def left_out(run_key: str, condition: str = "cond-a", attempt: int = 1) -> dict:
+    return {
+        "run_key": run_key,
+        "condition": condition,
+        "attempt": attempt,
+        "reason": "no replayed record covers its final attempt",
+    }
+
+
+def partial_export() -> dict:
+    """The export of a partial analysis: k4 is left out, and the attempts of its run are counted apart."""
+    data = export(partial=True, running_attempts=2, excluded_attempts=[left_out("k4")])
+    data["analysed_attempts"] = [e for e in data["analysed_attempts"] if e["run_key"] != "k4"]
+    data["planned_runs"] = 4
+    data["infrastructure_by_condition"] = [
+        {
+            "condition": "cond-a",
+            "kind": "knowledge",
+            "declared_treatment": True,
+            "set_aside": 1,
+            "treatment": 0,
+            "excluded": 2,
+        }
+    ]
+    return data
+
+
+def test_a_partial_analysis_says_so_and_lists_each_attempt_it_leaves_out_with_the_reason():
+    report = render(analysis(contrast("primary", "difference")), partial_export())
+    assert "**Partial analysis**: yes. 2 attempt(s) were still running when the replay check was made" in report
+    assert "1 run(s) are left out of the analysis" in report
+    assert "3 analysed" in report
+    assert "1 left out of the analysis" in report
+    listed = report.split("## Attempts left out of the analysis")[1]
+    assert "| k4 | 1 | no replayed record covers its final attempt |" in listed
+
+
+def test_every_count_comes_from_the_analysed_population_and_the_left_out_ones_have_a_column_of_their_own():
+    report = render(analysis(contrast("primary", "difference")), partial_export())
+    conditions = report.split("## Conditions")[1]
+    assert "| cond-a | 1 | 1 | 1 |" in conditions  # one run analysed, one left out, the median of the analysed one
+    assert "| cond-b | 2 | 0 | 2.5 |" in conditions
+    assert "| cond-a | knowledge | yes | 1 | 0 | 2 |" in conditions  # the two excluded attempts are not "scored"
+
+
+def test_a_complete_analysis_says_it_is_not_partial_and_leaves_nothing_out():
+    report = render(analysis(contrast("primary", "difference")))
+    assert "- Partial analysis: no" in report
+    assert report.split("## Attempts left out of the analysis")[1].strip() == "None."
+
+
+def test_a_report_of_a_partial_analysis_and_one_of_a_complete_analysis_are_different_texts():
     result = analysis(contrast("primary", "difference"))
-    report = render(result, running_at_check=2, excluded_runs=["k4"])
-    assert "**Partial analysis**: 2 attempt(s) were still running when the replay check was made" in report
-    assert "1 run(s) are left out because no replayed record covers their final attempt (`k4`)" in report
-    assert "3 analysed" in report  # k4 is not counted
-    assert "| cond-a | 1 | 1 |" in report  # nor in its condition, nor in its median
-    assert "Partial analysis" not in render(result)
-
-
-def test_a_long_list_of_left_out_runs_is_cut_and_counted():
-    names = [f"run-{n:02d}" for n in range(14)]
-    report = render(analysis(contrast("primary", "difference")), excluded_runs=names)
-    assert "`run-09` and 4 more" in report
-    assert "`run-10`" not in report
+    assert render(result, partial_export()) != render(result)

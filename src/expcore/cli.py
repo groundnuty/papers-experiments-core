@@ -111,8 +111,6 @@ def _report(args: argparse.Namespace) -> int:
         code=analysis.code,
         core_version=analysis.core_version,
         interval_level=analysis.study.prereg.bootstrap.ci_level,
-        running_at_check=analysis.running_at_check,
-        excluded_runs=analysis.excluded,
     )
     target = out_dir(analysis.study) / REPORT_FILE
     target.write_text(text, encoding="utf-8")

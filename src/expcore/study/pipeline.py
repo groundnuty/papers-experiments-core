@@ -44,7 +44,7 @@ from expcore.stats.analysis import AnalysisResult, analyse
 from expcore.stats.rows import Row
 from expcore.study.config import StudyConfig, find_study_root, load_study
 from expcore.study.plugin import StudyContext, StudyPlugin, load_plugin
-from expcore.study.verified import Unverified, load_verified
+from expcore.study.verified import UNCOVERED, Unverified, load_verified
 
 OUT_DIR = "out"
 RUNS_DIR = "runs"
@@ -71,8 +71,6 @@ class StudyAnalysis:
     scores: Mapping[str, Any]
     rows: tuple[Row, ...]
     result: AnalysisResult
-    running_at_check: int = 0  # attempts the check's snapshot held as still running (a partial analysis)
-    excluded: tuple[str, ...] = ()  # run keys left out because no replayed record covers their final attempt
 
 
 def out_dir(study: StudyConfig) -> Path:
@@ -239,14 +237,12 @@ def analyse_study(
         raise Refused(f"refusing to analyse: {error}") from None
     plugin = load_plugin(StudyContext(study, code))
     try:
-        export = export_run_state(verified.snapshot)
+        export = export_run_state(verified.snapshot, excluded=dict.fromkeys(verified.excluded, UNCOVERED))
     finally:
         verified.snapshot.close()
     write_export_data(export, out / EXPORT_FILE)
     rows, scores = [], {}
     for entry in export["analysed_attempts"]:
-        if entry["run_key"] in verified.excluded:
-            continue
         record = verified.record_for(entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
         if record is None:  # load_verified guarantees one for every attempt it did not exclude
             raise Refused(f"refusing to analyse: no verified record for {entry['run_key']}")
@@ -255,17 +251,7 @@ def analyse_study(
         task = study.tasks[str(entry["factors"]["task"])]
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))
     result = analyse(rows, study.prereg)
-    return StudyAnalysis(
-        study,
-        code,
-        sdk_version(CORE_DISTRIBUTION),
-        export,
-        scores,
-        tuple(rows),
-        result,
-        verified.running_at_check,
-        verified.excluded,
-    )
+    return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result)
 
 
 def write_analysis(analysis: StudyAnalysis) -> list[Path]:
@@ -276,6 +262,9 @@ def write_analysis(analysis: StudyAnalysis) -> list[Path]:
         "alpha": analysis.result.alpha,
         "code": {key: analysis.code.get(key) for key in ("commit", "tree_sha256", "dirty")},
         "core_version": analysis.core_version,
+        "partial": analysis.export["partial"],
+        "running_attempts": analysis.export["running_attempts"],
+        "excluded_attempts": analysis.export["excluded_attempts"],
         "contrasts": analysis.result.contrasts,
         "holm": analysis.result.holm,
     }

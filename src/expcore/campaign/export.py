@@ -25,6 +25,15 @@ file or the new one; it is owner-only (0600), because an export can carry study 
 Each analysed attempt also says when and how it began (`dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`), so
 an analysis can check the balance of the conditions over time: holds and unit caps can push one condition's runs late.
 
+A partial analysis leaves some runs out (`export_run_state(store, excluded=...)`: a run whose final attempt the replay
+check does not cover). The export then carries `partial` (true when anything is left out or an attempt was still
+running), `running_attempts`, and `excluded_attempts` (run key, attempt and reason of each, with the run's identity);
+`analysed_attempts` holds only what is scored, and the per-condition infrastructure counts take their set-aside and
+treatment attempts from the analysed runs alone, with the left-out runs' attempts in a column of their own
+(`excluded`). `discarded_usage` and `retries_by_kind` stay over every attempt: they are what was spent and what was
+set aside, not a population analysed. Without `excluded` the export has none of these keys, and a file that has
+`excluded_attempts` counts them with the other lists of runs.
+
 Empty lists are valid and must be written out: `read_export` rejects a file with a missing key.
 """
 
@@ -33,7 +42,7 @@ import json
 import os
 import sqlite3
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable, Mapping
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Protocol
@@ -86,15 +95,21 @@ def _identity(store: RunState, row: Any) -> dict[str, Any]:
     }
 
 
-def export_run_state(store: RunState) -> dict[str, Any]:
-    """Return the run state for the analysis, read in one snapshot so a running campaign cannot split it."""
+def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Return the run state for the analysis, read in one snapshot so a running campaign cannot split it.
+
+    `excluded` maps the key of a finished run to the reason its final attempt is left out of the analysis. Giving it, even
+    empty, asks for the partial-analysis form of the export (see the module docstring); leaving it out gives the
+    campaign's own view.
+    """
     with store.snapshot():
         runs = store.q("SELECT * FROM runs ORDER BY seq")
         attempts: dict[str, list[Any]] = collections.defaultdict(list)
         for attempt in store.q("SELECT * FROM attempts ORDER BY id"):
             attempts[attempt["run_key"]].append(attempt)
         identities = {run["run_key"]: _identity(store, run) for run in runs}
-    exhausted, unfinished, analysed = [], [], []
+    left_out = dict(excluded or {})
+    exhausted, unfinished, analysed, left = [], [], [], []
     for run in runs:
         who, tried = identities[run["run_key"]], attempts[run["run_key"]]
         if run["status"] == "infra_exhausted":
@@ -108,6 +123,9 @@ def export_run_state(store: RunState) -> dict[str, Any]:
             done = [a for a in tried if a["state"] == "done"]
             if len(done) != 1:
                 raise ExportError(f"run {run['run_key']} is done but has {len(done)} done attempts")
+            if run["run_key"] in left_out:
+                left.append({**who, "attempt": done[0]["attempt"], "reason": left_out[run["run_key"]]})
+                continue
             analysed.append(
                 {
                     **who,
@@ -120,7 +138,10 @@ def export_run_state(store: RunState) -> dict[str, Any]:
             )
         else:
             raise ExportError(f"run {run['run_key']}: unknown status {run['status']!r}")
-    return {
+    unknown = sorted(set(left_out) - {entry["run_key"] for entry in left})
+    if unknown:
+        raise ExportError(f"cannot leave out run {unknown[0]}: it is not a finished run of this campaign")
+    data = {
         "format": FORMAT,
         "factors": list(store.schema.order),
         "planned_runs": len(runs),
@@ -129,9 +150,15 @@ def export_run_state(store: RunState) -> dict[str, Any]:
         "analysed_attempts": analysed,
         "discarded_usage": _discarded_usage(identities, attempts),
         "retries_by_kind": _retries_by_kind(identities, attempts),
-        "infrastructure_by_condition": _infrastructure_by_condition(identities, attempts, store.schema.treatment_kinds),
+        "infrastructure_by_condition": _infrastructure_by_condition(
+            identities, attempts, store.schema.treatment_kinds, None if excluded is None else frozenset(left_out)
+        ),
         "kinds": list(infra_kinds()),
     }
+    if excluded is not None:
+        running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
+        data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
+    return data
 
 
 def _dispatch(attempt: Any) -> dict[str, Any]:
@@ -215,16 +242,26 @@ def _retries_by_kind(identities: dict[str, dict], attempts: dict[str, list[Any]]
 
 
 def _infrastructure_by_condition(
-    identities: dict[str, dict], attempts: dict[str, list[Any]], declared: dict[str, tuple[str, ...]]
+    identities: dict[str, dict],
+    attempts: dict[str, list[Any]],
+    declared: dict[str, tuple[str, ...]],
+    left_out: Collection[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Count, per condition and kind, the attempts set aside and run again and the attempts scored as treatment.
 
-    Every kind a condition declares as its treatment has a row, with zeros when nothing of that kind happened.
+    Every kind a condition declares as its treatment has a row, with zeros when nothing of that kind happened. With
+    `left_out` (the keys of runs a partial analysis leaves out) the attempts of those runs, whichever kind of attempt,
+    are counted in an `excluded` column and in neither of the others.
     """
+    split = left_out is not None
+
+    def blank() -> dict[str, int]:
+        return {"set_aside": 0, "treatment": 0, **({"excluded": 0} if split else {})}
+
     cells: dict[tuple[str, str], dict[str, int]] = {}
     for condition, kinds in declared.items():
         for kind in kinds:
-            cells[(condition, kind)] = {"set_aside": 0, "treatment": 0}
+            cells[(condition, kind)] = blank()
     for key, tried in attempts.items():
         condition = identities[key]["condition"]
         for attempt in tried:
@@ -234,7 +271,9 @@ def _infrastructure_by_condition(
                 field = "set_aside"
             else:
                 continue
-            cells.setdefault((condition, _kind_of(attempt)), {"set_aside": 0, "treatment": 0})[field] += 1
+            if left_out is not None and key in left_out:
+                field = "excluded"
+            cells.setdefault((condition, _kind_of(attempt)), blank())[field] += 1
     return [
         {"condition": condition, "kind": kind, "declared_treatment": kind in declared[condition], **counts}
         for (condition, kind), counts in sorted(cells.items(), key=_none_last)
@@ -284,7 +323,7 @@ def read_export(path: Path) -> dict[str, Any]:
     missing = [key for key in REQUIRED_KEYS if key not in data]
     if missing:
         raise ExportError(f"{path}: missing key(s) {', '.join(missing)}; an empty list must be written out")
-    listed = sum(len(data[name]) for name in RUN_LISTS)
+    listed = sum(len(data[name]) for name in RUN_LISTS) + len(data.get("excluded_attempts", ()))
     if listed != data["planned_runs"]:
         raise ExportError(f"{path}: lists {listed} runs but the plan held {data['planned_runs']}")
     return data

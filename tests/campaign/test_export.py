@@ -29,6 +29,7 @@ from expcore.campaign.export import (
     export_run_state,
     read_export,
     write_export,
+    write_export_data,
 )
 from expcore.campaign.markers import AttemptResult
 from expcore.campaign.recovery import recover
@@ -464,3 +465,92 @@ def test_c02_an_attempt_with_no_kind_is_counted_last_and_does_not_break_the_expo
         ("mount-read", "sandbox"),
         ("mount-read", None),
     ]
+
+
+# --- a partial analysis: what is left out is named, and none of it is counted as scored ---------------------
+
+
+def partial_store(tmp_path):
+    """Two treatment attempts and a scored one under api-none, a set-aside then a scored one under mount-read."""
+    schema = treatment_schema(("endpoint",))
+    store = open_store(tmp_path, schema)
+    manifest = make_manifest(schema)
+    store.sync_manifest(manifest.rows)
+    declared, other = keys_under(schema, manifest, "api-none"), keys_under(schema, manifest, "mount-read")
+    run_one(store, declared[0], infra("endpoint"))  # treatment
+    run_one(store, declared[1], infra("endpoint"))  # treatment
+    run_one(store, declared[2], finished())
+    run_one(store, other[0], infra("endpoint"), max_attempts=9)  # set aside, then run again to done
+    run_one(store, other[0], finished())
+    return store, declared, other
+
+
+def test_without_excluded_the_export_has_none_of_the_partial_keys(tmp_path):
+    store, _, _ = partial_store(tmp_path)
+    data = export_run_state(store)
+    assert not {"partial", "running_attempts", "excluded_attempts"} & set(data)
+    assert all("excluded" not in row for row in data["infrastructure_by_condition"])
+
+
+def test_an_export_asked_for_a_partial_analysis_with_nothing_left_out_says_it_is_not_partial(tmp_path):
+    store, _, _ = partial_store(tmp_path)
+    data = export_run_state(store, excluded={})
+    assert (data["partial"], data["running_attempts"], data["excluded_attempts"]) == (False, 0, [])
+    assert all(row["excluded"] == 0 for row in data["infrastructure_by_condition"])
+    assert len(data["analysed_attempts"]) == 4
+
+
+def test_a_run_left_out_is_named_with_its_attempt_and_reason_and_is_not_among_the_analysed(tmp_path):
+    store, declared, _ = partial_store(tmp_path)
+    data = export_run_state(store, excluded={declared[0]: "no replayed record covers its final attempt"})
+    assert data["partial"] is True
+    assert [(e["run_key"], e["attempt"], e["reason"]) for e in data["excluded_attempts"]] == [
+        (declared[0], 1, "no replayed record covers its final attempt")
+    ]
+    assert data["excluded_attempts"][0]["condition"] == "api-none"
+    assert declared[0] not in [e["run_key"] for e in data["analysed_attempts"]]
+    assert len(data["analysed_attempts"]) == 3  # four finished runs, one left out
+    assert data["planned_runs"] == sum(len(data[n]) for n in RUN_LISTS) + 1
+
+
+def test_the_attempts_of_a_run_left_out_are_counted_apart_and_not_as_scored_or_set_aside(tmp_path):
+    store, declared, other = partial_store(tmp_path)
+    full = {(r["condition"], r["kind"]): r for r in export_run_state(store)["infrastructure_by_condition"]}
+    assert full[("api-none", "endpoint")]["treatment"] == 2
+    assert full[("mount-read", "endpoint")]["set_aside"] == 1
+    data = export_run_state(store, excluded={declared[0]: "r", other[0]: "r"})
+    cells = {(r["condition"], r["kind"]): r for r in data["infrastructure_by_condition"]}
+    assert (cells[("api-none", "endpoint")]["treatment"], cells[("api-none", "endpoint")]["excluded"]) == (1, 1)
+    assert cells[("mount-read", "endpoint")]["set_aside"] == 0  # its set-aside attempt belongs to a run left out
+    assert cells[("mount-read", "endpoint")]["excluded"] == 1
+
+
+def test_what_was_spent_and_set_aside_stays_over_every_attempt_whoever_is_left_out(tmp_path):
+    store, declared, _ = partial_store(tmp_path)
+    everything = export_run_state(store)
+    data = export_run_state(store, excluded={declared[0]: "r"})
+    assert data["discarded_usage"] == everything["discarded_usage"]
+    assert data["retries_by_kind"] == everything["retries_by_kind"]
+
+
+def test_attempts_still_running_make_the_export_partial_even_with_nothing_left_out(tmp_path):
+    store, _, _ = partial_store(tmp_path)
+    store.begin_attempt(keys_under(store.schema, make_manifest(store.schema), "download-write")[0], NOW, 1, "")
+    data = export_run_state(store, excluded={})
+    assert (data["partial"], data["running_attempts"], data["excluded_attempts"]) == (True, 1, [])
+
+
+def test_a_run_that_is_not_finished_cannot_be_left_out(tmp_path):
+    store, _, _ = partial_store(tmp_path)
+    pending = keys_under(store.schema, make_manifest(store.schema), "download-write")[0]
+    with pytest.raises(ExportError, match="cannot leave out run"):
+        export_run_state(store, excluded={pending: "r"})
+
+
+def test_a_written_partial_export_reads_back_and_its_runs_still_add_up_to_the_plan(tmp_path):
+    store, declared, _ = partial_store(tmp_path)
+    path = tmp_path / "out" / "export.json"
+    write_export_data(export_run_state(store, excluded={declared[0]: "r"}), path)
+    back = read_export(path)
+    assert back["partial"] is True
+    assert len(back["excluded_attempts"]) == 1

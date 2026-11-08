@@ -118,7 +118,14 @@ def test_c01_the_treatment_failure_is_scored_and_never_run_again(resumed):
         rows = resumed.sql("SELECT state, charged, treatment, infra_kind FROM attempts WHERE run_key=?", key)
         assert [tuple(r) for r in rows] == [("done", 0, 1, "knowledge")]  # one attempt, ever
     assert resumed.read("export.json")["infrastructure_by_condition"] == [
-        {"condition": TREATMENT, "kind": "knowledge", "declared_treatment": True, "set_aside": 0, "treatment": 2}
+        {
+            "condition": TREATMENT,
+            "kind": "knowledge",
+            "declared_treatment": True,
+            "set_aside": 0,
+            "treatment": 2,
+            "excluded": 0,
+        }
     ]
     for key in keys:
         result = resumed.read("scores.json")[key]["tiny"]["result"]
@@ -229,11 +236,12 @@ def test_the_report_names_the_preregistration_the_code_and_the_core(resumed):
 
 def test_the_report_counts_the_treatment_failure_and_gives_each_condition_a_median_dispatch_position(resumed):
     kinds = table(resumed.report, "### Infrastructure failures")
-    assert kinds[TREATMENT] == [TREATMENT, "knowledge", "yes", "0", "2"]
+    assert kinds[TREATMENT] == [TREATMENT, "knowledge", "yes", "0", "2", "0"]  # set aside, scored, left out
     conditions = table(resumed.report, "## Conditions")
     assert set(conditions) == {"baseline", SUBSET, TREATMENT}
     assert {name: cells[1] for name, cells in conditions.items()} == {"baseline": "8", SUBSET: "6", TREATMENT: "8"}
-    assert all(cells[2] != "n/a" for cells in conditions.values())
+    assert {cells[2] for cells in conditions.values()} == {"0"}  # nothing is left out of a complete analysis
+    assert all(cells[3] != "n/a" for cells in conditions.values())
 
 
 def test_the_contrast_that_left_a_task_out_names_it(resumed):

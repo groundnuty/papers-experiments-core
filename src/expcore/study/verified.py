@@ -26,6 +26,8 @@ from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, StoreSnapsho
 from expcore.records.record import RunRecord, decode, record_filename
 from expcore.records.schema import RecordError
 
+UNCOVERED = "no replayed record covers its final attempt"  # why a partial analysis leaves a run out
+
 
 class Unverified(RuntimeError):
     """Something the analysis would use is not what the replay check verified; the message names it."""
