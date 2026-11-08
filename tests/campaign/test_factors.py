@@ -191,6 +191,13 @@ def test_the_condition_of_a_key_is_found_from_its_levels():
         schema.key("nope", "t", "m", 0)
 
 
+def test_a_key_whose_levels_fit_no_condition_is_refused():
+    schema = make_schema()
+    stray = RunKey(schema.order, ("task-a", "mount", "write", "m1", 1))  # mount and write are never assigned together
+    with pytest.raises(PlanError, match="fits no condition"):
+        schema.condition_of(stray)
+
+
 def test_the_digest_changes_with_any_part_of_the_schema():
     base = make_schema()
     other_order = FactorSchema(base.declared, ["seed", "task", "data_path", "tools", "model"], base.conditions)

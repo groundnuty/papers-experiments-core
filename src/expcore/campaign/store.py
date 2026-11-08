@@ -301,6 +301,10 @@ class Store:
         Refuses a key from another schema, and a plan whose order of the runs it shares with the store has changed.
         Returns the number of runs added.
         """
+        texts = [row.key.text for row in rows]
+        repeated = [text for text in dict.fromkeys(texts) if texts.count(text) > 1]
+        if repeated:
+            raise ValueError(f"run key {repeated[0]!r} appears more than once in the manifest")
         for row in rows:
             if row.key.names != self.schema.order:
                 raise ValueError(f"run key {row.key.text!r} is not of this schema's identity order")

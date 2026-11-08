@@ -2,6 +2,7 @@
 
 import sqlite3
 import threading
+from dataclasses import replace
 
 import pytest
 from campaign_support import LATER, NOW, defect, finished, infra, make_manifest, open_store, planned_store, run_one
@@ -85,6 +86,15 @@ def test_a_grown_plan_adds_the_new_runs_and_refreshes_the_places_of_the_old(tmp_
     assert store.sync_manifest(large.rows) == len(large.rows) - len(small.rows)
     places = {r["run_key"]: r["seq"] for r in store.q("SELECT run_key, seq FROM runs")}
     assert places == {row.key.text: row.seq for row in large.rows}
+
+
+def test_r11_a_run_key_listed_twice_in_a_manifest_is_refused_by_the_store(tmp_path):
+    """R11: a duplicate key is refused, even in a manifest built by hand."""
+    store, _, manifest = planned_store(tmp_path)
+    twice = replace(manifest, rows=(*manifest.rows, manifest.rows[0]))
+    with pytest.raises(ValueError, match="appears more than once in the manifest"):
+        store.sync_manifest(twice.rows)
+    assert store.q("SELECT COUNT(*) c FROM runs")[0]["c"] == len(manifest.rows)
 
 
 def test_a_key_of_another_identity_order_is_refused(tmp_path):

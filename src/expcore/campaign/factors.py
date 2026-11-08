@@ -187,9 +187,12 @@ class FactorSchema:
         return keys
 
     def condition_of(self, key: RunKey) -> str:
-        """Return the name of the condition a key belongs to."""
+        """Return the name of the condition a key belongs to; refuse a key whose levels fit none."""
         values = key.factors
-        return self._by_levels[tuple(str(values[f]) for f in self.declared)]
+        try:
+            return self._by_levels[tuple(str(values[f]) for f in self.declared)]
+        except KeyError:
+            raise PlanError(f"run key {key.text!r} fits no condition of the schema") from None
 
     # --- identity of the schema itself --------------------------------------------------------------------------
 
