@@ -20,8 +20,8 @@ waits. A test bends the fake through plain attributes:
 - `transfers_place_blocks`: False makes a replication end as `completed` with no block placed (the O01 fake);
 - `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks;
 - `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at all;
-- `resets`: a list of `[substring, count]`: the next `count` provider calls whose route contains the substring fail
-  with a connection reset;
+- `resets`: a list of `[substring, count]` or `[substring, count, provider id]`: the next `count` provider calls whose
+  route contains the substring (to that provider, when named) fail with a connection reset;
 - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
 - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status.
 
@@ -182,7 +182,7 @@ class FakeData(FakeFederation):
                 )
             )
             for fault in self.resets:
-                if fault[1] > 0 and fault[0] in route:
+                if fault[1] > 0 and fault[0] in route and (len(fault) < 3 or fault[2] == provider):
                     fault[1] -= 1
                     raise httpx.ConnectError("connection reset")
             for fault in self.statuses:

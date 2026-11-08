@@ -131,10 +131,13 @@ DEFAULT_TIMEOUT_S = 15.0
 class PlatformError(RuntimeError):
     """A request failed or was answered with something unreadable; the message holds no URL, body or header."""
 
-    def __init__(self, message: str, *, status: int | None = None, code: str | None = None) -> None:
+    def __init__(
+        self, message: str, *, status: int | None = None, code: str | None = None, transport: bool = False
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
+        self.transport = transport  # True only when no answer came back: a reset, a refusal or a timeout (O08)
 
 
 class OutOfScope(PlatformError):
@@ -249,7 +252,11 @@ class OnezoneClient:
         content: bytes | None = None,
         timeout_s: float | None = None,
     ) -> httpx.Response:
-        """Send one request and return the answer; a transport failure or a status of 400 or more is a PlatformError."""
+        """Send one request and return the answer; a transport failure or a status of 400 or more is a PlatformError.
+
+        A transport failure (a reset, a refusal, a timeout) has `transport` set and a real answer has its status, so
+        a caller that retries can tell the two apart (O08).
+        """
         base, label = self._base(provider)
         url = base + _check_path(path)
         try:
@@ -263,7 +270,7 @@ class OnezoneClient:
                 timeout=timeout_s if timeout_s is not None else self._timeout_s,
             )
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: {method} failed ({type(error).__name__})") from None
+            raise PlatformError(f"{label}: {method} failed ({type(error).__name__})", transport=True) from None
         if response.status_code >= 400:
             code = _error_code(response)
             raise PlatformError(

@@ -414,8 +414,15 @@ class Provisioner:
         tid = answer.get("transferId") if isinstance(answer, dict) else None
         if not isinstance(tid, str) or not tid:
             raise PlatformError("a transfer answer holds no transfer id")
-        self._write("transfer", id=tid, kind=kind, file=file_id)
+        self._write("transfer", id=tid, kind=kind, file=file_id, provider=provider)
         return tid
+
+    def transfers(self) -> list[tuple[str, str, str]]:
+        """Return `(provider, transfer id, kind)` of every transfer the log says this provisioner scheduled."""
+        if not self._log.exists():
+            return []
+        lines = (json.loads(t) for t in self._log.read_text(encoding="utf-8").splitlines() if t.strip())
+        return [(x["provider"], x["id"], x["kind"]) for x in lines if x.get("action") == "transfer"]
 
     def replicate(self, path: str, to_provider: str) -> dict[str, Any]:
         """Replicate a whole file to a provider and return a record once its block map there covers the file (O01).
