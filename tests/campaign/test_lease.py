@@ -1,7 +1,10 @@
 """Leases on shared mutable resources fail safe (C19): a fake probe and a fake clock, a real kill for the file lock."""
 
 import asyncio
+import errno
 import json
+import logging
+import os
 import signal
 import subprocess
 import sys
@@ -10,6 +13,7 @@ import textwrap
 import pytest
 from lease_support import Clock, Probe
 
+from expcore.campaign import lease as lease_module
 from expcore.campaign.lease import (
     DEAD_LOG,
     WAIT_LOG,
@@ -178,6 +182,88 @@ def test_c19_an_empty_note_in_a_lock_file_that_was_there_is_indeterminate_and_a_
     probe.gone_keys.add("k1")
     clock.now += 100
     assert leases.try_acquire("g", "run-b").key == "k1"
+
+
+class FullDisk:
+    """A lock file whose writes fail with ENOSPC: every other call goes to the real file."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def write(self, text):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_c19_a_note_is_written_with_flush_and_fsync_when_a_key_is_taken_and_when_it_is_released(tmp_path, monkeypatch):
+    """C19: the note is recovery state, so it reaches the disk: an fsync of the lock file follows each write."""
+    synced = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(lease_module.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+    leases = pool(tmp_path, keys=("k1",))
+    lease = leases.try_acquire("g", "run-a")
+    assert len(synced) == 1
+    assert json.loads((tmp_path / "leases" / "k1.lock").read_text())["run_key"] == "run-a"
+    lease.release()
+    assert len(synced) == 2
+    assert "released" in json.loads((tmp_path / "leases" / "k1.lock").read_text())
+
+
+def test_c19_a_note_that_cannot_be_written_fails_the_acquisition_and_releases_the_key(tmp_path, monkeypatch):
+    """C19: ENOSPC on the write of the note: the key is released, nothing is granted, the error is raised, and the
+    empty note it leaves is indeterminate for the next holder, never a key never used."""
+    leases = pool(tmp_path, keys=("k1",))
+    leases.dir.mkdir(parents=True)
+    (leases.dir / "k1.lock").write_text(json.dumps({"released": 1.0, "key": "k1"}), encoding="utf-8")
+    real_open = open
+    monkeypatch.setattr(lease_module, "open", lambda *a, **k: FullDisk(real_open(*a, **k)), raising=False)
+    with pytest.raises(OSError, match="No space left") as raised:
+        leases.try_acquire("g", "run-a")
+    assert raised.value.errno == errno.ENOSPC
+    monkeypatch.undo()
+    handle = leases._flock("k1")
+    assert handle is not None  # the lock was dropped with the failed acquisition
+    handle.close()
+    assert (leases.dir / "k1.lock").read_text() == ""
+    probe = Probe()
+    again = pool(tmp_path, keys=("k1",), probe=probe)
+    with pytest.raises(AllQuarantined):  # the file is empty but was there: its holder is unknown, so a proof is needed
+        again.try_acquire("g", "run-b")
+    assert probe.asked == [("k1", {})]
+    probe.gone_keys.add("k1")
+    again._clock.now += 100
+    assert again.try_acquire("g", "run-b") is not None
+
+
+def test_c19_a_note_that_cannot_be_synced_fails_the_acquisition_too(tmp_path, monkeypatch):
+    """C19: a write that reached the page cache but failed at fsync is a note that was not written."""
+
+    def failing(fd):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(lease_module.os, "fsync", failing)
+    leases = pool(tmp_path, keys=("k1", "k2"))
+    with pytest.raises(OSError, match="Input/output"):
+        leases.acquire("g", run_key="run-a")
+    monkeypatch.undo()
+    assert leases._flock("k1") is not None  # the key it had taken is free to lock, not held by a lease nobody has
+    assert leases.unusable() == set()
+
+
+def test_c19_a_release_whose_note_cannot_be_written_still_frees_the_key_and_says_so(tmp_path, monkeypatch, caplog):
+    """C19: the lock is dropped even when the note of the release is not written; the failure is logged."""
+    leases = pool(tmp_path, keys=("k1",))
+    lease = leases.try_acquire("g", "run-a")
+    real_open_handle = lease._handle
+    monkeypatch.setattr(lease, "_handle", FullDisk(real_open_handle))
+    with caplog.at_level(logging.ERROR, logger="expcore.campaign.lease"):
+        lease.release()
+    assert not lease.held
+    assert "could not note the release" in caplog.text
+    monkeypatch.undo()
+    assert leases._flock("k1") is not None
 
 
 def test_c19_an_empty_or_released_note_needs_no_proof(tmp_path):

@@ -213,8 +213,12 @@ class Lease:
         handle, self._handle = self._handle, None
         if handle is None:
             return
-        with contextlib.suppress(OSError):  # released in order: the next holder has nothing to reap
+        try:  # released in order: the next holder has nothing to reap
             _write_note(handle, {"released": time.time(), "key": self.key})
+        except OSError:
+            log.exception(
+                "could not note the release of %s: the next holder will need a proof the resource is gone", self.key
+            )
         with contextlib.suppress(OSError):
             handle.close()
 
@@ -234,11 +238,16 @@ class Lease:
 
 
 def _write_note(handle: Any, note: Mapping[str, Any]) -> None:
-    """Replace the note in a lock file. The note is for people and for the dead-holder rule; the lock is the truth."""
+    """Replace the note in a lock file, flushed and fsynced; raise OSError if it cannot be written.
+
+    The note is recovery state: it is how a later holder tells a key released in order from one a dead holder left. A
+    note that did not reach the disk is a note that was not written, so every error is the caller's to handle.
+    """
     handle.seek(0)
     handle.truncate()
     handle.write(json.dumps(note, sort_keys=True))
     handle.flush()
+    os.fsync(handle.fileno())
 
 
 class LeasePool:
@@ -381,8 +390,14 @@ class LeasePool:
     def _grant(self, handle: Any, key: str, group: str, run_key: str | None, wait_s: float) -> Lease:
         start = time.time()
         note = {"owner": self._owner, "pid": os.getpid(), "run_key": run_key, "since": start, "key": key}
-        with contextlib.suppress(OSError):  # the note is for people; the lock is the truth
+        try:
             _write_note(handle, note)
+        except BaseException:
+            # Without its note a holder that dies leaves a key nobody can tell from a free one. Nothing was started:
+            # drop the lock (closing the file does), leave the empty or partial note to read as indeterminate, raise.
+            with contextlib.suppress(OSError):
+                handle.close()
+            raise
         return Lease(handle, key, group, run_key, wait_s, start)
 
     def try_acquire(self, group: str, run_key: str | None = None) -> Lease | None:
