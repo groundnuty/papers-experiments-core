@@ -25,6 +25,7 @@ from expcore.study.config import load_study
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
 DERIVED = ("scores.json", "analysis.json", "export.json", "report.md")  # what `analyze` and `report` write under out/
+ANALYZED = ("scores.json", "analysis.json", "export.json")  # what `analyze` alone must have written
 BUMPED = "tools-effect-on-rounds"  # the only contrast that reads the outcome the new scorer changes
 FIRST = 'version = "1"'
 SECOND = 'version = "2"'
@@ -120,8 +121,10 @@ def test_r13_without_a_stored_score_analyze_and_report_derive_them_from_the_reco
         out_file(copy, name).unlink()
     with offline():
         analyze, _ = cli(clean_environment, "analyze", str(copy.root))
+        after_analyze = {name: out_file(copy, name).read_bytes() for name in ANALYZED if out_file(copy, name).exists()}
         report, _ = cli(clean_environment, "report", str(copy.root))
     assert (analyze, report) == (0, 0)
+    assert after_analyze == {name: before[name] for name in ANALYZED}  # analyze wrote them, before report ran
     assert {name: out_file(copy, name).read_bytes() for name in DERIVED} == before  # scores.json and the report too
     assert len(json.loads(before["scores.json"])) == 22
 
@@ -139,8 +142,12 @@ def bumped(pipeline, tmp_path_factory, clean_environment) -> dict[str, Any]:
     steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
     with offline():
         stale = cli(clean_environment, "analyze", str(copy.root))  # refused: the check is of the old scorer's code
-        codes = {name: cli(clean_environment, name, target)[0] for name, target in steps.items()}
-    return {"campaign": copy, "stale": stale, "codes": codes}
+        codes, analysed = {}, {}
+        for name, target in steps.items():
+            codes[name] = cli(clean_environment, name, target)[0]
+            if name == "analyze":  # read what analyze wrote before report can write it again
+                analysed = {n: out_file(copy, n).read_bytes() for n in ANALYZED if out_file(copy, n).exists()}
+    return {"campaign": copy, "stale": stale, "codes": codes, "analysed": analysed}
 
 
 def test_r13_a_new_scorer_version_needs_a_new_replay_check_before_the_scores_are_derived_again(bumped):
@@ -157,7 +164,8 @@ def test_r13_a_new_scorer_version_changes_one_outcome_in_the_known_way_and_is_re
 ):
     """R13: version 2 doubles the rounds of every scored run and nothing else; a run with no rounds still has none."""
     old = json.loads(out_file(pipeline, "scores.json").read_text(encoding="utf-8"))
-    new = json.loads(out_file(bumped["campaign"], "scores.json").read_text(encoding="utf-8"))
+    assert set(bumped["analysed"]) == set(ANALYZED)
+    new = json.loads(bumped["analysed"]["scores.json"].decode("utf-8"))
     assert old.keys() == new.keys()
     assert len(new) == 22
     for key, held in new.items():
