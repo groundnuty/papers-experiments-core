@@ -130,6 +130,10 @@ def test_a_tool_call_status_outside_the_closed_list_is_refused():
                 "started_s": 0.0,
                 "ended_s": 0.1,
                 "detail": "",
+                "source_truncated": None,
+                "waits_left_open": 0,
+                "terminal": False,
+                "infra_wait_by_kind": {},
             }
         ]
     )
@@ -152,7 +156,7 @@ V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
     "expcore-record/2",
     added={"record": ("instruments",), "turn": ("request_sha256",)},
-    config_before={"tool_grace_s": 60.0},
+    config_before={"cleanup_deadline_s": 60.0},
 )
 TABLE = (V1, V2)
 
@@ -172,7 +176,7 @@ def test_the_fields_a_later_version_added_are_not_the_older_versions():
 
 
 def test_the_defaults_in_force_before_a_setting_are_those_of_the_versions_after_the_record():
-    assert config_defaults("expcore-record/1", TABLE) == {"tool_grace_s": 60.0}
+    assert config_defaults("expcore-record/1", TABLE) == {"cleanup_deadline_s": 60.0}
     assert config_defaults("expcore-record/2", TABLE) == {}
 
 

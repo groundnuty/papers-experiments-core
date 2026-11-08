@@ -4,8 +4,9 @@ import asyncio
 import json
 
 import pytest
-from loop_support import FakeClock, FakeProvider, ScriptedBackend, malformed, never, turn
+from loop_support import ClockSleep, FakeClock, FakeProvider, ScriptedBackend, malformed, never, turn
 from record_support import CODE, IDENTITY, hand_made, make_config, record_run, sha
+from replay_scenarios import BadRequest, Hangs
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.models.adapters import StubAdapter
@@ -166,10 +167,15 @@ def test_a_failed_request_is_recorded_by_kind_with_stable_fields(raised, kind):
 
 def test_R07_exception_text_is_a_class_name_plus_a_stable_message():
     """R07: a library's own message is not stored for an error, a tool crash or a failed call; the class name is."""
-    record = record_run([ValueError("Expecting value: line 1 column 1 (char 0) -- text of one interpreter")], ECHO)
+    message = "Expecting value: line 1 column 1 (char 0) -- text of one interpreter"
+    record = record_run([BadRequest(message)], ECHO)
     assert record.outcome["name"] == "error"
-    assert (record.outcome["error_type"], record.outcome["detail"]) == ("ValueError", "ValueError")
+    assert (record.outcome["error_type"], record.outcome["detail"]) == ("BadRequest", "BadRequest")
     assert "interpreter" not in record.dumps()
+    backend_crash = record_run([ValueError(message)], ECHO)
+    assert backend_crash.outcome["name"] == "harness_defect"
+    assert (backend_crash.outcome["detail"], backend_crash.failed_request["error_type"]) == ("ValueError", "ValueError")
+    assert "interpreter" not in backend_crash.dumps()
 
     def crash(_args):
         raise KeyError("vary-by-version")
@@ -196,18 +202,13 @@ def test_R07_the_cores_own_fixed_fields_are_kept():
 
 
 def test_an_attempt_cut_at_its_time_cap_records_the_request_in_flight_as_cut():
-    class Hangs(StubAdapter):
-        async def step(self):
-            await asyncio.Event().wait()
-
-    async def at_once(_seconds):
-        await asyncio.sleep(0)
-
-    record = record_run([], ECHO, backend=Hangs([]), sleep=at_once)
+    clock = FakeClock()
+    record = record_run([], ECHO, backend=Hangs([], clock, 400), clock=clock, sleep=ClockSleep(clock))
     assert record.outcome["name"] == "time_cap"
     assert record.failed_request is not None
     assert record.failed_request["kind"] == "cut"
     assert record.totals["usage_incomplete"] is True
+    assert "watch" in [label for label, _ in record.clock]
 
 
 def test_the_record_refuses_a_backend_whose_history_is_not_the_recorded_turns():

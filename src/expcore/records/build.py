@@ -21,7 +21,7 @@ from typing import Any
 from expcore.loop.agent_loop import run_agent
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
-from expcore.loop.records import LoopResult
+from expcore.loop.records import LoopResult, TurnRecord
 from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import ModelBackend
@@ -125,7 +125,7 @@ def call_entry(call: Any) -> dict[str, Any]:
     return entry
 
 
-def turn_entry(index: int, captured: Captured, settings_sha256: str) -> dict[str, Any]:
+def turn_entry(index: int, captured: Captured, settings_sha256: str, loop_turn: TurnRecord) -> dict[str, Any]:
     """Return one model turn as the record keeps it: the neutral and the native message, and what surrounded them."""
     turn = captured.turn
     return {
@@ -151,6 +151,8 @@ def turn_entry(index: int, captured: Captured, settings_sha256: str) -> dict[str
         "served_model": turn.served_model,
         "system_fingerprint": turn.system_fingerprint,
         "retries": plain(list(turn.retries)),
+        "waits_left_open": loop_turn.waits_left_open,
+        "infra_wait_by_kind": plain(loop_turn.infra_wait_by_kind),
     }
 
 
@@ -211,7 +213,7 @@ def build_record(
     sets: dict[str, Any] = {}
     turns = []
     for index, c in enumerate(captured):
-        turns.append(turn_entry(index, c, digest(c.settings)))
+        turns.append(turn_entry(index, c, digest(c.settings), result.turns[index]))
         sets[digest(c.settings)] = c.settings
     failed = None
     if recording.failure is not None:
@@ -243,6 +245,10 @@ def build_record(
             "agent_s": result.agent_s,
             "elapsed_s": result.elapsed_s,
             "infra_wait_s": result.infra_wait_s,
+            "infra_wait_by_kind": plain(result.infra_wait_by_kind),
+            "cleanup_s": result.cleanup_s,
+            "cleanup_timed_out": result.cleanup_timed_out,
+            "abandoned_threads": result.abandoned_threads,
             "final_text": result.final_text,
         },
         instruments=plain(dict(instruments or {})),

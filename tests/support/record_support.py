@@ -44,6 +44,8 @@ def hand_made(**overrides: Any) -> RunRecord:
         "served_model": "m1",
         "system_fingerprint": None,
         "retries": [],
+        "waits_left_open": 0,
+        "infra_wait_by_kind": {},
     }
     fields: dict[str, Any] = {
         "run_key": IDENTITY.run_key,
@@ -74,6 +76,10 @@ def hand_made(**overrides: Any) -> RunRecord:
             "agent_s": 0.5,
             "elapsed_s": 0.5,
             "infra_wait_s": 0.0,
+            "infra_wait_by_kind": {},
+            "cleanup_s": 0.0,
+            "cleanup_timed_out": False,
+            "abandoned_threads": 0,
             "final_text": "hi",
         },
         "schema_version": CURRENT,
@@ -109,20 +115,22 @@ def record_run(
     user: str = "do the task",
     identity: RunIdentity = IDENTITY,
     shared_timer: bool = False,
+    cleanup_waiter: Any = None,
     **config: Any,
 ) -> RunRecord:
     """Run a scripted attempt through the real loop on a fake clock and return its record.
 
-    With `shared_timer` the loop's timer is made here and handed to the backend as its `time_left`, as a backend built
-    with a retry policy would have it, so the backend's own clock readings are in the record.
+    With `shared_timer` (or a `cleanup_waiter`, which the timer takes) the loop's timer is made here and handed to the
+    backend as its `time_left` and `timer`, as a backend built with a retry policy would have it, so the backend's own
+    clock readings and waits are in the record.
     """
     backend = backend or ScriptedBackend(script)
     providers = providers if providers is not None else [FakeProvider(handlers, terminal=terminal)]
     clock = clock or FakeClock()
     agent_config = make_config(**config)
-    timer = agent_config.timer(clock) if shared_timer else None
+    timer = agent_config.timer(clock, cleanup_waiter=cleanup_waiter) if shared_timer or cleanup_waiter else None
     if timer is not None:
-        backend.time_left = timer.time_left
+        backend.time_left, backend.timer = timer.time_left, timer
     return asyncio.run(
         record_attempt(
             backend,

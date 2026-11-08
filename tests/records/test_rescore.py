@@ -55,7 +55,7 @@ def test_R13_a_record_is_re_scored_offline_and_the_scorers_version_is_recorded()
     record = SCENARIOS["tools"][0]()
     scored = rescore(record, [TurnCount()])
     assert scored.scores == {
-        "turns": {"version": "1.2", "result": {"verdict": "fulfilled", "outcomes": {"turns": 5, "rounds": 5}}}
+        "turns": {"version": "1.2", "result": {"verdict": "fulfilled", "outcomes": {"turns": 6, "rounds": 6}}}
     }
     assert record.scores == {}
     assert RunRecord.from_json(decode(scored.dumps())) == scored

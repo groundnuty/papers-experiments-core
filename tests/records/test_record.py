@@ -14,7 +14,7 @@ V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
     "expcore-record/2",
     added={"record": ("instruments",), "turn": ("request_sha256",)},
-    config_before={"tool_grace_s": 60.0},
+    config_before={"cleanup_deadline_s": 60.0},
 )
 TABLE = (V1, V2)
 

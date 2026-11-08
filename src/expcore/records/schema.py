@@ -23,6 +23,7 @@ from typing import Any
 
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
+from expcore.plugin import WAIT_KINDS
 
 SCHEMA_PREFIX = "expcore-record/"
 NONE = type(None)
@@ -67,6 +68,8 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "served_model": (str, NONE),
         "system_fingerprint": (str, NONE),
         "retries": (list,),
+        "waits_left_open": (int,),
+        "infra_wait_by_kind": (dict,),
     },
     "neutral": {"text": (str,), "reasoning": (str, NONE), "tool_calls": (list,)},
     "neutral_call": {
@@ -99,6 +102,10 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "started_s": (*NUM, NONE),
         "ended_s": (*NUM, NONE),
         "detail": (str,),
+        "source_truncated": (bool, NONE),
+        "waits_left_open": (int,),
+        "terminal": (bool,),
+        "infra_wait_by_kind": (dict,),
     },
     "failed_request": {
         "kind": (str,),
@@ -126,6 +133,10 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "agent_s": NUM,
         "elapsed_s": NUM,
         "infra_wait_s": NUM,
+        "infra_wait_by_kind": (dict,),
+        "cleanup_s": NUM,
+        "cleanup_timed_out": (bool,),
+        "abandoned_threads": (int,),
         "final_text": (str, NONE),
     },
 }
@@ -232,8 +243,16 @@ def _check_list(section: str, items: Any, version: str, where: str, schemas: Seq
         check_section(section, item, version, f"{where}[{i}]", schemas)
 
 
+def _check_waited(waited: Any, where: str) -> None:
+    """Check seconds waited per kind: only kinds of the closed list, each a finite, positive number of seconds."""
+    bad = [k for k, v in waited.items() if k not in WAIT_KINDS or not _fits(v, NUM) or v <= 0]
+    if bad:
+        raise RecordError(f"{where}: seconds waited are given per kind of {tuple(WAIT_KINDS)}, not {sorted(bad)}")
+
+
 def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVersion]) -> None:
     """Check the parts of one turn entry."""
+    _check_waited(turn["infra_wait_by_kind"], f"{where}.infra_wait_by_kind")
     check_section("neutral", turn["neutral"], version, f"{where}.neutral", schemas)
     _check_list("neutral_call", turn["neutral"]["tool_calls"], version, f"{where}.neutral.tool_calls", schemas)
     check_section("usage", turn["usage"], version, f"{where}.usage", schemas)
@@ -287,6 +306,7 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
     for i, entry in enumerate(body["tool_calls"]):
         if entry["status"] not in TOOL_STATUSES:
             raise RecordError(f"tool_calls[{i}].status: {entry['status']!r} is not one of {TOOL_STATUSES}")
+        _check_waited(entry["infra_wait_by_kind"], f"tool_calls[{i}].infra_wait_by_kind")
     for i, reading in enumerate(body["clock"]):
         ok = isinstance(reading, list) and len(reading) == 2 and isinstance(reading[0], str) and _fits(reading[1], NUM)
         if not ok:
@@ -294,6 +314,7 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
     check_section("outcome", body["outcome"], version, "outcome", schemas)
     _check_outcome(body["outcome"], "outcome")
     check_section("totals", body["totals"], version, "totals", schemas)
+    _check_waited(body["totals"]["infra_wait_by_kind"], "totals.infra_wait_by_kind")
     for place in ("instruments", "scores"):
         held = body.get(place, {})  # absent from a record of a version that predates it
         bad = [k for k in held if not _NAMESPACE.fullmatch(k) or not isinstance(held[k], dict)]
