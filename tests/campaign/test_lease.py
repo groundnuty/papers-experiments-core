@@ -102,6 +102,42 @@ def test_c19_a_dead_holders_key_is_not_regranted_until_its_resource_is_shown_gon
     assert [e["gone"] for e in log] == [False, True]
 
 
+@pytest.mark.parametrize("how", ["unknown", "raises"])
+def test_c19_a_holder_whose_liveness_cannot_be_determined_is_regranted_only_after_the_resource_is_shown_gone(
+    tmp_path, how
+):
+    """C19: an indeterminate holder probe is no proof of a live holder: the key is quarantined until resource_gone."""
+    kill_a_holder(tmp_path / "leases")
+    clock = Clock()
+    probe = Probe(unknown_owners={"holder-1"}) if how == "unknown" else Probe(failing_owners={"holder-1"})
+    leases = pool(tmp_path, keys=("k1",), probe=probe, clock=clock)
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g", "run-b")
+    assert [asked[0] for asked in probe.asked] == ["k1"]  # the resource was looked at, and not shown gone
+    clock.now += 100
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g", "run-b")
+    probe.gone_keys.add("k1")
+    clock.now += 100
+    assert leases.try_acquire("g", "run-b").key == "k1"
+
+
+@pytest.mark.parametrize("answer", ["false", "raises"])
+def test_c19_a_dead_holders_key_stays_quarantined_while_the_resource_probe_is_indeterminate(tmp_path, answer):
+    """C19: the holder is shown gone; resource_gone saying no, or failing, keeps the key out. Only True frees it."""
+    kill_a_holder(tmp_path / "leases")
+    clock = Clock()
+    probe = Probe(gone_owners={"holder-1"}, failing_keys={"k1"} if answer == "raises" else ())
+    leases = pool(tmp_path, keys=("k1",), probe=probe, clock=clock)
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g")
+    assert leases.unusable() == {"k1"}
+    probe.failing_keys.clear()
+    probe.gone_keys.add("k1")
+    clock.now += 100
+    assert leases.try_acquire("g", "run-b").key == "k1"
+
+
 def test_c19_a_killed_holder_whose_owner_is_alive_by_the_probe_is_not_a_dead_holder(tmp_path):
     """C19: a note whose owner the probe still finds alive names no dead holder: the key is granted without a reap."""
     kill_a_holder(tmp_path / "leases")
@@ -124,6 +160,24 @@ def test_c19_an_unreadable_note_is_a_dead_holder_to_be_shown_gone_not_a_free_key
     probe.gone_keys.add("k1")
     leases._clock.now += 100
     assert leases.try_acquire("g") is not None
+
+
+def test_c19_an_empty_note_in_a_lock_file_that_was_there_is_indeterminate_and_a_new_file_is_a_key_never_used(tmp_path):
+    """C19: a holder can die between taking the key and writing its note: that is not "never used", it needs proof."""
+    directory = tmp_path / "leases"
+    directory.mkdir()
+    (directory / "k1.lock").write_text("", encoding="utf-8")  # the lock file of a holder that died before its note
+    probe = Probe()
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1", "k2"), probe=probe, clock=clock)
+    first = leases.try_acquire("g", "run-a")
+    assert first.key == "k2"  # k2 had no file: this acquisition created it, so it was never used and needs no proof
+    assert probe.asked == [("k1", {})]  # k1's empty note was looked into, and the resource was not shown gone
+    assert leases.unusable() == {"k1"}
+    assert leases.sweep_dead_holders(["g"]) == ["k1"]
+    probe.gone_keys.add("k1")
+    clock.now += 100
+    assert leases.try_acquire("g", "run-b").key == "k1"
 
 
 def test_c19_an_empty_or_released_note_needs_no_proof(tmp_path):
@@ -265,12 +319,39 @@ def test_c19_waiting_for_a_lease_is_a_lease_queue_wait_on_the_timer_and_not_the_
 def test_c19_the_owner_of_this_process_is_not_gone_and_a_reused_pid_is(tmp_path):
     """C19: the owner names boot, pid and start time, so a reused pid is no holder; what cannot be read is not gone."""
     owner = process_owner()
-    assert not process_gone(owner)
+    assert process_gone(owner) is False
     boot, pid, started = owner.split(":")
-    assert process_gone(f"{boot}:{pid}:{int(started) + 1}")
-    assert process_gone("another-boot:1:1")
-    assert not process_gone("not an owner")
-    assert not process_gone("pid:not-a-number")
+    assert process_gone(f"{boot}:{pid}:{int(started) + 1}") is True
+    assert process_gone("another-boot:1:1") is True
+    assert process_gone("not an owner") is None  # what cannot be read is not shown gone, and not shown alive
+    assert process_gone("pid:not-a-number") is None
+    assert process_gone("a:b:c:d") is None
+
+
+def test_c19_a_missing_proc_entry_is_a_process_that_is_gone_and_its_teardown_still_needs_proof(tmp_path):
+    """C19: no /proc/<pid> on this boot (FileNotFoundError) means the process is gone, and that alone frees nothing."""
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    boot = process_owner().split(":")[0]
+    assert process_gone(f"{boot}:{dead.pid}:1") is True
+    assert process_gone(f"pid:{dead.pid}") is True
+    directory = tmp_path / "leases"
+    directory.mkdir()
+    note = {"owner": f"{boot}:{dead.pid}:1", "pid": dead.pid, "run_key": "run-a", "key": "k1"}
+    (directory / "k1.lock").write_text(json.dumps(note), encoding="utf-8")
+
+    class ByProcess(Probe):
+        def holder_gone(self, owner):
+            return process_gone(owner)
+
+    probe = ByProcess()
+    leases = pool(tmp_path, keys=("k1",), probe=probe)
+    with pytest.raises(AllQuarantined):  # the holder is gone; its sandbox is not shown gone, so the key stays out
+        leases.try_acquire("g")
+    assert probe.asked == [("k1", note)]
+    probe.gone_keys.add("k1")
+    leases._clock.now += 100
+    assert leases.try_acquire("g", "run-b") is not None
 
 
 def test_c19_a_lease_is_freed_after_its_run_only_when_the_probe_shows_the_resource_gone(tmp_path):

@@ -13,11 +13,15 @@ declares them; nothing here knows what a key is). A lease is an exclusive `flock
   processes (a campaign and a script beside it);
 - dropped by the kernel when the holder dies, however it dies, so a killed process frees its key by itself;
 - **but not re-granted at once.** The holder's sandbox may outlive it and go on using the resource. A key whose last
-  holder died without releasing it goes to nobody until a `ResourceProbe` shows what the holder started to be gone
-  (the dead-holder rule); a probe that cannot show it keeps the key out and is asked again after `dead_retry_s`.
-- written crash-safely: the note in the lock file is only for people and for the dead-holder rule. An empty note is a
-  key never used; a note that is not readable names a holder that died mid-write, and is treated as a dead holder
-  that must be shown gone, never as a free key.
+  holder did not release it goes to nobody until `ResourceProbe.resource_gone` has answered True for it (the dead-holder
+  rule). That holds whether the holder is shown gone, or its liveness cannot be determined; only a holder the probe
+  shows alive (and so not holding the lock it let go of) leaves nothing to reap. A probe that cannot show the resource
+  gone, by saying so or by failing, quarantines the key: it is held back and asked again after `dead_retry_s`.
+- written crash-safely: the note in the lock file is recovery state, not decoration. It is written with a flush and an
+  fsync, and a note that cannot be written fails the acquisition: the key is released, nothing is started and the error
+  is raised. An empty note in a lock file that existed before this acquisition, and a note that cannot be read, name a
+  holder that died between taking the key and writing it, or mid-write: they are indeterminate and the key needs the
+  same proof, never "a key never used". Only a lock file this very acquisition created is a key never used.
 
 A teardown that cannot be proven **quarantines** the resource: the lease stays held, its use ends, and the key goes
 to nobody until the teardown is proven (`LeasePool.settle_quarantines` asks the proof). When every key of a group is
@@ -60,6 +64,8 @@ _KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 class LeaseRefused(RuntimeError):
     """No lease was granted and nothing was started: the run uses no attempt."""
 
+    wait_s: float = 0.0  # the seconds the caller waited before the refusal; set by `LeasePool.acquire`
+
 
 class NoResources(LeaseRefused):
     """The platform declares no key for this group."""
@@ -75,16 +81,22 @@ class AllQuarantined(LeaseRefused):
 
 
 class ResourceProbe(Protocol):
-    """What the platform can say about a holder and the resource it used. Both questions must fail safe: a probe that
-    cannot tell answers False (the holder is not shown gone, the resource is not shown gone)."""
+    """What the platform can say about a holder and the resource it used. Both questions must fail safe."""
 
-    def holder_gone(self, owner: str) -> bool:
-        """Tell whether the process named by `owner` (as `LeasePool` was told to write it) is gone for good."""
+    def holder_gone(self, owner: str) -> bool | None:
+        """Tell whether the process named by `owner` (as `LeasePool` was told to write it) is gone for good.
+
+        True: shown gone. False: shown alive. None, or an exception: cannot be told, which is treated like gone, since
+        only a holder shown alive leaves nothing to reap.
+        """
         ...
 
     def resource_gone(self, key: str, note: Mapping[str, Any]) -> bool:
         """Tell whether everything the holder started with this key is shown gone: its sandbox, its processes, its
-        mounts. `note` is what the holder wrote in the lock file (it may be empty when the file was unreadable)."""
+        mounts. `note` is what the holder wrote in the lock file (it may be empty when the file was unreadable).
+
+        Only True shows it. Anything else, an exception included, keeps the key quarantined.
+        """
         ...
 
 
@@ -107,24 +119,37 @@ def process_owner() -> str:
     return f"{boot}:{pid}:{started}"
 
 
-def process_gone(owner: str) -> bool:
+def process_gone(owner: str) -> bool | None:
     """Tell whether the process `process_owner` named is gone: another boot, no such pid, or the pid reused.
 
-    An owner this function cannot read is not shown gone.
+    True: it is gone, which is not a proof that what it started is (the teardown still needs one). False: it is alive.
+    None: this function cannot read the owner or the process table, so it cannot say.
     """
     parts = owner.split(":")
-    try:
-        if len(parts) == 2 and parts[0] == "pid":
+    if len(parts) == 2 and parts[0] == "pid":
+        try:
             os.kill(int(parts[1]), 0)
-            return False
-        boot, pid, started = parts
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False  # there is such a process, which is not ours to signal
+        except (ValueError, OSError):
+            return None
+        return False
+    if len(parts) != 3:
+        return None
+    boot, pid, started = parts
+    try:
         if boot != Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip():
             return True
+    except OSError:
+        return None  # no process table to look in at all
+    try:
         return _start_time(int(pid)) != started
-    except ProcessLookupError:
-        return True
-    except (PermissionError, ValueError, OSError):
-        return False
+    except FileNotFoundError:
+        return True  # this boot has no /proc/<pid>: the process is gone
+    except (ValueError, IndexError, OSError):
+        return None
 
 
 def _start_time(pid: int) -> str:
@@ -285,33 +310,45 @@ class LeasePool:
             return None
         return handle
 
-    def _dead_holder_cleared(self, key: str, handle: Any) -> bool:
+    def _holder_alive(self, owner: str) -> bool:
+        """Tell whether the probe shows the holder alive. Gone, unknown and a failing probe are all "not shown alive"."""
+        try:
+            return self._probe.holder_gone(owner) is False
+        except Exception:
+            log.exception("looking for the holder %s", owner)
+            return False
+
+    def _dead_holder_cleared(self, key: str, handle: Any, *, fresh: bool = False) -> bool:
         """Tell whether the key may go to a new holder, given that its flock is ours.
 
-        The kernel drops a dead process's lock at once, but its resource may go on being used. So a note that names a
-        holder who never released, or that cannot be read, goes to nobody until the probe shows the resource gone.
+        The kernel drops a dead process's lock at once, but its resource may go on being used. So a key whose note does
+        not say it was released goes to nobody until `resource_gone` answers True: when the holder is shown gone, when
+        its liveness cannot be determined, and when the note is empty (in a file that was there before) or unreadable. A
+        holder the probe shows alive does not hold the lock it let go of; nothing is left to reap. `fresh` says that this
+        acquisition created the lock file, so an empty note is a key never used.
         """
         handle.seek(0)
         text = handle.read()
-        if not text.strip():
+        note: dict[str, Any] = {}
+        if text.strip():
+            try:
+                parsed = json.loads(text)
+                note = parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                note = {}  # unreadable: a holder that died mid-write is a dead holder that must be shown gone
+        elif fresh:
             return True  # a key never used
-        try:
-            note = json.loads(text)
-            if not isinstance(note, dict):
-                raise ValueError("the note is not an object")
-        except ValueError:
-            note = {}  # unreadable: a holder that died mid-write is a dead holder that must be shown gone
-        owner = note.get("owner")
-        if note and (not owner or "released" in note):
+        if "released" in note:
             return True
-        if note and not self._probe.holder_gone(str(owner)):
-            return True  # its owner is still alive and does not hold the lock: it released it, nothing to reap
+        owner = note.get("owner")
+        if owner and self._holder_alive(str(owner)):
+            return True
         now = self._clock()
         with self._mutex:
             if now < self._dead_retry.get(key, 0.0):
                 return False
         try:
-            gone = bool(self._probe.resource_gone(key, note))
+            gone = self._probe.resource_gone(key, note) is True
         except Exception:
             log.exception("looking for the resource of the dead holder of %s", key)
             gone = False
@@ -321,7 +358,10 @@ class LeasePool:
             else:
                 self._dead_retry[key] = now + self._dead_retry_s
         if gone:
-            _write_note(handle, {"released": time.time(), "key": key, "reaped_owner": owner})
+            try:
+                _write_note(handle, {"released": time.time(), "key": key, "reaped_owner": owner})
+            except OSError:
+                log.exception("could not note that the resource of %s was reaped; the proof is asked again", key)
         _append_line(
             self.dir / DEAD_LOG,
             {"t": time.time(), "key": key, "run_key": note.get("run_key"), "owner": owner, "gone": gone},
@@ -329,10 +369,11 @@ class LeasePool:
         return gone
 
     def _try_key(self, key: str) -> Any:
+        fresh = not self._lock_path(key).exists()
         handle = self._flock(key)
         if handle is None:
             return None
-        if not self._dead_holder_cleared(key, handle):
+        if not self._dead_holder_cleared(key, handle, fresh=fresh):
             handle.close()
             return None
         return handle
