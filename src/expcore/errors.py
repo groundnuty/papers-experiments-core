@@ -11,7 +11,7 @@ code. The campaign decides whether to re-run the attempt.
 Never an InfraError: agent-code exceptions (non-zero exit codes), turn, time or token caps, report outcomes, slowness,
 and a context that outgrew the model's window (`ContextOverflow`).
 
-The kinds form a closed vocabulary: the core's five, plus whatever a platform registers once at import time with
+The kinds form a closed vocabulary: the core's six, plus whatever a platform registers once at import time with
 `register_infra_kind`. An unknown kind is a programming error and raises at once, so a typo never reaches a record.
 """
 
@@ -21,8 +21,9 @@ import re
 
 # endpoint: the model endpoint failed after the retries. key_rejected: HTTP 401 or 403 from the model API.
 # sandbox: the agent's sandbox failed. knowledge: a tool server failed. unattributed_kill: a process was killed
-# and no cause was recorded.
-CORE_KINDS = ("endpoint", "key_rejected", "sandbox", "knowledge", "unattributed_kill")
+# and no cause was recorded. ceiling: a call was still running when the whole-time ceiling passed, with the agent's
+# own time under its cap, so something other than the agent held it up (L04).
+CORE_KINDS = ("endpoint", "key_rejected", "sandbox", "knowledge", "unattributed_kill", "ceiling")
 
 _KIND_RE = re.compile(r"[a-z][a-z0-9_]*")
 _platform_kinds: dict[str, str] = {}

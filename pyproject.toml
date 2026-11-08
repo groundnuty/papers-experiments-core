@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=2.6.0",
     "httpx>=0.28.1",
+    "mcp>=2.3.0",
     "openai>=3.46.0",
 ]
 
@@ -29,6 +30,8 @@ packages = ["src/expcore", "src/expcore_onedata"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --import-mode=importlib"
+# Helper modules shared by several test files live here, outside any package, and are imported by plain name.
+pythonpath = ["tests/support"]
 
 [tool.ruff]
 line-length = 120
@@ -49,3 +52,8 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
 "src/expcore/models/served.py" = ["E501"]
 "src/expcore/provenance/codestamp.py" = ["E501"]
 "src/expcore/config/models.py" = ["E501"]
+"src/expcore/loop/agent_loop.py" = ["E501"]
+"src/expcore/loop/capping.py" = ["E501"]
+"src/expcore/prompt/templates.py" = ["E501"]
+"src/expcore/tools/mcp_client.py" = ["E501"]
+"src/expcore/tools/manifest.py" = ["E501"]
