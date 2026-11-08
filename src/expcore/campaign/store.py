@@ -20,12 +20,19 @@ stored in its row.
 Schema changes (C20). The fixed tables are created whole; a column added by a later version goes in with one
 `ALTER TABLE ... ADD COLUMN` per column, so a kill between two leaves a database that the next open finishes. The
 factor columns depend on the study; a database made for other factors is refused, never migrated.
+
+Concurrent opens (C20). Many processes may open one new database together. Each migration step runs in a write
+transaction of its own and the busy timeout orders them. The switch to WAL is not covered by the busy timeout, so
+`Store._enter_wal` retries it, bounded by the lock timeout, and refuses the database, naming it, when it still has not
+got WAL.
 """
 
 import datetime as dt
 import json
+import random
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -75,6 +82,10 @@ _BACKFILLS = {
 }
 
 
+# How long SQLite waits for a lock held by another connection, and how long an open waits to switch the database to WAL.
+_LOCK_TIMEOUT_S = 30.0
+
+
 def utc_now() -> str:
     """Return the current time as an ISO 8601 UTC string with a Z suffix."""
     return dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -88,23 +99,27 @@ def column_for(factor: str) -> str:
 class Store:
     """The campaign's state in one SQLite file, safe to share between threads of one process."""
 
-    def __init__(self, path: Path, schema: FactorSchema):
-        """Open or create the database for a schema's factors, finish any unfinished migration, refuse other factors."""
+    def __init__(self, path: Path, schema: FactorSchema, lock_timeout_s: float = _LOCK_TIMEOUT_S):
+        """Open or create the database for a schema's factors, finish any unfinished migration, refuse other factors.
+
+        An open that cannot get a lock, or the WAL journal mode, within `lock_timeout_s` raises `sqlite3.OperationalError`
+        naming the database.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self.schema = schema
         self._lock = threading.RLock()
-        self.db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=30)
+        self.db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=lock_timeout_s)
         self.db.row_factory = sqlite3.Row
         try:
-            self._open()
+            self._open(lock_timeout_s)
         except BaseException:
             self.db.close()
             raise
 
-    def _open(self) -> None:
+    def _open(self, lock_timeout_s: float) -> None:
         """Set the pragmas, create what is missing, check the factor columns, add the later columns one by one."""
-        self.db.execute("PRAGMA journal_mode=WAL")
+        self._enter_wal(lock_timeout_s)
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute(self._runs_sql())
@@ -117,6 +132,34 @@ class Store:
         self.db.executescript(_FIXED_SQL)
         for table, column, declaration in _ADDED_COLUMNS:
             self._migrate(table, column, declaration)
+
+    def _enter_wal(self, timeout_s: float) -> None:
+        """Put the database in WAL mode, trying again while a concurrent opener is doing the same (C20).
+
+        The switch is a write that first reads, then raises its read lock to the write lock. When another connection
+        already holds the write lock, SQLite returns SQLITE_BUSY at once and does not wait out the busy timeout, since
+        two connections that both waited there could deadlock. Many openers of one new database meet exactly this. A
+        loser pauses a random moment and tries again; once the winner has committed, the statement changes nothing and
+        reports 'wal'. The mode it reports is checked, and a database that does not reach WAL in time is refused.
+        """
+        deadline = time.monotonic() + timeout_s
+        pause = 0.001
+        while True:
+            failure = None
+            try:
+                mode = self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                if mode == "wal":
+                    return
+                reason = f"the journal mode stayed {mode}"
+            except sqlite3.OperationalError as error:
+                if error.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY:
+                    raise
+                failure, reason = error, str(error)
+            if time.monotonic() >= deadline:
+                message = f"{self.path}: could not switch the database to WAL within {timeout_s} s: {reason}"
+                raise sqlite3.OperationalError(message) from failure
+            time.sleep(random.uniform(0, pause))  # jitter, so the losers do not meet again in step
+            pause = min(pause * 2, 0.05)
 
     def _runs_sql(self) -> str:
         """Return the CREATE TABLE statement of `runs`, with one generated column per factor in identity order."""

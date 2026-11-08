@@ -129,6 +129,25 @@ def open_store(tmp_path: Path, schema: FactorSchema | None = None, name: str = "
     return Store(tmp_path / name, schema or make_schema())
 
 
+def open_in_rounds(base: str, rounds: int, barrier, results) -> None:
+    """Run in a child process: in each round wait at the barrier, open the round's new database, report what it got.
+
+    A report is `(journal mode, synchronous, None)` for an open that worked and `(None, None, repr(error))` for one that
+    raised. The barrier is entered in every round, whatever happened in the last, so one failure never leaves the
+    others waiting.
+    """
+    schema = make_schema()
+    for index in range(rounds):
+        barrier.wait(timeout=120)
+        try:
+            store = Store(Path(base) / f"round{index}" / "campaign.db", schema)
+            report = (store.q("PRAGMA journal_mode")[0][0], store.q("PRAGMA synchronous")[0][0], None)
+            store.close()
+        except Exception as error:  # reported to the parent, which fails on it
+            report = (None, None, repr(error))
+        results.put((index, report))
+
+
 def planned_store(tmp_path: Path, **plan):
     """Open a store holding the runs of a small plan; return the store, the schema and the manifest."""
     schema = make_schema()
