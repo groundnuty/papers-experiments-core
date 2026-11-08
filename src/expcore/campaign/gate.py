@@ -5,11 +5,12 @@
 """The budget gate: budgets are enforced, not only estimated (C12), and a hold is lifted by a release file (C13).
 
 Before a run starts, the gate asks whether the campaign can afford one more of its model. The answer is the dollars
-spent so far (attempts counted by their counts, an interrupted one by its bound, C05), plus what the runs in flight
-are expected to cost, plus what this run is expected to cost, against a ceiling. A run's expected cost is the mean
-cost of the model's finished runs, or, until there is a sample, its **bound**: one attempt's token budget at the
-model's dearest rate. A model with no sample is therefore never "unknown"; it is held only when even its bound does
-not fit.
+spent so far (attempts counted by their counts, an interrupted one by its bound, C05), plus what the runs in flight can
+cost, plus what this run can cost, against a ceiling. **What a run can cost is always its bound**, one attempt's token
+budget at the model's dearest rate, never the mean of the runs that finished: a reservation for a pending or running
+attempt is the worst case, because an attempt that overruns its mean is still inside the ceiling only if the bound was
+set aside for it. A run starts only when the remaining budget covers the bound. The historical mean is an estimate for
+the status and the reports (`BudgetState.estimate_usd`) and decides nothing.
 
 Cost that cannot be known holds like cost that is over: a model whose price is unknown (no price, not free) is held,
 and so is every model once an attempt of an unpriced model has been charged, because the total spent is then unknown.
@@ -86,8 +87,9 @@ class BudgetState:
 
     holds: Mapping[str, tuple[Hold, ...]]
     spent_usd: float | None
-    reserve_usd: Mapping[str, float | None]
+    reserve_usd: Mapping[str, float | None]  # per model, what one pending or running run is reserved: its bound
     ceiling_usd: float
+    estimate_usd: Mapping[str, float | None] = field(default_factory=dict)  # per model, the mean run else the bound
 
     def reason(self, model: str) -> str | None:
         """Return why the model may not start a run now, or None when it may."""
@@ -157,7 +159,8 @@ class BudgetGate:
         holds, released = self._apply_releases(self._json(HOLDS_KEY), self._json(RELEASED_KEY), now)
         costs = attempt_costs(self.store, self.models, self.token_budget)
         spent = spent_usd(costs)
-        reserve = {m: self._reserve(m, costs) for m in self.models}
+        reserve = {m: self._reserve(m) for m in self.models}
+        estimate = {m: self._estimate(m, costs) for m in self.models}
         flying = {m: sum(1 for x in in_flight if x == m) for m in self.models}
         found: dict[str, list[Hold]] = {}
         over: dict[str, str] = {}
@@ -167,10 +170,17 @@ class BudgetGate:
                 if hold.releasable:
                     over.setdefault(hold.scope, hold.reason)
         self._record_stops(holds, over, now)
-        return BudgetState({m: tuple(v) for m, v in found.items()}, spent, reserve, self.ceiling(ALL, released) or 0.0)
+        return BudgetState(
+            {m: tuple(v) for m, v in found.items()}, spent, reserve, self.ceiling(ALL, released) or 0.0, estimate
+        )
 
-    def _reserve(self, model: str, costs: list) -> float | None:
-        """Return what one more run of the model is expected to cost: its mean, else its bound; None if unpriced."""
+    def _reserve(self, model: str) -> float | None:
+        """Return what one pending or running run of the model is reserved: its bound, always; None if unpriced."""
+        spec = self.models[model]
+        return bound_usd(spec, self.token_budget) if spec.priced else None
+
+    def _estimate(self, model: str, costs: list) -> float | None:
+        """Return what one more run of the model is expected to cost, for reports: its mean, else its bound."""
         spec = self.models[model]
         if not spec.priced:
             return None

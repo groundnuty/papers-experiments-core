@@ -53,16 +53,26 @@ def test_c12_the_runs_in_flight_count_before_their_cost_is_recorded(tmp_path):
     assert "in flight 90.00" in gate.assess(["m1", "m1", "m1"], NOW).reason("m1")
 
 
-def test_c12_a_finished_runs_mean_replaces_the_bound_as_the_expected_cost(tmp_path):
-    """C12: once a run has finished, the next is expected to cost what finished runs cost."""
+def test_c12_a_reservation_is_the_bound_never_the_mean_of_finished_runs(tmp_path):
+    """C12: a $30 ceiling, a $30 bound and a first run at $4.50: the second is held, the mean is only an estimate."""
+    store, _, manifest = planned_store(tmp_path)
+    assert gate_for(store, max_usd=30.0).assess([], NOW).reason("m1") is None  # the first fits its bound exactly
+    run_one(store, keys_of(manifest)[0], finished(**TOKENS))
+    state = gate_for(store, max_usd=30.0).assess([], NOW)
+    assert state.spent_usd == pytest.approx(4.5)
+    assert state.reserve_usd["m1"] == pytest.approx(30.0)  # what a pending or running run is reserved
+    assert state.estimate_usd["m1"] == pytest.approx(4.5)  # for reports and estimates only
+    assert "4.50 + in flight 0.00 + this run 30.00" in state.reason("m1")
+
+
+def test_c12_a_second_run_is_admitted_only_when_the_remaining_budget_covers_the_bound(tmp_path):
+    """C12: spent 4.5 and a bound of 30: 34.5 admits the next run and anything under it holds, in flight or not."""
     store, _, manifest = planned_store(tmp_path)
     run_one(store, keys_of(manifest)[0], finished(**TOKENS))
-    gate = gate_for(store, max_usd=20.0)
-    state = gate.assess([], NOW)
-    assert state.reserve_usd["m1"] == pytest.approx(4.5)
-    assert state.spent_usd == pytest.approx(4.5)
-    assert state.reason("m1") is None
-    assert gate.assess(["m1"] * 3, NOW).reason("m1") is not None  # 4.5 + 13.5 + 4.5 is over 20
+    assert gate_for(store, max_usd=34.5).assess([], NOW).reason("m1") is None
+    assert gate_for(store, max_usd=34.4).assess([], NOW).reason("m1") is not None
+    assert gate_for(store, max_usd=64.5).assess(["m1"], NOW).reason("m1") is None  # a run in flight is also reserved 30
+    assert gate_for(store, max_usd=64.4).assess(["m1"], NOW).reason("m1") is not None
 
 
 def test_c12_an_interrupted_attempt_counts_its_bound_toward_the_spend(tmp_path):
