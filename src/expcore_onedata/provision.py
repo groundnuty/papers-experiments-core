@@ -27,12 +27,12 @@ no token and no credential.
 """
 
 import json
+import re
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from expcore_onedata import consistency
 from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
@@ -41,6 +41,7 @@ from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncove
 from expcore_onedata.rangemap import PlacementSettings, safe_path
 
 LISTING_LIMIT = 1000
+_SEGMENT = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # the charset of a file id the client accepts
 LISTING_ATTRIBUTES = ["name", "file_id", "size", "type"]  # Onedata 25 names attributes in snake case
 SHORT_FILES_SHOWN = 50
 
@@ -131,9 +132,16 @@ def resolve_provider_ids(config: PlatformConfig) -> dict[str, str]:
     return {provider.name: provider.id for provider in config.providers.values() if provider.id is not None}
 
 
-def _quote(identifier: str) -> str:
-    """Quote an opaque id for a path segment."""
-    return quote(identifier, safe="")
+def _segment(identifier: str) -> str:
+    """Return an opaque id as a path segment, unescaped; refuse one that would need escaping.
+
+    The client refuses a mutation path with an escape in it (it could be read as another path), so an id is never
+    percent-encoded here: one outside the plain charset of a file id is refused at the source instead of reaching the
+    client as a path it would reject.
+    """
+    if not isinstance(identifier, str) or not _SEGMENT.fullmatch(identifier):
+        raise PlatformError("an id is not a plain path segment")
+    return identifier
 
 
 def listing_entry(item: Any) -> Entry:
@@ -242,7 +250,7 @@ class Provisioner:
         entries: dict[str, Entry] = {}
         params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
         while True:
-            page = self._client.get(f"/data/{_quote(directory_id)}/children", provider=provider, params=params)
+            page = self._client.get(f"/data/{_segment(directory_id)}/children", provider=provider, params=params)
             if not isinstance(page, dict) or not isinstance(page.get("children"), list):
                 raise PlatformError("a listing answer holds no 'children'")
             for item in page["children"]:
@@ -282,7 +290,7 @@ class Provisioner:
         self._verified()
         answer = self._client.mutate(
             "POST",
-            f"/data/{_quote(parent_id)}/children",
+            f"/data/{_segment(parent_id)}/children",
             provider=self._settings.holder,
             params={"name": name, "type": kind},
         )
@@ -307,13 +315,13 @@ class Provisioner:
         for offset in range(0, len(data), self._settings.chunk_bytes):
             self._client.mutate(
                 "PUT",
-                f"/data/{_quote(file_id)}/content",
+                f"/data/{_segment(file_id)}/content",
                 provider=self._settings.holder,
                 params={"offset": offset},
                 content=data[offset : offset + self._settings.chunk_bytes],
                 timeout_s=self._settings.request_timeout_s,
             )
-        size = self._client.get(f"/data/{_quote(file_id)}", provider=self._settings.holder).get("size")
+        size = self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder).get("size")
         if size != len(data):
             raise ProvisionError("the size read back after an upload is not the size uploaded")
         return file_id
@@ -321,7 +329,7 @@ class Provisioner:
     # -- block maps ------------------------------------------------------------
     def blocks(self, file_id: str, provider: str, *, reader: str | None = None) -> list[Range]:
         """Return the blocks a provider holds of a file, read from the block map as the `reader` provider sees it."""
-        answer = self._client.get(f"/data/{_quote(file_id)}/distribution", provider=reader or provider)
+        answer = self._client.get(f"/data/{_segment(file_id)}/distribution", provider=reader or provider)
         try:
             return provider_blocks(answer, self.provider_id(provider))
         except ValueError as error:
@@ -353,7 +361,7 @@ class Provisioner:
         """
         self._verified()
         return self._client.read_range(
-            f"/data/{_quote(file_id)}/content",
+            f"/data/{_segment(file_id)}/content",
             provider=provider,
             offset=offset,
             length=length,
@@ -484,7 +492,7 @@ class Provisioner:
     def _gone(self, file_id: str) -> bool:
         """Tell whether the data provider has no such entry; any answer but a 404 is "no" for a read that worked."""
         try:
-            self._client.get(f"/data/{_quote(file_id)}", provider=self._settings.holder)
+            self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder)
         except PlatformError as error:
             if error.status == consistency.NOT_FOUND:
                 return True
@@ -505,7 +513,7 @@ class Provisioner:
                     left.append({"path": line["path"], "reason": "holds entries this provisioner did not create"})
                     continue
             try:
-                self._client.mutate("DELETE", f"/data/{_quote(fid)}", provider=self._settings.holder)
+                self._client.mutate("DELETE", f"/data/{_segment(fid)}", provider=self._settings.holder)
             except PlatformError as error:
                 if error.status != consistency.NOT_FOUND:
                     left.append({"path": line["path"], "reason": "the delete was refused or failed"})

@@ -390,7 +390,7 @@ class OnezoneClient:
             raise OutOfScope("the mutation names no space and no file, so it resolves to no space; nothing was sent")
         return self.file_space_name(file_id, provider)
 
-    def _require_study_space(self, name: str) -> None:
+    def _require_in_scope(self, name: str) -> None:
         if not name.startswith(self._config.space.prefixes):
             raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
 
@@ -420,7 +420,7 @@ class OnezoneClient:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
         self._base(provider)  # an undeclared provider is refused before anything is read
-        self._require_study_space(self._target_name(method, path, provider, json))
+        self._require_in_scope(self._target_name(method, path, provider, json))
         return self._send(
             method,
             path,
@@ -450,7 +450,7 @@ class OnezoneClient:
             raise OutOfScope("a range read needs a non-negative offset and a positive length")
         path = _check_path(path)
         self._base(provider)
-        self._require_study_space(self._target_name("GET", path, provider, None))
+        self._require_in_scope(self._target_name("GET", path, provider, None))
         headers = {**self._admin, "Range": f"bytes={offset}-{offset + length - 1}"}
         response = self._request("GET", path, provider=provider, headers=headers, timeout_s=timeout_s)
         label = self._base(provider)[1]

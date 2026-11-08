@@ -192,6 +192,23 @@ def test_put_file_uploads_in_blocks_and_verifies_the_size(provisioner, seeded):
     assert bytes(seeded.nodes[seeded.id_of("scratch/a.bin")].content) == DATA
 
 
+def test_o09_an_id_with_an_equals_sign_reaches_the_gate_unescaped(provisioner, seeded):
+    """O09: the gate refuses an escape in a mutation path, so ids are sent as they are and never percent-encoded."""
+    seeded.id_suffix = "=="
+    provisioner.put_file("scratch/a.bin", DATA)
+    assert provisioner.teardown().ok
+    assert all("%" not in route for _, _, route in seeded.provider_calls)
+    assert any(route.endswith("==/content") for _, method, route in seeded.provider_calls if method == "PUT")
+
+
+def test_o09_an_id_the_gate_would_refuse_is_refused_at_the_source(provisioner, seeded):
+    """O09: an id outside the plain charset is not turned into an escaped path; nothing is sent for it."""
+    seeded.id_suffix = "%2F"
+    with pytest.raises(PlatformError, match="plain path segment"):
+        provisioner.put_file("scratch/a.bin", DATA)
+    assert mutating(seeded) == [("prmock0001", "POST", "/data/root-0001/children")]
+
+
 def test_a_path_that_climbs_out_of_the_space_is_refused(provisioner, seeded):
     """A path with a parent reference or an absolute start never reaches a request."""
     for bad in ("../x", "/abs", "a//b", "a/./b", ""):

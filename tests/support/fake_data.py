@@ -96,6 +96,7 @@ class FakeData(FakeFederation):
         self.transfer_visible_after = 0
         self.root_enoent_polls = 0
         self.page_size = 1000
+        self.id_suffix = ""  # appended to every file id made from now on, for ids with characters like "="
         self.fail_deletes = False  # every DELETE answers 500
         self.ignore_deletes = False  # every DELETE answers 204 and removes nothing
         self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat answers 403
@@ -149,7 +150,7 @@ class FakeData(FakeFederation):
         return next((n.file_id for n in self.nodes.values() if n.parent == parent and n.name == name), None)
 
     def _create(self, parent: str, name: str, kind: str) -> str:
-        file_id = f"fid-{next(self._ids):04d}"
+        file_id = f"fid-{next(self._ids):04d}{self.id_suffix}"
         self.nodes[file_id] = Node(file_id, name, kind, parent)
         return file_id
 
