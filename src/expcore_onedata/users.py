@@ -46,6 +46,7 @@ a slot's users hold are checked, direct and effective, before every token is min
 """
 
 import json
+import os
 import secrets
 import time
 from collections.abc import Callable, Mapping
@@ -151,6 +152,15 @@ def load_slots(
     return Slots(tuple(slots))
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Make a directory's entries durable: a file created in it survives a crash only once this has returned."""
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class TokenJournal:
     """Append-only record of when each slot's tokens end: the slot, the plane and the expiry, never a token.
 
@@ -164,16 +174,25 @@ class TokenJournal:
     def record(
         self, slot: str, plane: str, expires_at: float, *, mint: str | None = None, provisional: bool = False
     ) -> None:
-        """Append one line, flushed at once, so a crash after it cannot lose the expiry."""
+        """Append one line and make it durable before returning: write, flush and fsync the file, and fsync the
+        directory when the line created the file (and that directory's parent when it created the directory), so
+        neither a crash nor a power cut after this call can lose the expiry."""
         line: dict[str, Any] = {"slot": slot, "plane": plane, "expires_at": expires_at}
         if mint is not None:
             line["mint"] = mint
         if provisional:
             line["provisional"] = True
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        directory = self._path.parent
+        new_directory, new_file = not directory.exists(), not self._path.exists()
+        directory.mkdir(parents=True, exist_ok=True)
         with open(self._path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(line) + "\n")
             handle.flush()
+            os.fsync(handle.fileno())
+        if new_file:
+            _fsync_directory(directory)
+        if new_directory:
+            _fsync_directory(directory.parent)
 
     def latest_expiry(self, slot: str) -> float | None:
         """Return the latest end journalled for a slot, or None when none was; raise if the journal is unreadable.

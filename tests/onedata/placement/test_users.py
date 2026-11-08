@@ -1,6 +1,7 @@
 """Leased platform users for the two planes: slots through the core's lease pool, and tokens no free slot outlives."""
 
 import os
+import stat
 
 import pytest
 from placement_support import with_placement
@@ -272,6 +273,62 @@ def test_a_ceiling_the_window_refuses_journals_and_mints_nothing(slots, client, 
     with pytest.raises(TokenRefused, match="finite number"):
         minter.mint(lease, ceiling_s=float("inf"), condition="read")
     assert journal.latest_expiry(lease.key) is None
+    assert not [r for r in fake.requests if r.path.endswith("/tokens/temporary")]
+
+
+def watch_fsync(monkeypatch, events):
+    """Record every os.fsync as a file's or a directory's, and still do it."""
+    real = os.fsync
+
+    def fsync(descriptor):
+        events.append("fsync directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "fsync file")
+        real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+
+
+def test_c19_the_provisional_line_is_durable_before_anything_is_minted(slots, client, tmp_path, monkeypatch):
+    """C19: the line is written, flushed and fsynced before the mint, and the directory is fsynced when the line
+    created the file (and the directory's parent when it created the directory); the exact line, written to a file
+    that exists, is fsynced too."""
+    config, loaded = slots
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    issuer = TokenIssuer(client, config, clock=lambda: NOW)
+    events = []
+    real_mint = issuer.mint_run_tokens
+
+    def mint(**kwargs):
+        events.append("mint")
+        return real_mint(**kwargs)
+
+    monkeypatch.setattr(issuer, "mint_run_tokens", mint)
+    watch_fsync(monkeypatch, events)
+    journal = TokenJournal(tmp_path / "fresh" / "journal")  # neither the directory nor the file exists yet
+    SlotTokens(issuer, config, loaded, journal, clock=lambda: NOW).mint(lease, ceiling_s=CEILING_S, condition="read")
+    assert events == ["fsync file", "fsync directory", "fsync directory", "mint", "fsync file"]
+
+
+def test_c19_a_journal_line_that_cannot_be_made_durable_stops_the_mint(slots, client, tmp_path, fake, monkeypatch):
+    """C19: if the provisional line cannot be fsynced, nothing is minted: a token must never exist that the journal
+    might not hold."""
+    config, loaded = slots
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+
+    def failing(descriptor):
+        raise OSError("the disk refused")
+
+    monkeypatch.setattr(os, "fsync", failing)
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW),
+        config,
+        loaded,
+        TokenJournal(tmp_path / "journal"),
+        clock=lambda: NOW,
+    )
+    with pytest.raises(OSError, match="refused"):
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     assert not [r for r in fake.requests if r.path.endswith("/tokens/temporary")]
 
 
