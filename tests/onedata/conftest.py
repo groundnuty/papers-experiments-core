@@ -2,7 +2,7 @@
 
 import pytest
 from fake_federation import FakeFederation
-from platform_support import ADMIN_ENV, BASELINE, NOW, SPACE_NAME, write_platform
+from platform_support import ADMIN_ENV, BASELINE, NOW, SPACE_NAME, USERS, write_platform
 from record_support import no_secrets_in_the_environment
 
 from expcore_onedata.client import OnezoneClient
@@ -19,11 +19,12 @@ def _clean_environment(no_secrets_in_the_environment):
 
 @pytest.fixture
 def fake(monkeypatch) -> FakeFederation:
-    """A federation with the study space, one provider that supports it, and three users with view and read."""
+    """A federation with the study space, one supporting provider, and three users who can log in and read."""
     federation = FakeFederation(space_name=SPACE_NAME)
     monkeypatch.setenv(ADMIN_ENV, federation.admin_token)
-    for user in ("u-data", "u-tools", "u-svc"):
-        federation.grant(user, BASELINE)
+    for login, (password, user_id) in USERS.items():
+        federation.add_user(login, password, user_id)
+        federation.grant(user_id, BASELINE)
     return federation
 
 

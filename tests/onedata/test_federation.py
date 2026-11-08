@@ -1,7 +1,7 @@
 """O03: discovery returns every provider of the space; the agent is pinned to its declared local provider or refused."""
 
 import pytest
-from platform_support import CEILING_S
+from platform_support import CEILING_S, SVC
 
 from expcore_onedata.federation import (
     FederationUnreadable,
@@ -18,7 +18,7 @@ SPACE = "spmock0001"
 
 @pytest.fixture
 def token(issuer):
-    return issuer.mint(data_path_spec(SPACE), "u-svc", ceiling_s=CEILING_S).reveal()
+    return issuer.mint(data_path_spec(SPACE), SVC, ceiling_s=CEILING_S).reveal()
 
 
 def two_providers(fake):
@@ -100,10 +100,57 @@ def test_o03_an_answer_without_the_space_or_its_providers_is_unreadable_not_empt
         parse_scope(answer, SPACE)
 
 
-def test_o03_a_provider_without_details_is_listed_but_matches_nothing():
-    """O03: a supporting provider whose details Onezone omits is still reported, with unknown fields."""
-    view = parse_scope({"dataAccessScope": {"spaces": {SPACE: {"name": "n", "supports": {"provider-one": {}}}}}}, SPACE)
-    assert [(p.id, p.name, p.domain, p.online) for p in view.providers] == [("provider-one", None, None, None)]
+GOOD_PROVIDER = {"name": "pr", "domain": "a.test", "online": True}
+
+
+def scope_with(provider, space_name="n"):
+    """A scope answer whose one supporting provider has the given details."""
+    return {
+        "dataAccessScope": {
+            "spaces": {SPACE: {"name": space_name, "supports": {"pr-a": {}}}},
+            "providers": {"pr-a": provider},
+        }
+    }
+
+
+BREAKS = [
+    (field, breakage)
+    for field in ("name", "domain", "online")
+    for breakage in ("absent", "null", "wrong type", "empty")
+    if not (field == "online" and breakage == "empty")  # a boolean has no empty form
+]
+
+
+@pytest.mark.parametrize(("field", "breakage"), BREAKS)
+def test_o03_a_provider_field_that_is_absent_or_shaped_otherwise_is_refused_by_name(field, breakage):
+    """O03: nothing is guessed. The name and online fields are unconfirmed by any source, the domain is confirmed;
+    a supporting provider without any of them, or with another shape, makes the answer unreadable, naming the field."""
+    broken = dict(GOOD_PROVIDER)
+    if breakage == "absent":
+        del broken[field]
+    elif breakage == "null":
+        broken[field] = None
+    elif breakage == "wrong type":
+        broken[field] = 7 if field != "online" else "yes"
+    else:
+        broken[field] = ""
+    with pytest.raises(FederationUnreadable, match=f"'{field}'"):
+        parse_scope(scope_with(broken), SPACE)
+
+
+def test_o03_a_supporting_provider_with_no_entry_or_an_unnamed_space_is_refused():
+    """O03: the entry of each supporting provider and the space's name are required."""
+    with pytest.raises(FederationUnreadable, match="no entry in 'providers'"):
+        parse_scope({"dataAccessScope": {"spaces": {SPACE: {"name": "n", "supports": {"pr-a": {}}}}}}, SPACE)
+    answer = scope_with(GOOD_PROVIDER)
+    del answer["dataAccessScope"]["spaces"][SPACE]["name"]
+    with pytest.raises(FederationUnreadable, match="'name' for the space"):
+        parse_scope(answer, SPACE)
+
+
+def test_o03_a_complete_entry_is_read_as_it_is():
+    view = parse_scope(scope_with(GOOD_PROVIDER), SPACE)
+    assert [(p.id, p.name, p.domain, p.online) for p in view.providers] == [("pr-a", "pr", "a.test", True)]
 
 
 def test_o03_supports_may_be_a_list_of_provider_ids_as_well_as_a_mapping():
@@ -111,7 +158,10 @@ def test_o03_supports_may_be_a_list_of_provider_ids_as_well_as_a_mapping():
     answer = {
         "dataAccessScope": {
             "spaces": {SPACE: {"name": "n", "supports": ["pr-b", "pr-a"]}},
-            "providers": {"pr-a": {"domain": "A.test"}, "pr-b": {"domain": "b.test"}},
+            "providers": {
+                "pr-a": {"name": "a", "domain": "A.test", "online": True},
+                "pr-b": {"name": "b", "domain": "b.test", "online": False},
+            },
         }
     }
     view = parse_scope(answer, SPACE)

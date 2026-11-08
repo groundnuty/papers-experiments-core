@@ -23,9 +23,14 @@ prefixes = ["..."]              # a mutation may only name a space whose name st
 providers = ["<name>", ...]     # the declared supporting set; health fails on any difference (O04)
 local = "<name>"                # the agent's own provider; the agent is pinned to it (O03)
 
-[credentials.admin]             # the credential that mints and examines tokens: exactly one of
+[credentials.admin]             # the admin access token that examines tokens and reads privileges: exactly one of
 env = "VARIABLE_NAME"           #   the name of an environment variable, or
 file = "path"                   #   a file (relative to this one), never the value itself
+
+[credentials.users]             # each platform user's own password, from which that user mints its own tokens
+directory_env = "VARIABLE_NAME" # the name of an environment variable that holds the directory of the files, or
+directory = "path"              #   the directory (relative to this file); exactly one of the two
+pattern = "{user}.pass"         # optional: the file of a user, one {user}, mode 0600; never the password itself
 
 [tokens]                        # optional; the lifetime rule of tokens.py
 margin_s = 900                  # a token outlives the run's whole-time ceiling by at least this
@@ -33,10 +38,11 @@ max_excess_s = 600              # and by at most this much more
 mint_headroom_s = 300           # the lifetime asked for beyond the minimum, for the seconds before examination
 max_ttl_s = 86400               # optional: the longest lifetime the platform grants
 
-[principals]                    # optional fixed users for runs that lease none (day-0, health, live checks)
-data_path = "..."
-toolserver = "..."
-service = "..."
+[principals.data_path]          # optional fixed users for runs that lease none (day-0, health, live checks)
+username = "..."                # the login name whose credential file is read
+user_id = "..."                 # the id Onezone gives the user: its privileges, and the subject of its tokens
+[principals.toolserver]         # likewise; never the same user as data_path
+[principals.service]            # likewise; the health check's own user
 
 [toolserver]
 command = "path/to/executable"
@@ -63,37 +69,12 @@ from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
+from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.rights import BASELINE_RIGHTS, KNOWN_RIGHTS, declares_write
 
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 HOSTNAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
-
-
-@dataclass(frozen=True)
-class SecretSource:
-    """Where a secret comes from: the name of an environment variable or the path of a file, never the value."""
-
-    kind: str  # "env" or "file"
-    ref: str
-
-    def describe(self) -> str:
-        """Name the source for a message."""
-        return f"environment variable {self.ref}" if self.kind == "env" else f"file {self.ref}"
-
-    def read(self, environ: Mapping[str, str] | None = None) -> str:
-        """Return the secret; raise ConfigError naming the source, never the value, when it is missing or empty."""
-        if self.kind == "env":
-            value = (os.environ if environ is None else environ).get(self.ref, "")
-        else:
-            try:
-                value = Path(self.ref).read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as error:
-                raise ConfigError(f"{self.describe()}: cannot be read ({type(error).__name__})") from None
-        value = value.strip()
-        if not value:
-            raise ConfigError(f"{self.describe()}: is not set or is empty")
-        return value
 
 
 @dataclass(frozen=True)
@@ -149,9 +130,9 @@ class TokenSettings:
 class Principals:
     """Fixed platform users for the runs that lease none; a leased user comes from the lease instead."""
 
-    data_path: str | None = None
-    toolserver: str | None = None
-    service: str | None = None
+    data_path: Principal | None = None
+    toolserver: Principal | None = None
+    service: Principal | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +173,7 @@ class PlatformConfig:
     space: Space
     support: Support
     admin: SecretSource
+    users: UserCredentials | None
     tokens: TokenSettings
     principals: Principals
     toolserver: ToolServer | None
@@ -329,13 +311,59 @@ def _tokens(section: Section) -> TokenSettings:
     return settings
 
 
+def _principal(section: Section, key: str) -> Principal | None:
+    """Read one optional principal table: its login name and its Onezone id."""
+    if key not in section.data:
+        return None
+    entry = section.section(key)
+    entry.reject_unknown(("username", "user_id"))
+    values = {name: entry.string(name) for name in ("username", "user_id")}
+    for name, value in values.items():
+        if not PLAIN_ID.fullmatch(value):
+            raise entry.fail(name, "must be a plain name of letters, digits and _.@-")
+    return Principal(**values)
+
+
 def _principals(section: Section) -> Principals:
-    """Read the optional [principals] table; the two planes never share a user."""
+    """Read the optional [principals] tables; the two planes never share a user, by name or by id."""
     section.reject_unknown(("data_path", "toolserver", "service"))
-    principals = Principals(*(section.optional_string(k) for k in ("data_path", "toolserver", "service")))
-    if principals.data_path is not None and principals.data_path == principals.toolserver:
+    principals = Principals(*(_principal(section, key) for key in ("data_path", "toolserver", "service")))
+    data, tool = principals.data_path, principals.toolserver
+    if data is not None and tool is not None and (data.username == tool.username or data.user_id == tool.user_id):
         raise section.fail("toolserver", "must be a different principal from data_path")
     return principals
+
+
+def _user_credentials(section: Section, base: Path) -> UserCredentials:
+    """Read [credentials.users]: a directory of per-user files, named by a variable or a path, and a file pattern."""
+    section.reject_unknown(("directory_env", "directory", "pattern"))
+    if ("directory_env" in section.data) == ("directory" in section.data):
+        raise section.fail(None, "must have exactly one of 'directory_env' and 'directory'")
+    pattern = section.optional_string("pattern") or DEFAULT_PATTERN
+    if pattern.count("{user}") != 1 or re.search(r"[/\\]|\.\.|\{(?!user\})", pattern) or pattern.startswith("."):
+        raise section.fail("pattern", "must be a file name with one {user} and no path")
+    if "directory_env" in section.data:
+        name = section.string("directory_env")
+        if not ENV_NAME.fullmatch(name):
+            raise section.fail("directory_env", "must be the name of an environment variable, not a path")
+        return UserCredentials("env", name, pattern)
+    return UserCredentials("dir", str((base / section.string("directory")).resolve()), pattern)
+
+
+def _check_fixed_users(
+    users: UserCredentials | None, principals: Principals, file: Path, environ: Mapping[str, str] | None
+) -> None:
+    """With credentials required, every fixed principal must have a credential file: presence and mode only."""
+    fixed = [p for p in (principals.data_path, principals.toolserver, principals.service) if p is not None]
+    if not fixed:
+        return
+    if users is None:
+        raise ConfigError(f"{file}: [credentials]: key 'users' is required when [principals] declares a user")
+    for principal in fixed:
+        try:
+            users.check(principal.username, environ)
+        except ConfigError as error:
+            raise ConfigError(f"{file}: [principals]: {error}") from None
 
 
 def _condition(name: str, section: Section, base: Path) -> Condition:
@@ -384,8 +412,9 @@ def load_platform(
 ) -> PlatformConfig:
     """Load and validate platform.toml; raise ConfigError naming the file and the key, never a value.
 
-    With `require_secrets` (the default, for a run) the admin credential's source must exist and hold something, so
-    a missing variable fails here and not at the first request.
+    With `require_secrets` (the default, for a run) the admin credential's source must exist and hold something, and
+    each fixed principal must have a credential file that others cannot read, so a missing variable or file fails here
+    and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
     """
     file = Path(path).resolve()
     root = Section(load_toml(file), file, "platform.toml")
@@ -394,7 +423,11 @@ def load_platform(
     zone.reject_unknown(("name", "url"))
     providers = _providers(root)
     credentials = root.section("credentials")
-    credentials.reject_unknown(("admin",))
+    credentials.reject_unknown(("admin", "users"))
+    users = _user_credentials(credentials.section("users"), file.parent) if "users" in credentials.data else None
+    principals = _principals(Section(root.table("principals"), file, "[principals]"))
+    if require_secrets:
+        _check_fixed_users(users, principals, file, environ)
     return PlatformConfig(
         file=file,
         zone=Zone(_name(zone, "name", zone.string("name"), "the zone name"), _url(zone, "url")),
@@ -402,7 +435,8 @@ def load_platform(
         space=_space(root.section("space")),
         support=_support(root.section("support"), providers),
         admin=_secret_source(credentials.section("admin"), file.parent, require=require_secrets, environ=environ),
+        users=users,
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),
-        principals=_principals(Section(root.table("principals"), file, "[principals]")),
+        principals=principals,
         toolserver=_toolserver(root.section("toolserver"), file.parent) if "toolserver" in root.data else None,
     )

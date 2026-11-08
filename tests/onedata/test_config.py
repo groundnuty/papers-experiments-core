@@ -56,6 +56,12 @@ def test_o12_a_missing_credential_fails_at_load_naming_the_source_only(tmp_path,
     assert load(tmp_path, require_secrets=False).admin.ref == ADMIN_ENV
 
 
+def _directory_env_that_is_a_path(data):
+    """Replace the directory with an environment variable name that is really a path."""
+    del data["credentials"]["users"]["directory"]
+    data["credentials"]["users"]["directory_env"] = "a path/not a name"
+
+
 BAD_EDITS = {
     "unknown key": (lambda d: d["space"].update(extra=1), "extra"),
     "url with credentials": (lambda d: d["zone"].update(url=f"https://user:{SENTINEL}@zone.test"), "url"),
@@ -71,7 +77,29 @@ BAD_EDITS = {
     "space without id": (lambda d: d["space"].pop("id"), "id"),
     "credential names a value": (lambda d: d["credentials"].update(admin={"env": f"two words {SENTINEL}"}), "env"),
     "credential with both sources": (lambda d: d["credentials"]["admin"].update(file="x"), "exactly one"),
-    "same principal on both planes": (lambda d: d["principals"].update(toolserver="u-data"), "toolserver"),
+    "same principal id on both planes": (
+        lambda d: d["principals"]["toolserver"].update(user_id=d["principals"]["data_path"]["user_id"]),
+        "toolserver",
+    ),
+    "same login on both planes": (
+        lambda d: d["principals"]["toolserver"].update(username=d["principals"]["data_path"]["username"]),
+        "toolserver",
+    ),
+    "principal with a path for a name": (lambda d: d["principals"]["service"].update(username="../x"), "username"),
+    "principal without an id": (lambda d: d["principals"]["service"].pop("user_id"), "user_id"),
+    "user credentials with both sources": (
+        lambda d: d["credentials"]["users"].update(directory_env="VAR"),
+        "exactly one",
+    ),
+    "user credentials with a path in the pattern": (
+        lambda d: d["credentials"]["users"].update(pattern="../{user}"),
+        "pattern",
+    ),
+    "user credentials with no user in the pattern": (
+        lambda d: d["credentials"]["users"].update(pattern="x.pass"),
+        "pattern",
+    ),
+    "user credentials naming a value": (_directory_env_that_is_a_path, "directory_env"),
     "unknown right": (
         lambda d: d["toolserver"]["conditions"]["read"].update(rights=[*BASELINE, "space_delete"]),
         "rights",
@@ -118,3 +146,47 @@ def test_a_write_right_is_one_of_the_closed_set():
     assert declares_write(MANAGE)
     assert not declares_write(BASELINE)
     assert declares_write(["space_schedule_replication"])
+
+
+def test_o12_a_fixed_principal_without_a_credential_file_fails_at_load_naming_no_value(tmp_path, monkeypatch):
+    """O12: each fixed principal needs a credential file at load; the message names the source, not a value."""
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    write_platform(tmp_path)
+    (tmp_path / "credentials" / "login-svc.pass").unlink()
+    with pytest.raises(ConfigError, match=r"\[principals\].*no credential file") as caught:
+        load_platform(tmp_path / "platform.toml")
+    assert "login-svc" not in str(caught.value)
+    assert load_platform(tmp_path / "platform.toml", require_secrets=False).principals.service.user_id == "u-svc"
+
+
+def test_o12_a_credential_file_that_others_can_read_is_refused_at_load(tmp_path, monkeypatch):
+    """O12: as the earlier code refused it, a password file open to group or others fails the load."""
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    write_platform(tmp_path)
+    (tmp_path / "credentials" / "login-data.pass").chmod(0o644)
+    with pytest.raises(ConfigError, match="readable by others"):
+        load_platform(tmp_path / "platform.toml")
+
+
+def test_o12_principals_need_user_credentials_to_be_declared(tmp_path, monkeypatch):
+    """O12: a fixed principal with nowhere to find its password is a configuration error, not a late one."""
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    with pytest.raises(ConfigError, match="users"):
+        load(tmp_path, lambda d: d["credentials"].pop("users"))
+
+
+def test_o12_the_user_credentials_directory_may_be_named_by_an_environment_variable(tmp_path, monkeypatch):
+    """O12: the directory is a path in the file or the name of a variable that holds it, never the value."""
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    monkeypatch.setenv("PLATFORM_TEST_USERS_DIR", str(tmp_path / "credentials"))
+
+    def use_variable(data):
+        del data["credentials"]["users"]["directory"]
+        data["credentials"]["users"]["directory_env"] = "PLATFORM_TEST_USERS_DIR"
+
+    config = load(tmp_path, use_variable)
+    assert (config.users.kind, config.users.ref) == ("env", "PLATFORM_TEST_USERS_DIR")
+    assert str(tmp_path) not in repr(config.users)
+    monkeypatch.delenv("PLATFORM_TEST_USERS_DIR")
+    with pytest.raises(ConfigError, match="PLATFORM_TEST_USERS_DIR"):
+        load(tmp_path, use_variable)

@@ -41,7 +41,7 @@ def compare(view: SpaceView, config: PlatformConfig) -> Health:
     """Compare the providers the federation reports for the space with the declared set; any difference fails."""
     if view.name != config.space.name:
         return Health(False, "the study space is reported under another name than the declared one")
-    matched: dict[str, bool | None] = {}
+    matched: dict[str, bool] = {}
     undeclared = 0
     for reported in view.providers:
         name = declared_name(config, reported)

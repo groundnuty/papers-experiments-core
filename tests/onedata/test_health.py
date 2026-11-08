@@ -132,3 +132,11 @@ def test_o04_the_check_needs_a_service_principal(tmp_path, fake):
     """O04: without a configured service user there is no token to read with, which fails at construction."""
     with pytest.raises(ConfigError, match="service"):
         health_for(tmp_path, fake, lambda d: d["principals"].pop("service"))
+
+
+def test_o04_a_provider_without_an_online_flag_is_unhealthy_naming_the_field(tmp_path, fake):
+    """O04: nothing is guessed from a scope answer whose provider lacks a field the check reads."""
+    del fake.providers["prmock0001"]["online"]
+    result = health_for(tmp_path, fake)()
+    assert result.ok is False
+    assert "'online'" in result.detail

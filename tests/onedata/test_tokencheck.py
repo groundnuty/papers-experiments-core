@@ -88,10 +88,17 @@ REFUSED = {
     "longer than needed": (info(lifetime=MAX_TTL + 1), "longer"),
     "another principal's": (info(subject="u-other"), "another principal"),
     "not a mapping": ("a string", "parsed"),
-    "no id": ({"subject": {"id": "u-data"}, "caveats": []}, "parsed"),
-    "caveats not a list": ({"id": "t", "subject": {"id": "u-data"}, "caveats": "x"}, "parsed"),
-    "a caveat without a type": ({"id": "t", "subject": {"id": "u-data"}, "caveats": [{"x": 1}]}, "parsed"),
-    "no subject": ({"id": "t", "caveats": []}, "parsed"),
+    "no id": ({"subject": {"id": "u-data"}, "caveats": []}, "'id'"),
+    "caveats not a list": ({"id": "t", "subject": {"id": "u-data"}, "caveats": "x"}, "'caveats'"),
+    "a caveat without a type": ({"id": "t", "subject": {"id": "u-data"}, "caveats": [{"x": 1}]}, "'caveats'"),
+    "no subject": ({"id": "t", "caveats": []}, "'subject.id'"),
+    "a subject that is a string": ({"id": "t", "subject": "u-data", "caveats": []}, "'subject.id'"),
+    "a subject with the id under another key": (
+        {"id": "t", "subject": {"user": "u-data"}, "caveats": []},
+        "'subject.id'",
+    ),
+    "a subject whose id is a number": ({"id": "t", "subject": {"id": 7}, "caveats": []}, "'subject.id'"),
+    "a subject with an empty id": ({"id": "t", "subject": {"id": ""}, "caveats": []}, "'subject.id'"),
 }
 
 

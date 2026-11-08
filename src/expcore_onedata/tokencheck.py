@@ -84,16 +84,30 @@ class Examined:
     caveat_types: tuple[str, ...]
 
 
+def _unparsed(field_name: str, wanted: str) -> TokenRefused:
+    """Refuse an examination that lacks a field or has it in another shape, naming the field and never guessing."""
+    return TokenRefused(f"the examination of the token could not be parsed: {field_name} is not {wanted}")
+
+
 def _parse(info: Any) -> tuple[str, str, list[Mapping[str, Any]]]:
-    """Return the token id, the subject and the caveats of an examination answer; raise TokenRefused if unreadable."""
-    try:
-        token_id, subject, caveats = info["id"], info["subject"]["id"], info["caveats"]
-    except (KeyError, TypeError):
-        raise TokenRefused("the examination of the token could not be parsed") from None
-    ok = isinstance(token_id, str) and token_id and isinstance(subject, str) and subject and isinstance(caveats, list)
-    if not (ok and all(isinstance(c, Mapping) and isinstance(c.get("type"), str) for c in caveats)):
-        raise TokenRefused("the examination of the token could not be parsed")
-    return token_id, subject, caveats
+    """Return the token id, the subject's id and the caveats of an examination answer; refuse if any is not as read.
+
+    `id` and `caveats` are the fields the earlier code read from a real examination. The subject's shape (an `id`
+    under `subject`) is not confirmed by any source, so a subject that is not exactly that is a refusal.
+    """
+    if not isinstance(info, Mapping):
+        raise _unparsed("the answer", "an object")
+    token_id, subject, caveats = info.get("id"), info.get("subject"), info.get("caveats")
+    if not isinstance(token_id, str) or not token_id:
+        raise _unparsed("'id'", "a non-empty string")
+    subject_id = subject.get("id") if isinstance(subject, Mapping) else None
+    if not isinstance(subject_id, str) or not subject_id:
+        raise _unparsed("'subject.id'", "a non-empty string")
+    if not isinstance(caveats, list):
+        raise _unparsed("'caveats'", "a list")
+    if not all(isinstance(c, Mapping) and isinstance(c.get("type"), str) for c in caveats):
+        raise _unparsed("'caveats'", "a list of objects each with a string 'type'")
+    return token_id, subject_id, caveats
 
 
 def _check_shape(caveats: list[Mapping[str, Any]], spec: CaveatSpec) -> None:

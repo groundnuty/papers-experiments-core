@@ -5,10 +5,13 @@ document, lets the test edit the parsed dictionary, and writes it as TOML, so a 
 """
 
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from expcore_onedata.credentials import Principal
 
 NOW = 1_800_000_000.0  # the issuer's clock in tests
 CEILING_S = 600.0  # a run's whole-time ceiling in tests
@@ -17,6 +20,14 @@ SPACE_NAME = "study-a-data"
 SPACE_PREFIX = "study-a-"
 BASELINE = ["space_view", "space_read_data"]
 MANAGE = [*BASELINE, "space_manage_qos"]
+# The test users: login name -> (password, Onezone user id). The password files are written by `platform_data`.
+USERS = {
+    "login-data": ("pw-data-0001", "u-data"),
+    "login-tools": ("pw-tools-0001", "u-tools"),
+    "login-svc": ("pw-svc-0001", "u-svc"),
+}
+DATA, TOOLS, SVC = (Principal(name, USERS[name][1]) for name in ("login-data", "login-tools", "login-svc"))
+CREDENTIALS_DIR = "credentials"
 SUPPORT_DIR = Path(__file__).resolve().parent
 FAKE_TOOL_SERVER = str(SUPPORT_DIR / "fake_onedata_mcp.py")
 
@@ -28,13 +39,24 @@ def platform_data(tmp_path: Path) -> dict[str, Any]:
         manifests[name] = tmp_path / f"{name}.manifest.json"
         if not manifests[name].exists():  # a test that froze a real manifest first keeps it
             manifests[name].write_text("{}", encoding="utf-8")
+    directory = tmp_path / CREDENTIALS_DIR
+    directory.mkdir(exist_ok=True)
+    for login, (password, _) in USERS.items():
+        file = directory / f"{login}.pass"
+        if not file.exists():
+            file.write_text(password + "\n", encoding="utf-8")
+            os.chmod(file, 0o600)
     return {
         "zone": {"name": "zone", "url": "https://zone.test"},
         "providers": {"alpha": {"url": "https://alpha.test"}, "beta": {"url": "https://beta.test"}},
         "space": {"name": SPACE_NAME, "id": "spmock0001", "prefixes": [SPACE_PREFIX]},
         "support": {"providers": ["alpha"], "local": "alpha"},
-        "credentials": {"admin": {"env": ADMIN_ENV}},
-        "principals": {"data_path": "u-data", "toolserver": "u-tools", "service": "u-svc"},
+        "credentials": {"admin": {"env": ADMIN_ENV}, "users": {"directory": CREDENTIALS_DIR}},
+        "principals": {
+            "data_path": {"username": DATA.username, "user_id": DATA.user_id},
+            "toolserver": {"username": TOOLS.username, "user_id": TOOLS.user_id},
+            "service": {"username": SVC.username, "user_id": SVC.user_id},
+        },
         "toolserver": {
             "command": sys.executable,
             "args": [FAKE_TOOL_SERVER],

@@ -17,9 +17,10 @@ Reads and mutations are separate calls:
 - `mutate` is any other method, and it names the space it acts on: it refuses before sending anything unless the
   space's name starts with one of the configured prefixes (`[space] prefixes`), so a mistaken or hostile name cannot
   reach a space outside the study's;
-- `mint_temporary_token` and `revoke_temporary_tokens` are the two operations on credentials. They act on a user's
-  tokens, not on a space, so they have calls of their own; the minted value is registered as a secret (R12) before the
-  call returns, and the credential the client itself uses is registered when the client is built.
+- `mint_own_token` is the one operation on credentials: a platform user mints its own temporary token with its own
+  password (HTTP Basic), as the earlier code did. It acts on no space, so it has a call of its own; the password is
+  registered as a secret when it is read and the minted value before the call returns (R12), and so is the admin token
+  the client itself uses, when the client is built. Tokens are not revoked: they end with their lifetime.
 
 The other halves of O09 (refuse to evict the data provider's own copy, tear down only logged ids, a teardown that finds
 files left revokes nothing) belong to provisioning and the sandbox (step 4b); they call `mutate`.
@@ -38,28 +39,27 @@ client test in a source sends it and reads the answer as this layer does.
   read. Confirmed by [S4] and [S5].
 - `query`: `POST /tokens/infer_access_token_scope`, body `{"token"}`, no header; the answer's
   `dataAccessScope.spaces[*].name` and `.supports` and `.providers[*].domain` are read. Confirmed by [S6].
-- `mint_temporary_token`: `POST /users/{user}/tokens/temporary`, body `{"type": {"accessToken": {}}, "caveats": [...]}`,
-  answer key `token`. The body and the answer are confirmed by [S1]; the **path is not confirmed**.
-- `revoke_temporary_tokens`: `DELETE /users/{user}/tokens/temporary`. **Not confirmed.**
+- `mint_own_token`: `POST /user/tokens/temporary` with `Authorization: Basic` of the user itself, body
+  `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
 - Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
-What the sources show for minting is `POST /user/tokens/temporary` (the singular `user`) authenticated with HTTP Basic
-credentials of the user whose token it is, an admin's own or a leased user's, not the admin's access token acting for
-another user. No source revokes a token: they rely on short lifetimes. `UNVERIFIED_ENDPOINTS` lists what stays
-unconfirmed, and each entry has a live contract test (`tests/live/test_contract.py`) that fails if the deployment
-answers otherwise.
+No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
+which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what no source confirms, and
+each entry has a live contract test (`tests/live/test_contract.py`) that fails if the deployment answers otherwise.
 """
 
+import base64
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
-from urllib.parse import quote
 
 import httpx
 
+from expcore.config.loading import ConfigError
 from expcore.records.redact import register_secret
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.credentials import Principal
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
 API_PROVIDER = "/api/v3/oneprovider"  # [S7]
@@ -74,15 +74,8 @@ READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_acc
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     (
         "POST",
-        "/users/{user}/tokens/temporary",
-        "minting for another user with the admin token; the sources mint at /user/tokens/temporary with the user's own "
-        "credentials [S1]",
-    ),
-    ("DELETE", "/users/{user}/tokens/temporary", "revoking a user's temporary tokens; no source revokes a token"),
-    (
-        "POST",
         "/tokens/examine",
-        "the shape of the answer's subject (an id under subject); the sources read id, caveats [S4]",
+        "the shape of the answer's subject (an id under subject); the sources read id and caveats [S4]",
     ),
     (
         "POST",
@@ -91,7 +84,6 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ),
 )
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
-_USER_ID = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
 DEFAULT_TIMEOUT_S = 15.0
 
 
@@ -141,6 +133,7 @@ class OnezoneClient:
         self._http = http if http is not None else httpx.Client(timeout=timeout_s)
         self._owns_http = http is None
         self._timeout_s = timeout_s
+        self._environ = environ
         credential = admin_token if admin_token is not None else config.admin.read(environ)
         register_secret(credential)
         self._admin = {AUTH_HEADER: credential}
@@ -209,26 +202,26 @@ class OnezoneClient:
             raise OutOfScope("the space is not one of the configured prefixes; nothing was sent")
         return self._send(method, path, provider=provider, headers=self._admin, json=json)
 
-    def mint_temporary_token(self, user_id: str, caveats: Sequence[Mapping[str, Any]]) -> str:
-        """Mint an access token for a user with exactly these caveats; register its value as a secret and return it."""
-        if not _USER_ID.fullmatch(user_id):
-            raise OutOfScope("the user id is not a plain id")
-        body = {"type": {"accessToken": {}}, "caveats": [dict(c) for c in caveats]}  # body and answer key: [S1]
-        # The path is unconfirmed (UNVERIFIED_ENDPOINTS): the sources mint at /user/tokens/temporary, as the user.
+    def mint_own_token(self, principal: Principal, caveats: Sequence[Mapping[str, Any]]) -> str:
+        """Mint a temporary access token for a user, as that user, with exactly these caveats; return the value.
+
+        The user authenticates with its own password (HTTP Basic), read from its credential file the moment it is
+        needed and registered as a secret, and the minted value is registered before it is returned (R12). [S1]
+        """
+        users = self._config.users
+        if users is None:
+            raise PlatformError("zone: platform.toml declares no [credentials.users], so no user can mint a token")
+        try:
+            password = users.read(principal.username, self._environ)
+        except ConfigError as error:
+            raise PlatformError(f"zone: a user's credential cannot be used ({error})") from None
+        basic = base64.b64encode(f"{principal.username}:{password}".encode()).decode()
+        body = {"type": {"accessToken": {}}, "caveats": [dict(c) for c in caveats]}
         answer = self._send(
-            "POST", f"/users/{quote(user_id, safe='')}/tokens/temporary", provider=None, headers=self._admin, json=body
+            "POST", "/user/tokens/temporary", provider=None, headers={"Authorization": f"Basic {basic}"}, json=body
         )
         value = answer.get("token") if isinstance(answer, dict) else None
         if not isinstance(value, str) or not value:
             raise PlatformError("zone: the answer to a token request holds no token")
         register_secret(value)
         return value
-
-    def revoke_temporary_tokens(self, user_id: str) -> None:
-        """Revoke every temporary token of a user; Onezone cannot revoke one of them alone.
-
-        The path is unconfirmed (UNVERIFIED_ENDPOINTS): no source revokes a token.
-        """
-        if not _USER_ID.fullmatch(user_id):
-            raise OutOfScope("the user id is not a plain id")
-        self._send("DELETE", f"/users/{quote(user_id, safe='')}/tokens/temporary", provider=None, headers=self._admin)

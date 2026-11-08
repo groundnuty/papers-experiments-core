@@ -9,7 +9,7 @@ import time
 
 import pytest
 from mcp import StdioServerParameters
-from platform_support import CEILING_S, FAKE_TOOL_SERVER, MANAGE, NOW, write_platform
+from platform_support import CEILING_S, DATA, FAKE_TOOL_SERVER, MANAGE, NOW, TOOLS, write_platform
 from record_support import make_config
 
 from expcore.errors import InfraError
@@ -83,7 +83,7 @@ def world(tmp_path, fake, frozen_manifests):
 
 
 def read_token(issuer, config):
-    return issuer.mint(tool_server_spec(config.space.id, config.condition("read")), "u-tools", ceiling_s=CEILING_S)
+    return issuer.mint(tool_server_spec(config.space.id, config.condition("read")), TOOLS, ceiling_s=CEILING_S)
 
 
 def start(launcher, ctx, condition, token, tmp_path, *, ceiling_s=CEILING_S, record=True):
@@ -116,8 +116,8 @@ def test_the_server_starts_with_the_conditions_allow_list_the_token_and_the_pinn
 def test_each_condition_gets_its_own_allow_list_and_manifest(world, fake, tmp_path):
     """Two conditions differing in tool exposure and rights run from one configuration side by side."""
     config, issuer, launcher = world
-    fake.grant("u-tools", MANAGE)
-    token = issuer.mint(tool_server_spec(config.space.id, config.condition("manage")), "u-tools", ceiling_s=CEILING_S)
+    fake.grant(TOOLS.user_id, MANAGE)
+    token = issuer.mint(tool_server_spec(config.space.id, config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
     tools, _, seen = start(launcher, RecordingContext(), "manage", token, tmp_path)
     assert tools == ["add", "echo", "fail"]
     assert seen[ENV_TOOLS] == "echo,add,fail"
@@ -176,7 +176,7 @@ def test_l13_a_server_that_exposes_a_tool_outside_the_frozen_manifest_fails_the_
 def test_a_token_of_the_other_plane_does_not_start_the_server(world, fake, tmp_path):
     """The tool server takes the tool-server plane's token only; nothing is spawned for another."""
     config, issuer, launcher = world
-    data = issuer.mint(data_path_spec(config.space.id), "u-data", ceiling_s=CEILING_S)
+    data = issuer.mint(data_path_spec(config.space.id), DATA, ceiling_s=CEILING_S)
     assert data.plane is Plane.DATA_PATH
     with pytest.raises(ValueError, match="tool-server plane"):
         start(launcher, RecordingContext(), "read", data, tmp_path)
@@ -184,7 +184,7 @@ def test_a_token_of_the_other_plane_does_not_start_the_server(world, fake, tmp_p
 
 
 def test_a_token_that_no_longer_examines_cleanly_does_not_start_the_server(world, fake, tmp_path):
-    """The token is examined again at launch, fail-closed: a revoked token cannot start the plane."""
+    """The token is examined again at launch, fail-closed: a token Onezone no longer knows cannot start the plane."""
     config, issuer, launcher = world
     token = read_token(issuer, config)
     fake.issued.clear()
@@ -235,7 +235,7 @@ def test_insecure_tls_is_a_setting_of_the_file(tmp_path, fake, frozen_manifests)
     config = load_platform(write_platform(tmp_path, lambda d: d["toolserver"].update(insecure_tls=True)))
     client = OnezoneClient(config, http=fake.client_http())
     token = TokenIssuer(client, config, clock=lambda: NOW).mint(
-        tool_server_spec(config.space.id, config.condition("read")), "u-tools", ceiling_s=CEILING_S
+        tool_server_spec(config.space.id, config.condition("read")), TOOLS, ceiling_s=CEILING_S
     )
     assert server_environment(config, config.condition("read"), token)["ONEDATA_ALLOW_INSECURE_TLS"] == "true"
 

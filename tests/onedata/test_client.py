@@ -4,9 +4,10 @@ import ast
 from pathlib import Path
 
 import pytest
-from platform_support import SPACE_PREFIX
+from platform_support import DATA, SPACE_PREFIX
 
 from expcore_onedata.client import AUTH_HEADER, OnezoneClient, OutOfScope, PlatformError
+from expcore_onedata.credentials import Principal
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "expcore_onedata"
 
@@ -36,7 +37,9 @@ def test_o09_mutate_takes_only_mutating_methods(method, client, fake):
     assert fake.requests == []
 
 
-@pytest.mark.parametrize("path", ["/spaces/x", "/users/x/tokens/temporary", "/tokens/revoke", "/anything"])
+@pytest.mark.parametrize(
+    "path", ["/spaces/x", "/user/tokens/temporary", "/users/x/tokens/temporary", "/tokens/revoke", "/anything"]
+)
 def test_o09_query_takes_only_the_listed_read_only_posts(path, client, fake):
     """O09: a POST that is not on the short list of reading endpoints is refused before it is sent."""
     with pytest.raises(OutOfScope):
@@ -65,13 +68,30 @@ def test_o09_an_undeclared_provider_is_refused(client, fake):
     assert fake.requests == []
 
 
-def test_o09_a_user_id_in_a_token_call_must_be_a_plain_id(client, fake):
-    """O09: the user id goes into a path, so an id with a slash or a dot-dot is refused."""
-    for user in ("a/b", "../x", "", "a b"):
-        with pytest.raises(OutOfScope):
-            client.mint_temporary_token(user, [{"type": "time", "validUntil": 1}])
-        with pytest.raises(OutOfScope):
-            client.revoke_temporary_tokens(user)
+def test_o09_a_user_mints_its_own_token_with_its_own_credential_and_no_other_way_exists(client, fake):
+    """O09: the one credential call logs in as the user (HTTP Basic) at the user's own path; there is no revoke call."""
+    value = client.mint_own_token(DATA, [{"type": "time", "validUntil": 1}])
+    sent = fake.requests[-1]
+    assert (sent.method, sent.path, sent.token) == ("POST", "/api/v3/onezone/user/tokens/temporary", None)
+    assert fake.issued[value]["subject"]["id"] == DATA.user_id
+    assert not hasattr(client, "revoke_temporary_tokens")
+    assert not hasattr(client, "mint_temporary_token")
+
+
+def test_o09_a_wrong_password_or_an_unknown_user_gets_no_token_and_the_error_has_no_secret(client, fake, tmp_path):
+    """O09: a login the federation refuses is a PlatformError with the status only, never the password."""
+    fake.users["login-data"] = ("another-password-9", DATA.user_id)
+    with pytest.raises(PlatformError) as caught:
+        client.mint_own_token(DATA, [{"type": "time", "validUntil": 1}])
+    assert caught.value.status == 401
+    assert "pw-data-0001" not in str(caught.value)
+    assert fake.issued == {}
+
+
+def test_o09_a_user_without_a_credential_file_cannot_mint(client, fake):
+    """O09: no file for the user is an error that names the source and nothing about a value."""
+    with pytest.raises(PlatformError, match="credential cannot be used"):
+        client.mint_own_token(Principal("login-nobody", "u-nobody"), [{"type": "time", "validUntil": 1}])
     assert fake.requests == []
 
 

@@ -5,8 +5,7 @@ a test hands the platform client `fake.client_http()` and no socket is opened. I
 
   POST   /api/v3/onezone/tokens/examine                           (admin credential)
   POST   /api/v3/onezone/tokens/infer_access_token_scope          (the token in the body)
-  POST   /api/v3/onezone/users/{user}/tokens/temporary            (admin credential)
-  DELETE /api/v3/onezone/users/{user}/tokens/temporary            (admin credential)
+  POST   /api/v3/onezone/user/tokens/temporary                    (HTTP Basic of the user itself)
   GET    /api/v3/onezone/spaces/{space}/users/{user}/privileges            (direct)
   GET    /api/v3/onezone/spaces/{space}/effective_users/{user}/privileges  (effective)
 
@@ -18,6 +17,7 @@ Every request is recorded in `.requests`, so a test can assert that a refused mu
 
 from __future__ import annotations
 
+import base64
 import itertools
 import json
 import re
@@ -44,10 +44,14 @@ class FakeFederation(MockOnedata):
         self.mint_hook: Callable[[str, list[dict]], list[dict]] | None = None
         self.examine_hook: Callable[[dict], Any] | None = None
         self.status_override: int | None = None
-        self.revoked_users: list[str] = []
+        self.users: dict[str, tuple[str, str]] = {}  # login name -> (password, user id)
         self._sequence = itertools.count(1)
 
     # -- setup helpers ----------------------------------------------------------
+    def add_user(self, username: str, password: str, user_id: str) -> None:
+        """Register a user who can log in with HTTP Basic and mint its own tokens."""
+        self.users[username] = (password, user_id)
+
     def grant(self, user: str, direct: Iterable[str], effective: Iterable[str] | None = None) -> None:
         """Give a user's privileges in the study space, direct and effective (the same unless said otherwise)."""
         direct = sorted(direct)
@@ -98,6 +102,8 @@ class FakeFederation(MockOnedata):
             if not self._accepts(sent.get("token")):
                 return self._error(401, "unauthorized")
             return httpx.Response(200, json=self._scope())
+        if request.method == "POST" and route == "/user/tokens/temporary":
+            return self._mint(request.headers.get("Authorization"), sent)
         if request.headers.get("X-Auth-Token") != self.admin_token:
             return self._error(401, "unauthorized")
         return self._admin_route(request.method, route, sent)
@@ -106,13 +112,6 @@ class FakeFederation(MockOnedata):
         """Answer the calls that need the admin credential."""
         if method == "POST" and route == "/tokens/examine":
             return self._examine(sent.get("token"))
-        found = re.fullmatch(r"/users/([^/]+)/tokens/temporary", route)
-        if found and method == "POST":
-            return self._mint(found.group(1), sent)
-        if found and method == "DELETE":
-            self.revoked_users.append(found.group(1))
-            self.issued = {v: r for v, r in self.issued.items() if r["subject"]["id"] != found.group(1)}
-            return httpx.Response(204)
         found = re.fullmatch(r"/spaces/([^/]+)/(users|effective_users)/([^/]+)/privileges", route)
         if found and method == "GET":
             entry = self.privileges.get((found.group(1), found.group(3)))
@@ -122,8 +121,22 @@ class FakeFederation(MockOnedata):
             return httpx.Response(200, json={"privileges": entry[kind]})
         return self._error(404, "notFound")
 
-    def _mint(self, user: str, sent: dict) -> httpx.Response:
-        """Issue a temporary token; like the real one it needs a time caveat."""
+    def _login(self, authorization: str | None) -> str | None:
+        """Return the user id of a valid HTTP Basic login, else None."""
+        if not authorization or not authorization.startswith("Basic "):
+            return None
+        try:
+            name, _, password = base64.b64decode(authorization[6:], validate=True).decode().partition(":")
+        except (ValueError, UnicodeDecodeError):
+            return None
+        known = self.users.get(name)
+        return known[1] if known and known[0] == password else None
+
+    def _mint(self, authorization: str | None, sent: dict) -> httpx.Response:
+        """Issue a temporary token to the user who logged in; like the real one it needs a time caveat."""
+        user = self._login(authorization)
+        if user is None:
+            return self._error(401, "unauthorized")
         caveats = list(sent.get("caveats") or [])
         if not any(c.get("type") == "time" for c in caveats):
             return self._error(400, "badValueTokenCaveats")

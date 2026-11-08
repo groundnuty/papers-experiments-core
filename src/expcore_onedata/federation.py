@@ -37,9 +37,9 @@ class ReportedProvider:
     """A provider that supports the space, as Onezone describes it; a field Onezone left out is None."""
 
     id: str
-    name: str | None
-    domain: str | None
-    online: bool | None
+    name: str
+    domain: str
+    online: bool
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ class SpaceView:
     """The study space as the federation reports it: its name and every provider that supports it."""
 
     space_id: str
-    name: str | None
+    name: str
     providers: tuple[ReportedProvider, ...]
 
 
@@ -59,9 +59,13 @@ class Pinned:
     reported: ReportedProvider
 
 
-def _text(value: Any) -> str | None:
-    """Return a value if it is a non-empty string, else None."""
-    return value if isinstance(value, str) and value else None
+def _field(entry: Mapping[str, Any], key: str, kind: type, whose: str) -> Any:
+    """Return a field of the scope answer that must be a non-empty string or a boolean; refuse naming the field."""
+    value = entry.get(key)
+    if not isinstance(value, kind) or (kind is str and not value):
+        article = "a boolean" if kind is bool else "a non-empty string"
+        raise FederationUnreadable(f"zone: the scope answer has no {key!r} for {whose}, or it is not {article}")
+    return value
 
 
 def parse_scope(answer: Any, space_id: str) -> SpaceView:
@@ -74,25 +78,27 @@ def parse_scope(answer: Any, space_id: str) -> SpaceView:
     except (KeyError, TypeError, AttributeError):
         raise FederationUnreadable("zone: the scope answer does not describe the study space") from None
     # The sources only iterate `supports` for provider ids (sandbox.py:500, health.py:64), so it is read as a mapping
-    # keyed by id or as a list of ids; they read the space's name and `providers[id]["domain"]`, and nothing else.
+    # keyed by id or as a list of ids. They read the space's `name` and `providers[id]["domain"]`; `providers[id].name`
+    # and `.online` are not confirmed by any source, so a provider without either, or with another shape, is refused.
     listed = isinstance(supports, Mapping) or (isinstance(supports, list) and all(isinstance(i, str) for i in supports))
     ids = sorted(supports) if listed else []
     if not ids or not isinstance(details, Mapping):
         raise FederationUnreadable("zone: the scope answer lists no supporting provider")
+    space_name = _field(space, "name", str, "the space")
     providers = []
     for provider_id in ids:
         entry = details.get(provider_id)
-        entry = entry if isinstance(entry, Mapping) else {}
-        online = entry.get("online")
+        if not isinstance(entry, Mapping):
+            raise FederationUnreadable("zone: the scope answer has no entry in 'providers' for a supporting provider")
         providers.append(
             ReportedProvider(
                 provider_id,
-                _text(entry.get("name")),
-                (_text(entry.get("domain")) or "").lower() or None,
-                online if isinstance(online, bool) else None,
+                _field(entry, "name", str, "a supporting provider"),
+                _field(entry, "domain", str, "a supporting provider").lower(),
+                _field(entry, "online", bool, "a supporting provider"),
             )
         )
-    return SpaceView(space_id, _text(space.get("name")), tuple(providers))
+    return SpaceView(space_id, space_name, tuple(providers))
 
 
 def read_space(client: OnezoneClient, token: str, space_id: str) -> SpaceView:
@@ -104,7 +110,7 @@ def is_declared(provider: Provider, reported: ReportedProvider) -> bool:
     """Tell whether a reported provider is a declared one: by id when declared, else by the URL's host."""
     if provider.id is not None:
         return reported.id == provider.id
-    return reported.domain is not None and reported.domain == provider.host
+    return reported.domain == provider.host
 
 
 def declared_name(config: PlatformConfig, reported: ReportedProvider) -> str | None:

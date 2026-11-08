@@ -16,7 +16,10 @@ What `TokenIssuer.mint` does, in this order, and refuses at the first failure:
    (O06: `token_window`);
 2. reads the principal's privileges back, direct and effective, and requires exactly the plane's set (O05);
 3. mints with the plane's exact caveats (`CaveatSpec`, shared with the examination);
-4. examines the token fail-closed, against that exact set and the lifetime window. A token that fails is revoked.
+4. examines the token fail-closed, against that exact set and the lifetime window. A token that fails is dropped.
+
+A principal mints its own token with its own credential (`OnezoneClient.mint_own_token`). Tokens are never revoked: no
+source revokes one, so each ends with its lifetime, which derives from the whole-time ceiling (O06).
 
 The minted value is registered with `expcore.records.redact.register_secret` inside the client, before it comes back
 here (R12), and it is wrapped in a `Secret` whose repr and str never show it. A caller reads it with `.reveal()` at the
@@ -37,6 +40,7 @@ from urllib.parse import quote
 
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, TokenSettings
+from expcore_onedata.credentials import Principal
 from expcore_onedata.rights import BASELINE_RIGHTS
 from expcore_onedata.tokencheck import (
     CaveatSpec,
@@ -153,12 +157,12 @@ class TokenIssuer:
         self._config = config
         self._clock = clock
 
-    def _read_privileges(self, subject: str) -> tuple[Any, Any]:
-        """Read a principal's privileges in the study space, direct and effective.
+    def _read_privileges(self, user_id: str) -> tuple[Any, Any]:
+        """Read a user's privileges in the study space, direct and effective.
 
         Both paths and the `privileges` key of the answer are confirmed by the source named in this file's header.
         """
-        space, user = quote(self._config.space.id, safe=""), quote(subject, safe="")
+        space, user = quote(self._config.space.id, safe=""), quote(user_id, safe="")
         answers = [
             self._client.get(f"/spaces/{space}/{kind}/{user}/privileges") for kind in ("users", "effective_users")
         ]
@@ -167,81 +171,64 @@ class TokenIssuer:
         except (KeyError, TypeError):
             raise TokenRefused("the principal's privileges could not be read") from None
 
-    def check_principal(self, spec: PlaneSpec, subject: str) -> None:
+    def check_principal(self, spec: PlaneSpec, principal: Principal) -> None:
         """Require the principal to hold exactly the plane's rights, direct and effective; refuse when unreadable."""
         try:
-            direct, effective = self._read_privileges(subject)
+            direct, effective = self._read_privileges(principal.user_id)
         except PlatformError as error:
             raise TokenRefused(f"the principal's privileges could not be read ({error})") from None
         require_privileges(spec.rights, direct=direct, effective=effective)
 
-    def examine(self, value: str, spec: PlaneSpec, subject: str, window: TokenWindow) -> Examined:
+    def examine(self, value: str, spec: PlaneSpec, user_id: str, window: TokenWindow) -> Examined:
         """Examine a token value against a plane's exact set and the lifetime window; raise TokenRefused otherwise."""
         return require_examined(
             value,
             spec.caveats,
-            subject=subject,
+            subject=user_id,
             examine=lambda token: self._client.query("/tokens/examine", {"token": token}),
             min_ttl_s=window.min_ttl_s,
             max_ttl_s=window.max_ttl_s,
             now=self._clock(),
         )
 
-    def mint(self, spec: PlaneSpec, subject: str, *, ceiling_s: float) -> MintedToken:
-        """Mint a plane's token for a principal and return it only if it passes examination."""
+    def mint(self, spec: PlaneSpec, principal: Principal, *, ceiling_s: float) -> MintedToken:
+        """Mint a plane's token as its principal, with the principal's own credential, and return it only if it passes.
+
+        A token that fails examination is dropped and never returned. Nothing revokes it: no source revokes a token,
+        and it ends with its lifetime, which derives from `ceiling_s` (O06).
+        """
         window = token_window(ceiling_s, self._config.tokens)
-        self.check_principal(spec, subject)
+        self.check_principal(spec, principal)
         valid_until = int(self._clock()) + window.mint_ttl_s
-        value = self._client.mint_temporary_token(subject, spec.caveats.caveats(valid_until))
-        try:
-            examined = self.examine(value, spec, subject, window)
-        except TokenRefused as refused:
-            if not self._revoke_best_effort(subject):
-                refused.add_note("the refused token could not be revoked and stays valid until it expires")
-            raise
-        return MintedToken(spec.plane, subject, examined.token_id, examined.valid_until, Secret(value))
-
-    def _revoke_best_effort(self, subject: str) -> bool:
-        """Revoke a principal's tokens while an error is already on its way; say whether it worked."""
-        try:
-            self._client.revoke_temporary_tokens(subject)
-        except PlatformError:
-            return False
-        return True
-
-    def revoke(self, token: MintedToken) -> None:
-        """Revoke the tokens of a principal when its run ends."""
-        self._client.revoke_temporary_tokens(token.subject)
+        value = self._client.mint_own_token(principal, spec.caveats.caveats(valid_until))
+        examined = self.examine(value, spec, principal.user_id, window)
+        return MintedToken(spec.plane, principal.user_id, examined.token_id, examined.valid_until, Secret(value))
 
     def mint_run_tokens(
         self,
         *,
-        data_user: str,
+        data: Principal,
         ceiling_s: float,
         interface: str = "rest",
-        tool_server: tuple[str, str] | None = None,
+        tool_server: tuple[Principal, str] | None = None,
     ) -> RunTokens:
-        """Mint the data path's token and, given `(user, condition name)`, the tool server's, on separate principals.
+        """Mint the data path's token and, given `(principal, condition name)`, the tool server's, on separate users.
 
-        The two users must differ; the tokens are checked to be different after minting. If anything fails, what was
-        already minted is revoked.
+        The two users must differ by name and by id; the two tokens are checked to be different after minting. A
+        refusal returns neither.
         """
         space = self._config.space.id
-        if tool_server is not None and tool_server[0] == data_user:
+        if tool_server is not None and (
+            tool_server[0].username == data.username or tool_server[0].user_id == data.user_id
+        ):
             raise TokenRefused("the two planes share a principal")
-        data = self.mint(data_path_spec(space, interface), data_user, ceiling_s=ceiling_s)
+        data_token = self.mint(data_path_spec(space, interface), data, ceiling_s=ceiling_s)
         if tool_server is None:
-            return RunTokens(data, None)
-        user, condition = tool_server
-        try:
-            tool = self.mint(tool_server_spec(space, self._config.condition(condition)), user, ceiling_s=ceiling_s)
-            require_distinct(
-                Examined(data.token_id, data.subject, data.expires_at, ()),
-                Examined(tool.token_id, tool.subject, tool.expires_at, ()),
-            )
-        except BaseException as error:
-            for plane, subject in (("data path's", data_user), ("tool server's", user)):
-                if not self._revoke_best_effort(subject):
-                    error.add_note(f"the {plane} token could not be revoked and stays valid until it expires")
-            raise
-        return RunTokens(data, tool)
+            return RunTokens(data_token, None)
+        principal, condition = tool_server
+        tool = self.mint(tool_server_spec(space, self._config.condition(condition)), principal, ceiling_s=ceiling_s)
+        require_distinct(
+            Examined(data_token.token_id, data_token.subject, data_token.expires_at, ()),
+            Examined(tool.token_id, tool.subject, tool.expires_at, ()),
+        )
+        return RunTokens(data_token, tool)
