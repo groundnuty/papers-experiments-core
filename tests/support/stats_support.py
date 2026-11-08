@@ -4,17 +4,11 @@ from expcore.stats.pairing import ContrastSpec
 from expcore.stats.rows import Row
 
 
-def make_row(task, model, seed, score, *, condition=None, cluster="grp-a", outcome="score", **factors):
-    """Build a row with one outcome, the task's cluster under the attribute `group`, and any declared factors."""
-    return Row(
-        task=task,
-        model=model,
-        seed=seed,
-        outcomes={outcome: score},
-        clusters={"group": cluster},
-        factors=dict(factors),
-        condition=condition,
-    )
+def make_row(task, model, seed, score, *, condition="cond-a", cluster="grp-a", outcome="score", **declared):
+    """Build a row as the export writes one: a run key, a condition, every factor, one outcome, the task's cluster."""
+    factors = {"task": task, "model": model, "seed": seed, **declared}
+    run_key = "|".join(f"{name}={value}" for name, value in [*factors.items(), ("condition", condition)])
+    return Row(run_key, condition, factors, {outcome: score}, {"group": cluster})
 
 
 def named(name="a-vs-b", a="cond-a", b="cond-b", *, outcome="score", estimator="wilcoxon_cluster_bootstrap"):

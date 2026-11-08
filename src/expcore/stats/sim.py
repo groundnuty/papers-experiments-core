@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
+from urllib.parse import quote
 
 import numpy as np
 
@@ -57,6 +58,8 @@ class SimSpec:
     n_clusters: int = 25
     tasks_per_cluster: int = 2
     cluster_attribute: str = "group"
+    # the identity order of the run key: task, the declared factors, model and seed unless given
+    order: tuple[str, ...] | None = None
     # planted per-model heterogeneity: (outcome, model, condition) -> additive shift (default 0)
     model_effect: Mapping[tuple[str, str, str], float] = dataclasses.field(default_factory=dict)
     # nuisance shared across conditions (additive; cancels in every contrast)
@@ -83,6 +86,9 @@ class SimSpec:
             raise ValueError("a spec needs conditions, outcomes, models and seeds")
         if self.n_clusters < 1 or self.tasks_per_cluster < 1:
             raise ValueError("n_clusters and tasks_per_cluster must be at least 1")
+        declared = list(next(iter(self.conditions.values())))
+        if self.order is not None and sorted(self.order) != sorted(["task", "model", "seed", *declared]):
+            raise ValueError("order must name task, model, seed and every declared factor exactly once")
         if min(self.model_shift, self.cluster_halfwidth, self.cluster_condition_halfwidth) < 0:
             raise ValueError("noise half-widths cannot be negative")
         for name, outcome in self.outcomes.items():
@@ -110,10 +116,17 @@ class SimSpec:
                 )
 
 
+def run_key_text(order: tuple[str, ...], factors: Mapping[str, str | int]) -> str:
+    """Write a run key the way the campaign does: name=value pairs in the identity order, values percent-encoded."""
+    return "|".join(f"{name}={quote(str(factors[name]), safe='')}" for name in order)
+
+
 def simulate(spec: SimSpec, rng: np.random.Generator) -> list[Row]:
     """Draw one row per cluster, task, condition, model and seed, with the planted effects and the stated noise."""
     spec.validate()
     uniform = rng.uniform
+    declared = list(next(iter(spec.conditions.values())))
+    order = spec.order or ("task", *declared, "model", "seed")
     clusters = [f"c{i:02d}" for i in range(spec.n_clusters)]
     shifts = {
         name: {
@@ -137,15 +150,14 @@ def simulate(spec: SimSpec, rng: np.random.Generator) -> list[Row]:
                             name: _draw(spec, rng, name, outcome, shifts[name], i, condition, model)
                             for name, outcome in spec.outcomes.items()
                         }
+                        factors = {"task": task, "model": model, "seed": seed, **assignment}
                         rows.append(
                             Row(
-                                task=task,
-                                model=model,
-                                seed=seed,
-                                outcomes=outcomes,
-                                clusters={spec.cluster_attribute: cluster},
-                                factors=dict(assignment),
+                                run_key=run_key_text(order, factors),
                                 condition=condition,
+                                factors={name: factors[name] for name in order},
+                                outcomes=outcomes,
+                                attributes={spec.cluster_attribute: cluster},
                             )
                         )
     return rows

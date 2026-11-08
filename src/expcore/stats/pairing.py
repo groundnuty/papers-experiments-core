@@ -1,11 +1,13 @@
 # Provenance: new
 """Pairing: rows to paired cluster differences, for a named-condition contrast or a factor contrast.
 
-A named-condition contrast compares condition A with condition B and pairs rows on task, model and seed. A factor
-contrast names the factor that varies, takes two of its levels and pairs on every other factor: task, model, seed
-and each other declared factor. Pairs are aggregated in plain-mean stages: pairs to (task, model), tasks to
-(cluster, model). A pair with a missing outcome (None or NaN) on either side is excluded and counted, never read as
-0 (R10, S05); a cluster left without any pair is dropped and counted (S03).
+A named-condition contrast compares condition A with condition B and pairs rows on the run identity that two
+conditions share: task, model and seed. A factor contrast names the factor that varies, takes two of its levels and
+pairs on every other factor of the run key: task, model, seed and each other declared factor. The conditions and the
+factors are those of the campaign's factor schema, which the preregistration is validated against when it is loaded;
+rows carry them as the campaign export writes them. Pairs are aggregated in plain-mean stages: pairs to
+(task, model), tasks to (cluster, model). A pair with a missing outcome (None or NaN) on either side is excluded
+and counted, never read as 0 (R10, S05); a cluster left without any pair is dropped and counted (S03).
 """
 
 from __future__ import annotations
@@ -66,32 +68,29 @@ class Pairing:
 def _arm(row: Row, spec: ContrastSpec) -> int | None:
     """Return 0 for arm A, 1 for arm B, None for a row the contrast does not use."""
     if spec.factor is None:
-        if row.condition is None:
-            raise ValueError(
-                f"contrast {spec.name!r}: {row.describe()} has no condition, which a named-condition contrast needs"
-            )
         selector = row.condition
     else:
         if spec.factor not in row.factors:
             raise ValueError(f"contrast {spec.name!r}: {row.describe()} has no factor {spec.factor!r}")
-        selector = row.factors[spec.factor]
+        selector = str(row.factors[spec.factor])
     arms = spec.arms
     return arms.index(selector) if selector in arms else None
 
 
 def _key(row: Row, spec: ContrastSpec) -> tuple:
-    """The pairing key: task, model and seed, plus every other declared factor for a factor contrast."""
-    base = (row.task, row.model, str(row.seed))
+    """The pairing key from the run identity: task, model and seed, and for a factor contrast the other factors."""
+    base = (row.task, row.model, row.seed)
     if spec.factor is None:
         return base
-    return (*base, tuple(sorted((k, v) for k, v in row.factors.items() if k != spec.factor)))
+    others = (name for name in row.factors if name not in ("task", "model", "seed", spec.factor))
+    return (*base, tuple(sorted((name, str(row.factors[name])) for name in others)))
 
 
 def _cluster(row: Row, spec: ContrastSpec, known: dict[str, str]) -> str:
     """Return the row's cluster, checking that every row of a task names the same one."""
-    if spec.cluster not in row.clusters:
+    if spec.cluster not in row.attributes:
         raise ValueError(f"contrast {spec.name!r}: {row.describe()} has no cluster attribute {spec.cluster!r}")
-    cluster = row.clusters[spec.cluster]
+    cluster = row.attributes[spec.cluster]
     if known.setdefault(row.task, cluster) != cluster:
         raise ValueError(f"contrast {spec.name!r}: task {row.task!r} belongs to two clusters by {spec.cluster!r}")
     return cluster

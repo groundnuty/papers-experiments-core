@@ -5,6 +5,7 @@ import dataclasses
 import numpy as np
 import pytest
 
+from expcore.campaign.factors import FactorSchema
 from expcore.stats.rows import Row
 from expcore.stats.sim import OutcomeSpec, SimSpec, simulate
 
@@ -27,9 +28,10 @@ def test_the_rows_cover_the_design_in_the_shape_the_pipeline_reads():
     assert len(rows) == 4 * 2 * 2 * 2 * 2
     assert all(isinstance(row, Row) for row in rows)
     first = rows[0]
-    assert (first.task, first.model, first.seed, first.condition) == ("c00-t0", "model-a", 1, "cond-a")
-    assert first.factors == {"gate": "open"}
-    assert first.clusters == {"group": "c00"}
+    assert (first.task, first.model, first.seed, first.condition) == ("c00-t0", "model-a", "1", "cond-a")
+    assert dict(first.factors) == {"task": "c00-t0", "gate": "open", "model": "model-a", "seed": 1}
+    assert first.run_key == "task=c00-t0|gate=open|model=model-a|seed=1"
+    assert first.attributes == {"group": "c00"}
     assert set(first.outcomes) == {"rate", "cost"}
     assert {row.task for row in rows} == {f"c{i:02d}-t{j}" for i in range(4) for j in range(2)}
 
@@ -125,3 +127,20 @@ def test_outcomes_go_missing_independently_of_their_value():
         spec(outcomes={"p": OutcomeSpec("proportion", {"cond-a": 0.5, "cond-b": 0.5})}), np.random.default_rng(6)
     )
     assert all(row.outcomes["p"] is not None for row in with_zero)
+
+
+def test_the_run_keys_are_the_ones_the_campaign_writes_for_the_same_design():
+    """The simulator formats run keys itself, so a test holds it to the factor schema's format, order and encoding."""
+    s = spec(order=("model", "gate", "task", "seed"))
+    schema = FactorSchema({"gate": ["open", "shut"]}, s.order, CONDITIONS)
+    for row in simulate(s, np.random.default_rng(1)):
+        key = schema.key(row.condition, row.task, row.model, int(row.seed))
+        assert row.run_key == key.text
+        assert dict(row.factors) == key.factors
+        assert schema.condition_named(row.factors) == row.condition
+
+
+def test_the_identity_order_must_name_every_factor_once():
+    """A run key needs task, model, seed and each declared factor exactly once."""
+    with pytest.raises(ValueError, match="order must name task, model, seed and every declared factor exactly once"):
+        simulate(spec(order=("task", "model", "seed")), np.random.default_rng(0))

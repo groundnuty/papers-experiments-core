@@ -11,6 +11,12 @@ from expcore.stats.pairing import ContrastSpec, pair_rows
 from expcore.stats.rows import Row
 
 
+def bad_row(outcomes, attributes):
+    """A row for condition cond-a with the given outcomes and task attributes, built as the export would."""
+    factors = {"task": "task-a", "model": "model-a", "seed": 1}
+    return Row("task=task-a|model=model-a|seed=1|condition=cond-a", "cond-a", factors, outcomes, attributes)
+
+
 def basic_rows():
     """Two clusters by two models; the hand-computed matrix is [[0.15, nan], [0.4, 0.0]]."""
     rows = []
@@ -142,19 +148,20 @@ def test_a_seed_is_compared_as_text_so_1_and_the_string_1_are_one_seed():
 def test_two_rows_with_one_run_key_in_an_arm_are_refused():
     """Run keys are unique; a repeated attempt is not averaged away."""
     rows = [*both_arms("task-a", "model-a", 1, 0.9, 0.5), make_row("task-a", "model-a", 1, 0.8, condition="cond-a")]
-    with pytest.raises(ValueError, match=r"share one run key \(task 'task-a', model 'model-a', seed 1\)"):
+    with pytest.raises(
+        ValueError, match=r"share one run key \(run 'task=task-a\|model=model-a\|seed=1\|condition=cond-a'\)"
+    ):
         pair_rows(rows, named())
 
 
 @pytest.mark.parametrize(
     ("row", "message"),
     [
-        (Row("task-a", "model-a", 1, {}, {"group": "grp-a"}, {}, "cond-a"), "has no outcome 'score'"),
-        (Row("task-a", "model-a", 1, {"score": 0.1}, {}, {}, "cond-a"), "has no cluster attribute 'group'"),
-        (Row("task-a", "model-a", 1, {"score": 0.1}, {"group": "grp-a"}, {}, None), "has no condition"),
-        (Row("task-a", "model-a", 1, {"score": True}, {"group": "grp-a"}, {}, "cond-a"), "must be a number or None"),
-        (Row("task-a", "model-a", 1, {"score": "0.1"}, {"group": "grp-a"}, {}, "cond-a"), "must be a number or None"),
-        (Row("task-a", "model-a", 1, {"score": math.inf}, {"group": "grp-a"}, {}, "cond-a"), "is infinite"),
+        (bad_row({}, {"group": "grp-a"}), "has no outcome 'score'"),
+        (bad_row({"score": 0.1}, {}), "has no cluster attribute 'group'"),
+        (bad_row({"score": True}, {"group": "grp-a"}), "must be a number or None"),
+        (bad_row({"score": "0.1"}, {"group": "grp-a"}), "must be a number or None"),
+        (bad_row({"score": math.inf}, {"group": "grp-a"}), "is infinite"),
     ],
 )
 def test_a_malformed_row_is_refused_and_named(row, message):
@@ -163,7 +170,7 @@ def test_a_malformed_row_is_refused_and_named(row, message):
     with pytest.raises(ValueError, match=message) as caught:
         pair_rows(rows, named())
     assert "'a-vs-b'" in str(caught.value)
-    assert "task 'task-a'" in str(caught.value)
+    assert "run 'task=task-a|model=model-a|seed=1" in str(caught.value)
 
 
 def test_a_factor_contrast_refuses_a_row_without_the_factor():

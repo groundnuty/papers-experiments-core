@@ -1,22 +1,59 @@
-"""The row the analysis consumes."""
+"""The row the analysis consumes, in the field names of the campaign export."""
 
 import dataclasses
 
 import pytest
 
+from expcore.campaign.factors import FactorSchema
 from expcore.stats.rows import Row
 
+FACTORS = {"task": "task-a", "gate": "open", "model": "model-a", "seed": 3}
 
-def test_a_row_names_its_run_by_the_built_in_factors_and_never_echoes_an_outcome():
-    """Messages built from a row carry the task, the model and the seed, and nothing a scorer computed."""
-    row = Row("task-a", "model-a", 3, {"score": 0.123456}, {"group": "grp-a"})
-    assert row.describe() == "task 'task-a', model 'model-a', seed 3"
+
+def test_a_row_names_its_run_by_the_run_key_and_never_echoes_an_outcome():
+    """Messages built from a row carry the run key, and nothing a scorer computed."""
+    row = Row("task=task-a|model=model-a|seed=3", "cond-a", FACTORS, {"score": 0.123456}, {"group": "grp-a"})
+    assert row.describe() == "run 'task=task-a|model=model-a|seed=3'"
     assert "0.1234" not in row.describe()
 
 
-def test_a_row_is_immutable_and_its_optional_parts_default_to_empty():
-    """Rows are values: they carry no condition and no factors unless given."""
-    row = Row("task-a", "model-a", 1, {"score": None})
-    assert (row.clusters, row.factors, row.condition) == ({}, {}, None)
+def test_the_built_in_factors_read_from_the_factors_with_the_seed_as_text():
+    """Task, model and seed are the pairing identity; the seed is compared the way the run key writes it."""
+    row = Row("key", "cond-a", FACTORS, {})
+    assert (row.task, row.model, row.seed) == ("task-a", "model-a", "3")
+
+
+def test_a_row_without_a_built_in_factor_is_refused():
+    """Every pairing key is made of task, model and seed, so a row that lacks one is not an analysed run."""
+    with pytest.raises(ValueError, match=r"run 'key': factors lack the built-in 'model', 'seed'"):
+        Row("key", "cond-a", {"task": "task-a"}, {})
+
+
+def test_a_row_is_immutable_and_its_attributes_default_to_empty():
+    """Rows are values."""
+    row = Row("key", "cond-a", FACTORS, {"score": None})
+    assert row.attributes == {}
     with pytest.raises(dataclasses.FrozenInstanceError):
-        row.task = "other"
+        row.condition = "other"
+
+
+def test_from_export_reads_the_fields_the_campaign_export_writes():
+    """The identity comes from an `analysed_attempts` entry as the export writes it; scores and attributes join it."""
+    schema = FactorSchema({"gate": ["open", "shut"]}, ["task", "gate", "model", "seed"], {"cond-a": {"gate": "open"}})
+    key = schema.key("cond-a", "task-a", "model-a", 3)
+    entry = {
+        "run_key": key.text,
+        "digest": key.digest,
+        "condition": "cond-a",
+        "factors": key.factors,
+        "attempt": 1,
+        "run_dir": "somewhere",
+        "treatment": False,
+        "infra_kind": None,
+    }
+    row = Row.from_export(entry, {"score": 0.5}, {"group": "grp-a"})
+    assert (row.run_key, row.condition, dict(row.factors)) == (key.text, "cond-a", key.factors)
+    assert (row.task, row.model, row.seed) == ("task-a", "model-a", "3")
+    assert (dict(row.outcomes), dict(row.attributes)) == ({"score": 0.5}, {"group": "grp-a"})
+    with pytest.raises(ValueError, match="export entry has no 'condition'"):
+        Row.from_export({"run_key": "key", "factors": FACTORS}, {})
