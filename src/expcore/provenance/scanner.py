@@ -251,7 +251,39 @@ def _scan_python(path: str, text: str, hashes: Hashes) -> set[Finding]:
     scan = _PythonScan(path, hashes)
     for tok in tokens:
         scan.feed(tok)
-    return scan.finish()
+    found = scan.finish()
+    return found | _scan_constants(path, body, hashes, found)
+
+
+def _scan_constants(path: str, body: str, hashes: Hashes, known: set[Finding]) -> set[Finding]:
+    """Check every string or bytes constant the parser sees, as whole values; nothing if the source does not parse.
+
+    The parser has already merged adjacent literals and the literal parts of f-strings, so forms the token pass
+    cannot follow (a literal inside an f-string expression, a literal next to an f-string) are covered here.
+    A finding the token pass already made inside the same constant is not repeated.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)  # an invalid escape is still a literal worth scanning
+            tree = ast.parse(body)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return set()
+    found: set[Finding] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str | bytes):
+            continue
+        value = node.value if isinstance(node.value, str) else node.value.decode("utf-8", errors="ignore")
+        digests = {digest for _, digest in _hits(value, hashes)}
+        whole = _whole_hit(value, hashes)
+        if whole:
+            digests.add(whole)
+        last = node.end_lineno or node.lineno
+        for digest in digests:
+            prefix = digest[:FINDING_PREFIX_CHARS]
+            seen = any(f.kind == "string" and f.hash_prefix == prefix and node.lineno <= f.line <= last for f in known)
+            if not seen:
+                found.add(Finding(path, node.lineno, "string", prefix))
+    return found
 
 
 def _path_digests(path: str, hashes: Hashes) -> set[str]:

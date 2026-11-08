@@ -140,3 +140,10 @@ def test_history_flag_makes_a_bare_revision_stand_for_its_whole_ancestry(history
     assert st.main([*base, third]) == 0
     assert st.main([*base, "--history", third]) == 1
     assert st.main([*base, "--history", first]) == 0
+
+
+def test_the_path_of_a_binary_file_is_checked_though_its_content_is_skipped(repo, hash_file):
+    (repo.path / f"{LONG_NAME}.bin").write_bytes(b"\0\1\2")
+    sha = repo.commit("binary with a revealing name")
+    found = st.check_commits(repo.path, [sha], st.load_hashes(hash_file))
+    assert [(f.path, f.kind) for _, f in found] == [("<path redacted>", "path")]

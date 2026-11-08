@@ -102,6 +102,12 @@ def repository_files(root: Path = Path()) -> list[Path]:
     return [root / name for name in names if (root / name).is_file()]
 
 
+def _scan_bytes(path: str, data: bytes, hashes: Hashes) -> list[Finding]:
+    """Scan a file's path always, and its content unless it is binary."""
+    text = _decode(data)
+    return scan_source(path, "" if text is None else text, hashes)
+
+
 def scan_paths(paths: Iterable[Path], hashes: Hashes) -> list[Finding]:
     """Scan files and directories (recursively); raise FileNotFoundError for a path that does not exist."""
     findings: list[Finding] = []
@@ -110,9 +116,8 @@ def scan_paths(paths: Iterable[Path], hashes: Hashes) -> list[Finding]:
             raise FileNotFoundError(f"no such path: {root}")
         for file in [root] if root.is_file() else _walk(root):
             shown = _display(file)
-            text = None if shown in EXCLUDED_PATHS else _decode(file.read_bytes())
-            if text is not None:
-                findings.extend(scan_source(shown, text, hashes))
+            if shown not in EXCLUDED_PATHS:
+                findings.extend(_scan_bytes(shown, file.read_bytes(), hashes))
     return findings
 
 
@@ -123,9 +128,8 @@ def check_commits(
     results: list[tuple[str, Finding]] = []
     for sha in resolve_commits(repo, revs, history=history):
         for path in changed_files(repo, sha):
-            text = None if path in EXCLUDED_PATHS else _decode(read_blob(repo, sha, path))
-            if text is not None:
-                results.extend((sha, finding) for finding in scan_source(path, text, hashes))
+            if path not in EXCLUDED_PATHS:
+                results.extend((sha, f) for f in _scan_bytes(path, read_blob(repo, sha, path), hashes))
     return results
 
 

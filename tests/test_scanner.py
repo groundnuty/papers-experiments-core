@@ -1,5 +1,7 @@
 """Scanner details: scope, path disclosure, f-strings, adjacent literals and edge separators. Names are invented."""
 
+from pathlib import Path
+
 import pytest
 
 from expcore.provenance import study_tokens as st
@@ -87,6 +89,14 @@ def test_path_under_docs_is_matched_against_all_scope_only(hashes):
     assert [f.kind for f in st.scan_source(f"docs/{NAME}.md", "text\n", hashes)] == ["path"]
 
 
+def test_scan_paths_checks_the_path_of_a_binary_file_but_not_its_content(tmp_path, hashes, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / f"{NAME}.bin").write_bytes(b"\0" + NAME.encode())
+    (tmp_path / "clean.bin").write_bytes(b"\0" + NAME.encode())
+    findings = st.scan_paths([Path(".")], hashes)
+    assert [(f.path, f.kind) for f in findings] == [(REDACTED_PATH, "path")]
+
+
 def test_scan_paths_hides_a_matching_path(tmp_path, hashes, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / NAME).mkdir()
@@ -128,10 +138,10 @@ def test_an_fstring_without_replacement_fields_is_one_whole_literal(hashes):
     assert lines_and_kinds(st.scan_source("m.py", 'x = rf"{{zq}}"\n', hashes)) == []
 
 
-def test_an_fstring_with_a_field_is_not_a_whole_literal(hashes):
-    assert st.scan_source("m.py", f'x = f"{SHORT}{{y}}"\n', hashes) == []
-    assert st.scan_source("m.py", f'x = f"{{y}}{SHORT}"\n', hashes) == []
-    assert st.scan_source("m.py", f'x = f"{SHORT}{{f"{{y}}"}}"\n', hashes) == []
+def test_the_literal_parts_of_an_fstring_with_fields_are_checked_as_whole_values(hashes):
+    for source in (f'x = f"{SHORT}{{y}}"\n', f'x = f"{{y}}{SHORT}"\n', f'x = f"{SHORT}{{f"{{y}}"}}"\n'):
+        assert lines_and_kinds(st.scan_source("m.py", source, hashes)) == [(1, "string")], source
+    assert st.scan_source("m.py", f'x = f"{SHORT}-{{y}}"\n', hashes) == []  # the part is "zq-", not the token
 
 
 def test_fstring_parts_still_match_embedded_tokens(hashes):
@@ -193,3 +203,53 @@ def test_twenty_four_component_tokens_are_found(hashes):
     long_hashes = st.parse_hash_file(st.render_hash_file([token]), "test")
     assert st.scan_source("a.txt", f"see {token}\n", long_hashes)
     assert st.scan_source("a.txt", f"see x.{token}.y\n", long_hashes)
+
+
+# --- constants the parser has merged --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "x = f\"{'secret-' 'space'}\"\n",
+        'x = "secret-" f"space{1}"\n',
+        'x = f"{1}secret-" "space"\n',
+        'x = f"{1}" "secret-" f"space{1}"\n',
+        "x = f\"{y:{'secret-' 'space'}}\"\n",
+        "x = (\n    'secret-'\n    f'space{1}'\n)\n",
+        "x = b'secret-' b'space'\n",
+        "x = b'secret-\\xffspace'\n",
+    ],
+)
+def test_literals_the_parser_merges_are_checked_as_one_value(source, hashes):
+    found = st.scan_source("m.py", source, hashes)
+    assert found, source
+    assert {f.kind for f in found} == {"string"}
+    assert {f.hash_prefix for f in found} == {st.token_hash(NAME)[:12]}
+
+
+def test_ast_findings_carry_the_line_of_the_constant(hashes):
+    source = "a = 1\nb = (\n    f'{a}' 'secret-'\n    'space'\n)\n"
+    assert lines_and_kinds(st.scan_source("m.py", source, hashes)) == [(3, "string")]
+
+
+def test_literals_that_are_not_contiguous_after_merging_are_not_joined(hashes):
+    assert st.scan_source("m.py", 'x = "secret-" f"{y}space"\n', hashes) == []
+    assert st.scan_source("m.py", "x = f\"{'secret-'}{'space'}\"\n", hashes) == []
+
+
+def test_a_finding_the_token_pass_made_is_not_repeated_by_the_constant_pass(hashes):
+    source = f'doc = """first\nsecond\nthird {NAME}\n"""\n'
+    assert lines_and_kinds(st.scan_source("m.py", source, hashes)) == [(3, "string")]
+
+
+def test_source_that_does_not_parse_keeps_only_the_token_pass(hashes):
+    valid = "x = f\"{'secret-' 'space'}\" + 'a'\n"
+    broken = "x = f\"{'secret-' 'space'}\" +\n"
+    assert st.scan_source("m.py", valid, hashes)
+    assert st.scan_source("m.py", broken, hashes) == []
+    assert lines_and_kinds(st.scan_source("m.py", f'x = "{NAME}" +\n', hashes)) == [(1, "string")]
+
+
+def test_an_invalid_escape_in_a_literal_does_not_stop_the_scan(hashes):
+    assert lines_and_kinds(st.scan_source("m.py", f'x = "\\d {NAME}"\n', hashes)) == [(1, "string")]
