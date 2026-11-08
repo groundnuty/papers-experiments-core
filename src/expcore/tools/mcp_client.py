@@ -7,19 +7,20 @@ ForgeOpenAILeg: spawn -> initialize -> list_tools -> call_tool), but reusable ac
 The server is the published groundnuty/onedata-mcp; its command comes from config. Tests drive
 a fake MCP server over the real stdio protocol.
 """
+
 from __future__ import annotations
 
 import contextlib
+import json
+from collections.abc import Iterable
+from typing import Any
 
 import anyio
-import json
-from typing import Any, Iterable
+from mcp import ClientSession, MCPError, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import CONNECTION_CLOSED, INTERNAL_ERROR
 
 from .errors import InfraError
-
-from mcp import ClientSession, MCPError, StdioServerParameters
-from mcp.types import CONNECTION_CLOSED, INTERNAL_ERROR
-from mcp.client.stdio import stdio_client
 
 
 def _attr(o: Any, snake: str, camel: str, default: Any = None) -> Any:
@@ -43,15 +44,16 @@ def mcp_result_to_text(result: Any) -> str:
 class KnowledgePlane:
     """Async context manager around one MCP server session (one per run)."""
 
-    def __init__(self, command: str, args: Iterable[str] = (), env: dict | None = None,
-                 allowed_tools: Iterable[str] = ()):
+    def __init__(
+        self, command: str, args: Iterable[str] = (), env: dict | None = None, allowed_tools: Iterable[str] = ()
+    ):
         self._params = StdioServerParameters(command=command, args=list(args), env=env)
         self._allowed = set(allowed_tools)
         self._stack = contextlib.AsyncExitStack()
         self._session: ClientSession | None = None
         self.tool_defs: list[dict] = []
 
-    async def __aenter__(self) -> "KnowledgePlane":
+    async def __aenter__(self) -> KnowledgePlane:
         try:
             read, write = await self._stack.enter_async_context(stdio_client(self._params))
             self._session = await self._stack.enter_async_context(ClientSession(read, write))
@@ -62,9 +64,13 @@ class KnowledgePlane:
             if missing:
                 raise RuntimeError(f"knowledge server does not expose tools: {sorted(missing)}")
             self.tool_defs = [
-                {"name": n, "description": t.description or "",
-                 "input_schema": _attr(t, "input_schema", "inputSchema") or {"type": "object", "properties": {}}}
-                for n, t in sorted(by_name.items()) if not self._allowed or n in self._allowed
+                {
+                    "name": n,
+                    "description": t.description or "",
+                    "input_schema": _attr(t, "input_schema", "inputSchema") or {"type": "object", "properties": {}},
+                }
+                for n, t in sorted(by_name.items())
+                if not self._allowed or n in self._allowed
             ]
         except BaseException:
             await self._stack.aclose()
@@ -84,8 +90,14 @@ class KnowledgePlane:
         try:
             res = await self._session.call_tool(name, args)
             return mcp_result_to_text(res), bool(_attr(res, "is_error", "isError", False))
-        except (ConnectionError, EOFError, BrokenPipeError, anyio.ClosedResourceError,
-                anyio.BrokenResourceError, anyio.EndOfStream) as e:
+        except (
+            ConnectionError,
+            EOFError,
+            BrokenPipeError,
+            anyio.ClosedResourceError,
+            anyio.BrokenResourceError,
+            anyio.EndOfStream,
+        ) as e:
             raise InfraError("knowledge", f"{type(e).__name__}: {e}"[:500]) from e
         except MCPError as e:
             # Server-side failures only are infra: the connection closed under us (the server crashed or
@@ -94,5 +106,5 @@ class KnowledgePlane:
             if e.code in (CONNECTION_CLOSED, INTERNAL_ERROR):
                 raise InfraError("knowledge", f"MCPError {e.code}: {e.message}"[:500]) from e
             return json.dumps({"error": f"MCPError {e.code}: {e.message}"}), True
-        except Exception as e:  # noqa: BLE001 -- a tool-level failure is the model's to see
+        except Exception as e:
             return json.dumps({"error": f"{type(e).__name__}: {e}"}), True
