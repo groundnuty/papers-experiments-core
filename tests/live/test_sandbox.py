@@ -53,13 +53,13 @@ def levels(config):
     return sorted(config.sandbox.data_paths)
 
 
-def spec_for(config, level, run_key):
+def spec_for(config, level, run_key, lease_key=None):
     from expcore_onedata.client import OnezoneClient
     from expcore_onedata.tokens import TokenIssuer, data_path_spec
 
     mode = config.sandbox.mode_of(level)
     if mode is DataPathMode.NONE:
-        return SandboxSpec(run_key=run_key, mode=mode)
+        return SandboxSpec(run_key=run_key, mode=mode, lease_key=lease_key)
     principal = config.principals.data_path
     if principal is None:
         pytest.skip("[principals.data_path] is needed to mint a data-path token")
@@ -76,6 +76,7 @@ def spec_for(config, level, run_key):
         token=token,
         zone=Endpoint.from_url(config.zone.url),
         provider=Endpoint.from_url(config.local_provider.url),
+        lease_key=lease_key,
     )
 
 
@@ -83,7 +84,8 @@ def spec_for(config, level, run_key):
 def test_each_configured_data_path_starts_runs_code_refuses_a_write_and_is_gone_after_stop(config, host):
     probe = SandboxProbe(host, config.sandbox)
     for level in levels(config):
-        sandbox = DockerSandbox.start(host, config.sandbox, spec_for(config, level, f"live-{int(time.time())}"))
+        key = "live-check"  # a label for the probe; no lease is taken
+        sandbox = DockerSandbox.start(host, config.sandbox, spec_for(config, level, f"live-{int(time.time())}", key))
         try:
             assert sandbox.metadata()["read_only_verified"]["root"] is True
             result = sandbox.exec("print(6 * 7)", 60)
@@ -92,7 +94,7 @@ def test_each_configured_data_path_starts_runs_code_refuses_a_write_and_is_gone_
         finally:
             sandbox.stop()
         assert sandbox.stopped
-        assert probe.holder_gone("not-a-real-owner") in (True, False, None)
+        assert probe.resource_gone(key, {}) is True
 
 
 @needs_platform
