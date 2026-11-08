@@ -64,6 +64,7 @@ _ADDED_COLUMNS = (
     ("attempts", "cache_read_tokens", "INTEGER"),  # a part of input_tokens
     ("attempts", "usage_complete", "INTEGER NOT NULL DEFAULT 1"),  # 0: the totals are known to be short
     ("attempts", "treatment", "INTEGER NOT NULL DEFAULT 0"),  # 1: a fault that is the condition's treatment
+    ("attempts", "outage_kind", "TEXT"),  # the kind of an outage that overlapped the attempt; apart from infra_kind
 )
 
 
@@ -356,16 +357,17 @@ class Store:
             condition = self.schema.condition_named(json.loads(row["factors"]), row["run_key"])
             state, charged, treatment = classify(result, self.schema.treatment_kinds[condition])
             self.db.execute(
-                "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, detail=?,"
-                " termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?, cache_read_tokens=?,"
-                " usage_complete=? WHERE id=?",
+                "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"
+                " detail=?, termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?,"
+                " cache_read_tokens=?, usage_complete=? WHERE id=?",
                 (
                     state,
                     int(charged),
                     int(treatment),
                     result.ended_utc,
                     result.wall_s,
-                    result.outage_kind or outcome.infra_kind,
+                    outcome.infra_kind,
+                    result.outage_kind,
                     detail,
                     outcome.name,
                     result.input_tokens,

@@ -346,3 +346,21 @@ def test_c09_the_reader_refuses_an_export_without_the_per_condition_counts(tmp_p
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ExportError, match=r"missing key.*infrastructure_by_condition"):
         read_export(path)
+
+
+def test_c02_a_treatment_attempt_is_counted_under_its_own_kind_when_an_outage_is_flagged(tmp_path):
+    """C02: adds that the export counts a treatment attempt under its outcome's kind, not under the outage's."""
+    schema = treatment_schema(("endpoint",))
+    store = open_store(tmp_path, schema)
+    manifest = make_manifest(schema)
+    store.sync_manifest(manifest.rows)
+    declared = keys_under(schema, manifest, "api-none")
+    run_one(store, declared[0], infra("endpoint", outage_kind="sandbox"))
+    run_one(store, declared[1], AttemptResult(Outcome("finished"), LATER, 1.0, outage_kind="sandbox"))
+    data = export_run_state(store)
+    cells = {(r["condition"], r["kind"]): (r["set_aside"], r["treatment"]) for r in data["infrastructure_by_condition"]}
+    assert cells == {("api-none", "endpoint"): (0, 1), ("api-none", "sandbox"): (1, 0)}
+    analysed = {r["run_key"]: r for r in data["analysed_attempts"]}
+    assert (analysed[declared[0]]["treatment"], analysed[declared[0]]["infra_kind"]) == (True, "endpoint")
+    retries = [(r["kind"], r["state"], r["attempts"]) for r in data["retries_by_kind"]]
+    assert retries == [("sandbox", "outage_discarded", 1)]

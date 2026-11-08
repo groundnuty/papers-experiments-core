@@ -113,6 +113,15 @@ def export_run_state(store: Store) -> dict[str, Any]:
     }
 
 
+def _kind_of(attempt: Any) -> str | None:
+    """Return the kind an infrastructure attempt is counted under.
+
+    An outage-discarded attempt is counted under the outage's kind; every other attempt, a treatment attempt included,
+    under the kind of its own outcome, which an outage flag never replaces.
+    """
+    return attempt["outage_kind"] if attempt["state"] == "outage_discarded" else attempt["infra_kind"]
+
+
 def _discarded_usage(identities: dict[str, dict], attempts: dict[str, list[Any]]) -> list[dict[str, Any]]:
     """Sum the usage of the attempts whose results were set aside, by condition, model and state."""
     cells: dict[tuple, dict[str, Any]] = {}
@@ -146,7 +155,7 @@ def _retries_by_kind(identities: dict[str, dict], attempts: dict[str, list[Any]]
                     (
                         who["condition"],
                         who["factors"]["model"],
-                        attempt["infra_kind"],
+                        _kind_of(attempt),
                         attempt["state"],
                         bool(attempt["charged"]),
                     )
@@ -177,7 +186,7 @@ def _infrastructure_by_condition(
                 field = "set_aside"
             else:
                 continue
-            cells.setdefault((condition, attempt["infra_kind"]), {"set_aside": 0, "treatment": 0})[field] += 1
+            cells.setdefault((condition, _kind_of(attempt)), {"set_aside": 0, "treatment": 0})[field] += 1
     return [
         {"condition": condition, "kind": kind, "declared_treatment": kind in declared[condition], **counts}
         for (condition, kind), counts in sorted(cells.items())

@@ -238,15 +238,15 @@ def test_c03_a_mixed_sequence_charges_exactly_the_infrastructure_attempts(tmp_pa
     assert store.charged_attempts(key) == 2
     assert run_one(store, key, infra("unattributed_kill")) == "infra_exhausted"
     assert store.charged_attempts(key) == 3
-    rows = store.q("SELECT state, infra_kind, charged FROM attempts ORDER BY id")
-    assert [(r["state"], r["infra_kind"], r["charged"]) for r in rows] == [
-        ("infra_fail", "key_rejected", 0),
-        ("outage_discarded", "sandbox", 0),
-        ("interrupted", None, 0),
-        ("infra_fail", "endpoint", 1),
-        ("harness_error", None, 0),
-        ("infra_fail", "sandbox", 1),
-        ("infra_fail", "unattributed_kill", 1),
+    rows = store.q("SELECT state, infra_kind, outage_kind, charged FROM attempts ORDER BY id")
+    assert [(r["state"], r["infra_kind"], r["outage_kind"], r["charged"]) for r in rows] == [
+        ("infra_fail", "key_rejected", None, 0),
+        ("outage_discarded", None, "sandbox", 0),
+        ("interrupted", None, None, 0),
+        ("infra_fail", "endpoint", None, 1),
+        ("harness_error", None, None, 0),
+        ("infra_fail", "sandbox", None, 1),
+        ("infra_fail", "unattributed_kill", None, 1),
     ]
 
 
@@ -480,3 +480,26 @@ def test_c01_classify_marks_treatment_only_for_an_infrastructure_outcome_of_a_li
     assert classify(finished(), ("endpoint",)) == ("done", False, False)
     flagged = AttemptResult(Outcome("finished"), LATER, 1.0, outage_kind="endpoint")
     assert classify(flagged, ("endpoint",)) == ("outage_discarded", False, False)
+
+
+def test_c01_an_outage_flag_does_not_replace_the_kind_of_a_scored_treatment_attempt(tmp_path, treatment):
+    """C01: adds that a treatment attempt keeps its own kind when an outage of another kind is flagged."""
+    store, (key, *_) = treatment_run(tmp_path, treatment)
+    assert run_one(store, key, infra("endpoint", outage_kind="sandbox")) == "done"
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["state"], row["treatment"], row["charged"]) == ("done", 1, 0)
+    assert (row["infra_kind"], row["outage_kind"]) == ("endpoint", "sandbox")
+
+
+def test_c03_the_outcome_kind_and_the_outage_kind_are_kept_apart_on_a_discarded_attempt(tmp_path):
+    """C03: adds that a discarded attempt records both the kind its outcome carried and the kind of the outage."""
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    assert run_one(store, key, infra("endpoint", outage_kind="sandbox")) == "pending"
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["state"], row["charged"], row["infra_kind"], row["outage_kind"]) == (
+        "outage_discarded",
+        0,
+        "endpoint",
+        "sandbox",
+    )
