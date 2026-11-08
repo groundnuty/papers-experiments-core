@@ -136,6 +136,10 @@ class Scheduler:
         """Return the current time as the store writes it."""
         return iso(self.clock())
 
+    def exact_stamp(self) -> str:
+        """Return the current time at full precision, microseconds included: the moment a stop begins is dated with it."""
+        return self.clock().astimezone(dt.UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
     def open(self) -> "Scheduler":
         """Take the lock, open the store for a resume, restore the gates and admit the endpoints."""
         self.root.mkdir(parents=True, exist_ok=True)
@@ -205,6 +209,7 @@ class Scheduler:
                 holds=self.holds,
                 recheck=self.recheck,
                 stop=self.stop,
+                exact_stamp=self.exact_stamp,
                 health=self.gate,
                 leases=self.leases,
                 lease_group=self.lease_group,
@@ -331,7 +336,7 @@ class Scheduler:
         if self.budget is None:
             return None
         with self._assess:
-            return self.budget.assess(flying, now)
+            return self.budget.assess(flying, now, exact=self.exact_stamp())
 
     def recheck(self, row: Any) -> Hold | None:
         """Tell why a run that holds its lease may not start after all, or None: the gates dispatch looked at, again.

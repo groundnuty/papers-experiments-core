@@ -55,7 +55,7 @@ def pause_the_unit(scheduler):
 
 def exhaust_the_budget(scheduler):
     scheduler.budget = SimpleNamespace(
-        assess=lambda flying, now: SimpleNamespace(reason=lambda model: "over its ceiling")
+        assess=lambda flying, now, exact=None: SimpleNamespace(reason=lambda model: "over its ceiling")
     )
 
 

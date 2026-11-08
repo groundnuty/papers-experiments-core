@@ -1,5 +1,6 @@
 """The stop and the unit's failure a result causes are stored with the result, and derived again at each start."""
 
+import datetime as dt
 import json
 import subprocess
 import sys
@@ -125,3 +126,14 @@ def test_c15_a_kill_after_the_marker_of_the_third_endpoint_failure_still_pauses_
         assert scheduler.recovery.committed == 1
         assert scheduler.units.down(UNIT)
         assert not scheduler.units.ok(UNIT)
+
+
+def test_c13_a_stop_fired_by_a_running_campaign_is_dated_at_the_clocks_full_precision(tmp_path):
+    """C13: the dispatcher dates the harness stop with its clock to the microsecond, not to the whole second."""
+    moment = dt.datetime(2026, 1, 1, 0, 0, 5, 800000, tzinfo=dt.UTC)
+    with build(tmp_path, executor=FakeExecutor(default=("defect",)), plan=SMALL, clock=lambda: moment) as scheduler:
+        scheduler.run()
+        stop = json.loads(scheduler.store.get_meta(STOPS_KEY))["models"]["m1"]
+        assert stop["utc"] == "2026-01-01T00:00:05Z"
+        assert stop["epoch"] == pytest.approx(moment.timestamp())
+        assert stop["epoch"] > dt.datetime(2026, 1, 1, 0, 0, 5, tzinfo=dt.UTC).timestamp() + 0.79

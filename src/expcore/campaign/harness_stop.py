@@ -16,6 +16,11 @@ attempts in the store, with their own end times, so the window is read from stor
 nothing. What is kept is a stop once it has fired (a window moving on never ends one), and the releases (`cleared`):
 a release ends a stop, and the errors up to then stop counting for that kind on that model, or on all models.
 
+A stop's time is kept at **full precision** (`epoch`, float seconds), not truncated to the whole seconds the store's
+timestamps carry: a release must be strictly newer than the stop, and a release written at .200 of a second must not
+pass for a stop at .800 of the same one. A stop derived at the start, whose error time is only known to the second, is
+dated at the end of that second, the latest it can have been.
+
 A stop is recorded **in the transaction that records the error that causes it** (`HarnessStops.note` joins the store's
 write transaction when called from `Store.finish_attempt`'s `also` step), so a kill between the two cannot lose it. And
 because a result can also reach the store from its outcome marker at the next start, without the process that made it,
@@ -79,6 +84,14 @@ def _epoch(utc: str | None) -> float:
     """Return a stored time as epoch seconds; one that cannot be read counts as now: toward the stop, never away."""
     try:
         return dt.datetime.fromisoformat(str(utc).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return time.time()
+
+
+def _end_of_second(utc: str) -> float:
+    """Return the end of the whole second a stored time names: the latest the moment can have been (or now, if unread)."""
+    try:
+        return dt.datetime.fromisoformat(str(utc).replace("Z", "+00:00")).timestamp() + 1.0
     except ValueError:
         return time.time()
 
@@ -156,11 +169,12 @@ class HarnessStops:
         return frozenset(state["models"]), state["all"] is not None or bool(state.get("unreadable"))
 
     def _fire(
-        self, state: dict[str, Any], errors: list[dict], model: str, kind: str, now: str
+        self, state: dict[str, Any], errors: list[dict], model: str, kind: str, now: str, epoch: float
     ) -> tuple[list[str], list[tuple[str, str | None, str]]]:
         """Change `state` by the stops that `errors` bring to reach their limit once one more of `kind` is on `model`.
 
-        Return the reasons of the stops that fired and their events. A stop that has fired stays: it fires once.
+        Return the reasons of the stops that fired and their events. A stop that has fired stays: it fires once. `now`
+        is its time as the store writes it and `epoch` the same moment at full precision.
         """
         inwin = counted(errors, state["cleared"], _epoch(now), self.cfg.window_s)
         ofkind = [e for e in inwin if e["kind"] == kind]
@@ -170,27 +184,29 @@ class HarnessStops:
         n_model = sum(1 for e in ofkind if e["model"] == model)
         if n_model >= self.cfg.stop_after and model not in state["models"]:
             why = f"{n_model} harness errors of kind {kind} on {model} within {window_h}"
-            state["models"][model] = {"kind": kind, "utc": now, "epoch": _epoch(now), "why": why}
+            state["models"][model] = {"kind": kind, "utc": now, "epoch": epoch, "why": why}
             reasons.append(why)
             events.append(("harness_error_stop", model, f"dispatch of {model} stops: {why}"))
         spread = sorted({e["model"] for e in ofkind})
         if len(spread) >= self.cfg.models_stop and state["all"] is None:
             why = f"kind {kind} on {len(spread)} models ({', '.join(spread)}) within {window_h}"
-            state["all"] = {"kinds": [kind], "utc": now, "epoch": _epoch(now), "why": why}
+            state["all"] = {"kinds": [kind], "utc": now, "epoch": epoch, "why": why}
             reasons.append(why)
             events.append(("harness_error_stop_all", None, f"dispatch of every model stops: {why}"))
         return reasons, events
 
-    def note(self, model: str, kind: str, now: str) -> list[str]:
+    def note(self, model: str, kind: str, now: str, exact: str | None = None) -> list[str]:
         """Count the harness errors after one more on `model`, fire the stops that reach their limit, and return the
-        reasons of those that fired now. The error must be in the store already; a stop that has fired stays."""
+        reasons of those that fired now. The error must be in the store already; a stop that has fired stays.
+
+        `exact` is the moment at full precision (fractional seconds); a stop is dated with it, else with `now`."""
         errors = stored_errors(self.store)
 
         def change(current: str | None) -> tuple[str | None, list[tuple[str, str | None, str]], list[str]]:
             state = parse(current)
             if state.get("unreadable"):
                 return None, [], []  # the record stays unreadable and everything stays stopped, until it is fixed
-            reasons, events = self._fire(state, errors, model, kind, now)
+            reasons, events = self._fire(state, errors, model, kind, now, _epoch(exact or now))
             return (json.dumps(state, sort_keys=True) if reasons else None), events, reasons
 
         return self.store.update_meta(KEY, change, now)
@@ -217,7 +233,9 @@ class HarnessStops:
             events: list[tuple[str, str | None, str]] = []
             for index, error in enumerate(errors):
                 at = error["utc"] if isinstance(error["utc"], str) and error["utc"] else now
-                fired, noted = self._fire(state, errors[: index + 1], error["model"], error["kind"], at)
+                fired, noted = self._fire(
+                    state, errors[: index + 1], error["model"], error["kind"], at, _end_of_second(at)
+                )
                 reasons += fired
                 events += [
                     (kind, model, f"{text} (derived at the start from the stored attempts)")

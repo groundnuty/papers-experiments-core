@@ -134,6 +134,33 @@ def test_c13_a_release_raises_the_ceiling_by_its_step_and_a_later_stop_needs_a_n
     assert kinds == ["budget_hold", "budget_released", "budget_hold"]
 
 
+def test_c13_a_release_written_earlier_in_the_second_than_the_budget_stop_does_not_end_it(tmp_path):
+    """C13: the budget stop is dated at full precision: .200 of the second is older than a stop at .800 of it."""
+    store, _, _ = planned_store(tmp_path)
+    path = tmp_path / "release"
+    gate = gate_for(store, max_usd=20.0, release_step_usd=15.0, release_file=path)
+    assert gate.assess([], NOW, exact="2026-01-01T00:00:00.800000Z").reason("m1") is not None
+    assert json.loads(store.get_meta(HOLDS_KEY))[ALL]["since_epoch"] == pytest.approx(epoch_of(NOW) + 0.8)
+    path.write_text(f"{ALL}\n", encoding="utf-8")
+    os.utime(path, (epoch_of(NOW) + 0.2, epoch_of(NOW) + 0.2))
+    assert gate.assess([], LATER).reason("m1") is not None  # not newer than the stop, though in the same second
+    assert path.exists()
+    os.utime(path, (epoch_of(NOW) + 0.9, epoch_of(NOW) + 0.9))
+    assert gate.assess([], LATER).reason("m1") is None
+    assert not path.exists()
+
+
+def test_c13_a_stop_recorded_without_its_full_precision_is_read_from_its_whole_second(tmp_path):
+    """C13: a record from before the precise time was kept still has its stop, at the second it names."""
+    store, _, _ = planned_store(tmp_path)
+    store.put_meta(HOLDS_KEY, json.dumps({ALL: {"since_utc": NOW, "reason": "over"}}), NOW)
+    path = tmp_path / "release"
+    gate = gate_for(store, max_usd=20.0, release_step_usd=15.0, release_file=path)
+    path.write_text(f"{ALL}\n", encoding="utf-8")
+    os.utime(path, (epoch_of(NOW) + 5, epoch_of(NOW) + 5))
+    assert gate.assess([], LATER).reason("m1") is None
+
+
 def test_c13_a_release_names_what_it_ends_and_leaves_other_stops(tmp_path):
     """C13: a model's name ends that model's ceiling; the total's stop is not ended by it."""
     store, _, _ = planned_store(tmp_path)

@@ -82,6 +82,7 @@ class Parts:
     holds: HoldRegistry
     recheck: Callable[[Any], Hold | None] = lambda row: None  # why a run that holds its lease may not start after all
     stop: threading.Event = field(default_factory=threading.Event)  # set when the campaign is ending
+    exact_stamp: Callable[[], str] | None = None  # now at full precision, for the moment a stop begins
     health: HealthGate | None = None
     leases: LeasePool | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
@@ -279,4 +280,5 @@ class AttemptRunner:
         if classified.state == "harness_error":
             defect = outcome.defect
             p.store.event(p.stamp(), "harness_error", model, f"{key}: {defect.exception if defect else 'unknown'}")
-            p.stops.note(model, kind_of(outcome), p.stamp())  # records the stop it fires, if any, as an event
+            now = p.stamp()  # records the stop it fires, if any, as an event
+            p.stops.note(model, kind_of(outcome), now, exact=p.exact_stamp() if p.exact_stamp else now)

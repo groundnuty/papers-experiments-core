@@ -21,7 +21,8 @@ first moment a ceiling is found over is its **stop**, recorded in the store with
 (`release.take_listed`) lists the scope it ends, `ALL` for the total or a model key, counts only if written after that
 stop, and is used up when it ends it. A release adds `release_step_usd` to the ceiling it ends, so it lets the campaign
 go on by a stated amount and no more; a campaign that wants no release leaves the step at 0. The stops and the amounts
-released are kept in the store (meta), so a restart changes nothing.
+released are kept in the store (meta), so a restart changes nothing. A stop is dated at full precision (`since_epoch`),
+not to the whole second the store's timestamps carry, because a release must be strictly newer than it.
 """
 
 import json
@@ -124,7 +125,7 @@ class BudgetGate:
         path = self.budget.release_file
         if path is None or not holds:
             return holds, released
-        stops = {scope: release.epoch_of(h.get("since_utc")) for scope, h in holds.items()}
+        stops = {scope: _stop_epoch(h) for scope, h in holds.items()}
         taken = release.take_listed(path, stops)
         if not taken:
             return holds, released
@@ -150,11 +151,12 @@ class BudgetGate:
 
     # --- the assessment -----------------------------------------------------------------------------------------------
 
-    def assess(self, in_flight: Sequence[str], now: str) -> BudgetState:
+    def assess(self, in_flight: Sequence[str], now: str, exact: str | None = None) -> BudgetState:
         """Decide which models may start a run, given the models of the runs now in flight.
 
         `in_flight` lists one model key per run being worked on, counted by the dispatcher itself, since an attempt's
-        row exists only a moment after the dispatcher chooses the run. Records the stops that began and ended.
+        row exists only a moment after the dispatcher chooses the run. Records the stops that began and ended. `exact` is
+        `now` at full precision (fractional seconds), with which a stop that begins is dated.
         """
         holds, released = self._apply_releases(self._json(HOLDS_KEY), self._json(RELEASED_KEY), now)
         costs = attempt_costs(self.store, self.models, self.token_budget)
@@ -169,7 +171,7 @@ class BudgetGate:
                 found.setdefault(model, []).append(hold)
                 if hold.releasable:
                     over.setdefault(hold.scope, hold.reason)
-        self._record_stops(holds, over, now)
+        self._record_stops(holds, over, now, exact or now)
         return BudgetState(
             {m: tuple(v) for m, v in found.items()}, spent, reserve, self.ceiling(ALL, released) or 0.0, estimate
         )
@@ -219,17 +221,26 @@ class BudgetGate:
             out.append(Hold(ALL, _over("the campaign", figure, spent, sum(later.values()), mine, total_cap), True))
         return out
 
-    def _record_stops(self, holds: dict, over: dict[str, str], now: str) -> None:
+    def _record_stops(self, holds: dict, over: dict[str, str], now: str, exact: str) -> None:
         """Keep the stops in force: a ceiling found over for the first time begins one, one no longer over ends it."""
         began = {s: r for s, r in over.items() if s not in holds}
         ended = [s for s in holds if s not in over]
         if not began and not ended:
             return
         kept = {s: h for s, h in holds.items() if s in over}
-        kept.update({s: {"since_utc": now, "reason": r} for s, r in began.items()})
+        since = release.epoch_of(exact)
+        kept.update({s: {"since_utc": now, "since_epoch": since, "reason": r} for s, r in began.items()})
         events = [("budget_hold", None if s == ALL else s, f"{s}: {r}") for s, r in sorted(began.items())]
         events += [("budget_hold_over", None if s == ALL else s, f"{s}: no longer over its ceiling") for s in ended]
         self.store.put_meta_many({HOLDS_KEY: json.dumps(kept, sort_keys=True)}, now, events)
+
+
+def _stop_epoch(hold: Mapping) -> float:
+    """Return when a stop began, at full precision where it was recorded so, else from its whole-second time."""
+    since = hold.get("since_epoch")
+    if isinstance(since, int | float) and not isinstance(since, bool):
+        return float(since)
+    return release.epoch_of(hold.get("since_utc"))
 
 
 def _over(what: str, figure: float, spent: float, flying: float, mine: float | None, cap: float) -> str:

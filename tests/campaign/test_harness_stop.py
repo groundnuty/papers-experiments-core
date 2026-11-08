@@ -278,3 +278,34 @@ def test_c10_the_derivation_fires_the_stop_at_the_third_error_to_end_whatever_or
     [reason] = stops.reconcile("2026-01-01T11:00:00Z")
     assert "3 harness errors of kind ValueError on m1" in reason
     assert stops.load()["models"]["m1"]["utc"] == "2026-01-01T03:00:00Z"
+
+
+def test_c13_a_release_written_earlier_in_the_second_than_the_stop_does_not_end_it(tmp_path):
+    """C13: the stop is dated at full precision: a release at .200 of the second does not pass for a stop at .800."""
+    path = tmp_path / "release"
+    store, stops = setup(tmp_path, release_file=path)
+    for index in range(2):
+        fail(store, stops, "m1", index)
+    run_one(store, keys_by_model(store)["m1"][2], error_of())
+    second = "2026-01-01T00:10:05Z"
+    stops.note("m1", "ValueError", second, exact="2026-01-01T00:10:05.800000Z")
+    assert stops.load()["models"]["m1"]["epoch"] == pytest.approx(epoch_of(second) + 0.8)
+    path.write_text("m1\n", encoding="utf-8")
+    os.utime(path, (epoch_of(second) + 0.2, epoch_of(second) + 0.2))
+    assert stops.take_releases("2026-01-01T00:10:06Z") == {}  # older than the stop, though in the same second
+    assert path.exists()
+    assert stops.stopped()[0] == frozenset({"m1"})
+    os.utime(path, (epoch_of(second) + 0.9, epoch_of(second) + 0.9))
+    assert set(stops.take_releases("2026-01-01T00:10:06Z")) == {"m1"}
+
+
+def test_c13_a_stop_derived_at_the_start_is_dated_at_the_end_of_the_second_its_error_ended_in(tmp_path):
+    """C13: the error's time is known to the second, so the derived stop is the latest it can have been."""
+    path = tmp_path / "release"
+    store, stops = setup(tmp_path, release_file=path)
+    stored_errors_without_notes(store, "m1", 3)
+    stops.reconcile("2026-01-01T00:30:00Z")
+    assert stops.load()["models"]["m1"]["epoch"] == pytest.approx(epoch_of(LATER) + 1.0)
+    path.write_text("m1\n", encoding="utf-8")
+    os.utime(path, (epoch_of(LATER) + 0.5, epoch_of(LATER) + 0.5))
+    assert stops.take_releases("2026-01-01T00:30:01Z") == {}
