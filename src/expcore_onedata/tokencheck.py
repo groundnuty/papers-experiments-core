@@ -33,6 +33,11 @@ class TokenRefused(RuntimeError):
     """A token or its principal failed examination; the message holds no value."""
 
 
+class PrivilegesMismatch(TokenRefused):
+    """A principal's privileges, read back, differ from the declared set: the one refusal that says the principal is
+    set up for other rights, as opposed to a token, an answer or a read that is wrong."""
+
+
 class ExaminationFailed(TokenRefused):
     """The call that examines a token failed; `error` is what it raised, for a caller that tells outages apart."""
 
@@ -210,7 +215,9 @@ def require_privileges(declared: Collection[str], *, direct: Any, effective: Any
             parts = ([f"lacks {', '.join(missing)}"] if missing else []) + (
                 [f"has also {', '.join(extra)}"] if extra else []
             )
-            raise TokenRefused(f"the principal's {what} privileges differ from the declared set: {'; '.join(parts)}")
+            raise PrivilegesMismatch(
+                f"the principal's {what} privileges differ from the declared set: {'; '.join(parts)}"
+            )
 
 
 def require_distinct(first: Examined, second: Examined) -> None:

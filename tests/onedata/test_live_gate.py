@@ -55,3 +55,13 @@ def test_the_slow_live_expiry_test_needs_its_own_switch():
     live = (ROOT / "tests" / "live" / "test_contract.py").read_text(encoding="utf-8")
     assert 'os.environ.get("EXPCORE_LIVE_SLOW") != "1"' in live
     assert "skipif" in live
+
+
+def test_o05_the_live_test_of_the_conditions_is_one_test_per_condition_named_by_position():
+    """O05: a condition that is skipped must not skip the others, so the tool-server token test is parametrised over
+    the conditions, by position (no condition name in the report), and nothing loops over them inside one test."""
+    live = (ROOT / "tests" / "live" / "test_contract.py").read_text(encoding="utf-8")
+    assert '@pytest.mark.parametrize("index", range(CONDITIONS), ids=lambda index: f"condition{index}")' in live
+    assert "for name in config.toolserver.conditions" not in live
+    assert "mint_for_condition(" in live
+    assert "pytest.skip(f" not in live

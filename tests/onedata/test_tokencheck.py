@@ -7,6 +7,7 @@ import pytest
 from expcore_onedata.tokencheck import (
     CaveatSpec,
     Examined,
+    PrivilegesMismatch,
     TokenRefused,
     require_distinct,
     require_examined,
@@ -204,3 +205,22 @@ def test_o05_a_path_caveat_in_non_canonical_base64_is_refused():
     assert examined(canonical).subject == "u-data"
     with pytest.raises(TokenRefused, match="not canonical"):
         examined(other)
+
+
+def test_o05_only_a_difference_between_the_privileges_and_the_declared_set_is_a_privileges_mismatch():
+    """O05: a caller that tells "the principal holds other rights" from every other refusal can: a mismatch is its own
+    class, and an unreadable answer, a missing caveat or an expired token is a TokenRefused that is not one."""
+    declared = ["space_view", "space_read_data"]
+    for direct, effective in ((["space_view"], declared), (declared, [*declared, "space_manage_qos"])):
+        with pytest.raises(PrivilegesMismatch):
+            require_privileges(declared, direct=direct, effective=effective)
+    others = [
+        lambda: require_privileges(declared, direct={"space_view": True}, effective=declared),
+        lambda: examine(info(caveats=without("data.readonly"))),
+        lambda: examine(info(lifetime=-5)),
+        lambda: examine("not an object"),
+    ]
+    for other in others:
+        with pytest.raises(TokenRefused) as caught:
+            other()
+        assert not isinstance(caught.value, PrivilegesMismatch)

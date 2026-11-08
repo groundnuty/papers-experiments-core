@@ -18,12 +18,14 @@ PLATFORM = os.environ.get("EXPCORE_LIVE_PLATFORM")
 if not PLATFORM:
     pytest.skip("EXPCORE_LIVE_PLATFORM is not set; these tests contact a real deployment", allow_module_level=True)
 
-from expcore_onedata.client import OnezoneClient, PlatformError  # noqa: E402 -- only once the module is known to run
+from live_support import mint_for_condition  # noqa: E402 -- only once the module is known to run
+
+from expcore_onedata.client import OnezoneClient, PlatformError  # noqa: E402
 from expcore_onedata.config import load_platform  # noqa: E402
 from expcore_onedata.federation import pin_local_provider, read_space  # noqa: E402
 from expcore_onedata.health import PlatformHealth  # noqa: E402
-from expcore_onedata.tokencheck import CaveatSpec, TokenRefused  # noqa: E402
-from expcore_onedata.tokens import TokenIssuer, data_path_spec, tool_server_spec  # noqa: E402
+from expcore_onedata.tokencheck import CaveatSpec  # noqa: E402
+from expcore_onedata.tokens import TokenIssuer, data_path_spec  # noqa: E402
 
 CEILING_S = 300.0
 EXPIRY_S = 5  # the shortest lifetime the expiry test asks for
@@ -31,6 +33,15 @@ SLOW = pytest.mark.skipif(
     os.environ.get("EXPCORE_LIVE_SLOW") != "1",
     reason="EXPCORE_LIVE_SLOW=1 is not set; this test waits out a token's lifetime",
 )
+
+
+def declared_conditions() -> int:
+    """How many conditions platform.toml declares, read without its secrets: the tests are one per condition."""
+    toolserver = load_platform(PLATFORM, require_secrets=False).toolserver
+    return len(toolserver.conditions) if toolserver else 0
+
+
+CONDITIONS = declared_conditions()
 
 
 @pytest.fixture(scope="module")
@@ -88,15 +99,15 @@ def test_the_health_check_reads_the_declared_support_set(config, client, issuer)
     assert result.ok, result.detail
 
 
-def test_each_condition_mints_and_examines_its_tool_server_token(config, issuer):
+@pytest.mark.parametrize("index", range(CONDITIONS), ids=lambda index: f"condition{index}")
+def test_each_condition_mints_and_examines_its_tool_server_token(index, config, issuer):
+    """O05: each declared condition is its own test, skipped only when the platform reports that the tool-server user
+    holds other rights than the condition declares. Any other refusal fails it, and one skip does not skip the rest."""
     if config.toolserver is None or config.principals.toolserver is None:
         pytest.skip("platform.toml declares no tool server or no [principals.toolserver] user")
-    for name in config.toolserver.conditions:
-        spec = tool_server_spec(config.space.id, config.condition(name))
-        try:
-            issuer.mint(spec, config.principals.toolserver, ceiling_s=CEILING_S)
-        except TokenRefused as refused:
-            pytest.skip(f"the tool-server user does not hold condition {name}'s rights: {refused}")
+    name = list(config.toolserver.conditions)[index]
+    token = mint_for_condition(issuer, config, name, config.principals.toolserver, CEILING_S)
+    assert token.subject == config.principals.toolserver.user_id
 
 
 @SLOW
