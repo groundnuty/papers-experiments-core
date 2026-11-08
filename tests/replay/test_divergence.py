@@ -1,6 +1,7 @@
 """Every divergence point of the replay (R03, R06), and a replay of a record of an older schema version."""
 
 import copy
+import json
 
 import pytest
 from replay_scenarios import SCENARIOS
@@ -58,9 +59,9 @@ def test_R03_the_stored_configuration_must_have_its_hash():
 
 
 def test_R03_a_configuration_the_loop_cannot_be_built_from_is_a_divergence():
-    """R03: an unknown setting in the configuration is named, not ignored."""
+    """R03: a value the loop refuses (a policy it does not have) is named, not ignored."""
     data = record_of()
-    data["agent_config"]["bogus"] = 1
+    data["agent_config"]["malformed_policy"] = "run_with_empty_arguments"
     diverges(data, "agent_config", "cannot be rebuilt")
 
 
@@ -74,16 +75,63 @@ def test_R03_a_result_message_that_does_not_hold_what_the_loop_gave_the_model_di
 def test_R03_a_changed_reply_makes_the_conversation_of_the_next_request_differ():
     """R03: the transcript before turn 1 differs: a recorded reply was edited, so the request digest no longer holds."""
     data = record_of()
-    data["transcript"][0]["native"]["content"] = "edited"
+    data["transcript"][0]["native"]["tool_calls"][0]["type"] = "other"  # nothing the neutral turn is derived from
     diverges(data, "transcript[1].request_sha256")
+
+
+def test_R03_a_native_message_that_the_neutral_turn_does_not_follow_from_diverges_naming_the_turn():
+    """R03: change only the native content; the loop would be served a reply the conversation does not hold."""
+    data = record_of("malformed")
+    assert data["transcript"][2]["neutral"]["text"] == "done"
+    data["transcript"][2]["native"]["content"] = "edited"
+    error = diverges(data, "transcript[2].neutral.text")
+    assert "native message of the same turn" in str(error)
+
+
+def test_R03_a_tool_call_changed_only_in_the_native_message_diverges():
+    """R03: the arguments a call was made with must be those of the native message that carries it."""
+    data = record_of()
+    data["transcript"][0]["native"]["tool_calls"][0]["function"]["arguments"] = '{"x": "other"}'
+    diverges(data, "transcript[0].neutral.tool_calls[0].arguments.x")
+
+
+def test_R03_a_malformed_call_follows_from_the_raw_arguments_in_its_native_message():
+    """R03: the history keeps the raw text of arguments that were not an object, and the parse error follows from it."""
+    data = record_of("malformed")
+    data["transcript"][0]["native"]["tool_calls"][0]["function"]["arguments"] = json.dumps({"_raw": '{"b":'})
+    diverges(data, "transcript[0].neutral.tool_calls[0].raw_arguments")
+
+
+def test_R03_a_record_of_a_backend_with_no_registered_parser_cannot_be_replayed():
+    """R03: the native messages of an unknown shape cannot be checked against the neutral turn, so the record fails."""
+    data = record_of()
+    data["route"]["backend"] = "some_new_backend"
+    diverges(data, "transcript[0].native")
+
+
+def test_R03_swapping_two_results_of_one_turn_diverges():
+    """R03: results are validated per call id, not by set membership: each message must hold its own call's result."""
+    data = record_of()
+    first, second = data["transcript"][0]["tool_messages"][:2]
+    assert first["tool_call_id"] != second["tool_call_id"]
+    first["content"], second["content"] = second["content"], first["content"]
+    error = diverges(data, "transcript[0].tool_messages")
+    assert first["tool_call_id"] in str(error) or second["tool_call_id"] in str(error)
 
 
 def test_R06_tampering_with_recorded_reasoning_diverges_on_replay():
     """R06: the reasoning is echoed in the next request, so editing it changes the digest that pins that request."""
     data = record_of("reasoning")
-    assert data["transcript"][0]["native"]["_reasoning"] == "private notes"
-    data["transcript"][0]["native"]["_reasoning"] = "edited notes"
+    assert data["transcript"][0]["native"]["reasoning_content"] == "private notes"
+    data["transcript"][0]["native"]["reasoning_content"] = "edited notes"
     diverges(data, "transcript[1].request_sha256", "pinned")
+
+
+def test_R06_reasoning_edited_where_the_neutral_turn_is_derived_from_diverges_at_that_turn():
+    """R06: the reasoning the loop was served is the native message's, so editing it there is found at its own turn."""
+    data = record_of("reasoning")
+    data["transcript"][0]["native"]["_reasoning"] = "edited notes"
+    diverges(data, "transcript[0].neutral.reasoning")
 
 
 def test_R06_a_settings_set_that_does_not_have_its_digest_diverges_on_replay():

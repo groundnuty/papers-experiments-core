@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Callable
 
-from loop_support import ClockSleep, FakeClock, FakeProvider, ScriptedBackend, call, malformed, turn
+from loop_support import ClockSleep, FakeClock, FakeProvider, ScriptedBackend, call, malformed, never, turn
 from record_support import record_run
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
@@ -39,11 +39,12 @@ class BadRequest(Exception):
 
 
 class Thinking(ScriptedBackend):
-    """A backend whose assistant messages carry the reasoning, and echo it back in the conversation."""
+    """A backend whose assistant messages carry the reasoning, and echo it back to the model in the next request."""
 
     async def step(self):
         reply = await super().step()
         self._messages[-1]["_reasoning"] = "private notes"
+        self._messages[-1]["reasoning_content"] = "private notes"  # the field the request echoes back
         reply.reasoning = "private notes"
         return reply
 
@@ -82,6 +83,17 @@ class Hangs(StubAdapter):
         if self.clock is not None:
             self.clock.advance(self.seconds)
         await asyncio.Event().wait()
+
+
+class Abandoning(FakeProvider):
+    """A provider that says a worker thread of a cancelled call may still be running."""
+
+    def abandoned_threads(self) -> int:
+        return 2
+
+
+def _abandoned_worker() -> RunRecord:
+    return record_run([[("echo", {})], "done"], {}, providers=[Abandoning(HANDLERS)])
 
 
 def _tools() -> RunRecord:
@@ -237,6 +249,17 @@ def _waits_by_kind() -> RunRecord:
     )
 
 
+def _zero_wait() -> RunRecord:
+    """A wait that is declared and lasts no time on the clock."""
+
+    async def instant(_args, ctx):
+        async with ctx.infrastructure_wait("lease_queue"):
+            pass
+        return "ok"
+
+    return record_run([[("echo", {})], "done"], {"echo": instant}, clock=FakeClock(), sleep=never)
+
+
 def _model_wait() -> RunRecord:
     clock = FakeClock()
     backend = Retrying([[("echo", {"x": "a"})], "done"])
@@ -291,11 +314,13 @@ SCENARIOS: dict[str, tuple[Callable[[], RunRecord], str]] = {
     ),
     "infra_tool": (_tool_infra, "infrastructure"),
     "tool_crash": (_tool_crash, "harness_defect"),
+    "abandoned_worker": (_abandoned_worker, "finished"),
     "tool_cut": (_tool_cut, "time_cap"),
     "ceiling_cut": (_ceiling_cut, "infrastructure"),
     "cleanup_in_time": (_cleanup_in_time, "time_cap"),
     "cleanup_timeout": (_cleanup_timeout, "time_cap"),
     "wait_left_open": (_wait_left_open, "finished"),
+    "zero_wait": (_zero_wait, "finished"),
     "waits_by_kind": (_waits_by_kind, "finished"),
     "model_wait": (_model_wait, "finished"),
     "model_error": (lambda: record_run([BadRequest("rejected")], HANDLERS), "error"),

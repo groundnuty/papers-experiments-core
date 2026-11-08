@@ -27,7 +27,9 @@ from expcore.records.build import info_of_route
 from expcore.records.digest import canonical, digest
 from expcore.records.record import RunRecord
 from expcore.replay.clock import ReplayClock, replay_waits
+from expcore.replay.compare import first_difference
 from expcore.replay.divergence import stop
+from expcore.replay.native import neutral_of, normalised
 
 # The error classes the tool box gives to calls it answers itself, which therefore never reach a provider.
 TOOLBOX_ERROR_CLASSES = frozenset({"UnknownTool", "InvalidArguments"})
@@ -45,15 +47,19 @@ def exception_named(name: str, *, provider_error: bool = False) -> type[Exceptio
     return type(name, (Exception,), attributes)
 
 
-def strings_of(value: Any) -> set[str]:
-    """Return every string inside a JSON value, keys excluded."""
-    if isinstance(value, str):
-        return {value}
+def holds_result(value: Any, call_id: str, text: str) -> bool:
+    """Tell whether some object inside a JSON value has both the call's id and the result's text among its own values.
+
+    That is the shape of a tool result in every native conversation: one object per call that names the call and
+    carries its text (`tool_call_id` and `content` in the chat-completions shape, `tool_use_id` and `content` in a
+    block of the Messages API). Checked per call, so two results swapped between their calls do not pass.
+    """
     if isinstance(value, dict):
-        return set().union(*(strings_of(v) for v in value.values())) if value else set()
+        own = {v for v in value.values() if isinstance(v, str)}
+        return (call_id in own and text in own) or any(holds_result(v, call_id, text) for v in value.values())
     if isinstance(value, list):
-        return set().union(*(strings_of(v) for v in value)) if value else set()
-    return set()
+        return any(holds_result(v, call_id, text) for v in value)
+    return False
 
 
 class RecordedBackend:
@@ -120,11 +126,25 @@ class RecordedBackend:
             if settings_sha256 not in sets or digest(sets[settings_sha256]) != settings_sha256:
                 stop(f"{path}.settings_sha256", "the settings stored under this digest do not have it")
 
+    def _check_neutral(self, k: int, entry: dict[str, Any]) -> None:
+        """Check that the neutral turn is what the native message of the same turn stands for, by the parser of the
+        backend that wrote it. The two are served to different places, so a record where they differ is not a run."""
+        derived = neutral_of(self._route.get("backend"), entry["native"])
+        if derived is None:
+            stop(
+                f"transcript[{k}].native",
+                f"no parser for the native messages of backend {self._route.get('backend')!r}",
+            )
+        where = first_difference(normalised(entry["neutral"]), derived, f"transcript[{k}].neutral")
+        if where is not None:
+            stop(where, "the neutral turn does not follow from the native message of the same turn")
+
     async def step(self) -> ModelTurn:
         """Serve the next recorded turn; the request after the last turn is the recorded failure, if there is one."""
         k = self._served
         if k < len(self._turns):
             entry = self._turns[k]
+            self._check_neutral(k, entry)
             self._check(f"transcript[{k}]", entry.get("request_sha256"), entry.get("settings_sha256"))
             await replay_waits(self._clock, self._waits, entry.get("waits_left_open", 0))
             self._served += 1
@@ -179,7 +199,6 @@ class RecordedBackend:
         k = self._served - 1
         entry = self._turns[k]
         logged = {c["call_id"]: (j, c) for j, c in enumerate(self._calls) if c["turn"] == k}
-        carried = strings_of(entry["tool_messages"])
         for result in results:
             found = logged.get(result.call.id)
             if found is None:
@@ -191,8 +210,11 @@ class RecordedBackend:
                 stop(
                     f"tool_calls[{j}].status", "the result is an error where the record says it was not, or the reverse"
                 )
-            if result.call.id not in carried or result.text not in carried:
-                stop(f"transcript[{k}].tool_messages", "the recorded result messages do not hold what the loop gave")
+            if not holds_result(entry["tool_messages"], result.call.id, result.text):
+                stop(
+                    f"transcript[{k}].tool_messages",
+                    f"the recorded message of call {result.call.id!r} does not hold the result the loop gave it",
+                )
         self._conversation += copy.deepcopy(entry["tool_messages"])
 
     def transcript(self) -> list[dict]:
@@ -219,6 +241,7 @@ class RecordedToolProvider:
         self._specs = [ToolSpec(**spec) for spec in record.tools]
         self._calls = [(j, c) for j, c in enumerate(record.tool_calls) if reaches_provider(c)]
         self._outcome = record.outcome
+        self._abandoned = record.totals["abandoned_threads"]
         self._clock = clock
         self._served = 0
 
@@ -231,6 +254,10 @@ class RecordedToolProvider:
     def served(self) -> int:
         """The number of calls served so far."""
         return self._served
+
+    def abandoned_threads(self) -> int:
+        """Return the worker threads the recorded run left behind, which the loop result counts again."""
+        return self._abandoned
 
     def tools(self) -> list[ToolSpec]:
         """Return the recorded tool specs."""

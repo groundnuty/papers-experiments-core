@@ -101,6 +101,8 @@ class ScriptedBackend(StubAdapter):
             return await super().step()
         self._i += 1
         entry: dict[str, Any] = {"role": "assistant", "content": item.text or None}
+        if item.reasoning:
+            entry["_reasoning"] = item.reasoning
         if item.tool_calls:
             entry["tool_calls"] = [
                 {
