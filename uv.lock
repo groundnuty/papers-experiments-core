@@ -621,6 +621,11 @@ dependencies = [
     { name = "scipy" },
 ]
 
+[package.optional-dependencies]
+onedata = [
+    { name = "httpx" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -631,6 +636,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=2.6.0" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "httpx", marker = "extra == 'onedata'", specifier = ">=0.28.1" },
     { name = "mcp", specifier = ">=2.3.0" },
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "openai", specifier = ">=3.46.0" },

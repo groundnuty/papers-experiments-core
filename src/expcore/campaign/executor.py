@@ -29,6 +29,7 @@ from expcore.plugin import ToolProvider
 from expcore.prompt.templates import RenderedPrompt
 from expcore.records.build import PromptText, RunIdentity, record_attempt
 from expcore.records.record import RunRecord
+from expcore.records.schema import first_turn_rule
 
 
 @dataclass(frozen=True)
@@ -160,7 +161,8 @@ def outcome_of(entry: Mapping[str, Any]) -> Outcome:
 
 
 def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | None = None) -> AttemptResult:
-    """Return the store's result for a record: its outcome, tokens as the turns reported them, and its treatment kinds.
+    """Return the store's result for a record: its outcome, tokens as the turns reported them, its treatment kinds, the
+    turns it completed and the treatment flag it carries (the store checks that flag against its own decision).
 
     A count no turn reported is unknown, and totals the loop knows to be short are marked incomplete (C05). The wall
     time is the record's elapsed time unless the caller gives one.
@@ -177,6 +179,9 @@ def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | Non
         cache_read_tokens=_total(turns, "cache_read_input_tokens"),
         usage_complete=not record.totals.get("usage_incomplete", False),
         treatment_kinds=tuple(record.treatment_kinds),
+        model_turns=len(turns),
+        recorded_treatment=bool(record.outcome["treatment"]),
+        first_turn_rule=first_turn_rule(record.schema_version),
     )
 
 

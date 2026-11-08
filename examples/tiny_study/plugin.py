@@ -80,7 +80,7 @@ def malformed() -> ModelTurn:
 # The runs that do something other than finish with the right answer, by (condition, task). The right models are
 # alpha-stub; beta-stub also answers wrongly on the runs in WRONG_FOR_BETA.
 SPECIAL = {
-    ("relay-down", "lake"): "infrastructure",  # the declared treatment: the tool server fails
+    ("relay-down", "lake"): "infrastructure",  # the declared treatment: the tool server fails after the first lookup
     ("baseline", "river"): "malformed",  # one malformed call, then the model recovers
     ("baseline", "hill"): "endless",  # keeps looking things up: ends at the turn cap
 }
@@ -94,8 +94,8 @@ def script_for(condition: str, task: str, model: str, tools: str) -> list[Any]:
     kind = SPECIAL.get((condition, task), "finish")
     wrong = model == "beta-stub" and (condition, task) in WRONG_FOR_BETA
     answer = "unknown" if wrong else FACTS[task]
-    if kind == "infrastructure":
-        return [InfraError("knowledge", "the tool server did not start")]
+    if kind == "infrastructure":  # one completed turn first: a failure before the agent's first turn is never treatment
+        return [ask, InfraError("knowledge", "the tool server went down after the first lookup")]
     if kind == "endless":
         return [ask] * 8
     done = [("submit", {"answer": answer})]

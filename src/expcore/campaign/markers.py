@@ -8,6 +8,11 @@ the next open commits it; the attempt is never run again. After the store, there
 
 The marker names the run and the store's id of the attempt, so a stale marker left in a reused directory by an earlier
 attempt is not mistaken for this one's.
+
+Schema 2 added the model turns the attempt completed and the treatment rule of its record's version. Schema 1 markers
+are still read, since a campaign killed between its marker and the store must resume after an upgrade: they have no
+turn count, so they are read under the version-1 rule (treatment by the declared kind alone) and marked
+`legacy_marker`, which recovery records as an event.
 """
 
 import json
@@ -20,7 +25,8 @@ from expcore.errors import infra_kinds
 from expcore.loop.outcomes import HarnessDefect, Outcome
 
 MARKER_NAME = "attempt-marker.json"
-MARKER_SCHEMA = 1
+MARKER_SCHEMA = 2  # 2: the result carries the model turns completed, the treatment flag of its record and the rule
+LEGACY_MARKER_SCHEMA = 1  # still readable: it has no model-turn count, so it is read under the version-1 rule
 _RESULT_FIELDS = (
     "ended_utc",
     "wall_s",
@@ -31,7 +37,12 @@ _RESULT_FIELDS = (
     "cache_read_tokens",
     "usage_complete",
     "treatment_kinds",
+    "model_turns",
+    "recorded_treatment",
+    "first_turn_rule",
 )
+# What a schema-1 marker holds of a result; the rest take their defaults under the version-1 rule.
+_LEGACY_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("model_turns")]
 
 
 class MarkerError(RuntimeError):
@@ -50,6 +61,18 @@ class AttemptResult:
     - `treatment_kinds`: the infrastructure kinds the attempt's record carried as its condition's treatment (the
       record's `treatment_kinds`; none by default). The store checks them against the condition's own declaration and
       refuses the result when they differ, so a record and the store cannot disagree about which failures are scored.
+    - `model_turns`: how many model turns the attempt completed, from its record's transcript; 0 when there is no
+      record (the executor raised, or nothing was run). An infrastructure outcome is treatment only after at least one
+      completed turn (`Outcome.is_treatment`): a failure before the agent's first turn is set aside whatever the
+      condition declares.
+    - `recorded_treatment`: the treatment flag the attempt's record carries, or None when there is no record. The store
+      refuses the result when its own decision differs, so the record and the store agree on which attempt is scored.
+    - `first_turn_rule`: whether the record's schema version requires a completed turn for treatment (version 2 does,
+      version 1 does not); the store decides with the rule of the record's version. A result with no record is new
+      work and takes the rule.
+    - `legacy_marker`: True for a result read from a schema-1 marker, which has no model-turn count. It is never
+      written; recovery applies the version-1 rule to such a result (first_turn_rule False, the declared kind alone
+      decides) and records a `legacy_marker` event.
     """
 
     outcome: Outcome
@@ -62,9 +85,19 @@ class AttemptResult:
     cache_read_tokens: int | None = None
     usage_complete: bool = True
     treatment_kinds: tuple[str, ...] = ()
+    model_turns: int = 0
+    recorded_treatment: bool | None = None
+    first_turn_rule: bool = True
+    legacy_marker: bool = False
 
     def __post_init__(self) -> None:
         """Refuse a kind outside the closed vocabulary, so a typo never reaches the store; keep the kinds sorted."""
+        if isinstance(self.model_turns, bool) or not isinstance(self.model_turns, int) or self.model_turns < 0:
+            raise ValueError("model_turns must be a count of completed turns, zero or more")
+        if self.recorded_treatment is not None and not isinstance(self.recorded_treatment, bool):
+            raise ValueError("recorded_treatment must be True, False or None")
+        if not isinstance(self.first_turn_rule, bool) or not isinstance(self.legacy_marker, bool):
+            raise ValueError("first_turn_rule and legacy_marker must be True or False")
         for kind in (*(() if self.outage_kind is None else (self.outage_kind,)), *self.treatment_kinds):
             if kind not in infra_kinds():
                 raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")
@@ -137,14 +170,22 @@ def read_marker(run_dir: Path, run_key: str, attempt_id: int) -> AttemptResult |
         raise MarkerError(f"{path}: cannot be read ({type(error).__name__})") from None
     try:
         body = json.loads(text)
-        if body["schema"] != MARKER_SCHEMA:
-            raise MarkerError(f"{path}: unknown marker schema {body['schema']!r}")
+        schema = body["schema"]
+        if isinstance(schema, bool) or schema not in (LEGACY_MARKER_SCHEMA, MARKER_SCHEMA):
+            raise MarkerError(f"{path}: unknown marker schema {schema!r}")
         if body["run_key"] != run_key or body["attempt_id"] != attempt_id:
             return None
         data = body["result"]
-        extra = set(data) - {"outcome", *_RESULT_FIELDS}
+        fields = _LEGACY_FIELDS if schema == LEGACY_MARKER_SCHEMA else _RESULT_FIELDS
+        extra = set(data) - {"outcome", *fields}
         if extra:
             raise MarkerError(f"{path}: unknown result fields: {', '.join(sorted(extra))}")
-        return AttemptResult(outcome=_outcome_from(data["outcome"]), **{f: data[f] for f in _RESULT_FIELDS})
+        # A schema-2 marker written before `first_turn_rule` was added holds a version-2 record: read it as such.
+        kept = {f: data[f] for f in fields if f != "first_turn_rule" or f in data}
+        if schema == MARKER_SCHEMA:
+            kept.setdefault("first_turn_rule", True)
+        if schema == LEGACY_MARKER_SCHEMA:  # no turn count to hold it to: the rule of the time, and a mark for recovery
+            kept.update(first_turn_rule=False, legacy_marker=True)
+        return AttemptResult(outcome=_outcome_from(data["outcome"]), **kept)
     except (ValueError, KeyError, TypeError) as error:
         raise MarkerError(f"{path}: not a valid marker ({type(error).__name__}: {error})") from None

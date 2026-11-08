@@ -29,7 +29,7 @@ The file is validated when it is loaded, with messages that name the file and th
 
     [endpoints.model-a]           # optional: the unit a model's runs count in (default: the model's own key)
     unit = "pool-a"
-    base_url = "https://llm.example.invalid/v1"
+    base_url = "https://llm.example.test/v1"
 """
 
 import dataclasses

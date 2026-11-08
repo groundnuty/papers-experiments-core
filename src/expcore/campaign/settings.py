@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.gate import Budget
 from expcore.campaign.harness_stop import HarnessStopConfig
-from expcore.errors import infra_kinds
+from expcore.errors import infra_kinds, untreatable_kinds
 
 
 @dataclass(frozen=True)
@@ -65,16 +65,31 @@ class SchedulerConfig:
             raise ValueError("; ".join(problems))
 
     def check_kinds(self, schema: FactorSchema) -> None:
-        """Refuse a health or identity kind that is unknown or that a condition declares as its treatment."""
-        for name in ("health_kind", "identity_kind"):
-            kind = getattr(self, name)
+        """Refuse a health or identity kind that is unknown or that a condition declares as its treatment.
+
+        The kinds a campaign charges its own failures to are untreatable for that campaign, as the registry's
+        untreatable kinds are for every one (`expcore.errors.untreatable_kinds`): a failed health check or a changed
+        endpoint would otherwise be scored as the condition's fault.
+        """
+        roles = {"health_kind": self.health_kind, "identity_kind": self.identity_kind}
+        for name, kind in roles.items():
             if kind not in infra_kinds():
                 raise ValueError(
                     f"{name} {kind!r} is not an infrastructure kind; known kinds: {', '.join(infra_kinds())}"
                 )
-            for condition, kinds in schema.treatment_kinds.items():
-                if kind in kinds:
-                    raise ValueError(
-                        f"{name} {kind!r} is the treatment of condition {condition!r}: a failed health check or a "
-                        "changed endpoint would be scored as that condition's fault; name another kind"
-                    )
+        untreatable = {
+            **untreatable_kinds(),
+            **{kind: f"it is this campaign's {name}" for name, kind in roles.items()},
+        }
+        refused = schema.refused_treatment(untreatable)
+        if refused is not None:
+            condition, kind = refused
+            name = next((n for n, k in roles.items() if k == kind), None)
+            if name is None:
+                raise ValueError(
+                    f"{kind!r} is the treatment of condition {condition!r} but can never be one: {untreatable[kind]}"
+                )
+            raise ValueError(
+                f"{name} {kind!r} is the treatment of condition {condition!r}: a failed health check or a "
+                "changed endpoint would be scored as that condition's fault; name another kind"
+            )

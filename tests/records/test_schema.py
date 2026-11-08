@@ -278,15 +278,40 @@ def test_R02_the_treatment_flag_must_be_what_the_outcome_and_the_declared_kinds_
     assert validate(infra_data([], False)) == CURRENT
     assert validate(infra_data(["sandbox"], False)) == CURRENT
     with pytest.raises(
-        RecordError, match=r"outcome\.treatment: is False but the outcome and treatment_kinds make it True"
+        RecordError,
+        match=r"outcome\.treatment: is False but .* 1 completed turn\(s\) make it True",
     ):
         validate(infra_data(["endpoint"], False))
     with pytest.raises(
-        RecordError, match=r"outcome\.treatment: is True but the outcome and treatment_kinds make it False"
+        RecordError,
+        match=r"outcome\.treatment: is True but .* 1 completed turn\(s\) make it False",
     ):
         validate(infra_data([], True))
     with pytest.raises(RecordError, match=r"outcome\.treatment: is True but .* make it False"):
         validate(data(outcome={**data()["outcome"], "treatment": True}))  # a finished outcome is never treatment
+
+
+def test_c01_a_failure_before_the_first_model_turn_is_never_marked_treatment():
+    """C01: a record of an infrastructure failure of a declared kind with no completed turn says treatment is False,
+    and a record that says True contradicts its own transcript."""
+    one = infra_data(["endpoint"], True)
+    assert len(one["transcript"]) == 1
+    none = copy.deepcopy(one)
+    none["transcript"] = []
+    none["outcome"]["treatment"] = False
+    assert validate(none) == CURRENT
+    none["outcome"]["treatment"] = True
+    with pytest.raises(RecordError, match=r"outcome\.treatment: is True but .* 0 completed turn\(s\) make it False"):
+        validate(none)
+
+
+def test_o05_a_record_cannot_mark_an_untreatable_kind_as_treatment():
+    """O05: a record that lists tool_plane_integrity among its treatment kinds and flags the failure as treatment is
+    refused, because the kind can never be one."""
+    bad = infra_data(["tool_plane_integrity"], True, kind="tool_plane_integrity")
+    with pytest.raises(RecordError, match=r"outcome\.treatment: is True but .* make it False"):
+        validate(bad)
+    assert validate(infra_data(["tool_plane_integrity"], False, kind="tool_plane_integrity")) == CURRENT
 
 
 @pytest.mark.parametrize(

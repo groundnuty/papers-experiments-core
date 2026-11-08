@@ -65,3 +65,14 @@ def test_the_health_and_identity_kinds_must_be_known_kinds_and_not_a_conditions_
     SchedulerConfig(health_kind="sandbox", identity_kind="endpoint").check_kinds(make_schema())
     with pytest.raises(ValueError, match="treatment of condition 'api-none'"):
         SchedulerConfig(identity_kind="endpoint").check_kinds(treatment_schema(("endpoint",), "api-none"))
+
+
+def test_c01_the_scheduler_refuses_its_health_and_identity_kinds_as_treatment_by_role():
+    """C01: the kinds a campaign charges its own failures to cannot be a condition's treatment, whichever kinds they
+    are; the refusal names the role. Other kinds a condition declares are left to the registry."""
+    with pytest.raises(ValueError, match="health_kind 'sandbox' is the treatment of condition 'api-none'"):
+        SchedulerConfig(health_kind="sandbox").check_kinds(treatment_schema(("sandbox",), "api-none"))
+    with pytest.raises(ValueError, match="identity_kind 'knowledge' is the treatment of condition 'api-none'"):
+        SchedulerConfig(identity_kind="knowledge").check_kinds(treatment_schema(("knowledge",), "api-none"))
+    SchedulerConfig().check_kinds(treatment_schema(("knowledge",), "api-none"))
+    SchedulerConfig(health_kind="tool_plane_integrity").check_kinds(make_schema())

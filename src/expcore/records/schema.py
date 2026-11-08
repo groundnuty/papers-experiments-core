@@ -12,6 +12,11 @@ adds to the agent configuration the value that was in force before (`config_befo
 under the rule it ran under; and bump nothing else. Older records keep loading, are written back as the bytes they
 were read from (R01), and are replayed with the defaults of their time.
 
+A version may also change a rule that the format does not show. Version 2 is that: no field was added, but an
+infrastructure outcome is flagged as treatment only after the model completed a turn (`first_turn_rule`). A record
+is validated, and replayed, under the rule of its own version, so a version-1 record that flags treatment with no
+completed turn stays valid, and every new record is written as version 2.
+
 Every section is a table of field name to the types the field may hold, in the order the file writes them. Numbers are
 finite: a count the run did not obtain is `None`, never 0 and never NaN (R10).
 """
@@ -165,12 +170,15 @@ class SchemaVersion:
     """One version of the record format.
 
     `added` maps a section name to the fields this version introduced into it. `config_before` maps a setting this
-    version added to the agent configuration to the value that was in force before it existed.
+    version added to the agent configuration to the value that was in force before it existed. `first_turn_rule` says
+    whether a record of this version flags an infrastructure outcome as treatment only after a completed model turn;
+    the first version predates the rule.
     """
 
     name: str
     added: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     config_before: Mapping[str, Any] = field(default_factory=dict)
+    first_turn_rule: bool = False
 
     def __post_init__(self) -> None:
         """Refuse a name outside the schema family and a table that lists a section or field the format lacks."""
@@ -186,8 +194,12 @@ class SchemaVersion:
 # The table of versions. Version 1 is frozen from its first pushed commit: nothing was published before it, so
 # its shape is the one that ships, and a change to it breaks every record written since. After that push, a
 # change to the format is a new version in this table that lists what it added, never an edit of version 1.
-# `tests/data/golden-record-v1.json` is a record of version 1 that must keep loading and writing back byte for byte.
-SCHEMAS: tuple[SchemaVersion, ...] = (SchemaVersion(f"{SCHEMA_PREFIX}1"),)
+# `tests/data/golden-record-v1.json` is a record of version 1 that must keep loading and writing back byte for byte;
+# `golden-record-v2.json` is the same for version 2, which adds no field but the first-turn rule for treatment.
+SCHEMAS: tuple[SchemaVersion, ...] = (
+    SchemaVersion(f"{SCHEMA_PREFIX}1"),
+    SchemaVersion(f"{SCHEMA_PREFIX}2", first_turn_rule=True),
+)
 CURRENT = SCHEMAS[-1].name
 
 
@@ -202,6 +214,11 @@ def position(version: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> int:
     if version not in readable:
         raise RecordError(f"unsupported record schema {version!r} (readable: {', '.join(readable)})")
     return readable.index(version)
+
+
+def first_turn_rule(version: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> bool:
+    """Tell whether a record of `version` flags treatment only after a completed model turn."""
+    return schemas[position(version, schemas)].first_turn_rule
 
 
 def added_after(version: str, section: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> frozenset[str]:
@@ -294,11 +311,15 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
         _check_keys(f"{where}.retries[{i}]", retry, RETRY_FIELDS, required=())
 
 
-def _check_outcome(outcome: dict, treatment_kinds: Any, where: str) -> None:
+def _check_outcome(
+    outcome: dict, treatment_kinds: Any, completed_turns: int, first_turn_rule: bool, where: str
+) -> None:
     """Build the outcome through the loop's own vocabulary check, so a name or kind outside it is refused here too.
 
-    The `treatment` flag must be what the outcome and the record's `treatment_kinds` make it: true exactly when the
-    outcome is infrastructure of a kind in the list. A record whose flag says otherwise contradicts itself (R02).
+    The `treatment` flag must be what the outcome, the record's `treatment_kinds` and its transcript make it: true
+    exactly when the outcome is infrastructure of a kind in the list that can be a treatment and, under the first-turn
+    rule of the record's version, the transcript holds at least one completed turn. A record whose flag says
+    otherwise contradicts itself (R02).
     """
     defect = outcome["defect"]
     if defect is not None:
@@ -307,13 +328,14 @@ def _check_outcome(outcome: dict, treatment_kinds: Any, where: str) -> None:
         held = None
         if defect is not None:
             held = HarnessDefect(defect["exception"], defect["stack_sha256"])
-        Outcome(outcome["name"], outcome["detail"], outcome["infra_kind"], outcome["error_type"], held)
+        built = Outcome(outcome["name"], outcome["detail"], outcome["infra_kind"], outcome["error_type"], held)
     except (KeyError, TypeError, ValueError) as exc:
         raise RecordError(f"{where}: {type(exc).__name__}: {exc}") from None
-    expected = outcome["name"] == "infrastructure" and outcome["infra_kind"] in treatment_kinds
+    expected = built.is_treatment(treatment_kinds, completed_turns, first_turn_rule=first_turn_rule)
     if outcome["treatment"] is not expected:
         raise RecordError(
-            f"{where}.treatment: is {outcome['treatment']} but the outcome and treatment_kinds make it {expected}"
+            f"{where}.treatment: is {outcome['treatment']} but the outcome, treatment_kinds and the {completed_turns} "
+            f"completed turn(s) make it {expected}"
         )
 
 
@@ -390,7 +412,9 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
             raise RecordError(f"clock[{i}]: expected [label, seconds]")
     _check_treatment_kinds(body["treatment_kinds"])
     check_section("outcome", body["outcome"], version, "outcome", schemas)
-    _check_outcome(body["outcome"], body["treatment_kinds"], "outcome")
+    _check_outcome(
+        body["outcome"], body["treatment_kinds"], len(body["transcript"]), first_turn_rule(version, schemas), "outcome"
+    )
     check_section("totals", body["totals"], version, "totals", schemas)
     _check_waited(body["totals"]["infra_wait_by_kind"], "totals.infra_wait_by_kind")
     for i, event in enumerate(body["totals"]["malformed_events"]):

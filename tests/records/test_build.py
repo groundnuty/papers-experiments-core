@@ -320,9 +320,9 @@ def test_R09_only_an_infrastructure_outcome_can_be_treatment_whatever_kinds_are_
         "error": {"error_type": "ContextOverflow"},
         "harness_defect": {"defect": HarnessDefect("KeyError", "e" * 64)},
     }
-    entry = outcome_entry(Outcome(name, "detail", **extra.get(name, {})), infra_kinds())
+    entry = outcome_entry(Outcome(name, "detail", **extra.get(name, {})), infra_kinds(), completed_turns=1)
     assert entry["treatment"] is (name == "infrastructure")
-    assert outcome_entry(Outcome(name, "detail", **extra.get(name, {})))["treatment"] is False
+    assert outcome_entry(Outcome(name, "detail", **extra.get(name, {})), completed_turns=1)["treatment"] is False
 
 
 def test_R02_the_declared_kinds_are_written_sorted_and_once():

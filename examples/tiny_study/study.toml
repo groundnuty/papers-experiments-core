@@ -27,8 +27,8 @@ access = "direct"
 tools = "extended"
 tasks = ["lake", "river", "hill"]
 
-# The condition's manipulation is the tool server failing, so a run that ends in that infrastructure failure is a
-# scored final attempt and is never run again.
+# The condition's manipulation is the tool server failing, so a run that ends in that infrastructure failure after the
+# agent's first turn is a scored final attempt and is never run again. (A failure before the first turn is set aside.)
 [conditions.relay-down]
 access = "relay"
 tools = "basic"

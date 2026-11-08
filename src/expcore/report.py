@@ -187,10 +187,12 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
 
 _COUNT_DEFINITIONS = [
     "- *Set aside*: attempts that ended as an infrastructure failure of a kind the condition does not declare as "
-    "treatment, or that were discarded for an outage. Counted over every run of the campaign whatever its status "
-    "(an exhausted run's last attempt included), except runs a partial analysis leaves out.",
+    "treatment, or before the model's first turn, or that were discarded for an outage. Counted over every run of "
+    "the campaign whatever its status (an exhausted run's last attempt included), except runs a partial analysis "
+    "leaves out.",
     "- *Scored as treatment*: attempts that ended as an infrastructure failure of a kind the condition declares as "
-    "treatment; each is its run's final, scored attempt. Runs a partial analysis leaves out are not included.",
+    "treatment, after the model's first turn; each is its run's final, scored attempt. Runs a partial analysis leaves "
+    "out are not included.",
     "- *Left out*: the set-aside and treatment attempts of runs a partial analysis leaves out, and only those.",
 ]
 

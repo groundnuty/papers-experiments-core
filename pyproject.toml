@@ -18,7 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-onedata = []
+onedata = [
+    "httpx>=0.28.1",
+]
 
 [dependency-groups]
 dev = [
@@ -78,3 +80,10 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
 "src/expcore/campaign/release.py" = ["E501"]
 "src/expcore/campaign/lease.py" = ["E501"]
 "src/expcore/campaign/reservation.py" = ["E501"]
+"src/expcore_onedata/tokens.py" = ["E501"]
+"src/expcore_onedata/tokencheck.py" = ["E501"]
+"src/expcore_onedata/toolserver.py" = ["E501"]
+"src/expcore_onedata/pin.py" = ["E501"]
+"src/expcore_onedata/federation.py" = ["E501"]
+"src/expcore_onedata/health.py" = ["E501"]
+"tests/support/fake_onedata.py" = ["E501"]

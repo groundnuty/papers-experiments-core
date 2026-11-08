@@ -220,6 +220,7 @@ TREATMENT_TOML = STUDY_TOML.replace(
 def registry(monkeypatch):
     """Start with only the core's infrastructure kinds and leave no platform kind behind."""
     monkeypatch.setattr(errors, "_platform_kinds", {})
+    monkeypatch.setattr(errors, "_platform_untreatable", {})
 
 
 def test_c02_a_condition_may_declare_infrastructure_kinds_as_its_treatment(tmp_path, registry):
@@ -396,3 +397,33 @@ def test_c06_the_conditions_treatment_kinds_are_found_from_a_run_key(registry):
     other = schema.key("mount-read", "task-a", "m1", 1)
     assert schema.treatment_kinds_of(declared) == ("endpoint", "sandbox")
     assert schema.treatment_kinds_of(other) == ()
+
+
+def test_o05_declaring_tool_plane_integrity_as_treatment_is_refused_at_load_naming_file_and_key(tmp_path, registry):
+    """O05: a run that failed an integrity check of its tool plane can never be scored as a condition's manipulation,
+    so the schema refuses the declaration when it is loaded, naming the file, the condition and the key."""
+    path = write_study(tmp_path, TREATMENT_TOML.replace('"sandbox", "endpoint"', '"endpoint", "tool_plane_integrity"'))
+    with pytest.raises(ConfigError) as caught:
+        load_factor_schema(path)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: [conditions.api-none]: key 'infrastructure_is_treatment'")
+    assert "'tool_plane_integrity'" in message
+    assert "can never be a treatment" in message
+
+
+def test_o05_a_kind_a_platform_registered_as_not_treatable_is_refused_and_a_treatable_one_is_not(tmp_path, registry):
+    """O05: the refusal is the registry's property, so it covers a platform's kinds too."""
+    errors.register_infra_kind("provider_tampered", "a provider whose state was changed", treatable=False)
+    errors.register_infra_kind("provider_down", "a provider that is down")
+    declared = TREATMENT_TOML.replace('"sandbox", "endpoint"', '"provider_down"')
+    assert load_factor_schema(write_study(tmp_path, declared)).treatment_kinds["api-none"] == ("provider_down",)
+    with pytest.raises(
+        ConfigError, match=r"key 'infrastructure_is_treatment' names infrastructure kind 'provider_tamp"
+    ):
+        load_factor_schema(write_study(tmp_path, declared.replace('"provider_down"', '"provider_tampered"')))
+
+
+def test_o05_a_schema_built_in_code_refuses_an_untreatable_kind_too(registry):
+    """O05: the check is the schema's, not the loader's."""
+    with pytest.raises(ConfigError, match="can never be a treatment"):
+        treatment_schema(("tool_plane_integrity",))

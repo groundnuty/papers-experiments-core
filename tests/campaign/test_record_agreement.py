@@ -5,6 +5,7 @@ from campaign_support import LATER, NOW, keys_under, make_manifest, open_store, 
 from record_support import no_secrets_in_the_environment, record_run
 
 from expcore.campaign.attempts import TreatmentKindsMismatch
+from expcore.campaign.executor import result_from_record
 from expcore.campaign.markers import AttemptResult
 from expcore.errors import InfraError
 from expcore.loop.outcomes import Outcome
@@ -12,6 +13,13 @@ from expcore.records.build import RunIdentity
 
 pytestmark = pytest.mark.usefixtures("no_secrets_in_the_environment")
 __all__ = ["no_secrets_in_the_environment"]
+
+ECHO = {"echo": lambda args: "echoed"}
+
+
+def after_a_turn(kind, detail="HTTP 503 after 8 retries"):
+    """A script in which the model completes one turn, calling a tool, and then the infrastructure fails."""
+    return [[("echo", {"x": "1"})], InfraError(kind, detail)]
 
 
 @pytest.mark.parametrize(
@@ -30,15 +38,15 @@ def test_c01_the_record_and_the_store_agree_on_which_infrastructure_failure_is_s
     key = next(row.key for row in manifest.rows if row.key.text == text)
 
     record = record_run(
-        [InfraError(kind, "HTTP 503 after 8 retries")],
-        {},
+        after_a_turn(kind),
+        ECHO,
         identity=RunIdentity(key.text, key.factors, 1),
         record_options={"treatment_kinds": schema.treatment_kinds_of(key)},
     )
-    held = record.outcome
-    outcome = Outcome(held["name"], held["detail"], infra_kind=held["infra_kind"])
     begun = store.begin_attempt(key.text, NOW, 1, "")
-    store.finish_attempt(begun.id, AttemptResult(outcome, LATER, 1.0, treatment_kinds=record.treatment_kinds), 3)
+    result = result_from_record(record, ended_utc=LATER)
+    assert (result.model_turns, result.recorded_treatment) == (1, scored)
+    store.finish_attempt(begun.id, result, 3)
 
     row = store.q("SELECT * FROM attempts")[0]
     assert record.outcome["treatment"] is scored
@@ -53,12 +61,12 @@ def test_c01_a_record_built_without_the_condition_s_kinds_is_the_one_that_would_
     schema = treatment_schema(("endpoint",))
     key = next(row.key for row in make_manifest(schema).rows if schema.condition_of(row.key) == "api-none")
     forgot = record_run(
-        [InfraError("endpoint", "down")], {}, identity=RunIdentity(key.text, key.factors, 1), record_options={}
+        after_a_turn("endpoint", "down"), ECHO, identity=RunIdentity(key.text, key.factors, 1), record_options={}
     )
     assert forgot.set_aside is True  # the store would score this attempt: this is what passing the kinds avoids
     passed = record_run(
-        [InfraError("endpoint", "down")],
-        {},
+        after_a_turn("endpoint", "down"),
+        ECHO,
         identity=RunIdentity(key.text, key.factors, 1),
         record_options={"treatment_kinds": schema.treatment_kinds_of(key)},
     )
@@ -76,14 +84,13 @@ def test_c01_the_store_refuses_the_result_of_a_runner_whose_record_lacks_the_con
     record_options = [{}, {"treatment_kinds": schema.treatment_kinds_of(key)}]
     forgot, passed = (
         record_run(
-            [InfraError("endpoint", "down")], {}, identity=RunIdentity(key.text, key.factors, 1), record_options=o
+            after_a_turn("endpoint", "down"), ECHO, identity=RunIdentity(key.text, key.factors, 1), record_options=o
         )
         for o in record_options
     )
     begun = store.begin_attempt(key.text, NOW, 1, "")
     with pytest.raises(TreatmentKindsMismatch, match="the attempt stays running"):
-        store.finish_attempt(begun.id, AttemptResult(outcome, LATER, 1.0, treatment_kinds=forgot.treatment_kinds), 3)
-    assert (
-        store.finish_attempt(begun.id, AttemptResult(outcome, LATER, 1.0, treatment_kinds=passed.treatment_kinds), 3)
-        == "done"
-    )
+        store.finish_attempt(
+            begun.id, AttemptResult(outcome, LATER, 1.0, treatment_kinds=forgot.treatment_kinds, model_turns=1), 3
+        )
+    assert store.finish_attempt(begun.id, result_from_record(passed, ended_utc=LATER), 3) == "done"

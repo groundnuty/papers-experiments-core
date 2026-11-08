@@ -454,8 +454,10 @@ class Store:
         The state, the charge and the treatment mark follow from the cause and the run's condition (`classify`). A run is
         done on an agent outcome or a treatment fault, exhausted when its charged attempts reach `max_attempts`, set
         aside as a harness error when our own code crashed, and otherwise pending again. An attempt that is not running is refused: its result would be recorded twice. So is a
-        result whose `treatment_kinds` differ from the condition's declaration (TreatmentKindsMismatch), and the attempt
-        then stays running.
+        result whose `treatment_kinds` differ from the condition's declaration, or whose record's treatment flag differs
+        from the store's own decision from the outcome, the declared kinds and the completed turns, taken with the
+        first-turn rule of the record's schema version (both are TreatmentKindsMismatch), and the attempt then stays
+        running.
         """
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
@@ -479,6 +481,12 @@ class Store:
                     f"condition {condition!r} declares {list(declared)}; the attempt stays running"
                 )
             state, charged, treatment = classify(result, declared)
+            if result.recorded_treatment is not None and result.recorded_treatment != treatment:
+                raise TreatmentKindsMismatch(
+                    f"{row['run_key']}: the record says treatment={result.recorded_treatment} but the store decides "
+                    f"{treatment} for the outcome, the declared kinds and the {result.model_turns} completed turn(s); "
+                    "the attempt stays running"
+                )
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"
                 " detail=?, termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?,"
