@@ -20,7 +20,13 @@ if not PLATFORM:
     pytest.skip("EXPCORE_LIVE_PLATFORM is not set; these tests contact a real deployment", allow_module_level=True)
 
 import httpx  # noqa: E402
-from live_support import mint_for_condition  # noqa: E402 -- only once the module is known to run
+from live_support import (  # noqa: E402 -- only once the module is known to run
+    mint_for_condition,
+    prerequisite_missing,
+    require_cleaned,
+    require_every_provider_refused,
+    require_passed,
+)
 
 from expcore_onedata.client import API_PROVIDER, AUTH_HEADER, OnezoneClient, PlatformError  # noqa: E402
 from expcore_onedata.config import load_platform  # noqa: E402
@@ -199,11 +205,20 @@ def test_a_real_block_map_has_the_documented_shape(day0, client, config):
 
 
 @MUTATE
-def test_the_day0_checks_that_change_state_pass_and_clean_up(day0):
+@pytest.mark.parametrize("name", ["read_only", "round_trip"])
+def test_a_day0_check_that_changes_state_passes_and_shows_its_cleanup(day0, name):
+    """Each state-changing check passes (`ok is True`; an unknown ran nothing) and the one that makes a scratch file
+    reports its cleanup explicitly as true. It is skipped only when platform.toml lacks what it needs, and the skip
+    names that."""
     from expcore_onedata.day0.runner import run_checks
 
+    missing = prerequisite_missing(name, day0)
+    if missing is not None:
+        pytest.skip(missing)
     day0.allow_mutation = True
-    entries = {e.name: e for e in run_checks(day0, ["read_only", "round_trip"])}
-    assert entries["read_only"].ok is not False, entries["read_only"].summary
-    assert entries["round_trip"].ok is not False, entries["round_trip"].summary
-    assert entries["round_trip"].facts.get("cleanup_verified", True) is True
+    entry = {e.name: e for e in run_checks(day0, [name])}[name]
+    require_passed(entry)
+    if name == "round_trip":
+        require_cleaned(entry)
+    else:
+        require_every_provider_refused(entry)
