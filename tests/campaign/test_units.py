@@ -85,13 +85,41 @@ def test_c15_the_state_survives_a_restart(tmp_path):
     assert again.status()["u"]["down"] is True
 
 
-def test_c15_a_record_that_cannot_be_read_starts_the_units_afresh_and_says_so(tmp_path):
-    """C15: an unreadable record is an event, and no unit is held on the strength of it."""
-    _units, moment, store = units_for(tmp_path)
-    store.put_meta(META, "{broken", NOW)
+@pytest.mark.parametrize("garbage", ["{broken", "[1, 2]", '{"u": 3}', "null"])
+def test_c15_a_record_that_cannot_be_read_pauses_every_unit_until_a_success_clears_it(tmp_path, garbage):
+    """C15: malformed unit state fails safe: every unit, listed or not, is paused and down, and the event is logged."""
+    _units, moment, store = units_for(tmp_path, pause_s=100.0)
+    store.put_meta(META, garbage, NOW)
     again = UnitHealth(store, fail_threshold=3, pause_s=100.0, now=moment, stamp=lambda: NOW)
-    assert again.ok("u")
     assert "unit_record_unreadable" in events(store)
+    for unit in ("u", "never-seen-before"):
+        assert not again.ok(unit)
+        assert again.down(unit)
+        assert again.paused_until(unit) == moment.now + 100.0
+    moment.now += 101  # the pause ends: one run may probe, as after any pause, but the unit is still down
+    assert again.ok("u")
+    assert again.down("u")
+    assert again.failure("u") is True  # a unit that is down and fails again is paused again on that one failure
+    assert not again.ok("u")
+    moment.now += 101
+    assert again.success("u") is True  # only a success clears it, and only that unit
+    assert again.ok("u")
+    assert not again.down("u")
+    assert again.down("other")
+
+
+def test_c15_the_pause_an_unreadable_record_caused_survives_a_restart_in_the_middle_of_it(tmp_path):
+    """C15: the fail-safe state is written back, so a restart before any success does not read the units as healthy."""
+    _units, moment, store = units_for(tmp_path, pause_s=100.0)
+    store.put_meta(META, "{broken", NOW)
+    UnitHealth(store, fail_threshold=3, pause_s=100.0, now=moment, stamp=lambda: NOW)
+    moment.now += 500
+    restarted = UnitHealth(store, fail_threshold=3, pause_s=100.0, now=moment, stamp=lambda: NOW)
+    assert restarted.down("u")
+    assert "unit_record_unreadable" in events(store)
+    assert events(store).count("unit_record_unreadable") == 1  # the record is readable again, so it is said once
+    assert restarted.success("u") is True
+    assert not restarted.down("u")
 
 
 def test_c15_the_limits_are_checked(tmp_path):
