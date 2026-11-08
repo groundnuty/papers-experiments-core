@@ -132,6 +132,60 @@ def test_p04_an_override_produces_a_hash_ending_in_override(tmp_path):
     assert smaller.with_override(alpha=0.01).sha256 == prereg.sha256 + "+override"  # marked once
 
 
+def test_p04_a_nested_parameter_cannot_be_edited_in_place(tmp_path):
+    """P04: every mapping a preregistration holds is read-only, so no edit can change it without the override mark."""
+    prereg = load(write(tmp_path))
+    with pytest.raises(TypeError):
+        prereg.estimator_params["wilcoxon_cluster_bootstrap"]["method"] = "approx"
+    with pytest.raises(TypeError):
+        prereg.estimator_params["another"] = {}
+    with pytest.raises(TypeError):
+        del prereg.estimator_params["wilcoxon_cluster_bootstrap"]
+    with pytest.raises(TypeError):
+        prereg.contrasts["extra"] = prereg.contrasts["a-vs-b"]
+    assert prereg.estimator_params == {"wilcoxon_cluster_bootstrap": {"method": "exact"}}
+    assert list(prereg.contrasts) == ["a-vs-b", "gate-effect"]
+
+
+def test_p04_the_nested_lists_and_mappings_of_a_built_preregistration_are_frozen_and_copied():
+    """P04: any construction freezes, not only the loader; lists become tuples, and the caller keeps its own dict."""
+    params = {"estimator": {"levels": [1, {"inner": [2, 3]}], "method": "exact"}}
+    prereg = Preregistration("inline", "a" * 64, 0.05, BootstrapSettings(10, 1), {}, ["a-vs-b"], None, params)
+    frozen = prereg.estimator_params["estimator"]
+    assert frozen["levels"] == (1, {"inner": (2, 3)})
+    assert isinstance(frozen["levels"], tuple)
+    assert isinstance(frozen["levels"][1]["inner"], tuple)
+    assert prereg.holm_family == ("a-vs-b",)
+    with pytest.raises(TypeError):
+        frozen["levels"][1]["inner"] = ()
+    params["estimator"]["levels"].append(4)  # the caller's own dict is still the caller's
+    params["estimator"]["method"] = "approx"
+    assert frozen["levels"] == (1, {"inner": (2, 3)})
+    assert frozen["method"] == "exact"
+
+
+def test_p04_an_override_shares_nothing_with_the_original_and_leaves_its_hash_and_parameters_alone(tmp_path):
+    """P04: editing an override's parameters, or the dict it was built from, never reaches the original."""
+    prereg = load(write(tmp_path))
+    original_hash = prereg.sha256
+    plain = prereg.with_override(alpha=0.01)
+    assert plain.estimator_params is not prereg.estimator_params
+    assert (
+        plain.estimator_params["wilcoxon_cluster_bootstrap"]
+        is not prereg.estimator_params["wilcoxon_cluster_bootstrap"]
+    )
+    assert plain.contrasts is not prereg.contrasts
+    with pytest.raises(TypeError):
+        plain.estimator_params["wilcoxon_cluster_bootstrap"]["method"] = "approx"
+    given = {"wilcoxon_cluster_bootstrap": {"method": "approx"}}
+    changed = prereg.with_override(estimator_params=given)
+    given["wilcoxon_cluster_bootstrap"]["method"] = "exact"
+    assert changed.estimator_params["wilcoxon_cluster_bootstrap"]["method"] == "approx"
+    assert changed.sha256 == original_hash + "+override"
+    assert prereg.sha256 == original_hash
+    assert prereg.estimator_params == {"wilcoxon_cluster_bootstrap": {"method": "exact"}}
+
+
 def test_p04_the_hash_itself_cannot_be_overridden(tmp_path):
     """P04: with_override marks the hash and refuses to set it."""
     with pytest.raises(TypeError, match="cannot be overridden"):

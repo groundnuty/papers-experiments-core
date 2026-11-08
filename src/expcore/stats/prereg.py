@@ -7,7 +7,8 @@
 The file is validated when it is loaded, against the campaign's factor schema (the conditions and factors its
 contrasts name must exist there), with messages that name the file and the key, and the SHA-256 of its bytes
 goes into every output manifest (P04). A copy made for a test marks that hash `+override`, so an output computed from
-changed settings cannot pass for one computed from the file.
+changed settings cannot pass for one computed from the file. The loaded object is deeply read-only: every nested
+mapping is a read-only view and every list a tuple, so no edit in place can change a preregistration without the mark.
 
     alpha = 0.05
     holm_family = ["a-vs-b"]
@@ -49,6 +50,7 @@ import dataclasses
 import hashlib
 import math
 import tomllib
+import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -76,9 +78,25 @@ class BootstrapSettings:
     ci_level: float = DEFAULT_CI_LEVEL
 
 
+def freeze(value: Any) -> Any:
+    """A deep, read-only copy: each mapping becomes a read-only view of a new dict, each list or tuple a tuple (P04).
+
+    The copy shares no container with its argument, so neither side can change the other afterwards.
+    """
+    if isinstance(value, Mapping):
+        return types.MappingProxyType({key: freeze(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(freeze(item) for item in value)
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class Preregistration:
-    """A loaded preregistration. `sha256` is the hash of the file, or of the file plus `+override` for a test copy."""
+    """A loaded preregistration. `sha256` is the hash of the file, or of the file plus `+override` for a test copy.
+
+    The mappings and sequences it holds are frozen when it is built, whichever way it is built: assigning into one
+    raises TypeError, and a mapping or list handed in is copied, so the caller's own object stays the caller's (P04).
+    """
 
     source: str
     sha256: str
@@ -90,8 +108,17 @@ class Preregistration:
     estimator_params: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
     schema_digest: str | None = None  # the factor schema the contrasts were validated against
 
+    def __post_init__(self) -> None:
+        """Deep-freeze the contrasts, the family and the estimator parameters into fresh read-only containers."""
+        for name in ("contrasts", "holm_family", "estimator_params"):
+            object.__setattr__(self, name, freeze(getattr(self, name)))
+
     def with_override(self, **changes: Any) -> Preregistration:
-        """Return a copy with fields replaced, for tests and never for production; its hash ends in `+override` (P04)."""
+        """Return a copy with fields replaced, for tests and never for production; its hash ends in `+override` (P04).
+
+        The copy is built anew, so it shares no mapping or list with the original: editing either never reaches the
+        other, and the original keeps its hash and its parameters.
+        """
         if "sha256" in changes:
             raise TypeError("the hash cannot be overridden; with_override marks it itself")
         marked = self.sha256 if self.sha256.endswith(OVERRIDE_MARK) else self.sha256 + OVERRIDE_MARK
