@@ -253,3 +253,8 @@ def test_source_that_does_not_parse_keeps_only_the_token_pass(hashes):
 
 def test_an_invalid_escape_in_a_literal_does_not_stop_the_scan(hashes):
     assert lines_and_kinds(st.scan_source("m.py", f'x = "\\d {NAME}"\n', hashes)) == [(1, "string")]
+
+
+def test_a_lone_surrogate_in_a_literal_is_scanned_without_error(hashes):
+    source = 'x = f"{1}\\ud800"\ny = "\\udfff"\n'
+    assert st.scan_source("src/a.py", source, hashes) == []

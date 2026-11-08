@@ -31,8 +31,11 @@ def normalise(token: str) -> str:
 
 @functools.lru_cache(maxsize=1 << 16)
 def token_hash(token: str) -> str:
-    """Return the hex SHA-256 of the versioned prefix followed by the normalised token."""
-    return hashlib.sha256((HASH_PREFIX + normalise(token)).encode("utf-8")).hexdigest()
+    """Return the hex SHA-256 of the versioned prefix followed by the normalised token.
+
+    Lone surrogates, which a valid Python literal may hold, are encoded with `surrogatepass` so hashing never raises.
+    """
+    return hashlib.sha256((HASH_PREFIX + normalise(token)).encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def iter_runs(text: str, *, unicode_words: bool = False) -> Iterator[re.Match[str]]:
