@@ -196,7 +196,11 @@ Each token is normalised (Unicode NFKC, case-folded, surrounding whitespace remo
 2. Split each into maximal runs of letters, digits and `_ . -`; this separates URL schemes, paths, ports, queries and assignments.
 3. From each run, emit every contiguous sequence of its components (split at `_`, `.` and `-`), re-joined with the separators it had. A hostname inside a URL, a space name inside a path and a name inside a composed identifier all become candidates.
 
-The test hashes every candidate and fails on a match, with fixtures for URLs, paths and composed names. Tokens shorter than four characters, such as single-letter option names, match only as a whole string literal or identifier, to avoid false positives. The hashes keep the names out of casual reading; a determined reader can still confirm a guessed name, so the list must not hold anything secret.
+The check hashes every candidate in every tracked file, and in each file's path, and fails on a match; findings print only a hash prefix, and a matching path is redacted. Tokens shorter than four characters match only as a whole string literal or identifier, to avoid false positives. Each hash carries a scope taken from the token's category:
+- **code** (conditions, data states, tasks, datasets, models, repositories): names a study chose, which code must not hard-code but prose may mention;
+- **all** (hosts, addresses, spaces, providers, users, environment variables): private everywhere.
+
+Prose (Markdown anywhere, and everything under `docs/`) is checked against `all` hashes only. `make check` runs the check over the working tree, and CI runs it over every commit of a push or pull request. A missing or empty hash file fails both, so deleting it cannot switch the check off. The hashes keep the names out of casual reading; a determined reader can still confirm a guessed name, so the list must not hold anything secret.
 
 ## Out of scope
 

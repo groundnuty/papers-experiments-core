@@ -1,0 +1,17 @@
+#!/bin/sh
+# Pre-push hook: run the study-token check over every commit being pushed, not only the tip.
+# A leak in any commit of a public history is permanent. Installed by `make hooks`.
+# Git passes "<local ref> <local sha> <remote ref> <remote sha>" lines on stdin.
+zero=0000000000000000000000000000000000000000
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue # deleting a ref pushes no commits
+    if [ "$remote_sha" = "$zero" ]; then
+        # New remote ref: check the whole history of the pushed commit. Tracking refs can be stale,
+        # so they are never trusted to say what the remote already has.
+        uv run --frozen python -m expcore.provenance.study_tokens check-commits --history "$local_sha" || status=1
+    else
+        uv run --frozen python -m expcore.provenance.study_tokens check-commits "$remote_sha..$local_sha" || status=1
+    fi
+done
+exit $status
