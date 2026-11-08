@@ -51,6 +51,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "totals": (dict,),
         "instruments": (dict,),
         "scores": (dict,),
+        "redacted_paths": (list,),
     },
     "prompt": {"system": (dict,), "user": (dict,), "tools_sha256": (str,)},
     "prompt_part": {"text": (str,), "sha256": (str,), "template_sha256": (str, NONE), "slots": (dict, NONE)},
@@ -315,6 +316,8 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
     _check_outcome(body["outcome"], "outcome")
     check_section("totals", body["totals"], version, "totals", schemas)
     _check_waited(body["totals"]["infra_wait_by_kind"], "totals.infra_wait_by_kind")
+    if any(not isinstance(p, str) for p in body.get("redacted_paths", ())):
+        raise RecordError("redacted_paths: a list of field paths")
     for place in ("instruments", "scores"):
         held = body.get(place, {})  # absent from a record of a version that predates it
         bad = [k for k in held if not _NAMESPACE.fullmatch(k) or not isinstance(held[k], dict)]

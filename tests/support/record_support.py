@@ -2,14 +2,17 @@
 
 import asyncio
 import hashlib
+import os
 from typing import Any
 
+import pytest
 from loop_support import FakeClock, FakeProvider, ScriptedBackend, never
 
 from expcore.config.models import Limits
 from expcore.loop.config import AgentConfig
 from expcore.records.build import RunIdentity, record_attempt
 from expcore.records.record import RunRecord
+from expcore.records.redact import SECRET_NAME, forget_secrets
 from expcore.records.schema import CURRENT
 
 CODE = {"commit": "c" * 40, "dirty": False, "source": "git", "stale": False, "why": None, "tree_sha256": "d" * 64}
@@ -146,3 +149,17 @@ def record_run(
             sleep=sleep,
         )
     )
+
+
+@pytest.fixture
+def no_secrets_in_the_environment(monkeypatch):
+    """Remove every variable named like a secret (a CI runner sets some) and forget registered secrets.
+
+    Their short values would otherwise redact ordinary numbers of a record, as the redaction rules intend. A test
+    module gets this as an autouse fixture by importing it in its directory's `conftest.py`.
+    """
+    for name in [n for n in os.environ if SECRET_NAME.search(n) and not n.startswith("GIT_")]:  # git needs its own
+        monkeypatch.delenv(name)
+    forget_secrets()
+    yield
+    forget_secrets()

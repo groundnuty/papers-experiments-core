@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.loop.outcomes import SET_ASIDE_OUTCOMES
-from expcore.records.redact import redact_structure
+from expcore.records.redact import Redactor
 from expcore.records.schema import (
     CURRENT,
     SCHEMAS,
@@ -71,6 +71,7 @@ class RunRecord:
     totals: dict[str, Any]
     instruments: dict[str, Any] = field(default_factory=dict)
     scores: dict[str, Any] = field(default_factory=dict)
+    redacted_paths: list[str] = field(default_factory=list)
     schema_version: str = CURRENT
 
     @property
@@ -117,15 +118,25 @@ class RunRecord:
         """
         data = self.to_json(schemas)
         validate(data, schemas)
-        data, count = redact_structure(data, environ)
+        data, paths = Redactor.from_environment(environ).structure(data)
+        if paths:
+            if "redacted_paths" in data:
+                data["redacted_paths"] = sorted({*data["redacted_paths"], *paths})
+            try:
+                validate(data, schemas)
+            except RecordError as exc:  # a number that was a secret became a string, in a field that must be numeric
+                raise RecordError(
+                    f"redacting secrets at {paths[:5]} leaves a record that is not valid ({exc}); "
+                    "a variable named like a secret holds a value that is also an ordinary number of the record"
+                ) from None
         try:
             text = json.dumps(data, ensure_ascii=False, indent=1, allow_nan=False)
         except ValueError as exc:
             raise RecordError(f"the record cannot be written as JSON: {exc}") from None
         text = _LONE_SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
-        if count:
+        if paths:
             warnings.warn(
-                f"record {self.filename[:12]}: redacted {count} secret value(s) before writing",
+                f"record {self.filename[:12]}: redacted secrets at {len(paths)} place(s) before writing",
                 RuntimeWarning,
                 stacklevel=2,
             )
