@@ -1,50 +1,51 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/harness/adapters.py, blob dd36da0e1152c8fb450d51cc44f8600f145989b7
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""Model adapters: one harness-owned tool-call loop for every model.
+#   changes: see git history of this file from its import commit
+"""Model adapters: one tool-call loop for every model, over each vendor's API directly.
 
-Both vendors' APIs are driven directly (OpenAI-compatible chat completions for the vLLM models,
-the Anthropic Messages API for Claude), so the full transcript and per-turn usage are recorded
-the same way for every model. The dataset_77 base used claude-agent-sdk on a subscription for the
-Claude leg, which loses the raw trace; that leg is deliberately not carried over.
+OpenAI-compatible chat completions and the Anthropic Messages API are driven without an agent SDK, so the full
+transcript and the per-turn usage are recorded the same way for every model. Replies are not streamed. Requests go
+through `Retrier`, which turns the SDKs' own retries off so every retry is counted and recorded.
 
-Per-model tool-calling adaptation (documented in docs/harness.md):
-  * all models: tool-call arguments that are not a JSON object are never resent; the history carries
+Per-backend tool-calling adaptation:
+  * all backends: tool-call arguments that are not a JSON object are never resent; the history carries
     {"_raw": <original text>} and the model gets an error tool result saying so (a normal tool round).
-  * openai_compat: native `tools`; seed, temperature, top_p honoured; other sampling keys and the
-    chat-template kwargs go in `extra_body`; reasoning text is recorded and, if the model entry
-    sets `echo_reasoning_field`, sent back on the assistant message.
-  * anthropic: `tools` with `input_schema`; no seed, temperature, top_p or top_k are sent (the
-    vendor requires them omitted); `thinking` and `output_config` come from `request_extra`;
-    assistant content blocks (thinking included) are returned verbatim with tool results.
+  * openai_compat: native `tools`; seed, temperature and top_p honoured; other sampling keys and the vendor extras
+    go in `extra_body`; reasoning text is recorded and, if the model entry sets `echo_reasoning_field`, sent back
+    on the assistant message (B04).
+  * anthropic: `tools` with `input_schema`; no seed, and only the sampling keys the entry sets; `thinking` and
+    `output_config` come from `extra_body`; assistant content blocks (thinking included) are returned verbatim
+    with tool results (B05).
+
+Every request is built once, and the record's settings come from that request object (B15). Usage is counted the
+moment a reply arrives and unreported counts stay None (B10).
 """
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import json
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
-from dataset_76.servedsettings import Served
+from expcore.config.models import ClientSettings, Limits, ModelSpec
+from expcore.errors import InfraError
+from expcore.models.retry import Retrier, RetryPolicy, SupportsUniform
+from expcore.models.route import public_url, sdk_version, settings_sent
+from expcore.models.served import Served
+from expcore.models.usage import UsageTally, token_count
 
-from .config import ClientSettings, Limits, ModelSpec
-from .errors import InfraError, RequestAbandoned
-
-
-def key_rejected(e: BaseException) -> InfraError:
-    """A 401 or 403 from a model API. 401 is a refused key (wrong, revoked, expired). 403 is a key that is known but not allowed this resource (Anthropic's permission_error;
-    an OpenAI-compatible gateway's forbidden): for the study either way no run of this model can succeed until someone fixes the key, so both hold the model. The detail is
-    the status and the exception class only: the SDK's message can echo part of a key (OpenAI's does), and a key is never recorded."""
-    return InfraError("key_rejected", f"HTTP {getattr(e, 'status_code', '?')} {type(e).__name__}")
-
-
-CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}  # Claude only, identical in every option and layout
+PROBE_PROMPT = "ping"
+# Stop reasons that mean the reply was cut at the output limit: OpenAI-compatible "length", Anthropic "max_tokens".
+OUTPUT_LIMIT_STOPS = frozenset({"length", "max_tokens"})
 
 
 @dataclasses.dataclass
 class ToolCall:
+    """One tool call the model made."""
+
     id: str
     name: str
     arguments: dict[str, Any]
@@ -54,6 +55,8 @@ class ToolCall:
 
 @dataclasses.dataclass
 class ToolResult:
+    """What a tool call returned to the model."""
+
     call: ToolCall
     text: str  # exactly as delivered to the model, after capping
     is_error: bool = False
@@ -61,49 +64,74 @@ class ToolResult:
 
 @dataclasses.dataclass
 class ModelTurn:
+    """One reply of the model with its usage; a count the reply did not carry is None, never 0 (B10)."""
+
     text: str
     tool_calls: list[ToolCall]
-    input_tokens: int
-    output_tokens: int
-    stop_reason: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    stop_reason: str | None  # the provider's own finish or stop reason (B12)
     latency_s: float
     reasoning: str | None = None
     # Claude prompt caching: input_tokens above is the whole prompt (the sum of these three parts);
-    # None / 0 for models that report no cache split
+    # None for backends that report no cache split
     uncached_input_tokens: int | None = None
-    cache_creation_input_tokens: int = 0
-    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    served_model: str | None = None  # the id the server said it ran (B06)
+    system_fingerprint: str | None = None
+    retries: tuple[dict[str, Any], ...] = ()  # the retries this reply took, each with its error (B01)
+
+    @property
+    def hit_output_limit(self) -> bool:
+        """Tell whether the reply was cut at the output limit, so it is not an answer (B12)."""
+        return self.stop_reason in OUTPUT_LIMIT_STOPS
 
 
-class ModelAdapter(Protocol):
-    def info(self) -> dict[str, Any]: ...
-    def begin(self, system: str, user: str, tools: list[dict]) -> None: ...
-    async def step(self) -> ModelTurn: ...
-    def add_tool_results(self, results: list[ToolResult]) -> None: ...
-    def transcript(self) -> list[dict]: ...
-    async def aclose(self) -> None: ...
+class ModelBackend(Protocol):
+    """What the agent loop needs from a model: a conversation, one reply per step, a record of how it went."""
 
+    @property
+    def output_limit(self) -> int | None:
+        """The max_tokens a request carries: the study's value or the model's own lower maximum (B11)."""
+        ...
 
-def _is_read_timeout(e: BaseException) -> bool:
-    """A timeout after the request was sent: the endpoint accepted it and the response is slow. Slowness
-    is never infra; the run keeps waiting within its remaining wall time and ends as time_cap. A connect
-    timeout (no connection was made) is a connection failure and stays infra. Matched by class name so it
-    holds for whichever httpx package the SDKs use."""
-    cause = e.__cause__ or e.__context__
-    names = {c.__name__ for c in type(cause).__mro__} if cause is not None else set()
-    return "ReadTimeout" in names  # pool, write and connect timeouts are failures to reach the endpoint
+    @property
+    def context_tokens(self) -> int | None:
+        """The endpoint's context window in tokens, when known."""
+        ...
 
+    def info(self) -> dict[str, Any]:
+        """Describe the route and what the replies reported, for the record."""
+        ...
 
-def _timeout(total_s: float):
-    """Long read timeout (the run's wall time), short connect timeout so a dead host fails fast as infra."""
-    try:
-        import httpx2 as httpx
-    except ImportError:
-        import httpx
-    return httpx.Timeout(float(total_s), connect=10.0)
+    def begin(self, system: str, user: str, tools: list[dict]) -> None:
+        """Start a conversation."""
+        ...
+
+    async def step(self) -> ModelTurn:
+        """Send the conversation and return the model's next reply."""
+        ...
+
+    def add_tool_results(self, results: list[ToolResult]) -> None:
+        """Append the results of the last reply's tool calls to the conversation."""
+        ...
+
+    def transcript(self) -> list[dict]:
+        """Return a copy of the conversation as sent, system prompt first."""
+        ...
+
+    async def probe(self) -> None:
+        """Send a one-token completion; raise when the model cannot serve one (B07)."""
+        ...
+
+    async def aclose(self) -> None:
+        """Release the client."""
+        ...
 
 
 def _parse_args(raw: str | None) -> tuple[dict, str | None]:
+    """Parse a tool call's argument text; return ({}, reason) when it is not a JSON object."""
     try:
         v = json.loads(raw or "{}")
     except json.JSONDecodeError as e:
@@ -113,75 +141,119 @@ def _parse_args(raw: str | None) -> tuple[dict, str | None]:
     return v, None
 
 
-class OpenAICompatAdapter:
-    """vLLM (or any OpenAI-compatible) endpoint, pinned to one slot for the whole session."""
+class _SdkBackend:
+    """What the two SDK-driven adapters share: the retrier, the usage tally, what the server reported."""
+
+    backend = ""
 
     def __init__(
         self,
         spec: ModelSpec,
-        base_url: str,
-        slot: str,
         seed: int,
         limits: Limits,
-        client_cfg: ClientSettings,
-        client: Any = None,
-        api_key: str = "none",
-        backend: str = "hpc",
+        client_cfg: ClientSettings | None,
+        base_url: str | None,
+        sleep: Callable[[float], Awaitable[None]] | None,
+        rng: SupportsUniform | None,
+        time_left: Callable[[], float | None] | None,
     ):
-        from openai import AsyncOpenAI
-
-        self.spec, self.base_url, self.slot, self.seed = spec, base_url, slot, seed
-        self.backend = backend
-        self._api_key = api_key
-        self.fingerprints: list[str] = []
-        self.rate_limited = 0  # 429 answers met (retried as registered); reported per run
-        self.usage_seen = {
-            "responses": 0,
-            "input": 0,
-            "output": 0,
-        }  # from every reply as it arrives, before any parsing can raise
-        self.usage_missing = 0  # replies that carried no usage: their tokens are unknown
-        self.served = Served()  # what the replies reported (model id and settings; not the requested values)
-        self.limits, self.cfg = limits, client_cfg
-        self._client = client or AsyncOpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            # a read timeout must mean "the run's wall time is gone", so it is never shorter than the time cap
-            timeout=_timeout(max(client_cfg.request_timeout_s, limits.time_cap_s + 60)),
-            max_retries=0,
+        self.spec, self.seed, self.limits = spec, seed, limits
+        self.cfg = client_cfg or ClientSettings()
+        self.base_url = base_url or spec.base_url
+        injected = {"sleep": sleep, "rng": rng, "time_left": time_left}
+        self.retrier = Retrier(
+            RetryPolicy.from_settings(self.cfg), **{k: v for k, v in injected.items() if v is not None}
         )
-        self._messages: list[dict] = []
-        self._tools: list[dict] = []
-        self.retries = 0
-        self.read_timeouts = 0
-        self.abandoned: dict | None = None
+        self.usage = UsageTally()
+        self.served = Served()
+        self._sent: dict[str, Any] = {}  # the settings of the latest request, taken from the request itself
 
-    def info(self) -> dict[str, Any]:
-        return {
-            "model_api_id": self.spec.api_id,
-            "checkpoint": self.spec.checkpoint,
-            "endpoint": self.base_url,
-            "slot": self.slot,
-            "seed": self.seed,
-            "seed_honoured": True,
-            "sampling": dict(self.spec.sampling),
-            "request_extra": self.spec.request_extra,
-            "retries": self.retries,
-            "read_timeouts": self.read_timeouts,
-            "abandoned_request": self.abandoned,
-            "backend": self.backend,
-            "system_fingerprints": sorted(set(self.fingerprints)),
-            **self.served.info(),
-            "rate_limited_429": self.rate_limited,
-            "usage_seen": dict(self.usage_seen),
-            "usage_missing": self.usage_missing,
-        }
+    @property
+    def output_limit(self) -> int:
+        """The max_tokens a request carries (B11)."""
+        return self.spec.output_tokens(self.limits.max_output_tokens)
+
+    @property
+    def context_tokens(self) -> int | None:
+        """The endpoint's context window, as the model table gives it."""
+        return self.spec.context_tokens
 
     def abandon(self, reason: str) -> None:
         """The run's deadline cancelled the request in flight; its usage is unknown."""
-        self.abandoned = {"reason": reason, "usage": "unknown"}
+        self.retrier.abandon(reason)
+
+    def _read_timeout_s(self) -> float:
+        """The read timeout: never shorter than the run's time cap, so it only fires when the run's time is gone."""
+        return max(self.cfg.request_timeout_s, self.limits.time_cap_s + 60)
+
+    def _info(self, sdk: str, **extra: Any) -> dict[str, Any]:
+        """The fields of the record both adapters share."""
+        stats = self.retrier.stats
+        return {
+            "backend": self.backend,
+            "model": self.spec.api_id,
+            "base_url": public_url(self.base_url),
+            "sdk_versions": {sdk: sdk_version(sdk)},
+            "seed": self.seed,
+            "seed_honoured": self.spec.seed_supported,
+            "settings_sent": dict(self._sent),
+            "retries": stats.retries,
+            "retry_events": list(self.retrier.events),
+            "read_timeouts": stats.read_timeouts,
+            "abandoned_request": self.retrier.abandoned,
+            "rate_limited_429": stats.rate_limited,
+            "usage_seen": self.usage.as_dict(),
+            **extra,
+            **self.served.info(),
+        }
+
+    def _count(self, input_tokens: int | None, output_tokens: int | None) -> None:
+        """Count a reply's usage the moment it arrives, and refuse a reply that carried none: its tokens are unknown."""
+        self.usage.note(input_tokens, output_tokens)
+        if input_tokens is None and output_tokens is None:
+            raise InfraError("endpoint", "reply carried no usage: its tokens are unknown")
+
+
+class OpenAICompatAdapter(_SdkBackend):
+    """An OpenAI-compatible endpoint (vLLM, a gateway, the vendor itself) named by a base URL."""
+
+    backend = "openai_compat"
+
+    def __init__(
+        self,
+        spec: ModelSpec,
+        seed: int,
+        limits: Limits,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        client_cfg: ClientSettings | None = None,
+        client: Any = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        rng: SupportsUniform | None = None,
+        time_left: Callable[[], float | None] | None = None,
+    ):
+        super().__init__(spec, seed, limits, client_cfg, base_url, sleep, rng, time_left)
+        if client is None:
+            from openai import AsyncOpenAI, Timeout
+
+            client = AsyncOpenAI(
+                base_url=self.base_url,
+                # an explicit key keeps the SDK from falling back to a key in the environment
+                api_key=api_key or "none",
+                timeout=Timeout(self._read_timeout_s(), connect=self.cfg.connect_timeout_s),
+                max_retries=0,
+            )
+        self._client = client
+        self._messages: list[dict] = []
+        self._tools: list[dict] = []
+
+    def info(self) -> dict[str, Any]:
+        """Describe the route and what the replies reported."""
+        return self._info("openai")
 
     def begin(self, system: str, user: str, tools: list[dict]) -> None:
+        """Start a conversation with the tools as chat-completion functions."""
         self._messages = ([{"role": "system", "content": system}] if system else []) + [
             {"role": "user", "content": user}
         ]
@@ -193,94 +265,54 @@ class OpenAICompatAdapter:
             for t in tools
         ]
 
+    def _extra_body(self) -> dict[str, Any]:
+        """The vendor extras plus the sampling keys the API takes only through `extra_body` (B14)."""
+        direct = {"temperature", "top_p"}
+        return {**{k: v for k, v in self.spec.sampling.items() if k not in direct}, **self.spec.extra_body}
+
     def _request(self) -> dict:
-        s = dict(self.spec.sampling)
+        """Build the request, and remember its settings for the record (B15)."""
         kw: dict[str, Any] = {
             "model": self.spec.api_id,
             "messages": self._wire_messages(),
-            "tools": self._tools,
-            "tool_choice": "auto",
             "seed": self.seed,
-            "max_tokens": self.spec.output_tokens(self.limits.max_output_tokens),
+            "max_tokens": self.output_limit,
         }
-        for k in ("temperature", "top_p"):
-            if k in s:
-                kw[k] = s.pop(k)
-        extra = {**s, **self.spec.request_extra}
-        if extra:
+        if self._tools:
+            kw.update(tools=self._tools, tool_choice="auto")
+        kw.update({k: v for k, v in self.spec.sampling.items() if k in ("temperature", "top_p")})
+        if extra := self._extra_body():
             kw["extra_body"] = extra
+        self._sent = settings_sent(kw)
         return kw
 
-    async def _create(self, kw: dict):
-        import openai
-
-        transient = (
-            openai.APIConnectionError,
-            openai.APITimeoutError,
-            openai.InternalServerError,
-            openai.RateLimitError,
-        )
-        attempt = 0
-        while True:
-            try:
-                return await self._client.chat.completions.create(**kw)
-            except asyncio.CancelledError:  # the run's deadline cancelled a request in flight
-                self.abandon("deadline")
-                raise
-            except (openai.AuthenticationError, openai.PermissionDeniedError) as e:
-                raise key_rejected(
-                    e
-                ) from None  # not retried, not the agent's: the key is refused (never the SDK's message, which can echo part of it)
-            except openai.APITimeoutError as e:
-                if _is_read_timeout(e):
-                    self.read_timeouts += 1  # accepted, then slow: abandon it, never resend
-                    self.abandoned = {"reason": "read_timeout", "usage": "unknown"}
-                    raise RequestAbandoned("read timeout") from e
-                if attempt >= self.cfg.connect_retries:
-                    raise InfraError(
-                        "endpoint", f"{type(e).__name__} (connect) after {attempt} retries: {e}"[:500]
-                    ) from e
-                self.retries += 1
-                await asyncio.sleep(min(self.cfg.retry_base_s * 2**attempt, self.cfg.retry_max_s))
-                attempt += 1
-            except transient as e:
-                if isinstance(e, openai.RateLimitError):
-                    self.rate_limited += 1
-                if attempt >= self.cfg.connect_retries:
-                    raise InfraError("endpoint", f"{type(e).__name__} after {attempt} retries: {e}"[:500]) from e
-                self.retries += 1
-                await asyncio.sleep(min(self.cfg.retry_base_s * 2**attempt, self.cfg.retry_max_s))
-                attempt += 1
-
     async def step(self) -> ModelTurn:
+        """Send the conversation and return the reply; usage and the served model are noted on arrival."""
         t0 = time.monotonic()
-        resp = await self._create(self._request())
-        u0 = getattr(
+        kw = self._request()
+        resp, retries = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
+        usage = getattr(
             resp, "usage", None
-        )  # counted the moment the reply arrives: a reply is billed even if reading it raises
-        self.usage_seen["responses"] += 1
-        if u0 is None:
-            self.usage_missing += 1
-        else:
-            self.usage_seen["input"] += getattr(u0, "prompt_tokens", 0) or 0
-            self.usage_seen["output"] += getattr(u0, "completion_tokens", 0) or 0
-        if u0 is None:  # a reply with no usage cannot be held to the token budget
-            raise InfraError("endpoint", "reply carried no usage: its tokens are unknown")
+        )  # counted the moment the reply arrives: a reply is billed even if reading it fails
+        in_tok, out_tok = token_count(usage, "prompt_tokens"), token_count(usage, "completion_tokens")
+        self.served.note(resp)
+        self._count(in_tok, out_tok)
         choices = getattr(resp, "choices", None)
         if not isinstance(choices, (list, tuple)) or not choices:
             raise InfraError("endpoint", f"reply carried no choices ({type(choices).__name__}); usage already counted")
-        msg = choices[0].message
+        choice = choices[0]
+        msg = choice.message
         extra = getattr(msg, "model_extra", None) or {}
         reasoning = extra.get("reasoning_content") or extra.get("reasoning")
-        calls: list[ToolCall] = []
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning_tokens = token_count(details, "reasoning_tokens")
+        self.served.note_thinking(bool(reasoning), reasoning_tokens)
         entry: dict[str, Any] = {"role": "assistant", "content": msg.content or None}
-        details = getattr(getattr(resp, "usage", None), "completion_tokens_details", None)
-        rtok = getattr(details, "reasoning_tokens", None)
-        self.served.note_thinking(bool(reasoning), rtok if isinstance(rtok, int) else None)
         if reasoning:
             entry["_reasoning"] = reasoning  # recorded; stripped before sending unless echoed
             if self.spec.echo_reasoning_field:
                 entry[self.spec.echo_reasoning_field] = reasoning
+        calls: list[ToolCall] = []
         if msg.tool_calls:
             entry["tool_calls"] = []
             for tc in msg.tool_calls:
@@ -288,229 +320,187 @@ class OpenAICompatAdapter:
                 args, err = _parse_args(raw)
                 calls.append(ToolCall(tc.id, tc.function.name, args, err, raw if err else None))
                 # Malformed arguments are never sent back (servers reject the history with HTTP 400): the
-                # history carries a valid JSON form that preserves the raw text. Same for every model.
+                # history carries a valid JSON form that preserves the raw text. Same for every backend.
                 sent = json.dumps({"_raw": raw}) if err else (raw or "{}")
                 entry["tool_calls"].append(
                     {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": sent}}
                 )
         self._messages.append(entry)
-        self.served.note(resp)
-        if getattr(resp, "system_fingerprint", None):
-            self.fingerprints.append(str(resp.system_fingerprint))
-        u = resp.usage
+        fingerprint = getattr(resp, "system_fingerprint", None)
         return ModelTurn(
-            msg.content or "",
-            calls,
-            getattr(u, "prompt_tokens", 0) or 0,
-            getattr(u, "completion_tokens", 0) or 0,
-            resp.choices[0].finish_reason,
-            time.monotonic() - t0,
-            reasoning,
+            text=msg.content or "",
+            tool_calls=calls,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            stop_reason=choice.finish_reason,
+            latency_s=time.monotonic() - t0,
+            reasoning=reasoning,
+            served_model=str(resp.model) if getattr(resp, "model", None) else None,
+            system_fingerprint=str(fingerprint) if fingerprint else None,
+            retries=retries,
         )
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
+        """Append one tool message per result."""
         for r in results:
             self._messages.append({"role": "tool", "tool_call_id": r.call.id, "content": r.text})
 
-    async def count_tokens(self, text: str) -> int:
-        """vLLM's /tokenize (served beside /v1): the model's own token count of a text."""
-        try:
-            import httpx2 as httpx
-        except ImportError:
-            import httpx
-        root = self.base_url.rsplit("/v1", 1)[0]
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(
-                f"{root}/tokenize",
-                json={"model": self.spec.api_id, "prompt": text},
-                headers={"Authorization": f"Bearer {self._api_key}"},
-            )
-            r.raise_for_status()
-            return int(r.json()["count"])
+    async def probe(self) -> None:
+        """Send a one-token completion with the model's id and its vendor extras (a provider pin applies to it too)."""
+        kw: dict[str, Any] = {
+            "model": self.spec.api_id,
+            "messages": [{"role": "user", "content": PROBE_PROMPT}],
+            "max_tokens": 1,
+        }
+        if extra := self._extra_body():
+            kw["extra_body"] = extra
+        resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
+        if not getattr(resp, "choices", None):
+            raise InfraError("endpoint", "the one-token completion carried no choices")
 
     def _wire_messages(self) -> list[dict]:
+        """The conversation as sent: the internal copy of the reasoning is stripped."""
         return [{k: v for k, v in m.items() if k != "_reasoning"} for m in self._messages]
 
     def transcript(self) -> list[dict]:
+        """Return the conversation including the recorded reasoning."""
         return json.loads(json.dumps(self._messages, default=str))
 
     async def aclose(self) -> None:
+        """Close the client."""
         await self._client.close()
 
 
-class AnthropicAdapter:
-    """Anthropic Messages API, harness-owned loop. No seed exists; recorded as not honoured."""
+class AnthropicAdapter(_SdkBackend):
+    """The Anthropic Messages API. No seed exists; recorded as not honoured."""
+
+    backend = "anthropic"
 
     def __init__(
         self,
         spec: ModelSpec,
         seed: int,
         limits: Limits,
-        api_key: str,
-        client: Any = None,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
         client_cfg: ClientSettings | None = None,
-        prompt_cache: bool = True,
+        client: Any = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        rng: SupportsUniform | None = None,
+        time_left: Callable[[], float | None] | None = None,
     ):
-        import anthropic
+        super().__init__(spec, seed, limits, client_cfg, base_url, sleep, rng, time_left)
+        if client is None:
+            from anthropic import AsyncAnthropic, Timeout
 
-        self.spec, self.seed, self.limits = spec, seed, limits
-        self.prompt_cache = prompt_cache
-        # the read timeout is at least the run's wall-time cap, so it only fires when the time is gone
-        self._client = client or anthropic.AsyncAnthropic(
-            api_key=api_key, max_retries=0, timeout=_timeout(limits.time_cap_s + 60)
-        )  # retries are ours, below
-        self.read_timeouts = 0
-        self.served = Served()
-        self.rate_limited = 0
-        self.usage_seen = {"responses": 0, "input": 0, "output": 0}
-        self.usage_missing = 0
-        self.abandoned: dict | None = None
-        self.retries = 0
-        self.cfg = client_cfg or ClientSettings("", 0, 8, 5.0, 120.0)
+            client = AsyncAnthropic(
+                api_key=api_key,
+                base_url=self.base_url,
+                timeout=Timeout(self._read_timeout_s(), connect=self.cfg.connect_timeout_s),
+                max_retries=0,  # retries are ours
+            )
+        self._client = client
         self._system = ""
         self._messages: list[dict] = []
         self._tools: list[dict] = []
 
-    def info(self) -> dict[str, Any]:
-        return {
-            "model_api_id": self.spec.api_id,
-            "checkpoint": self.spec.checkpoint,
-            "endpoint": "https://api.anthropic.com",
-            "slot": None,
-            "seed": self.seed,
-            "seed_honoured": False,
-            "sampling": dict(self.spec.sampling),
-            "request_extra": self.spec.request_extra,
-            "read_timeouts": self.read_timeouts,
-            "abandoned_request": self.abandoned,
-            "retries": self.retries,
-            "prompt_cache": dict(CACHE_CONTROL) if self.prompt_cache else None,
-            **self.served.info(),
-            "rate_limited_429": self.rate_limited,
-            "usage_seen": dict(self.usage_seen),
-            "usage_missing": self.usage_missing,
-        }
+    @property
+    def _cache_control(self) -> dict[str, str] | None:
+        """The cache marker, or None when the model entry sets no prompt cache."""
+        ttl = self.spec.prompt_cache_ttl
+        return {"type": "ephemeral", "ttl": ttl} if ttl else None
 
-    def abandon(self, reason: str) -> None:
-        """The run's deadline cancelled the request in flight; its usage is unknown."""
-        self.abandoned = {"reason": reason, "usage": "unknown"}
+    def info(self) -> dict[str, Any]:
+        """Describe the route and what the replies reported."""
+        return self._info("anthropic", prompt_cache=self._cache_control)
 
     def begin(self, system: str, user: str, tools: list[dict]) -> None:
+        """Start a conversation with the tools as Messages API tools."""
         self._system = system
         self._messages = [{"role": "user", "content": user}]
         self._tools = [
             {"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]} for t in tools
         ]
 
-    async def step(self) -> ModelTurn:
-        t0 = time.monotonic()
-        # the system prompt is always one text block (same model input as a string); the caching arm adds
-        # the marker to it and a top-level marker that follows the end of the conversation
-        sys_block: dict[str, Any] = {"type": "text", "text": self._system}
-        if self.prompt_cache:
-            sys_block["cache_control"] = dict(CACHE_CONTROL)
+    def _request(self) -> dict:
+        """Build the request, and remember its settings for the record (B15)."""
         kw: dict[str, Any] = {
             "model": self.spec.api_id,
-            "system": [sys_block],
-            "messages": self._messages,
-            "tools": self._tools,
-            "max_tokens": self.spec.output_tokens(self.limits.max_output_tokens),
+            "messages": list(self._messages),
+            "max_tokens": self.output_limit,
         }
-        kw.update(self.spec.sampling)  # empty for the 5.5 models: vendor says omit
-        if self.spec.request_extra:
-            kw["extra_body"] = self.spec.request_extra
-        if not self._system:
-            kw.pop("system")  # the protocol prompt is a single user message
-        if self.prompt_cache:
-            kw["cache_control"] = dict(CACHE_CONTROL)  # history is never touched: markers live only in the request
-        import anthropic
+        if self._tools:
+            kw["tools"] = self._tools
+        cache = self._cache_control
+        if self._system:
+            # the system prompt is always one text block (the same model input as a string)
+            block: dict[str, Any] = {"type": "text", "text": self._system}
+            if cache:
+                block["cache_control"] = dict(cache)
+            kw["system"] = [block]
+        kw.update(self.spec.sampling)  # empty where the vendor says to omit them
+        if self.spec.extra_body:
+            kw["extra_body"] = dict(self.spec.extra_body)
+        if cache:
+            kw["cache_control"] = dict(cache)  # history is never touched: markers live only in the request
+        self._sent = settings_sent(kw)
+        return kw
 
-        attempt = 0
-        while True:
-            try:
-                resp = await self._client.messages.create(**kw)  # the SDK does not retry (max_retries=0)
-                break
-            except asyncio.CancelledError:  # the run's deadline cancelled a request in flight
-                self.abandon("deadline")
-                raise
-            except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
-                raise key_rejected(e) from None  # not retried, not the agent's (see the OpenAI adapter)
-            except anthropic.APITimeoutError as e:
-                if _is_read_timeout(e):
-                    self.read_timeouts += 1  # accepted, then slow: abandon, never resend
-                    self.abandoned = {"reason": "read_timeout", "usage": "unknown"}
-                    raise RequestAbandoned("read timeout") from e
-                err = e
-            except (anthropic.APIConnectionError, anthropic.InternalServerError, anthropic.RateLimitError) as e:
-                if isinstance(e, anthropic.RateLimitError):
-                    self.rate_limited += 1
-                err = e
-            if attempt >= self.cfg.connect_retries:  # connection failures and 5xx/429 only
-                raise InfraError("endpoint", f"{type(err).__name__} after {attempt} retries: {err}"[:500]) from err
-            self.retries += 1
-            await asyncio.sleep(min(self.cfg.retry_base_s * 2**attempt, self.cfg.retry_max_s))
-            attempt += 1
-        self.served.note(resp)
+    async def step(self) -> ModelTurn:
+        """Send the conversation and return the reply; usage and the served model are noted on arrival."""
+        t0 = time.monotonic()
+        kw = self._request()
+        resp, retries = await self.retrier.call(lambda: self._client.messages.create(**kw))
         ua = getattr(resp, "usage", None)  # counted the moment the reply arrives (see the OpenAI adapter)
-        self.usage_seen["responses"] += 1
-        if ua is None:
-            self.usage_missing += 1
-        else:
-            self.usage_seen["input"] += (
-                (getattr(ua, "input_tokens", 0) or 0)
-                + (getattr(ua, "cache_creation_input_tokens", 0) or 0)
-                + (getattr(ua, "cache_read_input_tokens", 0) or 0)
-            )
-            self.usage_seen["output"] += getattr(ua, "output_tokens", 0) or 0
-        if ua is None:
-            raise InfraError("endpoint", "reply carried no usage: its tokens are unknown")
+        fresh = token_count(ua, "input_tokens")  # the API's input_tokens is only the uncached remainder
+        created = token_count(ua, "cache_creation_input_tokens")
+        read = token_count(ua, "cache_read_input_tokens")
+        out_tok = token_count(ua, "output_tokens")
+        in_tok = None if fresh is None else fresh + (created or 0) + (read or 0)  # the prompt size the budget counts
+        self.served.note(resp)
+        self._count(in_tok, out_tok)
         if not isinstance(getattr(resp, "content", None), (list, tuple)):
             raise InfraError("endpoint", "reply carried no content blocks; usage already counted")
         text, calls, reasoning = [], [], []
-        self.served.note_thinking(
-            any(getattr(b, "type", None) in ("thinking", "redacted_thinking") for b in resp.content)
-        )  # no separate count in this API
+        thinking_types = ("thinking", "redacted_thinking")
+        self.served.note_thinking(any(getattr(b, "type", None) in thinking_types for b in resp.content))
         for b in resp.content:
             if b.type == "text":
                 text.append(b.text)
             elif b.type == "tool_use":
                 ok = isinstance(b.input, dict)
+                raw = None if ok else json.dumps(b.input, default=str)
                 calls.append(
                     ToolCall(
-                        b.id,
-                        b.name,
-                        b.input if ok else {},
-                        None if ok else "arguments are not a JSON object",
-                        None if ok else json.dumps(b.input, default=str),
+                        b.id, b.name, b.input if ok else {}, None if ok else "arguments are not a JSON object", raw
                     )
                 )
-            elif b.type in ("thinking", "redacted_thinking"):
+            elif b.type in thinking_types:
                 reasoning.append(getattr(b, "thinking", "") or "")
-        # the assistant turn goes back verbatim (thinking blocks included)
+        # the assistant turn goes back verbatim (thinking blocks included, signatures with them)
         blocks = [b.model_dump(exclude_none=True) for b in resp.content]
-        for blk in blocks:  # same rule as every model: never resend a non-object input
+        for blk in blocks:  # same rule as every backend: never resend a non-object input
             if blk.get("type") == "tool_use" and not isinstance(blk.get("input"), dict):
                 blk["input"] = {"_raw": json.dumps(blk.get("input"), default=str)}
         self._messages.append({"role": "assistant", "content": blocks})
-        u = resp.usage
-        fresh = u.input_tokens or 0  # the API's input_tokens is only the uncached remainder
-        created = getattr(u, "cache_creation_input_tokens", 0) or 0
-        read = getattr(u, "cache_read_input_tokens", 0) or 0
-        inp_tok = fresh + created + read  # the prompt size: what P3 and {TOKEN_BUDGET} count
         return ModelTurn(
-            "".join(text),
-            calls,
-            inp_tok,
-            u.output_tokens or 0,
-            resp.stop_reason,
-            time.monotonic() - t0,
-            "\n".join(r for r in reasoning if r) or None,
-            fresh,
-            created,
-            read,
+            text="".join(text),
+            tool_calls=calls,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            stop_reason=resp.stop_reason,
+            latency_s=time.monotonic() - t0,
+            reasoning="\n".join(r for r in reasoning if r) or None,
+            uncached_input_tokens=fresh,
+            cache_creation_input_tokens=created,
+            cache_read_input_tokens=read,
+            served_model=str(resp.model) if getattr(resp, "model", None) else None,
+            retries=retries,
         )
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
+        """Append one user message holding every result, as the Messages API wants."""
         self._messages.append(
             {
                 "role": "user",
@@ -526,49 +516,71 @@ class AnthropicAdapter:
             }
         )
 
+    async def probe(self) -> None:
+        """Send a one-token completion. The vendor extras are left out: extended thinking needs a larger budget."""
+        kw = {"model": self.spec.api_id, "messages": [{"role": "user", "content": PROBE_PROMPT}], "max_tokens": 1}
+        resp, _ = await self.retrier.call(lambda: self._client.messages.create(**kw))
+        if not isinstance(getattr(resp, "content", None), (list, tuple)):
+            raise InfraError("endpoint", "the one-token completion carried no content blocks")
+
     def transcript(self) -> list[dict]:
-        # the system prompt travels as a separate API parameter; the record keeps it first
+        """Return the conversation with the system prompt first; on the wire it travels as a separate parameter."""
         full = ([{"role": "system", "content": self._system}] if self._system else []) + self._messages
         return json.loads(json.dumps(full, default=str))
 
     async def aclose(self) -> None:
+        """Close the client."""
         await self._client.close()
 
 
 class StubAdapter:
-    """Scripted adapter for tests and the oracle: replays a list of turns.
+    """Scripted backend for tests and the oracle: replays a list of turns.
 
-    Each item is either a final text (str) or a list of (tool_name, arguments) calls. Token counts
-    are synthetic (len of the text/args), and recorded as such in info().
+    Each item is a final text (str), a list of (tool_name, arguments) calls, a dict {"text": ..., "stop": ...} for a
+    reply with a given stop reason, or an exception, which `step` raises. Token counts are synthetic (the length of
+    the text or arguments), and recorded as such in info().
     """
 
-    def __init__(self, script: list, name: str = "stub", seed: int = 0):
+    def __init__(
+        self,
+        script: list,
+        name: str = "stub",
+        seed: int = 0,
+        *,
+        output_limit: int | None = None,
+        context_tokens: int | None = None,
+        probe_error: BaseException | None = None,
+    ):
         self._script, self._i, self.name, self.seed = list(script), 0, name, seed
+        self.output_limit, self.context_tokens, self._probe_error = output_limit, context_tokens, probe_error
         self._messages: list[dict] = []
         self._ctx_tokens = 0
 
     def info(self) -> dict[str, Any]:
+        """Describe the stub as a route."""
         return {
-            "model_api_id": self.name,
-            "checkpoint": self.name,
-            "endpoint": "stub://",
-            "slot": None,
+            "backend": "stub",
+            "model": self.name,
+            "base_url": None,
             "seed": self.seed,
             "seed_honoured": False,
-            "sampling": {},
-            "request_extra": {},
+            "settings_sent": {},
             "synthetic_tokens": True,
         }
 
     def begin(self, system: str, user: str, tools: list[dict]) -> None:
+        """Start a conversation."""
         self._messages = ([{"role": "system", "content": system}] if system else []) + [
             {"role": "user", "content": user}
         ]
         self._ctx_tokens = (len(system) + len(user)) // 4
 
     async def step(self) -> ModelTurn:
+        """Return the next scripted reply; "done" once the script is used up."""
         item = self._script[self._i] if self._i < len(self._script) else "done"
         self._i += 1
+        if isinstance(item, BaseException):
+            raise item
         if isinstance(item, dict):  # {"text": ..., "stop": "length"}: a reply with a given stop reason
             self._messages.append({"role": "assistant", "content": item["text"]})
             return ModelTurn(item["text"], [], self._ctx_tokens, len(item["text"]) // 4 + 1, item["stop"], 0.0)
@@ -592,12 +604,20 @@ class StubAdapter:
         return turn
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
+        """Append one tool message per result."""
         for r in results:
             self._messages.append({"role": "tool", "tool_call_id": r.call.id, "content": r.text})
             self._ctx_tokens += len(r.text) // 4
 
     def transcript(self) -> list[dict]:
+        """Return a copy of the conversation."""
         return json.loads(json.dumps(self._messages, default=str))
 
+    async def probe(self) -> None:
+        """Succeed, or raise the error the stub was given."""
+        if self._probe_error is not None:
+            raise self._probe_error
+
     async def aclose(self) -> None:
+        """Nothing to release."""
         return None
