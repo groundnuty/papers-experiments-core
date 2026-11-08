@@ -42,23 +42,26 @@ def test_o04_an_extra_provider_fails_an_exclusive_declaration(tmp_path, fake):
     fake.add_provider("pr-beta", "beta.test")
     result = health_for(tmp_path, fake)()
     assert result.ok is False
-    assert "declared but not in the support set: beta" in result.detail
+    assert "declared but not in the support set: providers[1]" in result.detail
+    assert "beta" not in result.detail
 
 
-def test_o04_an_undeclared_provider_fails_and_is_counted_not_named(tmp_path, fake):
-    """O04: a reported provider the file does not know fails the check; the detail counts it and shows no host."""
+def test_o04_an_undeclared_provider_fails_and_is_shown_by_its_reported_id(tmp_path, fake):
+    """O04: a reported provider the file does not know fails the check; the detail counts it and shows the id the
+    federation reports for it, never its host or name."""
     fake.add_provider("pr-stranger", "stranger.test")
     result = health_for(tmp_path, fake)()
     assert result.ok is False
-    assert "1 reported provider(s) not declared" in result.detail
-    assert "stranger" not in result.detail
+    assert "1 reported provider(s) not declared: pr-stranger" in result.detail
+    assert "stranger.test" not in result.detail
 
 
 def test_o04_a_missing_declared_provider_fails(tmp_path, fake):
     """O04: a declared provider the federation does not report is a failure."""
     result = health_for(tmp_path, fake, both_declared)()
     assert result.ok is False
-    assert "missing beta" in result.detail
+    assert "missing providers[1]" in result.detail
+    assert "beta" not in result.detail
 
 
 def test_o04_the_wrong_provider_alone_fails_both_ways(tmp_path, fake):
@@ -67,7 +70,8 @@ def test_o04_the_wrong_provider_alone_fails_both_ways(tmp_path, fake):
     fake.supports["pr-stranger"] = fake.supports.pop(ALPHA_ID)
     result = health_for(tmp_path, fake)()
     assert result.ok is False
-    assert "missing alpha" in result.detail
+    assert "missing providers[0]" in result.detail
+    assert "alpha" not in result.detail
     assert "1 reported provider(s) not declared" in result.detail
 
 
@@ -148,7 +152,8 @@ def test_o04_a_space_under_another_name_or_an_offline_provider_fails(tmp_path, f
     fake.providers["prmock0001"]["online"] = False
     result = health_for(tmp_path, fake)()
     assert result.ok is False
-    assert "offline: alpha" in result.detail
+    assert "offline: providers[0]" in result.detail
+    assert "alpha" not in result.detail
     fake.providers["prmock0001"]["online"] = True
     fake.space_name = "renamed-space"
     assert "another name" in health_for(tmp_path, fake)().detail

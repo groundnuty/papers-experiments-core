@@ -63,7 +63,7 @@ manifest = "path.json"          # the frozen manifest the client checks the serv
 import math
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -187,6 +187,15 @@ class PlatformConfig:
     def local_provider(self) -> Provider:
         """The agent's own provider."""
         return self.providers[self.support.local]
+
+    def provider_label(self, name: str) -> str:
+        """Name a declared provider for a message by its position in the file, `providers[i]`, never by its name."""
+        return f"providers[{list(self.providers).index(name)}]"
+
+    def provider_labels(self, names: Iterable[str]) -> str:
+        """Name several declared providers, in the file's order, joined for a message."""
+        order = list(self.providers)
+        return ", ".join(self.provider_label(n) for n in sorted(set(names), key=order.index))
 
     def condition(self, name: str) -> Condition:
         """Return a condition of the tool server; raise ConfigError, without naming it, when there is none."""

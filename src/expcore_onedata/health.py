@@ -14,12 +14,14 @@ declared fails the check as surely as a declared one that is missing. The check 
 provider is reported offline.
 
 An answer that cannot be read is unhealthy, never a crash and never a pass: any failure, including an unexpected
-exception, becomes `Health(False, reason)`. The reason names counts and configuration names, never a token, URL or host.
+exception, becomes `Health(False, reason)`. The reason names positions in the file (`providers[i]`), counts and the
+ids the federation reports, never a token, URL, host or configured name.
 
 The check of the earlier study also read one known file back through its provider and compared its checksum with a study manifest. That
 belongs to the study (its data) and not to the platform, so a study adds it with its own check.
 """
 
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -28,7 +30,7 @@ from expcore.campaign.healthgate import Health
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
-from expcore_onedata.federation import SpaceView, declared_names, read_space
+from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, read_space
 from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import MintedToken, TokenIssuer, data_path_spec
 
@@ -37,42 +39,57 @@ REFRESH_BEFORE_S = 120.0  # a cached token is replaced this long before it expir
 _SAFE = (PlatformError, TokenRefused)  # whose messages hold no URL, id or value, so they can be shown
 
 
+_PLAIN_ID = re.compile(r"[A-Za-z0-9_.:@-]{1,64}")
+_IDS_SHOWN = 5
+
+
+def _reported_ids(reported: list[ReportedProvider]) -> str:
+    """Name reported providers by the ids the federation gave them: a plain id as it is, anything else as a count."""
+    shown = [r.id if _PLAIN_ID.fullmatch(r.id) else "(an id that is not plain)" for r in reported[:_IDS_SHOWN]]
+    more = len(reported) - len(shown)
+    return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
+
+
 def compare(view: SpaceView, config: PlatformConfig) -> Health:
     """Compare the providers the federation reports for the space with the declared set; any difference fails.
 
     Reported providers are matched to declared ones by provider id. A reported provider no declaration fits, and a
     declared provider that more than one reported provider fits (or a reported provider that fits several declarations),
     fail the check: the first match is never taken, so a second provider cannot hide behind the declared one.
+
+    The detail holds no configured name, host, URL or id (O12). A declared provider is `providers[i]`, its position in
+    platform.toml; a provider no declaration fits is shown by the id the federation reports for it.
     """
     if view.name != config.space.name:
         return Health(False, "the study space is reported under another name than the declared one")
     matched: dict[str, list[bool]] = {}
-    undeclared = ambiguous = 0
+    strangers: list[ReportedProvider] = []
+    ambiguous: set[str] = set()
     for reported in view.providers:
         names = declared_names(config, reported)
         if not names:
-            undeclared += 1
+            strangers.append(reported)
         elif len(names) > 1:
-            ambiguous += 1
+            ambiguous.update(names)
         else:
             matched.setdefault(names[0], []).append(reported.online)
-    ambiguous += sum(len(online) > 1 for online in matched.values())
-    missing = sorted(set(config.support.providers) - set(matched))
-    unexpected = sorted(set(matched) - set(config.support.providers))
-    if missing or undeclared or unexpected or ambiguous:
+    ambiguous.update(name for name, online in matched.items() if len(online) > 1)
+    missing = set(config.support.providers) - set(matched)
+    unexpected = set(matched) - set(config.support.providers)
+    if missing or strangers or unexpected or ambiguous:
         parts = []
         if missing:
-            parts.append(f"missing {', '.join(missing)}")
-        if undeclared:
-            parts.append(f"{undeclared} reported provider(s) not declared")
+            parts.append(f"missing {config.provider_labels(missing)}")
+        if strangers:
+            parts.append(f"{len(strangers)} reported provider(s) not declared: {_reported_ids(strangers)}")
         if ambiguous:
-            parts.append(f"{ambiguous} ambiguous match(es) between reported and declared providers")
+            parts.append(f"ambiguous match for {config.provider_labels(ambiguous)}")
         if unexpected:
-            parts.append(f"declared but not in the support set: {', '.join(unexpected)}")
+            parts.append(f"declared but not in the support set: {config.provider_labels(unexpected)}")
         return Health(False, "the providers supporting the space differ from the declared set: " + "; ".join(parts))
-    offline = sorted(name for name, online in matched.items() if online[0] is False)
+    offline = [name for name, online in matched.items() if online[0] is False]
     if offline:
-        return Health(False, f"declared provider(s) reported offline: {', '.join(offline)}")
+        return Health(False, f"declared provider(s) reported offline: {config.provider_labels(offline)}")
     return Health(True, f"ok: the space is supported by exactly the {len(matched)} declared provider(s)")
 
 

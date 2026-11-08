@@ -114,3 +114,80 @@ def test_o12_a_provider_entry_that_is_not_a_table_is_reported_by_position(tmp_pa
     """O12: `providers.<name> = "..."` is reported as an entry that is not a table, by position."""
     with pytest.raises(ConfigError, match=r"providers.*entry \d must be a table"):
         load_platform(write_platform(tmp_path, lambda d: d["providers"].update(gamma="https://gamma.test")))
+
+
+def declared_both(data):
+    data["support"]["providers"] = ["alpha", "beta"]
+
+
+def health_detail(tmp_path, fake, edit=None):
+    from platform_support import NOW
+
+    from expcore_onedata.health import PlatformHealth
+    from expcore_onedata.tokens import TokenIssuer
+
+    config = load_platform(write_platform(tmp_path, edit))
+    client = OnezoneClient(config, http=fake.client_http())
+    return PlatformHealth(config, client, TokenIssuer(client, config, clock=lambda: NOW), clock=lambda: NOW)().detail
+
+
+def test_o12_a_health_detail_names_declared_providers_by_position_and_others_by_their_reported_id(tmp_path, fake):
+    """O12: whatever fails, the detail holds `providers[i]` for a declared provider and the federation's own id for a
+    reported one nobody declared, and none of the file's names, ids, hosts or URLs."""
+    details = []
+    details.append(health_detail(tmp_path, fake, declared_both))  # beta is declared and not reported: missing
+    fake.add_provider("pr-beta", "beta.test", online=False)
+    fake.providers["prmock0001"]["online"] = False
+    details.append(health_detail(tmp_path, fake, declared_both))  # both declared and reported, both offline
+    details.append(health_detail(tmp_path, fake))  # beta is reported but not in the support set
+    fake.add_provider("pr-stranger", "stranger.test")
+    details.append(health_detail(tmp_path, fake, declared_both))  # a stranger beside two declared providers
+    fake.add_provider("pr-second", "alpha.test")
+    details.append(health_detail(tmp_path, fake))
+    assert "missing providers[1]" in details[0]
+    assert "offline: providers[0], providers[1]" in details[1]
+    assert "declared but not in the support set: providers[1]" in details[2]
+    assert "not declared: pr-stranger" in details[3]
+    assert "2 reported provider(s) not declared: pr-second, pr-stranger" in details[4]
+    for detail in details:
+        assert leaked_values(detail, tmp_path) == [], detail
+        assert "stranger.test" not in detail
+
+
+def test_o12_a_host_only_declaration_that_is_ambiguous_is_reported_by_position(tmp_path, fake):
+    """O12: an ambiguous match names the declared provider by position, not the name, host or id."""
+    import dataclasses
+
+    from expcore_onedata.federation import ReportedProvider, SpaceView
+    from expcore_onedata.health import compare
+
+    config = load_platform(write_platform(tmp_path))
+    host_only = dataclasses.replace(config.providers["beta"], id=None)
+    config = dataclasses.replace(config, providers={**config.providers, "beta": host_only})
+    view = SpaceView(
+        "spmock0001",
+        config.space.name,
+        (
+            ReportedProvider("prmock0001", "a", "alpha.test", True),
+            ReportedProvider("pr-one", "b", "beta.test", True),
+            ReportedProvider("pr-two", "c", "beta.test", True),
+        ),
+    )
+    detail = compare(view, config).detail
+    assert "ambiguous match for providers[1]" in detail
+    assert leaked_values(detail, tmp_path) == [], detail
+
+
+def test_o12_reported_ids_that_are_not_plain_are_not_echoed_and_many_are_counted(tmp_path, fake):
+    """O12: the federation's own ids are shown only when they are plain, and only a few of them."""
+    from expcore_onedata.federation import ReportedProvider, SpaceView
+    from expcore_onedata.health import compare
+
+    config = load_platform(write_platform(tmp_path))
+    strangers = tuple(ReportedProvider(f"pr-{i}", "x", "x.test", True) for i in range(8))
+    odd = ReportedProvider("bad id\n<script>", "x", "x.test", True)
+    detail = compare(SpaceView("spmock0001", config.space.name, (*strangers, odd)), config).detail
+    assert "9 reported provider(s) not declared: pr-0, pr-1, pr-2, pr-3, pr-4 and 4 more" in detail
+    assert "script" not in detail
+    detail = compare(SpaceView("spmock0001", config.space.name, (odd,)), config).detail
+    assert "not declared: (an id that is not plain)" in detail

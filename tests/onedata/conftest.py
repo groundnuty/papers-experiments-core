@@ -7,6 +7,7 @@ from record_support import no_secrets_in_the_environment
 
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
+from expcore_onedata import health
 from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
 from expcore_onedata.config import PlatformConfig, load_platform
 from expcore_onedata.federation import FederationUnreadable, PinRefused
@@ -64,9 +65,10 @@ LAYER_EXCEPTIONS = (
 
 
 @pytest.fixture(autouse=True)
-def _no_exception_holds_a_configured_value(monkeypatch, tmp_path):
-    """O12: record the message of every platform-layer exception the test builds, and fail the test if any of them
-    holds a value of the fixture configuration (a name, a URL, a host, an id, a user or a path)."""
+def _no_message_holds_a_configured_value(monkeypatch, tmp_path):
+    """O12: record the message of every platform-layer exception and the detail of every health reading the test
+    builds, and fail the test if any holds a value of the fixture configuration (a name, a URL, a host, an id, a user
+    or a path)."""
     messages: list[str] = []
 
     def recording(original):
@@ -78,6 +80,14 @@ def _no_exception_holds_a_configured_value(monkeypatch, tmp_path):
 
     for exception in LAYER_EXCEPTIONS:
         monkeypatch.setattr(exception, "__init__", recording(exception.__init__))
+    reading = health.Health  # a NamedTuple, which has no __init__ to wrap: the health module's name for it is wrapped
+
+    def recording_health(*args, **kwargs):
+        made = reading(*args, **kwargs)
+        messages.append(made.detail)
+        return made
+
+    monkeypatch.setattr(health, "Health", recording_health)
     yield
     leaks = {text: found for text in messages if (found := leaked_values(text, tmp_path))}
     assert not leaks, f"a message of the platform layer holds configured values: {leaks}"
