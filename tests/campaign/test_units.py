@@ -1,9 +1,9 @@
 """Endpoint health per unit: N failures pause it, and only a success clears the pause (C15)."""
 
 import pytest
-from campaign_support import NOW, planned_store
+from campaign_support import NOW, finished, infra, planned_store, run_one
 
-from expcore.campaign.units import META, UnitHealth
+from expcore.campaign.units import META, UnitHealth, history_from_attempts
 
 
 class Time:
@@ -129,3 +129,45 @@ def test_c15_the_limits_are_checked(tmp_path):
         UnitHealth(store, fail_threshold=0, pause_s=1.0, now=Time(), stamp=lambda: NOW)
     with pytest.raises(ValueError, match="pause_s"):
         UnitHealth(store, fail_threshold=1, pause_s=0, now=Time(), stamp=lambda: NOW)
+
+
+def test_c15_the_stored_attempts_raise_a_unit_to_what_they_say_and_never_lower_what_the_record_holds(tmp_path):
+    """C15: replayed through the rules of failure and success, merged by taking the worse of each part."""
+    units, moment, _ = units_for(tmp_path, threshold=3, pause_s=100.0)
+    t = moment.now
+    units.failure("kept", immediate=True)  # a state the attempts cannot show: it stays, whatever they say
+    changed = units.reconcile(
+        [("lost", "failure", t), ("lost", "failure", t + 1), ("lost", "failure", t + 2), ("kept", "success", t + 5)]
+    )
+    assert changed == ["lost"]
+    assert units.down("lost")
+    assert units.paused_until("lost") == t + 2 + 100.0  # from the failure that paused it, not from the start
+    assert units.down("kept")  # a success only the attempts remember does not lower the record
+    assert units.reconcile([("lost", "failure", t), ("lost", "failure", t + 1), ("lost", "failure", t + 2)]) == []
+
+
+def test_c15_a_success_after_the_failures_in_the_attempts_leaves_the_unit_healthy(tmp_path):
+    """C15: the replay is ordered: failures a success followed do not pause the unit."""
+    units, moment, _ = units_for(tmp_path, threshold=2)
+    t = moment.now
+    assert units.reconcile([("u", "failure", t), ("u", "success", t + 1), ("u", "failure", t + 2)]) == ["u"]
+    assert units.status()["u"]["fails"] == 1
+    assert not units.down("u")
+
+
+def test_c15_the_history_reads_endpoint_failures_refused_keys_and_scored_runs_from_the_attempts(tmp_path):
+    """C15: infrastructure of kind endpoint and a refused key are failures; a scored attempt is a success; the rest
+    count for nothing."""
+    store, _, manifest = planned_store(tmp_path, seeds=(1, 2, 3, 4))
+    keys = [row.key.text for row in manifest.rows]
+    run_one(store, keys[0], infra("endpoint"))
+    run_one(store, keys[1], infra("key_rejected"))
+    run_one(store, keys[2], infra("sandbox"))  # the endpoint's health says nothing of a sandbox
+    run_one(store, keys[3], finished())
+    history = history_from_attempts(store, lambda model: f"unit-{model}")
+    assert [(unit, kind) for unit, kind, _ in history] == [
+        ("unit-m1", "failure"),
+        ("unit-m1", "immediate"),
+        ("unit-m1", "success"),
+    ]
+    assert history_from_attempts(store, lambda model: None) == []

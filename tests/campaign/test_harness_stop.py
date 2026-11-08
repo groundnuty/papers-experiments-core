@@ -190,3 +190,71 @@ def test_c10_the_limits_are_checked():
         HarnessStopConfig(stop_after=0)
     with pytest.raises(ValueError, match="window_s"):
         HarnessStopConfig(window_s=0)
+
+
+def stored_errors_without_notes(store, model, count, start=0, kind="ValueError", ended=LATER):
+    """Make runs end as harness errors without telling the stops: what a result committed from its marker leaves."""
+    for index in range(start, start + count):
+        run_one(store, keys_by_model(store)[model][index], error_of(kind, ended))
+
+
+def test_c10_the_stops_the_stored_errors_imply_are_derived_when_the_record_lacks_them(tmp_path):
+    """C10: three same-kind errors in the store and no record of a stop: reconcile fires it once, with its event."""
+    store, stops = setup(tmp_path)
+    stored_errors_without_notes(store, "m1", 3)
+    assert stops.stopped() == (frozenset(), False)
+    [reason] = stops.reconcile("2026-01-01T00:30:00Z")
+    assert "3 harness errors of kind ValueError on m1" in reason
+    assert stops.stopped() == (frozenset({"m1"}), False)
+    assert stops.reconcile("2026-01-01T00:31:00Z") == []  # again changes nothing
+    events = store.q("SELECT detail FROM events WHERE kind='harness_error_stop'")
+    assert len(events) == 1
+    assert "derived at the start from the stored attempts" in events[0]["detail"]
+    assert stops.load()["models"]["m1"]["utc"] == LATER  # the stop began when the third error ended, not at the start
+
+
+def test_c10_the_derivation_stops_all_dispatch_for_one_kind_on_a_wide_spread_and_not_for_two_models(tmp_path):
+    """C10: the all-stop is derived from the stored errors too; two models are below its limit."""
+    store, stops = setup(tmp_path)
+    stored_errors_without_notes(store, "m1", 1)
+    stored_errors_without_notes(store, "m2", 1)
+    assert stops.reconcile(LATER) == []
+    stored_errors_without_notes(store, "m3", 1)
+    [reason] = stops.reconcile(LATER)
+    assert "kind ValueError on 3 models" in reason
+    assert stops.stopped()[1]
+
+
+def test_c10_the_derivation_counts_only_what_a_stop_would_have_counted(tmp_path):
+    """C10: errors outside the window, of other kinds, or too few stop nothing."""
+    store, stops = setup(tmp_path, window_s=3600.0)
+    stored_errors_without_notes(store, "m1", 1, ended="2026-01-01T00:00:00Z")
+    stored_errors_without_notes(store, "m1", 1, start=1, ended="2026-01-01T05:00:00Z")  # two hours past the first
+    stored_errors_without_notes(store, "m1", 1, start=2, ended="2026-01-01T05:10:00Z", kind="KeyError")
+    assert stops.reconcile("2026-01-01T06:00:00Z") == []
+    assert stops.stopped() == (frozenset(), False)
+
+
+def test_c10_the_derivation_leaves_a_released_stop_released(tmp_path):
+    """C10: errors up to a release stop counting, so a restart after it does not stop the model again."""
+    path = tmp_path / "release"
+    store, stops = setup(tmp_path, release_file=path)
+    for index in range(3):
+        fail(store, stops, "m1", index)
+    path.write_text("m1\n", encoding="utf-8")
+    os.utime(path, (epoch_of(LATER) + 5, epoch_of(LATER) + 5))
+    assert set(stops.take_releases("2026-01-01T00:20:00Z")) == {"m1"}
+    assert stops.reconcile("2026-01-01T00:25:00Z") == []
+    assert stops.stopped() == (frozenset(), False)
+    stored_errors_without_notes(store, "m1", 2, start=3, ended="2026-01-01T00:22:00Z")  # two after the release: too few
+    assert stops.reconcile("2026-01-01T00:25:00Z") == []
+
+
+def test_c10_the_derivation_does_not_mend_an_unreadable_record(tmp_path):
+    """C10: a record nobody can read stays all-stopped; reconcile does not overwrite it."""
+    store, stops = setup(tmp_path)
+    stored_errors_without_notes(store, "m1", 3)
+    store.put_meta(KEY, "{broken", NOW)
+    assert stops.reconcile(LATER) == []
+    assert stops.stopped()[1]
+    assert store.get_meta(KEY) == "{broken"

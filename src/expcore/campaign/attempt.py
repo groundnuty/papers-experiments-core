@@ -14,8 +14,10 @@ The order is fixed, and each step is decided by what a kill at that point must l
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`;
 6. the post-run health check and the served-identity check, which can turn the result into infrastructure (C11, C16);
-7. the **outcome marker**, then the **store's record** of the result, in this order; the lease ends, and the unit's and
-   the harness-error bookkeeping follow (C15, C10).
+7. the **outcome marker**, then the **store's record** of the result, in this order, with the unit's and the
+   harness-error bookkeeping in the same transaction as the result (C04, C15, C10), so a kill cannot keep the result and
+   lose the stop or the failure it caused; the lease ends after it. A result committed from its marker at the next
+   start has no bookkeeping of its own: the scheduler derives the stops and the units from the stored attempts then.
 
 An exception in the executor is the study's: `InfraError` is infrastructure, anything else is a harness defect. An
 exception in the steps around it is our own bookkeeping failing, and propagates: the scheduler stops dispatch loudly and
@@ -213,8 +215,11 @@ class AttemptRunner:
         except Exception as error:  # the executor's: infrastructure or a defect of ours, classified by what it is
             result = failure_result(error, ended_utc=p.stamp(), wall_s=p.monotonic() - started, treatment_kinds=kinds)
         result, moved = self._judge(result, record, model, key)
-        status = self._finish(begun, run_dir, key, result)
-        self._bookkeeping(model, endpoint, key, result, kinds, moved)
+
+        def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
+            self._bookkeeping(model, endpoint, key, result, kinds, moved)
+
+        status = self._finish(begun, run_dir, key, result, bookkeeping)
         return p.settings.retry_delay_s if status == "pending" else 0.0
 
     def _judge(self, result: AttemptResult, record: Any, model: str, key: str) -> tuple[AttemptResult, bool]:
@@ -244,13 +249,15 @@ class AttemptRunner:
         outcome = Outcome("infrastructure", text, infra_kind=p.settings.identity_kind)
         return dataclasses.replace(result, outcome=outcome), True
 
-    def _finish(self, begun: Any, run_dir: Path, key: str, result: AttemptResult) -> str:
-        """Write the marker, then the store's record: a kill between them is settled by recovery (C04)."""
+    def _finish(
+        self, begun: Any, run_dir: Path, key: str, result: AttemptResult, also: Callable[[], None] | None = None
+    ) -> str:
+        """Write the marker, then the store's record, `also` in its transaction; a kill between is recovery's (C04)."""
         p = self.p
         p.crash_hook("before_marker", key)
         write_marker(run_dir, key, begun.id, result)
         p.crash_hook("after_marker", key)
-        status = p.store.finish_attempt(begun.id, result, p.settings.max_attempts)
+        status = p.store.finish_attempt(begun.id, result, p.settings.max_attempts, also=also)
         p.crash_hook("after_metadata", key)
         return status
 

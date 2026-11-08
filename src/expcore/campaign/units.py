@@ -11,6 +11,14 @@ a unit that is down and fails again is paused again on that one failure, and its
 succeeds. A success resets the count of failures. The state is kept in the store, so a restart does not forget a pause
 or end an outage without a success.
 
+**The accounting is not lost to a kill.** `failure` and `success` join the transaction that records the attempt's result
+(`Store.finish_attempt`'s `also` step), so the result and its effect on the unit are stored together or not at all. A
+result can also reach the store from its outcome marker at the next start, without the process that made it, so
+`reconcile` replays the stored attempts of every unit at each start (`history_from_attempts`) and raises the stored
+state to what they say: more failures, a pause, an open outage window. It never lowers it, so a state the attempts
+cannot show (a changed served identity) stays, and a success that only the attempts remember waits for the unit's next
+success.
+
 **A record that cannot be read fails safe**: whether any unit is down is then unknown, so every unit is paused for
 `pause_s` and stays down until a success on it clears it, and the event is logged. The record keeps this as the entry
 `"*"`, the state of every unit it does not list, so a restart in the middle of it does not forget it. One run may probe
@@ -24,10 +32,11 @@ leaves such attempts out; this class does not know about conditions.
 
 import json
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
-from expcore.campaign.store import Store
+from expcore.campaign import release
+from expcore.campaign.store import Store, column_for
 
 META = "unit_health"
 EVERY_OTHER = "*"  # the state of every unit the record does not list: set when the record could not be read
@@ -111,6 +120,9 @@ class UnitHealth:
 
         Return True when this failure paused the unit.
         """
+        return self.store.transact(lambda: self._failure(unit, immediate, detail))
+
+    def _failure(self, unit: str, immediate: bool, detail: str) -> bool:
         with self._lock:
             state = self._unit(unit)
             state["fails"] = int(state["fails"]) + 1
@@ -131,6 +143,9 @@ class UnitHealth:
 
     def success(self, unit: str) -> bool:
         """Count a success: the failures reset, the pause and the outage window end. True if it cleared a pause."""
+        return self.store.transact(lambda: self._success(unit))
+
+    def _success(self, unit: str) -> bool:
         with self._lock:
             state = self._state(unit)
             if not (state["fails"] or state["down"] or state["pause_until"]):
@@ -146,3 +161,76 @@ class UnitHealth:
         """Return a copy of every unit's state for the status view."""
         with self._lock:
             return {u: dict(s) for u, s in sorted(self._units.items())}
+
+    # --- the stored attempts -----------------------------------------------------------------------------------------
+
+    def reconcile(self, history: Iterable[tuple[str, str, float]]) -> list[str]:
+        """Raise the units to what the stored attempts say; return the units it changed.
+
+        `history` is `(unit, kind, epoch)` in the order the attempts ended, `kind` being `failure`, `immediate` (a
+        refused key) or `success`, as `history_from_attempts` reads them. It is replayed through the same rules as
+        `failure` and `success`, and the result is merged with the stored state by taking the worse of each part: the
+        larger count of failures, down if either says down, the later end of the pause.
+        """
+        derived: dict[str, dict[str, Any]] = {}
+        for unit, kind, when in history:
+            state = derived.setdefault(unit, {"fails": 0, "down": False, "pause_until": 0.0})
+            if kind == "success":
+                derived[unit] = {"fails": 0, "down": False, "pause_until": 0.0}
+                continue
+            state["fails"] += 1
+            if kind == "immediate" or state["down"] or state["fails"] >= self.fail_threshold:
+                state.update(fails=0, down=True, pause_until=when + self.pause_s)
+
+        def merge() -> list[str]:
+            changed = []
+            with self._lock:
+                for unit, found in sorted(derived.items()):
+                    stored = self._state(unit)
+                    merged = {
+                        "fails": max(int(stored["fails"]), found["fails"]),
+                        "down": bool(stored["down"]) or found["down"],
+                        "pause_until": max(float(stored["pause_until"]), found["pause_until"]),
+                    }
+                    if merged != {k: stored[k] for k in merged}:
+                        self._units[unit] = merged
+                        changed.append(unit)
+                if changed:
+                    self._save()
+                    for unit in changed:
+                        now = self._units[unit]
+                        text = f"{unit}: the stored attempts say more than the record did"
+                        text += f" (fails {now['fails']}, down {now['down']})"
+                        self.store.event(self._stamp(), "unit_reconciled", None, text)
+            return changed
+
+        return self.store.transact(merge)
+
+
+def history_from_attempts(store: Store, unit_of: Callable[[str], str | None]) -> list[tuple[str, str, float]]:
+    """Read the unit history from the stored attempts: `(unit, kind, epoch)` in the order the attempts ended.
+
+    A failure is an infrastructure attempt of kind `endpoint`, or `key_rejected` (which pauses at once); a success is a
+    scored attempt that is not a treatment fault (C15). Every other attempt is neither. `unit_of` maps a model to its
+    unit, or to None for a model nobody dispatches to.
+    """
+    rows = store.q(
+        f"SELECT r.{column_for('model')} AS model, a.state, a.treatment, a.infra_kind, a.ended_utc "
+        "FROM attempts a JOIN runs r USING(run_key) WHERE a.state IN ('done', 'infra_fail') "
+        "ORDER BY a.ended_utc, a.id"
+    )
+    out = []
+    for row in rows:
+        unit = unit_of(row["model"])
+        if unit is None:
+            continue
+        if row["state"] == "done" and not row["treatment"]:
+            kind = "success"
+        elif row["state"] == "infra_fail" and row["infra_kind"] == "key_rejected":
+            kind = "immediate"
+        elif row["state"] == "infra_fail" and row["infra_kind"] == "endpoint":
+            kind = "failure"
+        else:
+            continue
+        out.append((unit, kind, release.epoch_of(row["ended_utc"])))
+    return out

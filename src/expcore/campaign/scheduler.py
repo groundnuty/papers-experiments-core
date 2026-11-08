@@ -8,7 +8,8 @@ The imported campaign loop was one 3,000-line class that interleaved a study's h
 options with the dispatch. This is the generic kernel and nothing else:
 
 - **open** (`Scheduler.open`): take the one-dispatcher lock (C07), open the store for a resume and settle what a kill
-  left (C04, C06), restore the gates, admit each model's endpoint once (C14), sweep what dead lease holders left (C19).
+  left (C04, C06), derive the stops and the units' failures from the stored attempts (C10, C15), restore the gates,
+  admit each model's endpoint once (C14), sweep what dead lease holders left (C19).
 - **dispatch** (`Scheduler.run`): walk the pending runs in manifest order; a run starts when no hold applies to it and
   no cap is full. Every reason it may not is a `Hold` on a subject (all runs, a model, a unit), written to the event log
   when it changes (`holds`): a harness-error stop (C10), a closed health gate (C11), a budget (C12), an unadmitted model,
@@ -50,7 +51,7 @@ from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.store import Store, column_for
-from expcore.campaign.units import UnitHealth
+from expcore.campaign.units import UnitHealth, history_from_attempts
 from expcore.config.models import ModelTable
 from expcore.loop.config import AgentConfig
 from expcore.models.admission import admit
@@ -169,6 +170,7 @@ class Scheduler:
             stamp=self.stamp,
         )
         self.stops = HarnessStops(store, cfg.harness_stop)
+        self.reconcile_accounting()
         self.identities = ServedIdentities(store, self.stamp)
         self.budget = None
         if cfg.budget is not None:
@@ -207,6 +209,20 @@ class Scheduler:
                 leases=self.leases,
                 lease_group=self.lease_group,
                 crash_hook=self.crash_hook,
+            )
+        )
+
+    def reconcile_accounting(self) -> None:
+        """Derive the harness-error stops and the units' failures from the stored attempts (C04, C10, C15).
+
+        A result committed from its marker at this start never went through the bookkeeping of the process that made
+        it, and a record can be older than the attempts. So neither is trusted alone: what the attempts say is added.
+        """
+        assert self.store
+        self.stops.reconcile(self.stamp())
+        self.units.reconcile(
+            history_from_attempts(
+                self.store, lambda model: self.endpoints[model].unit if model in self.endpoints else None
             )
         )
 
