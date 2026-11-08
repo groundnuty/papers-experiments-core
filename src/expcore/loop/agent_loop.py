@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
-from expcore.loop.config import AgentConfig
+from expcore.loop.config import AgentConfig, config_sha256_of
 from expcore.loop.outcomes import Outcome, harness_defect_of
 from expcore.loop.records import LoopResult, ToolCallRecord, TurnRecord
 from expcore.loop.timer import AgentTimer, Tick
@@ -404,6 +404,7 @@ class _Run:
                 ended_s=self.timer.since_start(ended.now) if ended else None,
                 detail=detail,
                 source_truncated=run.source_truncated,
+                terminal=self.toolbox.is_terminal(call.name),
             )
         )
 
@@ -421,6 +422,8 @@ class _Run:
         end = self.timer.check("end") if self.timer.started else None
         info = self.backend.info()
         usage = info.get("usage_seen") or {}
+        # The terminal tools change what the run does, so they are part of the configuration the record keeps and hashes.
+        record = {**self.config.as_dict(), "terminal_tools": self.toolbox.terminal_names}
         incomplete = self.usage_incomplete or bool(info.get("abandoned_request")) or bool(usage.get("missing"))
         return LoopResult(
             outcome=self.outcome,
@@ -439,6 +442,6 @@ class _Run:
             transcript=self.backend.transcript(),
             backend_info=info,
             tool_manifest_sha256=self.toolbox.manifest_sha256,
-            config_sha256=self.config.config_sha256(),
-            config=self.config.as_dict(),
+            config_sha256=config_sha256_of(record),
+            config=record,
         )

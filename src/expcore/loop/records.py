@@ -54,6 +54,7 @@ class ToolCallRecord:
     ended_s: float | None = None
     detail: str = ""  # why a call was skipped or crashed
     source_truncated: bool | None = None  # the data source hit its own row or size limit, as the provider said (L07)
+    terminal: bool = False  # the tool is a terminal one: a successful call ended the attempt (L09)
 
     def __post_init__(self) -> None:
         """Refuse a status outside the closed list."""
@@ -86,7 +87,7 @@ class LoopResult:
     backend_info: dict[str, Any]
     tool_manifest_sha256: str
     config_sha256: str
-    config: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)  # the configuration's values plus `terminal_tools`
 
     @property
     def malformed_rounds(self) -> int:

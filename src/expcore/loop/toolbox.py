@@ -62,14 +62,27 @@ class ToolBox:
                 self._providers[spec.name] = provider
                 self._specs[spec.name] = spec
         self._definitions = [self._definition(self._specs[name]) for name in sorted(self._specs)]
+        # What the model is told is the definitions; the hash also covers which tools end the attempt, which the
+        # model is not told, because a tool that is terminal changes what a run does (L06, L09).
+        hashed = [{**d, "terminal": self._specs[d["name"]].terminal} for d in self._definitions]
         self.manifest_sha256 = hashlib.sha256(
-            json.dumps(self._definitions, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            json.dumps(hashed, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
 
     @property
     def names(self) -> list[str]:
         """The tool names, sorted."""
         return sorted(self._specs)
+
+    @property
+    def terminal_names(self) -> list[str]:
+        """The names of the terminal tools, sorted: a successful call to one ends the attempt."""
+        return [name for name in sorted(self._specs) if self._specs[name].terminal]
+
+    def is_terminal(self, name: str) -> bool:
+        """Tell whether the named tool is terminal; False for a name that is not a tool."""
+        spec = self._specs.get(name)
+        return spec is not None and spec.terminal
 
     def _definition(self, spec: ToolSpec) -> dict[str, Any]:
         """The tool as the model is told about it; the cap is part of the description, so the manifest hash pins it."""

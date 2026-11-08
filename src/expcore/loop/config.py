@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from expcore.config.models import Limits
@@ -23,6 +23,16 @@ CEILING_FACTOR = (
     3.0  # the whole-time ceiling is this many times the agent's time cap unless the run says otherwise (L04)
 )
 CEILING_KIND = "ceiling"  # the infrastructure kind of an attempt that passes the ceiling with the agent under its cap
+
+
+def config_sha256_of(values: Mapping[str, Any]) -> str:
+    """Return the SHA-256 of the canonical JSON form of a configuration record: sorted keys, no spaces, no NaN.
+
+    The loop hashes the record it keeps, which is the configuration's values plus what the tool box adds (the
+    terminal tools), so a reader can recompute the hash from the record alone.
+    """
+    canonical = json.dumps(values, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -105,5 +115,4 @@ class AgentConfig:
 
     def config_sha256(self) -> str:
         """Return the SHA-256 of the canonical form of every value; any cap that differs gives a different hash."""
-        canonical = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return config_sha256_of(self.as_dict())

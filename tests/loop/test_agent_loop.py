@@ -7,6 +7,7 @@ import pytest
 from loop_support import FakeProvider, ScriptedBackend, call, malformed, turn
 
 from expcore.loop.agent_loop import _Run, run_agent
+from expcore.loop.config import config_sha256_of
 from expcore.loop.records import TOOL_STATUSES
 from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import StubAdapter
@@ -344,6 +345,31 @@ def test_l06_two_caps_give_two_tool_manifests_and_two_configuration_hashes(run):
     assert one.config_sha256 != two.config_sha256
     again = run(StubAdapter(["a"]), [FakeProvider(ECHO)], output_cap_chars=8000)
     assert (again.tool_manifest_sha256, again.config_sha256) == (one.tool_manifest_sha256, one.config_sha256)
+
+
+def test_l09_which_tools_are_terminal_is_part_of_the_manifest_hash_and_the_configuration_hash(run):
+    """L09: a tool that ends the attempt changes what a run does, so two runs that differ only in that differ in both
+    hashes, while the definitions the model is given are the same."""
+    tools = {"echo": lambda a: "e", "submit": lambda a: "accepted"}
+    plain = run(StubAdapter([[("submit", {})], "done"]), [FakeProvider(tools)])
+    terminal = run(StubAdapter([[("submit", {})], "done"]), [FakeProvider(tools, terminal=("submit",))])
+    assert plain.tool_manifest_sha256 != terminal.tool_manifest_sha256
+    assert plain.config_sha256 != terminal.config_sha256
+    assert (plain.outcome.name, terminal.outcome.name) == ("finished", "finished")
+    again = run(StubAdapter([[("submit", {})], "done"]), [FakeProvider(tools, terminal=("submit",))])
+    assert (again.tool_manifest_sha256, again.config_sha256) == (terminal.tool_manifest_sha256, terminal.config_sha256)
+    box = ToolBox([FakeProvider(tools, terminal=("submit",))], cap_chars=100)
+    assert all(set(d) == {"name", "description", "input_schema"} for d in box.definitions())  # the model is not told
+
+
+def test_l09_the_record_keeps_the_terminal_tools_and_marks_each_call_to_one(run):
+    """L09: the configuration the record keeps lists the terminal tools, and the hash can be recomputed from it."""
+    provider = FakeProvider({"echo": lambda a: "e", "submit": lambda a: "accepted"}, terminal=("submit",))
+    result = run(StubAdapter([[("echo", {}), ("submit", {})], "never reached"]), [provider])
+    assert result.config["terminal_tools"] == ["submit"]
+    assert result.config["limits"]["output_cap_chars"] == 8000  # the configuration's own values are still there
+    assert config_sha256_of(result.config) == result.config_sha256
+    assert [(t.name, t.terminal) for t in result.tool_calls] == [("echo", False), ("submit", True)]
 
 
 def test_l09_calls_after_a_terminal_call_are_answered_skipped(run):
