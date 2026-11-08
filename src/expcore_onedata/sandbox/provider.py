@@ -26,6 +26,7 @@ import dataclasses
 import json
 import logging
 import re
+import threading
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any
 
@@ -44,6 +45,7 @@ from expcore_onedata.tokens import MintedToken, TokenIssuer, data_path_spec
 log = logging.getLogger(__name__)
 
 WAIT_KIND = "sandbox_lifecycle"
+CANCEL_WAIT_S = 120.0  # how long a cancelled launch waits for its start thread to notice and clean up, before it stops
 DATA_PATH_FACTOR = "data_path"  # the study's factor whose levels [sandbox.data_paths] maps
 DATA_USERS = "data_users"  # the lease group of the platform users a data path leases
 
@@ -88,6 +90,32 @@ class _Recorded:
         )
 
 
+class _StartThreads:
+    """The start threads of the platform that have not ended, by lease key: the probe says nothing is gone while one runs."""
+
+    def __init__(self) -> None:
+        self._lock, self._running = threading.Lock(), {}
+
+    def began(self, key: str | None) -> Callable[[], None]:
+        """Note a start thread of `key`; the function returned notes its end, once, however often it is called."""
+        done = [key is None]
+        if key is not None:
+            with self._lock:
+                self._running[key] = self._running.get(key, 0) + 1
+
+        def ended() -> None:
+            with self._lock:
+                if not done[0]:
+                    done[0] = True
+                    self._running[key] -= 1
+
+        return ended
+
+    def active(self, key: str) -> bool:
+        with self._lock:
+            return self._running.get(key, 0) > 0
+
+
 class SandboxProbe:
     """The `ResourceProbe` of the sandbox's leases: it proves a key's containers, networks and mounts gone (C19).
 
@@ -97,13 +125,19 @@ class SandboxProbe:
     root (`sandbox.MOUNT_RECORDS`), and the probe matches the table against those records, so a directory that was
     relocated or kept as evidence is still seen. A directory of the lease's sandbox id anywhere in a mount's path counts
     too. Anything it cannot read or ask, a record included, is False, so the key stays quarantined. It reads and never
-    removes: the sandbox's own stop, the next start's retry and the orphan reaper remove.
+    removes: the sandbox's own stop, the next start's retry and the orphan reaper remove. While a start thread of the key
+    is still running (a cancelled launch that gave up waiting for it) nothing is gone yet, whatever the reads show.
     """
 
     def __init__(
-        self, host: HostOps, settings: SandboxSettings, *, holder_gone: Callable[[str], bool | None] = process_gone
+        self,
+        host: HostOps,
+        settings: SandboxSettings,
+        *,
+        holder_gone: Callable[[str], bool | None] = process_gone,
+        starting: Callable[[str], bool] = lambda key: False,
     ) -> None:
-        self._host, self._s, self._holder_gone = host, settings, holder_gone
+        self._host, self._s, self._holder_gone, self._starting = host, settings, holder_gone, starting
 
     def holder_gone(self, owner: str) -> bool | None:
         """Whether the process that held the key is gone (the core's check of its boot, pid and start time)."""
@@ -111,6 +145,8 @@ class SandboxProbe:
 
     def resource_gone(self, key: str, note: Mapping[str, Any]) -> bool:
         """True only when nothing started with this key is left; False on anything else, a failed read included."""
+        if self._starting(key):  # a start thread of this key still runs: it may yet create what none of the reads show
+            return False
         label = f"label={self._s.label('lease')}={key}"
         try:
             containers = self._host.docker("ps", "-a", "-q", "--filter", label, check=False, timeout=30)
@@ -152,11 +188,14 @@ class SandboxPlatform:
         *,
         registry: Registry = DEFAULT,
         sandbox_options: Mapping[str, Any] | None = None,
+        cancel_wait_s: float = CANCEL_WAIT_S,
     ) -> None:
         if config.sandbox is None:
             raise ValueError(f"{config.file}: has no [sandbox] section")
         self._config, self._s, self._issuer, self._host = config, config.sandbox, issuer, host
         self._registry, self._options = registry, dict(sandbox_options or {})
+        self._cancel_wait_s = cancel_wait_s
+        self._threads = _StartThreads()
 
     # ------------------------------------------------------------------------------------------------ the plugin's hooks
     def mode(self, factors: Mapping[str, Any]) -> DataPathMode:
@@ -173,7 +212,15 @@ class SandboxPlatform:
 
     def probe(self) -> SandboxProbe:
         """The `ResourceProbe` for the plugin."""
-        return SandboxProbe(self._host, self._s)
+        return SandboxProbe(self._host, self._s, starting=self._threads.active)
+
+    @staticmethod
+    def _begin(sandbox: DockerSandbox, ended: Callable[[], None]) -> None:
+        """Blocking, in the start thread: begin the sandbox, and note that the thread has ended, however it ended."""
+        try:
+            sandbox.begin()
+        finally:
+            ended()
 
     # ------------------------------------------------------------------------------------------------ the launch
     def _principal(self, lease: Lease | None) -> Principal:
@@ -199,13 +246,19 @@ class SandboxPlatform:
             lease_key=lease.key if lease else None,
         )
 
-    def _start(self, run_key: str, mode: DataPathMode, lease: Lease | None, ceiling_s: float) -> DockerSandbox:
-        """Blocking: mint the token as the leased user, then start the sandbox with it."""
-        token = None
-        if mode is not DataPathMode.NONE:
-            spec = data_path_spec(self._config.space.id, mode.interface or "rest")
-            token = self._issuer.mint(spec, self._principal(lease), ceiling_s=ceiling_s)
-        sandbox = DockerSandbox.start(
+    def _mint(self, mode: DataPathMode, lease: Lease | None, ceiling_s: float) -> MintedToken | None:
+        """Blocking: mint the data-path token as the leased user. Nothing exists yet, so nothing needs undoing."""
+        if mode is DataPathMode.NONE:
+            return None
+        spec = data_path_spec(self._config.space.id, mode.interface or "rest")
+        return self._issuer.mint(spec, self._principal(lease), ceiling_s=ceiling_s)
+
+    def _prepare(
+        self, run_key: str, mode: DataPathMode, lease: Lease | None, token: MintedToken | None
+    ) -> DockerSandbox:
+        """The sandbox of a run, built and not started: it has no effect on the host, so a launch holds it, and can stop
+        it, from before the first resource exists."""
+        sandbox = DockerSandbox(
             self._host,
             self._s,
             self._spec(run_key, mode, token, lease),
@@ -227,10 +280,30 @@ class SandboxPlatform:
         The start and the stop are each inside `ctx.infrastructure_wait("sandbox_lifecycle")`; the body is the agent's
         own time. A teardown that leaves something behind raises `InfraError("sandbox")` when nothing else is in
         flight, and the lease's probe then keeps the key quarantined. `ceiling_s` is the run's whole-time ceiling (O06).
+
+        The start runs in a thread, and cancelling the launch does not stop a thread: it goes on creating the sandbox.
+        So the sandbox is built before the thread begins, and the launch holds it. On cancellation, or any failure of
+        the start, the launch asks the thread to stop creating things, waits for it with a deadline however often it is
+        cancelled meanwhile, and then tears down everything the sandbox registered; what a thread that outlives the
+        deadline creates afterwards carries the lease labels from the moment it exists, and the thread removes it
+        itself on its way out, or the probe and the orphan reaper find it (O15, C19).
         """
         mode = self._s.mode_of(level)
-        async with ctx.infrastructure_wait(WAIT_KIND):
-            sandbox = await asyncio.to_thread(self._start, run_key, mode, lease, ceiling_s)
+        sandbox: DockerSandbox | None = None
+        started: asyncio.Future[None] | None = None
+        try:
+            async with ctx.infrastructure_wait(WAIT_KIND):
+                token = await asyncio.to_thread(self._mint, mode, lease, ceiling_s)
+                sandbox = self._prepare(run_key, mode, lease, token)
+                ended = self._threads.began(lease.key if lease is not None else None)
+                started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended))
+                started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end
+                await asyncio.shield(started)
+        except BaseException:
+            if sandbox is not None and started is not None:
+                await self._settle_start(sandbox, started)
+                await self._stop(ctx, sandbox, quiet=True)
+            raise
         try:
             yield sandbox
         except BaseException:
@@ -238,14 +311,47 @@ class SandboxPlatform:
             raise
         await self._stop(ctx, sandbox, quiet=False)
 
+    async def _settle_start(self, sandbox: DockerSandbox, started: asyncio.Future[None]) -> None:
+        """Ask the start thread to stop and wait for it, at most `cancel_wait_s`, through any further cancellation."""
+        sandbox.abandon()
+        started.add_done_callback(
+            lambda f: f.cancelled() or f.exception()
+        )  # its failure is the caller's, not unretrieved
+        await _wait_through_cancellation(started, self._cancel_wait_s)
+
     async def _stop(self, ctx: CallContext, sandbox: DockerSandbox, *, quiet: bool) -> None:
         async with ctx.infrastructure_wait(WAIT_KIND):
             try:
-                await asyncio.to_thread(sandbox.stop)
+                await _complete(asyncio.to_thread(sandbox.stop))
             except SandboxError as error:
                 if not quiet:
                     raise InfraError("sandbox", f"the sandbox could not be torn down: {error}"[:600]) from None
                 log.error("the sandbox of an ended run could not be torn down: %s", error)
+
+
+async def _wait_through_cancellation(future: asyncio.Future[Any], seconds: float) -> bool:
+    """Wait until `future` is done, for at most `seconds`, however often this task is cancelled meanwhile; whether it is."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while not future.done() and (remaining := deadline - loop.time()) > 0:
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({future}, timeout=remaining)
+    return future.done()
+
+
+async def _complete(work: Any) -> None:
+    """Run `work` (a coroutine) to its end even if this task is cancelled meanwhile, then raise the cancellation: a
+    teardown that is cut short leaves what it exists to remove. An error of the work is raised in preference."""
+    task = asyncio.ensure_future(work)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 __all__ = ["DATA_PATH_FACTOR", "DATA_USERS", "SandboxPlatform", "SandboxProbe"]

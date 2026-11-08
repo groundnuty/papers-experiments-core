@@ -554,3 +554,48 @@ def test_c19_a_mount_record_the_probe_cannot_read_is_unknown_and_not_proof(world
         assert probe.resource_gone(KEY, {}) is False, text
     (records / "damaged.json").unlink()
     assert probe.resource_gone(KEY, {}) is True
+
+
+def test_o15_an_abandoned_start_creates_nothing_and_a_start_abandoned_midway_removes_what_it_made(world):
+    """O15: whoever holds the sandbox can abandon its start from another thread; the start thread then cleans up."""
+    sbx = DockerSandbox(world.host, world.s, make_spec(world, "via-gate"), **start_options(world))
+    sbx.abandon()
+    with pytest.raises(SandboxError, match="abandoned"):
+        sbx.begin()
+    assert nothing_left(world)
+    assert not world.s.work_root.exists() or not list(world.s.work_root.iterdir())
+
+    midway = DockerSandbox(world.host, world.s, make_spec(world, "via-gate"), **start_options(world))
+    original = world.host.docker
+
+    def abandon_when_the_gate_is_up(*args, **kwargs):
+        done = original(*args, **kwargs)
+        if args[0] == "network" and args[1] == "connect":  # the gate is on the network: the agent is next
+            midway.abandon()
+        return done
+
+    world.host.docker = abandon_when_the_gate_is_up
+    with pytest.raises(SandboxError, match="abandoned"):
+        midway.begin()
+    assert nothing_left(world)
+    assert midway.stopped
+
+
+def test_o15_a_stop_that_ran_during_the_start_is_not_the_last_word_on_the_sandbox(world):
+    """O15: what the start registers after a stop began leaves the sandbox not stopped, so the next stop runs."""
+    sbx = DockerSandbox(world.host, world.s, make_spec(world, "isolated"), **start_options(world))
+    sbx.begin()
+    sbx._register_container("sbx-late-arrival")  # created by the start thread after the stop below began
+    original = sbx._remove_the_rest
+
+    def remove_and_register(errors):
+        original(errors)
+        sbx._register_container("sbx-later-still")
+
+    sbx._remove_the_rest = remove_and_register
+    sbx.stop()
+    assert not sbx.stopped  # something was registered while it ran
+    sbx._remove_the_rest = original
+    sbx.stop(force=True)
+    assert sbx.stopped
+    assert nothing_left(world)

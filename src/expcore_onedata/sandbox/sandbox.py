@@ -110,6 +110,10 @@ class DockerSandbox:
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
         self._stopped, self._stop_lock = True, threading.Lock()
+        self._abandoned = (
+            threading.Event()
+        )  # set by `abandon`: the start thread is to stop creating things and clean up
+        self._created, self._created_lock = 0, threading.Lock()  # counts what was registered; a stop compares it
         self._sampler_stop = threading.Event()
         self._cells: CellRunner | None = None
         self._log_dir = ONECLIENT_LOG_DIR
@@ -121,24 +125,46 @@ class DockerSandbox:
     @classmethod
     def start(cls, host: HostOps, settings: SandboxSettings, spec: SandboxSpec, **options: Any) -> DockerSandbox:
         """Check the spec and pin the images, then build the sandbox; a failure after anything exists stops it first."""
-        TERM.raise_if_requested()  # a SIGTERM reached this process: nothing new starts
         self = cls(host, settings, spec, **options)
+        self.begin()
+        return self
+
+    def abandon(self) -> None:
+        """Ask a start that is running in another thread to stop creating things: it cleans up what it made and raises.
+        The constructor has no effect on the host, so whoever holds the sandbox can call this and then `stop` it, even
+        while `begin` is still inside a docker call (a cancelled launch, O15)."""
+        self._abandoned.set()
+
+    def _checkpoint(self) -> None:
+        """Before each step that creates something: an abandoned start creates nothing more."""
+        if self._abandoned.is_set():
+            raise SandboxError("the start was abandoned")
+
+    def _register_creation(self) -> None:
+        """Count a resource about to be created: a `stop` that ran before it is not the last word on this sandbox."""
+        with self._created_lock:
+            self._created += 1
+
+    def begin(self) -> None:
+        """The blocking half of `start`: check, pin, build. A failure after anything exists stops it first."""
+        TERM.raise_if_requested()  # a SIGTERM reached this process: nothing new starts
         self._validate()
         self._pin_images()  # a moved tag refuses the start (O13), before anything exists
+        self._checkpoint()
         self._stopped = False  # from here, `stop` has something to verify
         self._meta["pending_cleanups_left"] = self.registry.drain()
         try:
-            self._meta["reaped_orphans"] = netpool.reap_orphans(host, self.labels)  # never fails the start
+            self._meta["reaped_orphans"] = netpool.reap_orphans(self.host, self.labels)  # never fails the start
         except Exception as e:
             self._meta["reaped_orphans"] = {"error": describe_error(e)}
         try:
             self._build()
+            self._checkpoint()
             TERM.register(self)  # before the check: a SIGTERM after it finds this sandbox in the list
             TERM.raise_if_requested()  # one that came during the start: stopped below, never handed out
         except BaseException as exc:
             self._cleanup_after(exc)
             raise
-        return self
 
     def _validate(self) -> None:
         sp, s = self.spec, self.s
@@ -174,7 +200,7 @@ class DockerSandbox:
         """Stop what a failed start left. A cleanup that fails too is registered for the next start, and reachable on the
         exception, so whoever holds a lease on it can try again."""
         try:
-            self.stop()
+            self.stop(force=self._abandoned.is_set())  # an abandoned start may have created more after a stop
         except Exception as e:
             self.registry.add_pending(self)
             exc.sandbox = self  # type: ignore[attr-defined]
@@ -183,7 +209,9 @@ class DockerSandbox:
     # ------------------------------------------------------------------------------------------------ build
     def _build(self) -> None:
         s, _sp, mode = self.s, self.spec, self.spec.mode
+        self._checkpoint()
         self._write_mount_record()  # before anything exists: a mount is never made that the probe cannot be told of
+        self._register_creation()
         self.dir.mkdir(parents=True, exist_ok=False)
         self._started = time.time()
         self._meta.update(host=self.host.host_facts(), started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
@@ -194,15 +222,20 @@ class DockerSandbox:
         hosts = self._gate_hosts() if mode is DataPathMode.REST else {}
         if mode is DataPathMode.REST:
             self._prepare_gate(hosts)
+        self._checkpoint()
         subnet, tries = self._create_network()
         self._meta["network"] = {  # the position of the pool, never an address or the pool itself (O12)
             "pool": self._pool_position(subnet),
             "prefix": s.network.prefix,
             "attempts": tries,
         }
+        self._checkpoint()
         gate_ip = self._start_gate() if mode is DataPathMode.REST else None
+        self._checkpoint()
         share = self._start_mount() if mode is DataPathMode.MOUNT else None
+        self._checkpoint()
         self._start_agent(work, share, gate_ip, list(hosts))
+        self._checkpoint()
         roles = {"agent": self.names.agent} | ({"gate": self.names.gate} if gate_ip else {})
         if share:
             roles["sidecar"] = self.names.sidecar
@@ -264,6 +297,7 @@ class DockerSandbox:
 
     def _note_mount(self, path: Path) -> None:
         """Register a mount point and record it, before the mount is made."""
+        self._register_creation()
         self._mounts.append(path)
         self._mount_log.append({"path": str(path), "id": None, "dev": None})
         self._write_mount_record()
@@ -288,11 +322,17 @@ class DockerSandbox:
         except OSError as e:  # a record that stays only makes the probe look again, at a table with nothing of ours
             log.error("the record of the sandbox's mounts could not be removed: %s", describe_error(e))
 
+    def _register_container(self, name: str) -> None:
+        """Remember a container before it is created, so that no interrupt leaves one that `stop` misses."""
+        self._register_creation()
+        self._containers.append(name)
+
     def _label_args(self) -> list[str]:
         return self.labels.args(self.host, self.dir, self.spec.lease_key)
 
     def _create_network(self) -> tuple[str, int]:
         net = self.s.network
+        self._register_creation()
         self._net = self.names.net
         return netpool.create(
             self.host,
@@ -305,7 +345,7 @@ class DockerSandbox:
 
     def _start_gate(self) -> str:
         names, s = self.names, self.s
-        self._containers.append(
+        self._register_container(
             names.gate
         )  # registered before it is created: an interrupt cannot leave one `stop` misses
         args = gate_run_args(s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id)
@@ -349,7 +389,7 @@ class DockerSandbox:
             "io_mode": s.mount.io_mode,
             "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != ONECLIENT_LOG_DIR else "default",
         }
-        self._containers.append(names.sidecar)
+        self._register_container(names.sidecar)
         t0 = time.monotonic()
         args = sidecar_run_args(s, names, self._label_args(), share, s.oneclient.id, host_name)
         self.host.docker(*args, env={ENV_ACCESS_TOKEN: sp.token.reveal()})
@@ -371,7 +411,8 @@ class DockerSandbox:
         ca = (self.dir / "tls" / "ca.pem").read_text(encoding="utf-8")
         for n, path in enumerate(self.s.trust_paths):
             name = f"{self.names.agent}-once-{uuid.uuid4().hex[:6]}"
-            self._containers.append(name)  # registered before it is created
+            self._checkpoint()
+            self._register_container(name)  # registered before it is created
             # labelled like every other container of the sandbox, so that the probe and the orphan reaper find it if the
             # docker call is cut off before `--rm` has removed it (C19)
             base = self.host.docker(
@@ -390,7 +431,7 @@ class DockerSandbox:
             gate_ip=gate_ip, gate_hosts=gate_hosts, ca=self.dir / "tls" / "ca.pem" if rest else None,
             trust_bundles=self._trust_bundles() if rest else {}, zone_host=sp.zone.host if rest and sp.zone else None,
         )  # fmt: skip
-        self._containers.append(self.names.agent)
+        self._register_container(self.names.agent)
         self.host.docker(*args, env=env)
 
     def _verify_read_only(self) -> None:
@@ -421,7 +462,7 @@ class DockerSandbox:
             self._uptime0 = self.obs.uptime()  # the kernel log is read from here when a death needs its limit named
         self._watched[role] = {"container": container, "start": st}
         if container not in self._containers:
-            self._containers.append(container)
+            self._register_container(container)
 
     def infra_container_check(self) -> dict[str, Any]:
         """The state of every registered container now against its baseline, and the cause of each death. Read from the
@@ -577,13 +618,15 @@ class DockerSandbox:
         return meta
 
     # ------------------------------------------------------------------------------------------------ stop
-    def stop(self) -> None:
+    def stop(self, *, force: bool = False) -> None:
         """Tear down in order and verify; raise `SandboxError` when anything is not gone. Safe to call again (idempotent).
 
         One teardown at a time: the sampler's thread and the driver's `finally` may both stop; the second waits, then
-        finds it stopped. A SIGTERM cannot cut it short (termination.py): that would leave what it exists to remove."""
+        finds it stopped. A SIGTERM cannot cut it short (termination.py): that would leave what it exists to remove.
+        A stop that ran while a start was still creating things does not count as the last: whatever was registered
+        after it began leaves the sandbox not stopped, and `force` runs the teardown again whatever is believed."""
         with TERM.sigterm_deferred(), self._stop_lock:
-            self._stop_locked()
+            self._stop_locked(force)
 
     def _step(self, errors: list[str], fn: Callable[..., Any], *a: Any) -> None:
         """Every step runs whatever an earlier one raised (a timeout, a daemon error); a failure is recorded."""
@@ -593,9 +636,11 @@ class DockerSandbox:
             log.error("teardown step %s failed: %s", getattr(fn, "__name__", "step"), describe_error(e))
             errors.append(f"a teardown step failed ({type(e).__name__})")
 
-    def _stop_locked(self) -> None:
-        if self._stopped:
+    def _stop_locked(self, force: bool = False) -> None:
+        if self._stopped and not force:
             return
+        with self._created_lock:
+            created = self._created
         errors: list[str] = []
         complete = False
         self._sampler_stop.set()
@@ -622,10 +667,9 @@ class DockerSandbox:
                 self._remove_the_rest(errors)
             complete = not errors
         finally:
-            self._stopped = (
-                complete  # stopped only when everything is verifiably gone; an interrupt leaves it retryable
-            )
-            if complete:
+            with self._created_lock:  # and only if nothing was registered since this teardown began
+                self._stopped = complete and self._created == created
+            if self._stopped:
                 self._drop_mount_record()
                 TERM.unregister(self)
         if errors:

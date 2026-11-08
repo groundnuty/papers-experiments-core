@@ -3,6 +3,8 @@
 import asyncio
 import contextlib
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +14,7 @@ from sandbox_support import FAST
 
 from expcore.campaign.lease import LeasePool
 from expcore.errors import InfraError
-from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.sandbox.api import DataPathMode, SandboxError
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.provider import DATA_USERS, SandboxPlatform, SandboxProbe
 from expcore_onedata.sandbox.registry import Registry
@@ -290,3 +292,107 @@ def test_the_clock_of_the_token_follows_the_runs_ceiling(stage, tmp_path):
     sandbox, _ = run_launch(stage, "via-gate", lease)
     expires = sandbox.metadata()["data_path_token"]["expires_at"]
     assert expires >= NOW + CEILING_S + stage.config.tokens.margin_s
+
+
+def block_the_agents_docker_run(stage):
+    """Make the start thread wait inside the agent's `docker run`, after the network and the gate exist."""
+    entered, release = threading.Event(), threading.Event()
+    original = stage.host.docker
+
+    def slow(*args, **kwargs):
+        if args[0] == "run" and "--init" in args:  # the agent's `docker run`
+            entered.set()
+            assert release.wait(20), "the test never released the start thread"
+        return original(*args, **kwargs)
+
+    stage.host.docker = slow
+    return entered, release
+
+
+def nothing_of_the_sandbox_is_left(stage) -> bool:
+    return not stage.host.containers and not stage.host.networks and not stage.host.mounts
+
+
+async def cancel_mid_start(stage, lease, entered):
+    """Cancel a launch whose start thread is inside the agent's `docker run`; returns the probe's answers on the way."""
+    probe = stage.platform.probe()
+    seen = {}
+
+    async def launch():
+        async with stage.platform.launch(
+            RecordingContext(), run_key="run-1", level="via-gate", ceiling_s=CEILING_S, lease=lease
+        ):
+            pytest.fail("a cancelled start must not hand out a sandbox")
+
+    task = asyncio.ensure_future(launch())
+    assert await asyncio.to_thread(entered.wait, 20)  # the thread is creating the sandbox
+    task.cancel()
+    await asyncio.sleep(0.05)
+    seen["during"] = probe.resource_gone(lease.key, {})
+    return task, probe, seen
+
+
+def test_o15_a_launch_cancelled_mid_start_tears_down_what_the_start_thread_created(stage, tmp_path):
+    """O15, C19: a cancelled launch waits for the start thread (bounded), then tears down all of it; then True."""
+    lease = lease_pool(stage, tmp_path).acquire(DATA_USERS, run_key="run-1")
+    entered, release = block_the_agents_docker_run(stage)
+
+    async def go():
+        task, probe, seen = await cancel_mid_start(stage, lease, entered)
+        threading.Timer(0.2, release.set).start()  # the thread's docker call returns, after the cancellation
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        seen["after"] = probe.resource_gone(lease.key, {})
+        return seen
+
+    seen = asyncio.run(go())
+    assert seen["during"] is False  # the gate, the network and the mount exist, and the agent is being created
+    assert nothing_of_the_sandbox_is_left(stage)
+    assert stage.host.calls_of("removed")
+    assert stage.host.calls_of("network_removed")
+    assert seen["after"] is True
+
+
+def test_o15_a_cancelled_launch_that_gives_up_waiting_leaves_the_probe_not_true_until_the_thread_cleaned_up(
+    stage, tmp_path
+):
+    """O15, C19: past the deadline the thread is still running, so nothing is shown gone; what it creates after that
+    carries the lease labels, and it removes it on its way out."""
+    stage.platform = SandboxPlatform(
+        stage.config,
+        stage.platform._issuer,
+        stage.host,
+        registry=stage.registry,
+        sandbox_options={"waits": FAST, "sample_period_s": None, "sleep": lambda seconds: None},
+        cancel_wait_s=0.05,
+    )
+    lease = lease_pool(stage, tmp_path).acquire(DATA_USERS, run_key="run-1")
+    entered, release = block_the_agents_docker_run(stage)
+    answers = []
+
+    async def go():
+        task, probe, _ = await cancel_mid_start(stage, lease, entered)
+        with pytest.raises(asyncio.CancelledError):
+            await task  # it gave up waiting after 50 ms, and tore down what existed
+        answers.append(probe.resource_gone(lease.key, {}))  # the thread is still inside docker: not gone
+        release.set()  # now the agent container is created, labelled, after the teardown
+        deadline = time.monotonic() + 20
+        while not nothing_of_the_sandbox_is_left(stage) or probe.resource_gone(lease.key, {}) is not True:
+            answers.append(probe.resource_gone(lease.key, {}))
+            assert time.monotonic() < deadline, "the start thread never cleaned up after itself"
+            await asyncio.sleep(0.02)
+
+    asyncio.run(go())
+    assert answers[0] is False
+    assert nothing_of_the_sandbox_is_left(stage)
+    assert not stage.host.containers
+
+
+def test_o15_a_start_that_failed_is_stopped_again_by_the_launch_and_the_error_is_the_starts(stage, tmp_path):
+    """O15: any failure of the start, not only a cancellation, ends with the launch stopping what the sandbox made."""
+    stage.host.exec_handler = lambda container, argv, stdin: CmdResult(0, "WRITABLE\n")
+    lease = lease_pool(stage, tmp_path).acquire(DATA_USERS, run_key="run-1")
+    with pytest.raises(SandboxError, match="not read-only"):
+        run_launch(stage, "via-gate", lease)
+    assert nothing_of_the_sandbox_is_left(stage)
+    assert stage.platform.probe().resource_gone(lease.key, {}) is True
