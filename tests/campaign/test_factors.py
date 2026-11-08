@@ -3,8 +3,9 @@
 import hashlib
 
 import pytest
-from campaign_support import STUDY_TOML, make_schema, write_study
+from campaign_support import STUDY_TOML, make_schema, treatment_schema, write_study
 
+from expcore import errors
 from expcore.campaign.factors import FactorSchema, PlanError, RunKey, load_factor_schema
 from expcore.config.loading import ConfigError
 
@@ -205,3 +206,90 @@ def test_the_digest_changes_with_any_part_of_the_schema():
         {**base.declared, "tools": ["none", "read", "write", "admin"]}, base.order, base.conditions
     )
     assert len({base.digest, other_order.digest, other_levels.digest}) == 3
+
+
+# --- a condition whose treatment is an infrastructure fault ---------------------------------------------------------
+
+TREATMENT_TOML = STUDY_TOML.replace(
+    '[conditions.api-none]\ndata_path = "api"\ntools = "none"',
+    '[conditions.api-none]\ndata_path = "api"\ntools = "none"\ninfrastructure_is_treatment = ["sandbox", "endpoint"]',
+)
+
+
+@pytest.fixture
+def registry(monkeypatch):
+    """Start with only the core's infrastructure kinds and leave no platform kind behind."""
+    monkeypatch.setattr(errors, "_platform_kinds", {})
+
+
+def test_c02_a_condition_may_declare_infrastructure_kinds_as_its_treatment(tmp_path, registry):
+    """C02: the declared kinds come from the closed vocabulary, and the setting is no factor of the condition."""
+    schema = load_factor_schema(write_study(tmp_path, TREATMENT_TOML))
+    assert schema.treatment_kinds == {"mount-read": (), "api-none": ("endpoint", "sandbox"), "download-write": ()}
+    assert schema.conditions["api-none"] == {"data_path": "api", "tools": "none"}
+    assert schema.to_json()["treatment"] == {
+        "mount-read": [],
+        "api-none": ["endpoint", "sandbox"],
+        "download-write": [],
+    }
+    assert [k.text for k in schema.expand(["task-a"], ["m1"], [1])] == [
+        k.text for k in make_schema().expand(["task-a"], ["m1"], [1])
+    ]
+
+
+def test_c06_the_treatment_declaration_is_part_of_the_schema_s_identity(registry):
+    """C06: a schema that declares a treatment differs in digest from one that does not, so a resume sees it."""
+    assert treatment_schema().digest != make_schema().digest
+    assert treatment_schema(("endpoint",)).digest != treatment_schema(("endpoint", "sandbox")).digest
+    assert treatment_schema(("sandbox", "endpoint")).digest == treatment_schema(("endpoint", "sandbox")).digest
+
+
+def test_c02_an_unknown_infrastructure_kind_is_refused_naming_file_and_key(tmp_path, registry):
+    """C02: a kind outside the registry is refused at load, as every other bad value is."""
+    path = write_study(tmp_path, TREATMENT_TOML.replace('"sandbox", "endpoint"', '"endpoint", "wifi"'))
+    with pytest.raises(ConfigError) as caught:
+        load_factor_schema(path)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: [conditions.api-none]: key 'infrastructure_is_treatment'")
+    assert "unknown infrastructure kind 'wifi'" in message
+    assert "known kinds: endpoint" in message
+
+
+def test_c02_a_kind_a_platform_registered_is_accepted_and_refused_before_it_is(tmp_path, registry):
+    """C02: the registry is the platform's too, so a kind it adds can be a treatment."""
+    path = write_study(tmp_path, TREATMENT_TOML.replace('"sandbox", "endpoint"', '"provider_down"'))
+    with pytest.raises(ConfigError, match="unknown infrastructure kind 'provider_down'"):
+        load_factor_schema(path)
+    errors.register_infra_kind("provider_down", "a platform's own kind")
+    assert load_factor_schema(path).treatment_kinds["api-none"] == ("provider_down",)
+
+
+@pytest.mark.parametrize(
+    ("declaration", "message"),
+    [
+        ('["endpoint", "endpoint"]', "key 'infrastructure_is_treatment' repeats 'endpoint'"),
+        ('"endpoint"', "key 'infrastructure_is_treatment' must be an array of non-empty strings"),
+        ("[1]", "key 'infrastructure_is_treatment' must be an array of non-empty strings"),
+    ],
+)
+def test_c02_a_malformed_treatment_declaration_is_refused(tmp_path, registry, declaration, message):
+    """C02: the declaration is an array of distinct kinds."""
+    path = write_study(tmp_path, TREATMENT_TOML.replace('["sandbox", "endpoint"]', declaration))
+    with pytest.raises(ConfigError, match=message):
+        load_factor_schema(path)
+
+
+def test_c02_a_treatment_for_a_condition_that_does_not_exist_is_refused(registry):
+    """C02: a declaration built in code names a real condition."""
+    with pytest.raises(ConfigError, match="key 'nope' declares infrastructure_is_treatment but is no condition"):
+        FactorSchema({}, ["task", "model", "seed"], {"a": {}}, treatment={"nope": ["endpoint"]})
+
+
+def test_c02_the_setting_s_name_cannot_also_be_a_factor(registry):
+    """C02: the name is reserved, so a condition's setting is never read as a level."""
+    with pytest.raises(ConfigError, match="key 'infrastructure_is_treatment' is reserved"):
+        FactorSchema(
+            {"infrastructure_is_treatment": ["a"]},
+            ["task", "infrastructure_is_treatment", "model", "seed"],
+            {"c": {"infrastructure_is_treatment": "a"}},
+        )

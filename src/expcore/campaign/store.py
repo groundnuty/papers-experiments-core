@@ -14,9 +14,8 @@ process (holding the exclusive lock, so nothing else is running) calls `expcore.
 whose outcome marker was written (`expcore.campaign.markers`) is committed from it and never run again; every other
 'running' row becomes 'interrupted', is kept, is never charged, and its run is run again under the same attempt number.
 
-Charging (C03). An attempt counts against the attempt limit only when the infrastructure failed and the cause was not
-the key's (`UNCHARGED_KINDS`) and no outage overlapped it. Interrupted, outage-discarded and harness-error attempts are
-never charged. The charge is decided once, when the attempt finishes, and stored in the row.
+Charging (C03) and treatment attempts are decided by `expcore.campaign.attempts.classify` when an attempt finishes, and
+stored in its row.
 
 Schema changes (C20). The fixed tables are created whole; a column added by a later version goes in with one
 `ALTER TABLE ... ADD COLUMN` per column, so a kill between two leaves a database that the next open finishes. The
@@ -24,22 +23,25 @@ factor columns depend on the study; a database made for other factors is refused
 """
 
 import datetime as dt
+import json
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.attempts import (
+    AttemptRefused,
+    BegunAttempt,
+    PinMismatch,
+    ResumeRefused,
+    SchemaMismatch,
+    classify,
+)
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ManifestRow, relative_order_problem
 from expcore.campaign.markers import AttemptResult
-
-STATES = ("running", "done", "infra_fail", "outage_discarded", "interrupted", "harness_error")
-RUN_STATUSES = ("pending", "done", "infra_exhausted", "harness_error")
-# An infrastructure failure the key caused, not the attempt's run: it holds the model but costs the run no attempt.
-UNCHARGED_KINDS = frozenset({"key_rejected"})
 
 _FIXED_SQL = """
 CREATE TABLE IF NOT EXISTS attempts(
@@ -61,38 +63,8 @@ _ADDED_COLUMNS = (
     ("attempts", "cache_creation_tokens", "INTEGER"),  # a part of input_tokens
     ("attempts", "cache_read_tokens", "INTEGER"),  # a part of input_tokens
     ("attempts", "usage_complete", "INTEGER NOT NULL DEFAULT 1"),  # 0: the totals are known to be short
+    ("attempts", "treatment", "INTEGER NOT NULL DEFAULT 0"),  # 1: a fault that is the condition's treatment
 )
-
-
-class AttemptRefused(RuntimeError):
-    """A transaction refused to start or finish an attempt because the run or the attempt is not in the right state."""
-
-
-class ResumeRefused(RuntimeError):
-    """A resume would continue a different experiment than the one the store records."""
-
-
-class PinMismatch(ResumeRefused):
-    """A campaign-level fact differs from the value pinned at the first start."""
-
-    def __init__(self, key: str, pinned: str, now: str):
-        super().__init__(
-            f"{key} is pinned to {pinned} in this campaign, but is now {now}: refusing to resume with a different one "
-            "(re-pin only with the explicit operator flag)"
-        )
-        self.key, self.pinned, self.now = key, pinned, now
-
-
-class SchemaMismatch(ResumeRefused):
-    """The database was made for other factors than the schema given."""
-
-
-@dataclass(frozen=True)
-class BegunAttempt:
-    """A started attempt: the store's id for it, and its number among the run's charged attempts (1 for the first)."""
-
-    id: int
-    number: int
 
 
 def utc_now() -> str:
@@ -103,21 +75,6 @@ def utc_now() -> str:
 def column_for(factor: str) -> str:
     """Return the name of the generated column that holds a factor's value."""
     return f"f_{factor}"
-
-
-def classify(result: AttemptResult) -> tuple[str, bool]:
-    """Return the state an attempt ends in and whether it is charged, by cause (C01, C03).
-
-    An infrastructure outcome is never `done`: it is set aside and re-run, not scored. A crash in our own code is set
-    aside too and not charged. Any other outcome, a cap or an answer, is the agent's own and ends the run.
-    """
-    if result.outage_kind is not None:
-        return "outage_discarded", False
-    if result.outcome.name == "infrastructure":
-        return "infra_fail", result.outcome.infra_kind not in UNCHARGED_KINDS
-    if result.outcome.name == "harness_defect":
-        return "harness_error", False
-    return "done", False
 
 
 class Store:
@@ -374,13 +331,12 @@ class Store:
     def finish_attempt(self, attempt_id: int, result: AttemptResult, max_attempts: int) -> str:
         """Record how an attempt ended and move its run on, in one transaction; return the run's new status.
 
-        The state and the charge follow from the cause (`classify`). A run is done on an agent outcome, exhausted when
-        its charged attempts reach `max_attempts`, set aside as a harness error when our own code crashed, and
-        otherwise pending again. An attempt that is not running is refused: its result would be recorded twice.
+        The state, the charge and the treatment mark follow from the cause and the run's condition (`classify`). A run is
+        done on an agent outcome or a treatment fault, exhausted when its charged attempts reach `max_attempts`, set
+        aside as a harness error when our own code crashed, and otherwise pending again. An attempt that is not running is refused: its result would be recorded twice.
         """
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
-        state, charged = classify(result)
         outcome = result.outcome
         detail = outcome.detail
         if outcome.defect is not None:
@@ -388,17 +344,21 @@ class Store:
 
         def go() -> str:
             row = self.db.execute(
-                "SELECT run_key FROM attempts WHERE id=? AND state='running'", (attempt_id,)
+                "SELECT a.run_key, r.factors FROM attempts a JOIN runs r USING(run_key) WHERE a.id=? AND a.state='running'",
+                (attempt_id,),
             ).fetchone()
             if row is None:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so its result is not recorded")
+            condition = self.schema.condition_named(json.loads(row["factors"]), row["run_key"])
+            state, charged, treatment = classify(result, self.schema.treatment_kinds[condition])
             self.db.execute(
-                "UPDATE attempts SET state=?, charged=?, ended_utc=?, wall_s=?, infra_kind=?, detail=?, termination=?,"
-                " input_tokens=?, output_tokens=?, cache_creation_tokens=?, cache_read_tokens=?, usage_complete=?"
-                " WHERE id=?",
+                "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, detail=?,"
+                " termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?, cache_read_tokens=?,"
+                " usage_complete=? WHERE id=?",
                 (
                     state,
                     int(charged),
+                    int(treatment),
                     result.ended_utc,
                     result.wall_s,
                     result.outage_kind or outcome.infra_kind,

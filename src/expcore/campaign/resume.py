@@ -10,10 +10,11 @@ says so. The checks and the pins happen in one transaction, so a refused start l
 import json
 from pathlib import Path
 
+from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ORDER_RULE, Manifest, compare_fingerprints
 from expcore.campaign.recovery import Recovery, recover
-from expcore.campaign.store import ResumeRefused, Store
+from expcore.campaign.store import Store
 
 FINGERPRINT_KEY = "fingerprint"
 

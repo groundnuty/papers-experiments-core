@@ -4,12 +4,13 @@ import json
 import sqlite3
 
 import pytest
-from campaign_support import NOW, finished, make_fingerprint, make_manifest, make_schema, sha
+from campaign_support import NOW, finished, make_fingerprint, make_manifest, make_schema, sha, treatment_schema
 
+from expcore.campaign.attempts import PinMismatch, ResumeRefused, SchemaMismatch
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.recovery import Recovery
 from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, open_campaign
-from expcore.campaign.store import PinMismatch, ResumeRefused, SchemaMismatch, Store
+from expcore.campaign.store import Store
 
 LIMIT = 3
 
@@ -182,3 +183,31 @@ def test_a_refused_start_closes_the_store_it_opened(tmp_path, monkeypatch):
     (store,) = opened
     with pytest.raises(sqlite3.ProgrammingError):
         store.q("SELECT 1")  # closed
+
+
+def test_c06_a_treatment_declaration_added_changed_or_dropped_between_starts_is_refused(tmp_path):
+    """C06: adds that the infrastructure kinds a condition treats as its treatment are part of the experiment."""
+    start(tmp_path, schema=treatment_schema(("endpoint",)))[0].close()
+    for variant in (make_schema(), treatment_schema(("endpoint", "sandbox")), treatment_schema(("sandbox",))):
+        with pytest.raises(FingerprintMismatch, match=r"schema\.treatment\.api-none") as caught:
+            start(tmp_path, schema=variant, allow_growth=True)  # growth never excuses a changed declaration
+        assert caught.value.differences[0].startswith("schema.treatment.api-none: recorded ['endpoint']")
+    start(tmp_path, schema=treatment_schema(("endpoint",)))[0].close()  # the recorded declaration still resumes
+
+
+def test_c08_a_new_condition_that_declares_a_treatment_is_one_growth_entry(tmp_path):
+    """C08: adds that a new condition brings its treatment declaration with it as part of the same growth."""
+    base = make_schema()
+    start(tmp_path, schema=base)[0].close()
+    grown = FactorSchema(
+        base.declared,
+        base.order,
+        {**base.conditions, "mount-none": {"data_path": "mount", "tools": "none"}},
+        treatment={"mount-none": ["endpoint"]},
+    )
+    with pytest.raises(FingerprintMismatch) as caught:
+        start(tmp_path, schema=grown)
+    assert "schema.conditions.mount-none: not in the recorded experiment" in caught.value.differences
+    assert not [line for line in caught.value.differences if "treatment" in line]  # one entry, not two
+    store, _ = start(tmp_path, schema=grown, allow_growth=True)
+    assert json.loads(store.get_meta(FINGERPRINT_KEY))["schema"]["treatment"]["mount-none"] == ["endpoint"]

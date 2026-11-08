@@ -17,6 +17,20 @@ A run key is the factor values in the identity order, joined canonically; its SH
 Two runs share a key only if they agree on every factor, and two conditions never assign the same levels, so
 conditions never share a key (C18). A plan expands conditions x tasks x models x seeds and refuses a repeated
 value, so keys are unique by construction (R11).
+
+A condition may also declare which infrastructure failures are its treatment:
+
+    [conditions.provider-down]
+    data_path = "api"
+    infrastructure_is_treatment = ["endpoint"]
+
+Normally an attempt that ends as infrastructure is set aside and run again, because the fault says nothing about the
+agent. When a condition's manipulation is the fault itself (a provider that is down), running again until the run
+looks healthy would remove the effect being measured. Under such a condition an attempt that ends as infrastructure
+of a listed kind is a scored final attempt: the store marks it as treatment, never runs it again and does not charge
+it against the infrastructure limit. Other kinds under the same condition are set aside and run again as usual. The
+kinds are checked against the registry in `expcore.errors` (the core's kinds and any a platform registered), and
+the declaration is part of the schema, so changing it between a start and a resume is refused (C06).
 """
 
 import hashlib
@@ -31,8 +45,10 @@ from typing import Any
 from urllib.parse import quote
 
 from expcore.config.loading import Section, load_toml
+from expcore.errors import infra_kinds
 
 BUILTIN_FACTORS = ("task", "model", "seed")
+TREATMENT_KEY = "infrastructure_is_treatment"
 # A factor name becomes part of a SQL column name in the store, so it is held to a plain identifier.
 _NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _SEPARATOR = "|"
@@ -91,9 +107,13 @@ class FactorSchema:
         order: Sequence[str],
         conditions: Mapping[str, Mapping[str, str]],
         *,
+        treatment: Mapping[str, Sequence[str]] | None = None,
         file: str | os.PathLike[str] = "<schema>",
     ) -> None:
-        """Validate and keep copies of the declared levels, the identity order and the conditions."""
+        """Validate and keep copies of the declared levels, the identity order, the conditions and their treatments.
+
+        `treatment` maps a condition to the infrastructure kinds that are its treatment (see the module docstring).
+        """
         self.file = str(file)
         self.declared: dict[str, tuple[str, ...]] = {name: tuple(levels) for name, levels in declared.items()}
         self.order = tuple(order)
@@ -101,6 +121,7 @@ class FactorSchema:
         self._check_factors()
         self._check_order()
         self._check_conditions()
+        self.treatment_kinds: dict[str, tuple[str, ...]] = self._check_treatment(treatment or {})
         self._by_levels = {tuple(c[f] for f in self.declared): name for name, c in self.conditions.items()}
 
     # --- validation ---------------------------------------------------------------------------------------------
@@ -111,6 +132,8 @@ class FactorSchema:
             where = Section({"levels": list(levels)}, self.file, f"[factors.{name}]")
             if name in BUILTIN_FACTORS:
                 raise Section({}, self.file, "[factors]").fail(name, "is built in and cannot be declared")
+            if name == TREATMENT_KEY:
+                raise Section({}, self.file, "[factors]").fail(name, "is reserved for a condition's setting")
             if not _NAME_RE.fullmatch(name):
                 raise Section({}, self.file, "[factors]").fail(
                     name, "must start with a lower-case letter and use lower-case letters, digits and underscores"
@@ -161,6 +184,28 @@ class FactorSchema:
                 raise where.fail(None, f"duplicates condition {seen[levels]!r}: both assign the same levels")
             seen[levels] = name
 
+    def _check_treatment(self, declared: Mapping[str, Sequence[str]]) -> dict[str, tuple[str, ...]]:
+        """Check each declared treatment against the registry of kinds; return every condition's sorted kinds."""
+        out: dict[str, tuple[str, ...]] = dict.fromkeys(self.conditions, ())
+        for name, kinds in declared.items():
+            if name not in self.conditions:
+                raise Section({}, self.file, "[conditions]").fail(name, f"declares {TREATMENT_KEY} but is no condition")
+            where = Section({}, self.file, f"[conditions.{name}]")
+            kinds = tuple(kinds)
+            if not all(isinstance(k, str) and k for k in kinds):
+                raise where.fail(TREATMENT_KEY, "must be an array of infrastructure kinds")
+            for kind in kinds:
+                if kind not in infra_kinds():
+                    raise where.fail(
+                        TREATMENT_KEY,
+                        f"names unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}",
+                    )
+            repeated = sorted({k for k in kinds if kinds.count(k) > 1})
+            if repeated:
+                raise where.fail(TREATMENT_KEY, f"repeats {', '.join(map(repr, repeated))}")
+            out[name] = tuple(sorted(kinds))
+        return out
+
     # --- keys and plans -----------------------------------------------------------------------------------------
 
     def key(self, condition: str, task: str, model: str, seed: int) -> RunKey:
@@ -188,11 +233,14 @@ class FactorSchema:
 
     def condition_of(self, key: RunKey) -> str:
         """Return the name of the condition a key belongs to; refuse a key whose levels fit none."""
-        values = key.factors
+        return self.condition_named(key.factors, key.text)
+
+    def condition_named(self, factors: Mapping[str, str | int], label: str = "") -> str:
+        """Return the condition whose levels the factor values carry; `label` names the run in the refusal."""
         try:
-            return self._by_levels[tuple(str(values[f]) for f in self.declared)]
+            return self._by_levels[tuple(str(factors[f]) for f in self.declared)]
         except KeyError:
-            raise PlanError(f"run key {key.text!r} fits no condition of the schema") from None
+            raise PlanError(f"run key {label!r} fits no condition of the schema") from None
 
     # --- identity of the schema itself --------------------------------------------------------------------------
 
@@ -202,6 +250,7 @@ class FactorSchema:
             "factors": {name: list(levels) for name, levels in self.declared.items()},
             "order": list(self.order),
             "conditions": {name: dict(c) for name, c in self.conditions.items()},
+            "treatment": {name: list(kinds) for name, kinds in self.treatment_kinds.items()},
         }
 
     @cached_property
@@ -240,9 +289,10 @@ def load_factor_schema(path: str | os.PathLike[str]) -> FactorSchema:
                 raise table.fail("levels", "is required")
             declared[name] = table.strings("levels")
     order = _table(top, "identity", "[identity]").strings("order")
-    conditions = {}
+    conditions, treatment = {}, {}
     all_conditions = _table(top, "conditions", "[conditions]")
     for name in all_conditions.data:
         section = _table(all_conditions, name, f"[conditions.{name}]")
-        conditions[name] = {factor: section.string(factor) for factor in section.data}
-    return FactorSchema(declared, order, conditions, file=path)
+        conditions[name] = {f: section.string(f) for f in section.data if f != TREATMENT_KEY}
+        treatment[name] = section.strings(TREATMENT_KEY)
+    return FactorSchema(declared, order, conditions, treatment=treatment, file=path)

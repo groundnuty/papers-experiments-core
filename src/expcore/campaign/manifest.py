@@ -185,8 +185,8 @@ def _growth_item(path: tuple[str, ...]) -> tuple[str, ...] | None:
     """Name the whole entry a path belongs to when entries of its section may be added, else None."""
     if len(path) >= 2 and path[0] in GROWABLE_SECTIONS:
         return path[:2]
-    if len(path) >= 3 and path[:2] == ("schema", "conditions"):
-        return path[:3]
+    if len(path) >= 3 and path[:2] in (("schema", "conditions"), ("schema", "treatment")):
+        return ("schema", "conditions", path[2])  # a condition and its treatment declaration are one entry
     return None
 
 

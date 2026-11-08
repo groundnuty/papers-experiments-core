@@ -5,20 +5,25 @@ import threading
 from dataclasses import replace
 
 import pytest
-from campaign_support import LATER, NOW, defect, finished, infra, make_manifest, open_store, planned_store, run_one
-
-from expcore.campaign.factors import FactorSchema
-from expcore.campaign.markers import AttemptResult
-from expcore.campaign.recovery import recover
-from expcore.campaign.store import (
-    _ADDED_COLUMNS,
-    AttemptRefused,
-    PinMismatch,
-    SchemaMismatch,
-    Store,
-    classify,
-    column_for,
+from campaign_support import (
+    LATER,
+    NOW,
+    defect,
+    finished,
+    infra,
+    keys_under,
+    make_manifest,
+    open_store,
+    planned_store,
+    run_one,
+    treatment_schema,
 )
+
+from expcore.campaign.attempts import AttemptRefused, PinMismatch, SchemaMismatch, classify
+from expcore.campaign.factors import FactorSchema
+from expcore.campaign.markers import AttemptResult, write_marker
+from expcore.campaign.recovery import recover
+from expcore.campaign.store import _ADDED_COLUMNS, Store, column_for
 from expcore.errors import CORE_KINDS, InfraError
 from expcore.loop.outcomes import OUTCOMES, HarnessDefect, Outcome
 
@@ -389,3 +394,89 @@ def test_a_snapshot_reads_the_database_as_it_was_at_its_first_read(tmp_path):
         writer.put_meta("k", "after", LATER)
         assert reader.get_meta("k") == "before"
     assert reader.get_meta("k") == "after"
+
+
+# --- infrastructure that is a condition's treatment ----------------------------------------------------------------
+
+
+@pytest.fixture
+def treatment():
+    """A store schema whose api-none condition declares a failed endpoint as its treatment."""
+    return treatment_schema(("endpoint",))
+
+
+def treatment_run(tmp_path, schema, condition="api-none"):
+    """Open a store for the schema and return it with the run keys of a condition."""
+    store = open_store(tmp_path, schema)
+    manifest = make_manifest(schema)
+    store.sync_manifest(manifest.rows)
+    return store, keys_under(schema, manifest, condition)
+
+
+def test_c01_a_declared_infrastructure_kind_is_a_scored_final_attempt_that_is_not_run_again(tmp_path, treatment):
+    """C01: adds that under a condition declaring the kind, infrastructure is a scored treatment attempt."""
+    store, (key, *_) = treatment_run(tmp_path, treatment)
+    assert run_one(store, key, infra("endpoint", "HTTP 503 after 5 retries"), max_attempts=1) == "done"
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["state"], row["treatment"], row["charged"]) == ("done", 1, 0)
+    assert (row["termination"], row["infra_kind"], row["detail"]) == (
+        "infrastructure",
+        "endpoint",
+        "HTTP 503 after 5 retries",
+    )
+    assert store.charged_attempts(key) == 0
+    assert key not in [r["run_key"] for r in store.pending()]
+    with pytest.raises(AttemptRefused, match=r"is not pending \(it is done\)"):
+        store.begin_attempt(key, NOW, 1, "")
+
+
+def test_c01_another_kind_under_the_same_condition_is_set_aside_and_run_again(tmp_path, treatment):
+    """C01: adds that only the declared kinds are treatment; the condition's other faults are re-run as usual."""
+    store, (key, *_) = treatment_run(tmp_path, treatment)
+    assert run_one(store, key, infra("sandbox")) == "pending"
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["state"], row["treatment"], row["charged"]) == ("infra_fail", 0, 1)
+    assert key in [r["run_key"] for r in store.pending()]
+    assert run_one(store, key, infra("endpoint")) == "done"  # and the declared kind still ends the run
+    assert [(r["state"], r["treatment"], r["charged"]) for r in store.q("SELECT * FROM attempts ORDER BY id")] == [
+        ("infra_fail", 0, 1),
+        ("done", 1, 0),
+    ]
+
+
+def test_c01_the_same_kind_under_a_condition_that_does_not_declare_it_is_set_aside(tmp_path, treatment):
+    """C01: adds that the declaration belongs to one condition and does not leak to the others."""
+    store, (key, *_) = treatment_run(tmp_path, treatment, condition="mount-read")
+    assert run_one(store, key, infra("endpoint")) == "pending"
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["state"], row["treatment"], row["charged"]) == ("infra_fail", 0, 1)
+
+
+def test_c03_a_treatment_attempt_is_not_charged_against_the_infrastructure_limit(tmp_path, treatment):
+    """C03: adds that a treatment attempt costs the run no attempt, so earlier charged ones stay as they were."""
+    store, (key, *_) = treatment_run(tmp_path, treatment)
+    assert run_one(store, key, infra("sandbox"), max_attempts=2) == "pending"
+    assert run_one(store, key, infra("endpoint"), max_attempts=2) == "done"  # not exhausted by it
+    assert store.charged_attempts(key) == 1
+
+
+def test_c04_a_treatment_attempt_committed_from_its_marker_is_a_scored_final_attempt(tmp_path, treatment):
+    """C04: adds that recovery applies the condition's declaration, as a live finish does."""
+    store, (key, *_) = treatment_run(tmp_path, treatment)
+    begun = store.begin_attempt(key, NOW, 1, str(tmp_path / "run"))
+    write_marker(tmp_path / "run", key, begun.id, infra("endpoint"))
+    assert recover(store, LATER, 3).committed == 1
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["state"], row["treatment"], row["charged"]) == ("done", 1, 0)
+    assert store.q("SELECT status FROM runs WHERE run_key=?", (key,))[0]["status"] == "done"
+
+
+def test_c01_classify_marks_treatment_only_for_an_infrastructure_outcome_of_a_listed_kind():
+    """C01: adds the treatment mark to the classification, and keeps an outage flag on other outcomes a set-aside."""
+    assert classify(infra("endpoint"), ("endpoint",)) == ("done", False, True)
+    assert classify(infra("sandbox"), ("endpoint",)) == ("infra_fail", True, False)
+    assert classify(infra("key_rejected"), ("endpoint",)) == ("infra_fail", False, False)
+    assert classify(infra("key_rejected"), ("key_rejected",)) == ("done", False, True)
+    assert classify(finished(), ("endpoint",)) == ("done", False, False)
+    flagged = AttemptResult(Outcome("finished"), LATER, 1.0, outage_kind="endpoint")
+    assert classify(flagged, ("endpoint",)) == ("outage_discarded", False, False)

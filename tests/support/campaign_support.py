@@ -54,6 +54,17 @@ def make_schema() -> FactorSchema:
     )
 
 
+def treatment_schema(kinds=("endpoint",), condition: str = "api-none") -> FactorSchema:
+    """Return the standard schema with one condition declaring infrastructure kinds as its treatment."""
+    base = make_schema()
+    return FactorSchema(base.declared, base.order, base.conditions, treatment={condition: kinds})
+
+
+def keys_under(schema: FactorSchema, manifest: Manifest, condition: str) -> list[str]:
+    """Return the run keys of a condition, in manifest order."""
+    return [row.key.text for row in manifest.rows if schema.condition_of(row.key) == condition]
+
+
 def make_keys(schema: FactorSchema, tasks=("task-a", "task-b"), models=("m1",), seeds=(1, 2)) -> list[RunKey]:
     """Expand the plan of a schema over the given tasks, models and seeds."""
     return schema.expand(tasks, models, seeds)
