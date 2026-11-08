@@ -18,6 +18,7 @@ from typing import Any
 
 from expcore.loop.arguments import argument_problems
 from expcore.loop.capping import cap_error, cap_text, describe_cap, render_error
+from expcore.loop.records import ToolCallRecord
 from expcore.models.adapters import ToolCall, ToolResult
 from expcore.plugin import ToolProvider, ToolSpec
 
@@ -44,6 +45,42 @@ class ToolRun:
     infra_wait_s: float
     ends_attempt: bool  # a successful call of a terminal tool
     source_truncated: bool | None = None  # the data source's own limit was hit, as the provider says (L07)
+
+    def record(
+        self,
+        call: ToolCall,
+        *,
+        turn: int,
+        round_no: int,
+        started_s: float | None,
+        ended_s: float | None,
+        status: str | None = None,
+        detail: str = "",
+        terminal: bool = False,
+    ) -> ToolCallRecord:
+        """The record of this call: what the model sent, what it saw, and the full raw result.
+
+        `status` overrides the run's own (a cut or failed call is logged under the run that answered it as skipped).
+        """
+        return ToolCallRecord(
+            turn=turn,
+            round=round_no,
+            call_id=call.id,
+            name=call.name,
+            arguments={"_raw": call.raw_arguments} if call.parse_error else call.arguments,
+            status=status or self.status,
+            text=self.result.text,
+            raw_text=self.raw_text,
+            truncated=self.truncated,
+            error_class=self.error_class,
+            raw_arguments=call.raw_arguments if call.parse_error else None,
+            infra_wait_s=self.infra_wait_s,
+            started_s=started_s,
+            ended_s=ended_s,
+            detail=detail,
+            source_truncated=self.source_truncated,
+            terminal=terminal,
+        )
 
 
 class ToolBox:

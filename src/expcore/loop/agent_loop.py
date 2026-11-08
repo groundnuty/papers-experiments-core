@@ -25,6 +25,7 @@ from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.loop.config import AgentConfig, config_sha256_of
+from expcore.loop.endings import cannot_start, model_cut, time_ending, tool_cut
 from expcore.loop.leaks import leaked_tool
 from expcore.loop.outcomes import Outcome, harness_defect_of
 from expcore.loop.records import LoopResult, ToolCallRecord, TurnRecord
@@ -170,25 +171,9 @@ class _Run:
 
     def _guard(self, tick: Tick) -> None:
         """End the attempt when the agent's time is used up (checked first), or the whole-time ceiling is passed."""
-        over = self._expired(tick)
+        over = time_ending(tick, self.config, self.timer.infra_wait_s)
         if over is not None:
             raise _End(over)
-
-    def _expired(self, tick: Tick) -> Outcome | None:
-        """The ending a reading calls for, or None while the agent is under its cap and the ceiling is not passed.
-
-        The agent's own cap decides first; the ceiling only when the agent is still under its cap (L04).
-        """
-        if tick.remaining_s <= 0:
-            return Outcome("time_cap", f"the agent's time cap of {self.config.limits.time_cap_s:g} s was reached")
-        if tick.ceiling_passed:
-            return Outcome(
-                "infrastructure",
-                f"{tick.elapsed_s:.0f} s elapsed with {self.timer.infra_wait_s:.0f} s of waits, "
-                f"past the ceiling of {self.config.ceiling_s:g} s",
-                infra_kind=self.config.ceiling_kind,
-            )
-        return None
 
     async def _bounded[T](self, work: Awaitable[T], limit_s: float) -> T:
         """Await work, but cancel it and raise `_Bound` when the injected sleep for `limit_s` seconds ends first.
@@ -218,7 +203,7 @@ class _Run:
             return await self._bounded(self.backend.step(), tick.bound_s)
         except _Bound:
             self.usage_incomplete = True  # the request in flight was given up: its usage is unknown
-            raise _End(self._model_cut(tick)) from None
+            raise _End(model_cut(tick, self.config)) from None
         except RequestAbandoned:
             self.usage_incomplete = True  # accepted, then slow, never resent (B03)
             raise _End(
@@ -235,15 +220,6 @@ class _Run:
                 raise _End(self._defect("the model backend", exc)) from None
             # A provider error the retry layer passes on unchanged (a plain 400, a 404): the attempt's own ending.
             raise _End(Outcome("error", f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__)) from None
-
-    def _model_cut(self, tick: Tick) -> Outcome:
-        """The ending for a model request cut at its bound. A request reports no waits, so the time it ran is the
-        agent's: the bound was the ceiling only when less of it was left than of the agent's own time, and the agent is
-        then still under its cap. When both ran out together the agent's cap decides."""
-        if tick.ceiling_left_s is not None and tick.ceiling_left_s < tick.remaining_s:
-            detail = f"the model call was still running at the ceiling of {self.config.ceiling_s:g} s"
-            return Outcome("infrastructure", detail, infra_kind=self.config.ceiling_kind)
-        return Outcome("time_cap", "the model call was cut at the agent's time cap")
 
     def _note(self, turn: ModelTurn) -> None:
         """Count the reply's tokens (a missing count adds nothing and marks the totals incomplete, B10) and record it."""
@@ -319,7 +295,7 @@ class _Run:
         tick = self.timer.check("before_tool")
         late = tick.remaining_s < self.config.min_call_s  # no call starts with under a second left (L05)
         if late or tick.ceiling_passed:
-            stop = self._guard_outcome(tick, late)
+            stop = cannot_start(tick, self.config, too_late=late)
             return self._skip(index, call, "time"), stop
         try:
             # The provider is told the agent's time left, but a wait on infrastructure is reported only when the call
@@ -330,7 +306,7 @@ class _Run:
             after = self.timer.check("after_tool")
             cut = self.toolbox.skipped(call, "cut")
             self._log(index, call, cut, self.rounds, tick, after, status="cut")
-            return cut, self._cut_outcome(call, after)
+            return cut, tool_cut(call.name, after, self.config)
         except InfraError as exc:
             return self._failed(index, call, tick, f"infrastructure: {exc.kind}"), Outcome(
                 "infrastructure", exc.detail, infra_kind=exc.kind
@@ -343,33 +319,14 @@ class _Run:
         after = self.timer.check("after_tool")
         self._log(index, call, run, self.rounds, tick, after)
         if run.ends_attempt:
-            over = self._expired(after)  # a result that arrives after the agent's cap is not accepted (L04)
+            over = time_ending(
+                after, self.config, self.timer.infra_wait_s
+            )  # a result that arrives after the agent's cap is not accepted (L04)
             if over is not None:
                 detail = f"the terminal tool {call.name!r} returned, but {over.detail}"
                 return run, Outcome(over.name, detail, infra_kind=over.infra_kind)
             return run, Outcome("finished", f"a call to the terminal tool {call.name!r} succeeded")
         return run, None
-
-    def _cut_outcome(self, call: ToolCall, tick: Tick) -> Outcome:
-        """The ending for a tool call cut at the ceiling, judged by the reading taken after the cut.
-
-        The agent's time first: a call that reported no wait on infrastructure has used the time it ran as its own, so
-        when that used up the cap the ending is a time cap. With the agent still under its cap the ceiling decides.
-        """
-        if tick.remaining_s > 0:
-            detail = f"tool {call.name!r} was still running at the ceiling of {self.config.ceiling_s:g} s"
-            return Outcome("infrastructure", detail, infra_kind=self.config.ceiling_kind)
-        return Outcome("time_cap", f"tool {call.name!r} was still running at the agent's time cap")
-
-    def _guard_outcome(self, tick: Tick, late: bool) -> Outcome:
-        """The ending for a call that cannot start: the agent's time first, then the ceiling."""
-        if late:
-            return Outcome("time_cap", f"{max(tick.remaining_s, 0):.1f} s left, too little to start a tool call")
-        return Outcome(
-            "infrastructure",
-            f"{tick.elapsed_s:.0f} s elapsed, past the ceiling of {self.config.ceiling_s:g} s",
-            infra_kind=self.config.ceiling_kind,
-        )
 
     def _failed(self, index: int, call: ToolCall, tick: Tick, detail: str) -> ToolRun:
         """Log a call whose provider raised, and answer it as skipped so its reply stays whole."""
@@ -402,23 +359,14 @@ class _Run:
     ) -> None:
         """Append the record of one call: what the model sent, what it saw, and the full raw result."""
         self.calls.append(
-            ToolCallRecord(
+            run.record(
+                call,
                 turn=index,
-                round=round_no,
-                call_id=call.id,
-                name=call.name,
-                arguments={"_raw": call.raw_arguments} if call.parse_error else call.arguments,
-                status=status or run.status,
-                text=run.result.text,
-                raw_text=run.raw_text,
-                truncated=run.truncated,
-                error_class=run.error_class,
-                raw_arguments=call.raw_arguments if call.parse_error else None,
-                infra_wait_s=run.infra_wait_s,
+                round_no=round_no,
                 started_s=self.timer.since_start(started.now) if started else None,
                 ended_s=self.timer.since_start(ended.now) if ended else None,
+                status=status,
                 detail=detail,
-                source_truncated=run.source_truncated,
                 terminal=self.toolbox.is_terminal(call.name),
             )
         )
