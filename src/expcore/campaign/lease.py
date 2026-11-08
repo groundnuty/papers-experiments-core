@@ -585,7 +585,7 @@ class LeasePool:
         note = {"key": lease.key, "run_key": lease.run_key, "group": lease.group}
 
         def gone() -> bool:
-            return bool(self._probe.resource_gone(lease.key, note))
+            return self._probe.resource_gone(lease.key, note) is True  # only True; "unknown", 1 and "yes" are not proof
 
         try:
             shown = gone()
@@ -604,7 +604,8 @@ class LeasePool:
         """End the lease's use but keep its key held until `proven()` first says the teardown is done.
 
         Use it when a sandbox could not be torn down: it may still use the resource, so no other run may get the key.
-        `proven` is asked again by `settle_quarantines`; a proof that raises is not a proof.
+        `proven` is asked again by `settle_quarantines`; a proof that raises is not a proof, and neither is any answer
+        but exactly True.
         """
         if not lease._quarantine():
             return
@@ -621,7 +622,7 @@ class LeasePool:
         freed = []
         for key, (lease, proven, _) in due:
             try:
-                done = bool(proven())
+                done = proven() is True
             except Exception:
                 log.exception("proving the teardown behind %s", key)
                 done = False

@@ -342,6 +342,57 @@ def test_c19_an_empty_or_released_note_needs_no_proof(tmp_path):
     assert probe.asked == []
 
 
+ANSWERS_THAT_ARE_NOT_TRUE = ["unknown", 1, "yes", None, [True]]
+
+
+@pytest.mark.parametrize("answer", ANSWERS_THAT_ARE_NOT_TRUE)
+def test_c19_only_exactly_true_from_the_probe_frees_a_key_after_a_run(tmp_path, answer):
+    """C19: a probe that answers "unknown" (or anything truthy but True) has not shown the teardown: the key is held."""
+
+    class Doubtful(Probe):
+        def resource_gone(self, key, note):
+            return answer
+
+    leases = pool(tmp_path, keys=("k1",), probe=Doubtful(), clock=Clock(), quarantine_retry_s=60)
+    lease = leases.try_acquire("g", "run-a")
+    assert leases.finish(lease) is False
+    assert lease.quarantined
+    assert leases.held_back() == 1
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g", "run-b")
+
+
+@pytest.mark.parametrize("answer", ANSWERS_THAT_ARE_NOT_TRUE)
+def test_c19_only_exactly_true_settles_a_quarantine(tmp_path, answer):
+    """C19: a quarantine's proof counts when it is True and in no other form."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1",), clock=clock, quarantine_retry_s=60)
+    lease = leases.try_acquire("g", "run-a")
+    leases.quarantine(lease, lambda: answer)
+    clock.now += 61
+    assert leases.settle_quarantines() == []
+    assert lease.held
+    assert leases.held_back() == 1
+    leases.quarantine(lease, lambda: True)  # the same lease is already quarantined; the first proof stays
+    clock.now += 61
+    assert leases.settle_quarantines() == []
+
+
+@pytest.mark.parametrize("answer", ANSWERS_THAT_ARE_NOT_TRUE)
+def test_c19_a_dead_holders_key_is_not_freed_by_an_answer_that_is_not_true(tmp_path, answer):
+    """C19: the same rule for the dead-holder path."""
+    kill_a_holder(tmp_path / "leases")
+
+    class Doubtful(Probe):
+        def resource_gone(self, key, note):
+            return answer
+
+    leases = pool(tmp_path, keys=("k1",), probe=Doubtful(gone_owners={"holder-1"}), clock=Clock())
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g")
+    assert leases.unusable() == {"k1"}
+
+
 def test_c19_an_unproven_teardown_quarantines_the_key_until_it_is_proven(tmp_path):
     """C19: a quarantined lease stays held and ends its use; its key goes to nobody until the teardown is proven."""
     clock = Clock()
