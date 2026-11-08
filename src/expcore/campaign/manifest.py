@@ -1,160 +1,235 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/campaign/manifest.py, blob aac5bf109fa04b7a080706e27db2833d118bd18f
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""The run manifest: one row per (block, instance, option, layout, model, seed),
-in a fixed randomised order (#16)."""
-from __future__ import annotations
+#   merged: www-2027-experiments @ 46a5828d, scripts/run_pilot.py:1782-1855
+#   merged: www-2027-experiments @ 46a5828d, scripts/run_pilot.py:1413-1645
+#   changes: see git history of this file from its import commit
+"""The campaign manifest: the plan in a seeded run order, and the fingerprint of the experiment it belongs to.
 
-import collections
-import dataclasses
-import fractions
-import itertools
-import random
-from typing import Sequence
+Order (C08). Each run's place is the SHA-256 of the order seed and its run key, and the plan is sorted by it. A run's
+place depends on nothing else, so runs added to the plan never move the runs already in it, and a resume rebuilds the
+same order exactly. The order seed and the rule are pinned in the store; a resume under another seed is refused.
 
-from dataset_76.records import Instance, RunId
+Fingerprint (C06). A plain, JSON-ready dictionary of everything that makes two starts one experiment: the factor
+schema, the tasks, the models, the caps, the prompt and tool hashes of each condition, the scorer digest and the hash
+of every configuration file. Only hashes and numbers go in, never a secret. A resume must present the same
+fingerprint. The plan may grow, but only by whole tasks, models or conditions, and only when the caller allows it;
+changing or removing anything already recorded is refused.
+"""
 
-from .config import BlockSpec, CampaignConfig, stage_label
+import hashlib
+import json
+import math
+import re
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from functools import cached_property
+from typing import Any
+
+from expcore.campaign.factors import FactorSchema, PlanError, RunKey
+
+ORDER_RULE = "sha256(order_seed|run_key)"
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+# Sections of the fingerprint that may gain whole entries when the plan grows (C08), and the conditions of the schema.
+GROWABLE_SECTIONS = ("tasks", "models", "prompts", "tools")
+_SHOWN_LIMIT = 48
 
 
-# Amendments 27(b) and 29(b): the order is seed-first, and no launch setting changes it. The registered order stays in the code for the tests that are about it
-# (they set this False); nothing in a real launch does.
-SEED_FIRST = True
-
-# Amendments 39 and 40: in the LOWEST seed among the staged groups, these groups are ONE stage, merged per model by the fraction of each list taken so far (taken over planned),
-# a tie to the earlier list in this tuple: block 1 (main S1 and the pagination cell), then tier A, then tier B. Each list keeps its own seeded order; every run keeps its own
-# group, so the caps and the reports by group are unchanged. The tuple's order is the tie order. A later seed, and any group not named here, is emitted as before. Naming fewer than two
-# groups present in that seed changes nothing, and `()` is amendment 27(b)'s stage-by-stage order. No launch setting touches it: this is the registered order.
-MERGED_SEED1_GROUPS: tuple[str, ...] = ("condition_e", "condition_f", "condition_g")
+def order_key(order_seed: int, key: RunKey) -> str:
+    """Return a run's place in the order: the SHA-256 of the seed and the run key, which depend on nothing else."""
+    return hashlib.sha256(f"{order_seed}|{key.text}".encode()).hexdigest()
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclass(frozen=True)
 class ManifestRow:
+    """One planned run and its place in the order."""
+
     seq: int
-    block: str
-    run: RunId
-    exclude_from_analysis: bool = False
-    group: str = ""   # priority group (BlockSpec.interleave); groups run in manifest order
-    stage: str = ""   # seed-first: the run's priority group within its seed; "" for the pilot, calibration and the registered order
+    key: RunKey
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """The plan in run order, with the seed that made the order."""
+
+    order_seed: int
+    rows: tuple[ManifestRow, ...]
+
+    @cached_property
+    def plan_sha256(self) -> str:
+        """Return a hash of the set of planned runs, whatever their order."""
+        return _sha256_lines(sorted(row.key.text for row in self.rows))
+
+    @cached_property
+    def order_sha256(self) -> str:
+        """Return a hash of the run keys in run order."""
+        return _sha256_lines([row.key.text for row in self.rows])
+
+
+def _sha256_lines(lines: Iterable[str]) -> str:
+    """Return the SHA-256 of the lines joined by newlines."""
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def build_manifest(keys: Iterable[RunKey], order_seed: int) -> Manifest:
+    """Order the planned runs by their seeded place; refuse a run key that appears twice (R11)."""
+    if isinstance(order_seed, bool) or not isinstance(order_seed, int):
+        raise PlanError("the order seed must be an integer")
+    planned = list(keys)
+    texts = [key.text for key in planned]
+    repeated = [text for text in dict.fromkeys(texts) if texts.count(text) > 1]
+    if repeated:
+        raise PlanError(f"run key {repeated[0]!r} appears more than once in the plan")
+    ordered = sorted(planned, key=lambda key: order_key(order_seed, key))
+    return Manifest(order_seed, tuple(ManifestRow(seq, key) for seq, key in enumerate(ordered)))
+
+
+def relative_order_problem(recorded: Sequence[str], now: Sequence[str]) -> str | None:
+    """Describe how the runs two orders share come out in another relative order; None when they agree.
+
+    A plan that grew keeps the order of the runs it shares with the plan before it. If it does not, the remaining
+    runs would silently follow a different sequence than the finished ones did.
+    """
+    shared = set(recorded) & set(now)
+    if [key for key in recorded if key in shared] != [key for key in now if key in shared]:
+        return f"the {len(shared)} runs this plan shares with the recorded one come out in another relative order"
+    return None
+
+
+# --- the fingerprint -----------------------------------------------------------------------------------------------
+
+
+def _digest_map(label: str, value: Mapping[str, str], keys: Iterable[str] | None = None) -> dict[str, str]:
+    """Return a mapping of names to 64-character hex digests; with `keys`, require exactly those names."""
+    if not isinstance(value, Mapping) or not value:
+        raise PlanError(f"fingerprint {label} must be a non-empty mapping of names to digests")
+    for name, digest in value.items():
+        if not isinstance(name, str) or not name or not isinstance(digest, str) or not _HEX64.fullmatch(digest):
+            raise PlanError(f"fingerprint {label}[{name!r}] must be a 64-character lower-case hex digest")
+    if keys is not None and set(value) != set(keys):
+        missing, extra = sorted(set(keys) - set(value)), sorted(set(value) - set(keys))
+        raise PlanError(f"fingerprint {label} must cover exactly the conditions; missing {missing}, unexpected {extra}")
+    return dict(value)
+
+
+def _plain(label: str, value: Any) -> Any:
+    """Return a value made only of strings, finite numbers, booleans, None, lists and string-keyed mappings."""
+    if isinstance(value, Mapping):
+        if not all(isinstance(k, str) for k in value):
+            raise PlanError(f"fingerprint {label} has a key that is not a string")
+        return {k: _plain(f"{label}.{k}", v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_plain(label, v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise PlanError(f"fingerprint {label} holds a number that is not finite")
+    if value is not None and not isinstance(value, str | int | float | bool):
+        raise PlanError(f"fingerprint {label} holds a {type(value).__name__}, which is not plain data")
+    return value
+
+
+def build_fingerprint(
+    schema: FactorSchema,
+    *,
+    tasks: Mapping[str, str],
+    models: Mapping[str, Any],
+    caps: Mapping[str, Any],
+    prompts: Mapping[str, str],
+    tools: Mapping[str, str],
+    scorer_digest: str,
+    configs: Mapping[str, str],
+) -> dict[str, Any]:
+    """Return the fingerprint of an experiment.
+
+    - `tasks`: task id to a digest of the task's content.
+    - `models`: model key to a digest of its resolved settings, or to a mapping that holds that digest and the
+      model's own caps; the entry is compared whole, so a model that is added later brings its caps with it.
+    - `caps`: the campaign-wide caps, attempt limit and budgets.
+    - `prompts` and `tools`: for each condition, the hash of its prompt template and of its frozen tool manifest.
+    - `scorer_digest`: the digest of the scorers a resume must keep.
+    - `configs`: the hash of every configuration file, by file name.
+    """
+    if not isinstance(scorer_digest, str) or not _HEX64.fullmatch(scorer_digest):
+        raise PlanError("fingerprint scorer_digest must be a 64-character lower-case hex digest")
+    if not isinstance(models, Mapping) or not models or not all(isinstance(k, str) and k for k in models):
+        raise PlanError("fingerprint models must be a non-empty mapping of model keys to their settings")
+    fingerprint = {
+        "schema": schema.to_json(),
+        "tasks": _digest_map("tasks", tasks),
+        "models": _plain("models", models),
+        "caps": _plain("caps", caps),
+        "prompts": _digest_map("prompts", prompts, schema.conditions),
+        "tools": _digest_map("tools", tools, schema.conditions),
+        "scorer_digest": scorer_digest,
+        "configs": _digest_map("configs", configs),
+    }
+    return json.loads(json.dumps(fingerprint, sort_keys=True, allow_nan=False))
+
+
+def fingerprint_sha256(fingerprint: Mapping[str, Any]) -> str:
+    """Return the SHA-256 of a fingerprint's canonical JSON."""
+    text = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _flatten(obj: Any, prefix: tuple[str, ...] = ()) -> dict[tuple[str, ...], Any]:
+    """Map the path of every leaf of nested mappings to its value; an empty mapping and a list are leaves."""
+    if isinstance(obj, dict) and obj:
+        out: dict[tuple[str, ...], Any] = {}
+        for key, value in obj.items():
+            out.update(_flatten(value, (*prefix, str(key))))
+        return out
+    return {prefix: obj}
+
+
+def _growth_item(path: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Name the whole entry a path belongs to when entries of its section may be added, else None."""
+    if len(path) >= 2 and path[0] in GROWABLE_SECTIONS:
+        return path[:2]
+    if len(path) >= 3 and path[:2] == ("schema", "conditions"):
+        return path[:3]
+    return None
+
+
+def _shown(value: Any) -> str:
+    """Render a leaf for a message, cut short."""
+    text = repr(value)
+    return text if len(text) <= _SHOWN_LIMIT else text[: _SHOWN_LIMIT - 3] + "..."
+
+
+@dataclass(frozen=True)
+class FingerprintComparison:
+    """How a start's fingerprint differs from the recorded one: what would be refused, and what only grew the plan."""
+
+    refused: tuple[str, ...]
+    grown: tuple[str, ...]
 
     @property
-    def run_key(self) -> str:
-        return f"{self.block}__{self.run.key()}"
+    def same(self) -> bool:
+        """Tell whether the two fingerprints are equal."""
+        return not self.refused and not self.grown
 
 
-def block_rows(spec: BlockSpec, instances: Sequence[Instance]) -> list[tuple[str, RunId]]:
-    insts = list(instances)
-    if spec.instances == "pilot":
-        insts = [i for i in insts if i.pilot]
-    elif spec.instances == "condition_h":
-        # the calibration instance is the one #5 flags, never "the first pilot instance":
-        # instance order says nothing about which pilot instance meets the rule
-        flagged = [i for i in insts if i.calibration]
-        if len(flagged) != 1:
-            raise ValueError(f"expected exactly one instance flagged calibration, got "
-                             f"{[i.instance_id for i in flagged]}")
-        if not flagged[0].pilot:
-            raise ValueError(f"calibration instance {flagged[0].instance_id} is not a pilot instance")
-        insts = flagged
-    return [
-        (spec.name, RunId(i.instance_id, o, l, m, s))
-        for i, o, l, m, s in itertools.product(
-            insts, spec.option_enums(), spec.layout_enums(), spec.models, spec.seeds)
-    ]
+def compare_fingerprints(recorded: Mapping[str, Any], now: Mapping[str, Any]) -> FingerprintComparison:
+    """Compare a fingerprint with the recorded one, leaf by leaf.
 
-
-def build_manifest(cfg: CampaignConfig, instances: Sequence[Instance]) -> list[ManifestRow]:
-    """Order: priority groups in the order they first appear in cfg.blocks, each shuffled inside
-    with the campaign seed (blocks sharing a group, such as main S1 and the pagination cell, are
-    shuffled together so they share time of day and provider load). Blocks with interleave "after"
-    form one group each, last, in config order. A disabled block adds no rows and moves nothing, so
-    enabling an "after" block later only appends.
+    A leaf that changed, a leaf that vanished, and a leaf that appeared inside an entry already recorded are refusals.
+    A whole new entry of `tasks`, `models`, `prompts`, `tools` or a new condition of the schema is growth.
     """
-    groups: dict[str, list[tuple[str, RunId]]] = {}
-    excluded = {s.name for s in cfg.blocks if s.exclude_from_analysis}
-    afters: list[list[tuple[str, RunId]]] = []
-    for spec in cfg.blocks:
-        if not spec.enabled:
-            continue
-        rows = block_rows(spec, instances)
-        if spec.interleave == "after":
-            afters.append(rows)
+    before, after = _flatten(recorded), _flatten(now)
+    known = {item for path in before if (item := _growth_item(path)) is not None}
+    refused: list[str] = []
+    grown: set[tuple[str, ...]] = set()
+    for path in sorted(set(before) | set(after)):
+        name = ".".join(path)
+        if path in before and path in after:
+            if before[path] != after[path]:
+                refused.append(f"{name}: recorded {_shown(before[path])}, now {_shown(after[path])}")
+        elif path in before:
+            refused.append(f"{name}: recorded {_shown(before[path])}, now absent")
         else:
-            groups.setdefault(spec.interleave, []).extend(rows)
-
-    if SEED_FIRST:
-        return _seed_first(cfg, groups, afters, excluded)
-    ordered: list[tuple[str, str, RunId]] = []
-    for name, rows in list(groups.items()) + [(f"after{i}", r) for i, r in enumerate(afters)]:
-        rows = sorted(rows, key=lambda br: (br[0], br[1].key()))  # canonical, then shuffle
-        random.Random(f"{cfg.rng_seed}:{name}").shuffle(rows)
-        ordered.extend((name, b, r) for b, r in rows)
-    out = [ManifestRow(i, b, r, b in excluded, g) for i, (g, b, r) in enumerate(ordered)]
-    keys = [r.run_key for r in out]
-    assert len(set(keys)) == len(keys), "duplicate run keys in the manifest"
-    return out
-
-
-def _merge_stage(lists: Sequence[Sequence[tuple[str, RunId]]]) -> list[tuple[int, tuple[str, RunId]]]:
-    """Amendments 39 and 40: merge ordered lists of (block, run) into one order, per model by the greedy rule "the next run comes from the list with the smaller fraction taken so
-    far (taken over planned, planned being that model's runs in the list), a tie to the earlier list". Returns (list index, item) in the merged order. The rule is a sort: the
-    run with rank j (0-based) among a model's runs of a list is taken when that list's fraction is j / planned, so ordering by (j / planned, list index) is the greedy order, each
-    list's own order kept (j rises along it). Across models the third key, the place in the list, makes the same fractions proportional. Fractions are exact."""
-    keyed = []
-    for li, rows in enumerate(lists):
-        planned = collections.Counter(r.model for _, r in rows)
-        taken: collections.Counter[str] = collections.Counter()
-        for pos, item in enumerate(rows):
-            m = item[1].model
-            keyed.append(((fractions.Fraction(taken[m], planned[m]), li, pos), li, item))
-            taken[m] += 1
-    keyed.sort(key=lambda t: t[0])
-    return [(li, item) for _, li, item in keyed]
-
-
-def _seed_first(cfg: CampaignConfig, groups: dict[str, list[tuple[str, RunId]]], afters: list[list[tuple[str, RunId]]],
-                excluded: set[str]) -> list[ManifestRow]:
-    """Amendment 27(b): every planned run stays, only the order changes. Groups that hold a barrier block (pilot, calibration) come first, as registered, with
-    the same shuffle. The others go in stages for each seed, lowest seed first: within a seed the groups in the order they first appear in cfg.blocks (block 1,
-    which is main S1 with the pagination cell, then S2 tier A, then S2 tier B), each stage shuffled on its own with the campaign seed. Groups of "after"
-    blocks stay last.
-
-    Amendments 39 and 40: in the lowest seed the groups named in MERGED_SEED1_GROUPS (all three by default) are one stage (`_merge_stage`), where the first of them in that tuple would
-    have been. Each is first shuffled as its own stage would be (the same seed string, so each keeps its registered order); the merged stage's label is the first merged group's, block
-    1's `seed<n>:condition_e`, so block 1's runs keep the stage name they had; every run keeps its own group."""
-    barrier = set(cfg.barrier_blocks)
-    first = [g for g, rows in groups.items() if any(b in barrier for b, _ in rows)]
-    staged = [g for g in groups if g not in first]
-    seeds = sorted({r.seed for g in staged for _, r in groups[g]})
-    out: list[tuple[str, str, str, RunId]] = []          # (group, stage, block, run)
-
-    def shuffled(stage: str, rows: list[tuple[str, RunId]]) -> list[tuple[str, RunId]]:
-        rows = sorted(rows, key=lambda br: (br[0], br[1].key()))      # canonical, then shuffle, as registered
-        random.Random(f"{cfg.rng_seed}:{stage}").shuffle(rows)
-        return rows
-
-    def emit(group: str, stage: str, rows: list[tuple[str, RunId]]) -> None:
-        out.extend((group, stage, b, r) for b, r in shuffled(stage or group, rows))
-    for g in first:
-        emit(g, "", groups[g])
-    merged: list[str] = []                               # the groups merged in the lowest seed, in MERGED_SEED1_GROUPS order
-    if seeds:
-        merged = [g for g in MERGED_SEED1_GROUPS if g in staged and any(r.seed == seeds[0] for _, r in groups[g])]
-        if len(merged) < 2:
-            merged = []                                  # one group, or none: there is nothing to merge
-    for sd in seeds:
-        for g in staged:
-            rows = [(b, r) for b, r in groups[g] if r.seed == sd]
-            if sd == seeds[0] and g in merged:
-                if g == next(x for x in staged if x in merged):      # at the place of the first merged group in the config's order
-                    lists = [shuffled(stage_label(x, sd), [(b, r) for b, r in groups[x] if r.seed == sd]) for x in merged]
-                    label = stage_label(merged[0], sd)
-                    out.extend((merged[li], label, b, r) for li, (b, r) in _merge_stage(lists))
-            elif rows:
-                emit(g, stage_label(g, sd), rows)
-    for i, rows in enumerate(afters):
-        emit(f"after{i}", "", rows)
-    res = [ManifestRow(i, b, r, b in excluded, g, st) for i, (g, st, b, r) in enumerate(out)]
-    keys = [r.run_key for r in res]
-    assert len(set(keys)) == len(keys), "duplicate run keys in the manifest"
-    return res
+            item = _growth_item(path)
+            if item is not None and item not in known:
+                grown.add(item)
+            else:
+                refused.append(f"{name}: absent when the campaign started, now {_shown(after[path])}")
+    return FingerprintComparison(tuple(refused), tuple(".".join(item) for item in sorted(grown)))
