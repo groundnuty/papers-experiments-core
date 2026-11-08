@@ -34,6 +34,13 @@ def test_an_infrastructure_wait_must_be_a_non_negative_number(wait):
         ToolOutput("x", infra_wait_s=wait)
 
 
+def test_l07_the_source_flag_is_unset_by_default_and_must_be_a_boolean_when_given():
+    assert ToolOutput("x").source_truncated is None
+    assert ToolOutput("x", source_truncated=True).source_truncated is True
+    with pytest.raises(ValueError, match="source_truncated"):
+        ToolOutput("x", source_truncated="yes")  # type: ignore[arg-type]
+
+
 def test_a_class_with_the_two_methods_is_a_provider_without_inheriting():
     class Mine:
         def tools(self):

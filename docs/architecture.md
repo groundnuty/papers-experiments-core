@@ -103,7 +103,7 @@ tools = "read"
 - agent configuration as resolved for this run, not as a hash: turn, wall-time, token and output caps, the malformed-call policy (L01), reasoning echo and other per-model rules, retry policy; replay reads these values from the record, and a table maps each older schema version to the defaults then in force (WWW `replay.py:352-371`);
 - code stamp and core version (P01, P02);
 - transcript: per turn the neutral message, the native provider message, stop reason, usage (`None` when unreported, R10), served model and fingerprint (B06), retries with their errors, the echoed-request digest (R06);
-- tool calls: arguments, raw arguments when malformed (L01), the exact text the model saw, the raw result, status, timings;
+- tool calls: arguments, raw arguments when malformed (L01), the exact text the model saw, the raw result, status, timings, and two truncation flags kept apart: the harness cap's (L06) and the data source's own row or size limit, as the provider reports it (L07);
 - clock readings at every point the loop reads the clock;
 - outcome from a closed vocabulary, and infrastructure kind when it applies (C02);
 - instrument outputs, each under its own namespace;

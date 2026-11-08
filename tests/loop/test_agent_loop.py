@@ -294,6 +294,40 @@ def test_l06_a_long_error_keeps_its_class_the_raw_error_and_a_truncation_flag(ru
     assert record.status == "error"
 
 
+def test_l07_a_result_cut_by_its_source_is_flagged_apart_from_the_harness_cap(run):
+    """L07: a result the provider says hit the source's own limit is kept with that flag; the cap's flag stays False."""
+    outputs = {"rows": lambda a: ToolOutput("row\n" * 3, source_truncated=True)}
+    result = run(StubAdapter([[("rows", {})], "done"]), [FakeProvider(outputs)])
+    (record,) = result.tool_calls
+    assert (record.truncated, record.source_truncated) == (False, True)
+
+
+def test_l07_a_result_cut_by_the_harness_cap_is_flagged_apart_from_the_source(run):
+    """L07: the cap cutting a long result says nothing about the source; a provider that stays silent leaves None."""
+    outputs = {"big": lambda a: "r" * 5000, "checked": lambda a: ToolOutput("r" * 5000, source_truncated=False)}
+    result = run(StubAdapter([[("big", {}), ("checked", {})], "done"]), [FakeProvider(outputs)], output_cap_chars=1000)
+    silent, checked = result.tool_calls
+    assert (silent.truncated, silent.source_truncated) == (True, None)
+    assert (checked.truncated, checked.source_truncated) == (True, False)
+
+
+def test_l07_both_flags_can_be_set_and_an_error_result_keeps_the_source_flag(run):
+    """L07: a long result from a source that was cut has both flags; so does an error result the source flagged."""
+    outputs = {
+        "both": lambda a: ToolOutput("r" * 5000, source_truncated=True),
+        "failing": lambda a: ToolOutput("e" * 5000, is_error=True, error_class="Partial", source_truncated=True),
+    }
+    result = run(StubAdapter([[("both", {}), ("failing", {})], "done"]), [FakeProvider(outputs)], output_cap_chars=1000)
+    both, failing = result.tool_calls
+    assert (both.truncated, both.source_truncated) == (True, True)
+    assert (failing.status, failing.truncated, failing.source_truncated) == ("error", True, True)
+
+
+def test_l07_a_call_that_did_not_run_has_no_source_flag(run):
+    result = run(StubAdapter([[("nope", {})], "done"]), [FakeProvider(ECHO)])
+    assert result.tool_calls[0].source_truncated is None
+
+
 def test_l06_an_error_without_a_class_is_named_tool_error(run):
     """L06: the class always leads, even when the provider gave none."""
     failing = {"boom": lambda a: ToolOutput("it broke", is_error=True)}

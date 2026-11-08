@@ -43,6 +43,7 @@ class ToolRun:
     error_class: str | None
     infra_wait_s: float
     ends_attempt: bool  # a successful call of a terminal tool
+    source_truncated: bool | None = None  # the data source's own limit was hit, as the provider says (L07)
 
 
 class ToolBox:
@@ -119,8 +120,24 @@ class ToolBox:
         if output.is_error:
             error_class = output.error_class or "ToolError"
             run = self._error_run(call, "error", error_class, output.text)
-            return ToolRun(run.result, "error", run.raw_text, run.truncated, error_class, output.infra_wait_s, False)
+            return ToolRun(
+                run.result,
+                "error",
+                run.raw_text,
+                run.truncated,
+                error_class,
+                output.infra_wait_s,
+                False,
+                output.source_truncated,
+            )
         text, truncated = cap_text(output.text, self.cap_chars)
         return ToolRun(
-            ToolResult(call, text, False), "ok", output.text, truncated, None, output.infra_wait_s, spec.terminal
+            ToolResult(call, text, False),
+            "ok",
+            output.text,
+            truncated,
+            None,
+            output.infra_wait_s,
+            spec.terminal,
+            output.source_truncated,
         )

@@ -44,19 +44,27 @@ class ToolOutput:
     `text` is the full result, or for an error the message. An error names its `error_class`, which the model
     sees first. `infra_wait_s` is the time the call spent waiting on infrastructure (a store, a gate, a slot, a
     lock, output validation); the loop does not charge it to the agent's time cap (L04).
+
+    `source_truncated` is for the data source's own limit (L07): True when the source hit its row or size limit, so
+    the result may be cut by the source; False when the provider checked and it was not; None when the provider says
+    nothing. The record keeps it apart from the flag for the harness's output cap, which the loop sets on what it cut.
     """
 
     text: str
     is_error: bool = False
     error_class: str | None = None
     infra_wait_s: float = 0.0
+    source_truncated: bool | None = None
 
     def __post_init__(self) -> None:
-        """Refuse an error class on a result that is not an error, and a wait that is negative or not a number."""
+        """Refuse an error class on a result that is not an error, a wait that is negative or not a number, and a
+        source flag that is not a boolean."""
         if self.error_class is not None and not self.is_error:
             raise ValueError("error_class is only for a result with is_error set")
         if not math.isfinite(self.infra_wait_s) or self.infra_wait_s < 0:
             raise ValueError(f"infra_wait_s must be a finite number of seconds, not negative: {self.infra_wait_s!r}")
+        if self.source_truncated is not None and not isinstance(self.source_truncated, bool):
+            raise ValueError(f"source_truncated must be True, False or None, not {self.source_truncated!r}")
 
 
 @runtime_checkable

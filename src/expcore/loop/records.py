@@ -46,13 +46,14 @@ class ToolCallRecord:
     status: str  # one of TOOL_STATUSES
     text: str  # exactly what the model saw, after the cap
     raw_text: str  # the full result or error before the cap
-    truncated: bool  # the cap cut what the model saw (L06)
+    truncated: bool  # the harness cap cut what the model saw (L06); not the source's own limit, see source_truncated
     error_class: str | None = None
     raw_arguments: str | None = None  # the model's own text, kept when it did not parse
     infra_wait_s: float = 0.0
     started_s: float | None = None  # seconds since the run started; None when the call never started
     ended_s: float | None = None
     detail: str = ""  # why a call was skipped or crashed
+    source_truncated: bool | None = None  # the data source hit its own row or size limit, as the provider said (L07)
 
     def __post_init__(self) -> None:
         """Refuse a status outside the closed list."""

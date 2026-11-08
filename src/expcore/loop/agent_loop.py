@@ -403,6 +403,7 @@ class _Run:
                 started_s=self.timer.since_start(started.now) if started else None,
                 ended_s=self.timer.since_start(ended.now) if ended else None,
                 detail=detail,
+                source_truncated=run.source_truncated,
             )
         )
 
