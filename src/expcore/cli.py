@@ -4,7 +4,8 @@
     run STUDY       load the configuration, open or resume the campaign, run the scheduler
     check BATCH     the replay check over a batch of records (the study is found above the batch), with a copy of
                     the campaign store that the analysis reads instead of the live one
-    analyze STUDY   refuse without a current replay check; then export, scores and the preregistered analysis
+    analyze STUDY   refuse without a current replay check; then export, scores (derived from the records anew each time,
+                    so this is also how a changed scorer is applied) and the preregistered analysis
     report STUDY    the same refusal; then write out/report.md
 
 Exit status: 0 done, 1 refused (the message on stderr says why and what to do), 2 usage, 3 `run` ended with runs still
@@ -110,6 +111,7 @@ def _report(args: argparse.Namespace) -> int:
         study=analysis.study.name,
         code=analysis.code,
         core_version=analysis.core_version,
+        scorers=analysis.scorers,
         interval_level=analysis.study.prereg.bootstrap.ci_level,
     )
     target = out_dir(analysis.study) / REPORT_FILE

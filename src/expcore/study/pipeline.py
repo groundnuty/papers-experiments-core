@@ -14,7 +14,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 - `analyse_study` refuses unless the batch has a current passing check (R04, R05). It then uses only bytes the check
   verified (`study.verified`): the snapshot and the replayed records, each read once and compared with the check's
   hash, cross-validated against each other. It exports from the snapshot, scores the records in memory (a record is
-  never written after its check, since that would change its hash) and runs the preregistered analysis.
+  never written after its check, since that would change its hash) and runs the preregistered analysis. Every score is
+  derived anew from a record on each call and none is read back: `scores.json` is an output, so `analyze` is how a
+  study is re-scored (R13), offline, after a change to a scorer and a new check (a scorer is code the identity covers).
 """
 
 import dataclasses
@@ -38,7 +40,7 @@ from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.records.record import RunRecord
-from expcore.records.rescore import rescore
+from expcore.records.rescore import rescore, scorer_name, scorer_version
 from expcore.replay.check import BatchNotVerified, require_current_check, verify_batch, write_check
 from expcore.stats.analysis import AnalysisResult, analyse
 from expcore.stats.rows import Row
@@ -71,6 +73,7 @@ class StudyAnalysis:
     scores: Mapping[str, Any]
     rows: tuple[Row, ...]
     result: AnalysisResult
+    scorers: Mapping[str, str]  # the version of each scorer that scored the records, by name
 
 
 def out_dir(study: StudyConfig) -> Path:
@@ -251,7 +254,8 @@ def analyse_study(
         task = study.tasks[str(entry["factors"]["task"])]
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))
     result = analyse(rows, study.prereg)
-    return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result)
+    versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
+    return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)
 
 
 def write_analysis(analysis: StudyAnalysis) -> list[Path]:
@@ -262,6 +266,7 @@ def write_analysis(analysis: StudyAnalysis) -> list[Path]:
         "alpha": analysis.result.alpha,
         "code": {key: analysis.code.get(key) for key in ("commit", "tree_sha256", "dirty")},
         "core_version": analysis.core_version,
+        "scorers": dict(analysis.scorers),
         "partial": analysis.export["partial"],
         "running_attempts": analysis.export["running_attempts"],
         "excluded_attempts": analysis.export["excluded_attempts"],

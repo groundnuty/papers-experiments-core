@@ -15,8 +15,8 @@ are the same text: no clock, no path and no random number enters it.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
-- The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp
-  and the core version.
+- The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
+  the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13).
 """
 
 import math
@@ -229,6 +229,11 @@ def _left_out(excluded: Sequence[Mapping[str, Any]]) -> list[str]:
     return [*lines, *_table(["Run key", "Attempt", "Reason"], rows), ""]
 
 
+def _scorers(scorers: Mapping[str, str] | None) -> str:
+    """Each scorer's name and version in name order, or n/a when the report was not given them."""
+    return ", ".join(f"{name} `{version}`" for name, version in sorted((scorers or {}).items())) or UNKNOWN
+
+
 def render_report(
     result: AnalysisResult,
     export: Mapping[str, Any],
@@ -236,12 +241,14 @@ def render_report(
     study: str,
     code: Mapping[str, Any],
     core_version: str | None,
+    scorers: Mapping[str, str] | None = None,
     interval_level: float | None = None,
 ) -> str:
     """Render the report as Markdown.
 
-    `code` is the code identity (`provenance.codestamp.version`), `interval_level` the level of the contrasts'
-    intervals when the preregistration states one. A partial analysis is described by the export (`partial`,
+    `code` is the code identity (`provenance.codestamp.version`), `scorers` the version of each scorer by name (the
+    report says n/a without them), `interval_level` the level of the contrasts' intervals when the preregistration
+    states one. A partial analysis is described by the export (`partial`,
     `running_attempts`, `excluded_attempts`). What each number counts is stated in the report beside it. The
     text ends with a newline.
     """
@@ -260,6 +267,7 @@ def render_report(
     lines += [
         f"- Code: commit `{code.get('commit')}`, tree `{code.get('tree_sha256')}` ({state})",
         f"- Core version: {core_version or UNKNOWN}",
+        f"- Scorers: {_scorers(scorers)}",
         f"- Runs: {planned} planned, {len(export['analysed_attempts'])} analysed, "
         f"{len(export['exhausted_runs'])} exhausted (charged infrastructure attempts reached the limit; no scored "
         "attempt), "

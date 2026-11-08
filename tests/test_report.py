@@ -291,3 +291,10 @@ def test_c09_set_aside_counts_are_described_as_covering_every_run_not_only_the_a
     assert "Counted over every run of the campaign whatever its status" in report
     assert "- *Left out*: the set-aside and treatment attempts of runs a partial analysis leaves out" in report
     assert "every attempt failed on infrastructure" not in report
+
+
+def test_r13_the_report_names_each_scorer_with_its_version_or_says_it_does_not_know_them():
+    """R13: the version of every scorer that made the numbers is in the header, in name order."""
+    given = render(analysis(contrast("primary", "difference")), scorers={"tiny": "2", "alpha": "sha256:ab"})
+    assert "- Scorers: alpha `sha256:ab`, tiny `2`" in given
+    assert "- Scorers: n/a" in render(analysis(contrast("primary", "difference")))
