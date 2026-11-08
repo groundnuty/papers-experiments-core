@@ -5,9 +5,11 @@
 """Release files: someone's word that a stop may end (C13).
 
 The word is used once. A file left in place would silently end the next stop as well, and one written before the stop
-says nothing about it, because nobody had seen the stop yet. So a release counts only if it was written at or after the
-stop it ends, is removed when it ends it, and is recorded by who wrote it and when. A file that cannot be removed
-releases nothing: the stop holds and the alarm stays.
+says nothing about it, because nobody had seen the stop yet. So a release counts only if its modification time is
+**strictly newer** than the stop it ends, with no allowance for coarse file clocks: a file that cannot be told from the
+stop's own moment is not shown to have been written after it, and the person writes it again. A release is removed when
+it ends a stop and is recorded by who wrote it and when. A file that cannot be removed releases nothing: the stop holds
+and the alarm stays.
 
 Two forms. `take` is a file whose existence is the word, for one stop. `take_listed` is a file that lists names, one
 per line, each ending that name's stop; a name with no stop in force is left alone, and the file goes with its last
@@ -21,9 +23,6 @@ import pwd
 from pathlib import Path
 
 log = logging.getLogger(__name__)
-SLACK_S = (
-    1.0  # file times come from a coarser clock than time.time(): a file written just after a stop can read before it
-)
 
 
 def _signed(st: os.stat_result) -> str:
@@ -44,24 +43,24 @@ def epoch_of(utc: object) -> float:
 
 
 def written_after(path: str | Path, since: float) -> str | None:
-    """Return who wrote the file and when, if it exists and was written at or after `since`; it stays where it is."""
+    """Return who wrote the file and when, if it exists and was written strictly after `since`; it stays where it is."""
     try:
         st = Path(path).stat()
     except OSError:
         return None
-    return _signed(st) if st.st_mtime >= since - SLACK_S else None
+    return _signed(st) if st.st_mtime > since else None
 
 
 def take(path: str | Path, stopped_at: float) -> str | None:
     """Use up a file that ends one stop: its existence is the word.
 
     Return who and when (with its first line, if it says why) and remove it; None when there is no such file, it is
-    older than the stop, or it cannot be removed.
+    not newer than the stop, or it cannot be removed.
     """
     p = Path(path)
     try:
         st = p.stat()
-        if st.st_mtime < stopped_at - SLACK_S:
+        if st.st_mtime <= stopped_at:
             return None
         said = _signed(st)
         first = next(iter(p.read_text(errors="replace").splitlines()), "").strip()
@@ -78,7 +77,7 @@ def take_listed(path: str | Path, stops: dict[str, float]) -> dict[str, str]:
     """Use up the lines of a file that names the stops it ends, one name per line.
 
     `stops` maps each name with a stop in force to the epoch time of that stop. Return {name: who and when} for the names
-    the file lists and that were stopped before the file was written, and remove those lines, keeping the file's time
+    the file lists and that were stopped strictly before the file was written, and remove those lines, keeping the file's time
     for the rest. Nothing is released if the file cannot be rewritten.
     """
     p = Path(path)
@@ -87,7 +86,7 @@ def take_listed(path: str | Path, stops: dict[str, float]) -> dict[str, str]:
     try:
         st = p.stat()
         lines = [x.strip() for x in p.read_text(errors="replace").splitlines() if x.strip()]
-        taken = {name for name, t in stops.items() if name in lines and st.st_mtime >= t - SLACK_S}
+        taken = {name for name, t in stops.items() if name in lines and st.st_mtime > t}
         if not taken:
             return {}
         left = [x for x in lines if x not in taken]

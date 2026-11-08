@@ -3,7 +3,7 @@
 import os
 import stat
 
-from expcore.campaign.release import SLACK_S, epoch_of, take, take_listed, written_after
+from expcore.campaign.release import epoch_of, take, take_listed, written_after
 
 STOP = 1_000_000.0
 
@@ -36,10 +36,23 @@ def test_c13_a_release_written_before_the_stop_does_not_end_it(tmp_path):
     assert path.exists()
 
 
-def test_c13_a_file_a_moment_before_the_stop_counts_because_file_clocks_are_coarse(tmp_path):
-    """C13: file times come from a coarser clock, so a file within the slack of the stop counts as written after it."""
-    assert take(release_file(tmp_path, mtime=STOP - SLACK_S / 2), STOP) is not None
-    assert take(release_file(tmp_path, mtime=STOP - SLACK_S * 3, name="r2"), STOP) is None
+def test_c13_a_file_at_the_moment_of_the_stop_or_just_before_it_does_not_count_for_there_is_no_slack(tmp_path):
+    """C13: a release counts only if its mtime is strictly newer than the stop: equal, or a moment older, is refused."""
+    for index, mtime in enumerate((STOP, STOP - 0.5, STOP - 1.0)):
+        path = release_file(tmp_path, mtime=mtime, name=f"r{index}")
+        assert take(path, STOP) is None
+        assert path.exists()
+        assert take_listed(path, {"go": STOP}) == {}
+        assert written_after(path, STOP) is None
+    newer = release_file(tmp_path, mtime=STOP + 0.001, name="newer")
+    assert take(newer, STOP) is not None
+
+
+def test_c13_a_listed_name_stopped_at_the_files_own_time_is_left_in_the_file(tmp_path):
+    """C13: the strict rule holds for a listed release too: a stop at the file's mtime is not ended by it."""
+    path = release_file(tmp_path, "alpha\nbeta\n", mtime=STOP + 10)
+    assert set(take_listed(path, {"alpha": STOP + 10, "beta": STOP + 9.999})) == {"beta"}
+    assert path.read_text(encoding="utf-8").split() == ["alpha"]
 
 
 def test_c13_a_release_that_cannot_be_removed_releases_nothing(tmp_path):
@@ -66,7 +79,7 @@ def test_c13_a_listed_release_ends_only_the_stops_it_names_and_that_were_older_t
     assert path.read_text(encoding="utf-8").split() == ["beta", "gamma"]
     assert os.stat(path).st_mtime == STOP + 10  # what is left stays as old as it was
     assert take_listed(path, {"alpha": STOP}) == {}  # alpha was used up
-    later = take_listed(path, {"gamma": STOP + 10})
+    later = take_listed(path, {"gamma": STOP + 9})
     assert set(later) == {"gamma"}
     assert path.read_text(encoding="utf-8").split() == ["beta"]
 
