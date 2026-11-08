@@ -20,6 +20,7 @@ from campaign_support import (
 )
 
 from expcore.campaign.attempts import AttemptRefused, PinMismatch, SchemaMismatch, classify
+from expcore.campaign.export import export_run_state
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.markers import AttemptResult, write_marker
 from expcore.campaign.recovery import recover
@@ -578,3 +579,54 @@ def test_c20_a_duplicate_column_error_with_the_column_still_missing_is_raised(tm
     monkeypatch.setattr(Store, "_add_column", refuses)
     with pytest.raises(sqlite3.OperationalError, match="duplicate column name"):
         open_store(tmp_path)
+
+
+def test_c20_a_database_made_before_the_outage_column_gets_it_filled_from_the_old_place(tmp_path):
+    """C20: adds that the step adding the outage column fills it for old outage-discarded attempts in the same step."""
+    store, _, manifest = planned_store(tmp_path)
+    one, two, three = (row.key.text for row in manifest.rows[:3])
+    run_one(store, one, AttemptResult(Outcome("finished"), LATER, 1.0, outage_kind="sandbox"))
+    run_one(store, two, infra("endpoint"), max_attempts=9)
+    run_one(store, three, finished())
+    # as an older version left it: the outage's kind sat in infra_kind and the column did not exist
+    store.db.execute("UPDATE attempts SET infra_kind='sandbox' WHERE state='outage_discarded'")
+    store.close()
+    raw = sqlite3.connect(tmp_path / "campaign.db")
+    raw.execute("ALTER TABLE attempts DROP COLUMN outage_kind")
+    raw.commit()
+    raw.close()
+
+    reopened = open_store(tmp_path)
+    rows = {r["state"]: (r["infra_kind"], r["outage_kind"]) for r in reopened.q("SELECT * FROM attempts")}
+    assert rows == {
+        "outage_discarded": ("sandbox", "sandbox"),
+        "infra_fail": ("endpoint", None),  # only outage-discarded attempts are filled
+        "done": (None, None),
+    }
+    export = export_run_state(reopened)
+    assert [(r["kind"], r["state"]) for r in export["retries_by_kind"] if r["state"] == "outage_discarded"] == [
+        ("sandbox", "outage_discarded")
+    ]
+
+
+def test_c20_the_backfill_and_the_column_come_in_one_transaction(tmp_path, monkeypatch):
+    """C20: adds that a kill after the column is added and before it is filled leaves neither, to be redone whole."""
+    open_store(tmp_path).close()
+    raw = sqlite3.connect(tmp_path / "campaign.db")
+    raw.execute("ALTER TABLE attempts DROP COLUMN outage_kind")
+    raw.commit()
+    raw.close()
+    original = Store._add_column
+
+    def add_then_die(self, table, column, declaration):
+        original(self, table, column, declaration)
+        raise RuntimeError("killed after the column was added")
+
+    monkeypatch.setattr(Store, "_add_column", add_then_die)
+    with pytest.raises(RuntimeError, match="killed"):
+        open_store(tmp_path)
+    monkeypatch.undo()
+    check = sqlite3.connect(tmp_path / "campaign.db")
+    assert "outage_kind" not in [r[1] for r in check.execute("PRAGMA table_info(attempts)")]
+    check.close()
+    assert "outage_kind" in columns(open_store(tmp_path), "attempts")

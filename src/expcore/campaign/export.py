@@ -115,6 +115,16 @@ def export_run_state(store: Store) -> dict[str, Any]:
     }
 
 
+def _none_last(item: tuple[tuple, Any]) -> tuple:
+    """Order the cells of a table by their key, with a missing part (None) after every present one.
+
+    A kind can be missing on an attempt a database recorded before the outage kind had its own column and that no
+    backfill could name. Plain tuple ordering would raise on None against a string; this puts those cells last, and
+    the same way every time.
+    """
+    return tuple((part is None, "" if part is None else part) for part in item[0])
+
+
 def _kind_of(attempt: Any) -> str | None:
     """Return the kind an infrastructure attempt is counted under.
 
@@ -142,7 +152,7 @@ def _discarded_usage(identities: dict[str, dict], attempts: dict[str, list[Any]]
                 cell[name] += attempt[name] or 0
     return [
         {"condition": condition, "model": model, "state": state, **cell}
-        for (condition, model, state), cell in sorted(cells.items())
+        for (condition, model, state), cell in sorted(cells.items(), key=_none_last)
     ]
 
 
@@ -164,7 +174,7 @@ def _retries_by_kind(identities: dict[str, dict], attempts: dict[str, list[Any]]
                 ] += 1
     return [
         {"condition": condition, "model": model, "kind": kind, "state": state, "charged": charged, "attempts": n}
-        for (condition, model, kind, state, charged), n in sorted(counts.items())
+        for (condition, model, kind, state, charged), n in sorted(counts.items(), key=_none_last)
     ]
 
 
@@ -191,7 +201,7 @@ def _infrastructure_by_condition(
             cells.setdefault((condition, _kind_of(attempt)), {"set_aside": 0, "treatment": 0})[field] += 1
     return [
         {"condition": condition, "kind": kind, "declared_treatment": kind in declared[condition], **counts}
-        for (condition, kind), counts in sorted(cells.items())
+        for (condition, kind), counts in sorted(cells.items(), key=_none_last)
     ]
 
 

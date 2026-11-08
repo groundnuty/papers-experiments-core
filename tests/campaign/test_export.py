@@ -440,3 +440,18 @@ def test_c09_the_export_file_is_owner_only_whatever_the_umask(tmp_path, umask):
     finally:
         os.umask(previous)
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_c02_an_attempt_with_no_kind_is_counted_last_and_does_not_break_the_export(tmp_path):
+    """C02: adds that a missing kind, which no backfill could name, sorts after the named kinds instead of raising."""
+    store, schema, manifest = planned_store(tmp_path)
+    one, two, three = keys_under(schema, manifest, "mount-read")[:3]
+    for key, kind in ((one, "sandbox"), (two, "endpoint"), (three, "sandbox")):
+        run_one(store, key, AttemptResult(Outcome("finished"), LATER, 1.0, outage_kind=kind))
+    store.db.execute("UPDATE attempts SET outage_kind=NULL WHERE run_key=?", (two,))
+    data = export_run_state(store)
+    assert [(r["kind"], r["attempts"]) for r in data["retries_by_kind"]] == [("sandbox", 2), (None, 1)]
+    assert [(r["condition"], r["kind"]) for r in data["infrastructure_by_condition"]] == [
+        ("mount-read", "sandbox"),
+        ("mount-read", None),
+    ]

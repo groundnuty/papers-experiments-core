@@ -66,6 +66,12 @@ _ADDED_COLUMNS = (
     ("attempts", "treatment", "INTEGER NOT NULL DEFAULT 0"),  # 1: a fault that is the condition's treatment
     ("attempts", "outage_kind", "TEXT"),  # the kind of an outage that overlapped the attempt; apart from infra_kind
 )
+# Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
+# `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
+# database has it there.
+_BACKFILLS = {
+    "outage_kind": "UPDATE attempts SET outage_kind = infra_kind WHERE state = 'outage_discarded' AND outage_kind IS NULL",
+}
 
 
 def utc_now() -> str:
@@ -134,6 +140,9 @@ class Store:
     def _migrate(self, table: str, column: str, declaration: str) -> None:
         """Add one column if it is missing, checking and altering in one write transaction (C20).
 
+        A column that older databases kept elsewhere is backfilled (`_BACKFILLS`) in the same transaction, so a kill
+        never leaves the column added and empty.
+
         Two processes may open a database at once. Under BEGIN IMMEDIATE the second waits for the first, then finds the
         column there. A "duplicate column" error from a concurrent opener is taken as applied only after the column is
         seen to exist; any other failure, or a duplicate error with the column still missing, is raised.
@@ -142,6 +151,8 @@ class Store:
         def go() -> None:
             if column not in self._columns(table):
                 self._add_column(table, column, declaration)
+                if column in _BACKFILLS:
+                    self.db.execute(_BACKFILLS[column])
 
         try:
             self.transact(go)
