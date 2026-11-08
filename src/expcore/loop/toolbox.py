@@ -58,6 +58,7 @@ class ToolRun:
         waited_s: float = 0.0,
         waits_left_open: int = 0,
         terminal: bool = False,
+        waited_by_kind: dict[str, float] | None = None,
     ) -> ToolCallRecord:
         """The record of this call: what the model sent, what it saw, and the full raw result.
 
@@ -82,6 +83,7 @@ class ToolRun:
             source_truncated=self.source_truncated,
             waits_left_open=waits_left_open,
             terminal=terminal,
+            infra_wait_by_kind=dict(waited_by_kind or {}),
         )
 
 

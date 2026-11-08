@@ -1,9 +1,9 @@
 """Time in the loop: the agent is charged only for its own time (L04), no hidden call limit (L05), injected clock.
 
-Waits on infrastructure are measured live: a handler marks one with `async with ctx.infrastructure_wait()`, and the
-agent's clock is paused while it is open. The fake clock moves only when a handler or a backend moves it, and the
-loop's sleep (`sleeper`) ends when the fake clock reaches its bound, so a call is cut exactly when a test says time
-passed.
+Waits on infrastructure are measured live: a handler marks one with
+`async with ctx.infrastructure_wait("lease_queue")`, and the agent's clock is paused while it is open. The fake clock
+moves only when a handler or a backend moves it, and the loop's sleep (`sleeper`) ends when the fake clock reaches its
+bound, so a call is cut exactly when a test says time passed.
 """
 
 import asyncio
@@ -21,7 +21,7 @@ def slow(clock, seconds, *, wait=0.0, text="done"):
 
     async def handler(args, ctx):
         if wait:
-            async with ctx.infrastructure_wait():
+            async with ctx.infrastructure_wait("lease_queue"):
                 clock.advance(wait)
         clock.advance(seconds - wait)
         return text
@@ -48,7 +48,7 @@ def waits_on_infrastructure(clock, step=100.0, *, cleanup=0.0):
 
     async def handler(args, ctx):
         try:
-            async with ctx.infrastructure_wait():
+            async with ctx.infrastructure_wait("lease_queue"):
                 while True:
                     clock.advance(step)
                     await asyncio.sleep(0)
@@ -162,7 +162,7 @@ def test_l04_a_long_wait_on_infrastructure_is_not_cut_at_the_agents_cap(run, clo
     paused for the wait, so the call is not cut and nothing is charged."""
 
     async def waits(args, ctx):
-        async with ctx.infrastructure_wait():
+        async with ctx.infrastructure_wait("lease_queue"):
             for _ in range(5):
                 clock.advance(100)
                 await asyncio.sleep(0)  # let the loop look at the clock, as it would between real waits
@@ -180,7 +180,7 @@ def test_l04_the_agents_clock_runs_again_when_the_wait_ends(run, clock, sleeper)
     not at 300 s after the call began (the cap would have found it at 100 s of agent time)."""
 
     async def waits_then_works(args, ctx):
-        async with ctx.infrastructure_wait():
+        async with ctx.infrastructure_wait("lease_queue"):
             clock.advance(200)
         for _ in range(100):
             clock.advance(10)
@@ -371,7 +371,7 @@ def test_l04_the_live_waits_the_looks_and_the_cleanup_are_all_in_the_clock_readi
     )
     assert result.outcome.name == "infrastructure"
     labels = [label for label, _ in result.clock_readings]
-    assert {"wait_start", "wait_end", "watch", "cleanup_end"} <= set(labels)
+    assert {"wait_start:lease_queue", "wait_end:lease_queue", "watch", "cleanup_end"} <= set(labels)
     values = [value for _, value in result.clock_readings]
     assert values == sorted(values)
 
@@ -392,7 +392,7 @@ def waits_then_works_for_ever(clock, wait_s, step=1.0, yields=10):
             await asyncio.sleep(0)
 
     async def handler(args, ctx):
-        async with ctx.infrastructure_wait():
+        async with ctx.infrastructure_wait("lease_queue"):
             for _ in range(int(wait_s / step)):
                 await tick()
         while True:
@@ -425,7 +425,7 @@ def test_l04_the_watch_takes_a_reading_when_a_wait_opens_and_again_when_it_close
 
     async def waits_briefly(args, ctx):
         await asyncio.sleep(0)
-        async with ctx.infrastructure_wait():
+        async with ctx.infrastructure_wait("lease_queue"):
             for _ in range(5):
                 clock.advance(1)
                 await asyncio.sleep(0)
@@ -442,7 +442,7 @@ def test_l04_the_watch_takes_a_reading_when_a_wait_opens_and_again_when_it_close
     )
     assert result.outcome.name == "finished"
     labels = [label for label, _ in result.clock_readings]
-    start, end = labels.index("wait_start"), labels.index("wait_end")
+    start, end = labels.index("wait_start:lease_queue"), labels.index("wait_end:lease_queue")
     assert "watch" in labels[start:end]
     assert "watch" in labels[end:]
 
@@ -454,7 +454,7 @@ def leaves_a_wait_open(clock, seconds, kept=None):
     """A tool handler that opens a wait on infrastructure, never closes it, and returns after `seconds`."""
 
     async def handler(args, ctx):
-        wait = ctx.infrastructure_wait()
+        wait = ctx.infrastructure_wait("lease_queue")
         await wait.__aenter__()
         if kept is not None:
             kept.append(wait)
@@ -480,7 +480,7 @@ def test_l04_a_wait_left_open_by_a_call_that_raises_is_closed_when_it_raises(run
     """L04: the same when the provider raises: the invariant holds and the record says a wait was left open."""
 
     async def leaks_then_fails(args, ctx):
-        await ctx.infrastructure_wait().__aenter__()
+        await ctx.infrastructure_wait("lease_queue").__aenter__()
         clock.advance(5)
         raise InfraError("sandbox", "went away")
 
@@ -498,7 +498,7 @@ def test_l04_a_stale_wait_that_closes_late_does_not_close_the_next_calls_wait(ru
     kept: list = []
 
     async def closes_the_old_wait(args, ctx):
-        async with ctx.infrastructure_wait():
+        async with ctx.infrastructure_wait("lease_queue"):
             clock.advance(5)
             await kept[0].__aexit__(None, None, None)  # the stale one
             clock.advance(5)  # still inside this call's own wait
@@ -516,7 +516,7 @@ def test_l04_a_wait_a_model_request_leaves_open_is_closed_when_it_returns(make_c
 
     class Leaks(StubAdapter):
         async def step(self):
-            await timer.infrastructure_wait().__aenter__()
+            await timer.infrastructure_wait("lease_queue").__aenter__()
             clock.advance(7)
             return await super().step()
 

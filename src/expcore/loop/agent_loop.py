@@ -30,7 +30,7 @@ from expcore.loop.endings import cannot_start, cut_ending, time_ending
 from expcore.loop.leaks import leaked_tool
 from expcore.loop.outcomes import Outcome, harness_defect_of
 from expcore.loop.records import LoopResult, ToolCallRecord, TurnRecord
-from expcore.loop.timer import AgentTimer, Tick, WaitContext
+from expcore.loop.timer import AgentTimer, Tick, WaitContext, waited_since
 from expcore.loop.toolbox import ToolBox, ToolRun
 from expcore.loop.watch import Cut, Watcher
 from expcore.models.adapters import ModelBackend, ModelTurn, ToolCall
@@ -108,6 +108,7 @@ class _Run:
         self.final_text: str | None = None
         self.outcome: Outcome | None = None
         self._request_waits_left_open = 0  # waits the last model request left open, for its turn record
+        self._request_waited_by_kind: dict[str, float] = {}  # what the last model request waited, by kind
 
     async def execute(self) -> LoopResult:
         """Run the loop to its ending."""
@@ -183,6 +184,7 @@ class _Run:
 
     async def _step(self, tick: Tick) -> ModelTurn:
         """Ask the model for its next reply, cut when the agent's time or the ceiling is used up (L04)."""
+        by_kind0 = self.timer.infra_wait_by_kind
         try:
             return await self.watcher.run(self.backend.step(), tick)
         except Cut as cut:
@@ -206,6 +208,7 @@ class _Run:
             raise _End(Outcome("error", f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__)) from None
         finally:
             self._request_waits_left_open = self.timer.close_open_waits()  # a wait belongs to its request
+            self._request_waited_by_kind = waited_since(by_kind0, self.timer.infra_wait_by_kind)
 
     def _note(self, turn: ModelTurn) -> None:
         """Count the reply's tokens (a missing count adds nothing and marks the totals incomplete, B10) and record it."""
@@ -226,6 +229,7 @@ class _Run:
                 system_fingerprint=turn.system_fingerprint,
                 retries=turn.retries,
                 waits_left_open=self._request_waits_left_open,
+                infra_wait_by_kind=self._request_waited_by_kind,
             )
         )
 
@@ -284,7 +288,7 @@ class _Run:
         if late or tick.ceiling_passed:
             stop = cannot_start(tick, self.config, too_late=late)
             return self._skip(index, call, "time"), stop
-        waited0 = self.timer.infra_wait_s
+        waited0 = (self.timer.infra_wait_s, self.timer.infra_wait_by_kind)
         try:
             # The provider is told the agent's time left and marks its waits on infrastructure through the context; the
             # loop cuts the call if the agent's time, which leaves those waits out, or the ceiling is used up (L04, L05).
@@ -292,7 +296,7 @@ class _Run:
             run = await self.watcher.run(self.toolbox.run(call, timeout_s=tick.remaining_s, ctx=ctx), tick)
         except Cut as cut:
             cut_run = self.toolbox.skipped(call, "cut")
-            self._log(index, call, cut_run, self.rounds, tick, cut.tick, status="cut", waited_s=self._waited(waited0))
+            self._log(index, call, cut_run, self.rounds, tick, cut.tick, status="cut", waited=self._waited(waited0))
             return cut_run, cut_ending(f"tool {call.name!r}", cut.tick, self.config)
         except InfraError as exc:
             return self._failed(index, call, tick, f"infrastructure: {exc.kind}", waited0), Outcome(
@@ -304,7 +308,7 @@ class _Run:
             )
         left = self.timer.close_open_waits()  # a wait belongs to its call: one left open ends with the call (L04)
         after = self.timer.check("after_tool")
-        self._log(index, call, run, self.rounds, tick, after, waited_s=self._waited(waited0), waits_left_open=left)
+        self._log(index, call, run, self.rounds, tick, after, waited=self._waited(waited0), waits_left_open=left)
         if run.ends_attempt:
             over = time_ending(after, self.config, self.timer.infra_wait_s)  # a late result is not accepted (L04)
             if over is not None:
@@ -313,11 +317,14 @@ class _Run:
             return run, Outcome("finished", f"a call to the terminal tool {call.name!r} succeeded")
         return run, None
 
-    def _waited(self, before: float) -> float:
-        """The time the call just made spent waiting on infrastructure: the timer's total now, less what it was."""
-        return self.timer.infra_wait_s - before
+    def _waited(self, before: tuple[float, dict[str, float]]) -> tuple[float, dict[str, float]]:
+        """The time the call just made spent waiting on infrastructure, in all and by kind: the timer's totals now, less
+        what they were."""
+        return self.timer.infra_wait_s - before[0], waited_since(before[1], self.timer.infra_wait_by_kind)
 
-    def _failed(self, index: int, call: ToolCall, tick: Tick, detail: str, waited0: float) -> ToolRun:
+    def _failed(
+        self, index: int, call: ToolCall, tick: Tick, detail: str, waited0: tuple[float, dict[str, float]]
+    ) -> ToolRun:
         """Log a call whose provider raised, and answer it as skipped so its reply stays whole."""
         run = self.toolbox.skipped(call, "failed")
         left = self.timer.close_open_waits()
@@ -331,7 +338,7 @@ class _Run:
             after,
             status="failed",
             detail=detail,
-            waited_s=self._waited(waited0),
+            waited=self._waited(waited0),
             waits_left_open=left,
         )
         return run
@@ -358,7 +365,7 @@ class _Run:
         *,
         status: str | None = None,
         detail: str = "",
-        waited_s: float = 0.0,
+        waited: tuple[float, dict[str, float]] = (0.0, {}),
         waits_left_open: int = 0,
     ) -> None:
         """Append the record of one call: what the model sent, what it saw, and the full raw result."""
@@ -371,9 +378,10 @@ class _Run:
                 ended_s=self.timer.since_start(ended.now) if ended else None,
                 status=status,
                 detail=detail,
-                waited_s=waited_s,
+                waited_s=waited[0],
                 waits_left_open=waits_left_open,
                 terminal=self.toolbox.is_terminal(call.name),
+                waited_by_kind=waited[1],
             )
         )
 
@@ -408,6 +416,7 @@ class _Run:
             agent_s=end.agent_s if end else 0.0,
             elapsed_s=end.elapsed_s if end else 0.0,
             infra_wait_s=self.timer.infra_wait_s,
+            infra_wait_by_kind=self.timer.infra_wait_by_kind,
             cleanup_s=self.timer.cleanup_s,
             cleanup_timed_out=self.timer.cleanup_timed_out,
             abandoned_threads=self.toolbox.abandoned_threads(),

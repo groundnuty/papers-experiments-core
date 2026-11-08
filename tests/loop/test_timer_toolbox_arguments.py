@@ -22,7 +22,7 @@ def test_the_timer_pauses_the_agents_clock_while_a_wait_on_infrastructure_is_ope
 
     async def go():
         clock.advance(10)
-        async with timer.infrastructure_wait():
+        async with timer.infrastructure_wait("lease_queue"):
             clock.advance(50)
             during = timer.check("during")
         clock.advance(5)
@@ -41,9 +41,9 @@ def test_overlapping_waits_pause_the_clock_for_their_union_and_not_their_sum():
     timer.start()
 
     async def go():
-        async with timer.infrastructure_wait():
+        async with timer.infrastructure_wait("lease_queue"):
             clock.advance(10)
-            async with timer.infrastructure_wait():
+            async with timer.infrastructure_wait("lease_queue"):
                 clock.advance(10)
             clock.advance(10)
 
@@ -56,7 +56,7 @@ def test_a_wait_marked_before_the_run_starts_measures_nothing():
     timer = AgentTimer(100, clock=FakeClock())
 
     async def go():
-        async with timer.infrastructure_wait():
+        async with timer.infrastructure_wait("lease_queue"):
             pass
 
     asyncio.run(go())
@@ -71,7 +71,7 @@ def test_a_cut_ends_the_open_wait_at_the_cut_and_the_time_after_it_is_cleanup_no
 
     async def go():
         clock.advance(20)
-        wait = timer.infrastructure_wait()
+        wait = timer.infrastructure_wait("lease_queue")
         await wait.__aenter__()
         clock.advance(30)
         cut = timer.check("cut")
@@ -98,7 +98,7 @@ def test_the_ceiling_left_and_the_next_look_follow_the_pause():
     assert (running.ceiling_left_s, running.watch_s) == (260, 60)
 
     async def go():
-        async with timer.infrastructure_wait():
+        async with timer.infrastructure_wait("lease_queue"):
             return timer.check("paused")
 
     paused = asyncio.run(go())
