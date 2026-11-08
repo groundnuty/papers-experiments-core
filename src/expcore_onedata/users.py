@@ -1,425 +1,221 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/harness/slot_users.py, blob 6bd4dcbb3acbafbf3070773537c37b460f817ba9
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""Per-slot Onedata users for run attribution under concurrency (#11, dataset_76/faults/ATTRIBUTION.md).
+#   changes: see git history of this file from its import commit
+"""Leased platform users for the two token planes (C19, O09).
 
-One user per concurrency slot, one option per slot. Each user is a member of the study data space ONLY,
-with exactly {space_view, space_read_data}; nothing is copied per slot. The audit log's `user` field is
-the Onezone user id, so the slot map is {slot: {"user": <user id>, "option": <option>}}.
+A run needs a platform user for its data path and another for its tool server, because the audit log must name one run
+and the planes never share a principal (architecture.md, "Tokens and permissions"). Users are declared in platform.toml
+as **slots**: a slot is one lease key, and holding it gives the run both of its users, so a run takes one lease and two
+leases can never be taken in a bad order.
 
-Safety rules, all enforced here:
-- names are `slot-user-23-<option>-<n>`; nothing else is ever created, changed or deleted;
-- teardown deletes exactly the ids recorded in the change log (never a scan by name), and refuses any user
-  whose live username does not start with `slot-user-23-`;
-- every mutation is appended to the change log (no password or token value, ever);
-- passwords are generated here, written FIRST to a 0600 file in a 0700 directory (O_CREAT|O_EXCL) outside
-  the repo, and removed again if the create call fails;
-- `plan` is a read-only preflight; `apply` re-reads the privileges and refuses a membership that is not exact.
+```toml
+[slots.<name>]                 # the lease key: letters, digits, '_' and '-'
+[slots.<name>.data_path]       # the user whose token reads the data
+username = "..."               # the login name whose credential file is read ([credentials.users])
+user_id = "..."                # the id Onezone gives the user
+[slots.<name>.toolserver]      # the user whose token the tool server gets; never the data path's
+username = "..."
+user_id = "..."
+```
+
+The leases are the core's (`expcore.campaign.lease`): the plugin hands the scheduler `lease_group` (the constant `GROUP`)
+and `lease_keys` (`Slots.keys_of`), and the scheduler takes, holds and releases the key. `Slots.users_of(lease)` then says
+which two users the run has.
+
+**A slot is free again only when its tokens have ended.** No token is ever revoked, so a token minted for a slot stays
+good until its lifetime ends, and a run that died may have left a sandbox using it. `SlotTokens.mint` writes the latest
+end its tokens can have (never a token) to a journal beside the leases, and `SlotProbe.resource_gone` answers True for a
+slot only once every journalled end has passed and, when the platform supplies one, its sandbox probe also shows the run's resources
+gone. Anything it cannot read keeps the slot quarantined (the core's rule: only True frees a key).
+
+Users are created by the operator, not by this layer: there is no unscoped user creation or deletion here. The privileges
+a slot's users hold are checked, direct and effective, before every token is minted (`tokens.py`).
 """
-from __future__ import annotations
 
-import base64
-import dataclasses
 import json
-import os
-import re
-import secrets
-import sys
 import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any
 
-ONEZONE = "https://zone.example.org"
-STUDY_SPACE_ID = "a0000000000000000000000000000003ch0000"
-STUDY_SPACE_NAME = "study_space_15"
-ADMIN_PASS_FILE = Path("/home/ubuntu/.secrets/dataset-80/onedata.pass")
-SECRETS_DIR = Path("/home/ubuntu/.secrets/dataset-80/slot-users")
-PREFIX = "slot-user-23-"
-PRIVILEGES = ("space_view", "space_read_data")          # the minimum to read data: no write, invite or management
-OPTIONS = ("T", "condition_a", "D", "M")
-_NAME = re.compile(rf"^{re.escape(PREFIX)}(T|condition_a|D|M|M\+)-(\d+)$")
+from expcore.campaign.lease import Lease, process_gone
+from expcore.config.loading import ConfigError, Section, load_toml
+from expcore_onedata.config import NAME, PlatformConfig
+from expcore_onedata.credentials import Principal
+from expcore_onedata.tokens import RunTokens, TokenIssuer, token_window
 
-
-class SlotUserError(RuntimeError):
-    def __init__(self, msg: str, status: int | None = None):
-        super().__init__(msg)
-        self.status = status               # the HTTP status when the error is an Onezone answer
+GROUP = "platform_users"
+JOURNAL = "tokens.jsonl"
 
 
-def slot_name(option: str, n: int) -> str:
-    if n < 1:
-        raise ValueError("slot index starts at 1")
-    name = f"{PREFIX}{option}-{n}"
-    if not _NAME.match(name):
-        raise ValueError(f"not a valid slot name: {name}")
-    return name
-
-
-def slot_key(option: str, n: int) -> str:
-    return f"{option}-{n}"
-
-
-def token_caveats(option: str, ttl_s: int, space_id: str = STUDY_SPACE_ID, now: float | None = None) -> list[dict]:
-    """The run-shape token scope: time, read-only, data.path = the study space (+ interface for oneclient).
-    The same shape dataset_76.harness.oracle_real.mint_token uses."""
-    c = [{"type": "time", "validUntil": int((now if now is not None else time.time()) + ttl_s)},
-         {"type": "data.readonly"},
-         {"type": "data.path", "whitelist": [base64.b64encode(f"/{space_id}".encode()).decode()]}]
-    if option in ("M", "condition_b"):
-        c.append({"type": "interface", "interface": "oneclient"})
-    return c
-
-
-def describe_caveats(caveats: list[dict]) -> list[str]:
-    """Human-readable scope for the log: never contains a token."""
-    out = []
-    for c in caveats:
-        if c["type"] == "time":
-            out.append("time")
-        elif c["type"] == "data.path":
-            out.append("data.path=" + ",".join(base64.b64decode(w).decode() for w in c["whitelist"]))
-        elif c["type"] == "interface":
-            out.append(f"interface={c['interface']}")
-        else:
-            out.append(c["type"])
-    return out
-
-
-def _error_id(r) -> str:
-    """The Onedata error id only (e.g. badValueUsername); a raw body could echo a password or token."""
-    try:
-        eid = r.json().get("error", {}).get("id")
-    except Exception:  # noqa: BLE001 - any non-JSON body
-        return ""
-    return f" ({eid})" if isinstance(eid, str) and re.fullmatch(r"[A-Za-z0-9_]{1,60}", eid) else ""
-
-
-class Client:
-    """Thin Onezone REST client; `session` is injectable for tests."""
-
-    def __init__(self, session=None, admin_pass_file: Path = ADMIN_PASS_FILE, zone: str = ONEZONE):
-        import requests
-        self.s = session or requests.Session()
-        self.zone = zone
-        self._pf = admin_pass_file
-
-    def _admin_auth(self) -> dict:
-        try:
-            pw = Path(self._pf).read_text().strip()
-        except OSError as e:
-            raise SlotUserError(f"admin password file unreadable: {self._pf} ({type(e).__name__})") from None
-        if not pw:
-            raise SlotUserError(f"admin password file empty: {self._pf}")
-        return {"authorization": "Basic " + base64.b64encode(f"admin:{pw}".encode()).decode()}
-
-    def admin_token(self, ttl_s: int = 3600) -> str:
-        r = self.s.post(f"{self.zone}/api/v3/onezone/user/tokens/temporary", headers=self._admin_auth(), timeout=30,
-                        json={"type": {"accessToken": {}}, "caveats": [{"type": "time", "validUntil": int(time.time()) + ttl_s}]})
-        if r.status_code >= 300:
-            raise SlotUserError(f"admin token mint failed: HTTP {r.status_code}")
-        return r.json()["token"]
-
-    def oz(self, method: str, path: str, token: str, expect=(200, 201, 204), **kw):
-        r = self.s.request(method, f"{self.zone}/api/v3/onezone{path}", headers={"x-auth-token": token}, timeout=60, **kw)
-        if expect and r.status_code not in expect:
-            raise SlotUserError(f"{method} {path} -> HTTP {r.status_code}{_error_id(r)}", status=r.status_code)
-        return r
-
-
-def log_change(log: Path, action: str, **fields) -> None:
-    for k in fields:
-        if k in ("password", "token", "secret"):
-            raise ValueError(f"refusing to log a field named {k}")
-    Path(log).parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "a") as f:
-        f.write(json.dumps({"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "action": action, **fields}) + "\n")
-
-
-def read_log(log: Path) -> list[dict]:
-    p = Path(log)
-    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
-
-
-def logged_users(log: Path) -> dict[str, dict]:
-    """name -> {user_id, ...} for users created and not yet deleted, from the log alone."""
-    live: dict[str, dict] = {}
-    for e in read_log(log):
-        if e["action"] == "user_create":
-            live[e["username"]] = {"user_id": e["user_id"], "option": e["option"], "slot": e["slot"]}
-        elif e["action"] == "user_delete":
-            live.pop(e["username"], None)
-    return live
-
-
-def unresolved_intents(log: Path) -> dict[str, dict]:
-    """Intents with no later user_create, user_create_failed or user_delete for the same username."""
-    out: dict[str, dict] = {}
-    for e in read_log(log):
-        if e["action"] == "user_create_intent":
-            out[e["username"]] = e
-        elif e["action"] in ("user_create", "user_create_failed", "user_delete"):
-            out.pop(e["username"], None)
-    return out
-
-
-def _secret_path(dirpath: Path, username: str) -> Path:
-    return Path(dirpath) / f"{username}.pass"
-
-
-REPO = Path(__file__).resolve().parents[2]
-
-
-def _check_outside_repo(dirpath: Path) -> Path:
-    d = Path(dirpath).expanduser().resolve()
-    if d == REPO or REPO in d.parents:
-        raise SlotUserError(f"credentials directory {d} is inside the repository")
-    return d
-
-
-def _write_secret_first(dirpath: Path, username: str, password: str) -> Path:
-    d = _check_outside_repo(dirpath)
-    d.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(d, 0o700)
-    p = _secret_path(d, username)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)      # exists already -> refused, never overwritten
-    with os.fdopen(fd, "w") as f:
-        f.write(password)
-    return p
-
-
-def read_slot_password(username: str, dirpath: Path = SECRETS_DIR) -> str:
-    p = _secret_path(dirpath, username)
-    if not p.is_file():
-        raise SlotUserError(f"no credential file for {username}: {p}")
-    if p.stat().st_mode & 0o077:
-        raise SlotUserError(f"{p} is readable by others (mode {oct(p.stat().st_mode & 0o777)})")
-    return p.read_text().strip()
-
-
-def slot_user_token(client: Client, username: str, caveats: list[dict], dirpath: Path = SECRETS_DIR) -> str:
-    """A temporary access token of the slot user (basic auth), with the given caveats. In memory only."""
-    pw = read_slot_password(username, dirpath)
-    r = client.s.post(f"{client.zone}/api/v3/onezone/user/tokens/temporary", timeout=30,
-                      headers={"authorization": "Basic " + base64.b64encode(f"{username}:{pw}".encode()).decode()},
-                      json={"type": {"accessToken": {}}, "caveats": caveats})
-    if r.status_code >= 300:
-        raise SlotUserError(f"token mint for {username} failed: HTTP {r.status_code}")
-    return r.json()["token"]
-
-
-def mint_run_token(client: Client, username: str, option: str, time_cap_s: float,
-                   dirpath: Path = SECRETS_DIR, space_id: str = STUDY_SPACE_ID) -> tuple[str, list[dict]]:
-    """The token one run uses as this slot's user: run-shape scope, lifetime = required_token_ttl_s(time_cap_s)
-    of the run's stated cap (never a constant). Returns (token, caveats); the token is for memory only."""
-    from .config import check_token_ttl, required_token_ttl_s
-    ttl = required_token_ttl_s(time_cap_s)
-    check_token_ttl(ttl, time_cap_s, f"slot token of {username}")
-    caveats = token_caveats(option, ttl, space_id)
-    return slot_user_token(client, username, caveats, dirpath), caveats
-
-
-@dataclasses.dataclass
+@dataclass(frozen=True)
 class Slot:
-    option: str
-    n: int
+    """One lease key and the two platform users it gives a run."""
 
-    @property
-    def username(self) -> str:
-        return slot_name(self.option, self.n)
-
-    @property
-    def key(self) -> str:
-        return slot_key(self.option, self.n)
+    name: str
+    data_path: Principal
+    tool_server: Principal
 
 
-def wanted(options=OPTIONS, per_option: int = 1) -> list[Slot]:
-    """The slots to have: `per_option` per option. Adding more later is one call with a bigger number."""
-    bad = [o for o in options if o not in ("T", "condition_a", "D", "M", "condition_b")]
-    if bad:
-        raise ValueError(f"unknown options {bad}")
-    return [Slot(o, n) for o in options for n in range(1, per_option + 1)]
+@dataclass(frozen=True)
+class Slots:
+    """The declared slots, in the order of the file."""
+
+    slots: tuple[Slot, ...]
+
+    def keys_of(self, group: str) -> list[str]:
+        """Return the lease keys of the group; refuse a group this layer does not declare, so a typo is not an empty pool."""
+        if group != GROUP:
+            raise ValueError(f"the platform declares the lease group {GROUP!r}, not {group!r}")
+        return [slot.name for slot in self.slots]
+
+    def get(self, key: str) -> Slot:
+        """Return the slot a lease key names."""
+        for slot in self.slots:
+            if slot.name == key:
+                return slot
+        raise KeyError(f"no slot is named by the lease key {key!r}")
+
+    def users_of(self, lease: Lease) -> Slot:
+        """Return the slot a held lease gives; refuse a lease of another group or one that has been released."""
+        if lease.group != GROUP or not lease.held:
+            raise ValueError("the lease is not a held lease of the platform users")
+        return self.get(lease.key)
 
 
-def _existing_by_name(client: Client, tok: str) -> dict[str, str]:
-    """username -> id of every existing user whose name starts with the prefix (read-only)."""
-    out = {}
-    for uid in client.oz("GET", "/users", tok).json()["users"]:
-        u = client.oz("GET", f"/users/{uid}", tok, expect=None)
-        if u.status_code == 404:
-            continue                                      # deleted while we scanned
-        if u.status_code != 200:
-            raise SlotUserError(f"user scan incomplete: GET /users/<id> -> HTTP {u.status_code}", status=u.status_code)
-        if str(u.json().get("username", "")).startswith(PREFIX):
-            out[u.json()["username"]] = uid
-    return out
+def _principal(section: Section, key: str) -> Principal:
+    """Read one user of a slot."""
+    user = section.section(key)
+    user.reject_unknown(("username", "user_id"))
+    try:
+        return Principal(user.string("username"), user.string("user_id"))
+    except ValueError as error:
+        raise user.fail(None, str(error)) from None
 
 
-def plan(client: Client, slots: list[Slot], log: Path) -> dict:
-    """Read-only preflight: what exists, what would be created, exact privileges and caveats. No values."""
-    tok = client.admin_token()
-    me = client.oz("GET", "/user", tok).json()
-    eff = set(client.oz("GET", f"/users/{me['userId']}/effective_privileges", tok).json()["privileges"])
-    need = {"oz_users_create", "oz_users_delete", "oz_users_manage_passwords", "oz_spaces_add_relationships",
-            "oz_users_add_relationships", "oz_spaces_set_privileges"}
-    members = client.oz("GET", f"/spaces/{STUDY_SPACE_ID}/users", tok).json()["users"]
-    existing, logged = _existing_by_name(client, tok), logged_users(log)
-    acts = []
-    for s in slots:
-        have = existing.get(s.username)
-        acts.append({"slot": s.key, "username": s.username, "option": s.option,
-                     "action": "skip (exists, in the log)" if have and s.username in logged else
-                               "REFUSE: exists but was not created by this log" if have else "create",
-                     "privileges": list(PRIVILEGES), "run_token_scope": describe_caveats(token_caveats(s.option, 3600))})
-    return {"admin_has_needed_privileges": sorted(need - eff) == [], "missing_admin_privileges": sorted(need - eff),
-            "study_space": STUDY_SPACE_NAME, "space_member_count": len(members), "actions": acts}
+def load_slots(
+    path: str | Path, config: PlatformConfig, *, environ: Mapping[str, str] | None = None, require_secrets: bool = True
+) -> Slots:
+    """Read `[slots]` of a platform.toml against its loaded configuration; raise ConfigError naming the file and key.
+
+    Every username and every user id is used once, across slots, planes and the fixed `[principals]`. With
+    `require_secrets` each user must have a credential file that others cannot read, as the fixed principals must.
+    """
+    file = Path(path).resolve()
+    root = Section(load_toml(file), file, "platform.toml")
+    table = root.section("slots")
+    if not table.data:
+        raise table.fail(None, "must declare at least one slot")
+    fixed = [p for p in (config.principals.data_path, config.principals.toolserver, config.principals.service) if p]
+    names = {p.username for p in fixed}
+    ids = {p.user_id for p in fixed}
+    slots: list[Slot] = []
+    for name in table.data:
+        if not NAME.fullmatch(name):
+            raise table.fail(name, "must be letters, digits, '_' and '-', starting with a letter")
+        section = table.section(name)
+        section.reject_unknown(("data_path", "toolserver"))
+        slot = Slot(name, _principal(section, "data_path"), _principal(section, "toolserver"))
+        for plane, user in (("data_path", slot.data_path), ("toolserver", slot.tool_server)):
+            if user.username in names or user.user_id in ids:
+                raise section.fail(plane, "names a user that another slot, plane or fixed principal already uses")
+            names.add(user.username)
+            ids.add(user.user_id)
+            if require_secrets:
+                if config.users is None:
+                    raise section.fail(plane, "needs [credentials.users], which platform.toml does not declare")
+                try:
+                    config.users.check(user.username, environ)
+                except ConfigError as error:
+                    raise section.fail(plane, f"its credential cannot be used: {error}") from None
+        slots.append(slot)
+    return Slots(tuple(slots))
 
 
-def apply(client: Client, slots: list[Slot], log: Path, secrets_dir: Path = SECRETS_DIR,
-          note: Callable[[str], None] = print) -> dict[str, dict]:
-    """Create what is missing; idempotent. Returns the slot map {slot: {"user", "option"}} (ids, no secrets)."""
-    _check_outside_repo(secrets_dir)
-    Path(log).parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "a"):                                  # the log must be writable BEFORE anything is created
-        pass
-    tok = client.admin_token()
-    logged = logged_users(log)
-    intents = unresolved_intents(log)
-    existing = _existing_by_name(client, tok)
-    for s in slots:
-        have = existing.get(s.username)
-        if have and s.username not in logged and s.username in intents:
-            # a previous run logged its intent and lost the outcome (timeout, crash). Adopt only if the saved
-            # password still opens the account: that proves this log's POST created it, not someone else.
-            try:
-                slot_user_token(client, s.username, [{"type": "time", "validUntil": int(time.time()) + 60}], secrets_dir)
-            except Exception:  # noqa: BLE001
-                raise SlotUserError(f"{s.username} exists but the saved password does not open it (or basic auth is "
-                                    "off): not adopting it; resolve by hand") from None
-            log_change(log, "user_create", username=s.username, user_id=have, option=s.option, slot=s.key,
-                       credential_file=str(_secret_path(secrets_dir, s.username)), recovered_from_intent=True,
-                       where="onezone POST /users (outcome recovered)")
-            logged = logged_users(log)
-        if have and s.username not in logged:
-            raise SlotUserError(f"{s.username} exists (id {have[:6]}...) but this log did not create it: refusing to adopt it")
-        if s.username in logged:
-            uid = logged[s.username]["user_id"]
-            if existing.get(s.username) != uid:
-                raise SlotUserError(f"{s.username}: the log says {uid[:6]}... but Onezone has {str(existing.get(s.username))[:6]}...")
-        else:
-            password = secrets.token_urlsafe(24)
-            path = _write_secret_first(secrets_dir, s.username, password)
-            log_change(log, "user_create_intent", username=s.username, option=s.option, slot=s.key,
-                       credential_file=str(path), where="before onezone POST /users")
-            try:
-                r = client.oz("POST", "/users", tok, json={"username": s.username, "password": password,
-                                                           "fullName": f"dataset-80 slot {s.key}"})
-            except BaseException:
-                # The outcome may be ambiguous (a timeout after the server created it). Keep the credential
-                # unless Onezone confirms no such user exists.
-                # Only a definite refusal by Onezone (an HTTP 4xx answer) proves nothing was created. A timeout,
-                # transport error or 5xx may still complete server-side: keep the credential and the open intent.
-                st = getattr(sys.exc_info()[1], "status", None)
-                if st is not None and 400 <= st < 500:
-                    path.unlink(missing_ok=True)
-                    log_change(log, "user_create_failed", username=s.username, http=st)
-                raise
-            uid = r.headers["Location"].rstrip("/").split("/")[-1]
-            log_change(log, "user_create", username=s.username, user_id=uid, option=s.option, slot=s.key,
-                       credential_file=str(path), where="onezone POST /users")
-            note(f"created {s.username}")
-        ba = client.oz("GET", f"/users/{uid}", tok).json()
-        if ba.get("basicAuthEnabled") is not True:
-            client.oz("PATCH", f"/users/{uid}/basic_auth", tok, json={"basicAuthEnabled": True})
-            log_change(log, "user_basic_auth", username=s.username, user_id=uid, enabled=True,
-                       where=f"onezone PATCH /users/{{id}}/basic_auth")
-        _ensure_membership(client, tok, log, s, uid)
-    return slot_map(log, slots)
+class TokenJournal:
+    """Append-only record of when each slot's tokens end: the slot, the plane and the expiry, never a token."""
+
+    def __init__(self, directory: Path | str) -> None:
+        self._path = Path(directory) / JOURNAL
+
+    def record(self, slot: str, plane: str, expires_at: float) -> None:
+        """Append one line; flushed before the token is handed out, so a crash cannot lose an expiry."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"slot": slot, "plane": plane, "expires_at": expires_at}) + "\n")
+            handle.flush()
+
+    def latest_expiry(self, slot: str) -> float | None:
+        """Return the latest expiry journalled for a slot, or None when none was; raise if the journal is unreadable."""
+        if not self._path.exists():
+            return None
+        times = []
+        for text in self._path.read_text(encoding="utf-8").splitlines():
+            if text.strip():
+                line = json.loads(text)
+                if line["slot"] == slot:
+                    times.append(float(line["expires_at"]))
+        return max(times) if times else None
 
 
-def _ensure_membership(client: Client, tok: str, log: Path, s: Slot, uid: str) -> None:
-    cur = client.oz("GET", f"/spaces/{STUDY_SPACE_ID}/users", tok).json()["users"]
-    if uid not in cur:
-        client.oz("PUT", f"/spaces/{STUDY_SPACE_ID}/users/{uid}", tok, json={"privileges": list(PRIVILEGES)})
-        log_change(log, "space_member_add", username=s.username, user_id=uid, space_id=STUDY_SPACE_ID,
-                   privileges_requested=list(PRIVILEGES), where="onezone PUT /spaces/{id}/users/{uid}")
-    got = sorted(client.oz("GET", f"/spaces/{STUDY_SPACE_ID}/users/{uid}/privileges", tok).json()["privileges"])
-    log_change(log, "privileges_readback", username=s.username, user_id=uid, space_id=STUDY_SPACE_ID, privileges=got,
-               exact=got == sorted(PRIVILEGES), where="onezone GET /spaces/{id}/users/{uid}/privileges")
-    eff = sorted(client.oz("GET", f"/spaces/{STUDY_SPACE_ID}/effective_users/{uid}/privileges", tok).json()["privileges"])
-    log_change(log, "effective_privileges_readback", username=s.username, user_id=uid, space_id=STUDY_SPACE_ID,
-               privileges=eff, exact=eff == sorted(PRIVILEGES),
-               where="onezone GET /spaces/{id}/effective_users/{uid}/privileges")
-    if got != sorted(PRIVILEGES) or eff != sorted(PRIVILEGES):
-        raise SlotUserError(f"{s.username}: direct {got}, effective {eff}; expected exactly {sorted(PRIVILEGES)}")
+class SlotProbe:
+    """The `ResourceProbe` for slots: a slot's resource is gone once its tokens have ended and its sandbox is gone."""
+
+    def __init__(
+        self,
+        journal: TokenJournal,
+        *,
+        sandbox_gone: Callable[[str, Mapping[str, Any]], bool] | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._journal, self._sandbox_gone, self._clock = journal, sandbox_gone, clock
+
+    def holder_gone(self, owner: str) -> bool | None:
+        """Tell whether the process that held a slot is gone, as the core tells it."""
+        return process_gone(owner)
+
+    def resource_gone(self, key: str, note: Mapping[str, Any]) -> bool:
+        """Return True only when every token minted for the slot has expired and the sandbox probe, if any, agrees."""
+        try:
+            expiry = self._journal.latest_expiry(key)
+        except (OSError, ValueError, KeyError):
+            return False  # an unreadable journal cannot show the tokens ended
+        if expiry is not None and self._clock() <= expiry:
+            return False
+        return self._sandbox_gone is None or self._sandbox_gone(key, note) is True
 
 
-def slot_map(log: Path, slots: list[Slot] | None = None) -> dict[str, dict]:
-    """{slot: {"user": id, "option": option}} from the log, in the shape dataset_76.faults.matcher.load_slot_map reads."""
-    live = logged_users(log)
-    names = {s.username for s in slots} if slots is not None else set(live)
-    return {v["slot"]: {"user": v["user_id"], "option": v["option"]} for k, v in sorted(live.items()) if k in names}
+class SlotTokens:
+    """Mints the tokens of both planes for a leased slot, journalling when they will have ended before it mints."""
 
+    def __init__(
+        self,
+        issuer: TokenIssuer,
+        config: PlatformConfig,
+        slots: Slots,
+        journal: TokenJournal,
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._issuer, self._config, self._slots, self._journal, self._clock = issuer, config, slots, journal, clock
 
-def teardown(client: Client, log: Path, secrets_dir: Path = SECRETS_DIR, dry_run: bool = False) -> list[str]:
-    """Delete exactly the users the log says were created (and their credential files); nothing else."""
-    tok = client.admin_token()
-    done = []
-    for name, v in logged_users(log).items():
-        if not name.startswith(PREFIX) or not _NAME.match(name):
-            raise SlotUserError(f"refusing to delete {name!r}: not a slot name")
-        r = client.oz("GET", f"/users/{v['user_id']}", tok, expect=None)
-        if r.status_code == 404:
-            gone = True
-        elif r.status_code == 200:
-            if r.json().get("username") != name:
-                raise SlotUserError(f"{v['user_id'][:6]}... is {r.json().get('username')!r}, not {name!r}: refusing to delete")
-            gone = False
-        else:
-            raise SlotUserError(f"GET user {name} -> HTTP {r.status_code}")
-        if dry_run:
-            done.append(f"would delete {name}")
-            continue
-        if not gone:
-            client.oz("DELETE", f"/users/{v['user_id']}", tok)
-        log_change(log, "user_delete", username=name, user_id=v["user_id"], already_gone=gone, where="onezone DELETE /users/{id}")
-        _secret_path(secrets_dir, name).unlink(missing_ok=True)
-        done.append(f"deleted {name}")
-    return done
+    def mint(
+        self, lease: Lease, *, ceiling_s: float, condition: str | None = None, interface: str = "rest"
+    ) -> RunTokens:
+        """Mint the data path's token and, for a condition with a tool server, the tool server's, on the slot's users.
 
-
-# ---------------------------------------------------------------- command line
-DEFAULT_LOG = Path(__file__).resolve().parents[2] / "day0" / "evidence" / "slot_users_changes.jsonl"
-DEFAULT_MAP = Path(__file__).resolve().parents[2] / "config" / "slot_map.json"
-
-
-def main(argv: list[str] | None = None) -> int:
-    import argparse
-    ap = argparse.ArgumentParser(description="Per-slot Onedata users (read-only members of the study space)")
-    ap.add_argument("command", choices=["plan", "apply", "teardown"])
-    ap.add_argument("--options", nargs="+", default=list(OPTIONS))
-    ap.add_argument("--per-option", type=int, default=1, help="slots per option; raise it to add more")
-    ap.add_argument("--log", type=Path, default=DEFAULT_LOG)
-    ap.add_argument("--map", type=Path, default=DEFAULT_MAP, help="slot map written by apply")
-    ap.add_argument("--secrets-dir", type=Path, default=SECRETS_DIR)
-    ap.add_argument("--yes", action="store_true", help="really change Onezone (apply and teardown are dry runs without it)")
-    a = ap.parse_args(argv)
-    cl = Client()
-    slots = wanted(tuple(a.options), a.per_option)
-    if a.command == "plan" or (a.command == "apply" and not a.yes):
-        print(json.dumps(plan(cl, slots, a.log), indent=1))
-        if a.command == "apply":
-            print("dry run: nothing changed; add --yes to apply")
-        return 0
-    if a.command == "apply":
-        m = apply(cl, slots, a.log, a.secrets_dir)
-        a.map.parent.mkdir(parents=True, exist_ok=True)
-        a.map.write_text(json.dumps(m, indent=1, sort_keys=True) + "\n")
-        print(f"slot map: {a.map}")
-        return 0
-    for line in teardown(cl, a.log, a.secrets_dir, dry_run=not a.yes):
-        print(line)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        The latest moment either token can still be good (now plus the longest lifetime the window allows) is journalled
+        first, so a crash between minting and journalling cannot leave a token the journal does not know. A ceiling the
+        window refuses (O06) journals and mints nothing.
+        """
+        slot = self._slots.users_of(lease)
+        window = token_window(ceiling_s, self._config.tokens)
+        self._journal.record(slot.name, "bound", self._clock() + window.max_ttl_s)
+        return self._issuer.mint_run_tokens(
+            data=slot.data_path,
+            ceiling_s=ceiling_s,
+            interface=interface,
+            tool_server=(slot.tool_server, condition) if condition is not None else None,
+        )
