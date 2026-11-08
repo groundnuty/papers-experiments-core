@@ -22,9 +22,9 @@ import re
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
+from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
 
 BACKENDS = ("openai_compat", "anthropic", "stub")
 STATUSES = ("frozen", "draft")
@@ -174,11 +174,7 @@ def _endpoint_problems(spec: ModelSpec) -> list[str]:
         if spec.base_url or spec.key_env or spec.key_file:
             problems.append("a stub model takes no base_url, key_env or key_file")
         return problems
-    parts = urlsplit(spec.base_url or "")
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        problems.append("base_url must be an http or https URL")
-    elif parts.username or parts.password:
-        problems.append("base_url must not carry credentials; the key goes in key_env or key_file")
+    problems += base_url_problems(spec.base_url)
     if spec.key_env and spec.key_file:
         problems.append("give key_env or key_file, not both")
     if spec.backend == "anthropic" and not (spec.key_env or spec.key_file):
@@ -203,7 +199,10 @@ def _limit_problems(spec: ModelSpec) -> list[str]:
 
 def _request_problems(spec: ModelSpec) -> list[str]:
     """Rules for what the request carries: sampling, vendor extras, the reasoning echo and the cache."""
-    problems = []
+    problems = [
+        *sampling_problems(spec.sampling),
+        *thinking_problems(spec.backend, spec.extra_body, spec.max_output_tokens),
+    ]
     owned = _OWNED_FIELDS[spec.backend]
     for where, table in (("sampling", spec.sampling), ("extra_body", spec.extra_body)):
         problems += [f"{where} sets '{name}', which the adapter sets itself" for name in sorted(owned & table.keys())]
