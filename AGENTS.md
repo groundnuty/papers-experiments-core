@@ -217,7 +217,10 @@ A versioned Python package (`expcore`, with the Onedata platform layer `expcore_
 
 ## Build, test, run
 
-No code yet; issue #3 adds the package and its test command.
+- `uv sync`, then `make check` (lint, tests, study-token check over every tracked file): the definition of green, and what CI runs.
+- Maintainer-only tests need the private paths: `EXPCORE_STUDY_TOKENS=<plain list> EXPCORE_SOURCE_REPOS="<repo>=<path>;..." uv run pytest tests/test_provenance_history.py tests/test_no_study_tokens.py`.
+- Before pushing: `uv run python -m expcore.provenance.study_tokens check-commits <base>..HEAD` (commit messages are scanned too).
+- After changing the private list: `uv run python -m expcore.provenance.study_tokens hash "$EXPCORE_STUDY_TOKENS" > tests/data/study_tokens.sha256`.
 
 ## Conventions
 
@@ -233,6 +236,11 @@ No code yet; issue #3 adds the package and its test command.
 **Subagents**
 - Pin `model: "sonnet"` for coding and mechanical extraction.
 - Use `model: "opus"` only for architecture or evidence work where judgment dominates.
+- Each step of `docs/plans/v0.1.md` is one PR, stacked on the previous step's branch. A step built in parallel in a worktree is rebased onto the final previous step before review, which is allowed only while it is unpushed.
+
+**Study tokens**
+- Prose (Markdown anywhere, everything under `docs/`) is checked only for private names (hosts, addresses, spaces, providers, users, environment names). Code is also checked for the names a study chose (conditions, datasets, models, repositories).
+- `tests/data/study_tokens.acknowledged` is append-only: it accepts specific findings in already-pushed commits, by full commit id, path, line and hash prefix.
 
 **Sandbox**
 - `codex`, `gh` (stored login) and `git push` over SSH run only outside the sandbox.
