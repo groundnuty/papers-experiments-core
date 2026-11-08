@@ -325,7 +325,7 @@ def test_R12_the_writer_refuses_a_short_secret_in_the_environment_naming_the_var
 
 
 def test_R12_a_key_that_names_a_secret_is_applied_inside_a_string_that_holds_a_json_object():
-    """R12: the arguments of a tool call are a JSON string in a native message, and the key's value is still a secret."""
+    """R12: a tool call's arguments are a JSON string in a native message, and the key's value is still a secret."""
     arguments = '{"token": "live-value-123", "user": "ann"}'
     data = {"function": {"arguments": arguments}, "note": "[1, 2]", "plain": "{not json", "text": '{"user": "ann"}'}
     out, paths = redact_structure(data, {})

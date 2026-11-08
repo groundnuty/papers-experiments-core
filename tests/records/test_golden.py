@@ -1,9 +1,9 @@
 """The golden record: version 1 of the record format is frozen from its first pushed commit (R01, R02).
 
 `tests/data/golden-record-v1.json` is a record of a synthetic run with invented names: tool calls of every outcome, a
-result the data source cut, a call the loop skipped, a secret redacted from the prompt and from a result. It
-must load, write back byte for byte, and replay. If a change to the format makes this test fail, the change is
-to the shape that ships: it needs a new schema version in `expcore.records.schema.SCHEMAS`, not an edit of version 1, and
+result the data source cut, a call the loop skipped, a secret redacted from the prompt and from a result. It must
+load, write back byte for byte, and replay. If a change to the format makes this test fail, the change is to the
+shape that ships: it needs a new schema version in `expcore.records.schema.SCHEMAS`, not an edit of version 1, and
 the golden file stays as it is. The file was made by running the stub backend through the loop with an environment
 variable named GOLDEN_API_KEY set to an invented key, and writing `record.dumps()`.
 """
