@@ -229,6 +229,18 @@ def test_o08_a_provider_the_block_map_leaves_out_is_a_failed_probe_with_a_reason
     assert snapshot["pairs"] is None
 
 
+def test_o01_a_block_with_a_negative_length_is_a_failed_probe_not_a_zero_reading(probes, seeded):
+    """O01 with O08: an invalid block makes the provider's reading unknown (probe_ok False, no holdings), not zero."""
+    probes.start({})
+    seeded.blocks[(seeded.id_of(PATH), BETA_ID)] = [[0, -1]]
+    snapshot = probes.finish()
+    beta = snapshot["files"]["data"]["providers"]["beta"]["after"]
+    assert beta["probe_ok"] is False
+    assert (beta["held_bytes"], beta["blocks"]) == (None, None)
+    assert snapshot["ok"] is False
+    assert snapshot["pairs"] is None
+
+
 def test_a_snapshot_without_a_start_has_no_before_and_no_pairs(probes, seeded):
     """Without the reading at the start nothing can be said about growth: the snapshot is incomplete, not zero."""
     snapshot = probes.finish()

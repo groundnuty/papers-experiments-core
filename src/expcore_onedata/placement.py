@@ -16,12 +16,28 @@ from typing import Any
 Range = tuple[int, int]
 
 
+def _block(block: Any) -> Range:
+    """Return one block as `(offset, length)`, or raise ValueError unless it is a pair of integers (a bool is none)
+    with a non-negative offset and a positive length: anything else makes the provider's answer unknown."""
+    if (
+        not isinstance(block, list | tuple)
+        or len(block) != 2
+        or not all(isinstance(n, int) and not isinstance(n, bool) for n in block)
+    ):
+        raise ValueError("the distribution answer holds a block that is not an [offset, length] pair of integers")
+    offset, length = block
+    if offset < 0 or length <= 0:
+        raise ValueError("the distribution answer holds a block with a negative offset or a length below one")
+    return offset, length
+
+
 def provider_blocks(distribution: Mapping[str, Any], provider_id: str) -> list[Range]:
     """Return the sorted `(offset, length)` blocks a provider holds of one file, from a `/distribution` answer.
 
     Only an explicit empty list says a provider holds nothing. A provider that is absent from the answer is unknown, as
     is a listed one without a table of storage backends, a backend without a `blocks` list, or any other shape: each
-    raises ValueError. The answer may be partial, so absence is not proof of an empty holding, and an unknown is never
+    raises ValueError, as does any block that is not a pair of integers (a bool is none) with an offset of zero or more
+    and a length of one or more. The answer may be partial, so absence is not proof of an empty holding, and an unknown is never
     read as an empty list (O01, O08), or an eviction could be confirmed by it.
     """
     per_provider = distribution.get("distributionPerProvider")
@@ -41,9 +57,7 @@ def provider_blocks(distribution: Mapping[str, Any], provider_id: str) -> list[R
         if not isinstance(blocks, list | tuple):
             raise ValueError("the distribution answer's storage backend has no list of 'blocks'")
         for block in blocks:
-            if not (isinstance(block, list | tuple) and len(block) == 2 and all(isinstance(n, int) for n in block)):
-                raise ValueError("the distribution answer holds a block that is not an [offset, length] pair")
-            out.append((block[0], block[1]))
+            out.append(_block(block))
     return sorted(out)
 
 

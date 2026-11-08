@@ -62,6 +62,36 @@ def test_o08_a_missing_or_malformed_blocks_field_is_unknown_and_never_an_empty_l
         P.provider_blocks({"distributionPerProvider": {"a": entry}}, "a")
 
 
+@pytest.mark.parametrize(
+    "block",
+    [
+        [0, -1],  # a negative length
+        [-1, 5],  # a negative offset
+        [0, 0],  # an empty block places nothing and is not a block
+        ["a", 1],
+        [1, "5"],
+        [True, 1],  # a bool is not an integer here
+        [0, False],
+        [1.5, 2],
+        [0],
+        [0, 1, 2],
+        None,
+        "05",
+    ],
+)
+def test_o01_a_block_that_is_not_a_pair_of_integers_with_a_valid_offset_and_length_makes_the_answer_unknown(block):
+    """O01: every block is validated. A bad one among good ones makes the provider's whole answer unknown; it is never
+    dropped, clipped to zero or counted, since a block map is evidence of placement."""
+    for blocks in ([block], [[0, 5], block], [block, [10, 5]]):
+        with pytest.raises(ValueError, match="block"):
+            P.provider_blocks(distribution(a=blocks), "a")
+
+
+def test_o01_a_valid_block_is_accepted_at_offset_zero_and_with_a_length_of_one():
+    """O01: the bounds are inclusive at zero for the offset and one for the length."""
+    assert P.provider_blocks(distribution(a=[[0, 1], (5, 2)]), "a") == [(0, 1), (5, 2)]
+
+
 def test_o01_an_empty_list_of_blocks_is_an_answer_and_means_nothing_is_held():
     """O01: only an explicit empty list says a provider holds nothing."""
     assert P.provider_blocks(distribution(a=[]), "a") == []
