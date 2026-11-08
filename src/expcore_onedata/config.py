@@ -12,7 +12,7 @@ url = "https://..."             # scheme and host (and port) only
 
 [providers.<name>]              # the providers, by the name the rest of the file uses
 url = "https://..."
-id = "..."                      # optional: the id Onezone reports; without it the URL's host is matched to the domain
+id = "..."                      # the id Onezone reports for the provider; reported providers are matched by it (O04)
 
 [space]
 name = "..."
@@ -87,7 +87,11 @@ class Zone:
 
 @dataclass(frozen=True)
 class Provider:
-    """One provider the federation may report, with the id Onezone gives it when the file declares one."""
+    """One provider the federation may report, with the id Onezone gives it.
+
+    The file always declares the id and reported providers are matched by it. `id` is None only for a provider built in
+    code without one, which is then matched by its URL's host and refused as ambiguous when that host fits several.
+    """
 
     name: str
     url: str
@@ -255,7 +259,7 @@ def _secret_source(section: Section, base: Path, *, require: bool, environ: Mapp
 
 
 def _providers(root: Section) -> dict[str, Provider]:
-    """Read [providers.*]; at least one, each with a URL and perhaps an id."""
+    """Read [providers.*]; at least one, each with a URL and an id, no id twice."""
     table = root.section("providers")
     if not table.data:
         raise table.fail(None, "must declare at least one provider")
@@ -264,7 +268,10 @@ def _providers(root: Section) -> dict[str, Provider]:
         entry = table.section(name)
         _name(table, name, name, "a provider name")
         entry.reject_unknown(("url", "id"))
-        out[name] = Provider(name, _url(entry, "url"), entry.optional_string("id"))
+        out[name] = Provider(name, _url(entry, "url"), entry.string("id"))
+    ids = [provider.id for provider in out.values()]
+    if len(set(ids)) != len(ids):
+        raise table.fail(None, "must give each provider its own id")
     return out
 
 

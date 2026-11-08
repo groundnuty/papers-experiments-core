@@ -10,7 +10,9 @@
 supports the study space, as reported. Discovery therefore finds all of them, and a federation with several providers
 shows several. The agent must not read through whichever one is found first, so `pin_provider` picks the one the
 configuration declares as local (`[support] local`) and refuses when the space does not list it. Matching is by the
-provider id when the file declares one, else by the host of the declared URL against the domain Onezone reports.
+provider id, which the file always declares (O04). Only a `Provider` built in code without an id is matched by the host
+of its URL against the domain Onezone reports, and one host that fits several reported providers is ambiguous: it is
+refused here and fails the health check, never resolved by taking the first.
 
 An answer that cannot be read is an error (`FederationUnreadable`), never an empty federation. No name, host or id is
 written in this module: all of them come from the `PlatformConfig`.
@@ -107,15 +109,26 @@ def read_space(client: OnezoneClient, token: str, space_id: str) -> SpaceView:
 
 
 def is_declared(provider: Provider, reported: ReportedProvider) -> bool:
-    """Tell whether a reported provider is a declared one: by id when declared, else by the URL's host."""
+    """Tell whether a reported provider is a declared one: by its id, or by the URL's host when it has no id."""
     if provider.id is not None:
         return reported.id == provider.id
     return reported.domain == provider.host
 
 
+def declared_names(config: PlatformConfig, reported: ReportedProvider) -> list[str]:
+    """Return the names of every declared provider a reported one fits: none, one, or (ambiguously) several."""
+    return [p.name for p in config.providers.values() if is_declared(p, reported)]
+
+
 def declared_name(config: PlatformConfig, reported: ReportedProvider) -> str | None:
-    """Return the name of the declared provider a reported one is, or None when it is not declared."""
-    return next((p.name for p in config.providers.values() if is_declared(p, reported)), None)
+    """Return the name of the declared provider a reported one is, or None when it is not declared.
+
+    A reported provider that fits several declared ones is ambiguous and raises PinRefused, never the first of them.
+    """
+    names = declared_names(config, reported)
+    if len(names) > 1:
+        raise PinRefused("a reported provider fits more than one declared provider")
+    return names[0] if names else None
 
 
 def pin_provider(view: SpaceView, local: Provider | None) -> Pinned:

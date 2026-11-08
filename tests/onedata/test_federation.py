@@ -63,16 +63,17 @@ def test_o03_a_local_provider_the_space_does_not_list_is_a_refusal(client, confi
 
 
 def test_o03_a_declared_id_pins_by_id_not_by_domain(client, config, fake, token):
-    """O03: when the file declares the provider's id, only that id matches, even if another provider has the domain."""
+    """O03: the declared provider's id decides, even if another provider reports the same domain; a provider
+    declared without an id falls back to its host and then refuses when the host fits two."""
     import dataclasses
 
     two_providers(fake)
     fake.providers["pr-beta"]["domain"] = "alpha.test"  # a second provider claiming the same domain
     view = read_space(client, token, SPACE)
+    assert pin_local_provider(view, config).reported.id == "prmock0001"
+    host_only = dataclasses.replace(config.providers["alpha"], id=None)
     with pytest.raises(PinRefused, match="more than one"):
-        pin_local_provider(view, config)
-    alpha = dataclasses.replace(config.providers["alpha"], id="prmock0001")
-    assert pin_provider(view, alpha).reported.id == "prmock0001"
+        pin_provider(view, host_only)
     wrong = dataclasses.replace(config.providers["alpha"], id="pr-unknown")
     with pytest.raises(PinRefused, match="not among"):
         pin_provider(view, wrong)

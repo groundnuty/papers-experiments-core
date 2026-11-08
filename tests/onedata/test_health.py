@@ -1,13 +1,16 @@
 """O04: health compares the providers the federation reports with the declared set and fails on any difference."""
 
+import dataclasses
+
 import pytest
-from platform_support import NOW, write_platform
+from platform_support import ALPHA_ID, NOW, write_platform
 
 from expcore.campaign.healthgate import Health, read_health
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
-from expcore_onedata.health import REFRESH_BEFORE_S, TOKEN_CAP_S, PlatformHealth
+from expcore_onedata.federation import ReportedProvider, SpaceView
+from expcore_onedata.health import REFRESH_BEFORE_S, TOKEN_CAP_S, PlatformHealth, compare
 from expcore_onedata.tokens import TokenIssuer
 
 
@@ -59,12 +62,58 @@ def test_o04_a_missing_declared_provider_fails(tmp_path, fake):
 
 
 def test_o04_the_wrong_provider_alone_fails_both_ways(tmp_path, fake):
-    """O04: one declared and one reported, but not the same: missing and undeclared at once."""
-    fake.providers["prmock0001"]["domain"] = "stranger.test"
+    """O04: one declared and one reported, but not the same id: missing and undeclared at once."""
+    fake.providers["pr-stranger"] = fake.providers.pop(ALPHA_ID)
+    fake.supports["pr-stranger"] = fake.supports.pop(ALPHA_ID)
     result = health_for(tmp_path, fake)()
     assert result.ok is False
     assert "missing alpha" in result.detail
     assert "1 reported provider(s) not declared" in result.detail
+
+
+def test_o04_two_reported_providers_on_the_declared_host_fail_the_one_host_declaration(tmp_path, fake):
+    """O04: a second provider that reports the declared host is matched by its id, which no declaration has, so it
+    is undeclared and the check fails; it is not absorbed into the declared provider that shares the host."""
+    fake.add_provider("pr-second", "alpha.test")
+    result = health_for(tmp_path, fake)()
+    assert result.ok is False
+    assert "1 reported provider(s) not declared" in result.detail
+
+
+def test_o04_reported_providers_are_matched_by_id_not_by_host(tmp_path, fake):
+    """O04: the declared host reported under an id nobody declared is not the declared provider."""
+    fake.providers[ALPHA_ID]["domain"] = "elsewhere.test"  # the declared id on another host still matches by id
+    assert health_for(tmp_path, fake)().ok is True
+    fake.providers["pr-stranger"] = {"name": "x", "domain": "alpha.test", "online": True}
+    fake.supports["pr-stranger"] = {"readonly": False}
+    assert "not declared" in health_for(tmp_path, fake)().detail
+
+
+def test_o04_a_host_only_declaration_that_fits_two_reported_providers_is_ambiguous(tmp_path, fake):
+    """O04: a provider declared without an id matches by host; two reported on that host fail as ambiguous."""
+    config = load_platform(write_platform(tmp_path))
+    host_only = dataclasses.replace(config.providers["alpha"], id=None)
+    config = dataclasses.replace(config, providers={**config.providers, "alpha": host_only})
+    view = SpaceView(
+        "spmock0001",
+        config.space.name,
+        (
+            ReportedProvider("pr-one", "one", "alpha.test", True),
+            ReportedProvider("pr-two", "two", "alpha.test", True),
+        ),
+    )
+    result = compare(view, config)
+    assert result.ok is False
+    assert "ambiguous" in result.detail
+
+
+def test_o04_one_declared_provider_reported_twice_is_ambiguous(tmp_path, fake):
+    """O04: the same declared id listed twice in the scope answer is not one provider matching once."""
+    config = load_platform(write_platform(tmp_path))
+    twice = ReportedProvider(ALPHA_ID, "a", "alpha.test", True)
+    result = compare(SpaceView("spmock0001", config.space.name, (twice, twice)), config)
+    assert result.ok is False
+    assert "ambiguous" in result.detail
 
 
 def test_o04_an_unreadable_answer_is_unhealthy_never_a_pass(tmp_path, fake):
@@ -140,3 +189,12 @@ def test_o04_a_provider_without_an_online_flag_is_unhealthy_naming_the_field(tmp
     result = health_for(tmp_path, fake)()
     assert result.ok is False
     assert "'online'" in result.detail
+
+
+@pytest.mark.parametrize(
+    "edit", [lambda d: d["providers"]["alpha"].pop("id"), lambda d: d["providers"]["beta"].update(id=ALPHA_ID)]
+)
+def test_o04_every_declared_provider_needs_its_own_id(edit, tmp_path, fake):
+    """O04: the file must give each declared provider an id, and no two the same, so reports can be matched by id."""
+    with pytest.raises(ConfigError, match="id"):
+        load_platform(write_platform(tmp_path, edit))

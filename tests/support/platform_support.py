@@ -18,6 +18,7 @@ CEILING_S = 600.0  # a run's whole-time ceiling in tests
 ADMIN_ENV = "PLATFORM_TEST_ADMIN"
 SPACE_NAME = "study-a-data"
 SPACE_PREFIX = "study-a-"
+ALPHA_ID, BETA_ID = "prmock0001", "pr-beta"  # the ids the fake federation reports for the two providers
 BASELINE = ["space_view", "space_read_data"]
 MANAGE = [*BASELINE, "space_manage_qos"]
 # The test users: login name -> (password, Onezone user id). The password files are written by `platform_data`.
@@ -48,7 +49,10 @@ def platform_data(tmp_path: Path) -> dict[str, Any]:
             os.chmod(file, 0o600)
     return {
         "zone": {"name": "zone", "url": "https://zone.test"},
-        "providers": {"alpha": {"url": "https://alpha.test"}, "beta": {"url": "https://beta.test"}},
+        "providers": {
+            "alpha": {"url": "https://alpha.test", "id": ALPHA_ID},
+            "beta": {"url": "https://beta.test", "id": BETA_ID},
+        },
         "space": {"name": SPACE_NAME, "id": "spmock0001", "prefixes": [SPACE_PREFIX]},
         "support": {"providers": ["alpha"], "local": "alpha"},
         "credentials": {"admin": {"env": ADMIN_ENV}, "users": {"directory": CREDENTIALS_DIR}},
