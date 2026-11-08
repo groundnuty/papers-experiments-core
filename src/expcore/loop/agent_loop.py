@@ -271,13 +271,12 @@ class _Run:
             stop = self._guard_outcome(tick, late)
             return self._skip(index, call, "time"), stop
         try:
-            run = await self._bounded(
-                self.toolbox.run(call, timeout_s=tick.remaining_s), tick.remaining_s + self.config.tool_grace_s
-            )
+            run = await self._bounded(self.toolbox.run(call, timeout_s=tick.remaining_s), self._tool_bound(tick))
         except _Bound:
+            after = self.timer.check("after_tool")
             cut = self.toolbox.skipped(call, "cut")
-            self._log(index, call, cut, self.rounds, tick, self.timer.check("after_tool"), status="cut")
-            return cut, Outcome("time_cap", f"tool {call.name!r} was still running at the agent's time cap")
+            self._log(index, call, cut, self.rounds, tick, after, status="cut")
+            return cut, self._cut_outcome(call, after)
         except InfraError as exc:
             return self._failed(index, call, tick, f"infrastructure: {exc.kind}"), Outcome(
                 "infrastructure", exc.detail, infra_kind=exc.kind
@@ -291,6 +290,24 @@ class _Run:
         if run.ends_attempt:
             return run, Outcome("finished", f"a call to the terminal tool {call.name!r} succeeded")
         return run, None
+
+    def _tool_bound(self, tick: Tick) -> float:
+        """How long a tool call may take on the wall clock before it is cut.
+
+        With a ceiling on the whole elapsed time, a call may wait on infrastructure up to the ceiling: what it reports
+        as waiting is not the agent's time (L04). Without one the bound is the remaining time plus the declared grace,
+        so a provider that can wait longer than that on infrastructure needs a ceiling.
+        """
+        if self.config.ceiling_s is not None:
+            return self.config.ceiling_s - tick.elapsed_s
+        return tick.remaining_s + self.config.tool_grace_s
+
+    def _cut_outcome(self, call: ToolCall, tick: Tick) -> Outcome:
+        """The ending for a call cut at its bound: the agent's time first, then the ceiling that was the bound."""
+        if self.config.ceiling_s is not None and tick.remaining_s > 0:
+            detail = f"tool {call.name!r} was still running at the ceiling of {self.config.ceiling_s:g} s"
+            return Outcome("infrastructure", detail, infra_kind=self.config.ceiling_kind)
+        return Outcome("time_cap", f"tool {call.name!r} was still running at the agent's time cap")
 
     def _guard_outcome(self, tick: Tick, late: bool) -> Outcome:
         """The ending for a call that cannot start: the agent's time first, then the ceiling."""

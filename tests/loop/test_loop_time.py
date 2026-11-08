@@ -113,6 +113,69 @@ def test_l05_there_is_no_hidden_limit_beyond_the_remaining_time(run, clock):
     assert bounds == [300, 307, 200]  # model call, tool call, model call
 
 
+def test_l04_with_a_ceiling_a_tool_call_may_wait_on_infrastructure_up_to_the_ceiling(run, clock):
+    """L04: the wall-time bound of a tool call is the ceiling minus the time elapsed, so reported waits are not cut."""
+    bounds: list[float] = []
+
+    async def recording_sleep(seconds):
+        bounds.append(seconds)
+        await asyncio.Event().wait()
+
+    provider = FakeProvider({"store": slow(clock, 200, wait=200)})
+    run(
+        StubAdapter([[("store", {})], "done"]),
+        [provider],
+        sleep=recording_sleep,
+        time_cap_s=300,
+        ceiling_s=1000,
+        ceiling_kind="sandbox",
+    )
+    assert bounds == [
+        300,
+        1000,
+        300,
+    ]  # the model call, the tool call up to the ceiling, the model call: 200 s were waits
+
+
+def test_l04_a_tool_call_cut_at_the_ceiling_with_the_agent_under_its_cap_is_infrastructure(run, clock):
+    """L04: the agent's own time was not used up, so the cut call is infrastructure of the declared kind."""
+
+    async def hangs(args):
+        clock.advance(200)
+        await asyncio.Event().wait()
+
+    provider = FakeProvider({"store": slow(clock, 200, wait=200), "hang": hangs})
+    result = run(
+        StubAdapter([[("store", {})], [("hang", {})]]),
+        [provider],
+        sleep=at_once,
+        time_cap_s=300,
+        ceiling_s=400,
+        ceiling_kind="knowledge",
+    )
+    assert result.outcome.name == "infrastructure"
+    assert result.outcome.infra_kind == "knowledge"
+    assert result.tool_calls[-1].status == "cut"
+
+
+def test_l04_a_tool_call_cut_at_the_ceiling_with_the_agents_time_also_used_up_is_a_time_cap(run, clock):
+    """L04: the agent's own cap decides first, also when it is a running call that crosses both."""
+
+    async def hangs(args):
+        clock.advance(450)
+        await asyncio.Event().wait()
+
+    result = run(
+        StubAdapter([[("hang", {})]]),
+        [FakeProvider({"hang": hangs})],
+        sleep=at_once,
+        time_cap_s=300,
+        ceiling_s=400,
+        ceiling_kind="knowledge",
+    )
+    assert result.outcome.name == "time_cap"
+
+
 def test_l05_no_call_starts_with_less_than_a_second_left(run, clock):
     """L05: with half a second left a tool call is not started and the attempt ends as time cap."""
     provider = FakeProvider({"slow": slow(clock, 299.5), "later": lambda a: "never"})

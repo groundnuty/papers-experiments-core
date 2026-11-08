@@ -34,7 +34,9 @@ class AgentConfig:
       kind; the agent's own cap decides first (L04).
     - `min_call_s`: no tool call starts with less agent time than this left (L05).
     - `tool_grace_s`: how long past the remaining time the loop waits for a provider that ignores the timeout it
-      was given. The agent is told nothing of it; it never shortens a call.
+      was given. The agent is told nothing of it; it never shortens a call. With a ceiling set, a tool call is
+      bounded by the ceiling instead, so a provider that waits on infrastructure for longer than the grace needs
+      one: without it that wait is cut and counted as the agent's time.
     """
 
     limits: Limits
