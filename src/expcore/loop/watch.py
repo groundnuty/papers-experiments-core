@@ -13,9 +13,10 @@ and awaited, and the time that takes is cleanup, which the timer keeps apart fro
 runs when the whole run is cancelled from outside, and then the cancellation goes on to the caller.
 
 Stopping a call may take for ever (a cleanup that waits on something that never comes), and a cancellation must always
-end. So the wait for a cancelled call has a deadline in real time; past it the call is given up on and left pending,
-the timer records `cleanup_timed_out`, and the cut or the cancellation goes on. The event loop's own shutdown cancels
-what is left.
+end. So the wait for a cancelled call has a deadline; past it the call is given up on and left pending, the timer
+records `cleanup_timed_out`, and the cut or the cancellation goes on. The event loop's own shutdown cancels what is
+left. Whether the deadline ran out is decided by the timer's `cleanup_waiter`: real time by default, and a replay
+injects one that serves the recorded answer, which the reading that ends the cleanup carries.
 """
 
 import asyncio
@@ -85,26 +86,35 @@ class Watcher:
     async def _reap(self, *tasks: asyncio.Future) -> None:
         """Cancel the tasks and wait, up to the cleanup deadline, until they have stopped; give up on any that has not.
 
-        Then close the cleanup that the cut or the cancellation began.
+        When a cut or a cancellation began a cleanup, the timer's cleanup waiter decides whether the deadline ran out
+        (in real time unless a replay injected another), and the cleanup ends with that answer on its reading.
         """
         for task in tasks:
             task.cancel()
-        pending = {task for task in tasks if not task.done()}
-        if pending:
-            _, pending = await asyncio.wait(pending, timeout=self._cleanup_deadline_s)
+        waiting = [task for task in tasks if not task.done()]
+        cleaning = self._timer.cleaning
+        if cleaning:
+            timed_out = await self._timer.cleanup_waiter(waiting, self._cleanup_deadline_s)
+        elif waiting:
+            timed_out = bool((await asyncio.wait(waiting, timeout=self._cleanup_deadline_s))[1])
+        else:
+            timed_out = False
+        gave_up = [task for task in tasks if not task.done()]
         for task in tasks:
-            if task in pending:
+            if not task.done():
                 task.add_done_callback(_consume)  # given up on: whatever it ends with, nobody is waiting for it
             elif not task.cancelled():
                 task.exception()  # retrieved, so that it is not reported as never retrieved
-        if pending:
-            self._timer.cleanup_timed_out = True
+        if gave_up:
             log.warning(
                 "%d cancelled task(s) did not stop within %g s and were given up on",
-                len(pending),
+                len(gave_up),
                 self._cleanup_deadline_s,
             )
-        self._timer.end_cleanup()
+        if cleaning:
+            self._timer.end_cleanup(timed_out=timed_out)
+        elif gave_up:
+            self._timer.cleanup_timed_out = True
 
 
 def _consume(task: asyncio.Future) -> None:

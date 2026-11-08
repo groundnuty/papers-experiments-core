@@ -8,6 +8,7 @@ import pytest
 from loop_support import ClockSleep, FakeProvider, never
 
 from expcore.loop.agent_loop import run_agent
+from expcore.loop.timer import real_time_cleanup_waiter
 from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import StubAdapter
 from expcore.plugin import ToolSpec
@@ -219,3 +220,146 @@ def test_l15_a_later_run_on_the_same_provider_gets_a_tool_error_and_records_the_
     assert "still running" in refused.text
     assert second.outcome.name == "finished"
     assert second.abandoned_threads == 1
+
+
+# --- whether the cleanup timed out is decided by an injectable waiter (replay) ---------------------------------------
+
+
+class RecordingWaiter:
+    """An injected cleanup waiter: it records what it was asked and answers as told, without any real-time wait."""
+
+    def __init__(self, timed_out: bool):
+        self.timed_out = timed_out
+        self.calls: list[tuple[list, float]] = []
+
+    async def __call__(self, tasks, deadline_s):
+        self.calls.append((list(tasks), deadline_s))
+        if not self.timed_out:
+            await asyncio.gather(*tasks, return_exceptions=True)  # the cancelled work stops, as the recording says
+        return self.timed_out
+
+
+def stuck_after_cut(clock):
+    async def stuck(args):
+        clock.advance(300)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.Event().wait()
+
+    return stuck
+
+
+def labels_of(result):
+    return [label for label, _ in result.clock_readings]
+
+
+def test_an_injected_waiter_that_says_timed_out_decides_it_and_the_reading_carries_the_answer(run, clock, sleeper):
+    """The deadline is whatever the waiter says, not real time: with a 60 s deadline and a waiter answering True at
+    once, the stuck call is given up on and the reading that ends the cleanup says so."""
+    waiter = RecordingWaiter(timed_out=True)
+    result = run(
+        StubAdapter([[("stuck", {})]]),
+        [FakeProvider({"stuck": stuck_after_cut(clock)})],
+        sleep=sleeper,
+        time_cap_s=300,
+        cleanup_deadline_s=60,
+        cleanup_waiter=waiter,
+    )
+    assert result.outcome.name == "time_cap"
+    assert result.cleanup_timed_out is True
+    assert "cleanup_end_timed_out" in labels_of(result)
+    assert "cleanup_end" not in labels_of(result)
+    ((tasks, deadline_s),) = waiter.calls
+    assert deadline_s == 60
+    assert tasks  # it was handed the cancelled tasks
+
+
+def test_an_injected_waiter_that_says_it_did_not_time_out_gives_a_clean_cleanup(run, clock, sleeper):
+    """The same cut with a waiter answering False: not a timeout, and the reading says cleanup_end."""
+
+    async def stops(args):
+        clock.advance(300)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+
+    waiter = RecordingWaiter(timed_out=False)
+    result = run(
+        StubAdapter([[("stop", {})]]),
+        [FakeProvider({"stop": stops})],
+        sleep=sleeper,
+        time_cap_s=300,
+        cleanup_waiter=waiter,
+    )
+    assert result.cleanup_timed_out is False
+    assert "cleanup_end" in labels_of(result)
+    assert "cleanup_end_timed_out" not in labels_of(result)
+    assert len(waiter.calls) == 1
+
+
+def test_the_waiter_is_asked_only_when_a_call_was_cut_or_cancelled(run):
+    waiter = RecordingWaiter(timed_out=True)
+    result = run(StubAdapter([[("t", {})], "done"]), [FakeProvider({"t": lambda a: "x"})], cleanup_waiter=waiter)
+    assert result.outcome.name == "finished"
+    assert waiter.calls == []
+    assert not any(label.startswith("cleanup_end") for label in labels_of(result))
+
+
+def test_the_default_waiter_waits_in_real_time_and_its_timeout_is_on_the_reading(run, clock, sleeper):
+    """With no injected waiter a stuck cleanup times out in real time, and the reading says so."""
+    result = run(
+        StubAdapter([[("stuck", {})]]),
+        [FakeProvider({"stuck": stuck_after_cut(clock)})],
+        sleep=sleeper,
+        time_cap_s=300,
+        cleanup_deadline_s=0.05,
+    )
+    assert result.cleanup_timed_out is True
+    assert "cleanup_end_timed_out" in labels_of(result)
+
+
+def test_an_injected_waiter_also_decides_the_cleanup_of_an_outside_cancellation(make_config, clock):
+    """Cancelled from outside with a 60 s deadline and a waiter that answers at once: no real-time wait at all."""
+    waiter = RecordingWaiter(timed_out=True)
+    config = make_config(cleanup_deadline_s=60)
+    timer = config.timer(clock, cleanup_waiter=waiter)
+    seen = {}
+
+    async def scenario():
+        started = asyncio.Event()
+        box = ToolBox([FakeProvider({"t": lambda args: ""})], cap_chars=config.limits.output_cap_chars)
+        task = asyncio.ensure_future(
+            run_agent(StuckInCleanup(started), box, "s", "u", config, timer=timer, clock=clock, sleep=never)
+        )
+        await started.wait()
+        began = time.monotonic()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        seen["took_s"] = time.monotonic() - began
+
+    asyncio.run(scenario())
+    assert seen["took_s"] < 2.0
+    assert timer.cleanup_timed_out is True
+    assert [label for label, _ in timer.readings][-1] == "cleanup_end_timed_out"
+    assert len(waiter.calls) == 1
+
+
+def test_the_real_time_waiter_answers_true_for_a_task_still_running_and_false_for_finished_ones():
+    async def scenario():
+        done = asyncio.ensure_future(asyncio.sleep(0))
+        await done
+        running = asyncio.ensure_future(asyncio.Event().wait())
+        try:
+            return (
+                await real_time_cleanup_waiter([], 0.01),
+                await real_time_cleanup_waiter([done], 0.01),
+                await real_time_cleanup_waiter([running], 0.01),
+            )
+        finally:
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+    assert asyncio.run(scenario()) == (False, False, True)

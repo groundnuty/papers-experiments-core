@@ -15,7 +15,7 @@ from typing import Any
 
 from expcore.config.models import Limits
 from expcore.errors import infra_kinds
-from expcore.loop.timer import AgentTimer
+from expcore.loop.timer import AgentTimer, CleanupWaiter
 
 MALFORMED_POLICIES = ("report", "end")
 MIN_CALL_S = 1.0  # a tool call does not start with less time left than this (L05)
@@ -115,9 +115,15 @@ class AgentConfig:
             )
         return problems
 
-    def timer(self, clock: Callable[[], float] = time.monotonic) -> AgentTimer:
-        """Return a timer holding this configuration's time cap and ceiling, reading the given clock."""
-        return AgentTimer(self.limits.time_cap_s, clock=clock, ceiling_s=self.ceiling_s)
+    def timer(
+        self, clock: Callable[[], float] = time.monotonic, *, cleanup_waiter: CleanupWaiter | None = None
+    ) -> AgentTimer:
+        """Return a timer holding this configuration's time cap and ceiling, reading the given clock.
+
+        `cleanup_waiter` decides whether the cleanup of a cancelled call ran out of `cleanup_deadline_s`; the default
+        waits in real time, and a replay passes one that serves the recorded answer.
+        """
+        return AgentTimer(self.limits.time_cap_s, clock=clock, ceiling_s=self.ceiling_s, cleanup_waiter=cleanup_waiter)
 
     def as_dict(self) -> dict[str, Any]:
         """Return every value as the record keeps it."""

@@ -17,13 +17,28 @@ Waits belong to their call: when a call ends the loop closes any wait it left op
 moment and as infrastructure time, and the call's record says how many it was.
 
 Every clock reading is logged with a label, the live waits' and the cleanup's included. A replay serves the readings
-back in order instead of reading a clock.
+back in order instead of reading a clock. Whether the cleanup of a cancelled call ran out of its deadline is decided by
+an injectable `cleanup_waiter`, and the reading that ends the cleanup carries the answer in its label (`cleanup_end`,
+or `cleanup_end_timed_out`), so a replay can inject a waiter that serves it.
 """
 
+import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Collection
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+
+# How the loop waits for the tasks it cancelled: given the tasks and the cleanup deadline in seconds, return True when
+# the deadline ran out with some task still running. It may await the tasks, and it must not hide that one is running.
+CleanupWaiter = Callable[[Collection[asyncio.Future], float], Awaitable[bool]]
+
+
+async def real_time_cleanup_waiter(tasks: Collection[asyncio.Future], deadline_s: float) -> bool:
+    """The default cleanup waiter: wait up to `deadline_s` of real time; True when some task is still running."""
+    if not tasks:
+        return False
+    _, pending = await asyncio.wait(tasks, timeout=deadline_s)
+    return bool(pending)
 
 
 @dataclass(frozen=True)
@@ -57,6 +72,7 @@ class AgentTimer:
         *,
         clock: Callable[[], float] = time.monotonic,
         ceiling_s: float | None = None,
+        cleanup_waiter: CleanupWaiter | None = None,
     ):
         if time_cap_s <= 0:
             raise ValueError(f"the time cap must be positive, got {time_cap_s!r}")
@@ -74,6 +90,7 @@ class AgentTimer:
         self._cleanup_s = 0.0
         self._over = False  # a cut began its cleanup: no wait is counted from then on
         self.cleanup_timed_out = False  # the cancelled work did not stop within the cleanup deadline
+        self.cleanup_waiter: CleanupWaiter = cleanup_waiter or real_time_cleanup_waiter
         self.readings: list[tuple[str, float]] = []
 
     @property
@@ -167,10 +184,12 @@ class AgentTimer:
         self._open_waits.clear()
         self._cleanup_from = tick.now
 
-    def end_cleanup(self) -> None:
-        """Mark the moment the cancelled work has stopped, or been given up on."""
+    def end_cleanup(self, *, timed_out: bool = False) -> None:
+        """Mark the moment the cancelled work has stopped, or been given up on when `timed_out`. The reading's label
+        says which (`cleanup_end` or `cleanup_end_timed_out`), so a replay can serve the answer back."""
         if self._cleanup_from is not None:
-            self._cleanup_s += self.read("cleanup_end") - self._cleanup_from
+            self.cleanup_timed_out = self.cleanup_timed_out or timed_out
+            self._cleanup_s += self.read("cleanup_end_timed_out" if timed_out else "cleanup_end") - self._cleanup_from
             self._cleanup_from = None
 
     @property

@@ -47,12 +47,17 @@ def make_config():
 def run(make_config, clock):
     """Return a runner: run(backend, providers, **overrides) -> LoopResult, on the fake clock.
 
-    The default sleep never ends by itself, so a bound passes only when a test says so.
+    The default sleep never ends by itself, so a bound passes only when a test says so. A `timer` may be passed to
+    keep hold of it, or a `cleanup_waiter` to inject how the wait for a cancelled call is decided.
     """
 
-    def go(backend, providers, *, sleep=never, system="system", user="task", **overrides):
+    def go(
+        backend, providers, *, sleep=never, system="system", user="task", timer=None, cleanup_waiter=None, **overrides
+    ):
         config = make_config(**overrides)
+        if timer is None and cleanup_waiter is not None:
+            timer = config.timer(clock, cleanup_waiter=cleanup_waiter)
         box = ToolBox(list(providers), cap_chars=config.limits.output_cap_chars)
-        return asyncio.run(run_agent(backend, box, system, user, config, clock=clock, sleep=sleep))
+        return asyncio.run(run_agent(backend, box, system, user, config, timer=timer, clock=clock, sleep=sleep))
 
     return go
