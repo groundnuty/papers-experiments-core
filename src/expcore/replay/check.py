@@ -11,6 +11,10 @@ offline through the real loop. The result is written beside the records as `repl
      "hashed_only_patterns", "n_records", "n_ok", "failures": [{"file", "stage", "error"}], "hashed_only": [paths],
      "recompute": [{"name", "version", "records", "decisions", "failures"}], "inputs": {path: sha256}, "inputs_sha256"}
 
+`replayed` lists the records that loaded, wrote back and replayed. A run record is never hashed only: a pattern
+that names one is refused when the check is made (`HashedOnlyRecord`), and `require_current_check` refuses a stored
+check that has one, so a check that replayed nothing cannot vouch for the records beside it.
+
 `stage` is `load`, `roundtrip`, `replay` or `decision` (a failure at `decision` also names the `hook`). Paths are relative to the batch, so a batch extracted from an
 archive elsewhere has the same digest. An input is a record (a `.json` file anywhere under the batch, the check file
 excepted) or a file named by `hashed_only` patterns, which is hashed but not replayed, such as a manifest the analysis
@@ -36,6 +40,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -49,7 +54,7 @@ from expcore.provenance.codestamp import UNKNOWN, CodeScope, CodeVersionUnknown,
 from expcore.provenance.codestamp import version as code_version
 from expcore.records.record import RunRecord, decode
 from expcore.records.redact import redact_text
-from expcore.records.schema import SCHEMAS, RecordError, SchemaVersion
+from expcore.records.schema import SCHEMA_PREFIX, SCHEMAS, RecordError, SchemaVersion
 from expcore.replay.divergence import ReplayDivergence
 from expcore.replay.replay import replay_record
 
@@ -61,6 +66,38 @@ EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
 
 class BatchNotVerified(Exception):
     """A batch has no passing, current replay check; the message says why and what to run."""
+
+
+class HashedOnlyRecord(BatchNotVerified):
+    """A run record was named by a hashed-only pattern: it would be hashed but never replayed."""
+
+
+_RECORD_FILE = re.compile(r"[0-9a-f]{64}\.\d+\.json")
+
+
+def is_run_record(rel: str, raw: bytes) -> bool:
+    """Tell whether a file is a run record: it is named as one, or it holds the record schema marker.
+
+    A file that is neither (an outcome marker, a snapshot of the store, a manifest) may be hashed without being replayed.
+    """
+    if _RECORD_FILE.fullmatch(Path(rel).name):
+        return True
+    try:
+        data = decode(raw)
+    except RecordError:
+        return False
+    marker = data.get("schema_version") if isinstance(data, dict) else None
+    return isinstance(marker, str) and marker.startswith(SCHEMA_PREFIX)
+
+
+def _refuse_hashed_records(root: Path, hashed: Sequence[str], rerun: str | None = None) -> None:
+    """Raise HashedOnlyRecord for the first hashed-only file that is a run record."""
+    for rel in hashed:
+        if is_run_record(rel, (root / rel).read_bytes()):
+            raise HashedOnlyRecord(
+                f"{root}: {rel} is a run record, so it must be replayed; a hashed-only pattern may not name one"
+                + (f"; {rerun}" if rerun else "")
+            )
 
 
 class Recompute(Protocol):
@@ -201,6 +238,7 @@ def verify_batch(
             except Exception as exc:
                 stat["failures"] += 1
                 failures.append({"file": rel, "stage": "decision", "hook": hook.name, "error": _error(exc)})
+    _refuse_hashed_records(root, hashed)
     for rel in hashed:
         hashes[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
     return {
@@ -213,6 +251,7 @@ def verify_batch(
         "n_ok": len(records) - len({f["file"] for f in failures}),
         "failures": failures,
         "hashed_only": hashed,
+        "replayed": [rel for rel in records if rel not in {f["file"] for f in failures}],
         "recompute": list(ran.values()),
         "inputs": dict(sorted(hashes.items())),
         "inputs_sha256": inputs_sha256(hashes),
@@ -338,6 +377,13 @@ def require_current_check(
         raise BatchNotVerified(
             f"{root}: inputs changed since the replay check ({_changed_inputs(stored, current)}); {rerun}"
         )
+    hashed = check.get("hashed_only") or []
+    replayed = check.get("replayed")
+    if replayed is not None and (set(replayed) & set(hashed) or set(replayed) | set(hashed) != set(stored)):
+        raise BatchNotVerified(
+            f"{root}: the lists of replayed and hashed-only inputs in {CHECK_FILE} were altered; {rerun}"
+        )
+    _refuse_hashed_records(root, hashed, rerun)
     made = check.get("code") or {}
     problem = _code_problem(code, "the code in use", allow_dirty) or _code_problem(
         made, "the code the check was made under", allow_dirty
@@ -405,7 +451,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (BatchNotVerified, CodeVersionUnknown) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    check = verify_batch(args.batch, code=code, hashed_only=args.hashed_only)
+    try:
+        check = verify_batch(args.batch, code=code, hashed_only=args.hashed_only)
+    except HashedOnlyRecord as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
     path = write_check(args.batch, check)
     for failure in check["failures"]:
         print(f"FAIL {failure['file']} [{failure['stage']}] {failure['error']}")

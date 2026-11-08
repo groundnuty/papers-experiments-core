@@ -15,10 +15,12 @@ from expcore.replay.check import (
     CHECK_FILE,
     CHECK_SCHEMA,
     BatchNotVerified,
+    HashedOnlyRecord,
     RecomputeHook,
     check_record,
     input_hashes,
     inputs_sha256,
+    is_run_record,
     main,
     require_current_check,
     verify_batch,
@@ -247,6 +249,58 @@ def test_a_file_the_analysis_reads_that_is_not_a_record_is_hashed_not_replayed(b
     require_current_check(batch, code=CODE)
     (batch / "manifest.json").write_text('{"cells": 4}', encoding="utf-8")
     refused(batch, "changed manifest.json")
+
+
+def test_R04_a_run_record_cannot_be_hashed_only_so_a_check_cannot_replay_nothing_and_vouch_for_everything(batch):
+    """R04 and R05: a pattern that names a record is refused when the check is made, and nothing is written."""
+    for pattern in ("*", "*.json", "*.1.json"):
+        with pytest.raises(HashedOnlyRecord, match=r"is a run record, so it must be replayed"):
+            verify_batch(batch, code=CODE, hashed_only=[pattern])
+    assert not (batch / CHECK_FILE).exists()
+
+
+def test_R04_a_record_is_taken_for_one_by_its_name_or_by_its_schema_marker(tmp_path):
+    root = tmp_path / "b"
+    path = SCENARIOS["tools"][0]().write(root)
+    assert is_run_record(path.name, path.read_bytes())  # by its name
+    renamed = root / "renamed.json"
+    renamed.write_bytes(path.read_bytes())
+    assert is_run_record("renamed.json", renamed.read_bytes())  # by the marker it holds
+    assert not is_run_record("manifest.json", b'{"cells": 3}')
+    assert not is_run_record("campaign-snapshot.sqlite", b"SQLite format 3\x00\xff\xfe")
+
+
+def test_R04_the_check_lists_the_records_it_replayed_and_not_the_ones_that_failed_or_were_hashed_only(batch):
+    (batch / "manifest.json").write_text('{"cells": 3}', encoding="utf-8")
+    (batch / "garbage.json").write_text("nope", encoding="utf-8")
+    check = verify_batch(batch, code=CODE, hashed_only=["manifest.json"])
+    assert [f["file"] for f in check["failures"]] == ["garbage.json"]
+    assert "garbage.json" not in check["replayed"]
+    assert "manifest.json" not in check["replayed"]
+    assert sorted(check["replayed"]) == sorted(set(check["inputs"]) - {"manifest.json", "garbage.json"})
+
+
+def test_R04_a_stored_check_that_calls_a_record_hashed_only_is_refused_whoever_made_it(checked):
+    """R04: the check file edited so that no record is replayed any more (every input hashed, none replayed)."""
+    check = stored_check(checked)
+    check["hashed_only_patterns"] = ["*"]
+    check["hashed_only"] = sorted(check["inputs"])
+    check["replayed"] = []
+    (checked / CHECK_FILE).write_text(json.dumps(check), encoding="utf-8")
+    refused(checked, "is a run record, so it must be replayed")
+
+
+def test_R04_the_lists_of_replayed_and_hashed_only_inputs_must_account_for_every_input_once(checked):
+    check = stored_check(checked)
+    check["replayed"] = check["replayed"][1:]
+    (checked / CHECK_FILE).write_text(json.dumps(check), encoding="utf-8")
+    refused(checked, "replayed and hashed-only inputs .* were altered")
+
+
+def test_the_command_refuses_a_pattern_that_names_a_record_and_writes_no_check(batch, code_repo, capsys):
+    assert run_cli(batch, code_repo, "--hashed-only", "*") == 1
+    assert "is a run record, so it must be replayed" in capsys.readouterr().err
+    assert not (batch / CHECK_FILE).exists()
 
 
 def test_hidden_files_and_the_check_itself_are_not_inputs(checked):
