@@ -202,7 +202,7 @@ def test_R03_a_harness_defect_replays_without_its_stack_hash_and_with_its_except
 
 
 def test_R03_a_record_with_an_unknown_field_is_refused_before_replay():
-    """R02 and R03: the replay of a decoded record validates it first."""
+    """R03: the replay of a decoded record validates it first against its schema (R02)."""
     data = record_of()
     data["surprise"] = 1
     with pytest.raises(RecordError, match="unknown field"):
