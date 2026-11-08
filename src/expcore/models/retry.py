@@ -10,8 +10,9 @@ same shape is treated like the SDK's own. What each class of error means for a r
   backoff. Jitter only lengthens a delay, and a `Retry-After` is never shortened: the wait is at least the server's.
 - a read timeout (the request went out and the reply is slow): never resent; `RequestAbandoned`.
 - 401 and 403: `key_rejected` after one request. The SDK's text can echo part of a key, so it is never kept.
-- 400 or 413 naming the context: `ContextOverflow`, the agent's outcome, not retried.
-- anything else with a status (a plain 400, a 404): not retried, and passed on unchanged.
+- 400 or 413 whose code or message names the context: `ContextOverflow`, the agent's outcome, not retried. A 413
+  that does not (a body-size limit, a tokens-per-minute limit) is an ordinary request error, as a 400 would be.
+- anything else with a status (a plain 400 or 413, a 404): not retried, and passed on unchanged.
 
 The SDKs' own retries are switched off by the adapters, so every retry is counted and recorded here.
 """
@@ -128,7 +129,11 @@ def _seconds_from(value: str, now: Callable[[], datetime]) -> float:
 
 
 def context_overflow_match(status: int | None, code: str | None, message: str) -> str | None:
-    """Return the id of the pattern row (or "code" or "http_413") that makes this error a context overflow."""
+    """Return the id of the pattern row (or "code") that makes this error a context overflow, else None.
+
+    A 413 follows the rule of a 400: its code or message has to name the context. The status alone says only that
+    the request body was too large, which the provider may mean in bytes, or as a rate limit.
+    """
     if status not in _OVERFLOW_STATUSES:
         return None
     if code in _OVERFLOW_CODES:
@@ -136,7 +141,7 @@ def context_overflow_match(status: int | None, code: str | None, message: str) -
     for row_id, _example, pattern in CONTEXT_OVERFLOW_PATTERNS:
         if pattern.search(message):
             return row_id
-    return "http_413" if status == 413 else None
+    return None
 
 
 def _is_read_timeout(exc: BaseException) -> bool:

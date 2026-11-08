@@ -284,14 +284,41 @@ def test_b13_every_tested_provider_wording_classifies_as_context_overflow(make_e
             assert (info.kind, info.transient, info.overflow) == ("context_overflow", False, row_id)
 
 
-def test_b13_the_error_code_and_a_413_alone_are_enough(make_error):
-    """B13: The error code and a 413 alone are enough."""
-    by_code = classify(make_error(400, message="rejected", body={"error": {"code": "context_length_exceeded"}}))
-    assert by_code is not None
-    assert (by_code.kind, by_code.overflow) == ("context_overflow", "code")
-    bare_413 = classify(make_error(413, message="Payload Too Large"))
-    assert bare_413 is not None
-    assert (bare_413.kind, bare_413.overflow) == ("context_overflow", "http_413")
+def test_b13_the_error_code_is_enough_for_a_400_and_for_a_413(make_error):
+    """B13: A provider's context code classifies as overflow without a pattern in the message, on 400 and 413."""
+    for status in (400, 413):
+        by_code = classify(make_error(status, message="rejected", body={"error": {"code": "context_length_exceeded"}}))
+        assert by_code is not None
+        assert (by_code.kind, by_code.overflow) == ("context_overflow", "code")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Payload Too Large",
+        "Request body exceeds the 1 MB limit",
+        "Request too large for gpt-x on tokens per min (TPM): Limit 30000, Requested 45000",
+        "",
+    ],
+)
+def test_b13_a_413_that_does_not_name_the_context_is_an_ordinary_request_error(make_error, message):
+    """B13: 413 alone is not a context overflow; it is a non-transient request error, never an agent outcome."""
+    assert context_overflow_match(413, None, message) is None
+    info = classify(make_error(413, message=message))
+    assert info is not None
+    assert (info.kind, info.transient, info.overflow) == ("bad_request", False, None)
+
+
+def test_b13_a_413_that_does_not_name_the_context_is_raised_unchanged_and_not_retried(make_error, sleeps, jitter):
+    """B13: The retrier passes a bare 413 on as the provider's own error, after one request and no wait."""
+    error = make_error(413, message="Payload Too Large")
+    send = Script(error)
+    with pytest.raises(type(error)) as caught:
+        run(retrier(sleeps, jitter), send)
+    assert caught.value is error
+    assert not isinstance(caught.value, ContextOverflow)
+    assert send.requests == 1
+    assert sleeps.waits == []
 
 
 def test_b13_the_same_words_with_another_status_are_not_an_overflow(make_error):
