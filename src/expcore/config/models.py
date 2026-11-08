@@ -25,6 +25,7 @@ from typing import Any
 
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
+from expcore.config.prices import Price
 
 BACKENDS = ("openai_compat", "anthropic", "stub")
 STATUSES = ("frozen", "draft")
@@ -107,6 +108,8 @@ class ModelSpec:
     echo_reasoning_field: str | None = None  # openai_compat: assistant-message field the reasoning is sent back in
     extra_body: dict[str, Any] = dataclasses.field(default_factory=dict)  # vendor extras sent verbatim (B14)
     prompt_cache_ttl: str | None = None  # anthropic: cache lifetime ("5m" or "1h"); None sends no cache marker
+    price: Price | None = None  # dollars per million tokens; None with free=False is an unknown cost (C12)
+    free: bool = False  # a model that costs nothing per token (hosted by the study): priced without a price
 
     def __post_init__(self) -> None:
         """Refuse an entry whose settings break a rule, before any request can be built from it."""
@@ -117,6 +120,11 @@ class ModelSpec:
     def output_tokens(self, limit: int) -> int:
         """Return the max_tokens to send: the study's value, or the model's own maximum if that is lower (B11)."""
         return limit if self.max_output_tokens is None else min(limit, self.max_output_tokens)
+
+    @property
+    def priced(self) -> bool:
+        """Tell whether the cost of its tokens is known: it has a price, or its entry says it is free (C12)."""
+        return self.free or self.price is not None
 
     @property
     def seed_supported(self) -> bool:
@@ -225,6 +233,8 @@ def _request_problems(spec: ModelSpec) -> list[str]:
             problems.append(f"echo_reasoning_field {field!r} would overwrite a standard message field")
         elif not _IDENT_RE.fullmatch(field):
             problems.append("echo_reasoning_field must be a plain field name")
+    if spec.free and spec.price is not None:
+        problems.append("a model is free or has a price, not both")
     if spec.prompt_cache_ttl is not None:
         if spec.backend != "anthropic":
             problems.append("prompt_cache_ttl applies to anthropic models only")
@@ -275,6 +285,15 @@ class ModelTable:
         for name in names:
             assert_frozen(self.resolve(name))
 
+    def require_priced(self, names: Iterable[str]) -> None:
+        """Refuse a study run unless every named model has a price or is explicitly marked free (C12)."""
+        unpriced = [spec.key for spec in map(self.resolve, names) if not spec.priced]
+        if unpriced:
+            raise ConfigError(
+                f"{self.source}: no price for model(s) {', '.join(unpriced)}: give each a [models.<key>.price] table, "
+                "or mark it free = true if it costs nothing per token; a study run needs a known cost to enforce its budget"
+            )
+
     def require_keys(self, names: Iterable[str], env: Mapping[str, str] | None = None) -> None:
         """Check at startup that the key of every named model can be read; the values are discarded."""
         for name in names:
@@ -301,7 +320,41 @@ _ENTRY_KEYS = (
     "echo_reasoning_field",
     "extra_body",
     "prompt_cache_ttl",
+    "price",
+    "free",
 )
+_PRICE_KEYS = ("input_per_mtok", "output_per_mtok", "cache_write_per_mtok", "cache_read_per_mtok")
+
+
+def _flag(section: Section, key: str) -> bool:
+    """Read an optional boolean; absent is False."""
+    value = section.data.get(key, False)
+    if not isinstance(value, bool):
+        raise section.fail(key, f"must be true or false, got {type(value).__name__}")
+    return value
+
+
+def _price(section: Section) -> Price | None:
+    """Read the optional `price` table; its input and output prices are required, and a failure names the key."""
+    table = section.table("price")
+    if not table:
+        return None
+    where = section.section("price")
+    where.reject_unknown(_PRICE_KEYS)
+    values: dict[str, float] = {}
+    for name in _PRICE_KEYS:
+        if name in table:
+            value = table[name]
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise where.fail(name, f"must be a number of dollars per million tokens, got {type(value).__name__}")
+            values[name] = float(value)
+    for name in ("input_per_mtok", "output_per_mtok"):
+        if name not in values:
+            raise where.fail(name, "is required in a price table")
+    try:
+        return Price(**values)
+    except ValueError as error:
+        raise section.fail("price", str(error)) from None
 
 
 def _entry(section: Section, key: str) -> ModelSpec:
@@ -323,6 +376,8 @@ def _entry(section: Section, key: str) -> ModelSpec:
         "echo_reasoning_field": section.optional_string("echo_reasoning_field"),
         "extra_body": section.table("extra_body"),
         "prompt_cache_ttl": section.optional_string("prompt_cache_ttl"),
+        "price": _price(section),
+        "free": _flag(section, "free"),
     }
     if spec_args["api_id"] is None:
         raise section.fail("api_id", "is required")
