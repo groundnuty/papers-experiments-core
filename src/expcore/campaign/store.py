@@ -293,7 +293,7 @@ class Store:
     def sync_manifest_within(self, rows: Sequence[ManifestRow]) -> int:
         """Do what `sync_manifest` does inside a transaction the caller has begun, so it can stand or fall with more.
 
-        Statuses are never touched. Refuses a key listed twice, a key from another schema or fitting no condition, and
+        Statuses are never touched. Refuses a key listed twice, a key from another schema or that no condition runs, and
         a plan whose order of the runs it shares with the store has changed; the caller's transaction then rolls back.
         """
         texts = [row.key.text for row in rows]
@@ -303,7 +303,7 @@ class Store:
         for row in rows:
             if row.key.names != self.schema.order:
                 raise ValueError(f"run key {row.key.text!r} is not of this schema's identity order")
-            self.schema.condition_of(row.key)  # a key that fits no condition cannot have come from this plan
+            self.schema.check_key(row.key)  # a key no condition runs cannot have come from this plan
         recorded = [r["run_key"] for r in self.db.execute("SELECT run_key FROM runs ORDER BY seq")]
         problem = relative_order_problem(recorded, texts)
         if problem is not None:

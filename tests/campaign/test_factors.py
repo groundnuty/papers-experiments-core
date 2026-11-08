@@ -3,7 +3,7 @@
 import hashlib
 
 import pytest
-from campaign_support import STUDY_TOML, make_schema, treatment_schema, write_study
+from campaign_support import STUDY_TOML, chain_schema, make_schema, treatment_schema, write_study
 
 from expcore import errors
 from expcore.campaign.factors import FactorSchema, PlanError, RunKey, load_factor_schema
@@ -293,3 +293,97 @@ def test_c02_the_setting_s_name_cannot_also_be_a_factor(registry):
             ["task", "infrastructure_is_treatment", "model", "seed"],
             {"c": {"infrastructure_is_treatment": "a"}},
         )
+
+
+# --- a condition that runs on a subset of the tasks -----------------------------------------------------------------
+
+CHAIN_TOML = STUDY_TOML.replace(
+    '[conditions.download-write]\ndata_path = "download"\ntools = "write"',
+    '[conditions.download-write]\ndata_path = "download"\ntools = "write"\ntasks = ["task-b", "task-a"]',
+)
+PLAN_TASKS = ["task-a", "task-b", "task-c", "task-d"]
+
+
+def test_r11_a_condition_with_a_task_list_is_expanded_over_its_own_tasks_only():
+    """R11: adds that a chain design's subset arm gets keys for its own tasks, and the other arms keep every task."""
+    schema = chain_schema(("task-b", "task-a"))
+    keys = schema.expand(PLAN_TASKS, ["m1"], [1, 2])
+    by_condition = {c: [k for k in keys if schema.condition_of(k) == c] for c in schema.conditions}
+    assert {c: len(ks) for c, ks in by_condition.items()} == {"mount-read": 8, "api-none": 8, "download-write": 4}
+    assert {k.factors["task"] for k in by_condition["download-write"]} == {"task-a", "task-b"}
+    assert [k.factors["task"] for k in by_condition["download-write"]][:2] == ["task-a", "task-a"]  # the plan's order
+    assert len({k.text for k in keys}) == len(keys) == 20
+
+
+def test_r11_a_condition_without_a_task_list_runs_on_every_task_of_the_plan():
+    """R11: adds the default: no list, every task of the plan, so existing schemas expand as before."""
+    schema = make_schema()
+    assert schema.condition_tasks == {"mount-read": None, "api-none": None, "download-write": None}
+    assert len(schema.expand(PLAN_TASKS, ["m1"], [1])) == 12
+
+
+def test_r11_the_study_file_may_list_a_conditions_tasks_and_the_list_is_no_factor(tmp_path):
+    """R11: adds the loading of `tasks` in a condition, apart from the factors the condition assigns."""
+    schema = load_factor_schema(write_study(tmp_path, CHAIN_TOML))
+    assert schema.condition_tasks == {"mount-read": None, "api-none": None, "download-write": ("task-b", "task-a")}
+    assert schema.conditions["download-write"] == {"data_path": "download", "tools": "write"}
+    assert schema.to_json()["condition_tasks"]["download-write"] == {"task-b": True, "task-a": True}
+
+
+def test_r11_a_listed_task_that_is_not_in_the_plan_is_refused_naming_file_and_key(tmp_path):
+    """R11: adds that a task list is checked against the plan's tasks when the plan is expanded."""
+    path = write_study(tmp_path, CHAIN_TOML.replace('"task-b", "task-a"', '"task-a", "task-zz"'))
+    schema = load_factor_schema(path)
+    with pytest.raises(ConfigError) as caught:
+        schema.expand(PLAN_TASKS, ["m1"], [1])
+    message = str(caught.value)
+    assert message.startswith(f"{path}: [conditions.download-write]: key 'tasks'")
+    assert "names unknown task 'task-zz'" in message
+    assert "the plan's tasks are: task-a, task-b, task-c, task-d" in message
+
+
+@pytest.mark.parametrize(
+    ("declaration", "message"),
+    [
+        ("[]", "key 'tasks' must be a non-empty array of task names"),
+        ('["task-a", "task-a"]', "key 'tasks' repeats 'task-a'"),
+        ('"task-a"', "key 'tasks' must be an array of non-empty strings"),
+        ("[1]", "key 'tasks' must be an array of non-empty strings"),
+    ],
+)
+def test_r11_a_malformed_task_list_is_refused_at_load(tmp_path, declaration, message):
+    """R11: adds the shape checks on a condition's task list."""
+    path = write_study(tmp_path, CHAIN_TOML.replace('["task-b", "task-a"]', declaration))
+    with pytest.raises(ConfigError, match=message):
+        load_factor_schema(path)
+
+
+def test_r11_a_task_list_for_a_condition_that_does_not_exist_is_refused():
+    """R11: adds that a list built in code names a real condition."""
+    with pytest.raises(ConfigError, match="key 'nope' declares tasks but is no condition"):
+        FactorSchema({}, ["task", "model", "seed"], {"a": {}}, tasks={"nope": ["task-a"]})
+
+
+def test_r11_the_name_tasks_cannot_also_be_a_factor():
+    """R11: adds that the name is reserved, so a condition's list is never read as a level."""
+    with pytest.raises(ConfigError, match="key 'tasks' is reserved"):
+        FactorSchema({"tasks": ["a"]}, ["task", "tasks", "model", "seed"], {"c": {"tasks": "a"}})
+
+
+def test_r11_a_key_for_a_task_the_condition_does_not_run_is_refused():
+    """R11: adds that no key can be made, or accepted, for a task outside a condition's list."""
+    schema = chain_schema(("task-a",))
+    assert schema.key("download-write", "task-a", "m1", 1).factors["task"] == "task-a"
+    with pytest.raises(PlanError, match="task 'task-b' is not one of the tasks of condition 'download-write': task-a"):
+        schema.key("download-write", "task-b", "m1", 1)
+    outside = make_schema().key("download-write", "task-b", "m1", 1)  # made under a schema that has no such list
+    with pytest.raises(PlanError, match="is on a task that condition 'download-write' does not run"):
+        schema.check_key(outside)
+    assert schema.check_key(make_schema().key("download-write", "task-a", "m1", 1)) == "download-write"
+
+
+def test_c06_the_task_lists_are_part_of_the_schema_s_identity_whatever_their_order():
+    """C06: adds that a changed list changes the digest, and a reordered one does not."""
+    assert chain_schema(("task-a", "task-b")).digest != make_schema().digest
+    assert chain_schema(("task-a", "task-b")).digest != chain_schema(("task-a",)).digest
+    assert chain_schema(("task-a", "task-b")).digest == chain_schema(("task-b", "task-a")).digest

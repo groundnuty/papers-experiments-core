@@ -5,10 +5,19 @@ import sqlite3
 from dataclasses import replace
 
 import pytest
-from campaign_support import NOW, finished, make_fingerprint, make_manifest, make_schema, sha, treatment_schema
+from campaign_support import (
+    NOW,
+    chain_schema,
+    finished,
+    make_fingerprint,
+    make_manifest,
+    make_schema,
+    sha,
+    treatment_schema,
+)
 
 from expcore.campaign.attempts import PinMismatch, ResumeRefused, SchemaMismatch
-from expcore.campaign.factors import FactorSchema
+from expcore.campaign.factors import FactorSchema, PlanError
 from expcore.campaign.recovery import Recovery
 from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, RunSetMismatch, open_campaign
 from expcore.campaign.store import Store
@@ -283,3 +292,72 @@ def test_c06_a_refused_growth_leaves_the_stored_fingerprint_so_the_original_resu
     check.close()
     again, _ = start(tmp_path)  # the original start still resumes
     assert state_of(again) == before
+
+
+# --- a condition that runs on a subset of the tasks (resume) ---------------------------------------------------------
+
+PLAN = {"tasks": ("task-a", "task-b", "task-c", "task-d")}
+
+
+def test_r11_the_store_refuses_a_run_on_a_task_its_condition_does_not_run(tmp_path):
+    """R11: adds that a run outside a condition's task list cannot enter the store, even from a hand-made manifest."""
+    chain = chain_schema(("task-a", "task-b"))
+    store = Store(tmp_path / "campaign.db", chain)
+    outside = make_manifest(make_schema(), **PLAN)  # the full cross, which holds download-write on task-c
+    with pytest.raises(PlanError, match="is on a task that condition 'download-write' does not run"):
+        store.sync_manifest(outside.rows)
+    assert store.run_keys() == set()
+    inside = make_manifest(chain, **PLAN)
+    assert store.sync_manifest(inside.rows) == len(inside.rows)
+
+
+def test_r11_a_chain_design_plans_and_stores_the_subset_condition_on_its_tasks_only(tmp_path):
+    """R11: adds a chain design end to end: the subset condition has runs on its tasks and the others on all."""
+    chain = chain_schema(("task-a", "task-b"))
+    store, _ = start(tmp_path, schema=chain, plan=PLAN)
+    held = [json.loads(r["factors"]) for r in store.q("SELECT factors FROM runs")]
+    under = {
+        c: sorted({f["task"] for f in held if (f["data_path"], f["tools"]) == lv}) for c, lv in CHAIN_LEVELS.items()
+    }
+    assert under == {
+        "mount-read": ["task-a", "task-b", "task-c", "task-d"],
+        "api-none": ["task-a", "task-b", "task-c", "task-d"],
+        "download-write": ["task-a", "task-b"],
+    }
+    assert len(held) == 10 * 2  # ten runs per seed (4 + 4 + 2 tasks, one model), two seeds
+    assert len(store.pending(data_path="download")) == 2 * 2
+
+
+CHAIN_LEVELS = {"mount-read": ("mount", "read"), "api-none": ("api", "none"), "download-write": ("download", "write")}
+
+
+def test_c06_a_resume_that_changes_a_conditions_task_list_is_refused_and_one_that_adds_tasks_is_growth(tmp_path):
+    """C06: adds the task lists to resume: a changed list is refused, an added task needs leave and adds its runs."""
+    start(tmp_path, schema=chain_schema(("task-a", "task-b")), plan=PLAN)[0].close()
+    for changed in (("task-a",), ("task-a", "task-c")):
+        with pytest.raises(FingerprintMismatch, match=r"schema\.condition_tasks\.download-write"):
+            start(tmp_path, schema=chain_schema(changed), plan=PLAN, allow_growth=True)
+    with pytest.raises(FingerprintMismatch) as caught:
+        start(tmp_path, schema=chain_schema(("task-a", "task-b", "task-c")), plan=PLAN)
+    assert caught.value.differences == ("schema.condition_tasks.download-write.task-c: not in the recorded experiment",)
+    store, _ = start(tmp_path, schema=chain_schema(("task-a", "task-b", "task-c")), plan=PLAN, allow_growth=True)
+    assert len(store.run_keys()) == 11 * 2
+    assert store.q("SELECT detail FROM events WHERE kind='plan_grown'")[0]["detail"] == (
+        "added: schema.condition_tasks.download-write.task-c"
+    )
+
+
+def test_c06_a_manifest_that_runs_the_subset_condition_on_every_task_is_refused_before_the_store_opens(tmp_path):
+    """C06: adds that the run-set check is against the declared plan: the full cross is not the chain design."""
+    chain = chain_schema(("task-a", "task-b"))
+    fingerprint = make_fingerprint(chain, task_ids=PLAN["tasks"])
+    with pytest.raises(RunSetMismatch, match=r"lists 4 run\(s\) its fingerprint does not declare"):
+        open_campaign(
+            tmp_path / "campaign.db",
+            chain,
+            make_manifest(make_schema(), 7, **PLAN),
+            fingerprint,
+            now=NOW,
+            max_attempts=LIMIT,
+        )
+    assert not (tmp_path / "campaign.db").exists()

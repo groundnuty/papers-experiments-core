@@ -33,6 +33,7 @@ ORDER_RULE = "sha256(order_seed|run_key)"
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 # Sections of the fingerprint that may gain whole entries when the plan grows (C08), and the conditions of the schema.
 GROWABLE_SECTIONS = ("tasks", "models", "seeds", "prompts", "tools")
+_CONDITION_SECTIONS = (("schema", "conditions"), ("schema", "treatment"), ("schema", "condition_tasks"))
 _SHOWN_LIMIT = 48
 
 
@@ -212,12 +213,18 @@ def _flatten(obj: Any, prefix: tuple[str, ...] = ()) -> dict[tuple[str, ...], An
     return {prefix: obj}
 
 
-def _growth_item(path: tuple[str, ...]) -> tuple[str, ...] | None:
-    """Name the whole entry a path belongs to when entries of its section may be added, else None."""
+def _growth_item(path: tuple[str, ...], recorded_conditions: frozenset[str]) -> tuple[str, ...] | None:
+    """Name the whole entry a path belongs to when entries of its section may be added, else None.
+
+    A condition, its treatment declaration and its task list are one entry when the condition is new. A task added to
+    the list of a condition that already exists is an entry of its own.
+    """
     if len(path) >= 2 and path[0] in GROWABLE_SECTIONS:
         return path[:2]
-    if len(path) >= 3 and path[:2] in (("schema", "conditions"), ("schema", "treatment")):
-        return ("schema", "conditions", path[2])  # a condition and its treatment declaration are one entry
+    if len(path) >= 3 and path[:2] in _CONDITION_SECTIONS:
+        if path[1] == "condition_tasks" and len(path) >= 4 and path[2] in recorded_conditions:
+            return path[:4]
+        return ("schema", "conditions", path[2])
     return None
 
 
@@ -247,7 +254,8 @@ def compare_fingerprints(recorded: Mapping[str, Any], now: Mapping[str, Any]) ->
     A whole new entry of `tasks`, `models`, `prompts`, `tools` or a new condition of the schema is growth.
     """
     before, after = _flatten(recorded), _flatten(now)
-    known = {item for path in before if (item := _growth_item(path)) is not None}
+    conditions = frozenset(path[2] for path in before if path[:2] == ("schema", "conditions") and len(path) >= 3)
+    known = {item for path in before if (item := _growth_item(path, conditions)) is not None}
     refused: list[str] = []
     grown: set[tuple[str, ...]] = set()
     for path in sorted(set(before) | set(after)):
@@ -258,7 +266,7 @@ def compare_fingerprints(recorded: Mapping[str, Any], now: Mapping[str, Any]) ->
         elif path in before:
             refused.append(f"{name}: recorded {_shown(before[path])}, now absent")
         else:
-            item = _growth_item(path)
+            item = _growth_item(path, conditions)
             if item is not None and item not in known:
                 grown.add(item)
             else:

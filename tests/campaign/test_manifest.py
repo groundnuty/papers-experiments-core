@@ -3,7 +3,7 @@
 import copy
 
 import pytest
-from campaign_support import make_fingerprint, make_keys, make_manifest, make_schema, sha
+from campaign_support import chain_schema, make_fingerprint, make_keys, make_manifest, make_schema, sha
 
 from expcore.campaign.factors import FactorSchema, PlanError
 from expcore.campaign.manifest import (
@@ -325,3 +325,63 @@ def test_c06_a_manifest_must_be_exactly_the_plan_its_fingerprint_declares():
     assert fewer == "the manifest lists 0 run(s) its fingerprint does not declare and omits 6 that it does; " + AGREE
     other = plan_problem(schema, make_manifest(schema, seeds=(1, 2, 3)), fingerprint)
     assert other == "the manifest lists 6 run(s) its fingerprint does not declare and omits 0 that it does; " + AGREE
+
+
+# --- a condition that runs on a subset of the tasks (manifest) -------------------------------------------------------
+
+
+def chain_fingerprint(schema, **changes):
+    """The fingerprint of a chain campaign over four tasks."""
+    return make_fingerprint(schema, task_ids=("task-a", "task-b", "task-c", "task-d"), **changes)
+
+
+def test_c06_a_changed_task_list_is_a_refusal_and_added_tasks_alone_are_growth():
+    """C06: adds the task lists to what a resume compares: changing or dropping is refused, adding is growth (C08)."""
+    base = chain_fingerprint(chain_schema(("task-a", "task-b")))
+    grown = compare_fingerprints(base, chain_fingerprint(chain_schema(("task-a", "task-b", "task-c"))))
+    assert (grown.refused, grown.grown) == ((), ("schema.condition_tasks.download-write.task-c",))
+    dropped = compare_fingerprints(base, chain_fingerprint(chain_schema(("task-a",))))
+    assert dropped.refused == ("schema.condition_tasks.download-write.task-b: recorded True, now absent",)
+    swapped = compare_fingerprints(base, chain_fingerprint(chain_schema(("task-a", "task-c"))))
+    assert swapped.refused
+    assert swapped.grown == ("schema.condition_tasks.download-write.task-c",)
+
+
+def test_c06_a_condition_cannot_go_from_every_task_to_a_list_or_back_without_a_refusal():
+    """C06: adds that the default and an explicit list differ as experiments, even if the list names every task."""
+    everything = chain_fingerprint(make_schema())
+    listed = chain_fingerprint(chain_schema(("task-a", "task-b", "task-c", "task-d")))
+    assert compare_fingerprints(everything, listed).refused
+    assert compare_fingerprints(listed, everything).refused
+
+
+def test_c08_a_new_condition_with_a_task_list_is_one_growth_entry():
+    """C08: adds that a new condition brings its task list with it, reported once under the condition."""
+    base = make_schema()
+    bigger = FactorSchema(
+        base.declared,
+        base.order,
+        {**base.conditions, "mount-none": {"data_path": "mount", "tools": "none"}},
+        tasks={"mount-none": ["task-a"]},
+    )
+    comparison = compare_fingerprints(chain_fingerprint(base), chain_fingerprint(bigger))
+    assert comparison.refused == ()
+    assert [item for item in comparison.grown if "mount-none" in item] == [
+        "prompts.mount-none",
+        "schema.conditions.mount-none",
+        "tools.mount-none",
+    ]
+
+
+def test_c06_a_manifest_must_be_exactly_the_plan_with_each_condition_on_its_own_tasks():
+    """C06: adds that the declared plan is per condition: a manifest of the full cross is not the chain's plan."""
+    chain, full = chain_schema(("task-a", "task-b")), make_schema()
+    fingerprint = chain_fingerprint(chain)
+    chain_plan = make_manifest(chain, tasks=("task-a", "task-b", "task-c", "task-d"))
+    assert plan_problem(chain, chain_plan, fingerprint) is None
+    full_cross = make_manifest(full, tasks=("task-a", "task-b", "task-c", "task-d"))
+    assert plan_problem(chain, full_cross, fingerprint) == (
+        "the manifest lists 4 run(s) its fingerprint does not declare and omits 0 that it does; " + AGREE
+    )
+    short = make_manifest(chain, tasks=("task-a", "task-b"))
+    assert "omits" in plan_problem(chain, short, fingerprint)

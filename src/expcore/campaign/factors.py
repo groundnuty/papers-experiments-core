@@ -31,6 +31,17 @@ of a listed kind is a scored final attempt: the store marks it as treatment, nev
 it against the infrastructure limit. Other kinds under the same condition are set aside and run again as usual. The
 kinds are checked against the registry in `expcore.errors` (the core's kinds and any a platform registered), and
 the declaration is part of the schema, so changing it between a start and a resume is refused (C06).
+
+A condition may also name the tasks it runs on:
+
+    [conditions.chain-c]
+    data_path = "download"
+    tasks = ["task-a", "task-b"]
+
+By default a condition runs on every task of the plan. A chain design, where an arm is run on a subset, names the
+subset. Each listed task must be a task of the plan, which is checked when the plan is expanded, and the plan expands
+a condition over its own tasks only. The list is part of the schema, so changing it between a start and a resume is
+refused, while adding tasks to a condition is growth (C06, C08).
 """
 
 import hashlib
@@ -49,6 +60,7 @@ from expcore.errors import infra_kinds
 
 BUILTIN_FACTORS = ("task", "model", "seed")
 TREATMENT_KEY = "infrastructure_is_treatment"
+TASKS_KEY = "tasks"
 # A factor name becomes part of a SQL column name in the store, so it is held to a plain identifier.
 _NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _SEPARATOR = "|"
@@ -108,11 +120,13 @@ class FactorSchema:
         conditions: Mapping[str, Mapping[str, str]],
         *,
         treatment: Mapping[str, Sequence[str]] | None = None,
+        tasks: Mapping[str, Sequence[str]] | None = None,
         file: str | os.PathLike[str] = "<schema>",
     ) -> None:
-        """Validate and keep copies of the declared levels, the identity order, the conditions and their treatments.
+        """Validate and keep copies of the declared levels, the identity order, the conditions and their settings.
 
-        `treatment` maps a condition to the infrastructure kinds that are its treatment (see the module docstring).
+        `treatment` maps a condition to the infrastructure kinds that are its treatment, and `tasks` maps a condition
+        to the tasks it runs on; a condition not in `tasks` runs on every task (see the module docstring).
         """
         self.file = str(file)
         self.declared: dict[str, tuple[str, ...]] = {name: tuple(levels) for name, levels in declared.items()}
@@ -122,6 +136,7 @@ class FactorSchema:
         self._check_order()
         self._check_conditions()
         self.treatment_kinds: dict[str, tuple[str, ...]] = self._check_treatment(treatment or {})
+        self.condition_tasks: dict[str, tuple[str, ...] | None] = self._check_condition_tasks(tasks or {})
         self._by_levels = {tuple(c[f] for f in self.declared): name for name, c in self.conditions.items()}
 
     # --- validation ---------------------------------------------------------------------------------------------
@@ -132,7 +147,7 @@ class FactorSchema:
             where = Section({"levels": list(levels)}, self.file, f"[factors.{name}]")
             if name in BUILTIN_FACTORS:
                 raise Section({}, self.file, "[factors]").fail(name, "is built in and cannot be declared")
-            if name == TREATMENT_KEY:
+            if name in (TREATMENT_KEY, TASKS_KEY):
                 raise Section({}, self.file, "[factors]").fail(name, "is reserved for a condition's setting")
             if not _NAME_RE.fullmatch(name):
                 raise Section({}, self.file, "[factors]").fail(
@@ -206,6 +221,22 @@ class FactorSchema:
             out[name] = tuple(sorted(kinds))
         return out
 
+    def _check_condition_tasks(self, declared: Mapping[str, Sequence[str]]) -> dict[str, tuple[str, ...] | None]:
+        """Check each condition's task list; return it by condition, None where the condition runs on every task."""
+        out: dict[str, tuple[str, ...] | None] = dict.fromkeys(self.conditions)
+        for name, listed in declared.items():
+            if name not in self.conditions:
+                raise Section({}, self.file, "[conditions]").fail(name, f"declares {TASKS_KEY} but is no condition")
+            where = Section({}, self.file, f"[conditions.{name}]")
+            listed = tuple(listed)
+            if not listed or not all(isinstance(t, str) and t for t in listed):
+                raise where.fail(TASKS_KEY, "must be a non-empty array of task names")
+            repeated = sorted({t for t in listed if listed.count(t) > 1})
+            if repeated:
+                raise where.fail(TASKS_KEY, f"repeats {', '.join(map(repr, repeated))}")
+            out[name] = listed
+        return out
+
     # --- keys and plans -----------------------------------------------------------------------------------------
 
     def key(self, condition: str, task: str, model: str, seed: int) -> RunKey:
@@ -217,19 +248,47 @@ class FactorSchema:
                 raise PlanError(f"{label} must be a non-empty string")
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise PlanError("seed must be an integer")
+        listed = self.condition_tasks[condition]
+        if listed is not None and task not in listed:
+            raise PlanError(f"task {task!r} is not one of the tasks of condition {condition!r}: {', '.join(listed)}")
         values = {"task": task, "model": model, "seed": seed, **self.conditions[condition]}
         return RunKey(self.order, tuple(values[name] for name in self.order))
 
     def expand(self, tasks: Iterable[str], models: Iterable[str], seeds: Iterable[int]) -> list[RunKey]:
-        """Return the key of every condition x task x model x seed, refusing an empty list or a repeated value."""
+        """Return the key of every condition x task x model x seed, refusing an empty list or a repeated value.
+
+        A condition is expanded over its own tasks only (the plan's tasks, in the plan's order, when it names none).
+        A task a condition names that is not a task of the plan is refused, naming the file and the key.
+        """
         tasks, models, seeds = _distinct("task", tasks), _distinct("model", models), _distinct("seed", seeds)
         keys = [
             self.key(condition, task, model, seed)
-            for condition, task, model, seed in itertools.product(self.conditions, tasks, models, seeds)
+            for condition in self.conditions
+            for task, model, seed in itertools.product(self.tasks_of(condition, tasks), models, seeds)
         ]
         if len({k.text for k in keys}) != len(keys):  # unreachable while conditions differ; kept as the last guard
             raise PlanError("the plan holds a repeated run key")
         return keys
+
+    def tasks_of(self, condition: str, plan_tasks: Sequence[str]) -> list[str]:
+        """Return the tasks a condition runs on within a plan: its own list, or all of the plan's tasks."""
+        listed = self.condition_tasks[condition]
+        if listed is None:
+            return list(plan_tasks)
+        unknown = [t for t in listed if t not in plan_tasks]
+        if unknown:
+            raise Section({}, self.file, f"[conditions.{condition}]").fail(
+                TASKS_KEY, f"names unknown task {unknown[0]!r}; the plan's tasks are: {', '.join(plan_tasks)}"
+            )
+        return [t for t in plan_tasks if t in listed]
+
+    def check_key(self, key: RunKey) -> str:
+        """Return the condition of a key; refuse a key no condition runs, by its levels or by its task."""
+        condition = self.condition_of(key)
+        listed = self.condition_tasks[condition]
+        if listed is not None and key.factors["task"] not in listed:
+            raise PlanError(f"run key {key.text!r} is on a task that condition {condition!r} does not run")
+        return condition
 
     def condition_of(self, key: RunKey) -> str:
         """Return the name of the condition a key belongs to; refuse a key whose levels fit none."""
@@ -251,6 +310,10 @@ class FactorSchema:
             "order": list(self.order),
             "conditions": {name: dict(c) for name, c in self.conditions.items()},
             "treatment": {name: list(kinds) for name, kinds in self.treatment_kinds.items()},
+            "condition_tasks": {
+                name: None if listed is None else dict.fromkeys(listed, True)
+                for name, listed in self.condition_tasks.items()
+            },
         }
 
     @cached_property
@@ -289,10 +352,12 @@ def load_factor_schema(path: str | os.PathLike[str]) -> FactorSchema:
                 raise table.fail("levels", "is required")
             declared[name] = table.strings("levels")
     order = _table(top, "identity", "[identity]").strings("order")
-    conditions, treatment = {}, {}
+    conditions, treatment, tasks = {}, {}, {}
     all_conditions = _table(top, "conditions", "[conditions]")
     for name in all_conditions.data:
         section = _table(all_conditions, name, f"[conditions.{name}]")
-        conditions[name] = {f: section.string(f) for f in section.data if f != TREATMENT_KEY}
+        conditions[name] = {f: section.string(f) for f in section.data if f not in (TREATMENT_KEY, TASKS_KEY)}
         treatment[name] = section.strings(TREATMENT_KEY)
-    return FactorSchema(declared, order, conditions, treatment=treatment, file=path)
+        if TASKS_KEY in section.data:
+            tasks[name] = section.strings(TASKS_KEY)
+    return FactorSchema(declared, order, conditions, treatment=treatment, tasks=tasks, file=path)

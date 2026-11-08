@@ -60,6 +60,12 @@ def treatment_schema(kinds=("endpoint",), condition: str = "api-none") -> Factor
     return FactorSchema(base.declared, base.order, base.conditions, treatment={condition: kinds})
 
 
+def chain_schema(tasks=("task-a", "task-b"), condition: str = "download-write") -> FactorSchema:
+    """Return the standard schema in which one condition runs on a subset of the plan's tasks (a chain design)."""
+    base = make_schema()
+    return FactorSchema(base.declared, base.order, base.conditions, tasks={condition: tasks})
+
+
 def keys_under(schema: FactorSchema, manifest: Manifest, condition: str) -> list[str]:
     """Return the run keys of a condition, in manifest order."""
     return [row.key.text for row in manifest.rows if schema.condition_of(row.key) == condition]
