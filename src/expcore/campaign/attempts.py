@@ -21,6 +21,9 @@ STATES = ("running", "done", "infra_fail", "outage_discarded", "interrupted", "h
 RUN_STATUSES = ("pending", "done", "infra_exhausted", "harness_error")
 # An infrastructure failure the key caused, not the attempt's run: it holds the model but costs the run no attempt.
 UNCHARGED_KINDS = frozenset({"key_rejected"})
+# How the lease an attempt ran under was obtained. A refused lease (every key quarantined, a timeout) starts no attempt
+# and so has no row: it is in the lease wait log and the event log. `none`: the run's condition needs no lease.
+LEASE_OUTCOMES = ("granted", "none")
 
 
 class AttemptRefused(RuntimeError):
@@ -55,10 +58,12 @@ class SchemaMismatch(ResumeRefused):
 
 @dataclass(frozen=True)
 class BegunAttempt:
-    """A started attempt: the store's id for it, and its number among the run's charged attempts (1 for the first)."""
+    """A started attempt: the store's id for it, its number among the run's charged attempts (1 for the first), and its
+    place in the campaign's dispatch sequence."""
 
     id: int
     number: int
+    dispatch_seq: int = 0
 
 
 class Classified(NamedTuple):

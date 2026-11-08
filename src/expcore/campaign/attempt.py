@@ -172,13 +172,21 @@ class AttemptRunner:
             f"{hold.reason}",
         )
 
-    def _begin(self, row: Any) -> tuple[Any, Path]:
-        """Insert the 'running' row, with a directory of its own for this try."""
+    def _begin(self, row: Any, lease: Lease | None = None) -> tuple[Any, Path]:
+        """Insert the 'running' row, with a directory of its own for this try, and the lease it runs under."""
         p = self.p
         tries = len(p.store.q("SELECT 1 FROM attempts WHERE run_key=?", (row["run_key"],))) + 1
         run_dir = p.root / "runs" / row["digest"] / f"try{tries}"
         run_dir.mkdir(parents=True, exist_ok=True)
-        return p.store.begin_attempt(row["run_key"], p.stamp(), os.getpid(), str(run_dir)), run_dir
+        begun = p.store.begin_attempt(
+            row["run_key"],
+            p.stamp(),
+            os.getpid(),
+            str(run_dir),
+            lease_wait_s=None if lease is None else lease.wait_s,
+            lease_outcome="none" if lease is None else "granted",
+        )
+        return begun, run_dir
 
     def _charge_outage(self, row: Any, factors: Mapping[str, Any], detail: str) -> float:
         """The run found an outage with its pre-run check: it is the outage's one attempt, and nothing was run."""
@@ -204,7 +212,7 @@ class AttemptRunner:
             base_url=endpoint.base_url,
             time_left=timer.time_left,
         )
-        begun, run_dir = self._begin(row)
+        begun, run_dir = self._begin(row, lease)
         request = RunRequest(
             RunIdentity(key, factors, begun.number), run_dir, endpoint, backend, timer, p.monotonic, kinds, lease
         )

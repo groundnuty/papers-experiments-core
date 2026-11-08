@@ -22,6 +22,9 @@ fault was measured or re-run away. Field names are generic: a run is named by it
 factor values. The file is written to a temporary file in its directory and moved into place, so a reader sees the old
 file or the new one; it is owner-only (0600), because an export can carry study data.
 
+Each analysed attempt also says when and how it began (`dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`), so
+an analysis can check the balance of the conditions over time: holds and unit caps can push one condition's runs late.
+
 Empty lists are valid and must be written out: `read_export` rejects a file with a missing key.
 """
 
@@ -97,6 +100,7 @@ def export_run_state(store: Store) -> dict[str, Any]:
                     "run_dir": done[0]["run_dir"],
                     "treatment": bool(done[0]["treatment"]),
                     "infra_kind": done[0]["infra_kind"],
+                    **_dispatch(done[0]),
                 }
             )
         else:
@@ -112,6 +116,23 @@ def export_run_state(store: Store) -> dict[str, Any]:
         "retries_by_kind": _retries_by_kind(identities, attempts),
         "infrastructure_by_condition": _infrastructure_by_condition(identities, attempts, store.schema.treatment_kinds),
         "kinds": list(infra_kinds()),
+    }
+
+
+def _dispatch(attempt: Any) -> dict[str, Any]:
+    """Return when and how the attempt began, for the analysis to check that the conditions ran side by side in time.
+
+    `dispatch_seq` is its place in the campaign's dispatch sequence (it grows with every attempt, and carries on across
+    a restart), `started_at` the time it began (whole seconds, UTC), `lease_wait_s` the seconds it waited for its lease
+    and `lease_outcome` how the lease was obtained: `granted`, or `none` for a run that needs no lease. A refused lease
+    starts no attempt, so it has no row here; it is in the lease wait log and the event log. A value a database from
+    before the column did not keep is `None`: unknown, never zero.
+    """
+    return {
+        "dispatch_seq": attempt["dispatch_seq"],
+        "started_at": attempt["started_utc"],
+        "lease_wait_s": attempt["lease_wait_s"],
+        "lease_outcome": attempt["lease_outcome"],
     }
 
 
