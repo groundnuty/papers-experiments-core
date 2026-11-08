@@ -1,36 +1,61 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/harness/config.py, blob 4bf53fb3c2a01cb49ec4b77c7e3651c35128fb76
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""Harness configuration: frozen parameters, the model table, scheduler settings.
+#   changes: see git history of this file from its import commit
+"""The model table: every model a study may use, named once, with the settings its requests carry.
 
-Values live in `config/harness.toml` and `config/models.toml` (placeholders until the science
-agent's `protocol/` lands). Nothing is hard-coded here; `STUDY_VAR_56` points the
-loader at another directory.
+`models.toml` holds one `[models.<key>]` table per model. The key names the model everywhere else in
+configuration (caps and concurrency refer to keys, never to API ids); an API id or a name the server reports
+resolves to the same entry. Nothing is read lazily: `load_models` validates every entry, refuses a name that two
+entries share (P06), refuses settings that cannot work together (B16), and names the file and the key of every
+problem. The model's status gates study runs: only `frozen` settings may start one (B08).
 
-Derived from groundnuty/dataset-88 @ BASE_COMMIT (harness/panel.py,
-runner.py, schema.py); see docs/harness.md.
+Secrets never appear here. An entry points at an environment variable (`key_env`) or a file (`key_file`), and the
+key is read when a request is built, not when the table is loaded.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import os
-import tomllib
+import re
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-BASE_REPO = "user-10/repo-10"
-BASE_COMMIT = "06223f16181d53681b17e274aa2ccaec04ffbf06"
+from expcore.config.loading import ConfigError, Section, load_toml
 
-DEFAULT_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
+BACKENDS = ("openai_compat", "anthropic", "stub")
+STATUSES = ("frozen", "draft")
+CACHE_TTLS = ("5m", "1h")
+
+_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Request fields each adapter sets itself; a model entry that names one would be overridden or would override it.
+_OWNED_FIELDS = {
+    "openai_compat": frozenset(
+        {"model", "messages", "tools", "tool_choice", "max_tokens", "stream", "stream_options", "seed"}
+    ),
+    "anthropic": frozenset({"model", "system", "messages", "tools", "max_tokens", "stream", "cache_control"}),
+    "stub": frozenset(),
+}
+_ANTHROPIC_SAMPLING = frozenset({"temperature", "top_p", "top_k"})
+_MESSAGE_FIELDS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "_reasoning"})
 
 
-class ConfigError(RuntimeError):
-    pass
+class RuleViolation(ConfigError):
+    """A model entry whose settings cannot work together; `problems` lists each broken rule."""
+
+    def __init__(self, key: str, problems: list[str]):
+        super().__init__(f"model {key!r}: " + "; ".join(problems))
+        self.problems = problems
 
 
 @dataclasses.dataclass(frozen=True)
 class Limits:
+    """The study's per-run caps that the backends need: the time cap and the output-token limit."""
+
     max_tool_rounds: int
     time_cap_s: float
     token_budget: int
@@ -38,218 +63,286 @@ class Limits:
     max_output_tokens: int
 
 
-GiB = 1024**3
-
-
-@dataclasses.dataclass(frozen=True)
-class SandboxLimits:
-    """The agent sandbox's resource limits, identical in every option, by rule (science ruling on #9, 1 Nov).
-    The container's memory limit is the agent's allowance plus the tracer's measured headroom; the two parts are stated apart."""
-
-    agent_memory_gib: float
-    tracer_headroom_gib: (
-        float | None
-    )  # a measurement (#9, at real size); None = not yet measured: the real factory refuses
-    cpus: float
-    pids: int
-    nofile: int = 1048576
-
-    @property
-    def agent_memory_bytes(self) -> int:
-        return int(self.agent_memory_gib * GiB)
-
-    @property
-    def tracer_headroom_bytes(self) -> int | None:
-        return None if self.tracer_headroom_gib is None else int(self.tracer_headroom_gib * GiB)
-
-
 @dataclasses.dataclass(frozen=True)
 class ClientSettings:
-    endpoints_file: str
-    request_timeout_s: float
-    connect_retries: int
-    retry_base_s: float
-    retry_max_s: float
+    """How a backend talks to its endpoint: timeouts, and the retry policy for transient errors."""
+
+    request_timeout_s: float = 600.0
+    connect_timeout_s: float = 10.0
+    max_retries: int = 8
+    retry_base_s: float = 5.0
+    retry_max_s: float = 120.0
+    retry_jitter: float = 0.25
+
+    def __post_init__(self) -> None:
+        """Refuse settings that cannot work: non-positive times, negative retries, jitter outside 0..1."""
+        problems = []
+        if self.request_timeout_s < 0 or self.connect_timeout_s <= 0:
+            problems.append("timeouts must be positive (a request timeout of 0 means the run's time cap)")
+        if self.max_retries < 0:
+            problems.append("max_retries must not be negative")
+        if self.retry_base_s <= 0 or self.retry_max_s < self.retry_base_s:
+            problems.append("retry_base_s must be positive and no larger than retry_max_s")
+        if not 0 <= self.retry_jitter <= 1:
+            problems.append("retry_jitter must be between 0 and 1")
+        if problems:
+            raise ConfigError("client settings: " + "; ".join(problems))
 
 
 @dataclasses.dataclass(frozen=True)
 class ModelSpec:
-    key: str  # config key, also the slot model name in endpoints.json
-    reported_name: str
-    api_id: str
-    checkpoint: str  # the real checkpoint behind the API id
-    version_note: str
-    kind: str  # "openai_compat" | "anthropic"
-    provider_id: str
-    status: str  # "frozen" once the vendor settings are collected
-    slot_prefix: str | None = None
-    sampling: dict[str, Any] = dataclasses.field(default_factory=dict)
-    request_extra: dict[str, Any] = dataclasses.field(default_factory=dict)
-    echo_reasoning_field: str | None = None  # openai_compat: assistant-message field to send back
-    sources: list[str] = dataclasses.field(default_factory=list)
-    notes: str = ""
+    """One model: how to reach it, what to send it, and whether its settings are frozen for study runs."""
 
-    version_notes: dict[str, str] = dataclasses.field(default_factory=dict)  # per backend: hpc | provider_i | anthropic
-    max_output_tokens: int | None = None  # the model's own maximum per call, when lower than limits.max_output_tokens
+    key: str
+    backend: str  # one of BACKENDS
+    api_id: str  # the id sent to the endpoint
+    status: str  # "frozen" once the vendor settings are collected, else "draft"
+    base_url: str | None = None
+    aliases: tuple[str, ...] = ()  # other names the server reports for this model
+    key_env: str | None = None  # name of the environment variable holding the key
+    key_file: str | None = None  # or a file holding it
+    sampling: dict[str, Any] = dataclasses.field(default_factory=dict)
+    max_output_tokens: int | None = None  # the model's own maximum per call, when lower than the study's limit
+    context_tokens: int | None = None  # the endpoint's context window, when known; checked at admission (B11)
+    echo_reasoning_field: str | None = None  # openai_compat: assistant-message field the reasoning is sent back in
+    extra_body: dict[str, Any] = dataclasses.field(default_factory=dict)  # vendor extras sent verbatim (B14)
+    prompt_cache_ttl: str | None = None  # anthropic: cache lifetime ("5m" or "1h"); None sends no cache marker
+
+    def __post_init__(self) -> None:
+        """Refuse an entry whose settings break a rule, before any request can be built from it."""
+        problems = _rule_problems(self)
+        if problems:
+            raise RuleViolation(self.key, problems)
 
     def output_tokens(self, limit: int) -> int:
-        """The max_tokens sent: the study's value, or the model's own maximum if that is lower."""
+        """Return the max_tokens to send: the study's value, or the model's own maximum if that is lower (B11)."""
         return limit if self.max_output_tokens is None else min(limit, self.max_output_tokens)
-
-    def version_for(self, backend: str) -> str:
-        return self.version_notes.get(backend, "")
-
-    @property
-    def endpoint_name(self) -> str:
-        """The model name used in endpoints.json (its `model` field): the single mapping for slots."""
-        return self.slot_prefix or self.key
 
     @property
     def seed_supported(self) -> bool:
-        return self.kind == "openai_compat"
+        """Tell whether the backend takes a sampling seed."""
+        return self.backend == "openai_compat"
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """Return every name that resolves to this entry: its key, its API id and its aliases."""
+        return tuple(dict.fromkeys((self.key, self.api_id, *self.aliases)))
+
+    def read_key(self, env: Mapping[str, str] | None = None) -> str | None:
+        """Read the key from its environment variable or file now; None when the entry names neither.
+
+        The message of a failure names the variable or file, never a value.
+        """
+        if self.key_env:
+            value = (os.environ if env is None else env).get(self.key_env, "").strip()
+            if not value:
+                raise ConfigError(f"model {self.key!r}: environment variable {self.key_env} is not set or is empty")
+            return value
+        if self.key_file:
+            path = Path(os.path.expanduser(self.key_file))
+            try:
+                value = path.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError):
+                raise ConfigError(f"model {self.key!r}: key file {self.key_file!r} cannot be read") from None
+            if not value:
+                raise ConfigError(f"model {self.key!r}: key file {self.key_file!r} is empty")
+            return value
+        return None
+
+
+def _rule_problems(spec: ModelSpec) -> list[str]:
+    """List every rule the entry breaks: its shape, its secrets, and the combinations that cannot work (B16)."""
+    problems: list[str] = []
+    if not _KEY_RE.fullmatch(spec.key):
+        problems.append("key must be letters, digits, dot, dash and underscore, starting with a letter or digit")
+    if spec.backend not in BACKENDS:
+        return [*problems, f"backend must be one of {', '.join(BACKENDS)}, got {spec.backend!r}"]
+    if spec.status not in STATUSES:
+        problems.append(f"status must be one of {', '.join(STATUSES)}, got {spec.status!r}")
+    if not spec.api_id.strip():
+        problems.append("api_id must not be empty")
+    problems += _endpoint_problems(spec)
+    problems += _limit_problems(spec)
+    problems += _request_problems(spec)
+    return problems
+
+
+def _endpoint_problems(spec: ModelSpec) -> list[str]:
+    """Rules for the base URL and the place the key is read from."""
+    problems = []
+    if spec.backend == "stub":
+        if spec.base_url or spec.key_env or spec.key_file:
+            problems.append("a stub model takes no base_url, key_env or key_file")
+        return problems
+    parts = urlsplit(spec.base_url or "")
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        problems.append("base_url must be an http or https URL")
+    elif parts.username or parts.password:
+        problems.append("base_url must not carry credentials; the key goes in key_env or key_file")
+    if spec.key_env and spec.key_file:
+        problems.append("give key_env or key_file, not both")
+    if spec.backend == "anthropic" and not (spec.key_env or spec.key_file):
+        problems.append("an anthropic model needs key_env or key_file")
+    if spec.key_env and not _IDENT_RE.fullmatch(spec.key_env):
+        problems.append("key_env must be the name of an environment variable, never a key")
+    return problems
+
+
+def _limit_problems(spec: ModelSpec) -> list[str]:
+    """Rules for the output and context limits."""
+    problems = []
+    for name in ("max_output_tokens", "context_tokens"):
+        value = getattr(spec, name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            problems.append(f"{name} must be a positive integer")
+    limits_ok = not problems
+    if limits_ok and spec.max_output_tokens and spec.context_tokens and spec.max_output_tokens >= spec.context_tokens:
+        problems.append("max_output_tokens must be smaller than the context window (context_tokens)")
+    return problems
+
+
+def _request_problems(spec: ModelSpec) -> list[str]:
+    """Rules for what the request carries: sampling, vendor extras, the reasoning echo and the cache."""
+    problems = []
+    owned = _OWNED_FIELDS[spec.backend]
+    for where, table in (("sampling", spec.sampling), ("extra_body", spec.extra_body)):
+        problems += [f"{where} sets '{name}', which the adapter sets itself" for name in sorted(owned & table.keys())]
+    if (spec.sampling.keys() | spec.extra_body.keys()) & {"stream"}:
+        problems.append("streaming is not supported")
+    clash = sorted(spec.sampling.keys() & spec.extra_body.keys())
+    if clash:
+        problems.append(f"{', '.join(clash)} appear in both sampling and extra_body, so one would silently win")
+    if spec.backend == "anthropic":
+        bad = sorted(spec.sampling.keys() - _ANTHROPIC_SAMPLING - owned)
+        if bad:
+            problems.append(f"sampling keys {', '.join(bad)} are not accepted by the Messages API")
+    if spec.backend == "stub" and (spec.sampling or spec.extra_body):
+        problems.append("a stub model takes no sampling or extra_body")
+    field = spec.echo_reasoning_field
+    if field is not None:
+        if spec.backend != "openai_compat":
+            problems.append("echo_reasoning_field applies to openai_compat models only")
+        elif field in _MESSAGE_FIELDS:
+            problems.append(f"echo_reasoning_field {field!r} would overwrite a standard message field")
+        elif not _IDENT_RE.fullmatch(field):
+            problems.append("echo_reasoning_field must be a plain field name")
+    if spec.prompt_cache_ttl is not None:
+        if spec.backend != "anthropic":
+            problems.append("prompt_cache_ttl applies to anthropic models only")
+        elif spec.prompt_cache_ttl not in CACHE_TTLS:
+            problems.append(f"prompt_cache_ttl must be one of {', '.join(CACHE_TTLS)}")
+    return problems
 
 
 @dataclasses.dataclass(frozen=True)
-class HarnessConfig:
-    status: str
-    limits: Limits
-    sandbox_limits: SandboxLimits
-    seeds: tuple[int, ...]
-    site_id: str
-    provider_concurrency: dict[str, int]
-    client: ClientSettings
-    anthropic_key_file: str
-    knowledge: dict[str, Any]
-    models: dict[str, ModelSpec]
-    provider_i: dict[str, Any] = dataclasses.field(
-        default_factory=dict
-    )  # [provider_i]: base_url, key_file, concurrency
-    prompt_slots: dict[str, str] = dataclasses.field(default_factory=dict)
-    prompt_slots_by_layout: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
+class ModelTable:
+    """The single model table. Every name a configuration uses resolves to exactly one entry (P06)."""
 
-    def slots_for(self, layout) -> dict[str, str]:
-        """Prompt slot values for a layout; identical across options by construction."""
-        return {**self.prompt_slots, **self.prompt_slots_by_layout.get(getattr(layout, "value", layout), {})}
+    models: Mapping[str, ModelSpec]
+    source: str = "<memory>"
 
-    def concurrency_unit(self, spec: ModelSpec) -> str:
-        """The key of the cap this model's runs count against: `anthropic:<api id>` for a Claude model with its own entry
-        in provider_concurrency, else its provider. The one source of the caps is `[scheduler.provider_concurrency]`."""
-        own = f"{spec.provider_id}:{spec.api_id}"
-        return own if own in self.provider_concurrency else spec.provider_id
+    def __post_init__(self) -> None:
+        """Refuse a table in which two entries answer to the same name, ignoring case."""
+        seen: dict[str, str] = {}
+        for key, spec in self.models.items():
+            for name in spec.names:
+                other = seen.setdefault(name.lower(), key)
+                if other != key:
+                    raise ConfigError(
+                        f"{self.source}: models {other!r} and {key!r} both answer to {name!r}; each model is named once"
+                    )
 
-    def model(self, key_or_name: str) -> ModelSpec:
-        if key_or_name in self.models:
-            return self.models[key_or_name]
-        for m in self.models.values():
-            if key_or_name in (m.reported_name, m.api_id):
-                return m
-        low = key_or_name.lower()  # the campaign's reporting names ("model-1") differ in case from reported_name
-        for m in self.models.values():
-            if low in (m.key.lower(), m.reported_name.lower(), m.api_id.lower()):
-                return m
-        raise ConfigError(f"unknown model {key_or_name!r}")
+    def __iter__(self) -> Iterator[str]:
+        """Iterate over the keys in file order."""
+        return iter(self.models)
 
+    def __len__(self) -> int:
+        """Return the number of models."""
+        return len(self.models)
 
-def _read(path: Path) -> dict:
-    with open(path, "rb") as fh:
-        return tomllib.load(fh)
+    def resolve(self, name: str) -> ModelSpec:
+        """Return the entry a key, an API id or an alias names; raise ConfigError when none or several do."""
+        if name in self.models:
+            return self.models[name]
+        low = name.lower()
+        found = [spec for spec in self.models.values() if low in (n.lower() for n in spec.names)]
+        if len(found) == 1:
+            return found[0]
+        known = ", ".join(self.models)
+        raise ConfigError(f"{self.source}: unknown model {name!r}; the table holds: {known}")
 
+    def require_frozen(self, names: Iterable[str]) -> None:
+        """Refuse a study run unless every named model is frozen (B08)."""
+        for name in names:
+            assert_frozen(self.resolve(name))
 
-def _sandbox_limits(h: dict) -> SandboxLimits:
-    t = h.get("sandbox_limits")
-    if not t:
-        raise ConfigError(
-            "config/harness.toml has no [sandbox_limits]: the agent's memory allowance, the tracer headroom, cpus and pids are required"
-        )
-    for k in ("agent_memory_gib", "cpus", "pids"):
-        if k not in t:
-            raise ConfigError(f"[sandbox_limits] needs {k}")
-    return SandboxLimits(
-        float(t["agent_memory_gib"]),
-        None if t.get("tracer_headroom_gib") is None else float(t["tracer_headroom_gib"]),
-        float(t["cpus"]),
-        int(t["pids"]),
-        int(t.get("nofile", 1048576)),
-    )
+    def require_keys(self, names: Iterable[str], env: Mapping[str, str] | None = None) -> None:
+        """Check at startup that the key of every named model can be read; the values are discarded."""
+        for name in names:
+            self.resolve(name).read_key(env)
 
 
-def load_config(config_dir: str | os.PathLike | None = None) -> HarnessConfig:
-    d = Path(config_dir or os.environ.get("STUDY_VAR_56") or DEFAULT_CONFIG_DIR)
-    h = _read(d / "harness.toml")
-    m = _read(d / "models.toml")
-    models: dict[str, ModelSpec] = {}
-    for key, t in m["models"].items():
-        models[key] = ModelSpec(
-            key=key,
-            reported_name=t["reported_name"],
-            api_id=t["api_id"],
-            checkpoint=t["checkpoint"],
-            version_note=t.get("version_note", ""),
-            version_notes=dict(t.get("version_notes", {}))
-            or (
-                {"anthropic": t.get("version_note", "")}
-                if t["kind"] == "anthropic"
-                else {"hpc": t.get("version_note", "")}
-            ),
-            kind=t["kind"],
-            provider_id=t["provider_id"],
-            status=t.get("status", "pending-research"),
-            slot_prefix=t.get("slot_prefix"),
-            sampling=dict(t.get("sampling", {})),
-            request_extra=dict(t.get("request_extra", {})),
-            echo_reasoning_field=t.get("echo_reasoning_field"),
-            sources=list(t.get("sources", [])),
-            notes=t.get("notes", ""),
-            max_output_tokens=t.get("max_output_tokens"),
-        )
-    c = h["client"]
-    return HarnessConfig(
-        status=h["meta"]["status"],
-        limits=Limits(**h["limits"]),
-        sandbox_limits=_sandbox_limits(h),
-        seeds=tuple(h["seeds"]["values"]),
-        site_id=h["scheduler"]["site_id"],
-        provider_concurrency=dict(h["scheduler"]["provider_concurrency"]),
-        client=ClientSettings(
-            endpoints_file=os.path.expanduser(c["endpoints_file"]),
-            request_timeout_s=c["request_timeout_s"],
-            connect_retries=c["connect_retries"],
-            retry_base_s=c["retry_base_s"],
-            retry_max_s=c["retry_max_s"],
-        ),
-        anthropic_key_file=h["anthropic"]["key_file"],
-        knowledge=dict(h.get("knowledge", {})),
-        provider_i=dict(h.get("provider_i", {})),
-        models=models,
-        prompt_slots={k: str(v) for k, v in h.get("prompt_slots", {}).items() if not isinstance(v, dict)},
-        prompt_slots_by_layout={
-            k: {a: str(b) for a, b in v.items()} for k, v in h.get("prompt_slots", {}).items() if isinstance(v, dict)
-        },
-    )
-
-
-def assert_frozen(cfg: HarnessConfig, model: ModelSpec, check_config: bool = True) -> None:
-    """Refuse a live study run on unfrozen settings. The sampling/reasoning settings freeze before the pilot; the caps
-    and the rest of the harness config freeze after it (`check_config=False` checks the model settings only)."""
+def assert_frozen(model: ModelSpec) -> None:
+    """Refuse a study run on unfrozen settings: the sampling and reasoning settings freeze before the pilot (B08)."""
     if model.status != "frozen":
-        raise ConfigError(f"model {model.key}: sampling/reasoning settings are {model.status!r}, not 'frozen'")
-    if check_config and cfg.status != "frozen":
-        raise ConfigError(f"harness config status is {cfg.status!r}, not 'frozen'")
+        raise ConfigError(f"model {model.key}: settings are {model.status!r}, not 'frozen'; a study run needs 'frozen'")
 
 
-TOKEN_MARGIN_S = 3600  # sandbox start-up, collection and teardown after the time cap
+_ENTRY_KEYS = (
+    "backend",
+    "api_id",
+    "status",
+    "base_url",
+    "aliases",
+    "key_env",
+    "key_file",
+    "sampling",
+    "max_output_tokens",
+    "context_tokens",
+    "echo_reasoning_field",
+    "extra_body",
+    "prompt_cache_ttl",
+)
 
 
-def required_token_ttl_s(time_cap_s: float, margin_s: float = TOKEN_MARGIN_S) -> int:
-    """The one place a per-run credential's lifetime is derived: the run's time cap ({TIME_CAP_MIN}) plus a margin.
-    Every token a run uses (sandbox REST token, oneclient token for M and M+, knowledge-plane token) must live at least this long."""
-    return int(time_cap_s + margin_s)
+def _entry(section: Section, key: str) -> ModelSpec:
+    """Build one ModelSpec from its table; every failure names the file and the key."""
+    section.reject_unknown(_ENTRY_KEYS)
+    backend = section.string("backend")
+    spec_args: dict[str, Any] = {
+        "key": key,
+        "backend": backend,
+        "api_id": section.optional_string("api_id") or (key if backend == "stub" else None),
+        "status": section.optional_string("status") or "draft",
+        "base_url": section.optional_string("base_url"),
+        "aliases": section.strings("aliases"),
+        "key_env": section.optional_string("key_env"),
+        "key_file": section.optional_string("key_file"),
+        "sampling": section.table("sampling"),
+        "max_output_tokens": section.optional_integer("max_output_tokens"),
+        "context_tokens": section.optional_integer("context_tokens"),
+        "echo_reasoning_field": section.optional_string("echo_reasoning_field"),
+        "extra_body": section.table("extra_body"),
+        "prompt_cache_ttl": section.optional_string("prompt_cache_ttl"),
+    }
+    if spec_args["api_id"] is None:
+        raise section.fail("api_id", "is required")
+    try:
+        return ModelSpec(**spec_args)
+    except RuleViolation as error:
+        raise ConfigError(f"{section.file}: {section.where}: " + "; ".join(error.problems)) from None
 
 
-def check_token_ttl(ttl_s: float, time_cap_s: float, what: str = "token") -> None:
-    """Refuse a token that could expire before the run's time cap plus the margin."""
-    need = required_token_ttl_s(time_cap_s)
-    if ttl_s < need:
-        raise ConfigError(
-            f"{what} lifetime {int(ttl_s)} s is below the run's time cap plus margin ({need} s): it could expire mid-run"
-        )
+def load_models(path: str | os.PathLike[str]) -> ModelTable:
+    """Load and validate `models.toml`; fail at once, naming the file and the key, on the first bad entry."""
+    data = load_toml(path)
+    root = Section(data, path, "(file)")
+    root.reject_unknown(["models"])
+    table = root.table("models")
+    if not table:
+        raise root.fail("models", "is required and must hold at least one model")
+    models = Section(table, path, "[models]")
+    specs: dict[str, ModelSpec] = {}
+    for key in models.data:
+        specs[key] = _entry(models.section(key), key)
+    return ModelTable(specs, source=str(path))
