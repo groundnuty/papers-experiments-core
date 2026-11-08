@@ -23,6 +23,7 @@ changed settings cannot pass for one computed from the file.
     target_clusters = 25
     target_difference = 0.1
     sd_grid = [0.1, 0.2]
+    target_power = 0.8         # optional, default 0.8: the power a minimum detectable effect must reach
 
     [estimators.wilcoxon_cluster_bootstrap]   # optional parameters of a registered estimator
     method = "auto"
@@ -32,6 +33,7 @@ changed settings cannot pass for one computed from the file.
     outcome = "score"
     estimator = "wilcoxon_cluster_bootstrap"
     cluster = "group"          # the task attribute that is the unit of inference
+    equivalence_margin = 0.05  # optional: only with a margin can the result be called "equivalent"
 
     [contrasts.gate-effect]    # factor form: a declared factor of the schema and two of its levels
     factor = "gate"
@@ -60,8 +62,9 @@ from expcore.stats.power import PowerSettings
 
 OVERRIDE_MARK = "+override"
 DEFAULT_CI_LEVEL = 0.95
+DEFAULT_TARGET_POWER = 0.8
 _TOP_KEYS = ("alpha", "holm_family", "bootstrap", "power", "estimators", "contrasts")
-_CONTRAST_KEYS = ("conditions", "factor", "levels", "outcome", "estimator", "cluster")
+_CONTRAST_KEYS = ("conditions", "factor", "levels", "outcome", "estimator", "cluster", "equivalence_margin")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,13 +114,17 @@ class Preregistration:
         The seed is the bootstrap seed and a digest of the contrast's name, so a contrast draws the same resamples
         whichever contrasts run before it, or whether they run at all.
         """
-        digest = int.from_bytes(hashlib.sha256(spec.name.encode("utf-8")).digest()[:8], "big")
         return EstimatorSettings(
             replicates=self.bootstrap.replicates,
             level=self.bootstrap.ci_level,
-            seed=(self.bootstrap.seed, digest),
+            seed=(self.bootstrap.seed, name_digest(spec.name)),
             params=dict(self.estimator_params.get(spec.estimator, {})),
         )
+
+
+def name_digest(name: str) -> int:
+    """A number derived from a contrast's name, to seed its draws apart from every other contrast's."""
+    return int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big")
 
 
 def load(path: str | Path, schema: FactorSchema) -> Preregistration:
@@ -144,7 +151,9 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
     root.reject_unknown(_TOP_KEYS)
     alpha = _fraction(root, "alpha")
     bootstrap = _bootstrap(_table_section(root, "bootstrap"))
-    contrasts = {name: _contrast(source, name, table, schema) for name, table in _tables(root, "contrasts").items()}
+    contrasts = {
+        name: _contrast(source, name, table, schema, alpha) for name, table in _tables(root, "contrasts").items()
+    }
     if not contrasts:
         raise root.fail("contrasts", "must declare at least one contrast")
     family = _family(root, contrasts)
@@ -214,8 +223,8 @@ def _bootstrap(section: Section) -> BootstrapSettings:
 
 
 def _power(section: Section) -> PowerSettings:
-    """Read [power]: the seed, the simulation count, the target number of clusters and difference, the SD grid."""
-    section.reject_unknown(("seed", "n_simulations", "target_clusters", "target_difference", "sd_grid"))
+    """Read [power]: the seed, the simulation count, the target clusters and difference, the SD grid, the target power."""
+    section.reject_unknown(("seed", "n_simulations", "target_clusters", "target_difference", "sd_grid", "target_power"))
     difference = _number(section, "target_difference")
     if difference <= 0:
         raise section.fail("target_difference", f"must be positive, got {difference}")
@@ -231,6 +240,7 @@ def _power(section: Section) -> PowerSettings:
         target_clusters=_integer(section, "target_clusters", 2),
         target_difference=difference,
         sd_grid=sds,
+        target_power=_fraction(section, "target_power", DEFAULT_TARGET_POWER),
     )
 
 
@@ -254,7 +264,21 @@ def _arms(section: Section, key: str) -> tuple[str, str]:
     return arms[0], arms[1]
 
 
-def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema) -> ContrastSpec:
+def _margin(section: Section, alpha: float) -> float | None:
+    """Read the optional equivalence margin: positive, and only where 1 - 2 alpha is a level."""
+    if "equivalence_margin" not in section.data:
+        return None
+    margin = _number(section, "equivalence_margin")
+    if margin <= 0:
+        raise section.fail("equivalence_margin", f"must be positive, got {margin}")
+    if alpha >= 0.5:
+        raise section.fail(
+            "equivalence_margin", f"needs alpha below 0.5, since its interval is at 1 - 2 alpha; alpha is {alpha}"
+        )
+    return margin
+
+
+def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, alpha: float) -> ContrastSpec:
     """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
     section.reject_unknown(_CONTRAST_KEYS)
@@ -263,20 +287,21 @@ def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSc
         estimators.get(estimator)
     except UnknownEstimator as error:
         raise section.fail("estimator", str(error)) from None
+    margin = _margin(section, alpha)
     if "conditions" in table:
         for extra in ("factor", "levels"):
             if extra in table:
                 raise section.fail(extra, "belongs to the factor form; this contrast names conditions")
         conditions = _arms(section, "conditions")
         _check_conditions(section, conditions, schema)
-        return ContrastSpec(name, outcome, estimator, cluster, conditions=conditions)
+        return ContrastSpec(name, outcome, estimator, cluster, conditions=conditions, equivalence_margin=margin)
     if "factor" not in table:
         raise section.fail("conditions", "is required unless the contrast gives a factor with its levels")
     if "levels" not in table:
         raise section.fail("levels", "is required with a factor")
     factor, levels = section.string("factor"), _arms(section, "levels")
     _check_factor(section, factor, levels, schema)
-    return ContrastSpec(name, outcome, estimator, cluster, factor=factor, levels=levels)
+    return ContrastSpec(name, outcome, estimator, cluster, factor=factor, levels=levels, equivalence_margin=margin)
 
 
 def _check_conditions(section: Section, conditions: tuple[str, str], schema: FactorSchema) -> None:

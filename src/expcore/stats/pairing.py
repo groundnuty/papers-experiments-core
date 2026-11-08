@@ -32,6 +32,8 @@ class ContrastSpec:
     """One preregistered contrast: what is compared, on which outcome, with which estimator, clustered by what.
 
     Named-condition form: `conditions = (A, B)`. Factor form: `factor` and `levels = (A, B)`. The contrast is A - B.
+    `equivalence_margin`, in the outcome's units, is declared only for a contrast whose preregistration allows the
+    conclusion that the two arms are equivalent.
     """
 
     name: str
@@ -41,9 +43,14 @@ class ContrastSpec:
     conditions: tuple[str, str] | None = None
     factor: str | None = None
     levels: tuple[str, str] | None = None
+    equivalence_margin: float | None = None
 
     def __post_init__(self) -> None:
-        """Require exactly one form, with two different arms."""
+        """Require exactly one form, with two different arms, and a positive finite margin if one is given."""
+        margin = self.equivalence_margin
+        number = isinstance(margin, int | float) and not isinstance(margin, bool)
+        if margin is not None and not (number and math.isfinite(margin) and margin > 0):
+            raise ValueError(f"contrast {self.name!r}: the equivalence margin must be a positive finite number")
         if self.conditions is not None and (self.factor is not None or self.levels is not None):
             raise ValueError(f"contrast {self.name!r}: give conditions, or a factor with its levels, not both")
         if self.conditions is None and (self.factor is None or self.levels is None):

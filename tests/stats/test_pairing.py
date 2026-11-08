@@ -242,3 +242,19 @@ def test_a_factor_contrast_drops_tasks_the_same_way():
         make_row("task-b", "model-a", 1, 0.8, gate="open"),
     ]
     assert pair_rows(rows, by_factor()).tasks_dropped == ("task-b",)
+
+
+@pytest.mark.parametrize("margin", [0, -0.1, math.inf, math.nan, "wide", True])
+def test_a_spec_refuses_an_equivalence_margin_that_is_not_a_positive_finite_number(margin):
+    """The margin is checked where the contrast is built, whoever builds it."""
+    with pytest.raises(ValueError, match="equivalence margin must be a positive finite number"):
+        ContrastSpec("x", "score", "est", "group", conditions=("a", "b"), equivalence_margin=margin)
+
+
+def test_a_spec_keeps_a_valid_margin_and_defaults_to_none():
+    """No margin unless one is declared."""
+    assert ContrastSpec("x", "score", "est", "group", conditions=("a", "b")).equivalence_margin is None
+    assert (
+        ContrastSpec("x", "score", "est", "group", conditions=("a", "b"), equivalence_margin=0.1).equivalence_margin
+        == 0.1
+    )

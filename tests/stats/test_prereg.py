@@ -308,3 +308,52 @@ def test_the_manifest_names_the_factor_schema_the_contrasts_were_checked_against
     text = text.replace('factor = "gate"\nlevels = ["open", "shut"]', 'factor = "stage"\nlevels = ["one", "two"]')
     prereg = load_checked(write(tmp_path, text), CHAIN)
     assert prereg.manifest()["factor_schema_sha256"] == CHAIN.digest != SCHEMA.digest
+
+
+WITH_MARGIN = edited(
+    'cluster = "group"\n\n[contrasts.gate', 'cluster = "group"\nequivalence_margin = 0.05\n\n[contrasts.gate'
+)
+
+
+def test_a_contrast_may_declare_an_equivalence_margin_and_the_others_have_none(tmp_path):
+    """Only a contrast that declares a margin can be called equivalent."""
+    prereg = load(write(tmp_path, WITH_MARGIN))
+    assert prereg.contrasts["a-vs-b"].equivalence_margin == 0.05
+    assert prereg.contrasts["gate-effect"].equivalence_margin is None
+    assert load(write(tmp_path)).contrasts["a-vs-b"].equivalence_margin is None
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "fragment"),
+    [
+        ("equivalence_margin = 0.05", "equivalence_margin = 0", "must be positive"),
+        ("equivalence_margin = 0.05", "equivalence_margin = -0.1", "must be positive"),
+        ("equivalence_margin = 0.05", 'equivalence_margin = "small"', "must be a finite number"),
+        ("equivalence_margin = 0.05", "equivalence_margin = true", "must be a finite number"),
+        ("equivalence_margin = 0.05", "equivalence_margin = inf", "must be a finite number"),
+    ],
+)
+def test_a_bad_equivalence_margin_is_refused_with_the_file_and_the_key(tmp_path, old, new, fragment):
+    """The margin is a positive finite number in the outcome's units."""
+    path = write(tmp_path, edited(old, new, WITH_MARGIN))
+    with pytest.raises(ConfigError) as caught:
+        load(path)
+    assert str(caught.value).startswith(f"{path}: [contrasts.a-vs-b]: key 'equivalence_margin' ")
+    assert fragment in str(caught.value)
+
+
+def test_a_margin_needs_an_alpha_below_one_half(tmp_path):
+    """The equivalence interval is at 1 - 2 alpha, which is a level only when alpha is below 0.5."""
+    text = edited("alpha = 0.05", "alpha = 0.5", WITH_MARGIN)
+    with pytest.raises(ConfigError, match=r"key 'equivalence_margin' needs alpha below 0\.5"):
+        load(write(tmp_path, text))
+    assert load(write(tmp_path, edited("alpha = 0.05", "alpha = 0.5"))).alpha == 0.5  # no margin, no constraint
+
+
+def test_the_target_power_is_a_setting_with_a_default(tmp_path):
+    """The power a minimum detectable effect must reach: 0.8 unless the file says otherwise."""
+    assert load(write(tmp_path)).power.target_power == 0.8
+    prereg = load(write(tmp_path, edited("sd_grid = [0.1, 0.2]", "sd_grid = [0.1, 0.2]\ntarget_power = 0.9")))
+    assert prereg.power.target_power == 0.9
+    with pytest.raises(ConfigError, match="key 'target_power' must be strictly between 0 and 1"):
+        load(write(tmp_path, edited("sd_grid = [0.1, 0.2]", "sd_grid = [0.1, 0.2]\ntarget_power = 1.0")))
