@@ -15,10 +15,12 @@ it one built on a mock transport.
 Reads and mutations are separate calls:
 - `get` is a GET, and `query` a POST from a short list that only reads (examining a token, inferring its scope);
 - `mutate` is any other method. It takes no name from its caller: the path must lie under `/spaces/{space id}`, the
-  client reads that space's name from Onezone (`space_name`, cached for the client's lifetime) and refuses, before the
-  mutation is sent, unless the name starts with one of the configured prefixes (`[space] prefixes`). A path that does
-  not lie under a space, a file id or a path of a provider among them, resolves to no space and is refused, so a
-  mistaken or hostile target cannot reach a space outside the study's;
+  client reads that space's name from Onezone (`space_name`) right before sending and refuses unless the name starts
+  with one of the configured prefixes (`[space] prefixes`). The name is read afresh for every mutation and never
+  cached, because a space can be renamed out of the study's scope after an earlier read; a cache would go on
+  authorising it. A path that does not lie under a space, a file id or a path of a provider among them, resolves to no
+  space and is refused, so a mistaken or hostile target cannot reach a space outside the study's. What remains is the
+  interval between that read and the platform acting on the request, which a client cannot close;
 - `mint_own_token` is the one operation on credentials: a platform user mints its own temporary token with its own
   password (HTTP Basic), as the earlier code did. It acts on no space, so it has a call of its own; the password is
   registered as a secret when it is read and the minted value before the call returns (R12), and so is the admin token
@@ -162,7 +164,6 @@ class OnezoneClient:
         credential = admin_token if admin_token is not None else config.admin.read(environ)
         register_secret(credential)
         self._admin = {AUTH_HEADER: credential}
-        self._space_names: dict[str, str] = {}  # space id -> name, read from Onezone once per id
 
     def close(self) -> None:
         """Close the connection pool when the client built it."""
@@ -182,9 +183,7 @@ class OnezoneClient:
             return self._config.zone.url + API_ZONE, "zone"
         if provider not in self._config.providers:
             raise OutOfScope("the request names a provider that is not declared")
-        return self._config.providers[
-            provider
-        ].url + API_PROVIDER, f"providers[{list(self._config.providers).index(provider)}]"
+        return self._config.providers[provider].url + API_PROVIDER, self._config.provider_label(provider)
 
     def _send(
         self, method: str, path: str, *, provider: str | None, headers: Mapping[str, str], json: Any = None
@@ -226,32 +225,30 @@ class OnezoneClient:
         return self._send("POST", path, provider=None, headers=headers, json=dict(body))
 
     def space_name(self, space_id: str) -> str:
-        """Return the name Onezone gives a space, read once per id for the client's lifetime.
+        """Read the name Onezone gives a space now; the answer is never kept, so none can authorise a later request.
 
         A space Onezone does not know, or an answer without a name, raises OutOfScope; any other failure of the read
         raises PlatformError. Neither message holds the id or a name.
         """
         if not isinstance(space_id, str) or not _SPACE_ID.fullmatch(space_id):
             raise OutOfScope("the target space id is not a plain id, so it resolves to no space")
-        if space_id not in self._space_names:
-            try:
-                answer = self._send("GET", f"/spaces/{space_id}", provider=None, headers=self._admin)
-            except PlatformError as error:
-                if error.status == 404:
-                    raise OutOfScope("the target space is unknown to Onezone, so it resolves to no space") from None
-                raise
-            name = answer.get("name") if isinstance(answer, dict) else None
-            if not isinstance(name, str) or not name:
-                raise OutOfScope("Onezone's answer for the target space holds no name, so it resolves to no space")
-            self._space_names[space_id] = name
-        return self._space_names[space_id]
+        try:
+            answer = self._send("GET", f"/spaces/{space_id}", provider=None, headers=self._admin)
+        except PlatformError as error:
+            if error.status == 404:
+                raise OutOfScope("the target space is unknown to Onezone, so it resolves to no space") from None
+            raise
+        name = answer.get("name") if isinstance(answer, dict) else None
+        if not isinstance(name, str) or not name:
+            raise OutOfScope("Onezone's answer for the target space holds no name, so it resolves to no space")
+        return name
 
     def mutate(self, method: str, path: str, *, provider: str | None = None, json: Any = None) -> Any:
         """Send a request that can change state; refuse it, before it is sent, unless it acts on a study space.
 
-        The target is the space id in the path, resolved to its name by a read on Onezone; the caller names no space
-        and no name. The mutation is refused unless that name starts with a configured prefix, and when the path lies
-        under no space.
+        The target is the space id in the path, resolved to its name by a read on Onezone made for this mutation alone;
+        the caller names no space and no name, and no earlier answer is reused. The mutation is refused unless that name
+        starts with a configured prefix, and when the path lies under no space.
         """
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")

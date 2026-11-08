@@ -95,19 +95,46 @@ def test_o09_the_study_space_resolves_to_its_declared_name(client, fake):
     assert client.space_name("spmock0001") == SPACE_NAME
 
 
-def test_o09_a_space_id_is_resolved_once_per_client(client, fake):
-    """O09: the name of an id is read once and kept for the client's lifetime, however many mutations follow."""
+def test_o09_a_space_renamed_out_of_scope_after_an_earlier_mutation_is_refused(client, fake):
+    """O09: the name that authorised one mutation authorises nothing later. The space was renamed out of the study's
+    prefixes between two mutations; the second re-reads the name, finds it out of scope and sends nothing."""
+    fake.other_spaces["sp-run-1"] = SPACE_PREFIX + "run-1"
+    with pytest.raises(PlatformError) as first:  # the fake has no such route; reaching it is the point
+        client.mutate("POST", "/spaces/sp-run-1/a")
+    assert not isinstance(first.value, OutOfScope)
+    fake.other_spaces["sp-run-1"] = "renamed-elsewhere"
+    sent_before = len(mutations_sent(fake))
+    with pytest.raises(OutOfScope, match="not one of the configured prefixes"):
+        client.mutate("POST", "/spaces/sp-run-1/b")
+    assert len(mutations_sent(fake)) == sent_before
+    assert "renamed" not in repr(client)
+
+
+def test_o09_every_mutation_reads_the_name_again_right_before_it_is_sent(client, fake):
+    """O09: one read per mutation, each just before its request, whether or not the name changed; a space renamed
+    back into scope is allowed again, and a name read for display is not what authorises a mutation."""
     fake.other_spaces["sp-run-1"] = SPACE_PREFIX + "run-1"
     for path in ("/spaces/sp-run-1/a", "/spaces/sp-run-1/b", "/spaces/sp-run-1"):
         with pytest.raises(PlatformError):
             client.mutate("POST", path)
-    reads = [r for r in fake.requests if r.method == "GET"]
-    assert [r.path for r in reads] == ["/api/v3/onezone/spaces/sp-run-1"]
-    assert len(mutations_sent(fake)) == 3
-    fake.other_spaces["sp-run-1"] = "renamed-elsewhere"  # a rename is not seen by this client
-    with pytest.raises(PlatformError):
+    sequence = [(r.method, r.path.rsplit("/", 1)[-1]) for r in fake.requests]
+    assert sequence == [
+        ("GET", "sp-run-1"),
+        ("POST", "a"),
+        ("GET", "sp-run-1"),
+        ("POST", "b"),
+        ("GET", "sp-run-1"),
+        ("POST", "sp-run-1"),
+    ]
+    assert client.space_name("sp-run-1") == SPACE_PREFIX + "run-1"
+    fake.other_spaces["sp-run-1"] = "elsewhere"
+    assert client.space_name("sp-run-1") == "elsewhere"  # nothing is kept from the earlier read
+    with pytest.raises(OutOfScope):
         client.mutate("POST", "/spaces/sp-run-1/c")
-    assert len([r for r in fake.requests if r.method == "GET"]) == 1
+    fake.other_spaces["sp-run-1"] = SPACE_PREFIX + "run-2"
+    with pytest.raises(PlatformError) as again:
+        client.mutate("POST", "/spaces/sp-run-1/d")
+    assert not isinstance(again.value, OutOfScope)
 
 
 @pytest.mark.parametrize(
