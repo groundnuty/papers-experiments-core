@@ -12,7 +12,9 @@ dependencies = [
     "anthropic>=2.6.0",
     "httpx>=0.28.1",
     "mcp>=2.3.0",
+    "numpy>=2.5.4",
     "openai>=3.46.0",
+    "scipy>=1.18.1",
 ]
 
 [project.optional-dependencies]
@@ -63,3 +65,8 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
 "src/expcore/campaign/manifest.py" = ["E501"]
 "src/expcore/campaign/store.py" = ["E501"]
 "src/expcore/campaign/export.py" = ["E501"]
+"src/expcore/stats/contrasts.py" = ["E501"]
+"src/expcore/stats/prereg.py" = ["E501"]
+"src/expcore/stats/sim.py" = ["E501"]
+"src/expcore/stats/power.py" = ["E501"]
+"src/expcore/coding/kappa.py" = ["E501"]
