@@ -6,7 +6,7 @@ import copy
 import pytest
 from replay_scenarios import SCENARIOS
 
-from expcore.records.record import RunRecord
+from expcore.records.record import RunRecord, decode
 from expcore.replay.clock import ReplayClock
 from expcore.replay.divergence import Halt, ReplayDivergence
 from expcore.replay.replay import replay_record
@@ -120,3 +120,12 @@ def test_r03_a_watch_reading_nobody_takes_stops_the_replay_instead_of_waiting_fo
         asyncio.run(serve())
     assert caught.value.divergence.path == "clock"
     assert "never taken" in caught.value.divergence.message
+
+
+def test_l04_a_wait_that_lasted_no_time_is_recorded_as_zero_seconds_and_replays(tmp_path):
+    """L04: a declared wait of 0.0 seconds is written, read back and replayed like any other."""
+    record = SCENARIOS["zero_wait"][0]()
+    assert record.totals["infra_wait_by_kind"] == {"lease_queue": 0.0}
+    assert record.tool_calls[0]["infra_wait_by_kind"] == {}
+    stored = RunRecord.from_json(decode(record.write(tmp_path).read_bytes()))
+    assert replay_record(stored).totals["infra_wait_by_kind"] == {"lease_queue": 0.0}

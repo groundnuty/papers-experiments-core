@@ -238,7 +238,7 @@ def test_R12_a_secret_that_equals_a_number_the_record_must_hold_refuses_the_writ
     """R12: replacing a count with text would write a record that cannot be read back; it is refused, not written."""
     base = hand_made()
     record = hand_made(totals={**base.totals, "tokens_used": 4096})
-    with pytest.raises(RecordError, match=r"redacting secrets at \['totals.tokens_used'\] leaves a record"):
+    with pytest.raises(RecordError, match=r"redacting secrets at \[.*'totals\.tokens_used'.*\] leaves a record"):
         record.write(tmp_path, environ={"MAX_TOKEN": "4096"})
     assert not list(tmp_path.iterdir())
 

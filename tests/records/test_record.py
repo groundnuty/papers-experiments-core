@@ -23,7 +23,8 @@ def older_record() -> RunRecord:
     """A record of the older version of TABLE: the fields version 2 added are left out, as they were then."""
     base = hand_made(schema_version="expcore-record/1")
     turn = {k: v for k, v in base.transcript[0].items() if k != "request_sha256"}
-    return RunRecord(**{**base.__dict__, "transcript": [turn]})
+    config = {k: v for k, v in base.agent_config.items() if k != "cleanup_deadline_s"}  # a setting version 2 added
+    return RunRecord(**{**base.__dict__, "transcript": [turn], "agent_config": config})
 
 
 def test_the_file_is_named_by_the_digest_of_the_run_key_and_the_attempt():

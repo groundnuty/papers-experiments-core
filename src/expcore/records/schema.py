@@ -15,12 +15,15 @@ Every section is a table of field name to the types the field may hold, in the o
 finite: a count the run did not obtain is `None`, never 0 and never NaN (R10).
 """
 
+import dataclasses
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from expcore.config.models import Limits
+from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
 from expcore.plugin import WAIT_KINDS
@@ -142,6 +145,9 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
     },
 }
 FAILURE_KINDS = ("infra", "context_overflow", "abandoned", "error", "cut")
+# The fields of a retry event (`expcore.models.retry.Retrier`) and of a code identity (`codestamp.version`).
+RETRY_FIELDS = ("retry", "kind", "error", "status", "retry_after_s", "wait_s", "message")
+CODE_FIELDS = ("commit", "dirty", "source", "stale", "why", "tree_sha256")
 
 
 class RecordError(ValueError):
@@ -244,9 +250,24 @@ def _check_list(section: str, items: Any, version: str, where: str, schemas: Seq
         check_section(section, item, version, f"{where}[{i}]", schemas)
 
 
+def _check_keys(where: str, data: Any, allowed: Collection[str], required: Collection[str] | None = None) -> None:
+    """Refuse an object with a key outside `allowed`, or without one of `required` (by default, all of `allowed`)."""
+    if not isinstance(data, dict):
+        raise RecordError(f"{where}: expected an object, got {type(data).__name__}")
+    unknown = sorted(set(data) - set(allowed))
+    if unknown:
+        raise RecordError(f"{where}: unknown field(s) {unknown}")
+    missing = sorted(set(allowed if required is None else required) - set(data))
+    if missing:
+        raise RecordError(f"{where}: missing field(s) {missing}")
+
+
 def _check_waited(waited: Any, where: str) -> None:
-    """Check seconds waited per kind: only kinds of the closed list, each a finite, positive number of seconds."""
-    bad = [k for k, v in waited.items() if k not in WAIT_KINDS or not _fits(v, NUM) or v <= 0]
+    """Check seconds waited per kind: only kinds of the closed list, each a finite number of seconds, not negative.
+
+    A wait that was declared and lasted no time is 0.0 seconds, and valid.
+    """
+    bad = [k for k, v in waited.items() if k not in WAIT_KINDS or not _fits(v, NUM) or v < 0]
     if bad:
         raise RecordError(f"{where}: seconds waited are given per kind of {tuple(WAIT_KINDS)}, not {sorted(bad)}")
 
@@ -260,13 +281,14 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
     if turn["native"].get("role") != "assistant":
         raise RecordError(f"{where}.native: the native message of a turn must have the role 'assistant'")
     for i, retry in enumerate(turn["retries"]):
-        if not isinstance(retry, dict):
-            raise RecordError(f"{where}.retries[{i}]: expected an object")
+        _check_keys(f"{where}.retries[{i}]", retry, RETRY_FIELDS, required=())
 
 
 def _check_outcome(outcome: dict, where: str) -> None:
     """Build the outcome through the loop's own vocabulary check, so a name or kind outside it is refused here too."""
     defect = outcome["defect"]
+    if defect is not None:
+        _check_keys(f"{where}.defect", defect, ("exception", "stack_sha256"))
     try:
         held = None
         if defect is not None:
@@ -274,6 +296,26 @@ def _check_outcome(outcome: dict, where: str) -> None:
         Outcome(outcome["name"], outcome["detail"], outcome["infra_kind"], outcome["error_type"], held)
     except (KeyError, TypeError, ValueError) as exc:
         raise RecordError(f"{where}: {type(exc).__name__}: {exc}") from None
+
+
+def _check_configuration(config: Any, version: str, schemas: Sequence[SchemaVersion]) -> None:
+    """Check the agent configuration against the loop's own fields, less the settings a later version added."""
+    later = set(config_defaults(version, schemas))
+    allowed = {f.name for f in dataclasses.fields(AgentConfig)} | {"terminal_tools"}
+    _check_keys("agent_config", config, allowed - later)
+    _check_keys("agent_config.limits", config["limits"], {f.name for f in dataclasses.fields(Limits)})
+    tools = config["terminal_tools"]
+    if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
+        raise RecordError("agent_config.terminal_tools: a list of tool names")
+
+
+def _check_route(route: Any) -> None:
+    """Check the parts of the route that the record itself adds: the settings sets and the digest of the latest."""
+    sets = route.get("settings")
+    if not isinstance(sets, dict) or any(not isinstance(v, dict) for v in sets.values()):
+        raise RecordError("route.settings: the settings of each request, an object per digest")
+    if not isinstance(route.get("settings_sent_sha256"), str):
+        raise RecordError("route.settings_sent_sha256: the digest of the settings of the latest request")
 
 
 def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
@@ -316,6 +358,11 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
     _check_outcome(body["outcome"], "outcome")
     check_section("totals", body["totals"], version, "totals", schemas)
     _check_waited(body["totals"]["infra_wait_by_kind"], "totals.infra_wait_by_kind")
+    for i, event in enumerate(body["totals"]["malformed_events"]):
+        _check_keys(f"totals.malformed_events[{i}]", event, ("round", "call_id", "name", "error", "raw"))
+    _check_configuration(body["agent_config"], version, schemas)
+    _check_keys("code", body["code"], CODE_FIELDS)
+    _check_route(body["route"])
     if any(not isinstance(p, str) for p in body.get("redacted_paths", ())):
         raise RecordError("redacted_paths: a list of field paths")
     for place in ("instruments", "scores"):

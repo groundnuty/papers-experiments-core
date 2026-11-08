@@ -61,7 +61,7 @@ def hand_made(**overrides: Any) -> RunRecord:
             "tools_sha256": sha("tools"),
         },
         "tools": [],
-        "agent_config": {"limits": {"max_tool_rounds": 3}},
+        "agent_config": {**make_config().as_dict(), "terminal_tools": []},
         "agent_config_sha256": sha("config"),
         "code": dict(CODE),
         "core_version": "0.1.0",

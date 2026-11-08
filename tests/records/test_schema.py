@@ -186,3 +186,78 @@ def test_R02_a_field_a_later_schema_added_is_refused_in_an_older_record():
     older["transcript"][0]["request_sha256"] = "a" * 64
     with pytest.raises(RecordError, match=r"request_sha256 added by a later schema than expcore-record/1"):
         validate(older, TABLE)
+
+
+# --- every structure the core defines refuses a field it does not know (R02) ----------------------------------------
+
+
+def scenario_json(name):
+    from replay_scenarios import SCENARIOS
+
+    return copy.deepcopy(SCENARIOS[name][0]().to_json())
+
+
+def put(data, path, key, value=1):
+    node = data
+    for step in path:
+        node = node[step]
+    node[key] = value
+    return data
+
+
+@pytest.mark.parametrize(
+    ("scenario", "path", "where"),
+    [
+        ("tool_crash", ("outcome", "defect"), "outcome.defect"),
+        ("malformed", ("totals", "malformed_events", 0), r"totals.malformed_events\[0\]"),
+        ("tools", ("agent_config",), "agent_config"),
+        ("tools", ("agent_config", "limits"), r"agent_config.limits"),
+        ("tools", ("code",), "code"),
+        ("cached_turn", ("transcript", 0, "retries", 0), r"transcript\[0\].retries\[0\]"),
+    ],
+)
+def test_R02_an_unknown_field_in_a_structure_the_core_defines_fails_load(scenario, path, where):
+    """R02: the defect of an outcome, a malformed-call event, the configuration, the code identity and a retry."""
+    data = put(scenario_json(scenario), path, "surprise")
+    with pytest.raises(RecordError, match=f"{where}: unknown field.*surprise"):
+        validate(data)
+
+
+def test_R02_a_defect_or_a_configuration_with_a_missing_field_fails_load():
+    """R02: the structures the core defines are not left half empty either."""
+    data = scenario_json("tool_crash")
+    del data["outcome"]["defect"]["stack_sha256"]
+    with pytest.raises(RecordError, match=r"outcome.defect: missing field.*stack_sha256"):
+        validate(data)
+    data = scenario_json("tools")
+    del data["agent_config"]["limits"]["token_budget"]
+    with pytest.raises(RecordError, match=r"agent_config.limits: missing field.*token_budget"):
+        validate(data)
+    data = scenario_json("tools")
+    data["agent_config"]["terminal_tools"] = "submit"
+    with pytest.raises(RecordError, match="terminal_tools"):
+        validate(data)
+
+
+def test_R02_a_route_without_the_settings_the_record_adds_fails_load():
+    """R02: replay reads the settings sets and their digest from the route, so a route without them is refused."""
+    data = scenario_json("tools")
+    del data["route"]["settings"]
+    with pytest.raises(RecordError, match=r"route\.settings"):
+        validate(data)
+    data = scenario_json("tools")
+    data["route"]["settings_sent_sha256"] = 3
+    with pytest.raises(RecordError, match="settings_sent_sha256"):
+        validate(data)
+
+
+def test_L04_a_wait_that_was_declared_and_lasted_no_time_is_valid_and_a_negative_one_is_not():
+    """L04: 0.0 seconds waited under a kind is a figure a real run can produce; less than nothing is not."""
+    data = scenario_json("tools")
+    data["tool_calls"][0]["infra_wait_by_kind"] = {"lease_queue": 0.0}
+    data["transcript"][0]["infra_wait_by_kind"] = {"model_retry": 0}
+    data["totals"]["infra_wait_by_kind"] = {"sandbox_lifecycle": 0.0}
+    assert validate(data) == CURRENT
+    data["totals"]["infra_wait_by_kind"] = {"sandbox_lifecycle": -0.5}
+    with pytest.raises(RecordError, match="seconds waited are given per kind"):
+        validate(data)
