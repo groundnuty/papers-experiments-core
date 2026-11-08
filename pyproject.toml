@@ -8,7 +8,11 @@ version = "0.1.0.dev0"
 description = "Reusable core for agentic experiment studies: loop, records, campaigns, statistics and provenance tooling."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "anthropic>=2.6.0",
+    "httpx>=0.28.1",
+    "openai>=3.46.0",
+]
 
 [project.optional-dependencies]
 onedata = []
