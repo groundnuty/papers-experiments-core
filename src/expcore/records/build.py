@@ -216,6 +216,7 @@ def redactor_for(
 
     Raises ConfigError, naming the variable, when a secret is too short to redact (see `expcore.records.redact`).
     """
+    secrets, secret_env = tuple(secrets), tuple(secret_env)  # whatever iterable the caller gave is read once
     names, keys = model_secrets(backend, models, environ)
     return Redactor.from_environment(environ, [*secrets, *keys], [*secret_env, *names])
 
@@ -259,6 +260,7 @@ def build_record(
     variables in `secret_env`, the key variables of the models in use, the registered ones, and `secrets` for this
     record) unless a `redactor` is given. A replay passes `Redactor.none()`: what it reads is redacted already.
     """
+    secrets, secret_env = tuple(secrets), tuple(secret_env)
     sys_prompt, user_prompt = PromptText.of(system), PromptText.of(user)
     captured = recording.captured
     if len(captured) != len(result.turns):
@@ -359,6 +361,7 @@ async def record_attempt(
     A secret too short to redact raises ConfigError before the run starts. The secrets are read again when the record
     is built, after the run, so one registered during the run (a token a provider minted) is redacted too.
     """
+    secrets, secret_env = tuple(secrets), tuple(secret_env)  # read once: the early check would use up an iterator
     redactor_for(backend, environ=environ, secrets=secrets, secret_env=secret_env, models=models)  # fail early
     recording = RecordingBackend(backend)
     box = ToolBox(list(providers), cap_chars=config.limits.output_cap_chars)

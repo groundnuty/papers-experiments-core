@@ -7,16 +7,19 @@ would become the nearest float and `1e400` would overflow. So the text is scanne
 each secret-keyed value is replaced; every other character stays as it was. A string that is itself JSON text inside a
 value is handled the same way, and written back only if something in it changed.
 
-The scan is strict JSON (RFC 8259) and nothing more, and numbers are read as text, never as values. Text that is not
-valid JSON in that sense, or nests deeper than `MAX_DEPTH`, cannot be scanned unambiguously: `redact_keys` returns None
-for it, and the caller falls back to redacting by value only.
+The scan is strict JSON (RFC 8259) and nothing more, and numbers are read as text, never as values. It keeps its own
+stack instead of calling itself, so the depth of the JSON is bounded by memory and not by the interpreter, and every
+strict-JSON string is scanned in full. Text that is not strict JSON cannot be scanned unambiguously: `redact_keys`
+returns None for it, and the caller falls back to redacting by value only. Only the depth to which a string holds
+JSON text inside a string, each level of which doubles the escapes, takes a recursion, and that is bounded by the
+logarithm of the text's size.
 """
 
 import json
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 
-MAX_DEPTH = 64
 MARKER = '"[redacted]"'
 _NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 _LITERALS = ("true", "false", "null")
@@ -29,6 +32,18 @@ Edit = tuple[int, int, str]
 
 class _Unscannable(Exception):
     """The text is not JSON that the scan can read with certainty."""
+
+
+@dataclass
+class _Frame:
+    """An open object or array. For an object, the member being read: its key, where its value starts, and how many
+    edits there were before it, so the edits inside a value that is replaced whole can be dropped."""
+
+    is_object: bool
+    property_names: bool = False  # the members of this object name things (it is the value of `properties`)
+    key: str = ""
+    value_start: int = 0
+    mark: int = 0
 
 
 class _Scanner:
@@ -64,20 +79,23 @@ class _Scanner:
                 i += 1
         raise _Unscannable
 
-    def value(self, i: int, depth: int, own_key: str | None = None) -> int:
-        """Scan the value that starts at `i`, recording edits; return the index after it.
-
-        `own_key` is the key the value is under; the members of the object under `properties` name things."""
-        if depth > MAX_DEPTH:
+    def member(self, i: int, frame: _Frame) -> int:
+        """Read an object member's key and colon from `i`, note them in the frame, and return where its value starts."""
+        start = self.skip(i)
+        end = self.string(start)
+        frame.key = json.loads(self.text[start:end])
+        colon = self.skip(end)
+        if self.text[colon : colon + 1] != ":":
             raise _Unscannable
-        c = self.text[i : i + 1]
-        if c == "{":
-            return self.obj(i, depth, property_names=own_key == "properties")
-        if c == "[":
-            return self.array(i, depth)
-        if c == '"':
+        frame.value_start = self.skip(colon + 1)
+        frame.mark = len(self.edits)
+        return frame.value_start
+
+    def scalar(self, i: int) -> int:
+        """Return the index after the string, number or literal that starts at `i`; a string may hold JSON text."""
+        if self.text[i : i + 1] == '"':
             end = self.string(i)
-            self.nested(i, end, depth)
+            self.nested(i, end)
             return end
         for literal in _LITERALS:
             if self.text.startswith(literal, i):
@@ -87,68 +105,72 @@ class _Scanner:
             return number.end()
         raise _Unscannable
 
-    def nested(self, start: int, end: int, depth: int) -> None:
+    def nested(self, start: int, end: int) -> None:
         """A string value that is JSON text is scanned in turn and, if it changed, written back as a string."""
         inner = json.loads(self.text[start:end])
         if inner.lstrip()[:1] in ("{", "["):
-            changed = redact_keys(inner, self.is_secret_key, depth + 1)
+            changed = redact_keys(inner, self.is_secret_key)
             if changed is not None and changed != inner:
                 self.edits.append((start, end, json.dumps(changed, ensure_ascii=False)))
 
-    def obj(self, i: int, depth: int, property_names: bool) -> int:
-        i = self.skip(i + 1)
-        if self.text[i : i + 1] == "}":
-            return i + 1
+    def finish_member(self, frame: _Frame, end: int) -> None:
+        """A member's value ended at `end`: if its key names a secret the whole value goes, and what was found in it."""
+        if self.is_secret_key(frame.key) and not frame.property_names:
+            del self.edits[frame.mark :]
+            if self.text[frame.value_start : end] != MARKER:
+                self.edits.append((frame.value_start, end, MARKER))
+
+    def scan(self) -> None:
+        """Scan the whole text with an explicit stack; raise _Unscannable unless it is exactly one strict JSON value."""
+        stack: list[_Frame] = []
+        i = self.skip(0)
         while True:
-            key_end = self.string(self.skip(i))
-            key = json.loads(self.text[self.skip(i) : key_end])
-            i = self.skip(key_end)
-            if self.text[i : i + 1] != ":":
-                raise _Unscannable
-            start = self.skip(i + 1)
-            if self.is_secret_key(key) and not property_names:
-                before = len(self.edits)
-                end = self.value(start, depth + 1, own_key=key)
-                del self.edits[before:]  # the whole value goes, so nothing inside it matters
-                if self.text[start:end] != MARKER:
-                    self.edits.append((start, end, MARKER))
+            # begin a value at i: open a container (and go on into it), or read a scalar and fall through to unwind
+            opener = self.text[i : i + 1]
+            end = -1
+            if opener in ("{", "["):
+                parent = stack[-1] if stack else None
+                frame = _Frame(opener == "{", property_names=parent is not None and parent.key == "properties")
+                i = self.skip(i + 1)
+                if self.text[i : i + 1] == ("}" if frame.is_object else "]"):
+                    end = i + 1
+                else:
+                    stack.append(frame)
+                    i = self.member(i, frame) if frame.is_object else i
+                    continue
             else:
-                end = self.value(start, depth + 1, own_key=key)
-            i = self.skip(end)
-            separator = self.text[i : i + 1]
-            if separator == "}":
-                return i + 1
-            if separator != ",":
-                raise _Unscannable
-            i += 1
+                end = self.scalar(i)
+            # a value ended at `end`: close the members and containers it completes, or go on to the next value
+            while True:
+                if not stack:
+                    if self.skip(end) != len(self.text):
+                        raise _Unscannable
+                    return
+                frame = stack[-1]
+                if frame.is_object:
+                    self.finish_member(frame, end)
+                i = self.skip(end)
+                separator = self.text[i : i + 1]
+                if separator == ("}" if frame.is_object else "]"):
+                    stack.pop()
+                    end = i + 1
+                    continue
+                if separator != ",":
+                    raise _Unscannable
+                i = self.member(i + 1, frame) if frame.is_object else self.skip(i + 1)
+                break
 
-    def array(self, i: int, depth: int) -> int:
-        i = self.skip(i + 1)
-        if self.text[i : i + 1] == "]":
-            return i + 1
-        while True:
-            i = self.skip(self.value(self.skip(i), depth + 1))
-            separator = self.text[i : i + 1]
-            if separator == "]":
-                return i + 1
-            if separator != ",":
-                raise _Unscannable
-            i += 1
 
-
-def redact_keys(text: str, is_secret_key: Callable[[str], bool], depth: int = 0) -> str | None:
+def redact_keys(text: str, is_secret_key: Callable[[str], bool]) -> str | None:
     """Return the text with the value of every secret-named key replaced by the marker, all else unchanged.
 
     The same text comes back when nothing needed replacing. None means the text could not be scanned unambiguously
-    (it is not strict JSON, or it nests too deeply), and the caller redacts by value only.
+    (it is not strict JSON), and the caller redacts by value only.
     """
     scanner = _Scanner(text, is_secret_key)
     try:
-        start = scanner.skip(0)
-        end = scanner.skip(scanner.value(start, depth))
-        if end != len(text):
-            return None
-    except (_Unscannable, ValueError, IndexError):
+        scanner.scan()
+    except (_Unscannable, ValueError, IndexError, RecursionError):
         return None
     for begin, stop, replacement in sorted(scanner.edits, reverse=True):
         text = text[:begin] + replacement + text[stop:]
