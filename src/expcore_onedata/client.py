@@ -259,6 +259,10 @@ class OnezoneClient:
             raise OutOfScope("the request names a provider that is not declared")
         return self._config.providers[provider].url + API_PROVIDER, self._config.provider_label(provider)
 
+    def provider_label(self, provider: str) -> str:
+        """Name a declared provider for a message by its position in the file, `providers[i]`, never by its name."""
+        return self._base(provider)[1]
+
     def _request(
         self,
         method: str,

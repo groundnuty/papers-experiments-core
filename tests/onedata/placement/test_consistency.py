@@ -2,11 +2,12 @@
 
 import asyncio
 
+import httpx
 import pytest
 from placement_support import Ticker
 
 from expcore_onedata import consistency
-from expcore_onedata.client import PlatformError
+from expcore_onedata.client import OnezoneClient, PlatformError
 
 
 def scripted(values):
@@ -92,3 +93,15 @@ def test_a_transfer_record_without_a_known_state_field_has_the_state_unknown():
     assert consistency.transfer_state({"bytesReplicated": 5}) == "unknown"
     assert "unknown" not in consistency.ENDED_STATES
     assert consistency.transfer_state({"replicationStatus": "completed"}) == "completed"
+
+
+def test_o12_a_space_root_answer_without_a_file_id_names_the_provider_by_position_not_by_name(config):
+    """O12: the message says `providers[1]`, the position of the provider in platform.toml, and none of its name or
+    address; the autouse scan of this directory also fails the test if any configured value is in it."""
+    client = OnezoneClient(
+        config, http=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+    )
+    with pytest.raises(PlatformError, match="holds no root file id") as raised:
+        consistency.space_root(client, "beta", config.space.id)
+    assert str(raised.value).startswith("providers[1]: ")
+    assert "beta" not in str(raised.value)

@@ -197,6 +197,6 @@ def space_root(
             continue
         root = answer.get("fileId") if isinstance(answer, dict) else None
         if not isinstance(root, str) or not root:
-            raise PlatformError(f"provider {provider}: the space's answer holds no root file id")
+            raise PlatformError(f"{client.provider_label(provider)}: the space's answer holds no root file id")
         return root
     raise AssertionError("unreachable")  # pragma: no cover - the loop returns or raises
