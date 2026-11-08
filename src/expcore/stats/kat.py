@@ -11,8 +11,8 @@ code stamp cover.
 Every expected value below has its derivation beside it, except the bootstrap intervals of `INTERVAL_CASES`, which
 were produced once by the reviewed implementation and frozen (see there). Two further rules hold for every case. An
 interval known by hand (equal differences give a point interval) is checked against it. Where the cluster differences
-vary, the interval must have width and must enclose the estimate strictly, so an estimator whose interval collapses
-onto its point estimate fails whatever else it gets right.
+vary, the interval must have positive width and must enclose the estimate, ends included, so an estimator whose
+interval collapses onto its point estimate fails whatever else it gets right.
 
 Every registered estimator needs a case; `run()` reports one that has none, so a new estimator cannot be added without
 a known answer.
@@ -328,17 +328,21 @@ def _check_estimator(name: str, case: EstimatorCase, problems: list[str]) -> Non
 
 
 def _check_interval_has_width(label: str, matrix: np.ndarray, result: EstimatorResult, problems: list[str]) -> None:
-    """Where the cluster differences vary, require ci_low < estimate < ci_high (P05).
+    """Where the cluster differences vary, require ci_low < ci_high and ci_low <= estimate <= ci_high (P05).
 
     An interval collapsed onto the point estimate says nothing about uncertainty, and no answer worked out by hand
-    for a seeded bootstrap would notice it.
+    for a seeded bootstrap would notice it. The enclosure is closed because a percentile interval may legitimately end
+    on the estimate: nine zero clusters and one cluster of 1 give the estimate 0.1 and, at 40% coverage, the interval
+    from 0 to 0.1.
     """
     spread = contrasts.cluster_means(matrix)
-    if np.nanmax(spread) - np.nanmin(spread) > TOLERANCE and not (result.ci_low < result.estimate < result.ci_high):
-        problems.append(
-            f"{label}: the interval {result.ci_low!r}..{result.ci_high!r} has no width around the estimate "
-            f"{result.estimate!r} although the cluster differences vary"
-        )
+    if np.nanmax(spread) - np.nanmin(spread) <= TOLERANCE:
+        return
+    low, high, estimate = result.ci_low, result.ci_high, result.estimate
+    if not low < high:
+        problems.append(f"{label}: the interval {low!r}..{high!r} has no width although the cluster differences vary")
+    elif not low - TOLERANCE <= estimate <= high + TOLERANCE:
+        problems.append(f"{label}: the interval {low!r}..{high!r} does not enclose the estimate {estimate!r}")
 
 
 def _check_interval(name: str, case: IntervalCase, problems: list[str]) -> None:

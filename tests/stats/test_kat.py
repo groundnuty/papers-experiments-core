@@ -174,8 +174,8 @@ VARYING_CASES = {
 }
 
 
-def test_p05_where_the_differences_vary_the_interval_has_width_around_the_estimate():
-    """P05: ci_low < estimate < ci_high on every case with varying differences, and a point where they are equal."""
+def test_p05_where_the_differences_vary_the_interval_has_width_and_encloses_the_estimate():
+    """P05: ci_low < ci_high and ci_low <= estimate <= ci_high where differences vary, a point where they are equal."""
     for case in kat.WILCOXON_CASES:
         matrix = np.array(case.matrix, dtype=float)
         paired = estimators.PairedDifferences(
@@ -186,7 +186,8 @@ def test_p05_where_the_differences_vary_the_interval_has_width_around_the_estima
         )
         spread = contrasts.cluster_means(matrix)
         if np.nanmax(spread) > np.nanmin(spread):
-            assert result.ci_low < result.estimate < result.ci_high, case.name
+            assert result.ci_low < result.ci_high, case.name
+            assert result.ci_low <= result.estimate <= result.ci_high, case.name
         else:
             assert result.ci_low == result.estimate == result.ci_high, case.name
 
@@ -198,10 +199,58 @@ def test_p05_an_estimator_whose_interval_collapses_onto_its_estimate_fails_the_k
     problems = kat.run()
     assert problems
     assert case_names(problems) >= VARYING_CASES
-    assert any("has no width around the estimate" in problem for problem in problems)
+    assert any("has no width" in problem for problem in problems)
     assert any("frozen interval" in problem for problem in problems)
-    with pytest.raises(kat.KnownAnswerError, match="has no width around the estimate"):
+    with pytest.raises(kat.KnownAnswerError, match="has no width"):
         kat.verify()
+
+
+NINE_ZEROS_AND_A_ONE = kat.IntervalCase(
+    "nine zeros and a one",
+    ((0.0,),) * 9 + ((1.0,),),
+    {},
+    replicates=400,
+    level=0.4,
+    seed=(7, 11),
+    interval=(0.0, 0.1),
+    model_intervals=((0.0, 0.1),),
+)
+
+
+def test_p05_a_percentile_interval_that_ends_on_the_estimate_is_legitimate_and_passes(monkeypatch):
+    """P05: the estimate is 0.1 and the 40% interval is 0 to 0.1; enclosure includes its ends, width is positive."""
+    monkeypatch.setattr(kat, "INTERVAL_CASES", {estimators.WILCOXON: (NINE_ZEROS_AND_A_ONE,)})
+    assert kat.run() == []
+    case = NINE_ZEROS_AND_A_ONE
+    paired = estimators.PairedDifferences(
+        tuple(f"grp-{i}" for i in range(10)), ("model-a",), np.array(case.matrix, dtype=float)
+    )
+    result = estimators.get(estimators.WILCOXON)(paired, estimators.EstimatorSettings(400, 0.4, (7, 11), {}))
+    assert (result.ci_low, result.estimate, result.ci_high) == pytest.approx((0.0, 0.1, 0.1))
+    assert result.ci_high == pytest.approx(result.estimate)  # the premise: the interval ends on the estimate
+
+
+def test_p05_the_collapse_is_still_caught_on_the_input_where_the_interval_ends_on_the_estimate(monkeypatch):
+    """P05: relaxing the enclosure to closed does not let ci_low = ci_high = estimate through."""
+    monkeypatch.setattr(kat, "INTERVAL_CASES", {estimators.WILCOXON: (NINE_ZEROS_AND_A_ONE,)})
+    wrapping_the_registered_estimator(monkeypatch, collapsing)
+    problems = [p for p in kat.run() if p.startswith("wilcoxon_cluster_bootstrap / nine zeros and a one")]
+    assert any("has no width" in problem for problem in problems)
+
+
+def test_p05_an_interval_that_misses_the_estimate_is_reported_even_with_width(monkeypatch):
+    """P05: closed enclosure still excludes an interval that lies to one side of the estimate."""
+
+    def shifted(estimator):
+        def wrapped(paired, settings):
+            result = estimator(paired, settings)
+            return dataclasses.replace(result, ci_low=result.estimate + 1.0, ci_high=result.estimate + 2.0)
+
+        return wrapped
+
+    monkeypatch.setattr(kat, "INTERVAL_CASES", {})
+    wrapping_the_registered_estimator(monkeypatch, shifted)
+    assert any("does not enclose the estimate" in problem for problem in kat.run())
 
 
 def test_p05_the_width_rule_alone_catches_the_collapse_in_every_case_with_varying_differences(monkeypatch):
@@ -216,7 +265,7 @@ def test_p05_the_width_rule_alone_catches_the_collapse_in_every_case_with_varyin
         "wilcoxon_cluster_bootstrap / ties",
         "wilcoxon_cluster_bootstrap / two models, one cell missing",
     }
-    assert all("has no width around the estimate" in problem for problem in problems)
+    assert all("has no width" in problem for problem in problems)
 
 
 def test_p05_a_change_of_the_seeded_bootstrap_fails_the_frozen_endpoints_and_nothing_else(monkeypatch):
