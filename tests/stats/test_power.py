@@ -1,11 +1,21 @@
 """Power by simulation, driven by the preregistration's power settings."""
 
+import dataclasses
 import math
 
 import numpy as np
 import pytest
+from scipy import stats
 
-from expcore.stats.power import PowerSettings, pilot_cluster_sd, pilot_power, power_sim, power_table
+from expcore.stats.power import (
+    PowerSettings,
+    minimum_detectable_effect,
+    pilot_cluster_sd,
+    pilot_power,
+    power_sim,
+    power_table,
+    signed_rank_p_values,
+)
 
 SETTINGS = PowerSettings(seed=5, n_simulations=40, target_clusters=25, target_difference=0.2, sd_grid=(0.1, 0.3))
 
@@ -110,3 +120,84 @@ def test_pilot_power_gives_each_contrast_its_own_sd_and_keeps_the_ones_it_cannot
     assert not math.isnan(rows[0]["power"])
     assert math.isnan(rows[2]["sd"])
     assert math.isnan(rows[2]["power"])
+
+
+def test_the_vectorised_signed_rank_p_value_is_the_hand_computed_one():
+    """Hand-computed: ranks 1..5 all positive give W = 0 and p = 2 / 2**5; one negative sixth rank gives 28 / 64."""
+    p = signed_rank_p_values(np.array([[1.0, 2.0, 3.0, 4.0, 5.0], [5.0, 1.0, 4.0, 2.0, 3.0]]))
+    assert p == pytest.approx([0.0625, 0.0625])
+    assert signed_rank_p_values(np.array([[1.0, 2.0, 3.0, 4.0, 5.0, -6.0]])) == pytest.approx([0.4375])
+
+
+@pytest.mark.parametrize("n", [1, 3, 7, 25, 50])
+def test_the_vectorised_signed_rank_p_value_agrees_with_scipys_exact_test(n):
+    """On continuous draws, which have no ties, every row gives scipy's exact p-value."""
+    draws = np.random.default_rng(n).normal(0.3, 1.0, size=(60, n))
+    expected = [stats.wilcoxon(row, method="exact").pvalue for row in draws]
+    assert signed_rank_p_values(draws) == pytest.approx(expected, abs=1e-12)
+
+
+def test_beyond_the_exact_limit_the_normal_curve_stands_in_and_is_close_to_scipys():
+    """With 250 clusters the null distribution is the normal one; the p-values stay within a hundredth of scipy's."""
+    draws = np.random.default_rng(9).normal(0.1, 1.0, size=(30, 250))
+    expected = [stats.wilcoxon(row, method="approx").pvalue for row in draws]
+    assert signed_rank_p_values(draws) == pytest.approx(expected, abs=0.01)
+
+
+def test_the_signed_rank_p_values_refuse_a_wrong_shape():
+    """A (studies x clusters) array is required."""
+    with pytest.raises(ValueError, match="studies x clusters"):
+        signed_rank_p_values(np.array([1.0, 2.0]))
+
+
+def test_the_minimum_detectable_effect_is_near_the_textbook_figure_and_reaches_the_target_power():
+    """With 25 clusters at alpha 0.05 and power 0.8 it is about 2.8 / 5 of the SD (a little more for a rank test)."""
+    settings = PowerSettings(seed=1, n_simulations=1500, target_clusters=25, target_difference=0.1, sd_grid=(0.1,))
+    mde = minimum_detectable_effect(0.2, 25, 0.05, settings, np.random.default_rng(3))
+    assert 0.2 * 0.5 < mde < 0.2 * 0.68
+    reached = power_sim(0.2, 25, mde, 0.05, 300, np.random.default_rng(4))
+    assert reached == pytest.approx(0.8, abs=0.1)
+
+
+def test_the_minimum_detectable_effect_scales_with_the_sd_and_shrinks_with_more_clusters():
+    """The test sees ranks, so doubling the SD doubles the effect; more clusters detect a smaller one."""
+    settings = PowerSettings(seed=1, n_simulations=500, target_clusters=25, target_difference=0.1, sd_grid=(0.1,))
+    one = minimum_detectable_effect(1.0, 20, 0.05, settings, np.random.default_rng(5))
+    two = minimum_detectable_effect(2.0, 20, 0.05, settings, np.random.default_rng(5))
+    assert two == pytest.approx(2 * one)
+    assert minimum_detectable_effect(1.0, 60, 0.05, settings, np.random.default_rng(5)) < one
+    stricter = minimum_detectable_effect(1.0, 20, 0.01, settings, np.random.default_rng(5))
+    assert stricter > one
+
+
+def test_the_minimum_detectable_effect_follows_the_target_power_in_the_settings():
+    """A higher target power needs a larger effect, and the default target is 0.8."""
+    low = PowerSettings(1, 500, 25, 0.1, (0.1,), target_power=0.6)
+    high = dataclasses.replace(low, target_power=0.95)
+    assert minimum_detectable_effect(1.0, 20, 0.05, low, np.random.default_rng(6)) < minimum_detectable_effect(
+        1.0, 20, 0.05, high, np.random.default_rng(6)
+    )
+    assert PowerSettings(1, 10, 5, 0.1, (0.1,)).target_power == 0.8
+
+
+def test_the_minimum_detectable_effect_is_nan_when_the_test_can_never_reject():
+    """Five clusters cannot give a two-sided p-value below 0.0625, so nothing is detectable at alpha 0.05."""
+    settings = PowerSettings(1, 200, 5, 0.1, (0.1,))
+    assert math.isnan(minimum_detectable_effect(1.0, 5, 0.05, settings, np.random.default_rng(7)))
+    assert not math.isnan(minimum_detectable_effect(1.0, 6, 0.05, settings, np.random.default_rng(7)))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"sd": 0.0}, "sd must be a positive number"),
+        ({"sd": math.nan}, "sd must be a positive number"),
+        ({"n": 0}, "n must be at least 1"),
+        ({"alpha": 1.0}, "alpha must be strictly between 0 and 1"),
+    ],
+)
+def test_the_minimum_detectable_effect_refuses_parameters_it_cannot_search(kwargs, message):
+    """Bad inputs fail by name."""
+    params = {"sd": 1.0, "n": 10, "alpha": 0.05, "settings": SETTINGS, "rng": np.random.default_rng(0)} | kwargs
+    with pytest.raises(ValueError, match=message):
+        minimum_detectable_effect(**params)

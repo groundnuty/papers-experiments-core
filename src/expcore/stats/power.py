@@ -12,6 +12,7 @@ test enforces it. Pilot differences enter as plain arrays; building them from ro
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from collections.abc import Mapping, Sequence
 
@@ -28,6 +29,7 @@ class PowerSettings:
     target_clusters: int
     target_difference: float
     sd_grid: tuple[float, ...]
+    target_power: float = 0.8  # the power a minimum detectable effect must reach
 
 
 def power_sim(
@@ -47,6 +49,79 @@ def power_sim(
     draws = rng.normal(delta, sd, size=(n_sim, n))
     hits = sum(stats.wilcoxon(row, zero_method="wilcox", method=method).pvalue < alpha for row in draws)
     return hits / n_sim
+
+
+EXACT_LIMIT = (
+    200  # up to this many clusters the null distribution is listed exactly, beyond it the normal curve is used
+)
+
+
+@functools.cache
+def _null_cdf(n: int) -> np.ndarray:
+    """P(W <= k) for k = 0..n(n+1)/2, W the sum of the ranks that carry a plus sign when n ranks are signed at random."""
+    total = n * (n + 1) // 2
+    pmf = np.zeros(total + 1)
+    pmf[0] = 1.0
+    for rank in range(1, n + 1):
+        shifted = np.zeros_like(pmf)
+        shifted[rank:] = pmf[: total + 1 - rank]
+        pmf = (pmf + shifted) / 2
+    return np.cumsum(pmf)
+
+
+def signed_rank_p_values(samples: np.ndarray) -> np.ndarray:
+    """Two-sided signed-rank p-value of every row of a (studies x clusters) array of continuous differences.
+
+    Rows are taken to hold no zero and no tie, which draws from a continuous distribution give with probability one.
+    The p-value is twice the null probability of a rank sum at most as large as the smaller of the two signed sums
+    (exact for up to EXACT_LIMIT clusters, the normal approximation beyond), at most 1. It agrees with scipy's exact
+    test on such rows and runs over all rows at once, which a search for a minimum detectable effect needs.
+    """
+    x = np.asarray(samples, dtype=float)
+    if x.ndim != 2 or x.shape[1] < 1:
+        raise ValueError("samples must be a (studies x clusters) array with at least one cluster")
+    n = x.shape[1]
+    ranks = np.argsort(np.argsort(np.abs(x), axis=1), axis=1) + 1
+    plus = (ranks * (x > 0)).sum(axis=1)
+    total = n * (n + 1) // 2
+    smaller = np.minimum(plus, total - plus)
+    if n <= EXACT_LIMIT:
+        return np.minimum(1.0, 2.0 * _null_cdf(n)[smaller])
+    mean, sd = total / 2, math.sqrt(n * (n + 1) * (2 * n + 1) / 24)
+    return np.minimum(1.0, 2.0 * stats.norm.cdf((smaller + 0.5 - mean) / sd))
+
+
+def minimum_detectable_effect(
+    sd: float, n: int, alpha: float, settings: PowerSettings, rng: np.random.Generator
+) -> float:
+    """The smallest difference the signed-rank test detects at `settings.target_power` with n clusters, by simulation.
+
+    Cluster differences are drawn from N(delta, sd^2), `settings.n_simulations` studies of n clusters sharing one set
+    of standard normal draws, and delta is found by bisection between 0 and 8 sd to a precision of sd / 1000. The
+    result is NaN when even 8 sd does not reach the target power, which is when n is too small for a two-sided test at
+    this alpha to ever reject (five clusters cannot reach p below 0.0625). It scales with sd, since the test sees ranks.
+    """
+    if not (math.isfinite(sd) and sd > 0):
+        raise ValueError(f"sd must be a positive number, got {sd}")
+    if n < 1:
+        raise ValueError(f"n must be at least 1, got {n}")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError(f"alpha must be strictly between 0 and 1, got {alpha}")
+    noise = rng.standard_normal((settings.n_simulations, n))
+
+    def power(delta: float) -> float:
+        return float((signed_rank_p_values(delta + sd * noise) < alpha).mean())
+
+    low, high = 0.0, 8.0 * sd
+    if power(high) < settings.target_power:
+        return math.nan
+    while high - low > sd / 1000:
+        middle = (low + high) / 2
+        if power(middle) >= settings.target_power:
+            high = middle
+        else:
+            low = middle
+    return high
 
 
 def pilot_cluster_sd(differences: Sequence[float]) -> float:
