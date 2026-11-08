@@ -1,82 +1,103 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/harness/health.py, blob d841c16205d7b5b545c0186eec9788b9965880e6
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""The campaign's Onedata health check (`health_check() -> (ok, detail)`), run before and after every run.
+#   changes: see git history of this file from its import commit
+"""The platform's health check, run before and after every attempt (O04).
 
-Read-only, with a scoped short-lived token and short timeouts. It runs on the HOST with its own client (never through a
-run's gate, sidecar or network namespace), and the scheduler calls it outside `execute_run`, so its time and bytes can
-never enter a run's wall time, byte counter or time cap. The file it reads (a 1982 day) lies outside every instance's
-required extent, so it cannot warm anything a run will read (asserted against `dataset_76.instances` in the tests). It checks, in order: (1) the study space is supported by
-fr ONLY (Onezone's view of the token's scope), (2) fr answers, (3) one known S1 file read back through fr has the
-sha256 of #3's manifest. Any failure, including an exception, is `(False, reason)`: infra by the #16 rule, never a crash.
+`PlatformHealth` implements the core's `HealthCheck` protocol: it is called with no arguments and returns
+`Health(ok, detail)`. It reads Onezone's view of the study space with a short-lived data-path token of the configured
+service principal, on the host and outside every run, and compares the providers that support the space with the
+declared set (`[support] providers`). The declared set is the only expectation: a multi-provider federation passes when it
+reports exactly its declared providers, and a provider that is reported but not declared fails the check as surely as a
+declared one that is missing. The check also fails when the space's name differs from the declared one or a declared
+provider is reported offline.
+
+An answer that cannot be read is unhealthy, never a crash and never a pass: any failure, including an unexpected
+exception, becomes `Health(False, reason)`. The reason names counts and configuration names, never a token, URL or host.
+
+The check of the earlier study also read one known file back through its provider and compared its checksum with a study manifest. That
+belongs to the study (its data) and not to the platform, so a study adds it with its own check.
 """
-from __future__ import annotations
 
-import hashlib
-import json
 import threading
 import time
-from pathlib import Path
-from typing import Any, Callable
+from collections.abc import Callable
 
-from .config import required_token_ttl_s
-from .real_sandbox import ONEZONE_HOST, PROVIDER_HOST, S1_DIR, SPACE_ID, SPACE_NAME, mint_token
+from expcore.campaign.healthgate import Health
+from expcore.config.loading import ConfigError
+from expcore_onedata.client import OnezoneClient, PlatformError
+from expcore_onedata.config import PlatformConfig
+from expcore_onedata.federation import SpaceView, declared_name, read_space
+from expcore_onedata.tokencheck import TokenRefused
+from expcore_onedata.tokens import MintedToken, TokenIssuer, data_path_spec
 
-REPO = Path(__file__).resolve().parents[2]
-FR_PROVIDER_ID = json.loads((REPO / "data" / "upload_record.json").read_text())["provider_id"]
-MANIFEST = REPO / "data" / "manifest" / "s1_sha256.txt"
-KNOWN_FILE = "dataset-97.nc"           # the first S1 day, about 190 kB: a whole-file read is cheap
-TIMEOUT_S = 15.0
-TOKEN_CAP_S = 300.0                       # the check's own wall budget; the token outlives it plus the margin
-
-_cache: dict[str, Any] = {"token": None, "exp": 0.0}
-_lock = threading.Lock()
+TOKEN_CAP_S = 300.0  # the check's own budget; its token outlives it by the configured margin
+REFRESH_BEFORE_S = 120.0  # a cached token is replaced this long before it expires
+_SAFE = (PlatformError, TokenRefused)  # whose messages hold no URL, id or value, so they can be shown
 
 
-def _token(mint: Callable) -> str:
-    with _lock:
-        if _cache["token"] is None or time.time() > _cache["exp"] - 120:
-            _cache["token"] = mint(oneclient=False, time_cap_s=TOKEN_CAP_S, service=True)[0]      # default lifetime: cap + margin
-            _cache["exp"] = time.time() + required_token_ttl_s(TOKEN_CAP_S)
-        return _cache["token"]
+def compare(view: SpaceView, config: PlatformConfig) -> Health:
+    """Compare the providers the federation reports for the space with the declared set; any difference fails."""
+    if view.name != config.space.name:
+        return Health(False, "the study space is reported under another name than the declared one")
+    matched: dict[str, bool | None] = {}
+    undeclared = 0
+    for reported in view.providers:
+        name = declared_name(config, reported)
+        if name is None:
+            undeclared += 1
+        else:
+            matched[name] = reported.online
+    missing = sorted(set(config.support.providers) - set(matched))
+    unexpected = sorted(set(matched) - set(config.support.providers))
+    if missing or undeclared or unexpected:
+        parts = []
+        if missing:
+            parts.append(f"missing {', '.join(missing)}")
+        if undeclared:
+            parts.append(f"{undeclared} reported provider(s) not declared")
+        if unexpected:
+            parts.append(f"declared but not in the support set: {', '.join(unexpected)}")
+        return Health(False, "the providers supporting the space differ from the declared set: " + "; ".join(parts))
+    offline = sorted(name for name, online in matched.items() if online is False)
+    if offline:
+        return Health(False, f"declared provider(s) reported offline: {', '.join(offline)}")
+    return Health(True, f"ok: the space is supported by exactly the {len(matched)} declared provider(s)")
 
 
-def expected_sha(name: str = KNOWN_FILE, manifest: Path = MANIFEST) -> str:
-    for line in manifest.read_text().splitlines():
-        h, _, n = line.partition("  ")
-        if n.strip() == name:
-            return h
-    raise KeyError(f"{name} not in {manifest}")
+class PlatformHealth:
+    """The platform's `HealthCheck`; keep one for the campaign so that its token is reused until it nears its end."""
 
+    def __init__(
+        self,
+        config: PlatformConfig,
+        client: OnezoneClient,
+        issuer: TokenIssuer,
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if config.principals.service is None:
+            raise ConfigError(f"{config.file}: [principals]: key 'service' is required for the health check")
+        self._config, self._client, self._issuer, self._clock = config, client, issuer, clock
+        self._service = config.principals.service
+        self._token: MintedToken | None = None
+        self._lock = threading.Lock()
 
-def health_check(*, post: Callable | None = None, get: Callable | None = None,
-                 mint: Callable | None = None, manifest: Path = MANIFEST) -> tuple[bool, str]:
-    t0 = time.monotonic()
-    try:
-        import requests
-        post, get, mint = post or requests.post, get or requests.get, mint or mint_token
-        tok = _token(mint)
-        h = {"x-auth-token": tok}
-        r = post(f"https://{ONEZONE_HOST}/api/v3/onezone/tokens/infer_access_token_scope", json={"token": tok}, timeout=TIMEOUT_S)
-        if r.status_code != 200:
-            return False, f"onezone scope inference HTTP {r.status_code}"
-        spaces = r.json()["dataAccessScope"]["spaces"]
-        sp = spaces.get(SPACE_ID)
-        if not sp or sp.get("name") != SPACE_NAME:
-            return False, f"study space {SPACE_NAME} not in the token's scope"
-        if sorted(sp.get("supports", [])) != [FR_PROVIDER_ID]:
-            return False, f"study space supported by {sorted(sp.get('supports', []))}, expected only fr ({FR_PROVIDER_ID})"
-        base = f"https://{PROVIDER_HOST}/api/v3/oneprovider"
-        r = post(f"{base}/lookup-file-id/{SPACE_NAME}/{S1_DIR}/{KNOWN_FILE}", headers=h, timeout=TIMEOUT_S)
-        if r.status_code != 200:
-            return False, f"fr lookup of {KNOWN_FILE} HTTP {r.status_code}"
-        fid = r.json()["fileId"]
-        r = get(f"{base}/data/{fid}/content", headers={**h, "Range": "bytes=0-"}, timeout=TIMEOUT_S)
-        if r.status_code not in (200, 206):
-            return False, f"fr read of {KNOWN_FILE} HTTP {r.status_code}"
-        got = hashlib.sha256(r.content).hexdigest()
-        if got != expected_sha(manifest=manifest):
-            return False, f"{KNOWN_FILE} sha256 differs from the manifest"
-        return True, f"ok: space supported by fr only, {KNOWN_FILE} sha256 ok ({time.monotonic() - t0:.1f}s)"
-    except Exception as e:  # noqa: BLE001 -- a check that cannot run is a failed check
-        return False, f"health check raised {type(e).__name__}: {str(e)[:200]}"
+    def _current_token(self) -> MintedToken:
+        """Return the cached token, minting a new one when none is left or it is about to expire."""
+        with self._lock:
+            token = self._token
+            if token is None or self._clock() > token.expires_at - REFRESH_BEFORE_S:
+                spec = data_path_spec(self._config.space.id)
+                token = self._token = self._issuer.mint(spec, self._service, time_cap_s=TOKEN_CAP_S)
+            return token
+
+    def __call__(self) -> Health:
+        """Return the platform's health; never raise."""
+        try:
+            view = read_space(self._client, self._current_token().reveal(), self._config.space.id)
+            return compare(view, self._config)
+        except _SAFE as error:
+            return Health(False, f"health check failed: {error}")
+        except Exception as error:
+            return Health(False, f"health check raised {type(error).__name__}")
