@@ -1,4 +1,11 @@
 # Provenance: new
+#   merged: [S1] icsa-2027-experiments @ 6fc798cf, icsa/harness/slot_users.py:113-117,197-204, day0/scripts/od.py:63-77
+#   merged: [S2] icsa-2027-experiments @ 6fc798cf, icsa/harness/slot_users.py:120, day0/scripts/od.py:122
+#   merged: [S3] icsa-2027-experiments @ 6fc798cf, icsa/harness/slot_users.py:342,345
+#   merged: [S4] icsa-2027-experiments @ 6fc798cf, icsa/knowledge/live.py:36,52, icsa/knowledge/tokencheck.py:47-49
+#   merged: [S5] onedata-mcp @ 0cc17ce, onedata_mcp/api/tokens.py:24-25, test/unit/api/test_tokens.py:20
+#   merged: [S6] icsa-2027-experiments @ 6fc798cf, icsa/sandbox/sandbox.py:494-505, icsa/harness/health.py:57-64
+#   merged: [S7] onedata-mcp @ 0cc17ce, onedata_mcp/api/spaces.py:90
 """The one HTTP client of the platform layer, and the gate every mutation goes through (O09).
 
 Every request the layer sends leaves through `OnezoneClient`; no other module imports httpx (a test holds that). The
@@ -19,6 +26,29 @@ files left revokes nothing) belong to provisioning and the sandbox (step 4b); th
 
 A failure raises `PlatformError` with the status and Onedata's error id only. The message never holds a URL, a body or a
 header, so neither a token nor a federation name reaches a log or a record through it.
+
+Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S7]` are the
+`merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
+client test in a source sends it and reads the answer as this layer does.
+
+- Authentication: the header `X-Auth-Token` with an access token. Confirmed by [S2].
+- `get`: `GET /spaces/{space}/users/{user}/privileges` and `GET /spaces/{space}/effective_users/{user}/privileges`; the
+  answer key is `privileges`. Confirmed by [S3].
+- `query`: `POST /tokens/examine`, body `{"token"}`, sent with the admin token; the answer keys `id` and `caveats` are
+  read. Confirmed by [S4] and [S5].
+- `query`: `POST /tokens/infer_access_token_scope`, body `{"token"}`, no header; the answer's
+  `dataAccessScope.spaces[*].name` and `.supports` and `.providers[*].domain` are read. Confirmed by [S6].
+- `mint_temporary_token`: `POST /users/{user}/tokens/temporary`, body `{"type": {"accessToken": {}}, "caveats": [...]}`,
+  answer key `token`. The body and the answer are confirmed by [S1]; the **path is not confirmed**.
+- `revoke_temporary_tokens`: `DELETE /users/{user}/tokens/temporary`. **Not confirmed.**
+- Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
+(All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
+
+What the sources show for minting is `POST /user/tokens/temporary` (the singular `user`) authenticated with HTTP Basic
+credentials of the user whose token it is, an admin's own or a leased user's, not the admin's access token acting for
+another user. No source revokes a token: they rely on short lifetimes. `UNVERIFIED_ENDPOINTS` lists what stays
+unconfirmed, and each entry has a live contract test (`tests/live/test_contract.py`) that fails if the deployment
+answers otherwise.
 """
 
 import re
@@ -31,12 +61,35 @@ import httpx
 from expcore.records.redact import register_secret
 from expcore_onedata.config import PlatformConfig
 
-API_ZONE = "/api/v3/onezone"
-API_PROVIDER = "/api/v3/oneprovider"
-AUTH_HEADER = "X-Auth-Token"
+API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
+API_PROVIDER = "/api/v3/oneprovider"  # [S7]
+AUTH_HEADER = "X-Auth-Token"  # [S2]
 MUTATING = ("POST", "PUT", "PATCH", "DELETE")
-# POSTs that only read, and whether they are sent with the admin credential.
+# POSTs that only read, and whether they are sent with the admin credential: the examination is [S4], [S5], called as
+# an admin; the scope inference is [S6], called without a header.
 READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_access_token_scope": False}
+
+# What no source confirms: (method, path, what is unconfirmed). Each has a test in tests/live/test_contract.py marked
+# `covers:` with its method and path; a unit test holds that none is missing there.
+UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
+    (
+        "POST",
+        "/users/{user}/tokens/temporary",
+        "minting for another user with the admin token; the sources mint at /user/tokens/temporary with the user's own "
+        "credentials [S1]",
+    ),
+    ("DELETE", "/users/{user}/tokens/temporary", "revoking a user's temporary tokens; no source revokes a token"),
+    (
+        "POST",
+        "/tokens/examine",
+        "the shape of the answer's subject (an id under subject); the sources read id, caveats [S4]",
+    ),
+    (
+        "POST",
+        "/tokens/infer_access_token_scope",
+        "the providers' name and online fields; the sources read the space's name and supports and the domain [S6]",
+    ),
+)
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _USER_ID = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
 DEFAULT_TIMEOUT_S = 15.0
@@ -134,7 +187,10 @@ class OnezoneClient:
             raise PlatformError(f"{label}: {method} answered something that is not JSON") from None
 
     def get(self, path: str, *, provider: str | None = None, token: str | None = None) -> Any:
-        """GET a path of Onezone or of a declared provider, with the admin credential or as the token given."""
+        """GET a path of Onezone or of a declared provider, with the admin credential or as the token given.
+
+        The privilege reads of tokens.py are the layer's only callers in step 4a ([S3]).
+        """
         headers = {AUTH_HEADER: token} if token is not None else self._admin
         return self._send("GET", path, provider=provider, headers=headers)
 
@@ -157,7 +213,8 @@ class OnezoneClient:
         """Mint an access token for a user with exactly these caveats; register its value as a secret and return it."""
         if not _USER_ID.fullmatch(user_id):
             raise OutOfScope("the user id is not a plain id")
-        body = {"type": {"accessToken": {}}, "caveats": [dict(c) for c in caveats]}
+        body = {"type": {"accessToken": {}}, "caveats": [dict(c) for c in caveats]}  # body and answer key: [S1]
+        # The path is unconfirmed (UNVERIFIED_ENDPOINTS): the sources mint at /user/tokens/temporary, as the user.
         answer = self._send(
             "POST", f"/users/{quote(user_id, safe='')}/tokens/temporary", provider=None, headers=self._admin, json=body
         )
@@ -168,7 +225,10 @@ class OnezoneClient:
         return value
 
     def revoke_temporary_tokens(self, user_id: str) -> None:
-        """Revoke every temporary token of a user; Onezone cannot revoke one of them alone."""
+        """Revoke every temporary token of a user; Onezone cannot revoke one of them alone.
+
+        The path is unconfirmed (UNVERIFIED_ENDPOINTS): no source revokes a token.
+        """
         if not _USER_ID.fullmatch(user_id):
             raise OutOfScope("the user id is not a plain id")
         self._send("DELETE", f"/users/{quote(user_id, safe='')}/tokens/temporary", provider=None, headers=self._admin)

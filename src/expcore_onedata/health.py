@@ -1,6 +1,7 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/harness/health.py, blob d841c16205d7b5b545c0186eec9788b9965880e6
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
+#   merged: icsa-2027-experiments @ 6fc798cf, icsa/harness/health.py:57-64 (the scope of a token)
 #   changes: see git history of this file from its import commit
 """The platform's health check, run before and after every attempt (O04).
 

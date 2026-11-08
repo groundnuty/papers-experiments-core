@@ -88,7 +88,9 @@ def test_o03_a_declared_id_pins_by_id_not_by_domain(client, config, fake, token)
         {"dataAccessScope": {"spaces": {}}},
         {"dataAccessScope": {"spaces": {SPACE: {"name": "n"}}}},
         {"dataAccessScope": {"spaces": {SPACE: {"name": "n", "supports": {}}}}},
-        {"dataAccessScope": {"spaces": {SPACE: {"name": "n", "supports": ["p"]}}}},
+        {"dataAccessScope": {"spaces": {SPACE: {"name": "n", "supports": "p"}}}},
+        {"dataAccessScope": {"spaces": {SPACE: {"name": "n", "supports": [1, 2]}}}},
+        {"dataAccessScope": {"spaces": {SPACE: {"name": "n", "supports": []}}}},
         {"dataAccessScope": {"spaces": {SPACE: {"name": "n", "supports": {"p": {}}}}, "providers": []}},
     ],
 )
@@ -102,3 +104,15 @@ def test_o03_a_provider_without_details_is_listed_but_matches_nothing():
     """O03: a supporting provider whose details Onezone omits is still reported, with unknown fields."""
     view = parse_scope({"dataAccessScope": {"spaces": {SPACE: {"name": "n", "supports": {"provider-one": {}}}}}}, SPACE)
     assert [(p.id, p.name, p.domain, p.online) for p in view.providers] == [("provider-one", None, None, None)]
+
+
+def test_o03_supports_may_be_a_list_of_provider_ids_as_well_as_a_mapping():
+    """O03: the earlier code only iterated the supports for ids, so a list of ids is read like a mapping keyed by id."""
+    answer = {
+        "dataAccessScope": {
+            "spaces": {SPACE: {"name": "n", "supports": ["pr-b", "pr-a"]}},
+            "providers": {"pr-a": {"domain": "A.test"}, "pr-b": {"domain": "b.test"}},
+        }
+    }
+    view = parse_scope(answer, SPACE)
+    assert [(p.id, p.domain) for p in view.providers] == [("pr-a", "a.test"), ("pr-b", "b.test")]

@@ -1,6 +1,8 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/scripted/federation.py, blob 8195d16935d767970798b6c4ceb4b420f3bd633d
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
+#   merged: icsa-2027-experiments @ 6fc798cf, icsa/sandbox/sandbox.py:494-505 (the providers from the scope)
+#   merged: icsa-2027-experiments @ 6fc798cf, icsa/harness/health.py:57-64 (the space and its supports)
 #   changes: see git history of this file from its import commit
 """The federation as Onezone reports it for the study space, and the agent's pin to its local provider (O03).
 
@@ -71,10 +73,14 @@ def parse_scope(answer: Any, space_id: str) -> SpaceView:
         details = scope.get("providers", {})
     except (KeyError, TypeError, AttributeError):
         raise FederationUnreadable("zone: the scope answer does not describe the study space") from None
-    if not isinstance(supports, Mapping) or not supports or not isinstance(details, Mapping):
+    # The sources only iterate `supports` for provider ids (sandbox.py:500, health.py:64), so it is read as a mapping
+    # keyed by id or as a list of ids; they read the space's name and `providers[id]["domain"]`, and nothing else.
+    listed = isinstance(supports, Mapping) or (isinstance(supports, list) and all(isinstance(i, str) for i in supports))
+    ids = sorted(supports) if listed else []
+    if not ids or not isinstance(details, Mapping):
         raise FederationUnreadable("zone: the scope answer lists no supporting provider")
     providers = []
-    for provider_id in sorted(supports):
+    for provider_id in ids:
         entry = details.get(provider_id)
         entry = entry if isinstance(entry, Mapping) else {}
         online = entry.get("online")

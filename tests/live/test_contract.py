@@ -16,12 +16,12 @@ PLATFORM = os.environ.get("EXPCORE_LIVE_PLATFORM")
 if not PLATFORM:
     pytest.skip("EXPCORE_LIVE_PLATFORM is not set; these tests contact a real deployment", allow_module_level=True)
 
-from expcore_onedata.client import OnezoneClient  # noqa: E402 -- imported only once the module is known to run
+from expcore_onedata.client import OnezoneClient, PlatformError  # noqa: E402 -- only once the module is known to run
 from expcore_onedata.config import load_platform  # noqa: E402
 from expcore_onedata.federation import pin_local_provider, read_space  # noqa: E402
 from expcore_onedata.health import PlatformHealth  # noqa: E402
 from expcore_onedata.tokencheck import TokenRefused  # noqa: E402
-from expcore_onedata.tokens import TokenIssuer, data_path_spec, token_window, tool_server_spec  # noqa: E402
+from expcore_onedata.tokens import TokenIssuer, data_path_spec, tool_server_spec  # noqa: E402
 
 TIME_CAP_S = 300.0
 
@@ -49,20 +49,26 @@ def service_user(config):
     return config.principals.service
 
 
-def test_a_freshly_minted_data_path_token_examines_cleanly_and_is_revoked(config, issuer):
+def test_a_freshly_minted_data_path_token_examines_cleanly_and_is_revoked(config, issuer, client):
+    # covers: POST /users/{user}/tokens/temporary
+    # covers: POST /tokens/examine
+    # covers: DELETE /users/{user}/tokens/temporary
     user = service_user(config)
     spec = data_path_spec(config.space.id)
-    token = issuer.mint(spec, user, time_cap_s=TIME_CAP_S)  # examined inside mint
+    token = issuer.mint(spec, user, time_cap_s=TIME_CAP_S)  # minted and examined inside mint
     try:
-        assert token.subject == user
+        assert token.subject == user  # the answer's subject names the user the token was minted for
         assert token.expires_at > time.time()
     finally:
         issuer.revoke(token)
-    with pytest.raises(TokenRefused):  # a revoked token is no longer examined as valid
-        issuer.examine(token.reveal(), spec, user, token_window(TIME_CAP_S, config.tokens))
+    # An examination decodes a token without verifying it, so revocation shows as a refusal to use the token.
+    with pytest.raises(PlatformError) as refused:
+        read_space(client, token.reveal(), config.space.id)
+    assert refused.value.status in (401, 403)
 
 
 def test_discovery_finds_the_space_and_the_declared_local_provider(config, issuer, client):
+    # covers: POST /tokens/infer_access_token_scope
     user = service_user(config)
     token = issuer.mint(data_path_spec(config.space.id), user, time_cap_s=TIME_CAP_S)
     try:
@@ -72,6 +78,9 @@ def test_discovery_finds_the_space_and_the_declared_local_provider(config, issue
         issuer.revoke(token)
     assert view.name == config.space.name
     assert pinned.provider.name == config.support.local
+    for provider in view.providers:  # the fields no source confirms: a name and an online flag per provider
+        assert isinstance(provider.name, str)
+        assert isinstance(provider.online, bool)
 
 
 def test_the_health_check_reads_the_declared_support_set(config, client, issuer):

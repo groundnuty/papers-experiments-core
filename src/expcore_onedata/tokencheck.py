@@ -1,6 +1,7 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/knowledge/tokencheck.py, blob 80f29a7b310adef07c5baf41fcb60aa05b133869
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
+#   merged: icsa-2027-experiments @ 6fc798cf, icsa/knowledge/live.py:36,52 (the examination: id, caveats)
 #   changes: see git history of this file from its import commit
 """Examine a token, and the principal that holds it, before either is used. Fail closed (O05, O06).
 

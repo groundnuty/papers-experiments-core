@@ -1,6 +1,8 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/scripted/tokens.py, blob 502f83b763e6c4750b2a826866780be1155e3a9e
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
+#   merged: icsa-2027-experiments @ 6fc798cf, icsa/harness/slot_users.py:342,345 (privilege reads, direct and effective)
+#   merged: icsa-2027-experiments @ 6fc798cf, icsa/harness/slot_users.py:197-204 (the temporary token of a user)
 #   changes: see git history of this file from its import commit
 """Mint the tokens of a run's two planes, each for its own principal, and examine each before it is handed out.
 
@@ -151,7 +153,10 @@ class TokenIssuer:
         self._clock = clock
 
     def _read_privileges(self, subject: str) -> tuple[Any, Any]:
-        """Read a principal's privileges in the study space, direct and effective."""
+        """Read a principal's privileges in the study space, direct and effective.
+
+        Both paths and the `privileges` key of the answer are confirmed by the source named in this file's header.
+        """
         space, user = quote(self._config.space.id, safe=""), quote(subject, safe="")
         answers = [
             self._client.get(f"/spaces/{space}/{kind}/{user}/privileges") for kind in ("users", "effective_users")
