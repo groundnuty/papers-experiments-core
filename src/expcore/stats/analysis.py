@@ -112,6 +112,17 @@ def analyse(rows: Iterable[Row], prereg: Preregistration) -> AnalysisResult:
     return AnalysisResult(results, decisions, prereg.alpha, prereg.manifest())
 
 
+def power_study(prereg: Preregistration, simulate: bool = True) -> list[dict]:
+    """The power table of the preregistration's [power] settings, at alpha and at alpha divided by the family size.
+
+    It reads nothing but the preregistration and runs scipy's test directly (see power), so it checks the design
+    without touching the pipeline.
+    """
+    if prereg.power is None:
+        raise ValueError(f"{prereg.source}: has no [power] section, so there is no power study to run")
+    return power.power_table(prereg.power, prereg.alpha, len(prereg.holm_family), simulate=simulate)
+
+
 def pilot_power(rows: Iterable[Row], prereg: Preregistration, names: Sequence[str] | None = None) -> list[dict]:
     """Power re-estimate from pilot rows: each contrast's between-cluster SD of paired differences feeds the table.
 

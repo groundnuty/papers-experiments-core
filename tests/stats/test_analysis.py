@@ -1,5 +1,6 @@
 """A preregistration run end to end: simulated rows with planted effects, estimators by name, Holm over the family."""
 
+import dataclasses
 import math
 import tomllib
 
@@ -8,7 +9,7 @@ import pytest
 from stats_support import both_arms, make_row
 
 from expcore.stats import estimators
-from expcore.stats.analysis import analyse, pilot_power, run_contrast
+from expcore.stats.analysis import analyse, pilot_power, power_study, run_contrast
 from expcore.stats.estimators import EstimatorResult
 from expcore.stats.pairing import ContrastSpec
 from expcore.stats.prereg import parse
@@ -150,7 +151,7 @@ def test_s02_an_untestable_contrast_keeps_its_place_in_the_family():
 
 
 def test_s03_the_counts_of_what_pairing_left_out_reach_the_result(prereg):
-    """S03 and R10: dropped clusters, unpaired runs and missing outcomes are reported with the estimate."""
+    """S03, R10: dropped clusters, unpaired runs and missing outcomes are reported with the estimate."""
     rows = []
     for i in range(6):
         rows += both_arms(f"t{i}", "model-a", 1, 0.8, 0.5, cluster=f"c{i}")
@@ -224,3 +225,17 @@ def test_pilot_power_refuses_what_it_cannot_run(prereg, planted):
         pilot_power(rows, prereg.with_override(power=None))
     with pytest.raises(ValueError, match="inline: no contrast named 'nope'"):
         pilot_power(rows, prereg, names=["nope"])
+
+
+def test_the_power_study_runs_on_the_preregistered_settings_and_the_family_size(prereg):
+    """The grid, the targets, the seed and the number of simulations come from the file; alpha is divided by m = 3."""
+    table = power_study(prereg)
+    assert [(row["sd"], row["alpha_level"]) for row in table] == [(0.1, "alpha"), (0.1, "alpha_over_contrasts")]
+    assert table[1]["alpha"] == pytest.approx(0.05 / 3)
+    assert {(row["n_clusters"], row["delta"]) for row in table} == {(20, 0.1)}
+    assert table == power_study(prereg)  # seeded by the file
+    assert all(math.isnan(row["power"]) for row in power_study(prereg, simulate=False))
+    changed = prereg.with_override(power=dataclasses.replace(prereg.power, target_difference=0.3))
+    assert power_study(changed)[0]["power"] > table[0]["power"]
+    with pytest.raises(ValueError, match=r"inline: has no \[power\] section"):
+        power_study(prereg.with_override(power=None))
