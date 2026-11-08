@@ -9,8 +9,8 @@ change to a parser or scorer is visible in the records it re-scored.
 A scorer declares `version`. A plain function has none, so its version is the SHA-256 of its source file, which stands
 in for a commit when the code is not in git.
 
-An attempt that is set aside (an infrastructure failure or a harness defect) is never scored; re-scoring leaves it as
-it was, with no scores.
+An attempt that is set aside (an infrastructure failure, unless its condition declares that kind as treatment, or a
+harness defect) is never scored; re-scoring leaves it as it was, with no scores.
 """
 
 import copy

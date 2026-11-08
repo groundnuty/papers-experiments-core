@@ -15,12 +15,13 @@ import asyncio
 import dataclasses
 import time
 import warnings
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore.config.models import ModelTable
+from expcore.errors import infra_kinds
 from expcore.loop.agent_loop import run_agent
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
@@ -101,8 +102,12 @@ def stable_call_detail(status: str, detail: str) -> str:
     return detail
 
 
-def outcome_entry(outcome: Outcome) -> dict[str, Any]:
-    """Return the outcome as the record keeps it."""
+def outcome_entry(outcome: Outcome, treatment_kinds: Collection[str] = ()) -> dict[str, Any]:
+    """Return the outcome as the record keeps it.
+
+    `treatment` is true exactly when the outcome is infrastructure of a kind the attempt's condition declares as its
+    treatment: then it is a scored final attempt and the record is not set aside.
+    """
     defect = outcome.defect
     return {
         "name": outcome.name,
@@ -110,7 +115,19 @@ def outcome_entry(outcome: Outcome) -> dict[str, Any]:
         "infra_kind": outcome.infra_kind,
         "error_type": outcome.error_type,
         "defect": None if defect is None else {"exception": defect.exception, "stack_sha256": defect.stack_sha256},
+        "treatment": outcome.name == "infrastructure" and outcome.infra_kind in treatment_kinds,
     }
+
+
+def treatment_list(treatment_kinds: Iterable[str]) -> list[str]:
+    """Return the declared treatment kinds sorted, each once; refuse a kind outside the registry (R02)."""
+    kinds = sorted(set(treatment_kinds))
+    unknown = [k for k in kinds if k not in infra_kinds()]
+    if unknown:
+        raise RecordError(
+            f"unknown infrastructure kind {unknown[0]!r} in treatment_kinds; known: {', '.join(infra_kinds())}"
+        )
+    return kinds
 
 
 def tool_entry(spec: ToolSpec) -> dict[str, Any]:
@@ -241,6 +258,7 @@ def build_record(
     code: Mapping[str, Any],
     core_version: str | None = None,
     instruments: Mapping[str, Any] | None = None,
+    treatment_kinds: Iterable[str] = (),
     redactor: Redactor | None = None,
     secrets: Iterable[str] = (),
     secret_env: Iterable[str] = (),
@@ -253,6 +271,10 @@ def build_record(
     conversation that is not the one the pieces make, which means the backend's history is not the plain
     system, user, assistant, tool-results sequence the replay serves.
 
+    `treatment_kinds` are the infrastructure kinds the attempt's condition declares as its treatment; the campaign
+    passes `FactorSchema.treatment_kinds_of(key)`. They are kept in the record's identity, and the outcome's `treatment`
+    flag is derived from them: an infrastructure failure of a listed kind is a scored final attempt, not set aside.
+
     Secrets are redacted here, before any digest is taken: the digests the record pins (prompt texts, the
     conversation each request carried, the settings each sent, the configuration) are those of the redacted
     data, which is what is stored and replayed, and `redacted_paths` lists where something was replaced.
@@ -261,6 +283,7 @@ def build_record(
     record) unless a `redactor` is given. A replay passes `Redactor.none()`: what it reads is redacted already.
     """
     secrets, secret_env = tuple(secrets), tuple(secret_env)
+    kinds = treatment_list(treatment_kinds)
     sys_prompt, user_prompt = PromptText.of(system), PromptText.of(user)
     captured = recording.captured
     if len(captured) != len(result.turns):
@@ -283,6 +306,7 @@ def build_record(
         "run_key": identity.run_key,
         "factors": plain(dict(identity.factors)),
         "attempt": identity.attempt,
+        "treatment_kinds": kinds,
         "route": route_entry(result.backend_info, sets),
         "prompt": {
             "system": sys_prompt.entry(),
@@ -298,7 +322,7 @@ def build_record(
         "failed_request": failed,
         "tool_calls": [call_entry(c) for c in result.tool_calls],
         "clock": [[label, value] for label, value in result.clock_readings],
-        "outcome": outcome_entry(result.outcome),
+        "outcome": outcome_entry(result.outcome, kinds),
         "totals": {
             "rounds": result.rounds,
             "malformed_calls": result.malformed_calls,
@@ -340,6 +364,7 @@ async def record_attempt(
     *,
     code: Mapping[str, Any],
     core_version: str | None = None,
+    treatment_kinds: Iterable[str] = (),
     timer: AgentTimer | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -352,7 +377,8 @@ async def record_attempt(
 
     The tool box takes its cap from the configuration, so the record's configuration describes what the model saw.
     `code` is the code identity, for example `expcore.provenance.codestamp.version(root, scope)`, and `core_version`
-    defaults to the installed version of the core. The caller builds the backend (passing it `timer.time_left` when
+    defaults to the installed version of the core. `treatment_kinds` are the infrastructure kinds the condition declares
+    as its treatment (see `build_record`). The caller builds the backend (passing it `timer.time_left` when
     it uses the loop's time) and closes it.
 
     Secrets are redacted from the record (R12): those of environment variables named like one, the variables
@@ -379,6 +405,7 @@ async def record_attempt(
         specs=specs,
         code=code,
         core_version=core_version if core_version is not None else sdk_version(CORE_DISTRIBUTION),
+        treatment_kinds=treatment_kinds,
         secrets=secrets,
         secret_env=secret_env,
         models=models,

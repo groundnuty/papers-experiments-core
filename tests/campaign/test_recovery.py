@@ -1,0 +1,171 @@
+"""Kill safety: a process killed at each point of an attempt resumes cleanly (C04), and the outcome marker."""
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from campaign_crash import KILLED
+from campaign_support import (
+    LATER,
+    NOW,
+    defect,
+    infra,
+    make_manifest,
+    make_schema,
+    open_store,
+    planned_store,
+    run_one,
+)
+
+from expcore.campaign.markers import MARKER_NAME, MarkerError, read_marker, write_marker
+from expcore.campaign.recovery import Recovery, recover
+
+CRASH = Path(__file__).resolve().parents[1] / "support" / "campaign_crash.py"
+
+
+def kill_at(tmp_path: Path, point: str):
+    """Run a child that dies at `point`; return the store opened afterwards, the run key and the run directory."""
+    database, run_dir = tmp_path / "campaign.db", tmp_path / "run"
+    done = subprocess.run(
+        [sys.executable, str(CRASH), str(database), str(run_dir), point], capture_output=True, text=True
+    )
+    assert done.returncode == KILLED, done.stderr
+    return open_store(tmp_path), make_manifest(make_schema()).rows[0].key.text, run_dir
+
+
+def attempts(store):
+    return [(r["state"], r["charged"], r["attempt"]) for r in store.q("SELECT * FROM attempts ORDER BY id")]
+
+
+def status(store, key):
+    return store.q("SELECT status FROM runs WHERE run_key=?", (key,))[0]["status"]
+
+
+def test_c04_a_kill_before_the_marker_leaves_an_interrupted_uncharged_attempt_and_a_run_to_redo(tmp_path):
+    """C04: a kill after the attempt began and before its marker: interrupted, never charged, run again."""
+    store, key, run_dir = kill_at(tmp_path, "before_marker")
+    assert attempts(store) == [("running", 0, 1)]
+    assert not (run_dir / MARKER_NAME).exists()
+    assert recover(store, LATER, 3) == Recovery(committed=0, interrupted=1, requeued=0)
+    assert attempts(store) == [("interrupted", 0, 1)]
+    assert store.charged_attempts(key) == 0
+    assert status(store, key) == "pending"
+    assert store.q("SELECT usage_complete FROM attempts")[0][0] == 0  # nobody knows what it used
+    redo = store.begin_attempt(key, LATER, 1, str(run_dir))
+    assert redo.number == 1  # the same attempt number, as no fault was observed
+
+
+def test_c04_a_kill_after_the_marker_commits_the_marked_result_and_never_runs_it_again(tmp_path):
+    """C04: an outcome marker written before the kill is committed, never re-run."""
+    store, key, run_dir = kill_at(tmp_path, "after_marker")
+    assert attempts(store) == [("running", 0, 1)]
+    assert (run_dir / MARKER_NAME).is_file()
+    assert recover(store, LATER, 3) == Recovery(committed=1, interrupted=0, requeued=0)
+    assert attempts(store) == [("done", 0, 1)]
+    assert status(store, key) == "done"
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["input_tokens"], row["output_tokens"], row["termination"], row["wall_s"]) == (10, 5, "finished", 12.5)
+    assert key not in [r["run_key"] for r in store.pending()]
+    assert store.q("SELECT kind FROM events")[0]["kind"] == "recovered_committed"
+
+
+def test_c04_a_kill_after_the_metadata_write_leaves_nothing_to_repair(tmp_path):
+    """C04: a kill after the store recorded the result: the result stands and recovery does nothing."""
+    store, key, _ = kill_at(tmp_path, "after_metadata")
+    assert attempts(store) == [("done", 0, 1)]
+    assert status(store, key) == "done"
+    assert recover(store, LATER, 3) == Recovery(0, 0, 0)
+    assert attempts(store) == [("done", 0, 1)]
+    assert status(store, key) == "done"
+
+
+@pytest.mark.parametrize("point", ["before_marker", "after_marker", "after_metadata"])
+def test_c04_recovery_is_safe_to_repeat_after_a_kill_of_its_own(tmp_path, point):
+    """C04: a second recovery finds nothing left to settle."""
+    store, key, _ = kill_at(tmp_path, point)
+    recover(store, LATER, 3)
+    snapshot = (attempts(store), status(store, key))
+    assert recover(store, LATER, 3) == Recovery(0, 0, 0)
+    assert (attempts(store), status(store, key)) == snapshot
+
+
+def test_c04_a_marked_infrastructure_failure_is_charged_when_committed_from_its_marker(tmp_path):
+    """C04: a marker's result is committed by the same rules as a live finish, including the charge."""
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    begun = store.begin_attempt(key, NOW, 1, str(tmp_path / "run"))
+    write_marker(tmp_path / "run", key, begun.id, infra("sandbox"))
+    assert recover(store, LATER, 3).committed == 1
+    assert (attempts(store), status(store, key)) == ([("infra_fail", 1, 1)], "pending")
+    assert store.charged_attempts(key) == 1
+
+
+def test_c04_a_marker_left_by_an_earlier_attempt_does_not_end_this_one(tmp_path):
+    """C04: the marker names the attempt it ended, so a stale one in a reused directory is ignored."""
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    run_dir = tmp_path / "run"
+    first = store.begin_attempt(key, NOW, 1, str(run_dir))
+    write_marker(run_dir, key, first.id, infra("endpoint"))
+    store.finish_attempt(first.id, infra("endpoint"), 3)
+    second = store.begin_attempt(key, LATER, 1, str(run_dir))  # the same directory; the old marker is still there
+    assert read_marker(run_dir, key, second.id) is None
+    assert recover(store, LATER, 3) == Recovery(0, 1, 0)
+    assert attempts(store) == [("infra_fail", 1, 1), ("interrupted", 0, 2)]
+
+
+def test_c04_a_marker_that_cannot_be_trusted_stops_recovery_instead_of_guessing(tmp_path):
+    """C04: neither losing a finished attempt nor running it twice is acceptable, so recovery fails loudly."""
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    run_dir = tmp_path / "run"
+    store.begin_attempt(key, NOW, 1, str(run_dir))
+    run_dir.mkdir()
+    (run_dir / MARKER_NAME).write_text("{not json", encoding="utf-8")
+    with pytest.raises(MarkerError, match="not a valid marker"):
+        recover(store, LATER, 3)
+    assert attempts(store) == [("running", 0, 1)]
+
+
+def test_c04_an_attempt_with_no_run_directory_is_interrupted(tmp_path):
+    """C04: with nowhere to look for a marker the attempt cannot have finished."""
+    store, _, manifest = planned_store(tmp_path)
+    store.begin_attempt(manifest.rows[0].key.text, NOW, 1, "")
+    assert recover(store, LATER, 3).interrupted == 1
+
+
+def test_a_harness_error_run_goes_back_to_pending_from_the_same_row_with_its_attempt_kept(tmp_path):
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    assert run_one(store, key, defect()) == "harness_error"
+    assert key not in [r["run_key"] for r in store.pending()]
+    assert recover(store, LATER, 3) == Recovery(0, 0, 1)
+    assert status(store, key) == "pending"
+    assert attempts(store) == [("harness_error", 0, 1)]
+    assert store.q("SELECT detail FROM attempts")[0]["detail"].startswith("ValueError aaaaaaaaaaaa: boom")
+    assert store.q("SELECT kind FROM events")[0]["kind"] == "harness_error_requeued"
+
+
+def test_c04_a_harness_error_ends_in_the_same_state_after_one_recovery_whichever_side_of_the_write_the_kill_fell(
+    tmp_path,
+):
+    """C04: adds that the kill after the marker and the kill after the metadata write agree after one recovery."""
+    outcomes = {}
+    for point in ("after_marker", "after_metadata"):
+        store, _, manifest = planned_store(tmp_path / point)
+        key = manifest.rows[0].key.text
+        run_dir = tmp_path / point / "run"
+        begun = store.begin_attempt(key, NOW, 1, str(run_dir))
+        write_marker(run_dir, key, begun.id, defect())
+        if point == "after_metadata":
+            store.finish_attempt(begun.id, defect(), 3)
+            assert status(store, key) == "harness_error"  # the stored result, before any recovery
+        recover(store, LATER, 3)
+        outcomes[point] = (
+            attempts(store),
+            status(store, key),
+            store.charged_attempts(key),
+            key in [r["run_key"] for r in store.pending()],
+        )
+    assert outcomes["after_marker"] == outcomes["after_metadata"] == ([("harness_error", 0, 1)], "pending", 0, True)

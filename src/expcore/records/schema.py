@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore.config.models import Limits
+from expcore.errors import infra_kinds
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
@@ -40,6 +41,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "run_key": (str,),
         "factors": (dict,),
         "attempt": (int,),
+        "treatment_kinds": (list,),
         "route": (dict,),
         "prompt": (dict,),
         "tools": (list,),
@@ -130,6 +132,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "infra_kind": (str, NONE),
         "error_type": (str, NONE),
         "defect": (dict, NONE),
+        "treatment": (bool,),
     },
     "totals": {
         "rounds": (int,),
@@ -291,8 +294,12 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
         _check_keys(f"{where}.retries[{i}]", retry, RETRY_FIELDS, required=())
 
 
-def _check_outcome(outcome: dict, where: str) -> None:
-    """Build the outcome through the loop's own vocabulary check, so a name or kind outside it is refused here too."""
+def _check_outcome(outcome: dict, treatment_kinds: Any, where: str) -> None:
+    """Build the outcome through the loop's own vocabulary check, so a name or kind outside it is refused here too.
+
+    The `treatment` flag must be what the outcome and the record's `treatment_kinds` make it: true exactly when the
+    outcome is infrastructure of a kind in the list. A record whose flag says otherwise contradicts itself (R02).
+    """
     defect = outcome["defect"]
     if defect is not None:
         _check_keys(f"{where}.defect", defect, ("exception", "stack_sha256"))
@@ -303,6 +310,24 @@ def _check_outcome(outcome: dict, where: str) -> None:
         Outcome(outcome["name"], outcome["detail"], outcome["infra_kind"], outcome["error_type"], held)
     except (KeyError, TypeError, ValueError) as exc:
         raise RecordError(f"{where}: {type(exc).__name__}: {exc}") from None
+    expected = outcome["name"] == "infrastructure" and outcome["infra_kind"] in treatment_kinds
+    if outcome["treatment"] is not expected:
+        raise RecordError(
+            f"{where}.treatment: is {outcome['treatment']} but the outcome and treatment_kinds make it {expected}"
+        )
+
+
+def _check_treatment_kinds(kinds: Any) -> None:
+    """Check the infrastructure kinds the condition declared as treatment: distinct, sorted, from the registry."""
+    if not isinstance(kinds, list) or any(not isinstance(k, str) for k in kinds):
+        raise RecordError("treatment_kinds: a list of infrastructure kinds")
+    unknown = [k for k in kinds if k not in infra_kinds()]
+    if unknown:
+        raise RecordError(
+            f"treatment_kinds: unknown infrastructure kind {unknown[0]!r}; known: {', '.join(infra_kinds())}"
+        )
+    if kinds != sorted(set(kinds)):
+        raise RecordError("treatment_kinds: the kinds are written sorted, each once")
 
 
 def _check_configuration(config: Any, version: str, schemas: Sequence[SchemaVersion]) -> None:
@@ -363,8 +388,9 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
         ok = isinstance(reading, list) and len(reading) == 2 and isinstance(reading[0], str) and _fits(reading[1], NUM)
         if not ok:
             raise RecordError(f"clock[{i}]: expected [label, seconds]")
+    _check_treatment_kinds(body["treatment_kinds"])
     check_section("outcome", body["outcome"], version, "outcome", schemas)
-    _check_outcome(body["outcome"], "outcome")
+    _check_outcome(body["outcome"], body["treatment_kinds"], "outcome")
     check_section("totals", body["totals"], version, "totals", schemas)
     _check_waited(body["totals"]["infra_wait_by_kind"], "totals.infra_wait_by_kind")
     for i, event in enumerate(body["totals"]["malformed_events"]):

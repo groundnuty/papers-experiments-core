@@ -8,11 +8,12 @@ from loop_support import ClockSleep, FakeClock, FakeProvider, ScriptedBackend, m
 from record_support import CODE, IDENTITY, hand_made, make_config, record_run, sha
 from replay_scenarios import BadRequest, Hangs
 
-from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
+from expcore.errors import ContextOverflow, InfraError, RequestAbandoned, infra_kinds
+from expcore.loop.outcomes import OUTCOMES, HarnessDefect, Outcome
 from expcore.models.adapters import StubAdapter
 from expcore.plugin import ToolOutput
 from expcore.prompt.templates import PromptTemplate
-from expcore.records.build import PromptText, build_record, record_attempt
+from expcore.records.build import PromptText, build_record, outcome_entry, record_attempt
 from expcore.records.digest import digest
 from expcore.records.record import RunRecord, decode
 from expcore.records.recording import RecordingBackend
@@ -276,3 +277,61 @@ def test_the_core_version_defaults_to_the_installed_one_and_the_stamp_is_kept_as
     assert run().core_version == sdk_version("papers-experiments-core")
     assert run(core_version="9.9").core_version == "9.9"
     assert run().code == CODE
+
+
+# --- infrastructure that is a condition's treatment ----------------------------------------------------------------
+
+DOWN = [[("echo", {"x": "1"})], InfraError("endpoint", "HTTP 503 after 8 retries")]
+
+
+def test_R09_a_declared_infrastructure_kind_is_a_treatment_outcome_that_is_not_set_aside():
+    """R09: adds that the partial record of a declared kind is a scored final attempt; its turns are kept."""
+    record = reread(record_run(DOWN, ECHO, record_options={"treatment_kinds": ["endpoint"]}))
+    assert record.treatment_kinds == ["endpoint"]
+    assert (record.outcome["name"], record.outcome["infra_kind"], record.outcome["treatment"]) == (
+        "infrastructure",
+        "endpoint",
+        True,
+    )
+    assert record.set_aside is False
+    assert [t["index"] for t in record.transcript] == [0]
+    assert record.failed_request is not None
+
+
+def test_R09_a_kind_the_condition_did_not_declare_is_still_set_aside():
+    """R09: adds that only declared kinds are treatment; another infrastructure kind keeps the record aside."""
+    record = reread(record_run(DOWN, ECHO, record_options={"treatment_kinds": ["sandbox"]}))
+    assert record.treatment_kinds == ["sandbox"]
+    assert (record.outcome["infra_kind"], record.outcome["treatment"]) == ("endpoint", False)
+    assert record.set_aside is True
+
+
+def test_R09_without_declared_kinds_every_infrastructure_outcome_is_set_aside():
+    """R09: adds the default: no kinds declared, so the flag is false and the record is set aside as before."""
+    record = reread(record_run(DOWN, ECHO))
+    assert (record.treatment_kinds, record.outcome["treatment"], record.set_aside) == ([], False, True)
+
+
+@pytest.mark.parametrize("name", OUTCOMES)
+def test_R09_only_an_infrastructure_outcome_can_be_treatment_whatever_kinds_are_declared(name):
+    """R09: adds that no scored ending and no harness defect ever carries the flag, even with every kind declared."""
+    extra = {
+        "infrastructure": {"infra_kind": "endpoint"},
+        "error": {"error_type": "ContextOverflow"},
+        "harness_defect": {"defect": HarnessDefect("KeyError", "e" * 64)},
+    }
+    entry = outcome_entry(Outcome(name, "detail", **extra.get(name, {})), infra_kinds())
+    assert entry["treatment"] is (name == "infrastructure")
+    assert outcome_entry(Outcome(name, "detail", **extra.get(name, {})))["treatment"] is False
+
+
+def test_R02_the_declared_kinds_are_written_sorted_and_once():
+    """R02: adds that two orders of the same declaration make one record."""
+    record = record_run(DOWN, ECHO, record_options={"treatment_kinds": ["sandbox", "endpoint", "sandbox"]})
+    assert record.treatment_kinds == ["endpoint", "sandbox"]
+
+
+def test_R02_a_declared_kind_outside_the_registry_is_refused_when_the_record_is_built():
+    """R02: adds that a typo in the declaration cannot reach a record."""
+    with pytest.raises(RecordError, match="unknown infrastructure kind 'wifi' in treatment_kinds"):
+        record_run(DOWN, ECHO, record_options={"treatment_kinds": ["wifi"]})

@@ -204,3 +204,13 @@ def test_R13_a_result_that_cannot_be_written_stops_the_run_before_any_write(corp
     with pytest.raises(RecordError, match="cannot be written as JSON"):
         rescore_files(corpus, [nan_scorer])
     assert written_files(corpus) == before
+
+
+def test_R13_a_treatment_attempt_is_scored_like_any_other_scored_attempt():
+    """R13: adds that an infrastructure outcome of a declared kind is not set aside, so the scorers run on it."""
+    record = SCENARIOS["infra_treatment"][0]()
+    assert record.set_aside is False
+    scored = rescore(record, [TurnCount()])
+    assert scored is not record
+    assert scored.scores["turns"]["result"]["outcomes"]["turns"] == len(record.transcript)
+    assert scored.outcome == record.outcome

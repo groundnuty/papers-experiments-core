@@ -7,6 +7,7 @@
   "seed": 0
  },
  "attempt": 1,
+ "treatment_kinds": [],
  "route": {
   "backend": "stub",
   "model": "stub",
@@ -777,7 +778,8 @@
   "detail": "a call to the terminal tool 'submit' succeeded",
   "infra_kind": null,
   "error_type": null,
-  "defect": null
+  "defect": null,
+  "treatment": false
  },
  "totals": {
   "rounds": 6,

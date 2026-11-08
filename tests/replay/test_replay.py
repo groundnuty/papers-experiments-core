@@ -1,6 +1,7 @@
 """Replay (R03): the real loop re-run from a record re-derives transcript, tool-call log, outcome and clock."""
 
 import asyncio
+import dataclasses
 import socket
 
 import pytest
@@ -13,7 +14,7 @@ from expcore.loop.toolbox import ToolBox
 from expcore.records.record import RunRecord, load_record
 from expcore.replay.clock import BACKEND_CLOCK_LABELS, ReplayClock
 from expcore.replay.recorded import TOOLBOX_ERROR_CLASSES
-from expcore.replay.replay import config_of, replay_async, replay_record
+from expcore.replay.replay import ReplayDivergence, config_of, replay_async, replay_record
 
 
 def blank_stack(outcome):
@@ -141,3 +142,36 @@ def test_a_replay_does_not_run_the_tools_it_serves_their_recorded_results():
     live = FakeProvider({**HANDLERS, "echo": poisoned, "fail": poisoned, "submit": poisoned})
     replay_record(record)
     assert live.calls == []
+
+
+def test_R03_a_treatment_attempt_replays_and_re_derives_its_flag_from_the_recorded_kinds():
+    """R03: adds that the treatment flag is derived again from the recorded kinds and the replayed outcome."""
+    record = SCENARIOS["infra_treatment"][0]()
+    assert record.outcome["treatment"] is True
+    replayed = replay_record(record)
+    assert replayed.outcome == record.outcome
+    assert replayed.treatment_kinds == ["endpoint"]
+    assert replayed.set_aside is False
+
+
+def test_R03_a_flipped_treatment_flag_is_a_divergence():
+    """R03: adds that a flag turned either way after the run, past the load checks, no longer matches the replay."""
+    treatment = SCENARIOS["infra_treatment"][0]()
+    unflagged = dataclasses.replace(treatment, outcome={**treatment.outcome, "treatment": False})
+    with pytest.raises(ReplayDivergence) as caught:
+        replay_record(unflagged)
+    assert caught.value.path == "outcome.treatment"
+    aside = SCENARIOS["infra_turn_three"][0]()
+    flagged = dataclasses.replace(aside, outcome={**aside.outcome, "treatment": True})
+    with pytest.raises(ReplayDivergence) as caught:
+        replay_record(flagged)
+    assert caught.value.path == "outcome.treatment"
+
+
+def test_R03_declared_kinds_edited_away_from_the_flag_are_a_divergence():
+    """R03: adds that removing the recorded kinds while the flag stays set makes the replayed outcome differ."""
+    treatment = SCENARIOS["infra_treatment"][0]()
+    edited = dataclasses.replace(treatment, treatment_kinds=[])
+    with pytest.raises(ReplayDivergence) as caught:
+        replay_record(edited)
+    assert caught.value.path == "outcome.treatment"
