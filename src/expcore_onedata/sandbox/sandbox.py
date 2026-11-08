@@ -65,6 +65,7 @@ log = logging.getLogger(__name__)
 
 RUN_KEY = re.compile(r"[\x21-\x7e]{1,200}")  # it becomes an HTTP header value at the gate
 GATE_FILES = Path(__file__).resolve().parent  # gate.py and gatepolicy.py are mounted from here into the gate container
+MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
 MOUNT_WAIT_S = 60.0
 READ_ONLY_PROBE = (
@@ -101,6 +102,7 @@ class DockerSandbox:
         self.labels = netpool.Labels(settings.label_namespace)
         self.obs = Observer(host, settings.agent_uid)
         self._mounts: list[Path] = []
+        self._mount_log: list[dict[str, Any]] = []  # what the record file holds: each mount's path and identity
         self._containers: list[str] = []
         self._net: str | None = None
         self._watched: dict[str, dict[str, Any]] = {}
@@ -181,12 +183,14 @@ class DockerSandbox:
     # ------------------------------------------------------------------------------------------------ build
     def _build(self) -> None:
         s, _sp, mode = self.s, self.spec, self.spec.mode
+        self._write_mount_record()  # before anything exists: a mount is never made that the probe cannot be told of
         self.dir.mkdir(parents=True, exist_ok=False)
         self._started = time.time()
         self._meta.update(host=self.host.host_facts(), started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         work = self.dir / "work"
-        self._mounts.append(work)  # registered before the mount (unmounting what never got mounted is harmless)
+        self._note_mount(work)  # registered before the mount (unmounting what never got mounted is harmless)
         self.host.make_quota_dir(self.dir / "work.img", work, s.limits.work_disk_bytes, s.agent_uid)
+        self._note_mounted(work)
         hosts = self._gate_hosts() if mode is DataPathMode.REST else {}
         if mode is DataPathMode.REST:
             self._prepare_gate(hosts)
@@ -234,6 +238,55 @@ class DockerSandbox:
         net = ipaddress.ip_network(subnet)
         pools = hostops.strict_networks(self.s.network.pools)
         return next((i for i, pool in enumerate(pools) if net.subnet_of(pool)), None)
+
+    # ------------------------------------------------------------------------------------------------ mount record
+    def _record_file(self) -> Path:
+        return self.s.work_root / MOUNT_RECORDS / f"{self.sid}.json"
+
+    def _write_mount_record(self) -> None:
+        """Write, crash-safely, the lease and the mounts of this sandbox: what a probe finds them by, wherever the
+        directory has gone (C19). A mount is identified by its path and by the mount id and device the kernel gave it,
+        which a rename of the directory above it does not change."""
+        document = {"sid": self.sid, "lease": self.spec.lease_key, "mounts": self._mount_log}
+        target = self._record_file()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_suffix(".tmp")
+            with open(temporary, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(document, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        except OSError as e:
+            raise SandboxError(
+                f"the record of the sandbox's mounts could not be written ({describe_error(e)})"
+            ) from None
+
+    def _note_mount(self, path: Path) -> None:
+        """Register a mount point and record it, before the mount is made."""
+        self._mounts.append(path)
+        self._mount_log.append({"path": str(path), "id": None, "dev": None})
+        self._write_mount_record()
+
+    def _note_mounted(self, path: Path) -> None:
+        """Add the identity the kernel gave the mount just made; a table that cannot be read leaves the path alone."""
+        try:
+            table = hostops.parse_mountinfo(self.host.read_text("/proc/self/mountinfo"))
+        except (OSError, SandboxError) as e:
+            log.error("the identity of a new mount could not be read: %s", describe_error(e))
+            return
+        found = [m for m in table if m["mountpoint"] == str(path)]
+        if found:  # the last one is the one on top
+            entry = next(e for e in self._mount_log if e["path"] == str(path))
+            entry.update(id=found[-1]["id"], dev=found[-1]["dev"])
+            self._write_mount_record()
+
+    def _drop_mount_record(self) -> None:
+        """The sandbox is verifiably gone with its mounts: the record has nothing left to say."""
+        try:
+            self._record_file().unlink(missing_ok=True)
+        except OSError as e:  # a record that stays only makes the probe look again, at a table with nothing of ours
+            log.error("the record of the sandbox's mounts could not be removed: %s", describe_error(e))
 
     def _label_args(self) -> list[str]:
         return self.labels.args(self.host, self.dir, self.spec.lease_key)
@@ -284,9 +337,10 @@ class DockerSandbox:
         s, sp, names = self.s, self.spec, self.names
         share = self.dir / "mount"
         share.mkdir()
-        self._mounts.append(share)
+        self._note_mount(share)
         self.host.run(["mount", "--bind", str(share), str(share)], 60, sudo=True)
         self.host.run(["mount", "--make-rshared", str(share)], 60, sudo=True)  # so the sidecar's mount propagates out
+        self._note_mounted(share)
         host_name = sp.provider.host
         command = sidecar_command(host_name, s)
         self._log_dir = effective_log_dir(command)
@@ -572,26 +626,50 @@ class DockerSandbox:
                 complete  # stopped only when everything is verifiably gone; an interrupt leaves it retryable
             )
             if complete:
+                self._drop_mount_record()
                 TERM.unregister(self)
         if errors:
             raise SandboxError("sandbox cleanup incomplete: " + "; ".join(errors))
 
+    def _mounts_may_be_live(self, errors: list[str]) -> bool:
+        """Whether a mount under the run directory may still be live: an unmount that failed, a mount table that cannot
+        be shown whole, or a mount the table still lists there. Unknown is live (C19)."""
+        if errors:  # the unmounts above are the only steps that ran since the caller began counting
+            return True
+        try:
+            return bool(hostops.mounts_under(self.host.read_text("/proc/self/mountinfo"), self.dir))
+        except (OSError, SandboxError):
+            return True
+
     def _remove_the_rest(self, errors: list[str]) -> None:
         if self._net:
             self._step(errors, hostops.remove_network, self.host, self._net)  # a leaked network keeps its subnet
+        unmount_errors: list[str] = []
         for m in reversed(self._mounts):
-            self._step(errors, self.host.unmount, m)
+            self._step(unmount_errors, self.host.unmount, m)
+        errors.extend(unmount_errors)
+        if self.keep_evidence:
+            self._meta["evidence_kept"] = {
+                "under": "sandbox.work_root",
+                "directory_id": self.sid.rsplit("-", 1)[-1],
+                "relocated": False,
+            }
+        if self._mounts_may_be_live(unmount_errors):
+            # a directory is never moved, renamed or removed while a mount under it may be live: the mount would go with
+            # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)
+            errors.append("the run directory is left where it is: a mount under it may be live")
+            return
         if self.keep_evidence:  # the copy failed: the disks hold the only record of the run
             kept = self.s.work_root / "_kept_evidence"
             self._step(errors, lambda: self.host.run(["mkdir", "-p", str(kept)], 20, sudo=True))
             self._step(errors, lambda: self.host.run(["mv", str(self.dir), str(kept / self.sid)], 60, sudo=True))
-            self._meta["evidence_kept"] = {"under": "sandbox.work_root", "directory_id": self.sid.rsplit("-", 1)[-1]}
+            self._meta["evidence_kept"]["relocated"] = True
+            if self.dir.exists() or not (kept / self.sid).exists():
+                errors.append("the evidence could not be moved to the place it is kept")
         else:
             self._step(errors, lambda: self.host.run(["rm", "-rf", "--one-file-system", str(self.dir)], 300, sudo=True))
-        if (
-            self.dir.exists() and not self.keep_evidence
-        ):  # verified, not assumed: a mount left behind keeps the directory
-            errors.append("the run directory still exists")
+            if self.dir.exists():  # verified, not assumed
+                errors.append("the run directory still exists")
 
     def __enter__(self) -> DockerSandbox:
         return self

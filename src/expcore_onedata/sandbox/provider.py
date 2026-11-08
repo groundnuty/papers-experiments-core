@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import json
 import logging
 import re
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -33,9 +35,9 @@ from expcore.plugin import CallContext
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec
-from expcore_onedata.sandbox.hostops import HostOps, mounted_points
+from expcore_onedata.sandbox.hostops import HostOps, parse_mountinfo
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
-from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
 from expcore_onedata.sandbox.settings import SandboxSettings
 from expcore_onedata.tokens import MintedToken, TokenIssuer, data_path_spec
 
@@ -46,13 +48,56 @@ DATA_PATH_FACTOR = "data_path"  # the study's factor whose levels [sandbox.data_
 DATA_USERS = "data_users"  # the lease group of the platform users a data path leases
 
 
+def _well_formed(document: Any) -> bool:
+    """Whether a decoded mount record has the shape `DockerSandbox` writes."""
+    return (
+        isinstance(document, dict)
+        and "lease" in document
+        and isinstance(document.get("sid"), str)
+        and isinstance(document.get("mounts"), list)
+        and all(isinstance(m, dict) and isinstance(m.get("path"), str) for m in document["mounts"])
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _Recorded:
+    """What the records say a lease's sandboxes mounted, and the question of whether a mount is one of them."""
+
+    paths: tuple[str, ...]
+    identities: frozenset[tuple[str, str]]  # (mount id, device): they do not change when the directory is renamed
+    sids: frozenset[str]
+    key_dir: re.Pattern[str]
+
+    @classmethod
+    def of(cls, records: Sequence[Mapping[str, Any]], key: str) -> _Recorded:
+        mounts = [m for r in records for m in r["mounts"]]
+        return cls(
+            tuple(m["path"] for m in mounts),
+            frozenset((str(m["id"]), str(m["dev"])) for m in mounts if m.get("id") and m.get("dev")),
+            frozenset(r["sid"] for r in records),
+            re.compile(re.escape(key) + r"-[0-9a-f]{8}"),
+        )
+
+    def owns(self, mount: Mapping[str, str]) -> bool:
+        path = mount["mountpoint"]
+        parts = path.split("/")
+        return (
+            any(path == p or path.startswith(p.rstrip("/") + "/") for p in self.paths)
+            or (mount["id"], mount["dev"]) in self.identities
+            or any(part in self.sids or self.key_dir.fullmatch(part) for part in parts)
+        )
+
+
 class SandboxProbe:
     """The `ResourceProbe` of the sandbox's leases: it proves a key's containers, networks and mounts gone (C19).
 
     `resource_gone` answers exactly True only when docker lists no container and no network carrying the lease key's
-    label, and the mount table shows no mount in a directory of the key. Anything it cannot read or ask is False, so the
-    key stays quarantined. It reads and never removes: the sandbox's own stop, the next start's retry and the orphan
-    reaper remove.
+    label, and the whole mount table shows no mount of the lease. A mount is the lease's by identity, not by where it is
+    now: the sandbox records the mount id and device of each mount it makes, with its path, in a file under the work
+    root (`sandbox.MOUNT_RECORDS`), and the probe matches the table against those records, so a directory that was
+    relocated or kept as evidence is still seen. A directory of the lease's sandbox id anywhere in a mount's path counts
+    too. Anything it cannot read or ask, a record included, is False, so the key stays quarantined. It reads and never
+    removes: the sandbox's own stop, the next start's retry and the orphan reaper remove.
     """
 
     def __init__(
@@ -74,11 +119,26 @@ class SandboxProbe:
                 return False
             if containers.stdout.strip() or networks.stdout.strip():
                 return False
-            mounts = mounted_points(self._host.read_text("/proc/self/mountinfo"))
+            mounts = parse_mountinfo(self._host.read_text("/proc/self/mountinfo"))
+            records = self._records(key)
         except (OSError, SandboxError):
             return False
-        own = re.compile(re.escape(str(self._s.work_root)) + "/" + re.escape(key) + r"-[0-9a-f]{8}(/|$)")
-        return not any(own.match(m) for m in mounts)
+        if records is None:
+            return False
+        recorded = _Recorded.of(records, key)
+        return not any(recorded.owns(m) for m in mounts)
+
+    def _records(self, key: str) -> list[dict[str, Any]] | None:
+        """The mount records of the lease's sandboxes; None when any record cannot be read or is not one (unknown)."""
+        directory = self._s.work_root / MOUNT_RECORDS
+        try:
+            files = sorted(directory.glob("*.json")) if directory.exists() else []
+            documents = [json.loads(file.read_text(encoding="utf-8")) for file in files]
+        except (OSError, ValueError):
+            return None
+        if not all(_well_formed(d) for d in documents):
+            return None
+        return [d for d in documents if d["lease"] == key]
 
 
 class SandboxPlatform:

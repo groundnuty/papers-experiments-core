@@ -430,7 +430,7 @@ def test_o12_a_failed_collection_records_where_the_evidence_is_by_id_and_key_not
     world.host.run_handlers.pop("cp")
     sbx.stop()
     kept = sbx.metadata()["evidence_kept"]
-    assert kept == {"under": "sandbox.work_root", "directory_id": sbx.sid.rsplit("-", 1)[-1]}
+    assert kept == {"under": "sandbox.work_root", "directory_id": sbx.sid.rsplit("-", 1)[-1], "relocated": True}
 
 
 def test_o12_a_sidecar_that_exited_is_reported_by_the_size_and_digest_of_its_stderr(world, caplog):
@@ -494,3 +494,63 @@ def test_c19_a_trust_bundle_container_that_docker_did_not_remove_blocks_the_prob
     assert one_shot.name not in world.host.containers
     sbx.stop()
     assert probe.resource_gone("login-data", {}) is True
+
+
+KEY = "login-data"
+
+
+def test_o15_a_failed_unmount_after_a_failed_collection_leaves_the_directory_where_it_is(world, tmp_path):
+    """O15: never move a run directory while a mount under it may be live; the probe then does not say True."""
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    sbx = start(world, "isolated", lease_key=KEY)
+    (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
+    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
+    with pytest.raises(SandboxError, match="copying"):
+        sbx.collect(tmp_path / "e", outputs=["out.txt"])
+    world.host.run_handlers.pop("cp")
+    world.host.stuck_mounts.add(str(sbx.dir / "work"))
+    with pytest.raises(SandboxError, match="a mount under it may be live"):
+        sbx.stop()
+    assert not [c for c in world.host.calls_of("run") if c[1][0] == "mv"]  # nothing was moved
+    assert sbx.dir.exists()
+    assert not (world.s.work_root / "_kept_evidence").exists()
+    assert sbx.metadata()["evidence_kept"]["relocated"] is False
+    probe = SandboxProbe(world.host, world.s)
+    assert probe.resource_gone(KEY, {}) is False
+    world.host.stuck_mounts.clear()  # the next try unmounts, then keeps the evidence
+    sbx.stop()
+    assert (world.s.work_root / "_kept_evidence" / sbx.sid / "work" / "out.txt").read_text() == "x"
+    assert sbx.metadata()["evidence_kept"]["relocated"] is True
+    assert probe.resource_gone(KEY, {}) is True
+
+
+def test_c19_the_probe_finds_a_mount_by_its_recorded_identity_wherever_its_directory_has_gone(world):
+    """C19: a relocated path is still seen: the mount keeps the id and device the sandbox recorded for it."""
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    sbx = start(world, "isolated", lease_key=KEY)
+    probe = SandboxProbe(world.host, world.s)
+    assert probe.resource_gone(KEY, {}) is False  # the mount is live at its own place
+    world.host.relocate_mounts(str(sbx.dir), "/srv/elsewhere/a")  # a path of no pattern: only the identity is left
+    assert probe.resource_gone(KEY, {}) is False
+    assert probe.resource_gone("login-data2", {}) is True  # it is the lease's, nobody else's
+    world.host.relocate_mounts("/srv/elsewhere/a", str(sbx.dir))
+    sbx.stop()
+    assert probe.resource_gone(KEY, {}) is True
+    assert not (world.s.work_root / "_mounts" / f"{sbx.sid}.json").exists()  # the record goes with the sandbox
+
+
+def test_c19_a_mount_record_the_probe_cannot_read_is_unknown_and_not_proof(world):
+    """C19: an unreadable or malformed record, of any lease, keeps every key from being shown gone."""
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    probe = SandboxProbe(world.host, world.s)
+    records = world.s.work_root / "_mounts"
+    records.mkdir(parents=True)
+    assert probe.resource_gone(KEY, {}) is True
+    for text in ("{not json", "[]", '{"sid": "x"}', '{"sid": "x", "lease": "k", "mounts": [{"id": 1}]}'):
+        (records / "damaged.json").write_text(text, encoding="utf-8")
+        assert probe.resource_gone(KEY, {}) is False, text
+    (records / "damaged.json").unlink()
+    assert probe.resource_gone(KEY, {}) is True

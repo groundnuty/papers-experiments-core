@@ -291,7 +291,7 @@ def _unescape(field: str) -> str:
 
 
 def parse_mountinfo(mountinfo: str) -> list[dict[str, str]]:
-    """Every mount of a mountinfo table, strictly: `{"mountpoint", "dev", "root", "fstype", "source"}` each.
+    """Every mount of a mountinfo table, strictly: `{"id", "mountpoint", "dev", "root", "fstype", "source"}` each.
 
     A table that cannot be shown whole is unknown, and a caller that reads "no mount of mine" from it would free a
     resource that is still mounted (C19). So an empty table, any line that does not parse (an id and a parent, a
@@ -317,6 +317,7 @@ def parse_mountinfo(mountinfo: str) -> list[dict[str, str]]:
             raise MountTableError(f"line {number} of the mount table does not parse")
         out.append(
             {
+                "id": fields[0],
                 "mountpoint": _unescape(fields[4]),
                 "dev": fields[2],
                 "root": _unescape(fields[3]),

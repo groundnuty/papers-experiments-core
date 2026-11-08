@@ -126,6 +126,7 @@ class FakeHost:
         self.fail_run: set[str] = set()
         self.fail_network_create: list[str] = []
         self.stuck_mounts: set[str] = set()
+        self.mount_ids: dict[str, int] = {}  # a mount keeps its id when the directory above it is renamed
         self.one_shots: list[FakeContainer] = []  # the `--rm` containers that were run, as they were labelled
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
@@ -170,9 +171,17 @@ class FakeHost:
     # ---------------------------------------------------------------- HostOps: files and processes
     def mountinfo(self) -> str:
         lines = ["1 0 8:1 / / rw - ext4 /dev/root rw"]  # every real table has the root mount; the probe checks for it
-        for n, (path, kind) in enumerate(self.mounts.items()):
-            lines.append(f"{40 + n} 25 0:{100 + n} / {path} rw - {kind} source rw")
+        for path, kind in self.mounts.items():
+            mount_id = self.mount_ids.setdefault(path, 40 + len(self.mount_ids))
+            lines.append(f"{mount_id} 25 0:{60 + mount_id} / {path} rw - {kind} source rw")  # device 100 for the first
         return "\n".join(lines) + "\n"
+
+    def relocate_mounts(self, old: str, new: str) -> None:
+        """What renaming a directory does to the mounts under it: they move with it, with the same id and device."""
+        for path in [p for p in self.mounts if p == old or p.startswith(old + "/")]:
+            moved = new + path[len(old) :]
+            self.mount_ids[moved] = self.mount_ids.pop(path, 40 + len(self.mount_ids))
+            self.mounts[moved] = self.mounts.pop(path)
 
     def read_text(self, path: str | Path) -> str:
         path = str(path)
@@ -212,7 +221,9 @@ class FakeHost:
         with self.lock:
             self.calls.append(("unmount", str(path)))
             if str(path) in self.stuck_mounts:
-                raise SandboxError(f"{path} is still mounted after an unmount and a lazy unmount")
+                raise SandboxError(
+                    "a mount is still mounted after an unmount and a lazy unmount"
+                )  # as DockerHost words it
             self.mounts.pop(str(path), None)
 
     def image_id(self, reference: str) -> str:
@@ -276,6 +287,7 @@ class FakeHost:
                 return CmdResult(0)
             case "mv":
                 shutil.move(argv[-2], argv[-1])
+                self.relocate_mounts(argv[-2], argv[-1])
                 return CmdResult(0)
             case "mount" | "nsenter" | "sh" | "find" | "test" | "truncate" | "chown":
                 return CmdResult(0)
