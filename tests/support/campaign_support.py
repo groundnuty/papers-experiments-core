@@ -168,6 +168,7 @@ def planned_store(tmp_path: Path, **plan):
         (tmp_path / "template.db").unlink()
         for leftover in tmp_path.glob("template.db-*"):
             leftover.unlink()
+    tmp_path.mkdir(parents=True, exist_ok=True)  # a test may name a directory that does not exist yet
     (tmp_path / "campaign.db").write_bytes(_TEMPLATES[name])
     return open_store(tmp_path, schema), schema, manifest
 
