@@ -12,7 +12,7 @@ from expcore.stats.rows import Row
 
 
 def basic_rows():
-    """Three clusters of the same design: hand-computed matrix [[0.15, nan], [0.4, 0.0]] over grp-a, grp-b and model-a, model-b."""
+    """Two clusters by two models; the hand-computed matrix is [[0.15, nan], [0.4, 0.0]]."""
     rows = []
     rows += both_arms("task-a", "model-a", 1, 0.9, 0.5)  # difference 0.4
     rows += both_arms("task-a", "model-a", 2, 0.7, 0.5)  # 0.2, so (task-a, model-a) is the mean 0.3
