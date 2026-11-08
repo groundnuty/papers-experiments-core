@@ -46,10 +46,11 @@ class AgentConfig:
     - `ceiling_s`, `ceiling_factor` and `ceiling_kind`: the ceiling on the whole elapsed time, waits on infrastructure
       included. There is always one, so a call that hangs on infrastructure cannot run for ever: it is `ceiling_s`
       when given, else `ceiling_factor` times the time cap (3 by default), and never below the cap. Every model
-      request and tool call is bounded by what is left of it. A call still running when it passes, with the agent
-      under its own cap, ends the attempt as infrastructure of `ceiling_kind` (the core's `ceiling` by default);
-      the agent's own cap decides first (L04). Both fields are filled in on construction, so the record holds the
-      ceiling that was in force.
+      request and tool call is watched on the injected clock and cut when the agent's own time, which leaves out the
+      waits on infrastructure the call has marked while they are open, reaches the cap (a time cap), or the total time
+      reaches the ceiling with the agent under its cap (infrastructure of `ceiling_kind`, the core's `ceiling` by
+      default). The agent's own cap decides first (L04). Both fields are filled in on construction, so the record
+      holds the ceiling that was in force.
     - `min_call_s`: no tool call starts with less agent time than this left; never below one second (L05).
     - `cleanup_deadline_s`: how long, in real time, the loop waits for a call it cancelled (cut at a limit, or the whole
       run cancelled from outside) to stop. Past it the call is given up on and left pending, the result says so
