@@ -318,7 +318,11 @@ class DockerSandbox:
         for n, path in enumerate(self.s.trust_paths):
             name = f"{self.names.agent}-once-{uuid.uuid4().hex[:6]}"
             self._containers.append(name)  # registered before it is created
-            base = self.host.docker("run", "--rm", "--name", name, "--entrypoint", "cat", self.s.agent.id, path).stdout
+            # labelled like every other container of the sandbox, so that the probe and the orphan reaper find it if the
+            # docker call is cut off before `--rm` has removed it (C19)
+            base = self.host.docker(
+                *("run", "--rm", "--name", name, *self._label_args(), "--entrypoint", "cat", self.s.agent.id, path)
+            ).stdout
             bundle = self.dir / "tls" / f"trust-{n}.pem"
             bundle.write_text(base + "\n" + ca, encoding="utf-8")
             out[path] = bundle

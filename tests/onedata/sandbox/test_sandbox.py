@@ -451,3 +451,46 @@ def test_o12_a_sidecar_that_exited_is_reported_by_the_size_and_digest_of_its_std
         start(world, "mounted")
     assert "invented-detail" not in str(caught.value)
     assert "invented-detail" not in caplog.text
+
+
+def rest_start_with_a_bundle(world, lease_key="login-data"):
+    """A REST sandbox whose agent image has a CA bundle to extend, so a throwaway container reads it first."""
+    from dataclasses import replace
+
+    settings = replace(world.s, trust_paths=("/etc/ssl/bundle.pem",))
+    spec = make_spec(world, "via-gate", lease_key=lease_key)
+    return DockerSandbox.start(world.host, settings, spec, **start_options(world))
+
+
+def test_c19_the_temporary_trust_bundle_container_carries_the_labels_of_every_other_container(world):
+    """C19: sandbox, owner and lease key, like the gate and the agent, from the moment it is created."""
+    sbx = rest_start_with_a_bundle(world)
+    (one_shot,) = world.host.one_shots
+    others = [world.host.containers[sbx.names.agent], world.host.containers[sbx.names.gate]]
+    assert one_shot.labels == others[0].labels == others[1].labels
+    assert one_shot.labels["org.test.lease"] == "login-data"
+    assert {"org.test.sandbox", "org.test.owner", "org.test.dir"} <= set(one_shot.labels)
+    sbx.stop()
+
+
+def test_c19_a_trust_bundle_container_that_docker_did_not_remove_blocks_the_probe_and_is_found_by_the_reaper(world):
+    """C19: left behind by a cut-off docker call, it keeps the probe from saying True and the reaper removes it."""
+    from expcore_onedata.sandbox import netpool
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    world.host.stuck_one_shots = True
+    sbx = rest_start_with_a_bundle(world)
+    (one_shot,) = world.host.one_shots
+    world.host.fail_remove.add(one_shot.name)
+    with pytest.raises(SandboxError, match="cleanup incomplete"):
+        sbx.stop()
+    probe = SandboxProbe(world.host, world.s)
+    assert probe.resource_gone("login-data", {}) is False  # found by the lease label
+    world.host.fail_remove.clear()
+    left = world.host.containers[one_shot.name]
+    left.labels["org.test.owner"] = f"{netpool.owner_id(world.host).split('/')[0]}/4026531836/4242/9"  # a dead owner
+    reaped = netpool.reap_orphans(world.host, netpool.Labels("org.test"))
+    assert one_shot.id in reaped["containers"]
+    assert one_shot.name not in world.host.containers
+    sbx.stop()
+    assert probe.resource_gone("login-data", {}) is True

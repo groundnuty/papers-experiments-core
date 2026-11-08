@@ -126,6 +126,8 @@ class FakeHost:
         self.fail_run: set[str] = set()
         self.fail_network_create: list[str] = []
         self.stuck_mounts: set[str] = set()
+        self.one_shots: list[FakeContainer] = []  # the `--rm` containers that were run, as they were labelled
+        self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
         self.base_bundle = "BASE BUNDLE\n"
         self.add_process(__import__("os").getpid(), start=777)
@@ -318,6 +320,14 @@ class FakeHost:
     def _run_container(self, args: list[str], env: Mapping[str, str] | None) -> CmdResult:
         options, image, command = _parse_run(args)
         if options.get("--rm"):  # a one-shot: its output is what the test configured, nothing is kept
+            one_shot = FakeContainer(
+                name=options["--name"], id=f"{abs(hash(options['--name'])) % 10**12:012x}" + "1" * 52,
+                image=image, options=options, command=command,
+                labels=dict(item.split("=", 1) for item in options.get("--label", [])),
+            )  # fmt: skip
+            self.one_shots.append(one_shot)
+            if self.stuck_one_shots:
+                self.containers[one_shot.name] = one_shot
             return CmdResult(0, self.base_bundle if options.get("--entrypoint") == "cat" else "oneclient 1.0\n")
         name = options["--name"]
         if name in self.fail_run:
