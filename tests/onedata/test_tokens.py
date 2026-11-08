@@ -233,3 +233,11 @@ def test_a_secret_shows_nothing_and_reveals_on_request():
     assert "abcd" not in repr(secret)
     assert "abcd" not in str(secret)
     assert secret.reveal() == "abcd-1234"
+
+
+def test_o05_a_federation_that_answers_privileges_as_a_dict_of_booleans_mints_nothing(issuer, fake):
+    """O05: the privilege answer is read as a list of strings only; a dict of flags is refused before any mint."""
+    fake.privileges[(fake.SPACE_ID, DATA.user_id)]["direct"] = {"space_view": True, "space_read_data": True}
+    with pytest.raises(TokenRefused, match="direct privileges could not be read"):
+        issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)
+    assert fake.issued == {}

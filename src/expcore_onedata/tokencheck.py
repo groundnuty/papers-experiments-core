@@ -186,9 +186,13 @@ def require_examined(
 
 
 def _rights(values: Any, what: str) -> set[str]:
-    """Read a list of privileges; raise TokenRefused when the answer is not one."""
-    if not isinstance(values, Collection) or isinstance(values, str) or not all(isinstance(v, str) for v in values):
-        raise TokenRefused(f"the {what} privileges could not be read")
+    """Read a list of privileges; raise TokenRefused naming the field when the answer is not a list of strings.
+
+    Only a list will do. A mapping such as `{"space_view": true}` is a collection whose iteration yields its keys, so
+    taking it for a list would read a set of flags, including false ones, as the rights held.
+    """
+    if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+        raise TokenRefused(f"the {what} privileges could not be read: 'privileges' is not a list of strings")
     return set(values)
 
 

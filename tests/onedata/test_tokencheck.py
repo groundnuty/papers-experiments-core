@@ -153,6 +153,31 @@ def test_o05_privileges_must_equal_the_declared_set_direct_and_effective():
             require_privileges(declared, direct=unreadable, effective=declared)
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"space_view": True, "space_read_data": True},
+        {"space_view": False, "space_read_data": True},
+        ("space_view", "space_read_data"),
+        {"space_view", "space_read_data"},
+        [["space_view"], "space_read_data"],
+        [{"space_view": True}],
+        [None],
+        7.5,
+        b"space_view",
+    ],
+    ids=lambda answer: type(answer).__name__,
+)
+def test_o05_a_privilege_answer_that_is_not_a_list_of_strings_is_refused_naming_the_field(answer):
+    """O05: a dict of booleans iterates as its keys and would read as the rights held, so only a list of strings is
+    accepted, for the direct read and for the effective read alike, and the message names the field."""
+    declared = ["space_view", "space_read_data"]
+    with pytest.raises(TokenRefused, match=r"direct privileges could not be read: 'privileges' is not a list"):
+        require_privileges(declared, direct=answer, effective=declared)
+    with pytest.raises(TokenRefused, match=r"effective privileges could not be read: 'privileges' is not a list"):
+        require_privileges(declared, direct=declared, effective=answer)
+
+
 def test_the_two_planes_share_neither_a_principal_nor_a_token():
     one = Examined("token-one", "user-one", 1.0, ())
     require_distinct(one, Examined("token-two", "user-two", 1.0, ()))
