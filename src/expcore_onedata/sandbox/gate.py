@@ -1,0 +1,1053 @@
+# Provenance:
+#   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/sandbox/gate.py, blob 81e0330d90ea3d9a21ed27a9a9a09e9a78cafab0
+#   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
+"""Policy gate: the only network peer the sandbox has (the sandbox network is internal).
+
+Runs in its own container, as root with all capabilities but NET_BIND_SERVICE
+dropped, attached to the sandbox's internal network and to a bridge to reach
+the upstream. Configuration: JSON at the path in argv[1]:
+
+  {"option": "T", "page_limit": 1000, "log": "/var/gate/requests.jsonl",
+   "tls_dir": "/etc/gate/tls",
+   "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
+                        "port": 443, "tls": true}},
+   "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
+
+For each host name the sandbox resolves (via --add-host) to the gate, the gate
+terminates TLS with a certificate for that name (signed by the run's CA, which
+only the sandbox trusts), applies gatepolicy, and forwards to the real upstream
+(verifying its certificate against the system CAs). `tcp_forwards` are plain TCP
+pass-through for the knowledge plane. Every request is logged as one JSON line.
+
+Connections are kept alive on both sides: each request is still decided by gatepolicy on its own, and logged on its
+own, whatever came before it on the connection; a refusal or an error closes the client's connection. Each client
+connection is served by its own thread and owns its upstream connections: nothing is shared between threads but the
+TLS context and the log.
+
+Every line the handler of a client connection logs carries that connection's `conn` (unique in this process), and a request's line carries
+`req_headers`: the few request headers that say what client it was (REQ_HEADERS_LOGGED), never any other. When a connection ends after a response without a
+request following, one `conn_close` event line says how (see `Handler._peer_gone`), with the kernel's counters of that connection at that moment: a response's
+`body_bytes` counts what the gate's socket accepted, which says nothing of what the client read, and the close is what shows it. When the gate itself is stopped
+(SIGTERM or SIGINT: `serve`; or the server closed: `GateServer.server_close`), every connection still open gets that line with `ended` "teardown", before the process
+exits (`teardown`); a gate that is killed (SIGKILL, `docker rm -f`) cannot write one, and a connection with no close line at all says so.
+
+Errors and retries, identical on every path (T, condition_a, D): an upstream attempt that fails before any byte of
+an answer arrives (connect, handshake, send, or the peer closing first) is retried once, on a new connection, before
+anything reaches the client; nothing is retried after an answer began, and a read timeout is never retried. Every
+failure is logged with its origin, `upstream` (the platform) or `gate` (the gate itself), and with what the client saw
+(`5xx` or `reset`), so a run can tell an error the gate made from one the platform made.
+"""
+from __future__ import annotations
+
+import errno
+import http.client
+import io
+import itertools
+import json
+import os
+import select
+import signal
+import socket
+import ssl
+import struct
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qsl, urlencode, urlsplit
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gatepolicy  # noqa: E402
+
+CFG: dict = {}
+_LOCK = threading.Lock()
+_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
+        "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
+RUN_HEADER = "X-dataset-192"
+
+
+def _log(rec: dict) -> None:
+    rec["t"] = time.time()
+    try:
+        with _LOCK, open(CFG["log"], "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError as e:  # never take the request down, but never be silent
+        print("GATE LOG FAILED", e, file=sys.stderr, flush=True)
+
+
+_LIVE: dict[str, "Handler"] = {}    # the client connections being served, by `conn`: added when a handler is set up, removed when it finishes
+_LIVE_LOCK = threading.Lock()
+TEARDOWN_BUDGET_S = 1.0             # the most the gate waits for its teardown lines when it stops
+_CONN_IDS = itertools.count(1)      # next() is atomic: one id per client connection, unique in this process (its pid is in the id, for logs of several)
+REQ_HEADERS_LOGGED = ("user-agent", "accept", "accept-encoding", "connection")    # a fixed allowlist: headers that carry no content, nothing else is ever logged
+REQ_HEADER_MAX = 512
+SIOCOUTQNSD = 0x894B                # ioctl: bytes the socket has queued and not yet sent (termios has SIOCOUTQ as TIOCOUTQ, not this)
+
+
+def _logged_headers(headers: dict) -> dict:
+    """The allowlisted request headers the request carried (names lower-case, as `headers` has them), and no others: a token, a cookie or any other header never
+    reaches the log, since this is the only place a header is read for it. A value is cut at REQ_HEADER_MAX characters."""
+    return {k: str(headers[k])[:REQ_HEADER_MAX] for k in REQ_HEADERS_LOGGED if k in headers}
+
+
+def _tcp_facts(sock) -> dict:
+    """The kernel's view of a TCP connection now: its state (`tcp_state`, 7 = CLOSE: a reset arrived, 8 = CLOSE_WAIT: a FIN), the bytes of the send queue not yet
+    acknowledged (`outq_unacked`, SIOCOUTQ) and not yet sent (`outq_unsent`, SIOCOUTQNSD), and TCP_INFO's `bytes_acked`, `bytes_sent` and `bytes_retrans` (retransmissions
+    are counted in `bytes_sent`). Each is None when the kernel does not give it: this never raises, and a field it cannot read is not a zero. The TCP_INFO offsets are
+    those of `struct tcp_info`, which only grows at its end; a shorter buffer leaves the later fields None."""
+    out = dict.fromkeys(("tcp_state", "outq_unacked", "outq_unsent", "bytes_acked", "bytes_sent", "bytes_retrans"))
+    try:
+        buf = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+    except (OSError, AttributeError, ValueError):
+        buf = b""
+    if buf:
+        out["tcp_state"] = buf[0]
+        for key, off in (("bytes_acked", 120), ("bytes_sent", 200), ("bytes_retrans", 208)):
+            if len(buf) >= off + 8:
+                out[key] = struct.unpack_from("=Q", buf, off)[0]
+    try:
+        import fcntl
+        import termios
+        for key, req in (("outq_unacked", termios.TIOCOUTQ), ("outq_unsent", SIOCOUTQNSD)):
+            try:
+                out[key] = struct.unpack("=i", fcntl.ioctl(sock.fileno(), req, b"\0\0\0\0"))[0]
+            except (OSError, ValueError, AttributeError, struct.error):
+                pass
+    except ImportError:
+        pass
+    return out
+
+
+# The gate must never give up before the client would. The shipped client's effective timeouts are 8 s to connect
+# (TCP and TLS) and 4 h to read (sandbox/hooks/dataset_181.py); behind the gate the client's 8 s covers only
+# the hop to the gate, and it then waits up to 4 h for the answer. So upstream (Onezone and Oneprovider alike) the gate
+# allows 60 s to connect and hand-shake, plus one transparent retry, and 4 h to read. #8's oracle got a 502 on 1 Nov
+# when the old gate's 8 s bound ran out on a TLS handshake to Onezone under load.
+CONNECT_TIMEOUT = 60       # gate config `upstream_connect_timeout_s` overrides
+READ_TIMEOUT = 14400       # not below the client's read timeout: the gate must never fail first
+LOCAL_ERRNOS = {errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.ENOBUFS, errno.ENOSPC, errno.EDQUOT, errno.EROFS,
+                errno.EADDRNOTAVAIL}      # the last: the gate's own ephemeral ports ran out
+_SPOOL = {"now": 0, "peak": 0}
+# The gate container has --memory 1g, and its memory cgroup is charged for the page cache of the spool it writes (dirty pages first) and
+# reads back. Left alone, a whole file several times the cap filled the cap with `file` and the kernel OOM-killed the gate (S2, 3.79 GB).
+# So the spool is written to disk and dropped from the cache in batches of SPOOL_SYNC_BYTES, and dropped again, in the same batches, as it is sent.
+# The batches are ALIGNED to that size, and it is a power of two: a large page-cache folio (the kernel caches a file in folios of up to several MiB) that
+# straddles the range given to POSIX_FADV_DONTNEED is not dropped, so 1 MiB ranges left almost the whole read-back in the cache (measured: 1 GiB of `file`).
+SPOOL_SYNC_BYTES = 64 << 20
+
+
+HANDSHAKE_TIMEOUT_S = 30   # a client's TLS handshake, in its own thread
+IDLE_TIMEOUT_S = 300       # a client connection with no request for this long is closed (threads are capped by --pids-limit)
+BODY_TIMEOUT_S = 60        # a request body must arrive within this; the allowed calls send a few KB at most
+MAX_BODY = 1 << 20         # larger request bodies are refused unread (the allowed calls are lookups)
+_CTX: dict[bool, ssl.SSLContext] = {}
+
+
+def _upstream_ctx(verify: bool) -> ssl.SSLContext:
+    """One client TLS context per process and verification mode: building one reloads the CA bundle (25 ms under load)."""
+    with _LOCK:
+        if verify not in _CTX:
+            try:
+                import certifi
+                ctx = ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                ctx = ssl.create_default_context()
+            if not verify:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            _CTX[verify] = ctx
+        return _CTX[verify]
+
+
+def _upstream_conn(h: dict) -> http.client.HTTPConnection:
+    if h.get("tls", True):
+        conn = http.client.HTTPSConnection(h["addr"], h.get("port", 443), context=_upstream_ctx(CFG.get("verify_ssl", True)),
+                                           timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT))
+    else:
+        conn = http.client.HTTPConnection(h["addr"], h.get("port", 80), timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT))
+    conn.connect()
+    conn.sock.settimeout(READ_TIMEOUT)  # short connect, then a read timeout that outlasts the client's
+    return conn
+
+
+def _went_stale(conn: http.client.HTTPConnection) -> bool:
+    """A kept connection with nothing owed to us: readable now means the peer closed it (FIN, RST or close_notify)."""
+    if conn.sock is None:
+        return True
+    p = select.poll()
+    p.register(conn.sock, select.POLLIN)
+    return bool(p.poll(0))
+
+
+def _spool_drop(fd: int, start: int, end: int) -> None:
+    """Drop the spool's bytes [start, end) from the page cache (clean pages only: the kernel keeps dirty ones)."""
+    os.posix_fadvise(fd, start, end - start, os.POSIX_FADV_DONTNEED)
+
+
+def _spool_flush(f, start: int, end: int) -> None:
+    """Write the spool to disk, then drop its bytes [start, end) from the page cache (dirty pages cannot be dropped before they are written).
+    An OSError (a full disk, an I/O error) is the gate's own, as one from `write` is."""
+    f.flush()
+    os.fdatasync(f.fileno())
+    _spool_drop(f.fileno(), start, end)
+
+
+def _spool_add(n: int) -> None:
+    with _LOCK:
+        _SPOOL["now"] += n
+        _SPOOL["peak"] = max(_SPOOL["peak"], _SPOOL["now"])
+
+
+class _CountingRaw(io.RawIOBase):
+    """The socket below the response's buffer: every byte that arrives is counted as it arrives, so an answer that
+    began and then failed (a partial status line, then a reset) is never taken for "no answer"."""
+
+    def __init__(self, raw, seen: dict):
+        super().__init__()
+        self._raw, self._seen = raw, seen
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        n = self._raw.readinto(b)
+        self._seen["bytes"] += n or 0
+        return n
+
+    def close(self) -> None:
+        self._raw.close()
+        super().close()
+
+
+class _ProbedRaw(io.RawIOBase):
+    """The socket below the request reader's buffer, with a switch: while `probing`, a read answers "nothing yet" (None, as a non-blocking socket would) without
+    touching the socket, so `BufferedReader.peek` then shows what the buffer already holds and never reads. That is how the gate sees a request that is already
+    in the handler's buffer, which neither `select` nor a peek at the kernel's queue can see."""
+
+    def __init__(self, raw):
+        super().__init__()
+        self._raw, self.probing = raw, False
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b):
+        return None if self.probing else self._raw.readinto(b)
+
+    def close(self) -> None:
+        self._raw.close()
+        super().close()
+
+
+class _LastLine:
+    """Keeps the last line http.client read, to tell whether the header block reached its terminating blank line."""
+
+    def __init__(self, fp, seen: dict):
+        self._fp, self._seen = fp, seen
+
+    def readline(self, *a):
+        line = self._fp.readline(*a)
+        self._seen["last_line"] = line
+        return line
+
+    def __getattr__(self, name):
+        return getattr(self._fp, name)
+
+
+class _CountingResponse(http.client.HTTPResponse):
+    def __init__(self, sock, debuglevel=0, method=None, url=None, *, seen: dict):
+        super().__init__(sock, debuglevel, method=method, url=url)
+        unbuffered = sock.makefile("rb", buffering=0)     # its own reference to the socket, taken before the old one goes
+        self.fp.close()
+        self.fp = _LastLine(io.BufferedReader(_CountingRaw(unbuffered, seen)), seen)
+
+
+class _Framing(Exception):
+    """An upstream response whose head or framing cannot be trusted: never retried, answered with 502."""
+
+
+def origin_of(e: BaseException) -> str:
+    """Whose failure a failed upstream call is. The gate's: its own timer ran out (a direct client would have had at
+    least as long), a local resource ran out (descriptors, memory, the spool's disk), or anything that is not a transport
+    error (a bug). The platform's: the connection refused, reset or lost, a failed TLS handshake, a name that does not
+    resolve, a cut or malformed answer."""
+    if isinstance(e, TimeoutError):
+        return "gate"
+    if isinstance(e, OSError) and e.errno in LOCAL_ERRNOS:
+        return "gate"
+    if isinstance(e, (_Framing, http.client.HTTPException, ConnectionError, ssl.SSLError, socket.gaierror, OSError)):
+        return "upstream"
+    return "gate"
+
+
+class _Upstream(Exception):
+    """A failed upstream call; `origin` says whether the platform or the gate itself failed it (`origin_of`)."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(repr(cause))
+        self.cause = cause
+        self.origin = origin_of(cause)
+
+
+_LOST = (ConnectionError, http.client.CannotSendRequest, http.client.RemoteDisconnected, ssl.SSLEOFError,
+         ssl.SSLZeroReturnError)
+
+
+def _repeatable(e: BaseException, phase: str, answer_bytes: int) -> bool:
+    """May this failed attempt be made once more? Never for a failure of the gate's own resources. Connecting (TCP,
+    TLS handshake): any other OSError, a timeout included, since nothing was sent. Exchanging: only a connection lost
+    (a TLS EOF included) with no byte of an answer received. A timeout while waiting for an answer is never repeatable:
+    the request may still be running upstream, and a timed-out request is never sent twice."""
+    if isinstance(e, OSError) and e.errno in LOCAL_ERRNOS:
+        return False
+    if phase == "connect":
+        return isinstance(e, OSError)
+    if answer_bytes or isinstance(e, TimeoutError):
+        return False
+    return isinstance(e, _LOST)
+
+
+def _checked(resp: http.client.HTTPResponse, seen: dict) -> http.client.HTTPResponse:
+    if seen.get("last_line") not in (b"\r\n", b"\n"):
+        raise _Framing("the upstream response ended inside its header block")
+    te = resp.getheader("Transfer-Encoding")
+    cl = resp.getheader("Content-Length")
+    if te is not None and cl is not None:
+        raise _Framing("the upstream response has both Transfer-Encoding and Content-Length")
+    if cl is not None and not resp.chunked and resp.length is None and resp.status not in (204, 304):
+        raise _Framing(f"the upstream response has an invalid Content-Length {cl!r}")
+    return resp
+
+
+TLS_RECORD = 16384   # the most plaintext one TLS record carries: a client reads a record whole or not at all
+
+
+class _CountingWriter:
+    """The client's side of a response, counted: what each write handed to the socket, and where the headers ended.
+
+    `socketserver`'s writer is one `sendall` per write, which raises after sending part of the buffer without saying how
+    much: a write that failed would be counted as nothing, and a log that holds less than the client received (a cancelled
+    transfer, a reset) breaks amendment 22. So the progress is taken from the socket's own `send`, which returns what went out,
+    and a failed write counts what it sent in `n` and the rest of itself in `failed`: what did not go out, so not confirmed.
+    `total` is the body's length when the response declared one (its Content-Length), for the log's `body_bytes_unconfirmed`.
+    Over TLS a `send` is one `SSL_write`, which raises with an unknown number of its records already out, so a TLS
+    socket is written one record (16 KiB) at a time: the client cannot read a record that is not whole, so the count is
+    never below what the client received. Without a socket to write through (`sock` None) a failed write is all `failed`."""
+
+    def __init__(self, raw, sock=None):
+        self.raw, self.sock, self.n, self.mark, self.failed, self.total = raw, sock, 0, None, 0, None
+        self.step = TLS_RECORD if isinstance(sock, ssl.SSLSocket) else None
+
+    def reset(self) -> None:
+        self.n, self.mark, self.failed, self.total = 0, None, 0, None
+
+    def write(self, b):
+        if self.sock is None:
+            try:
+                r = self.raw.write(b)
+            except BaseException:
+                self.failed += len(b)
+                raise
+            self.n += len(b)
+            return r
+        view = memoryview(b).cast("B")
+        total, sent = len(view), 0
+        try:
+            while sent < total:
+                k = self.sock.send(view[sent:sent + self.step] if self.step else view[sent:])
+                if not k:
+                    raise ConnectionError("the client's socket took no bytes")
+                sent += k
+        except BaseException:
+            self.n += sent
+            self.failed += total - sent
+            raise
+        self.n += total
+        return total
+
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "dataset-149"
+    disable_nagle_algorithm = True   # headers and body are separate writes: keep-alive would stall on Nagle + delayed ACK
+
+    def log_message(self, *a):  # noqa: D401 - silence default stderr logging
+        pass
+
+    def setup(self) -> None:
+        self._conn = f"{os.getpid()}-{next(_CONN_IDS)}"      # first: whatever this handler logs, from here on, is this connection's
+        self._timed_out = False
+        self._last_logged = 0                                # the number of the last request line this connection wrote
+        self._close_logged = False
+        # the TLS handshake runs here, in this connection's own thread: done in accept() it would serialise every
+        # client's handshake behind the slowest one, and a client that never finishes it would stall the gate
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.settimeout(HANDSHAKE_TIMEOUT_S)
+            self.request.do_handshake()
+        super().setup()
+        self.wfile = self._w = _CountingWriter(self.wfile, self.connection)
+        self._probe = _ProbedRaw(self.rfile.detach())                 # the buffer socketserver made, nothing read yet, rebuilt over a raw that can be probed
+        self.rfile = io.BufferedReader(self._probe, io.DEFAULT_BUFFER_SIZE)     # the size `makefile` gives it
+        self._pool: dict[tuple, http.client.HTTPConnection] = {}   # this client connection's upstream connections
+        self._served = 0                                           # requests so far on this client connection
+        self._response_started = False
+        with _LIVE_LOCK:                                              # last: a handler whose setup failed was never live
+            _LIVE[self._conn] = self
+
+    def finish(self) -> None:
+        with _LIVE_LOCK:
+            _LIVE.pop(self._conn, None)
+        for conn in self._pool.values():
+            conn.close()
+        self._pool.clear()
+        super().finish()
+
+    def handle_one_request(self) -> None:
+        self.connection.settimeout(IDLE_TIMEOUT_S)   # only while waiting for a request: `_handle` lifts it
+        self.raw_requestline = b""                    # set by the parser once a request line has arrived
+        self._w.reset()
+        self._timed_out = False
+        after = self._served
+        if self._peer_gone():
+            return
+        super().handle_one_request()
+        if after and not self.raw_requestline and not self._timed_out:
+            # the TLS read came back empty after a response: the connection ended with no request, and the raw peek had taken the first bytes (a close_notify) for one
+            self._conn_close("tls_close", after)
+
+    def _input_waiting(self) -> bool:
+        """Bytes already taken off the socket and not yet used: decrypted by TLS (`pending`) or in the request reader's buffer. The kernel's queue does not show them,
+        so a request that is already here, pipelined behind the one just answered, would otherwise read as a quiet socket. Reads nothing."""
+        try:
+            if getattr(self.connection, "pending", lambda: 0)():
+                return True
+        except (OSError, ValueError):
+            pass
+        self._probe.probing = True
+        try:
+            return bool(self.rfile.peek(0))
+        finally:
+            self._probe.probing = False
+
+    def _conn_close(self, ended: str, after: int, **extra) -> None:
+        """Log how this connection ended after `after` responses, with the kernel's counters of it (`_tcp_facts`) taken now."""
+        self._close_logged = True
+        _log({"event": "conn_close", "conn": self._conn, "after_request": after, "ended": ended, **_tcp_facts(self.connection), **extra})
+
+    def _teardown_line(self) -> None:
+        """The gate is stopping and this connection is open: its close line, `ended` "teardown", unless it has written one. `after_request` is the last request line
+        it wrote; `in_request` says a request was read and not yet answered (its line will never be written), which is then what is outstanding."""
+        if self._close_logged:
+            return
+        after = self._last_logged
+        self._conn_close("teardown", after, in_request=self._served > after)
+
+    def _peer_gone(self) -> bool:
+        """After a response and before the next request: has the client gone? If so the line `conn_close` is logged and True is returned (the connection ends here).
+
+        Only a connection that has served a response is looked at, and only before the TLS layer reads anything: through TLS, the next `readline` returns b'' both for a
+        clean close and for a reset, and the counters change once it has read. A request already in hand (`_input_waiting`) is a request. Otherwise the gate waits for the
+        socket to become readable, for at most IDLE_TIMEOUT_S as before (`ended` "idle_timeout": the connection closes, as it always did, and now says so), and then
+        peeks at one byte of the kernel's queue without taking it: a byte is a request or a TLS alert (the caller goes on, and a TLS read that then returns nothing is
+        `tls_close`), b'' is the client's FIN (`eof`), a reset is `reset`, any other error `error`. Nothing is sent and nothing consumed: what the client sees is unchanged."""
+        after = self._served
+        if not after or self._input_waiting():
+            return False
+        p = select.poll()
+        p.register(self.connection, select.POLLIN)
+        if not p.poll(IDLE_TIMEOUT_S * 1000):
+            self._conn_close("idle_timeout", after)
+            self.close_connection = True
+            return True
+        extra: dict = {}
+        try:
+            data = socket.socket.recv(self.connection, 1, socket.MSG_PEEK | socket.MSG_DONTWAIT)   # the socket's own recv, below the TLS layer
+        except ConnectionResetError:
+            ended = "reset"
+        except (BlockingIOError, TimeoutError):
+            return False                                  # readable and then not: let the ordinary read wait as it always did
+        except OSError as e:
+            ended, extra = "error", {"error": repr(e)[:300]}
+        else:
+            if data:
+                return False
+            ended = "eof"
+        self._conn_close(ended, after, **extra)
+        self.close_connection = True
+        return True
+
+    def log_error(self, fmt, *args) -> None:
+        """http.server reports a timed-out request read here and nowhere else. A request whose line arrived but whose
+        headers did not is logged as the client's; a connection idle between requests closes without a record."""
+        msg = fmt % args if args else fmt
+        if msg.startswith("Request timed out"):
+            self._timed_out = True
+        if msg.startswith("Request timed out") and self.raw_requestline:
+            _log({"event": "request_error", "conn": self._conn, "status": None, "reason": "request headers not received in time",
+                  "error_origin": "client", "client_saw": "close",
+                  "request_line": self.raw_requestline[:200].decode("latin-1", "replace").strip()})
+
+    def send_header(self, keyword, value) -> None:
+        super().send_header(keyword, value)
+        if keyword.lower() == "content-length":
+            try:
+                self._w.total = int(value)             # the body's length, as the client is told it (the last one sent)
+            except ValueError:
+                pass
+
+    def end_headers(self) -> None:
+        super().end_headers()
+        self._w.mark = self._w.n                      # what follows is the body
+        self._response_started = True
+
+    def _log(self, rec: dict) -> None:
+        """A request's line, with the body bytes its response handed to the client's socket (amendment 17(c): the record that stands in for Traefik's), on every
+        response: a denial's, the gate's own error, a short or cut transfer.
+
+        `body_bytes`: the bytes of this response's body that the gate's socket accepted, counting the partial progress of a write that failed
+        (see `_CountingWriter`); never below what the client received. `body_bytes_unconfirmed`, present only when a write failed: the rest of that body's
+        length that was not confirmed sent, the length declared (Content-Length) minus `body_bytes`, so that the two add up to the body's full length. A body
+        with no declared length (chunked, or ended by the close) has no total to subtract from: it is the rest of the write that failed. A failed write of the
+        headers is the body not sent at all."""
+        w = self._w
+        rec.setdefault("conn", self._conn)
+        if "conn_request" in rec:
+            self._last_logged = rec["conn_request"]
+        body = 0 if w.mark is None else w.n - w.mark
+        rec["body_bytes"] = body
+        if w.failed:
+            in_body = w.failed if w.mark is not None else 0       # a header write's rest is not body
+            total = w.total if w.total is not None else body + in_body
+            rec["body_bytes_unconfirmed"] = max(total - body, in_body)
+        _log(rec)
+
+    def send_error(self, code, message=None, explain=None) -> None:
+        """Errors the request parser answers before `_handle` runs (a malformed request line or version, an unknown
+        method, an oversized line): logged like every other request, as the client's own. `_handle` never calls this."""
+        rec = {"event": "request_error", "status": code, "reason": message or "", "error_origin": "client",
+               "client_saw": "5xx" if code >= 500 else "4xx",
+               "request_line": (getattr(self, "raw_requestline", b"") or b"")[:200].decode("latin-1", "replace").strip()}
+        try:
+            super().send_error(code, message, explain)
+        finally:
+            self._log(rec)
+
+    def _answer(self, rec: dict, code: int, obj: dict) -> None:
+        """The gate's own answer, and then its line, so the line has the answer's body bytes; logged whatever the client did meanwhile."""
+        try:
+            self._send_json(code, obj)
+        finally:
+            self._log(rec)
+
+    def _send_json(self, code: int, obj: dict, *, close: bool = True) -> int:
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if close:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        self.wfile.write(body)
+        return len(body)
+
+    # ------------------------------------------------------------ upstream, one request at a time
+    def _drop(self, hcfg: dict) -> None:
+        conn = self._pool.pop((hcfg["addr"], hcfg.get("port", 443)), None)
+        if conn is not None:
+            conn.close()
+
+    def _read_body(self, n: int) -> tuple[bytes | None, int, str | None]:
+        """(body, 0, None) or (None, status, reason): the whole body by one deadline, however slowly it trickles."""
+        if not n:
+            return None, 0, None
+        deadline = time.monotonic() + BODY_TIMEOUT_S
+        parts, got = [], 0
+        while got < n:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None, 408, f"request body not received within {BODY_TIMEOUT_S} s"
+            self.connection.settimeout(left)
+            try:
+                b = self.rfile.read1(min(n - got, 1 << 16))
+            except TimeoutError:
+                return None, 408, f"request body not received within {BODY_TIMEOUT_S} s"
+            except OSError as e:
+                return None, 400, f"request body cut short: {e!r}"
+            if not b:
+                return None, 400, "request body cut short"
+            parts.append(b)
+            got += len(b)
+        return b"".join(parts), 0, None
+
+    def _upstream(self, hcfg: dict, method: str, target: str, body, headers: dict, rec: dict):
+        """(response) of one upstream request on this client connection's kept connection to that host.
+
+        A kept connection found closed is replaced before anything is sent (`upstream_stale`). An attempt that then fails
+        with no byte of an answer received is made once more on a new connection (`upstream_retries`), whether its
+        connection was new or kept; that is the only retry, it happens before any byte reaches the client, and it is the
+        same for every option. An answer begun (an interim 100 included), a read timeout, or a second failure is raised
+        as an upstream failure."""
+        key = (hcfg["addr"], hcfg.get("port", 443))
+        conn = self._pool.get(key)
+        if conn is not None and _went_stale(conn):
+            self._drop(hcfg)
+            rec["upstream_stale"] = rec.get("upstream_stale", 0) + 1
+            conn = None
+        for attempt in (1, 2):
+            seen = {"bytes": 0}
+            rec["upstream_conn"] = "reused" if conn is not None else "new"
+            phase = "connect"
+            try:
+                if conn is None:
+                    conn = self._pool[key] = _upstream_conn(hcfg)
+                phase = "exchange"
+                conn.response_class = lambda sock, *a, **kw: _CountingResponse(sock, *a, seen=seen, **kw)
+                conn.request(method, target, body=body, headers=headers)
+                return _checked(conn.getresponse(), seen)
+            except _Framing as e:
+                self._drop(hcfg)
+                raise _Upstream(e) from e
+            except Exception as e:  # noqa: BLE001
+                self._pool.pop(key, None) if conn is None else self._drop(hcfg)
+                if attempt == 2 or not _repeatable(e, phase, seen["bytes"]):
+                    raise _Upstream(e) from e
+                rec["upstream_retries"] = rec.get("upstream_retries", 0) + 1
+                rec["upstream_retry_cause"] = repr(e)[:200]
+                conn = None
+        raise AssertionError("unreachable")
+
+    def _settle(self, hcfg: dict, resp) -> None:
+        """After a response is read to its end: the connection goes back to the pool unless the peer is closing it."""
+        if resp.will_close:
+            self._drop(hcfg)
+
+    def _abort_client(self) -> None:
+        """End the client's connection with a reset: a body already begun must not look complete."""
+        self.close_connection = True
+        try:
+            # linger 0 makes close() a reset; closing here comes before socketserver's shutdown, whose FIN would look clean
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            self.connection.close()
+        except OSError:
+            pass
+
+    def _handle(self) -> None:
+        self.connection.settimeout(BODY_TIMEOUT_S)   # the head has arrived; the body gets a bounded time
+        self._served += 1
+        self._response_started = False
+        host = (self.headers.get("Host") or "").split(":")[0].lower()
+        hcfg = CFG["hosts"].get(host)
+        url = urlsplit(self.path)
+        headers = {k.lower(): v for k, v in self.headers.items()}
+        rec = {"host": host, "method": self.command, "path": url.path, "query": url.query,
+               "range": headers.get("range"), "conn": self._conn, "conn_request": self._served, "req_headers": _logged_headers(headers)}
+        n = headers.get("content-length") or "0"
+        if "transfer-encoding" in headers or not n.isdecimal():
+            # only a declared length frames a body here: anything else could leave bytes to be read as the next request
+            rec.update(decision="deny", reason="request body framing not allowed", status=400)
+            self._answer(rec, 400, {"error": {"id": "badRequest", "details": "request body framing not allowed"}})
+            return
+        if int(n) > MAX_BODY:
+            rec.update(decision="deny", reason="request body too large", status=413)
+            self._answer(rec, 413, {"error": {"id": "badRequest", "details": "request body too large"}})
+            return
+        body, code, why = self._read_body(int(n))
+        if why is not None:
+            rec.update(decision="deny", reason=why, status=code)
+            try:
+                self._answer(rec, rec["status"], {"error": {"id": "badRequest", "details": why}})
+            except OSError:
+                self.close_connection = True
+            return
+        self.connection.settimeout(None)             # the upstream's own timeouts bound the rest
+        if hcfg is None:
+            rec.update(decision="deny", reason="host not allowed", status=403)
+            self._answer(rec, 403, {"error": {"id": "forbidden", "details": "host not allowed"}})
+            return
+        dec = gatepolicy.decide(CFG["option"], hcfg["role"], self.command, url.path, headers)
+        rec.update(decision="allow" if dec.allow else "deny", reason=dec.reason, tag=dec.tag)
+        if not dec.allow:
+            rec["status"] = dec.status
+            self._answer(rec, dec.status, {"error": {"id": "forbidden" if dec.status == 403 else "badRequest", "details": dec.reason}})
+            return
+        try:
+            if dec.merge_pages:
+                self._merged_listing(hcfg, url, headers, body, rec)
+            elif dec.store_and_forward:
+                self._store_and_forward(hcfg, url, headers, body, rec)
+            else:
+                self._forward(hcfg, url, headers, body, rec)
+        except (ConnectionError, ssl.SSLError) as e:
+            # unwrapped connection and TLS errors come only from the client's socket (upstream ones arrive as
+            # _Upstream): the client went away, for instance while the headers were written; its own doing, not an error
+            self._drop(hcfg)
+            rec.update(client_aborted=True, error=repr(e)[:300])
+            rec.setdefault("status", None)
+            self._log(rec)
+            self.close_connection = True
+        except Exception as e:  # noqa: BLE001
+            self._drop(hcfg)              # its state is unknown: it is never reused
+            origin = e.origin if isinstance(e, _Upstream) else "gate"
+            rec.update(status=502, error=repr(e.cause if isinstance(e, _Upstream) else e)[:500], error_origin=origin)
+            if self._response_started:    # a 502 cannot follow a response already begun: its body must not look complete
+                rec["client_saw"] = "reset"
+                self._log(rec)
+                self._abort_client()
+                return
+            rec["client_saw"] = "5xx"
+            try:
+                self._answer(rec, 502, {"error": {"id": "badGateway", "details": str(e)}})
+            except OSError:
+                pass
+
+    def _fwd_headers(self, headers: dict) -> dict:
+        # the run attribution is the gate's: whatever the agent sent under that name is dropped, then ours is added
+        out = {k: v for k, v in headers.items() if k not in _HOP and k != RUN_HEADER.lower()}
+        out["Host"] = headers.get("host", "")
+        if CFG.get("run_key"):
+            out[RUN_HEADER] = CFG["run_key"]
+        return out
+
+    def _forward(self, hcfg, url, headers, body, rec) -> None:
+        target = url.path + ("?" + url.query if url.query else "")
+        resp = self._upstream(hcfg, self.command, target, body, self._fwd_headers(headers), rec)
+        # the length http.client frames the body by (None: chunked, or until EOF), never the raw header
+        declared = None if resp.chunked else resp.length
+        self.send_response(resp.status)
+        for k, v in resp.getheaders():
+            if k.lower() not in _HOP:
+                self.send_header(k, v)
+        if resp.status in (204, 304):
+            declared = 0                                   # no body by definition, nothing to frame
+        elif declared is not None:
+            self.send_header("Content-Length", str(declared))   # a framed body: this connection can carry the next request
+        else:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        sent, failure, failure_origin = 0, None, "upstream"
+        while True:
+            try:
+                chunk = resp.read(1 << 20)
+            except (OSError, http.client.HTTPException) as e:
+                failure, failure_origin = repr(e), origin_of(e)     # the gate's own read timeout is the gate's
+                break
+            if not chunk:
+                break
+            try:
+                self.wfile.write(chunk)
+            except OSError as e:
+                if e.errno in LOCAL_ERRNOS:            # the gate's own resources failed the write, not the client
+                    failure, failure_origin = repr(e), "gate"
+                else:
+                    rec["client_aborted"] = True
+                break
+            sent += len(chunk)
+        if failure is None and not rec.get("client_aborted") and declared is not None and sent != declared:
+            failure = f"upstream sent {sent} of {declared} bytes"     # http.client does not raise on an early EOF here
+        if failure or rec.get("client_aborted"):
+            self._drop(hcfg)
+            self._abort_client()
+        else:
+            self._settle(hcfg, resp)
+        if failure:
+            rec.update(status=502, upstream_status=resp.status, bytes=sent, error=failure, error_origin=failure_origin,
+                       client_saw="reset")
+        else:
+            rec.update(status=resp.status, bytes=sent)
+            if resp.status >= 500:
+                rec.update(error_origin="upstream", client_saw="5xx")    # the platform's own 5xx, passed on as it was
+        self._log(rec)
+
+    def _store_and_forward(self, hcfg, url, headers, body, rec) -> None:
+        """D: the whole file reaches the gate before the sandbox sees any byte of it.
+
+        Whatever the agent's code does with the response (read 1 KB and close, stream, abort), the transfer
+        between the sites is the complete file: there is no in-place remote read, not even a partial
+        consumption of a whole-file request. The spool is on the gate's own disk (bounded by the file size)
+        and is deleted afterwards.
+        """
+        target = url.path + ("?" + url.query if url.query else "")
+        resp = self._upstream(hcfg, self.command, target, body, self._fwd_headers(headers), rec)
+        if resp.status != 200:  # errors are small: pass through
+            try:
+                data = resp.read()
+            except (OSError, http.client.HTTPException) as e:
+                raise _Upstream(e) from e
+            self._settle(hcfg, resp)
+            self.send_response(resp.status)
+            self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            rec.update(status=resp.status, bytes=len(data))
+            if resp.status >= 500:
+                rec.update(error_origin="upstream", client_saw="5xx")
+            self._log(rec)
+            return
+        spool_dir = os.path.join(os.path.dirname(CFG["log"]), "spool")
+        os.makedirs(spool_dir, exist_ok=True)     # a failure here is the gate's own (handled by the caller as one)
+        fd, spool = tempfile.mkstemp(dir=spool_dir)
+        sent = 0
+        try:
+            # phase 1: the complete file from the provider (an upstream failure propagates: handled as 502)
+            with os.fdopen(fd, "wb") as f:
+                got = synced = 0
+                while True:
+                    try:
+                        chunk = resp.read(1 << 20)
+                    except (OSError, http.client.HTTPException) as e:
+                        raise _Upstream(e) from e
+                    if not chunk:
+                        break
+                    f.write(chunk)                   # the gate's disk: an OSError here is the gate's
+                    got += len(chunk)
+                    _spool_add(len(chunk))
+                    if got - got % SPOOL_SYNC_BYTES > synced:     # the page cache of the spool stays bounded (see SPOOL_SYNC_BYTES)
+                        boundary = got - got % SPOOL_SYNC_BYTES
+                        _spool_flush(f, synced, boundary)
+                        synced = boundary
+                # no flush of the last, partial batch: under SPOOL_SYNC_BYTES, so it bounds nothing, and an fsync per small file (S1 is ~15k of them) would cost D real time
+            declared = resp.getheader("Content-Length")
+            if declared is not None and got != int(declared):  # premature EOF is not a whole-file download
+                raise _Upstream(OSError(f"upstream sent {got} of {declared} bytes"))
+            self._settle(hcfg, resp)
+            rec.update(upstream_bytes=got, t_upstream_done=time.time(), spool_peak_bytes=_SPOOL["peak"])
+            # phase 2: only now release the first byte to the sandbox
+            try:
+                self.send_response(200)
+                for k, v in resp.getheaders():
+                    if k.lower() not in _HOP:
+                        self.send_header(k, v)
+                self.send_header("Content-Length", str(got))
+                self.end_headers()
+                rec["t_first_byte_sent"] = time.time()
+                with open(spool, "rb") as f:
+                    dropped = 0
+                    while chunk := f.read(1 << 20):
+                        self.wfile.write(chunk)
+                        sent += len(chunk)
+                        if sent - sent % SPOOL_SYNC_BYTES > dropped:     # what is sent leaves the page cache, in aligned batches
+                            boundary = sent - sent % SPOOL_SYNC_BYTES
+                            _spool_drop(f.fileno(), dropped, boundary)
+                            dropped = boundary
+            except (ConnectionError, ssl.SSLError):     # the client went away (TLS too): the transfer still happened
+                rec["client_aborted"] = True
+                self.close_connection = True
+            rec.update(status=200, bytes=sent)
+            self._log(rec)
+        finally:
+            rec["spool_peak_bytes"] = _SPOOL["peak"]  # also for a failed transfer (logged by the caller)
+            _spool_add(-os.path.getsize(spool))
+            os.unlink(spool)
+
+    def _merged_listing(self, hcfg, url, headers, body, rec) -> None:
+        """condition_a: follow pagination upstream, return the whole directory."""
+        q = dict(parse_qsl(url.query, keep_blank_values=True))
+        children, token, pages = [], None, 0
+        while True:
+            q["limit"] = str(CFG.get("page_limit", 1000))
+            if token is None:
+                q.pop("token", None)
+            else:
+                q["token"] = token
+            resp = self._upstream(hcfg, "GET", f"{url.path}?{urlencode(q)}", body, self._fwd_headers(headers), rec)
+            try:
+                data = resp.read()
+            except (OSError, http.client.HTTPException) as e:
+                raise _Upstream(e) from e
+            self._settle(hcfg, resp)
+            if resp.status != 200:
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                rec.update(status=resp.status, pages=pages)
+                if resp.status >= 500:
+                    rec.update(error_origin="upstream", client_saw="5xx")
+                self._log(rec)
+                return
+            try:
+                page = json.loads(data)
+                if not isinstance(page, dict) or not isinstance(page.get("children"), list):
+                    raise ValueError(f"listing page without a list of children: {str(data[:120])}")
+            except ValueError as e:
+                raise _Upstream(_Framing(str(e))) from e
+            pages += 1
+            children.extend(page["children"])
+            token, is_last = page.get("nextPageToken"), page.get("isLast")
+            if is_last is True:
+                break
+            if is_last is not False or not token:   # never rewritten as complete: this is what condition_a exists to expose
+                raise _Upstream(_Framing(f"listing page with no valid end or continuation: isLast={is_last!r}, nextPageToken present: {bool(token)}"))
+        n = self._send_json(200, {"children": children, "isLast": True, "nextPageToken": None}, close=False)
+        rec.update(status=200, bytes=n, pages=pages, entries=len(children))
+        self._log(rec)
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _handle
+
+
+def _teardown_lines() -> None:
+    with _LIVE_LOCK:
+        live = list(_LIVE.values())
+    for h in live:
+        try:
+            h._teardown_line()
+        except Exception as e:  # noqa: BLE001 - one connection's line must not cost the others theirs
+            print("GATE TEARDOWN LINE FAILED", repr(e)[:200], file=sys.stderr, flush=True)
+
+
+def teardown() -> None:
+    """The gate is stopping: a `conn_close` line (`ended` "teardown") for every client connection still open, before the process exits. Never raises, and never waits
+    more than TEARDOWN_BUDGET_S: the lines are written by a thread this waits for that long, so a log that is stuck cannot hold the gate up."""
+    try:
+        t = threading.Thread(target=_teardown_lines, daemon=True)
+        t.start()
+        t.join(TEARDOWN_BUDGET_S)
+        if t.is_alive():
+            print("GATE TEARDOWN INCOMPLETE", file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001
+        print("GATE TEARDOWN FAILED", repr(e)[:200], file=sys.stderr, flush=True)
+
+
+class GateServer(ThreadingHTTPServer):
+    """One thread per client connection; a deep accept queue for bursts of new connections (the default is 5; gate
+    config `listen_backlog` overrides). Closing it is the gate's stop: the connections still open get their teardown lines first (`teardown`)."""
+    request_queue_size = 256
+    daemon_threads = True
+
+    def server_close(self) -> None:
+        try:
+            teardown()
+        finally:
+            super().server_close()
+
+    def handle_error(self, request, client_address) -> None:
+        """A connection that failed outside a request (a TLS handshake, a thread that could not start): logged, never
+        silent. Its origin is the gate unless the client broke off its own handshake."""
+        import traceback
+        e = sys.exc_info()[1]
+        client = isinstance(e, (ssl.SSLError, ConnectionError, TimeoutError, socket.timeout))
+        _log({"event": "connection_error", "error": repr(e)[:300], "error_origin": "client" if client else "gate",
+              "client_saw": "reset", "trace": traceback.format_exc(limit=3)[-600:]})
+
+
+def _tls_context() -> ssl.SSLContext:
+    ctxs = {}
+    for name in CFG["hosts"]:
+        c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        c.load_cert_chain(os.path.join(CFG["tls_dir"], f"{name}.pem"), os.path.join(CFG["tls_dir"], f"{name}.key"))
+        ctxs[name] = c
+    first = next(iter(ctxs.values()))
+
+    def pick(sock, server_name, _ctx):
+        sock.context = ctxs.get((server_name or "").lower(), first)
+
+    first.sni_callback = pick
+    return first
+
+
+def _pipe(a, b, sides: tuple[str, str], state: dict, listen: int) -> None:
+    """Copy a -> b for the knowledge-plane forward. The first failure of a connection pair is logged once: a local
+    resource error is the gate's, otherwise the side that failed decides (the platform's side, or the client's own);
+    the other direction then fails only because this one shut both down, and is not logged."""
+    failed = None
+    try:
+        while True:
+            try:
+                d = a.recv(65536)
+            except OSError as e:
+                failed = (sides[0], e)
+                break
+            if not d:
+                break
+            try:
+                b.sendall(d)
+            except OSError as e:
+                failed = (sides[1], e)
+                break
+    finally:
+        with _LOCK:
+            first = not state["closing"]
+            state["closing"] = True
+        if failed and first:
+            side, e = failed
+            origin = "gate" if e.errno in LOCAL_ERRNOS else ("upstream" if side == "upstream" else "client")
+            _log({"event": "tcp_forward_error", "listen": listen, "side": side, "error": repr(e)[:300],
+                  "error_origin": origin, "client_saw": None if origin == "client" else "reset"})
+        for s_ in (a, b):
+            try:
+                s_.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def _tcp_forward(listen: int, host: str, port: int) -> None:
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", listen))
+    srv.listen(64)
+
+    def serve():
+        while True:                       # nothing that happens to one connection may end the accept loop
+            try:
+                c, _ = srv.accept()
+            except OSError as e:
+                _log({"event": "tcp_forward_error", "listen": listen, "error": repr(e)[:300], "error_origin": "gate",
+                      "client_saw": None})
+                time.sleep(0.1)
+                continue
+            u = None
+            try:
+                u = socket.create_connection((host, port), timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT))
+                u.settimeout(None)        # the connect bound only: reading waits as long as the client does
+                state = {"closing": False}
+                threading.Thread(target=_pipe, args=(c, u, ("client", "upstream"), state, listen), daemon=True).start()
+                threading.Thread(target=_pipe, args=(u, c, ("upstream", "client"), state, listen), daemon=True).start()
+            except Exception as e:  # noqa: BLE001 - a refused connect, or no thread to be had (the pids limit)
+                _log({"event": "tcp_forward_error", "listen": listen, "error": repr(e)[:300],
+                      "error_origin": origin_of(e) if isinstance(e, OSError) else "gate", "client_saw": "reset"})
+                for s_ in (c, u):
+                    if s_ is not None:
+                        try:
+                            s_.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        s_.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+
+
+def serve(httpd) -> None:
+    """Serve until SIGTERM or SIGINT (a container's PID 1 ignores SIGTERM unless it has a handler), then stop: close the server, which writes the teardown lines.
+    The handler only asks a thread to end the loop: `shutdown` called from the thread that runs the loop would wait for itself."""
+    def stop(signum, frame):
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, stop)
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+
+
+def main() -> None:
+    CFG.update(json.load(open(sys.argv[1])))
+    for f in CFG.get("tcp_forwards", []):
+        _tcp_forward(f["listen"], f["host"], f["port"])
+    GateServer.request_queue_size = int(CFG.get("listen_backlog", GateServer.request_queue_size))
+    httpd = GateServer(("0.0.0.0", 443), Handler)
+    httpd.socket = _tls_context().wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+    open(CFG["log"], "a").close()     # a gate that cannot log does not start, and one that started leaves a log, so a missing log is lost evidence, not zero errors
+    print("gate ready", flush=True)
+    serve(httpd)
+
+
+if __name__ == "__main__":
+    main()
