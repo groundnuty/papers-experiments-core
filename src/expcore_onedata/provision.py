@@ -510,8 +510,25 @@ class Provisioner:
             raise
         return False
 
+    def _confirm_gone(self, file_id: str) -> bool:
+        """Tell whether the data provider shows the entry absent on consecutive polls, within the bound."""
+        return consistency.converge(
+            lambda: self._gone(file_id),
+            bool,
+            timeout_s=self._settings.settle_timeout_s,
+            poll_s=self._settings.poll_s,
+            consecutive=self._settings.consecutive_polls,
+            clock=self._clock,
+            sleep=self._sleep,
+        ).converged
+
     def teardown(self) -> TeardownReport:
-        """Delete exactly the entries the log says were created, newest first, and report anything left (O09)."""
+        """Delete exactly the entries the log says were created, newest first, and report anything left (O09, O11).
+
+        A deletion is logged only once the entry's absence is confirmed, so an entry whose DELETE answered success and
+        that is still there keeps its creation record and a later teardown deletes and checks it again. A directory
+        is deleted only when everything in it is an entry this teardown has confirmed gone.
+        """
         self._verified()
         deleted: list[str] = []
         left: list[dict[str, Any]] = []
@@ -529,27 +546,10 @@ class Provisioner:
                 if error.status != consistency.NOT_FOUND:
                     left.append({"path": line["path"], "reason": "the delete was refused or failed"})
                     continue
+            if not self._confirm_gone(fid):
+                left.append({"path": line["path"], "reason": "still listed after its delete"})
+                continue
             self._write("delete", id=fid, path=line["path"])
             removed.add(fid)
             deleted.append(fid)
-        for fid in deleted:
-            result = consistency.converge(
-                lambda fid=fid: self._gone(fid),
-                bool,
-                timeout_s=self._settings.settle_timeout_s,
-                poll_s=self._settings.poll_s,
-                consecutive=self._settings.consecutive_polls,
-                clock=self._clock,
-                sleep=self._sleep,
-            )
-            if not result.converged:
-                left.append({"path": self._path_of(fid), "reason": "still listed after its delete"})
         return TeardownReport(tuple(deleted), tuple(left))
-
-    def _path_of(self, file_id: str) -> str:
-        """Return the logged path of an id."""
-        for text in self._log.read_text(encoding="utf-8").splitlines():
-            line = json.loads(text)
-            if line.get("id") == file_id and line.get("action") == "create":
-                return str(line["path"])
-        return "?"

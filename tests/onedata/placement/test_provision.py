@@ -199,6 +199,28 @@ def test_o09_teardown_reports_a_file_still_listed_after_a_delete_that_was_accept
     assert any("still listed" in entry["reason"] for entry in report.left)
 
 
+def test_o11_a_deletion_is_logged_only_after_absence_is_verified_so_a_second_teardown_checks_again(provisioner, seeded):
+    """O11 with O09: a DELETE that answered 204 and left the entry is not a deletion. The creation record stays, the
+    second teardown does not report ok without deleting and verifying the entry again, and once the provider really
+    removes it the log is empty."""
+    file_id = provisioner.put_file("scratch/a.bin", DATA)
+    seeded.ignore_deletes = True
+    first = provisioner.teardown()
+    assert not first.ok
+    assert file_id not in first.deleted
+    assert file_id in [line["id"] for line in provisioner.logged()]  # no deletion line was written
+    deletes_before = len([c for c in seeded.provider_calls if c[1] == "DELETE"])
+    second = provisioner.teardown()
+    assert not second.ok  # not returned as ok without checking: the entry is still there
+    assert len([c for c in seeded.provider_calls if c[1] == "DELETE"]) > deletes_before  # and was deleted again
+    seeded.ignore_deletes = False
+    third = provisioner.teardown()
+    assert third.ok
+    assert file_id in third.deleted
+    assert provisioner.logged() == []
+    assert not seeded.exists("scratch/a.bin")
+
+
 def test_o09_put_file_refuses_to_adopt_a_file_that_exists(provisioner, seeded):
     """O09: a file already at the path is refused, so teardown can never delete something it did not create."""
     with pytest.raises(ProvisionError, match="already exists"):
