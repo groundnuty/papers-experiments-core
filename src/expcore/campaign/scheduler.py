@@ -121,6 +121,9 @@ class Scheduler:
         self._lock = DispatchLock(self.root)
         self._cv = threading.Condition()
         self._inflight: dict[str, tuple[str, str]] = {}  # run key -> (model, unit)
+        self._assess = (
+            threading.Lock()
+        )  # the budget is assessed by the dispatcher and by the workers' recheck, one at a time
         self._not_before: dict[str, float] = {}  # run key -> monotonic time before which it does not start again
         self._workers: list[threading.Thread] = []
         self._fatal: BaseException | None = None
@@ -197,6 +200,7 @@ class Scheduler:
                 stops=self.stops,
                 identities=self.identities,
                 holds=self.holds,
+                recheck=self.recheck,
                 health=self.gate,
                 leases=self.leases,
                 lease_group=self.lease_group,
@@ -282,6 +286,32 @@ class Scheduler:
                 counts[unit] = counts.get(unit, 0) + 1
         return counts
 
+    def _assessed(self, flying: list[str], now: str) -> Any:
+        """Assess the budget for the models of the runs in flight (None without a budget)."""
+        if self.budget is None:
+            return None
+        with self._assess:
+            return self.budget.assess(flying, now)
+
+    def recheck(self, row: Any) -> Hold | None:
+        """Tell why a run that holds its lease may not start after all, or None: the gates dispatch looked at, again.
+
+        A worker calls it once its lease is in hand, because the wait for a lease can be long. The run is not counted
+        among the runs in flight for the budget, as at dispatch, so its own bound is reserved once.
+        """
+        if self.stop.is_set():
+            return Hold("shutdown", "the campaign is ending", temporary=True)
+        key, model = row["run_key"], row[column_for("model")]
+        with self._cv:
+            others = [m for k, (m, _) in self._inflight.items() if k != key]
+        stopped, stopped_all = self.stops.stopped()
+        budget = self._assessed(others, self.stamp())
+        return (
+            self._all_hold(stopped_all)
+            or self._model_hold(model, stopped, budget)
+            or self._unit_hold(self.endpoints[model].unit)
+        )
+
     def _all_hold(self, stopped_all: bool) -> Hold | None:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
         if stopped_all:
@@ -336,7 +366,7 @@ class Scheduler:
         if self.leases is not None:
             self.leases.settle_quarantines()
         stopped, stopped_all = self.stops.stopped()
-        budget = None if self.budget is None else self.budget.assess([m for m, _ in self._inflight.values()], now)
+        budget = self._assessed([m for m, _ in self._inflight.values()], now)
         in_use = self._in_use()
         held_in_unit = self._quarantined_per_unit()
         waiting = False

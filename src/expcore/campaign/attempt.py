@@ -7,10 +7,14 @@ The order is fixed, and each step is decided by what a kill at that point must l
 1. the **health gate**: a held run stays pending and charges nothing; the run that finds an outage is its one attempt;
 2. a **lease**, when the platform declares resources: with none to be had (every key quarantined, or none declared) the
    run is left unstarted and uses no attempt, because no attempt row exists yet (C19);
-3. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
-4. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`;
-5. the post-run health check and the served-identity check, which can turn the result into infrastructure (C11, C16);
-6. the **outcome marker**, then the **store's record** of the result, in this order; the lease ends, and the unit's and
+3. **the gates again**: a lease can take a long wait, in which the health gate may have closed, a harness stop or a
+   unit's pause or the budget may have begun, or the campaign may have been told to end. If any is closed now the
+   lease is released cleanly (nothing was launched, so there is no teardown to prove) and the run stays pending with no
+   attempt used (C11, C17);
+4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
+5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`;
+6. the post-run health check and the served-identity check, which can turn the result into infrastructure (C11, C16);
+7. the **outcome marker**, then the **store's record** of the result, in this order; the lease ends, and the unit's and
    the harness-error bookkeeping follow (C15, C10).
 
 An exception in the executor is the study's: `InfraError` is infrastructure, anything else is a harness defect. An
@@ -73,6 +77,7 @@ class Parts:
     stops: HarnessStops
     identities: ServedIdentities
     holds: HoldRegistry
+    recheck: Callable[[Any], Hold | None] = lambda row: None  # why a run that holds its lease may not start after all
     health: HealthGate | None = None
     leases: LeasePool | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
@@ -103,11 +108,20 @@ class AttemptRunner:
         lease, granted = self._lease(row, factors, timer)
         if not granted:
             return p.settings.retry_delay_s  # left unstarted: no attempt row exists, so none is used
+        launched = False
         try:
+            hold = p.recheck(row)
+            if hold is not None:
+                self._leave_unstarted(row, factors, hold)
+                return 0.0  # the hold decides when it may start again
+            launched = True
             return self._attempt(row, factors, timer, lease)
         finally:
             if lease is not None and p.leases is not None:
-                p.leases.finish(lease)
+                if launched:
+                    p.leases.finish(lease)
+                else:
+                    lease.release()  # nothing ran under it: a clean release, with no teardown to prove
 
     # --- the steps ------------------------------------------------------------------------------------------------
 
@@ -129,6 +143,17 @@ class AttemptRunner:
         if lease.wait_s >= LEASE_WAIT_NOTED_S:
             p.store.event(p.stamp(), "lease_waited", model, f"{key}: waited {lease.wait_s:.1f} s for lease {lease.key}")
         return lease, True
+
+    def _leave_unstarted(self, row: Any, factors: Mapping[str, Any], hold: Hold) -> None:
+        """Say that a run which got its lease was held after all: nothing started, no attempt used (C11, C17)."""
+        key = row["run_key"]
+        self.p.store.event(
+            self.p.stamp(),
+            "run_unstarted",
+            factors["model"],
+            f"{key}: a {hold.kind} hold began while it waited for its lease; the lease is released, no attempt used: "
+            f"{hold.reason}",
+        )
 
     def _begin(self, row: Any) -> tuple[Any, Path]:
         """Insert the 'running' row, with a directory of its own for this try."""
