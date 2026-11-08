@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import random
 import re
@@ -41,6 +42,7 @@ from pathlib import Path
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.hostops import HostOps, strict_networks
 
+log = logging.getLogger(__name__)
 _REAP_LOCK = (
     threading.Lock()
 )  # a mount orphan's ordered teardown takes tens of seconds; starts run from several threads
@@ -203,7 +205,7 @@ def check_pool(host: HostOps, pool: str) -> None:
     """Refuse a range that this host already routes: sandbox networks inside it would shadow real destinations."""
     out = host.run(["ip", "-4", "route", "show", "table", "all"], 30)
     if out.returncode != 0:
-        raise SandboxError(f"cannot read the host's routes to check the subnet pool: {out.stderr.strip()[:200]}")
+        raise SandboxError("the host's routes could not be read to check the subnet pool")
     # our own sandbox networks add no host route (inhibit_ipv4), so any overlap is someone else's
     hits = route_overlaps(pool, out.stdout, docker_bridges(host))
     if hits:
@@ -260,11 +262,12 @@ def create(
         if r.returncode == 0:
             return str(cand), tried
         if OVERLAP not in r.stderr:
-            raise SandboxError(f"docker network create {name} failed: {r.stderr.strip()[:300]}")
+            log.error("docker network create failed: %s", r.stderr.strip()[:300])
+            raise SandboxError("docker network create failed")
         used.append(cand)  # taken meanwhile by another process: the next candidate
         if tried >= attempts:
             break
-    raise SandboxError(f"no free /{prefix} in the pools for {name} after {tried} attempts")
+    raise SandboxError(f"no free /{prefix} in the pools after {tried} attempts")
 
 
 # ------------------------------------------------------------------------------------------------ orphans

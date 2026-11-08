@@ -49,6 +49,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import http.client
+import importlib.util
 import io
 import itertools
 import json
@@ -64,8 +65,19 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import gatepolicy  # the sibling module, found through the path set above
+
+def _load_policy():
+    """The sibling `gatepolicy.py`, loaded by its path: the gate runs alone in its container, where this directory is
+    mounted and nothing is installed, so there is no package to import it from."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gatepolicy.py")
+    spec = importlib.util.spec_from_file_location("gatepolicy", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["gatepolicy"] = module  # a dataclass looks its module up by name while it is being built
+    spec.loader.exec_module(module)
+    return module
+
+
+gatepolicy = _load_policy()
 
 CFG: dict = {}
 _LOCK = threading.Lock()

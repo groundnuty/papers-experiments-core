@@ -72,7 +72,7 @@ def test_o15_the_teardown_order_is_readers_then_unmount_then_sidecar_then_agent(
 
 
 def test_o15_the_readers_are_signalled_without_the_init_and_its_sleep(world):
-    """O15: the container's init and its `sleep` stay, because they keep the mount namespace alive until the last step."""
+    """O15: the container's init and its `sleep` stay: they keep the mount namespace alive until the last step."""
     run_teardown(world)
     signalled = {pid for call in world.calls if call[0] == "run" and call[1][0] == "kill" for pid in call[1][3:]}
     assert signalled == {"22", "23"}
@@ -113,7 +113,7 @@ def test_o15_a_mount_that_cannot_be_unmounted_but_is_aborted_lets_the_containers
     stick(world, abort_works=True)
     result = run_teardown(world)
     assert result.fuse_safe is True
-    assert [r for r in result.log if r["step"] == "abort"][0]["ok"] is True
+    assert next(r for r in result.log if r["step"] == "abort")["ok"] is True
     removals = [name for kind, name in effects(world) if kind == "remove"]
     assert removals == [SIDECAR, AGENT]
 
@@ -122,7 +122,7 @@ def test_o15_a_failed_removal_is_recorded_and_the_next_step_still_runs(world):
     """O15: every step runs whatever an earlier one raised; the failure is in the result."""
     world.fail_remove.add(SIDECAR)
     result = run_teardown(world)
-    assert any(SIDECAR in error for error in result.errors)
+    assert any("sidecar could not be removed" in error for error in result.errors)
     assert AGENT not in world.containers
 
 
@@ -131,12 +131,13 @@ def test_o15_the_log_is_written_step_by_step_so_a_freeze_leaves_its_last_step(wo
     log = tmp_path / "log" / "run1.jsonl"
     run_teardown(world, log_path=log)
     steps = [line.split('"step": "')[1].split('"')[0] for line in log.read_text().splitlines()]
-    assert steps[0] == "begin" and steps[-1] == "end"
+    assert steps[0] == "begin"
+    assert steps[-1] == "end"
     assert steps.index("unmount") < steps.index("sidecar") < steps.index("agent")
 
 
 def test_o15_the_orphan_reaper_runs_the_same_order_before_removing_anything(world):
-    """O15: a cleanup that removes containers by name without knowing the order goes through the ordered teardown first."""
+    """O15: a cleanup that removes containers by name, not knowing the order, goes through the ordered teardown."""
     held = teardown.fuse_first(world, [AGENT, SIDECAR], waits=WAITS)
     assert held == set()
     kinds = [kind for kind, _ in effects(world)]

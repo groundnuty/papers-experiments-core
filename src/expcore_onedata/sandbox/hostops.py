@@ -13,6 +13,7 @@ tail of the tool's own stderr, never the environment.
 
 import ipaddress
 import json
+import logging
 import os
 import platform
 import re
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from expcore_onedata.sandbox.api import SandboxError
+
+log = logging.getLogger(__name__)
 
 DOCKER_TIMEOUT_S = 120.0
 TIMED_OUT = 124  # the exit code GNU timeout uses, and what a bounded command that ran out of time reports
@@ -138,9 +141,12 @@ class DockerHost:
     ) -> CmdResult:
         result = self._run(["docker", *args], DOCKER_TIMEOUT_S if timeout is None else timeout, env=env, input=input)
         if check and result.returncode != 0:
-            raise SandboxError(
-                f"docker {args[0] if args else ''} failed ({result.returncode}): {result.stderr.strip()[-300:]}"
+            # the tool's own words may name an image, a container or a path from the configuration: they go to the
+            # log, and the exception (which reaches a record) carries the subcommand and the exit code only
+            log.error(
+                "docker %s failed (%s): %s", args[0] if args else "", result.returncode, result.stderr.strip()[-300:]
             )
+            raise SandboxError(f"docker {args[0] if args else ''} failed ({result.returncode})")
         return result
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
@@ -169,7 +175,8 @@ class DockerHost:
     def _must(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = True) -> None:
         result = self.run(argv, timeout_s, sudo=sudo)
         if result.returncode != 0:
-            raise SandboxError(f"{argv[0]} failed ({result.returncode}): {result.stderr.strip()[-300:]}")
+            log.error("%s failed (%s): %s", argv[0], result.returncode, result.stderr.strip()[-300:])
+            raise SandboxError(f"{argv[0]} failed ({result.returncode})")
 
     def make_quota_dir(self, image: Path, mountpoint: Path, size_bytes: int, uid: int) -> None:
         mountpoint.mkdir(parents=True, exist_ok=True)
@@ -218,7 +225,8 @@ class DockerHost:
             self.run(argv, 60, sudo=True)
             if str(path) not in mounted_points(self.read_text("/proc/self/mountinfo")):
                 return
-        raise SandboxError(f"{path} is still mounted after an unmount and a lazy unmount")
+        log.error("%s is still mounted after an unmount and a lazy unmount", path)
+        raise SandboxError("a mount is still mounted after an unmount and a lazy unmount")
 
     def image_id(self, reference: str) -> str:
         found = self.docker("image", "inspect", "-f", "{{.Id}}", reference, check=False, timeout=30)
@@ -304,7 +312,8 @@ def remove_container(host: HostOps, name: str) -> None:
     """Remove a container with its volumes and verify it is gone; raise `SandboxError` when it is not."""
     host.docker("rm", "-f", "-v", name, check=False, timeout=60)
     if container_exists(host, name) is not False:
-        raise SandboxError(f"container {name} is not shown gone after its removal")
+        log.error("container %s is not shown gone after its removal", name)
+        raise SandboxError("a container is not shown gone after its removal")
 
 
 def network_exists(host: HostOps, name: str) -> bool | None:
@@ -319,7 +328,8 @@ def remove_network(host: HostOps, name: str) -> None:
     """Remove a network and verify it is gone (a leaked network keeps its subnet); raise `SandboxError` otherwise."""
     host.docker("network", "rm", name, check=False, timeout=60)
     if network_exists(host, name) is not False:
-        raise SandboxError(f"network {name} is not shown gone after its removal")
+        log.error("network %s is not shown gone after its removal", name)
+        raise SandboxError("a network is not shown gone after its removal")
 
 
 def strict_networks(values: Sequence[str]) -> list[ipaddress.IPv4Network]:

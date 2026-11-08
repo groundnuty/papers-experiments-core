@@ -268,7 +268,7 @@ def test_o09_no_other_module_of_the_platform_layer_imports_httpx():
     offenders = []
     for path in sorted(SRC.rglob("*.py")):
         # The data gate is a separate program that runs in its own container and passes read calls only (O16); it
-        # imports nothing of this package, which test_gate checks. It is the one file besides the client that speaks HTTP.
+        # imports nothing of this package, which test_gate checks. It is the one file besides the client with HTTP.
         if path.name == "client.py" or path.relative_to(SRC).as_posix() == "sandbox/gate.py":
             continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):

@@ -24,7 +24,7 @@ def test_o18_enoent_erofs_and_eisdir_on_a_client_log_line_are_not_sidecar_errors
 
 
 def test_o18_the_platform_error_count_ignores_what_the_agent_caused():
-    """O18: the count that goes against the platform leaves out the three errnos, in a log that also holds real faults."""
+    """O18: the count against the platform leaves out the three errnos, in a log that also holds real faults."""
     got = summary("oneclient.log")
     assert got["fuse_caused_by_agent"] == 3
     assert log.platform_errors(got) == got["total"] - 3
@@ -32,7 +32,7 @@ def test_o18_the_platform_error_count_ignores_what_the_agent_caused():
 
 
 def test_o18_the_errnos_the_agent_cannot_cause_by_itself_are_not_excused():
-    """O18: EIO and a connection failure count; EACCES and EPERM are ambiguous and so are never counted as the agent's."""
+    """O18: EIO and a connection failure count; EACCES and EPERM are ambiguous, never counted as the agent's."""
     got = summary("oneclient.log")
     assert got["by_kind"]["fuse_error:EIO"] == 1
     assert got["by_origin"]["sidecar"] == 1  # the connection failure

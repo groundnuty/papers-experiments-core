@@ -182,7 +182,7 @@ def test_o16_concurrent_reads_give_no_gate_origin_5xx(world):
                 if answer.status != 200 or answer.read() != BODY:
                     failures.append(f"status {answer.status}")
             conn.close()
-        except Exception as error:  # noqa: BLE001 -- recorded and asserted below
+        except Exception as error:  # recorded and asserted below
             failures.append(repr(error))
 
     threads = [threading.Thread(target=client) for _ in range(20)]
@@ -252,7 +252,7 @@ def test_the_gate_imports_nothing_but_the_standard_library_and_its_policy():
             names.add((node.module or "").split(".")[0])
     import sys
 
-    assert names - set(sys.stdlib_module_names) == {"gatepolicy"}
+    assert names - set(sys.stdlib_module_names) == set()
     policy = ast.parse((Path(gate.__file__).parent / "gatepolicy.py").read_text(encoding="utf-8"))
     imported = {
         a.name.split(".")[0] if isinstance(n, ast.Import) else (n.module or "").split(".")[0]

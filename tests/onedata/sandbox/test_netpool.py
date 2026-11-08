@@ -14,7 +14,7 @@ SMALL_POOL = ["10.77.0.0/24"]  # sixteen networks of 16 addresses: sixteen concu
 
 
 def test_o14_sixteen_concurrent_creates_get_disjoint_networks():
-    """O14: 16 concurrent creates get disjoint networks, even when the pool holds exactly 16 and every start collides."""
+    """O14: 16 concurrent creates get disjoint networks, even when the pool holds just 16 and every start collides."""
     host = FakeHost()
     results, errors = {}, []
 
@@ -110,7 +110,9 @@ def test_reaping_removes_only_the_resources_of_a_provably_dead_owner(tmp_path):
         host.docker(
             "run", "-d", "--name", name, *[a for k, v in labels.items() for a in ("--label", f"{k}={v}")], "img"
         )
-    host.docker("network", "create", "--subnet", "10.77.0.0/28", "--label", f"org.test.sandbox=1", "--label", f"org.test.owner={dead}", "--label", f"org.test.dir={tmp_path}", "dead-net")  # fmt: skip
+    labels = {"org.test.sandbox": "1", "org.test.owner": dead, "org.test.dir": str(tmp_path)}
+    flags = [a for k, v in labels.items() for a in ("--label", f"{k}={v}")]
+    host.docker("network", "create", "--subnet", "10.77.0.0/28", *flags, "dead-net")
     out = netpool.reap_orphans(host, LABELS)
     assert set(host.containers) == {"mine-gate"}
     assert out["networks"] == ["dead-net"]

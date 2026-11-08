@@ -113,7 +113,7 @@ class _StepLog:
         if path is not None:
             try:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
-                self._fh = open(path, "a")  # noqa: SIM115 -- held open for the life of the teardown, closed in close()
+                self._fh = open(path, "a")  # noqa: SIM115 -- held open for the whole teardown; closed in `close`
             except OSError as e:
                 self.ctx = {**ctx, "log_file_error": repr(e)[:200]}
 
@@ -529,7 +529,7 @@ def ordered_fuse_teardown(
             )
         if not (unmounted or aborted):
             errors.append(
-                f"FUSE mount at {mp} could be neither unmounted nor aborted: {sidecar} and {agent} left running"
+                "the FUSE mount could be neither unmounted nor aborted: the sidecar and the agent are left running"
             )
             L.event("held", outcome="containers left running", detail="no SIGKILL while the FUSE mount is live")
             return TeardownResult(False, removed, errors, L.records)
@@ -570,7 +570,7 @@ def ordered_fuse_teardown(
             removed.append(sidecar)
             L("sidecar", action="removed")
         except Exception as e:
-            errors.append(f"remove {sidecar}: {e!r}"[:300])
+            errors.append(f"the sidecar could not be removed ({type(e).__name__})")
             L("sidecar", action="remove failed", error=repr(e)[:200])
 
         # 4. the agent container, last
@@ -588,7 +588,7 @@ def ordered_fuse_teardown(
                 removed.append(agent)
                 L("agent", action="removed")
             except Exception as e:
-                errors.append(f"remove {agent}: {e!r}"[:300])
+                errors.append(f"the agent could not be removed ({type(e).__name__})")
                 L("agent", action="remove failed", error=repr(e)[:200])
         L("end", fuse_safe=True, unmounted=unmounted, aborted=aborted, errors=len(errors))
         return TeardownResult(True, removed, errors, L.records)

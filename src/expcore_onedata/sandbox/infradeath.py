@@ -84,11 +84,11 @@ def parse_inspect(text: str) -> dict[str, Any] | None:
 
 
 def problems(
-    role: str, condition: str, container: str, start: dict | None, end: dict | None, read_error: str | None = None
+    role: str, condition: str, start: dict | None, end: dict | None, read_error: str | None = None
 ) -> list[str]:
     """What is wrong with a gate or sidecar between its baseline `start` and now `end` (None: it could not be read, `read_error` says why). [] when it ran throughout.
-    Each item names the role, the container, the condition and the evidence."""
-    who = f"{role} {container} (condition {condition})"
+    Each item names the role, the condition and the evidence."""
+    who = f"{role} (condition {condition})"
     if end is None:
         return [f"{who}: its state could not be read at collection ({read_error or 'no reason given'})"]
     if start is None:

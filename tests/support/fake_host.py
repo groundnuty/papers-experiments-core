@@ -119,16 +119,23 @@ class FakeHost:
         self.dmesg = ""
         self.next_pid = 5000
         self.sudo_commands: list[list[str]] = []
-        self.exec_handler: Callable[[FakeContainer, list[str], str | None], CmdResult] = lambda c, argv, stdin: (
-            CmdResult(0)
-        )
+        self.exec_handler: Callable[[FakeContainer, list[str], str | None], CmdResult] = self._default_exec
+        self.journal = ""
         self.run_handlers: dict[str, Callable[[list[str]], CmdResult]] = {}
         self.fail_remove: set[str] = set()
+        self.fail_run: set[str] = set()
         self.fail_network_create: list[str] = []
         self.stuck_mounts: set[str] = set()
         self.oneclient_images: set[str] = set()
         self.base_bundle = "BASE BUNDLE\n"
         self.add_process(__import__("os").getpid(), start=777)
+
+    @staticmethod
+    def _default_exec(container: FakeContainer, argv: list[str], stdin: str | None) -> CmdResult:
+        """The agent's code does nothing, and the read-only probe is refused as a read-only filesystem refuses it."""
+        if stdin and "open(" in stdin and "'w'" in stdin:
+            return CmdResult(0, "blocked 30\n")
+        return CmdResult(0)
 
     # ---------------------------------------------------------------- setup helpers
     def add_image(self, reference: str, image_id: str) -> None:
@@ -140,7 +147,7 @@ class FakeHost:
         self.files[f"/proc/{pid}/stat"] = f"{pid} (python) S " + " ".join(["0"] * 18) + f" {start} 0\n"
 
     def add_cgroup(self, container: "FakeContainer", pids: Sequence[int], *, events: str | None = None) -> str:
-        """Give a container a cgroup directory (the first layout docker uses) with these processes; return the directory."""
+        """Give a container a cgroup directory (the first layout docker uses) with these processes."""
         directory = f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope"
         self.files[f"{directory}/cgroup.procs"] = "".join(f"{pid}\n" for pid in pids)
         if events is not None:
@@ -230,6 +237,16 @@ class FakeHost:
         match argv[0]:
             case "ip":
                 return CmdResult(0, self.routes)
+            case "journalctl":
+                return CmdResult(0, self.journal)
+            case "cp":
+                src, dst = Path(argv[-2]), Path(argv[-1])
+                if src.is_dir():
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                return CmdResult(0)
             case "dmesg":
                 return CmdResult(0, self.dmesg)
             case "cat":
@@ -289,7 +306,7 @@ class FakeHost:
             return self._run_container(rest, env)
         if command == "exec":
             return self._exec(rest, stdin)
-        if command in ("rm", "stop", "inspect", "ps", "logs"):
+        if command in ("rm", "stop", "inspect", "ps", "logs", "kill"):
             return getattr(self, f"_{command}")(rest)
         if command == "network":
             return getattr(self, f"_net_{rest[0]}")(rest[1:])
@@ -303,6 +320,8 @@ class FakeHost:
         if options.get("--rm"):  # a one-shot: its output is what the test configured, nothing is kept
             return CmdResult(0, self.base_bundle if options.get("--entrypoint") == "cat" else "oneclient 1.0\n")
         name = options["--name"]
+        if name in self.fail_run:
+            return CmdResult(125, "", "cannot start the container")
         if name in self.containers:
             return CmdResult(125, "", f"Conflict. The container name {name} is already in use")
         labels = dict(item.split("=", 1) for item in options.get("--label", []))
@@ -319,6 +338,8 @@ class FakeHost:
             container.logs = "gate ready\n"
         self.alive.add(container.pid)
         self.containers[name] = container
+        self.add_stat(container.pid, "tini", 1)
+        self.add_cgroup(container, [container.pid], events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
         container.options["_env"] = dict(env or {})
         return CmdResult(0, container.id + "\n")
 
@@ -359,6 +380,15 @@ class FakeHost:
         container.running = False
         self.alive.discard(container.pid)
         self.calls.append(("stopped", container.name))
+        return CmdResult(0, container.name + "\n")
+
+    def _kill(self, args: list[str]) -> CmdResult:
+        container = self._find(args[-1])
+        if container is None:
+            return CmdResult(1, "", "No such container")
+        container.running, container.exit_code = False, 0
+        self.alive.discard(container.pid)
+        self.calls.append(("signalled", container.name, args[args.index("-s") + 1] if "-s" in args else "KILL"))
         return CmdResult(0, container.name + "\n")
 
     def _inspect(self, args: list[str]) -> CmdResult:

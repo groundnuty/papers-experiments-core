@@ -51,7 +51,7 @@ def test_o17_a_kill_with_no_rise_of_the_containers_own_counter_is_the_hosts():
 
 
 def test_o17_the_exit_code_decides_nothing():
-    """O17: 137, 124, 143 or 0 with the same counters is the same cause, and a cell that ran to its limit is the agent's."""
+    """O17: 137, 124, 143 or 0 with the same counters is the same cause; a cell at its limit is the agent's."""
     causes = {classify("memory_events_host_killer.txt", exit_code=code)["reason"] for code in (137, 124, 143, 0, 1)}
     assert causes == {"host_oom"}
     got = classify("memory_events_start.txt", duration=LIMIT_S)
@@ -135,7 +135,7 @@ def test_o17_an_unrecognised_category_is_unknown_and_retried():
 
 
 def test_o17_unknown_is_retried_within_the_attempt_limit(tmp_path):
-    """O17: a kill nothing attributes ends the attempt as infrastructure, charged, and the run is retried until the limit."""
+    """O17: a kill nothing attributes ends the attempt as infrastructure, and the run is retried to the limit."""
     store, _, manifest = planned_store(tmp_path)
     key = manifest.rows[0].key.text
     error = kinds.kill_error(classify("memory_events_start.txt", duration=3.0))
@@ -151,9 +151,9 @@ def inspect_state(name: str) -> dict:
 
 def test_o17_a_container_that_ran_throughout_has_no_problem():
     running = {**inspect_state("inspect_running.json"), "oom": 0, "oom_kill": 0}
-    assert infradeath.problems("gate", "rest", "sbx-gate", running, dict(running)) == []
+    assert infradeath.problems("gate", "rest", running, dict(running)) == []
     unreadable = inspect_state("inspect_running.json")  # counters that could not be read: unknown is not clean
-    assert infradeath.problems("gate", "rest", "sbx-gate", unreadable, dict(unreadable))
+    assert infradeath.problems("gate", "rest", unreadable, dict(unreadable))
 
 
 @pytest.mark.parametrize(
@@ -167,7 +167,7 @@ def test_o17_a_container_that_ran_throughout_has_no_problem():
 )
 def test_o17_the_death_of_a_component_is_infrastructure_and_retried(end, cause, category):
     start, now = inspect_state("inspect_running.json"), inspect_state(end)
-    assert infradeath.problems("gate", "rest", "sbx-gate", start, now)
+    assert infradeath.problems("gate", "rest", start, now)
     got = infradeath.cause_of("gate", start, now)
     assert (got["cause"], got["category"]) == (cause, category)
 
@@ -181,7 +181,7 @@ def test_o17_a_death_that_the_host_caused_is_host_pressure():
 
 def test_o17_a_death_the_state_cannot_show_is_undetermined_not_clean():
     start = inspect_state("inspect_running.json")
-    assert infradeath.problems("gate", "rest", "sbx-gate", start, None, "daemon timeout")
+    assert infradeath.problems("gate", "rest", start, None, "daemon timeout")
     assert infradeath.cause_of("gate", start, None, "daemon timeout")["cause"] == "undetermined"
     assert infradeath.parse_inspect("not json") is None
 
@@ -197,7 +197,7 @@ def test_o17_the_sidecar_hitting_its_own_limit_under_the_agents_reads_is_the_age
 
 def test_o17_a_death_of_infrastructure_makes_a_sandbox_error_that_names_the_cause():
     start, now = inspect_state("inspect_running.json"), inspect_state("inspect_crashed.json")
-    problems = infradeath.problems("gate", "rest", "sbx-gate", start, now)
+    problems = infradeath.problems("gate", "rest", start, now)
     death = {**infradeath.cause_of("gate", start, now), "role": "gate", "problems": problems}
     error = kinds.death_error([death])
     assert error.kind == "sandbox"

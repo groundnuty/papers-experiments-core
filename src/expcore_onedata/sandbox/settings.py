@@ -14,6 +14,7 @@ agent_uid = 10001               # the unprivileged user the agent's code runs as
 python = "python"               # the interpreter in the agent image that runs the agent's code
 sudo = ["sudo", "-n"]           # the privilege command for host steps; [] when the driver runs as root
 earlyoom_comm = "expcore-drv"   # optional: the process name the host's earlyoom is told to spare
+trust_paths = []                # optional: paths in the agent image of CA bundles that must also trust the run's CA
 
 [sandbox.images.agent]          # also the gate's image unless [sandbox.images.gate] names another
 name = "image:tag"              # a tag or an id, only ever resolved to the id below
@@ -132,12 +133,12 @@ class SandboxSettings:
     data_paths: Mapping[str, DataPathMode]
     users: Mapping[str, str]
     earlyoom_comm: str | None = None
+    trust_paths: tuple[str, ...] = ()
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
         if level not in self.data_paths:
-            known = ", ".join(sorted(self.data_paths)) or "none"
-            raise ValueError(f"[sandbox.data_paths] has no level {level!r}; mapped levels: {known}")
+            raise ValueError("[sandbox.data_paths] does not map the level of this run's data_path factor")
         return self.data_paths[level]
 
     def label(self, name: str) -> str:
@@ -226,12 +227,14 @@ def _mount(section: Section) -> MountSettings:
 def _data_paths(section: Section) -> Mapping[str, DataPathMode]:
     """Read [sandbox.data_paths]: level of the study's factor -> mount, rest or none."""
     out = {}
-    for level in section.data:
+    for position, level in enumerate(section.data):  # a level is the study's word: it is named by position, not echoed
         value = section.string(level)
         try:
             out[level] = DataPathMode(value)
         except ValueError:
-            raise section.fail(level, f"must be one of: {', '.join(m.value for m in DataPathMode)}") from None
+            raise section.fail(
+                None, f"entry {position}: must be one of: {', '.join(m.value for m in DataPathMode)}"
+            ) from None
     if not out:
         raise section.fail(None, "must map at least one level of the data_path factor")
     return MappingProxyType(out)
@@ -240,12 +243,14 @@ def _data_paths(section: Section) -> Mapping[str, DataPathMode]:
 def _users(section: Section) -> Mapping[str, str]:
     """Read [sandbox.users]: login name -> Onezone user id. A login is also a lease key, so it is a plain file name."""
     out = {}
-    for login in section.data:
+    for position, login in enumerate(section.data):  # a login is a configured value: it is named by position
         user_id = section.string(login)
         if not LEASE_KEY.fullmatch(login):
-            raise section.fail(login, "a login must be letters, digits, '.', '-' and '_' to serve as a lease key")
+            raise section.fail(
+                None, f"entry {position}: a login must be letters, digits, '.', '-' and '_' to serve as a lease key"
+            )
         if not PLAIN_ID.fullmatch(user_id):
-            raise section.fail(login, "must be a plain user id of letters, digits and _.@-")
+            raise section.fail(None, f"entry {position}: must be a plain user id of letters, digits and _.@-")
         out[login] = user_id
     if len(set(out.values())) != len(out):
         raise section.fail(None, "two logins have the same user id")
@@ -262,7 +267,16 @@ def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, .
 
 def load_sandbox(section: Section, base: Path) -> SandboxSettings:
     """Validate the `[sandbox]` table; raise ConfigError naming the file and key, never a value."""
-    keys = ("work_root", "name_prefix", "label_namespace", "agent_uid", "python", "sudo", "earlyoom_comm")
+    keys = (
+        "work_root",
+        "name_prefix",
+        "label_namespace",
+        "agent_uid",
+        "python",
+        "sudo",
+        "earlyoom_comm",
+        "trust_paths",
+    )
     section.reject_unknown((*keys, "images", "network", "limits", "mount", "data_paths", "users"))
     work_root = (base / section.string("work_root")).resolve()
     prefix = section.optional_string("name_prefix") or "sbx"
@@ -295,6 +309,7 @@ def load_sandbox(section: Section, base: Path) -> SandboxSettings:
         data_paths=data_paths,
         users=_users(section.section("users")) if "users" in section.data else {},
         earlyoom_comm=comm,
+        trust_paths=_words(section, "trust_paths", ()),
     )
 
 

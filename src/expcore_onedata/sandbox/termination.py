@@ -3,7 +3,7 @@
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
 """SIGTERM as a normal exit for a driver of real sandboxes.
 
-Python's default for SIGTERM ends the process on the spot: no `finally` runs, so an M sandbox's sidecar and FUSE mount are
+Python's default for SIGTERM ends the process on the spot: no `finally` runs, so a mount sandbox's sidecar and FUSE mount are
 left to the orphan reaper. `exit_on_sigterm()`, called at the top of a driver's `main`, makes it an orderly exit instead:
 
   * the FIRST SIGTERM stops every sandbox this process has up, in a thread of its own (at most `MAX_PARALLEL_STOPS` at a
@@ -24,6 +24,7 @@ The campaign CLI has its own graceful stop (a stop event that drains the runs) a
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import signal
@@ -119,10 +120,8 @@ def _on_sigterm(signum, frame) -> None:
     _requested.set()
     if not first:
         return
-    try:
+    with contextlib.suppress(OSError):
         os.write(2, b"SIGTERM: stopping this process's sandboxes, no new ones start\n")
-    except OSError:
-        pass
     try:
         t = threading.Thread(target=_stop_live, name="sigterm-stopper", daemon=False)  # the process waits for it
         t.start()
@@ -133,13 +132,13 @@ def _on_sigterm(signum, frame) -> None:
         raise SystemExit(EXIT_CODE)
 
 
-def exit_on_sigterm() -> bool:
-    """Install the handler. Only the main thread can; returns False (and logs it) anywhere else. Also names this process as a driver,
-    which the host's earlyoom ignores (earlyoom.py): this call is what every real-sandbox driver already makes at its start."""
-    from . import earlyoom
+def exit_on_sigterm(driver_comm: str | None = None) -> bool:
+    """Install the handler. Only the main thread can; returns False (and logs it) anywhere else. With `driver_comm`
+    (`[sandbox] earlyoom_comm`) it also names this process as a driver, which the host's earlyoom ignores (earlyoom.py)."""
+    from expcore_onedata.sandbox import earlyoom
 
-    if threading.current_thread() is threading.main_thread():
-        earlyoom.name_this_driver()
+    if driver_comm and threading.current_thread() is threading.main_thread():
+        earlyoom.name_this_driver(driver_comm)
     try:
         signal.signal(signal.SIGTERM, _on_sigterm)
     except ValueError as e:

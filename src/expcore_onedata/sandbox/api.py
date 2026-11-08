@@ -13,6 +13,7 @@ import dataclasses
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 
 class SandboxError(RuntimeError):
@@ -38,6 +39,45 @@ class DataPathMode(StrEnum):
     def interface(self) -> str | None:
         """The token's interface caveat for this path (the mounting client or REST); None when there is no token."""
         return {"mount": "oneclient", "rest": "rest"}.get(self.value)
+
+
+class SecretLike(Protocol):
+    """A secret that does not show itself (`tokens.MintedToken`): read with `reveal` where it is used."""
+
+    def reveal(self) -> str: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Endpoint:
+    """A host the sandbox reaches through the gate or the mount: name, port and whether it speaks TLS."""
+
+    host: str
+    port: int
+    tls: bool = True
+
+    @classmethod
+    def from_url(cls, url: str) -> "Endpoint":
+        """The endpoint of a configured URL (scheme, host and perhaps a port: `config.py` guarantees nothing else)."""
+        parts = urlsplit(url)
+        tls = parts.scheme == "https"
+        return cls(parts.hostname or "", parts.port or (443 if tls else 80), tls)
+
+
+@dataclasses.dataclass(frozen=True)
+class SandboxSpec:
+    """What one run asks of a sandbox: its data path and, for a path, the token, the zone and the pinned provider.
+
+    The agent is pinned to its local provider (O03): `provider` is that one, and no other host is reachable. A run with
+    no data path has no token and no endpoint. `lease_key` names the leased resource the sandbox's containers, network
+    and directories are labelled with, so a probe can prove them gone (C19).
+    """
+
+    run_key: str
+    mode: DataPathMode
+    token: SecretLike | None = None
+    zone: Endpoint | None = None
+    provider: Endpoint | None = None
+    lease_key: str | None = None
 
 
 @dataclasses.dataclass
