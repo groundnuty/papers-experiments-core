@@ -11,9 +11,10 @@ place depends on nothing else, so runs added to the plan never move the runs alr
 same order exactly. The order seed and the rule are pinned in the store; a resume under another seed is refused.
 
 Fingerprint (C06). A plain, JSON-ready dictionary of everything that makes two starts one experiment: the factor
-schema, the tasks, the models, the caps, the prompt and tool hashes of each condition, the scorer digest and the hash
-of every configuration file. Only hashes and numbers go in, never a secret. A resume must present the same
-fingerprint. The plan may grow, but only by whole tasks, models or conditions, and only when the caller allows it;
+schema, the tasks, the models and the seeds (the built-in factors of every run), the caps, the prompt and tool hashes
+of each condition, the scorer digest and the hash of every configuration file. Only hashes and numbers go in, never a
+secret. A resume must present the same fingerprint, and a manifest that is not the plan the fingerprint declares is
+refused. The plan may grow, but only by whole tasks, models, seeds or conditions, and only when the caller allows it;
 changing or removing anything already recorded is refused.
 """
 
@@ -31,7 +32,7 @@ from expcore.campaign.factors import FactorSchema, PlanError, RunKey
 ORDER_RULE = "sha256(order_seed|run_key)"
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 # Sections of the fingerprint that may gain whole entries when the plan grows (C08), and the conditions of the schema.
-GROWABLE_SECTIONS = ("tasks", "models", "prompts", "tools")
+GROWABLE_SECTIONS = ("tasks", "models", "seeds", "prompts", "tools")
 _SHOWN_LIMIT = 48
 
 
@@ -132,6 +133,7 @@ def build_fingerprint(
     *,
     tasks: Mapping[str, str],
     models: Mapping[str, Any],
+    seeds: Iterable[int],
     caps: Mapping[str, Any],
     prompts: Mapping[str, str],
     tools: Mapping[str, str],
@@ -143,6 +145,8 @@ def build_fingerprint(
     - `tasks`: task id to a digest of the task's content.
     - `models`: model key to a digest of its resolved settings, or to a mapping that holds that digest and the
       model's own caps; the entry is compared whole, so a model that is added later brings its caps with it.
+    - `seeds`: the integer seeds of the plan. With `tasks` and `models` they are the built-in factors of every run, so
+      a resume cannot change which runs are planned without the fingerprint changing.
     - `caps`: the campaign-wide caps, attempt limit and budgets.
     - `prompts` and `tools`: for each condition, the hash of its prompt template and of its frozen tool manifest.
     - `scorer_digest`: the digest of the scorers a resume must keep.
@@ -152,10 +156,16 @@ def build_fingerprint(
         raise PlanError("fingerprint scorer_digest must be a 64-character lower-case hex digest")
     if not isinstance(models, Mapping) or not models or not all(isinstance(k, str) and k for k in models):
         raise PlanError("fingerprint models must be a non-empty mapping of model keys to their settings")
+    seed_list = list(seeds)
+    if not seed_list or not all(isinstance(x, int) and not isinstance(x, bool) for x in seed_list):
+        raise PlanError("fingerprint seeds must be a non-empty list of integers")
+    if len(set(seed_list)) != len(seed_list):
+        raise PlanError("fingerprint seeds must not repeat")
     fingerprint = {
         "schema": schema.to_json(),
         "tasks": _digest_map("tasks", tasks),
         "models": _plain("models", models),
+        "seeds": {str(seed): True for seed in seed_list},
         "caps": _plain("caps", caps),
         "prompts": _digest_map("prompts", prompts, schema.conditions),
         "tools": _digest_map("tools", tools, schema.conditions),
@@ -163,6 +173,27 @@ def build_fingerprint(
         "configs": _digest_map("configs", configs),
     }
     return json.loads(json.dumps(fingerprint, sort_keys=True, allow_nan=False))
+
+
+def plan_problem(schema: FactorSchema, manifest: Manifest, fingerprint: Mapping[str, Any]) -> str | None:
+    """Describe how a manifest is not the plan its fingerprint declares; None when it is exactly that plan.
+
+    The plan is every condition x task x model x seed of the fingerprint. A manifest that lists other runs would be a
+    different experiment whatever the fingerprint says, so a start whose two disagree is refused.
+    """
+    declared = {
+        key.text
+        for key in schema.expand(
+            fingerprint["tasks"], fingerprint["models"], [int(seed) for seed in fingerprint["seeds"]]
+        )
+    }
+    planned = {row.key.text for row in manifest.rows}
+    if planned == declared:
+        return None
+    return (
+        f"the manifest lists {len(planned - declared)} run(s) its fingerprint does not declare and omits "
+        f"{len(declared - planned)} that it does; the tasks, models, seeds and conditions must agree"
+    )
 
 
 def fingerprint_sha256(fingerprint: Mapping[str, Any]) -> str:

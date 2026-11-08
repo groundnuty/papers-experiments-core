@@ -75,11 +75,14 @@ def make_manifest(schema: FactorSchema, order_seed: int = 7, **plan) -> Manifest
     return build_manifest(make_keys(schema, **plan), order_seed)
 
 
-def make_fingerprint(schema: FactorSchema, task_ids=("task-a", "task-b"), model_keys=("m1",), **changes) -> dict:
+def make_fingerprint(
+    schema: FactorSchema, task_ids=("task-a", "task-b"), model_keys=("m1",), seed_ids=(1, 2), **changes
+) -> dict:
     """Return the fingerprint of a campaign over a schema; keyword arguments replace one section whole."""
     inputs = {
         "tasks": {t: sha(f"task {t}") for t in task_ids},
         "models": {m: sha(f"model {m}") for m in model_keys},
+        "seeds": list(seed_ids),
         "caps": {"attempt_limit": 3, "time_cap_s": 600},
         "prompts": {c: sha(f"prompt {c}") for c in schema.conditions},
         "tools": {c: sha(f"tools {c}") for c in schema.conditions},

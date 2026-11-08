@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from dataclasses import replace
 
 import pytest
 from campaign_support import NOW, finished, make_fingerprint, make_manifest, make_schema, sha, treatment_schema
@@ -9,7 +10,7 @@ from campaign_support import NOW, finished, make_fingerprint, make_manifest, mak
 from expcore.campaign.attempts import PinMismatch, ResumeRefused, SchemaMismatch
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.recovery import Recovery
-from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, open_campaign
+from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, RunSetMismatch, open_campaign
 from expcore.campaign.store import Store
 
 LIMIT = 3
@@ -21,7 +22,8 @@ def start(tmp_path, *, order_seed=7, allow_growth=False, schema=None, plan=None,
     manifest = make_manifest(schema, order_seed, **(plan or {}))
     tasks = tuple(dict.fromkeys(row.key.factors["task"] for row in manifest.rows))
     models = tuple(dict.fromkeys(row.key.factors["model"] for row in manifest.rows))
-    fingerprint = make_fingerprint(schema, task_ids=tasks, model_keys=models, **inputs)
+    seeds = tuple(dict.fromkeys(row.key.factors["seed"] for row in manifest.rows))
+    fingerprint = make_fingerprint(schema, task_ids=tasks, model_keys=models, seed_ids=seeds, **inputs)
     return open_campaign(
         tmp_path / "campaign.db", schema, manifest, fingerprint, now=NOW, max_attempts=LIMIT, allow_growth=allow_growth
     )
@@ -211,3 +213,73 @@ def test_c08_a_new_condition_that_declares_a_treatment_is_one_growth_entry(tmp_p
     assert not [line for line in caught.value.differences if "treatment" in line]  # one entry, not two
     store, _ = start(tmp_path, schema=grown, allow_growth=True)
     assert json.loads(store.get_meta(FINGERPRINT_KEY))["schema"]["treatment"]["mount-none"] == ["endpoint"]
+
+
+def test_c06_a_resume_with_other_seeds_is_refused_even_when_growth_is_allowed(tmp_path):
+    """C06: adds that the seeds are fingerprinted, so seeds [1] then [2] is a changed run set and is refused."""
+    start(tmp_path, plan={"seeds": (1,)})[0].close()
+    with pytest.raises(FingerprintMismatch) as caught:
+        start(tmp_path, plan={"seeds": (2,)}, allow_growth=True)
+    assert "seeds.1: recorded True, now absent" in caught.value.differences
+    start(tmp_path, plan={"seeds": (1,)})[0].close()  # the recorded seeds still resume
+
+
+def test_c08_new_seeds_are_growth_that_a_resume_must_ask_for(tmp_path):
+    """C08: adds that a seed added to the plan is growth, refused without leave and added with it."""
+    start(tmp_path, plan={"seeds": (1,)})[0].close()
+    with pytest.raises(FingerprintMismatch) as caught:
+        start(tmp_path, plan={"seeds": (1, 2)})
+    assert caught.value.differences == ("seeds.2: not in the recorded experiment",)
+    store, _ = start(tmp_path, plan={"seeds": (1, 2)}, allow_growth=True)
+    assert len(store.run_keys()) == len(make_manifest(make_schema(), 7).rows)
+
+
+def test_c06_a_manifest_that_is_not_the_plan_of_its_fingerprint_is_refused_before_the_store_is_opened(tmp_path):
+    """C06: adds that a start whose manifest and fingerprint disagree about the runs is refused and creates nothing."""
+    schema = make_schema()
+    manifest = make_manifest(schema, 7, seeds=(1,))
+    fingerprint = make_fingerprint(schema, seed_ids=(1, 2))
+    with pytest.raises(RunSetMismatch, match="omits 6 that it does"):
+        open_campaign(tmp_path / "campaign.db", schema, manifest, fingerprint, now=NOW, max_attempts=LIMIT)
+    assert not (tmp_path / "campaign.db").exists()
+
+
+def test_c06_runs_the_store_holds_are_never_dropped_and_runs_it_lacks_need_leave(tmp_path):
+    """C06: adds the run-set check against the store: a removed run is always refused, an added one needs growth."""
+    store, _ = start(tmp_path)
+    keys = sorted(store.run_keys())
+    store.db.execute("INSERT INTO runs(run_key,digest,seq,factors) VALUES('task=old','d0',99,'{}')")
+    store.close()
+    with pytest.raises(RunSetMismatch, match=r"omits 1 run\(s\) the store holds, the first 'task=old'"):
+        start(tmp_path, allow_growth=True)  # leave to grow never excuses a removal
+    store = Store(tmp_path / "campaign.db", make_schema())
+    store.db.execute("DELETE FROM runs WHERE run_key='task=old'")
+    store.db.execute("DELETE FROM runs WHERE run_key=?", (keys[0],))
+    store.close()
+    with pytest.raises(RunSetMismatch, match=r"adds 1 run\(s\) the store does not hold.*pass allow_growth"):
+        start(tmp_path)
+    again, _ = start(tmp_path, allow_growth=True)
+    assert again.run_keys() == set(keys)
+
+
+def test_c06_a_refused_growth_leaves_the_stored_fingerprint_so_the_original_resumes(tmp_path):
+    """C06: adds that the fingerprint update, the checks and the insertion of runs stand or fall in one transaction."""
+    store, _ = start(tmp_path)
+    before = state_of(store)
+    recorded = store.get_meta(FINGERPRINT_KEY)
+    store.close()
+    schema = make_schema()
+    grown_plan = {"tasks": ("task-a", "task-b", "task-c")}
+    manifest = make_manifest(schema, 7, **grown_plan)
+    bad = replace(manifest, rows=(*manifest.rows, manifest.rows[0]))  # a duplicate key, past the plan builder
+    fingerprint = make_fingerprint(schema, task_ids=grown_plan["tasks"], model_keys=("m1",))
+    with pytest.raises(ValueError, match="appears more than once"):
+        open_campaign(
+            tmp_path / "campaign.db", schema, bad, fingerprint, now=NOW, max_attempts=LIMIT, allow_growth=True
+        )
+    check = Store(tmp_path / "campaign.db", schema)
+    assert check.get_meta(FINGERPRINT_KEY) == recorded
+    assert state_of(check) == before  # no run, no event, no pin changed
+    check.close()
+    again, _ = start(tmp_path)  # the original start still resumes
+    assert state_of(again) == before

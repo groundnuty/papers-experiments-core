@@ -253,10 +253,14 @@ class Store:
     # --- the manifest -------------------------------------------------------------------------------------------
 
     def sync_manifest(self, rows: Sequence[ManifestRow]) -> int:
-        """Insert the runs the store lacks and refresh every run's place; statuses are never touched.
+        """Insert the runs the store lacks and refresh every run's place, in one transaction; return the number added."""
+        return self.transact(lambda: self.sync_manifest_within(rows))
 
-        Refuses a key from another schema, and a plan whose order of the runs it shares with the store has changed.
-        Returns the number of runs added.
+    def sync_manifest_within(self, rows: Sequence[ManifestRow]) -> int:
+        """Do what `sync_manifest` does inside a transaction the caller has begun, so it can stand or fall with more.
+
+        Statuses are never touched. Refuses a key listed twice, a key from another schema or fitting no condition, and
+        a plan whose order of the runs it shares with the store has changed; the caller's transaction then rolls back.
         """
         texts = [row.key.text for row in rows]
         repeated = [text for text in dict.fromkeys(texts) if texts.count(text) > 1]
@@ -266,23 +270,23 @@ class Store:
             if row.key.names != self.schema.order:
                 raise ValueError(f"run key {row.key.text!r} is not of this schema's identity order")
             self.schema.condition_of(row.key)  # a key that fits no condition cannot have come from this plan
+        recorded = [r["run_key"] for r in self.db.execute("SELECT run_key FROM runs ORDER BY seq")]
+        problem = relative_order_problem(recorded, texts)
+        if problem is not None:
+            raise ResumeRefused(problem)
+        added = 0
+        for row in rows:
+            cursor = self.db.execute(
+                "INSERT OR IGNORE INTO runs(run_key,digest,seq,factors) VALUES(?,?,?,?)",
+                (row.key.text, row.key.digest, row.seq, row.key.factors_json),
+            )
+            added += cursor.rowcount
+            self.db.execute("UPDATE runs SET seq=? WHERE run_key=?", (row.seq, row.key.text))
+        return added
 
-        def go() -> int:
-            recorded = [r["run_key"] for r in self.db.execute("SELECT run_key FROM runs ORDER BY seq")]
-            problem = relative_order_problem(recorded, [row.key.text for row in rows])
-            if problem is not None:
-                raise ResumeRefused(problem)
-            added = 0
-            for row in rows:
-                cursor = self.db.execute(
-                    "INSERT OR IGNORE INTO runs(run_key,digest,seq,factors) VALUES(?,?,?,?)",
-                    (row.key.text, row.key.digest, row.seq, row.key.factors_json),
-                )
-                added += cursor.rowcount
-                self.db.execute("UPDATE runs SET seq=? WHERE run_key=?", (row.seq, row.key.text))
-            return added
-
-        return self.transact(go)
+    def run_keys(self) -> set[str]:
+        """Return the key of every run the store holds."""
+        return {r["run_key"] for r in self.q("SELECT run_key FROM runs")}
 
     def pending(self, **where: str | int) -> list[sqlite3.Row]:
         """Return the pending runs in manifest order, optionally only those with the given factor values."""

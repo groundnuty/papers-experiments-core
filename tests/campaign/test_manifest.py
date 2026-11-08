@@ -12,6 +12,7 @@ from expcore.campaign.manifest import (
     compare_fingerprints,
     fingerprint_sha256,
     order_key,
+    plan_problem,
     relative_order_problem,
 )
 
@@ -108,7 +109,17 @@ def test_the_order_seed_must_be_an_integer(seed):
 def test_the_fingerprint_is_plain_data_that_survives_json_and_is_hashed_canonically():
     schema = make_schema()
     fingerprint = make_fingerprint(schema)
-    assert set(fingerprint) == {"schema", "tasks", "models", "caps", "prompts", "tools", "scorer_digest", "configs"}
+    assert set(fingerprint) == {
+        "schema",
+        "tasks",
+        "models",
+        "seeds",
+        "caps",
+        "prompts",
+        "tools",
+        "scorer_digest",
+        "configs",
+    }
     assert fingerprint["schema"] == schema.to_json()
     reordered = make_fingerprint(schema, task_ids=("task-b", "task-a"))
     assert fingerprint_sha256(fingerprint) == fingerprint_sha256(reordered)
@@ -120,6 +131,7 @@ CONFIGS = {"study.toml": sha("study"), "models.toml": sha("models"), "campaign.t
 CHANGES = {
     "task content": ("tasks", {"task-a": sha("edited"), "task-b": sha("task task-b")}),
     "model settings": ("models", {"m1": sha("edited")}),
+    "seeds": ("seeds", [1]),
     "caps": ("caps", {"attempt_limit": 4, "time_cap_s": 600}),
     "prompt hash": ("prompts", OTHER_DIGESTS),
     "tool hash": ("tools", OTHER_DIGESTS),
@@ -266,9 +278,50 @@ def test_building_a_fingerprint_needs_the_schema_s_conditions_to_be_covered():
             schema,
             tasks={"t": sha("t")},
             models={"m": sha("m")},
+            seeds=[1],
             caps={},
             prompts={},
             tools={},
             scorer_digest=sha("s"),
             configs={"c": sha("c")},
         )
+
+
+AGREE = "the tasks, models, seeds and conditions must agree"
+
+
+@pytest.mark.parametrize(
+    ("seeds", "message"),
+    [
+        ([], "seeds must be a non-empty list"),
+        ([1, 1], "must not repeat"),
+        (["1"], "list of integers"),
+        ([True], "list of integers"),
+    ],
+)
+def test_c06_the_seeds_of_the_fingerprint_are_distinct_integers(seeds, message):
+    """C06: adds that the seeds, a built-in factor of every run, are validated as the plan's seeds."""
+    with pytest.raises(PlanError, match=message):
+        make_fingerprint(make_schema(), seeds=seeds)
+
+
+def test_c06_changed_seeds_are_a_refusal_and_new_seeds_alone_are_growth():
+    """C06: adds the seeds to what a resume compares: dropping one is refused, adding one is growth."""
+    schema = make_schema()
+    base = make_fingerprint(schema, seed_ids=(1, 2))
+    swapped = compare_fingerprints(base, make_fingerprint(schema, seed_ids=(1, 3)))
+    assert swapped.refused == ("seeds.2: recorded True, now absent",)
+    assert swapped.grown == ("seeds.3",)
+    added = compare_fingerprints(base, make_fingerprint(schema, seed_ids=(1, 2, 3)))
+    assert (added.refused, added.grown) == ((), ("seeds.3",))
+
+
+def test_c06_a_manifest_must_be_exactly_the_plan_its_fingerprint_declares():
+    """C06: adds that a manifest of other runs than the fingerprint's tasks, models and seeds is not that experiment."""
+    schema = make_schema()
+    fingerprint = make_fingerprint(schema)
+    assert plan_problem(schema, make_manifest(schema), fingerprint) is None
+    fewer = plan_problem(schema, make_manifest(schema, seeds=(1,)), fingerprint)
+    assert fewer == "the manifest lists 0 run(s) its fingerprint does not declare and omits 6 that it does; " + AGREE
+    other = plan_problem(schema, make_manifest(schema, seeds=(1, 2, 3)), fingerprint)
+    assert other == "the manifest lists 6 run(s) its fingerprint does not declare and omits 0 that it does; " + AGREE
