@@ -130,14 +130,14 @@ def admin_file(tmp_path, mode=0o600):
     return file
 
 
-def test_p_the_admin_file_at_mode_0600_is_read(tmp_path):
-    """P: the one mode a credential file may have; the admin file is read like a user's."""
+def test_r12_the_admin_file_at_mode_0600_is_read(tmp_path):
+    """R12: the one mode a credential file may have; the admin file is read like a user's."""
     assert SecretSource("file", str(admin_file(tmp_path))).read() == ADMIN_VALUE
 
 
 @pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o660, 0o606, 0o666, 0o601, 0o602, 0o610])
-def test_p_an_admin_file_with_any_group_or_other_bit_is_refused_naming_the_key(mode, tmp_path):
-    """P: 0644 and every other mode with a group or other bit is refused for the admin file, naming the config key
+def test_r12_an_admin_file_with_any_group_or_other_bit_is_refused_naming_the_key(mode, tmp_path):
+    """R12: 0644 and every other mode with a group or other bit is refused for the admin file, naming the config key
     and holding neither the path nor the contents."""
     file = admin_file(tmp_path, mode)
     with pytest.raises(ConfigError) as caught:
@@ -149,8 +149,8 @@ def test_p_an_admin_file_with_any_group_or_other_bit_is_refused_naming_the_key(m
     assert ADMIN_VALUE not in message
 
 
-def test_p_a_user_file_with_a_group_or_other_bit_is_refused_for_check_and_read(directory):
-    """P: the same rule for a user's file, whether it is only checked or read."""
+def test_r12_a_user_file_with_a_group_or_other_bit_is_refused_for_check_and_read(directory):
+    """R12: the same rule for a user's file, whether it is only checked or read."""
     credentials = UserCredentials("dir", str(directory))
     for mode in (0o644, 0o640, 0o604, 0o666):
         (directory / "alice.pass").chmod(mode)
@@ -160,8 +160,8 @@ def test_p_a_user_file_with_a_group_or_other_bit_is_refused_for_check_and_read(d
             assert str(directory) not in str(caught.value)
 
 
-def test_p_a_file_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
-    """P: ownership is part of the rule, so a file whose owner is not the current user is refused even at mode 0600."""
+def test_r12_a_file_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
+    """R12: ownership is part of the rule, so a file owned by another user is refused even at mode 0600."""
     file = admin_file(tmp_path)
     monkeypatch.setattr(os, "getuid", lambda: os.stat(file).st_uid + 1)
     with pytest.raises(ConfigError, match=r"credentials\.admin.*regular file owned by the current user"):
@@ -174,8 +174,8 @@ def test_p_a_file_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
         UserCredentials("dir", str(users)).read("alice")
 
 
-def test_p_a_link_a_directory_or_a_pipe_is_not_a_credential_file(tmp_path):
-    """P: only a regular file counts. A link to a good file is not followed, and a pipe is refused, not waited on."""
+def test_r12_a_link_a_directory_or_a_pipe_is_not_a_credential_file(tmp_path):
+    """R12: only a regular file counts. A link to a good file is not followed, and a pipe is refused, not waited on."""
     target = admin_file(tmp_path)
     link = tmp_path / "link.token"
     link.symlink_to(target)
@@ -192,8 +192,8 @@ def test_p_a_link_a_directory_or_a_pipe_is_not_a_credential_file(tmp_path):
         UserCredentials("dir", str(users)).read("alice")
 
 
-def test_p_a_credential_file_of_a_fixed_user_with_group_access_fails_the_load_of_the_platform(tmp_path, monkeypatch):
-    """P: the check that loading makes of each fixed user's file applies the whole rule, not just the group bits."""
+def test_r12_a_credential_file_of_a_fixed_user_with_group_access_fails_the_load_of_the_platform(tmp_path, monkeypatch):
+    """R12: the check that loading makes of each fixed user's file applies the whole rule, not just the group bits."""
     from platform_support import ADMIN_ENV, write_platform
 
     from expcore_onedata.config import load_platform
