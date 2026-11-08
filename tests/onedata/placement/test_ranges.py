@@ -68,7 +68,7 @@ def test_o02_long_ranges_are_read_in_blocks_of_the_configured_size(provisioner, 
 
 
 def test_o02_the_bytes_read_are_the_files_bytes(client, provisioner, seeded):
-    """The range read returns the file's own bytes at that offset."""
+    """O02: the range read returns the file's own bytes at that offset."""
     place_ranges(provisioner, [ROW])
     entry = provisioner.resolve(PATH)
     data = client.read_range(f"/data/{entry.file_id}/content", provider="beta", offset=2000, length=500)

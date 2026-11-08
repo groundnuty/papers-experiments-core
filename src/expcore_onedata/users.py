@@ -112,10 +112,13 @@ def load_slots(
     names = {p.username for p in fixed}
     ids = {p.user_id for p in fixed}
     slots: list[Slot] = []
-    for name in table.data:
+    for index, (name, raw) in enumerate(table.data.items(), start=1):
+        where = f"slots[{index}]"  # a position, never the slot's name (O12)
         if not NAME.fullmatch(name):
-            raise table.fail(name, "must be letters, digits, '_' and '-', starting with a letter")
-        section = table.section(name)
+            raise table.fail(None, f"{where} must be named with letters, digits, '_' and '-', starting with a letter")
+        if not isinstance(raw, Mapping):
+            raise table.fail(None, f"{where} must be a table")
+        section = Section(raw, file, where)
         section.reject_unknown(("data_path", "toolserver"))
         slot = Slot(name, _principal(section, "data_path"), _principal(section, "toolserver"))
         for plane, user in (("data_path", slot.data_path), ("toolserver", slot.tool_server)):

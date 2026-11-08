@@ -351,20 +351,23 @@ class Provisioner:
         )
 
     def read_through(self, provider: str, file_id: str, offset: int, length: int) -> int:
-        """Read a range of a file through a provider, which fetches what it lacks; return the bytes read.
+        """Read a range of a file through a provider, which fetches what it lacks; return how many bytes were read."""
+        return len(self.fetch(provider, file_id, offset, length))
+
+    def fetch(self, provider: str, file_id: str, offset: int, length: int) -> bytes:
+        """Read a range of a file through a provider, which fetches what it lacks; return the bytes.
 
         This is a range read and never a transfer job (O02). It is gated like a mutation, because it changes the
         provider's block map.
         """
         self._verified()
-        data = self._client.read_range(
+        return self._client.read_range(
             f"/data/{_quote(file_id)}/content",
             provider=provider,
             offset=offset,
             length=length,
             timeout_s=self._settings.request_timeout_s,
         )
-        return len(data)
 
     def holds(self, provider: str, file_ids: Iterable[str]) -> int:
         """Return how many bytes `provider` holds of these files together, by the block map."""

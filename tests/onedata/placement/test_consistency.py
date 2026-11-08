@@ -65,7 +65,7 @@ def test_o07_all_polls_failing_gives_no_value_and_no_convergence():
 
 
 def test_o07_a_defect_in_the_reader_is_not_swallowed():
-    """A reader that raises something other than a platform error is a defect and propagates."""
+    """O07: a reader that raises something other than a platform error is a defect and propagates."""
     with pytest.raises(KeyError):
         run([KeyError("x")], Ticker())
 

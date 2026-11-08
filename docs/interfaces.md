@@ -9,8 +9,8 @@ All of them are `typing.Protocol`s, so a test double needs no inheritance. Signa
 | Architecture name | In v0.1 |
 |---|---|
 | `Study` | the study directory (`study.toml` and its siblings) plus one plugin module whose `build(context)` returns a `StudyPlugin` ([below](#the-study-plugin)) |
-| `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` and its own `ToolProvider`s through the same `StudyPlugin`; its sandbox is [described below](#the-platform-layers-sandbox) |
-| `ToolProvider`, `Scorer`, `Instrument` | [`ToolProvider`](#toolprovider-and-callcontext) and [`Scorer`](#scorer) are protocols. `Instrument` is **not yet a protocol**: see [Instrument](#instrument) |
+| `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` (leased platform users), its own `ToolProvider`s and an `Instrument` (the platform probes) through the same `StudyPlugin`; its sandbox is [described below](#the-platform-layers-sandbox) |
+| `ToolProvider`, `Scorer`, `Instrument` | protocols: [`ToolProvider`](#toolprovider-and-callcontext), [`Scorer`](#scorer) and [`Instrument`](#instrument) (a protocol since step 4b2) |
 | `ModelBackend`, `RunExecutor`, `HealthCheck`, `ResourceProbe` | protocols, below |
 
 ## The study plugin
@@ -137,7 +137,33 @@ Implementer must guarantee:
 
 ## Instrument
 
-Not yet a protocol. [`architecture.md`](architecture.md#plugin-interfaces) describes it: hooks at run start and end that write into the record under their own namespace. In v0.1 the record has the place for it (`RunRecord.instruments`, `RunRecord.with_instrument(namespace, data)`, a namespace of lower-case letters, digits and underscores, data a JSON object) and nothing calls an instrument for you. Platform probes (4b) will define the protocol; a study that needs one before then writes its snapshot with `with_instrument` in its executor.
+`expcore.plugin.Instrument`, defined in step 4b2. Hooks at the start and the end of a run that write into the record under their own namespace.
+
+```python
+class Instrument(Protocol):
+    namespace: str
+    def start(self, identity: Mapping[str, Any]) -> None
+    def finish(self) -> Mapping[str, Any]
+```
+
+The study's executor calls them; nothing in the loop does. `expcore.records.instruments` has the two helpers an executor uses:
+
+```python
+def start_instruments(instruments: Sequence[Instrument], identity: Mapping[str, Any]) -> None
+def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> RunRecord
+```
+
+Core guarantees:
+- `check_instruments` runs first on both: a namespace that is not lower-case letters, digits and underscores, and two instruments with one namespace, raise before anything runs.
+- `finish_instruments` returns a new record with each snapshot in `RunRecord.instruments[namespace]`, a JSON object (NaN and values JSON cannot hold are refused). An instrument whose `finish` raises, or returns anything but a JSON object, is recorded as `{"ok": false, "error": <class name>}`: the attempt keeps its record and a scorer that needs the snapshot sees that it failed (O08).
+- The snapshot is the only platform state a scorer reads (R13); replay serves it and asks the platform nothing.
+
+Implementer must guarantee:
+- `start` and `finish` run outside the agent's time: before the loop starts and after it ends. They do blocking I/O, so an async executor calls them with `asyncio.to_thread`. The platform's waits for the federation to settle (`expcore_onedata.consistency`) are not a declared wait kind and refuse to run on the thread of a running event loop.
+- `finish` records what it read and never guesses: a reading that failed is `None` (with the failure beside it), not zero, and anything derived from it is `None` too (R10).
+- The snapshot holds no secret and no identifier of the deployment beyond the labels the study's configuration gives.
+
+The platform's own instrument is `expcore_onedata.probes.PlatformProbes` (namespace `platform_probes`): the block map of each tracked file on each tracked provider before and after the run, the records of the transfers the provisioner scheduled, and the bytes moved between provider pairs, attributed to a source only where exactly one other provider held those bytes at the start. See its module docstring for the snapshot's fields.
 
 ## RunExecutor
 

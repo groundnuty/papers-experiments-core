@@ -154,3 +154,56 @@ def test_a_token_stops_working_when_its_lifetime_ends(config, client):
     with pytest.raises(PlatformError) as refused:
         read_space(client, value, config.space.id)
     assert refused.value.status in (401, 403)
+
+
+# -- step 4b2: placement, probes and day-0 checks ----------------------------------------------------------------------
+# These read a real deployment's providers (the listing, a block map, the public configuration). The two that change
+# state, the read-only enforcement and the placement round trip on a scratch file under the configured prefixes, also
+# need EXPCORE_LIVE_MUTATE=1.
+
+MUTATE = pytest.mark.skipif(
+    os.environ.get("EXPCORE_LIVE_MUTATE") != "1",
+    reason="EXPCORE_LIVE_MUTATE=1 is not set; this test changes state in the configured space",
+)
+
+
+@pytest.fixture(scope="module")
+def day0(tmp_path_factory):
+    from expcore_onedata.day0.runner import build_context
+
+    return build_context(PLATFORM, tmp_path_factory.mktemp("day0"))
+
+
+def test_the_read_only_day0_checks_do_not_fail_on_the_real_deployment(day0):
+    from expcore_onedata.day0.runner import run_checks
+
+    entries = run_checks(day0, ["reachability", "health", "tokens", "listing"])
+    failures = {e.name: e.summary for e in entries if e.ok is False}
+    assert not failures, failures
+
+
+def test_a_real_block_map_has_the_documented_shape(day0, client, config):
+    """The distribution answer parses; a regular file is found by listing the first supporting provider's root."""
+    from expcore_onedata import consistency
+    from expcore_onedata.placement import provider_blocks
+
+    provider = config.support.providers[0]
+    root = consistency.space_root(client, provider, config.space.id)
+    params = {"limit": 50, "attribute": ["file_id", "type"]}
+    entries = client.get(f"/data/{root}/children", provider=provider, params=params)
+    files = [c for c in entries["children"] if c.get("type") == "REG"]
+    if not files:
+        pytest.skip("the space root holds no regular file to read a block map of")
+    distribution = client.get(f"/data/{files[0]['file_id']}/distribution", provider=provider)
+    assert all(isinstance(provider_blocks(distribution, pid), list) for pid in day0.provider_ids.values())
+
+
+@MUTATE
+def test_the_day0_checks_that_change_state_pass_and_clean_up(day0):
+    from expcore_onedata.day0.runner import run_checks
+
+    day0.allow_mutation = True
+    entries = {e.name: e for e in run_checks(day0, ["read_only", "round_trip"])}
+    assert entries["read_only"].ok is not False, entries["read_only"].summary
+    assert entries["round_trip"].ok is not False, entries["round_trip"].summary
+    assert entries["round_trip"].facts.get("cleanup_verified", True) is True

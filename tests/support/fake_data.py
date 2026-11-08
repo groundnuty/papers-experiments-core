@@ -23,6 +23,8 @@ waits. A test bends the fake through plain attributes:
 - `resets`: a list of `[substring, count]` or `[substring, count, provider id]`: the next `count` provider calls whose
   route contains the substring (to that provider, when named) fail with a connection reset;
 - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
+- `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
+- `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
 - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status.
 
 `provider_calls` lists `(provider id, method, route)` of every provider call, so a test can assert what was sent where.
@@ -96,6 +98,7 @@ class FakeData(FakeFederation):
         self.page_size = 1000
         self.fail_deletes = False  # every DELETE answers 500
         self.ignore_deletes = False  # every DELETE answers 204 and removes nothing
+        self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat answers 403
         self.resets: list[list] = []
         self.statuses: list[list] = []
         self._ids = itertools.count(1)
@@ -210,6 +213,14 @@ class FakeData(FakeFederation):
 
     def _provider_route(self, request: httpx.Request, provider: str, route: str) -> httpx.Response:
         method, query = request.method, request.url.params
+        issued = self.issued.get(request.headers.get("X-Auth-Token", ""))
+        if (
+            self.enforce_readonly
+            and issued is not None
+            and method in ("POST", "PUT", "DELETE")
+            and any(c.get("type") == "data.readonly" for c in issued["caveats"])
+        ):
+            return self._error(403, "forbidden")
         found = re.fullmatch(r"/spaces/([^/]+)", route)
         if found and method == "GET":
             return self._space_root(found.group(1))

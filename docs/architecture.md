@@ -36,10 +36,15 @@ src/expcore_onedata/
   tokens.py      minting, examination, rights per condition
   sandbox/       containers, data gate, mount sidecar, networks, teardown, kill causes
   toolserver.py  onedata-mcp launch with a frozen allow-list per condition
-  provision.py   evict, require empty, replicate, wait; placement by block map
-  probes.py      file distribution, transfer records, bytes per provider pair
+  provision.py   scoped create and teardown of study data; replicate and evict, each confirmed by the block map
+  placement.py   block-map arithmetic: what a provider holds, what is missing
+  rangemap.py    the declared per-file, per-provider byte-range map and the [placement] settings
+  ranges.py      range placement by reads through the receiving provider
+  consistency.py bounded waits: transfers ended, a new space root, two consecutive matching polls
+  probes.py      the platform instrument: file distribution, transfer records, bytes per provider pair
+  users.py       leased platform users (a slot gives a run one user per token plane) and the token journal
   health.py      pre- and post-run checks against the declared support set
-  day0/          checks that write dated reports
+  day0/          registry of checks (reachability, health, tokens, listing, read-only, round trip) and a dated report
 examples/        a toy study using only the public interfaces (#5)
 ```
 

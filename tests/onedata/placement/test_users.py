@@ -77,8 +77,8 @@ def test_a_group_the_layer_does_not_declare_is_refused_not_read_as_empty(slots):
 @pytest.mark.parametrize(
     ("kw", "message"),
     [
-        ({"second_data": "slot-one-data"}, r"slots\.two: key 'data_path' names a user that another"),
-        ({"second_tool": "login-tools"}, r"slots\.two: key 'toolserver' names a user that another"),
+        ({"second_data": "slot-one-data"}, r"slots\[2\]: key 'data_path' names a user that another"),
+        ({"second_tool": "login-tools"}, r"slots\[2\]: key 'toolserver' names a user that another"),
         ({"second_data": "slot-two-data", "second_tool": "slot-two-data"}, r"key 'toolserver' names a user"),
     ],
 )
@@ -96,7 +96,7 @@ def test_a_user_used_twice_is_refused_naming_the_slot_and_the_plane_and_not_the_
 def test_a_slot_user_without_a_credential_file_is_refused_at_load(tmp_path, slot_federation):
     path = write(tmp_path)
     (tmp_path / CREDENTIALS_DIR / "slot-two-tool.pass").unlink()
-    with pytest.raises(ConfigError, match=r"slots\.two: key 'toolserver' its credential cannot be used"):
+    with pytest.raises(ConfigError, match=r"slots\[2\]: key 'toolserver' its credential cannot be used"):
         load_slots(path, load_platform(path, require_secrets=False))
 
 

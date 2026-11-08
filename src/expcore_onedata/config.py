@@ -60,6 +60,10 @@ manifest = "path.json"          # the frozen manifest the client checks the serv
 
 [sandbox]                       # optional: images, network pool, limits, mount, data paths (see sandbox/settings.py)
 ```
+
+Two more tables are accepted here and read by the modules that use them, each validated against this file's providers:
+`[placement]` (the data provider, the bounds of placement and the declared range map; `rangemap.load_placement`) and
+`[slots.<name>]` (the leased platform users, one per token plane; `users.load_slots`).
 """
 
 import hashlib
@@ -463,7 +467,7 @@ def load_platform(
             "principals",
             "toolserver",
             "sandbox",
-            "placement",  # read by placement_config.load_placement
+            "placement",  # read by rangemap.load_placement
             "slots",  # read by users.load_slots
         )
     )

@@ -71,6 +71,8 @@ each entry has a live contract test (`tests/live/test_contract.py`) that fails i
 
 import base64
 import re
+import socket
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -402,6 +404,7 @@ class OnezoneClient:
         params: Mapping[str, Any] | None = None,
         content: bytes | None = None,
         timeout_s: float | None = None,
+        token: str | None = None,
     ) -> Any:
         """Send a request that can change state; refuse it, before it is sent, unless it acts on a study space.
 
@@ -409,6 +412,9 @@ class OnezoneClient:
         is resolved to a name by a read on Onezone made for this mutation alone; the caller names no space and no
         name, and no earlier answer is reused. The mutation is refused unless that name starts with a configured
         prefix, and when the request names no space and no file.
+
+        It is sent with the admin credential, or as `token` when one is given: day-0 sends a write as a data-path token
+        to see it refused. The gate applies either way, and is resolved with the admin credential.
         """
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
@@ -419,7 +425,7 @@ class OnezoneClient:
             method,
             path,
             provider=provider,
-            headers=self._admin,
+            headers={AUTH_HEADER: token} if token is not None else self._admin,
             json=json,
             params=params,
             content=content,
@@ -485,3 +491,15 @@ class OnezoneClient:
             raise PlatformError("zone: the answer to a token request holds no token")
         register_secret(value)
         return value
+
+
+def tcp_connect(host: str, port: int, timeout_s: float) -> float:
+    """Open a TCP connection to a host and return the milliseconds it took; raise OSError when it cannot be opened.
+
+    A raw connection sends no request, so it cannot change anything; it lives here because this module is the only one
+    of the layer that touches the network (a test holds that). Day-0's reachability check samples it.
+    """
+    began = time.perf_counter()
+    with socket.create_connection((host, port), timeout=timeout_s):
+        pass
+    return (time.perf_counter() - began) * 1000
