@@ -81,6 +81,14 @@ def copy_campaign(source: Campaign, base: Path, name: str) -> Campaign:
     return Campaign(Path(shutil.copytree(source.root, base / name)))
 
 
+def table(report: str, heading: str) -> dict[str, list[str]]:
+    """The rows of the table under a heading of the report, by the text of their first cell."""
+    section = report.split(heading, 1)[1].split("\n#", 1)[0]
+    rows = [line for line in section.splitlines() if line.startswith("| ")][1:]
+    split = [[cell.strip() for cell in line.strip("|").split(" | ")] for line in rows]
+    return {cells[0].strip(): cells for cells in split}
+
+
 def cli(env: dict[str, str], *argv: str, process: bool = False) -> tuple[int, str]:
     """Run a command and return its exit status and stderr, in this process or as `python -m expcore`."""
     if process:

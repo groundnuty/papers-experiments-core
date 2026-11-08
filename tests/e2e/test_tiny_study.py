@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from study_crash import KILLED
-from study_support import HEAD, ROOT, Campaign, clean_environment, cli, finish, make_copy
+from study_support import HEAD, ROOT, Campaign, clean_environment, cli, finish, make_copy, table
 
 from expcore.cli import main
 from expcore.records.record import load_record, record_filename
@@ -80,14 +80,6 @@ def record_of(campaign: Campaign, entry: dict[str, Any]):
     """The record of an analysed attempt of the export."""
     where = campaign.runs / entry["digest"] / Path(entry["run_dir"]).name
     return load_record(where / record_filename(entry["run_key"], entry["attempt"]))
-
-
-def table(report: str, heading: str) -> dict[str, list[str]]:
-    """The rows of the table under a heading of the report, by the text of their first cell."""
-    section = report.split(heading, 1)[1].split("\n#", 1)[0]
-    rows = [line for line in section.splitlines() if line.startswith("| ")][1:]
-    split = [[cell.strip() for cell in line.strip("|").split(" | ")] for line in rows]
-    return {cells[0].strip(): cells for cells in split}
 
 
 # --- the campaign ----------------------------------------------------------------------------------------------------
