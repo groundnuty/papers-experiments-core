@@ -2,6 +2,7 @@
 
 import ipaddress
 import json
+from pathlib import Path
 
 import pytest
 from sandbox_support import TOKEN, make_spec, start_options
@@ -86,12 +87,62 @@ def test_o05_a_probe_that_cannot_run_also_refuses_the_start(world):
     assert nothing_left(world)
 
 
-def test_the_token_is_in_the_agents_environment_on_the_rest_path_and_in_no_argument(world):
-    sbx = start(world, "via-gate")
+CREDENTIAL_WORDS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH", "CREDENTIAL")
+
+
+def bound_sources(container) -> list[Path]:
+    """The host paths bound into a container: where its files come from."""
+    out = [Path(spec.split(":")[0]) for spec in container.options.get("-v", [])]
+    for spec in container.options.get("--mount", []):
+        out += [Path(part[4:]) for part in spec.split(",") if part.startswith("src=")]
+    return out
+
+
+def files_under(path: Path) -> list[Path]:
+    return [f for f in (path.rglob("*") if path.is_dir() else [path]) if f.is_file()]
+
+
+def where_a_credential_is_visible(world, sbx, token: str) -> list[str]:
+    """Every place the agent's code could read `token`, or any credential, from inside the agent: its environment, its
+    files (what is bound into it and its working directory), its process arguments and the commands run in it."""
     agent = world.host.containers[sbx.names.agent]
-    assert agent.options["_env"]["ONEDATA_TOKEN"] == TOKEN
-    assert TOKEN not in flat(agent)
-    assert TOKEN not in flat(world.host.containers[sbx.names.gate])
+    env = agent.options.get("_env", {})
+    found = []
+    if token in json.dumps(env):
+        found.append("the environment")
+    found += [f"environment variable {n}" for n in env if any(w in n.upper() for w in CREDENTIAL_WORDS)]
+    if token in flat(agent) or any(token in word for word in agent.command):
+        found.append("the process arguments")
+    for source in bound_sources(agent):
+        for file in files_under(source):
+            if file.suffix == ".key" or token in file.read_text(encoding="utf-8", errors="replace"):
+                found.append(f"the file {file.name}")
+    return found
+
+
+@pytest.mark.parametrize("level", ["via-gate", "mounted", "isolated"])
+def test_o05_no_credential_is_visible_inside_the_agent_on_any_data_path(world, level):
+    """O05: the agent's code must never be able to read a token: not in its environment, its files or its arguments."""
+    seen = []
+    world.host.exec_handler = lambda container, argv, stdin: (seen.append((argv, stdin)), CmdResult(0, "blocked 30\n"))[
+        1
+    ]
+    sbx = start(world, level)
+    sbx.exec("print(1)", 30)
+    assert where_a_credential_is_visible(world, sbx, TOKEN) == []
+    assert seen
+    assert not [1 for argv, stdin in seen if TOKEN in " ".join(argv) or TOKEN in (stdin or "")]
+    sbx.stop()
+
+
+def test_o05_the_gate_holds_the_rest_token_in_its_environment_and_nowhere_on_disk_or_in_an_argument(world):
+    """O05: the token is the gate's; it travels in the docker client's environment, as the sidecar's does."""
+    sbx = start(world, "via-gate")
+    gate = world.host.containers[sbx.names.gate]
+    assert gate.options["_env"] == {"GATE_ACCESS_TOKEN": TOKEN}
+    assert "GATE_ACCESS_TOKEN" in gate.options["-e"]
+    assert TOKEN not in flat(gate)
+    assert not [f for f in files_under(sbx.dir) if TOKEN in f.read_text(encoding="utf-8", errors="replace")]
     assert TOKEN not in json.dumps(sbx.metadata())
     sbx.stop()
 

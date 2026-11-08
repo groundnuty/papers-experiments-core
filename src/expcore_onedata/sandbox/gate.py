@@ -19,6 +19,10 @@ only the sandbox trusts), applies gatepolicy, and forwards to the real upstream
 (verifying its certificate against the system CAs). `tcp_forwards` are plain TCP
 pass-through for the knowledge plane. Every request is logged as one JSON line.
 
+The gate holds the data-path token (from its environment, never from the configuration file or an argument) and adds it
+to every request it forwards; an `X-Auth-Token`, `Authorization` or `Cookie` header the client sent is dropped, and a
+token-scope inference carries the gate's token in its body. So the agent's code holds no credential at all (O05).
+
 This file runs alone in the gate container with the standard library only; it imports nothing of the platform layer
 (tests/onedata/sandbox/test_gate.py checks that). It passes only the reads that gatepolicy lists, so the data path
 through the gate is read-only whatever the client asks (O05). A request it refuses is answered 4xx and logged as a
@@ -94,6 +98,11 @@ _HOP = {
     "content-length",
 }
 RUN_HEADER = "X-Run-Key"
+TOKEN_ENV = (
+    "GATE_ACCESS_TOKEN"  # the data-path token, in the gate's environment: the agent's code never holds one (O05)
+)
+AUTH_HEADER = "X-Auth-Token"
+CLIENT_CREDENTIALS = {AUTH_HEADER.lower(), "authorization", "cookie"}  # whatever the agent sends of these is dropped
 
 
 def _log(rec: dict) -> None:
@@ -741,6 +750,12 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": {"id": "forbidden" if dec.status == 403 else "badRequest", "details": dec.reason}},
             )
             return
+        if dec.tag == "scope" and CFG.get("token"):
+            body = self._with_gate_token(body)
+            if body is None:
+                rec.update(decision="deny", reason="a scope request body must be a JSON object", status=400)
+                self._answer(rec, 400, {"error": {"id": "badRequest", "details": rec["reason"]}})
+                return
         try:
             self._forward(hcfg, url, headers, body, rec)
         except (ConnectionError, ssl.SSLError) as e:
@@ -766,11 +781,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def _fwd_headers(self, headers: dict) -> dict:
         # the run attribution is the gate's: whatever the agent sent under that name is dropped, then ours is added
-        out = {k: v for k, v in headers.items() if k not in _HOP and k != RUN_HEADER.lower()}
+        out = {
+            k: v
+            for k, v in headers.items()
+            if k not in _HOP and k != RUN_HEADER.lower() and k not in CLIENT_CREDENTIALS
+        }
         out["Host"] = headers.get("host", "")
         if CFG.get("run_key"):
             out[RUN_HEADER] = CFG["run_key"]
+        if CFG.get("token"):  # the credential is the gate's: the agent holds none, and any it sent is gone (O05)
+            out[AUTH_HEADER] = CFG["token"]
         return out
+
+    @staticmethod
+    def _with_gate_token(body: bytes | None) -> bytes | None:
+        """The body of a token-scope inference with the gate's token in it, whatever the client put there; None when
+        the body is not a JSON object. The call names the token it asks about in its body, and the agent has none."""
+        try:
+            document = json.loads(body or b"{}")
+        except ValueError:
+            return None
+        if not isinstance(document, dict):
+            return None
+        return json.dumps({**document, "token": CFG["token"]}).encode()
 
     def _forward(self, hcfg, url, headers, body, rec) -> None:
         target = url.path + ("?" + url.query if url.query else "")
@@ -1017,6 +1050,9 @@ def serve(httpd) -> None:
 def main() -> None:
     with open(sys.argv[1]) as handle:
         CFG.update(json.load(handle))
+    CFG["token"] = os.environ.pop(TOKEN_ENV, "")  # out of the environment as soon as it is read
+    if not CFG["token"]:
+        raise SystemExit("the gate has no token to add to the requests it forwards")
     for f in CFG.get("tcp_forwards", []):
         _tcp_forward(f["listen"], f["host"], f["port"])
     GateServer.request_queue_size = int(CFG.get("listen_backlog", GateServer.request_queue_size))

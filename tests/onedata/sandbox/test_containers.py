@@ -31,7 +31,6 @@ def agent(s, names, mode, **kw):
         "ca": None,
         "trust_bundles": {},
         "zone_host": None,
-        "with_token": False,
     }
     return C.agent_run_args(s, names, LABELS, **(defaults | kw))
 
@@ -89,6 +88,16 @@ def test_o05_the_sidecar_is_the_only_container_with_fuse_and_the_token_goes_by_n
     assert "type=bind,src=/w/mount,dst=/mnt/oneclient,bind-propagation=rshared" in args
 
 
+def test_o05_the_gate_takes_the_token_by_name_and_it_is_the_name_the_gate_reads(s, names):
+    """O05: the gate holds the token: it is named with -e and its value travels in the docker client's environment."""
+    from expcore_onedata.sandbox import gate
+
+    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id)
+    assert ("-e", C.ENV_GATE_TOKEN) in pairs(args)
+    assert C.ENV_GATE_TOKEN == gate.TOKEN_ENV
+    assert not [a for a in args if "=" in a and a.startswith(C.ENV_GATE_TOKEN)]  # never NAME=value
+
+
 def test_the_sidecar_command_sets_tls_from_the_settings_alone(s):
     assert "--insecure" not in C.sidecar_command("p.test", s)
     insecure = s.__class__(**{**s.__dict__, "mount": s.mount.__class__("/data", "insecure")})
@@ -101,14 +110,15 @@ def test_the_rest_agent_trusts_only_the_runs_ca_and_resolves_the_hosts_to_the_ga
     bundle = Path("/w/tls/trust-0.pem")
     args, env = agent(
         s, names, DataPathMode.REST, gate_ip="10.1.0.2", gate_hosts=["z.test", "p.test"], ca=Path("/w/ca.pem"),
-        trust_bundles={"/usr/lib/bundle.pem": bundle}, zone_host="z.test", with_token=True,
+        trust_bundles={"/usr/lib/bundle.pem": bundle}, zone_host="z.test",
     )  # fmt: skip
     values = [v for f, v in pairs(args) if f == "--add-host"]
     assert values == ["z.test:10.1.0.2", "p.test:10.1.0.2"]
     assert f"{bundle}:/usr/lib/bundle.pem:ro" in [v for f, v in pairs(args) if f == "-v"]
-    assert env[C.ENV_TOKEN] == ""  # the caller fills it in; the arguments carry the name only
-    assert C.ENV_TOKEN in [v for f, v in pairs(args) if f == "-e"]
     assert env["SSL_CERT_FILE"] == C.CA_PATH
+    names_given = {v for f, v in pairs(args) if f == "-e"}
+    assert names_given == set(env)
+    assert not [n for n in names_given if any(w in n.upper() for w in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))]
 
 
 def test_a_rest_agent_without_a_gate_is_refused(s, names):

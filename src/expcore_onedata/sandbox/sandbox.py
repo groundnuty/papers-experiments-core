@@ -9,7 +9,8 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
     user; ENOSPC beyond the quota);
   * an INTERNAL docker network from the dedicated pool (no route out) holding the agent container, and in REST mode the
     gate container, the agent's only network peer (O14);
-  * REST data path: the data gate (gate.py, gatepolicy.py), whose files are mounted from this package, read-only;
+  * REST data path: the data gate (gate.py, gatepolicy.py), whose files are mounted from this package, read-only. It
+    holds the token, in its environment, and adds it to the requests it forwards; the agent holds no credential;
   * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
     propagation; the agent has neither the token, nor FUSE, nor a route to any host;
   * no data path: neither;
@@ -45,7 +46,7 @@ from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, 
 from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
     ENV_ACCESS_TOKEN,
-    ENV_TOKEN,
+    ENV_GATE_TOKEN,
     ONECLIENT_LOG_DIR,
     Names,
     agent_run_args,
@@ -254,7 +255,10 @@ class DockerSandbox:
         self._containers.append(
             names.gate
         )  # registered before it is created: an interrupt cannot leave one `stop` misses
-        self.host.docker(*gate_run_args(s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id))
+        args = gate_run_args(s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id)
+        self.host.docker(
+            *args, env={ENV_GATE_TOKEN: self.spec.token.reveal()}
+        )  # the gate holds the token, not the agent
         self.host.docker("network", "connect", names.net, names.gate)
         self._wait_gate()
         self.watch_container("gate", names.gate)  # its state as the run begins: the baseline the check compares with
@@ -327,10 +331,7 @@ class DockerSandbox:
             s, self.names, self._label_args(), image_id=s.agent.id, mode=sp.mode, work=work, share=share,
             gate_ip=gate_ip, gate_hosts=gate_hosts, ca=self.dir / "tls" / "ca.pem" if rest else None,
             trust_bundles=self._trust_bundles() if rest else {}, zone_host=sp.zone.host if rest and sp.zone else None,
-            with_token=rest,
         )  # fmt: skip
-        if rest:
-            env[ENV_TOKEN] = sp.token.reveal()
         self._containers.append(self.names.agent)
         self.host.docker(*args, env=env)
 

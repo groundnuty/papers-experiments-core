@@ -49,6 +49,19 @@ def host(config):
     return DockerHost(sudo_command=config.sandbox.sudo)
 
 
+def configured_levels() -> list[str]:
+    """The levels of the platform file's `[sandbox.data_paths]`, read at collection so each one is a test of its own."""
+    if not PLATFORM:
+        return []
+    from expcore_onedata.config import load_platform
+
+    loaded = load_platform(PLATFORM, require_secrets=False)
+    return sorted(loaded.sandbox.data_paths) if loaded.sandbox is not None else []
+
+
+LEVELS = configured_levels()
+
+
 def levels(config):
     return sorted(config.sandbox.data_paths)
 
@@ -106,5 +119,47 @@ def test_a_write_to_the_agents_root_is_refused_in_a_started_sandbox(config, host
             "import errno\ntry:\n    open('/probe', 'w')\nexcept OSError as e:\n    print(e.errno == errno.EROFS)", 60
         )
         assert result.stdout.strip() == "True"
+    finally:
+        sandbox.stop()
+
+
+NO_CREDENTIAL = """
+import os, pathlib
+needle = {needle!r}.encode()
+hits = []
+for name in os.environ:
+    if any(w in name.upper() for w in ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")):
+        hits.append("an environment variable named like a credential")
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    for what in ("environ", "cmdline"):
+        try:
+            data = pathlib.Path("/proc/" + pid + "/" + what).read_bytes()
+        except OSError:
+            continue
+        if needle in data:
+            hits.append("the " + what + " of a process")
+for top in ("/work", "/tmp", "/etc", "/home", "/root", "/run", "/var", "/opt", "/srv", "/mnt"):
+    for here, _, files in os.walk(top, onerror=lambda e: None):
+        for name in files:
+            try:
+                path = pathlib.Path(here, name)
+                if path.stat().st_size < (1 << 22) and needle in path.read_bytes():
+                    hits.append("a file")
+            except OSError:
+                continue
+print("clean" if not hits else sorted(set(hits)))
+"""
+
+
+@needs_platform
+@pytest.mark.parametrize("level", LEVELS)
+def test_no_credential_is_visible_inside_the_agent_on_the_data_path_of_this_level(config, host, level):
+    """O05: the agent's code cannot read the data-path token: not in its environment, its files or its processes."""
+    spec = spec_for(config, level, f"live-cred-{int(time.time())}")
+    sandbox = DockerSandbox.start(host, config.sandbox, spec)
+    try:
+        needle = spec.token.reveal() if spec.token is not None else "no-token-for-this-level"
+        result = sandbox.exec(NO_CREDENTIAL.format(needle=needle), 120)
+        assert result.stdout.strip() == "clean"
     finally:
         sandbox.stop()

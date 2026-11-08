@@ -27,7 +27,7 @@ ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image'
 ONECLIENT_LOG_DIR = "/tmp/oneclient/0"  # where it writes its log unless told otherwise
 # The published REST client's settings (its environment), not names of any federation.
 ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
-ENV_TOKEN = "ONEDATA_TOKEN"
+ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gate.TOKEN_ENV); the agent has no token
 ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
 ENV_CA_BUNDLES = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
@@ -83,9 +83,12 @@ def effective_log_dir(args: Sequence[str], default: str = ONECLIENT_LOG_DIR) -> 
 def gate_run_args(
     s: SandboxSettings, names: Names, labels: Sequence[str], sdir: Path, gate_files: Path, image_id: str
 ) -> list[str]:
-    """`docker run` for the gate: read-only root, one capability (to bind its port), its files mounted read-only."""
+    """`docker run` for the gate: read-only root, one capability (to bind its port), its files mounted read-only.
+
+    The gate holds the data-path token and adds it to the requests it forwards (O05): it is named with `-e NAME`, and
+    its value travels in the environment of the docker client, as the sidecar's does."""
     return [
-        *("run", "-d", "--name", names.gate, "--network", "bridge", *labels),
+        *("run", "-d", "--name", names.gate, "--network", "bridge", *labels, "-e", ENV_GATE_TOKEN),
         *("--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", "--security-opt", "no-new-privileges"),
         *("--read-only", "--user", "0", "--pids-limit", "512", "--memory", str(s.limits.gate_memory_bytes)),
         *("-v", f"{sdir / 'tls'}:/etc/gate/tls:ro", "-v", f"{sdir / 'gate.json'}:/etc/gate/gate.json:ro"),
@@ -124,12 +127,12 @@ def agent_run_args(
     ca: Path | None,
     trust_bundles: Mapping[str, Path],
     zone_host: str | None,
-    with_token: bool,
 ) -> tuple[list[str], dict[str, str]]:
     """`docker run` for the agent and the environment names it takes: read-only root, no capability, no new privilege.
 
-    In REST mode the agent resolves the zone and the provider to the gate and trusts the run's CA; it holds the
-    data-path token in its environment. In mount mode the read-only mount is bound in with `readonly`. With no data path
+    In REST mode the agent resolves the zone and the provider to the gate and trusts the run's CA. It holds no token
+    and no other credential, in its environment or in a file: the gate adds the token to the requests it forwards, and
+    the sidecar owns the mount's (O05). In mount mode the read-only mount is bound in with `readonly`. With no data path
     it has neither.
     """
     lim, uid = s.limits, s.agent_uid
@@ -152,12 +155,10 @@ def agent_run_args(
         for name in gate_hosts:
             args += ["--add-host", f"{name}:{gate_ip}"]
         env = dict.fromkeys(ENV_CA_BUNDLES, CA_PATH) | {ENV_ZONE_HOST: zone_host, ENV_VERIFY_SSL: "true"}
-        if with_token:
-            env[ENV_TOKEN] = ""  # the value is set by the caller from the token; only the name goes in the arguments
     elif mode is DataPathMode.MOUNT:
         if share is None or s.mount is None:
             raise ValueError("a mount data path needs the shared mount point and [sandbox.mount]")
         args += ["--mount", f"type=bind,src={share},dst={s.mount.path},readonly,bind-propagation=rslave"]
-    for name in env:
+    for name in env:  # settings only, never a credential; their values travel in the docker client's environment
         args += ["-e", name]
     return [*args, image_id, "sleep", "infinity"], env

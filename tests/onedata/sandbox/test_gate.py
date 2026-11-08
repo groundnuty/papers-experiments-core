@@ -27,6 +27,8 @@ FILE = "/api/v3/oneprovider/data/f1/content"
 BODY = bytes(range(256)) * 64  # 16 KiB
 BIG = 12 * 1024 * 1024
 RUN_HEADER_VALUE = "run-test-1"
+GATE_TOKEN = "tok-gate-0123456789"  # an invented token value: the gate holds it, the client never does
+SCOPE = "/api/v3/onezone/tokens/infer_access_token_scope"
 
 
 class Upstream(ThreadingHTTPServer):
@@ -37,6 +39,7 @@ class Upstream(ThreadingHTTPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), UpstreamHandler)
         self.seen: list[tuple[str, str, dict]] = []
+        self.bodies: list[bytes] = []
         self.mode = "ok"
 
 
@@ -45,6 +48,15 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    def do_POST(self):
+        self.server.seen.append((self.command, self.path, dict(self.headers)))
+        self.server.bodies.append(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+        answer = b"{}"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(answer)))
+        self.end_headers()
+        self.wfile.write(answer)
 
     def do_GET(self):
         self.server.seen.append((self.command, self.path, dict(self.headers)))
@@ -86,6 +98,7 @@ def world(tls, tmp_path):
     gate.CFG.clear()
     gate.CFG.update(
         run_key=RUN_HEADER_VALUE,
+        token=GATE_TOKEN,
         log=str(log),
         tls_dir=str(tls),
         hosts=hosts,
@@ -139,6 +152,70 @@ def test_o05_an_allowed_read_reaches_the_upstream_with_the_gates_run_attribution
     assert headers["X-Run-Key"] == RUN_HEADER_VALUE
     assert "authorization" not in {k.lower() for k in headers}  # the gate adds no credential and logs none
     conn.close()
+
+
+def test_o05_the_gate_adds_its_token_and_drops_every_credential_the_agent_sent(world):
+    """O05: the token is the gate's; the agent holds none, and whatever it sends as one never reaches the upstream."""
+    conn = connect(world)
+    sent = {"X-Auth-Token": "agent-made-up", "Authorization": "Bearer agent-made-up", "Cookie": "session=agent-made-up"}
+    conn.request("GET", FILE, headers=sent)
+    conn.getresponse().read()
+    _, _, headers = world.upstream.seen[0]
+    assert headers["X-Auth-Token"] == GATE_TOKEN
+    assert {k.lower() for k in headers} & {"authorization", "cookie"} == set()
+    assert "agent-made-up" not in json.dumps(headers)
+    conn.close()
+    assert GATE_TOKEN not in world.log.read_text()  # and the gate never logs it
+
+
+def test_o05_a_token_scope_inference_carries_the_gates_token_in_its_body(world):
+    """O05: the call names its token in the body, and the agent has none, so the gate puts its own there."""
+    conn = connect(world, ZONE)
+    for body in (b"{}", b'{"token": "agent-made-up", "other": 1}'):
+        conn.request("POST", SCOPE, body=body, headers={"Content-Type": "application/json"})
+        assert conn.getresponse().read() == b"{}"
+    assert [json.loads(b).get("token") for b in world.upstream.bodies] == [GATE_TOKEN, GATE_TOKEN]
+    assert json.loads(world.upstream.bodies[1])["other"] == 1
+    conn.close()
+
+
+def test_o05_a_token_scope_inference_that_is_not_a_json_object_is_refused_and_not_forwarded(world):
+    """O05: the gate cannot put its token into a body that is not an object, so it does not forward the call."""
+    conn = connect(world, ZONE)
+    conn.request("POST", SCOPE, body=b"[1, 2]", headers={"Content-Type": "application/json"})
+    answer = conn.getresponse()
+    answer.read()
+    assert answer.status == 400
+    assert world.upstream.bodies == []
+    conn.close()
+
+
+def test_o05_the_gate_takes_its_token_from_its_environment_and_removes_it(tmp_path, monkeypatch):
+    """O05: the token is read from the environment, never from the configuration file, and removed from it."""
+    config = tmp_path / "gate.json"
+    config.write_text(
+        json.dumps({"log": str(tmp_path / "r.jsonl"), "hosts": {}, "listen_host": "127.0.0.1", "listen_port": 0}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("sys.argv", ["gate.py", str(config)])
+    monkeypatch.setenv(gate.TOKEN_ENV, GATE_TOKEN)
+    gate.CFG.clear()
+    monkeypatch.setattr(gate, "_tls_context", lambda: type("Plain", (), {"wrap_socket": lambda self, s, **k: s})())
+
+    def stop_serving(httpd):
+        httpd.server_close()
+        raise SystemExit("stop here")
+
+    monkeypatch.setattr(gate, "serve", stop_serving)
+    with pytest.raises(SystemExit, match="stop here"):
+        gate.main()
+    assert gate.CFG["token"] == GATE_TOKEN
+    assert gate.TOKEN_ENV not in __import__("os").environ
+    monkeypatch.delenv(gate.TOKEN_ENV, raising=False)
+    gate.CFG.clear()
+    with pytest.raises(SystemExit, match="no token"):
+        gate.main()
+    gate.CFG.clear()
 
 
 @pytest.mark.parametrize("method", ["PUT", "POST", "DELETE", "PATCH"])
