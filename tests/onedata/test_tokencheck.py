@@ -185,3 +185,22 @@ def test_the_two_planes_share_neither_a_principal_nor_a_token():
         require_distinct(one, Examined("token-two", "user-one", 1.0, ()))
     with pytest.raises(TokenRefused, match="token"):
         require_distinct(one, Examined("token-one", "user-two", 1.0, ()))
+
+
+def test_o05_a_path_caveat_in_non_canonical_base64_is_refused():
+    """O05: "L3N=" decodes strictly to the same path as "L3M=" but is a different text, so it is refused."""
+    spec = CaveatSpec("s", readonly=True, interface="rest")
+    canonical, other = "L3M=", "L3N="
+    assert base64.b64decode(canonical, validate=True) == base64.b64decode(other, validate=True) == b"/s"
+    assert spec.caveats(NOW + 1800)[-1]["whitelist"] == [canonical]
+
+    def examined(text):
+        caveats = [
+            c if c["type"] != "data.path" else {"type": "data.path", "whitelist": [text]}
+            for c in spec.caveats(NOW + 1800)
+        ]
+        return examine(info(spec, caveats=caveats), spec)
+
+    assert examined(canonical).subject == "u-data"
+    with pytest.raises(TokenRefused, match="not canonical"):
+        examined(other)

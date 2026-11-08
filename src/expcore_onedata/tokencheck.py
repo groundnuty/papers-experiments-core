@@ -134,9 +134,14 @@ def _check_values(caveats: list[Mapping[str, Any]], spec: CaveatSpec) -> float:
     if not isinstance(whitelist, list) or not all(isinstance(w, str) for w in whitelist):
         raise TokenRefused("the data.path caveat is malformed")
     try:
-        paths = [base64.b64decode(w, validate=True).decode() for w in whitelist]
+        decoded = [base64.b64decode(w, validate=True) for w in whitelist]
+        paths = [d.decode() for d in decoded]
     except (binascii.Error, UnicodeDecodeError):
         raise TokenRefused("the data.path caveat is malformed") from None
+    # A strict decode still accepts text whose spare trailing bits are not zero ("L3N=" decodes as "L3M=" does), so
+    # the same path could be written many ways. Only the one canonical text of each path is accepted.
+    if any(base64.b64encode(d).decode() != w for d, w in zip(decoded, whitelist, strict=True)):
+        raise TokenRefused("the data.path caveat is not canonical base64")
     if paths != [f"/{spec.space_id}"]:
         raise TokenRefused("the data.path caveat is not the study space alone")
     if by_type["interface"]["interface"] != spec.interface:
