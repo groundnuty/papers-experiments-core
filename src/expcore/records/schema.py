@@ -6,7 +6,8 @@ A record names its schema version. A version is readable when it is in `SCHEMAS`
 the record's version, or an earlier one, introduced it. Anything else is refused at load, whether it is an unknown
 version, an unknown field, a missing field or a field added by a later version than the record's own (R02).
 
-To change the record format, append a `SchemaVersion` that lists, per section, the fields it adds; give the settings it
+Version 1 is frozen from its first pushed commit (see the table below). To change the record format, append a
+`SchemaVersion` that lists, per section, the fields it adds; give the settings it
 adds to the agent configuration the value that was in force before (`config_before`), so an older record replays
 under the rule it ran under; and bump nothing else. Older records keep loading, are written back as the bytes they
 were read from (R01), and are replayed with the defaults of their time.
@@ -110,6 +111,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "waits_left_open": (int,),
         "terminal": (bool,),
         "infra_wait_by_kind": (dict,),
+        "rendering_verified": (bool,),
     },
     "failed_request": {
         "kind": (str,),
@@ -177,6 +179,10 @@ class SchemaVersion:
                 raise ValueError(f"{self.name} lists fields the {section!r} section does not have: {unknown}")
 
 
+# The table of versions. Version 1 is frozen from its first pushed commit: nothing was published before it, so
+# its shape is the one that ships, and a change to it breaks every record written since. After that push, a
+# change to the format is a new version in this table that lists what it added, never an edit of version 1.
+# `tests/data/golden-record-v1.json` is a record of version 1 that must keep loading and writing back byte for byte.
 SCHEMAS: tuple[SchemaVersion, ...] = (SchemaVersion(f"{SCHEMA_PREFIX}1"),)
 CURRENT = SCHEMAS[-1].name
 

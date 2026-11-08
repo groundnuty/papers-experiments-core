@@ -4,22 +4,27 @@
 
 A secret comes from three places, and redaction works on parsed values, so its output is still valid JSON:
 
-1. **The environment.** The value of every variable whose name contains KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL
-   or AUTH, whatever the value looks like. A value of 8 or more characters is replaced wherever it occurs inside a
-   string, in values and in keys. A shorter value would match ordinary text, so it is replaced only where an entire
-   string equals it, or where a number's string form does (a numeric value 4096 is compared as "4096").
-2. **A key that names a secret.** The value of a mapping key called token, api_key, apikey, password, secret,
+1. **Environment variables.** The value of every variable the caller declares (`secret_env` on the record builder; the
+   `key_env` of every model in use is added by the builder), and of every variable whose name ends in `_API_KEY`,
+   `_APIKEY`, `_SECRET`, `_SECRET_KEY`, `_PASSWORD`, `_PASSWD`, `_ACCESS_TOKEN`, `_AUTH_TOKEN` or `_TOKEN`, in any case.
+   The suffix ends the name, so `MAX_TOKENS`, `SSH_AUTH_SOCK` and `KEYBOARD_LAYOUT` are not secrets.
+2. **A registered secret.** `register_secret(value)` adds a value for the rest of the process. A token minted at run
+   time (the platform layer mints the tokens of both planes) is in no environment variable, so the code that mints it
+   must register it, or it is not redacted. `build_record(secrets=...)` takes values for one record only.
+3. **A key that names a secret.** The value of a mapping key called token, api_key, apikey, password, secret,
    authorization or bearer (or ending in `_` and one of them, such as `x-api-key` or `client_secret`), in any case, is
-   replaced whatever it is. This is how a credential the process was never told about, a header or an argument,
-   is still caught.
-3. **A registered secret.** `register_secret(value)` adds a value for the rest of the process. A token minted at run
-   time (the platform layer mints the tokens of both planes) is in no environment variable and sits in no key the
-   rules above know: the code that mints it must register it, or it is not redacted. `build_record(secrets=...)`
-   takes values for one record only.
+   replaced whatever it is, so a credential nothing told us about is still caught. A JSON-schema definition is
+   exempt, since it names things and holds no value: the tools of a record, and any mapping under a `properties` key.
+   The rule reaches inside a string that is itself a JSON object, such as the arguments of a tool call in a
+   native message.
 
-Every secret is also redacted in its JSON-escaped and its percent-encoded forms, since a native message carries
-text inside JSON strings and a URL carries it percent-encoded. A secret that was replaced is gone: neither the text nor
-a decoding of it holds the value.
+Every secret value of 4 or more characters is replaced wherever it occurs inside a string, in values and in keys.
+A value under 4 characters would match ordinary text, so it is refused instead, with a `ConfigError` that names the
+variable and never shows the value. A number whose string form is a secret is replaced too.
+
+A secret is redacted in its raw form, in its JSON-escaped forms up to three levels of escaping (text inside a JSON
+string inside a JSON string), and percent-encoded, since a native message carries text in JSON strings and a URL
+carries it percent-encoded. A secret that was replaced is gone: neither the text nor a decoding of it holds the value.
 
 Redaction records the paths of what it changed, never values. It is a fixed point: redacting a redacted structure
 changes nothing. A number that is replaced becomes a string, so a record whose redaction would break a field that must
@@ -34,13 +39,28 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import quote, quote_plus
 
-SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH", re.IGNORECASE)
+from expcore.config.loading import ConfigError
+
+SECRET_NAME = re.compile(
+    r"(?:^|_)(?:API_KEY|APIKEY|SECRET_KEY|SECRET|PASSWORD|PASSWD|ACCESS_TOKEN|AUTH_TOKEN|TOKEN)$", re.IGNORECASE
+)
 SECRET_KEYS = ("token", "api_key", "apikey", "password", "secret", "authorization", "bearer")
-MIN_SUBSTRING_LEN = 8
+MIN_SECRET_LEN = 4
+ESCAPING_LEVELS = 3
 REDACTED = "[redacted]"
+SCHEMA_ROOT = "tools"  # the top-level record field that holds the JSON-schema definitions of the tools
 
 _registered: set[str] = set()
 _lock = threading.Lock()
+
+
+def _refuse_short(value: str, what: str) -> None:
+    """Refuse a secret too short to redact without damaging ordinary text, naming where it came from, not what it is."""
+    if len(value) < MIN_SECRET_LEN:
+        raise ConfigError(
+            f"{what} holds a secret of fewer than {MIN_SECRET_LEN} characters, which cannot be redacted without "
+            "redacting ordinary text; use a longer value"
+        )
 
 
 def register_secret(value: str) -> None:
@@ -50,6 +70,7 @@ def register_secret(value: str) -> None:
     """
     if not isinstance(value, str) or not value:
         raise ValueError("a secret to register is a non-empty string")
+    _refuse_short(value, "a registered secret")
     with _lock:
         _registered.add(value)
 
@@ -60,34 +81,48 @@ def forget_secrets() -> None:
         _registered.clear()
 
 
-def _env_secrets(environ: Mapping[str, str] | None) -> dict[str, str]:
-    """Return the secret-looking variables of an environment (the process's by default) that have a value."""
+def secret_env_names(environ: Mapping[str, str] | None = None, declared: Iterable[str] = ()) -> list[str]:
+    """Return the names, never the values, of the environment variables treated as secrets that have a value.
+
+    A variable is one when its name ends as the pattern says, or the caller declared it.
+    """
     env = os.environ if environ is None else environ
-    return {k: v for k, v in env.items() if SECRET_NAME.search(k) and v and v.strip()}
+    named = set(declared)
+    return sorted(n for n, v in env.items() if v and v.strip() and (n in named or SECRET_NAME.search(n)))
 
 
-def secret_names(environ: Mapping[str, str] | None = None) -> list[str]:
-    """Return the names, never the values, of the environment variables treated as secrets."""
-    return sorted(_env_secrets(environ))
+def secret_values(
+    environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
+) -> list[str]:
+    """Return the distinct secret values (environment, registered and `extra`), longest first.
 
-
-def secret_values(environ: Mapping[str, str] | None = None, extra: Iterable[str] = ()) -> list[str]:
-    """Return the distinct secret values (environment, registered, and `extra`), longest first."""
+    Raises ConfigError, naming the variable, for a value under the minimum length.
+    """
+    env = os.environ if environ is None else environ
+    values: set[str] = set()
+    for name in secret_env_names(env, declared):
+        _refuse_short(env[name], f"environment variable {name}")
+        values.add(env[name])
     with _lock:
         registered = set(_registered)
-    values = {*_env_secrets(environ).values(), *registered, *(v for v in extra if v)}
+    for value in registered:
+        _refuse_short(value, "a registered secret")
+    for value in extra:
+        if value:
+            _refuse_short(value, "a secret given for this record")
+            values.add(value)
+    values |= registered
     return sorted((v for v in values if v not in REDACTED), key=len, reverse=True)
 
 
 def forms_of(value: str) -> set[str]:
-    """Return the ways a secret can appear in text: raw, JSON-escaped (both ways) and percent-encoded (both ways)."""
-    return {
-        value,
-        json.dumps(value)[1:-1],
-        json.dumps(value, ensure_ascii=False)[1:-1],
-        quote(value, safe=""),
-        quote_plus(value),
-    }
+    """Return the ways a secret can appear in text: raw, JSON-escaped up to three levels, and percent-encoded."""
+    forms = {value}
+    level = {value}
+    for _ in range(ESCAPING_LEVELS):
+        level = {json.dumps(v)[1:-1] for v in level} | {json.dumps(v, ensure_ascii=False)[1:-1] for v in level}
+        forms |= level
+    return forms | {quote(value, safe=""), quote_plus(value)}
 
 
 def is_secret_key(key: str) -> bool:
@@ -105,17 +140,19 @@ class Redactor:
 
     def __init__(self, secrets: Iterable[str] = (), *, keys: bool = True):
         values = [s for s in secrets if s and s not in REDACTED]
-        self._whole: frozenset[str] = frozenset(f for s in values for f in forms_of(s))
-        self._inside: tuple[str, ...] = tuple(
-            sorted({f for s in values if len(s) >= MIN_SUBSTRING_LEN for f in forms_of(s)}, key=len, reverse=True)
-        )
+        for value in values:
+            _refuse_short(value, "a secret")
+        self._inside: tuple[str, ...] = tuple(sorted({f for s in values for f in forms_of(s)}, key=len, reverse=True))
         self._numbers: frozenset[str] = frozenset(values)
         self._keys = keys
 
     @classmethod
-    def from_environment(cls, environ: Mapping[str, str] | None = None, extra: Iterable[str] = ()) -> "Redactor":
-        """Build a redactor from the environment (the process's by default), the registered secrets and `extra`."""
-        return cls(secret_values(environ, extra))
+    def from_environment(
+        cls, environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
+    ) -> "Redactor":
+        """Build a redactor from the environment (the process's by default), the registered secrets, `extra` values and
+        the variables named in `declared`."""
+        return cls(secret_values(environ, extra, declared))
 
     @classmethod
     def none(cls) -> "Redactor":
@@ -123,9 +160,7 @@ class Redactor:
         return cls((), keys=False)
 
     def text(self, value: str) -> str:
-        """Return the string with every secret replaced: all of it if it equals one, else each long one inside it."""
-        if value in self._whole:
-            return REDACTED
+        """Return the string with every secret replaced."""
         for form in self._inside:
             if form in value:
                 value = value.replace(form, REDACTED)
@@ -141,9 +176,25 @@ class Redactor:
         """
         paths: list[str] = []
 
-        def walk(value: Any, path: str) -> Any:
+        def in_json_text(text: str, path: str) -> str:
+            """Apply the rules about keys inside a string that holds a JSON object or array (a tool call's arguments
+            are one in a native message), and write it again only if something there was replaced."""
+            if text.lstrip()[:1] not in ("{", "["):
+                return text
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                return text
+            if not isinstance(parsed, (dict, list)):
+                return text
+            redacted = walk(parsed, path)
+            return text if redacted == parsed else json.dumps(redacted, ensure_ascii=False)
+
+        def walk(value: Any, path: str, schema: bool = False, property_names: bool = False) -> Any:
             if isinstance(value, str):
                 new = self.text(value)
+                if self._keys and not schema:
+                    new = in_json_text(new, path)
                 if new != value:
                     paths.append(path)
                 return new
@@ -161,29 +212,32 @@ class Redactor:
                         paths.append(here)
                     if key in out:
                         raise ValueError("two keys are the same once secret values are redacted")
-                    if self._keys and isinstance(k, str) and is_secret_key(k):
+                    named_secret = isinstance(k, str) and is_secret_key(k)
+                    if self._keys and named_secret and not (schema or property_names):
                         out[key] = REDACTED
                         if v != REDACTED:
                             paths.append(here)
                     else:
-                        out[key] = walk(v, here)
+                        in_schema = schema or (path == "" and k == SCHEMA_ROOT)
+                        out[key] = walk(v, here, in_schema, k == "properties")
                 return out
             if isinstance(value, (list, tuple)):
-                return [walk(v, f"{path}[{i}]") for i, v in enumerate(value)]
+                return [walk(v, f"{path}[{i}]", schema) for i, v in enumerate(value)]
             return value
 
         return walk(obj, ""), sorted(set(paths))
 
 
 def redact_structure(
-    obj: Any, environ: Mapping[str, str] | None = None, extra: Iterable[str] = ()
+    obj: Any, environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
 ) -> tuple[Any, list[str]]:
     """Redact a JSON-like structure with the environment's, the registered and the `extra` secrets; see `Redactor`."""
-    return Redactor.from_environment(environ, extra).structure(obj)
+    return Redactor.from_environment(environ, extra, declared).structure(obj)
 
 
-def redact_text(text: str, environ: Mapping[str, str] | None = None, extra: Iterable[str] = ()) -> tuple[str, int]:
+def redact_text(
+    text: str, environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
+) -> tuple[str, int]:
     """Redact plain text such as a log line or an error message; return the text and how many places changed."""
-    redactor = Redactor.from_environment(environ, extra)
-    new = redactor.text(text)
+    new = Redactor.from_environment(environ, extra, declared).text(text)
     return new, int(new != text)

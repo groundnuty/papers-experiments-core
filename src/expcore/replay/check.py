@@ -44,6 +44,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import UNKNOWN, CodeScope, CodeVersionUnknown, require_known
 from expcore.provenance.codestamp import version as code_version
 from expcore.records.record import RunRecord, decode
@@ -129,9 +130,18 @@ def input_hashes(batch: Path, hashed_only: Sequence[str] = ()) -> dict[str, str]
     return {rel: hashlib.sha256((batch / rel).read_bytes()).hexdigest() for rel in [*records, *hashed]}
 
 
+def _redacted(text: str) -> str:
+    """Return a failure's text for the check file, with any secret redacted; if the environment's secrets cannot be
+    read (one is too short to redact), return no text at all rather than text that may hold one."""
+    try:
+        return redact_text(text)[0][:ERROR_LIMIT]
+    except ConfigError:
+        return "(text withheld: the environment holds a secret that cannot be redacted)"
+
+
 def _error(exc: BaseException) -> str:
     """Return a short description of a failure for the check file, with any secret redacted."""
-    return redact_text(f"{type(exc).__name__}: {exc}")[0][:ERROR_LIMIT]
+    return _redacted(f"{type(exc).__name__}: {exc}")
 
 
 def check_record(raw: bytes, *, schemas: Sequence[SchemaVersion] = SCHEMAS) -> tuple[str, str] | None:
@@ -139,7 +149,7 @@ def check_record(raw: bytes, *, schemas: Sequence[SchemaVersion] = SCHEMAS) -> t
     try:
         record = RunRecord.from_json(decode(raw), tuple(schemas))
     except RecordError as exc:
-        return "load", redact_text(str(exc))[0][:ERROR_LIMIT]
+        return "load", _redacted(str(exc))
     try:
         written = record.dumps(tuple(schemas)).encode("utf-8")
     except RecordError as exc:
@@ -149,7 +159,7 @@ def check_record(raw: bytes, *, schemas: Sequence[SchemaVersion] = SCHEMAS) -> t
     try:
         replay_record(record, schemas=schemas)
     except ReplayDivergence as exc:
-        return "replay", redact_text(str(exc))[0][:ERROR_LIMIT]
+        return "replay", _redacted(str(exc))
     except Exception as exc:
         return "replay", _error(exc)
     return None

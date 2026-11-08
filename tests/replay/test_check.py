@@ -206,11 +206,11 @@ def test_R04_check_record_reports_the_stage_and_a_message_that_names_the_path(ba
     raw = first_record(batch).read_bytes()
     assert check_record(raw) is None
     data = decode(raw)
-    data["transcript"][0]["tool_messages"] = []
+    data["tool_calls"][0]["arguments"] = {"x": "other"}
     text = json.dumps(data, indent=1, ensure_ascii=False)
     stage, error = check_record(text.encode("utf-8"))
     assert stage == "replay"
-    assert "transcript[0].tool_messages" in error
+    assert "tool_calls[0].arguments" in error
 
 
 def test_a_failure_message_never_holds_a_secret_from_the_environment(batch, monkeypatch):

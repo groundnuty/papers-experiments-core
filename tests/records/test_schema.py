@@ -134,6 +134,7 @@ def test_a_tool_call_status_outside_the_closed_list_is_refused():
                 "waits_left_open": 0,
                 "terminal": False,
                 "infra_wait_by_kind": {},
+                "rendering_verified": True,
             }
         ]
     )

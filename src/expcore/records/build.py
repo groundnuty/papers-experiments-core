@@ -19,6 +19,8 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from expcore.config.loading import ConfigError
+from expcore.config.models import ModelTable
 from expcore.loop.agent_loop import run_agent
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
@@ -34,7 +36,7 @@ from expcore.records.record import RunRecord
 from expcore.records.recording import Captured, RecordingBackend
 from expcore.records.redact import Redactor
 from expcore.records.schema import CURRENT, RecordError
-from expcore.records.seal import seal
+from expcore.records.seal import mark_unverified, seal
 
 CORE_DISTRIBUTION = "papers-experiments-core"
 CONTEXT_OVERFLOW = "ContextOverflow"
@@ -125,6 +127,7 @@ def call_entry(call: Any) -> dict[str, Any]:
     """Return a tool-call log entry as the record keeps it."""
     entry = plain(dataclasses.asdict(call))
     entry["detail"] = stable_call_detail(entry["status"], entry["detail"])
+    entry["rendering_verified"] = True  # until redaction changes what the cap or the error text is computed from
     return entry
 
 
@@ -178,6 +181,45 @@ def info_of_route(route: Mapping[str, Any]) -> dict[str, Any]:
     return {**rest, "settings_sent": route["settings"].get(route["settings_sent_sha256"], {})}
 
 
+def model_secrets(
+    backend: Any, models: ModelTable | None, environ: Mapping[str, str] | None
+) -> tuple[list[str], list[str]]:
+    """Return the names of the key variables of the models in use, and the keys themselves.
+
+    The models in use are the backend's own (the adapters hold their entry as `spec`) and, when given, every entry of
+    the model table. A key is read the way the backend reads it, so one kept in a file is found too.
+    """
+    specs = [spec] if (spec := getattr(backend, "spec", None)) is not None else []
+    specs += [models.resolve(key) for key in models] if models is not None else []
+    names = [s.key_env for s in specs if getattr(s, "key_env", None)]
+    values = []
+    for s in specs:
+        try:
+            value = s.read_key(environ)
+        except ConfigError:
+            continue  # no key is set for that entry: nothing of it to redact
+        if value:
+            values.append(value)
+    return names, values
+
+
+def redactor_for(
+    backend: Any,
+    *,
+    environ: Mapping[str, str] | None = None,
+    secrets: Iterable[str] = (),
+    secret_env: Iterable[str] = (),
+    models: ModelTable | None = None,
+) -> Redactor:
+    """Build the redactor of a record: the environment's secrets, the variables named in `secret_env`, the key
+    variables of the models in use (added automatically), the registered secrets and `secrets`.
+
+    Raises ConfigError, naming the variable, when a secret is too short to redact (see `expcore.records.redact`).
+    """
+    names, keys = model_secrets(backend, models, environ)
+    return Redactor.from_environment(environ, [*secrets, *keys], [*secret_env, *names])
+
+
 def expected_conversation(system: str, user: str, captured: Sequence[Captured]) -> list[dict[str, Any]]:
     """Return the conversation the pieces add up to: system (when given), user, then each turn and its results."""
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}] if system else []
@@ -200,6 +242,8 @@ def build_record(
     instruments: Mapping[str, Any] | None = None,
     redactor: Redactor | None = None,
     secrets: Iterable[str] = (),
+    secret_env: Iterable[str] = (),
+    models: ModelTable | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> RunRecord:
     """Build the record of a finished attempt from the loop's result and the recording wrapper it ran through.
@@ -211,8 +255,9 @@ def build_record(
     Secrets are redacted here, before any digest is taken: the digests the record pins (prompt texts, the
     conversation each request carried, the settings each sent, the configuration) are those of the redacted
     data, which is what is stored and replayed, and `redacted_paths` lists where something was replaced.
-    The secrets are the environment's (`environ`, the process's by default), the registered ones, and
-    `secrets` for this record. A replay passes `Redactor.none()`: what it reads is redacted already.
+    The secrets are those of `redactor_for` (the environment's, `environ` being the process's by default, the
+    variables in `secret_env`, the key variables of the models in use, the registered ones, and `secrets` for this
+    record) unless a `redactor` is given. A replay passes `Redactor.none()`: what it reads is redacted already.
     """
     sys_prompt, user_prompt = PromptText.of(system), PromptText.of(user)
     captured = recording.captured
@@ -270,8 +315,10 @@ def build_record(
         "instruments": plain(dict(instruments or {})),
         "scores": {},
     }
-    redactor = redactor if redactor is not None else Redactor.from_environment(environ, secrets)
+    if redactor is None:
+        redactor = redactor_for(recording.inner, environ=environ, secrets=secrets, secret_env=secret_env, models=models)
     redacted, paths = redactor.structure(fields)
+    mark_unverified(redacted, paths)
     if paths:
         warnings.warn(
             f"record of attempt {identity.attempt}: redacted secrets at {len(paths)} place(s)",
@@ -295,6 +342,9 @@ async def record_attempt(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     secrets: Iterable[str] = (),
+    secret_env: Iterable[str] = (),
+    models: ModelTable | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> RunRecord:
     """Run one attempt through the loop, recording it, and return its record.
 
@@ -303,9 +353,12 @@ async def record_attempt(
     defaults to the installed version of the core. The caller builds the backend (passing it `timer.time_left` when
     it uses the loop's time) and closes it.
 
-    Secrets are redacted from the record (R12): the environment's, the ones registered with
-    `expcore.records.redact.register_secret` (a platform that mints a token registers it), and `secrets`.
+    Secrets are redacted from the record (R12): those of environment variables named like one, the variables
+    named in `secret_env`, the key variables of the backend's model and of the `models` table, the ones registered
+    with `expcore.records.redact.register_secret` (a platform that mints a token registers it), and `secrets`.
+    A secret too short to redact raises ConfigError before the run starts.
     """
+    redactor = redactor_for(backend, environ=environ, secrets=secrets, secret_env=secret_env, models=models)
     recording = RecordingBackend(backend)
     box = ToolBox(list(providers), cap_chars=config.limits.output_cap_chars)
     specs = [spec for provider in providers for spec in provider.tools()]
@@ -322,5 +375,5 @@ async def record_attempt(
         specs=specs,
         code=code,
         core_version=core_version if core_version is not None else sdk_version(CORE_DISTRIBUTION),
-        secrets=secrets,
+        redactor=redactor,
     )

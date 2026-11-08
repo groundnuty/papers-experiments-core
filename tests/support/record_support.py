@@ -14,6 +14,7 @@ from expcore.records.build import RunIdentity, record_attempt
 from expcore.records.record import RunRecord
 from expcore.records.redact import SECRET_NAME, forget_secrets
 from expcore.records.schema import CURRENT
+from expcore.records.seal import seal
 
 CODE = {"commit": "c" * 40, "dirty": False, "source": "git", "stale": False, "why": None, "tree_sha256": "d" * 64}
 IDENTITY = RunIdentity(
@@ -87,6 +88,7 @@ def hand_made(**overrides: Any) -> RunRecord:
         },
         "schema_version": CURRENT,
     }
+    seal(fields)  # a hand-made record is consistent; a test that breaks it does so with an override
     fields.update(overrides)
     return RunRecord(**fields)
 
@@ -119,6 +121,7 @@ def record_run(
     identity: RunIdentity = IDENTITY,
     shared_timer: bool = False,
     cleanup_waiter: Any = None,
+    record_options: dict | None = None,
     **config: Any,
 ) -> RunRecord:
     """Run a scripted attempt through the real loop on a fake clock and return its record.
@@ -147,6 +150,7 @@ def record_run(
             timer=timer,
             clock=clock,
             sleep=sleep,
+            **(record_options or {}),
         )
     )
 

@@ -2,21 +2,24 @@
 
 import json
 import warnings
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import pytest
 from record_support import hand_made
 
+from expcore.config.loading import ConfigError
 from expcore.records.record import RunRecord, decode
 from expcore.records.redact import (
     REDACTED,
+    SECRET_NAME,
     Redactor,
     forget_secrets,
+    forms_of,
     is_secret_key,
     redact_structure,
     redact_text,
     register_secret,
-    secret_names,
+    secret_env_names,
     secret_values,
 )
 from expcore.records.schema import RecordError
@@ -25,61 +28,92 @@ KEY = "sk-live-0123456789abcdefghij"
 ENV = {"MODEL_API_KEY": KEY, "SERVICE_TOKEN": "tok_ABCDEFGH12345678", "HOME": "/home/someone/long-path-here"}
 
 
-def test_R12_a_variable_is_a_secret_by_its_name_whatever_its_value_looks_like():
-    """R12: KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL and AUTH in the name; no filter on the value."""
-    env = {
-        "MODEL_API_KEY": KEY,
-        "db_password": "correct horse battery",
-        "SOME_SECRET": "short",
-        "COUNT_TOKEN": "1234567890123456789",
-        "DB_PASSWD": "pw",
-        "CLOUD_CREDENTIAL": "[abc]",
-        "SSH_AUTH_SOCK": "/run/agent.1",
-        "PATH": "/usr/bin:/bin:/usr/local/bin:/very/long/path",
-        "EMPTY_KEY": "",
-        "BLANK_KEY": "   ",
-    }
-    assert secret_names(env) == [
-        "CLOUD_CREDENTIAL",
-        "COUNT_TOKEN",
-        "DB_PASSWD",
-        "MODEL_API_KEY",
-        "SOME_SECRET",
-        "SSH_AUTH_SOCK",
-        "db_password",
-    ]
-    assert secret_values(env)[0] == KEY  # longest first
+@pytest.mark.parametrize(
+    "name",
+    [
+        "OPENAI_API_KEY",
+        "X_APIKEY",
+        "CLIENT_SECRET",
+        "SIGNING_SECRET_KEY",
+        "DB_PASSWORD",
+        "db_passwd",
+        "CLOUD_ACCESS_TOKEN",
+        "REFRESH_AUTH_TOKEN",
+        "GITHUB_TOKEN",
+        "service_token",
+        "TOKEN",
+        "PASSWORD",
+        "API_KEY",
+    ],
+)
+def test_R12_a_name_that_ends_as_a_secret_name_does_is_a_secret(name):
+    """R12: the suffix pattern, in any case, with or without something before it."""
+    assert SECRET_NAME.search(name)
 
 
-def test_R12_a_long_value_is_replaced_inside_strings_and_keys_and_a_short_one_only_as_a_whole_string():
-    """R12: 8 or more characters are replaced as substrings; fewer only where the whole string equals the value."""
-    env = {"A_PASSWORD": "hunter2", "B_KEY": "ab[cd]efghij", "C_TOKEN": "98765432101"}
-    data = {
-        "note": "the password is hunter2 and the key is ab[cd]efghij",
-        "whole": "hunter2",
-        "digits": "id 98765432101 end",
-        "ab[cd]efghij": ["hunter2", "x hunter2"],
-    }
-    out, paths = redact_structure(data, env)
-    assert out == {
-        "note": "the password is hunter2 and the key is [redacted]",
-        "whole": REDACTED,
-        "digits": f"id {REDACTED} end",
-        REDACTED: [REDACTED, "x hunter2"],
-    }
-    assert paths == ["digits", "note", "whole", "{key 3}", "{key 3}[0]"]
+@pytest.mark.parametrize(
+    "name", ["MAX_TOKENS", "SSH_AUTH_SOCK", "KEYBOARD_LAYOUT", "TOKEN_BUDGET", "AUTHOR", "PASSWORDS"]
+)
+def test_R12_a_name_that_only_contains_the_word_is_not_a_secret(name):
+    """R12: the suffix must end the name, so counts, sockets and layouts are left alone."""
+    assert not SECRET_NAME.search(name)
+    assert secret_env_names({name: "some value here"}) == []
 
 
-def test_R12_the_forms_codex_listed_a_short_password_all_digits_brackets_a_number_and_a_minted_token():
-    """R12: each form that used to survive is now gone from the written structure."""
+def test_R12_the_caller_can_declare_the_variables_that_hold_secrets():
+    """R12: a name outside the pattern is a secret when declared, and a variable without a value is nothing."""
+    env = {"ODD_NAME": "declared-value-1", "OTHER": "not declared", "EMPTY_API_KEY": "", "BLANK_TOKEN": "  "}
+    assert secret_env_names(env) == []
+    assert secret_env_names(env, declared=["ODD_NAME", "UNSET"]) == ["ODD_NAME"]
+    assert secret_values(env, declared=["ODD_NAME"]) == ["declared-value-1"]
+
+
+def test_R12_every_value_of_four_or_more_characters_is_redacted_inside_text_whatever_its_length():
+    """R12: password=hunter2 loses hunter2, and a four-character value is redacted as a substring too."""
+    env = {"A_PASSWORD": "hunter2", "B_SECRET": "ab12"}
+    out, paths = redact_structure(
+        {"url": "login?user=x&password=hunter2&ok=1", "note": "code ab12cd", "other": "ab1"}, env
+    )
+    assert out == {"url": f"login?user=x&password={REDACTED}&ok=1", "note": f"code {REDACTED}cd", "other": "ab1"}
+    assert paths == ["note", "url"]
+
+
+@pytest.mark.parametrize("value", ["zq9", "q7", "z"])
+def test_R12_a_value_under_four_characters_is_refused_naming_the_variable_and_never_the_value(value):
+    """R12: it would redact ordinary text, so it is a configuration error, not a quiet gap."""
+    with pytest.raises(ConfigError, match="environment variable A_PASSWORD") as caught:
+        secret_values({"A_PASSWORD": value})
+    assert f"'{value}'" not in str(caught.value)
+    assert f"={value}" not in str(caught.value)
+    with pytest.raises(ConfigError, match="a registered secret"):
+        register_secret(value)
+    with pytest.raises(ConfigError, match="given for this record"):
+        secret_values({}, extra=[value])
+    with pytest.raises(ConfigError, match="fewer than 4 characters"):
+        Redactor([value])
+
+
+def test_R12_a_variable_with_no_value_is_nothing_to_redact_not_a_short_secret():
+    """R12: an unset or empty variable is skipped."""
+    assert secret_values({"A_PASSWORD": "", "B_TOKEN": "   "}) == []
+
+
+def test_R12_a_number_whose_string_form_is_a_secret_is_replaced():
+    """R12: numbers are compared by their string form."""
+    out, paths = redact_structure({"pin": 482913, "n": 3, "f": 2.5, "ok": True}, {"A_PASSWORD": "482913"})
+    assert out == {"pin": REDACTED, "n": 3, "f": 2.5, "ok": True}
+    assert paths == ["pin"]
+
+
+def test_R12_the_forms_codex_listed_a_short_password_all_digits_brackets_and_a_minted_token():
+    """R12: each form that used to survive is gone from the written structure."""
     forget_secrets()
     register_secret("minted-9f8e7d6c5b4a")
-    env = {"P_PASSWORD": "pw1", "N_KEY": "123456789012", "B_SECRET": "a]b[c]d[e", "I_TOKEN": "4096"}
+    env = {"P_PASSWORD": "pw12", "N_SECRET": "123456789012", "B_SECRET_KEY": "a]b[c]d[e"}
     data = {
-        "short": "pw1",
+        "short": "the password pw12 here",
         "digits": "pin 123456789012",
         "brackets": "x a]b[c]d[e y",
-        "number": 4096,
         "big": 123456789012,
         "token": "minted-9f8e7d6c5b4a",
         "arguments": {"token": 12, "headers": {"Authorization": "Bearer minted-9f8e7d6c5b4a"}},
@@ -88,9 +122,8 @@ def test_R12_the_forms_codex_listed_a_short_password_all_digits_brackets_a_numbe
     out, _ = redact_structure(data, env)
     forget_secrets()
     text = json.dumps(out)
-    for secret in ("pw1", "123456789012", "a]b[c]d[e", "minted-9f8e7d6c5b4a"):
+    for secret in ("pw12", "123456789012", "a]b[c]d[e", "minted-9f8e7d6c5b4a"):
         assert secret not in text
-    assert out["number"] == REDACTED
     assert out["big"] == REDACTED
     assert out["ordinary"] == [1, 2.5, True, None, "text"]
 
@@ -146,26 +179,51 @@ def test_R12_keys_that_only_contain_the_word_are_not_secrets():
     assert not is_secret_key("author")
 
 
+def test_R12_a_json_schema_definition_is_not_redacted_by_the_name_of_a_property():
+    """R12: the tools of a record and any mapping under properties name things; a token property keeps its schema."""
+    schema = {"type": "object", "properties": {"token": {"type": "string"}, "password": {"type": "string"}}}
+    record_like = {"tools": [{"name": "login", "input_schema": schema}], "other": {"properties": {"secret": {"a": 1}}}}
+    out, paths = redact_structure(record_like, {})
+    assert out == record_like
+    assert paths == []
+    arguments = {"arguments": {"token": "live-value"}}
+    assert redact_structure(arguments, {})[0] == {"arguments": {"token": REDACTED}}
+
+
 def test_R12_a_secret_inside_a_json_string_is_redacted_in_its_escaped_form():
     """R12: a native message holds text inside JSON strings, where a quote in the value is a backslash and a quote."""
     secret = 'sk"live\\0123456789'
     message = {"role": "tool", "content": json.dumps({"echo": secret, "n": 1})}
     assert json.dumps(secret)[1:-1] in message["content"]
-    out, _ = redact_structure(message, {"A_KEY": secret})
+    out, _ = redact_structure(message, {"A_API_KEY": secret})
     assert secret not in out["content"]
     assert json.dumps(secret)[1:-1] not in out["content"]
     assert json.loads(out["content"]) == {"echo": REDACTED, "n": 1}
+
+
+def test_R12_a_secret_in_json_inside_json_inside_json_is_redacted_at_every_level():
+    """R12: up to three levels of escaping; decoding the result at any level does not recover the value."""
+    secret = 'sk"live\\0123456789'
+    level1 = json.dumps({"k": secret})
+    level2 = json.dumps({"inner": level1})
+    level3 = json.dumps({"outer": level2})
+    out, _ = redact_structure({"one": level1, "two": level2, "three": level3}, {"A_API_KEY": secret})
+    flat = json.dumps(out)
+    assert secret not in flat
+    for form in forms_of(secret):
+        assert form not in flat
+    decoded = json.loads(json.loads(json.loads(out["three"])["outer"])["inner"])
+    assert decoded == {"k": REDACTED}
+    assert json.loads(json.loads(out["two"])["inner"]) == {"k": REDACTED}
 
 
 def test_R12_a_secret_in_a_url_is_redacted_in_its_percent_encoded_form():
     """R12: decoding the redacted text must not recover the value."""
     secret = "sk/live+key 0123456789"
     url = f"https://host/p?k={quote(secret, safe='')}&z=1"
-    out, _ = redact_structure({"url": url}, {"A_KEY": secret})
+    out, _ = redact_structure({"url": url}, {"A_API_KEY": secret})
     assert quote(secret, safe="") not in out["url"]
     assert out["url"] == f"https://host/p?k={REDACTED}&z=1"
-    from urllib.parse import unquote
-
     assert secret not in unquote(out["url"])
 
 
@@ -191,7 +249,7 @@ def test_R12_the_paths_name_the_fields_that_changed_and_never_a_value():
 def test_two_keys_that_collide_once_redacted_are_refused_not_merged():
     other = "sk-live-9999999999999999999"
     with pytest.raises(ValueError, match="two keys are the same"):
-        redact_structure({KEY: 1, other: 2}, {"A_KEY": KEY, "B_KEY": other})
+        redact_structure({KEY: 1, other: 2}, {"A_API_KEY": KEY, "B_API_KEY": other})
 
 
 def test_redact_text_replaces_the_secret_in_every_form():
@@ -258,3 +316,22 @@ def test_R12_the_default_environment_is_the_processs_own(monkeypatch):
     with pytest.warns(RuntimeWarning, match="redacted secrets at 1 place"):
         text = record.dumps()
     assert "fresh-value-1234567890-abc" not in text
+
+
+def test_R12_the_writer_refuses_a_short_secret_in_the_environment_naming_the_variable(tmp_path):
+    """R12: a secret too short to redact is a configuration error at the write as it is when the builder starts."""
+    with pytest.raises(ConfigError, match="environment variable DB_PASSWORD"):
+        hand_made().write(tmp_path, environ={"DB_PASSWORD": "abc"})
+
+
+def test_R12_a_key_that_names_a_secret_is_applied_inside_a_string_that_holds_a_json_object():
+    """R12: the arguments of a tool call are a JSON string in a native message, and the key's value is still a secret."""
+    arguments = '{"token": "live-value-123", "user": "ann"}'
+    data = {"function": {"arguments": arguments}, "note": "[1, 2]", "plain": "{not json", "text": '{"user": "ann"}'}
+    out, paths = redact_structure(data, {})
+    assert json.loads(out["function"]["arguments"]) == {"token": REDACTED, "user": "ann"}
+    assert (out["note"], out["plain"], out["text"]) == ("[1, 2]", "{not json", '{"user": "ann"}')
+    assert "function.arguments" in paths
+    again, more = redact_structure(out, {})
+    assert again == out
+    assert more == []

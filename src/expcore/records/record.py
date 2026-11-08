@@ -38,6 +38,7 @@ from expcore.records.schema import (
     added_after,
     validate,
 )
+from expcore.records.seal import mark_unverified, seal
 
 _LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")  # in a str only unpaired (a valid pair decodes to one character)
 
@@ -122,13 +123,17 @@ class RunRecord:
         if paths:
             if "redacted_paths" in data:
                 data["redacted_paths"] = sorted({*data["redacted_paths"], *paths})
-            try:
-                validate(data, schemas)
-            except RecordError as exc:  # a number that was a secret became a string, in a field that must be numeric
-                raise RecordError(
-                    f"redacting secrets at {paths[:5]} leaves a record that is not valid ({exc}); "
-                    "a variable named like a secret holds a value that is also an ordinary number of the record"
-                ) from None
+            mark_unverified(data, paths)
+        seal(data)  # always: every stored digest is that of the data as written, whatever was redacted just now
+        try:
+            validate(data, schemas)
+        except RecordError as exc:  # a number that was a secret became a string, in a field that must be numeric
+            if not paths:
+                raise
+            raise RecordError(
+                f"redacting secrets at {paths[:5]} leaves a record that is not valid ({exc}); "
+                "a variable named like a secret holds a value that is also an ordinary number of the record"
+            ) from None
         try:
             text = json.dumps(data, ensure_ascii=False, indent=1, allow_nan=False)
         except ValueError as exc:
