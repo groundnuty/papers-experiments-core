@@ -5,7 +5,11 @@
 """The health gate: health that cannot be read is unhealthy, and an outage holds all dispatch (C11).
 
 A pre-run health check (a `HealthCheck` the platform supplies) runs before every attempt. One that fails, raises, times
-out or answers something that is not a `Health` counts as a failed check, never as a crash and never as a pass. The
+out or answers something that is not a `Health` counts as a failed check, never as a crash and never as a pass. **Every
+callback runs in a thread of its own** (the pre-run and post-run checks of the workers and the dispatcher's own), and
+the caller waits for it at most `timeout_s`: a check that hangs is unhealthy when the time is up, and ending the
+campaign stops the wait at once, so a hanging check never blocks a shutdown. A check that has outlived its time and not
+yet answered blocks the next ones from starting: they read unhealthy without a second thread piling up behind it. The
 first failed check **closes the gate**: no run starts until the dispatcher's own check, which it runs itself every
 `recheck_s` seconds, passes. **One attempt is charged per outage**, to the run that found it; any other run whose check
 fails while the gate is closed, or that finds it closed, is not charged and not recorded, and stays pending.
@@ -30,6 +34,7 @@ post-run check that returns while the gate is still open does not close it; the 
 import contextlib
 import json
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
@@ -152,7 +157,9 @@ class HealthGate:
         self._outages: list[dict[str, Any]] = []
         self._lock = threading.Lock()  # "who found it" and the record's writes are one step each
         self._wake = threading.Event()  # set when the gate closes
-        self._call: dict[str, Any] | None = None  # the check in flight: one at a time
+        self._hung_lock = threading.Lock()
+        self._hung: list[dict[str, Any]] = []  # checks that outlived their time and have not answered
+        self._stop: threading.Event | None = None  # the campaign's end, set by `start`
         self._thread: threading.Thread | None = None
         self.check_now = False  # a gate restored by a restart is checked at once, not after a period
 
@@ -228,13 +235,47 @@ class HealthGate:
 
     # --- the checks of a run ----------------------------------------------------------------------------------------
 
+    def _ask(self, stop: threading.Event | None) -> Health | None:
+        """Run the check in a thread of its own and wait for its answer at most `timeout_s`.
+
+        Return what it said; a check that does not answer in time reads as down and its late answer is thrown away.
+        Return None when `stop` is set before it answers: the campaign is ending and nobody is waiting for it. While an
+        earlier check that outlived its time is still out, no new one starts: it reads as down at once.
+        """
+        with self._hung_lock:
+            self._hung = [box for box in self._hung if not box["done"].is_set()]
+            if self._hung:
+                return Health(False, "the previous health check has still not answered")
+        box: dict[str, Any] = {"done": threading.Event()}
+
+        def go() -> None:
+            try:
+                box["health"] = read_health(self.check)
+            finally:
+                box["done"].set()
+
+        threading.Thread(target=go, daemon=True, name="health-check").start()
+        deadline = time.monotonic() + self.timeout_s
+        while not box["done"].wait(0.02):  # in slices, so the end of the run is seen at once
+            ending = stop is not None and stop.is_set()
+            if ending or time.monotonic() >= deadline:
+                with self._hung_lock:
+                    self._hung.append(box)
+                if ending:
+                    return None
+                return Health(False, f"the health check did not answer within {self.timeout_s:g} s: counted as down")
+        return box["health"]
+
     def _read_at_gate(self) -> tuple[Health, dict[str, Any] | None]:
         """Run a check and take the gate's state the instant it returns: the open outage's record or None.
 
-        The check runs outside the lock, since it may take as long as its timeouts. The gate is read with the answer in
-        hand, and the run is classified from that read, not from one made after other statements.
+        The check runs outside the lock, since it may take as long as its timeout. The gate is read with the answer in
+        hand, and the run is classified from that read, not from one made after other statements. A check the ending
+        campaign did not wait for reads as down: its health is unknown.
         """
-        health = read_health(self.check)
+        health = self._ask(self._stop)
+        if health is None:
+            health = Health(False, "the campaign is ending: the health check was not waited for")
         with self._lock:
             return health, self._open
 
@@ -244,7 +285,13 @@ class HealthGate:
         closed it first, holds this one."""
         if self._open is not None:
             return PreRun(HOLD, "the gate is closed")
-        health, closed = self._read_at_gate()
+        if self._stop is not None and self._stop.is_set():
+            return PreRun(HOLD, "the campaign is ending")
+        answer = self._ask(self._stop)
+        if answer is None:
+            return PreRun(HOLD, "the campaign is ending")  # nothing is charged for a shutdown
+        with self._lock:
+            health, closed = answer, self._open
         if closed is not None:
             return PreRun(HOLD, "the gate closed while this check was out")
         if health.ok:
@@ -294,29 +341,9 @@ class HealthGate:
         return health.ok
 
     def _timed(self, stop: threading.Event | None) -> Health:
-        """One check of the dispatcher's own, with a timeout: one that does not answer in `timeout_s` reads as down and
-        its late answer is thrown away. While it is out no second one starts."""
-        previous = self._call
-        if previous is not None and not previous["done"].is_set():
-            return Health(False, "the previous health check has still not answered")
-        box: dict[str, Any] = {"done": threading.Event()}
-
-        def go() -> None:
-            try:
-                box["health"] = read_health(self.check)
-            finally:
-                box["done"].set()
-
-        self._call = box
-        threading.Thread(target=go, daemon=True, name="health-gate-check").start()
-        waited = 0.0
-        while not box["done"].wait(0.02):  # in slices, so the end of the run is seen at once
-            waited += 0.02
-            if stop is not None and stop.is_set():
-                return Health(False, "the campaign is ending")
-            if waited >= self.timeout_s:
-                return Health(False, f"the health check did not answer within {self.timeout_s:g} s: counted as down")
-        return box["health"]
+        """One check of the dispatcher's own, with a timeout: see `_ask`. The end of the campaign reads as down."""
+        health = self._ask(stop)
+        return health if health is not None else Health(False, "the campaign is ending")
 
     def poll(self, stop: threading.Event | None = None) -> bool:
         """Run the dispatcher's own check once, if the gate is closed; return True when it opened the gate."""
@@ -353,7 +380,8 @@ class HealthGate:
                 stop.wait(1.0)
 
     def start(self, stop: threading.Event, on_open: Callable[[], None] = lambda: None) -> None:
-        """Start the thread that re-checks while the gate is closed."""
+        """Start the thread that re-checks while the gate is closed; `stop` also ends the wait for any check."""
+        self._stop = stop
         self._wake.clear()
         self._thread = threading.Thread(target=self.run_loop, args=(stop, on_open), daemon=True, name="health-gate")
         self._thread.start()

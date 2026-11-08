@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 
 import pytest
 from campaign_support import LATER, NOW, planned_store
@@ -153,6 +154,98 @@ def test_c11_a_check_that_does_not_answer_in_time_reads_as_down_and_its_late_ans
     assert gate.poll() is False  # the first is still out
     assert "still not answered" in parse(gate.store.get_meta(META))[0]["last_detail"]
     release.set()
+
+
+class Hang:
+    """A health check that does not answer until it is let go; it counts the calls that reached it."""
+
+    def __init__(self, then=None):
+        self.release, self.then, self.calls = threading.Event(), then or Health(True, "late"), 0
+
+    def __call__(self):
+        self.calls += 1
+        self.release.wait(30)
+        return self.then
+
+
+def test_c11_a_pre_run_check_that_hangs_reads_as_down_after_the_timeout_and_charges_the_one_attempt(tmp_path):
+    """C11: the pre-run callback runs in a worker thread with the timeout: a hang is a failed check, not a hung run."""
+    hang = Hang()
+    gate, _ = gate_for(tmp_path, hang, timeout_s=0.1)
+    began = time.monotonic()
+    verdict = gate.before_run("run-a")
+    assert time.monotonic() - began < 5
+    assert verdict.verdict == FOUND  # unhealthy: the gate closes and this run is the outage's one attempt
+    assert "did not answer within" in verdict.detail
+    assert gate.closed
+    hang.release.set()
+
+
+def test_c11_a_post_run_check_that_hangs_reads_as_down_after_the_timeout(tmp_path):
+    """C11: the post-run callback is bounded too, and a timeout is unhealthy, never a pass."""
+    hang = Hang()
+    gate, _ = gate_for(tmp_path, hang, timeout_s=0.1)
+    began = time.monotonic()
+    health, outage = gate.after_run()
+    assert time.monotonic() - began < 5
+    assert not health.ok
+    assert "did not answer within" in health.detail
+    assert outage is None  # the gate was open, so this check does not close it
+    hang.release.set()
+
+
+def test_c11_a_hung_check_blocks_the_next_ones_from_starting_and_reads_as_down(tmp_path):
+    """C11: while a check that outlived its time is out no second one starts behind it; once it answers they do."""
+    hang = Hang()
+    gate, _ = gate_for(tmp_path, hang, timeout_s=0.1)
+    gate.after_run()
+    health, _ = gate.after_run()
+    assert not health.ok
+    assert "still not answered" in health.detail
+    assert hang.calls == 1
+    hang.release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not gate.after_run()[0].ok:
+        time.sleep(0.02)
+    assert gate.after_run()[0].ok
+
+
+def test_c11_ending_the_campaign_stops_the_wait_for_a_hanging_check_and_charges_nothing(tmp_path):
+    """C11: a check that hangs never blocks a shutdown; a pre-run check cut short holds the run, it closes no gate."""
+    hang = Hang()
+    gate, store = gate_for(tmp_path, hang, timeout_s=60)
+    stop = threading.Event()
+    gate.start(stop)
+    threading.Timer(0.1, stop.set).start()
+    began = time.monotonic()
+    verdict = gate.before_run("run-a")
+    assert time.monotonic() - began < 5
+    assert verdict.verdict == HOLD
+    assert not gate.closed
+    assert parse(store.get_meta(META)) in ([], None)  # no outage was recorded
+    health, outage = gate.after_run()  # the campaign is ending: unknown health reads as down
+    assert not health.ok
+    assert outage is None
+    hang.release.set()
+    gate.join()
+
+
+def test_c11_checks_of_several_workers_run_at_once_and_none_reads_as_still_out(tmp_path):
+    """C11: a slow check that is within its time does not make the check of another worker fail."""
+    check = Hang(Health(True, "up"))
+    gate, _ = gate_for(tmp_path, check, timeout_s=10)
+    verdicts = []
+    workers = [threading.Thread(target=lambda: verdicts.append(gate.before_run("run"))) for _ in range(3)]
+    for worker in workers:
+        worker.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and check.calls < 3:
+        time.sleep(0.01)
+    check.release.set()
+    for worker in workers:
+        worker.join(10)
+    assert check.calls == 3
+    assert [v.verdict for v in verdicts] == [GO, GO, GO]
 
 
 def test_c11_the_gates_own_thread_opens_it_on_the_first_passing_check(tmp_path):
