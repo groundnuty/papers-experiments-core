@@ -18,11 +18,11 @@ never requested is a mismatch too (that is a silent server default).
                 (or was never in) the request: dispatch of that model STOPS
     unreported  no model id came back at all: the run proves nothing; alarmed, nothing stops
 
-Which settings. Every one the request carried, whatever its name, and every one the reply reported that is not a
-field describing the reply itself (`REPLY_FIELDS`). A server that echoes `top_k` is checked like one that echoes
-`temperature`; the five names in `SETTINGS` are only those always listed in the record, as "not reported" when no
-reply carried them. A reply field that is neither a setting nor listed in `REPLY_FIELDS` surfaces as a setting that
-was never requested, naming its key, rather than being lost.
+Which settings are judged. A reported field is a setting, and so compared, when the request carried it (under any
+name, from sampling, `extra_body` or its `chat_template_kwargs`) or when its name is a known sampling or reasoning
+setting (`KNOWN_SETTINGS`): a server that echoes `top_k` is checked like one that echoes `temperature`, and an echo
+nobody asked for is a silent server default. Any other field a reply carries (a request id, timings) is reply
+metadata: it is recorded under `other_reply_fields` and never judged, so a server adding one stops nothing.
 
 Model ids. A dated snapshot of the expected id (`<model>-YYYYMMDD`) is the same model.
 
@@ -45,29 +45,22 @@ SETTINGS_NOTE = (
     "took effect; false does not show it did not"
 )
 SETTINGS = ("temperature", "top_p", "reasoning_effort", "enable_thinking", "thinking")  # always listed in the record
-# Reply fields that describe the reply, not the settings it was produced with.
-REPLY_FIELDS = frozenset(
-    {
-        "id",
-        "object",
-        "type",
-        "role",
-        "created",
-        "model",
-        "choices",
-        "content",
-        "usage",
-        "system_fingerprint",
-        "service_tier",
-        "stop_reason",
-        "stop_sequence",
-        "container",
-        "timings",
-        "prompt_logprobs",
-        "prompt_token_ids",
-        "kv_transfer_params",
-    }
+# Sampling settings a server may echo: a reported one that was never requested is a silent server default.
+SAMPLING_SETTINGS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "seed",
+    "max_tokens",
+    "max_completion_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+    "repetition_penalty",
+    "stop",
+    "n",
 )
+KNOWN_SETTINGS = frozenset((*SAMPLING_SETTINGS, *SETTINGS))
 _TYPED_SETTINGS = ("temperature", "top_p")  # attributes some SDK reply objects carry rather than extras
 _TEMPLATE_KWARGS = "chat_template_kwargs"
 MIXED_FINGERPRINTS = " | "
@@ -96,13 +89,20 @@ def _fingerprint_of(resp: Any) -> str | None:
 
 
 class Served:
-    """Collects what the replies of one run reported."""
+    """Collects what the replies of one run reported.
 
-    def __init__(self) -> None:
+    `requested` names the settings the request carries; a reported field with one of those names, or a known
+    setting's name, is kept as a setting. `expect` adds names as the requests are built.
+    """
+
+    def __init__(self, requested: Iterable[str] = ()) -> None:
+        self.requested: set[str] = set(requested)
         self.ids: set[str] = set()
         self.fingerprints: list[str] = []  # distinct, in the order met; a mixed one is kept whole
         # every distinct value reported, in order: a later reply must not be forgotten
         self.fields: dict[str, list[Any]] = {}
+        # reply metadata that is not a setting: the first value and the number of replies that carried it
+        self.other: dict[str, dict[str, Any]] = {}
         self.reasoning_calls = 0  # replies that carried reasoning/thinking content (or blocks)
         # summed where the API reports them (usage.completion_tokens_details.reasoning_tokens); else None
         self.reasoning_tokens: int | None = None
@@ -119,20 +119,33 @@ class Served:
         if reasoning_tokens is not None:
             self.reasoning_tokens = (self.reasoning_tokens or 0) + int(reasoning_tokens)
 
+    def expect(self, requested: Iterable[str]) -> None:
+        """Add the names of settings a request carries, before its reply is noted."""
+        self.requested.update(requested)
+
     def note(self, resp: Any) -> None:
-        """Take the served model id, the system fingerprint and every echoed setting from one reply."""
+        """Take the served model id, the system fingerprint and every echoed setting from one reply.
+
+        A field that is neither requested nor a known setting is kept apart, with its first value, never judged.
+        """
         mid = getattr(resp, "model", None)
         if mid:
             self.ids.add(str(mid))
         fingerprint = _fingerprint_of(resp)
         if fingerprint and fingerprint not in self.fingerprints:
             self.fingerprints.append(fingerprint)
-        reported = {k: v for k, v in (getattr(resp, "model_extra", None) or {}).items() if k not in REPLY_FIELDS}
+        reported = dict(getattr(resp, "model_extra", None) or {})
         for k in _TYPED_SETTINGS:
             reported.setdefault(k, getattr(resp, k, None))
         for k, v in reported.items():
-            if v is not None and v not in self.fields.setdefault(k, []):
-                self.fields[k].append(v)
+            if v is None:
+                continue
+            if k in KNOWN_SETTINGS or k in self.requested:
+                if v not in self.fields.setdefault(k, []):
+                    self.fields[k].append(v)
+            else:
+                seen = self.other.setdefault(k, {"first": v, "replies": 0})
+                seen["replies"] += 1
 
     def info(self) -> dict[str, Any]:
         """Return what was reported, for the record: a setting no reply carried reads "not reported"."""
@@ -149,6 +162,7 @@ class Served:
                 )
                 for k in (*SETTINGS, *(name for name in self.fields if name not in SETTINGS))
             },
+            "other_reply_fields": {k: dict(v) for k, v in self.other.items()},
             "reasoning_content_seen": self.reasoning_seen,
             "settings_note": SETTINGS_NOTE,
             "thinking": {
@@ -216,6 +230,16 @@ def requested_settings(sampling: Mapping[str, Any] | None, extra_body: Mapping[s
     return out
 
 
+def requested_from_sent(sent: Mapping[str, Any]) -> dict[str, Any]:
+    """Every setting a request carried, from the settings an adapter recorded as sent (`settings_sent`).
+
+    Unlike `requested_settings` this includes what the adapter sets itself, `seed` and `max_tokens`, so a server
+    that echoes them is not charged with a default nobody asked for.
+    """
+    plain = {k: v for k, v in sent.items() if k not in ("model", "extra_body")}
+    return requested_settings(plain, sent.get("extra_body"))
+
+
 def _same(a: Any, b: Any) -> bool:
     """Compare two setting values as numbers when both are, else as given."""
     try:
@@ -247,8 +271,8 @@ def judge(
         reasons.append(f"served model id {bad} is not the expected {expected_id!r}")
     reasons += _fingerprint_reasons(served_fingerprints, expected_fingerprint)
     for k, vv in reported_by.items():
-        if vv == NOT_REPORTED or vv is None:
-            continue
+        if vv == NOT_REPORTED or vv is None or (k not in requested and k not in KNOWN_SETTINGS):
+            continue  # not reported, or reply metadata that is neither requested nor a known setting
         # a "varied" entry lists replies that disagreed with each other
         vals = vv["varied"] if isinstance(vv, dict) and "varied" in vv else [vv]
         if len(vals) > 1:

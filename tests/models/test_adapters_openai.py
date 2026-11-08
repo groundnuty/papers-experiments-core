@@ -7,6 +7,7 @@ import pytest
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.models.adapters import OpenAICompatAdapter, ToolResult
+from expcore.models.served import judge, requested_from_sent
 
 TOOLS = [{"name": "run", "description": "run code", "input_schema": {"type": "object", "properties": {}}}]
 
@@ -363,6 +364,26 @@ def test_b06_what_the_replies_reported_is_in_the_record(make_spec, limits, compl
     assert info["served_model_ids"] == ["test-model-20261001"]
     assert info["system_fingerprints"] == ["fp-1"]
     assert info["served_settings"]["temperature"] == "not reported"
+
+
+def test_b06_the_adapter_tells_the_check_what_it_sent_so_an_echo_of_it_is_judged(
+    make_spec, limits, completion, fake_client
+):
+    """B06: seed and max_tokens echoed back are no silent default; a changed vendor extra is a mismatch."""
+    spec = make_spec(sampling={"temperature": 0.2}, extra_body={"preserve_thinking": True})
+    reply = completion(usage=(1, 1))
+    reply.seed, reply.max_tokens, reply.temperature = 7, 4096, 0.2
+    reply.preserve_thinking, reply.request_id = False, "req-1"
+    backend = adapter(spec, limits, fake_client(reply))
+    backend.begin("", "go", [])
+    step(backend)
+    info = backend.info()
+    assert info["served_settings"]["preserve_thinking"] is False
+    assert info["other_reply_fields"] == {"request_id": {"first": "req-1", "replies": 1}}
+    requested = requested_from_sent(info["settings_sent"])
+    result = judge(info["served_model_ids"], info["served_settings"], "test-model", requested)
+    assert result["state"] == "mismatch"
+    assert result["reasons"] == ["the server reports preserve_thinking=False, requested True"]
 
 
 def test_probe_sends_one_token_with_the_vendor_extras_and_counts_no_usage(make_spec, limits, completion, fake_client):

@@ -5,13 +5,16 @@ from types import SimpleNamespace
 import pytest
 
 from expcore.models.served import (
+    KNOWN_SETTINGS,
     MIXED_FINGERPRINTS,
     NOT_REPORTED,
+    SAMPLING_SETTINGS,
     SETTINGS,
     Baseline,
     Served,
     is_mixed,
     judge,
+    requested_from_sent,
     requested_settings,
     same_model,
 )
@@ -23,8 +26,8 @@ def reply(model="test-model", fingerprint=None, **extra):
     return SimpleNamespace(model=model, system_fingerprint=fingerprint, model_extra=extra)
 
 
-def served_after(*replies):
-    served = Served()
+def served_after(*replies, requested=()):
+    served = Served(requested)
     for item in replies:
         served.note(item)
     return served
@@ -230,7 +233,8 @@ def test_b06_an_unrequested_setting_outside_the_five_listed_names_is_a_silent_se
 def test_b06_a_setting_outside_the_five_listed_names_that_equals_the_request_is_a_match():
     """B06: Settings the request carried, echoed back unchanged, are a match."""
     requested = requested_settings({"top_k": 20}, {"chat_template_kwargs": {"preserve_thinking": True}})
-    served = served_after(reply(top_k=20, preserve_thinking=True))
+    served = served_after(reply(top_k=20, preserve_thinking=True), requested=requested)
+    assert served.info()["served_settings"]["preserve_thinking"] is True
     assert judged(served, requested=requested)["state"] == "match"
 
 
@@ -251,12 +255,69 @@ def test_b06_a_requested_setting_no_reply_carried_is_not_reported_never_the_requ
     assert "top_k" not in served_after(reply()).info()["served_settings"]
 
 
-def test_b06_fields_that_describe_the_reply_are_not_settings():
-    """B06: The id, usage and timings of a reply are not requested settings, so they cause no mismatch."""
-    metadata = {"id": "chatcmpl-1", "object": "chat.completion", "usage": {"total_tokens": 3}, "timings": {"ms": 1}}
-    served = served_after(reply(**metadata, prompt_logprobs=None))
-    assert judged(served)["state"] == "match"
+def test_b06_reply_metadata_is_recorded_but_never_judged():
+    """B06: A request id the server adds is not a setting: the check matches, and the field is in the record."""
+    served = served_after(reply(request_id="req-1"), reply(request_id="req-2"), reply(timings={"ms": 3}))
+    result = judged(served)
+    assert (result["state"], result["reasons"]) == ("match", [])
+    assert served.info()["other_reply_fields"] == {
+        "request_id": {"first": "req-1", "replies": 2},
+        "timings": {"first": {"ms": 3}, "replies": 1},
+    }
     assert set(served.info()["served_settings"]) == set(SETTINGS)
+
+
+def test_b06_a_field_that_is_neither_requested_nor_a_known_setting_is_not_judged_even_in_a_hand_built_record():
+    """B06: Only a requested name or a known sampling setting can be a silent server default."""
+    settings = {"temperature": NOT_REPORTED, "request_id": "req-1", "custom_flag": {"varied": [1, 2]}}
+    result = judge(["test-model"], settings, "test-model", {})
+    assert (result["state"], result["reasons"]) == ("match", [])
+    assert judge(["test-model"], settings, "test-model", {"custom_flag": 1})["state"] == "mismatch"
+
+
+@pytest.mark.parametrize("name", SAMPLING_SETTINGS)
+def test_b06_every_known_sampling_setting_that_was_never_requested_is_a_silent_server_default(name):
+    """B06: temperature, top_p, top_k, min_p, seed, max_tokens, the penalties, stop and n, when unrequested."""
+    result = judged(served_after(reply(**{name: 1})), requested={})
+    assert result["state"] == "mismatch"
+    assert result["reasons"] == [f"the server reports {name}=1 but none was requested (a server default)"]
+    assert name in KNOWN_SETTINGS
+
+
+def test_b06_a_setting_the_request_carried_under_a_name_the_list_does_not_know_is_compared():
+    """B06: preserve_thinking is no known sampling setting, but the model table sends it, so a change is a mismatch."""
+    requested = requested_settings(None, {"chat_template_kwargs": {"preserve_thinking": True}})
+    served = served_after(reply(preserve_thinking=False), requested=requested)
+    result = judged(served, requested=requested)
+    assert result["state"] == "mismatch"
+    assert result["reasons"] == ["the server reports preserve_thinking=False, requested True"]
+    unknown_to_served = served_after(reply(preserve_thinking=False))  # a Served told nothing keeps it as metadata
+    assert judged(unknown_to_served, requested=requested)["state"] == "match"
+    told_later = served_after(requested=[])
+    told_later.expect(["preserve_thinking"])
+    told_later.note(reply(preserve_thinking=False))
+    assert judged(told_later, requested=requested)["state"] == "mismatch"
+
+
+def test_b06_what_a_request_sent_includes_what_the_adapter_sets_itself():
+    """B06: seed and max_tokens come from the adapter, not the model table, yet a server may echo them."""
+    sent = {
+        "model": "test-model",
+        "seed": 7,
+        "max_tokens": 4096,
+        "temperature": 0.2,
+        "extra_body": {"top_k": 20, "chat_template_kwargs": {"enable_thinking": True}},
+    }
+    assert requested_from_sent(sent) == {
+        "seed": 7,
+        "max_tokens": 4096,
+        "temperature": 0.2,
+        "top_k": 20,
+        "enable_thinking": True,
+    }
+    served = served_after(reply(seed=7, max_tokens=4096, top_k=20), requested=requested_from_sent(sent))
+    assert judged(served, requested=requested_from_sent(sent))["state"] == "match"
+    assert requested_from_sent({}) == {}
 
 
 def test_b06_baseline_the_first_reply_sets_the_id_and_the_fingerprint_and_passes():

@@ -34,7 +34,7 @@ from expcore.config.models import ClientSettings, Limits, ModelSpec
 from expcore.errors import InfraError
 from expcore.models.retry import Retrier, RetryPolicy, SupportsUniform
 from expcore.models.route import public_url, sdk_version, settings_sent
-from expcore.models.served import Served
+from expcore.models.served import Served, requested_from_sent
 from expcore.models.usage import UsageTally, token_count
 
 PROBE_PROMPT = "ping"
@@ -168,6 +168,11 @@ class _SdkBackend:
         self.served = Served()
         self._sent: dict[str, Any] = {}  # the settings of the latest request, taken from the request itself
 
+    def _remember_sent(self, request: dict[str, Any]) -> None:
+        """Keep the settings of the request about to go out, and tell the served-model check which ones they are."""
+        self._sent = settings_sent(request)
+        self.served.expect(requested_from_sent(self._sent))
+
     @property
     def output_limit(self) -> int:
         """The max_tokens a request carries (B11)."""
@@ -283,7 +288,7 @@ class OpenAICompatAdapter(_SdkBackend):
         kw.update({k: v for k, v in self.spec.sampling.items() if k in ("temperature", "top_p")})
         if extra := self._extra_body():
             kw["extra_body"] = extra
-        self._sent = settings_sent(kw)
+        self._remember_sent(kw)
         return kw
 
     async def step(self) -> ModelTurn:
@@ -444,7 +449,7 @@ class AnthropicAdapter(_SdkBackend):
             kw["extra_body"] = dict(self.spec.extra_body)
         if cache:
             kw["cache_control"] = dict(cache)  # history is never touched: markers live only in the request
-        self._sent = settings_sent(kw)
+        self._remember_sent(kw)
         return kw
 
     async def step(self) -> ModelTurn:
