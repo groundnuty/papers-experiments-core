@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 NOW = 1_800_000_000.0  # the issuer's clock in tests
-TIME_CAP_S = 600.0  # a run's time cap in tests
+CEILING_S = 600.0  # a run's whole-time ceiling in tests
 ADMIN_ENV = "PLATFORM_TEST_ADMIN"
 SPACE_NAME = "study-a-data"
 SPACE_PREFIX = "study-a-"

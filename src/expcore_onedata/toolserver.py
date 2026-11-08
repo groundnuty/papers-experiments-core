@@ -83,14 +83,14 @@ def _server(config: PlatformConfig) -> ToolServer:
 
 
 def _prepare(
-    issuer: TokenIssuer, config: PlatformConfig, condition: Condition, token: MintedToken, time_cap_s: float
+    issuer: TokenIssuer, config: PlatformConfig, condition: Condition, token: MintedToken, ceiling_s: float
 ) -> None:
     """The checks before a spawn: the pinned checkout, and the token examined again against the condition's set."""
     if token.plane is not Plane.TOOL_SERVER:
         raise ValueError("the tool server takes the tool-server plane's token, not another plane's")
     verify_configured(_server(config))
     spec = tool_server_spec(config.space.id, condition)
-    issuer.examine(token.reveal(), spec, token.subject, token_window(time_cap_s, config.tokens))
+    issuer.examine(token.reveal(), spec, token.subject, token_window(ceiling_s, config.tokens))
 
 
 def _is_outage(error: Exception) -> bool:
@@ -112,13 +112,13 @@ class ToolServerLauncher:
         condition: str,
         token: MintedToken,
         *,
-        time_cap_s: float,
+        ceiling_s: float,
         extra_env: Mapping[str, str] | None = None,
     ) -> AsyncIterator[McpToolProvider]:
         """Start the server for a condition and yield its tool provider; stop it on leaving.
 
         The start and the stop are each inside `ctx.infrastructure_wait("toolserver_lifecycle")`. An outage of Onezone
-        while the token is examined is infrastructure of kind `knowledge`; a token it refuses is a `TokenRefused`. `time_cap_s` is the same value the token
+        while the token is examined is infrastructure of kind `knowledge`; a token it refuses is a `TokenRefused`. `ceiling_s` is the same value the token
         was minted for, so a token that cannot last the run is refused here.
         """
         server, chosen = _server(self._config), self._config.condition(condition)
@@ -133,7 +133,7 @@ class ToolServerLauncher:
         )
         async with ctx.infrastructure_wait(WAIT_KIND):
             try:
-                await asyncio.to_thread(_prepare, self._issuer, self._config, chosen, token, time_cap_s)
+                await asyncio.to_thread(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
             except ExaminationFailed as failed:
                 if _is_outage(failed.error):
                     raise InfraError(

@@ -23,7 +23,7 @@ from expcore_onedata.health import PlatformHealth  # noqa: E402
 from expcore_onedata.tokencheck import TokenRefused  # noqa: E402
 from expcore_onedata.tokens import TokenIssuer, data_path_spec, tool_server_spec  # noqa: E402
 
-TIME_CAP_S = 300.0
+CEILING_S = 300.0
 
 
 @pytest.fixture(scope="module")
@@ -55,7 +55,7 @@ def test_a_freshly_minted_data_path_token_examines_cleanly_and_is_revoked(config
     # covers: DELETE /users/{user}/tokens/temporary
     user = service_user(config)
     spec = data_path_spec(config.space.id)
-    token = issuer.mint(spec, user, time_cap_s=TIME_CAP_S)  # minted and examined inside mint
+    token = issuer.mint(spec, user, ceiling_s=CEILING_S)  # minted and examined inside mint
     try:
         assert token.subject == user  # the answer's subject names the user the token was minted for
         assert token.expires_at > time.time()
@@ -70,7 +70,7 @@ def test_a_freshly_minted_data_path_token_examines_cleanly_and_is_revoked(config
 def test_discovery_finds_the_space_and_the_declared_local_provider(config, issuer, client):
     # covers: POST /tokens/infer_access_token_scope
     user = service_user(config)
-    token = issuer.mint(data_path_spec(config.space.id), user, time_cap_s=TIME_CAP_S)
+    token = issuer.mint(data_path_spec(config.space.id), user, ceiling_s=CEILING_S)
     try:
         view = read_space(client, token.reveal(), config.space.id)
         pinned = pin_local_provider(view, config)
@@ -95,7 +95,7 @@ def test_each_condition_mints_and_examines_its_tool_server_token(config, issuer)
     for name in config.toolserver.conditions:
         spec = tool_server_spec(config.space.id, config.condition(name))
         try:
-            token = issuer.mint(spec, config.principals.toolserver, time_cap_s=TIME_CAP_S)
+            token = issuer.mint(spec, config.principals.toolserver, ceiling_s=CEILING_S)
         except TokenRefused as refused:
             pytest.skip(f"the tool-server user does not hold condition {name}'s rights: {refused}")
         issuer.revoke(token)

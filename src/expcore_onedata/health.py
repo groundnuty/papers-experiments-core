@@ -90,7 +90,7 @@ class PlatformHealth:
             token = self._token
             if token is None or self._clock() > token.expires_at - REFRESH_BEFORE_S:
                 spec = data_path_spec(self._config.space.id)
-                token = self._token = self._issuer.mint(spec, self._service, time_cap_s=TOKEN_CAP_S)
+                token = self._token = self._issuer.mint(spec, self._service, ceiling_s=TOKEN_CAP_S)
             return token
 
     def __call__(self) -> Health:

@@ -28,7 +28,7 @@ env = "VARIABLE_NAME"           #   the name of an environment variable, or
 file = "path"                   #   a file (relative to this one), never the value itself
 
 [tokens]                        # optional; the lifetime rule of tokens.py
-margin_s = 900                  # a token outlives the run's time cap by at least this
+margin_s = 900                  # a token outlives the run's whole-time ceiling by at least this
 max_excess_s = 600              # and by at most this much more
 mint_headroom_s = 300           # the lifetime asked for beyond the minimum, for the seconds before examination
 max_ttl_s = 86400               # optional: the longest lifetime the platform grants

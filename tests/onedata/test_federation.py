@@ -1,7 +1,7 @@
 """O03: discovery returns every provider of the space; the agent is pinned to its declared local provider or refused."""
 
 import pytest
-from platform_support import TIME_CAP_S
+from platform_support import CEILING_S
 
 from expcore_onedata.federation import (
     FederationUnreadable,
@@ -18,7 +18,7 @@ SPACE = "spmock0001"
 
 @pytest.fixture
 def token(issuer):
-    return issuer.mint(data_path_spec(SPACE), "u-svc", time_cap_s=TIME_CAP_S).reveal()
+    return issuer.mint(data_path_spec(SPACE), "u-svc", ceiling_s=CEILING_S).reveal()
 
 
 def two_providers(fake):

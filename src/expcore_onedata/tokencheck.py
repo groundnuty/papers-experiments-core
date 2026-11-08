@@ -146,7 +146,7 @@ def require_examined(
     """Examine a token and return what was established, or raise TokenRefused.
 
     `examine` asks Onezone (a test passes a fake). The token must be the principal's (`subject`), carry exactly the
-    spec's caveats, and expire no sooner than `min_ttl_s` (a run's time cap plus a margin, O06) and no later than
+    spec's caveats, and expire no sooner than `min_ttl_s` (a run's whole-time ceiling plus a margin, O06) and no later than
     `max_ttl_s` from `now`.
     """
     if not token:

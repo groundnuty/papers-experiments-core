@@ -9,7 +9,7 @@ import time
 
 import pytest
 from mcp import StdioServerParameters
-from platform_support import FAKE_TOOL_SERVER, MANAGE, NOW, TIME_CAP_S, write_platform
+from platform_support import CEILING_S, FAKE_TOOL_SERVER, MANAGE, NOW, write_platform
 from record_support import make_config
 
 from expcore.errors import InfraError
@@ -83,16 +83,16 @@ def world(tmp_path, fake, frozen_manifests):
 
 
 def read_token(issuer, config):
-    return issuer.mint(tool_server_spec(config.space.id, config.condition("read")), "u-tools", time_cap_s=TIME_CAP_S)
+    return issuer.mint(tool_server_spec(config.space.id, config.condition("read")), "u-tools", ceiling_s=CEILING_S)
 
 
-def start(launcher, ctx, condition, token, tmp_path, *, time_cap_s=TIME_CAP_S, record=True):
+def start(launcher, ctx, condition, token, tmp_path, *, ceiling_s=CEILING_S, record=True):
     """Launch, call echo once, leave; return the settings the server saw."""
     seen = tmp_path / "seen.json"
 
     async def go():
         env = {"FAKE_MCP_RECORD": str(seen)} if record else None
-        async with launcher.launch(ctx, condition, token, time_cap_s=time_cap_s, extra_env=env) as provider:
+        async with launcher.launch(ctx, condition, token, ceiling_s=ceiling_s, extra_env=env) as provider:
             tools = sorted(t.name for t in provider.tools())
             echoed = await provider.execute("echo", {"text": "hi"}, timeout_s=10, ctx=ctx)
         return tools, echoed
@@ -117,7 +117,7 @@ def test_each_condition_gets_its_own_allow_list_and_manifest(world, fake, tmp_pa
     """Two conditions differing in tool exposure and rights run from one configuration side by side."""
     config, issuer, launcher = world
     fake.grant("u-tools", MANAGE)
-    token = issuer.mint(tool_server_spec(config.space.id, config.condition("manage")), "u-tools", time_cap_s=TIME_CAP_S)
+    token = issuer.mint(tool_server_spec(config.space.id, config.condition("manage")), "u-tools", ceiling_s=CEILING_S)
     tools, _, seen = start(launcher, RecordingContext(), "manage", token, tmp_path)
     assert tools == ["add", "echo", "fail"]
     assert seen[ENV_TOOLS] == "echo,add,fail"
@@ -150,7 +150,7 @@ def test_the_wait_around_the_stop_is_entered_when_the_body_fails(world, tmp_path
     ctx = RecordingContext()
 
     async def go():
-        async with launcher.launch(ctx, "read", read_token(issuer, config), time_cap_s=TIME_CAP_S):
+        async with launcher.launch(ctx, "read", read_token(issuer, config), ceiling_s=CEILING_S):
             raise RuntimeError("the run failed")
 
     with pytest.raises(RuntimeError, match="the run failed"):
@@ -176,7 +176,7 @@ def test_l13_a_server_that_exposes_a_tool_outside_the_frozen_manifest_fails_the_
 def test_a_token_of_the_other_plane_does_not_start_the_server(world, fake, tmp_path):
     """The tool server takes the tool-server plane's token only; nothing is spawned for another."""
     config, issuer, launcher = world
-    data = issuer.mint(data_path_spec(config.space.id), "u-data", time_cap_s=TIME_CAP_S)
+    data = issuer.mint(data_path_spec(config.space.id), "u-data", ceiling_s=CEILING_S)
     assert data.plane is Plane.DATA_PATH
     with pytest.raises(ValueError, match="tool-server plane"):
         start(launcher, RecordingContext(), "read", data, tmp_path)
@@ -194,10 +194,10 @@ def test_a_token_that_no_longer_examines_cleanly_does_not_start_the_server(world
 
 
 def test_o06_a_token_that_cannot_last_the_run_does_not_start_the_server(world, tmp_path):
-    """O06: launching for a longer time cap than the token was minted for is refused before the spawn."""
+    """O06: launching for a longer ceiling than the token was minted for is refused before the spawn."""
     config, issuer, launcher = world
     with pytest.raises(TokenRefused, match="shorter"):
-        start(launcher, RecordingContext(), "read", read_token(issuer, config), tmp_path, time_cap_s=7200)
+        start(launcher, RecordingContext(), "read", read_token(issuer, config), tmp_path, ceiling_s=7200)
     assert not (tmp_path / "seen.json").exists()
 
 
@@ -235,7 +235,7 @@ def test_insecure_tls_is_a_setting_of_the_file(tmp_path, fake, frozen_manifests)
     config = load_platform(write_platform(tmp_path, lambda d: d["toolserver"].update(insecure_tls=True)))
     client = OnezoneClient(config, http=fake.client_http())
     token = TokenIssuer(client, config, clock=lambda: NOW).mint(
-        tool_server_spec(config.space.id, config.condition("read")), "u-tools", time_cap_s=TIME_CAP_S
+        tool_server_spec(config.space.id, config.condition("read")), "u-tools", ceiling_s=CEILING_S
     )
     assert server_environment(config, config.condition("read"), token)["ONEDATA_ALLOW_INSECURE_TLS"] == "true"
 

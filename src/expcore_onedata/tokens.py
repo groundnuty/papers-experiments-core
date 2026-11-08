@@ -12,7 +12,7 @@ exactly view and read. The tool server's token and user match the condition's de
 its token is read-only only when the condition declares no write right.
 
 What `TokenIssuer.mint` does, in this order, and refuses at the first failure:
-1. derives the lifetime from the run's time cap and checks it against the platform's limit, before anything is minted
+1. derives the lifetime from the run's whole-time ceiling and checks it against the platform's limit, before anything is minted
    (O06: `token_window`);
 2. reads the principal's privileges back, direct and effective, and requires exactly the plane's set (O05);
 3. mints with the plane's exact caveats (`CaveatSpec`, shared with the examination);
@@ -22,8 +22,9 @@ The minted value is registered with `expcore.records.redact.register_secret` ins
 here (R12), and it is wrapped in a `Secret` whose repr and str never show it. A caller reads it with `.reveal()` at the
 one place it is needed, such as the environment of a child process.
 
-`time_cap_s` is the longest the attempt can last. The agent's clock stops during waits on infrastructure, so a caller
-that has a whole-time ceiling (`AgentConfig.ceiling_s`) passes that.
+`ceiling_s` is the whole-time ceiling of the attempt (`AgentConfig.ceiling_s`), not the agent's time cap: the agent's
+clock stops during declared waits on infrastructure, so an attempt can last longer than its cap by the length of those
+waits, and a token that expired at the cap plus a margin could end during one.
 """
 
 import math
@@ -125,17 +126,17 @@ def tool_server_spec(space_id: str, condition: Condition) -> PlaneSpec:
     )
 
 
-def token_window(time_cap_s: float, settings: TokenSettings) -> TokenWindow:
-    """Derive a token's lifetimes from the run's time cap, and refuse what the platform cannot grant (O06).
+def token_window(ceiling_s: float, settings: TokenSettings) -> TokenWindow:
+    """Derive a token's lifetimes from the run's whole-time ceiling, and refuse what the platform cannot grant (O06).
 
     The least is the cap plus the margin; the most adds the allowed excess; the lifetime asked for adds the headroom
     that covers the seconds between minting and examination.
     """
-    if isinstance(time_cap_s, bool) or not isinstance(time_cap_s, int | float) or not math.isfinite(time_cap_s):
-        raise TokenRefused("the run's time cap is not a finite number")
-    if time_cap_s <= 0:
-        raise TokenRefused("the run's time cap must be positive")
-    least = math.ceil(time_cap_s + settings.margin_s)
+    if isinstance(ceiling_s, bool) or not isinstance(ceiling_s, int | float) or not math.isfinite(ceiling_s):
+        raise TokenRefused("the run's ceiling is not a finite number")
+    if ceiling_s <= 0:
+        raise TokenRefused("the run's ceiling must be positive")
+    least = math.ceil(ceiling_s + settings.margin_s)
     window = TokenWindow(least, least + settings.max_excess_s, least + settings.mint_headroom_s)
     if settings.max_ttl_s is not None and window.mint_ttl_s > settings.max_ttl_s:
         raise TokenRefused("the platform does not grant a token as long as this run needs")
@@ -186,9 +187,9 @@ class TokenIssuer:
             now=self._clock(),
         )
 
-    def mint(self, spec: PlaneSpec, subject: str, *, time_cap_s: float) -> MintedToken:
+    def mint(self, spec: PlaneSpec, subject: str, *, ceiling_s: float) -> MintedToken:
         """Mint a plane's token for a principal and return it only if it passes examination."""
-        window = token_window(time_cap_s, self._config.tokens)
+        window = token_window(ceiling_s, self._config.tokens)
         self.check_principal(spec, subject)
         valid_until = int(self._clock()) + window.mint_ttl_s
         value = self._client.mint_temporary_token(subject, spec.caveats.caveats(valid_until))
@@ -216,7 +217,7 @@ class TokenIssuer:
         self,
         *,
         data_user: str,
-        time_cap_s: float,
+        ceiling_s: float,
         interface: str = "rest",
         tool_server: tuple[str, str] | None = None,
     ) -> RunTokens:
@@ -228,12 +229,12 @@ class TokenIssuer:
         space = self._config.space.id
         if tool_server is not None and tool_server[0] == data_user:
             raise TokenRefused("the two planes share a principal")
-        data = self.mint(data_path_spec(space, interface), data_user, time_cap_s=time_cap_s)
+        data = self.mint(data_path_spec(space, interface), data_user, ceiling_s=ceiling_s)
         if tool_server is None:
             return RunTokens(data, None)
         user, condition = tool_server
         try:
-            tool = self.mint(tool_server_spec(space, self._config.condition(condition)), user, time_cap_s=time_cap_s)
+            tool = self.mint(tool_server_spec(space, self._config.condition(condition)), user, ceiling_s=ceiling_s)
             require_distinct(
                 Examined(data.token_id, data.subject, data.expires_at, ()),
                 Examined(tool.token_id, tool.subject, tool.expires_at, ()),
