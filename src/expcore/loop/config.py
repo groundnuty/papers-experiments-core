@@ -39,7 +39,7 @@ class AgentConfig:
       under its own cap, ends the attempt as infrastructure of `ceiling_kind` (the core's `ceiling` by default);
       the agent's own cap decides first (L04). Both fields are filled in on construction, so the record holds the
       ceiling that was in force.
-    - `min_call_s`: no tool call starts with less agent time than this left (L05).
+    - `min_call_s`: no tool call starts with less agent time than this left; never below one second (L05).
     """
 
     limits: Limits
@@ -60,8 +60,10 @@ class AgentConfig:
         if self.malformed_policy not in MALFORMED_POLICIES:
             problems.append(f"malformed_policy must be one of {', '.join(MALFORMED_POLICIES)}")
         problems.extend(self._settle_ceiling())
-        if self.min_call_s < 0:
-            problems.append("min_call_s must not be negative")
+        if not (math.isfinite(self.min_call_s) and self.min_call_s >= MIN_CALL_S):
+            problems.append(
+                f"min_call_s must be a finite number of at least {MIN_CALL_S:g} s: no call starts with less (L05)"
+            )
         if problems:
             raise ValueError("agent configuration: " + "; ".join(problems))
 

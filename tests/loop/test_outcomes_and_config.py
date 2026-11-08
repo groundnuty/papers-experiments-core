@@ -107,12 +107,23 @@ def test_the_configuration_as_the_record_keeps_it_holds_the_values_not_only_a_ha
         ({"ceiling_factor": 0.5}, "ceiling_factor"),
         ({"ceiling_factor": float("inf")}, "ceiling_factor"),
         ({"ceiling_s": 400.0, "ceiling_factor": 2.0}, "disagree"),
-        ({"min_call_s": -1.0}, "must not be negative"),
     ],
 )
 def test_a_configuration_that_cannot_work_is_refused(kwargs, message):
     with pytest.raises(ValueError, match=message):
         AgentConfig(LIMITS, **kwargs)
+
+
+@pytest.mark.parametrize("seconds", [-1.0, 0.0, 0.5, 0.999, float("nan"), float("inf")])
+def test_l05_a_minimum_call_time_under_a_second_is_refused_at_construction(seconds):
+    """L05: no tool call starts with less than a second left, so a configuration cannot ask for less."""
+    with pytest.raises(ValueError, match="min_call_s"):
+        AgentConfig(LIMITS, min_call_s=seconds)
+
+
+@pytest.mark.parametrize("seconds", [1.0, 2.5, 30.0])
+def test_l05_a_minimum_call_time_of_a_second_or_more_is_accepted(seconds):
+    assert AgentConfig(LIMITS, min_call_s=seconds).min_call_s == seconds
 
 
 def test_l04_a_configuration_has_a_ceiling_of_three_times_the_time_cap_unless_it_says_otherwise():
