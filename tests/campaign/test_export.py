@@ -428,10 +428,15 @@ def test_c09_two_writers_of_one_destination_always_leave_a_complete_export_for_a
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
 
 
-def test_the_export_file_has_the_mode_a_plain_file_would_have(tmp_path):
+@pytest.mark.parametrize("umask", [0o000, 0o022, 0o077])
+def test_c09_the_export_file_is_owner_only_whatever_the_umask(tmp_path, umask):
+    """C09: adds that an export, which can carry study data, is written 0600 and no umask widens it."""
     store, _, _ = planned_store(tmp_path)
     target = tmp_path / "export.json"
-    write_export(store, target)
-    mask = os.umask(0)
-    os.umask(mask)
-    assert stat.S_IMODE(target.stat().st_mode) == 0o666 & ~mask
+    previous = os.umask(umask)
+    try:
+        write_export(store, target)
+        write_export(store, target)  # and a rewrite over an existing file keeps the mode
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
