@@ -339,37 +339,47 @@ def test_R12_a_key_that_names_a_secret_is_applied_inside_a_string_that_holds_a_j
 SECRET_FOR_CUTS = "zqx7-live-key-4455667788"
 
 
-def test_R12_a_fragment_of_a_secret_left_at_the_end_by_a_cut_is_redacted():
-    """R12: four or more characters of a secret at the end of the text, where a cap or a slice cut it, are replaced."""
+NOTICE = "\n[output truncated: 312 of 600 characters dropped by the harness cap]"
+
+
+def test_R12_the_fragment_a_cap_left_at_its_cut_point_is_replaced_by_one_marker_and_the_notice_stays():
+    """R12: four or more characters that begin a secret, just before the cap's notice, are the cut secret."""
     env = {"A_API_KEY": SECRET_FOR_CUTS}
-    cut = f"result: {SECRET_FOR_CUTS[:6]}"
-    assert redact_text(cut, env)[0] == f"result: {REDACTED}"
-    assert redact_text(f"result: {SECRET_FOR_CUTS[:4]}", env)[0] == f"result: {REDACTED}"
-    assert redact_text(f"result: {SECRET_FOR_CUTS[:3]}", env)[0] == f"result: {SECRET_FOR_CUTS[:3]}"
-    assert redact_text(f"{SECRET_FOR_CUTS[:6]} and more", env)[0] == f"{SECRET_FOR_CUTS[:6]} and more"
-
-
-def test_R12_a_fragment_before_the_caps_notice_is_redacted_and_the_notice_stays():
-    """R12: the cap writes its notice after what it kept, so the cut secret is the end of the text before the notice."""
-    env = {"A_API_KEY": SECRET_FOR_CUTS}
-    notice = "\n[output truncated: 312 of 600 characters dropped by the harness cap]"
-    out = redact_text(f"head {SECRET_FOR_CUTS[:7]}{notice}", env)[0]
-    assert out == f"head {REDACTED}{notice}"
-    assert redact_text(out, env)[0] == out
-
-
-def test_R12_a_fragment_of_a_secret_left_at_the_start_by_a_slice_is_redacted():
-    """R12: four or more characters that end a secret, at the start of the text, are replaced."""
-    env = {"A_API_KEY": SECRET_FOR_CUTS}
-    assert redact_text(f"{SECRET_FOR_CUTS[-6:]} rest", env)[0] == f"{REDACTED} rest"
-    assert redact_text(f"{SECRET_FOR_CUTS[-3:]} rest", env)[0] == f"{SECRET_FOR_CUTS[-3:]} rest"
-
-
-def test_R12_the_fragment_rule_is_a_fixed_point_and_leaves_texts_that_end_in_the_marker_alone():
-    env = {"A_API_KEY": SECRET_FOR_CUTS}
-    once = redact_text(f"x {SECRET_FOR_CUTS[:9]}", env)[0]
+    for length in (4, 7, len(SECRET_FOR_CUTS) - 1):
+        out = redact_text(f"head {SECRET_FOR_CUTS[:length]}{NOTICE}", env)[0]
+        assert out == f"head {REDACTED}{NOTICE}"
+    assert redact_text(f"head {SECRET_FOR_CUTS[:3]}{NOTICE}", env)[0] == f"head {SECRET_FOR_CUTS[:3]}{NOTICE}"
+    once = redact_text(f"head {SECRET_FOR_CUTS[:9]}{NOTICE}", env)[0]
     assert redact_text(once, env)[0] == once
-    assert redact_text(f"x {REDACTED}", env)[0] == f"x {REDACTED}"
+
+
+def test_R12_a_fragment_anywhere_but_the_cut_point_is_ordinary_text_and_is_left_alone():
+    """R12: the end of a text with no notice, the start of a text, and the middle of one are not cut points."""
+    env = {"A_API_KEY": SECRET_FOR_CUTS}
+    start, mid = SECRET_FOR_CUTS[:6], SECRET_FOR_CUTS[:5]
+    for text in (
+        f"result: {start}",  # ends with it, but nothing was cut
+        f"{start} and more",
+        f"{SECRET_FOR_CUTS[-6:]} rest",  # begins with the end of the secret
+        f"a {mid} in the middle",
+        f"x {mid} y{NOTICE}",  # a notice, but the fragment is not at the cut
+    ):
+        assert redact_text(text, env)[0] == text
+
+
+def test_R12_ordinary_text_that_looks_like_the_start_of_a_secret_is_untouched_except_at_a_cut():
+    """R12: Codex's case; abcd begins a secret, and is a word elsewhere."""
+    env = {"A_API_KEY": "abcd-secret-value-0001"}
+    ordinary = "abcd is just a word; abcd again"
+    assert redact_text(ordinary, env)[0] == ordinary
+    assert redact_text("x" * 127 + "abcd" + "Y" * 400, env)[0] == "x" * 127 + "abcd" + "Y" * 400
+    assert redact_text("x" * 127 + "abcd" + NOTICE, env)[0] == "x" * 127 + REDACTED + NOTICE
+
+
+def test_R12_a_marker_already_at_the_cut_point_is_not_marked_twice():
+    env = {"A_API_KEY": SECRET_FOR_CUTS}
+    text = f"head {REDACTED}{NOTICE}"
+    assert redact_text(text, env)[0] == text
 
 
 def test_R12_only_the_value_of_a_secret_named_key_changes_inside_json_text_every_other_character_stays():

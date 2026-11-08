@@ -9,7 +9,9 @@ that opens it, `rendering_verified: false`, is checked before the run:
   is a divergence that names the call;
 - and what can still be checked is: a call that was not truncated shows exactly its raw text; a truncated call shows a
   cut of its raw text followed by the cap's notice, so what precedes the notice must be a prefix of the raw text. A cut
-  that fell inside a secret leaves fewer than four characters of it, or a marker, where the raw text has a marker.
+  that fell inside a secret leaves a marker where redaction marked the fragment (one trailing marker is set aside
+  before comparing, whatever the raw text has there) or fewer than four characters of it where the raw text has its
+  marker. Replay never sees a secret, so none of this depends on one.
 """
 
 import re
@@ -35,6 +37,9 @@ def shown_follows_raw(text: str, raw: str, truncated: bool) -> bool:
     head = text[: notice.start()] if notice else text  # a cap smaller than its notice is a plain cut
     if raw.startswith(head):
         return True
+    if head.endswith(REDACTED) and raw.startswith(head[: -len(REDACTED)]):
+        return True  # redaction marked the fragment the cut left, and the redacted raw text has the whole of it or none
+    # a cut that fell inside a secret and left fewer than four characters of it, where the raw text has its marker
     return any(raw.startswith(head[: len(head) - j] + REDACTED) for j in range(1, min(MIN_SECRET_LEN, len(head) + 1)))
 
 

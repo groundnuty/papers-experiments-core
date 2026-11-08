@@ -23,8 +23,9 @@ A secret comes from three places, and redaction works on parsed values, so its o
    redacted by value only.
 
 Every secret value of 4 or more characters is replaced wherever it occurs inside a string, in values and in keys,
-and so is a fragment of 4 or more characters of one at the start or the end of a string, where the output cap or a
-slice cut it (a cap that cuts a secret after six characters leaves six characters of it).
+and so is the fragment of one that the output cap leaves where it cut a result: 4 or more characters just before the
+cap's notice that begin a secret (a cap that cuts a secret after six characters leaves six characters of it). That is
+the only place a fragment is looked for, and it becomes one marker.
 A value under 4 characters would match ordinary text, so it is refused instead, with a `ConfigError` that names the
 variable and never shows the value. A number whose string form is a secret is replaced too.
 
@@ -173,24 +174,28 @@ class Redactor:
         return self._fragments(value) if self._inside else value
 
     def _fragments(self, value: str) -> str:
-        """Replace a fragment of 4 or more characters of a secret that a cut left at the end of the text (before the
-        cap's notice, if the text ends with one) or at its start. A text that ends or starts with the marker is done."""
+        """Replace, with one marker, the characters just before the cap's notice that begin a secret: the cut point.
+
+        The output cap keeps the start of a result and writes its notice after it, so a secret the limit fell inside is
+        cut, and what is left of it ends the kept text. That is the only place a fragment is looked for: four or more
+        characters there that start a secret in any of its forms. A text with no notice is not a cut text, and ordinary
+        text that happens to begin like a secret, anywhere else, is left alone.
+        """
         notice = _CAP_NOTICE.search(value)
-        head, tail = (value[: notice.start()], value[notice.start() :]) if notice else (value, "")
-        if not head.endswith(REDACTED):
-            cut = max((self._overlap(head, form, end=True) for form in self._inside), default=0)
-            head = head[:-cut] + REDACTED if cut else head
-        if not head.startswith(REDACTED):
-            cut = max((self._overlap(head, form, end=False) for form in self._inside), default=0)
-            head = REDACTED + head[cut:] if cut else head
-        return head + tail
+        if notice is None:
+            return value
+        head, tail = value[: notice.start()], value[notice.start() :]
+        if head.endswith(REDACTED):
+            return value
+        cut = max((self._overlap(head, form) for form in self._inside), default=0)
+        return head[:-cut] + REDACTED + tail if cut else value
 
     @staticmethod
-    def _overlap(head: str, form: str, *, end: bool) -> int:
-        """The length of the longest fragment, at least 4 characters and shorter than the form, that the end of `head`
-        shares with the start of the form (`end`), or the start of `head` with the end of the form."""
+    def _overlap(head: str, form: str) -> int:
+        """The length of the longest fragment, at least 4 characters and shorter than the form, with which `head` ends
+        and the form begins."""
         for k in range(min(len(head), len(form) - 1), MIN_SECRET_LEN - 1, -1):
-            if head.endswith(form[:k]) if end else head.startswith(form[-k:]):
+            if head.endswith(form[:k]):
                 return k
         return 0
 

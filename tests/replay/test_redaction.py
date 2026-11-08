@@ -406,9 +406,42 @@ def test_R03_a_truncated_flagged_call_must_show_a_cut_of_its_raw_text(key_in_env
             False,
         ),
         ("plain cut with no notice", "plain cut with no notice and more", True, True),
+        (
+            "ab[redacted]\n[output truncated: 5 of 9 characters dropped by the harness cap]",
+            "abXYZ and more",
+            True,
+            True,
+        ),
+        ("ab[redacted]\n[output truncated: 5 of 9 characters dropped by the harness cap]", "zzzzzz", True, False),
+        ("[redacted]\n[output truncated: 5 of 9 characters dropped by the harness cap]", "anything", True, True),
         ("longer than its raw text", "longer", True, False),
     ],
 )
 def test_R03_what_can_be_checked_about_a_shown_text(text, raw, truncated, follows):
     """R03: equal when not truncated; a cut of the raw text when truncated, a cut inside a secret or marker allowed."""
     assert shown_follows_raw(text, raw, truncated) is follows
+
+
+def test_R03_a_cut_that_ends_on_ordinary_text_beginning_a_secret_is_marked_and_replays_faithfully():
+    """R03: Codex's case; x repeated, then abcd, then Y repeated, with a secret that begins abcd registered."""
+    register_secret("abcd-secret-value-0001")
+    n = next(
+        n
+        for n in range(60, 160)
+        if cap_text("x" * n + "abcd" + "Y" * 400, 200)[0].split("\n[output truncated")[0] == "x" * n + "abcd"
+    )
+    result = "x" * n + "abcd" + "Y" * 400
+    with pytest.warns(RuntimeWarning):
+        record = record_run(
+            [[("echo", {"x": "1"})], "done"], {"echo": lambda args: result}, user="say abcd now, abcd again"
+        )
+    call = record.tool_calls[0]
+    assert call["text"].split("\n[output truncated")[0] == "x" * n + REDACTED  # one marker at the cut
+    assert call["text"].count(REDACTED) == 1
+    assert call["raw_text"] == result  # the raw result held no secret: it is as it was
+    assert record.prompt["user"]["text"] == "say abcd now, abcd again"  # ordinary abcd elsewhere is untouched
+    assert "tool_calls[0].text" in record.redacted_paths
+    assert call["rendering_verified"] is False
+    replayed = replay_record(record)
+    assert replayed.tool_calls == record.tool_calls
+    assert replayed.outcome["name"] == "finished"
