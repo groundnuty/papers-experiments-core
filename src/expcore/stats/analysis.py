@@ -39,8 +39,14 @@ class ContrastResult:
     n_pairs: int
     n_pairs_missing: int
     n_unpaired: int
+    tasks_dropped: tuple[str, ...]  # tasks one of the two arms did not run, left out of this contrast only
     counts: Mapping[str, int]
     per_model: tuple[ModelEstimate, ...]
+
+    @property
+    def n_tasks_dropped(self) -> int:
+        """How many tasks were left out of this contrast because one of its arms did not run them."""
+        return len(self.tasks_dropped)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +97,7 @@ def run_contrast(rows: Iterable[Row], spec: ContrastSpec, prereg: Preregistratio
         n_pairs=pairing.n_pairs,
         n_pairs_missing=pairing.n_pairs_missing,
         n_unpaired=pairing.n_unpaired,
+        tasks_dropped=pairing.tasks_dropped,
         counts=dict(estimate.counts),
         per_model=estimate.per_model,
     )

@@ -196,3 +196,49 @@ def test_a_spec_has_exactly_one_form_with_two_different_arms():
         ContrastSpec("x", "score", "est", "group", conditions=("a", "a"))
     with pytest.raises(ValueError, match="two different names"):
         ContrastSpec("x", "score", "est", "group", factor="gate", levels=("open", "open"))
+
+
+def test_a_task_one_arm_did_not_run_is_dropped_named_and_counted_and_its_runs_are_unpaired():
+    """A condition that runs on some tasks only: the tasks missing in either arm leave the contrast, by name."""
+    rows = [
+        *both_arms("task-a", "model-a", 1, 0.9, 0.5, cluster="grp-a"),
+        make_row("task-b", "model-a", 1, 0.8, condition="cond-a", cluster="grp-a"),  # task-b has no B run
+        make_row("task-b", "model-a", 2, 0.8, condition="cond-a", cluster="grp-a"),
+        make_row("task-c", "model-a", 1, 0.2, condition="cond-b", cluster="grp-b"),  # task-c has no A run
+        *both_arms("task-d", "model-a", 1, 0.7, 0.4, cluster="grp-b"),
+    ]
+    pairing = pair_rows(rows, named())
+    assert pairing.tasks_dropped == ("task-b", "task-c")
+    assert pairing.n_tasks_dropped == 2
+    assert pairing.n_unpaired == 3  # the three runs on the dropped tasks
+    assert pairing.differences.matrix == pytest.approx(np.array([[0.4], [0.3]]))  # only task-a and task-d count
+
+
+def test_a_cluster_whose_tasks_are_all_dropped_is_dropped_with_them():
+    """The clusters of the dropped tasks are counted as dropped when nothing else keeps them."""
+    rows = [
+        *both_arms("task-a", "model-a", 1, 0.9, 0.5, cluster="grp-a"),
+        make_row("task-b", "model-a", 1, 0.8, condition="cond-a", cluster="grp-b"),
+        make_row("task-c", "model-a", 1, 0.8, condition="cond-a", cluster="grp-b"),
+    ]
+    pairing = pair_rows(rows, named())
+    assert pairing.differences.clusters == ("grp-a",)
+    assert pairing.n_clusters_dropped == 1
+    assert pairing.tasks_dropped == ("task-b", "task-c")
+
+
+def test_no_task_is_dropped_when_both_arms_run_the_same_ones_even_with_runs_missing():
+    """A run missing on a task both arms ran is an unpaired run, not a dropped task."""
+    rows = [*both_arms("task-a", "model-a", 1, 0.9, 0.5), make_row("task-a", "model-a", 2, 0.4, condition="cond-a")]
+    pairing = pair_rows(rows, named())
+    assert (pairing.tasks_dropped, pairing.n_unpaired) == ((), 1)
+
+
+def test_a_factor_contrast_drops_tasks_the_same_way():
+    """The count is by arm, whichever way the arms are named."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.8, gate="open"),
+        make_row("task-a", "model-a", 1, 0.5, gate="shut"),
+        make_row("task-b", "model-a", 1, 0.8, gate="open"),
+    ]
+    assert pair_rows(rows, by_factor()).tasks_dropped == ("task-b",)

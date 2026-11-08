@@ -8,6 +8,10 @@ factors are those of the campaign's factor schema, which the preregistration is 
 rows carry them as the campaign export writes them. Pairs are aggregated in plain-mean stages: pairs to
 (task, model), tasks to (cluster, model). A pair with a missing outcome (None or NaN) on either side is excluded
 and counted, never read as 0 (R10, S05); a cluster left without any pair is dropped and counted (S03).
+
+A condition may run on only some of the tasks (a chain design lists the tasks of an arm). A task that has no run in
+one of the contrast's two arms is dropped from that contrast, named and counted in its pairing; it takes no part in
+any other contrast, and the runs of the other conditions are not looked at.
 """
 
 from __future__ import annotations
@@ -63,6 +67,12 @@ class Pairing:
     n_pairs_missing: int  # pairs excluded because an outcome is missing on either side
     n_unpaired: int  # run keys present in one arm only
     n_clusters_dropped: int  # clusters seen in either arm that were left without a pair
+    tasks_dropped: tuple[str, ...] = ()  # tasks with runs in one arm only, sorted
+
+    @property
+    def n_tasks_dropped(self) -> int:
+        """How many tasks the contrast dropped because one of its arms has no run on them."""
+        return len(self.tasks_dropped)
 
 
 def _arm(row: Row, spec: ContrastSpec) -> int | None:
@@ -131,6 +141,7 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec) -> Pairing:
             )
         arms[arm][key] = row
     first, second = arms
+    tasks_dropped = tuple(sorted({r.task for r in first.values()} ^ {r.task for r in second.values()}))
     cells: dict[tuple[str, str, str], list[float]] = {}  # (cluster, model, task) -> pair differences
     used = missing = 0
     for key in sorted(first.keys() & second.keys()):
@@ -155,4 +166,5 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec) -> Pairing:
         n_pairs_missing=missing,
         n_unpaired=len(first.keys() ^ second.keys()),
         n_clusters_dropped=len(seen) - len(clusters),
+        tasks_dropped=tasks_dropped,
     )

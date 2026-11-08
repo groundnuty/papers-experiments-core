@@ -14,6 +14,7 @@ from expcore.stats.analysis import analyse, pilot_power, power_study, run_contra
 from expcore.stats.estimators import EstimatorResult
 from expcore.stats.pairing import ContrastSpec
 from expcore.stats.prereg import parse
+from expcore.stats.rows import Row
 from expcore.stats.sim import OutcomeSpec, SimSpec, simulate
 
 TEXT = """\
@@ -260,3 +261,113 @@ def test_the_power_study_runs_on_the_preregistered_settings_and_the_family_size(
     assert power_study(changed).manifest == manifest("a" * 64 + "+override")
     with pytest.raises(ValueError, match=r"inline: has no \[power\] section"):
         power_study(prereg.with_override(power=None))
+
+
+# --- a chain design: the third condition runs on some of the tasks only ---------------------------------------------
+
+CHAIN_TASKS = ["task-a", "task-b", "task-c", "task-d", "task-e", "task-f"]
+CHAIN_CLUSTERS = dict(zip(CHAIN_TASKS, ["grp-a", "grp-a", "grp-b", "grp-b", "grp-c", "grp-c"], strict=True))
+CHAIN = FactorSchema(
+    {"stage": ["one", "two", "three"]},
+    ["task", "stage", "model", "seed"],
+    {"chain-one": {"stage": "one"}, "chain-two": {"stage": "two"}, "chain-three": {"stage": "three"}},
+    tasks={"chain-three": ["task-a", "task-b", "task-c", "task-d"]},
+)
+CHAIN_TEXT = """\
+alpha = 0.05
+holm_family = ["one-vs-two", "two-vs-three"]
+
+[bootstrap]
+replicates = 200
+seed = 5
+
+[contrasts.one-vs-two]
+conditions = ["chain-one", "chain-two"]
+outcome = "score"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+
+[contrasts.two-vs-three]
+conditions = ["chain-two", "chain-three"]
+outcome = "score"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+
+[contrasts.one-vs-three]
+conditions = ["chain-one", "chain-three"]
+outcome = "score"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+"""
+
+
+def chain_score(stage, index, model):
+    """The score of a run: a base per task, a step per stage that differs by task, and a shift per model."""
+    base = 0.2 + 0.01 * index + (0.05 if model == "model-b" else 0.0)
+    return base + {"one": 0.0, "two": 0.1 + 0.005 * index, "three": 0.15 + 0.01 * index}[stage]
+
+
+def chain_rows(schema=CHAIN, stages=("one", "two", "three")):
+    """Rows for the planned runs of the chain schema, as the export and the scorers would give them."""
+    rows = []
+    for key in schema.expand(CHAIN_TASKS, ["model-a", "model-b"], [1, 2]):
+        factors = key.factors
+        if factors["stage"] not in stages:
+            continue
+        index = CHAIN_TASKS.index(factors["task"])
+        score = chain_score(factors["stage"], index, factors["model"])
+        rows.append(
+            Row(
+                key.text,
+                schema.condition_of(key),
+                factors,
+                {"score": score},
+                {"group": CHAIN_CLUSTERS[factors["task"]]},
+            )
+        )
+    return rows
+
+
+@pytest.fixture
+def chain():
+    """The chain preregistration, checked against the chain schema."""
+    return parse(tomllib.loads(CHAIN_TEXT), "inline", "d" * 64, CHAIN)
+
+
+def test_a_condition_on_some_tasks_drops_the_others_from_its_contrasts_and_counts_them(chain):
+    """Reviewer request: tasks missing in either arm leave that contrast, and the output says which and how many."""
+    result = analyse(chain_rows(), chain)
+    two_vs_three = result.contrast("two-vs-three")
+    assert two_vs_three.tasks_dropped == ("task-e", "task-f")
+    assert two_vs_three.n_tasks_dropped == 2
+    assert two_vs_three.n_unpaired == 2 * 2 * 2  # two tasks, two models, two seeds
+    assert (two_vs_three.n_clusters, two_vs_three.n_clusters_dropped) == (2, 1)  # grp-c had only the dropped tasks
+    one_vs_three = result.contrast("one-vs-three")
+    assert one_vs_three.tasks_dropped == ("task-e", "task-f")
+
+
+def test_the_estimate_of_a_contrast_with_dropped_tasks_is_taken_over_the_tasks_both_arms_ran(chain):
+    """Hand-computed: stage two against three on tasks a to d, per cluster the mean over its two tasks."""
+    result = analyse(chain_rows(), chain).contrast("two-vs-three")
+    step = [(0.15 + 0.01 * i) - (0.1 + 0.005 * i) for i in range(4)]  # three minus two, so the contrast is negated
+    expected = -((step[0] + step[1]) / 2 + (step[2] + step[3]) / 2) / 2
+    assert result.estimate == pytest.approx(expected)
+
+
+def test_other_contrasts_are_unaffected_by_a_condition_that_runs_on_some_tasks_only(chain):
+    """The all-task contrast gives exactly the result it gives when the third condition does not exist."""
+    with_chain = analyse(chain_rows(), chain)
+    without = parse(tomllib.loads(CHAIN_TEXT), "inline", "d" * 64, CHAIN).with_override(
+        contrasts={"one-vs-two": chain.contrasts["one-vs-two"]}, holm_family=("one-vs-two",)
+    )
+    alone = analyse(chain_rows(stages=("one", "two")), without)
+    assert with_chain.contrast("one-vs-two") == alone.contrast("one-vs-two")
+    assert with_chain.contrast("one-vs-two").tasks_dropped == ()
+    assert with_chain.contrast("one-vs-two").n_clusters == 3
+
+
+def test_the_family_keeps_every_contrast_when_one_of_them_drops_tasks(chain):
+    """Holm runs over the declared family whatever each contrast dropped; the dropped tasks do not shrink m."""
+    result = analyse(chain_rows(), chain)
+    assert [d.name for d in result.holm] == ["one-vs-two", "two-vs-three"]
+    assert sorted(d.level for d in result.holm) == pytest.approx([0.05 / 2, 0.05])
