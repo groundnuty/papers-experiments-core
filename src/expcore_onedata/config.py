@@ -25,12 +25,12 @@ local = "<name>"                # the agent's own provider; the agent is pinned 
 
 [credentials.admin]             # the admin access token that examines tokens and reads privileges: exactly one of
 env = "VARIABLE_NAME"           #   the name of an environment variable, or
-file = "path"                   #   a file (relative to this one), never the value itself
+file = "path"                   #   a file (relative to this one), never the value itself; mode 0600, owned by you
 
 [credentials.users]             # each platform user's own password, from which that user mints its own tokens
 directory_env = "VARIABLE_NAME" # the name of an environment variable that holds the directory of the files, or
 directory = "path"              #   the directory (relative to this file); exactly one of the two
-pattern = "{user}.pass"         # optional: the file of a user, one {user}, mode 0600; never the password itself
+pattern = "{user}.pass"         # optional: the file of a user, one {user}, mode 0600, owned by you; never the password
 
 [tokens]                        # optional; the lifetime rule of tokens.py
 margin_s = 900                  # a token outlives the run's whole-time ceiling by at least this

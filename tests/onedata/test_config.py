@@ -42,6 +42,7 @@ def test_o12_the_credential_is_a_source_not_a_value(tmp_path, monkeypatch):
 def test_o12_a_credential_file_is_read_relative_to_the_configuration(tmp_path):
     """O12: a file source is resolved next to platform.toml and its contents are never kept in the configuration."""
     (tmp_path / "admin.secret").write_text(f"{SENTINEL}\n", encoding="utf-8")
+    (tmp_path / "admin.secret").chmod(0o600)
     config = load(tmp_path, lambda d: d["credentials"].update(admin={"file": "admin.secret"}))
     assert config.admin.kind == "file"
     assert SENTINEL not in repr(config)
@@ -51,8 +52,9 @@ def test_o12_a_credential_file_is_read_relative_to_the_configuration(tmp_path):
 def test_o12_a_missing_credential_fails_at_load_naming_the_source_only(tmp_path, monkeypatch):
     """O12: a variable that is not set fails at load, not at the first request, and the message names the variable."""
     monkeypatch.delenv(ADMIN_ENV, raising=False)
-    with pytest.raises(ConfigError, match=ADMIN_ENV):
+    with pytest.raises(ConfigError, match=r"credentials\.admin.*environment variable.*not set") as caught:
         load(tmp_path)
+    assert ADMIN_ENV not in str(caught.value)
     assert load(tmp_path, require_secrets=False).admin.ref == ADMIN_ENV
 
 
@@ -166,7 +168,7 @@ def test_o12_a_credential_file_that_others_can_read_is_refused_at_load(tmp_path,
     monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
     write_platform(tmp_path)
     (tmp_path / "credentials" / "login-data.pass").chmod(0o644)
-    with pytest.raises(ConfigError, match="readable by others"):
+    with pytest.raises(ConfigError, match="mode 0600"):
         load_platform(tmp_path / "platform.toml")
 
 
@@ -190,5 +192,6 @@ def test_o12_the_user_credentials_directory_may_be_named_by_an_environment_varia
     assert (config.users.kind, config.users.ref) == ("env", "PLATFORM_TEST_USERS_DIR")
     assert str(tmp_path) not in repr(config.users)
     monkeypatch.delenv("PLATFORM_TEST_USERS_DIR")
-    with pytest.raises(ConfigError, match="PLATFORM_TEST_USERS_DIR"):
+    with pytest.raises(ConfigError, match=r"directory_env.*not set") as caught:
         load(tmp_path, use_variable)
+    assert "PLATFORM_TEST_USERS_DIR" not in str(caught.value)
