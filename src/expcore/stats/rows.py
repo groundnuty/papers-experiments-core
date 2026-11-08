@@ -9,6 +9,8 @@ the scorers and the attributes from the study's tasks, and `Row.from_export` joi
 
 from __future__ import annotations
 
+import math
+import numbers
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,10 +35,23 @@ class Row:
     attributes: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Require the built-in factors, which every pairing key is made of."""
+        """Require the built-in factors, which every pairing key is made of, and a finite number or None per outcome."""
         missing = [name for name in BUILTIN_FACTORS if name not in self.factors]
         if missing:
             raise ValueError(f"run {self.run_key!r}: factors lack the built-in {', '.join(map(repr, missing))}")
+        for name, value in self.outcomes.items():
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, numbers.Real):
+                raise ValueError(
+                    f"run {self.run_key!r}: outcome {name!r} must be a finite number or None, "
+                    f"got {type(value).__name__}"
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"run {self.run_key!r}: outcome {name!r} is not finite; a missing value is None, "
+                    "never NaN or an infinity"
+                )
 
     @property
     def task(self) -> str:

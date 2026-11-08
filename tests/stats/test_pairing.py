@@ -12,9 +12,15 @@ from expcore.stats.rows import Row
 
 
 def bad_row(outcomes, attributes):
-    """A row for condition cond-a with the given outcomes and task attributes, built as the export would."""
+    """A row for condition cond-a with the given outcomes and task attributes, as it would be if it got past `Row`.
+
+    A row refuses a non-number, NaN or an infinity when it is built, but its outcomes are a plain dict that an edit can
+    still change, so pairing checks the values it reads as well. The outcomes are put in after construction.
+    """
     factors = {"task": "task-a", "model": "model-a", "seed": 1}
-    return Row("task=task-a|model=model-a|seed=1|condition=cond-a", "cond-a", factors, outcomes, attributes)
+    row = Row("task=task-a|model=model-a|seed=1|condition=cond-a", "cond-a", factors, {}, attributes)
+    row.outcomes.update(outcomes)
+    return row
 
 
 def basic_rows():
@@ -114,13 +120,11 @@ def test_r10_a_missing_outcome_is_excluded_from_its_pair_and_never_read_as_zero(
     assert (pairing.n_pairs, pairing.n_pairs_missing) == (1, 1)
 
 
-def test_r10_a_missing_outcome_on_the_b_side_and_nan_are_missing_too():
-    """R10: missing on either side counts, and NaN is an undefined value like None."""
-    rows = (
-        both_arms("task-a", "model-a", 1, 0.9, None)
-        + both_arms("task-a", "model-a", 2, math.nan, 0.2)
-        + both_arms("task-a", "model-a", 3, 0.6, 0.2)
-    )
+def test_r10_a_missing_outcome_on_the_b_side_and_a_nan_that_got_past_the_row_are_missing_too():
+    """R10: missing on either side counts, and pairing still reads a NaN edited into a row as missing, like None."""
+    nan_row = both_arms("task-a", "model-a", 2, 0.5, 0.2)
+    nan_row[0].outcomes["score"] = math.nan  # a row refuses NaN when built; this is an edit after the fact
+    rows = both_arms("task-a", "model-a", 1, 0.9, None) + nan_row + both_arms("task-a", "model-a", 3, 0.6, 0.2)
     pairing = pair_rows(rows, named())
     assert pairing.differences.matrix == pytest.approx(np.array([[0.4]]))
     assert (pairing.n_pairs, pairing.n_pairs_missing) == (1, 2)

@@ -107,6 +107,22 @@ def test_s06_s09_studies_with_a_zero_a_tie_or_an_undefined_cluster_go_through_th
         assert np.array_equal(got, expected, equal_nan=True), method
 
 
+@pytest.mark.parametrize("method", ["auto", "exact", "approx"])
+def test_s05_s01_a_study_with_an_infinite_value_goes_through_the_scalar_wilcoxon_p(method):
+    """S05, S01: [1, -2, inf, -inf] has no tie by subtraction (inf - inf is NaN) yet is not a rank-sum study."""
+    studies = np.array(
+        [
+            [1.0, -2.0, math.inf, -math.inf],  # the input that gave 0.875 in the batch and 1.0 one study at a time
+            [math.inf, 0.2, 0.3, 0.4],
+            [-math.inf, 0.2, 0.3, 0.4],
+            [0.3, 0.1, 0.5, 0.2],  # an ordinary study in the same batch
+        ]
+    )
+    expected = np.array([wilcoxon_p(row, method=method) for row in studies])
+    assert wilcoxon_p([1.0, -2.0, math.inf, -math.inf], method="exact") == 1.0
+    assert np.array_equal(wilcoxon_p_studies(studies, method=method), expected, equal_nan=True)
+
+
 def test_s06_s09_many_studies_cost_one_wilcoxon_p_per_distinct_sum_of_positive_ranks(monkeypatch):
     """S06, S09: 300 studies of five clusters have at most 16 rank sums, so the real function runs at most 16 times."""
     calls = []

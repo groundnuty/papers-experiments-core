@@ -213,7 +213,8 @@ def wilcoxon_p_studies(studies, decimals: int = DEFAULT_SNAP_DECIMALS, method: s
     A study whose snapped differences hold no zero and no two equal magnitudes (what draws from a continuous
     distribution give) takes its p-value from `_p_at_rank_sum`, one call of `wilcoxon_p` for each distinct sum of
     positive ranks instead of one for each study, which is what makes a simulation of thousands of studies affordable.
-    Any other study, with a zero, a tie or an undefined cluster, goes through `wilcoxon_p` itself.
+    Any other study, with a zero, a tie, an undefined cluster or an infinite value (the tie test subtracts magnitudes,
+    and infinity minus infinity is not a tie), goes through `wilcoxon_p` itself.
     """
     values = np.asarray(studies, dtype=float)
     if values.ndim != 2:
@@ -221,8 +222,8 @@ def wilcoxon_p_studies(studies, decimals: int = DEFAULT_SNAP_DECIMALS, method: s
     n = values.shape[1]
     snapped = _snap_differences(values, decimals)
     magnitudes = np.abs(snapped)
-    with np.errstate(invalid="ignore"):  # a NaN in a row makes the row irregular, whatever these give for it
-        irregular = np.isnan(magnitudes).any(axis=1) | (magnitudes == 0).any(axis=1)
+    with np.errstate(invalid="ignore"):  # a non-finite value makes the row irregular, whatever these give for it
+        irregular = ~np.isfinite(values).all(axis=1) | (magnitudes == 0).any(axis=1)
         irregular |= (np.diff(np.sort(magnitudes, axis=1), axis=1) == 0).any(axis=1)
     if n == 0:
         irregular[:] = True
