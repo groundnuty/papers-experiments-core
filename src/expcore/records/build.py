@@ -14,7 +14,8 @@ library puts in an exception differs between interpreter versions and would stop
 import asyncio
 import dataclasses
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+import warnings
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,7 +32,9 @@ from expcore.prompt.templates import RenderedPrompt, sha256_of
 from expcore.records.digest import digest, plain
 from expcore.records.record import RunRecord
 from expcore.records.recording import Captured, RecordingBackend
+from expcore.records.redact import Redactor
 from expcore.records.schema import CURRENT, RecordError
+from expcore.records.seal import seal
 
 CORE_DISTRIBUTION = "papers-experiments-core"
 CONTEXT_OVERFLOW = "ContextOverflow"
@@ -137,7 +140,7 @@ def turn_entry(index: int, captured: Captured, settings_sha256: str, loop_turn: 
         },
         "native": captured.native,
         "tool_messages": captured.tool_messages,
-        "request_sha256": captured.request_sha256,
+        "request_sha256": "",  # filled in by `seal`, over the redacted conversation
         "settings_sha256": settings_sha256,
         "stop_reason": turn.stop_reason,
         "usage": {
@@ -195,12 +198,21 @@ def build_record(
     code: Mapping[str, Any],
     core_version: str | None = None,
     instruments: Mapping[str, Any] | None = None,
+    redactor: Redactor | None = None,
+    secrets: Iterable[str] = (),
+    environ: Mapping[str, str] | None = None,
 ) -> RunRecord:
     """Build the record of a finished attempt from the loop's result and the recording wrapper it ran through.
 
     Raises RecordError when the pieces do not add up: a different number of replies than the loop counted, or a
     conversation that is not the one the pieces make, which means the backend's history is not the plain
     system, user, assistant, tool-results sequence the replay serves.
+
+    Secrets are redacted here, before any digest is taken: the digests the record pins (prompt texts, the
+    conversation each request carried, the settings each sent, the configuration) are those of the redacted
+    data, which is what is stored and replayed, and `redacted_paths` lists where something was replaced.
+    The secrets are the environment's (`environ`, the process's by default), the registered ones, and
+    `secrets` for this record. A replay passes `Redactor.none()`: what it reads is redacted already.
     """
     sys_prompt, user_prompt = PromptText.of(system), PromptText.of(user)
     captured = recording.captured
@@ -220,23 +232,27 @@ def build_record(
         failed = dict(recording.failure)
         sets[failed["settings_sha256"]] = recording.failure_settings
     config = plain(result.config)
-    return RunRecord(
-        run_key=identity.run_key,
-        factors=plain(dict(identity.factors)),
-        attempt=identity.attempt,
-        route=route_entry(result.backend_info, sets),
-        prompt={"system": sys_prompt.entry(), "user": user_prompt.entry(), "tools_sha256": result.tool_manifest_sha256},
-        tools=[tool_entry(s) for s in specs],
-        agent_config=config,
-        agent_config_sha256=result.config_sha256,
-        code=plain(dict(code)),
-        core_version=core_version,
-        transcript=turns,
-        failed_request=failed,
-        tool_calls=[call_entry(c) for c in result.tool_calls],
-        clock=[[label, value] for label, value in result.clock_readings],
-        outcome=outcome_entry(result.outcome),
-        totals={
+    fields = {
+        "run_key": identity.run_key,
+        "factors": plain(dict(identity.factors)),
+        "attempt": identity.attempt,
+        "route": route_entry(result.backend_info, sets),
+        "prompt": {
+            "system": sys_prompt.entry(),
+            "user": user_prompt.entry(),
+            "tools_sha256": result.tool_manifest_sha256,
+        },
+        "tools": [tool_entry(s) for s in specs],
+        "agent_config": config,
+        "agent_config_sha256": result.config_sha256,
+        "code": plain(dict(code)),
+        "core_version": core_version,
+        "transcript": turns,
+        "failed_request": failed,
+        "tool_calls": [call_entry(c) for c in result.tool_calls],
+        "clock": [[label, value] for label, value in result.clock_readings],
+        "outcome": outcome_entry(result.outcome),
+        "totals": {
             "rounds": result.rounds,
             "malformed_calls": result.malformed_calls,
             "malformed_events": plain(result.malformed_events),
@@ -251,9 +267,18 @@ def build_record(
             "abandoned_threads": result.abandoned_threads,
             "final_text": result.final_text,
         },
-        instruments=plain(dict(instruments or {})),
-        schema_version=CURRENT,
-    )
+        "instruments": plain(dict(instruments or {})),
+        "scores": {},
+    }
+    redactor = redactor if redactor is not None else Redactor.from_environment(environ, secrets)
+    redacted, paths = redactor.structure(fields)
+    if paths:
+        warnings.warn(
+            f"record of attempt {identity.attempt}: redacted secrets at {len(paths)} place(s)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return RunRecord(**seal(redacted), redacted_paths=paths, schema_version=CURRENT)
 
 
 async def record_attempt(
@@ -269,6 +294,7 @@ async def record_attempt(
     timer: AgentTimer | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    secrets: Iterable[str] = (),
 ) -> RunRecord:
     """Run one attempt through the loop, recording it, and return its record.
 
@@ -276,6 +302,9 @@ async def record_attempt(
     `code` is the code identity, for example `expcore.provenance.codestamp.version(root, scope)`, and `core_version`
     defaults to the installed version of the core. The caller builds the backend (passing it `timer.time_left` when
     it uses the loop's time) and closes it.
+
+    Secrets are redacted from the record (R12): the environment's, the ones registered with
+    `expcore.records.redact.register_secret` (a platform that mints a token registers it), and `secrets`.
     """
     recording = RecordingBackend(backend)
     box = ToolBox(list(providers), cap_chars=config.limits.output_cap_chars)
@@ -293,4 +322,5 @@ async def record_attempt(
         specs=specs,
         code=code,
         core_version=core_version if core_version is not None else sdk_version(CORE_DISTRIBUTION),
+        secrets=secrets,
     )

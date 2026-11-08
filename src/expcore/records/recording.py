@@ -31,12 +31,11 @@ class Captured:
 
     turn: ModelTurn
     native: dict[str, Any]
-    request_sha256: str
     settings: dict[str, Any]
     tool_messages: list[dict[str, Any]] = field(default_factory=list)
 
 
-def failure_of(exc: BaseException | None, request_sha256: str, settings: dict[str, Any]) -> dict[str, Any]:
+def failure_of(exc: BaseException | None, settings: dict[str, Any]) -> dict[str, Any]:
     """Describe a request that did not return a reply, in the stable fields of the record (R07).
 
     `exc` is None for a request the loop gave up on while it was in flight (cancelled): kind `cut`. A library's own
@@ -50,7 +49,7 @@ def failure_of(exc: BaseException | None, request_sha256: str, settings: dict[st
         "pattern": None,
         "error_type": None,
         "settings_sha256": digest(settings),
-        "request_sha256": request_sha256,
+        "request_sha256": "",  # filled in by `seal`, over the redacted conversation
     }
     if isinstance(exc, InfraError):
         entry.update(kind="infra", infra_kind=exc.kind, detail=exc.detail)
@@ -98,27 +97,26 @@ class RecordingBackend:
 
     async def step(self) -> ModelTurn:
         """Ask the inner backend for a reply and keep what surrounds it; a request that raises is the failure."""
-        request = digest(self.inner.transcript())
         try:
             turn = await self.inner.step()
         except asyncio.CancelledError:
-            self._fail(None, request)
+            self._fail(None)
             raise
         except Exception as exc:
-            self._fail(exc, request)
+            self._fail(exc)
             raise
         conversation = self.inner.transcript()
         native = conversation[-1] if conversation else {}
         if native.get("role") != "assistant":
             raise RecordError("the backend's conversation does not end with an assistant message after a reply")
-        self.captured.append(Captured(turn, native, request, self._settings()))
+        self.captured.append(Captured(turn, native, self._settings()))
         self._known = len(conversation)
         return turn
 
-    def _fail(self, exc: BaseException | None, request: str) -> None:
+    def _fail(self, exc: BaseException | None) -> None:
         """Keep the request that raised, with the settings it carried."""
         settings = self._settings()
-        self.failure = failure_of(exc, request, settings)
+        self.failure = failure_of(exc, settings)
         self.failure_settings = settings
 
     def add_tool_results(self, results: list[ToolResult]) -> None:

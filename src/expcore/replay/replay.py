@@ -49,6 +49,7 @@ from expcore.records.build import PromptText, RunIdentity, build_record
 from expcore.records.digest import digest
 from expcore.records.record import RunRecord
 from expcore.records.recording import RecordingBackend
+from expcore.records.redact import Redactor
 from expcore.records.schema import SCHEMAS, RecordError, SchemaVersion, config_defaults
 from expcore.replay.clock import ReplayClock
 from expcore.replay.compare import compare
@@ -167,6 +168,7 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
             code=rec.code,
             core_version=rec.core_version,
             instruments=rec.instruments,
+            redactor=Redactor.none(),  # the record is redacted already; what the loop derives from it is too
         )
     except RecordError as exc:
         raise ReplayDivergence("transcript", str(exc)) from None
