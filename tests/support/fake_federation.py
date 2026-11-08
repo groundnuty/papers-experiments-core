@@ -6,6 +6,7 @@ a test hands the platform client `fake.client_http()` and no socket is opened. I
   POST   /api/v3/onezone/tokens/examine                           (admin credential)
   POST   /api/v3/onezone/tokens/infer_access_token_scope          (the token in the body)
   POST   /api/v3/onezone/user/tokens/temporary                    (HTTP Basic of the user itself)
+  GET    /api/v3/onezone/spaces/{space}                           (admin credential; the study space and `other_spaces`)
   GET    /api/v3/onezone/spaces/{space}/users/{user}/privileges            (direct)
   GET    /api/v3/onezone/spaces/{space}/effective_users/{user}/privileges  (effective)
 
@@ -44,6 +45,7 @@ class FakeFederation(MockOnedata):
         self.mint_hook: Callable[[str, list[dict]], list[dict]] | None = None
         self.examine_hook: Callable[[dict], Any] | None = None
         self.status_override: int | None = None
+        self.other_spaces: dict[str, str] = {}  # id -> name of the spaces besides the study space that Onezone knows
         self.users: dict[str, tuple[str, str]] = {}  # login name -> (password, user id)
         self._sequence = itertools.count(1)
 
@@ -112,6 +114,12 @@ class FakeFederation(MockOnedata):
         """Answer the calls that need the admin credential."""
         if method == "POST" and route == "/tokens/examine":
             return self._examine(sent.get("token"))
+        space = re.fullmatch(r"/spaces/([^/]+)", route)
+        if space and method == "GET":
+            names = {self.SPACE_ID: self.space_name, **self.other_spaces}
+            if space.group(1) not in names:
+                return self._error(404, "notFound")
+            return httpx.Response(200, json={"spaceId": space.group(1), "name": names[space.group(1)]})
         found = re.fullmatch(r"/spaces/([^/]+)/(users|effective_users)/([^/]+)/privileges", route)
         if found and method == "GET":
             entry = self.privileges.get((found.group(1), found.group(3)))

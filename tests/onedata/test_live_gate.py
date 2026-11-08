@@ -34,17 +34,20 @@ def test_every_unverified_endpoint_has_a_live_contract_test():
     assert not missing, f"no live test covers: {missing}"
 
 
-def test_the_unconfirmed_details_are_exactly_the_subject_and_the_providers_name_and_online():
-    """No path is unconfirmed any more: the list holds the two answer details no source confirms, and nothing else."""
+def test_the_unconfirmed_calls_and_details_are_exactly_the_space_read_and_two_answer_details():
+    """The list holds the space-details read the mutation gate relies on, and the two answer details no source
+    confirms (the subject of an examination, and the providers' name and online fields); nothing else."""
     from expcore_onedata.client import UNVERIFIED_ENDPOINTS
 
     assert {(m, p) for m, p, _ in UNVERIFIED_ENDPOINTS} == {
+        ("GET", "/spaces/{space}"),
         ("POST", "/tokens/examine"),
         ("POST", "/tokens/infer_access_token_scope"),
     }
     what = " ".join(w for _, _, w in UNVERIFIED_ENDPOINTS)
     assert "subject" in what
     assert "name and online" in what
+    assert "name field" in what
 
 
 def test_the_slow_live_expiry_test_needs_its_own_switch():

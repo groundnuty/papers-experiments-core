@@ -14,9 +14,11 @@ it one built on a mock transport.
 
 Reads and mutations are separate calls:
 - `get` is a GET, and `query` a POST from a short list that only reads (examining a token, inferring its scope);
-- `mutate` is any other method, and it names the space it acts on: it refuses before sending anything unless the
-  space's name starts with one of the configured prefixes (`[space] prefixes`), so a mistaken or hostile name cannot
-  reach a space outside the study's;
+- `mutate` is any other method. It takes no name from its caller: the path must lie under `/spaces/{space id}`, the
+  client reads that space's name from Onezone (`space_name`, cached for the client's lifetime) and refuses, before the
+  mutation is sent, unless the name starts with one of the configured prefixes (`[space] prefixes`). A path that does
+  not lie under a space, a file id or a path of a provider among them, resolves to no space and is refused, so a
+  mistaken or hostile target cannot reach a space outside the study's;
 - `mint_own_token` is the one operation on credentials: a platform user mints its own temporary token with its own
   password (HTTP Basic), as the earlier code did. It acts on no space, so it has a call of its own; the password is
   registered as a secret when it is read and the minted value before the call returns (R12), and so is the admin token
@@ -36,6 +38,8 @@ client test in a source sends it and reads the answer as this layer does.
 - Authentication: the header `X-Auth-Token` with an access token. Confirmed by [S2].
 - `get`: `GET /spaces/{space}/users/{user}/privileges` and `GET /spaces/{space}/effective_users/{user}/privileges`; the
   answer key is `privileges`. Confirmed by [S3].
+- `space_name`: `GET /spaces/{space}` with the admin token, the answer key `name`. Unconfirmed: see
+  `UNVERIFIED_ENDPOINTS`.
 - `query`: `POST /tokens/examine`, body `{"token"}`, sent with the admin token; the answer keys `id` and `caveats` are
   read. Confirmed by [S4] and [S5].
 - `query`: `POST /tokens/infer_access_token_scope`, body `{"token"}`, no header; the answer's
@@ -74,6 +78,11 @@ READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_acc
 # `covers:` with its method and path; a unit test holds that none is missing there.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     (
+        "GET",
+        "/spaces/{space}",
+        "the whole call: no source reads a space's details; the answer's name field is what the mutation gate checks",
+    ),
+    (
         "POST",
         "/tokens/examine",
         "the shape of the answer's subject (an id under subject); the sources read id and caveats [S4]",
@@ -85,6 +94,7 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ),
 )
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_SPACE_ID = re.compile(r"[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}")  # one plain path segment, never "." or ".."
 DEFAULT_TIMEOUT_S = 15.0
 
 
@@ -98,7 +108,7 @@ class PlatformError(RuntimeError):
 
 
 class OutOfScope(PlatformError):
-    """A mutation named a space outside the configured prefixes, or a path that leaves the API; nothing was sent."""
+    """A mutation's target is no study space, or a path leaves the API; the mutation was not sent."""
 
 
 def _error_code(response: httpx.Response) -> str | None:
@@ -115,6 +125,20 @@ def _check_path(path: str) -> str:
     if not path.startswith("/") or path.startswith("//") or "://" in path or ".." in path.split("/") or "\\" in path:
         raise OutOfScope("the request path is not a plain path of the API")
     return path
+
+
+def _target_space_id(path: str) -> str:
+    """Return the id of the space a mutation's path lies under, or raise OutOfScope when it lies under none.
+
+    Only `/spaces/{id}` and what is below it name a space. The path must be plain, with no percent-escape, query or
+    fragment that the server could read as another path than the one read here.
+    """
+    if any(mark in path for mark in "%?#"):
+        raise OutOfScope("the request path of a mutation must be plain, without an escape, query or fragment")
+    parts = path.split("/")
+    if len(parts) < 3 or parts[1] != "spaces" or not _SPACE_ID.fullmatch(parts[2]) or "" in parts[2:-1]:
+        raise OutOfScope("the mutation does not lie under a space, so it resolves to no space; nothing was sent")
+    return parts[2]
 
 
 class OnezoneClient:
@@ -138,6 +162,7 @@ class OnezoneClient:
         credential = admin_token if admin_token is not None else config.admin.read(environ)
         register_secret(credential)
         self._admin = {AUTH_HEADER: credential}
+        self._space_names: dict[str, str] = {}  # space id -> name, read from Onezone once per id
 
     def close(self) -> None:
         """Close the connection pool when the client built it."""
@@ -200,12 +225,41 @@ class OnezoneClient:
         headers = self._admin if READING_POSTS[path] else {}
         return self._send("POST", path, provider=None, headers=headers, json=dict(body))
 
-    def mutate(self, method: str, path: str, *, space_name: str, provider: str | None = None, json: Any = None) -> Any:
-        """Send a request that can change state on a space; refuse, before sending, a space outside the prefixes."""
+    def space_name(self, space_id: str) -> str:
+        """Return the name Onezone gives a space, read once per id for the client's lifetime.
+
+        A space Onezone does not know, or an answer without a name, raises OutOfScope; any other failure of the read
+        raises PlatformError. Neither message holds the id or a name.
+        """
+        if not isinstance(space_id, str) or not _SPACE_ID.fullmatch(space_id):
+            raise OutOfScope("the target space id is not a plain id, so it resolves to no space")
+        if space_id not in self._space_names:
+            try:
+                answer = self._send("GET", f"/spaces/{space_id}", provider=None, headers=self._admin)
+            except PlatformError as error:
+                if error.status == 404:
+                    raise OutOfScope("the target space is unknown to Onezone, so it resolves to no space") from None
+                raise
+            name = answer.get("name") if isinstance(answer, dict) else None
+            if not isinstance(name, str) or not name:
+                raise OutOfScope("Onezone's answer for the target space holds no name, so it resolves to no space")
+            self._space_names[space_id] = name
+        return self._space_names[space_id]
+
+    def mutate(self, method: str, path: str, *, provider: str | None = None, json: Any = None) -> Any:
+        """Send a request that can change state; refuse it, before it is sent, unless it acts on a study space.
+
+        The target is the space id in the path, resolved to its name by a read on Onezone; the caller names no space
+        and no name. The mutation is refused unless that name starts with a configured prefix, and when the path lies
+        under no space.
+        """
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
-        if not isinstance(space_name, str) or not space_name.startswith(self._config.space.prefixes):
-            raise OutOfScope("the space is not one of the configured prefixes; nothing was sent")
+        path = _check_path(path)
+        self._base(provider)  # an undeclared provider is refused before anything is read
+        name = self.space_name(_target_space_id(path))
+        if not name.startswith(self._config.space.prefixes):
+            raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
         return self._send(method, path, provider=provider, headers=self._admin, json=json)
 
     def mint_own_token(self, principal: Principal, caveats: Sequence[Mapping[str, Any]]) -> str:

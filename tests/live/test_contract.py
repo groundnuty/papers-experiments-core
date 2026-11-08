@@ -64,6 +64,11 @@ def test_a_user_mints_its_own_token_and_it_examines_cleanly(config, issuer):
     assert token.expires_at > time.time()
 
 
+def test_the_study_space_resolves_to_its_declared_name(config, client):
+    # covers: GET /spaces/{space}
+    assert client.space_name(config.space.id) == config.space.name  # the name the mutation gate checks the prefixes of
+
+
 def test_discovery_finds_the_space_and_the_declared_local_provider(config, issuer, client):
     # covers: POST /tokens/infer_access_token_scope
     user = service_user(config)
