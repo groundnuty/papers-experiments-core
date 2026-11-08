@@ -10,12 +10,15 @@ failures ('infra_exhausted') has no scored attempt, so without this export it wo
 attempts' usage, and the one analysed attempt of every finished run. The three lists of runs partition the plan, and
 `planned_runs` says how many it held, so a reader can check that no run went missing.
 
-Rule: a run's analysed attempt is the one that ended with an agent outcome. Every infrastructure attempt is discarded,
-and so are all the attempts of an exhausted run. Interrupted, outage-discarded and harness-error attempts are reported
+Rule: a run's analysed attempt is the one that ended with an agent outcome, or with an infrastructure fault that its
+condition declares as its treatment (it carries `treatment` and the fault's `infra_kind`). Every other infrastructure
+attempt is discarded, and so are all the attempts of an exhausted run. Interrupted, outage-discarded and harness-error attempts are reported
 in their own rows of `discarded_usage`, never folded into one another.
 
 Infrastructure retries are grouped by the kind from the closed vocabulary in `expcore.errors`, each under its own name
-(C02). Field names are generic: a run is named by its key, its condition, its model and its factor values. The file
+(C02). `infrastructure_by_condition` adds, per condition and kind, how many attempts were set aside and run again and
+how many were scored as treatment, with the kinds each condition declares, so a reader sees whether a condition's
+fault was measured or re-run away. Field names are generic: a run is named by its key, its condition, its model and its factor values. The file
 is written to a temporary file in its directory and moved into place, so a reader sees the old file or the new one.
 
 Empty lists are valid and must be written out: `read_export` rejects a file with a missing key.
@@ -40,6 +43,7 @@ REQUIRED_KEYS = (
     *RUN_LISTS,
     "discarded_usage",
     "retries_by_kind",
+    "infrastructure_by_condition",
     "kinds",
 )
 _DISCARDED_STATES = ("infra_fail", "outage_discarded", "interrupted", "harness_error")
@@ -84,7 +88,15 @@ def export_run_state(store: Store) -> dict[str, Any]:
             done = [a for a in tried if a["state"] == "done"]
             if len(done) != 1:
                 raise ExportError(f"run {run['run_key']} is done but has {len(done)} done attempts")
-            analysed.append({**who, "attempt": done[0]["attempt"], "run_dir": done[0]["run_dir"]})
+            analysed.append(
+                {
+                    **who,
+                    "attempt": done[0]["attempt"],
+                    "run_dir": done[0]["run_dir"],
+                    "treatment": bool(done[0]["treatment"]),
+                    "infra_kind": done[0]["infra_kind"],
+                }
+            )
         else:
             raise ExportError(f"run {run['run_key']}: unknown status {run['status']!r}")
     return {
@@ -96,6 +108,7 @@ def export_run_state(store: Store) -> dict[str, Any]:
         "analysed_attempts": analysed,
         "discarded_usage": _discarded_usage(identities, attempts),
         "retries_by_kind": _retries_by_kind(identities, attempts),
+        "infrastructure_by_condition": _infrastructure_by_condition(identities, attempts, store.schema.treatment_kinds),
         "kinds": list(infra_kinds()),
     }
 
@@ -141,6 +154,33 @@ def _retries_by_kind(identities: dict[str, dict], attempts: dict[str, list[Any]]
     return [
         {"condition": condition, "model": model, "kind": kind, "state": state, "charged": charged, "attempts": n}
         for (condition, model, kind, state, charged), n in sorted(counts.items())
+    ]
+
+
+def _infrastructure_by_condition(
+    identities: dict[str, dict], attempts: dict[str, list[Any]], declared: dict[str, tuple[str, ...]]
+) -> list[dict[str, Any]]:
+    """Count, per condition and kind, the attempts set aside and run again and the attempts scored as treatment.
+
+    Every kind a condition declares as its treatment has a row, with zeros when nothing of that kind happened.
+    """
+    cells: dict[tuple[str, str], dict[str, int]] = {}
+    for condition, kinds in declared.items():
+        for kind in kinds:
+            cells[(condition, kind)] = {"set_aside": 0, "treatment": 0}
+    for key, tried in attempts.items():
+        condition = identities[key]["condition"]
+        for attempt in tried:
+            if attempt["treatment"]:
+                field = "treatment"
+            elif attempt["state"] in ("infra_fail", "outage_discarded"):
+                field = "set_aside"
+            else:
+                continue
+            cells.setdefault((condition, attempt["infra_kind"]), {"set_aside": 0, "treatment": 0})[field] += 1
+    return [
+        {"condition": condition, "kind": kind, "declared_treatment": kind in declared[condition], **counts}
+        for (condition, kind), counts in sorted(cells.items())
     ]
 
 

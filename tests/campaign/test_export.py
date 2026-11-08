@@ -4,7 +4,19 @@ import json
 import os
 
 import pytest
-from campaign_support import LATER, NOW, defect, finished, infra, planned_store, run_one
+from campaign_support import (
+    LATER,
+    NOW,
+    defect,
+    finished,
+    infra,
+    keys_under,
+    make_manifest,
+    open_store,
+    planned_store,
+    run_one,
+    treatment_schema,
+)
 
 from expcore import errors
 from expcore.campaign.export import (
@@ -204,7 +216,7 @@ def test_the_export_uses_generic_field_names_only(tmp_path):
     assert data["factors"] == ["task", "data_path", "tools", "model", "seed"]
     assert set(data["exhausted_runs"][0]) == identity | {"attempts", "reasons"}
     assert set(data["unfinished_runs"][0]) == identity | {"status"}
-    assert set(data["analysed_attempts"][0]) == identity | {"attempt", "run_dir"}
+    assert set(data["analysed_attempts"][0]) == identity | {"attempt", "run_dir", "treatment", "infra_kind"}
     assert set(data["discarded_usage"][0]) == {
         "condition",
         "model",
@@ -218,6 +230,13 @@ def test_the_export_uses_generic_field_names_only(tmp_path):
         "wall_s",
     }
     assert set(data["retries_by_kind"][0]) == {"condition", "model", "kind", "state", "charged", "attempts"}
+    assert set(data["infrastructure_by_condition"][0]) == {
+        "condition",
+        "kind",
+        "declared_treatment",
+        "set_aside",
+        "treatment",
+    }
 
 
 def test_the_export_is_written_to_a_temporary_file_and_moved_into_place(tmp_path, monkeypatch):
@@ -259,3 +278,71 @@ def test_a_failed_write_leaves_the_earlier_export_whole_and_no_temporary_file(tm
         write_export(store, target)
     assert target.read_text(encoding="utf-8") == before
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
+
+
+# --- infrastructure that is a condition's treatment ----------------------------------------------------------------
+
+
+def test_c09_a_treatment_attempt_reaches_the_analysis_marked_with_its_kind(tmp_path):
+    """C09: adds that a run ended by its condition's treatment fault is an analysed attempt, not an exhausted run."""
+    schema = treatment_schema(("endpoint",))
+    store = open_store(tmp_path, schema)
+    manifest = make_manifest(schema)
+    store.sync_manifest(manifest.rows)
+    down, healthy = keys_under(schema, manifest, "api-none")[0], keys_under(schema, manifest, "mount-read")[0]
+    run_one(store, down, infra("endpoint", "HTTP 503"))
+    run_one(store, healthy, finished())
+    data = export_run_state(store)
+    rows = {r["run_key"]: r for r in data["analysed_attempts"]}
+    assert (rows[down]["treatment"], rows[down]["infra_kind"]) == (True, "endpoint")
+    assert (rows[healthy]["treatment"], rows[healthy]["infra_kind"]) == (False, None)
+    assert data["exhausted_runs"] == []
+    assert down not in [r["run_key"] for r in data["unfinished_runs"]]
+    assert sum(len(data[name]) for name in RUN_LISTS) == data["planned_runs"] == len(manifest.rows)
+
+
+def test_c02_the_export_counts_set_aside_and_treatment_attempts_per_condition_and_kind(tmp_path):
+    """C02: adds per-condition counts of set-aside and treatment attempts for each kind, beside the retry totals."""
+    schema = treatment_schema(("endpoint", "knowledge"))
+    store = open_store(tmp_path, schema)
+    manifest = make_manifest(schema)
+    store.sync_manifest(manifest.rows)
+    declared, other = keys_under(schema, manifest, "api-none"), keys_under(schema, manifest, "mount-read")
+    run_one(store, declared[0], infra("endpoint"))  # treatment
+    run_one(store, declared[1], infra("endpoint"))  # treatment
+    run_one(store, declared[2], infra("sandbox"), max_attempts=9)  # set aside: not declared
+    run_one(store, declared[3], AttemptResult(Outcome("finished"), LATER, 1.0, outage_kind="endpoint"))  # set aside
+    run_one(store, other[0], infra("endpoint"), max_attempts=9)  # set aside: this condition declares nothing
+    run_one(store, other[0], infra("endpoint"), max_attempts=9)
+    data = export_run_state(store)
+    by_cell = {(r["condition"], r["kind"]): r for r in data["infrastructure_by_condition"]}
+    assert {k: (v["declared_treatment"], v["set_aside"], v["treatment"]) for k, v in by_cell.items()} == {
+        ("api-none", "endpoint"): (True, 1, 2),
+        ("api-none", "knowledge"): (True, 0, 0),  # declared, and nothing of it happened
+        ("api-none", "sandbox"): (False, 1, 0),
+        ("mount-read", "endpoint"): (False, 2, 0),
+    }
+    assert list(data["infrastructure_by_condition"][0]) == [
+        "condition",
+        "kind",
+        "declared_treatment",
+        "set_aside",
+        "treatment",
+    ]
+    retries = {}
+    for row in data["retries_by_kind"]:
+        retries[row["kind"]] = retries.get(row["kind"], 0) + row["attempts"]
+    assert retries == {"endpoint": 3, "sandbox": 1}  # the treatment attempts are not retries
+
+
+def test_c09_the_reader_refuses_an_export_without_the_per_condition_counts(tmp_path):
+    """C09: adds that the per-condition counts are a required key, so an export cannot omit them silently."""
+    store, _, _ = planned_store(tmp_path)
+    path = tmp_path / "export.json"
+    write_export(store, path)
+    assert read_export(path)["infrastructure_by_condition"] == []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["infrastructure_by_condition"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ExportError, match=r"missing key.*infrastructure_by_condition"):
+        read_export(path)
