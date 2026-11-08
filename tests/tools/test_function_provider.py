@@ -258,3 +258,67 @@ def test_a_function_that_does_not_take_ctx_is_not_handed_one():
 
     assert execute(provider(plain=plain), "plain") == ToolOutput("ok")
     assert seen == ["called"]
+
+
+# --- an abandoned thread blocks new calls (L15) ----------------------------------------------------------------------
+
+
+def test_l15_while_an_abandoned_thread_is_running_new_calls_are_refused_with_a_tool_error_that_says_why():
+    """L15: a thread cannot be killed; until it returns, every new call gets an error naming the reason, and calls are
+    accepted again afterwards."""
+    started, release = threading.Event(), threading.Event()
+
+    def blocks(args, timeout_s):
+        started.set()
+        release.wait(timeout=10)
+        return "late"
+
+    p = provider(blocks=blocks, other=lambda args, timeout_s: "fine")
+    seen = {}
+
+    async def scenario():
+        task = asyncio.ensure_future(p.execute("blocks", {}, timeout_s=5.0))
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        seen["abandoned"] = p.abandoned_threads()
+        seen["refused"] = await p.execute("other", {}, timeout_s=5.0)
+        seen["refused_same_tool"] = await p.execute("blocks", {}, timeout_s=5.0)
+        release.set()
+        while p.abandoned_threads():
+            await asyncio.sleep(0.001)
+        seen["after"] = await p.execute("other", {}, timeout_s=5.0)
+
+    asyncio.run(scenario())
+    assert seen["abandoned"] == 1
+    for refused in (seen["refused"], seen["refused_same_tool"]):
+        assert refused.is_error
+        assert refused.error_class == "AbandonedThread"
+        assert "blocks" in refused.text
+        assert "cannot be killed" in refused.text
+    assert seen["after"] == ToolOutput("fine")
+
+
+def test_l15_the_provider_does_not_try_to_stop_a_thread():
+    """L15: nothing is done to the thread; it runs to its own end (here it sets a flag after the call was cancelled)."""
+    started, release = threading.Event(), threading.Event()
+    finished = []
+
+    def blocks(args, timeout_s):
+        started.set()
+        release.wait(timeout=10)
+        finished.append("ran to its end")
+        return "late"
+
+    async def scenario():
+        p = provider(blocks=blocks)
+        task = asyncio.ensure_future(p.execute("blocks", {}, timeout_s=5.0))
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        release.set()
+
+    asyncio.run(scenario())
+    assert finished == ["ran to its end"]

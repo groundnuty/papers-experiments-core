@@ -1,14 +1,17 @@
 """An outside cancellation of the loop leaves no child task of the loop pending, and a cancellation always ends."""
 
 import asyncio
+import threading
 import time
 
 import pytest
-from loop_support import FakeProvider, never
+from loop_support import ClockSleep, FakeProvider, never
 
 from expcore.loop.agent_loop import run_agent
 from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import StubAdapter
+from expcore.plugin import ToolSpec
+from expcore.tools.function_provider import FunctionProvider
 
 
 class Hangs(StubAdapter):
@@ -145,3 +148,74 @@ def test_a_cleanup_that_finishes_in_time_is_not_a_timeout(run, clock, sleeper):
     )
     assert result.outcome.name == "time_cap"
     assert result.cleanup_timed_out is False
+
+
+# --- threads that cannot be stopped (L15) ---------------------------------------------------------------------------
+
+
+def blocking_provider(clock, started, release):
+    """A function provider with one tool whose thread uses up the agent's cap on the fake clock and then blocks."""
+
+    def blocks(args, timeout_s):
+        clock.advance(300)
+        started.set()
+        release.wait(timeout=10)
+        return "late"
+
+    return FunctionProvider([(ToolSpec("blocks", "A tool that blocks."), blocks)])
+
+
+def test_l15_the_loop_result_records_the_threads_a_cut_call_left_running(make_config, clock):
+    """L15: the call is cut at the time cap; its thread cannot be killed, and the result says it may still run."""
+    started, release = threading.Event(), threading.Event()
+    config = make_config(time_cap_s=300)
+    p = blocking_provider(clock, started, release)
+
+    async def scenario():
+        box = ToolBox([p], cap_chars=config.limits.output_cap_chars)
+        try:
+            return await run_agent(
+                StubAdapter([[("blocks", {})]]), box, "s", "u", config, clock=clock, sleep=ClockSleep(clock)
+            )
+        finally:
+            release.set()  # let the thread end, so that the loop can shut down
+
+    result = asyncio.run(scenario())
+    assert result.outcome.name == "time_cap"
+    assert result.tool_calls[0].status == "cut"
+    assert result.abandoned_threads == 1
+
+
+def test_l15_a_run_with_no_abandoned_thread_records_none(run):
+    result = run(StubAdapter(["done"]), [FakeProvider({"t": lambda a: ""})])
+    assert result.abandoned_threads == 0
+
+
+def test_l15_a_later_run_on_the_same_provider_gets_a_tool_error_and_records_the_thread_still_running(
+    make_config, clock
+):
+    """L15: the second attempt's call is refused with an error naming the reason, and its result records the thread."""
+    started, release = threading.Event(), threading.Event()
+    config = make_config(time_cap_s=300)
+    p = blocking_provider(clock, started, release)
+
+    async def scenario():
+        box = ToolBox([p], cap_chars=config.limits.output_cap_chars)
+        try:
+            first = await run_agent(
+                StubAdapter([[("blocks", {})]]), box, "s", "u", config, clock=clock, sleep=ClockSleep(clock)
+            )
+            second = await run_agent(
+                StubAdapter([[("blocks", {})], "done"]), box, "s", "u", config, clock=clock, sleep=ClockSleep(clock)
+            )
+        finally:
+            release.set()
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert first.abandoned_threads == 1
+    (refused,) = second.tool_calls
+    assert (refused.status, refused.error_class) == ("error", "AbandonedThread")
+    assert "still running" in refused.text
+    assert second.outcome.name == "finished"
+    assert second.abandoned_threads == 1

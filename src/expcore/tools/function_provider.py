@@ -11,7 +11,10 @@ but the function goes on in its thread until it returns, and the default executo
 `asyncio.run` waits for it. So a plain function is handed the time the run has left, as the keyword `timeout_s`, and
 is expected to bound itself with it (L05); registering a plain function that cannot take the keyword is refused. A
 call cancelled while its thread was running is recorded on the provider (`threads_possibly_running`,
-`abandoned_total`), and the provider never waits for the thread: the cancelled call returns at once.
+`abandoned_threads`, `abandoned_total`), and the provider never waits for the thread: the cancelled call returns at
+once. Python offers no way to stop a thread, and this module does not try to: while such a thread is still running
+the provider refuses every new call with a tool error that says why, since the thread may still hold what the new call
+would need. The loop result records the count (`abandoned_threads`).
 
 A function that waits on infrastructure declares a `ctx` parameter and wraps each wait in `ctx.infrastructure_wait()`,
 so the harness pauses the agent's clock for it (L04). A coroutine function gets the call context itself and uses
@@ -135,6 +138,10 @@ class FunctionProvider:
         """Return the specs, in registration order."""
         return list(self._specs)
 
+    def abandoned_threads(self) -> int:
+        """Return how many threads of cancelled calls may still be running; the loop records it in its result."""
+        return len(self.threads_possibly_running())
+
     def threads_possibly_running(self) -> list[str]:
         """Return the tool names of calls that were cancelled while their function ran and that have not returned.
 
@@ -149,8 +156,16 @@ class FunctionProvider:
         """Run the function: a coroutine function on the loop, any other function in a worker thread (L15).
 
         A cancelled call returns at once and does not wait for its thread (the thread cannot be killed); see
-        `threads_possibly_running`.
+        `threads_possibly_running`, and until they return a new call is refused with a tool error.
         """
+        running = self.threads_possibly_running()
+        if running:
+            return ToolOutput(
+                f"not run: an earlier call to {', '.join(sorted(set(running)))} was cancelled and its worker thread is "
+                "still running; a thread cannot be killed, so no new call is accepted until it returns",
+                is_error=True,
+                error_class="AbandonedThread",
+            )
         function = self._functions[name]
         extra = {_CONTEXT_KEYWORD: ctx} if _takes_context(function) else {}
         if inspect.iscoroutinefunction(function):
