@@ -1,8 +1,8 @@
 .PHONY: check test lint fmt clean hooks
 
-# The definition of green: lint, unit tests, and the study-token check over src/.
+# The definition of green: lint, unit tests, and the study-token check over every tracked file.
 check: lint test
-	uv run python -m expcore.provenance.study_tokens check src/
+	uv run python -m expcore.provenance.study_tokens check
 
 test:
 	uv run pytest

@@ -13,6 +13,7 @@ import tokenize
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+from expcore.provenance.candidates import iter_windows, normalise
 from expcore.provenance.gitobjects import blob_id
 from expcore.provenance.headers import (
     HeaderError,
@@ -23,14 +24,8 @@ from expcore.provenance.headers import (
     strip_header,
 )
 from expcore.provenance.sanitise_map import Entry, MapError, load_map, matches_on_components
-from expcore.provenance.study_tokens import (
-    EXIT_ERROR,
-    EXIT_FINDINGS,
-    EXIT_OK,
-    FSTRING_MIDDLE_TYPES,
-    iter_windows,
-    normalise,
-)
+from expcore.provenance.scanner import FSTRING_MIDDLE_TYPES
+from expcore.provenance.study_tokens import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK
 
 _RUN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
 _STRING_PARTS_RE = re.compile(r"(?s)^([A-Za-z]*)('''|\"\"\"|'|\")(.*)\2$")

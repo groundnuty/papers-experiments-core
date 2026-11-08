@@ -34,7 +34,7 @@ replacement = "space_a"
 category = "space"
 
 [[entry]]
-token = "de"
+token = "zq"
 replacement = "xx"
 category = "option"
 
@@ -57,16 +57,16 @@ OTHER = "/data/Secret-Space-Extra/in"
 NET = "10.99.0.0/16"
 NOTE = "allow 10.99.0.0/16 here"
 secret_space = 1
-get_secret_space_path = secret_space  # de-duplication of secret-space
-MODE = "de"
-LABEL = 'de-dup'
+get_secret_space_path = secret_space  # zq-duplication of secret-space
+MODE = "zq"
+LABEL = 'zq-dup'
 EMBEDDED = "supersecret-spaces"
 GREETING = "héllo secret-space"
 INDEX = "index"
 
 
-def index(de, *, mode=os.sep):
-    return f"{de}-secret-space-{mode}"
+def index(zq, *, mode=os.sep):
+    return f"{zq}-secret-space-{mode}"
 '''
 
 
@@ -105,7 +105,7 @@ def test_identifiers_are_replaced_whole_and_as_components(token_map):
 
 def test_comments_and_docstrings_are_sanitised(token_map):
     result = sn.sanitise_python(SOURCE, token_map.entries)
-    assert "# de-duplication of space-a" in result
+    assert "# zq-duplication of space-a" in result
     assert "The second line names space-a too." in result
     assert "https://host-1.example.test:8443/api." in result
 
@@ -113,8 +113,8 @@ def test_comments_and_docstrings_are_sanitised(token_map):
 def test_short_token_leaves_longer_words_alone_but_replaces_the_whole_literal(token_map):
     result = sn.sanitise_python(SOURCE, token_map.entries)
     assert 'MODE = "xx"' in result
-    assert "# de-duplication" in result
-    assert "LABEL = 'de-dup'" in result
+    assert "# zq-duplication" in result
+    assert "LABEL = 'zq-dup'" in result
     assert 'INDEX = "index"' in result
     assert "def index(xx, *, mode=os.sep):" in result
 
