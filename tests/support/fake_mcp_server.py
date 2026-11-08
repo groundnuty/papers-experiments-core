@@ -1,10 +1,9 @@
 """A tiny real MCP stdio server for the client tests, built with the SDK's server API.
 
-    python fake_mcp_server.py --tools echo,add [--suffix TEXT] [--hang] [--pidfile PATH]
+    python fake_mcp_server.py --tools echo,add [--suffix TEXT] [--hang]
 
 `--tools` is the server-side allow-list: only the named tools of the catalogue are registered. `--suffix` changes
-every description. `--hang` makes the server never speak. `--pidfile` records the process id, so a test can see that
-a failed start left no child behind.
+every description. `--hang` makes the server never speak.
 """
 
 import argparse
@@ -57,11 +56,7 @@ def main() -> None:
     parser.add_argument("--tools", default="echo,add")
     parser.add_argument("--suffix", default="")
     parser.add_argument("--hang", action="store_true")
-    parser.add_argument("--pidfile")
     args = parser.parse_args()
-    if args.pidfile:
-        with open(args.pidfile, "w", encoding="utf-8") as handle:
-            handle.write(str(os.getpid()))
     if args.hang:
         time.sleep(3600)
         sys.exit(0)

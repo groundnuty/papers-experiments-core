@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 
+import anyio
 import pytest
 from mcp import MCPError, StdioServerParameters
 from mcp.types import CONNECTION_CLOSED, INTERNAL_ERROR, INVALID_PARAMS
@@ -23,20 +24,18 @@ from expcore.tools.mcp_client import McpToolProvider
 SERVER = str(Path(__file__).resolve().parents[1] / "support" / "fake_mcp_server.py")
 
 
-def launch(tools="echo,add", *, suffix="", hang=False, pidfile=None):
+def launch(tools="echo,add", *, suffix="", hang=False):
     """The command and arguments of the fake server, with its server-side allow-list."""
     args = [SERVER, "--tools", tools]
     if suffix:
         args += ["--suffix", suffix]
     if hang:
         args.append("--hang")
-    if pidfile:
-        args += ["--pidfile", str(pidfile)]
     return sys.executable, args
 
 
 def provider(frozen, tools="echo,add", **kwargs):
-    command, args = launch(tools, **{k: kwargs.pop(k) for k in ("suffix", "hang", "pidfile") if k in kwargs})
+    command, args = launch(tools, **{k: kwargs.pop(k) for k in ("suffix", "hang") if k in kwargs})
     kwargs.setdefault("allowed_tools", [t for t in tools.split(",") if t])
     return McpToolProvider(command, args, frozen=frozen, **kwargs)
 
@@ -139,28 +138,46 @@ def test_l14_a_server_that_answers_starts_within_a_generous_bound(frozen):
     assert asyncio.run(go()) == ["add", "echo"]
 
 
-def test_l14_a_server_that_never_answers_fails_the_start_at_the_bound_and_leaves_no_child(frozen, tmp_path):
+@pytest.fixture
+def spawned(monkeypatch) -> list[int]:
+    """The pid of every process the MCP client spawns, taken from the launcher's own process handle.
+
+    The pid is known the moment the process exists, whatever the child has got round to doing, so a test that asserts
+    the child's end does not wait for a loaded machine to let the child write a file first.
+    """
+    pids: list[int] = []
+    launch_process = anyio.open_process
+
+    async def spy(*args, **kwargs):
+        process = await launch_process(*args, **kwargs)
+        pids.append(process.pid)
+        return process
+
+    monkeypatch.setattr(anyio, "open_process", spy)
+    return pids
+
+
+def test_l14_a_server_that_never_answers_fails_the_start_at_the_bound_and_leaves_no_child(frozen, spawned):
     """L14: a server that never speaks is broken: the start fails as knowledge infrastructure at its timeout.
 
     The server sleeps for an hour, so a start that returns at all was cut by the bound. The bound is never honoured
     early (the lower limit), and the upper limit is loose by tens of seconds: the test does not depend on how fast
-    the machine is, only on the bound being enforced rather than the hour being waited out.
+    the machine is, only on the bound being enforced rather than the hour being waited out. The child it started is
+    found by the pid the launcher reports, and must be gone.
     """
-    bound_s, pidfile = 1.0, tmp_path / "pid"
+    bound_s = 1.0
     started = time.monotonic()
-    error = start_fails(provider(frozen, hang=True, pidfile=pidfile, start_timeout_s=bound_s))
+    error = start_fails(provider(frozen, hang=True, start_timeout_s=bound_s))
     elapsed = time.monotonic() - started
     assert bound_s <= elapsed < bound_s + 30
     assert isinstance(error, InfraError)
     assert error.kind == "knowledge"
     assert "did not start within 1 s" in error.detail
-    # The child writes its pid once Python is up, which on a loaded disk can be after the bound passed.
-    wait_for(lambda: pidfile.exists() and pidfile.read_text().strip(), what="the server's pid file")
-    pid = int(pidfile.read_text())
+    assert len(spawned) == 1, "the client was expected to launch the server through anyio.open_process"
 
     def gone() -> bool:
         try:
-            os.kill(pid, 0)
+            os.kill(spawned[0], 0)
         except ProcessLookupError:
             return True
         return False
