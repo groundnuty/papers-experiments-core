@@ -5,7 +5,7 @@ import warnings
 from urllib.parse import quote, unquote
 
 import pytest
-from record_support import hand_made
+from record_support import clear_registry, hand_made
 
 from expcore.config.loading import ConfigError
 from expcore.records.record import RunRecord, decode
@@ -13,7 +13,6 @@ from expcore.records.redact import (
     REDACTED,
     SECRET_NAME,
     Redactor,
-    forget_secrets,
     forms_of,
     is_secret_key,
     redact_structure,
@@ -107,7 +106,7 @@ def test_R12_a_number_whose_string_form_is_a_secret_is_replaced():
 
 def test_R12_the_forms_codex_listed_a_short_password_all_digits_brackets_and_a_minted_token():
     """R12: each form that used to survive is gone from the written structure."""
-    forget_secrets()
+    clear_registry()
     register_secret("minted-9f8e7d6c5b4a")
     env = {"P_PASSWORD": "pw12", "N_SECRET": "123456789012", "B_SECRET_KEY": "a]b[c]d[e"}
     data = {
@@ -120,7 +119,7 @@ def test_R12_the_forms_codex_listed_a_short_password_all_digits_brackets_and_a_m
         "ordinary": [1, 2.5, True, None, "text"],
     }
     out, _ = redact_structure(data, env)
-    forget_secrets()
+    clear_registry()
     text = json.dumps(out)
     for secret in ("pw12", "123456789012", "a]b[c]d[e", "minted-9f8e7d6c5b4a"):
         assert secret not in text
@@ -130,7 +129,7 @@ def test_R12_the_forms_codex_listed_a_short_password_all_digits_brackets_and_a_m
 
 def test_R12_a_minted_token_is_redacted_everywhere_once_registered_and_not_before():
     """R12: a token minted at run time is in no environment variable; registering it is what makes it a secret."""
-    forget_secrets()
+    clear_registry()
     token = "minted-0a1b2c3d4e5f"
     data = {"url": f"https://host/path?access={token}", "note": f"bearer {token}"}
     assert redact_structure(data, {})[0] == data
@@ -138,7 +137,7 @@ def test_R12_a_minted_token_is_redacted_everywhere_once_registered_and_not_befor
     try:
         out, paths = redact_structure(data, {})
     finally:
-        forget_secrets()
+        clear_registry()
     assert token not in json.dumps(out)
     assert paths == ["note", "url"]
     with pytest.raises(ValueError, match="non-empty string"):
@@ -335,3 +334,87 @@ def test_R12_a_key_that_names_a_secret_is_applied_inside_a_string_that_holds_a_j
     again, more = redact_structure(out, {})
     assert again == out
     assert more == []
+
+
+SECRET_FOR_CUTS = "zqx7-live-key-4455667788"
+
+
+def test_R12_a_fragment_of_a_secret_left_at_the_end_by_a_cut_is_redacted():
+    """R12: four or more characters of a secret at the end of the text, where a cap or a slice cut it, are replaced."""
+    env = {"A_API_KEY": SECRET_FOR_CUTS}
+    cut = f"result: {SECRET_FOR_CUTS[:6]}"
+    assert redact_text(cut, env)[0] == f"result: {REDACTED}"
+    assert redact_text(f"result: {SECRET_FOR_CUTS[:4]}", env)[0] == f"result: {REDACTED}"
+    assert redact_text(f"result: {SECRET_FOR_CUTS[:3]}", env)[0] == f"result: {SECRET_FOR_CUTS[:3]}"
+    assert redact_text(f"{SECRET_FOR_CUTS[:6]} and more", env)[0] == f"{SECRET_FOR_CUTS[:6]} and more"
+
+
+def test_R12_a_fragment_before_the_caps_notice_is_redacted_and_the_notice_stays():
+    """R12: the cap writes its notice after what it kept, so the cut secret is the end of the text before the notice."""
+    env = {"A_API_KEY": SECRET_FOR_CUTS}
+    notice = "\n[output truncated: 312 of 600 characters dropped by the harness cap]"
+    out = redact_text(f"head {SECRET_FOR_CUTS[:7]}{notice}", env)[0]
+    assert out == f"head {REDACTED}{notice}"
+    assert redact_text(out, env)[0] == out
+
+
+def test_R12_a_fragment_of_a_secret_left_at_the_start_by_a_slice_is_redacted():
+    """R12: four or more characters that end a secret, at the start of the text, are replaced."""
+    env = {"A_API_KEY": SECRET_FOR_CUTS}
+    assert redact_text(f"{SECRET_FOR_CUTS[-6:]} rest", env)[0] == f"{REDACTED} rest"
+    assert redact_text(f"{SECRET_FOR_CUTS[-3:]} rest", env)[0] == f"{SECRET_FOR_CUTS[-3:]} rest"
+
+
+def test_R12_the_fragment_rule_is_a_fixed_point_and_leaves_texts_that_end_in_the_marker_alone():
+    env = {"A_API_KEY": SECRET_FOR_CUTS}
+    once = redact_text(f"x {SECRET_FOR_CUTS[:9]}", env)[0]
+    assert redact_text(once, env)[0] == once
+    assert redact_text(f"x {REDACTED}", env)[0] == f"x {REDACTED}"
+
+
+def test_R12_only_the_value_of_a_secret_named_key_changes_inside_json_text_every_other_character_stays():
+    """R12: a long number and an overflowing one are byte for byte as they were, and so are the spaces."""
+    text = '{"token": "abc123", "a": 1.234567890123456789,  "b": 1e400, "c": [0.10, 2E5], "d": {"password": {"x": 1}}}'
+    out, paths = redact_structure({"arguments": text}, {})
+    assert out["arguments"] == (
+        '{"token": "[redacted]", "a": 1.234567890123456789,  "b": 1e400, "c": [0.10, 2E5], '
+        '"d": {"password": "[redacted]"}}'
+    )
+    assert paths == ["arguments"]
+    assert redact_structure(out, {})[0] == out
+
+
+def test_R12_json_text_inside_json_text_is_scanned_in_turn_and_other_values_stay():
+    """R12: the inner string is written back only because a secret was in it."""
+    inner = '{"token": "zzz", "n": 1e400, "m": 1.234567890123456789}'
+    message = '{"args": ' + json.dumps(inner) + ', "k": 2.50}'
+    out, _ = redact_structure({"message": message}, {})
+    decoded = json.loads(out["message"])
+    assert json.loads(decoded["args"])["token"] == REDACTED
+    assert "1e400" in decoded["args"]
+    assert "1.234567890123456789" in decoded["args"]
+    assert out["message"].endswith(', "k": 2.50}')
+
+
+def test_R12_json_text_that_cannot_be_scanned_is_redacted_by_value_only():
+    """R12: text that is not strict JSON (NaN, a trailing comma, a broken end) is left as the value rules made it."""
+    for text in ('{"token": "abc123", "x": NaN}', '{"token": "abc123",}', '{"token": "abc123"} trailing', "[1, 2"):
+        assert redact_structure({"s": text}, {})[0] == {"s": text}
+    secret = "value-based-secret-99"
+    out, _ = redact_structure({"s": '{"token": "' + secret + '", "x": NaN}'}, {"A_API_KEY": secret})
+    assert out["s"] == '{"token": "[redacted]", "x": NaN}'
+
+
+def test_R12_property_names_inside_json_text_are_not_secrets_either():
+    """R12: a schema written as JSON text keeps the properties it names."""
+    text = '{"properties": {"token": {"type": "string"}}, "required": ["token"]}'
+    assert redact_structure({"s": text}, {})[0] == {"s": text}
+
+
+def test_R12_the_registry_of_secrets_only_grows_nothing_in_the_module_removes_a_secret():
+    """R12: no function of the module forgets a secret; a value registered stays redacted for the process."""
+    from expcore.records import redact
+
+    assert not hasattr(redact, "forget_secrets")
+    register_secret("registered-for-good-81726354")
+    assert redact_structure({"a": "registered-for-good-81726354"}, {})[0] == {"a": REDACTED}

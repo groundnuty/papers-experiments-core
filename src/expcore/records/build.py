@@ -356,9 +356,10 @@ async def record_attempt(
     Secrets are redacted from the record (R12): those of environment variables named like one, the variables
     named in `secret_env`, the key variables of the backend's model and of the `models` table, the ones registered
     with `expcore.records.redact.register_secret` (a platform that mints a token registers it), and `secrets`.
-    A secret too short to redact raises ConfigError before the run starts.
+    A secret too short to redact raises ConfigError before the run starts. The secrets are read again when the record
+    is built, after the run, so one registered during the run (a token a provider minted) is redacted too.
     """
-    redactor = redactor_for(backend, environ=environ, secrets=secrets, secret_env=secret_env, models=models)
+    redactor_for(backend, environ=environ, secrets=secrets, secret_env=secret_env, models=models)  # fail early
     recording = RecordingBackend(backend)
     box = ToolBox(list(providers), cap_chars=config.limits.output_cap_chars)
     specs = [spec for provider in providers for spec in provider.tools()]
@@ -375,5 +376,8 @@ async def record_attempt(
         specs=specs,
         code=code,
         core_version=core_version if core_version is not None else sdk_version(CORE_DISTRIBUTION),
-        redactor=redactor,
+        secrets=secrets,
+        secret_env=secret_env,
+        models=models,
+        environ=environ,
     )

@@ -10,9 +10,10 @@ from loop_support import FakeClock, FakeProvider, ScriptedBackend, never
 
 from expcore.config.models import Limits
 from expcore.loop.config import AgentConfig
+from expcore.records import redact
 from expcore.records.build import RunIdentity, record_attempt
 from expcore.records.record import RunRecord
-from expcore.records.redact import SECRET_NAME, forget_secrets
+from expcore.records.redact import SECRET_NAME
 from expcore.records.schema import CURRENT
 from expcore.records.seal import seal
 
@@ -155,6 +156,12 @@ def record_run(
     )
 
 
+def clear_registry() -> None:
+    """Empty the registry of secrets between tests. The registry only grows in a process; this is the tests' reset."""
+    with redact._lock:
+        redact._registered.clear()
+
+
 @pytest.fixture
 def no_secrets_in_the_environment(monkeypatch):
     """Remove every variable named like a secret (a CI runner sets some) and forget registered secrets.
@@ -164,6 +171,6 @@ def no_secrets_in_the_environment(monkeypatch):
     """
     for name in [n for n in os.environ if SECRET_NAME.search(n) and not n.startswith("GIT_")]:  # git needs its own
         monkeypatch.delenv(name)
-    forget_secrets()
+    clear_registry()
     yield
-    forget_secrets()
+    clear_registry()
