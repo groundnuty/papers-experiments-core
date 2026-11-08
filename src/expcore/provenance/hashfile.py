@@ -19,7 +19,9 @@ from expcore.provenance.candidates import HASH_PREFIX, WHOLE_ONLY_BELOW, normali
 SCOPE_ALL = "all"
 SCOPE_CODE = "code"
 SCOPES = (SCOPE_CODE, SCOPE_ALL)
-CODE_CATEGORIES = frozenset({"conditions", "data-states", "tasks", "datasets"})
+# Names a study invented for its design, and public model names: code must not hard-code them, but prose may name
+# them. Everything else (hosts, addresses, spaces, providers, users, environment variables) is private everywhere.
+CODE_CATEGORIES = frozenset({"conditions", "data-states", "tasks", "datasets", "models", "repositories"})
 
 _CATEGORY_RE = re.compile(r"^#\s*category\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")

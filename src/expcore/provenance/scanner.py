@@ -266,15 +266,17 @@ def _path_digests(path: str, hashes: Hashes) -> set[str]:
 
 
 def is_docs_path(path: str) -> bool:
-    """Tell whether a repository-relative path lies under docs/."""
-    return PurePosixPath(path).parts[:1] == (DOCS_ROOT,)
+    """Tell whether a repository-relative path is prose: under docs/, or any Markdown file."""
+    posix = PurePosixPath(path)
+    return posix.parts[:1] == (DOCS_ROOT,) or posix.suffix.casefold() == ".md"
 
 
 def scan_source(path: str | PathLike[str], text: str, hashes: Hashes) -> list[Finding]:
     """Scan one file: its path, then its text (Python by tokens, anything else by line).
 
-    Files under docs/ are checked only against `all`-scope hashes. If the path itself matches, it is reported as
-    a `path` finding and replaced by a placeholder in every finding of the file.
+    Prose (files under docs/ and Markdown anywhere) is checked only against `all`-scope hashes, because it may
+    describe a study's design. If the path itself matches, it is reported as a `path` finding and replaced by a
+    placeholder in every finding of the file.
     """
     name = str(path)
     scoped = hashes.only_all() if is_docs_path(name) else hashes

@@ -3,6 +3,7 @@
 import pytest
 
 from expcore.provenance import study_tokens as st
+from expcore.provenance.hashfile import scope_for_category
 from expcore.provenance.scanner import REDACTED_PATH, Finding, decode_escapes
 
 HOST = "fake-zone.example.net"
@@ -24,19 +25,31 @@ def lines_and_kinds(findings: list[Finding]) -> list[tuple[int, str]]:
 # --- scope ----------------------------------------------------------------------------------------------------------
 
 
-def test_code_scope_tokens_are_found_everywhere_but_under_docs(hashes):
+def test_code_scope_tokens_are_found_in_code_but_not_in_prose(hashes):
     text = f"{HOST} and {NAME}\n"
-    assert len(st.scan_source("README.md", text, hashes)) == 2
     assert len(st.scan_source("src/a.py", f"# {text}", hashes)) == 2
-    in_docs = st.scan_source("docs/guide.md", text, hashes)
-    assert [f.hash_prefix for f in in_docs] == [st.token_hash(NAME)[:12]]
+    assert len(st.scan_source("config/settings.toml", text, hashes)) == 2
+    all_only = [st.token_hash(NAME)[:12]]
+    assert [f.hash_prefix for f in st.scan_source("docs/guide.md", text, hashes)] == all_only
+    assert [f.hash_prefix for f in st.scan_source("README.md", text, hashes)] == all_only
     assert len(st.scan_source("docs/sub/dir/page.py", f"# {text}", hashes)) == 1
 
 
-def test_only_a_leading_docs_directory_is_special(hashes):
-    assert len(st.scan_source("src/docs/guide.md", f"{HOST}\n", hashes)) == 1
-    assert len(st.scan_source("mydocs/guide.md", f"{HOST}\n", hashes)) == 1
-    assert st.scan_source("./docs/guide.md", f"{HOST}\n", hashes) == []
+def test_prose_is_any_markdown_file_or_anything_under_a_leading_docs_directory(hashes):
+    assert st.scan_source("src/docs/guide.md", f"{HOST}\n", hashes) == []
+    assert st.scan_source(".claude/commands/x.md", f"{HOST}\n", hashes) == []
+    assert st.scan_source("./docs/guide.txt", f"{HOST}\n", hashes) == []
+    assert len(st.scan_source("mydocs/guide.txt", f"{HOST}\n", hashes)) == 1
+
+
+@pytest.mark.parametrize("category", ["models", "repositories", "conditions", "datasets"])
+def test_design_and_public_name_categories_are_code_scope(category):
+    assert scope_for_category(category) == "code"
+
+
+@pytest.mark.parametrize("category", ["hosts", "addresses", "spaces", "providers", "users", "env-vars", None])
+def test_private_name_categories_are_checked_everywhere(category):
+    assert scope_for_category(category) == "all"
 
 
 # --- path disclosure ------------------------------------------------------------------------------------------------
