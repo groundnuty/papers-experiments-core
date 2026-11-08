@@ -24,11 +24,18 @@ the spawn, and again while the run goes on; a client cannot prevent that, so the
 (c) at teardown, after the server has stopped, the launcher reads the principal's direct and effective privileges again
     and examines the token again. A difference from the condition's declared rights means the run's tool plane was not
     what was declared, so the launcher records a `tool_plane_rights_changed` event through the sink it was given and
-    raises `InfraError` of kind `knowledge` (the core's kind for a tool server), which sets the run aside as
-    infrastructure. A teardown that cannot re-verify the plane (an outage of Onezone, a token that no longer examines
-    cleanly) is set aside the same way, without the event, because unknown is not a pass. The token's remaining life is
-    not held to the run's minimum then, because the run is over; it only has to be unexpired.
+    raises `InfraError` of kind `tool_plane_integrity`, which sets the run aside as infrastructure. A teardown that
+    cannot re-verify the plane (an outage of Onezone, a token that no longer examines cleanly) is set aside the same
+    way, without the event, because unknown is not a pass. The token's remaining life is not held to the run's minimum
+    then, because the run is over; it only has to be unexpired.
 The event and the error name the condition by its position (`conditions[i]`), never by its name.
+
+The kind of every integrity failure is `tool_plane_integrity`, not `knowledge`. `knowledge` is the core's kind for a tool
+server that failed, and a study may declare it as a condition's treatment (a relay that goes down is the manipulation).
+A rights change, a token that fails its examination at launch or at teardown, and a privilege read that fails are not
+that: they say the plane was not what was declared, so they must be set aside under every condition. The registry
+marks `tool_plane_integrity` as not treatable, so no condition can declare it, and the core scores no attempt that
+failed before the model's first turn as treatment.
 
 Waits. The only infrastructure wait kind this module uses is `toolserver_lifecycle`, around the start (the pre-checks
 and the spawn) and around the stop. What the agent triggers through the tools, a federation operation or a read of data,
@@ -46,7 +53,7 @@ import os
 import sys
 from collections.abc import AsyncIterator, Callable, Mapping
 
-from expcore.errors import InfraError
+from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
 from expcore_onedata.client import PlatformError
@@ -56,7 +63,7 @@ from expcore_onedata.tokencheck import ExaminationFailed, PrivilegesMismatch, To
 from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, token_window, tool_server_spec
 
 WAIT_KIND = "toolserver_lifecycle"
-INFRA_KIND = "knowledge"  # the core's kind for a tool server that failed
+INTEGRITY_KIND = TOOL_PLANE_INTEGRITY  # the kind of every failure of the plane's integrity checks; not treatable
 EVENT_RIGHTS_CHANGED = "tool_plane_rights_changed"
 
 # Where the launcher records an event: called with the event's kind and a detail that holds no configured name, token or
@@ -125,6 +132,18 @@ def _is_outage(error: Exception) -> bool:
     return isinstance(error, PlatformError) and (error.status is None or error.status >= 500)
 
 
+def _integrity_failure(label: str, when: str, refused: TokenRefused) -> InfraError:
+    """The set-aside error for a plane that cannot be shown to be what the condition declared, at launch or teardown.
+
+    Whether Onezone could not be reached or the token or principal was refused, the plane is unverified, which is an
+    integrity failure of the same kind either way; only the words differ. The text holds the refusal's own message,
+    which names rights and caveat types and never a value.
+    """
+    outage = isinstance(refused, ExaminationFailed) and _is_outage(refused.error)
+    what = "could not be reached" if outage else "failed its check"
+    return InfraError(INTEGRITY_KIND, f"{label}: the tool plane {what} {when}: {refused}")
+
+
 def _recheck(
     issuer: TokenIssuer, config: PlatformConfig, condition: Condition, token: MintedToken, ceiling_s: float
 ) -> None:
@@ -149,22 +168,20 @@ class ToolServerLauncher:
         self._events = events
 
     async def _verify_plane(self, condition: str, chosen: Condition, token: MintedToken, ceiling_s: float) -> None:
-        """Re-verify the tool plane after the server stopped; raise InfraError of kind knowledge unless it held."""
+        """Re-verify the tool plane after the server stopped; raise InfraError of kind tool_plane_integrity unless it held."""
         label = self._config.condition_label(condition)
         try:
             await asyncio.to_thread(_recheck, self._issuer, self._config, chosen, token, ceiling_s)
         except PrivilegesMismatch as changed:
             detail = f"{label}: the tool plane's rights changed during the run: {changed}"
-            error = InfraError(INFRA_KIND, detail)
+            error = InfraError(INTEGRITY_KIND, detail)
             try:
                 self._events(EVENT_RIGHTS_CHANGED, detail)
             except Exception as sink_error:  # the run is set aside whether or not the event could be written
                 raise error from sink_error
             raise error from None
         except TokenRefused as refused:
-            outage = isinstance(refused, ExaminationFailed) and _is_outage(refused.error)
-            what = "could not be reached" if outage else "no longer passes its examination"
-            raise InfraError(INFRA_KIND, f"{label}: the tool plane {what} at teardown: {refused}") from None
+            raise _integrity_failure(label, "at teardown", refused) from None
 
     @contextlib.asynccontextmanager
     async def launch(
@@ -178,14 +195,16 @@ class ToolServerLauncher:
     ) -> AsyncIterator[McpToolProvider]:
         """Start the server for a condition and yield its tool provider; stop it on leaving.
 
-        The start and the stop are each inside `ctx.infrastructure_wait("toolserver_lifecycle")`. An outage of Onezone
-        while the token is examined or the principal's privileges are read is infrastructure of kind `knowledge`; a
-        token or principal it refuses is a `TokenRefused`. `ceiling_s` is the same value the token was minted for, so a
-        token that cannot last the run is refused here.
+        The start and the stop are each inside `ctx.infrastructure_wait("toolserver_lifecycle")`. A token that fails its
+        examination, a principal whose privileges differ from the condition's rights, and a read of either that fails
+        (an outage included) raise `InfraError` of kind `tool_plane_integrity` before the server is started; a server
+        that fails to start is the server's own. `ceiling_s` is the same value the token was minted for, so a token that
+        cannot last the run fails here.
 
         On leaving, after the server has stopped, the principal's privileges and the token are checked again: a
         change from the condition's declared rights records `tool_plane_rights_changed` and raises `InfraError` of kind
-        `knowledge`, which replaces any exception of the run's body, because the run is set aside whatever it did.
+        `tool_plane_integrity`, which replaces any exception of the run's body, because the run is set aside whatever
+        it did.
         """
         server, chosen = _server(self._config), self._config.condition(condition)
         env = server_environment(self._config, chosen, token, extra_env)
@@ -200,13 +219,8 @@ class ToolServerLauncher:
         async with ctx.infrastructure_wait(WAIT_KIND):
             try:
                 await asyncio.to_thread(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
-            except ExaminationFailed as failed:
-                if _is_outage(failed.error):
-                    raise InfraError(
-                        "knowledge",
-                        f"the token or its principal could not be examined before the start: {failed.error}",
-                    ) from None
-                raise
+            except TokenRefused as refused:
+                raise _integrity_failure(self._config.condition_label(condition), "before the start", refused) from None
             await provider.__aenter__()
         try:
             yield provider

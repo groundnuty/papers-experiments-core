@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import re
 import shutil
@@ -22,7 +23,6 @@ from expcore.tools.manifest import FrozenManifest, ManifestError, live_manifest
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.pin import PinError
-from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import Plane, TokenIssuer, data_path_spec, token_window, tool_server_spec
 from expcore_onedata.toolserver import (
     ENV_PROVIDER_HOST,
@@ -204,7 +204,7 @@ def test_a_token_that_no_longer_examines_cleanly_does_not_start_the_server(world
     config, issuer, launcher = world
     token = read_token(issuer, config)
     fake.issued.clear()
-    with pytest.raises(TokenRefused, match="could not be examined"):
+    with pytest.raises(InfraError, match="could not be examined"):
         start(launcher, RecordingContext(), "read", token, tmp_path)
     assert not (tmp_path / "seen.json").exists()
 
@@ -212,7 +212,7 @@ def test_a_token_that_no_longer_examines_cleanly_does_not_start_the_server(world
 def test_o06_a_token_that_cannot_last_the_run_does_not_start_the_server(world, tmp_path):
     """O06: launching for a longer ceiling than the token was minted for is refused before the spawn."""
     config, issuer, launcher = world
-    with pytest.raises(TokenRefused, match="shorter"):
+    with pytest.raises(InfraError, match="shorter"):
         start(launcher, RecordingContext(), "read", read_token(issuer, config), tmp_path, ceiling_s=7200)
     assert not (tmp_path / "seen.json").exists()
 
@@ -252,7 +252,7 @@ def test_o05_o06_a_token_minted_for_one_conditions_rights_does_not_start_another
     assert caveats == tool_server_spec(config.space.id, config.condition("replicate")).caveats.caveats(
         caveats[0]["validUntil"]
     )  # the examination of the caveats alone cannot tell the two conditions apart
-    with pytest.raises(TokenRefused, match=r"privileges differ.*lacks space_schedule_replication") as caught:
+    with pytest.raises(InfraError, match=r"privileges differ.*lacks space_schedule_replication") as caught:
         start(launcher, RecordingContext(), "replicate", token, tmp_path)
     assert "space_manage_qos" in str(caught.value)
     assert not (tmp_path / "seen.json").exists()
@@ -278,7 +278,7 @@ def test_o05_o06_a_change_of_privileges_between_minting_and_launch_does_not_star
     config, issuer, launcher = world
     token = read_token(issuer, config)
     fake.grant(TOOLS.user_id, direct, effective)
-    with pytest.raises(TokenRefused, match=reason):
+    with pytest.raises(InfraError, match=reason):
         start(launcher, RecordingContext(), "read", token, tmp_path)
     assert not (tmp_path / "seen.json").exists()
 
@@ -304,12 +304,12 @@ def test_o05_o06_a_principal_whose_privileges_cannot_be_read_does_not_start_the_
     config, issuer, launcher = world
     token = read_token(issuer, config)
     del fake.privileges[(fake.SPACE_ID, TOOLS.user_id)]
-    with pytest.raises(TokenRefused, match="privileges could not be read"):
+    with pytest.raises(InfraError, match="privileges could not be read"):
         start(launcher, RecordingContext(), "read", token, tmp_path)
     assert not (tmp_path / "seen.json").exists()
 
 
-def test_a_federation_that_cannot_answer_the_privilege_read_is_infrastructure_of_kind_knowledge(
+def test_a_federation_that_cannot_answer_the_privilege_read_is_infrastructure_of_kind_tool_plane_integrity(
     world, fake, tmp_path, monkeypatch
 ):
     """An outage of Onezone while the principal's privileges are read at launch is an infrastructure failure, as it is
@@ -324,7 +324,7 @@ def test_a_federation_that_cannot_answer_the_privilege_read_is_infrastructure_of
     )
     with pytest.raises(InfraError) as caught:
         start(launcher, RecordingContext(), "read", token, tmp_path)
-    assert caught.value.kind == "knowledge"
+    assert caught.value.kind == "tool_plane_integrity"
     assert token.reveal() not in str(caught.value)
     assert not (tmp_path / "seen.json").exists()
 
@@ -362,7 +362,7 @@ def test_o05_o06_a_change_of_privileges_between_launch_and_teardown_sets_the_run
     ctx = RecordingContext()
     with pytest.raises(InfraError, match="rights changed during the run") as caught:
         run_with(launcher, ctx, "read", token, lambda: fake.grant(TOOLS.user_id, direct, effective))
-    assert caught.value.kind == "knowledge"
+    assert caught.value.kind == "tool_plane_integrity"
     assert re.search(reason, str(caught.value))
     assert [kind for kind, _ in events] == ["tool_plane_rights_changed"]
     assert events[0][1] == caught.value.detail
@@ -372,7 +372,7 @@ def test_o05_o06_a_change_of_privileges_between_launch_and_teardown_sets_the_run
     assert ctx.events[-2:] == [("open", WAIT_KIND), ("close", WAIT_KIND)]  # the teardown check is inside the wait
     outcome = failure_result(caught.value, ended_utc="2026-01-01T00:00:00Z", wall_s=1.0)
     assert outcome.outcome.name == "infrastructure"
-    assert outcome.outcome.infra_kind == "knowledge"
+    assert outcome.outcome.infra_kind == "tool_plane_integrity"
     assert classify(outcome).state == "infra_fail"
 
 
@@ -398,7 +398,7 @@ def test_o05_o06_a_change_is_detected_after_a_failure_of_the_body_too(world, fak
     assert events == []
     with pytest.raises(InfraError, match="rights changed during the run") as caught:
         run_with(launcher, RecordingContext(), "read", token, lambda: fake.grant(TOOLS.user_id, MANAGE), body=crash)
-    assert caught.value.kind == "knowledge"
+    assert caught.value.kind == "tool_plane_integrity"
     assert [kind for kind, _ in events] == ["tool_plane_rights_changed"]
 
 
@@ -428,11 +428,11 @@ def test_o05_o06_a_plane_that_cannot_be_re_verified_at_teardown_is_set_aside_wit
     outage = lambda method, route, sent: fake._error(503, "x") if method == "GET" else reads(method, route, sent)  # noqa: E731
     with pytest.raises(InfraError, match="could not be reached at teardown") as caught:
         run_with(launcher, RecordingContext(), "read", token, lambda: monkeypatch.setattr(fake, "_admin_route", outage))
-    assert caught.value.kind == "knowledge"
+    assert caught.value.kind == "tool_plane_integrity"
     monkeypatch.setattr(fake, "_admin_route", reads)
-    with pytest.raises(InfraError, match="no longer passes its examination") as caught:
+    with pytest.raises(InfraError, match="failed its check at teardown") as caught:
         run_with(launcher, RecordingContext(), "read", token, fake.issued.clear)
-    assert caught.value.kind == "knowledge"
+    assert caught.value.kind == "tool_plane_integrity"
     assert events == []
 
 
@@ -448,19 +448,92 @@ def test_o06_the_token_at_teardown_only_has_to_be_unexpired(three_conditions, tm
     run_with(launcher, RecordingContext(), "read", token, lambda: now.__setitem__(0, token.expires_at - 10))
     assert token.expires_at - (token.expires_at - 10) < window.min_ttl_s  # it would not pass the launch-time window
     now[0] = NOW
-    with pytest.raises(InfraError, match="no longer passes its examination") as caught:
+    with pytest.raises(InfraError, match="failed its check at teardown") as caught:
         run_with(launcher, RecordingContext(), "read", token, lambda: now.__setitem__(0, token.expires_at + 1))
-    assert caught.value.kind == "knowledge"
+    assert caught.value.kind == "tool_plane_integrity"
 
 
-def test_a_federation_that_cannot_examine_the_token_is_infrastructure_of_kind_knowledge(world, fake, tmp_path):
+def test_o05_every_failure_of_the_launch_time_check_is_of_the_integrity_kind_and_spawns_nothing(
+    world, fake, tmp_path, monkeypatch
+):
+    """O05: a token that fails its examination, a lifetime the run outlasts, privileges that differ from the condition's
+    rights, a privilege read that fails and an outage of Onezone are all `tool_plane_integrity`, never `knowledge`,
+    which a study may declare as treatment; and no server is started for any of them."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    reads = fake._admin_route
+    attempts = [
+        ("no longer examines", lambda: fake.issued.clear()),
+        ("shorter", lambda: None),
+        ("privileges differ", lambda: fake.grant(TOOLS.user_id, MANAGE)),
+        ("privileges could not be read", lambda: fake.privileges.pop((fake.SPACE_ID, TOOLS.user_id))),
+        (
+            "could not be reached",
+            lambda: monkeypatch.setattr(fake, "status_override", 503),
+        ),
+    ]
+    for reason, prepare in attempts:
+        prepare()
+        ceiling = 7200 if reason == "shorter" else CEILING_S
+        with pytest.raises(InfraError) as caught:
+            start(launcher, RecordingContext(), "read", token, tmp_path, ceiling_s=ceiling)
+        assert caught.value.kind == "tool_plane_integrity", reason
+        assert "before the start" in str(caught.value)
+        assert token.reveal() not in str(caught.value)
+        assert not (tmp_path / "seen.json").exists(), reason
+        monkeypatch.setattr(fake, "status_override", None)
+        monkeypatch.setattr(fake, "_admin_route", reads)
+        fake.grant(TOOLS.user_id, BASELINE)
+        token = read_token(issuer, config)
+
+
+def test_c01_a_rights_change_at_teardown_is_set_aside_and_never_scored_under_a_condition_declaring_knowledge(
+    world, fake, events, tmp_path
+):
+    """C01, O05: a condition whose treatment is the tool server failing (`knowledge`) scores a server failure after the
+    agent's first turn. A rights change found at teardown is not that failure: it is `tool_plane_integrity`, so the
+    attempt is set aside and charged, whatever turns it completed, and the run is attempted again."""
+    from campaign_support import LATER, NOW, keys_under, make_manifest, open_store, treatment_schema
+
+    config, issuer, launcher = world
+    with pytest.raises(InfraError) as caught:
+        run_with(
+            launcher, RecordingContext(), "read", read_token(issuer, config), lambda: fake.grant(TOOLS.user_id, MANAGE)
+        )
+    assert caught.value.kind == "tool_plane_integrity"
+    assert [kind for kind, _ in events] == ["tool_plane_rights_changed"]
+
+    schema = treatment_schema(("knowledge",))
+    store = open_store(tmp_path / "campaign", schema)
+    manifest = make_manifest(schema)
+    store.sync_manifest(manifest.rows)
+    text = keys_under(schema, manifest, "api-none")[0]
+    key = next(row.key for row in manifest.rows if row.key.text == text)
+    kinds = schema.treatment_kinds_of(key)
+    assert kinds == ("knowledge",)
+
+    def finish(error, turns):
+        begun = store.begin_attempt(key.text, NOW, 1, "")
+        result = failure_result(error, ended_utc=LATER, wall_s=1.0, treatment_kinds=kinds)
+        status = store.finish_attempt(begun.id, dataclasses.replace(result, model_turns=turns), 3)
+        row = store.q("SELECT state, charged, treatment, infra_kind FROM attempts WHERE id=?", (begun.id,))[0]
+        return status, (row["state"], row["charged"], row["treatment"], row["infra_kind"])
+
+    assert finish(caught.value, turns=3) == ("pending", ("infra_fail", 1, 0, "tool_plane_integrity"))
+    server_down = InfraError("knowledge", "the tool server went down")
+    assert finish(server_down, turns=3) == ("done", ("done", 0, 1, "knowledge"))  # the server failing is still scored
+
+
+def test_a_federation_that_cannot_examine_the_token_is_infrastructure_of_kind_tool_plane_integrity(
+    world, fake, tmp_path
+):
     """An outage of Onezone while the token is examined at launch is an infrastructure failure, not a defect."""
     config, issuer, launcher = world
     token = read_token(issuer, config)
     fake.status_override = 503
     with pytest.raises(InfraError) as caught:
         start(launcher, RecordingContext(), "read", token, tmp_path)
-    assert caught.value.kind == "knowledge"
+    assert caught.value.kind == "tool_plane_integrity"
     assert token.reveal() not in str(caught.value)
 
 
