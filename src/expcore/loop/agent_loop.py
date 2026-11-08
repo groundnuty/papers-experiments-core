@@ -70,6 +70,8 @@ async def run_agent(
         timer = config.timer(clock)
     elif timer.time_cap_s != config.limits.time_cap_s or timer.ceiling_s != config.ceiling_s:
         raise ValueError("the timer's caps differ from the run configuration")
+    elif timer.started:
+        raise ValueError("the timer has already started; the loop starts it")
     return await _Run(backend, toolbox, system, user, config, timer, sleep).execute()
 
 

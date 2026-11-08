@@ -290,3 +290,37 @@ def test_the_tool_box_cap_must_match_the_configuration(make_config):
     box = ToolBox([FakeProvider(ECHO)], cap_chars=100)
     with pytest.raises(ValueError, match="configuration hash"):
         asyncio.run(run_agent(StubAdapter(["x"]), box, "s", "u", make_config(output_cap_chars=8000)))
+
+
+def test_a_timer_passed_in_is_the_account_the_backend_reads_its_time_left_from(make_config, clock):
+    """B03: the backend's retry policy and the loop read one account of the agent's time (time_left)."""
+    config = make_config(time_cap_s=300)
+    timer = config.timer(clock)
+    seen = []
+
+    class Reads(StubAdapter):
+        async def step(self):
+            seen.append(timer.time_left())
+            return await super().step()
+
+    def spend(args):
+        clock.advance(50)
+        return "ok"
+
+    box = ToolBox([FakeProvider({"spend": spend})], cap_chars=config.limits.output_cap_chars)
+    result = asyncio.run(run_agent(Reads([[("spend", {})], "done"]), box, "s", "u", config, timer=timer))
+    assert result.outcome.name == "finished"
+    assert seen == [300, 250]
+    assert timer.readings == [tuple(r) for r in result.clock_readings]
+
+
+def test_a_timer_that_does_not_match_the_configuration_or_has_started_is_refused(make_config, clock):
+    config = make_config(time_cap_s=300)
+    box = ToolBox([FakeProvider(ECHO)], cap_chars=config.limits.output_cap_chars)
+    other = make_config(time_cap_s=100).timer(clock)
+    with pytest.raises(ValueError, match="caps differ"):
+        asyncio.run(run_agent(StubAdapter(["x"]), box, "s", "u", config, timer=other))
+    started = config.timer(clock)
+    started.start()
+    with pytest.raises(ValueError, match="already started"):
+        asyncio.run(run_agent(StubAdapter(["x"]), box, "s", "u", config, timer=started))
