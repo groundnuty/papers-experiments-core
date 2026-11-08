@@ -132,10 +132,40 @@ def test_b01_the_policy_comes_from_the_client_settings():
 def test_b01_retry_after_is_read_in_seconds_milliseconds_and_as_a_date(make_error):
     """B01: Retry after is read in seconds milliseconds and as a date."""
     assert retry_after_seconds(make_error(429, headers={"Retry-After": "12"})) == 12.0
-    assert retry_after_seconds(make_error(429, headers={"retry-after-ms": "1500", "retry-after": "9"})) == 1.5
+    assert retry_after_seconds(make_error(429, headers={"retry-after-ms": "1500"})) == 1.5
     now = datetime(2026, 11, 8, 12, 0, 0, tzinfo=UTC)
     dated = format_datetime(now + timedelta(seconds=45), usegmt=True)
     assert retry_after_seconds(make_error(429, headers={"retry-after": dated}), now=lambda: now) == 45.0
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({"retry-after-ms": "1500", "retry-after": "9"}, 9.0),
+        ({"retry-after-ms": "30000", "retry-after": "9"}, 30.0),
+        ({"Retry-After-Ms": "9000", "Retry-After": "9"}, 9.0),
+        ({"retry-after-ms": "soon", "retry-after": "9"}, 9.0),
+        ({"retry-after-ms": "-500", "retry-after": "9"}, 9.0),
+        ({"retry-after-ms": "inf", "retry-after": "9"}, 9.0),
+        ({"retry-after-ms": "1500", "retry-after": "soon"}, 1.5),
+        ({"retry-after-ms": "1500", "retry-after": "-5"}, 1.5),
+        ({"retry-after-ms": "1500", "retry-after": ""}, 1.5),
+        ({"retry-after-ms": "soon", "retry-after": "soon"}, None),
+    ],
+)
+def test_b01_retry_after_ms_never_shortens_retry_after_and_a_malformed_header_leaves_the_other(
+    make_error, headers, expected
+):
+    """B01: the wait is the longer of the two valid headers; a malformed one falls back to the valid one."""
+    assert retry_after_seconds(make_error(429, headers=headers)) == expected
+
+
+def test_b01_the_longer_header_is_the_floor_of_the_wait(make_error, sleeps, jitter):
+    """B01: A millisecond header shorter than Retry-After leaves the sleep at least Retry-After."""
+    headers = {"retry-after-ms": "1500", "retry-after": "60"}
+    send = Script(make_error(429, headers=headers))
+    run(retrier(sleeps, jitter, share=0.0), send)
+    assert sleeps.waits == [60.0]
 
 
 @pytest.mark.parametrize("value", ["soon", "-5", "nan", "inf", ""])

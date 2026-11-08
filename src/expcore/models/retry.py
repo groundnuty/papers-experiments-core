@@ -87,19 +87,31 @@ def _error_code(exc: BaseException) -> str | None:
 
 
 def retry_after_seconds(exc: BaseException, now: Callable[[], datetime] | None = None) -> float | None:
-    """Read `Retry-After` (seconds, or an HTTP date) or `Retry-After-Ms` from the response; None when absent."""
+    """Read the server's wait from `Retry-After` (seconds, or an HTTP date) and `Retry-After-Ms`; None when absent.
+
+    When both are present and valid the longer one is returned, so the millisecond header never shortens the wait
+    the standard one asks for (B01). A malformed header is ignored and the other one is used.
+    """
     headers = getattr(getattr(exc, "response", None), "headers", None)
     if headers is None:
         return None
     lowered = {str(k).lower(): v for k, v in headers.items()}
+    clock = now or (lambda: datetime.now(UTC))
+    waits = (
+        _header_wait(lowered.get("retry-after-ms"), lambda text: float(text) / 1000.0),
+        _header_wait(lowered.get("retry-after"), lambda text: _seconds_from(text, clock)),
+    )
+    valid = [wait for wait in waits if wait is not None]
+    return max(valid) if valid else None
+
+
+def _header_wait(value: object, parse: Callable[[str], float]) -> float | None:
+    """Parse one header value into a finite, non-negative number of seconds; None when absent or unreadable."""
+    if value is None:
+        return None
     try:
-        if lowered.get("retry-after-ms") is not None:
-            seconds = float(lowered["retry-after-ms"]) / 1000.0
-        elif lowered.get("retry-after") is not None:
-            seconds = _seconds_from(str(lowered["retry-after"]).strip(), now or (lambda: datetime.now(UTC)))
-        else:
-            return None
-    except (TypeError, ValueError):
+        seconds = parse(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
         return None
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
