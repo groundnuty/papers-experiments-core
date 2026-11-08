@@ -12,13 +12,17 @@ it does carry is compared with what was requested; a value the harness never req
     mismatch    another model id, or a reported setting that differs from (or was never in) the request: dispatch of that model STOPS
     unreported  no model id came back at all: the run proves nothing; alarmed, nothing stops
 """
+
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 NOT_REPORTED = "not reported"
-SETTINGS_NOTE = ("requested; the servers don't report them. reasoning_content_seen=true shows a reasoning/thinking mode took effect; "
-                 "false does not show it did not")
+SETTINGS_NOTE = (
+    "requested; the servers don't report them. reasoning_content_seen=true shows a reasoning/thinking mode took effect; "
+    "false does not show it did not"
+)
 SETTINGS = ("temperature", "top_p", "reasoning_effort", "enable_thinking", "thinking")
 
 
@@ -27,11 +31,15 @@ class Served:
 
     def __init__(self) -> None:
         self.ids: set[str] = set()
-        self.fields: dict[str, list[Any]] = {}     # every distinct value reported, in order: a later reply must not be forgotten
-        self.reasoning_calls = 0           # replies that carried reasoning/thinking content (or blocks)
-        self.reasoning_tokens: int | None = None   # summed where the API reports them (usage.completion_tokens_details.reasoning_tokens); else None
+        self.fields: dict[
+            str, list[Any]
+        ] = {}  # every distinct value reported, in order: a later reply must not be forgotten
+        self.reasoning_calls = 0  # replies that carried reasoning/thinking content (or blocks)
+        self.reasoning_tokens: int | None = (
+            None  # summed where the API reports them (usage.completion_tokens_details.reasoning_tokens); else None
+        )
         self.calls = 0
-        self.reasoning_seen = False       # a reply carried reasoning/thinking content: proof that a mode took effect (its absence proves nothing)
+        self.reasoning_seen = False  # a reply carried reasoning/thinking content: proof that a mode took effect (its absence proves nothing)
 
     def note_thinking(self, present: bool, reasoning_tokens: int | None = None) -> None:
         """Once per reply, after its content was read."""
@@ -53,11 +61,27 @@ class Served:
                 self.fields[k].append(v)
 
     def info(self) -> dict[str, Any]:
-        return {"served_model_ids": sorted(self.ids), "served_settings": {k: (NOT_REPORTED if not self.fields.get(k) else self.fields[k][0] if len(self.fields[k]) == 1
-                                                     else {"varied": list(self.fields[k])}) for k in SETTINGS},
-                "reasoning_content_seen": self.reasoning_seen, "settings_note": SETTINGS_NOTE,
-                "thinking": {"calls": self.calls, "calls_with_thinking": self.reasoning_calls, "thinking_tokens": self.reasoning_tokens,
-                             "thinking_tokens_note": "None = the API does not report them separately (they are inside output tokens)"}}
+        return {
+            "served_model_ids": sorted(self.ids),
+            "served_settings": {
+                k: (
+                    NOT_REPORTED
+                    if not self.fields.get(k)
+                    else self.fields[k][0]
+                    if len(self.fields[k]) == 1
+                    else {"varied": list(self.fields[k])}
+                )
+                for k in SETTINGS
+            },
+            "reasoning_content_seen": self.reasoning_seen,
+            "settings_note": SETTINGS_NOTE,
+            "thinking": {
+                "calls": self.calls,
+                "calls_with_thinking": self.reasoning_calls,
+                "thinking_tokens": self.reasoning_tokens,
+                "thinking_tokens_note": "None = the API does not report them separately (they are inside output tokens)",
+            },
+        }
 
 
 def requested_settings(sampling: dict | None, request_extra: dict | None) -> dict[str, Any]:
@@ -76,8 +100,13 @@ def _same(a: Any, b: Any) -> bool:
         return a == b
 
 
-def judge(served_ids: Iterable[str], served_settings: dict[str, Any] | None, expected_id: str, requested: dict[str, Any],
-          accepted_ids: Iterable[str] = ()) -> dict[str, Any]:
+def judge(
+    served_ids: Iterable[str],
+    served_settings: dict[str, Any] | None,
+    expected_id: str,
+    requested: dict[str, Any],
+    accepted_ids: Iterable[str] = (),
+) -> dict[str, Any]:
     """{"state": match|mismatch|unreported, "reasons": [...], "not_reported": [settings the server did not report]}."""
     ids = sorted({str(x) for x in served_ids if x})
     ok_ids = {expected_id, *accepted_ids}
@@ -90,7 +119,9 @@ def judge(served_ids: Iterable[str], served_settings: dict[str, Any] | None, exp
         if vv == NOT_REPORTED or vv is None:
             not_rep.append(k)
             continue
-        vals = vv["varied"] if isinstance(vv, dict) and "varied" in vv else [vv]       # replies that disagreed with each other
+        vals = (
+            vv["varied"] if isinstance(vv, dict) and "varied" in vv else [vv]
+        )  # replies that disagreed with each other
         if len(vals) > 1:
             reasons.append(f"the server reported different {k} in different replies: {vals!r}")
         for v in vals:
@@ -98,7 +129,7 @@ def judge(served_ids: Iterable[str], served_settings: dict[str, Any] | None, exp
                 reasons.append(f"the server reports {k}={v!r} but none was requested (a server default)")
             elif not _same(v, requested[k]):
                 reasons.append(f"the server reports {k}={v!r}, requested {requested[k]!r}")
-    if reasons:                       # a wrong setting stops the model even when the reply named no model id
+    if reasons:  # a wrong setting stops the model even when the reply named no model id
         return {"state": "mismatch", "reasons": sorted(set(reasons)), "not_reported": not_rep}
     if not ids:
         return {"state": "unreported", "reasons": ["the server reported no model id"], "not_reported": list(SETTINGS)}

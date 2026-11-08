@@ -10,6 +10,7 @@ loader at another directory.
 Derived from groundnuty/dataset-88 @ BASE_COMMIT (harness/panel.py,
 runner.py, schema.py); see docs/harness.md.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -37,15 +38,18 @@ class Limits:
     max_output_tokens: int
 
 
-GiB = 1024 ** 3
+GiB = 1024**3
 
 
 @dataclasses.dataclass(frozen=True)
 class SandboxLimits:
     """The agent sandbox's resource limits, identical in every option, by rule (science ruling on #9, 1 Nov).
     The container's memory limit is the agent's allowance plus the tracer's measured headroom; the two parts are stated apart."""
+
     agent_memory_gib: float
-    tracer_headroom_gib: float | None      # a measurement (#9, at real size); None = not yet measured: the real factory refuses
+    tracer_headroom_gib: (
+        float | None
+    )  # a measurement (#9, at real size); None = not yet measured: the real factory refuses
     cpus: float
     pids: int
     nofile: int = 1048576
@@ -70,14 +74,14 @@ class ClientSettings:
 
 @dataclasses.dataclass(frozen=True)
 class ModelSpec:
-    key: str                       # config key, also the slot model name in endpoints.json
+    key: str  # config key, also the slot model name in endpoints.json
     reported_name: str
     api_id: str
-    checkpoint: str                # the real checkpoint behind the API id
+    checkpoint: str  # the real checkpoint behind the API id
     version_note: str
-    kind: str                      # "openai_compat" | "anthropic"
+    kind: str  # "openai_compat" | "anthropic"
     provider_id: str
-    status: str                    # "frozen" once the vendor settings are collected
+    status: str  # "frozen" once the vendor settings are collected
     slot_prefix: str | None = None
     sampling: dict[str, Any] = dataclasses.field(default_factory=dict)
     request_extra: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -85,8 +89,8 @@ class ModelSpec:
     sources: list[str] = dataclasses.field(default_factory=list)
     notes: str = ""
 
-    version_notes: dict[str, str] = dataclasses.field(default_factory=dict)   # per backend: hpc | provider_i | anthropic
-    max_output_tokens: int | None = None      # the model's own maximum per call, when lower than limits.max_output_tokens
+    version_notes: dict[str, str] = dataclasses.field(default_factory=dict)  # per backend: hpc | provider_i | anthropic
+    max_output_tokens: int | None = None  # the model's own maximum per call, when lower than limits.max_output_tokens
 
     def output_tokens(self, limit: int) -> int:
         """The max_tokens sent: the study's value, or the model's own maximum if that is lower."""
@@ -117,13 +121,15 @@ class HarnessConfig:
     anthropic_key_file: str
     knowledge: dict[str, Any]
     models: dict[str, ModelSpec]
-    provider_i: dict[str, Any] = dataclasses.field(default_factory=dict)   # [provider_i]: base_url, key_file, concurrency
+    provider_i: dict[str, Any] = dataclasses.field(
+        default_factory=dict
+    )  # [provider_i]: base_url, key_file, concurrency
     prompt_slots: dict[str, str] = dataclasses.field(default_factory=dict)
     prompt_slots_by_layout: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
 
     def slots_for(self, layout) -> dict[str, str]:
         """Prompt slot values for a layout; identical across options by construction."""
-        return {**self.prompt_slots, **self.prompt_slots_by_layout.get(getattr(layout, 'value', layout), {})}
+        return {**self.prompt_slots, **self.prompt_slots_by_layout.get(getattr(layout, "value", layout), {})}
 
     def concurrency_unit(self, spec: ModelSpec) -> str:
         """The key of the cap this model's runs count against: `anthropic:<api id>` for a Claude model with its own entry
@@ -137,7 +143,7 @@ class HarnessConfig:
         for m in self.models.values():
             if key_or_name in (m.reported_name, m.api_id):
                 return m
-        low = key_or_name.lower()      # the campaign's reporting names ("model-1") differ in case from reported_name
+        low = key_or_name.lower()  # the campaign's reporting names ("model-1") differ in case from reported_name
         for m in self.models.values():
             if low in (m.key.lower(), m.reported_name.lower(), m.api_id.lower()):
                 return m
@@ -152,12 +158,19 @@ def _read(path: Path) -> dict:
 def _sandbox_limits(h: dict) -> SandboxLimits:
     t = h.get("sandbox_limits")
     if not t:
-        raise ConfigError("config/harness.toml has no [sandbox_limits]: the agent's memory allowance, the tracer headroom, cpus and pids are required")
+        raise ConfigError(
+            "config/harness.toml has no [sandbox_limits]: the agent's memory allowance, the tracer headroom, cpus and pids are required"
+        )
     for k in ("agent_memory_gib", "cpus", "pids"):
         if k not in t:
             raise ConfigError(f"[sandbox_limits] needs {k}")
-    return SandboxLimits(float(t["agent_memory_gib"]), None if t.get("tracer_headroom_gib") is None else float(t["tracer_headroom_gib"]),
-                         float(t["cpus"]), int(t["pids"]), int(t.get("nofile", 1048576)))
+    return SandboxLimits(
+        float(t["agent_memory_gib"]),
+        None if t.get("tracer_headroom_gib") is None else float(t["tracer_headroom_gib"]),
+        float(t["cpus"]),
+        int(t["pids"]),
+        int(t.get("nofile", 1048576)),
+    )
 
 
 def load_config(config_dir: str | os.PathLike | None = None) -> HarnessConfig:
@@ -172,8 +185,12 @@ def load_config(config_dir: str | os.PathLike | None = None) -> HarnessConfig:
             api_id=t["api_id"],
             checkpoint=t["checkpoint"],
             version_note=t.get("version_note", ""),
-            version_notes=dict(t.get("version_notes", {})) or (
-                {"anthropic": t.get("version_note", "")} if t["kind"] == "anthropic" else {"hpc": t.get("version_note", "")}),
+            version_notes=dict(t.get("version_notes", {}))
+            or (
+                {"anthropic": t.get("version_note", "")}
+                if t["kind"] == "anthropic"
+                else {"hpc": t.get("version_note", "")}
+            ),
             kind=t["kind"],
             provider_id=t["provider_id"],
             status=t.get("status", "pending-research"),
@@ -205,8 +222,9 @@ def load_config(config_dir: str | os.PathLike | None = None) -> HarnessConfig:
         provider_i=dict(h.get("provider_i", {})),
         models=models,
         prompt_slots={k: str(v) for k, v in h.get("prompt_slots", {}).items() if not isinstance(v, dict)},
-        prompt_slots_by_layout={k: {a: str(b) for a, b in v.items()}
-                                for k, v in h.get("prompt_slots", {}).items() if isinstance(v, dict)},
+        prompt_slots_by_layout={
+            k: {a: str(b) for a, b in v.items()} for k, v in h.get("prompt_slots", {}).items() if isinstance(v, dict)
+        },
     )
 
 
@@ -214,14 +232,12 @@ def assert_frozen(cfg: HarnessConfig, model: ModelSpec, check_config: bool = Tru
     """Refuse a live study run on unfrozen settings. The sampling/reasoning settings freeze before the pilot; the caps
     and the rest of the harness config freeze after it (`check_config=False` checks the model settings only)."""
     if model.status != "frozen":
-        raise ConfigError(
-            f"model {model.key}: sampling/reasoning settings are {model.status!r}, not 'frozen'"
-        )
+        raise ConfigError(f"model {model.key}: sampling/reasoning settings are {model.status!r}, not 'frozen'")
     if check_config and cfg.status != "frozen":
         raise ConfigError(f"harness config status is {cfg.status!r}, not 'frozen'")
 
 
-TOKEN_MARGIN_S = 3600     # sandbox start-up, collection and teardown after the time cap
+TOKEN_MARGIN_S = 3600  # sandbox start-up, collection and teardown after the time cap
 
 
 def required_token_ttl_s(time_cap_s: float, margin_s: float = TOKEN_MARGIN_S) -> int:
@@ -234,4 +250,6 @@ def check_token_ttl(ttl_s: float, time_cap_s: float, what: str = "token") -> Non
     """Refuse a token that could expire before the run's time cap plus the margin."""
     need = required_token_ttl_s(time_cap_s)
     if ttl_s < need:
-        raise ConfigError(f"{what} lifetime {int(ttl_s)} s is below the run's time cap plus margin ({need} s): it could expire mid-run")
+        raise ConfigError(
+            f"{what} lifetime {int(ttl_s)} s is below the run's time cap plus margin ({need} s): it could expire mid-run"
+        )

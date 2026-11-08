@@ -10,6 +10,7 @@ outside the agent's code. The campaign layer (#16) decides whether to retry the 
 Never an InfraError: agent-code exceptions (non-zero exit codes), turn/time/token caps, report
 outcomes, or slowness.
 """
+
 from __future__ import annotations
 
 
@@ -22,5 +23,5 @@ class RequestAbandoned(Exception):
 class InfraError(RuntimeError):
     def __init__(self, kind: str, detail: str):
         super().__init__(f"{kind}: {detail}")
-        self.kind = kind          # "endpoint" | "sandbox" | "knowledge" | "unattributed_kill" | "key_rejected" (HTTP 401/403 from the model API)
+        self.kind = kind  # "endpoint" | "sandbox" | "knowledge" | "unattributed_kill" | "key_rejected" (HTTP 401/403 from the model API)
         self.detail = detail
