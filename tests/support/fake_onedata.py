@@ -17,6 +17,7 @@ Page size as measured on the real federation (#10): default 1000, `max_limit` 10
 `.requests` so tests can assert what actually went over the wire. Files are
 bytes or pathlib.Path (read lazily with seek, so large files stay on disk).
 """
+
 from __future__ import annotations
 
 import binascii
@@ -26,8 +27,8 @@ import pathlib
 import re
 import threading
 import time
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Mapping
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -39,22 +40,29 @@ class Request:
     range: str | None
     token: str | None
     body: bytes = b""
-    run_headers: tuple = ()   # every X-dataset-192 header value received
+    run_headers: tuple = ()  # every X-dataset-192 header value received
 
 
 class MockOnedata:
     SPACE_ID = "spmock0001"
     PROVIDER_ID = "prmock0001"
 
-    def __init__(self, files: Mapping[str, bytes | pathlib.Path], *, space_name: str = "dataset-176",
-                 zone_host: str = "onezone.mock", provider_host: str = "provider.mock",
-                 max_limit: int | None = 10000, token: str = "mock-read-only-token",
-                 provider_version: str = "25.0.0"):
+    def __init__(
+        self,
+        files: Mapping[str, bytes | pathlib.Path],
+        *,
+        space_name: str = "dataset-176",
+        zone_host: str = "onezone.mock",
+        provider_host: str = "provider.mock",
+        max_limit: int | None = 10000,
+        token: str = "mock-read-only-token",
+        provider_version: str = "25.0.0",
+    ):
         self.files = {k.strip("/"): v for k, v in files.items()}
         self.space_name, self.zone_host, self.provider_host = space_name, zone_host, provider_host
         self.max_limit, self.token, self.provider_version = max_limit, token, provider_version
         self._index()
-        self.content_delay_s = 0.0   # tests: delay the headers of every content response
+        self.content_delay_s = 0.0  # tests: delay the headers of every content response
         self.requests: list[Request] = []
         self._lock = threading.Lock()
         self._httpd: ThreadingHTTPServer | None = None
@@ -93,13 +101,19 @@ class MockOnedata:
 
     def _attrs(self, path: str, keys: list[str] | None) -> dict:
         d = self._is_dir(path)
-        a = {"fileId": self._id(path), "name": path.rsplit("/", 1)[-1] if path else self.space_name,
-             "type": "DIR" if d else "REG", "size": 0 if d else self._size(path), "mtime": 0,
-             "posixPermissions": "644", "path": "/" + self.space_name + ("/" + path if path else "")}
+        a = {
+            "fileId": self._id(path),
+            "name": path.rsplit("/", 1)[-1] if path else self.space_name,
+            "type": "DIR" if d else "REG",
+            "size": 0 if d else self._size(path),
+            "mtime": 0,
+            "posixPermissions": "644",
+            "path": "/" + self.space_name + ("/" + path if path else ""),
+        }
         return {k: a.get(k) for k in keys} if keys else a
 
     # -- server -------------------------------------------------------------
-    def start(self, host: str = "0.0.0.0") -> "MockOnedata":
+    def start(self, host: str = "0.0.0.0") -> MockOnedata:
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -126,8 +140,17 @@ class MockOnedata:
                 body = self.rfile.read(n) if n else b""
                 tok = self.headers.get("X-Auth-Token")
                 with outer._lock:
-                    outer.requests.append(Request(self.command, u.path, q, self.headers.get("Range"), tok, body,
-                                                  tuple(self.headers.get_all("X-dataset-192") or ())))
+                    outer.requests.append(
+                        Request(
+                            self.command,
+                            u.path,
+                            q,
+                            self.headers.get("Range"),
+                            tok,
+                            body,
+                            tuple(self.headers.get_all("X-dataset-192") or ()),
+                        )
+                    )
                 if self.command == "POST" and u.path.endswith("/onezone/tokens/infer_access_token_scope"):
                     sent = json.loads(body or b"{}").get("token")
                     if sent != outer.token:
@@ -146,7 +169,7 @@ class MockOnedata:
                     path = outer._path(m.group(1))
                     if path is None or not (outer._is_dir(path) or path in outer.files):
                         return self._err(404, "posix", "enoent")
-                    keys = (json.loads(body).get("attributes") if body else None)
+                    keys = json.loads(body).get("attributes") if body else None
                     if m.group(2) is None:
                         return self._json(200, outer._attrs(path, keys))
                     if m.group(2) == "/children":
@@ -160,12 +183,18 @@ class MockOnedata:
                 if outer.max_limit is not None and limit > outer.max_limit:
                     return self._err(400, "badValueNotInRange", f"limit must be <= {outer.max_limit}")
                 start = int(q["token"]) if q.get("token") else 0
-                page = names[start:start + limit]
+                page = names[start : start + limit]
                 nxt = start + len(page)
                 last = nxt >= len(names)
                 pre = path + "/" if path else ""
-                self._json(200, {"children": [outer._attrs(pre + n, keys) for n in page],
-                                 "isLast": last, "nextPageToken": None if last else str(nxt)})
+                self._json(
+                    200,
+                    {
+                        "children": [outer._attrs(pre + n, keys) for n in page],
+                        "isLast": last,
+                        "nextPageToken": None if last else str(nxt),
+                    },
+                )
 
             def _content(self, path):
                 v = outer.files.get(path)
@@ -206,7 +235,7 @@ class MockOnedata:
                             self.wfile.write(b)
                             left -= len(b)
                 else:
-                    self.wfile.write(v[lo:hi + 1])
+                    self.wfile.write(v[lo : hi + 1])
 
             do_GET = do_POST = do_PUT = do_DELETE = _go
 
@@ -222,9 +251,20 @@ class MockOnedata:
             self._httpd.server_close()
 
     def _scope(self) -> dict:
-        return {"validUntil": 0, "dataAccessScope": {
-            "readonly": True,
-            "spaces": {self.SPACE_ID: {"name": self.space_name,
-                                       "supports": {self.PROVIDER_ID: {"readonly": False}}}},
-            "providers": {self.PROVIDER_ID: {"name": "mock-provider", "domain": self.provider_host,
-                                             "version": self.provider_version, "online": True}}}}
+        return {
+            "validUntil": 0,
+            "dataAccessScope": {
+                "readonly": True,
+                "spaces": {
+                    self.SPACE_ID: {"name": self.space_name, "supports": {self.PROVIDER_ID: {"readonly": False}}}
+                },
+                "providers": {
+                    self.PROVIDER_ID: {
+                        "name": "mock-provider",
+                        "domain": self.provider_host,
+                        "version": self.provider_version,
+                        "online": True,
+                    }
+                },
+            },
+        }
