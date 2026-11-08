@@ -29,6 +29,7 @@ from expcore.plugin import ToolProvider
 from expcore.prompt.templates import RenderedPrompt
 from expcore.records.build import PromptText, RunIdentity, record_attempt
 from expcore.records.record import RunRecord
+from expcore.records.schema import first_turn_rule
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,7 @@ def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | Non
         treatment_kinds=tuple(record.treatment_kinds),
         model_turns=len(turns),
         recorded_treatment=bool(record.outcome["treatment"]),
+        first_turn_rule=first_turn_rule(record.schema_version),
     )
 
 

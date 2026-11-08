@@ -20,7 +20,7 @@ from expcore.errors import infra_kinds
 from expcore.loop.outcomes import HarnessDefect, Outcome
 
 MARKER_NAME = "attempt-marker.json"
-MARKER_SCHEMA = 2  # 2: the result carries the model turns completed and the treatment flag its record carried
+MARKER_SCHEMA = 2  # 2: the result carries the model turns completed, the treatment flag of its record and the rule
 _RESULT_FIELDS = (
     "ended_utc",
     "wall_s",
@@ -33,6 +33,7 @@ _RESULT_FIELDS = (
     "treatment_kinds",
     "model_turns",
     "recorded_treatment",
+    "first_turn_rule",
 )
 
 
@@ -58,6 +59,9 @@ class AttemptResult:
       condition declares.
     - `recorded_treatment`: the treatment flag the attempt's record carries, or None when there is no record. The store
       refuses the result when its own decision differs, so the record and the store agree on which attempt is scored.
+    - `first_turn_rule`: whether the record's schema version requires a completed turn for treatment (version 2 does,
+      version 1 does not); the store decides with the rule of the record's version. A result with no record is new
+      work and takes the rule.
     """
 
     outcome: Outcome
@@ -72,6 +76,7 @@ class AttemptResult:
     treatment_kinds: tuple[str, ...] = ()
     model_turns: int = 0
     recorded_treatment: bool | None = None
+    first_turn_rule: bool = True
 
     def __post_init__(self) -> None:
         """Refuse a kind outside the closed vocabulary, so a typo never reaches the store; keep the kinds sorted."""
@@ -79,6 +84,8 @@ class AttemptResult:
             raise ValueError("model_turns must be a count of completed turns, zero or more")
         if self.recorded_treatment is not None and not isinstance(self.recorded_treatment, bool):
             raise ValueError("recorded_treatment must be True, False or None")
+        if not isinstance(self.first_turn_rule, bool):
+            raise ValueError("first_turn_rule must be True or False")
         for kind in (*(() if self.outage_kind is None else (self.outage_kind,)), *self.treatment_kinds):
             if kind not in infra_kinds():
                 raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")

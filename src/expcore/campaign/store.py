@@ -455,8 +455,9 @@ class Store:
         done on an agent outcome or a treatment fault, exhausted when its charged attempts reach `max_attempts`, set
         aside as a harness error when our own code crashed, and otherwise pending again. An attempt that is not running is refused: its result would be recorded twice. So is a
         result whose `treatment_kinds` differ from the condition's declaration, or whose record's treatment flag differs
-        from the store's own decision from the outcome, the declared kinds and the completed turns (both are
-        TreatmentKindsMismatch), and the attempt then stays running.
+        from the store's own decision from the outcome, the declared kinds and the completed turns, taken with the
+        first-turn rule of the record's schema version (both are TreatmentKindsMismatch), and the attempt then stays
+        running.
         """
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")

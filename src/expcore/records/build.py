@@ -36,7 +36,7 @@ from expcore.records.digest import digest, plain
 from expcore.records.record import RunRecord
 from expcore.records.recording import Captured, RecordingBackend
 from expcore.records.redact import Redactor
-from expcore.records.schema import CURRENT, RecordError
+from expcore.records.schema import CURRENT, RecordError, first_turn_rule
 from expcore.records.seal import mark_unverified, seal
 
 CORE_DISTRIBUTION = "papers-experiments-core"
@@ -102,13 +102,16 @@ def stable_call_detail(status: str, detail: str) -> str:
     return detail
 
 
-def outcome_entry(outcome: Outcome, treatment_kinds: Collection[str] = (), *, completed_turns: int) -> dict[str, Any]:
+def outcome_entry(
+    outcome: Outcome, treatment_kinds: Collection[str] = (), *, completed_turns: int, first_turn_rule: bool = True
+) -> dict[str, Any]:
     """Return the outcome as the record keeps it.
 
     `treatment` is true exactly when the outcome is infrastructure of a kind the attempt's condition declares as its
     treatment, the kind can be one, and the model completed at least one turn (`completed_turns`, the record's
     transcript): then it is a scored final attempt and the record is not set aside. A failure before the first turn
-    is never treatment.
+    is never treatment, except under `first_turn_rule=False`, the rule of schema version 1, which a replay of a
+    version-1 record keeps.
     """
     defect = outcome.defect
     return {
@@ -117,7 +120,7 @@ def outcome_entry(outcome: Outcome, treatment_kinds: Collection[str] = (), *, co
         "infra_kind": outcome.infra_kind,
         "error_type": outcome.error_type,
         "defect": None if defect is None else {"exception": defect.exception, "stack_sha256": defect.stack_sha256},
-        "treatment": outcome.is_treatment(treatment_kinds, completed_turns),
+        "treatment": outcome.is_treatment(treatment_kinds, completed_turns, first_turn_rule=first_turn_rule),
     }
 
 
@@ -261,6 +264,7 @@ def build_record(
     core_version: str | None = None,
     instruments: Mapping[str, Any] | None = None,
     treatment_kinds: Iterable[str] = (),
+    schema_version: str = CURRENT,
     redactor: Redactor | None = None,
     secrets: Iterable[str] = (),
     secret_env: Iterable[str] = (),
@@ -277,6 +281,9 @@ def build_record(
     passes `FactorSchema.treatment_kinds_of(key)`. They are kept in the record's identity, and the outcome's `treatment`
     flag is derived from them: an infrastructure failure of a listed kind, after the model completed a turn, is a scored
     final attempt, not set aside.
+
+    The record is written as `schema_version` (the current one unless a replay of an older record asks for its own),
+    and its outcome's treatment flag follows the first-turn rule of that version.
 
     Secrets are redacted here, before any digest is taken: the digests the record pins (prompt texts, the
     conversation each request carried, the settings each sent, the configuration) are those of the redacted
@@ -325,7 +332,9 @@ def build_record(
         "failed_request": failed,
         "tool_calls": [call_entry(c) for c in result.tool_calls],
         "clock": [[label, value] for label, value in result.clock_readings],
-        "outcome": outcome_entry(result.outcome, kinds, completed_turns=len(turns)),
+        "outcome": outcome_entry(
+            result.outcome, kinds, completed_turns=len(turns), first_turn_rule=first_turn_rule(schema_version)
+        ),
         "totals": {
             "rounds": result.rounds,
             "malformed_calls": result.malformed_calls,
@@ -354,7 +363,7 @@ def build_record(
             RuntimeWarning,
             stacklevel=2,
         )
-    return RunRecord(**seal(redacted), redacted_paths=paths, schema_version=CURRENT)
+    return RunRecord(**seal(redacted), redacted_paths=paths, schema_version=schema_version)
 
 
 async def record_attempt(
@@ -368,6 +377,7 @@ async def record_attempt(
     code: Mapping[str, Any],
     core_version: str | None = None,
     treatment_kinds: Iterable[str] = (),
+    schema_version: str = CURRENT,
     timer: AgentTimer | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -409,6 +419,7 @@ async def record_attempt(
         code=code,
         core_version=core_version if core_version is not None else sdk_version(CORE_DISTRIBUTION),
         treatment_kinds=treatment_kinds,
+        schema_version=schema_version,
         secrets=secrets,
         secret_env=secret_env,
         models=models,

@@ -11,7 +11,8 @@ attempt that ends as infrastructure of such a kind, under that condition, is a s
 again until the run looks healthy would remove the very fault the condition is meant to measure. Two things are never
 treatment: a kind the registry marks as not treatable (the schema refuses to declare one), and a failure before the
 agent's first turn, which happened before the agent met the condition (`Outcome.is_treatment`: at least one completed
-model turn is needed). Both are set aside and run again as any other infrastructure failure.
+model turn is needed). Both are set aside and run again as any other infrastructure failure. The first-turn rule is
+the record's schema version 2; a result from a version-1 record or from a schema-1 marker is decided without it.
 """
 
 from collections.abc import Collection
@@ -87,7 +88,7 @@ def classify(result: AttemptResult, treatment_kinds: Collection[str] = ()) -> Cl
     ends the run. An outage the caller flags on an attempt that did not end as infrastructure sets its result aside.
     """
     outcome = result.outcome
-    if outcome.is_treatment(treatment_kinds, result.model_turns):
+    if outcome.is_treatment(treatment_kinds, result.model_turns, first_turn_rule=result.first_turn_rule):
         return Classified("done", False, True)
     if result.outage_kind is not None:
         return Classified("outage_discarded", False)

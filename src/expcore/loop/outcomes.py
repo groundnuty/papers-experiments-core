@@ -91,18 +91,22 @@ class Outcome:
         """Tell whether the attempt is set aside and re-run instead of scored (infrastructure, harness defect)."""
         return self.name in SET_ASIDE_OUTCOMES
 
-    def is_treatment(self, treatment_kinds: Collection[str], completed_turns: int) -> bool:
+    def is_treatment(
+        self, treatment_kinds: Collection[str], completed_turns: int, *, first_turn_rule: bool = True
+    ) -> bool:
         """Tell whether the attempt is a scored final attempt because its condition's manipulation is this fault.
 
-        True only for an infrastructure outcome of a kind the condition declares as its treatment, that can be one
-        (`expcore.errors.is_treatable`), and only if the model completed at least one turn. A failure before the
-        agent's first turn happened to the harness before the agent met the condition, so it says nothing about the
-        manipulation and is set aside whatever the condition declares. The store, the record and the replay all
-        derive the flag through this method, so they cannot disagree.
+        True only for an infrastructure outcome of a kind the condition declares as its treatment and that can be one
+        (`expcore.errors.is_treatable`), and, under the first-turn rule, only if the model completed at least one turn.
+        A failure before the agent's first turn happened to the harness before the agent met the condition, so it says
+        nothing about the manipulation and is set aside whatever the condition declares. Records of the first schema
+        version, and markers written before the rule, were made without it (`first_turn_rule=False`): for them the
+        declared kind alone decides. The store, the record and the replay all derive the flag through this method, each
+        with the rule of the record's version, so they cannot disagree.
         """
         return (
             self.name == "infrastructure"
-            and completed_turns >= 1
+            and (completed_turns >= 1 or not first_turn_rule)
             and self.infra_kind in treatment_kinds
             and is_treatable(self.infra_kind)
         )

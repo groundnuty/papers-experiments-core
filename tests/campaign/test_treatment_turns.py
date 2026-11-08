@@ -157,3 +157,41 @@ def test_c01_a_marker_with_a_negative_or_boolean_turn_count_is_not_a_result():
             AttemptResult(infra("endpoint").outcome, LATER, 1.0, model_turns=bad)
     with pytest.raises(ValueError, match="recorded_treatment"):
         AttemptResult(infra("endpoint").outcome, LATER, 1.0, recorded_treatment="yes")
+
+
+def record_of_version(schema, key, script, version):
+    """The record of a scripted attempt of the key, written as the given schema version."""
+    return record_run(
+        script,
+        ECHO,
+        identity=RunIdentity(key.text, key.factors, 1),
+        record_options={"treatment_kinds": schema.treatment_kinds_of(key), "schema_version": version},
+    )
+
+
+def test_c01_the_store_decides_with_the_rule_of_the_records_version(tmp_path):
+    """C01: a result from a version-1 record is decided without the first-turn rule, as the record flagged it, and
+    one from a version-2 record with it; the cross-check in finish_attempt holds each to its own version's rule."""
+    schema, store, key = setup_run(tmp_path)
+    old = record_of_version(schema, key, BEFORE_A_TURN, "expcore-record/1")
+    new = record_of_version(schema, key, BEFORE_A_TURN, "expcore-record/2")
+    old_result, new_result = (result_from_record(r, ended_utc=LATER) for r in (old, new))
+    assert (old_result.first_turn_rule, old_result.recorded_treatment, old_result.model_turns) == (False, True, 0)
+    assert (new_result.first_turn_rule, new_result.recorded_treatment, new_result.model_turns) == (True, False, 0)
+    begun = store.begin_attempt(key.text, NOW, 1, "")
+    wrong_rule = dataclasses.replace(
+        old_result, first_turn_rule=True
+    )  # the store would set it aside; the record scored it
+    with pytest.raises(TreatmentKindsMismatch, match="record says treatment=True but the store decides False"):
+        store.finish_attempt(begun.id, wrong_rule, 3)
+    assert store.finish_attempt(begun.id, old_result, 3) == "done"  # version 1: treatment by the declared kind alone
+    assert store.q("SELECT state, charged, treatment FROM attempts")[0][:] == ("done", 0, 1)
+
+
+def test_c01_the_same_failure_in_a_version_two_record_is_set_aside_by_the_store(tmp_path):
+    """C01: the version-2 record of that failure says set aside and the store agrees."""
+    schema, store, key = setup_run(tmp_path)
+    new = record_of_version(schema, key, BEFORE_A_TURN, "expcore-record/2")
+    begun = store.begin_attempt(key.text, NOW, 1, "")
+    assert store.finish_attempt(begun.id, result_from_record(new, ended_utc=LATER), 3) == "pending"
+    assert store.q("SELECT state, charged, treatment FROM attempts")[0][:] == ("infra_fail", 1, 0)
