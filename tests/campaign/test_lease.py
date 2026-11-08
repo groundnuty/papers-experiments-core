@@ -1,0 +1,305 @@
+"""Leases on shared mutable resources fail safe (C19): a fake probe and a fake clock, a real kill for the file lock."""
+
+import asyncio
+import json
+import signal
+import subprocess
+import sys
+import textwrap
+
+import pytest
+
+from expcore.campaign.lease import (
+    DEAD_LOG,
+    WAIT_LOG,
+    AllQuarantined,
+    LeasePool,
+    LeaseTimeout,
+    NoResources,
+    process_gone,
+    process_owner,
+)
+from expcore.loop.timer import AgentTimer
+
+
+class Clock:
+    """A clock that only moves when told to; `sleep` moves it and runs an optional hook."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.on_sleep = None
+        self.sleeps = 0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps += 1
+        self.now += seconds
+        if self.on_sleep is not None:
+            self.on_sleep()
+
+
+class Probe:
+    """Answers what a platform would: which holders are gone and which resources are shown gone."""
+
+    def __init__(self, gone_owners=(), gone_keys=()):
+        self.gone_owners, self.gone_keys = set(gone_owners), set(gone_keys)
+        self.asked: list[tuple[str, dict]] = []
+
+    def holder_gone(self, owner):
+        return owner in self.gone_owners
+
+    def resource_gone(self, key, note):
+        self.asked.append((key, dict(note)))
+        return key in self.gone_keys
+
+
+def pool(tmp_path, keys=("k1", "k2"), probe=None, clock=None, owner="me", **options):
+    clock = clock or Clock()
+    return LeasePool(
+        tmp_path / "leases", lambda group: list(keys), probe or Probe(), owner=owner, clock=clock, sleep=clock.sleep,
+        **options,
+    )  # fmt: skip
+
+
+HOLDER = textwrap.dedent(
+    """
+    import sys
+    from pathlib import Path
+    from expcore.campaign.lease import LeasePool
+
+    class Probe:
+        def holder_gone(self, owner): return False
+        def resource_gone(self, key, note): return False
+
+    pool = LeasePool(Path(sys.argv[1]), lambda group: ["k1"], Probe(), owner="holder-1")
+    lease = pool.acquire("g", run_key="run-a")
+    print("held", flush=True)
+    sys.stdin.read()
+    """
+)
+
+
+def kill_a_holder(directory):
+    """Start a process that leases key k1, then kill it without a release; return nothing once it is dead."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", HOLDER, str(directory)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert child.stdout.readline().strip() == "held"
+        child.send_signal(signal.SIGKILL)
+        child.wait(timeout=10)
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_c19_a_key_is_held_by_one_lease_at_a_time(tmp_path):
+    """C19: two leases never hold one key; a group of two keys serves two runs and a third finds none free."""
+    leases = pool(tmp_path)
+    first, second = leases.try_acquire("g", "run-a"), leases.try_acquire("g", "run-b")
+    assert {first.key, second.key} == {"k1", "k2"}
+    assert leases.try_acquire("g", "run-c") is None
+    first.release()
+    third = leases.try_acquire("g", "run-c")
+    assert third.key == first.key
+    assert third.end is None
+    assert first.end is not None
+    assert (third.record()["key"], third.record()["group"]) == (first.key, "g")
+
+
+def test_c19_a_dead_holders_key_is_not_regranted_until_its_resource_is_shown_gone(tmp_path):
+    """C19: a killed holder's lock is freed at once, but its sandbox may live: no new holder until it is shown gone."""
+    kill_a_holder(tmp_path / "leases")
+    clock = Clock()
+    probe = Probe(gone_owners={"holder-1"})
+    leases = pool(tmp_path, keys=("k1",), probe=probe, clock=clock)
+    with pytest.raises(AllQuarantined):  # the only key is held back for its dead holder: refused, not left to wait
+        leases.try_acquire("g")
+    assert leases.sweep_dead_holders(["g"]) == ["k1"]  # still held back, and said so
+    assert (probe.asked[0][0], probe.asked[0][1]["run_key"]) == ("k1", "run-a")
+    asked = len(probe.asked)
+    clock.now += 10  # inside the retry period: not asked again
+    assert leases.sweep_dead_holders(["g"]) == ["k1"]
+    assert len(probe.asked) == asked
+    probe.gone_keys.add("k1")
+    clock.now += 60  # past it: asked again, and shown gone
+    lease = leases.try_acquire("g", "run-b")
+    assert lease is not None
+    assert lease.key == "k1"
+    note = json.loads((tmp_path / "leases" / "k1.lock").read_text())
+    assert note["run_key"] == "run-b"
+    log = [json.loads(x) for x in (tmp_path / "leases" / DEAD_LOG).read_text().splitlines()]
+    assert [e["gone"] for e in log] == [False, True]
+
+
+def test_c19_a_killed_holder_whose_owner_is_alive_by_the_probe_is_not_a_dead_holder(tmp_path):
+    """C19: a note whose owner the probe still finds alive names no dead holder: the key is granted without a reap."""
+    kill_a_holder(tmp_path / "leases")
+    probe = Probe(gone_owners=())
+    lease = pool(tmp_path, keys=("k1",), probe=probe).try_acquire("g")
+    assert lease is not None
+    assert probe.asked == []
+
+
+def test_c19_an_unreadable_note_is_a_dead_holder_to_be_shown_gone_not_a_free_key(tmp_path):
+    """C19: a holder killed mid-write leaves a note nobody can read; it is treated as a dead holder, never as free."""
+    directory = tmp_path / "leases"
+    directory.mkdir()
+    (directory / "k1.lock").write_text('{"owner": "holder-1", "run_ke', encoding="utf-8")
+    probe = Probe()
+    leases = pool(tmp_path, keys=("k1",), probe=probe)
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g")
+    assert probe.asked == [("k1", {})]
+    probe.gone_keys.add("k1")
+    leases._clock.now += 100
+    assert leases.try_acquire("g") is not None
+
+
+def test_c19_an_empty_or_released_note_needs_no_proof(tmp_path):
+    """C19: a key never used, and one its last holder released, go to the next run without asking the probe."""
+    probe = Probe()
+    leases = pool(tmp_path, keys=("k1",), probe=probe)
+    first = leases.try_acquire("g")
+    first.release()
+    assert leases.try_acquire("g") is not None
+    assert probe.asked == []
+
+
+def test_c19_an_unproven_teardown_quarantines_the_key_until_it_is_proven(tmp_path):
+    """C19: a quarantined lease stays held and ends its use; its key goes to nobody until the teardown is proven."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1", "k2"), clock=clock, quarantine_retry_s=60)
+    proven = {"yes": False}
+    lease = leases.try_acquire("g", "run-a")
+    leases.quarantine(lease, lambda: proven["yes"])
+    assert lease.quarantined
+    assert lease.end is not None
+    assert lease.held
+    lease.release()  # a release does not undo a quarantine
+    assert lease.held
+    assert leases.held_back() == 1
+    other = leases.try_acquire("g", "run-b")
+    assert other.key != lease.key  # the quarantined key is not offered
+    assert leases.settle_quarantines() == []  # not due yet
+    clock.now += 61
+    assert leases.settle_quarantines() == []  # due, not proven: it stays
+    proven["yes"] = True
+    clock.now += 61
+    assert leases.settle_quarantines() == [lease.key]
+    assert not lease.held
+    assert leases.held_back() == 0
+    other.release()
+    assert leases.try_acquire("g", "run-c") is not None
+
+
+def test_c19_a_proof_that_raises_is_not_a_proof(tmp_path):
+    """C19: a failing check of the teardown leaves the key quarantined."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1",), clock=clock, quarantine_retry_s=1)
+
+    def broken():
+        raise OSError("cannot look")
+
+    leases.quarantine(leases.try_acquire("g"), broken)
+    clock.now += 5
+    assert leases.settle_quarantines() == []
+    assert leases.held_back() == 1
+
+
+def test_c19_with_every_key_quarantined_the_run_is_refused_before_it_waits(tmp_path):
+    """C19: no usable key means AllQuarantined at once, not a wait for a proof that may never come."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1", "k2"), clock=clock)
+    for _key in ("k1", "k2"):
+        leases.quarantine(leases.try_acquire("g"), lambda: False)
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g", "run-c")
+    with pytest.raises(AllQuarantined):
+        leases.acquire("g", run_key="run-c")
+    assert clock.sleeps == 0
+
+
+def test_c19_a_key_held_back_for_a_dead_holder_counts_as_quarantined(tmp_path):
+    """C19: when the only key waits for its dead holder's proof, the run is refused rather than left to wait."""
+    kill_a_holder(tmp_path / "leases")
+    leases = pool(tmp_path, keys=("k1",), probe=Probe(gone_owners={"holder-1"}))
+    assert leases.sweep_dead_holders(["g"]) == ["k1"]
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g")
+
+
+def test_c19_a_held_back_key_does_not_refuse_a_run_while_another_key_is_only_busy(tmp_path):
+    """C19: refusal needs every key unusable; with one key merely busy the run waits for it as for any contention."""
+    kill_a_holder(tmp_path / "leases")  # leaves k1 held back for its dead holder
+    leases = pool(tmp_path, keys=("k1", "k2"), probe=Probe(gone_owners={"holder-1"}))
+    busy = leases.try_acquire("g", "run-a")  # k1 is held back, so this is k2
+    assert busy.key == "k2"
+    assert leases.try_acquire("g", "run-b") is None
+    busy.release()
+    assert leases.try_acquire("g", "run-b").key == "k2"
+
+
+def test_c19_a_group_without_keys_is_refused(tmp_path):
+    """C19: a platform that declares no key for a group leaves the run unstarted."""
+    with pytest.raises(NoResources):
+        pool(tmp_path, keys=()).try_acquire("g")
+
+
+def test_c19_a_key_that_is_not_a_file_name_is_refused(tmp_path):
+    """C19: a key names a lock file, so it cannot climb out of the lease directory."""
+    with pytest.raises(ValueError, match="lease key"):
+        pool(tmp_path, keys=("../escape",)).try_acquire("g")
+
+
+def test_c19_a_wait_is_logged_and_a_timeout_is_a_refusal(tmp_path):
+    """C19: with no free key the caller waits and the wait is logged with its run; past the timeout it is refused."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1",), clock=clock, poll_s=2.0)
+    holder = leases.try_acquire("g", "run-a")
+    clock.on_sleep = lambda: holder.release() if clock.sleeps == 3 else None
+    got = leases.acquire("g", run_key="run-b", timeout_s=60)
+    assert got.run_key == "run-b"
+    assert got.wait_s == pytest.approx(6.0)
+    line = json.loads((tmp_path / "leases" / WAIT_LOG).read_text().splitlines()[0])
+    assert (line["run_key"], line["group"], line["wait_s"]) == ("run-b", "g", 6.0)
+    clock.on_sleep = None
+    with pytest.raises(LeaseTimeout):
+        leases.acquire("g", run_key="run-c", timeout_s=5)
+
+
+def test_c19_waiting_for_a_lease_is_a_lease_queue_wait_on_the_timer_and_not_the_agents_time(tmp_path):
+    """C19: a wait for a lease taken under a started timer is marked lease_queue, so the agent's clock does not run."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1",), clock=clock, poll_s=2.0)
+    holder = leases.try_acquire("g", "run-a")
+    clock.on_sleep = lambda: holder.release() if clock.sleeps == 2 else None
+    timer = AgentTimer(600, clock=clock)
+    timer.start()
+
+    async def go():
+        lease = await leases.acquire_under(timer, "g", run_key="run-b")
+        return lease, timer.check("after")
+
+    lease, tick = asyncio.run(go())
+    assert lease.key == "k1"
+    assert timer.infra_wait_by_kind == {"lease_queue": pytest.approx(4.0)}
+    assert tick.agent_s == pytest.approx(0.0)
+    assert tick.elapsed_s == pytest.approx(4.0)
+    assert [label for label, _ in timer.readings if label.startswith("wait_")] == [
+        "wait_start:lease_queue",
+        "wait_end:lease_queue",
+    ]
+
+
+def test_c19_the_owner_of_this_process_is_not_gone_and_a_reused_pid_is(tmp_path):
+    """C19: the owner names boot, pid and start time, so a reused pid is no holder; what cannot be read is not gone."""
+    owner = process_owner()
+    assert not process_gone(owner)
+    boot, pid, started = owner.split(":")
+    assert process_gone(f"{boot}:{pid}:{int(started) + 1}")
+    assert process_gone("another-boot:1:1")
+    assert not process_gone("not an owner")
+    assert not process_gone("pid:not-a-number")
