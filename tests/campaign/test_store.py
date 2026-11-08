@@ -183,6 +183,17 @@ def test_c01_only_an_agent_outcome_can_be_scored_and_an_infrastructure_one_never
     assert {n for n, s in states.items() if s == "done"} == set(OUTCOMES) - {"infrastructure", "harness_defect"}
 
 
+@pytest.mark.parametrize("name", OUTCOMES)
+def test_c01_the_store_accepts_every_outcome_of_the_loop_vocabulary(tmp_path, name):
+    """C01: every ending the loop can report is recorded, and only the two set-aside ones are not scored."""
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    status = run_one(store, key, AttemptResult(outcome_for(name), LATER, 1.0))
+    expected = {"infrastructure": "pending", "harness_defect": "harness_error"}.get(name, "done")
+    assert status == expected
+    assert store.q("SELECT termination FROM attempts")[0]["termination"] == name
+
+
 def test_c01_an_adapter_error_is_an_infrastructure_attempt_and_leaves_the_run_unscored(tmp_path):
     """C01: the error a backend raised after its retries becomes an infrastructure attempt, not a result."""
     store, _, manifest = planned_store(tmp_path)

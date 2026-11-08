@@ -18,7 +18,7 @@ from expcore.campaign.export import (
 )
 from expcore.campaign.markers import AttemptResult
 from expcore.campaign.recovery import recover
-from expcore.errors import infra_kinds, register_infra_kind
+from expcore.errors import CORE_KINDS, infra_kinds, register_infra_kind
 from expcore.loop.outcomes import Outcome
 
 
@@ -112,7 +112,7 @@ def test_c02_every_infrastructure_kind_keeps_its_own_name_in_the_export(tmp_path
     register_infra_kind("tool_outage", "a platform's own kind")
     store, _, manifest = planned_store(tmp_path, tasks=("task-a", "task-b", "task-c"))
     kinds = infra_kinds()
-    assert len(kinds) == 6
+    assert len(kinds) == len(CORE_KINDS) + 1
     for index, kind in enumerate(kinds):
         for _ in range(index + 1):  # a different count for each kind, so a merge could not hide
             run_one(store, keys_of(manifest)[index], infra(kind), max_attempts=10)
@@ -122,7 +122,7 @@ def test_c02_every_infrastructure_kind_keeps_its_own_name_in_the_export(tmp_path
     for row in data["retries_by_kind"]:
         per_kind[row["kind"]] = per_kind.get(row["kind"], 0) + row["attempts"]
     assert per_kind == {kind: index + 1 for index, kind in enumerate(kinds)}
-    assert {"knowledge", "unattributed_kill", "tool_outage"} <= set(per_kind)  # none folded into "sandbox"
+    assert {"knowledge", "unattributed_kill", "ceiling", "tool_outage"} <= set(per_kind)  # none folded into "sandbox"
 
 
 def test_retries_are_counted_per_condition_model_kind_and_whether_they_were_charged(tmp_path):
