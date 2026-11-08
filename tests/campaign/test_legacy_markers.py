@@ -110,3 +110,14 @@ def test_c04_a_schema_one_marker_with_a_field_of_schema_two_is_not_trusted(tmp_p
     path.write_text(json.dumps(body))
     with pytest.raises(MarkerError, match="unknown result fields: first_turn_rule, model_turns, recorded_treatment"):
         read_marker(tmp_path, "k", 1)
+
+
+def test_c04_a_schema_two_marker_without_the_rule_field_reads_under_the_version_two_rule(tmp_path):
+    """C04: a schema-2 marker written before the rule field existed holds a version-2 record, so recovery reads it
+    with the first-turn rule rather than refusing it."""
+    path = write_marker(tmp_path, "k", 1, infra("endpoint"))
+    body = json.loads(path.read_text())
+    del body["result"]["first_turn_rule"]
+    path.write_text(json.dumps(body, sort_keys=True))
+    result = read_marker(tmp_path, "k", 1)
+    assert (result.first_turn_rule, result.legacy_marker) == (True, False)

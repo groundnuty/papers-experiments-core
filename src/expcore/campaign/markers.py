@@ -180,7 +180,10 @@ def read_marker(run_dir: Path, run_key: str, attempt_id: int) -> AttemptResult |
         extra = set(data) - {"outcome", *fields}
         if extra:
             raise MarkerError(f"{path}: unknown result fields: {', '.join(sorted(extra))}")
-        kept = {f: data[f] for f in fields}
+        # A schema-2 marker written before `first_turn_rule` was added holds a version-2 record: read it as such.
+        kept = {f: data[f] for f in fields if f != "first_turn_rule" or f in data}
+        if schema == MARKER_SCHEMA:
+            kept.setdefault("first_turn_rule", True)
         if schema == LEGACY_MARKER_SCHEMA:  # no turn count to hold it to: the rule of the time, and a mark for recovery
             kept.update(first_turn_rule=False, legacy_marker=True)
         return AttemptResult(outcome=_outcome_from(data["outcome"]), **kept)

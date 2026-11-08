@@ -11,7 +11,7 @@ from loop_support import FakeClock, FakeProvider, ScriptedBackend, never
 from expcore.config.models import Limits
 from expcore.loop.config import AgentConfig
 from expcore.records import redact
-from expcore.records.build import RunIdentity, record_attempt
+from expcore.records.build import RunIdentity, _record_attempt, record_attempt
 from expcore.records.record import RunRecord
 from expcore.records.redact import SECRET_NAME
 from expcore.records.schema import CURRENT
@@ -146,8 +146,13 @@ def record_run(
     timer = agent_config.timer(clock, cleanup_waiter=cleanup_waiter) if shared_timer or cleanup_waiter else None
     if timer is not None:
         backend.time_left, backend.timer = timer.time_left, timer
+    options = dict(record_options or {})
+    # Only a test may build a record of an older schema version, through the private function; live runs cannot.
+    # `use_public` forces the public path, to show that it refuses a version.
+    public = options.pop("use_public", False)
+    run = _record_attempt if "schema_version" in options and not public else record_attempt
     return asyncio.run(
-        record_attempt(
+        run(
             backend,
             providers,
             system,
@@ -159,7 +164,7 @@ def record_run(
             timer=timer,
             clock=clock,
             sleep=sleep,
-            **(record_options or {}),
+            **options,
         )
     )
 

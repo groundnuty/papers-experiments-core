@@ -366,7 +366,7 @@ def build_record(
     return RunRecord(**seal(redacted), redacted_paths=paths, schema_version=schema_version)
 
 
-async def record_attempt(
+async def _record_attempt(
     backend: ModelBackend,
     providers: Sequence[ToolProvider],
     system: "str | RenderedPrompt | PromptText",
@@ -386,7 +386,10 @@ async def record_attempt(
     models: ModelTable | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> RunRecord:
-    """Run one attempt through the loop, recording it, and return its record.
+    """Run one attempt through the loop, recording it as `schema_version`, and return its record.
+
+    Private: live runs go through `record_attempt`, which always writes the current version. Only tests building
+    records of an older version call this directly.
 
     The tool box takes its cap from the configuration, so the record's configuration describes what the model saw.
     `code` is the code identity, for example `expcore.provenance.codestamp.version(root, scope)`, and `core_version`
@@ -425,3 +428,23 @@ async def record_attempt(
         models=models,
         environ=environ,
     )
+
+
+async def record_attempt(
+    backend: ModelBackend,
+    providers: Sequence[ToolProvider],
+    system: "str | RenderedPrompt | PromptText",
+    user: "str | RenderedPrompt | PromptText",
+    config: AgentConfig,
+    identity: RunIdentity,
+    **options: Any,
+) -> RunRecord:
+    """Run one attempt through the loop, recording it, and return its record, always as the current schema version.
+
+    A live run cannot choose an older record version: that would apply an older treatment rule to a new run.
+    The keyword options are those of the private `_record_attempt` (`code`, `core_version`, `treatment_kinds`,
+    `timer`, `clock`, `sleep`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is refused.
+    """
+    if "schema_version" in options:
+        raise TypeError("record_attempt writes the current record version; a live run cannot choose another")
+    return await _record_attempt(backend, providers, system, user, config, identity, **options)

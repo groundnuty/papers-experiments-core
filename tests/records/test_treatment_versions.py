@@ -76,3 +76,10 @@ def test_c01_each_version_refuses_the_flag_the_other_would_set():
     as_v1["schema_version"] = V1
     with pytest.raises(RecordError, match=r"outcome\.treatment: is False but .* 0 completed turn\(s\) make it True"):
         validate(as_v1)
+
+
+def test_c01_a_live_run_cannot_choose_an_older_record_version():
+    """C01: record_attempt always writes the current version, so a live run cannot apply the version-1 treatment
+    rule to a failure before its first turn."""
+    with pytest.raises(TypeError, match="current record version"):
+        record_run(BEFORE_A_TURN, ECHO, record_options={"schema_version": V1, "use_public": True})
