@@ -210,12 +210,14 @@ def test_the_result_finds_a_contrast_by_name(prereg, planted):
 def test_pilot_power_pairs_the_pilot_rows_and_uses_the_preregistered_settings(prereg, planted):
     """Each contrast's SD comes from its own paired cluster differences; the grid and targets come from the file."""
     _, rows = planted
-    table = pilot_power(rows, prereg, names=["gate-effect"])
+    result = pilot_power(rows, prereg, names=["gate-effect"])
+    table = result.rows
     assert {row["contrast"] for row in table} == {"gate-effect"}
     assert {row["pilot_clusters"] for row in table} == {30}
     assert {(row["n_clusters"], row["delta"]) for row in table} == {(20, 0.1)}
     assert all(0.0 <= row["power"] <= 1.0 for row in table)
-    assert len(pilot_power(rows, prereg)) == 3 * 2
+    assert len(pilot_power(rows, prereg).rows) == 3 * 2
+    assert result.manifest == {"preregistration_sha256": "a" * 64}  # P04
 
 
 def test_pilot_power_refuses_what_it_cannot_run(prereg, planted):
@@ -229,13 +231,16 @@ def test_pilot_power_refuses_what_it_cannot_run(prereg, planted):
 
 def test_the_power_study_runs_on_the_preregistered_settings_and_the_family_size(prereg):
     """The grid, the targets, the seed and the number of simulations come from the file; alpha is divided by m = 3."""
-    table = power_study(prereg)
+    result = power_study(prereg)
+    table = result.rows
+    assert result.manifest == {"preregistration_sha256": "a" * 64}  # P04: the power table carries the hash too
     assert [(row["sd"], row["alpha_level"]) for row in table] == [(0.1, "alpha"), (0.1, "alpha_over_contrasts")]
     assert table[1]["alpha"] == pytest.approx(0.05 / 3)
     assert {(row["n_clusters"], row["delta"]) for row in table} == {(20, 0.1)}
-    assert table == power_study(prereg)  # seeded by the file
-    assert all(math.isnan(row["power"]) for row in power_study(prereg, simulate=False))
+    assert power_study(prereg) == result  # seeded by the file
+    assert all(math.isnan(row["power"]) for row in power_study(prereg, simulate=False).rows)
     changed = prereg.with_override(power=dataclasses.replace(prereg.power, target_difference=0.3))
-    assert power_study(changed)[0]["power"] > table[0]["power"]
+    assert power_study(changed).rows[0]["power"] > table[0]["power"]
+    assert power_study(changed).manifest == {"preregistration_sha256": "a" * 64 + "+override"}
     with pytest.raises(ValueError, match=r"inline: has no \[power\] section"):
         power_study(prereg.with_override(power=None))

@@ -112,7 +112,15 @@ def analyse(rows: Iterable[Row], prereg: Preregistration) -> AnalysisResult:
     return AnalysisResult(results, decisions, prereg.alpha, prereg.manifest())
 
 
-def power_study(prereg: Preregistration, simulate: bool = True) -> list[dict]:
+@dataclasses.dataclass(frozen=True)
+class PowerResult:
+    """A power table with the manifest entries of the preregistration it was computed under (P04)."""
+
+    rows: tuple[dict, ...]
+    manifest: Mapping[str, str]
+
+
+def power_study(prereg: Preregistration, simulate: bool = True) -> PowerResult:
     """The power table of the preregistration's [power] settings, at alpha and at alpha divided by the family size.
 
     It reads nothing but the preregistration and runs scipy's test directly (see power), so it checks the design
@@ -120,10 +128,11 @@ def power_study(prereg: Preregistration, simulate: bool = True) -> list[dict]:
     """
     if prereg.power is None:
         raise ValueError(f"{prereg.source}: has no [power] section, so there is no power study to run")
-    return power.power_table(prereg.power, prereg.alpha, len(prereg.holm_family), simulate=simulate)
+    rows = power.power_table(prereg.power, prereg.alpha, len(prereg.holm_family), simulate=simulate)
+    return PowerResult(tuple(rows), prereg.manifest())
 
 
-def pilot_power(rows: Iterable[Row], prereg: Preregistration, names: Sequence[str] | None = None) -> list[dict]:
+def pilot_power(rows: Iterable[Row], prereg: Preregistration, names: Sequence[str] | None = None) -> PowerResult:
     """Power re-estimate from pilot rows: each contrast's between-cluster SD of paired differences feeds the table.
 
     Pairing is the pipeline's job, so it happens here and the power module receives plain arrays (S09).
@@ -136,4 +145,4 @@ def pilot_power(rows: Iterable[Row], prereg: Preregistration, names: Sequence[st
     if unknown:
         raise ValueError(f"{prereg.source}: no contrast named {unknown[0]!r}; declared: {', '.join(prereg.contrasts)}")
     pilot = {name: pair_rows(rows, prereg.contrasts[name]).differences.cluster_differences for name in chosen}
-    return power.pilot_power(pilot, prereg.power, prereg.alpha)
+    return PowerResult(tuple(power.pilot_power(pilot, prereg.power, prereg.alpha)), prereg.manifest())
