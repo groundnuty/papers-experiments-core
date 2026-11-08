@@ -178,3 +178,15 @@ def test_a_redacted_path_cannot_be_acknowledged():
     redacted = Finding(REDACTED_PATH, 0, "path", "b" * 12)
     entry = ack.Acknowledgement("a" * 40, REDACTED_PATH, 0, "b" * 12, 1)  # even if built directly
     assert not entry.matches("a" * 40, redacted)
+
+
+def test_a_finding_in_an_old_commit_message_can_be_acknowledged_like_any_other(repo, hash_file, capsys):
+    repo.write("src/ok.py", "x = 1\n")
+    root = repo.commit("clean root")
+    leak = repo.commit(f"chore: {NAME}")
+    tip = repo.commit("chore: clean")
+    ack = write_ack(repo, f"{leak} <commit message>:1 {PREFIX}")
+    base = ["check-commits", "--hashes", str(hash_file), "--repo", str(repo.path)]
+    assert st.main([*base, f"{root}..{tip}"]) == 1
+    assert st.main([*base, "--acknowledged", str(ack), f"{root}..{tip}"]) == 0
+    assert "1 finding(s) acknowledged" in capsys.readouterr().err

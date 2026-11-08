@@ -147,3 +147,82 @@ def test_the_path_of_a_binary_file_is_checked_though_its_content_is_skipped(repo
     sha = repo.commit("binary with a revealing name")
     found = st.check_commits(repo.path, [sha], st.load_hashes(hash_file))
     assert [(f.path, f.kind) for _, f in found] == [("<path redacted>", "path")]
+
+
+# --- commit messages: published with the repository, so scanned as prose ---------------------------------------------
+
+
+def message_findings(repo, hash_file, *revs):
+    return [(sha, str(f)) for sha, f in st.check_commits(repo.path, list(revs), st.load_hashes(hash_file))]
+
+
+def test_a_commit_message_is_scanned_and_reported_by_line_without_the_matched_text(repo, hash_file, capsys):
+    repo.write("src/ok.py", "x = 1\n")
+    repo.commit("clean root")
+    leaking = repo.commit(f"fix: tidy\n\nThe body is fine.\nThis line names {LONG_NAME} by mistake.\n")
+    base = ["check-commits", "--hashes", str(hash_file), "--repo", str(repo.path)]
+    assert st.main([*base, leaking]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == f"{leaking[:12]} <commit message>:4 message {st.token_hash(LONG_NAME)[:12]}\n"
+    assert LONG_NAME not in captured.out + captured.err
+
+
+def test_a_commit_that_changes_no_file_is_still_checked_for_its_message(repo, hash_file):
+    repo.write("src/ok.py", "x = 1\n")
+    repo.commit("clean root")
+    empty = repo.commit(f"chore: {LONG_NAME}")
+    assert repo.git("diff-tree", "--no-commit-id", "--name-only", "-r", empty) == ""
+    assert message_findings(repo, hash_file, empty) == [
+        (empty, f"<commit message>:1 message {st.token_hash(LONG_NAME)[:12]}")
+    ]
+
+
+def test_a_commit_message_is_prose_so_a_code_scope_token_in_it_is_not_a_finding(repo, hash_file):
+    sha = repo.commit(f"docs: the service runs on {LONG_HOST}\n\n{LONG_HOST}\n")
+    assert message_findings(repo, hash_file, sha) == []
+
+
+def test_every_line_of_a_message_is_scanned_including_the_trailers(repo, hash_file):
+    sha = repo.commit(f"{LONG_NAME}\n\nplain body\n\nCo-Authored-By: {LONG_NAME} <noreply@example.invalid>")
+    prefix = st.token_hash(LONG_NAME)[:12]
+    assert message_findings(repo, hash_file, sha) == [
+        (sha, f"<commit message>:1 message {prefix}"),
+        (sha, f"<commit message>:5 message {prefix}"),
+    ]
+
+
+def test_a_clean_message_gives_no_finding(repo, hash_file):
+    sha = repo.commit("feat: a clean subject\n\nA clean body, with Co-Authored-By: Someone <someone@example.invalid>\n")
+    assert message_findings(repo, hash_file, sha) == []
+
+
+def test_only_the_messages_of_the_commits_in_the_range_are_scanned(repo, hash_file):
+    repo.commit("chore: root")
+    leaking = repo.commit(f"chore: {LONG_NAME}")
+    clean = repo.commit("chore: nothing to see")
+    tip = repo.commit("chore: nothing either")
+    assert message_findings(repo, hash_file, f"{clean}..{tip}") == []
+    assert [sha for sha, _ in message_findings(repo, hash_file, f"{leaking}~1..{tip}")] == [leaking]
+    assert message_findings(repo, hash_file, clean) == []
+
+
+def test_a_leak_in_a_message_survives_a_later_commit_that_says_nothing_of_it(repo, hash_file, capsys):
+    first = repo.commit("chore: root")
+    repo.commit(f"chore: {LONG_NAME}")
+    third = repo.commit("chore: fix the name in the next commit")
+    base = ["check-commits", "--hashes", str(hash_file), "--repo", str(repo.path)]
+    assert st.main([*base, f"{first}..{third}"]) == 1
+    assert st.main([*base, third]) == 0
+    capsys.readouterr()
+
+
+def test_a_message_that_is_not_valid_utf8_is_scanned_not_a_crash(repo, hash_file, tmp_path):
+    repo.write("src/ok.py", "x = 1\n")
+    repo.git("add", "--all")
+    message = tmp_path / "message.bin"
+    message.write_bytes(b"caf\xe9\n\n" + LONG_NAME.encode() + b"\n")  # a latin-1 byte in a message declared UTF-8
+    repo.git("-c", "commit.gpgsign=false", "commit", "--quiet", "-F", str(message))
+    sha = repo.git("rev-parse", "HEAD")
+    assert message_findings(repo, hash_file, sha) == [
+        (sha, f"<commit message>:3 message {st.token_hash(LONG_NAME)[:12]}")
+    ]

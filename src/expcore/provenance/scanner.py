@@ -3,7 +3,8 @@
 
 Python source is scanned by token: identifiers, comments, string literals (with escapes decoded), the literal
 parts of f-strings, and the concatenation of adjacent literals. Any other file is scanned line by line. The
-file's own path is scanned too; when it matches, every finding for that file hides the path.
+file's own path is scanned too; when it matches, every finding for that file hides the path. A commit message is
+scanned as prose.
 """
 
 import ast
@@ -23,6 +24,7 @@ from expcore.provenance.headers import blank_header
 
 FINDING_PREFIX_CHARS = 12
 REDACTED_PATH = "<path redacted>"
+MESSAGE_LABEL = "<commit message>"
 DOCS_ROOT = "docs"
 
 
@@ -317,3 +319,11 @@ def scan_source(path: str | PathLike[str], text: str, hashes: Hashes) -> list[Fi
     found = _scan_python(shown, text, scoped) if name.endswith(".py") else _scan_text(shown, text, scoped)
     found |= {Finding(shown, 0, "path", digest[:FINDING_PREFIX_CHARS]) for digest in path_digests}
     return sorted(found)
+
+
+def scan_message(text: str, hashes: Hashes) -> list[Finding]:
+    """Scan a commit message, line by line, as prose: only `all`-scope hashes, like a Markdown file.
+
+    A finding reads `<commit message>:<line> message <hash prefix>`, the line counted from the subject as line 1.
+    """
+    return sorted(_scan_text(MESSAGE_LABEL, text, hashes.only_all(), kind="message"))
