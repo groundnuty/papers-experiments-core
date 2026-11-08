@@ -27,6 +27,13 @@ class AttemptRefused(RuntimeError):
     """A transaction refused to start or finish an attempt because the run or the attempt is not in the right state."""
 
 
+class TreatmentKindsMismatch(AttemptRefused):
+    """The record of an attempt carries other treatment kinds than its run's condition declares.
+
+    The attempt stays running, so recovery treats it like any interrupted attempt.
+    """
+
+
 class ResumeRefused(RuntimeError):
     """A resume would continue a different experiment than the one the store records."""
 

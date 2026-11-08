@@ -37,6 +37,7 @@ from expcore.campaign.attempts import (
     PinMismatch,
     ResumeRefused,
     SchemaMismatch,
+    TreatmentKindsMismatch,
     classify,
 )
 from expcore.campaign.factors import FactorSchema
@@ -371,7 +372,9 @@ class Store:
 
         The state, the charge and the treatment mark follow from the cause and the run's condition (`classify`). A run is
         done on an agent outcome or a treatment fault, exhausted when its charged attempts reach `max_attempts`, set
-        aside as a harness error when our own code crashed, and otherwise pending again. An attempt that is not running is refused: its result would be recorded twice.
+        aside as a harness error when our own code crashed, and otherwise pending again. An attempt that is not running is refused: its result would be recorded twice. So is a
+        result whose `treatment_kinds` differ from the condition's declaration (TreatmentKindsMismatch), and the attempt
+        then stays running.
         """
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
@@ -388,7 +391,13 @@ class Store:
             if row is None:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so its result is not recorded")
             condition = self.schema.condition_named(json.loads(row["factors"]), row["run_key"])
-            state, charged, treatment = classify(result, self.schema.treatment_kinds[condition])
+            declared = self.schema.treatment_kinds[condition]
+            if result.treatment_kinds != declared:
+                raise TreatmentKindsMismatch(
+                    f"{row['run_key']}: the record carries treatment kinds {list(result.treatment_kinds)} but "
+                    f"condition {condition!r} declares {list(declared)}; the attempt stays running"
+                )
+            state, charged, treatment = classify(result, declared)
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"
                 " detail=?, termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?,"

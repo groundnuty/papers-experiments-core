@@ -30,6 +30,7 @@ _RESULT_FIELDS = (
     "cache_creation_tokens",
     "cache_read_tokens",
     "usage_complete",
+    "treatment_kinds",
 )
 
 
@@ -46,6 +47,9 @@ class AttemptResult:
       outcome was; the attempt is not charged. It names the infrastructure kind of the outage (C03).
     - usage: tokens as reported, `None` when the endpoint did not report them; `usage_complete` is False when the
       totals are known to be short.
+    - `treatment_kinds`: the infrastructure kinds the attempt's record carried as its condition's treatment (the
+      record's `treatment_kinds`; none by default). The store checks them against the condition's own declaration and
+      refuses the result when they differ, so a record and the store cannot disagree about which failures are scored.
     """
 
     outcome: Outcome
@@ -57,13 +61,14 @@ class AttemptResult:
     cache_creation_tokens: int | None = None
     cache_read_tokens: int | None = None
     usage_complete: bool = True
+    treatment_kinds: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """Refuse an outage kind outside the closed vocabulary, so a typo never reaches the store."""
-        if self.outage_kind is not None and self.outage_kind not in infra_kinds():
-            raise ValueError(
-                f"unknown infrastructure kind {self.outage_kind!r}; known kinds: {', '.join(infra_kinds())}"
-            )
+        """Refuse a kind outside the closed vocabulary, so a typo never reaches the store; keep the kinds sorted."""
+        for kind in (*(() if self.outage_kind is None else (self.outage_kind,)), *self.treatment_kinds):
+            if kind not in infra_kinds():
+                raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")
+        object.__setattr__(self, "treatment_kinds", tuple(sorted(set(self.treatment_kinds))))
 
 
 def _outcome_json(outcome: Outcome) -> dict[str, Any]:
@@ -96,7 +101,11 @@ def write_marker(run_dir: Path, run_key: str, attempt_id: int, result: AttemptRe
         "schema": MARKER_SCHEMA,
         "run_key": run_key,
         "attempt_id": attempt_id,
-        "result": {"outcome": _outcome_json(result.outcome), **{f: getattr(result, f) for f in _RESULT_FIELDS}},
+        "result": {
+            "outcome": _outcome_json(result.outcome),
+            **{f: getattr(result, f) for f in _RESULT_FIELDS if f != "treatment_kinds"},
+            "treatment_kinds": list(result.treatment_kinds),
+        },
     }
     target = run_dir / MARKER_NAME
     temporary = run_dir / f".{MARKER_NAME}.{os.getpid()}.tmp"

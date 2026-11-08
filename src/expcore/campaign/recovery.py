@@ -9,6 +9,7 @@ repairs a kill between them, and it is safe to run again after a kill of its own
 from dataclasses import dataclass
 from pathlib import Path
 
+from expcore.campaign.attempts import TreatmentKindsMismatch
 from expcore.campaign.markers import read_marker
 from expcore.campaign.store import Store
 
@@ -38,7 +39,12 @@ def recover(store: Store, now: str, max_attempts: int) -> Recovery:
         if result is None:
             orphans.append(row["id"])
             continue
-        store.finish_attempt(row["id"], result, max_attempts)
+        try:
+            store.finish_attempt(row["id"], result, max_attempts)
+        except TreatmentKindsMismatch as refusal:  # a runner that built its record with other kinds: not a result
+            store.event(now, "recovered_marker_refused", None, str(refusal))
+            orphans.append(row["id"])
+            continue
         store.event(now, "recovered_committed", None, f"{row['run_key']}: attempt {row['id']} from its marker")
         committed += 1
     interrupted = store.transact(lambda: _interrupt(store, orphans, now))

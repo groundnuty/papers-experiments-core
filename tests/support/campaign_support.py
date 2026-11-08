@@ -1,6 +1,8 @@
 """Shared helpers for the campaign tests: a small schema and plans over it."""
 
+import dataclasses
 import hashlib
+import json
 from pathlib import Path
 
 from expcore.campaign.factors import FactorSchema, RunKey
@@ -137,6 +139,14 @@ def planned_store(tmp_path: Path, **plan):
 
 
 def run_one(store: Store, key: str, result: AttemptResult, max_attempts: int = 3, run_dir: str = "") -> str:
-    """Begin an attempt of a run and finish it with a result; return the run's status."""
+    """Begin an attempt of a run and finish it with a result; return the run's status.
+
+    A runner passes the treatment kinds its record carried. For a result that names none, this passes the run's
+    condition's own, as a runner that built its record from `treatment_kinds_of` would.
+    """
+    if not result.treatment_kinds:
+        factors = json.loads(store.q("SELECT factors FROM runs WHERE run_key=?", (key,))[0]["factors"])
+        kinds = store.schema.treatment_kinds[store.schema.condition_named(factors, key)]
+        result = dataclasses.replace(result, treatment_kinds=kinds)
     begun = store.begin_attempt(key, NOW, 1234, run_dir)
     return store.finish_attempt(begun.id, result, max_attempts)

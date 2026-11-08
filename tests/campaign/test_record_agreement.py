@@ -4,6 +4,7 @@ import pytest
 from campaign_support import LATER, NOW, keys_under, make_manifest, open_store, treatment_schema
 from record_support import no_secrets_in_the_environment, record_run
 
+from expcore.campaign.attempts import TreatmentKindsMismatch
 from expcore.campaign.markers import AttemptResult
 from expcore.errors import InfraError
 from expcore.loop.outcomes import Outcome
@@ -37,7 +38,7 @@ def test_c01_the_record_and_the_store_agree_on_which_infrastructure_failure_is_s
     held = record.outcome
     outcome = Outcome(held["name"], held["detail"], infra_kind=held["infra_kind"])
     begun = store.begin_attempt(key.text, NOW, 1, "")
-    store.finish_attempt(begun.id, AttemptResult(outcome, LATER, 1.0), 3)
+    store.finish_attempt(begun.id, AttemptResult(outcome, LATER, 1.0, treatment_kinds=record.treatment_kinds), 3)
 
     row = store.q("SELECT * FROM attempts")[0]
     assert record.outcome["treatment"] is scored
@@ -62,3 +63,27 @@ def test_c01_a_record_built_without_the_condition_s_kinds_is_the_one_that_would_
         record_options={"treatment_kinds": schema.treatment_kinds_of(key)},
     )
     assert passed.set_aside is False
+
+
+def test_c01_the_store_refuses_the_result_of_a_runner_whose_record_lacks_the_condition_s_kinds(tmp_path):
+    """C01: adds the runtime check behind the lookup: a record built without the kinds is refused at the store."""
+    schema = treatment_schema(("endpoint",))
+    store = open_store(tmp_path, schema)
+    manifest = make_manifest(schema)
+    store.sync_manifest(manifest.rows)
+    key = next(row.key for row in manifest.rows if schema.condition_of(row.key) == "api-none")
+    outcome = Outcome("infrastructure", "down", infra_kind="endpoint")
+    record_options = [{}, {"treatment_kinds": schema.treatment_kinds_of(key)}]
+    forgot, passed = (
+        record_run(
+            [InfraError("endpoint", "down")], {}, identity=RunIdentity(key.text, key.factors, 1), record_options=o
+        )
+        for o in record_options
+    )
+    begun = store.begin_attempt(key.text, NOW, 1, "")
+    with pytest.raises(TreatmentKindsMismatch, match="the attempt stays running"):
+        store.finish_attempt(begun.id, AttemptResult(outcome, LATER, 1.0, treatment_kinds=forgot.treatment_kinds), 3)
+    assert (
+        store.finish_attempt(begun.id, AttemptResult(outcome, LATER, 1.0, treatment_kinds=passed.treatment_kinds), 3)
+        == "done"
+    )

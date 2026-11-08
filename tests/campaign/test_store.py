@@ -19,7 +19,13 @@ from campaign_support import (
     treatment_schema,
 )
 
-from expcore.campaign.attempts import AttemptRefused, PinMismatch, SchemaMismatch, classify
+from expcore.campaign.attempts import (
+    AttemptRefused,
+    PinMismatch,
+    SchemaMismatch,
+    TreatmentKindsMismatch,
+    classify,
+)
 from expcore.campaign.export import export_run_state
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.markers import AttemptResult, write_marker
@@ -465,7 +471,7 @@ def test_c04_a_treatment_attempt_committed_from_its_marker_is_a_scored_final_att
     """C04: adds that recovery applies the condition's declaration, as a live finish does."""
     store, (key, *_) = treatment_run(tmp_path, treatment)
     begun = store.begin_attempt(key, NOW, 1, str(tmp_path / "run"))
-    write_marker(tmp_path / "run", key, begun.id, infra("endpoint"))
+    write_marker(tmp_path / "run", key, begun.id, infra("endpoint", treatment_kinds=("endpoint",)))
     assert recover(store, LATER, 3).committed == 1
     row = store.q("SELECT * FROM attempts")[0]
     assert (row["state"], row["treatment"], row["charged"]) == ("done", 1, 0)
@@ -630,3 +636,64 @@ def test_c20_the_backfill_and_the_column_come_in_one_transaction(tmp_path, monke
     assert "outage_kind" not in [r[1] for r in check.execute("PRAGMA table_info(attempts)")]
     check.close()
     assert "outage_kind" in columns(open_store(tmp_path), "attempts")
+
+
+# --- the record's treatment kinds must be the condition's -----------------------------------------------------------
+
+
+def test_c01_a_runner_that_omits_the_treatment_kinds_is_refused_and_one_that_passes_them_succeeds(tmp_path, treatment):
+    """C01: adds that finish_attempt checks the record's kinds against the condition's, naming the run, and refuses."""
+    store, (key, *_) = treatment_run(tmp_path, treatment)
+    begun = store.begin_attempt(key, NOW, 1, "")
+    with pytest.raises(TreatmentKindsMismatch) as caught:
+        store.finish_attempt(begun.id, infra("endpoint"), 3)  # the runner built its record without the kinds
+    message = str(caught.value)
+    assert message.startswith(key)
+    assert "carries treatment kinds []" in message
+    assert "condition 'api-none' declares ['endpoint']" in message
+    assert isinstance(caught.value, AttemptRefused)
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["state"], row["treatment"], row["ended_utc"]) == ("running", 0, None)  # still running, nothing recorded
+    assert store.q("SELECT status FROM runs WHERE run_key=?", (key,))[0]["status"] == "pending"
+    # the same attempt, finished again with the kinds its condition declares
+    assert store.finish_attempt(begun.id, infra("endpoint", treatment_kinds=("endpoint",)), 3) == "done"
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["state"], row["treatment"]) == ("done", 1)
+
+
+def test_c01_kinds_the_condition_does_not_declare_are_refused_too(tmp_path, treatment):
+    """C01: adds that the check is equality: extra kinds on a condition that declares none, or other kinds, differ."""
+    store, (other, *_) = treatment_run(tmp_path, treatment, condition="mount-read")
+    begun = store.begin_attempt(other, NOW, 1, "")
+    with pytest.raises(
+        TreatmentKindsMismatch, match=r"carries treatment kinds \['endpoint'\] but condition 'mount-read'"
+    ):
+        store.finish_attempt(begun.id, infra("endpoint", treatment_kinds=("endpoint",)), 3)
+    assert store.finish_attempt(begun.id, infra("endpoint"), 3) == "pending"  # none declared, none carried
+    store, (declared, *_) = treatment_run(tmp_path / "second", treatment)
+    begun = store.begin_attempt(declared, NOW, 1, "")
+    with pytest.raises(TreatmentKindsMismatch, match=r"declares \['endpoint'\]"):
+        store.finish_attempt(begun.id, infra("sandbox", treatment_kinds=("sandbox",)), 3)
+
+
+def test_c01_the_kinds_of_a_result_are_sorted_once_and_must_be_known():
+    """C01: adds that two orders of one declaration are one value, and a typo never reaches the store."""
+    result = AttemptResult(Outcome("finished"), LATER, 1.0, treatment_kinds=("sandbox", "endpoint", "sandbox"))
+    assert result.treatment_kinds == ("endpoint", "sandbox")
+    with pytest.raises(ValueError, match="unknown infrastructure kind 'wifi'"):
+        AttemptResult(Outcome("finished"), LATER, 1.0, treatment_kinds=("wifi",))
+
+
+def test_c04_recovery_treats_a_marker_with_the_wrong_kinds_like_an_interrupted_attempt(tmp_path, treatment):
+    """C04: adds that a marker a refused finish would not commit is interrupted, uncharged, and named in an event."""
+    store, (key, *_) = treatment_run(tmp_path, treatment)
+    begun = store.begin_attempt(key, NOW, 1, str(tmp_path / "run"))
+    write_marker(tmp_path / "run", key, begun.id, infra("endpoint"))  # the runner left the kinds out
+    recovery = recover(store, LATER, 3)
+    assert (recovery.committed, recovery.interrupted) == (0, 1)
+    row = store.q("SELECT * FROM attempts")[0]
+    assert (row["state"], row["charged"], row["treatment"]) == ("interrupted", 0, 0)
+    assert store.q("SELECT status FROM runs WHERE run_key=?", (key,))[0]["status"] == "pending"
+    event = store.q("SELECT kind, detail FROM events WHERE kind='recovered_marker_refused'")[0]
+    assert event["detail"].startswith(key)
+    assert key in [r["run_key"] for r in store.pending()]  # run again under the same number

@@ -24,6 +24,13 @@ def test_a_marker_reads_back_the_result_it_was_written_from(tmp_path, result):
     assert read_marker(tmp_path / "run", "k", 7) == result
 
 
+def test_a_marker_keeps_the_treatment_kinds_the_record_carried(tmp_path):
+    result = AttemptResult(Outcome("finished"), LATER, 9.0, treatment_kinds=("sandbox", "endpoint"))
+    write_marker(tmp_path, "k", 1, result)
+    assert read_marker(tmp_path, "k", 1).treatment_kinds == ("endpoint", "sandbox")
+    assert read_marker(tmp_path, "k", 1) == result
+
+
 def test_a_marker_keeps_usage_and_an_outage_kind(tmp_path):
     result = AttemptResult(
         Outcome("finished"),
