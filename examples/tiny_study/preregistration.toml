@@ -1,0 +1,44 @@
+# Written and frozen before the runs. Its hash goes into every analysis and into the report.
+
+alpha = 0.05
+holm_family = ["extended-vs-baseline", "relay-vs-baseline"]
+
+[bootstrap]
+replicates = 200
+seed = 20260101
+ci_level = 0.95
+
+# Power settings give each contrast a minimum detectable effect at its own number of clusters.
+[power]
+seed = 1
+n_simulations = 50
+target_clusters = 10
+target_difference = 0.2
+sd_grid = [0.1, 0.2]
+
+[estimators.wilcoxon_cluster_bootstrap]
+method = "auto"
+
+# Two named contrasts in the Holm family. Only the first declares an equivalence margin, so only it can be called
+# "equivalent".
+[contrasts.extended-vs-baseline]
+conditions = ["extended", "baseline"]
+outcome = "accuracy"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "region"
+equivalence_margin = 0.2
+
+[contrasts.relay-vs-baseline]
+conditions = ["relay-down", "baseline"]
+outcome = "accuracy"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "region"
+
+# Not in the family: exploratory, judged by its raw p-value, and labelled so wherever it is shown. A factor contrast
+# varies one factor and pairs on every other.
+[contrasts.tools-effect-on-rounds]
+factor = "tools"
+levels = ["extended", "basic"]
+outcome = "rounds"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "region"
