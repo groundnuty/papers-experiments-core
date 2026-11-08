@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from expcore.report import render_report
+from expcore.report import render_report, summary_lines
 from expcore.stats.analysis import CONCLUSIONS, AnalysisResult, ContrastResult, HolmDecision
 
 CODE = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
@@ -127,6 +127,16 @@ def test_a_value_that_could_not_be_estimated_reads_n_a_and_never_zero():
     cells = row(render(analysis(contrast("primary", "not_detected", estimate=math.nan, p_value=math.nan))), "primary")
     assert cells[3] == "n/a"
     assert cells[5] == "n/a"
+
+
+def test_the_terminal_summary_gives_each_conclusion_with_its_basis_and_labels_the_exploratory_ones():
+    member = contrast("in-family", "difference", p_value=0.012)
+    outside = contrast("extra", "equivalent", in_family=False, exploratory=True, estimate=math.nan, p_value=0.3)
+    lines = summary_lines(analysis(member, outside, family=["in-family"]))
+    assert lines == [
+        "in-family: estimate 0.25, p 0.0120, Holm p 0.0200, difference",
+        "extra: estimate n/a, p 0.3000, Holm p exploratory, equivalent (exploratory)",
+    ]
 
 
 def test_the_header_names_the_preregistration_hash_with_its_override_mark_the_code_and_the_core_version():

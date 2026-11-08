@@ -21,7 +21,7 @@ from expcore.campaign.scheduler import CampaignLocked
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import CodeVersionUnknown
 from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE
-from expcore.report import render_report
+from expcore.report import render_report, summary_lines
 from expcore.study.pipeline import (
     REPORT_FILE,
     Refused,
@@ -84,8 +84,7 @@ def _analyze(args: argparse.Namespace) -> int:
     analysis = _analysis(args)
     for path in write_analysis(analysis):
         print(f"wrote {path}")
-    for r in analysis.result.contrasts:
-        print(f"{r.name}: estimate {r.estimate:.4g}, p {r.p_value:.4g}, {r.conclusion}")
+    print("\n".join(summary_lines(analysis.result)))
     return EXIT_OK
 
 

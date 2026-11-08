@@ -272,6 +272,17 @@ def test_c04_the_attempts_the_kill_left_keep_their_places_and_the_resumed_ones_c
     assert min(now[i] for i in now if i not in resumed.before) > max(resumed.before.values())
 
 
+def test_the_analyze_summary_gives_every_conclusion_with_its_holm_p_or_the_word_exploratory(resumed, capsys):
+    assert main(["analyze", str(resumed.root)]) == 0
+    lines = {line.split(":")[0]: line for line in capsys.readouterr().out.splitlines() if "estimate" in line}
+    assert set(lines) == set(CONTRASTS)
+    for name, exploratory in CONTRASTS.items():
+        basis = ", Holm p exploratory, " if exploratory else ", Holm p "
+        assert basis in lines[name]
+        assert lines[name].endswith("(exploratory)") == exploratory
+        assert lines[name].removesuffix(" (exploratory)").split(", ")[-1] in CONCLUSIONS
+
+
 # --- the report ----------------------------------------------------------------------------------------------------
 
 

@@ -166,6 +166,20 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
     return [*lines, ""]
 
 
+def summary_lines(result: AnalysisResult) -> list[str]:
+    """One line per contrast for a terminal: the estimate, the raw p-value, the Holm-adjusted one (or the word
+    exploratory) and the conclusion word, which is labelled exploratory too outside the family. A conclusion is never
+    printed without the basis it rests on."""
+    adjusted = {d.name: d.p_holm for d in result.holm}
+    lines = []
+    for r in result.contrasts:
+        member = r.name in adjusted
+        holm = _p(adjusted[r.name]) if member else EXPLORATORY
+        word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"
+        lines.append(f"{r.name}: estimate {_num(r.estimate)}, p {_p(r.p_value)}, Holm p {holm}, {word}")
+    return lines
+
+
 def render_report(
     result: AnalysisResult,
     export: Mapping[str, Any],
