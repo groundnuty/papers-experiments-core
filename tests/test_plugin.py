@@ -38,7 +38,7 @@ def test_a_tool_output_takes_no_reported_wait_any_more():
 
 def test_a_call_context_can_be_used_outside_the_loop_and_measures_nothing():
     async def go():
-        async with NO_WAITS.infrastructure_wait():
+        async with NO_WAITS.infrastructure_wait("lease_queue"):
             return "done"
 
     assert isinstance(NO_WAITS, CallContext)

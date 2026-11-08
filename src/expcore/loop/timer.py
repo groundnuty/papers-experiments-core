@@ -5,8 +5,9 @@
 
 The agent's time is the elapsed time minus the time spent waiting on infrastructure and minus the time spent
 cleaning up after a cut. Waits are measured live: a provider (or a model backend) wraps each one in
-`infrastructure_wait()`, and the agent's clock is paused while any is open, so a slow store or a busy slot never ends a
-run as a time cap and nothing has to be reported afterwards. The ceiling on the whole elapsed time, waits included,
+`infrastructure_wait(kind)`, with a kind from the closed `WAIT_KINDS`, and the agent's clock is paused while any is
+open, so a slow queue or a starting sandbox never ends a run as a time cap and nothing has to be reported afterwards.
+The seconds are kept per kind as well as in total. The ceiling on the whole elapsed time, waits included,
 catches an infrastructure that hangs; it is checked after the agent's own cap, so the agent's cap decides first.
 
 When the loop cuts a call it begins the cleanup: from the moment of the cut, the time the cancelled work takes to
@@ -28,6 +29,8 @@ from collections.abc import Awaitable, Callable, Collection
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 
+from expcore.plugin import check_wait_kind
+
 # How the loop waits for the tasks it cancelled: given the tasks and the cleanup deadline in seconds, return True when
 # the deadline ran out with some task still running. It may await the tasks, and it must not hide that one is running.
 CleanupWaiter = Callable[[Collection[asyncio.Future], float], Awaitable[bool]]
@@ -39,6 +42,11 @@ async def real_time_cleanup_waiter(tasks: Collection[asyncio.Future], deadline_s
         return False
     _, pending = await asyncio.wait(tasks, timeout=deadline_s)
     return bool(pending)
+
+
+def waited_since(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
+    """Return the seconds waited per kind between two readings of `AgentTimer.infra_wait_by_kind`, kinds that grew."""
+    return {kind: after[kind] - before.get(kind, 0.0) for kind in after if after[kind] > before.get(kind, 0.0)}
 
 
 @dataclass(frozen=True)
@@ -82,8 +90,11 @@ class AgentTimer:
         self.ceiling_s = ceiling_s
         self._clock = clock
         self._start: float | None = None
-        self._open_waits: set[_Wait] = set()  # the agent's clock runs only while there is none
+        self._open_waits: dict[_Wait, None] = {}  # in the order they opened; the agent's clock runs only while none is
         self._wait_since: float | None = None  # when the first open wait began
+        self._kind_open: dict[str, int] = {}  # open waits per kind
+        self._kind_since: dict[str, float] = {}  # when the first open wait of each open kind began
+        self._by_kind: dict[str, float] = {}  # seconds in waits of each kind that have ended: a kind's own union
         self._listeners: list[Callable[[], None]] = []  # told when a wait opens or closes the pause
         self._infra_wait_s = 0.0  # closed waits
         self._cleanup_from: float | None = None  # when the cleanup after a cut began, while it lasts
@@ -104,6 +115,13 @@ class AgentTimer:
         return self._infra_wait_s
 
     @property
+    def infra_wait_by_kind(self) -> dict[str, float]:
+        """The seconds of waits that have ended, by kind. A kind's figure is the union of its own waits, so two kinds
+        that overlap are each counted for the whole overlap and the figures can add up to more than `infra_wait_s`,
+        which is the union of all (L04)."""
+        return dict(self._by_kind)
+
+    @property
     def cleanup_s(self) -> float:
         """The time spent stopping cancelled work after a cut, which is harness time and not the agent's."""
         return self._cleanup_s
@@ -122,40 +140,61 @@ class AgentTimer:
 
     # --- waits on infrastructure, measured live -------------------------------------------------------------------
 
-    def infrastructure_wait(self) -> AbstractAsyncContextManager[None]:
-        """Return a context manager that pauses the agent's clock while it is open (L04).
+    def infrastructure_wait(self, kind: str) -> AbstractAsyncContextManager[None]:
+        """Return a context manager that pauses the agent's clock while it is open, for a wait of one of the
+        `WAIT_KINDS`; any other kind raises ValueError here, at the call, naming it (L04).
 
         This is what a provider reaches through its call context, and a model backend can use it directly. Waits may
-        nest or overlap; the clock is paused for their union. Before the run starts, or after a cut has begun its
-        cleanup, it measures nothing. A wait still open when its call ends is closed by the loop (`close_open_waits`).
+        nest or overlap; the clock is paused for their union, and each kind is also counted on its own. Every wait
+        takes a reading when it opens and when it closes, labelled `wait_start:<kind>` and `wait_end:<kind>`. Before
+        the run starts, or after a cut has begun its cleanup, it measures nothing. A wait still open when its call
+        ends is closed by the loop (`close_open_waits`).
         """
-        return _Wait(self)
+        return _Wait(self, check_wait_kind(kind))
 
     def _open_wait(self, wait: "_Wait") -> None:
         if self._start is None or self._over:
             return
-        self._open_waits.add(wait)
-        if len(self._open_waits) == 1:
-            self._wait_since = self.read("wait_start")
+        now = self.read(f"wait_start:{wait.kind}")
+        first = not self._open_waits
+        self._open_waits[wait] = None
+        if not self._kind_open.get(wait.kind):
+            self._kind_since[wait.kind] = now
+        self._kind_open[wait.kind] = self._kind_open.get(wait.kind, 0) + 1
+        if first:
+            self._wait_since = now
             self._notify()
+
+    def _release(self, wait: "_Wait", now: float) -> None:
+        """Take a wait out of the open ones at `now`; the last of its kind ends the kind's span."""
+        del self._open_waits[wait]
+        self._kind_open[wait.kind] -= 1
+        if not self._kind_open[wait.kind]:
+            del self._kind_open[wait.kind]
+            self._by_kind[wait.kind] = self._by_kind.get(wait.kind, 0.0) + now - self._kind_since.pop(wait.kind)
 
     def _close_wait(self, wait: "_Wait") -> None:
         if wait not in self._open_waits:  # never opened, or closed already by the end of its call or by a cut
             return
-        self._open_waits.discard(wait)
+        now = self.read(f"wait_end:{wait.kind}")
+        self._release(wait, now)
         if not self._open_waits and self._wait_since is not None:
-            self._infra_wait_s += self.read("wait_end") - self._wait_since
+            self._infra_wait_s += now - self._wait_since
             self._wait_since = None
             self._notify()
 
     def close_open_waits(self) -> int:
         """Close every wait still open, now, and return how many there were. The time they were open is infrastructure
         time, since the provider declared it so, and the agent's clock runs again. The loop does this when a call ends,
-        so a wait is scoped to its call; the one that closes it later finds it closed and does nothing."""
+        so a wait is scoped to its call; the one that closes it later finds it closed and does nothing. Each wait takes
+        a reading of its own, in the order they opened."""
         left = len(self._open_waits)
+        now = 0.0
+        for wait in list(self._open_waits):
+            now = self.read(f"wait_end:{wait.kind}")
+            self._release(wait, now)
         if left and self._wait_since is not None:
-            self._open_waits.clear()
-            self._infra_wait_s += self.read("wait_end") - self._wait_since
+            self._infra_wait_s += now - self._wait_since
             self._wait_since = None
         return left
 
@@ -178,10 +217,11 @@ class AgentTimer:
         if self._over:
             return
         self._over = True
+        for wait in list(self._open_waits):
+            self._release(wait, tick.now)
         if self._wait_since is not None:
             self._infra_wait_s += tick.now - self._wait_since
             self._wait_since = None
-        self._open_waits.clear()
         self._cleanup_from = tick.now
 
     def end_cleanup(self, *, timed_out: bool = False) -> None:
@@ -235,16 +275,17 @@ class WaitContext:
     def __init__(self, timer: AgentTimer):
         self._timer = timer
 
-    def infrastructure_wait(self) -> AbstractAsyncContextManager[None]:
-        """Pause the agent's clock while the returned context manager is open (L04)."""
-        return self._timer.infrastructure_wait()
+    def infrastructure_wait(self, kind: str) -> AbstractAsyncContextManager[None]:
+        """Pause the agent's clock while the returned context manager is open, for a wait of a known kind (L04)."""
+        return self._timer.infrastructure_wait(kind)
 
 
 class _Wait:
     """One wait on infrastructure: an async context manager that pauses the agent's clock while it is open."""
 
-    def __init__(self, timer: AgentTimer):
+    def __init__(self, timer: AgentTimer, kind: str):
         self._timer = timer
+        self.kind = kind
 
     async def __aenter__(self) -> None:
         self._timer._open_wait(self)

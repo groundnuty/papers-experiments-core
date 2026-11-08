@@ -28,6 +28,7 @@ import contextlib
 import inspect
 import threading
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,7 +75,7 @@ def _takes_context(function: ToolFunction) -> bool:
 
 
 class _ThreadWaits:
-    """The call context for a plain function in a worker thread: `with ctx.infrastructure_wait():` marks a wait.
+    """The call context for a plain function in a worker thread: `with ctx.infrastructure_wait(kind):` marks a wait.
 
     The wait is opened and closed on the event loop, where the harness's clock lives, and the thread waits for each to
     be done. If the loop is gone or does not answer, the thread goes on and the wait is simply not measured.
@@ -83,9 +84,13 @@ class _ThreadWaits:
     def __init__(self, loop: asyncio.AbstractEventLoop, ctx: CallContext):
         self._loop, self._ctx = loop, ctx
 
+    def infrastructure_wait(self, kind: str) -> contextlib.AbstractContextManager[None]:
+        """Return the context manager of a wait of the given kind; a kind outside the vocabulary raises here, in the
+        thread, at the call (L04)."""
+        return self._wait(self._ctx.infrastructure_wait(kind))
+
     @contextlib.contextmanager
-    def infrastructure_wait(self) -> Iterator[None]:
-        wait = self._ctx.infrastructure_wait()
+    def _wait(self, wait: AbstractAsyncContextManager[None]) -> Iterator[None]:
         opened = self._on_loop(wait.__aenter__())
         try:
             yield

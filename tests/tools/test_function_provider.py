@@ -222,7 +222,7 @@ def test_l04_a_coroutine_function_that_takes_ctx_marks_its_wait_and_the_harness_
     clock, timer = started_timer()
 
     async def store(args, ctx):
-        async with ctx.infrastructure_wait():
+        async with ctx.infrastructure_wait("lease_queue"):
             clock.advance(40)
         clock.advance(2)
         return "ok"
@@ -238,7 +238,7 @@ def test_l04_a_plain_function_in_a_thread_marks_its_wait_with_a_plain_with():
     clock, timer = started_timer()
 
     def store(args, timeout_s, ctx):
-        with ctx.infrastructure_wait():
+        with ctx.infrastructure_wait("lease_queue"):
             clock.advance(40)
         clock.advance(2)
         return "ok"
@@ -322,3 +322,23 @@ def test_l15_the_provider_does_not_try_to_stop_a_thread():
 
     asyncio.run(scenario())
     assert finished == ["ran to its end"]
+
+
+def test_l04_a_plain_function_that_names_a_kind_outside_the_vocabulary_fails_at_the_call():
+    """L04: the wrong kind raises in the thread when the context is asked for, not when the wait is entered."""
+    _, timer = started_timer()
+    raised = []
+
+    def store(args, timeout_s, ctx):
+        try:
+            ctx.infrastructure_wait("data_access")
+        except ValueError as exc:
+            raised.append(str(exc))
+            raise
+        return "ok"
+
+    p = provider(store=store)
+    with pytest.raises(ValueError, match="unknown infrastructure wait kind 'data_access'"):
+        asyncio.run(p.execute("store", {}, timeout_s=5.0, ctx=WaitContext(timer)))
+    assert "data_access" in raised[0]
+    assert timer.infra_wait_s == 0

@@ -43,7 +43,7 @@ class ToolOutput:
 
     `text` is the full result, or for an error the message. An error names its `error_class`, which the model
     sees first. Time spent waiting on infrastructure is not reported here: the provider wraps each such wait in
-    `ctx.infrastructure_wait()` while it happens, and the harness measures it (L04).
+    `ctx.infrastructure_wait(kind)` while it happens, and the harness measures it (L04).
 
     `source_truncated` is for the data source's own limit (L07): True when the source hit its row or size limit, so
     the result may be cut by the source; False when the provider checked and it was not; None when the provider says
@@ -63,27 +63,57 @@ class ToolOutput:
             raise ValueError(f"source_truncated must be True, False or None, not {self.source_truncated!r}")
 
 
+# The kinds of wait on infrastructure, a closed vocabulary. Each is time the agent neither controls nor causes: the
+# harness's own machinery. None can cover tool execution, data access or a federation operation the agent triggers.
+WAIT_KINDS: dict[str, str] = {
+    "model_retry": "retries of a model request and the backoff between them",
+    "lease_queue": "waiting for a slot or a lease",
+    "sandbox_lifecycle": "start-up and teardown of the sandbox",
+    "toolserver_lifecycle": "start-up and teardown of a tool server",
+}
+
+
+def check_wait_kind(kind: object) -> str:
+    """Return the kind when it is one of `WAIT_KINDS`; raise ValueError naming it otherwise (L04)."""
+    if not isinstance(kind, str) or kind not in WAIT_KINDS:
+        raise ValueError(f"unknown infrastructure wait kind {kind!r}; the kinds are: {', '.join(WAIT_KINDS)}")
+    return kind
+
+
 @runtime_checkable
 class CallContext(Protocol):
     """What the harness hands a provider with one call: the way to say that the call is waiting on infrastructure.
 
-    `async with ctx.infrastructure_wait():` wraps a wait on a store, a gate, a slot, a lock or output validation. The
-    harness pauses the agent's clock while any such wait is open and measures it as it happens, so a wait is never
-    charged to the agent and never has to be reported afterwards (L04). Waits may nest or overlap. A wait still open
-    when the harness cuts the call ends at the cut; the time the call then takes to stop is the harness's own.
+    `async with ctx.infrastructure_wait(kind):` wraps a wait of one of the `WAIT_KINDS`: `model_retry` (retries and
+    backoff), `lease_queue` (waiting for a slot or a lease), `sandbox_lifecycle` and `toolserver_lifecycle` (start-up
+    and teardown). Any other kind, or none, raises at once, naming it. The harness pauses the agent's clock while any
+    such wait is open and measures it as it happens, per kind, so a wait is never charged to the agent and never has
+    to be reported afterwards (L04). Waits may nest or overlap; the clock is paused for their union.
+
+    What the agent's own call does is never infrastructure, and no kind covers it: executing a tool, reading or
+    writing data, and any federation operation the agent triggers (a transfer, a replication) are the agent's time,
+    however long they take. A provider cannot hide that cost in a wait, because there is no kind to hide it under. A
+    wait still open when the harness cuts the call ends at the cut; the time the call then takes to stop is the
+    harness's own.
     """
 
-    def infrastructure_wait(self) -> AbstractAsyncContextManager[None]:
+    def infrastructure_wait(self, kind: str) -> AbstractAsyncContextManager[None]:
         """Return an async context manager that pauses the agent's clock for as long as it is open."""
         ...
 
 
-class _NoWaits:
-    """A call context with no clock behind it, for a provider run outside the loop: waits are not measured."""
+@asynccontextmanager
+async def _no_wait() -> AsyncIterator[None]:
+    yield
 
-    @asynccontextmanager
-    async def infrastructure_wait(self) -> AsyncIterator[None]:
-        yield
+
+class _NoWaits:
+    """A call context with no clock behind it, for a provider run outside the loop: waits are not measured. The kind
+    is still checked, so a provider that names a wrong one fails here as it would in a run."""
+
+    def infrastructure_wait(self, kind: str) -> AbstractAsyncContextManager[None]:
+        check_wait_kind(kind)
+        return _no_wait()
 
 
 NO_WAITS: CallContext = _NoWaits()
@@ -104,7 +134,7 @@ class ToolProvider(Protocol):
     (`FunctionProvider` does, and refuses new calls until the thread returns). A provider that can leave work running
     this way may offer `abandoned_threads() -> int`; the loop result records the count.
 
-    Every wait on infrastructure is wrapped in `ctx.infrastructure_wait()` (see `CallContext`).
+    Every wait on infrastructure is wrapped in `ctx.infrastructure_wait(kind)` (see `CallContext`).
     """
 
     def tools(self) -> Sequence[ToolSpec]:

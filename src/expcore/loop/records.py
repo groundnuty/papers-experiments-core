@@ -33,6 +33,7 @@ class TurnRecord:
     system_fingerprint: str | None = None
     retries: tuple[dict[str, Any], ...] = ()
     waits_left_open: int = 0  # waits on infrastructure the request left open; the loop closed them when it returned
+    infra_wait_by_kind: dict[str, float] = field(default_factory=dict)  # seconds the request waited, by kind (L04)
 
 
 @dataclass
@@ -47,6 +48,7 @@ class ToolCallRecord:
     status: str  # one of TOOL_STATUSES
     text: str  # exactly what the model saw, after the cap
     raw_text: str  # the full result or error before the cap
+    raw_chars: int  # the length of raw_text before redaction; not a secret, and lets replay check a cut
     truncated: bool  # the harness cap cut what the model saw (L06); not the source's own limit, see source_truncated
     error_class: str | None = None
     raw_arguments: str | None = None  # the model's own text, kept when it did not parse
@@ -57,6 +59,7 @@ class ToolCallRecord:
     source_truncated: bool | None = None  # the data source hit its own row or size limit, as the provider said (L07)
     waits_left_open: int = 0  # waits on infrastructure the call left open; the loop closed them when it ended (L04)
     terminal: bool = False  # the tool is a terminal one: a successful call ended the attempt (L09)
+    infra_wait_by_kind: dict[str, float] = field(default_factory=dict)  # seconds the call waited, by kind (L04)
 
     def __post_init__(self) -> None:
         """Refuse a status outside the closed list."""
@@ -93,6 +96,9 @@ class LoopResult:
     cleanup_s: float = 0.0  # harness time spent stopping a call after a cut; never part of agent_s
     cleanup_timed_out: bool = False  # the cut call did not stop within the cleanup deadline and was given up on
     abandoned_threads: int = 0  # worker threads of cancelled calls that may still be running when the attempt ended
+    # seconds the attempt waited on infrastructure, by kind; a kind counts its own union, so the figures can add up to
+    # more than infra_wait_s where two kinds overlapped (L04)
+    infra_wait_by_kind: dict[str, float] = field(default_factory=dict)
 
     @property
     def malformed_rounds(self) -> int:
