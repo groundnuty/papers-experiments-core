@@ -25,12 +25,13 @@ class Recovery:
 def recover(store: Store, now: str, max_attempts: int) -> Recovery:
     """Settle the 'running' rows. Call only while holding the campaign lock: every 'running' row is stale.
 
-    Harness-error runs go back to pending, from the same row, their failed attempts kept. An attempt with a marker
-    that names it is committed from the marker and never run again. Every other running attempt becomes interrupted,
-    uncharged, with its usage marked incomplete, and its run stays pending to be run again under the same number.
-    A marker that exists but cannot be trusted raises MarkerError and settles nothing further.
+    An attempt with a marker that names it is committed from the marker and never run again. Every other running
+    attempt becomes interrupted, uncharged, with its usage marked incomplete, and its run stays pending to be run
+    again under the same number. Only then do harness-error runs go back to pending, from the same row, their failed
+    attempts kept: a kill after the marker and a kill after the metadata write leave the same state after one
+    recovery, because a marker that ends as a harness error is requeued like a result that was stored. A marker that
+    exists but cannot be trusted raises MarkerError and settles nothing further.
     """
-    requeued = store.transact(lambda: _requeue_harness_errors(store, now))
     committed, orphans = 0, []
     for row in store.running_attempts():
         result = read_marker(Path(row["run_dir"]), row["run_key"], row["id"]) if row["run_dir"] else None
@@ -41,6 +42,7 @@ def recover(store: Store, now: str, max_attempts: int) -> Recovery:
         store.event(now, "recovered_committed", None, f"{row['run_key']}: attempt {row['id']} from its marker")
         committed += 1
     interrupted = store.transact(lambda: _interrupt(store, orphans, now))
+    requeued = store.transact(lambda: _requeue_harness_errors(store, now))
     return Recovery(committed, interrupted, requeued)
 
 

@@ -145,3 +145,27 @@ def test_a_harness_error_run_goes_back_to_pending_from_the_same_row_with_its_att
     assert attempts(store) == [("harness_error", 0, 1)]
     assert store.q("SELECT detail FROM attempts")[0]["detail"].startswith("ValueError aaaaaaaaaaaa: boom")
     assert store.q("SELECT kind FROM events")[0]["kind"] == "harness_error_requeued"
+
+
+def test_c04_a_harness_error_ends_in_the_same_state_after_one_recovery_whichever_side_of_the_write_the_kill_fell(
+    tmp_path,
+):
+    """C04: adds that the kill after the marker and the kill after the metadata write agree after one recovery."""
+    outcomes = {}
+    for point in ("after_marker", "after_metadata"):
+        store, _, manifest = planned_store(tmp_path / point)
+        key = manifest.rows[0].key.text
+        run_dir = tmp_path / point / "run"
+        begun = store.begin_attempt(key, NOW, 1, str(run_dir))
+        write_marker(run_dir, key, begun.id, defect())
+        if point == "after_metadata":
+            store.finish_attempt(begun.id, defect(), 3)
+            assert status(store, key) == "harness_error"  # the stored result, before any recovery
+        recover(store, LATER, 3)
+        outcomes[point] = (
+            attempts(store),
+            status(store, key),
+            store.charged_attempts(key),
+            key in [r["run_key"] for r in store.pending()],
+        )
+    assert outcomes["after_marker"] == outcomes["after_metadata"] == ([("harness_error", 0, 1)], "pending", 0, True)
