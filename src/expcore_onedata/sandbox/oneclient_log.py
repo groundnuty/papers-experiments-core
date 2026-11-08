@@ -1,10 +1,10 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/sandbox/oneclient_log.py, blob 40f08eced5e22b3c17a5d6db07d96ff5b923aa75
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""What the oneclient sidecar's own log says went wrong, per run: the M counterpart of the gate's 5xx counts.
+"""What the oneclient sidecar's own log says went wrong, per run: the mount counterpart of the gate's 5xx counts.
 
 Read from outside the agent (the sidecar's log file and its container output), so it adds nothing to the agent's
-interpreter and nothing that one option has and the others lack. Format of a line (glog):
+interpreter and nothing that one data path has and the others lack. Format of a line (glog):
 
     [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] message
 
@@ -205,6 +205,15 @@ def summarize(log_text: str) -> dict:
     }
 
 
+def platform_errors(summary: dict) -> int:
+    """The warnings and errors of a `summarize` result that count against the platform (O18).
+
+    A FUSE error whose errno the agent's own request causes (ENOENT, EROFS, EISDIR) is the mount doing what it
+    should, so it is left out. EACCES and EPERM stay in: on a read inside the space they mean the read-only token
+    failed or expired, and the line cannot say which."""
+    return int(summary["total"]) - int(summary["fuse_caused_by_agent"])
+
+
 DETECT_START = re.compile(
     r"Performing automatic storage access type detection for storage (\S+) for file \S+ "
     r"with forced proxy io mode: (\d)"
@@ -219,7 +228,7 @@ DETECT_NOTE = (
 
 
 def storage_detection(log_text: str) -> dict:
-    """Oneclient's storage access type detection, from its own log (the M set-up cost that is not the mount itself).
+    """Oneclient's storage access type detection, from its own log (the set-up cost of a mount that is not the mount itself).
 
     Each detection has a start line and an end line; a phase is the log-time difference of the two (container clock, so
     the host's load does not enter). `storage_detection_s` is the FIRST complete phase (the one the application's first read

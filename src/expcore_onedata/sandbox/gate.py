@@ -7,7 +7,7 @@ Runs in its own container, as root with all capabilities but NET_BIND_SERVICE
 dropped, attached to the sandbox's internal network and to a bridge to reach
 the upstream. Configuration: JSON at the path in argv[1]:
 
-  {"option": "T", "page_limit": 1000, "log": "/var/gate/requests.jsonl",
+  {"run_key": "...", "verify_ssl": true, "log": "/var/gate/requests.jsonl",
    "tls_dir": "/etc/gate/tls",
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
                         "port": 443, "tls": true}},
@@ -18,6 +18,12 @@ terminates TLS with a certificate for that name (signed by the run's CA, which
 only the sandbox trusts), applies gatepolicy, and forwards to the real upstream
 (verifying its certificate against the system CAs). `tcp_forwards` are plain TCP
 pass-through for the knowledge plane. Every request is logged as one JSON line.
+
+This file runs alone in the gate container with the standard library only; it imports nothing of the platform layer
+(tests/onedata/sandbox/test_gate.py checks that). It passes only the reads that gatepolicy lists, so the data path
+through the gate is read-only whatever the client asks (O05). A request it refuses is answered 4xx and logged as a
+decision, never as an error; an error the gate makes itself is logged with origin `gate`, so a run can tell it from the
+platform's (O16).
 
 Connections are kept alive on both sides: each request is still decided by gatepolicy on its own, and logged on its
 own, whatever came before it on the connection; a refusal or an error closes the client's connection. Each client
@@ -31,7 +37,7 @@ request following, one `conn_close` event line says how (see `Handler._peer_gone
 (SIGTERM or SIGINT: `serve`; or the server closed: `GateServer.server_close`), every connection still open gets that line with `ended` "teardown", before the process
 exits (`teardown`); a gate that is killed (SIGKILL, `docker rm -f`) cannot write one, and a connection with no close line at all says so.
 
-Errors and retries, identical on every path (T, condition_a, D): an upstream attempt that fails before any byte of
+Errors and retries, identical on every path: an upstream attempt that fails before any byte of
 an answer arrives (connect, handshake, send, or the peer closing first) is retried once, on a new connection, before
 anything reaches the client; nothing is retried after an answer began, and a read timeout is never retried. Every
 failure is logged with its origin, `upstream` (the platform) or `gate` (the gate itself), and with what the client saw
@@ -40,6 +46,7 @@ failure is logged with its origin, `upstream` (the platform) or `gate` (the gate
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import http.client
 import io
@@ -52,14 +59,13 @@ import socket
 import ssl
 import struct
 import sys
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import gatepolicy
+import gatepolicy  # the sibling module, found through the path set above
 
 CFG: dict = {}
 _LOCK = threading.Lock()
@@ -75,7 +81,7 @@ _HOP = {
     "host",
     "content-length",
 }
-RUN_HEADER = "X-dataset-192"
+RUN_HEADER = "X-Run-Key"
 
 
 def _log(rec: dict) -> None:
@@ -131,17 +137,15 @@ def _tcp_facts(sock) -> dict:
         import termios
 
         for key, req in (("outq_unacked", termios.TIOCOUTQ), ("outq_unsent", SIOCOUTQNSD)):
-            try:
+            with contextlib.suppress(OSError, ValueError, AttributeError, struct.error):
                 out[key] = struct.unpack("=i", fcntl.ioctl(sock.fileno(), req, b"\0\0\0\0"))[0]
-            except (OSError, ValueError, AttributeError, struct.error):
-                pass
     except ImportError:
         pass
     return out
 
 
-# The gate must never give up before the client would. The shipped client's effective timeouts are 8 s to connect
-# (TCP and TLS) and 4 h to read (sandbox/hooks/dataset_181.py); behind the gate the client's 8 s covers only
+# The gate must never give up before the client would. A client's effective timeouts can be 8 s to connect
+# (TCP and TLS) and 4 h to read; behind the gate the client's 8 s covers only
 # the hop to the gate, and it then waits up to 4 h for the answer. So upstream (Onezone and Oneprovider alike) the gate
 # allows 60 s to connect and hand-shake, plus one transparent retry, and 4 h to read. #8's oracle got a 502 on 1 Nov
 # when the old gate's 8 s bound ran out on a TLS handshake to Onezone under load.
@@ -157,13 +161,6 @@ LOCAL_ERRNOS = {
     errno.EROFS,
     errno.EADDRNOTAVAIL,
 }  # the last: the gate's own ephemeral ports ran out
-_SPOOL = {"now": 0, "peak": 0}
-# The gate container has --memory 1g, and its memory cgroup is charged for the page cache of the spool it writes (dirty pages first) and
-# reads back. Left alone, a whole file several times the cap filled the cap with `file` and the kernel OOM-killed the gate (S2, 3.79 GB).
-# So the spool is written to disk and dropped from the cache in batches of SPOOL_SYNC_BYTES, and dropped again, in the same batches, as it is sent.
-# The batches are ALIGNED to that size, and it is a power of two: a large page-cache folio (the kernel caches a file in folios of up to several MiB) that
-# straddles the range given to POSIX_FADV_DONTNEED is not dropped, so 1 MiB ranges left almost the whole read-back in the cache (measured: 1 GiB of `file`).
-SPOOL_SYNC_BYTES = 64 << 20
 
 
 HANDSHAKE_TIMEOUT_S = 30  # a client's TLS handshake, in its own thread
@@ -177,12 +174,7 @@ def _upstream_ctx(verify: bool) -> ssl.SSLContext:
     """One client TLS context per process and verification mode: building one reloads the CA bundle (25 ms under load)."""
     with _LOCK:
         if verify not in _CTX:
-            try:
-                import certifi
-
-                ctx = ssl.create_default_context(cafile=certifi.where())
-            except ImportError:
-                ctx = ssl.create_default_context()
+            ctx = ssl.create_default_context(cafile=CFG.get("upstream_ca_file"))  # None: the image's system CAs
             if not verify:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
@@ -214,25 +206,6 @@ def _went_stale(conn: http.client.HTTPConnection) -> bool:
     p = select.poll()
     p.register(conn.sock, select.POLLIN)
     return bool(p.poll(0))
-
-
-def _spool_drop(fd: int, start: int, end: int) -> None:
-    """Drop the spool's bytes [start, end) from the page cache (clean pages only: the kernel keeps dirty ones)."""
-    os.posix_fadvise(fd, start, end - start, os.POSIX_FADV_DONTNEED)
-
-
-def _spool_flush(f, start: int, end: int) -> None:
-    """Write the spool to disk, then drop its bytes [start, end) from the page cache (dirty pages cannot be dropped before they are written).
-    An OSError (a full disk, an I/O error) is the gate's own, as one from `write` is."""
-    f.flush()
-    os.fdatasync(f.fileno())
-    _spool_drop(f.fileno(), start, end)
-
-
-def _spool_add(n: int) -> None:
-    with _LOCK:
-        _SPOOL["now"] += n
-        _SPOOL["peak"] = max(_SPOOL["peak"], _SPOOL["now"])
 
 
 class _CountingRaw(io.RawIOBase):
@@ -305,7 +278,7 @@ class _Framing(Exception):
 
 def origin_of(e: BaseException) -> str:
     """Whose failure a failed upstream call is. The gate's: its own timer ran out (a direct client would have had at
-    least as long), a local resource ran out (descriptors, memory, the spool's disk), or anything that is not a transport
+    least as long), a local resource ran out (descriptors, memory, disk), or anything that is not a transport
     error (a bug). The platform's: the connection refused, reset or lost, a failed TLS handshake, a name that does not
     resolve, a cut or malformed answer."""
     if isinstance(e, TimeoutError):
@@ -413,7 +386,7 @@ class _CountingWriter:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "dataset-149"
+    server_version = "gate"
     disable_nagle_algorithm = (
         True  # headers and body are separate writes: keep-alive would stall on Nagle + delayed ACK
     )
@@ -560,10 +533,8 @@ class Handler(BaseHTTPRequestHandler):
     def send_header(self, keyword, value) -> None:
         super().send_header(keyword, value)
         if keyword.lower() == "content-length":
-            try:
+            with contextlib.suppress(ValueError):
                 self._w.total = int(value)  # the body's length, as the client is told it (the last one sent)
-            except ValueError:
-                pass
 
     def end_headers(self) -> None:
         super().end_headers()
@@ -661,7 +632,7 @@ class Handler(BaseHTTPRequestHandler):
         A kept connection found closed is replaced before anything is sent (`upstream_stale`). An attempt that then fails
         with no byte of an answer received is made once more on a new connection (`upstream_retries`), whether its
         connection was new or kept; that is the only retry, it happens before any byte reaches the client, and it is the
-        same for every option. An answer begun (an interim 100 included), a read timeout, or a second failure is raised
+        same for every request. An answer begun (an interim 100 included), a read timeout, or a second failure is raised
         as an upstream failure."""
         key = (hcfg["addr"], hcfg.get("port", 443))
         conn = self._pool.get(key)
@@ -677,7 +648,7 @@ class Handler(BaseHTTPRequestHandler):
                 if conn is None:
                     conn = self._pool[key] = _upstream_conn(hcfg)
                 phase = "exchange"
-                conn.response_class = lambda sock, *a, **kw: _CountingResponse(sock, *a, seen=seen, **kw)
+                conn.response_class = lambda sock, *a, seen=seen, **kw: _CountingResponse(sock, *a, seen=seen, **kw)
                 conn.request(method, target, body=body, headers=headers)
                 return _checked(conn.getresponse(), seen)
             except _Framing as e:
@@ -748,7 +719,7 @@ class Handler(BaseHTTPRequestHandler):
             rec.update(decision="deny", reason="host not allowed", status=403)
             self._answer(rec, 403, {"error": {"id": "forbidden", "details": "host not allowed"}})
             return
-        dec = gatepolicy.decide(CFG["option"], hcfg["role"], self.command, url.path, headers)
+        dec = gatepolicy.decide(hcfg["role"], self.command, url.path)
         rec.update(decision="allow" if dec.allow else "deny", reason=dec.reason, tag=dec.tag)
         if not dec.allow:
             rec["status"] = dec.status
@@ -759,12 +730,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         try:
-            if dec.merge_pages:
-                self._merged_listing(hcfg, url, headers, body, rec)
-            elif dec.store_and_forward:
-                self._store_and_forward(hcfg, url, headers, body, rec)
-            else:
-                self._forward(hcfg, url, headers, body, rec)
+            self._forward(hcfg, url, headers, body, rec)
         except (ConnectionError, ssl.SSLError) as e:
             # unwrapped connection and TLS errors come only from the client's socket (upstream ones arrive as
             # _Upstream): the client went away, for instance while the headers were written; its own doing, not an error
@@ -783,10 +749,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._abort_client()
                 return
             rec["client_saw"] = "5xx"
-            try:
+            with contextlib.suppress(OSError):
                 self._answer(rec, 502, {"error": {"id": "badGateway", "details": str(e)}})
-            except OSError:
-                pass
 
     def _fwd_headers(self, headers: dict) -> dict:
         # the run attribution is the gate's: whatever the agent sent under that name is dropped, then ours is added
@@ -836,6 +800,11 @@ class Handler(BaseHTTPRequestHandler):
         if failure is None and not rec.get("client_aborted") and declared is not None and sent != declared:
             failure = f"upstream sent {sent} of {declared} bytes"  # http.client does not raise on an early EOF here
         if failure or rec.get("client_aborted"):
+            rec["cut"] = (
+                True  # a transfer the gate did not finish (O16): the bytes the client never got are on the line
+            )
+            if declared is not None:
+                rec["unread_bytes"] = max(declared - sent, 0)
             self._drop(hcfg)
             self._abort_client()
         else:
@@ -853,142 +822,6 @@ class Handler(BaseHTTPRequestHandler):
             rec.update(status=resp.status, bytes=sent)
             if resp.status >= 500:
                 rec.update(error_origin="upstream", client_saw="5xx")  # the platform's own 5xx, passed on as it was
-        self._log(rec)
-
-    def _store_and_forward(self, hcfg, url, headers, body, rec) -> None:
-        """D: the whole file reaches the gate before the sandbox sees any byte of it.
-
-        Whatever the agent's code does with the response (read 1 KB and close, stream, abort), the transfer
-        between the sites is the complete file: there is no in-place remote read, not even a partial
-        consumption of a whole-file request. The spool is on the gate's own disk (bounded by the file size)
-        and is deleted afterwards.
-        """
-        target = url.path + ("?" + url.query if url.query else "")
-        resp = self._upstream(hcfg, self.command, target, body, self._fwd_headers(headers), rec)
-        if resp.status != 200:  # errors are small: pass through
-            try:
-                data = resp.read()
-            except (OSError, http.client.HTTPException) as e:
-                raise _Upstream(e) from e
-            self._settle(hcfg, resp)
-            self.send_response(resp.status)
-            self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            rec.update(status=resp.status, bytes=len(data))
-            if resp.status >= 500:
-                rec.update(error_origin="upstream", client_saw="5xx")
-            self._log(rec)
-            return
-        spool_dir = os.path.join(os.path.dirname(CFG["log"]), "spool")
-        os.makedirs(spool_dir, exist_ok=True)  # a failure here is the gate's own (handled by the caller as one)
-        fd, spool = tempfile.mkstemp(dir=spool_dir)
-        sent = 0
-        try:
-            # phase 1: the complete file from the provider (an upstream failure propagates: handled as 502)
-            with os.fdopen(fd, "wb") as f:
-                got = synced = 0
-                while True:
-                    try:
-                        chunk = resp.read(1 << 20)
-                    except (OSError, http.client.HTTPException) as e:
-                        raise _Upstream(e) from e
-                    if not chunk:
-                        break
-                    f.write(chunk)  # the gate's disk: an OSError here is the gate's
-                    got += len(chunk)
-                    _spool_add(len(chunk))
-                    if (
-                        got - got % SPOOL_SYNC_BYTES > synced
-                    ):  # the page cache of the spool stays bounded (see SPOOL_SYNC_BYTES)
-                        boundary = got - got % SPOOL_SYNC_BYTES
-                        _spool_flush(f, synced, boundary)
-                        synced = boundary
-                # no flush of the last, partial batch: under SPOOL_SYNC_BYTES, so it bounds nothing, and an fsync per small file (S1 is ~15k of them) would cost D real time
-            declared = resp.getheader("Content-Length")
-            if declared is not None and got != int(declared):  # premature EOF is not a whole-file download
-                raise _Upstream(OSError(f"upstream sent {got} of {declared} bytes"))
-            self._settle(hcfg, resp)
-            rec.update(upstream_bytes=got, t_upstream_done=time.time(), spool_peak_bytes=_SPOOL["peak"])
-            # phase 2: only now release the first byte to the sandbox
-            try:
-                self.send_response(200)
-                for k, v in resp.getheaders():
-                    if k.lower() not in _HOP:
-                        self.send_header(k, v)
-                self.send_header("Content-Length", str(got))
-                self.end_headers()
-                rec["t_first_byte_sent"] = time.time()
-                with open(spool, "rb") as f:
-                    dropped = 0
-                    while chunk := f.read(1 << 20):
-                        self.wfile.write(chunk)
-                        sent += len(chunk)
-                        if (
-                            sent - sent % SPOOL_SYNC_BYTES > dropped
-                        ):  # what is sent leaves the page cache, in aligned batches
-                            boundary = sent - sent % SPOOL_SYNC_BYTES
-                            _spool_drop(f.fileno(), dropped, boundary)
-                            dropped = boundary
-            except (ConnectionError, ssl.SSLError):  # the client went away (TLS too): the transfer still happened
-                rec["client_aborted"] = True
-                self.close_connection = True
-            rec.update(status=200, bytes=sent)
-            self._log(rec)
-        finally:
-            rec["spool_peak_bytes"] = _SPOOL["peak"]  # also for a failed transfer (logged by the caller)
-            _spool_add(-os.path.getsize(spool))
-            os.unlink(spool)
-
-    def _merged_listing(self, hcfg, url, headers, body, rec) -> None:
-        """condition_a: follow pagination upstream, return the whole directory."""
-        q = dict(parse_qsl(url.query, keep_blank_values=True))
-        children, token, pages = [], None, 0
-        while True:
-            q["limit"] = str(CFG.get("page_limit", 1000))
-            if token is None:
-                q.pop("token", None)
-            else:
-                q["token"] = token
-            resp = self._upstream(hcfg, "GET", f"{url.path}?{urlencode(q)}", body, self._fwd_headers(headers), rec)
-            try:
-                data = resp.read()
-            except (OSError, http.client.HTTPException) as e:
-                raise _Upstream(e) from e
-            self._settle(hcfg, resp)
-            if resp.status != 200:
-                self.send_response(resp.status)
-                self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                rec.update(status=resp.status, pages=pages)
-                if resp.status >= 500:
-                    rec.update(error_origin="upstream", client_saw="5xx")
-                self._log(rec)
-                return
-            try:
-                page = json.loads(data)
-                if not isinstance(page, dict) or not isinstance(page.get("children"), list):
-                    raise ValueError(f"listing page without a list of children: {data[:120]!s}")
-            except ValueError as e:
-                raise _Upstream(_Framing(str(e))) from e
-            pages += 1
-            children.extend(page["children"])
-            token, is_last = page.get("nextPageToken"), page.get("isLast")
-            if is_last is True:
-                break
-            if (
-                is_last is not False or not token
-            ):  # never rewritten as complete: this is what condition_a exists to expose
-                raise _Upstream(
-                    _Framing(
-                        f"listing page with no valid end or continuation: isLast={is_last!r}, nextPageToken present: {bool(token)}"
-                    )
-                )
-        n = self._send_json(200, {"children": children, "isLast": True, "nextPageToken": None}, close=False)
-        rec.update(status=200, bytes=n, pages=pages, entries=len(children))
         self._log(rec)
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _handle
@@ -1100,10 +933,8 @@ def _pipe(a, b, sides: tuple[str, str], state: dict, listen: int) -> None:
                 }
             )
         for s_ in (a, b):
-            try:
+            with contextlib.suppress(OSError):
                 s_.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
 
 
 def _tcp_forward(listen: int, host: str, port: int) -> None:
@@ -1149,10 +980,8 @@ def _tcp_forward(listen: int, host: str, port: int) -> None:
                 )
                 for s_ in (c, u):
                     if s_ is not None:
-                        try:
+                        with contextlib.suppress(OSError):
                             s_.shutdown(socket.SHUT_RDWR)
-                        except OSError:
-                            pass
                         s_.close()
 
     threading.Thread(target=serve, daemon=True).start()
@@ -1174,15 +1003,16 @@ def serve(httpd) -> None:
 
 
 def main() -> None:
-    CFG.update(json.load(open(sys.argv[1])))
+    with open(sys.argv[1]) as handle:
+        CFG.update(json.load(handle))
     for f in CFG.get("tcp_forwards", []):
         _tcp_forward(f["listen"], f["host"], f["port"])
     GateServer.request_queue_size = int(CFG.get("listen_backlog", GateServer.request_queue_size))
-    httpd = GateServer(("0.0.0.0", 443), Handler)
+    httpd = GateServer((CFG.get("listen_host", "0.0.0.0"), int(CFG.get("listen_port", 443))), Handler)
     httpd.socket = _tls_context().wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
-    open(
-        CFG["log"], "a"
-    ).close()  # a gate that cannot log does not start, and one that started leaves a log, so a missing log is lost evidence, not zero errors
+    # a gate that cannot log does not start, and one that started leaves a log, so a missing log is lost evidence, not zero errors
+    with open(CFG["log"], "a"):
+        pass
     print("gate ready", flush=True)
     serve(httpd)
 

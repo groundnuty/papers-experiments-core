@@ -16,10 +16,10 @@ Docker's `OOMKilled` flag is sticky (it stays true after the first kill) and say
 recorded by the caller but never decides a category.
 
 Categories: `agent` (the agent's own doing: a run outcome, never retried), `infrastructure` (retried), `unknown` (what the harness lost track of: unreadable counters, conflicting
-evidence, a kill nothing attributes. Retried too, within the same 3 attempts, by science's ruling of 2 Nov; since that can discard an agent's own outcome, `export_infra` counts these
-attempts per option and model).
+evidence, a kill nothing attributes. Retried too, within the attempt limit, as the core's `unattributed_kill`; since that can discard an agent's own outcome, the export counts these
+attempts per condition and model).
 
-One cause per run, in this order (science's ruling, 2 Nov: kills correlate with option, since D's download is charged to memory twice, so a cause must not depend on which
+One cause per run, in this order (kills can correlate with the condition, since a download may be charged to memory twice, so a cause must not depend on which
 was looked at first): `earlyoom` (its journal, whatever the counters and the exit code), `container_dead`, `host_oom`, `memory_limit`, `time_limit`, `killed_other`,
 `unknown`. An infrastructure cause ends the run and retries it; the agent's own cause, or an exception in its code, is its outcome and is kept. `run_cause` applies the
 order to a run's cells.
@@ -52,7 +52,7 @@ def run_cause(reasons) -> str | None:
 
 
 def earlyoom_cause(kills: list[dict]) -> dict:
-    """A cell of a run earlyoom hit (dataset_76.sandbox.earlyoom): infrastructure whatever else the counters say, and whatever the cell's
+    """A cell of a run earlyoom hit (earlyoom.py): infrastructure whatever else the counters say, and whatever the cell's
     exit code, since it leaves no counter and no kernel line, and the victim may be another container of the run."""
     who = ", ".join(sorted({f"{k['comm']} ({k['role']})" for k in kills}))
     return {

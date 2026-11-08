@@ -187,7 +187,8 @@ class DockerHost:
         directory.mkdir(parents=True, exist_ok=True)
         ca_key, ca_pem = directory / "ca.key", directory / "ca.pem"
         self._openssl(
-            "req -x509 -newkey rsa:2048 -nodes -keyout {key} -out {pem} -days 2 -subj /CN=sandbox-run-ca",
+            "req -x509 -newkey rsa:2048 -nodes -keyout {key} -out {pem} -days 2 -subj /CN=sandbox-run-ca"
+            " -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign",
             key=ca_key,
             pem=ca_pem,
         )
@@ -196,7 +197,11 @@ class DockerHost:
             self._openssl(
                 "req -newkey rsa:2048 -nodes -keyout {key} -out {csr} -subj /CN={cn}", key=key, csr=csr, cn=name
             )
-            ext.write_text(f"subjectAltName=DNS:{name}\n", encoding="utf-8")
+            ext.write_text(
+                f"subjectAltName=DNS:{name}\nbasicConstraints=CA:FALSE\n"
+                "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n",
+                encoding="utf-8",
+            )
             self._openssl(
                 "x509 -req -in {csr} -CA {ca} -CAkey {cakey} -CAcreateserial -out {pem} -days 2 -extfile {ext}",
                 csr=csr,

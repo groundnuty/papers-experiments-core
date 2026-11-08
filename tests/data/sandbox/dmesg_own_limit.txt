@@ -1,0 +1,2 @@
+[  100.000001] some unrelated line
+[ 1234.567890] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=x,mems_allowed=0,oom_memcg=/system.slice/docker-ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12.scope,task_memcg=/system.slice/docker-ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12.scope,task=python,pid=4321,uid=10001

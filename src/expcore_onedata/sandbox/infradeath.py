@@ -3,8 +3,8 @@
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
 """Did a gate or a sidecar of a run die during it? Pure functions over `docker inspect` and the cgroup's `oom_kill` count (no docker, no host access).
 
-Science's ruling (2 Nov, GitHub #2): any gate or sidecar death during a run (an OOM kill, a container exit, a restart) makes that attempt an infrastructure failure,
-retried and never an agent outcome, in every option. It is decided from the container's own state, checked at collection, and never from what the agent saw fail:
+The rule (O17): any gate or sidecar death during a run (an OOM kill, a container exit, a restart) makes that attempt an infrastructure failure,
+retried and never an agent outcome, in every condition. It is decided from the container's own state, checked at collection, and never from what the agent saw fail:
 the agent may not have touched the gate after it died, or may have caught the error.
 
 What is compared, per container, between the state recorded when it came up (the baseline) and the state at collection:
@@ -19,18 +19,18 @@ What is compared, per container, between the state recorded when it came up (the
 
 A state that cannot be read at collection is a problem too (not known is not clean). A healthy container gives no problem.
 
-Whose doing was it? Amendment 24 (science, #2, 20:48Z): a death is infrastructure only if agent code did not cause it. `cause_of` gives each death one cause from a fixed vocabulary:
+Whose doing was it? A death is infrastructure only if agent code did not cause it. `cause_of` gives each death one cause from a fixed vocabulary:
 
 * `host_pressure` (infrastructure): earlyoom's journal names the kill, or the OOM kill came from the host (the kernel log's CONSTRAINT_NONE or an ancestor's limit, or the cgroup's
   `oom_kill` rising with its own `oom` not rising: killcause.py's reading).
-* `component_defect` (infrastructure): the gate hit its OWN memory limit (the spool: whatever the agent asked of it, it must not die), or a component ended by itself (an exit code of its
+* `component_defect` (infrastructure): the gate hit its OWN memory limit (whatever the agent asked of it, it must not die), or a component ended by itself (an exit code of its
   own, or a crash signal).
-* `own_limit_agent` (the AGENT's outcome, not retried): the oneclient sidecar hit its own memory limit. M's reads are charged to it as T's and D's client memory is charged to the agent's.
+* `own_limit_agent` (the AGENT's outcome, not retried): the oneclient sidecar hit its own memory limit. a mount's reads are charged to it, as a REST client's memory is charged to the agent's.
 * `undetermined` (infrastructure, retried and listed): anything else, e.g. a SIGKILL or SIGTERM from outside with no OOM counter, no kernel line and no earlyoom record (`docker kill`, `docker stop`,
   `docker restart`, a daemon restart: a host or operator action, which the agent cannot reach), a restart whose earlier stop left no cause, a limit that the evidence cannot name,
   a state that could not be read. A replay of the agent's code is never part of this.
 
-The caller turns the infrastructure deaths into `InfraError("sandbox", ...)` (dataset_76.harness.runner), and records every death, the agent's included, in the run's metadata and its `infra.json`.
+The caller turns the infrastructure deaths into `InfraError("sandbox", ...)` (kinds.py), and records every death, the agent's included, in the run's metadata and its `infra.json`.
 """
 
 from __future__ import annotations
@@ -84,11 +84,11 @@ def parse_inspect(text: str) -> dict[str, Any] | None:
 
 
 def problems(
-    role: str, option: str, container: str, start: dict | None, end: dict | None, read_error: str | None = None
+    role: str, condition: str, container: str, start: dict | None, end: dict | None, read_error: str | None = None
 ) -> list[str]:
     """What is wrong with a gate or sidecar between its baseline `start` and now `end` (None: it could not be read, `read_error` says why). [] when it ran throughout.
-    Each item names the role, the container, the option and the evidence."""
-    who = f"{role} {container} (option {option})"
+    Each item names the role, the container, the condition and the evidence."""
+    who = f"{role} {container} (condition {condition})"
     if end is None:
         return [f"{who}: its state could not be read at collection ({read_error or 'no reason given'})"]
     if start is None:
@@ -209,7 +209,7 @@ def cause_of(
         if role == "sidecar":
             return out(
                 OWN_LIMIT_AGENT,
-                f"the sidecar hit its own memory limit ({src}): M's reads are charged to it, so it is the agent's outcome (science, amendment 24)",
+                f"the sidecar hit its own memory limit ({src}): a mount's reads are charged to it, so it is the agent's outcome",
             )
         return out(UNDETERMINED, f"the {role} hit its own memory limit ({src}), and nothing says whose allowance it is")
     if end["id"] != start["id"]:
