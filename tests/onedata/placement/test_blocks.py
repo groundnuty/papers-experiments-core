@@ -14,10 +14,18 @@ def distribution(**providers):
     }
 
 
-def test_blocks_of_a_provider_are_read_sorted_and_a_missing_provider_holds_nothing():
-    answer = distribution(a=[[100, 50], [0, 10]])
-    assert P.provider_blocks(answer, "a") == [(0, 10), (100, 50)]
-    assert P.provider_blocks(answer, "b") == []
+def test_blocks_of_a_provider_are_read_sorted():
+    assert P.provider_blocks(distribution(a=[[100, 50], [0, 10]]), "a") == [(0, 10), (100, 50)]
+
+
+def test_o01_a_provider_the_answer_does_not_list_is_unknown_and_never_an_empty_holding():
+    """O01 and O08: the answer may be partial, so a declared provider absent from it is not proof that it holds
+    nothing; it raises, as a missing blocks field does."""
+    answer = distribution(a=[[0, 10]])
+    with pytest.raises(ValueError, match="does not list the provider"):
+        P.provider_blocks(answer, "b")
+    with pytest.raises(ValueError, match="does not list the provider"):
+        P.provider_blocks({"distributionPerProvider": {}}, "a")
 
 
 def test_a_distribution_of_the_wrong_shape_is_refused_not_read_as_empty():

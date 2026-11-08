@@ -201,7 +201,10 @@ def test_a_real_block_map_has_the_documented_shape(day0, client, config):
     if not files:
         pytest.skip("the space root holds no regular file to read a block map of")
     distribution = client.get(f"/data/{files[0]['file_id']}/distribution", provider=provider)
-    assert all(isinstance(provider_blocks(distribution, pid), list) for pid in day0.provider_ids.values())
+    # a provider that does not support the space is not listed in the answer, and an unlisted provider is unknown
+    supporting = [day0.provider_ids[name] for name in config.support.providers]
+    assert supporting
+    assert all(isinstance(provider_blocks(distribution, pid), list) for pid in supporting)
 
 
 @MUTATE

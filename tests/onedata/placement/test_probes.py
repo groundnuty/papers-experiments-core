@@ -213,6 +213,22 @@ def test_o08_a_reset_inside_the_resolution_is_retried_and_counted_in_the_probes_
     assert len(ticker.slept) == 2
 
 
+def test_o08_a_provider_the_block_map_leaves_out_is_a_failed_probe_with_a_reason_not_an_empty_reading(probes, seeded):
+    """O08 with O01: a partial answer that does not list a tracked provider is recorded as probe_ok False with a
+    reason, its holdings None; it is not a reading of nothing held."""
+    probes.start({})
+    seeded.omit_providers = {BETA_ID}
+    snapshot = probes.finish()
+    assert snapshot["ok"] is False
+    beta = snapshot["files"]["data"]["providers"]["beta"]["after"]
+    assert beta["probe_ok"] is False
+    assert beta["error"]
+    assert (beta["held_bytes"], beta["blocks"]) == (None, None)
+    assert snapshot["files"]["data"]["providers"]["alpha"]["after"]["probe_ok"] is True
+    assert snapshot["files"]["data"]["pairs"] is None
+    assert snapshot["pairs"] is None
+
+
 def test_a_snapshot_without_a_start_has_no_before_and_no_pairs(probes, seeded):
     """Without the reading at the start nothing can be said about growth: the snapshot is incomplete, not zero."""
     snapshot = probes.finish()

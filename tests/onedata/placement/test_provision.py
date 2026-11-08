@@ -36,6 +36,17 @@ def test_o01_an_eviction_is_not_confirmed_by_a_block_map_that_gives_no_blocks(pr
     assert provisioner.evict(PATH, "beta")["empty"] is True
 
 
+def test_o01_an_eviction_is_not_confirmed_by_a_block_map_that_leaves_the_provider_out(provisioner, seeded):
+    """O01 and O08: after the eviction the answer does not list the provider at all; absence is unknown, not empty,
+    so the eviction is not confirmed until the provider is listed with an empty list of blocks."""
+    provisioner.replicate(PATH, "beta")
+    seeded.omit_providers = {BETA_ID}
+    with pytest.raises(NotPlaced):
+        provisioner.evict(PATH, "beta")
+    seeded.omit_providers = set()
+    assert provisioner.evict(PATH, "beta")["empty"] is True
+
+
 def test_o01_a_replication_is_placed_once_the_block_map_covers_the_file(provisioner, seeded):
     """O01: success needs the map on the receiving provider to cover the range, on consecutive polls."""
     seeded.fetch_lag = 3  # the blocks show only after three more reads of the map

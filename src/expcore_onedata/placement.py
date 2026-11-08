@@ -19,16 +19,16 @@ Range = tuple[int, int]
 def provider_blocks(distribution: Mapping[str, Any], provider_id: str) -> list[Range]:
     """Return the sorted `(offset, length)` blocks a provider holds of one file, from a `/distribution` answer.
 
-    A provider absent from the answer holds nothing. A provider that is listed must say what it holds: a table of
-    storage backends, each with a list of blocks, whose union is returned (an empty list is a real answer). An entry
-    without such a table, a backend without a `blocks` list, or any other shape raises ValueError: what is held is
-    unknown then, and an unknown is never read as an empty list (O01, O08), or an eviction could be confirmed by it.
+    Only an explicit empty list says a provider holds nothing. A provider that is absent from the answer is unknown, as
+    is a listed one without a table of storage backends, a backend without a `blocks` list, or any other shape: each
+    raises ValueError. The answer may be partial, so absence is not proof of an empty holding, and an unknown is never
+    read as an empty list (O01, O08), or an eviction could be confirmed by it.
     """
     per_provider = distribution.get("distributionPerProvider")
     if not isinstance(per_provider, Mapping):
         raise ValueError("the distribution answer has no 'distributionPerProvider' table")
     if provider_id not in per_provider:
-        return []
+        raise ValueError("the distribution answer does not list the provider, so what it holds is unknown")
     entry = per_provider[provider_id]
     backends = entry.get("distributionPerStorageBackend") if isinstance(entry, Mapping) else None
     if not isinstance(backends, Mapping) or not backends:
