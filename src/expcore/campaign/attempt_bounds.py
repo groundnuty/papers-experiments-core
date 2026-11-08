@@ -1,107 +1,121 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/campaign/attempt_bounds.py, blob aa745b2e86b2bd41637333a5a7ec1a9256542c1f
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""The token budget an attempt ran under, from a store record (science, #34, 4 Nov 00:32Z).
+#   changes: see git history of this file from its import commit
+"""What an attempt cost, and the bound charged for one that left no count (C05).
 
-An attempt killed before its outcome was recorded (an `interrupted` attempt: usage_complete 0, no counts, no transcript or usage log) is charged amendment 26(c)'s bound, one
-attempt's token budget at the dearest rate (progress.bounded_usage). That budget is the harness config's NOW, and the config's value has moved (4,000,000 in the pilot, 12,190,000
-in main): the ruling prices such an attempt at "the token budget then in force", the one it ran under. This record says which, per attempt, with who set it and from what source.
-It is read fresh at every call, like the endpoint caps (endpoint_caps.py): by the spend alarm and the model_66 gate through `progress.bounded_usage`, never cached, so a record
-written while the dispatcher runs applies at the next evaluation with no restart. `python -m dataset_76.campaign price-attempt` writes it.
+An attempt killed before its outcome was recorded is `interrupted`: no counts, no transcript. It may have spent anything
+up to its token budget, so it is **charged its bound, one attempt's token budget at the model's dearest rate**, never 0.
+The same goes for an attempt whose usage is known to be short (an abandoned request) or was never reported. A bounded
+attempt is part of what has been spent, and no part of what a run costs: **the mean cost of a run leaves bounded
+attempts out**, so a kill does not make a model look dear to the projection, and its bound does not make it look cheap.
 
-    meta `attempt_bounds` = {"<attempts.id>": {"token_budget": <int > 0>, "who": <who set it>, "source": <who said so, where>, "set_utc": <UTC>}, ...}
-
-Keyed by the attempt's row id (an interrupted attempt and its re-run share one attempt number). An entry applies to an attempt that bounded_usage charges for incomplete usage: billed
-(progress.billed_cond) with usage_complete 0. Any other entry, and any record that cannot be read, is IGNORED with a reason (never a crash, never a zero bound): the attempt is then
-charged at the harness config's budget, which is the dearer bound. A record only ever replaces the budget; the attempt's own per-call records still come first when the harness left any.
+The bound is for the budget the attempt ran under, which the caller names (`token_budget`, normally the campaign's
+`Limits.token_budget`). A model whose cost is unknown (no price, not free) has no cost at all: `None`, never 0, and the
+budget gate holds it (C12).
 """
-from __future__ import annotations
 
-import json
-from typing import Any, NamedTuple
+from collections.abc import Mapping
+from dataclasses import dataclass
 
-from .store import Store
+from expcore.campaign.store import Store, column_for
+from expcore.config.models import ModelSpec
 
-META = "attempt_bounds"
-FIELDS = ("token_budget", "who", "source", "set_utc")
-
-
-class Bounds(NamedTuple):
-    present: bool                       # a record exists in the state (readable or not)
-    entries: dict[int, dict[str, Any]]  # attempt id -> the entry as stored, with the attempt's run_key, model and state added: what is applied
-    ignored: list[str]                  # one reason per entry (or per record) that is not applied
-
-    def budgets(self) -> dict[int, int]:
-        return {i: e["token_budget"] for i, e in self.entries.items()}
+# Attempts that spent tokens: every state but `running`, whose cost is not known yet.
+BILLED_STATES = ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded")
 
 
-MAX_BUDGET = 10 ** 18 - 1       # 18 digits, as the command takes: a larger figure prices to a Fraction no status can show as a float, and no run budget is near it
+@dataclass(frozen=True)
+class AttemptCost:
+    """The cost of one attempt in dollars: `None` when the model's price is unknown; `bounded` when it is the bound."""
+
+    attempt_id: int
+    run_key: str
+    model: str
+    state: str
+    usd: float | None
+    bounded: bool
 
 
-def _is_budget(v: Any) -> bool:
-    return isinstance(v, int) and not isinstance(v, bool) and 0 < v <= MAX_BUDGET
+def bound_usd(spec: ModelSpec, token_budget: int) -> float | None:
+    """Return the bound of one attempt: its token budget at the model's dearest rate; 0 for a free model, None unknown."""
+    if isinstance(token_budget, bool) or not isinstance(token_budget, int) or token_budget <= 0:
+        raise ValueError(f"the token budget of an attempt is a positive integer, not {token_budget!r}")
+    if spec.free:
+        return 0.0
+    if spec.price is None:
+        return None
+    return token_budget * spec.price.dearest_per_token()
 
 
-def shape_problems(entry: Any) -> list[str]:
-    """Why an entry is no record of a budget: not an object, an unknown field, a budget that is not a whole number above 0 (a bool or a float is not one), no who, source or time."""
-    if not isinstance(entry, dict):
-        return ["the entry is not an object"]
-    out = [f"unknown field {k!r}" for k in entry if k not in FIELDS]
-    if not _is_budget(entry.get("token_budget")):
-        out.append(f"token_budget {str(entry.get('token_budget'))[:30]!r} is not a positive whole number up to {MAX_BUDGET}")
-    out += [f"{k} is missing or empty" for k in ("who", "source", "set_utc") if not (isinstance(entry.get(k), str) and entry[k].strip())]
-    return out
+def measured_usd(spec: ModelSpec, row: Mapping[str, int | None]) -> float | None:
+    """Return the cost of an attempt from its counts, or None if the model's price is unknown or a count is missing.
+
+    A count the endpoint did not report is unknown, never zero, so the caller bounds the attempt instead.
+    """
+    if spec.free:
+        return 0.0
+    if spec.price is None or row["input_tokens"] is None or row["output_tokens"] is None:
+        return None
+    return spec.price.usd(
+        row["input_tokens"],
+        row["output_tokens"],
+        row["cache_creation_tokens"] or 0,
+        row["cache_read_tokens"] or 0,
+    )
 
 
-def attempt_problems(store: Store, billed: str, attempt_id: int) -> tuple[dict[str, Any] | None, str | None]:
-    """(the attempt's run_key, model and state, None) when a bound can apply to it: it exists, bills (`billed`: a SQL tuple of states, see progress.billed_cond) and its usage is
-    incomplete. Otherwise (None, why)."""
-    from .progress import billed_cond
-    rows = store.q(f"SELECT a.id, a.run_key, a.state, runs.model, COALESCE(a.usage_complete,1) uc, ({billed_cond(billed)}) bills FROM attempts a JOIN runs USING(run_key) WHERE a.id=?",
-                   [attempt_id])
-    if not rows:
-        return None, f"no such attempt {attempt_id}"
-    r = rows[0]
-    if not r["bills"]:
-        return None, f"attempt {attempt_id} ({r['run_key']}, {r['state']}) does not bill: a bound is for an attempt that did"
-    if r["uc"] != 0:
-        return None, f"attempt {attempt_id} ({r['run_key']}, {r['state']}) has complete usage: its recorded counts are the cost, a bound is for an attempt with incomplete usage"
-    return {"run_key": r["run_key"], "model": r["model"], "state": r["state"]}, None
+def attempt_costs(store: Store, models: Mapping[str, ModelSpec], token_budget: int) -> list[AttemptCost]:
+    """Return the cost of every attempt that spent tokens, in attempt order, each charged as the module docstring says.
 
-
-def parse(raw: str | None) -> tuple[dict[str, Any] | None, str | None]:
-    """(the record's entries, None), or (None, why the record cannot be read at all). No record at all is ({}, None)."""
-    if raw is None:
-        return {}, None
-    try:
-        rec = json.loads(raw)
-    except ValueError as e:
-        return None, f"the record is not JSON ({e})"
-    if not isinstance(rec, dict):
-        return None, "the record is not an object"
-    return rec, None
-
-
-def read(store: Store, billed: str) -> Bounds:
-    """The record now in the state, entry by entry: what applies, and why each other entry does not. Reads the state on every call. `billed` is the caller's own SQL tuple of
-    billed states (the gate's and the spend alarm's differ by `running`), so an entry applies to exactly the attempts that caller charges for incomplete usage."""
-    raw = store.get_meta(META)
-    rec, bad = parse(raw)
-    if rec is None:
-        return Bounds(True, {}, [f"attempt_bounds: {bad}, so no entry of it applies"])
-    entries: dict[int, dict[str, Any]] = {}
-    ignored: list[str] = []
-    for key, entry in rec.items():
-        if not (isinstance(key, str) and key.isascii() and key.isdigit() and len(key) <= 18 and key == str(int(key)) and int(key) > 0):       # 18 digits: within SQLite's integer
-            ignored.append(f"attempt_bounds[{key!r}] ignored: the key is not an attempt id")
+    `models` maps a run's model key to its table entry; a key it lacks is an unknown cost.
+    """
+    marks = ",".join("?" * len(BILLED_STATES))
+    rows = store.q(
+        "SELECT a.id, a.run_key, a.state, r." + column_for("model") + " AS model, a.input_tokens, a.output_tokens, "
+        "a.cache_creation_tokens, a.cache_read_tokens, COALESCE(a.usage_complete,1) AS complete "
+        f"FROM attempts a JOIN runs r USING(run_key) WHERE a.state IN ({marks}) ORDER BY a.id",
+        BILLED_STATES,
+    )
+    costs = []
+    for row in rows:
+        spec = models.get(row["model"])
+        if spec is None:
+            costs.append(AttemptCost(row["id"], row["run_key"], row["model"], row["state"], None, False))
             continue
-        why = shape_problems(entry)
-        info = None
-        if not why:
-            info, w = attempt_problems(store, billed, int(key))
-            why = [w] if w else []
-        if why:
-            ignored.append(f"attempt_bounds[{key}] ignored: " + "; ".join(why))
-        else:
-            entries[int(key)] = {**entry, **(info or {})}
-    return Bounds(raw is not None, entries, ignored)
+        measured = measured_usd(spec, row) if row["complete"] else None
+        if measured is not None:
+            costs.append(AttemptCost(row["id"], row["run_key"], row["model"], row["state"], measured, False))
+            continue
+        bound = bound_usd(spec, token_budget)
+        costs.append(
+            AttemptCost(
+                row["id"], row["run_key"], row["model"], row["state"], bound, bound is not None and not spec.free
+            )
+        )
+    return costs
+
+
+def spent_usd(costs: list[AttemptCost], model: str | None = None) -> float | None:
+    """Return the dollars spent, bounds included, on one model or on all; None if any attempt's cost is unknown."""
+    chosen = [c for c in costs if model is None or c.model == model]
+    if any(c.usd is None for c in chosen):
+        return None
+    return sum(c.usd for c in chosen if c.usd is not None)
+
+
+def mean_run_usd(store: Store, costs: list[AttemptCost], model: str) -> float | None:
+    """Return what a finished run of the model costs on average, from measured attempts only; None without a sample.
+
+    A sample is a run with status `done` and at least one measured attempt. Bounded attempts, whose cost is a ceiling and
+    not a measurement, are no part of the mean (C05).
+    """
+    done = {
+        r["run_key"]
+        for r in store.q(f"SELECT run_key FROM runs WHERE status='done' AND {column_for('model')}=?", (model,))
+    }
+    per_run: dict[str, float] = {}
+    for c in costs:
+        if c.model == model and c.run_key in done and not c.bounded and c.usd is not None:
+            per_run[c.run_key] = per_run.get(c.run_key, 0.0) + c.usd
+    return sum(per_run.values()) / len(per_run) if per_run else None
