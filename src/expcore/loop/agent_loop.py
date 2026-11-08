@@ -144,17 +144,25 @@ class _Run:
 
     def _guard(self, tick: Tick) -> None:
         """End the attempt when the agent's time is used up (checked first), or the whole-time ceiling is passed."""
+        over = self._expired(tick)
+        if over is not None:
+            raise _End(over)
+
+    def _expired(self, tick: Tick) -> Outcome | None:
+        """The ending a reading calls for, or None while the agent is under its cap and the ceiling is not passed.
+
+        The agent's own cap decides first; the ceiling only when the agent is still under its cap (L04).
+        """
         if tick.remaining_s <= 0:
-            raise _End(Outcome("time_cap", f"the agent's time cap of {self.config.limits.time_cap_s:g} s was reached"))
+            return Outcome("time_cap", f"the agent's time cap of {self.config.limits.time_cap_s:g} s was reached")
         if tick.ceiling_passed:
-            raise _End(
-                Outcome(
-                    "infrastructure",
-                    f"{tick.elapsed_s:.0f} s elapsed with {self.timer.infra_wait_s:.0f} s of waits, "
-                    f"past the ceiling of {self.config.ceiling_s:g} s",
-                    infra_kind=self.config.ceiling_kind,
-                )
+            return Outcome(
+                "infrastructure",
+                f"{tick.elapsed_s:.0f} s elapsed with {self.timer.infra_wait_s:.0f} s of waits, "
+                f"past the ceiling of {self.config.ceiling_s:g} s",
+                infra_kind=self.config.ceiling_kind,
             )
+        return None
 
     async def _bounded[T](self, work: Awaitable[T], limit_s: float) -> T:
         """Await work, but cancel it and raise `_Bound` when the injected sleep for `limit_s` seconds ends first."""
@@ -299,8 +307,13 @@ class _Run:
                 f"tool {call.name!r}", exc
             )
         self.timer.add_infra_wait(run.infra_wait_s)  # waits on infrastructure are not the agent's time (L04)
-        self._log(index, call, run, self.rounds, tick, self.timer.check("after_tool"))
+        after = self.timer.check("after_tool")
+        self._log(index, call, run, self.rounds, tick, after)
         if run.ends_attempt:
+            over = self._expired(after)  # a result that arrives after the agent's cap is not accepted (L04)
+            if over is not None:
+                detail = f"the terminal tool {call.name!r} returned, but {over.detail}"
+                return run, Outcome(over.name, detail, infra_kind=over.infra_kind)
             return run, Outcome("finished", f"a call to the terminal tool {call.name!r} succeeded")
         return run, None
 

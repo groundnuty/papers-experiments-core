@@ -239,6 +239,44 @@ def test_l04_a_tool_call_cut_at_the_ceiling_with_the_agents_time_also_used_up_is
     assert result.outcome.name == "time_cap"
 
 
+def test_l04_a_terminal_result_that_arrives_after_the_agents_cap_is_not_accepted(run, clock):
+    """L04: the submission came back 350 s in, over the 300 s cap: a time cap, not finished. The result is still
+    logged and answered, and the calls after it are answered as skipped."""
+    provider = FakeProvider(
+        {"submit": slow(clock, 350, text="accepted"), "later": lambda a: "never"}, terminal=("submit",)
+    )
+    result = run(StubAdapter([[("submit", {}), ("later", {})], "never asked"]), [provider], time_cap_s=300)
+    assert result.outcome.name == "time_cap"
+    assert "terminal tool 'submit' returned" in result.outcome.detail
+    assert [t.status for t in result.tool_calls] == ["ok", "skipped"]
+    assert result.tool_calls[0].text == "accepted"
+    assert len([m for m in result.transcript if m["role"] == "tool"]) == 2
+    assert result.final_text is None
+    assert len(result.turns) == 1
+
+
+def test_l04_a_terminal_result_after_a_long_reported_wait_is_accepted(run, clock):
+    """L04: the same 350 s, reported as waiting on infrastructure, leaves the agent under its cap: finished."""
+    provider = FakeProvider({"submit": slow(clock, 350, wait=350)}, terminal=("submit",))
+    result = run(StubAdapter([[("submit", {})], "never asked"]), [provider], time_cap_s=300)
+    assert result.outcome.name == "finished"
+
+
+def test_l04_a_terminal_result_that_arrives_after_the_ceiling_with_the_agent_under_its_cap_is_infrastructure(
+    run, clock
+):
+    """L04: the agent's time was not used up, but the result came after the ceiling: set aside, not finished."""
+    provider = FakeProvider({"submit": slow(clock, 450, wait=450)}, terminal=("submit",))
+    result = run(
+        StubAdapter([[("submit", {})], "never asked"]),
+        [provider],
+        time_cap_s=300,
+        ceiling_s=400,
+        ceiling_kind="sandbox",
+    )
+    assert (result.outcome.name, result.outcome.infra_kind) == ("infrastructure", "sandbox")
+
+
 def test_l05_no_call_starts_with_less_than_a_second_left(run, clock):
     """L05: with half a second left a tool call is not started and the attempt ends as time cap."""
     provider = FakeProvider({"slow": slow(clock, 299.5), "later": lambda a: "never"})
