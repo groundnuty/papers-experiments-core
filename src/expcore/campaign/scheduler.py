@@ -126,6 +126,7 @@ class Scheduler:
         )  # the budget is assessed by the dispatcher and by the workers' recheck, one at a time
         self._not_before: dict[str, float] = {}  # run key -> monotonic time before which it does not start again
         self._workers: list[threading.Thread] = []
+        self._run_thread: threading.Thread | None = None  # the thread inside `run`, while there is one
         self._fatal: BaseException | None = None
 
     # --- lifecycle ------------------------------------------------------------------------------------------------
@@ -201,6 +202,7 @@ class Scheduler:
                 identities=self.identities,
                 holds=self.holds,
                 recheck=self.recheck,
+                stop=self.stop,
                 health=self.gate,
                 leases=self.leases,
                 lease_group=self.lease_group,
@@ -248,8 +250,15 @@ class Scheduler:
             )
 
     def close(self) -> None:
-        """Stop the gate's thread, close the store and release the lock."""
+        """Signal the end, wait for the workers, then stop the gate's thread, close the store and release the lock.
+
+        A worker is never cut off: it ends its current attempt (a run waiting for a lease or a health check gives up at
+        once, since it has started nothing), so its result is recorded before the store closes. A run is unfinished
+        only if the process dies, and the next open settles that (C04). The lock is released last: while any worker
+        can still write, no other dispatcher can start on the store (C07).
+        """
         self.stop.set()
+        self._wait_for_workers()
         gate = getattr(self, "gate", None)
         if gate is not None:
             gate.join()
@@ -257,6 +266,19 @@ class Scheduler:
             self.store.close()
             self.store = None
         self._lock.release()
+
+    def _wait_for_workers(self) -> None:
+        """Wait for the dispatch loop, if another thread is inside `run`, and for every worker to end."""
+        me = threading.current_thread()
+        with self._cv:
+            looping = self._run_thread
+        if looping is not None and looping is not me:
+            looping.join()  # it starts no worker once `stop` is set, and joins those it started
+        with self._cv:
+            workers = list(self._workers)
+        for worker in workers:
+            if worker is not me:
+                worker.join()
 
     def __enter__(self) -> "Scheduler":
         return self.open()
@@ -431,6 +453,8 @@ class Scheduler:
         if self.gate is not None:
             self.gate.start(self.stop, on_open=self._wake)
         dispatched = 0
+        with self._cv:
+            self._run_thread = threading.current_thread()
         try:
             while not self.stop.is_set():
                 with self._cv:
@@ -445,15 +469,20 @@ class Scheduler:
                     model = row[column_for("model")]
                     self._inflight[row["run_key"]] = (model, self.endpoints[model].unit)
                 worker = threading.Thread(target=self._work, args=(row,), daemon=True, name=f"run-{row['seq']}")
-                self._workers.append(worker)
+                with self._cv:
+                    self._workers.append(worker)
                 worker.start()
                 dispatched += 1
                 if max_dispatch is not None and dispatched >= max_dispatch:
                     break
         finally:
-            for worker in self._workers:
+            with self._cv:
+                workers = list(self._workers)
+            for worker in workers:
                 worker.join()
-            self._workers.clear()
+            with self._cv:
+                self._workers.clear()
+                self._run_thread = None
         if self._fatal is not None:
             raise RuntimeError(f"campaign stopped by an unexpected error: {self._fatal!r}") from self._fatal
         statuses = {r["status"]: r["n"] for r in store.q("SELECT status, COUNT(*) AS n FROM runs GROUP BY status")}

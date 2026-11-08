@@ -78,12 +78,21 @@ class LeaseTimeout(LeaseRefused):
     """No key came free within the time the caller allowed."""
 
 
+class LeaseCancelled(LeaseRefused):
+    """The caller's `cancel` event was set while it waited: the campaign is ending and nothing was started."""
+
+
 class AllQuarantined(LeaseRefused):
     """Every key of the group is quarantined or held back for a dead holder: a wait would end only when a teardown is
     proven, so the run is refused before anything starts."""
 
 
-_OUTCOMES = {NoResources: "no_resources", AllQuarantined: "all_quarantined", LeaseTimeout: "timeout"}
+_OUTCOMES = {
+    NoResources: "no_resources",
+    AllQuarantined: "all_quarantined",
+    LeaseTimeout: "timeout",
+    LeaseCancelled: "cancelled",
+}
 
 
 class ResourceProbe(Protocol):
@@ -454,11 +463,19 @@ class LeasePool:
             raise NoResources(f"the platform declares no key for group {group!r}")
         return keys
 
-    def acquire(self, group: str, *, run_key: str | None = None, timeout_s: float | None = None) -> Lease:
+    def acquire(
+        self,
+        group: str,
+        *,
+        run_key: str | None = None,
+        timeout_s: float | None = None,
+        cancel: threading.Event | None = None,
+    ) -> Lease:
         """Take a free key of the group, waiting while there is none, and log the wait.
 
         Raises NoResources, AllQuarantined (as soon as no key can come free without a teardown being proven, so a
-        run is not left waiting for ever) and LeaseTimeout. The seconds waited are measured on every path, so no queue
+        run is not left waiting for ever), LeaseTimeout and LeaseCancelled (the `cancel` event was set: the caller's
+        campaign is ending, and a wait that may last minutes must not hold up its shutdown). The seconds waited are measured on every path, so no queue
         time is lost to the throughput analysis: they are `Lease.wait_s` for a lease, `LeaseRefused.wait_s` for a
         refusal, and a line of `waits.jsonl` either way (a granted lease only when it waited or was contended).
         """
@@ -475,6 +492,8 @@ class LeasePool:
                 contended = True
                 if timeout_s is not None and self._clock() - began >= timeout_s:
                     raise LeaseTimeout(f"no free key in group {group!r} after {timeout_s:g} s")
+                if cancel is not None and cancel.is_set():
+                    raise LeaseCancelled(f"the campaign is ending: no lease taken in group {group!r}")
                 self._sleep(self._poll_s)
         except LeaseRefused as refusal:
             refusal.wait_s = self._clock() - began
@@ -495,7 +514,13 @@ class LeasePool:
         )
 
     async def acquire_under(
-        self, waits: WaitSource, group: str, *, run_key: str | None = None, timeout_s: float | None = None
+        self,
+        waits: WaitSource,
+        group: str,
+        *,
+        run_key: str | None = None,
+        timeout_s: float | None = None,
+        cancel: threading.Event | None = None,
     ) -> Lease:
         """Take a key inside `infrastructure_wait("lease_queue")` of a timer or a call context, off the event loop.
 
@@ -503,7 +528,9 @@ class LeasePool:
         seconds it waited.
         """
         async with waits.infrastructure_wait("lease_queue"):
-            return await asyncio.to_thread(lambda: self.acquire(group, run_key=run_key, timeout_s=timeout_s))
+            return await asyncio.to_thread(
+                lambda: self.acquire(group, run_key=run_key, timeout_s=timeout_s, cancel=cancel)
+            )
 
     def finish(self, lease: Lease) -> bool:
         """End a lease after its run: free the key if the probe shows what the run started gone, else quarantine it.

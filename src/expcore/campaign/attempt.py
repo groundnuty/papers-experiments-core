@@ -26,8 +26,9 @@ import asyncio
 import dataclasses
 import json
 import os
+import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +46,7 @@ from expcore.campaign.harness_stop import HarnessStops, kind_of
 from expcore.campaign.healthgate import FOUND, HOLD, HealthGate
 from expcore.campaign.holds import Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
-from expcore.campaign.lease import Lease, LeasePool, LeaseRefused
+from expcore.campaign.lease import Lease, LeaseCancelled, LeasePool, LeaseRefused
 from expcore.campaign.markers import AttemptResult, write_marker
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.store import Store
@@ -78,6 +79,7 @@ class Parts:
     identities: ServedIdentities
     holds: HoldRegistry
     recheck: Callable[[Any], Hold | None] = lambda row: None  # why a run that holds its lease may not start after all
+    stop: threading.Event = field(default_factory=threading.Event)  # set when the campaign is ending
     health: HealthGate | None = None
     leases: LeasePool | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
@@ -133,7 +135,12 @@ class AttemptRunner:
             return None, True
         key, model = row["run_key"], factors["model"]
         try:
-            lease = asyncio.run(p.leases.acquire_under(timer, group, run_key=key, timeout_s=p.settings.lease_timeout_s))
+            lease = asyncio.run(
+                p.leases.acquire_under(timer, group, run_key=key, timeout_s=p.settings.lease_timeout_s, cancel=p.stop)
+            )
+        except LeaseCancelled as refusal:  # the campaign is ending: not a hold on the group, just a run not started
+            p.store.event(p.stamp(), "run_unstarted", model, f"{key}: no lease, the campaign is ending: {refusal}")
+            return None, False
         except LeaseRefused as refusal:
             p.holds.note(f"lease:{group}", Hold("lease", f"{type(refusal).__name__}: {refusal}", temporary=True))
             waited = f"after waiting {refusal.wait_s:.1f} s "

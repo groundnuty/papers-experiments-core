@@ -19,6 +19,7 @@ from expcore.campaign.lease import (
     DEAD_LOG,
     WAIT_LOG,
     AllQuarantined,
+    LeaseCancelled,
     LeasePool,
     LeaseTimeout,
     NoResources,
@@ -458,6 +459,20 @@ def test_c19_the_wait_before_an_all_quarantined_refusal_is_recorded_too(tmp_path
         leases.acquire("g", run_key="run-d")
     assert at_once.value.wait_s == 0.0
     assert wait_lines(tmp_path)[-1]["wait_s"] == 0.0
+
+
+def test_c19_a_wait_for_a_key_ends_when_the_callers_campaign_is_ending_and_the_wait_is_recorded(tmp_path):
+    """C19: the cancel event ends a wait that may last minutes, with a refusal that carries the seconds waited."""
+    clock = Clock()
+    leases = pool(tmp_path, keys=("k1",), clock=clock, poll_s=2.0)
+    holder = leases.try_acquire("g", "run-a")
+    ending = threading.Event()
+    clock.on_sleep = lambda: ending.set() if clock.sleeps == 2 else None
+    with pytest.raises(LeaseCancelled) as refused:
+        leases.acquire("g", run_key="run-b", cancel=ending)
+    assert refused.value.wait_s == pytest.approx(4.0)
+    assert wait_lines(tmp_path)[-1]["outcome"] == "cancelled"
+    assert holder.held
 
 
 def test_c19_a_group_without_a_key_is_logged_as_a_refusal_without_a_wait(tmp_path):
