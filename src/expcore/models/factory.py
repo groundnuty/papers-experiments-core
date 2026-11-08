@@ -4,9 +4,29 @@
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
+from expcore.config.loading import ConfigError
+from expcore.config.model_checks import thinking_problems
 from expcore.config.models import ClientSettings, Limits, ModelSpec, assert_frozen
 from expcore.models.adapters import AnthropicAdapter, ModelBackend, OpenAICompatAdapter, StubAdapter
 from expcore.models.retry import SupportsUniform
+
+
+def refuse_unsendable_thinking(spec: ModelSpec, limits: Limits) -> None:
+    """Refuse a thinking budget that is not below the output limit a request will carry: the lower of two caps (B16).
+
+    The entry alone cannot say, when it sets no maximum of its own: the study's limit may be the lower one.
+    """
+    effective = spec.output_tokens(limits.max_output_tokens)
+    model_cap = "unset" if spec.max_output_tokens is None else spec.max_output_tokens
+    problems = thinking_problems(
+        spec.backend,
+        spec.extra_body,
+        effective,
+        "the effective output limit",
+        f", the lower of the study's max_output_tokens ({limits.max_output_tokens}) and the model's ({model_cap})",
+    )
+    if problems:
+        raise ConfigError(f"model {spec.key!r}: " + "; ".join(problems))
 
 
 def build_backend(
@@ -29,9 +49,12 @@ def build_backend(
     A study run needs frozen settings: with `require_frozen` (the default) an entry that is not frozen raises
     before anything is built, let alone sent (B08). A pilot passes False. `base_url` overrides the entry's, for a
     campaign whose admitted endpoint is the one a run must use (C14). `script` is the stub's list of turns.
+    An Anthropic thinking budget that is not below the effective output limit, the lower of the study's cap and
+    the entry's own, raises before anything is built (B16).
     """
     if require_frozen:
         assert_frozen(spec)
+    refuse_unsendable_thinking(spec, limits)
     if spec.backend == "stub":
         return StubAdapter(
             list(script),

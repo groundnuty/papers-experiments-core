@@ -1,6 +1,7 @@
 """Building the backend a model entry names: B08 (frozen before any request), keys read at use time, C14 (override)."""
 
 import asyncio
+import dataclasses
 
 import pytest
 
@@ -63,3 +64,56 @@ def test_c14_a_base_url_override_is_the_one_the_backend_and_its_record_use(make_
     assert backend.info()["base_url"] == "https://admitted.example.invalid/v1"
     assert str(backend._client.base_url).startswith("https://admitted.example.invalid/v1")
     asyncio.run(backend.aclose())
+
+
+THINKING = {"thinking": {"type": "enabled", "budget_tokens": 4096}}
+
+
+def test_b16_a_thinking_budget_not_below_the_effective_output_limit_is_refused_naming_the_model(
+    make_spec, limits, fake_client
+):
+    """B16: budget 4096, model maximum 8192, study cap 2048: every request would carry max_tokens 2048."""
+    claude = make_spec(backend="anthropic", max_output_tokens=8192, extra_body=THINKING)
+    client = fake_client(api="anthropic")
+    study = dataclasses.replace(limits, max_output_tokens=2048)
+    with pytest.raises(ConfigError) as caught:
+        build_backend(claude, seed=1, limits=study, client=client, env={"TEST_CLAUDE_KEY": "k"})
+    message = str(caught.value)
+    assert message.startswith("model 'test-model': ")
+    assert "budget_tokens (4096) must be smaller than the effective output limit (2048)" in message
+    assert "the lower of the study's max_output_tokens (2048) and the model's (8192)" in message
+    assert client.requests == []
+
+
+def test_b16_a_budget_equal_to_the_effective_limit_is_refused_whether_or_not_the_model_sets_a_maximum(
+    make_spec, limits
+):
+    """B16: With no maximum on the entry, the study's own limit is the one the budget must stay under."""
+    env = {"TEST_CLAUDE_KEY": "k"}
+    capped = make_spec(backend="anthropic", max_output_tokens=8192, extra_body=THINKING)
+    with pytest.raises(ConfigError, match=r"effective output limit \(4096\).*the model's \(8192\)"):
+        build_backend(capped, seed=1, limits=limits, env=env)
+    alone = make_spec(backend="anthropic", extra_body=THINKING)
+    with pytest.raises(ConfigError, match=r"effective output limit \(4096\).*the model's \(unset\)"):
+        build_backend(alone, seed=1, limits=limits, env=env)
+
+
+def test_b16_a_thinking_budget_below_the_effective_output_limit_builds(make_spec, limits, fake_client):
+    """B16: 4096 under 8192 builds, for a study run and a pilot alike."""
+    roomy = dataclasses.replace(limits, max_output_tokens=8192)
+    claude = make_spec(backend="anthropic", max_output_tokens=8192, extra_body=THINKING, status="draft")
+    env = {"TEST_CLAUDE_KEY": "k"}
+    backend = build_backend(
+        claude, seed=1, limits=roomy, client=fake_client(api="anthropic"), env=env, require_frozen=False
+    )
+    assert isinstance(backend, AnthropicAdapter)
+    assert backend.output_limit == 8192
+
+
+def test_b16_the_thinking_rule_is_checked_for_a_pilot_too_and_for_no_other_backend(make_spec, limits, fake_client):
+    """B16: A pilot may run unfrozen settings but not a request that cannot be sent; other backends have no rule."""
+    claude = make_spec(backend="anthropic", extra_body=THINKING, status="draft")
+    with pytest.raises(ConfigError, match="effective output limit"):
+        build_backend(claude, seed=1, limits=limits, env={"TEST_CLAUDE_KEY": "k"}, require_frozen=False)
+    same_extras = make_spec(extra_body={"thinking": {"type": "enabled", "budget_tokens": 99999}})
+    assert isinstance(build_backend(same_extras, seed=1, limits=limits, client=fake_client()), OpenAICompatAdapter)

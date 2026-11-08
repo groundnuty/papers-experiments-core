@@ -63,12 +63,19 @@ def sampling_problems(sampling: Mapping[str, Any]) -> list[str]:
     return problems
 
 
-def thinking_problems(backend: str, extra_body: Mapping[str, Any], max_output_tokens: object) -> list[str]:
-    """Check that an Anthropic thinking budget leaves room under the model's output maximum (B16).
+def thinking_problems(
+    backend: str,
+    extra_body: Mapping[str, Any],
+    output_limit: object,
+    limit_name: str = "max_output_tokens",
+    detail: str = "",
+) -> list[str]:
+    """Check that an Anthropic thinking budget leaves room under the output limit a request can carry (B16).
 
-    The Messages API refuses a request whose `thinking.budget_tokens` is not below `max_tokens`. The model's own
-    maximum is the largest `max_tokens` a request can carry, so a budget at or above it can never be sent. Without a
-    maximum on the entry there is nothing to compare at load.
+    The Messages API refuses a request whose `thinking.budget_tokens` is not below `max_tokens`. At load the limit
+    is the entry's own `max_output_tokens`, the most any request can carry; without one there is nothing to compare
+    yet. Where the entry meets the study's limits, the limit is the lower of the two (`limit_name` and `detail`
+    say which, in the message).
     """
     thinking = extra_body.get("thinking") if backend == "anthropic" else None
     if not isinstance(thinking, Mapping) or "budget_tokens" not in thinking:
@@ -76,9 +83,9 @@ def thinking_problems(backend: str, extra_body: Mapping[str, Any], max_output_to
     budget = thinking["budget_tokens"]
     if not _is_integer(budget):
         return [f"extra_body.thinking.budget_tokens must be an integer, got {type(budget).__name__}"]
-    if isinstance(max_output_tokens, int) and not isinstance(max_output_tokens, bool) and budget >= max_output_tokens:
+    if isinstance(output_limit, int) and not isinstance(output_limit, bool) and budget >= output_limit:
         return [
-            f"extra_body.thinking.budget_tokens ({budget}) must be smaller than max_output_tokens "
-            f"({max_output_tokens}): the Messages API needs room for the answer after the thinking"
+            f"extra_body.thinking.budget_tokens ({budget}) must be smaller than {limit_name} ({output_limit}){detail}: "
+            "the Messages API needs room for the answer after the thinking"
         ]
     return []
