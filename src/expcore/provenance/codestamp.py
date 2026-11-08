@@ -7,9 +7,10 @@
 A run's code identity is its commit plus a hash of the tree under the scope's roots: the code and the data files the
 code reads (P02). The commit comes from git when it works, else from `.code-stamp.json`, which a snapshot copied
 without `.git` carries (the head and the tree hash, written by `write_stamp` where the repository is), else it is
-UNKNOWN. Unknown counts as dirty, never as clean, and so does a git status that cannot be read (P01). A stamp whose
-tree hash does not match the files beside it is stale. The tree hash ignores modification times, caches and bytecode
-(P03). `require_known` refuses to start a study run on unknown, stale or, unless allowed, dirty code.
+UNKNOWN. Unknown counts as dirty, never as clean (P01). So does a git status that cannot be read, a stamp whose
+head is not a git sha, and an untracked file under the roots: the tree hash covers it, the commit does not. A stamp
+whose tree hash does not match the files beside it is stale. The tree hash ignores modification times, caches and
+bytecode (P03). `require_known` refuses to start a study run on unknown, stale or, unless allowed, dirty code.
 
 What the identity covers is a parameter, not a constant: a study names its own roots and the files under them that
 are records rather than code.
@@ -30,6 +31,7 @@ SKIP_DIRS = frozenset({"__pycache__", ".pytest_cache", ".venv", ".git"})
 SKIP_SUFFIXES = frozenset({".pyc"})
 UNKNOWN = "unknown"
 _HEX = frozenset("0123456789abcdef")
+_SHA_CHARS = 40
 
 
 class CodeVersionUnknown(RuntimeError):
@@ -115,6 +117,11 @@ def hashed_root_of(path: Path | str, tree_root: Path | str, scope: CodeScope) ->
     return rel.parts[0] if rel.parts and rel.parts[0] in {PurePosixPath(r).parts[0] for r in scope.roots} else None
 
 
+def is_sha(head: object) -> bool:
+    """Tell whether a value is a full git sha: forty lowercase hexadecimal characters."""
+    return isinstance(head, str) and len(head) == _SHA_CHARS and not set(head) - _HEX
+
+
 def _git(repo: Path, *args: str) -> str | None:
     """Run git in the repository; None when git cannot run or fails, never an empty string for a failure."""
     try:
@@ -129,11 +136,11 @@ def write_stamp(
 ):
     """Write DEST/.code-stamp.json for the tree at `tree_root` (default DEST) with the given git head.
 
-    The head must be a git sha. `dirty` says the source had uncommitted changes when it was stamped: the files are
+    The head must be a full git sha. `dirty` says the source had uncommitted changes when it was stamped: the files are
     what is stamped, but they are not the head's.
     """
     dest = Path(dest)
-    if not 7 <= len(head) <= 64 or set(head) - _HEX:
+    if not is_sha(head):
         raise ValueError(f"not a git sha: {head!r}")
     stamp = {
         "head": head,
@@ -147,26 +154,60 @@ def write_stamp(
 
 
 def read_stamp(root: Path | str) -> dict | None:
-    """Read the stamp beside the files; None when it is absent, unreadable or lacks a head and a tree hash."""
+    """Read the stamp beside the files; None when it is absent, unreadable, or lacks a git sha head and a tree hash.
+
+    A head that is empty or not a sha names no code, so such a stamp is read as no stamp: the version is unknown (P01).
+    """
     try:
         stamp = json.loads((Path(root) / STAMP).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    ok = isinstance(stamp, dict) and isinstance(stamp.get("head"), str) and isinstance(stamp.get("tree_sha256"), str)
+    ok = isinstance(stamp, dict) and is_sha(stamp.get("head")) and isinstance(stamp.get("tree_sha256"), str)
     return stamp if ok else None
+
+
+def _untracked_covered(root: Path, scope: CodeScope) -> list[str] | None:
+    """List the untracked files the tree hash covers; None when git cannot list them.
+
+    A new file under a root changes the hash while `git status --untracked-files=no` stays silent about it.
+    """
+    listing = _git(root, "ls-files", "-z", "--others", "--exclude-standard")
+    if listing is None:
+        return None
+    untracked = {name for name in listing.split("\0") if name}
+    return [name for name in (f.relative_to(root).as_posix() for f in _files(root, scope)) if name in untracked]
+
+
+def _dirty_reason(root: Path, scope: CodeScope) -> str | None:
+    """Say why a git checkout is dirty, else None.
+
+    Dirty is a change to a tracked file, an untracked file under the roots, or a git that cannot say.
+    """
+    status = _git(root, "status", "--porcelain", "--untracked-files=no")
+    if status is None:
+        return "git status could not be read"
+    if status:
+        return "uncommitted changes"
+    untracked = _untracked_covered(root, scope)
+    if untracked is None:
+        return "git status could not be read"
+    if untracked:
+        more = f" and {len(untracked) - 3} more" if len(untracked) > 3 else ""
+        return f"untracked files under the hashed roots: {', '.join(untracked[:3])}{more}"
+    return None
 
 
 def version(root: Path | str, scope: CodeScope) -> dict:
     """Return the code identity: {"commit", "dirty", "source": git|stamp|none, "stale", "why", "tree_sha256"}.
 
-    Unknown is dirty. A git status that fails is dirty, not clean. `tree_sha256` is recomputed on every call, so the
-    identity is re-verified each time it is asked for (P02); it is None only when the version is unknown.
+    Unknown is dirty. A git status that fails is dirty, not clean, and so is an untracked file under the scope's
+    roots. `tree_sha256` is recomputed on every call, so the identity is re-verified each time it is asked for (P02);
+    it is None only when the version is unknown.
     """
     root = Path(root)
     head = _git(root, "rev-parse", "HEAD")
     if head:
-        status = _git(root, "status", "--porcelain", "--untracked-files=no")
-        why = "git status could not be read" if status is None else ("uncommitted changes" if status else None)
+        why = _dirty_reason(root, scope)
         return {
             "commit": head,
             "dirty": why is not None,

@@ -151,6 +151,19 @@ def test_p01_an_unreadable_stamp_is_unknown(tree):
     assert read_stamp(tree) is None
 
 
+@pytest.mark.parametrize("head", ["", "not-a-sha", "abcdef1", "A" * 40, "a" * 39, "a" * 41, 12345, None])
+def test_p01_a_stamp_whose_head_is_not_a_full_sha_is_unknown_code_that_refuses_a_study_run(tree, head):
+    """P01: An empty or non-sha head names no code; the stamp is not read and the version is unknown."""
+    stamp = {"head": head, "tree_sha256": tree_hash(tree, SCOPE)}
+    (tree / STAMP).write_text(json.dumps(stamp), encoding="utf-8")
+    assert read_stamp(tree) is None
+    found = version(tree, SCOPE)
+    assert (found["commit"], found["dirty"], found["source"]) == (UNKNOWN, True, "none")
+    for allow in (False, True):
+        with pytest.raises(CodeVersionUnknown, match="the code version is unknown"):
+            require_known("study run", tree, SCOPE, allow_dirty=allow)
+
+
 def test_p01_a_clean_checkout_names_its_head_and_is_not_dirty(checkout):
     """P01: A clean checkout names its head and is not dirty."""
     found = version(checkout.path, SCOPE)
@@ -172,6 +185,42 @@ def test_p01_uncommitted_changes_are_dirty_and_do_not_start_a_study_run_unless_a
     with pytest.raises(CodeVersionUnknown, match="dirty code"):
         require_known("study run", checkout.path, SCOPE)
     assert require_known("pilot", checkout.path, SCOPE, allow_dirty=True)["dirty"] is True
+
+
+def test_p01_an_untracked_file_under_a_root_is_dirty_because_the_tree_hash_covers_it(checkout):
+    """P01: `git status --untracked-files=no` is silent about a new .py, but the tree hash includes it."""
+    clean = version(checkout.path, SCOPE)
+    (checkout.path / "pkg" / "new.py").write_text("print('new')\n", encoding="utf-8")
+    found = version(checkout.path, SCOPE)
+    assert found["tree_sha256"] != clean["tree_sha256"]
+    assert (found["dirty"], found["source"]) == (True, "git")
+    assert "untracked files under the hashed roots: pkg/new.py" in found["why"]
+    with pytest.raises(CodeVersionUnknown, match="dirty code"):
+        require_known("study run", checkout.path, SCOPE)
+    assert require_known("pilot", checkout.path, SCOPE, allow_dirty=True)["dirty"] is True
+    checkout.commit("add new")
+    assert version(checkout.path, SCOPE)["dirty"] is False
+
+
+def test_p01_an_untracked_file_outside_the_roots_or_not_hashed_or_ignored_is_not_dirt(checkout):
+    """P01: Only what the tree hash covers can make the identity differ from the commit."""
+    scope = CodeScope.of(SCOPE.roots, not_hashed=[*SCOPE.not_hashed, "data/log.md"])
+    for name in ("notes.txt", "other/scratch.py", "data/log.md", "pkg/__pycache__/run.cpython-312.pyc"):
+        (checkout.path / name).parent.mkdir(parents=True, exist_ok=True)
+        (checkout.path / name).write_text("x\n", encoding="utf-8")
+    assert version(checkout.path, scope)["dirty"] is False
+    (checkout.path / "data" / "extra.csv").write_text("a\n", encoding="utf-8")
+    assert version(checkout.path, scope)["dirty"] is True
+    (checkout.path / ".gitignore").write_text("data/extra.csv\n", encoding="utf-8")  # git is told to disregard it
+    assert version(checkout.path, scope)["dirty"] is False
+
+
+def test_p01_many_untracked_files_are_named_briefly(checkout):
+    """P01: The reason names the first few untracked files and counts the rest."""
+    for number in range(5):
+        (checkout.path / "pkg" / f"new{number}.py").write_text("x = 1\n", encoding="utf-8")
+    why = version(checkout.path, SCOPE)["why"]
+    assert why == "untracked files under the hashed roots: pkg/new0.py, pkg/new1.py, pkg/new2.py and 2 more"
 
 
 def test_p01_a_git_status_that_fails_is_dirty_never_clean(checkout):
@@ -243,8 +292,8 @@ def test_a_stamp_can_cover_a_tree_other_than_where_it_is_written(tmp_path):
     assert read_stamp(snapshot)["tree_sha256"] == tree_hash(source, SCOPE)
 
 
-@pytest.mark.parametrize("head", ["abc", "G" * 40, "A" * 40, "a" * 65, ""])
-def test_a_stamp_refuses_a_head_that_is_not_a_git_sha(tree, head):
+@pytest.mark.parametrize("head", ["abc", "abcdef1", "G" * 40, "A" * 40, "a" * 39, "a" * 41, "a" * 64, ""])
+def test_a_stamp_refuses_a_head_that_is_not_a_full_git_sha(tree, head):
     with pytest.raises(ValueError, match="not a git sha"):
         write_stamp(tree, head, SCOPE)
     assert not (tree / STAMP).exists()
