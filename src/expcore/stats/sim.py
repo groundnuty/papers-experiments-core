@@ -16,29 +16,29 @@ contrast of two options is the plain difference of the stated parameters:
 cancel in expectation). Nuisance processes (unknown labels, time-cap and
 turn-cap terminations) are independent of the outcome unless the spec says so.
 """
+
 from __future__ import annotations
 
 import dataclasses
 
 import numpy as np
-
 from dataset_76.records import Layout, OmissionLabel, Option, RunId, ScoredRow, Termination
 
 OPTS = ("T", "D", "M")
 LAYS = ("state_a", "state_b")
-KINDS = ("omission", "coverage_baseline", "coverage_target", "event_f1", "false_alarm", "tokens")   # one noise draw each
+KINDS = ("omission", "coverage_baseline", "coverage_target", "event_f1", "false_alarm", "tokens")  # one noise draw each
 
 
 @dataclasses.dataclass
 class SimSpec:
     """True parameters. Dict keys: (layout, option) unless noted."""
 
-    omission: dict            # mean omission probability among finished, labelled runs
-    coverage_baseline: dict   # mean share of the required baseline extent analysed
-    coverage_target: dict     # mean share of the required target extent analysed (a separate truth)
-    event_f1: dict            # mean F1 on instances with events
-    log2_tokens: dict         # mean log2(total tokens)
-    false_alarm: dict         # false-alarm probability on event-free instances
+    omission: dict  # mean omission probability among finished, labelled runs
+    coverage_baseline: dict  # mean share of the required baseline extent analysed
+    coverage_target: dict  # mean share of the required target extent analysed (a separate truth)
+    event_f1: dict  # mean F1 on instances with events
+    log2_tokens: dict  # mean log2(total tokens)
+    false_alarm: dict  # false-alarm probability on event-free instances
     models: tuple = ("m1", "m2", "m3", "m4", "m5", "m6", "m7")
     n_regions: int = 25
     periods: int = 2
@@ -47,18 +47,18 @@ class SimSpec:
     # on omission / both coverages / F1 / log2 tokens (default 0)
     model_effect: dict = dataclasses.field(default_factory=dict)
     # nuisance shared across options (additive; cancels in every contrast)
-    model_shift: float = 0.04          # half-width of a uniform per-model shift
-    region_halfwidth: float = 0.08     # uniform region shift, shared across options
+    model_shift: float = 0.04  # half-width of a uniform per-model shift
+    region_halfwidth: float = 0.08  # uniform region shift, shared across options
     region_option_halfwidth: float = 0.08  # uniform region x option shift (drives the SD of differences)
-    run_halfwidth: float = 0.05        # uniform run-level noise on continuous outcomes
-    tokens_halfwidth: float = 0.4      # log2 units (run noise)
-    tokens_noise_scale: float = 5.0    # region/model noise on log2 tokens = scale x the proportion half-widths
+    run_halfwidth: float = 0.05  # uniform run-level noise on continuous outcomes
+    tokens_halfwidth: float = 0.4  # log2 units (run noise)
+    tokens_noise_scale: float = 5.0  # region/model noise on log2 tokens = scale x the proportion half-widths
     p_event_free: float = 0.25
     # nuisance, per option (independent of the true outcome)
     p_unknown: dict = dataclasses.field(default_factory=lambda: {o: 0.05 for o in OPTS})
     p_time_cap: dict = dataclasses.field(default_factory=lambda: {o: 0.03 for o in OPTS})
     p_turn_cap: dict = dataclasses.field(default_factory=lambda: {o: 0.03 for o in OPTS})
-    p_disclose: float = 0.5            # P(self-report says incomplete | omitting)
+    p_disclose: float = 0.5  # P(self-report says incomplete | omitting)
     p_correct: float = 0.7
 
     def eff(self, m, layout, option) -> float:
@@ -66,18 +66,26 @@ class SimSpec:
 
     def true_contrast(self, outcome: str, layout: str, a: str, b: str) -> float:
         """The planted A-B contrast, by plain arithmetic on the inputs."""
-        tab = {"omission": self.omission, "coverage_baseline": self.coverage_baseline,
-               "coverage_target": self.coverage_target, "event_f1": self.event_f1,
-               "tokens": self.log2_tokens, "false_alarm": self.false_alarm}[outcome]
+        tab = {
+            "omission": self.omission,
+            "coverage_baseline": self.coverage_baseline,
+            "coverage_target": self.coverage_target,
+            "event_f1": self.event_f1,
+            "tokens": self.log2_tokens,
+            "false_alarm": self.false_alarm,
+        }[outcome]
         shift = lambda o: np.mean([self.eff(m, layout, o) for m in self.models])
         return (tab[(layout, a)] + shift(a)) - (tab[(layout, b)] + shift(b))
 
     def validate(self) -> None:
         slack = self.model_shift + self.region_halfwidth + self.region_option_halfwidth
-        for name, tab, extra in (("omission", self.omission, 0.0),
-                                 ("coverage_baseline", self.coverage_baseline, self.run_halfwidth),
-                                 ("coverage_target", self.coverage_target, self.run_halfwidth),
-                                 ("event_f1", self.event_f1, self.run_halfwidth), ("false_alarm", self.false_alarm, 0.0)):
+        for name, tab, extra in (
+            ("omission", self.omission, 0.0),
+            ("coverage_baseline", self.coverage_baseline, self.run_halfwidth),
+            ("coverage_target", self.coverage_target, self.run_halfwidth),
+            ("event_f1", self.event_f1, self.run_halfwidth),
+            ("false_alarm", self.false_alarm, 0.0),
+        ):
             for (l, o), mu in tab.items():
                 worst = max(abs(self.eff(m, l, o)) for m in self.models)
                 if not (worst + slack + extra <= min(mu, 1 - mu)):
@@ -90,8 +98,12 @@ def simulate(spec: SimSpec, rng: np.random.Generator) -> list[ScoredRow]:
     u = rng.uniform
     region_sh = {k: u(-spec.region_halfwidth, spec.region_halfwidth, R) for k in KINDS}
     model_sh = {k: {m: u(-spec.model_shift, spec.model_shift) for m in spec.models} for k in KINDS}
-    ro = {(k, l, o): u(-spec.region_option_halfwidth, spec.region_option_halfwidth, R)
-          for k in KINDS for l in LAYS for o in OPTS}
+    ro = {
+        (k, l, o): u(-spec.region_option_halfwidth, spec.region_option_halfwidth, R)
+        for k in KINDS
+        for l in LAYS
+        for o in OPTS
+    }
     event_free = rng.random((R, P)) < spec.p_event_free
     rows: list[ScoredRow] = []
     for r in range(R):
@@ -100,7 +112,7 @@ def simulate(spec: SimSpec, rng: np.random.Generator) -> list[ScoredRow]:
             for l in LAYS:
                 for o in OPTS:
                     for m in spec.models:
-                        e = spec.eff(m, l, o)   # one planted shift, applied to all five outcomes
+                        e = spec.eff(m, l, o)  # one planted shift, applied to all five outcomes
                         k = spec.tokens_noise_scale
 
                         def val(k, tab):
@@ -109,11 +121,30 @@ def simulate(spec: SimSpec, rng: np.random.Generator) -> list[ScoredRow]:
                         p_om = val("omission", spec.omission)
                         p_fa = val("false_alarm", spec.false_alarm)
                         for s in spec.seeds:
-                            rows.append(_one(spec, rng, inst, r, bool(event_free[r, p]), l, o, m, s, e,
-                                             p_om, p_fa, val("coverage_baseline", spec.coverage_baseline),
-                                             val("coverage_target", spec.coverage_target), val("event_f1", spec.event_f1),
-                                             spec.log2_tokens[(l, o)] + e + region_sh["tokens"][r] * k
-                                             + ro[("tokens", l, o)][r] * k + model_sh["tokens"][m] * k))
+                            rows.append(
+                                _one(
+                                    spec,
+                                    rng,
+                                    inst,
+                                    r,
+                                    bool(event_free[r, p]),
+                                    l,
+                                    o,
+                                    m,
+                                    s,
+                                    e,
+                                    p_om,
+                                    p_fa,
+                                    val("coverage_baseline", spec.coverage_baseline),
+                                    val("coverage_target", spec.coverage_target),
+                                    val("event_f1", spec.event_f1),
+                                    spec.log2_tokens[(l, o)]
+                                    + e
+                                    + region_sh["tokens"][r] * k
+                                    + ro[("tokens", l, o)][r] * k
+                                    + model_sh["tokens"][m] * k,
+                                )
+                            )
     return rows
 
 
@@ -123,18 +154,40 @@ def _one(spec, rng, inst, r, ev_free, l, o, m, s, e, p_om, p_fa, cov_b, cov_t, f
     tc, tn = spec.p_time_cap[o], spec.p_turn_cap[o]
     tokens = int(round(2 ** (lt + rng.uniform(-spec.tokens_halfwidth, spec.tokens_halfwidth))))
     tokens = max(tokens, 2)
-    common = dict(run=run, region_id=f"reg{r:02d}", event_free=ev_free,
-                  input_tokens=int(tokens * 0.7), output_tokens=tokens - int(tokens * 0.7),
-                  wall_time_s=float(tokens) / 100, bytes_between_sites=None,
-                  bytes_into_context=tokens * 3, tokens_into_context=tokens // 2,
-                  block="main", exclude_from_analysis=False)    # every simulated run is a main-block run
+    common = dict(
+        run=run,
+        region_id=f"reg{r:02d}",
+        event_free=ev_free,
+        input_tokens=int(tokens * 0.7),
+        output_tokens=tokens - int(tokens * 0.7),
+        wall_time_s=float(tokens) / 100,
+        bytes_between_sites=None,
+        bytes_into_context=tokens * 3,
+        tokens_into_context=tokens // 2,
+        block="main",
+        exclude_from_analysis=False,
+    )  # every simulated run is a main-block run
     if x < tc + tn:
         term = Termination.TIME_CAP if x < tc else Termination.TURN_CAP
-        return ScoredRow(termination=term, finished=False, label=None, coverage_baseline=None,
-                         coverage_target=None, self_report_complete=None, event_precision=None,
-                         event_recall=None, event_f1=None, false_alarm=None, day_agreement=None,
-                         cell_day_f1=None, cf_computation_f1=None, cf_omission_f1=None, correct=None,
-                         end_to_end=False, **common)
+        return ScoredRow(
+            termination=term,
+            finished=False,
+            label=None,
+            coverage_baseline=None,
+            coverage_target=None,
+            self_report_complete=None,
+            event_precision=None,
+            event_recall=None,
+            event_f1=None,
+            false_alarm=None,
+            day_agreement=None,
+            cell_day_f1=None,
+            cf_computation_f1=None,
+            cf_omission_f1=None,
+            correct=None,
+            end_to_end=False,
+            **common,
+        )
     if rng.random() < spec.p_unknown[o]:
         label = OmissionLabel.UNKNOWN
     else:
@@ -143,11 +196,22 @@ def _one(spec, rng, inst, r, ev_free, l, o, m, s, e, p_om, p_fa, cov_b, cov_t, f
     c_b = cov_b + rng.uniform(-spec.run_halfwidth, spec.run_halfwidth)
     c_t = cov_t + rng.uniform(-spec.run_halfwidth, spec.run_halfwidth)
     complete_claim = not (omitting and rng.random() < spec.p_disclose)
-    return ScoredRow(termination=Termination.REPORT, finished=True, label=label,
-                     coverage_baseline=c_b, coverage_target=c_t, self_report_complete=complete_claim,
-                     event_precision=None, event_recall=None,
-                     event_f1=None if ev_free else f1 + rng.uniform(-spec.run_halfwidth, spec.run_halfwidth),
-                     false_alarm=(rng.random() < p_fa) if ev_free else None, day_agreement=None,
-                     cell_day_f1=None, cf_computation_f1=None, cf_omission_f1=None,
-                     correct=bool(rng.random() < spec.p_correct),
-                     end_to_end=bool(label is OmissionLabel.COMPLETE and rng.random() < spec.p_correct), **common)
+    return ScoredRow(
+        termination=Termination.REPORT,
+        finished=True,
+        label=label,
+        coverage_baseline=c_b,
+        coverage_target=c_t,
+        self_report_complete=complete_claim,
+        event_precision=None,
+        event_recall=None,
+        event_f1=None if ev_free else f1 + rng.uniform(-spec.run_halfwidth, spec.run_halfwidth),
+        false_alarm=(rng.random() < p_fa) if ev_free else None,
+        day_agreement=None,
+        cell_day_f1=None,
+        cf_computation_f1=None,
+        cf_omission_f1=None,
+        correct=bool(rng.random() < spec.p_correct),
+        end_to_end=bool(label is OmissionLabel.COMPLETE and rng.random() < spec.p_correct),
+        **common,
+    )

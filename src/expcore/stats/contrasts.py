@@ -8,6 +8,7 @@ A contrast A-B is paired at the (instance, model) cell *before* averaging up,
 so a cell missing in one option drops out of that contrast only. The region is
 the unit of inference. All options pass through the same code.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -16,18 +17,17 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy import stats
-
 from dataset_76.analysis.config import Config
+from scipy import stats
 
 
 @dataclasses.dataclass(frozen=True)
 class Outcome:
     name: str
     column: str
-    primary: bool          # one of the pre-registered primary outcomes (coverage counts as two)
-    scale: str             # "proportion" or "log2"
-    smallest: str | None   # "proportion", "cost" or None (no pre-registered smallest effect)
+    primary: bool  # one of the pre-registered primary outcomes (coverage counts as two)
+    scale: str  # "proportion" or "log2"
+    smallest: str | None  # "proportion", "cost" or None (no pre-registered smallest effect)
 
 
 OUTCOMES = [
@@ -59,11 +59,15 @@ def snap(x, cfg: Config) -> np.ndarray:
 
 # Instance domain of the outcomes that exist on only one kind of instance. Out-of-domain
 # instances are not part of that outcome at all: not undefined, not dropped, not imputed.
-DOMAIN = {"event_f1": lambda d: ~d["event_free"].astype(bool),     # events to match
-          "false_alarm": lambda d: d["event_free"].astype(bool)}   # event-free instances only
+DOMAIN = {
+    "event_f1": lambda d: ~d["event_free"].astype(bool),  # events to match
+    "false_alarm": lambda d: d["event_free"].astype(bool),
+}  # event-free instances only
 
 
-def instance_values(df: pd.DataFrame, column: str, defined_only: bool = True, impute: float | None = None) -> pd.DataFrame:
+def instance_values(
+    df: pd.DataFrame, column: str, defined_only: bool = True, impute: float | None = None
+) -> pd.DataFrame:
     """Seeds -> instance: mean over the seeds whose denominator is defined.
 
     An instance with no defined seed is *undefined* for the outcome: dropped
@@ -73,7 +77,7 @@ def instance_values(df: pd.DataFrame, column: str, defined_only: bool = True, im
     keys = ["option", "layout", "model", "instance_id", "region_id"]
     if column in DOMAIN:
         df = df[DOMAIN[column](df)]
-    g = df.groupby(keys, as_index=False, sort=True)[column].mean()   # NaN where no seed defined
+    g = df.groupby(keys, as_index=False, sort=True)[column].mean()  # NaN where no seed defined
     g = g.rename(columns={column: "value"})
     if impute is not None:
         g["value"] = g["value"].fillna(impute)
@@ -116,7 +120,7 @@ def paired_matrix(inst: pd.DataFrame, a: str, b: str, layout: str, pair: str = "
         v[np.searchsorted(models, mod[m]), np.searchsorted(insts, ins[m])] = val[m]
         return v
 
-    def region_mean(v):                                        # (M, I) -> (M, R), mean of defined instances
+    def region_mean(v):  # (M, I) -> (M, R), mean of defined instances
         ok = ~np.isnan(v)
         num = np.where(ok, v, 0.0) @ member.T
         cnt = ok.astype(float) @ member.T
@@ -176,12 +180,12 @@ def cluster_bootstrap(mat: np.ndarray, B: int, level: float, rng: np.random.Gene
     model's column. Returns overall (point, lo, hi) and per-model arrays (point, lo, hi).
     """
     R, M = mat.shape
-    reg = region_means(mat)                      # (R,)
+    reg = region_means(mat)  # (R,)
     point = float(np.mean(reg))
     idx = rng.integers(0, R, size=(B, R))
     overall = reg[idx].mean(axis=1)
     point_pm = _equal_model_mean(mat)
-    pm = _equal_model_mean(mat[idx])             # (B, M)
+    pm = _equal_model_mean(mat[idx])  # (B, M)
     q = [(1 - level) / 2 * 100, (1 + level) / 2 * 100]
     lo, hi = np.percentile(overall, q)
     with warnings.catch_warnings():
@@ -220,12 +224,11 @@ def wilcoxon_p(diffs: np.ndarray, cfg: Config) -> float:
     if d.size == 0:
         return float("nan")
     if np.all(d == 0):
-        return 1.0                      # no evidence of a difference; scipy would raise
+        return 1.0  # no evidence of a difference; scipy would raise
     inf = cfg["inference"]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return float(stats.wilcoxon(d, zero_method=inf["wilcoxon_zero_method"],
-                                    method=inf["wilcoxon_method"]).pvalue)
+        return float(stats.wilcoxon(d, zero_method=inf["wilcoxon_zero_method"], method=inf["wilcoxon_method"]).pvalue)
 
 
 def holm(p: pd.Series) -> pd.Series:
@@ -249,9 +252,17 @@ def holm(p: pd.Series) -> pd.Series:
     return out
 
 
-def contrast_one(inst: pd.DataFrame, a: str, b: str, layout: str, outcome: Outcome,
-                 cfg: Config, bootstrap: bool = True, rng: np.random.Generator | None = None,
-                 pair: str = "region"):
+def contrast_one(
+    inst: pd.DataFrame,
+    a: str,
+    b: str,
+    layout: str,
+    outcome: Outcome,
+    cfg: Config,
+    bootstrap: bool = True,
+    rng: np.random.Generator | None = None,
+    pair: str = "region",
+):
     """One contrast on one outcome and layout. Returns (summary dict, per-model DataFrame)."""
     mat, regions, models = paired_matrix(inst, a, b, layout, pair)
     row = {"outcome": outcome.name, "layout": layout, "contrast": f"{a}-{b}", "option_a": a, "option_b": b}
@@ -262,11 +273,16 @@ def contrast_one(inst: pd.DataFrame, a: str, b: str, layout: str, outcome: Outco
     region_diff = region_means(mat)
     pm_point = _equal_model_mean(mat)
     point = float(np.mean(region_diff))
-    row.update(n_regions=len(regions), n_models=len(models), effect=point,
-               n_zero_dropped=zeros_dropped(region_diff, cfg),    # zero region differences the Wilcoxon test drops
-               p_raw=wilcoxon_p(region_diff, cfg))
-    permodel = pd.DataFrame({"outcome": outcome.name, "layout": layout, "contrast": f"{a}-{b}",
-                             "model": models, "effect": pm_point})
+    row.update(
+        n_regions=len(regions),
+        n_models=len(models),
+        effect=point,
+        n_zero_dropped=zeros_dropped(region_diff, cfg),  # zero region differences the Wilcoxon test drops
+        p_raw=wilcoxon_p(region_diff, cfg),
+    )
+    permodel = pd.DataFrame(
+        {"outcome": outcome.name, "layout": layout, "contrast": f"{a}-{b}", "model": models, "effect": pm_point}
+    )
     if bootstrap:
         bs = cfg["bootstrap"]
         rng = rng or np.random.default_rng(bs["seed"])
@@ -287,24 +303,36 @@ def _decorate(tab: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     sm = []
     for _, r in tab.iterrows():
         k = OUTCOME[r["outcome"]].smallest
-        sm.append({"proportion": eff["smallest_effect_proportion"],
-                   "cost": float(np.log2(eff["smallest_effect_cost_factor"])), None: np.nan}[k])
+        sm.append(
+            {
+                "proportion": eff["smallest_effect_proportion"],
+                "cost": float(np.log2(eff["smallest_effect_cost_factor"])),
+                None: np.nan,
+            }[k]
+        )
     tab["smallest_effect"] = sm
     undefined = tab["smallest_effect"].isna() | tab["effect"].isna() | tab["p_holm"].isna()
     # "at least" the smallest effect (registration, as science ruled on #14, 19:11Z): |effect| >= 0.10, or |log2 ratio| >= 1 for cost,
     # both sides rounded to the same grid as the tests' inputs, so an effect exactly at the smallest effect counts whatever its float noise
     at_least = (snap(tab["effect"].abs(), cfg) >= snap(tab["smallest_effect"], cfg)).astype(float)
     tab["at_least_smallest"] = np.where(tab["smallest_effect"].isna() | tab["effect"].isna(), np.nan, at_least)
-    tab["counts_for_guide"] = np.where(undefined, np.nan, ((tab["p_holm"] < cfg.alpha) & (at_least == 1.0)).astype(float))
+    tab["counts_for_guide"] = np.where(
+        undefined, np.nan, ((tab["p_holm"] < cfg.alpha) & (at_least == 1.0)).astype(float)
+    )
     is_tok = tab["outcome"] == "tokens"
     for c in ("effect", "ci_lo", "ci_hi"):
         tab[f"{c}_ratio"] = np.where(is_tok, 2.0 ** tab[c], np.nan)
     return tab
 
 
-def contrast_tables(df: pd.DataFrame, cfg: Config, outcomes: list[str] | None = None,
-                    bootstrap: bool = True, value_override: dict[str, str] | None = None,
-                    impute: float | None = None):
+def contrast_tables(
+    df: pd.DataFrame,
+    cfg: Config,
+    outcomes: list[str] | None = None,
+    bootstrap: bool = True,
+    value_override: dict[str, str] | None = None,
+    impute: float | None = None,
+):
     """All option contrasts x layouts x outcomes. Returns (summary, per-model) DataFrames.
 
     `value_override` maps an outcome name to another column of `df` (used by the

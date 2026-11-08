@@ -3,6 +3,7 @@
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
 """Cohen's kappa between the rule coder and the second coder, on the primary code, with a
 seeded percentile bootstrap CI over runs, overall and per option."""
+
 from __future__ import annotations
 
 import math
@@ -28,8 +29,7 @@ def cohen_kappa(a: Sequence[str], b: Sequence[str]) -> dict:
     return {"kappa": kappa, "po": po, "pe": pe, "n": n}
 
 
-def kappa_ci(a: Sequence[str], b: Sequence[str], *, n_boot: int = 2000, alpha: float = 0.05,
-             seed: int = 0) -> dict:
+def kappa_ci(a: Sequence[str], b: Sequence[str], *, n_boot: int = 2000, alpha: float = 0.05, seed: int = 0) -> dict:
     """Point estimate plus percentile bootstrap CI. Replicates where kappa is undefined are
     dropped and counted (`n_boot_valid`); the CI is NaN if fewer than half are defined."""
     base = cohen_kappa(a, b)
@@ -44,12 +44,13 @@ def kappa_ci(a: Sequence[str], b: Sequence[str], *, n_boot: int = 2000, alpha: f
             if not math.isnan(k):
                 ks.append(k)
     ok = len(ks) >= n_boot / 2
-    lo, hi = (np.percentile(ks, [100 * alpha / 2, 100 * (1 - alpha / 2)]) if ok else (math.nan, math.nan))
+    lo, hi = np.percentile(ks, [100 * alpha / 2, 100 * (1 - alpha / 2)]) if ok else (math.nan, math.nan)
     return {**base, "ci_low": float(lo), "ci_high": float(hi), "n_boot_valid": len(ks), "alpha": alpha}
 
 
-def kappa_report(key: pd.DataFrame, first: pd.DataFrame, second: pd.DataFrame, *, n_boot: int = 2000,
-                 seed: int = 0) -> pd.DataFrame:
+def kappa_report(
+    key: pd.DataFrame, first: pd.DataFrame, second: pd.DataFrame, *, n_boot: int = 2000, seed: int = 0
+) -> pd.DataFrame:
     """`key`: sheet_id, block, run_key, option. `first`: the rule coder's table (block, run_key,
     cause). `second`: the filled sheet (sheet_id, coder_primary). One row for all runs and one
     per option. Sheet ids missing from the filled sheet, or left blank, are an error."""
@@ -62,8 +63,9 @@ def kappa_report(key: pd.DataFrame, first: pd.DataFrame, second: pd.DataFrame, *
     missing = set(key["sheet_id"]) - set(s["sheet_id"])
     if missing:
         raise ValueError(f"{len(missing)} sampled runs missing from the filled sheet")
-    m = key.merge(first[["block", "run_key", "cause"]], on=["block", "run_key"], how="left", validate="1:1") \
-        .merge(s, on="sheet_id", how="inner", validate="1:1")
+    m = key.merge(first[["block", "run_key", "cause"]], on=["block", "run_key"], how="left", validate="1:1").merge(
+        s, on="sheet_id", how="inner", validate="1:1"
+    )
     if m["cause"].isna().any():
         raise ValueError("sampled runs without a rule-coder cause")
     rows = []
