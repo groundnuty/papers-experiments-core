@@ -8,34 +8,41 @@
   request have theirs, and that every tool result the loop hands back is the text the model saw.
 - `RecordedToolProvider` serves each tool result by call order and exact arguments. Calls the tool box answers itself
   (unknown tool, bad arguments, malformed arguments, skipped calls) never reach it.
-- `ReplayClock` serves the recorded clock readings. Readings labelled `time_left` are not served: they were taken by the
-  live backend's retry policy, and a recorded backend never retries.
+- The recorded clock (`clock.py`) serves the recorded readings. Both pieces above walk the waits on infrastructure
+  the record shows at the start of their call, through the context they are given, so the readings line up.
 
 A divergence found while the loop runs stops it through `Halt`, not as an outcome of the attempt.
 """
 
 import asyncio
 import copy
-from collections.abc import Sequence
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.models.adapters import ModelTurn, ToolCall, ToolResult
-from expcore.plugin import ToolOutput, ToolSpec
+from expcore.plugin import CallContext, ToolOutput, ToolSpec
 from expcore.records.build import info_of_route
 from expcore.records.digest import canonical, digest
 from expcore.records.record import RunRecord
+from expcore.replay.clock import ReplayClock, replay_waits
 from expcore.replay.divergence import stop
 
-# The label under which `AgentTimer.time_left` logs its readings.
-BACKEND_CLOCK_LABELS = frozenset({"time_left"})
 # The error classes the tool box gives to calls it answers itself, which therefore never reach a provider.
 TOOLBOX_ERROR_CLASSES = frozenset({"UnknownTool", "InvalidArguments"})
 
 
-def exception_named(name: str) -> type[Exception]:
-    """Return an exception class with the given name, for re-raising a failure that is recorded by class name only."""
-    return type(name, (Exception,), {"__module__": __name__})
+def exception_named(name: str, *, provider_error: bool = False) -> type[Exception]:
+    """Return an exception class with the given name, for re-raising a failure that is recorded by class name only.
+
+    With `provider_error` it carries a status code, as an error the endpoint answered with does, which is what makes the
+    loop take it for the attempt's own error and not for a crash in our code.
+    """
+    attributes: dict[str, Any] = {"__module__": __name__}
+    if provider_error:
+        attributes["status_code"] = 400
+    return type(name, (Exception,), attributes)
 
 
 def strings_of(value: Any) -> set[str]:
@@ -49,36 +56,21 @@ def strings_of(value: Any) -> set[str]:
     return set()
 
 
-class ReplayClock:
-    """Serves the recorded clock readings one by one. Used as the loop's injected clock."""
-
-    def __init__(self, readings: Sequence[Sequence[Any]]):
-        self._values = [float(value) for label, value in readings if label not in BACKEND_CLOCK_LABELS]
-        self._read = 0
-
-    def __call__(self) -> float:
-        """Return the next recorded reading; the loop reading more often than it did when recorded is a divergence."""
-        if self._read >= len(self._values):
-            stop("clock", f"the loop read the clock {self._read + 1} times; the record holds {len(self._values)}")
-        value = self._values[self._read]
-        self._read += 1
-        return value
-
-    @property
-    def unused(self) -> int:
-        """How many recorded readings the replay did not read."""
-        return len(self._values) - self._read
-
-
 class RecordedBackend:
     """A model backend that serves the turns of a record."""
 
-    def __init__(self, record: RunRecord, cut: asyncio.Event):
+    def __init__(
+        self,
+        record: RunRecord,
+        clock: ReplayClock,
+        waits: Callable[[str], AbstractAsyncContextManager[None]],
+    ):
         self._route = record.route
         self._turns = record.transcript
         self._failed = record.failed_request
         self._calls = record.tool_calls
-        self._cut = cut
+        self._outcome = record.outcome
+        self._clock, self._waits = clock, waits
         self._served = 0
         self._conversation: list[dict[str, Any]] = []
         self._latest: str | None = None
@@ -134,14 +126,16 @@ class RecordedBackend:
         if k < len(self._turns):
             entry = self._turns[k]
             self._check(f"transcript[{k}]", entry.get("request_sha256"), entry.get("settings_sha256"))
+            await replay_waits(self._clock, self._waits, entry.get("waits_left_open", 0))
             self._served += 1
             self._latest = entry.get("settings_sha256", self._latest)
             self._conversation.append(copy.deepcopy(entry["native"]))
             return self._model_turn(entry)
         if self._failed is not None and k == len(self._turns):
             self._check("failed_request", self._failed["request_sha256"], self._failed["settings_sha256"])
-            self._served += 1
+            self._served += 1  # counted before the waits: a request that is cut is cut while it waits or hangs
             self._latest = self._failed["settings_sha256"]
+            await replay_waits(self._clock, self._waits, 0)
             await self._raise_failure(self._failed)
         stop("transcript", f"the replay asked for model step {k + 1}; the record holds {self.expected_steps}")
 
@@ -166,11 +160,10 @@ class RecordedBackend:
         )
 
     async def _raise_failure(self, failed: dict[str, Any]) -> None:
-        """Fail the way the recorded request failed. A request the loop gave up on is not answered, and the replay's
-        sleep is released so the loop's bound passes at once."""
+        """Fail the way the recorded request failed. A request the loop gave up on is not answered: it waits until the
+        loop's watch, which the recorded readings make look at the right moment, cuts it."""
         kind = failed["kind"]
         if kind == "cut":
-            self._cut.set()
             await asyncio.Event().wait()
         if kind == "infra":
             raise InfraError(failed["infra_kind"], failed["detail"] or "")
@@ -178,7 +171,8 @@ class RecordedBackend:
             raise ContextOverflow(failed["status"], failed["pattern"] or "")
         if kind == "abandoned":
             raise RequestAbandoned("read timeout")
-        raise exception_named(failed["error_type"] or "Exception")()
+        recorded_as_error = self._outcome["name"] == "error"
+        raise exception_named(failed["error_type"] or "Exception", provider_error=recorded_as_error)()
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
         """Take the results the loop produced, check each against what the model saw, and extend the conversation."""
@@ -221,11 +215,11 @@ def reaches_provider(call: dict[str, Any]) -> bool:
 class RecordedToolProvider:
     """Serves the recorded results of the calls that reached a provider, by call order and exact arguments."""
 
-    def __init__(self, record: RunRecord, cut: asyncio.Event):
+    def __init__(self, record: RunRecord, clock: ReplayClock):
         self._specs = [ToolSpec(**spec) for spec in record.tools]
         self._calls = [(j, c) for j, c in enumerate(record.tool_calls) if reaches_provider(c)]
         self._outcome = record.outcome
-        self._cut = cut
+        self._clock = clock
         self._served = 0
 
     @property
@@ -242,7 +236,7 @@ class RecordedToolProvider:
         """Return the recorded tool specs."""
         return list(self._specs)
 
-    async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float) -> ToolOutput:
+    async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
         """Serve the next recorded call; a call beyond the record, or with other arguments, is a divergence."""
         i = self._served
         if i >= len(self._calls):
@@ -254,14 +248,14 @@ class RecordedToolProvider:
             stop(f"tool_calls[{j}].arguments", "the arguments differ from the recorded ones")
         self._served += 1
         status = call["status"]
+        await replay_waits(self._clock, ctx.infrastructure_wait, call["waits_left_open"])
         if status == "cut":
-            self._cut.set()
-            await asyncio.Event().wait()
+            await asyncio.Event().wait()  # the loop's watch cuts it, at the recorded reading
         if status == "failed":
             self._raise_recorded_failure(j)
         if status == "ok":
-            return ToolOutput(call["raw_text"], infra_wait_s=call["infra_wait_s"])
-        return ToolOutput(self._error_message(call), True, call["error_class"], call["infra_wait_s"])
+            return ToolOutput(call["raw_text"], source_truncated=call["source_truncated"])
+        return ToolOutput(self._error_message(call), True, call["error_class"], call["source_truncated"])
 
     def _raise_recorded_failure(self, j: int) -> None:
         """Raise what the provider raised: an infrastructure failure of the recorded kind, or a crash by class name."""

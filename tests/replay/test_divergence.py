@@ -105,14 +105,14 @@ def test_R03_a_model_step_beyond_the_record_is_a_divergence():
     """R03: the record holds fewer turns than the loop asks for."""
     data = record_of()
     data["transcript"].pop()
-    diverges(data, "transcript", "model step 5")
+    diverges(data, "transcript", "model step 6")
 
 
 def test_R03_a_tool_call_beyond_the_record_is_a_divergence():
     """R03: the loop runs a call the record never made."""
     data = record_of()
     del data["tool_calls"][call_index(data, "submit")]
-    diverges(data, "tool_calls", "the replay ran tool call 4")
+    diverges(data, "tool_calls", "the replay ran tool call 5")
 
 
 def test_R03_a_tool_called_with_other_arguments_is_a_divergence():
@@ -147,7 +147,7 @@ def test_R03_recorded_model_steps_left_unused_are_a_divergence():
     """R03: the record holds a turn the replay never asked for."""
     data = record_of()
     data["transcript"].append(copy.deepcopy(data["transcript"][-1]))
-    diverges(data, "transcript", "5 of 6")
+    diverges(data, "transcript", "6 of 7")
 
 
 def test_R03_recorded_tool_calls_left_unused_are_a_divergence():
@@ -156,7 +156,7 @@ def test_R03_recorded_tool_calls_left_unused_are_a_divergence():
     extra = copy.deepcopy(data["tool_calls"][0])
     extra["call_id"] = "extra"
     data["tool_calls"].append(extra)
-    diverges(data, "tool_calls", "4 of 5")
+    diverges(data, "tool_calls", "5 of 6")
 
 
 def test_R03_a_clock_read_beyond_the_record_is_a_divergence():
@@ -215,21 +215,21 @@ V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
     "expcore-record/2",
     added={"record": ("instruments",), "turn": ("request_sha256",), "tool_call": ("detail",)},
-    config_before={"tool_grace_s": 7.0},
+    config_before={"cleanup_deadline_s": 7.0},
 )
 TABLE = (V1, V2)
 
 
 def older(data: dict) -> dict:
     """Make the JSON of a record look as one written before version 2: without the fields that version added, and
-    without the tool-grace setting, which the loop then read as 7 seconds."""
+    without the cleanup-deadline setting, which the loop then read as 7 seconds."""
     data["schema_version"] = "expcore-record/1"
     del data["instruments"]
     for entry in data["transcript"]:
         del entry["request_sha256"]
     for entry in data["tool_calls"]:
         del entry["detail"]
-    del data["agent_config"]["tool_grace_s"]
+    del data["agent_config"]["cleanup_deadline_s"]
     data["agent_config_sha256"] = digest(data["agent_config"])
     return data
 
@@ -237,10 +237,10 @@ def older(data: dict) -> dict:
 def test_R03_a_record_of_an_older_schema_replays_with_the_defaults_then_in_force():
     """R03: the fields version 2 added are excused, and a setting version 2 added is read as it was before."""
     old = RunRecord.from_json(older(record_of("malformed")), TABLE)
-    assert "tool_grace_s" not in old.agent_config
+    assert "cleanup_deadline_s" not in old.agent_config
     replayed = replay_record(old, schemas=TABLE)
     assert replayed.outcome["name"] == "finished"
-    assert replayed.agent_config["tool_grace_s"] == 7.0
+    assert replayed.agent_config["cleanup_deadline_s"] == 7.0
 
 
 def test_R03_an_older_record_still_checks_the_digests_it_has():

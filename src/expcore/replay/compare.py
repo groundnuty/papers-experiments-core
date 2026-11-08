@@ -18,8 +18,8 @@ from typing import Any
 from expcore.records.digest import plain
 from expcore.records.record import RunRecord
 from expcore.records.schema import SCHEMAS, SchemaVersion, added_after, config_defaults
+from expcore.replay.clock import BACKEND_CLOCK_LABELS
 from expcore.replay.divergence import ReplayDivergence
-from expcore.replay.recorded import BACKEND_CLOCK_LABELS
 
 # The sections compared, in the order the first difference is looked for.
 COMPARED = (

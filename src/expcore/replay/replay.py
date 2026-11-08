@@ -19,6 +19,13 @@ The divergence points, in the order they are met:
 - after the loop: recorded model requests, tool calls or clock readings left unused; any section of the replayed record
   that differs from the stored one.
 
+The loop's own watch is replayed too (`clock.py`). The recorded provider and backend enter the waits on infrastructure
+the record shows, of the recorded kinds, and leave open the ones the loop closed; the replay's sleep ends exactly when
+the next recorded reading is a `watch` reading, so a call is cut at the reading that cut it; and the cleanup after a
+cut is answered from the label of the reading that ended it. So the figures the timer derives from the readings, the
+seconds waited by kind, the cleanup time and whether it timed out, come out as recorded. Waits are replayed for tool
+providers and for backends alike.
+
 Replay does not re-execute tool calls: a tool's output is served from the record, not recomputed. Scores are not
 replayed: they are recomputed by running the scorers on the record (`expcore.records.rescore`). A record of an older
 schema version is replayed under the defaults then in force (`config_of`). The stack hash of a harness defect, which
@@ -29,7 +36,7 @@ offline through the `recompute` hook of the replay check (`check.py`, R05).
 """
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any
 
 from expcore.config.models import Limits
@@ -43,9 +50,10 @@ from expcore.records.digest import digest
 from expcore.records.record import RunRecord
 from expcore.records.recording import RecordingBackend
 from expcore.records.schema import SCHEMAS, RecordError, SchemaVersion, config_defaults
+from expcore.replay.clock import ReplayClock
 from expcore.replay.compare import compare
 from expcore.replay.divergence import Halt, ReplayDivergence
-from expcore.replay.recorded import RecordedBackend, RecordedToolProvider, ReplayClock
+from expcore.replay.recorded import RecordedBackend, RecordedToolProvider
 
 __all__ = ["ReplayDivergence", "config_of", "replay_async", "replay_record"]
 
@@ -62,6 +70,7 @@ def config_of(record: RunRecord, schemas: Sequence[SchemaVersion] = SCHEMAS) -> 
     a setting the record holds is used as recorded. A configuration that cannot be rebuilt is a divergence.
     """
     merged = {**config_defaults(record.schema_version, schemas), **record.agent_config}
+    merged.pop("terminal_tools", None)  # the tool box adds it to the record; it follows from the recorded tools
     try:
         limits = Limits(**merged.pop("limits"))
         return AgentConfig(limits, **merged)
@@ -95,6 +104,19 @@ def _check_used(backend: RecordedBackend, provider: RecordedToolProvider, clock:
         raise ReplayDivergence("clock", f"{clock.unused} recorded clock readings were not read")
 
 
+def _cleanup_waiter_for(clock: ReplayClock):
+    """Return the cleanup waiter of a replay: it answers as the record says, from the label of the reading that ended the
+    cleanup, and waits for the cancelled tasks to stop unless the record says the deadline ran out."""
+
+    async def waiter(tasks: Collection[asyncio.Future], _deadline_s: float) -> bool:
+        timed_out = clock.cleanup_timed_out()
+        if tasks and not timed_out:
+            await asyncio.wait(tasks)
+        return timed_out
+
+    return waiter
+
+
 def _prompt(entry: dict[str, Any]) -> PromptText:
     """Rebuild a prompt text from its record entry."""
     return PromptText(entry["text"], entry["template_sha256"], entry["slots"])
@@ -107,8 +129,9 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
     """
     rec = as_record(record, schemas)
     config = config_of(rec, schemas)
-    cut = asyncio.Event()  # set by a recorded piece that must not answer: the loop's time bound then passes at once
-    backend, provider, clock = RecordedBackend(rec, cut), RecordedToolProvider(rec, cut), ReplayClock(rec.clock)
+    clock = ReplayClock(rec.clock)
+    timer = config.timer(clock, cleanup_waiter=_cleanup_waiter_for(clock))
+    backend, provider = RecordedBackend(rec, clock, timer.infrastructure_wait), RecordedToolProvider(rec, clock)
     try:
         box = ToolBox([provider], cap_chars=config.limits.output_cap_chars)
     except ValueError as exc:
@@ -116,8 +139,8 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
     _check_inputs(rec, box)
     recording = RecordingBackend(backend)
 
-    async def released(_seconds: float) -> None:
-        await cut.wait()
+    async def sleep_until_a_watch_is_due(_seconds: float) -> None:
+        await clock.watch_due.wait()
 
     try:
         result = await run_agent(
@@ -126,8 +149,9 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
             rec.prompt["system"]["text"],
             rec.prompt["user"]["text"],
             config,
+            timer=timer,
             clock=clock,
-            sleep=released,
+            sleep=sleep_until_a_watch_is_due,
         )
     except Halt as halt:
         raise halt.divergence from None

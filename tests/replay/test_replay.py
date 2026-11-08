@@ -11,7 +11,8 @@ from replay_scenarios import SCENARIOS, tools_provider
 from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
 from expcore.records.record import RunRecord, load_record
-from expcore.replay.recorded import BACKEND_CLOCK_LABELS, TOOLBOX_ERROR_CLASSES, ReplayClock
+from expcore.replay.clock import BACKEND_CLOCK_LABELS, ReplayClock
+from expcore.replay.recorded import TOOLBOX_ERROR_CLASSES
 from expcore.replay.replay import config_of, replay_async, replay_record
 
 
@@ -84,19 +85,26 @@ def test_R03_the_clock_readings_the_backend_took_are_recorded_and_not_served():
     record = SCENARIOS["time_left_readings"][0]()
     labels = [label for label, _ in record.clock]
     assert labels.count("time_left") == 2
-    clock = ReplayClock(record.clock)
-    served = []
-    for _ in range(len(labels) - 2):
-        served.append(clock())
-    assert clock.unused == 0
+
+    async def serve_all():
+        clock = ReplayClock(record.clock)
+        for _ in range(len(labels) - 2):
+            clock()
+        return clock.unused
+
+    assert asyncio.run(serve_all()) == 0
     assert replay_record(record).outcome["name"] == "finished"
 
 
 def test_a_replay_serves_the_clock_so_it_takes_no_time_and_does_not_sleep(monkeypatch):
     record = SCENARIOS["tools"][0]()
 
-    async def refuse(_seconds):
-        raise AssertionError("a replay slept")
+    real_sleep = asyncio.sleep
+
+    async def refuse(seconds, *args):
+        if seconds:
+            raise AssertionError("a replay slept")
+        await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", refuse)
     assert replay_record(record).outcome["name"] == "finished"
