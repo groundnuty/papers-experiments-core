@@ -7,17 +7,15 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 from expcore.config.loading import ConfigError, load_toml
-from expcore_onedata.client import OnezoneClient, PlatformError, tcp_connect
+from expcore_onedata.client import OnezoneClient, tcp_connect
 from expcore_onedata.config import load_platform
 from expcore_onedata.day0 import checks as _checks  # noqa: F401 -- importing registers the checks
 from expcore_onedata.day0 import mutating as _mutating  # noqa: F401
 from expcore_onedata.day0.registry import REGISTRY, Context, Result, failed
 from expcore_onedata.day0.report import Entry, build_report, stamp, write_report
-from expcore_onedata.federation import read_space
 from expcore_onedata.provision import resolve_provider_ids
 from expcore_onedata.rangemap import load_placement
-from expcore_onedata.tokencheck import TokenRefused
-from expcore_onedata.tokens import TokenIssuer, data_path_spec
+from expcore_onedata.tokens import TokenIssuer
 
 MUTATE_VARIABLE = "EXPCORE_LIVE_MUTATE"
 EXIT_PASS, EXIT_FAIL, EXIT_UNKNOWN, EXIT_USAGE = 0, 1, 3, 2
@@ -26,19 +24,6 @@ EXIT_PASS, EXIT_FAIL, EXIT_UNKNOWN, EXIT_USAGE = 0, 1, 3, 2
 def mutation_allowed(environ: Mapping[str, str] | None = None) -> bool:
     """The caller has allowed the checks that change state when EXPCORE_LIVE_MUTATE is exactly "1"."""
     return (os.environ if environ is None else environ).get(MUTATE_VARIABLE) == "1"
-
-
-def _fill_provider_ids(ctx: Context) -> None:
-    """Add the ids of providers platform.toml does not declare, from the space as a data-path token sees it."""
-    ctx.provider_ids = resolve_provider_ids(ctx.config)
-    principal = ctx.config.principals.data_path
-    if principal is None or len(ctx.provider_ids) == len(ctx.config.providers):
-        return
-    try:
-        token = ctx.issuer.mint(data_path_spec(ctx.config.space.id), principal, ceiling_s=ctx.ceiling_s)
-        ctx.provider_ids = resolve_provider_ids(ctx.config, read_space(ctx.client, token.reveal(), ctx.config.space.id))
-    except (PlatformError, TokenRefused):
-        pass  # the providers left without an id make the checks that need one unknown; nothing is guessed
 
 
 def build_context(
@@ -78,7 +63,7 @@ def build_context(
         sleep=sleep,
         now=now,
     )
-    _fill_provider_ids(ctx)
+    ctx.provider_ids = resolve_provider_ids(config)
     return ctx
 
 

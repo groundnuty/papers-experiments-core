@@ -21,7 +21,7 @@ from expcore_onedata.client import PlatformError
 from expcore_onedata.day0.registry import Context, Result, failed, passed, register, unknown
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.probes import run_probe
-from expcore_onedata.tokencheck import TokenRefused
+from expcore_onedata.tokencheck import PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import Plane, data_path_spec, tool_server_spec
 
 CONNECT_TIMEOUT_S = 5.0
@@ -129,13 +129,17 @@ def tokens(ctx: Context) -> Result:
     for label, spec, principal in jobs:
         if spec.plane == Plane.TOOL_SERVER:
             try:  # a fixed user can stand for one condition's rights only; a run leases a user that matches
-                ctx.issuer.check_principal(spec, principal)
-            except (TokenRefused, PlatformError):
+                ctx.issuer.check_user(spec, principal.user_id)
+            except PrivilegesMismatch:
                 planes[label] = {
                     "examined": None,
                     "skipped": "the fixed tool-server user does not hold exactly these rights",
                 }
                 skipped.append(label)
+                continue
+            except (TokenRefused, PlatformError) as error:  # an outage or an unreadable answer is a failure, not a skip
+                planes[label] = {"examined": False, "refusal": str(error)[:200]}
+                problems.append(label)
                 continue
         try:
             minted = ctx.issuer.mint(spec, principal, ceiling_s=ctx.ceiling_s)

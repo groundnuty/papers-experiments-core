@@ -37,7 +37,6 @@ from urllib.parse import quote
 from expcore_onedata import consistency
 from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
 from expcore_onedata.config import PlatformConfig
-from expcore_onedata.federation import SpaceView, is_declared
 from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncovered
 from expcore_onedata.rangemap import PlacementSettings, safe_path
 
@@ -127,17 +126,9 @@ class TeardownReport:
             raise ProvisionError(f"teardown left {len(self.left)} entr(ies) behind; see the report")
 
 
-def resolve_provider_ids(config: PlatformConfig, view: SpaceView | None = None) -> dict[str, str]:
-    """Map each declared provider's name to the id Onezone gives it: the declared id, else the one reported by host."""
-    ids: dict[str, str] = {}
-    for provider in config.providers.values():
-        if provider.id is not None:
-            ids[provider.name] = provider.id
-            continue
-        for reported in view.providers if view else ():
-            if is_declared(provider, reported):
-                ids[provider.name] = reported.id
-    return ids
+def resolve_provider_ids(config: PlatformConfig) -> dict[str, str]:
+    """Map each declared provider's name to the id Onezone gives it; platform.toml always declares it."""
+    return {provider.name: provider.id for provider in config.providers.values() if provider.id is not None}
 
 
 def _quote(identifier: str) -> str:
