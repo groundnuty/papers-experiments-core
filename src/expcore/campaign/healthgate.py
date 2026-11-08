@@ -11,9 +11,9 @@ the caller waits for it at most `timeout_s`: a check that hangs is unhealthy whe
 a worker for ever. Ending the campaign stops the wait of the checks that have started nothing, the pre-run check and the
 dispatcher's own, at once; a pre-run check cut short holds the run and charges nothing. A **post-run check is part of
 finishing the attempt**, which a shutdown waits for, so it is not cut short: it waits out its answer or its timeout, and
-a finished result is never relabelled as infrastructure because the campaign was ending. A check that has outlived its
-time and not yet answered blocks the next ones from starting: they read unhealthy without a second thread piling up
-behind it. The
+a finished result is never relabelled as infrastructure because the campaign was ending. A check that has outlived **its
+own** time and not yet answered blocks the next ones from starting: they read unhealthy without a second thread piling
+up behind it. A wait cancelled before its time is abandoned, not hung, and never changes another check's answer. The
 Each outage is one record in the store's meta `health_outages`, written when the gate closes, at every check and when
 it opens, so a restart in the outage restores it (`restarts` counts those) and the status lists it from the same record:
 
@@ -157,8 +157,8 @@ class HealthGate:
         self._outages: list[dict[str, Any]] = []
         self._lock = threading.Lock()  # "who found it" and the record's writes are one step each
         self._wake = threading.Event()  # set when the gate closes
-        self._hung_lock = threading.Lock()
-        self._hung: list[dict[str, Any]] = []  # checks that outlived their time and have not answered
+        self._out_lock = threading.Lock()
+        self._out: list[dict[str, Any]] = []  # checks started and not yet answered, each with the deadline of its wait
         self._stop: threading.Event | None = None  # the campaign's end, set by `start`
         self._thread: threading.Thread | None = None
         self.check_now = False  # a gate restored by a restart is checked at once, not after a period
@@ -239,14 +239,17 @@ class HealthGate:
         """Run the check in a thread of its own and wait for its answer at most `timeout_s`.
 
         Return what it said; a check that does not answer in time reads as down and its late answer is thrown away.
-        Return None when `stop` is set before it answers: the campaign is ending and nobody is waiting for it. While an
-        earlier check that outlived its time is still out, no new one starts: it reads as down at once.
+        Return None when `stop` is set before it answers: the campaign is ending and nobody is waiting for it. A check
+        counts as hung only once **its own** timeout has elapsed without an answer, whether its caller waited out the
+        time or gave up at the end of the campaign; while one is hung no new one starts and they read as down at once.
+        A wait that was cancelled before its time is abandoned, not hung: it says nothing about another check's answer.
         """
-        with self._hung_lock:
-            self._hung = [box for box in self._hung if not box["done"].is_set()]
-            if self._hung:
+        with self._out_lock:
+            self._out = [box for box in self._out if not box["done"].is_set()]
+            if any(time.monotonic() >= box["deadline"] for box in self._out):
                 return Health(False, "the previous health check has still not answered")
-        box: dict[str, Any] = {"done": threading.Event()}
+            box: dict[str, Any] = {"done": threading.Event(), "deadline": time.monotonic() + self.timeout_s}
+            self._out.append(box)
 
         def go() -> None:
             try:
@@ -255,14 +258,10 @@ class HealthGate:
                 box["done"].set()
 
         threading.Thread(target=go, daemon=True, name="health-check").start()
-        deadline = time.monotonic() + self.timeout_s
         while not box["done"].wait(0.02):  # in slices, so the end of the run is seen at once
-            ending = stop is not None and stop.is_set()
-            if ending or time.monotonic() >= deadline:
-                with self._hung_lock:
-                    self._hung.append(box)
-                if ending:
-                    return None
+            if stop is not None and stop.is_set():
+                return None
+            if time.monotonic() >= box["deadline"]:
                 return Health(False, f"the health check did not answer within {self.timeout_s:g} s: counted as down")
         return box["health"]
 

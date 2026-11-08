@@ -251,6 +251,53 @@ def test_c11_a_post_run_check_is_not_cut_short_by_the_end_of_the_campaign(tmp_pa
     gate2.join()
 
 
+class FirstHangs:
+    """A health check whose first call hangs until it is let go and whose later calls answer healthy at once."""
+
+    def __init__(self):
+        self.release, self.calls = threading.Event(), 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls == 1:
+            self.release.wait(30)
+        return Health(True, "up")
+
+
+def test_c11_a_pre_run_check_cancelled_at_shutdown_does_not_turn_another_workers_post_run_check_unhealthy(tmp_path):
+    """C11 and C07: worker A's successful post-run check stays healthy when shutdown cancels worker B's pre-run check:
+    a cancelled wait is abandoned, not hung, and says nothing of another check's answer."""
+    check = FirstHangs()
+    gate, _ = gate_for(tmp_path, check, timeout_s=60)
+    stop = threading.Event()
+    gate.start(stop)
+    threading.Timer(0.1, stop.set).start()
+    assert gate.before_run("run-b").verdict == HOLD  # B is cancelled by the end of the campaign, its callback still out
+    health, outage = gate.after_run()  # A's result is judged by A's own answer
+    assert health == Health(True, "up")
+    assert outage is None
+    assert check.calls == 2
+    check.release.set()
+    gate.join()
+
+
+def test_c11_a_cancelled_check_counts_as_hung_once_its_own_timeout_has_elapsed(tmp_path):
+    """C11: abandoned is not hung until the callback's own time is up; then it blocks the next ones like any hang."""
+    check = FirstHangs()
+    gate, _ = gate_for(tmp_path, check, timeout_s=0.3)
+    stop = threading.Event()
+    gate.start(stop)
+    threading.Timer(0.05, stop.set).start()
+    assert gate.before_run("run-b").verdict == HOLD
+    time.sleep(0.4)  # the abandoned callback's own timeout has passed and it still has not answered
+    health, _ = gate.after_run()
+    assert not health.ok
+    assert "still not answered" in health.detail
+    assert check.calls == 1  # and no second callback was started behind it
+    check.release.set()
+    gate.join()
+
+
 def test_c11_checks_of_several_workers_run_at_once_and_none_reads_as_still_out(tmp_path):
     """C11: a slow check that is within its time does not make the check of another worker fail."""
     check = Hang(Health(True, "up"))
