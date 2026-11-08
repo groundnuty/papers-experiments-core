@@ -54,7 +54,7 @@ from expcore.records.schema import SCHEMAS, RecordError, SchemaVersion, config_d
 from expcore.replay.clock import ReplayClock
 from expcore.replay.compare import compare
 from expcore.replay.divergence import Halt, ReplayDivergence
-from expcore.replay.recorded import RecordedBackend, RecordedToolProvider
+from expcore.replay.recorded import RecordedBackend, RecordedToolProvider, ReplayToolBox
 
 __all__ = ["ReplayDivergence", "config_of", "replay_async", "replay_record"]
 
@@ -134,7 +134,7 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
     timer = config.timer(clock, cleanup_waiter=_cleanup_waiter_for(clock))
     backend, provider = RecordedBackend(rec, clock, timer.infrastructure_wait), RecordedToolProvider(rec, clock)
     try:
-        box = ToolBox([provider], cap_chars=config.limits.output_cap_chars)
+        box = ReplayToolBox([provider], cap_chars=config.limits.output_cap_chars, recorded=rec.tool_calls)
     except ValueError as exc:
         raise ReplayDivergence("tools", f"the recorded tools cannot be offered ({exc})") from None
     _check_inputs(rec, box)
@@ -172,6 +172,9 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
         )
     except RecordError as exc:
         raise ReplayDivergence("transcript", str(exc)) from None
+    for entry in replayed.tool_calls:  # the replay's own copy: a call served as recorded stays marked as such
+        if entry["call_id"] in {c["call_id"] for c in rec.tool_calls if not c.get("rendering_verified", True)}:
+            entry["rendering_verified"] = False
     compare(rec, replayed, schemas)
     return replayed
 

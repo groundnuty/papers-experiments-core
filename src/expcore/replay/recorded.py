@@ -16,20 +16,22 @@ A divergence found while the loop runs stops it through `Halt`, not as an outcom
 
 import asyncio
 import copy
-from collections.abc import Callable
+import dataclasses
+from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
+from expcore.loop.toolbox import ToolBox, ToolRun
 from expcore.models.adapters import ModelTurn, ToolCall, ToolResult
-from expcore.plugin import CallContext, ToolOutput, ToolSpec
+from expcore.plugin import NO_WAITS, CallContext, ToolOutput, ToolProvider, ToolSpec
 from expcore.records.build import info_of_route
 from expcore.records.digest import canonical, digest
 from expcore.records.record import RunRecord
 from expcore.replay.clock import ReplayClock, replay_waits
 from expcore.replay.compare import first_difference
 from expcore.replay.divergence import stop
-from expcore.replay.native import neutral_of, normalised
+from expcore.replay.native import malformed_flags, neutral_of, normalised
 
 # The error classes the tool box gives to calls it answers itself, which therefore never reach a provider.
 TOOLBOX_ERROR_CLASSES = frozenset({"UnknownTool", "InvalidArguments"})
@@ -47,16 +49,23 @@ def exception_named(name: str, *, provider_error: bool = False) -> type[Exceptio
     return type(name, (Exception,), attributes)
 
 
-def holds_result(value: Any, call_id: str, text: str) -> bool:
-    """Tell whether some object inside a JSON value has both the call's id and the result's text among its own values.
+# The fields of the object that carries a tool result in a native conversation: the call it answers, and its text.
+RESULT_ID_FIELDS = ("tool_call_id", "tool_use_id")
+RESULT_CONTENT_FIELD = "content"
 
-    That is the shape of a tool result in every native conversation: one object per call that names the call and
-    carries its text (`tool_call_id` and `content` in the chat-completions shape, `tool_use_id` and `content` in a
-    block of the Messages API). Checked per call, so two results swapped between their calls do not pass.
+
+def holds_result(value: Any, call_id: str, text: str) -> bool:
+    """Tell whether some object inside a JSON value is the result of this call: its call-id field is the call's id and
+    its content field is the text.
+
+    A tool result is one object per call in every native conversation (`tool_call_id` and `content` in the
+    chat-completions shape, `tool_use_id` and `content` in a block of the Messages API). The fields are compared by
+    name, so a result whose id and text have traded places, or two results swapped between their calls, do not pass.
     """
     if isinstance(value, dict):
-        own = {v for v in value.values() if isinstance(v, str)}
-        return (call_id in own and text in own) or any(holds_result(v, call_id, text) for v in value.values())
+        if value.get(RESULT_CONTENT_FIELD) == text and any(value.get(f) == call_id for f in RESULT_ID_FIELDS):
+            return True
+        return any(holds_result(v, call_id, text) for v in value.values())
     if isinstance(value, list):
         return any(holds_result(v, call_id, text) for v in value)
     return False
@@ -129,7 +138,7 @@ class RecordedBackend:
     def _check_neutral(self, k: int, entry: dict[str, Any]) -> None:
         """Check that the neutral turn is what the native message of the same turn stands for, by the parser of the
         backend that wrote it. The two are served to different places, so a record where they differ is not a run."""
-        derived = neutral_of(self._route.get("backend"), entry["native"])
+        derived = neutral_of(self._route.get("backend"), entry["native"], malformed_flags(entry["neutral"]))
         if derived is None:
             stop(
                 f"transcript[{k}].native",
@@ -226,6 +235,35 @@ class RecordedBackend:
 
     async def aclose(self) -> None:
         """Nothing to release."""
+
+
+class ReplayToolBox(ToolBox):
+    """A tool box that serves, for a call whose rendering was redacted, the recorded shown text instead of rendering it.
+
+    The cap and the error text are computed from the characters of the result, and redaction changed them: a secret
+    and its replacement are not the same length. For such a call (`rendering_verified` false in the record) the box
+    still has the provider serve it, so the call's identity and arguments are checked, but it returns the recorded
+    shown text, raw text, error class and truncation flag as they are. Every other call is rendered, and the cap is
+    recomputed, as the loop did.
+    """
+
+    def __init__(self, providers: Sequence[ToolProvider], *, cap_chars: int, recorded: Sequence[dict[str, Any]]):
+        super().__init__(providers, cap_chars=cap_chars)
+        self._unrendered = {c["call_id"]: c for c in recorded if not c.get("rendering_verified", True)}
+
+    async def run(self, call: ToolCall, *, timeout_s: float, ctx: CallContext = NO_WAITS) -> ToolRun:
+        """Run the call; for one whose rendering is not verifiable, put the recorded rendering in place of ours."""
+        run = await super().run(call, timeout_s=timeout_s, ctx=ctx)
+        recorded = self._unrendered.get(call.id)
+        if recorded is None or not reaches_provider(recorded) or recorded["status"] not in ("ok", "error"):
+            return run
+        return dataclasses.replace(
+            run,
+            result=ToolResult(call, recorded["text"], run.result.is_error),
+            raw_text=recorded["raw_text"],
+            truncated=recorded["truncated"],
+            error_class=recorded["error_class"],
+        )
 
 
 def reaches_provider(call: dict[str, Any]) -> bool:

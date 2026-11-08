@@ -109,6 +109,14 @@ def test_R03_a_record_of_a_backend_with_no_registered_parser_cannot_be_replayed(
     diverges(data, "transcript[0].native")
 
 
+def test_R03_a_result_whose_call_id_and_content_have_traded_places_diverges():
+    """R03: the fields are compared by name, so the same two strings in the other fields are not the result."""
+    data = record_of()
+    message = data["transcript"][0]["tool_messages"][0]
+    message["tool_call_id"], message["content"] = message["content"], message["tool_call_id"]
+    diverges(data, "transcript[0].tool_messages")
+
+
 def test_R03_swapping_two_results_of_one_turn_diverges():
     """R03: results are validated per call id, not by set membership: each message must hold its own call's result."""
     data = record_of()
