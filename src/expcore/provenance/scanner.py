@@ -85,7 +85,9 @@ def _literal_values(raw: str) -> tuple[str, str | None]:
     parts = _STRING_PARTS_RE.match(raw)
     content = parts.group(2) if parts else raw
     try:
-        value = ast.literal_eval(raw)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)  # an invalid escape is still a literal worth scanning
+            value = ast.literal_eval(raw)
     except (ValueError, SyntaxError):
         return content, None
     if isinstance(value, bytes):
