@@ -7,6 +7,9 @@ whose check is missing or not current, and `archived_records` finds every `recor
 can put each record in each of them through the same load, write-back and replay as a live batch.
 """
 
+import hashlib
+import io
+import json
 import os
 import tarfile
 import tempfile
@@ -15,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.records.schema import SCHEMAS, SchemaVersion
-from expcore.replay.check import CHECK_FILE, input_files, require_current_check
+from expcore.replay.check import CHECK_FILE, BatchNotVerified, input_files, require_current_check
 
 ARCHIVE_GLOB = "records*.tar.gz"
 
@@ -52,23 +55,45 @@ def archive_batch(
     *,
     code: Mapping[str, Any],
     allow_dirty: bool = False,
+    required_recompute: Sequence[str] = (),
     schemas: Sequence[SchemaVersion] = SCHEMAS,
 ) -> Path:
     """Archive a batch, its inputs and its check, into a `.tar.gz` file; refuse unless the check is current.
 
     Raises BatchNotVerified (see `require_current_check`) when the batch has no passing check made under the code in
-    use. The archive is written to a temporary file and renamed, so a killed process leaves no archive that looks whole.
+    use, or lacks a recompute hook in `required_recompute`. Each input is read once, its SHA-256 is compared with the
+    one the check holds, and the archive is written from those same bytes, so a record replaced after the check was
+    verified is refused, and what is archived is what was checked. The archive is written to a temporary file and
+    renamed, so a killed process leaves no archive that looks whole.
     """
     root = Path(batch)
-    check = require_current_check(root, code=code, allow_dirty=allow_dirty, schemas=schemas)
+    check = require_current_check(
+        root, code=code, allow_dirty=allow_dirty, required_recompute=required_recompute, schemas=schemas
+    )
     records, hashed = input_files(root, check.get("hashed_only_patterns") or ())
+    names = [*records, *hashed]
+    held = check["inputs"]
+    if sorted(names) != sorted(held):
+        raise BatchNotVerified(f"{root}: the inputs changed between the check and the archive; check the batch again")
+    contents: dict[str, bytes] = {}
+    for rel in names:
+        data = (root / rel).read_bytes()  # read once: these are the bytes that are verified and archived
+        if hashlib.sha256(data).hexdigest() != held[rel]:
+            raise BatchNotVerified(f"{root}: {rel} changed after the check was verified; check the batch again")
+        contents[rel] = data
+    check_bytes = (root / CHECK_FILE).read_bytes()
+    if json.loads(check_bytes) != check:
+        raise BatchNotVerified(f"{root}: {CHECK_FILE} changed while the batch was archived; check the batch again")
+    contents[CHECK_FILE] = check_bytes
     target = Path(archive)
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
     os.close(fd)
     try:
         with tarfile.open(tmp, "w:gz") as tar:
-            for rel in [*records, *hashed, CHECK_FILE]:
-                tar.add(root / rel, arcname=rel, recursive=False)
+            for rel, data in contents.items():
+                info = tarfile.TarInfo(rel)
+                info.size, info.mode, info.mtime = len(data), 0o644, 0
+                tar.addfile(info, io.BytesIO(data))
         os.replace(tmp, target)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)

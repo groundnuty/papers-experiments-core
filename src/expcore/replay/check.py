@@ -9,9 +9,9 @@ offline through the real loop. The result is written beside the records as `repl
 
     {"schema": "replay-check/1", "record_schema", "checked_at", "code": {the code identity},
      "hashed_only_patterns", "n_records", "n_ok", "failures": [{"file", "stage", "error"}], "hashed_only": [paths],
-     "decisions_recomputed", "inputs": {path: sha256}, "inputs_sha256"}
+     "recompute": [{"name", "version", "records", "decisions", "failures"}], "inputs": {path: sha256}, "inputs_sha256"}
 
-`stage` is `load`, `roundtrip`, `replay` or `decision`. Paths are relative to the batch, so a batch extracted from an
+`stage` is `load`, `roundtrip`, `replay` or `decision` (a failure at `decision` also names the `hook`). Paths are relative to the batch, so a batch extracted from an
 archive elsewhere has the same digest. An input is a record (a `.json` file anywhere under the batch, the check file
 excepted) or a file named by `hashed_only` patterns, which is hashed but not replayed, such as a manifest the analysis
 reads. A `.json` file that is not a record must therefore be named in `hashed_only`, or it fails the check at `load`.
@@ -22,9 +22,13 @@ changed, that the check was made under the code in use (the same commit and tree
 unless allowed, dirty), and that it was made under the schemas in use. Otherwise the check runs again.
 
 Decisions served during replay (R05): the core records none yet. A study that records a decision and serves it back
-from the record passes `recompute`, a function that takes the loaded record and raises when the decision the record
-holds is contradicted by recomputing it offline from what the record keeps; the record then fails the check at stage
-`decision`, so a decision is never accepted unverified.
+from the record passes `recompute`, hooks that each have a `name` and a `version` and take the loaded record, return
+how many decisions they recomputed in it, and raise when one is contradicted by recomputing it offline from what the
+record keeps; the record then fails the check at stage `decision`. The check records which hooks ran, on how many
+records, and how many decisions each recomputed. A study that serves decisions names its hooks as required
+(`required_recompute`, `--require-recompute`), and `require_current_check` and `archive_batch` then refuse a check
+that lacks one, that ran it on fewer records than the batch holds, or that it disagreed with: a check made without the
+recompute does not vouch for the decisions, so a decision is never accepted unverified.
 """
 
 import argparse
@@ -35,9 +39,10 @@ import os
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from expcore.provenance.codestamp import UNKNOWN, CodeScope, CodeVersionUnknown, require_known
 from expcore.provenance.codestamp import version as code_version
@@ -55,6 +60,44 @@ EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
 
 class BatchNotVerified(Exception):
     """A batch has no passing, current replay check; the message says why and what to run."""
+
+
+class Recompute(Protocol):
+    """A hook that recomputes, offline, the decisions a record holds (R05).
+
+    It has a `name` and a `version`, takes a loaded record, returns how many decisions it recomputed in it, and raises
+    if one is contradicted by what the record keeps.
+    """
+
+    name: str
+    version: str
+
+    def __call__(self, record: RunRecord) -> int: ...
+
+
+@dataclass(frozen=True)
+class RecomputeHook:
+    """A named, versioned hook made from a function that returns how many decisions it recomputed (or None for none)."""
+
+    name: str
+    version: str
+    check: Callable[[RunRecord], int | None]
+
+    def __call__(self, record: RunRecord) -> int:
+        return int(self.check(record) or 0)
+
+
+def _hooks(recompute: Sequence[Recompute]) -> list[Recompute]:
+    """Check that every hook has a name and a version, and that no name is used twice."""
+    hooks = list(recompute)
+    for hook in hooks:
+        for field in ("name", "version"):
+            if not isinstance(getattr(hook, field, None), str) or not getattr(hook, field):
+                raise TypeError(f"a recompute hook has a {field}, so the check can say which one ran")
+    names = [hook.name for hook in hooks]
+    if len(set(names)) != len(names):
+        raise ValueError(f"two recompute hooks are named alike: {sorted(n for n in names if names.count(n) > 1)}")
+    return hooks
 
 
 def input_files(batch: Path, hashed_only: Sequence[str] = ()) -> tuple[list[str], list[str]]:
@@ -91,12 +134,7 @@ def _error(exc: BaseException) -> str:
     return redact_text(f"{type(exc).__name__}: {exc}")[0][:ERROR_LIMIT]
 
 
-def check_record(
-    raw: bytes,
-    *,
-    schemas: Sequence[SchemaVersion] = SCHEMAS,
-    recompute: Callable[[RunRecord], None] | None = None,
-) -> tuple[str, str] | None:
+def check_record(raw: bytes, *, schemas: Sequence[SchemaVersion] = SCHEMAS) -> tuple[str, str] | None:
     """Return None when the stored bytes load, write back to themselves and replay; else (stage, error)."""
     try:
         record = RunRecord.from_json(decode(raw), tuple(schemas))
@@ -114,11 +152,6 @@ def check_record(
         return "replay", redact_text(str(exc))[0][:ERROR_LIMIT]
     except Exception as exc:
         return "replay", _error(exc)
-    if recompute is not None:
-        try:
-            recompute(record)
-        except Exception as exc:
-            return "decision", _error(exc)
     return None
 
 
@@ -127,23 +160,37 @@ def verify_batch(
     *,
     code: Mapping[str, Any],
     hashed_only: Sequence[str] = (),
-    recompute: Callable[[RunRecord], None] | None = None,
+    recompute: Sequence[Recompute] = (),
     schemas: Sequence[SchemaVersion] = SCHEMAS,
 ) -> dict[str, Any]:
     """Check every record of a batch and return the check, which `write_check` stores.
 
-    `code` is the identity of the code the check covers. The bytes hashed are the bytes checked.
+    `code` is the identity of the code the check covers. The bytes hashed are the bytes checked. Each of the `recompute`
+    hooks runs on every record that loads, writes back and replays, and the check says which ran, on how many records,
+    and how many decisions each recomputed.
     """
     root = Path(batch)
+    hooks = _hooks(recompute)
+    ran = {h.name: {"name": h.name, "version": h.version, "records": 0, "decisions": 0, "failures": 0} for h in hooks}
     records, hashed = input_files(root, hashed_only)
     hashes: dict[str, str] = {}
-    failures = []
+    failures: list[dict[str, Any]] = []
     for rel in records:
         raw = (root / rel).read_bytes()
         hashes[rel] = hashlib.sha256(raw).hexdigest()
-        failed = check_record(raw, schemas=schemas, recompute=recompute)
+        failed = check_record(raw, schemas=schemas)
         if failed is not None:
             failures.append({"file": rel, "stage": failed[0], "error": failed[1]})
+            continue
+        record = RunRecord.from_json(decode(raw), tuple(schemas)) if hooks else None
+        for hook in hooks:
+            stat = ran[hook.name]
+            stat["records"] += 1
+            try:
+                stat["decisions"] += int(hook(record))
+            except Exception as exc:
+                stat["failures"] += 1
+                failures.append({"file": rel, "stage": "decision", "hook": hook.name, "error": _error(exc)})
     for rel in hashed:
         hashes[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
     return {
@@ -153,10 +200,10 @@ def verify_batch(
         "code": dict(code),
         "hashed_only_patterns": list(hashed_only),
         "n_records": len(records),
-        "n_ok": len(records) - len(failures),
+        "n_ok": len(records) - len({f["file"] for f in failures}),
         "failures": failures,
         "hashed_only": hashed,
-        "decisions_recomputed": 0 if recompute is None else len(records) - len(failures),
+        "recompute": list(ran.values()),
         "inputs": dict(sorted(hashes.items())),
         "inputs_sha256": inputs_sha256(hashes),
     }
@@ -217,18 +264,41 @@ def _changed_inputs(stored: Mapping[str, str], current: Mapping[str, str]) -> st
     return "; ".join(parts)
 
 
+def _require_recompute(root: Path, check: Mapping[str, Any], required: Sequence[str], rerun: str) -> None:
+    """Refuse a check that lacks a required recompute hook, ran it on too few records, or whose hook disagreed."""
+    ran = {entry.get("name"): entry for entry in check.get("recompute") or [] if isinstance(entry, dict)}
+    for name in required:
+        entry = ran.get(name)
+        if entry is None:
+            raise BatchNotVerified(
+                f"{root}: the check did not run the required recompute hook {name!r} (it ran: {sorted(ran) or 'none'}); "
+                f"run the check with that hook, then {rerun}"
+            )
+        if entry.get("failures"):
+            raise BatchNotVerified(
+                f"{root}: the recompute hook {name!r} disagreed with {entry['failures']} record(s) (see {CHECK_FILE})"
+            )
+        if entry.get("records") != check.get("n_records"):
+            raise BatchNotVerified(
+                f"{root}: the recompute hook {name!r} ran on {entry.get('records')} of {check.get('n_records')} records"
+            )
+
+
 def require_current_check(
     batch: str | os.PathLike[str],
     *,
     code: Mapping[str, Any],
     allow_dirty: bool = False,
+    required_recompute: Sequence[str] = (),
     schemas: Sequence[SchemaVersion] = SCHEMAS,
 ) -> dict[str, Any]:
     """Return the batch's stored check when it passed and is current; else raise BatchNotVerified saying why (R04).
 
     Refused: no check; a check of another check schema or of other record schemas than the ones in use; a check with
     failures; inputs added, removed or changed since; a check made under another commit or tree hash than `code`, the
-    identity of the code in use; code that is unknown, stale or, unless `allow_dirty`, dirty.
+    identity of the code in use; code that is unknown, stale or, unless `allow_dirty`, dirty; and, for each name in
+    `required_recompute`, a check that did not run that recompute hook, ran it on fewer records than the batch holds,
+    or whose hook disagreed with a record (R05).
     """
     root = Path(batch)
     rerun = f"run `python -m expcore.replay.check {root}` first"
@@ -240,6 +310,7 @@ def require_current_check(
             f"{root}: the check was made under record schema {check.get('record_schema')!r}, "
             f"the schema in use is {schemas[-1].name!r}; {rerun}"
         )
+    _require_recompute(root, check, required_recompute, rerun)
     if check.get("n_ok") != check.get("n_records") or check.get("failures"):
         raise BatchNotVerified(
             f"{root}: the replay check failed for {len(check.get('failures') or [])} of {check.get('n_records')} "
@@ -292,6 +363,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--require", action="store_true", help="do not run the check; refuse unless the stored one is current"
     )
+    parser.add_argument(
+        "--require-recompute",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="refuse unless the check ran this recompute hook on every record and it agreed (repeat)",
+    )
     return parser
 
 
@@ -301,7 +379,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     scope = CodeScope.of(args.root)
     try:
         if args.require:
-            require_current_check(args.batch, code=code_version(args.code_root, scope), allow_dirty=args.allow_dirty)
+            require_current_check(
+                args.batch,
+                code=code_version(args.code_root, scope),
+                allow_dirty=args.allow_dirty,
+                required_recompute=args.require_recompute,
+            )
             print(f"ok {args.batch}: the replay check is current")
             return EXIT_OK
         code = require_known("replay check", args.code_root, scope, allow_dirty=args.allow_dirty)
@@ -313,6 +396,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     for failure in check["failures"]:
         print(f"FAIL {failure['file']} [{failure['stage']}] {failure['error']}")
     print(f"{check['n_ok']} of {check['n_records']} records passed; check written to {path}")
+    if args.require_recompute and not check["failures"]:
+        try:  # this command runs no recompute hook, so a check it made cannot satisfy a requirement for one
+            _require_recompute(args.batch, check, args.require_recompute, "run the check from the study's own code")
+        except BatchNotVerified as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return EXIT_REFUSED
     return EXIT_OK if not check["failures"] else EXIT_REFUSED
 
 

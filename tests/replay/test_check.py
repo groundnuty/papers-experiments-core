@@ -15,6 +15,7 @@ from expcore.replay.check import (
     CHECK_FILE,
     CHECK_SCHEMA,
     BatchNotVerified,
+    RecomputeHook,
     check_record,
     input_hashes,
     inputs_sha256,
@@ -244,25 +245,80 @@ def test_hidden_files_and_the_check_itself_are_not_inputs(checked):
 # --- R05: decisions served during replay ------------------------------------------------------------------------------
 
 
+def decisions(run_key_to_contradict=None, name="decisions", version="1"):
+    """A hook that recomputes one decision per record, and contradicts the one of the named run."""
+
+    def check(record: RunRecord) -> int:
+        if record.run_key == run_key_to_contradict:
+            raise ReplayDivergence("decision", "the recomputed decision differs from the recorded one")
+        return 1
+
+    return RecomputeHook(name, version, check)
+
+
 def test_R05_a_recorded_decision_the_offline_recompute_contradicts_holds_the_batch(batch):
     """R05: the hook raises for a record whose decision it contradicts; that record fails at stage decision."""
-
-    def recompute(record: RunRecord) -> None:
-        if record.run_key == "run-malformed":
-            raise ReplayDivergence("decision", "the recomputed decision differs from the recorded one")
-
-    check = verify_batch(batch, code=CODE, recompute=recompute)
-    assert [f["stage"] for f in check["failures"]] == ["decision"]
-    assert check["decisions_recomputed"] == 3
+    check = verify_batch(batch, code=CODE, recompute=[decisions("run-malformed")])
+    assert [(f["stage"], f["hook"]) for f in check["failures"]] == [("decision", "decisions")]
+    assert check["recompute"] == [{"name": "decisions", "version": "1", "records": 4, "decisions": 3, "failures": 1}]
+    assert (check["n_records"], check["n_ok"]) == (4, 3)
     write_check(batch, check)
     refused(batch, "failed for 1 of 4")
+    refused(batch, "recompute hook 'decisions' disagreed with 1 record", required_recompute=["decisions"])
 
 
-def test_R05_a_recompute_that_agrees_with_every_record_passes(batch):
+def test_R05_a_recompute_that_agrees_with_every_record_passes_and_the_check_says_what_ran(batch):
+    """R05: the check records the hook's name and version, the records it ran on and the decisions it recomputed."""
     seen = []
-    check = verify_batch(batch, code=CODE, recompute=lambda record: seen.append(record.run_key))
+
+    def record_seen(record):
+        seen.append(record.run_key)
+        return 2
+
+    check = verify_batch(batch, code=CODE, recompute=[RecomputeHook("seen", "3.1", record_seen)])
     assert sorted(seen) == sorted(f"run-{n}" for n in NAMES)
-    assert (check["n_ok"], check["decisions_recomputed"]) == (4, 4)
+    assert check["recompute"] == [{"name": "seen", "version": "3.1", "records": 4, "decisions": 8, "failures": 0}]
+    assert check["n_ok"] == 4
+
+
+def test_R05_a_hook_without_a_name_or_a_version_or_with_a_name_used_twice_is_refused(batch):
+    """R05: the check must be able to say which hooks ran."""
+    nameless = RecomputeHook("", "1", lambda record: 1)
+    with pytest.raises(TypeError, match="has a name"):
+        verify_batch(batch, code=CODE, recompute=[nameless])
+    with pytest.raises(TypeError, match="has a version"):
+        verify_batch(batch, code=CODE, recompute=[RecomputeHook("a", "", lambda record: 1)])
+    with pytest.raises(ValueError, match="named alike"):
+        verify_batch(batch, code=CODE, recompute=[decisions(), decisions(version="2")])
+
+
+def test_R04_a_check_made_without_a_required_recompute_is_refused(batch):
+    """R04 and R05: the plain check passes on its own terms, and does not vouch for decisions it did not recompute."""
+    write_check(batch, verify_batch(batch, code=CODE))
+    assert require_current_check(batch, code=CODE)
+    refused(
+        batch, r"did not run the required recompute hook 'decisions' \(it ran: none\)", required_recompute=["decisions"]
+    )
+
+
+def test_R04_a_required_recompute_that_ran_and_agreed_is_accepted_and_one_that_ran_on_fewer_records_is_not(batch):
+    """R04 and R05: the hook must have run on every record of the batch."""
+    write_check(batch, verify_batch(batch, code=CODE, recompute=[decisions()]))
+    assert require_current_check(batch, code=CODE, required_recompute=["decisions"])
+    refused(batch, r"'other' \(it ran: \['decisions'\]\)", required_recompute=["decisions", "other"])
+    check = stored_check(batch)
+    check["recompute"][0]["records"] = 2
+    write_check(batch, check)
+    refused(batch, "'decisions' ran on 2 of 4 records", required_recompute=["decisions"])
+
+
+def test_R08_an_archive_can_require_the_recompute_too(batch, tmp_path):
+    """R08 and R05: an output is not archived on a check that lacks a required recompute."""
+    write_check(batch, verify_batch(batch, code=CODE))
+    with pytest.raises(BatchNotVerified, match="required recompute hook 'decisions'"):
+        archive_batch(batch, tmp_path / "records.tar.gz", code=CODE, required_recompute=["decisions"])
+    write_check(batch, verify_batch(batch, code=CODE, recompute=[decisions()]))
+    assert archive_batch(batch, tmp_path / "records.tar.gz", code=CODE, required_recompute=["decisions"]).exists()
 
 
 # --- R08: archives ----------------------------------------------------------------------------------------------------
@@ -279,6 +335,44 @@ def test_R08_no_output_is_archived_without_its_replay_check(batch, tmp_path):
         archive_batch(batch, target, code=CODE)
     assert not target.exists()
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(".records")]
+
+
+def test_R08_a_record_replaced_after_the_check_was_verified_is_refused_and_nothing_is_archived(
+    checked, tmp_path, monkeypatch
+):
+    """R08: each record is read once and its bytes checked against the check; the archive holds those bytes."""
+    import expcore.replay.archive as archive_module
+
+    real = archive_module.require_current_check
+    victim = first_record(checked)
+
+    def verified_then_replaced(*args, **kwargs):
+        result = real(*args, **kwargs)
+        victim.write_bytes(victim.read_bytes() + b" ")  # swapped after the verification, before the archive is read
+        return result
+
+    monkeypatch.setattr(archive_module, "require_current_check", verified_then_replaced)
+    target = tmp_path / "records.tar.gz"
+    with pytest.raises(BatchNotVerified, match=f"{victim.name} changed after the check was verified"):
+        archive_batch(checked, target, code=CODE)
+    assert not target.exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".records")]
+
+
+def test_R08_a_record_added_after_the_check_was_verified_is_refused(checked, tmp_path, monkeypatch):
+    """R08: the set of inputs must be the checked one when the archive is written."""
+    import expcore.replay.archive as archive_module
+
+    real = archive_module.require_current_check
+
+    def verified_then_added(*args, **kwargs):
+        result = real(*args, **kwargs)
+        (checked / ("d" * 64 + ".1.json")).write_text("{}", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(archive_module, "require_current_check", verified_then_added)
+    with pytest.raises(BatchNotVerified, match="inputs changed between the check and the archive"):
+        archive_batch(checked, tmp_path / "records.tar.gz", code=CODE)
 
 
 def test_R08_every_records_archive_is_collected_shards_included(checked, tmp_path):
@@ -356,3 +450,22 @@ def test_the_command_needs_to_be_told_which_code_it_covers(batch, capsys):
         main([str(batch)])
     assert caught.value.code == 2
     assert "--root" in capsys.readouterr().err
+
+
+def test_R04_the_plain_command_is_refused_when_a_recompute_is_required(batch, code_repo, capsys):
+    """R04 and R05: the command runs no recompute hook, so the check it makes cannot satisfy a requirement for one."""
+    assert run_cli(batch, code_repo, "--require-recompute", "decisions") == 1
+    assert "did not run the required recompute hook 'decisions'" in capsys.readouterr().err
+    assert run_cli(batch, code_repo) == 0
+    assert run_cli(batch, code_repo, "--require") == 0
+    assert run_cli(batch, code_repo, "--require", "--require-recompute", "decisions") == 1
+
+
+def test_R04_the_command_accepts_a_stored_check_that_ran_the_required_recompute(batch, code_repo):
+    """R04 and R05: a study's own code runs the hook and stores the check; the command then confirms it is current."""
+    from expcore.provenance.codestamp import CodeScope, version
+
+    code = version(code_repo.path, CodeScope.of(["src"]))
+    write_check(batch, verify_batch(batch, code=code, recompute=[decisions()]))
+    assert run_cli(batch, code_repo, "--require", "--require-recompute", "decisions") == 0
+    assert run_cli(batch, code_repo, "--require", "--require-recompute", "other") == 1
