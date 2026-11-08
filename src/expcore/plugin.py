@@ -68,7 +68,9 @@ class ToolProvider(Protocol):
     `InfraError` when the infrastructure failed, and any other exception for a defect in the provider, which the
     loop records as a harness defect and sets the attempt aside (L08).
 
-    Work that blocks must not run on the event loop: a provider wraps it in `asyncio.to_thread` (L15).
+    Work that blocks must not run on the event loop: a provider wraps it in `asyncio.to_thread` (L15). A running
+    thread cannot be killed, so the function in it must bound itself with `timeout_s`, and a provider whose call is
+    cancelled must say that the thread may still be running, without waiting for it (`FunctionProvider` does).
     """
 
     def tools(self) -> Sequence[ToolSpec]:
