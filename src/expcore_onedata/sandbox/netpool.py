@@ -21,6 +21,7 @@ with no such process, or from an earlier boot (an M sandbox's sidecar and agent 
 left alone, and so is anything without all three labels. It deletes no files: a killed run's directory and loop mounts
 stay until its owner's lane removes them.
 """
+
 from __future__ import annotations
 
 import ipaddress
@@ -34,11 +35,13 @@ from pathlib import Path
 
 from . import hostops as H
 
-_REAP_LOCK = threading.Lock()   # an M orphan's ordered teardown takes tens of seconds; starts run from several worker threads
+_REAP_LOCK = (
+    threading.Lock()
+)  # an M orphan's ordered teardown takes tens of seconds; starts run from several worker threads
 
 POOL_ENV = "STUDY_VAR_89"
 DEFAULT_POOL = "10.16.0.0/13"
-PREFIX = 28                 # 16 addresses: the gate and the agent need two
+PREFIX = 28  # 16 addresses: the gate and the agent need two
 MAX_ATTEMPTS = 64
 LABEL, OWNER, DIR = "org.dataset_76.sandbox", "org.dataset_76.owner", "org.dataset_76.dir"
 OVERLAP = "Pool overlaps"
@@ -59,7 +62,7 @@ def _start_time(pid: int) -> str | None:
         return None
     except ProcessLookupError:
         return None
-    return stat.rsplit(")", 1)[1].split()[19]   # fields after the command name start at field 3
+    return stat.rsplit(")", 1)[1].split()[19]  # fields after the command name start at field 3
 
 
 def _boot_id() -> str:
@@ -88,7 +91,7 @@ def _no_such_process(pid: int) -> bool:
     except ProcessLookupError:
         return True
     except PermissionError:
-        return False                         # it exists, as someone else's
+        return False  # it exists, as someone else's
     return False
 
 
@@ -102,9 +105,9 @@ def owner_gone(owner: str) -> bool:
     boot, ns, pid, start = m.groups()
     try:
         if boot != _boot_id():
-            return True                      # no process outlives a reboot
+            return True  # no process outlives a reboot
         if ns != _pid_ns():
-            return False                     # its pids are not ours to look up
+            return False  # its pids are not ours to look up
         seen = _start_time(int(pid))
         if seen is None:
             return _no_such_process(int(pid))
@@ -132,8 +135,9 @@ def docker_bridges() -> set[str]:
     ids = H.docker("network", "ls", "-q", "--filter", "driver=bridge", check=False).stdout.split()
     if not ids:
         return set()
-    out = H.docker("network", "inspect", "-f", '{{.Id}} {{index .Options "com.docker.network.bridge.name"}}', *ids,
-                   check=False).stdout
+    out = H.docker(
+        "network", "inspect", "-f", '{{.Id}} {{index .Options "com.docker.network.bridge.name"}}', *ids, check=False
+    ).stdout
     names = set()
     for line in out.splitlines():
         parts = line.split()
@@ -195,8 +199,15 @@ def used_subnets() -> list[ipaddress.IPv4Network]:
     return used
 
 
-def create(name: str, *, pool: str | None = None, prefix: int = PREFIX, attempts: int = MAX_ATTEMPTS,
-           extra: list[str] | None = None, rng: random.Random | None = None) -> tuple[str, int]:
+def create(
+    name: str,
+    *,
+    pool: str | None = None,
+    prefix: int = PREFIX,
+    attempts: int = MAX_ATTEMPTS,
+    extra: list[str] | None = None,
+    rng: random.Random | None = None,
+) -> tuple[str, int]:
     """Create the internal network `name` on a free /`prefix` of the pool: (subnet, attempts used).
 
     Raises SandboxError when no candidate was accepted within `attempts`; nothing is left behind then."""
@@ -211,13 +222,23 @@ def create(name: str, *, pool: str | None = None, prefix: int = PREFIX, attempts
         if any(cand.overlaps(u) for u in used):
             continue
         tried += 1
-        r = H.docker("network", "create", "--internal", "--opt", "com.docker.network.bridge.inhibit_ipv4=true",
-                     "--subnet", str(cand), *(extra or []), name, check=False)
+        r = H.docker(
+            "network",
+            "create",
+            "--internal",
+            "--opt",
+            "com.docker.network.bridge.inhibit_ipv4=true",
+            "--subnet",
+            str(cand),
+            *(extra or []),
+            name,
+            check=False,
+        )
         if r.returncode == 0:
             return str(cand), tried
         if OVERLAP not in r.stderr:
             raise H.SandboxError(f"docker network create {name} failed: {r.stderr.strip()[:300]}")
-        used.append(cand)            # taken meanwhile by another process: the next candidate
+        used.append(cand)  # taken meanwhile by another process: the next candidate
         if tried >= attempts:
             break
     raise H.SandboxError(f"no free /{prefix} in {pool} for {name} after {tried} attempts")
@@ -228,7 +249,7 @@ def reap_orphans() -> dict:
     """Remove the containers and networks of sandboxes whose owner is provably gone (`owner_gone`). Only resources
     carrying all three labels are considered; containers first, so that the network can go."""
     out = {"containers": [], "networks": [], "held": []}
-    if not _REAP_LOCK.acquire(blocking=False):       # a concurrent start is reaping: this one need not wait on it
+    if not _REAP_LOCK.acquire(blocking=False):  # a concurrent start is reaping: this one need not wait on it
         return {**out, "skipped": "another thread of this process is reaping"}
     try:
         return _reap_locked(out)
@@ -239,7 +260,9 @@ def reap_orphans() -> dict:
 def _reap_locked(out: dict) -> dict:
     full = ["--filter", f"label={LABEL}=1", "--filter", f"label={OWNER}", "--filter", f"label={DIR}"]
     ps = H.docker("ps", "-a", *full, "--format", '{{.ID}}\t{{.Names}}\t{{.Label "' + OWNER + '"}}', check=False)
-    if ps.returncode != 0:         # a docker that did not answer lists nothing: that is not "none left", and the caller that must know sees `skipped`
+    if (
+        ps.returncode != 0
+    ):  # a docker that did not answer lists nothing: that is not "none left", and the caller that must know sees `skipped`
         return {**out, "skipped": f"docker ps failed ({ps.returncode}): {str(ps.stderr).strip()[:200]}"}
     rows = ps.stdout
     gone = []
@@ -250,6 +273,7 @@ def _reap_locked(out: dict) -> dict:
     # an M sandbox's sidecar may still hold a live FUSE mount: the readers stop, the mount goes, then the sidecar and the
     # agent (teardown.fuse_first); a sandbox whose mount could not be released is left running, never SIGKILLed with it
     from . import teardown
+
     held = teardown.fuse_first([n for _, n in gone])
     for cid, name in gone:
         if name in held:

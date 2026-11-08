@@ -21,6 +21,7 @@ other hosts. The option-specific rules are the manipulated variable:
                     request that the client reads 1 KB of and closes costs the complete transfer.
   M, M+             no Onedata REST at all (the data comes from the mount).
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -31,8 +32,10 @@ REST_OPTIONS = (T, condition_c, D)
 ALL_OPTIONS = (T, condition_c, D, M, condition_d)
 
 ONEZONE, ONEPROVIDER = "onezone", "oneprovider"
-D_MESSAGE = ("In this sandbox, files cannot be read remotely in place; "
-             "download whole files with fs.get(remote_path, local_path) first.")
+D_MESSAGE = (
+    "In this sandbox, files cannot be read remotely in place; "
+    "download whole files with fs.get(remote_path, local_path) first."
+)
 
 _P = "/api/v3/"
 _RULES = (
@@ -52,7 +55,7 @@ class Decision:
     tag: str = ""
     store_and_forward: bool = False  # D content: fetch the whole file upstream before releasing any byte
     merge_pages: bool = False  # follow pagination upstream, answer with one complete page
-    status: int = 403          # HTTP status of a refusal
+    status: int = 403  # HTTP status of a refusal
 
 
 def decide(option: str, role: str, method: str, path: str, headers: dict[str, str]) -> Decision:
@@ -72,8 +75,7 @@ def decide(option: str, role: str, method: str, path: str, headers: dict[str, st
     if tag == "content" and option == D and "range" in headers:
         # 400, not 403: the shipped client's 403 path raises an unrelated TypeError (it takes len() of the
         # empty request body while logging), which would hide the reason from the agent
-        return Decision(False, D_MESSAGE, tag,
-                        status=400)
+        return Decision(False, D_MESSAGE, tag, status=400)
     if tag == "children" and option == condition_c:
         return Decision(True, "listing merged into one page", tag, merge_pages=True)
     if tag == "content" and option == D:

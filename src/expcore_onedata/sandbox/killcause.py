@@ -24,16 +24,24 @@ was looked at first): `earlyoom` (its journal, whatever the counters and the exi
 `unknown`. An infrastructure cause ends the run and retries it; the agent's own cause, or an exception in its code, is its outcome and is kept. `run_cause` applies the
 order to a run's cells.
 """
+
 from __future__ import annotations
 
 import re
 
 REASONS = ("memory_limit", "host_oom", "earlyoom", "container_dead", "time_limit", "killed_other", "unknown")
-CATEGORY = {"memory_limit": "agent", "time_limit": "agent", "host_oom": "infrastructure", "earlyoom": "infrastructure",
-            "container_dead": "infrastructure", "killed_other": "unknown", "unknown": "unknown"}
+CATEGORY = {
+    "memory_limit": "agent",
+    "time_limit": "agent",
+    "host_oom": "infrastructure",
+    "earlyoom": "infrastructure",
+    "container_dead": "infrastructure",
+    "killed_other": "unknown",
+    "unknown": "unknown",
+}
 
 
-AT_THE_LIMIT_S = 0.25   # a cell's time, from before its launch, against its limit: `timeout` itself starts later than that clock, so this is only for a coarse clock
+AT_THE_LIMIT_S = 0.25  # a cell's time, from before its launch, against its limit: `timeout` itself starts later than that clock, so this is only for a coarse clock
 PRECEDENCE = ("earlyoom", "container_dead", "host_oom", "memory_limit", "time_limit", "killed_other", "unknown")
 
 
@@ -47,8 +55,12 @@ def earlyoom_cause(kills: list[dict]) -> dict:
     """A cell of a run earlyoom hit (dataset_76.sandbox.earlyoom): infrastructure whatever else the counters say, and whatever the cell's
     exit code, since it leaves no counter and no kernel line, and the victim may be another container of the run."""
     who = ", ".join(sorted({f"{k['comm']} ({k['role']})" for k in kills}))
-    return {"reason": "earlyoom", "category": CATEGORY["earlyoom"], "basis": f"earlyoom's journal: {len(kills)} kill(s) of this run: {who}",
-            "earlyoom_kills": kills}
+    return {
+        "reason": "earlyoom",
+        "category": CATEGORY["earlyoom"],
+        "basis": f"earlyoom's journal: {len(kills)} kill(s) of this run: {who}",
+        "earlyoom_kills": kills,
+    }
 
 
 def parse_events(text: str) -> dict[str, int] | None:
@@ -80,12 +92,22 @@ def parse_kernel_oom(log: str, since_s: float | None = None) -> list[dict]:
         if since_s is not None and (ts is None or ts < since_s):
             continue
         mc = re.search(r"oom_memcg=(\S+?)(?:,|$|\s)", line)
-        out.append({"t": ts, "constraint": m.group("c"), "oom_memcg": mc.group(1) if mc else "", "text": line.strip()[:400]})
+        out.append(
+            {"t": ts, "constraint": m.group("c"), "oom_memcg": mc.group(1) if mc else "", "text": line.strip()[:400]}
+        )
     return out
 
 
-def classify(before: dict[str, int] | None, after: dict[str, int] | None, *, container_running: bool | None,
-             duration_s: float, timeout_s: float, kernel: list[dict] | None = None, container_id: str | None = None) -> dict:
+def classify(
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+    *,
+    container_running: bool | None,
+    duration_s: float,
+    timeout_s: float,
+    kernel: list[dict] | None = None,
+    container_id: str | None = None,
+) -> dict:
     """The cause of a cell that ended with 137/124. Returns {"reason", "category", "basis", ...deltas}.
 
     `kernel` is the OOM-kill lines of the cell's window (None: the log could not be read). Never guesses: conflicting or missing
@@ -100,35 +122,60 @@ def classify(before: dict[str, int] | None, after: dict[str, int] | None, *, con
     # the limit that was hit is `oom_memcg`: this container's own cgroup = its own limit; an ancestor's limit (the container is only
     # the victim, `task_memcg`) or CONSTRAINT_NONE = a limit the agent's allocation did not set, so not the agent's outcome
     own = [k for k in mine if k["constraint"] == "CONSTRAINT_MEMCG" and container_id in k.get("oom_memcg", "")]
-    host = [k for k in mine if k["constraint"] == "CONSTRAINT_NONE"
-            or (k["constraint"] == "CONSTRAINT_MEMCG" and container_id not in k.get("oom_memcg", ""))]
-    facts = {"events_delta": d or None, "kernel_lines": None if kernel is None else len(kernel),
-             "kernel_memcg_own": len(own), "kernel_host": len(host)}
+    host = [
+        k
+        for k in mine
+        if k["constraint"] == "CONSTRAINT_NONE"
+        or (k["constraint"] == "CONSTRAINT_MEMCG" and container_id not in k.get("oom_memcg", ""))
+    ]
+    facts = {
+        "events_delta": d or None,
+        "kernel_lines": None if kernel is None else len(kernel),
+        "kernel_memcg_own": len(own),
+        "kernel_host": len(host),
+    }
 
     def out(reason: str, basis: str) -> dict:
         return {"reason": reason, "category": CATEGORY[reason], "basis": basis, **facts}
 
-    if container_running is False:      # a dead sandbox ends the run whatever else is on record: infrastructure, retried
-        return out("container_dead", "the container is no longer running"
-                   + (f" (OOM counters in the cell's window: {d})" if d and d.get("oom_kill") else ""))
+    if container_running is False:  # a dead sandbox ends the run whatever else is on record: infrastructure, retried
+        return out(
+            "container_dead",
+            "the container is no longer running"
+            + (f" (OOM counters in the cell's window: {d})" if d and d.get("oom_kill") else ""),
+        )
     if d.get("oom_kill", 0) > 0:
         if d.get("oom", 0) > 0:
             if host and not own:
-                return out("unknown", "memory.events says the container limit, the kernel log says the host: conflicting")
-            if host:      # both happened in this window, each with its own line: the order decides, whichever the counters show
-                return out("host_oom", "the kernel log has both the container's limit and the host's killing a process of this container")
+                return out(
+                    "unknown", "memory.events says the container limit, the kernel log says the host: conflicting"
+                )
+            if (
+                host
+            ):  # both happened in this window, each with its own line: the order decides, whichever the counters show
+                return out(
+                    "host_oom",
+                    "the kernel log has both the container's limit and the host's killing a process of this container",
+                )
             return out("memory_limit", "memory.events: oom and oom_kill rose" + (" (kernel log agrees)" if own else ""))
         if own and not host:
             return out("unknown", "memory.events says the host, the kernel log says the container limit: conflicting")
-        return out("host_oom", "memory.events: oom_kill rose without oom (not this cgroup's own limit)"
-                   + (" (kernel log agrees)" if host else ""))
-    if not d and kernel:      # counters unreadable: the kernel log alone
+        return out(
+            "host_oom",
+            "memory.events: oom_kill rose without oom (not this cgroup's own limit)"
+            + (" (kernel log agrees)" if host else ""),
+        )
+    if not d and kernel:  # counters unreadable: the kernel log alone
         if own and not host:
             return out("memory_limit", "kernel log: CONSTRAINT_MEMCG of this container (memory.events unreadable)")
         if host and not own:
-            return out("host_oom", "kernel log: CONSTRAINT_NONE killing a process of this container (memory.events unreadable)")
+            return out(
+                "host_oom", "kernel log: CONSTRAINT_NONE killing a process of this container (memory.events unreadable)"
+            )
         return out("unknown", "memory.events unreadable and the kernel log has no unambiguous line for this container")
-    if duration_s >= timeout_s - AT_THE_LIMIT_S:      # `timeout -s KILL` fires at the time left; a cell that ended earlier did not hit it
+    if (
+        duration_s >= timeout_s - AT_THE_LIMIT_S
+    ):  # `timeout -s KILL` fires at the time left; a cell that ended earlier did not hit it
         return out("time_limit", "the cell ran to its time limit" + ("" if d else " (memory.events unreadable)"))
     if not d and container_running is None:
         return out("unknown", "nothing could be read: memory.events, the container state, the kernel log")

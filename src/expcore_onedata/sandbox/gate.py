@@ -37,6 +37,7 @@ anything reaches the client; nothing is retried after an answer began, and a rea
 failure is logged with its origin, `upstream` (the platform) or `gate` (the gate itself), and with what the client saw
 (`5xx` or `reset`), so a run can tell an error the gate made from one the platform made.
 """
+
 from __future__ import annotations
 
 import errno
@@ -58,12 +59,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import gatepolicy  # noqa: E402
+import gatepolicy
 
 CFG: dict = {}
 _LOCK = threading.Lock()
-_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
-        "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
+_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+}
 RUN_HEADER = "X-dataset-192"
 
 
@@ -76,13 +87,22 @@ def _log(rec: dict) -> None:
         print("GATE LOG FAILED", e, file=sys.stderr, flush=True)
 
 
-_LIVE: dict[str, "Handler"] = {}    # the client connections being served, by `conn`: added when a handler is set up, removed when it finishes
+_LIVE: dict[
+    str, Handler
+] = {}  # the client connections being served, by `conn`: added when a handler is set up, removed when it finishes
 _LIVE_LOCK = threading.Lock()
-TEARDOWN_BUDGET_S = 1.0             # the most the gate waits for its teardown lines when it stops
-_CONN_IDS = itertools.count(1)      # next() is atomic: one id per client connection, unique in this process (its pid is in the id, for logs of several)
-REQ_HEADERS_LOGGED = ("user-agent", "accept", "accept-encoding", "connection")    # a fixed allowlist: headers that carry no content, nothing else is ever logged
+TEARDOWN_BUDGET_S = 1.0  # the most the gate waits for its teardown lines when it stops
+_CONN_IDS = itertools.count(
+    1
+)  # next() is atomic: one id per client connection, unique in this process (its pid is in the id, for logs of several)
+REQ_HEADERS_LOGGED = (
+    "user-agent",
+    "accept",
+    "accept-encoding",
+    "connection",
+)  # a fixed allowlist: headers that carry no content, nothing else is ever logged
 REQ_HEADER_MAX = 512
-SIOCOUTQNSD = 0x894B                # ioctl: bytes the socket has queued and not yet sent (termios has SIOCOUTQ as TIOCOUTQ, not this)
+SIOCOUTQNSD = 0x894B  # ioctl: bytes the socket has queued and not yet sent (termios has SIOCOUTQ as TIOCOUTQ, not this)
 
 
 def _logged_headers(headers: dict) -> dict:
@@ -109,6 +129,7 @@ def _tcp_facts(sock) -> dict:
     try:
         import fcntl
         import termios
+
         for key, req in (("outq_unacked", termios.TIOCOUTQ), ("outq_unsent", SIOCOUTQNSD)):
             try:
                 out[key] = struct.unpack("=i", fcntl.ioctl(sock.fileno(), req, b"\0\0\0\0"))[0]
@@ -124,10 +145,18 @@ def _tcp_facts(sock) -> dict:
 # the hop to the gate, and it then waits up to 4 h for the answer. So upstream (Onezone and Oneprovider alike) the gate
 # allows 60 s to connect and hand-shake, plus one transparent retry, and 4 h to read. #8's oracle got a 502 on 1 Nov
 # when the old gate's 8 s bound ran out on a TLS handshake to Onezone under load.
-CONNECT_TIMEOUT = 60       # gate config `upstream_connect_timeout_s` overrides
-READ_TIMEOUT = 14400       # not below the client's read timeout: the gate must never fail first
-LOCAL_ERRNOS = {errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.ENOBUFS, errno.ENOSPC, errno.EDQUOT, errno.EROFS,
-                errno.EADDRNOTAVAIL}      # the last: the gate's own ephemeral ports ran out
+CONNECT_TIMEOUT = 60  # gate config `upstream_connect_timeout_s` overrides
+READ_TIMEOUT = 14400  # not below the client's read timeout: the gate must never fail first
+LOCAL_ERRNOS = {
+    errno.EMFILE,
+    errno.ENFILE,
+    errno.ENOMEM,
+    errno.ENOBUFS,
+    errno.ENOSPC,
+    errno.EDQUOT,
+    errno.EROFS,
+    errno.EADDRNOTAVAIL,
+}  # the last: the gate's own ephemeral ports ran out
 _SPOOL = {"now": 0, "peak": 0}
 # The gate container has --memory 1g, and its memory cgroup is charged for the page cache of the spool it writes (dirty pages first) and
 # reads back. Left alone, a whole file several times the cap filled the cap with `file` and the kernel OOM-killed the gate (S2, 3.79 GB).
@@ -137,10 +166,10 @@ _SPOOL = {"now": 0, "peak": 0}
 SPOOL_SYNC_BYTES = 64 << 20
 
 
-HANDSHAKE_TIMEOUT_S = 30   # a client's TLS handshake, in its own thread
-IDLE_TIMEOUT_S = 300       # a client connection with no request for this long is closed (threads are capped by --pids-limit)
-BODY_TIMEOUT_S = 60        # a request body must arrive within this; the allowed calls send a few KB at most
-MAX_BODY = 1 << 20         # larger request bodies are refused unread (the allowed calls are lookups)
+HANDSHAKE_TIMEOUT_S = 30  # a client's TLS handshake, in its own thread
+IDLE_TIMEOUT_S = 300  # a client connection with no request for this long is closed (threads are capped by --pids-limit)
+BODY_TIMEOUT_S = 60  # a request body must arrive within this; the allowed calls send a few KB at most
+MAX_BODY = 1 << 20  # larger request bodies are refused unread (the allowed calls are lookups)
 _CTX: dict[bool, ssl.SSLContext] = {}
 
 
@@ -150,6 +179,7 @@ def _upstream_ctx(verify: bool) -> ssl.SSLContext:
         if verify not in _CTX:
             try:
                 import certifi
+
                 ctx = ssl.create_default_context(cafile=certifi.where())
             except ImportError:
                 ctx = ssl.create_default_context()
@@ -162,10 +192,16 @@ def _upstream_ctx(verify: bool) -> ssl.SSLContext:
 
 def _upstream_conn(h: dict) -> http.client.HTTPConnection:
     if h.get("tls", True):
-        conn = http.client.HTTPSConnection(h["addr"], h.get("port", 443), context=_upstream_ctx(CFG.get("verify_ssl", True)),
-                                           timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT))
+        conn = http.client.HTTPSConnection(
+            h["addr"],
+            h.get("port", 443),
+            context=_upstream_ctx(CFG.get("verify_ssl", True)),
+            timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT),
+        )
     else:
-        conn = http.client.HTTPConnection(h["addr"], h.get("port", 80), timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT))
+        conn = http.client.HTTPConnection(
+            h["addr"], h.get("port", 80), timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT)
+        )
     conn.connect()
     conn.sock.settimeout(READ_TIMEOUT)  # short connect, then a read timeout that outlasts the client's
     return conn
@@ -258,7 +294,7 @@ class _LastLine:
 class _CountingResponse(http.client.HTTPResponse):
     def __init__(self, sock, debuglevel=0, method=None, url=None, *, seen: dict):
         super().__init__(sock, debuglevel, method=method, url=url)
-        unbuffered = sock.makefile("rb", buffering=0)     # its own reference to the socket, taken before the old one goes
+        unbuffered = sock.makefile("rb", buffering=0)  # its own reference to the socket, taken before the old one goes
         self.fp.close()
         self.fp = _LastLine(io.BufferedReader(_CountingRaw(unbuffered, seen)), seen)
 
@@ -290,8 +326,13 @@ class _Upstream(Exception):
         self.origin = origin_of(cause)
 
 
-_LOST = (ConnectionError, http.client.CannotSendRequest, http.client.RemoteDisconnected, ssl.SSLEOFError,
-         ssl.SSLZeroReturnError)
+_LOST = (
+    ConnectionError,
+    http.client.CannotSendRequest,
+    http.client.RemoteDisconnected,
+    ssl.SSLEOFError,
+    ssl.SSLZeroReturnError,
+)
 
 
 def _repeatable(e: BaseException, phase: str, answer_bytes: int) -> bool:
@@ -320,7 +361,7 @@ def _checked(resp: http.client.HTTPResponse, seen: dict) -> http.client.HTTPResp
     return resp
 
 
-TLS_RECORD = 16384   # the most plaintext one TLS record carries: a client reads a record whole or not at all
+TLS_RECORD = 16384  # the most plaintext one TLS record carries: a client reads a record whole or not at all
 
 
 class _CountingWriter:
@@ -355,7 +396,7 @@ class _CountingWriter:
         total, sent = len(view), 0
         try:
             while sent < total:
-                k = self.sock.send(view[sent:sent + self.step] if self.step else view[sent:])
+                k = self.sock.send(view[sent : sent + self.step] if self.step else view[sent:])
                 if not k:
                     raise ConnectionError("the client's socket took no bytes")
                 sent += k
@@ -373,15 +414,19 @@ class _CountingWriter:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "dataset-149"
-    disable_nagle_algorithm = True   # headers and body are separate writes: keep-alive would stall on Nagle + delayed ACK
+    disable_nagle_algorithm = (
+        True  # headers and body are separate writes: keep-alive would stall on Nagle + delayed ACK
+    )
 
-    def log_message(self, *a):  # noqa: D401 - silence default stderr logging
+    def log_message(self, *a):
         pass
 
     def setup(self) -> None:
-        self._conn = f"{os.getpid()}-{next(_CONN_IDS)}"      # first: whatever this handler logs, from here on, is this connection's
+        self._conn = (
+            f"{os.getpid()}-{next(_CONN_IDS)}"  # first: whatever this handler logs, from here on, is this connection's
+        )
         self._timed_out = False
-        self._last_logged = 0                                # the number of the last request line this connection wrote
+        self._last_logged = 0  # the number of the last request line this connection wrote
         self._close_logged = False
         # the TLS handshake runs here, in this connection's own thread: done in accept() it would serialise every
         # client's handshake behind the slowest one, and a client that never finishes it would stall the gate
@@ -390,12 +435,14 @@ class Handler(BaseHTTPRequestHandler):
             self.request.do_handshake()
         super().setup()
         self.wfile = self._w = _CountingWriter(self.wfile, self.connection)
-        self._probe = _ProbedRaw(self.rfile.detach())                 # the buffer socketserver made, nothing read yet, rebuilt over a raw that can be probed
-        self.rfile = io.BufferedReader(self._probe, io.DEFAULT_BUFFER_SIZE)     # the size `makefile` gives it
-        self._pool: dict[tuple, http.client.HTTPConnection] = {}   # this client connection's upstream connections
-        self._served = 0                                           # requests so far on this client connection
+        self._probe = _ProbedRaw(
+            self.rfile.detach()
+        )  # the buffer socketserver made, nothing read yet, rebuilt over a raw that can be probed
+        self.rfile = io.BufferedReader(self._probe, io.DEFAULT_BUFFER_SIZE)  # the size `makefile` gives it
+        self._pool: dict[tuple, http.client.HTTPConnection] = {}  # this client connection's upstream connections
+        self._served = 0  # requests so far on this client connection
         self._response_started = False
-        with _LIVE_LOCK:                                              # last: a handler whose setup failed was never live
+        with _LIVE_LOCK:  # last: a handler whose setup failed was never live
             _LIVE[self._conn] = self
 
     def finish(self) -> None:
@@ -407,8 +454,8 @@ class Handler(BaseHTTPRequestHandler):
         super().finish()
 
     def handle_one_request(self) -> None:
-        self.connection.settimeout(IDLE_TIMEOUT_S)   # only while waiting for a request: `_handle` lifts it
-        self.raw_requestline = b""                    # set by the parser once a request line has arrived
+        self.connection.settimeout(IDLE_TIMEOUT_S)  # only while waiting for a request: `_handle` lifts it
+        self.raw_requestline = b""  # set by the parser once a request line has arrived
         self._w.reset()
         self._timed_out = False
         after = self._served
@@ -436,7 +483,16 @@ class Handler(BaseHTTPRequestHandler):
     def _conn_close(self, ended: str, after: int, **extra) -> None:
         """Log how this connection ended after `after` responses, with the kernel's counters of it (`_tcp_facts`) taken now."""
         self._close_logged = True
-        _log({"event": "conn_close", "conn": self._conn, "after_request": after, "ended": ended, **_tcp_facts(self.connection), **extra})
+        _log(
+            {
+                "event": "conn_close",
+                "conn": self._conn,
+                "after_request": after,
+                "ended": ended,
+                **_tcp_facts(self.connection),
+                **extra,
+            }
+        )
 
     def _teardown_line(self) -> None:
         """The gate is stopping and this connection is open: its close line, `ended` "teardown", unless it has written one. `after_request` is the last request line
@@ -465,11 +521,13 @@ class Handler(BaseHTTPRequestHandler):
             return True
         extra: dict = {}
         try:
-            data = socket.socket.recv(self.connection, 1, socket.MSG_PEEK | socket.MSG_DONTWAIT)   # the socket's own recv, below the TLS layer
+            data = socket.socket.recv(
+                self.connection, 1, socket.MSG_PEEK | socket.MSG_DONTWAIT
+            )  # the socket's own recv, below the TLS layer
         except ConnectionResetError:
             ended = "reset"
         except (BlockingIOError, TimeoutError):
-            return False                                  # readable and then not: let the ordinary read wait as it always did
+            return False  # readable and then not: let the ordinary read wait as it always did
         except OSError as e:
             ended, extra = "error", {"error": repr(e)[:300]}
         else:
@@ -487,21 +545,29 @@ class Handler(BaseHTTPRequestHandler):
         if msg.startswith("Request timed out"):
             self._timed_out = True
         if msg.startswith("Request timed out") and self.raw_requestline:
-            _log({"event": "request_error", "conn": self._conn, "status": None, "reason": "request headers not received in time",
-                  "error_origin": "client", "client_saw": "close",
-                  "request_line": self.raw_requestline[:200].decode("latin-1", "replace").strip()})
+            _log(
+                {
+                    "event": "request_error",
+                    "conn": self._conn,
+                    "status": None,
+                    "reason": "request headers not received in time",
+                    "error_origin": "client",
+                    "client_saw": "close",
+                    "request_line": self.raw_requestline[:200].decode("latin-1", "replace").strip(),
+                }
+            )
 
     def send_header(self, keyword, value) -> None:
         super().send_header(keyword, value)
         if keyword.lower() == "content-length":
             try:
-                self._w.total = int(value)             # the body's length, as the client is told it (the last one sent)
+                self._w.total = int(value)  # the body's length, as the client is told it (the last one sent)
             except ValueError:
                 pass
 
     def end_headers(self) -> None:
         super().end_headers()
-        self._w.mark = self._w.n                      # what follows is the body
+        self._w.mark = self._w.n  # what follows is the body
         self._response_started = True
 
     def _log(self, rec: dict) -> None:
@@ -520,7 +586,7 @@ class Handler(BaseHTTPRequestHandler):
         body = 0 if w.mark is None else w.n - w.mark
         rec["body_bytes"] = body
         if w.failed:
-            in_body = w.failed if w.mark is not None else 0       # a header write's rest is not body
+            in_body = w.failed if w.mark is not None else 0  # a header write's rest is not body
             total = w.total if w.total is not None else body + in_body
             rec["body_bytes_unconfirmed"] = max(total - body, in_body)
         _log(rec)
@@ -528,9 +594,14 @@ class Handler(BaseHTTPRequestHandler):
     def send_error(self, code, message=None, explain=None) -> None:
         """Errors the request parser answers before `_handle` runs (a malformed request line or version, an unknown
         method, an oversized line): logged like every other request, as the client's own. `_handle` never calls this."""
-        rec = {"event": "request_error", "status": code, "reason": message or "", "error_origin": "client",
-               "client_saw": "5xx" if code >= 500 else "4xx",
-               "request_line": (getattr(self, "raw_requestline", b"") or b"")[:200].decode("latin-1", "replace").strip()}
+        rec = {
+            "event": "request_error",
+            "status": code,
+            "reason": message or "",
+            "error_origin": "client",
+            "client_saw": "5xx" if code >= 500 else "4xx",
+            "request_line": (getattr(self, "raw_requestline", b"") or b"")[:200].decode("latin-1", "replace").strip(),
+        }
         try:
             super().send_error(code, message, explain)
         finally:
@@ -612,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
             except _Framing as e:
                 self._drop(hcfg)
                 raise _Upstream(e) from e
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self._pool.pop(key, None) if conn is None else self._drop(hcfg)
                 if attempt == 2 or not _repeatable(e, phase, seen["bytes"]):
                     raise _Upstream(e) from e
@@ -637,15 +708,23 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _handle(self) -> None:
-        self.connection.settimeout(BODY_TIMEOUT_S)   # the head has arrived; the body gets a bounded time
+        self.connection.settimeout(BODY_TIMEOUT_S)  # the head has arrived; the body gets a bounded time
         self._served += 1
         self._response_started = False
         host = (self.headers.get("Host") or "").split(":")[0].lower()
         hcfg = CFG["hosts"].get(host)
         url = urlsplit(self.path)
         headers = {k.lower(): v for k, v in self.headers.items()}
-        rec = {"host": host, "method": self.command, "path": url.path, "query": url.query,
-               "range": headers.get("range"), "conn": self._conn, "conn_request": self._served, "req_headers": _logged_headers(headers)}
+        rec = {
+            "host": host,
+            "method": self.command,
+            "path": url.path,
+            "query": url.query,
+            "range": headers.get("range"),
+            "conn": self._conn,
+            "conn_request": self._served,
+            "req_headers": _logged_headers(headers),
+        }
         n = headers.get("content-length") or "0"
         if "transfer-encoding" in headers or not n.isdecimal():
             # only a declared length frames a body here: anything else could leave bytes to be read as the next request
@@ -664,7 +743,7 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self.close_connection = True
             return
-        self.connection.settimeout(None)             # the upstream's own timeouts bound the rest
+        self.connection.settimeout(None)  # the upstream's own timeouts bound the rest
         if hcfg is None:
             rec.update(decision="deny", reason="host not allowed", status=403)
             self._answer(rec, 403, {"error": {"id": "forbidden", "details": "host not allowed"}})
@@ -673,7 +752,11 @@ class Handler(BaseHTTPRequestHandler):
         rec.update(decision="allow" if dec.allow else "deny", reason=dec.reason, tag=dec.tag)
         if not dec.allow:
             rec["status"] = dec.status
-            self._answer(rec, dec.status, {"error": {"id": "forbidden" if dec.status == 403 else "badRequest", "details": dec.reason}})
+            self._answer(
+                rec,
+                dec.status,
+                {"error": {"id": "forbidden" if dec.status == 403 else "badRequest", "details": dec.reason}},
+            )
             return
         try:
             if dec.merge_pages:
@@ -690,11 +773,11 @@ class Handler(BaseHTTPRequestHandler):
             rec.setdefault("status", None)
             self._log(rec)
             self.close_connection = True
-        except Exception as e:  # noqa: BLE001
-            self._drop(hcfg)              # its state is unknown: it is never reused
+        except Exception as e:
+            self._drop(hcfg)  # its state is unknown: it is never reused
             origin = e.origin if isinstance(e, _Upstream) else "gate"
             rec.update(status=502, error=repr(e.cause if isinstance(e, _Upstream) else e)[:500], error_origin=origin)
-            if self._response_started:    # a 502 cannot follow a response already begun: its body must not look complete
+            if self._response_started:  # a 502 cannot follow a response already begun: its body must not look complete
                 rec["client_saw"] = "reset"
                 self._log(rec)
                 self._abort_client()
@@ -723,9 +806,11 @@ class Handler(BaseHTTPRequestHandler):
             if k.lower() not in _HOP:
                 self.send_header(k, v)
         if resp.status in (204, 304):
-            declared = 0                                   # no body by definition, nothing to frame
+            declared = 0  # no body by definition, nothing to frame
         elif declared is not None:
-            self.send_header("Content-Length", str(declared))   # a framed body: this connection can carry the next request
+            self.send_header(
+                "Content-Length", str(declared)
+            )  # a framed body: this connection can carry the next request
         else:
             self.send_header("Connection", "close")
             self.close_connection = True
@@ -735,33 +820,39 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 chunk = resp.read(1 << 20)
             except (OSError, http.client.HTTPException) as e:
-                failure, failure_origin = repr(e), origin_of(e)     # the gate's own read timeout is the gate's
+                failure, failure_origin = repr(e), origin_of(e)  # the gate's own read timeout is the gate's
                 break
             if not chunk:
                 break
             try:
                 self.wfile.write(chunk)
             except OSError as e:
-                if e.errno in LOCAL_ERRNOS:            # the gate's own resources failed the write, not the client
+                if e.errno in LOCAL_ERRNOS:  # the gate's own resources failed the write, not the client
                     failure, failure_origin = repr(e), "gate"
                 else:
                     rec["client_aborted"] = True
                 break
             sent += len(chunk)
         if failure is None and not rec.get("client_aborted") and declared is not None and sent != declared:
-            failure = f"upstream sent {sent} of {declared} bytes"     # http.client does not raise on an early EOF here
+            failure = f"upstream sent {sent} of {declared} bytes"  # http.client does not raise on an early EOF here
         if failure or rec.get("client_aborted"):
             self._drop(hcfg)
             self._abort_client()
         else:
             self._settle(hcfg, resp)
         if failure:
-            rec.update(status=502, upstream_status=resp.status, bytes=sent, error=failure, error_origin=failure_origin,
-                       client_saw="reset")
+            rec.update(
+                status=502,
+                upstream_status=resp.status,
+                bytes=sent,
+                error=failure,
+                error_origin=failure_origin,
+                client_saw="reset",
+            )
         else:
             rec.update(status=resp.status, bytes=sent)
             if resp.status >= 500:
-                rec.update(error_origin="upstream", client_saw="5xx")    # the platform's own 5xx, passed on as it was
+                rec.update(error_origin="upstream", client_saw="5xx")  # the platform's own 5xx, passed on as it was
         self._log(rec)
 
     def _store_and_forward(self, hcfg, url, headers, body, rec) -> None:
@@ -791,7 +882,7 @@ class Handler(BaseHTTPRequestHandler):
             self._log(rec)
             return
         spool_dir = os.path.join(os.path.dirname(CFG["log"]), "spool")
-        os.makedirs(spool_dir, exist_ok=True)     # a failure here is the gate's own (handled by the caller as one)
+        os.makedirs(spool_dir, exist_ok=True)  # a failure here is the gate's own (handled by the caller as one)
         fd, spool = tempfile.mkstemp(dir=spool_dir)
         sent = 0
         try:
@@ -805,10 +896,12 @@ class Handler(BaseHTTPRequestHandler):
                         raise _Upstream(e) from e
                     if not chunk:
                         break
-                    f.write(chunk)                   # the gate's disk: an OSError here is the gate's
+                    f.write(chunk)  # the gate's disk: an OSError here is the gate's
                     got += len(chunk)
                     _spool_add(len(chunk))
-                    if got - got % SPOOL_SYNC_BYTES > synced:     # the page cache of the spool stays bounded (see SPOOL_SYNC_BYTES)
+                    if (
+                        got - got % SPOOL_SYNC_BYTES > synced
+                    ):  # the page cache of the spool stays bounded (see SPOOL_SYNC_BYTES)
                         boundary = got - got % SPOOL_SYNC_BYTES
                         _spool_flush(f, synced, boundary)
                         synced = boundary
@@ -832,11 +925,13 @@ class Handler(BaseHTTPRequestHandler):
                     while chunk := f.read(1 << 20):
                         self.wfile.write(chunk)
                         sent += len(chunk)
-                        if sent - sent % SPOOL_SYNC_BYTES > dropped:     # what is sent leaves the page cache, in aligned batches
+                        if (
+                            sent - sent % SPOOL_SYNC_BYTES > dropped
+                        ):  # what is sent leaves the page cache, in aligned batches
                             boundary = sent - sent % SPOOL_SYNC_BYTES
                             _spool_drop(f.fileno(), dropped, boundary)
                             dropped = boundary
-            except (ConnectionError, ssl.SSLError):     # the client went away (TLS too): the transfer still happened
+            except (ConnectionError, ssl.SSLError):  # the client went away (TLS too): the transfer still happened
                 rec["client_aborted"] = True
                 self.close_connection = True
             rec.update(status=200, bytes=sent)
@@ -876,7 +971,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 page = json.loads(data)
                 if not isinstance(page, dict) or not isinstance(page.get("children"), list):
-                    raise ValueError(f"listing page without a list of children: {str(data[:120])}")
+                    raise ValueError(f"listing page without a list of children: {data[:120]!s}")
             except ValueError as e:
                 raise _Upstream(_Framing(str(e))) from e
             pages += 1
@@ -884,8 +979,14 @@ class Handler(BaseHTTPRequestHandler):
             token, is_last = page.get("nextPageToken"), page.get("isLast")
             if is_last is True:
                 break
-            if is_last is not False or not token:   # never rewritten as complete: this is what condition_a exists to expose
-                raise _Upstream(_Framing(f"listing page with no valid end or continuation: isLast={is_last!r}, nextPageToken present: {bool(token)}"))
+            if (
+                is_last is not False or not token
+            ):  # never rewritten as complete: this is what condition_a exists to expose
+                raise _Upstream(
+                    _Framing(
+                        f"listing page with no valid end or continuation: isLast={is_last!r}, nextPageToken present: {bool(token)}"
+                    )
+                )
         n = self._send_json(200, {"children": children, "isLast": True, "nextPageToken": None}, close=False)
         rec.update(status=200, bytes=n, pages=pages, entries=len(children))
         self._log(rec)
@@ -899,7 +1000,7 @@ def _teardown_lines() -> None:
     for h in live:
         try:
             h._teardown_line()
-        except Exception as e:  # noqa: BLE001 - one connection's line must not cost the others theirs
+        except Exception as e:
             print("GATE TEARDOWN LINE FAILED", repr(e)[:200], file=sys.stderr, flush=True)
 
 
@@ -912,13 +1013,14 @@ def teardown() -> None:
         t.join(TEARDOWN_BUDGET_S)
         if t.is_alive():
             print("GATE TEARDOWN INCOMPLETE", file=sys.stderr, flush=True)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print("GATE TEARDOWN FAILED", repr(e)[:200], file=sys.stderr, flush=True)
 
 
 class GateServer(ThreadingHTTPServer):
     """One thread per client connection; a deep accept queue for bursts of new connections (the default is 5; gate
     config `listen_backlog` overrides). Closing it is the gate's stop: the connections still open get their teardown lines first (`teardown`)."""
+
     request_queue_size = 256
     daemon_threads = True
 
@@ -932,10 +1034,18 @@ class GateServer(ThreadingHTTPServer):
         """A connection that failed outside a request (a TLS handshake, a thread that could not start): logged, never
         silent. Its origin is the gate unless the client broke off its own handshake."""
         import traceback
+
         e = sys.exc_info()[1]
         client = isinstance(e, (ssl.SSLError, ConnectionError, TimeoutError, socket.timeout))
-        _log({"event": "connection_error", "error": repr(e)[:300], "error_origin": "client" if client else "gate",
-              "client_saw": "reset", "trace": traceback.format_exc(limit=3)[-600:]})
+        _log(
+            {
+                "event": "connection_error",
+                "error": repr(e)[:300],
+                "error_origin": "client" if client else "gate",
+                "client_saw": "reset",
+                "trace": traceback.format_exc(limit=3)[-600:],
+            }
+        )
 
 
 def _tls_context() -> ssl.SSLContext:
@@ -979,8 +1089,16 @@ def _pipe(a, b, sides: tuple[str, str], state: dict, listen: int) -> None:
         if failed and first:
             side, e = failed
             origin = "gate" if e.errno in LOCAL_ERRNOS else ("upstream" if side == "upstream" else "client")
-            _log({"event": "tcp_forward_error", "listen": listen, "side": side, "error": repr(e)[:300],
-                  "error_origin": origin, "client_saw": None if origin == "client" else "reset"})
+            _log(
+                {
+                    "event": "tcp_forward_error",
+                    "listen": listen,
+                    "side": side,
+                    "error": repr(e)[:300],
+                    "error_origin": origin,
+                    "client_saw": None if origin == "client" else "reset",
+                }
+            )
         for s_ in (a, b):
             try:
                 s_.shutdown(socket.SHUT_RDWR)
@@ -995,24 +1113,40 @@ def _tcp_forward(listen: int, host: str, port: int) -> None:
     srv.listen(64)
 
     def serve():
-        while True:                       # nothing that happens to one connection may end the accept loop
+        while True:  # nothing that happens to one connection may end the accept loop
             try:
                 c, _ = srv.accept()
             except OSError as e:
-                _log({"event": "tcp_forward_error", "listen": listen, "error": repr(e)[:300], "error_origin": "gate",
-                      "client_saw": None})
+                _log(
+                    {
+                        "event": "tcp_forward_error",
+                        "listen": listen,
+                        "error": repr(e)[:300],
+                        "error_origin": "gate",
+                        "client_saw": None,
+                    }
+                )
                 time.sleep(0.1)
                 continue
             u = None
             try:
-                u = socket.create_connection((host, port), timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT))
-                u.settimeout(None)        # the connect bound only: reading waits as long as the client does
+                u = socket.create_connection(
+                    (host, port), timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT)
+                )
+                u.settimeout(None)  # the connect bound only: reading waits as long as the client does
                 state = {"closing": False}
                 threading.Thread(target=_pipe, args=(c, u, ("client", "upstream"), state, listen), daemon=True).start()
                 threading.Thread(target=_pipe, args=(u, c, ("upstream", "client"), state, listen), daemon=True).start()
-            except Exception as e:  # noqa: BLE001 - a refused connect, or no thread to be had (the pids limit)
-                _log({"event": "tcp_forward_error", "listen": listen, "error": repr(e)[:300],
-                      "error_origin": origin_of(e) if isinstance(e, OSError) else "gate", "client_saw": "reset"})
+            except Exception as e:
+                _log(
+                    {
+                        "event": "tcp_forward_error",
+                        "listen": listen,
+                        "error": repr(e)[:300],
+                        "error_origin": origin_of(e) if isinstance(e, OSError) else "gate",
+                        "client_saw": "reset",
+                    }
+                )
                 for s_ in (c, u):
                     if s_ is not None:
                         try:
@@ -1027,8 +1161,10 @@ def _tcp_forward(listen: int, host: str, port: int) -> None:
 def serve(httpd) -> None:
     """Serve until SIGTERM or SIGINT (a container's PID 1 ignores SIGTERM unless it has a handler), then stop: close the server, which writes the teardown lines.
     The handler only asks a thread to end the loop: `shutdown` called from the thread that runs the loop would wait for itself."""
+
     def stop(signum, frame):
         threading.Thread(target=httpd.shutdown, daemon=True).start()
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, stop)
     try:
@@ -1044,7 +1180,9 @@ def main() -> None:
     GateServer.request_queue_size = int(CFG.get("listen_backlog", GateServer.request_queue_size))
     httpd = GateServer(("0.0.0.0", 443), Handler)
     httpd.socket = _tls_context().wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
-    open(CFG["log"], "a").close()     # a gate that cannot log does not start, and one that started leaves a log, so a missing log is lost evidence, not zero errors
+    open(
+        CFG["log"], "a"
+    ).close()  # a gate that cannot log does not start, and one that started leaves a log, so a missing log is lost evidence, not zero errors
     print("gate ready", flush=True)
     serve(httpd)
 

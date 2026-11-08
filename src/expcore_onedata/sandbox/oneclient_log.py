@@ -20,6 +20,7 @@ Only warnings, errors and fatals are counted. Each is classified by ORIGIN where
 `agent_saw_sidecar_error` is NOT derived here: whether the agent's process received the errno is a fact of the
 agent's file operations (the #9 tracer's errno records), and stays None (unknown) until that is read.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -28,12 +29,17 @@ from collections import Counter
 
 LINE = re.compile(r"^([IEWF])(\d{4}) (\d\d:\d\d:\d\d\.\d+)\s+(\d+) ([\w./-]+):(\d+)\] (.*)$")
 SIDECAR_FILES = ("connectionPool.cc", "handshake", "tls", "ssl", "fuseFileHandle.cc", "storageHelper", "helpers")
-CONTEXT_WINDOW_S = 5.0     # how far back a FUSE exception looks for the sidecar error that may explain it
+CONTEXT_WINDOW_S = 5.0  # how far back a FUSE exception looks for the sidecar error that may explain it
 FUSE_LINES_KEPT = 50
 # UNOBSERVED so far: no log of 31 Oct - 1 Nov contains a line in which the provider replies with an error, so these
 # markers are guesses at oneclient's wording and the platform bucket has never been filled by a real line.
-PLATFORM_MARKERS = ("oneprovider returned", "provider returned", "received error from oneprovider",
-                    "oneprovider responded with", "error response from oneprovider")
+PLATFORM_MARKERS = (
+    "oneprovider returned",
+    "provider returned",
+    "received error from oneprovider",
+    "oneprovider responded with",
+    "error response from oneprovider",
+)
 # errnos that the agent's OWN request causes, whatever the operation: it asked for a path that is not there, wrote to the
 # read-only mount, opened a directory as a file. The mount did what it should; this is not a failure of the data path, and
 # no "the agent saw an error" fallback may count it.
@@ -46,9 +52,15 @@ AGENT_CAUSED = {"No such file or directory": "ENOENT", "Read-only file system": 
 # infrastructure faults. They are marked `ambiguous_permission` so the analysis can see them.
 AMBIGUOUS_PERMISSION = {"Permission denied": "EACCES", "Operation not permitted": "EPERM"}
 # errno texts the FUSE layer reports (strerror) for the transient failures that matter to a reader
-TRANSIENT = {"Input/output error": "EIO", "Resource temporarily unavailable": "EAGAIN",
-             "Transport endpoint is not connected": "ENOTCONN", "Stale file handle": "ESTALE",
-             "Connection timed out": "ETIMEDOUT", "Host is down": "EHOSTDOWN", "Connection refused": "ECONNREFUSED"}
+TRANSIENT = {
+    "Input/output error": "EIO",
+    "Resource temporarily unavailable": "EAGAIN",
+    "Transport endpoint is not connected": "ENOTCONN",
+    "Stale file handle": "ESTALE",
+    "Connection timed out": "ETIMEDOUT",
+    "Host is down": "EHOSTDOWN",
+    "Connection refused": "ECONNREFUSED",
+}
 
 
 def signature(msg: str) -> str:
@@ -79,7 +91,9 @@ def classify(file: str, msg: str) -> tuple[str, str]:
     m = re.search(r"fuse error exception: (.*)$", low)
     if m:
         text = m.group(1).strip()
-        errno = next((v for k, v in {**TRANSIENT, **AGENT_CAUSED, **AMBIGUOUS_PERMISSION}.items() if k.lower() == text), "other")
+        errno = next(
+            (v for k, v in {**TRANSIENT, **AGENT_CAUSED, **AMBIGUOUS_PERMISSION}.items() if k.lower() == text), "other"
+        )
         return "unattributed", f"fuse_error:{errno}"
     if any(f.lower() in file.lower() for f in SIDECAR_FILES):
         return "sidecar", "client_internal"
@@ -87,8 +101,8 @@ def classify(file: str, msg: str) -> tuple[str, str]:
 
 
 HEADER = re.compile(r"^Log file created at: (\d{4})/(\d\d)/(\d\d) (\d\d:\d\d:\d\d)")
-FALLBACK_YEAR = 2024        # a leap year: used only for a log without its creation header
-REF_YEAR = 2000             # a leap year: orders month-days (Feb 29 included) to find a year end
+FALLBACK_YEAR = 2024  # a leap year: used only for a log without its creation header
+REF_YEAR = 2000  # a leap year: orders month-days (Feb 29 included) to find a year end
 
 
 def _t(year: int, md: str, ts: str) -> float | None:
@@ -99,9 +113,11 @@ def _t(year: int, md: str, ts: str) -> float | None:
     try:
         h, m, sec = ts.split(":")
         sec_f = float(sec)
-        if not 0 <= sec_f < 60:      # datetime would accept the minutes and hours but not the seconds: reject them here
+        if not 0 <= sec_f < 60:  # datetime would accept the minutes and hours but not the seconds: reject them here
             return None
-        return (dt.datetime(year, int(md[:2]), int(md[2:]), int(h), int(m)) - dt.datetime(2000, 1, 1)).total_seconds() + sec_f
+        return (
+            dt.datetime(year, int(md[:2]), int(md[2:]), int(h), int(m)) - dt.datetime(2000, 1, 1)
+        ).total_seconds() + sec_f
     except (ValueError, OverflowError):
         return None
 
@@ -117,13 +133,18 @@ def summarize(log_text: str) -> dict:
     first = last = None
     last_sidecar: tuple[float, str] | None = None
     n_lines = n_bad = fuse_total = fuse_agent = 0
-    year, prev_ref = FALLBACK_YEAR, None   # year end: a month-day more than half a year before the previous one is next year
+    year, prev_ref = (
+        FALLBACK_YEAR,
+        None,
+    )  # year end: a month-day more than half a year before the previous one is next year
     for raw in log_text.splitlines():
         n_lines += 1
         h = HEADER.match(raw)
         if h:
             year = int(h.group(1))
-            prev_ref = _t(REF_YEAR, h.group(2) + h.group(3), h.group(4))     # the creation date seeds the year-end tracking
+            prev_ref = _t(
+                REF_YEAR, h.group(2) + h.group(3), h.group(4)
+            )  # the creation date seeds the year-end tracking
             continue
         m = LINE.match(raw)
         if not m:
@@ -148,27 +169,53 @@ def summarize(log_text: str) -> dict:
         if origin == "sidecar":
             last_sidecar = (t, kind) if t is not None else None
         elif kind.startswith("fuse_error:"):
-            near = last_sidecar if (t is not None and last_sidecar and 0 <= t - last_sidecar[0] <= CONTEXT_WINDOW_S) else None
+            near = (
+                last_sidecar
+                if (t is not None and last_sidecar and 0 <= t - last_sidecar[0] <= CONTEXT_WINDOW_S)
+                else None
+            )
             ctx[near[1] if near else "none"] += 1
             agent = caused_by_agent(kind)
             fuse_total += 1
             fuse_agent += agent
             if len(fuse_lines) < FUSE_LINES_KEPT:
-                fuse_lines.append({"t": f"{md} {ts}", "errno": kind.split(":", 1)[1], "preceded_by": near[1] if near else None,
-                                   "gap_s": round(t - near[0], 6) if near else None, "caused_by_agent": agent,
-                                   "ambiguous_permission": ambiguous_permission(kind)})
-    return {"total": n_bad, "by_origin": dict(by_origin), "by_kind": dict(by_kind), "signatures": dict(sigs.most_common(20)),
-            "fuse_preceded_by": dict(ctx), "fuse_lines": fuse_lines,
-            "fuse_total": fuse_total, "fuse_caused_by_agent": fuse_agent, "fuse_not_caused_by_agent": fuse_total - fuse_agent, "first": first, "last": last, "log_lines": n_lines}
+                fuse_lines.append(
+                    {
+                        "t": f"{md} {ts}",
+                        "errno": kind.split(":", 1)[1],
+                        "preceded_by": near[1] if near else None,
+                        "gap_s": round(t - near[0], 6) if near else None,
+                        "caused_by_agent": agent,
+                        "ambiguous_permission": ambiguous_permission(kind),
+                    }
+                )
+    return {
+        "total": n_bad,
+        "by_origin": dict(by_origin),
+        "by_kind": dict(by_kind),
+        "signatures": dict(sigs.most_common(20)),
+        "fuse_preceded_by": dict(ctx),
+        "fuse_lines": fuse_lines,
+        "fuse_total": fuse_total,
+        "fuse_caused_by_agent": fuse_agent,
+        "fuse_not_caused_by_agent": fuse_total - fuse_agent,
+        "first": first,
+        "last": last,
+        "log_lines": n_lines,
+    }
 
 
-DETECT_START = re.compile(r"Performing automatic storage access type detection for storage (\S+) for file \S+ "
-                          r"with forced proxy io mode: (\d)")
+DETECT_START = re.compile(
+    r"Performing automatic storage access type detection for storage (\S+) for file \S+ "
+    r"with forced proxy io mode: (\d)"
+)
 DETECT_END = re.compile(r"Storage '(\S+)' is not directly accessible to the client\.")
-DETECT_RESULTS = {DETECT_END: "not_directly_accessible"}      # the only end line oneclient 25.0 has been seen to write
-DETECT_NOTE = ("oneclient logs the start (helpersCache.h:467) and the end (helpersCache.h:752) of each storage access type "
-               "detection; the first phase (auto mode) is storage_detection_s; a later phase (forced proxy io mode 1) follows "
-               "at once in the same log and is listed in phases, not added: the log does not say whether the application waits for it")
+DETECT_RESULTS = {DETECT_END: "not_directly_accessible"}  # the only end line oneclient 25.0 has been seen to write
+DETECT_NOTE = (
+    "oneclient logs the start (helpersCache.h:467) and the end (helpersCache.h:752) of each storage access type "
+    "detection; the first phase (auto mode) is storage_detection_s; a later phase (forced proxy io mode 1) follows "
+    "at once in the same log and is listed in phases, not added: the log does not say whether the application waits for it"
+)
 
 
 def storage_detection(log_text: str) -> dict:
@@ -193,8 +240,15 @@ def storage_detection(log_text: str) -> dict:
         t = _t(year, md, ts)
         st = DETECT_START.search(msg)
         if st:
-            ph = {"storage": st.group(1), "forced_proxy_io_mode": int(st.group(2)), "start": f"{md} {ts}", "end": None,
-                  "seconds": None, "result": None, "_t0": t}
+            ph = {
+                "storage": st.group(1),
+                "forced_proxy_io_mode": int(st.group(2)),
+                "start": f"{md} {ts}",
+                "end": None,
+                "seconds": None,
+                "result": None,
+                "_t0": t,
+            }
             phases.append(ph)
             open_[st.group(1)] = ph
             continue
@@ -207,15 +261,32 @@ def storage_detection(log_text: str) -> dict:
                     ph["seconds"] = round(t - ph["_t0"], 6)
     for ph in phases:
         del ph["_t0"]
-    out = {"storage_detection_s": None, "none_reason": None, "start": None, "end": None, "result": None,
-           "forced_proxy_io_mode": None, "phases": phases, "note": DETECT_NOTE}
+    out = {
+        "storage_detection_s": None,
+        "none_reason": None,
+        "start": None,
+        "end": None,
+        "result": None,
+        "forced_proxy_io_mode": None,
+        "phases": phases,
+        "note": DETECT_NOTE,
+    }
     if not phases:
-        out["none_reason"] = "no storage access type detection line in the log (no file read yet, or oneclient did not log one)"
+        out["none_reason"] = (
+            "no storage access type detection line in the log (no file read yet, or oneclient did not log one)"
+        )
     elif phases[0]["seconds"] is None:
-        out["none_reason"] = ("the first detection has no usable end line (not finished, an end line of unseen wording, "
-                              "or timestamps out of order)")
+        out["none_reason"] = (
+            "the first detection has no usable end line (not finished, an end line of unseen wording, "
+            "or timestamps out of order)"
+        )
     else:
         f = phases[0]
-        out.update(storage_detection_s=f["seconds"], start=f["start"], end=f["end"], result=f["result"],
-                   forced_proxy_io_mode=f["forced_proxy_io_mode"])
+        out.update(
+            storage_detection_s=f["seconds"],
+            start=f["start"],
+            end=f["end"],
+            result=f["result"],
+            forced_proxy_io_mode=f["forced_proxy_io_mode"],
+        )
     return out

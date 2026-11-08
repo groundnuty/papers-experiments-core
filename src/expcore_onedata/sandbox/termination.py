@@ -21,6 +21,7 @@ left to the orphan reaper. `exit_on_sigterm()`, called at the top of a driver's 
 
 The campaign CLI has its own graceful stop (a stop event that drains the runs) and does not use this.
 """
+
 from __future__ import annotations
 
 import logging
@@ -30,14 +31,14 @@ import threading
 
 log = logging.getLogger(__name__)
 
-EXIT_CODE = 143                 # 128 + SIGTERM, what a shell reports for a process SIGTERM ended
-MAX_PARALLEL_STOPS = 4          # each teardown unmounts and stops containers: not all of a level's at the same instant
+EXIT_CODE = 143  # 128 + SIGTERM, what a shell reports for a process SIGTERM ended
+MAX_PARALLEL_STOPS = 4  # each teardown unmounts and stops containers: not all of a level's at the same instant
 
 _requested = threading.Event()
 _live: list = []
 _live_lock = threading.Lock()
 _stopper: threading.Thread | None = None
-_main_deferred = 0              # main thread only: how many sigterm_deferred() regions it is in
+_main_deferred = 0  # main thread only: how many sigterm_deferred() regions it is in
 
 
 def register(sbx) -> None:
@@ -83,7 +84,7 @@ class sigterm_deferred:
 def _stop_one(sbx) -> None:
     try:
         sbx.stop()
-    except BaseException as e:  # noqa: BLE001 -- the driver's own stop retries, and its failure path quarantines the slot
+    except BaseException as e:
         log.error("SIGTERM: stopping %s failed: %r", getattr(sbx, "name", sbx), e)
 
 
@@ -96,6 +97,7 @@ def _stop_live() -> None:
     def one(sbx) -> None:
         with slots:
             _stop_one(sbx)
+
     threads = [threading.Thread(target=one, args=(s,), name="sigterm-stop", daemon=False) for s in todo]
     for t in threads:
         t.start()
@@ -122,10 +124,10 @@ def _on_sigterm(signum, frame) -> None:
     except OSError:
         pass
     try:
-        t = threading.Thread(target=_stop_live, name="sigterm-stopper", daemon=False)    # the process waits for it
+        t = threading.Thread(target=_stop_live, name="sigterm-stopper", daemon=False)  # the process waits for it
         t.start()
         _stopper = t
-    except RuntimeError as e:          # already shutting down: the driver's own finally blocks are all there is
+    except RuntimeError as e:  # already shutting down: the driver's own finally blocks are all there is
         log.error("SIGTERM: the stopper could not start: %r", e)
     if _main_deferred == 0:
         raise SystemExit(EXIT_CODE)
@@ -135,6 +137,7 @@ def exit_on_sigterm() -> bool:
     """Install the handler. Only the main thread can; returns False (and logs it) anywhere else. Also names this process as a driver,
     which the host's earlyoom ignores (earlyoom.py): this call is what every real-sandbox driver already makes at its start."""
     from . import earlyoom
+
     if threading.current_thread() is threading.main_thread():
         earlyoom.name_this_driver()
     try:

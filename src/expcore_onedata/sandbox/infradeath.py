@@ -32,17 +32,27 @@ Whose doing was it? Amendment 24 (science, #2, 20:48Z): a death is infrastructur
 
 The caller turns the infrastructure deaths into `InfraError("sandbox", ...)` (dataset_76.harness.runner), and records every death, the agent's included, in the run's metadata and its `infra.json`.
 """
+
 from __future__ import annotations
 
 import json
 from typing import Any
 
-NEVER = "0001-01-01T00:00:00Z"       # Docker's value for a time that has not happened (FinishedAt of a container that never stopped)
+NEVER = "0001-01-01T00:00:00Z"  # Docker's value for a time that has not happened (FinishedAt of a container that never stopped)
 
-HOST_PRESSURE, COMPONENT_DEFECT, OWN_LIMIT_AGENT, UNDETERMINED = "host_pressure", "component_defect", "own_limit_agent", "undetermined"
-CAUSES = (HOST_PRESSURE, COMPONENT_DEFECT, OWN_LIMIT_AGENT, UNDETERMINED)       # the fixed vocabulary of a death's cause
-INFRASTRUCTURE = (HOST_PRESSURE, COMPONENT_DEFECT, UNDETERMINED)                # retried; the order is the run's one cause when several containers died: the specific before undetermined
-CRASH_EXITS = (132, 134, 135, 136, 139)                                         # 128 + SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV: a process that crashed itself
+HOST_PRESSURE, COMPONENT_DEFECT, OWN_LIMIT_AGENT, UNDETERMINED = (
+    "host_pressure",
+    "component_defect",
+    "own_limit_agent",
+    "undetermined",
+)
+CAUSES = (HOST_PRESSURE, COMPONENT_DEFECT, OWN_LIMIT_AGENT, UNDETERMINED)  # the fixed vocabulary of a death's cause
+INFRASTRUCTURE = (
+    HOST_PRESSURE,
+    COMPONENT_DEFECT,
+    UNDETERMINED,
+)  # retried; the order is the run's one cause when several containers died: the specific before undetermined
+CRASH_EXITS = (132, 134, 135, 136, 139)  # 128 + SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV: a process that crashed itself
 
 
 def parse_inspect(text: str) -> dict[str, Any] | None:
@@ -56,13 +66,26 @@ def parse_inspect(text: str) -> dict[str, Any] | None:
         return None
     if not isinstance(cid, str) or not cid or not isinstance(status, str):
         return None
-    return {"id": cid[:64], "status": status, "running": s.get("Running") is True, "restarting": s.get("Restarting") is True,
-            "paused": s.get("Paused") is True, "oom_killed": s.get("OOMKilled") is True, "exit_code": s.get("ExitCode"),
-            "restart_count": int(d.get("RestartCount") or 0), "started_at": s.get("StartedAt"), "finished_at": s.get("FinishedAt"),
-            "error": str(s.get("Error") or "")[:200], "oom": None, "oom_kill": None}      # `oom` and `oom_kill`: the cgroup's counters, which the caller reads and sets
+    return {
+        "id": cid[:64],
+        "status": status,
+        "running": s.get("Running") is True,
+        "restarting": s.get("Restarting") is True,
+        "paused": s.get("Paused") is True,
+        "oom_killed": s.get("OOMKilled") is True,
+        "exit_code": s.get("ExitCode"),
+        "restart_count": int(d.get("RestartCount") or 0),
+        "started_at": s.get("StartedAt"),
+        "finished_at": s.get("FinishedAt"),
+        "error": str(s.get("Error") or "")[:200],
+        "oom": None,
+        "oom_kill": None,
+    }  # `oom` and `oom_kill`: the cgroup's counters, which the caller reads and sets
 
 
-def problems(role: str, option: str, container: str, start: dict | None, end: dict | None, read_error: str | None = None) -> list[str]:
+def problems(
+    role: str, option: str, container: str, start: dict | None, end: dict | None, read_error: str | None = None
+) -> list[str]:
     """What is wrong with a gate or sidecar between its baseline `start` and now `end` (None: it could not be read, `read_error` says why). [] when it ran throughout.
     Each item names the role, the container, the option and the evidence."""
     who = f"{role} {container} (option {option})"
@@ -74,23 +97,37 @@ def problems(role: str, option: str, container: str, start: dict | None, end: di
     if end["id"] != start["id"]:
         out.append(f"{who}: another container now holds the name (id {start['id'][:12]} then {end['id'][:12]})")
     if end["status"] != "running":
-        out.append(f"{who}: not running at collection (status {end['status']}, exit code {end['exit_code']}, OOMKilled {str(end['oom_killed']).lower()}, "
-                   f"finished {end['finished_at']}" + (f", error {end['error']!r}" if end["error"] else "") + ")")
+        out.append(
+            f"{who}: not running at collection (status {end['status']}, exit code {end['exit_code']}, OOMKilled {str(end['oom_killed']).lower()}, "
+            f"finished {end['finished_at']}" + (f", error {end['error']!r}" if end["error"] else "") + ")"
+        )
     elif end["restarting"]:
         out.append(f"{who}: restarting at collection")
     if end["restart_count"] > start["restart_count"]:
-        out.append(f"{who}: restarted {end['restart_count'] - start['restart_count']} time(s) by Docker (RestartCount {start['restart_count']} then {end['restart_count']})")
+        out.append(
+            f"{who}: restarted {end['restart_count'] - start['restart_count']} time(s) by Docker (RestartCount {start['restart_count']} then {end['restart_count']})"
+        )
     if end["started_at"] != start["started_at"]:
-        out.append(f"{who}: started again during the run (StartedAt {start['started_at']} then {end['started_at']}, last exit code {end['exit_code']})")
+        out.append(
+            f"{who}: started again during the run (StartedAt {start['started_at']} then {end['started_at']}, last exit code {end['exit_code']})"
+        )
     elif end["finished_at"] != start["finished_at"] and end["status"] == "running":
-        out.append(f"{who}: stopped during the run (FinishedAt {start['finished_at']} then {end['finished_at']}, exit code {end['exit_code']})")
+        out.append(
+            f"{who}: stopped during the run (FinishedAt {start['finished_at']} then {end['finished_at']}, exit code {end['exit_code']})"
+        )
     if end["oom_killed"] and not start["oom_killed"]:
-        out.append(f"{who}: OOM-killed during the run (Docker's OOMKilled was false at the start and is true now, exit code {end['exit_code']})")
+        out.append(
+            f"{who}: OOM-killed during the run (Docker's OOMKilled was false at the start and is true now, exit code {end['exit_code']})"
+        )
     a, b = start.get("oom_kill"), end.get("oom_kill")
     if a is not None and b is not None and b > a:
-        out.append(f"{who}: the cgroup's oom_kill rose by {b - a} ({a} then {b}): a process of the container was killed by an OOM killer")
+        out.append(
+            f"{who}: the cgroup's oom_kill rose by {b - a} ({a} then {b}): a process of the container was killed by an OOM killer"
+        )
     if not out and (a is None or b is None):
-        out.append(f"{who}: the cgroup's oom_kill counter could not be read (at the start {a}, now {b}): not known whether a process of it was killed")
+        out.append(
+            f"{who}: the cgroup's oom_kill counter could not be read (at the start {a}, now {b}): not known whether a process of it was killed"
+        )
     return out
 
 
@@ -99,21 +136,39 @@ def _kernel_verdict(kernel: list[dict] | None, cid: str) -> tuple[str | None, in
     CONSTRAINT_NONE, or a limit of an ancestor cgroup (the container only the victim). Both, or neither: no verdict."""
     mine = [k for k in kernel or [] if cid and cid in k.get("text", "")]
     own = [k for k in mine if k["constraint"] == "CONSTRAINT_MEMCG" and cid in k.get("oom_memcg", "")]
-    host = [k for k in mine if k["constraint"] == "CONSTRAINT_NONE" or (k["constraint"] == "CONSTRAINT_MEMCG" and cid not in k.get("oom_memcg", ""))]
+    host = [
+        k
+        for k in mine
+        if k["constraint"] == "CONSTRAINT_NONE"
+        or (k["constraint"] == "CONSTRAINT_MEMCG" and cid not in k.get("oom_memcg", ""))
+    ]
     return ("own" if own and not host else "host" if host and not own else None), len(own), len(host)
 
 
-def cause_of(role: str, start: dict | None, end: dict | None, read_error: str | None = None, *, kernel: list[dict] | None = None, earlyoom: bool = False) -> dict:
+def cause_of(
+    role: str,
+    start: dict | None,
+    end: dict | None,
+    read_error: str | None = None,
+    *,
+    kernel: list[dict] | None = None,
+    earlyoom: bool = False,
+) -> dict:
     """The one cause of a death of a gate or sidecar: {"cause", "category" ("agent" | "infrastructure"), "basis"}. Call it only for a container with problems.
 
     `kernel`: the OOM-kill lines of the run's window (killcause.parse_kernel_oom), None when the log could not be read. `earlyoom`: its journal named a kill of this role's process.
     Never guesses: evidence that cannot name the cause gives `undetermined`, which is retried and listed."""
+
     def out(cause: str, basis: str) -> dict:
         return {"cause": cause, "category": "agent" if cause == OWN_LIMIT_AGENT else "infrastructure", "basis": basis}
+
     if earlyoom:
         return out(HOST_PRESSURE, "earlyoom's journal names a kill of this container's process")
     if end is None or start is None:
-        return out(UNDETERMINED, f"its state could not be read ({read_error or 'no state was recorded when it came up'}): not known how it ended")
+        return out(
+            UNDETERMINED,
+            f"its state could not be read ({read_error or 'no state was recorded when it came up'}): not known how it ended",
+        )
     cid = end["id"]
     a_oom, b_oom, a_kill, b_kill = start.get("oom"), end.get("oom"), start.get("oom_kill"), end.get("oom_kill")
     d_kill = (b_kill - a_kill) if a_kill is not None and b_kill is not None else None
@@ -125,20 +180,37 @@ def cause_of(role: str, start: dict | None, end: dict | None, read_error: str | 
         # after it is gone. Docker's flag says only that a kill happened. Counters and log must agree; both host and own lines, or no line and no counter, name nothing.
         c = None if not d_kill else ("own" if (d_oom or 0) > 0 else "host")
         if n_own and n_host:
-            return out(UNDETERMINED, "an OOM kill, and the kernel log has both this container's own limit and the host's killing a process of it")
+            return out(
+                UNDETERMINED,
+                "an OOM kill, and the kernel log has both this container's own limit and the host's killing a process of it",
+            )
         if c and k and c != k:
-            return out(UNDETERMINED, f"an OOM kill: the cgroup's counters say the {c} limit, the kernel log the {k} one: conflicting")
+            return out(
+                UNDETERMINED,
+                f"an OOM kill: the cgroup's counters say the {c} limit, the kernel log the {k} one: conflicting",
+            )
         verdict = c or k
         if verdict is None:
-            return out(UNDETERMINED, "an OOM kill (" + ("Docker's OOMKilled is newly true" if flag else "the cgroup's oom_kill rose") + ") whose limit cannot be established: "
-                       f"no counter delta that names it ({d_oom}, {d_kill}) and {'no line naming this container in the kernel log' if kernel is not None else 'the kernel log could not be read'}")
+            return out(
+                UNDETERMINED,
+                "an OOM kill ("
+                + ("Docker's OOMKilled is newly true" if flag else "the cgroup's oom_kill rose")
+                + ") whose limit cannot be established: "
+                f"no counter delta that names it ({d_oom}, {d_kill}) and {'no line naming this container in the kernel log' if kernel is not None else 'the kernel log could not be read'}",
+            )
         src = "the cgroup's counters" if c else "the kernel log"
         if verdict == "host":
             return out(HOST_PRESSURE, f"killed by the host's OOM killer, not at this container's own limit ({src})")
         if role == "gate":
-            return out(COMPONENT_DEFECT, f"the gate hit its own memory limit ({src}), e.g. its spool: a defect of the component whatever the agent asked of it")
+            return out(
+                COMPONENT_DEFECT,
+                f"the gate hit its own memory limit ({src}), e.g. its spool: a defect of the component whatever the agent asked of it",
+            )
         if role == "sidecar":
-            return out(OWN_LIMIT_AGENT, f"the sidecar hit its own memory limit ({src}): M's reads are charged to it, so it is the agent's outcome (science, amendment 24)")
+            return out(
+                OWN_LIMIT_AGENT,
+                f"the sidecar hit its own memory limit ({src}): M's reads are charged to it, so it is the agent's outcome (science, amendment 24)",
+            )
         return out(UNDETERMINED, f"the {role} hit its own memory limit ({src}), and nothing says whose allowance it is")
     if end["id"] != start["id"]:
         return out(UNDETERMINED, "another container holds the name: nothing says how the first ended")
@@ -147,12 +219,23 @@ def cause_of(role: str, start: dict | None, end: dict | None, read_error: str | 
     if end["status"] != "running":
         code = end["exit_code"]
         if isinstance(code, int) and (code in CRASH_EXITS or 1 <= code < 128):
-            return out(COMPONENT_DEFECT, f"the {role} ended by itself with exit code {code}" + (" (a crash signal)" if code in CRASH_EXITS else "") + ": no OOM kill, no host kill on record")
+            return out(
+                COMPONENT_DEFECT,
+                f"the {role} ended by itself with exit code {code}"
+                + (" (a crash signal)" if code in CRASH_EXITS else "")
+                + ": no OOM kill, no host kill on record",
+            )
         # 0 is what a SIGTERM handler or a plain stop gives; 137 and 143 are SIGKILL and SIGTERM, which `docker kill` and `docker stop` send as much as a killer does
-        return out(UNDETERMINED, f"ended with exit code {code} and no OOM counter, no kernel OOM line and no earlyoom record: a signal sent from outside (docker kill, stop, restart: a host or "
-                                 "operator action, which agent code cannot do) or a host kill that left nothing")
+        return out(
+            UNDETERMINED,
+            f"ended with exit code {code} and no OOM counter, no kernel OOM line and no earlyoom record: a signal sent from outside (docker kill, stop, restart: a host or "
+            "operator action, which agent code cannot do) or a host kill that left nothing",
+        )
     if end["started_at"] != start["started_at"] or end["restart_count"] > start["restart_count"]:
-        return out(UNDETERMINED, "it was stopped and started again (docker restart, a restart policy, a daemon restart): its state keeps no reliable record of why it stopped")
+        return out(
+            UNDETERMINED,
+            "it was stopped and started again (docker restart, a restart policy, a daemon restart): its state keeps no reliable record of why it stopped",
+        )
     return out(UNDETERMINED, "a problem with its state or its OOM counter, and no death shape that names a cause")
 
 
@@ -166,7 +249,9 @@ def attempt_cause(deaths) -> str | None:
     """The one cause an attempt carries in the campaign's store: the infrastructure cause when any death was infrastructure (the attempt is retried whatever else died), else the agent's
     own-limit cause, else None (no container died). `deaths`: the per-container death records of the run's metadata."""
     deaths = [d for d in deaths or [] if isinstance(d, dict)]
-    return run_cause(d.get("cause") for d in deaths) or next((d["cause"] for d in deaths if d.get("cause") == OWN_LIMIT_AGENT), None)
+    return run_cause(d.get("cause") for d in deaths) or next(
+        (d["cause"] for d in deaths if d.get("cause") == OWN_LIMIT_AGENT), None
+    )
 
 
 def infra_detail(deaths) -> str | None:
@@ -174,7 +259,9 @@ def infra_detail(deaths) -> str | None:
     infra = [d for d in deaths or [] if isinstance(d, dict) and d.get("category") == "infrastructure"]
     if not infra:
         return None
-    return f"{MARKER}{run_cause(d['cause'] for d in infra)}): " + "; ".join(f"{p} [cause {d['cause']}: {d['basis']}]" for d in infra for p in d["problems"])
+    return f"{MARKER}{run_cause(d['cause'] for d in infra)}): " + "; ".join(
+        f"{p} [cause {d['cause']}: {d['basis']}]" for d in infra for p in d["problems"]
+    )
 
 
-MARKER = "container death (cause="       # what `infra_detail` starts with, so an attempt's stored detail says what it was; the cause itself is stored per attempt (campaign store: container_death_cause)
+MARKER = "container death (cause="  # what `infra_detail` starts with, so an attempt's stored detail says what it was; the cause itself is stored per attempt (campaign store: container_death_cause)
