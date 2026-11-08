@@ -19,9 +19,10 @@ declares them; nothing here knows what a key is). A lease is an exclusive `flock
   gone, by saying so or by failing, quarantines the key: it is held back and asked again after `dead_retry_s`.
 - written crash-safely: the note in the lock file is recovery state, not decoration. It is written with a flush and an
   fsync, and a note that cannot be written fails the acquisition: the key is released, nothing is started and the error
-  is raised. An empty note in a lock file that existed before this acquisition, and a note that cannot be read, name a
-  holder that died between taking the key and writing it, or mid-write: they are indeterminate and the key needs the
-  same proof, never "a key never used". Only a lock file this very acquisition created is a key never used.
+  is raised. A lock file is created complete, by a hard link, with a note that says it was released, so a key never
+  used has one and two runs first using a key at once cannot see each other's empty file. An empty note, or one that
+  cannot be read, can then only be a holder that died between taking the key and writing it, or mid-write: it is
+  indeterminate and the key needs the same proof, never "a key never used".
 
 A teardown that cannot be proven **quarantines** the resource: the lease stays held, its use ends, and the key goes
 to nobody until the teardown is proven (`LeasePool.settle_quarantines` asks the proof). When every key of a group is
@@ -43,6 +44,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -316,9 +318,32 @@ class LeasePool:
     def _lock_path(self, key: str) -> Path:
         return self.dir / f"{key}.lock"
 
+    def _create_lock_file(self, key: str) -> None:
+        """Create the key's lock file complete, if it does not exist: it appears with its note already in it.
+
+        The note says the key was released, which is what a key never used is. The file is written and synced under a
+        name nobody looks at, then hard-linked into place, which fails if another run got there first. So no one can
+        open a lock file and read it empty because its creator has not written yet: an empty note is then always a
+        holder that died while writing, never "a key being created".
+        """
+        path = self._lock_path(key)
+        if path.exists():
+            return
+        scratch = self.dir / f".{key}.{os.getpid()}.{secrets.token_hex(4)}.new"
+        fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, json.dumps({"released": 0.0, "key": key, "created": time.time()}, sort_keys=True).encode())
+            os.fsync(fd)
+            with contextlib.suppress(FileExistsError):  # lost the race: the file that is there is complete too
+                os.link(scratch, path)
+        finally:
+            os.close(fd)
+            os.unlink(scratch)
+
     def _flock(self, key: str) -> Any:
         """Return the key's lock file with its flock taken, or None when a live holder has it."""
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._create_lock_file(key)
         # a+: never truncates a holder's note. The handle outlives this call when the lock is taken, so no `with`.
         handle = open(self._lock_path(key), "a+", encoding="utf-8")  # noqa: SIM115
         try:
@@ -336,7 +361,7 @@ class LeasePool:
             log.exception("looking for the holder %s", owner)
             return False
 
-    def _dead_holder_cleared(self, key: str, handle: Any, *, fresh: bool = False) -> bool:
+    def _dead_holder_cleared(self, key: str, handle: Any) -> bool:
         """Tell whether the key may go to a new holder, given that its flock is ours.
 
         The kernel drops a dead process's lock at once, but its resource may go on being used. So a key whose note does
@@ -354,8 +379,6 @@ class LeasePool:
                 note = parsed if isinstance(parsed, dict) else {}
             except ValueError:
                 note = {}  # unreadable: a holder that died mid-write is a dead holder that must be shown gone
-        elif fresh:
-            return True  # a key never used
         if "released" in note:
             return True
         owner = note.get("owner")
@@ -387,11 +410,10 @@ class LeasePool:
         return gone
 
     def _try_key(self, key: str) -> Any:
-        fresh = not self._lock_path(key).exists()
         handle = self._flock(key)
         if handle is None:
             return None
-        if not self._dead_holder_cleared(key, handle, fresh=fresh):
+        if not self._dead_holder_cleared(key, handle):
             handle.close()
             return None
         return handle

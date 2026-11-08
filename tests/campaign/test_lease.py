@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 
 import pytest
 from lease_support import Clock, Probe
@@ -203,6 +204,8 @@ def test_c19_a_note_is_written_with_flush_and_fsync_when_a_key_is_taken_and_when
     real_fsync = os.fsync
     monkeypatch.setattr(lease_module.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
     leases = pool(tmp_path, keys=("k1",))
+    leases.try_acquire("g", "run-a").release()  # the first use creates the file, which is synced too
+    synced.clear()
     lease = leases.try_acquire("g", "run-a")
     assert len(synced) == 1
     assert json.loads((tmp_path / "leases" / "k1.lock").read_text())["run_key"] == "run-a"
@@ -264,6 +267,32 @@ def test_c19_a_release_whose_note_cannot_be_written_still_frees_the_key_and_says
     assert "could not note the release" in caplog.text
     monkeypatch.undo()
     assert leases._flock("k1") is not None
+
+
+def test_c19_runs_that_first_use_the_same_keys_at_once_never_mistake_a_file_being_created_for_a_dead_holder(tmp_path):
+    """C19: a lock file appears complete, so the run that opens it a moment after its creator never reads it empty."""
+    keys = tuple(f"k{i}" for i in range(8))
+    for _round in range(5):
+        directory = tmp_path / f"round{_round}"
+        probe = Probe()  # no resource is ever shown gone: a key misread as a dead holder's would stay out
+        leases = LeasePool(directory, lambda group: list(keys), probe, owner="me")
+        barrier = threading.Barrier(8)
+        got = []
+
+        def take(leases=leases, barrier=barrier, got=got):
+            barrier.wait()
+            got.append(leases.try_acquire("g", "run"))
+
+        threads = [threading.Thread(target=take) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert all(lease is not None for lease in got)
+        assert sorted(lease.key for lease in got) == sorted(keys)
+        assert probe.asked == []
+        assert leases.unusable() == set()
+        assert not [p for p in directory.iterdir() if p.name.endswith(".new")]  # no scratch file is left
 
 
 def test_c19_an_empty_or_released_note_needs_no_proof(tmp_path):
