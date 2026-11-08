@@ -62,6 +62,7 @@ manifest = "path.json"          # the frozen manifest the client checks the serv
 ```
 """
 
+import hashlib
 import math
 import os
 import re
@@ -186,6 +187,7 @@ class PlatformConfig:
     principals: Principals
     toolserver: ToolServer | None
     sandbox: SandboxSettings | None = None
+    sha256: str = ""  # of the file as loaded: a record names the configuration by this, never by a value in it
 
     @property
     def local_provider(self) -> Provider:
@@ -448,6 +450,7 @@ def load_platform(
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
     """
     file = Path(path).resolve()
+    digest = hashlib.sha256(file.read_bytes()).hexdigest()
     root = Section(load_toml(file), file, "platform.toml")
     root.reject_unknown(
         ("zone", "providers", "space", "support", "credentials", "tokens", "principals", "toolserver", "sandbox")
@@ -475,4 +478,5 @@ def load_platform(
         sandbox=load_sandbox(Section(root.table("sandbox"), file, "[sandbox]"), file.parent)
         if "sandbox" in root.data
         else None,
+        sha256=digest,
     )

@@ -344,3 +344,59 @@ def test_the_data_path_modes_of_a_start_are_recorded_by_name(world):
     sbx = start(world, "mounted")
     assert sbx.metadata()["data_path"] == DataPathMode.MOUNT.value
     sbx.stop()
+
+
+def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_hash(world):
+    """O12: the metadata holds no address of the pool, no mount or evidence path, and the platform file's SHA-256."""
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()
+    assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
+    assert set(meta["mount"]) == {"tls", "io_mode", "log_dir_from", "wait_s"}
+    assert meta["mount"]["log_dir_from"] == "default"
+    text = json.dumps(meta, default=str)
+    assert world.s.network.pools[0] not in text
+    assert str(world.s.work_root) not in text
+    assert world.s.mount.path not in text
+    sbx.stop()
+
+
+def test_o12_a_platform_sandbox_records_the_hash_of_the_platform_file(world):
+    """O12: the hash of the file as loaded reaches the run's metadata through the options of a start."""
+    spec = make_spec(world, "isolated")
+    sbx = DockerSandbox.start(world.host, world.s, spec, config_sha256=world.config.sha256, **start_options(world))
+    assert len(world.config.sha256) == 64
+    assert sbx.metadata()["platform_config_sha256"] == world.config.sha256
+    sbx.stop()
+
+
+def test_o12_a_failed_collection_records_where_the_evidence_is_by_id_and_key_not_by_path(world, tmp_path):
+    """O12: the kept-evidence record names the setting the directory is under and its id, never the path."""
+    sbx = start(world, "isolated")
+    (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
+    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
+    with pytest.raises(SandboxError, match="copying"):
+        sbx.collect(tmp_path / "e", outputs=["out.txt"])
+    world.host.run_handlers.pop("cp")
+    sbx.stop()
+    kept = sbx.metadata()["evidence_kept"]
+    assert kept == {"under": "sandbox.work_root", "directory_id": sbx.sid.rsplit("-", 1)[-1]}
+
+
+def test_o12_a_sidecar_that_exited_is_reported_by_the_size_and_digest_of_its_stderr(world, caplog):
+    """O12: the tool's words are not copied into the error or the log: their byte count and SHA-256 are."""
+    original = world.host._run_container
+
+    def exiting(args, env):
+        result = original(args, env)
+        for container in world.host.containers.values():
+            if container.name.endswith("-oneclient"):
+                container.running = False
+        return result
+
+    world.host._run_container = exiting
+    world.host.oneclient_images.clear()  # no mount appears
+    world.host._logs = lambda args: CmdResult(0, "", "invented-detail-of-a-mount-failure\n")
+    with pytest.raises(SandboxError, match=r"sidecar exited \(stderr 35 bytes, sha256 [0-9a-f]{64}\)") as caught:
+        start(world, "mounted")
+    assert "invented-detail" not in str(caught.value)
+    assert "invented-detail" not in caplog.text

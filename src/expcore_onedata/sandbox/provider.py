@@ -146,12 +146,16 @@ class SandboxPlatform:
             spec = data_path_spec(self._config.space.id, mode.interface or "rest")
             token = self._issuer.mint(spec, self._principal(lease), ceiling_s=ceiling_s)
         sandbox = DockerSandbox.start(
-            self._host, self._s, self._spec(run_key, mode, token, lease), registry=self._registry, **self._options
+            self._host,
+            self._s,
+            self._spec(run_key, mode, token, lease),
+            registry=self._registry,
+            config_sha256=self._config.sha256,
+            **self._options,
         )
-        if token is not None:
-            sandbox.record(
-                data_path_token={"subject": token.subject, "expires_at": token.expires_at}
-            )  # never the value
+        if token is not None:  # never the value, and the user by its place in the file, not by its id (O12)
+            user = list(self._s.users).index(lease.key) if lease is not None else "principals.data_path"
+            sandbox.record(data_path_token={"user": user, "expires_at": token.expires_at})
         return sandbox
 
     @contextlib.asynccontextmanager

@@ -224,11 +224,21 @@ def _mount(section: Section) -> MountSettings:
     return MountSettings(path, tls, io_mode, tuple(extra))
 
 
+def _entry_string(section: Section, key: str, position: int) -> str:
+    """The non-empty string at a key that is itself a configured value (a level, a login), named by position on failure.
+
+    `Section.string` would name the key in its message, and here the key is the value to keep out of it (O12)."""
+    value = section.data[key]
+    if not isinstance(value, str) or not value.strip():
+        raise section.fail(None, f"entry {position}: must be a non-empty string, got {type(value).__name__}")
+    return value
+
+
 def _data_paths(section: Section) -> Mapping[str, DataPathMode]:
     """Read [sandbox.data_paths]: level of the study's factor -> mount, rest or none."""
     out = {}
     for position, level in enumerate(section.data):  # a level is the study's word: it is named by position, not echoed
-        value = section.string(level)
+        value = _entry_string(section, level, position)
         try:
             out[level] = DataPathMode(value)
         except ValueError:
@@ -244,7 +254,7 @@ def _users(section: Section) -> Mapping[str, str]:
     """Read [sandbox.users]: login name -> Onezone user id. A login is also a lease key, so it is a plain file name."""
     out = {}
     for position, login in enumerate(section.data):  # a login is a configured value: it is named by position
-        user_id = section.string(login)
+        user_id = _entry_string(section, login, position)
         if not LEASE_KEY.fullmatch(login):
             raise section.fail(
                 None, f"entry {position}: a login must be letters, digits, '.', '-' and '_' to serve as a lease key"

@@ -25,6 +25,7 @@ every path that ends a sandbox, in order, and is verified (O15).
 from __future__ import annotations
 
 import errno
+import ipaddress
 import json
 import logging
 import os
@@ -45,6 +46,7 @@ from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
     ENV_ACCESS_TOKEN,
     ENV_TOKEN,
+    ONECLIENT_LOG_DIR,
     Names,
     agent_run_args,
     effective_log_dir,
@@ -52,7 +54,7 @@ from expcore_onedata.sandbox.containers import (
     sidecar_command,
     sidecar_run_args,
 )
-from expcore_onedata.sandbox.hostops import HostOps
+from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr, stderr_digest
 from expcore_onedata.sandbox.observe import Observer
 from expcore_onedata.sandbox.oneclient_log import summarize as summarize_oneclient_log
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
@@ -87,6 +89,7 @@ class DockerSandbox:
         waits: TD.Waits | None = None,
         sample_period_s: float | None = 1.0,
         sleep: Callable[[float], None] = time.sleep,
+        config_sha256: str | None = None,
     ) -> None:
         self.host, self.s, self.spec, self.registry = host, settings, spec, registry
         self.waits, self._sample_period, self._sleep = waits or TD.WAITS, sample_period_s, sleep
@@ -101,9 +104,12 @@ class DockerSandbox:
         self._net: str | None = None
         self._watched: dict[str, dict[str, Any]] = {}
         self._meta: dict[str, Any] = {"run_key": spec.run_key, "data_path": spec.mode.value, "images": {}}
+        if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
+            self._meta["platform_config_sha256"] = config_sha256
         self._stopped, self._stop_lock = True, threading.Lock()
         self._sampler_stop = threading.Event()
         self._cells: CellRunner | None = None
+        self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
         self._uptime0: float | None = None
         self.teardown_log: list[dict] = []
@@ -121,7 +127,7 @@ class DockerSandbox:
         try:
             self._meta["reaped_orphans"] = netpool.reap_orphans(host, self.labels)  # never fails the start
         except Exception as e:
-            self._meta["reaped_orphans"] = {"error": repr(e)[:300]}
+            self._meta["reaped_orphans"] = {"error": describe_error(e)}
         try:
             self._build()
             TERM.register(self)  # before the check: a SIGTERM after it finds this sandbox in the list
@@ -169,7 +175,7 @@ class DockerSandbox:
         except Exception as e:
             self.registry.add_pending(self)
             exc.sandbox = self  # type: ignore[attr-defined]
-            log.error("sandbox %s: cleanup after a failed start was incomplete: %s", self.names.agent, e)
+            log.error("cleanup after a failed start was incomplete: %s", describe_error(e))
 
     # ------------------------------------------------------------------------------------------------ build
     def _build(self) -> None:
@@ -184,7 +190,11 @@ class DockerSandbox:
         if mode is DataPathMode.REST:
             self._prepare_gate(hosts)
         subnet, tries = self._create_network()
-        self._meta["network"] = {"subnet": subnet, "attempts": tries, "pools": list(s.network.pools)}
+        self._meta["network"] = {  # the position of the pool, never an address or the pool itself (O12)
+            "pool": self._pool_position(subnet),
+            "prefix": s.network.prefix,
+            "attempts": tries,
+        }
         gate_ip = self._start_gate() if mode is DataPathMode.REST else None
         share = self._start_mount() if mode is DataPathMode.MOUNT else None
         self._start_agent(work, share, gate_ip, list(hosts))
@@ -217,6 +227,12 @@ class DockerSandbox:
             "hosts": hosts,
         }
         (self.dir / "gate.json").write_text(json.dumps(config), encoding="utf-8")
+
+    def _pool_position(self, subnet: str) -> int | None:
+        """Which pool of `[sandbox.network] pools`, by position in the file, a subnet was taken from."""
+        net = ipaddress.ip_network(subnet)
+        pools = hostops.strict_networks(self.s.network.pools)
+        return next((i for i, pool in enumerate(pools) if net.subnet_of(pool)), None)
 
     def _label_args(self) -> list[str]:
         return self.labels.args(self.host, self.dir, self.spec.lease_key)
@@ -254,7 +270,7 @@ class DockerSandbox:
             if "gate ready" in logs.stdout:
                 return
             if (hostops.inspect(self.host, self.names.gate) or {}).get("State", {}).get("Running") is not True:
-                log.error("the gate exited: %s", logs.stderr[-500:])
+                log.error("the gate exited: %s", describe_stderr(logs.stderr))
                 raise SandboxError("the gate exited before it was ready")
             self._sleep(0.1)
         raise SandboxError("the gate did not become ready")
@@ -269,11 +285,11 @@ class DockerSandbox:
         self.host.run(["mount", "--make-rshared", str(share)], 60, sudo=True)  # so the sidecar's mount propagates out
         host_name = sp.provider.host
         command = sidecar_command(host_name, s)
-        self._meta["mount"] = {
+        self._log_dir = effective_log_dir(command)
+        self._meta["mount"] = {  # the keys that set it, never a path (O12)
             "tls": s.mount.tls,
             "io_mode": s.mount.io_mode,
-            "log_dir": effective_log_dir(command),
-            "path": s.mount.path,
+            "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != ONECLIENT_LOG_DIR else "default",
         }
         self._containers.append(names.sidecar)
         t0 = time.monotonic()
@@ -282,10 +298,8 @@ class DockerSandbox:
         deadline = time.monotonic() + MOUNT_WAIT_S
         while not hostops.is_fuse_mounted(self.host.read_text("/proc/self/mountinfo"), str(share)):
             if (hostops.inspect(self.host, names.sidecar) or {}).get("State", {}).get("Running") is not True:
-                raise SandboxError(
-                    "the oneclient sidecar exited: "
-                    + self.host.docker("logs", names.sidecar, check=False).stderr[-500:]
-                )
+                logs = self.host.docker("logs", names.sidecar, check=False)
+                raise SandboxError(f"the oneclient sidecar exited ({describe_stderr(logs.stderr)})")
             if time.monotonic() > deadline:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(0.2)
@@ -330,7 +344,7 @@ class DockerSandbox:
             r = self._cells.run(READ_ONLY_PROBE.format(path=path), 60, record=False)
             said = r.stdout.strip()
             if r.exit_code != 0 or said != f"blocked {errno.EROFS}":
-                log.error("read-only probe of the %s said %r %r", what, said, r.stderr.strip()[-120:])
+                log.error("read-only probe of the %s said %r (%s)", what, said, describe_stderr(r.stderr))
                 raise SandboxError(f"the {what} is not read-only for the agent")
             proved[what] = True
         self._meta["read_only_verified"] = proved
@@ -357,19 +371,22 @@ class DockerSandbox:
         for role, w in self._watched.items():
             end, why = self.obs.state(w["container"])
             probs = ID.problems(role, self.spec.mode.value, w["start"], end, why)
-            containers[role] = {"container": w["container"], "start": w["start"], "end": end, "problems": probs}
+            containers[role] = {
+                "start": w["start"],
+                "end": end,
+                "problems": probs,
+            }  # by role: a name holds the lease key
             if probs:
-                found.append((role, w["container"], probs, w["start"], end, why))
+                found.append((role, probs, w["start"], end, why))
         deaths: list[dict] = []
         if found:
             kernel = self.obs.kernel_oom(self._uptime0)
             hit = {k.get("role") for k in self._meta.get("earlyoom_kills") or [] if isinstance(k, dict)}
-            for role, container, probs, start, end, why in found:
+            for role, probs, start, end, why in found:
                 cause = ID.cause_of(role, start, end, why, kernel=kernel, earlyoom=role in hit)
                 deaths.append(
                     {
                         "role": role,
-                        "container": container,
                         "condition": self.spec.mode.value,
                         **cause,
                         "problems": probs,
@@ -386,8 +403,8 @@ class DockerSandbox:
             while not self._sampler_stop.is_set():
                 try:
                     self._cells.sample_pids()
-                except Exception:
-                    log.debug("sampling failed", exc_info=True)
+                except Exception as e:
+                    log.debug("sampling failed: %s", describe_error(e))
                 self._sampler_stop.wait(self._sample_period)
 
         threading.Thread(target=loop, daemon=True, name=f"sample-{self.names.agent}").start()
@@ -427,7 +444,7 @@ class DockerSandbox:
         r = self.host.run(["cp", "-r", "--no-preserve=ownership", str(src), str(dst)], 600, sudo=True)
         owner = self.host.run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", str(dst)], 60, sudo=True)
         if r.returncode != 0 or owner.returncode != 0:
-            log.error("copying out failed: %s", (r.stderr or owner.stderr).strip()[-200:])
+            log.error("copying out failed: %s", describe_stderr(r.stderr or owner.stderr))
             raise SandboxError("copying a file out of the sandbox failed")
 
     def _collect(self, dest: Path, outputs: Sequence[str]) -> dict[str, Any]:
@@ -468,16 +485,17 @@ class DockerSandbox:
             logs = self.host.docker("logs", self.names.gate, check=False, timeout=30)
             note["log_write_failed"] = "GATE LOG FAILED" in logs.stderr + logs.stdout
         except Exception as e:
-            note["error"] = repr(e)[:200]
+            note["error"] = describe_error(e)
 
     def sidecar_errors(self) -> dict[str, Any] | None:
         """Warnings and errors of the oneclient sidecar by origin, or `{"unavailable": reason}`; None without a sidecar."""
         if self.spec.mode is not DataPathMode.MOUNT:
             return None
-        logdir = self._meta.get("mount", {}).get("log_dir")
-        r = self.host.docker("exec", self.names.sidecar, "cat", f"{logdir}/oneclient.INFO", check=False, timeout=60)
+        r = self.host.docker(
+            "exec", self.names.sidecar, "cat", f"{self._log_dir}/oneclient.INFO", check=False, timeout=60
+        )
         if r.returncode != 0:
-            return {"unavailable": f"the oneclient log could not be read: {r.stderr.strip()[:150]}"}
+            return {"unavailable": "the oneclient log could not be read", "stderr": stderr_digest(r.stderr)}
         token = self.spec.token.reveal() if self.spec.token else ""
         return summarize_oneclient_log(r.stdout.replace(token, "<token>") if token else r.stdout)
 
@@ -513,7 +531,7 @@ class DockerSandbox:
         try:
             fn(*a)
         except Exception as e:
-            log.error("teardown step %s failed: %r", getattr(fn, "__name__", "step"), e)
+            log.error("teardown step %s failed: %s", getattr(fn, "__name__", "step"), describe_error(e))
             errors.append(f"a teardown step failed ({type(e).__name__})")
 
     def _stop_locked(self) -> None:
@@ -562,7 +580,7 @@ class DockerSandbox:
             kept = self.s.work_root / "_kept_evidence"
             self._step(errors, lambda: self.host.run(["mkdir", "-p", str(kept)], 20, sudo=True))
             self._step(errors, lambda: self.host.run(["mv", str(self.dir), str(kept / self.sid)], 60, sudo=True))
-            self._meta["evidence_kept_at"] = str(kept / self.sid)
+            self._meta["evidence_kept"] = {"under": "sandbox.work_root", "directory_id": self.sid.rsplit("-", 1)[-1]}
         else:
             self._step(errors, lambda: self.host.run(["rm", "-rf", "--one-file-system", str(self.dir)], 300, sudo=True))
         if (

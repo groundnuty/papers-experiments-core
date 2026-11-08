@@ -21,7 +21,7 @@ from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox.api import ExecResult
 from expcore_onedata.sandbox.containers import Names
-from expcore_onedata.sandbox.hostops import TIMED_OUT, HostOps
+from expcore_onedata.sandbox.hostops import TIMED_OUT, HostOps, describe_error
 from expcore_onedata.sandbox.observe import Observer
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -132,7 +132,7 @@ class CellRunner:
             if killed is not None:
                 state.update(killed=killed, left=[{k: p[k] for k in ("pid", "comm", "state")} for p in left[:16]])
         except Exception as e:
-            state.update(killed=None, left=None, error=repr(e)[:200])
+            state.update(killed=None, left=None, error=describe_error(e))
         self._meta.setdefault("quiesced", []).append(state)
         return state
 
@@ -148,7 +148,7 @@ class CellRunner:
         try:
             self.quiesce("time cap")
         except Exception as e:
-            log.error("sandbox %s: killing its processes at the cap failed: %r", self._names.agent, e)
+            log.error("killing the processes of a cell at its cap failed: %s", describe_error(e))
 
     # ------------------------------------------------------------------------------------------------ the cell
     def run(self, code: str, timeout_s: float, *, record: bool = True) -> ExecResult:
@@ -245,7 +245,7 @@ class CellRunner:
         except Exception as e:
             found = []
             self._meta["earlyoom_log_readable"] = False
-            self._meta["earlyoom_scan_error"] = repr(e)[:200]
+            self._meta["earlyoom_scan_error"] = describe_error(e)
         new = found[self._earlyoom_seen :]
         if not new and res.exit_code in SIGNAL_EXITS:
             sampled = [

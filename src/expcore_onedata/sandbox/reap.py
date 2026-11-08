@@ -26,7 +26,8 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from expcore_onedata.sandbox import hostops, netpool
-from expcore_onedata.sandbox.hostops import HostOps
+from expcore_onedata.sandbox.api import SandboxError
+from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr
 from expcore_onedata.sandbox.settings import SandboxSettings
 
 log = logging.getLogger(__name__)
@@ -35,8 +36,8 @@ REAPED = "reaped.jsonl"  # what was removed, written before it is removed
 YOUNG_S = 120.0  # a directory this new, with no container, may be a live start's: not touched yet
 
 
-class CollectFailed(RuntimeError):
-    pass
+class CollectFailed(SandboxError):
+    """A kept copy of an attempt's evidence could not be made or checked; its message names no configured value."""
 
 
 def sid_pattern(key: str) -> re.Pattern[str]:
@@ -57,7 +58,7 @@ def _facts(host: HostOps, path: Path) -> tuple[int, int]:
     """(files, bytes) under `path`, read as root: an agent's files need not be readable by us."""
     r = _sudo(host, "find", str(path), "-type", "f", "-printf", "%s\\n", timeout_s=120.0)
     if r.returncode != 0:
-        raise CollectFailed(f"listing {path}: {str(r.stderr).strip()[:200]}")
+        raise CollectFailed(f"listing a directory failed ({r.returncode}): {describe_stderr(r.stderr)}")
     sizes = [int(s) for s in r.stdout.split()]
     return len(sizes), sum(sizes)
 
@@ -74,12 +75,12 @@ def _copy(host: HostOps, what: str, src: Path, dst: Path) -> dict:
     if t.returncode == 1 and not _sudo_refused(t):
         return {"what": what, "absent": True}  # the attempt never got that far: nothing to keep, and not a failure
     if t.returncode != 0:  # a timeout, a command that could not start, a sudo that refused: nothing is known
-        raise CollectFailed(f"testing {src}: exit {t.returncode} {str(t.stderr).strip()[:200]}")
+        raise CollectFailed(f"testing for {what}: exit {t.returncode}, {describe_stderr(t.stderr)}")
     dst.parent.mkdir(parents=True, exist_ok=True)
     for argv in (("cp", "-r", str(src), str(dst)), ("chown", "-R", f"{os.getuid()}:{os.getgid()}", str(dst))):
         r = _sudo(host, *argv, timeout_s=600.0)
         if r.returncode != 0:
-            raise CollectFailed(f"{argv[0]} of {what}: {str(r.stderr).strip()[:200]}")
+            raise CollectFailed(f"{argv[0]} of {what}: {describe_stderr(r.stderr)}")
     want, got = _facts(host, src), _facts(host, dst)
     if want != got:
         raise CollectFailed(f"{what}: {want} files and bytes there, {got} copied")
@@ -94,7 +95,7 @@ def collect(host: HostOps, x: Path, keep: Path, outputs: Sequence[str]) -> list[
         work.mkdir(exist_ok=True)
         r = _sudo(host, "mount", "-o", "loop,ro", str(x / "work.img"), str(work), timeout_s=60.0)
         if r.returncode != 0:
-            raise CollectFailed(f"mounting the working disk: {str(r.stderr).strip()[:200]}")
+            raise CollectFailed(f"mounting the working disk: {describe_stderr(r.stderr)}")
     kept = [_copy(host, rel, work / rel, keep / "work" / rel) for rel in outputs]
     return [*kept, _copy(host, "gate log", x / "gatelog", keep / "gatelog")]
 
@@ -138,14 +139,14 @@ def _reap_one(host: HostOps, log_dir: Path, x: Path, outputs: Sequence[str]) -> 
             f.flush()
             os.fsync(f.fileno())
     except (OSError, CollectFailed) as e:
-        log.error("reap: not collected, so its disks stay (%s): %s", x.name, e)
+        log.error("reap: a run directory was not collected, so its disks stay: %s", describe_error(e))
         return False
     try:
         for m in mounts_under(host, x):
             host.unmount(m)
         _sudo(host, "rm", "-rf", "--one-file-system", str(x), timeout_s=300.0)
     except Exception as e:
-        log.error("reap: %s: %s: %s", x.name, type(e).__name__, e)
+        log.error("reap: a run directory could not be handled: %s", describe_error(e))
         return False
     return not x.exists()  # verified, not assumed: a mount left behind keeps the directory
 

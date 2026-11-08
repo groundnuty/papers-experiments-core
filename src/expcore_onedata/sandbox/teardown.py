@@ -115,7 +115,7 @@ class _StepLog:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
                 self._fh = open(path, "a")  # noqa: SIM115 -- held open for the whole teardown; closed in `close`
             except OSError as e:
-                self.ctx = {**ctx, "log_file_error": repr(e)[:200]}
+                self.ctx = {**ctx, "log_file_error": hostops.describe_error(e)}
 
     def __call__(self, step: str, **kw) -> dict:
         rec = {
@@ -147,7 +147,7 @@ class _StepLog:
                     f.flush()
                     os.fsync(f.fileno())
             except OSError as e:
-                log.error("teardown: the events file could not be written: %r", e)
+                log.error("teardown: the events file could not be written: %s", hostops.describe_error(e))
         return rec
 
     def close(self) -> None:
@@ -339,7 +339,7 @@ def _abort(host: HostOps, devs: list[str], waits: Waits) -> dict:
             out[d] = "gone"
             continue
         r = _sudo(host, "sh", "-c", f"echo 1 > {FUSECTL / n / 'abort'}", timeout_s=waits.command_s)
-        out[d] = "aborted" if r.returncode == 0 else f"failed rc {r.returncode}: {r.stderr.strip()[:120]}"
+        out[d] = "aborted" if r.returncode == 0 else f"failed rc {r.returncode}: {hostops.describe_stderr(r.stderr)}"
     return out
 
 
@@ -366,7 +366,7 @@ def _unmount_host(host: HostOps, mp: str, fuse0: list[dict] | None, waits: Waits
         method="fusermount -u",
         attempts=attempts,
         rc=r.returncode,
-        stderr=r.stderr.strip()[-200:],
+        stderr=hostops.stderr_digest(r.stderr),
     )
     for method, cmd in (("fusermount -uz", ["fusermount", "-uz", mp]), ("umount -l", ["umount", "-l", mp])):
         r = _sudo(host, *cmd, timeout_s=waits.command_s)
@@ -379,7 +379,7 @@ def _unmount_host(host: HostOps, mp: str, fuse0: list[dict] | None, waits: Waits
             outcome="failed",
             method=method,
             rc=r.returncode,
-            stderr=r.stderr.strip()[-200:],
+            stderr=hostops.stderr_digest(r.stderr),
             fuse_left=None if now is None else len(now),
         )
     return False
@@ -427,7 +427,7 @@ def _unmount_namespaces(host: HostOps, targets: list[tuple[str, int]], waits: Wa
             copies=[m["mountpoint"] for m in copies],
             verified=again == [],
             rc=r.returncode,
-            stderr=r.stderr.strip()[-200:],
+            stderr=hostops.stderr_digest(r.stderr),
         )
         clean = clean and ok
     return clean
@@ -449,7 +449,7 @@ def ordered_fuse_teardown(
     while the FUSE mount may still be live (`fuse_safe` False: the caller must leave the sidecar and the agent)."""
     waits = waits or WAITS
     mp = host_path(mountpoint)
-    L = _StepLog(log_path, {"sidecar": sidecar})
+    L = _StepLog(log_path, {"sidecar": hostops.name_digest(sidecar)})
     errors: list[str] = []
     removed: list[str] = []
     try:
@@ -466,8 +466,8 @@ def ordered_fuse_teardown(
         )
         L(
             "begin",
-            agent=agent,
-            mountpoint=mp,
+            agent=hostops.name_digest(agent) if agent else None,
+            mountpoint=hostops.name_digest(mp),
             agent_init_pid=ai and ai["pid"],
             agent_running=ai and ai["running"],
             sidecar_pid=si and si["pid"],
@@ -482,7 +482,13 @@ def ordered_fuse_teardown(
         for name in extra_readers:
             r = host.docker("stop", "-t", "2", name, check=False, timeout=2 + waits.command_s)
             after = _inspect(host, name, waits)
-            L("readers", who=name, action="docker stop", rc=r.returncode, running_after=after and after["running"])
+            L(
+                "readers",
+                who=hostops.name_digest(name),
+                action="docker stop",
+                rc=r.returncode,
+                running_after=after and after["running"],
+            )
             if after is not None and after["running"] is not False:
                 unknown.append(name)
         readers = _stop_readers(host, ai, waits, L)
@@ -494,7 +500,7 @@ def ordered_fuse_teardown(
         if unknown:  # docker could not say whether these run: a copy of the mount may be live in one, as with an unreadable namespace
             L(
                 "unmount_ns",
-                who=",".join(unknown),
+                who=",".join(w if w in ("agent", "sidecar") else hostops.name_digest(w) for w in unknown),
                 outcome="unknown",
                 detail="docker could not say whether the container is running",
             )
@@ -550,7 +556,7 @@ def ordered_fuse_teardown(
             "sidecar",
             action="docker stop",
             rc=r.returncode,
-            stderr=r.stderr.strip()[-200:] if r.returncode else "",
+            stderr=hostops.stderr_digest(r.stderr) if r.returncode else None,
             fuse_waiting_before=w,
             sidecar_running_after=after and after["running"],
             readers_left=len(left),
@@ -571,7 +577,7 @@ def ordered_fuse_teardown(
             L("sidecar", action="removed")
         except Exception as e:
             errors.append(f"the sidecar could not be removed ({type(e).__name__})")
-            L("sidecar", action="remove failed", error=repr(e)[:200])
+            L("sidecar", action="remove failed", error=hostops.describe_error(e))
 
         # 4. the agent container, last
         if agent:
@@ -589,7 +595,7 @@ def ordered_fuse_teardown(
                 L("agent", action="removed")
             except Exception as e:
                 errors.append(f"the agent could not be removed ({type(e).__name__})")
-                L("agent", action="remove failed", error=repr(e)[:200])
+                L("agent", action="remove failed", error=hostops.describe_error(e))
         L("end", fuse_safe=True, unmounted=unmounted, aborted=aborted, errors=len(errors))
         return TeardownResult(True, removed, errors, L.records)
     finally:
@@ -610,7 +616,11 @@ def fuse_first(host: HostOps, names: list[str], *, waits: Waits | None = None, l
             (m.get("Source", "") for m in (info or {}).get("Mounts") or [] if m.get("Destination") == SIDECAR_MOUNT), ""
         )
         if not src:
-            log.error("teardown: the mount point of %s could not be found: it and %s are left running", side, agent)
+            log.error(
+                "teardown: the mount point of a sidecar could not be found: it and its agent are left running (%s, %s)",
+                hostops.name_digest(side),
+                hostops.name_digest(agent),
+            )
             held |= {side, agent}
             continue
         run_dir = Path(src).parent

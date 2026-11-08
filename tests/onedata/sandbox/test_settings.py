@@ -148,3 +148,15 @@ def test_two_logins_cannot_share_a_user_id(tmp_path):
 
     with pytest.raises(ConfigError, match="same user id"):
         load(tmp_path, edit)
+
+
+@pytest.mark.parametrize(("table", "key"), [("data_paths", "mounted"), ("users", "login-data")])
+def test_o12_a_level_or_login_with_a_bad_value_is_named_by_position_and_never_by_itself(tmp_path, table, key):
+    """O12: the key of these tables is itself a configured value (a level, a login), so the message cannot echo it."""
+
+    def edit(data):
+        data["sandbox"][table][key] = 7
+
+    with pytest.raises(ConfigError, match=r"entry \d+: must be a non-empty string, got int") as caught:
+        load(tmp_path, edit)
+    assert key not in str(caught.value)

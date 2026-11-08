@@ -205,3 +205,20 @@ def test_the_reaper_does_not_touch_the_directory_of_another_key(world, dead_run,
 def test_a_sandbox_root_that_cannot_be_read_is_not_shown_gone(world, tmp_path):
     missing = tmp_path / "no-such-root"
     assert reap.reap_dirs(world.host, tmp_path, missing, reap.sid_pattern("k"), netpool.Labels("org.test").dir) is False
+
+
+def test_o12_a_failed_docker_command_is_logged_by_the_size_and_digest_of_its_stderr(caplog, monkeypatch):
+    """O12: a real host's failure holds the subcommand and exit code, and the log the digest, not the tool's words."""
+    import hashlib
+
+    from expcore_onedata.sandbox.api import SandboxError
+    from expcore_onedata.sandbox.hostops import CmdResult, DockerHost
+
+    words = "invented: no such image registry.example"
+    host = DockerHost()
+    monkeypatch.setattr(host, "_run", lambda *a, **k: CmdResult(125, "", words))
+    with caplog.at_level("ERROR"), pytest.raises(SandboxError, match=r"docker run failed \(125\)") as caught:
+        host.docker("run", "x")
+    assert words not in str(caught.value)
+    assert words not in caplog.text
+    assert f"stderr {len(words)} bytes, sha256 {hashlib.sha256(words.encode()).hexdigest()}" in caplog.text

@@ -116,8 +116,15 @@ def test_o05_each_data_path_gets_a_read_only_token_of_its_own_interface_minted_b
     caveats = {c["type"]: c for c in json.loads(mint.body)["caveats"]}
     assert "data.readonly" in caveats
     assert caveats["interface"]["interface"] == interface
-    assert sandbox.metadata()["data_path_token"]["subject"] == "u-data"
+    assert sandbox.metadata()["data_path_token"]["user"] == 0  # the first of [sandbox.users], by position
     assert "token" not in json.dumps(sandbox.metadata()["data_path_token"]).lower().replace("data_path_token", "")
+
+
+def test_o12_the_platform_launch_records_the_hash_of_the_platform_file(stage):
+    """O12: the run's metadata names the configuration by the SHA-256 of the file, never by a value in it."""
+    sandbox, _ = run_launch(stage, "isolated")
+    assert sandbox.metadata()["platform_config_sha256"] == stage.config.sha256
+    assert len(stage.config.sha256) == 64
 
 
 def test_a_run_with_no_data_path_mints_no_token(stage):

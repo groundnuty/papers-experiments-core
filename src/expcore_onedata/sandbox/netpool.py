@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from expcore_onedata.sandbox.api import SandboxError
-from expcore_onedata.sandbox.hostops import HostOps, strict_networks
+from expcore_onedata.sandbox.hostops import HostOps, describe_stderr, strict_networks
 
 log = logging.getLogger(__name__)
 _REAP_LOCK = (
@@ -262,7 +262,7 @@ def create(
         if r.returncode == 0:
             return str(cand), tried
         if OVERLAP not in r.stderr:
-            log.error("docker network create failed: %s", r.stderr.strip()[:300])
+            log.error("docker network create failed: %s", describe_stderr(r.stderr))
             raise SandboxError("docker network create failed")
         used.append(cand)  # taken meanwhile by another process: the next candidate
         if tried >= attempts:
@@ -286,7 +286,7 @@ def reap_orphans(host: HostOps, labels: Labels) -> dict:
 def _reap_locked(host: HostOps, labels: Labels, out: dict) -> dict:
     ps = host.docker("ps", "-a", "-q", *labels.filters(), check=False)
     if ps.returncode != 0:  # a docker that did not answer lists nothing: that is not "none left"
-        return {**out, "skipped": f"docker ps failed ({ps.returncode}): {str(ps.stderr).strip()[:200]}"}
+        return {**out, "skipped": f"docker ps failed ({ps.returncode}): {describe_stderr(ps.stderr)}"}
     gone = []
     ids = ps.stdout.split()
     for info in _json(host.docker("inspect", *ids, check=False).stdout) if ids else []:

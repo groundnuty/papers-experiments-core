@@ -12,6 +12,8 @@ import logging
 import threading
 from typing import Protocol
 
+from expcore_onedata.sandbox.hostops import describe_error
+
 log = logging.getLogger(__name__)
 
 
@@ -50,8 +52,8 @@ class Registry:
             for sandbox in todo:
                 try:
                     sandbox.stop()
-                except Exception:
-                    log.warning("a sandbox's cleanup is still incomplete", exc_info=True)
+                except Exception as e:
+                    log.warning("a sandbox's cleanup is still incomplete: %s", describe_error(e))
                     continue  # still pending; an interrupt propagates and leaves it registered
                 with self._lock:
                     if sandbox in self._pending:

@@ -7,10 +7,12 @@ with `docker` and the host's own tools; a test double implements the same protoc
 that reaches the host takes a `HostOps` as its first argument; none of them imports `subprocess` or reads `/proc`,
 `/sys` or the kernel log itself.
 
-Secrets never travel in an argument list: `docker` takes an `env` mapping for them, and a failure message holds the
-tail of the tool's own stderr, never the environment.
+Secrets never travel in an argument list: `docker` takes an `env` mapping for them, and a failure is logged with the
+size and SHA-256 of the tool's own stderr, never its text and never the environment.
 """
 
+import errno
+import hashlib
 import ipaddress
 import json
 import logging
@@ -96,6 +98,38 @@ class HostOps(Protocol):
         ...
 
 
+def stderr_digest(text: str | bytes | None) -> dict[str, Any]:
+    """What a log line or a record keeps of a tool's stderr: how many bytes it was and their SHA-256, never the text.
+
+    The tool's own words may name an image, a path or an address from the configuration (O12), so they are not copied
+    anywhere; two failures with the same digest are the same words."""
+    data = text if isinstance(text, bytes) else (text or "").encode("utf-8", "replace")
+    return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def name_digest(name: object) -> str:
+    """A container's name or a host path as a log keeps it: twelve hex digits of its SHA-256. The name holds the lease
+    key and the path the work directory, both configured values (O12); whoever holds the name can hash it to match."""
+    return hashlib.sha256(str(name).encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def describe_error(error: BaseException) -> str:
+    """An exception for a log line or a record, without anything it may have been given. The sandbox's own errors are
+    written to name no configured value; any other holds its class and, for an OS error, the errno's name, never the
+    path or the text the system attached."""
+    if isinstance(error, SandboxError):
+        return f"{type(error).__name__}: {error}"
+    if isinstance(error, OSError) and error.errno:
+        return f"{type(error).__name__} ({errno.errorcode.get(error.errno, error.errno)})"
+    return type(error).__name__
+
+
+def describe_stderr(text: str | bytes | None) -> str:
+    """`stderr_digest` as the words of a log line or a message."""
+    digest = stderr_digest(text)
+    return f"stderr {digest['bytes']} bytes, sha256 {digest['sha256']}"
+
+
 def _text(value: str | bytes | None) -> str:
     """Text of a captured stream, which a timed-out process may leave as bytes or None."""
     if value is None:
@@ -141,10 +175,11 @@ class DockerHost:
     ) -> CmdResult:
         result = self._run(["docker", *args], DOCKER_TIMEOUT_S if timeout is None else timeout, env=env, input=input)
         if check and result.returncode != 0:
-            # the tool's own words may name an image, a container or a path from the configuration: they go to the
-            # log, and the exception (which reaches a record) carries the subcommand and the exit code only
+            # the tool's own words may name an image, a container or a path from the configuration: neither the log
+            # nor the exception (which reaches a record) carries them, only the subcommand, the exit code and the
+            # size and SHA-256 of the stderr
             log.error(
-                "docker %s failed (%s): %s", args[0] if args else "", result.returncode, result.stderr.strip()[-300:]
+                "docker %s failed (%s): %s", args[0] if args else "", result.returncode, describe_stderr(result.stderr)
             )
             raise SandboxError(f"docker {args[0] if args else ''} failed ({result.returncode})")
         return result
@@ -175,7 +210,7 @@ class DockerHost:
     def _must(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = True) -> None:
         result = self.run(argv, timeout_s, sudo=sudo)
         if result.returncode != 0:
-            log.error("%s failed (%s): %s", argv[0], result.returncode, result.stderr.strip()[-300:])
+            log.error("%s failed (%s): %s", argv[0], result.returncode, describe_stderr(result.stderr))
             raise SandboxError(f"{argv[0]} failed ({result.returncode})")
 
     def make_quota_dir(self, image: Path, mountpoint: Path, size_bytes: int, uid: int) -> None:
@@ -312,7 +347,7 @@ def remove_container(host: HostOps, name: str) -> None:
     """Remove a container with its volumes and verify it is gone; raise `SandboxError` when it is not."""
     host.docker("rm", "-f", "-v", name, check=False, timeout=60)
     if container_exists(host, name) is not False:
-        log.error("container %s is not shown gone after its removal", name)
+        log.error("container %s is not shown gone after its removal", name_digest(name))
         raise SandboxError("a container is not shown gone after its removal")
 
 
@@ -328,19 +363,19 @@ def remove_network(host: HostOps, name: str) -> None:
     """Remove a network and verify it is gone (a leaked network keeps its subnet); raise `SandboxError` otherwise."""
     host.docker("network", "rm", name, check=False, timeout=60)
     if network_exists(host, name) is not False:
-        log.error("network %s is not shown gone after its removal", name)
+        log.error("network %s is not shown gone after its removal", name_digest(name))
         raise SandboxError("a network is not shown gone after its removal")
 
 
 def strict_networks(values: Sequence[str]) -> list[ipaddress.IPv4Network]:
     """Parse address ranges as networks in strict mode (no host bits set); raise `ValueError`, never echoing a value."""
     out = []
-    for value in values:
+    for position, value in enumerate(values):  # a range is a configured value: it is named by its position
         try:
             net = ipaddress.ip_network(value, strict=True)
         except ValueError:
-            raise ValueError("is not a valid IPv4 network with no host bits set") from None
+            raise ValueError(f"entry {position}: is not a valid IPv4 network with no host bits set") from None
         if not isinstance(net, ipaddress.IPv4Network):
-            raise ValueError("must be an IPv4 network")
+            raise ValueError(f"entry {position}: must be an IPv4 network")
         out.append(net)
     return out

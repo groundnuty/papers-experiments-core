@@ -28,7 +28,7 @@ import logging
 import re
 from pathlib import Path
 
-from expcore_onedata.sandbox.hostops import HostOps
+from expcore_onedata.sandbox.hostops import HostOps, describe_stderr
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ def read_kills(host: HostOps, since: float, until: float | None = None) -> list[
         ["journalctl", "-u", "earlyoom", "--no-pager", "-q", "-o", "short-unix", "--since", f"@{int(since)}"], 20
     )
     if p.returncode != 0:
-        log.error("earlyoom: journalctl exited %s: %s", p.returncode, (p.stderr or "")[-200:])
+        log.error("earlyoom: journalctl exited %s: %s", p.returncode, describe_stderr(p.stderr))
         return None
     return [k for k in parse_kills(p.stdout) if k.t >= since and (until is None or k.t <= until)]
 
