@@ -55,6 +55,7 @@ from expcore.replay.clock import ReplayClock
 from expcore.replay.compare import compare
 from expcore.replay.divergence import Halt, ReplayDivergence
 from expcore.replay.recorded import RecordedBackend, RecordedToolProvider, ReplayToolBox
+from expcore.replay.rendering import check_rendering
 
 __all__ = ["ReplayDivergence", "config_of", "replay_async", "replay_record"]
 
@@ -87,6 +88,7 @@ def _check_inputs(record: RunRecord, box: ToolBox) -> None:
         entry = record.prompt[part]
         if sha256_of(entry["text"]) != entry["sha256"]:
             raise ReplayDivergence(f"prompt.{part}.sha256", "the prompt text does not have the recorded hash")
+    check_rendering(record)
     if box.manifest_sha256 != record.prompt["tools_sha256"]:
         raise ReplayDivergence("prompt.tools_sha256", "the tools rebuilt from the record do not have the recorded hash")
 

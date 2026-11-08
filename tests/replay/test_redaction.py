@@ -10,6 +10,7 @@ from record_support import CODE, IDENTITY, make_config, record_run
 
 from expcore.config.loading import ConfigError
 from expcore.loop.agent_loop import run_agent
+from expcore.loop.capping import cap_text
 from expcore.loop.toolbox import ToolBox
 from expcore.prompt.templates import PromptTemplate, sha256_of
 from expcore.records.build import build_record, record_attempt
@@ -19,6 +20,7 @@ from expcore.records.recording import RecordingBackend
 from expcore.records.redact import REDACTED, register_secret
 from expcore.replay.check import check_record
 from expcore.replay.divergence import ReplayDivergence
+from expcore.replay.rendering import shown_follows_raw
 from expcore.replay.replay import replay_record
 
 KEY = "sk-live-0123456789abcdefghij"
@@ -298,3 +300,115 @@ def test_R12_a_call_that_was_not_affected_keeps_the_cap_recomputation(key_in_env
     with pytest.raises(ReplayDivergence) as caught:
         replay_record(RunRecord.from_json(data))
     assert caught.value.path == "tool_calls[1].text"
+
+
+def cut_after_six(secret, cap=200):
+    """The filler length with which the output cap cuts the secret after six of its characters."""
+    for n in range(60, cap - 40):
+        shown = cap_text("a" * n + secret + "b" * 400, cap)[0]
+        head = shown.split("\n[output truncated")[0]
+        if head == "a" * n + secret[:6]:
+            return n
+    raise AssertionError("no filler length cuts the secret after six characters")
+
+
+def test_R12_a_cap_that_cuts_a_registered_secret_after_six_characters_leaves_none_of_it_in_the_record():
+    """R12: the shown text ends with a fragment of the secret before the cap's notice; no substring rule finds that."""
+    secret = "zqx7-live-key-4455667788"
+    register_secret(secret)
+    n = cut_after_six(secret)
+    result = "a" * n + secret + "b" * 400
+    with pytest.warns(RuntimeWarning):
+        record = record_run([[("echo", {"x": "1"})], "done"], {"echo": lambda args: result})
+    dumped = record.dumps()
+    for k in range(4, len(secret) + 1):
+        assert secret[:k] not in dumped
+    call = record.tool_calls[0]
+    assert call["truncated"] is True
+    assert call["text"].split("\n[output truncated")[0] == "a" * n + REDACTED
+    assert call["rendering_verified"] is False
+    assert replay_record(record).tool_calls == record.tool_calls
+
+
+def test_R12_a_secret_registered_during_the_run_is_redacted_from_the_record_built_after_it():
+    """R12: a provider that mints a token registers it and returns it; the record never holds it."""
+    minted = "minted-in-run-7c6b5a4938"
+
+    def mint(arguments):
+        register_secret(minted)
+        return f"issued {minted}"
+
+    with pytest.warns(RuntimeWarning):
+        record = record_run([[("echo", {"x": "1"})], "done"], {"echo": mint})
+    assert minted not in record.dumps(environ={})
+    assert record.tool_calls[0]["text"] == f"issued {REDACTED}"
+    assert replay_record(record).tool_calls == record.tool_calls
+
+
+def test_R03_a_call_marked_as_not_verifiable_that_redaction_never_touched_diverges_naming_the_call():
+    """R03: the flag opens a hole in replay, so it is honoured only where redacted_paths shows a redaction."""
+    record = record_run([[("echo", {"x": "1"})], "done"], {"echo": lambda args: "a plain result"})
+    assert record.redacted_paths == []
+    data = copy.deepcopy(record.to_json())
+    data["tool_calls"][0]["rendering_verified"] = False
+    data["tool_calls"][0]["raw_text"] = "a result nobody produced"
+    with pytest.raises(ReplayDivergence) as caught:
+        replay_record(RunRecord.from_json(data))
+    assert caught.value.path == "tool_calls[0].rendering_verified"
+    assert "call_1_0" in str(caught.value)
+
+
+def test_R03_a_flagged_call_with_a_changed_raw_text_diverges_even_when_the_flag_is_honoured(key_in_environment):
+    """R03: Codex's fabrication; the flag is honoured, and the shown text must still equal the raw text."""
+    with pytest.warns(RuntimeWarning):
+        record = record_run([[("echo", {"x": "1"})], "done"], {"echo": lambda args: f"the key is {KEY}"})
+    assert record.tool_calls[0]["rendering_verified"] is False
+    assert replay_record(record).outcome["name"] == "finished"
+    data = copy.deepcopy(record.to_json())
+    data["tool_calls"][0]["raw_text"] = "a different raw result"
+    with pytest.raises(ReplayDivergence) as caught:
+        replay_record(RunRecord.from_json(data))
+    assert caught.value.path == "tool_calls[0].text"
+
+
+def test_R03_a_truncated_flagged_call_must_show_a_cut_of_its_raw_text(key_in_environment):
+    """R03: what precedes the cap's notice must be a prefix of the redacted raw text."""
+    big = "a" * 50 + KEY + "b" * 300
+    with pytest.warns(RuntimeWarning):
+        record = record_run([[("echo", {"x": "1"})], "done"], {"echo": lambda args: big})
+    assert record.tool_calls[0]["truncated"] is True
+    assert replay_record(record).tool_calls == record.tool_calls  # the faithful redacted capped call passes
+    data = copy.deepcopy(record.to_json())
+    data["tool_calls"][0]["raw_text"] = "X" + data["tool_calls"][0]["raw_text"][1:]
+    with pytest.raises(ReplayDivergence) as caught:
+        replay_record(RunRecord.from_json(data))
+    assert caught.value.path == "tool_calls[0].text"
+
+
+@pytest.mark.parametrize(
+    ("text", "raw", "truncated", "follows"),
+    [
+        ("same", "same", False, True),
+        ("same", "other", False, False),
+        ("abc\n[output truncated: 5 of 9 characters dropped by the harness cap]", "abcdefghi", True, True),
+        ("abd\n[output truncated: 5 of 9 characters dropped by the harness cap]", "abcdefghi", True, False),
+        ("ab[reda\n[output truncated: 5 of 9 characters dropped by the harness cap]", "ab[redacted]", True, True),
+        (
+            "ab" + "xyz" + "\n[output truncated: 5 of 9 characters dropped by the harness cap]",
+            "ab[redacted]cd",
+            True,
+            True,
+        ),
+        (
+            "ab" + "xyzw" + "\n[output truncated: 5 of 9 characters dropped by the harness cap]",
+            "ab[redacted]cd",
+            True,
+            False,
+        ),
+        ("plain cut with no notice", "plain cut with no notice and more", True, True),
+        ("longer than its raw text", "longer", True, False),
+    ],
+)
+def test_R03_what_can_be_checked_about_a_shown_text(text, raw, truncated, follows):
+    """R03: equal when not truncated; a cut of the raw text when truncated, a cut inside a secret or marker allowed."""
+    assert shown_follows_raw(text, raw, truncated) is follows
