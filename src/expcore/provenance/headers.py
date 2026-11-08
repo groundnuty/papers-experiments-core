@@ -3,6 +3,7 @@
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 NEW_LINE = "# Provenance: new"
 _START = "# Provenance:"
@@ -141,4 +142,13 @@ def _imported(fields: dict[str, list[str]]) -> Provenance:
         map_sha256=imported.group("map"),
         merged=tuple(fields["merged"]),
         changes=_last(fields["changes"]),
+    )
+
+
+def missing_headers(root: Path) -> list[str]:
+    """Return the root-relative paths of the Python modules under root that have no provenance header, sorted."""
+    return sorted(
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if read_header(path.read_text(encoding="utf-8")) is None
     )

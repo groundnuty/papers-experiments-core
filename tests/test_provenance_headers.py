@@ -9,6 +9,7 @@ from expcore.provenance.headers import (
     blank_header,
     format_import_header,
     insert_header,
+    missing_headers,
     read_header,
     split_lines,
     strip_header,
@@ -25,10 +26,21 @@ IMPORTED = (
 
 
 def test_every_module_under_src_has_a_header():
-    modules = sorted(SRC.rglob("*.py"))
-    assert modules
-    missing = [str(p.relative_to(SRC)) for p in modules if read_header(p.read_text(encoding="utf-8")) is None]
+    assert any(SRC.rglob("*.py"))
+    missing = missing_headers(SRC)
     assert not missing, f"modules without a '# Provenance:' header: {missing}"
+
+
+def test_the_tree_check_reports_a_planted_module_without_a_header(tmp_path):
+    """A planted violation: the same check the repository test runs finds a module that lacks a header."""
+    package = tmp_path / "pkg" / "sub"
+    package.mkdir(parents=True)
+    (tmp_path / "pkg" / "__init__.py").write_text("# Provenance: new\n", encoding="utf-8")
+    (package / "fresh.py").write_text("# Provenance: new\nx = 1\n", encoding="utf-8")
+    (package / "imported.py").write_text(IMPORTED + "y = 2\n", encoding="utf-8")
+    (package / "bare.py").write_text('"""No header here."""\nz = 3\n', encoding="utf-8")
+    (package / "late.py").write_text("x = 1\n# Provenance: new\n", encoding="utf-8")  # not at the top
+    assert missing_headers(tmp_path) == ["pkg/sub/bare.py", "pkg/sub/late.py"]
 
 
 def test_modules_written_fresh_say_so_on_their_first_line():
