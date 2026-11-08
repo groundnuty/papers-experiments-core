@@ -195,10 +195,68 @@ def test_b06_the_same_fingerprint_on_every_reply_and_none_at_all_are_no_change()
 def test_b06_requested_settings_come_from_sampling_extra_body_and_chat_template_kwargs():
     """B06: Requested settings come from sampling extra body and chat template kwargs."""
     assert requested_settings(
-        {"temperature": 0.2, "seed": 1},
+        {"temperature": 0.2, "top_k": 20},
         {"thinking": {"type": "enabled"}, "chat_template_kwargs": {"enable_thinking": True}},
-    ) == {"temperature": 0.2, "thinking": {"type": "enabled"}, "enable_thinking": True}
+    ) == {"temperature": 0.2, "top_k": 20, "thinking": {"type": "enabled"}, "enable_thinking": True}
     assert requested_settings(None, None) == {}
+
+
+def test_b06_requested_settings_carry_every_setting_not_only_the_five_listed_names():
+    """B06: A setting under any name, from any of the three places, is a requested setting."""
+    assert requested_settings(
+        {"top_k": 20, "min_p": 0.05},
+        {"repetition_penalty": 1.1, "chat_template_kwargs": {"preserve_thinking": True}},
+    ) == {"top_k": 20, "min_p": 0.05, "repetition_penalty": 1.1, "preserve_thinking": True}
+    assert requested_settings({}, {"chat_template_kwargs": "not a table"}) == {"chat_template_kwargs": "not a table"}
+
+
+def test_b06_a_changed_setting_outside_the_five_listed_names_is_a_mismatch():
+    """B06: top_k 20 requested and 99 reported is a mismatch, as it is for the temperature."""
+    result = judged(served_after(reply(top_k=99)), requested={"top_k": 20})
+    assert result["state"] == "mismatch"
+    assert result["reasons"] == ["the server reports top_k=99, requested 20"]
+
+
+def test_b06_an_unrequested_setting_outside_the_five_listed_names_is_a_silent_server_default():
+    """B06: A reported top_k that was never requested is a mismatch, whatever its name."""
+    result = judged(served_after(reply(top_k=40, min_p=0.1)))
+    assert result["state"] == "mismatch"
+    assert result["reasons"] == [
+        "the server reports min_p=0.1 but none was requested (a server default)",
+        "the server reports top_k=40 but none was requested (a server default)",
+    ]
+
+
+def test_b06_a_setting_outside_the_five_listed_names_that_equals_the_request_is_a_match():
+    """B06: Settings the request carried, echoed back unchanged, are a match."""
+    requested = requested_settings({"top_k": 20}, {"chat_template_kwargs": {"preserve_thinking": True}})
+    served = served_after(reply(top_k=20, preserve_thinking=True))
+    assert judged(served, requested=requested)["state"] == "match"
+
+
+def test_b06_every_setting_reported_is_recorded_and_the_five_listed_names_stay_when_no_reply_carries_them():
+    """B06: A setting under another name is recorded; the five always listed read "not reported" when absent."""
+    settings = served_after(reply(top_k=20), reply(top_k=20), reply(min_p=0.1)).info()["served_settings"]
+    assert settings["top_k"] == 20
+    assert settings["min_p"] == 0.1
+    assert all(settings[name] == NOT_REPORTED for name in SETTINGS)
+    assert served_after(reply(top_k=20), reply(top_k=99)).info()["served_settings"]["top_k"] == {"varied": [20, 99]}
+
+
+def test_b06_a_requested_setting_no_reply_carried_is_not_reported_never_the_requested_value():
+    """B06: top_k requested and never echoed is listed as not reported, and is no mismatch."""
+    result = judged(served_after(reply()), requested={"top_k": 20, "temperature": 0.2})
+    assert result["state"] == "match"
+    assert result["not_reported"] == [*SETTINGS, "top_k"]
+    assert "top_k" not in served_after(reply()).info()["served_settings"]
+
+
+def test_b06_fields_that_describe_the_reply_are_not_settings():
+    """B06: The id, usage and timings of a reply are not requested settings, so they cause no mismatch."""
+    metadata = {"id": "chatcmpl-1", "object": "chat.completion", "usage": {"total_tokens": 3}, "timings": {"ms": 1}}
+    served = served_after(reply(**metadata, prompt_logprobs=None))
+    assert judged(served)["state"] == "match"
+    assert set(served.info()["served_settings"]) == set(SETTINGS)
 
 
 def test_b06_baseline_the_first_reply_sets_the_id_and_the_fingerprint_and_passes():
