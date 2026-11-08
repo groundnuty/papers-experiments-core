@@ -27,6 +27,7 @@ Empty lists are valid and must be written out: `read_export` rejects a file with
 import collections
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,16 @@ REQUIRED_KEYS = (
 )
 _DISCARDED_STATES = ("infra_fail", "outage_discarded", "interrupted", "harness_error")
 _USAGE_SUMS = ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens", "wall_s")
+
+
+def _read_umask() -> int:
+    """Return the process umask, read once at import while no other thread can be changing it."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+_UMASK = _read_umask()
 
 
 class ExportError(RuntimeError):
@@ -194,15 +205,22 @@ def _infrastructure_by_condition(
 
 
 def write_export(store: Store, path: Path) -> dict[str, Any]:
-    """Write the export atomically (temporary file in the same directory, fsync, os.replace) and return it."""
+    """Write the export atomically and return it.
+
+    The data goes to a temporary file of its own in the destination's directory (named by `tempfile.mkstemp`, so two
+    writers never share one), is flushed and fsynced, given the mode a plain file would have, and moved over the
+    destination with `os.replace`. A reader sees the old file or a complete new one, whoever else is writing.
+    """
     data = export_run_state(store)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temporary = Path(name)
     try:
-        with open(temporary, "w", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=1)
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temporary, 0o666 & ~_UMASK)
         os.replace(temporary, path)
     except BaseException:
         temporary.unlink(missing_ok=True)

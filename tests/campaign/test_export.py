@@ -2,6 +2,8 @@
 
 import json
 import os
+import stat
+import threading
 
 import pytest
 from campaign_support import (
@@ -364,3 +366,72 @@ def test_c02_a_treatment_attempt_is_counted_under_its_own_kind_when_an_outage_is
     assert (analysed[declared[0]]["treatment"], analysed[declared[0]]["infra_kind"]) == (True, "endpoint")
     retries = [(r["kind"], r["state"], r["attempts"]) for r in data["retries_by_kind"]]
     assert retries == [("sandbox", "outage_discarded", 1)]
+
+
+def test_c09_every_write_of_the_export_uses_a_temporary_file_of_its_own(tmp_path, monkeypatch):
+    """C09: adds that two writes never share a temporary file, so a second writer cannot move or damage the first's."""
+    store, _, _ = planned_store(tmp_path)
+    target = tmp_path / "out" / "export.json"
+    sources = []
+    real_replace = os.replace
+
+    def spy(source, destination):
+        sources.append(os.fspath(source))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", spy)
+    write_export(store, target)
+    write_export(store, target)
+    assert len(set(sources)) == 2
+    assert all(
+        os.path.dirname(s) == str(target.parent) and os.path.basename(s).startswith(".export.json.") for s in sources
+    )
+    assert [p.name for p in target.parent.iterdir()] == ["export.json"]
+
+
+def test_c09_two_writers_of_one_destination_always_leave_a_complete_export_for_a_reader(tmp_path):
+    """C09: adds that concurrent writers never expose a half-written or missing file to a reader of the destination."""
+    quiet, _, _ = planned_store(tmp_path / "quiet")
+    busy, _, manifest = planned_store(tmp_path / "busy")
+    for key in keys_of(manifest)[:6]:
+        run_one(busy, key, finished())
+    target = tmp_path / "export.json"
+    write_export(quiet, target)
+    failures, stop = [], threading.Event()
+
+    def writer(store):
+        try:
+            for _ in range(25):
+                write_export(store, target)
+        except Exception as error:  # the test reports whatever a writer raised
+            failures.append(error)
+
+    def reader():
+        while not stop.is_set():
+            try:
+                read_export(target)
+            except Exception as error:  # a torn or missing file is the failure being tested for
+                failures.append(error)
+                return
+
+    threads = [threading.Thread(target=writer, args=(s,)) for s in (quiet, busy)]
+    watcher = threading.Thread(target=reader)
+    watcher.start()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    stop.set()
+    watcher.join()
+    assert failures == []
+    assert read_export(target)["planned_runs"] == len(manifest.rows)
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
+
+
+def test_the_export_file_has_the_mode_a_plain_file_would_have(tmp_path):
+    store, _, _ = planned_store(tmp_path)
+    target = tmp_path / "export.json"
+    write_export(store, target)
+    mask = os.umask(0)
+    os.umask(mask)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o666 & ~mask
