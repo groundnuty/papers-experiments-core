@@ -30,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
+from urllib.parse import quote
 
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, TokenSettings
@@ -151,9 +152,9 @@ class TokenIssuer:
 
     def _read_privileges(self, subject: str) -> tuple[Any, Any]:
         """Read a principal's privileges in the study space, direct and effective."""
-        space = self._config.space.id
+        space, user = quote(self._config.space.id, safe=""), quote(subject, safe="")
         answers = [
-            self._client.get(f"/spaces/{space}/{kind}/{subject}/privileges") for kind in ("users", "effective_users")
+            self._client.get(f"/spaces/{space}/{kind}/{user}/privileges") for kind in ("users", "effective_users")
         ]
         try:
             return answers[0]["privileges"], answers[1]["privileges"]

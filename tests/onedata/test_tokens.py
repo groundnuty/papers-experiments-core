@@ -80,6 +80,16 @@ def test_o05_a_principal_that_cannot_be_read_gets_no_token(issuer, fake):
     assert fake.issued == {}
 
 
+def test_o05_a_principal_id_cannot_change_the_path_of_the_privilege_read(issuer, fake):
+    """O05: the id goes into a URL path quoted, so an id with a slash or a query reads nothing but itself."""
+    for user in ("u-data/../x", "u-data?a=b", "u-data#x"):
+        with pytest.raises(TokenRefused, match="could not be read"):
+            issuer.mint(data_path_spec("spmock0001"), user, time_cap_s=TIME_CAP_S)
+    assert fake.requests
+    assert all(r.query == {} for r in fake.requests)  # a "?" in the id stayed in the path
+    assert fake.issued == {}
+
+
 def test_o05_the_tool_server_token_has_the_conditions_caveats_no_more_and_no_less(issuer, fake, config):
     """O05: read-only when the condition declares no write right, without the read-only caveat when it does."""
     reading = issuer.mint(tool_server_spec("spmock0001", config.condition("read")), "u-tools", time_cap_s=TIME_CAP_S)
