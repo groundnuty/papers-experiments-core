@@ -11,12 +11,20 @@ only costs another reading; a limit is never passed unseen, because the agent's 
 A call that finishes first returns its result, whatever the clock says after the fact. A call that is cut is cancelled
 and awaited, and the time that takes is cleanup, which the timer keeps apart from the agent's time. The same cleanup
 runs when the whole run is cancelled from outside, and then the cancellation goes on to the caller.
+
+Stopping a call may take for ever (a cleanup that waits on something that never comes), and a cancellation must always
+end. So the wait for a cancelled call has a deadline in real time; past it the call is given up on and left pending,
+the timer records `cleanup_timed_out`, and the cut or the cancellation goes on. The event loop's own shutdown cancels
+what is left.
 """
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 
 from expcore.loop.timer import AgentTimer, Tick
+
+log = logging.getLogger(__name__)
 
 
 class Cut(Exception):
@@ -30,9 +38,10 @@ class Cut(Exception):
 class Watcher:
     """Runs calls under watch, on the run's timer and its injected sleep."""
 
-    def __init__(self, timer: AgentTimer, sleep: Callable[[float], Awaitable[None]]):
+    def __init__(self, timer: AgentTimer, sleep: Callable[[float], Awaitable[None]], *, cleanup_deadline_s: float):
         self._timer = timer
         self._sleep = sleep
+        self._cleanup_deadline_s = cleanup_deadline_s
 
     async def run[T](self, work: Awaitable[T], tick: Tick) -> T:
         """Await `work`, started right after the reading `tick`; raise `Cut` when a limit passes first.
@@ -61,8 +70,31 @@ class Watcher:
             await self._reap(job, sleeper)
 
     async def _reap(self, *tasks: asyncio.Future) -> None:
-        """Cancel the tasks and wait until they have stopped, then close the cleanup the cut or the cancel began."""
+        """Cancel the tasks and wait, up to the cleanup deadline, until they have stopped; give up on any that has not.
+
+        Then close the cleanup that the cut or the cancellation began.
+        """
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        pending = {task for task in tasks if not task.done()}
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=self._cleanup_deadline_s)
+        for task in tasks:
+            if task in pending:
+                task.add_done_callback(_consume)  # given up on: whatever it ends with, nobody is waiting for it
+            elif not task.cancelled():
+                task.exception()  # retrieved, so that it is not reported as never retrieved
+        if pending:
+            self._timer.cleanup_timed_out = True
+            log.warning(
+                "%d cancelled task(s) did not stop within %g s and were given up on",
+                len(pending),
+                self._cleanup_deadline_s,
+            )
         self._timer.end_cleanup()
+
+
+def _consume(task: asyncio.Future) -> None:
+    """Retrieve the outcome of a task that was given up on, so that it is not reported as never retrieved."""
+    if not task.cancelled():
+        task.exception()

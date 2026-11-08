@@ -63,6 +63,10 @@ async def run_agent(
     `clock` and `sleep` are injected so a test or a replay controls time; the default is monotonic time. A caller
     that builds the backend with `time_left` passes the same `timer` to both (`config.timer(clock)`), so the
     backend's retry policy and the loop read one account of the agent's time.
+
+    Cancelling the run from outside cancels the call in flight, waits for it up to `config.cleanup_deadline_s`, and
+    raises `CancelledError`. No result is returned then; a caller that passed its own `timer` finds there how long the
+    cleanup took (`cleanup_s`) and whether it was given up on (`cleanup_timed_out`).
     """
     if toolbox.cap_chars != config.limits.output_cap_chars:
         raise ValueError(
@@ -93,7 +97,7 @@ class _Run:
     ):
         self.backend, self.toolbox, self.system, self.user = backend, toolbox, system, user
         self.config, self.timer = config, timer
-        self.watcher = Watcher(timer, sleep)
+        self.watcher = Watcher(timer, sleep, cleanup_deadline_s=config.cleanup_deadline_s)
         self.turns: list[TurnRecord] = []
         self.calls: list[ToolCallRecord] = []
         self.rounds = 0

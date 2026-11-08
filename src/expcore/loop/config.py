@@ -22,6 +22,7 @@ MIN_CALL_S = 1.0  # a tool call does not start with less time left than this (L0
 CEILING_FACTOR = (
     3.0  # the whole-time ceiling is this many times the agent's time cap unless the run says otherwise (L04)
 )
+CLEANUP_DEADLINE_S = 10.0  # how long the loop waits for a cancelled call to stop before it gives up on it
 CEILING_KIND = "ceiling"  # the infrastructure kind of an attempt that passes the ceiling with the agent under its cap
 
 
@@ -50,6 +51,9 @@ class AgentConfig:
       the agent's own cap decides first (L04). Both fields are filled in on construction, so the record holds the
       ceiling that was in force.
     - `min_call_s`: no tool call starts with less agent time than this left; never below one second (L05).
+    - `cleanup_deadline_s`: how long, in real time, the loop waits for a call it cancelled (cut at a limit, or the whole
+      run cancelled from outside) to stop. Past it the call is given up on and left pending, the result says so
+      (`cleanup_timed_out`) and the ending stands, so a cancellation always terminates.
     """
 
     limits: Limits
@@ -58,6 +62,7 @@ class AgentConfig:
     ceiling_kind: str | None = None
     min_call_s: float = MIN_CALL_S
     ceiling_factor: float | None = None
+    cleanup_deadline_s: float = CLEANUP_DEADLINE_S
 
     def __post_init__(self) -> None:
         """Refuse caps that cannot work and an unknown policy, and settle the ceiling and the kind it ends as."""
@@ -69,6 +74,8 @@ class AgentConfig:
             problems.append("time_cap_s must be a positive number of seconds")
         if self.malformed_policy not in MALFORMED_POLICIES:
             problems.append(f"malformed_policy must be one of {', '.join(MALFORMED_POLICIES)}")
+        if not (math.isfinite(self.cleanup_deadline_s) and self.cleanup_deadline_s > 0):
+            problems.append("cleanup_deadline_s must be a positive, finite number of seconds")
         problems.extend(self._settle_ceiling())
         if not (math.isfinite(self.min_call_s) and self.min_call_s >= MIN_CALL_S):
             problems.append(

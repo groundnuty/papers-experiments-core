@@ -127,6 +127,17 @@ def test_l05_a_minimum_call_time_of_a_second_or_more_is_accepted(seconds):
     assert AgentConfig(LIMITS, min_call_s=seconds).min_call_s == seconds
 
 
+@pytest.mark.parametrize("seconds", [0.0, -1.0, float("nan"), float("inf")])
+def test_a_cleanup_deadline_that_is_not_a_positive_finite_time_is_refused(seconds):
+    with pytest.raises(ValueError, match="cleanup_deadline_s"):
+        AgentConfig(LIMITS, cleanup_deadline_s=seconds)
+
+
+def test_the_cleanup_deadline_defaults_to_ten_seconds_and_is_part_of_the_hash():
+    assert AgentConfig(LIMITS).cleanup_deadline_s == 10.0
+    assert AgentConfig(LIMITS, cleanup_deadline_s=2.0).config_sha256() != AgentConfig(LIMITS).config_sha256()
+
+
 def test_l04_a_configuration_has_a_ceiling_of_three_times_the_time_cap_unless_it_says_otherwise():
     """L04: the whole-time ceiling is always set, and the record holds the value that was in force."""
     default = AgentConfig(LIMITS)
