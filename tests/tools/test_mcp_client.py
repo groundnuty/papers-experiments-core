@@ -119,24 +119,53 @@ def test_l13_the_client_does_not_filter_a_server_that_shows_more_than_the_allow_
     assert any("outside the allow-list: ['add']" in p for p in error.problems)
 
 
-def test_l14_a_server_that_never_answers_fails_the_start_within_the_bound_and_leaves_no_child(frozen, tmp_path):
-    """L14: a server that never speaks is broken: the start fails as knowledge infrastructure within the timeout."""
-    pidfile = tmp_path / "pid"
+def wait_for(condition, *, what: str, deadline_s: float = 60.0) -> None:
+    """Poll until `condition()` is true; fail naming `what` after a bound that no loaded machine should reach."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.05)
+    pytest.fail(f"{what} did not happen within {deadline_s:g} s")
+
+
+def test_l14_a_server_that_answers_starts_within_a_generous_bound(frozen):
+    """L14: the success path. The bound is generous (60 s) on a fast server, so a slow disk cannot fail the start."""
+
+    async def go():
+        async with provider(frozen, start_timeout_s=60.0) as p:
+            return [s.name for s in p.tools()]
+
+    assert asyncio.run(go()) == ["add", "echo"]
+
+
+def test_l14_a_server_that_never_answers_fails_the_start_at_the_bound_and_leaves_no_child(frozen, tmp_path):
+    """L14: a server that never speaks is broken: the start fails as knowledge infrastructure at its timeout.
+
+    The server sleeps for an hour, so a start that returns at all was cut by the bound. The bound is never honoured
+    early (the lower limit), and the upper limit is loose by tens of seconds: the test does not depend on how fast
+    the machine is, only on the bound being enforced rather than the hour being waited out.
+    """
+    bound_s, pidfile = 1.0, tmp_path / "pid"
     started = time.monotonic()
-    error = start_fails(provider(frozen, hang=True, pidfile=pidfile, start_timeout_s=1.0))
-    assert time.monotonic() - started < 15
+    error = start_fails(provider(frozen, hang=True, pidfile=pidfile, start_timeout_s=bound_s))
+    elapsed = time.monotonic() - started
+    assert bound_s <= elapsed < bound_s + 30
     assert isinstance(error, InfraError)
     assert error.kind == "knowledge"
     assert "did not start within 1 s" in error.detail
+    # The child writes its pid once Python is up, which on a loaded disk can be after the bound passed.
+    wait_for(lambda: pidfile.exists() and pidfile.read_text().strip(), what="the server's pid file")
     pid = int(pidfile.read_text())
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
+
+    def gone() -> bool:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            return
-        time.sleep(0.1)
-    pytest.fail("the child process of the failed start is still running")
+            return True
+        return False
+
+    wait_for(gone, what="the exit of the failed start's child process")
 
 
 def test_l14_a_command_that_cannot_be_launched_is_a_broken_server(frozen):
