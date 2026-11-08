@@ -12,6 +12,12 @@ import sys
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+from expcore.provenance.acknowledged import (
+    DEFAULT_ACKNOWLEDGED,
+    load_acknowledgements,
+    refuse_current_commit,
+    split_acknowledged,
+)
 from expcore.provenance.candidates import (
     MAX_CANDIDATE_CHARS,
     MAX_COMPONENTS,
@@ -198,7 +204,13 @@ def _cmd_check_commits(args: argparse.Namespace) -> int:
     if hashes is None:
         return EXIT_OK
     results = check_commits(args.repo, args.revs, hashes, history=args.history)
-    return _report([f"{sha[:12]} {finding}" for sha, finding in results])
+    source = args.acknowledged or DEFAULT_ACKNOWLEDGED
+    entries = load_acknowledgements(source, required=args.acknowledged is not None)
+    refuse_current_commit(entries, args.repo, str(source))
+    remaining, acknowledged = split_acknowledged(results, entries)
+    if acknowledged:
+        print(f"{len(acknowledged)} finding(s) acknowledged in {source}", file=sys.stderr)
+    return _report([f"{sha[:12]} {finding}" for sha, finding in remaining])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -221,6 +233,12 @@ def build_parser() -> argparse.ArgumentParser:
     commits = sub.add_parser("check-commits", parents=[common], help="scan each commit of the given ranges or shas")
     commits.add_argument("--repo", type=Path, default=Path.cwd(), help="repository (default: current directory)")
     commits.add_argument("--history", action="store_true", help="a bare REV stands for its whole history")
+    commits.add_argument(
+        "--acknowledged",
+        type=Path,
+        default=None,
+        help=f"findings in already-pushed commits to accept (default: {DEFAULT_ACKNOWLEDGED} if present)",
+    )
     commits.add_argument("revs", nargs="+", metavar="REV", help="A..B range or a single commit")
     commits.set_defaults(run=_cmd_check_commits)
     return parser
