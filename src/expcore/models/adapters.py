@@ -542,8 +542,12 @@ class StubAdapter:
     """Scripted backend for tests and the oracle: replays a list of turns.
 
     Each item is a final text (str), a list of (tool_name, arguments) calls, a dict {"text": ..., "stop": ...} for a
-    reply with a given stop reason, or an exception, which `step` raises. Token counts are synthetic (the length of
-    the text or arguments), and recorded as such in info().
+    reply with a given stop reason, a ready-made `ModelTurn` (for a call with malformed arguments, or usage the reply
+    did not report), or an exception, which `step` raises. Token counts of the other items are synthetic (the length
+    of the text or arguments), and recorded as such in info().
+
+    The backend of a campaign run is built by the scheduler from the model table, so its script is set afterwards by
+    the study's executor, with `use`.
     """
 
     def __init__(
@@ -560,6 +564,10 @@ class StubAdapter:
         self.output_limit, self.context_tokens, self._probe_error = output_limit, context_tokens, probe_error
         self._messages: list[dict] = []
         self._ctx_tokens = 0
+
+    def use(self, script: list) -> None:
+        """Replace the script and start it from its first item; the conversation so far is not touched."""
+        self._script, self._i = list(script), 0
 
     def info(self) -> dict[str, Any]:
         """Describe the stub as a route."""
@@ -586,6 +594,9 @@ class StubAdapter:
         self._i += 1
         if isinstance(item, BaseException):
             raise item
+        if isinstance(item, ModelTurn):
+            self._messages.append(self._assistant_message(item))
+            return item
         if isinstance(item, dict):  # {"text": ..., "stop": "length"}: a reply with a given stop reason
             self._messages.append({"role": "assistant", "content": item["text"]})
             return ModelTurn(item["text"], [], self._ctx_tokens, len(item["text"]) // 4 + 1, item["stop"], 0.0)
@@ -607,6 +618,30 @@ class StubAdapter:
         turn = ModelTurn("", calls, self._ctx_tokens, out, "tool_calls", 0.0)
         self._ctx_tokens += out
         return turn
+
+    @staticmethod
+    def _assistant_message(turn: ModelTurn) -> dict[str, Any]:
+        """The assistant message a ready-made turn adds to the history.
+
+        Adapters never resend malformed arguments, so the history of a malformed call holds valid JSON with the raw
+        text under `_raw`.
+        """
+        entry: dict[str, Any] = {"role": "assistant", "content": turn.text or None}
+        if turn.reasoning:
+            entry["_reasoning"] = turn.reasoning
+        if turn.tool_calls:
+            entry["tool_calls"] = [
+                {
+                    "id": c.id,
+                    "type": "function",
+                    "function": {
+                        "name": c.name,
+                        "arguments": json.dumps({"_raw": c.raw_arguments} if c.parse_error else c.arguments),
+                    },
+                }
+                for c in turn.tool_calls
+            ]
+        return entry
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
         """Append one tool message per result."""
