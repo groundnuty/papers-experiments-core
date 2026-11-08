@@ -10,7 +10,9 @@ call, a terminal tool succeeds, or a cap or a failure ends the attempt.
 One model call per round and every tool call of a round executed in order, with the results appended together; the
 tool box and the model backend come from their own modules. Added to that base: a closed outcome vocabulary, the
 injected clock and sleep, the time charged to the agent only (L04), calls answered as skipped after a call that ends
-the attempt (L09), and a crash in harness or tool code recorded as a harness defect (L08).
+the attempt (L09), and a crash in harness, backend or tool code recorded as a harness defect (L08): only the errors the
+model layer raises on purpose (infrastructure, an abandoned request, a context overflow, a provider error status) map
+to their own endings.
 
 The loop never raises for an ending. Infrastructure failures, defects and caps all come back as a `LoopResult` that
 holds everything the attempt did so far, so an unscored ending still leaves a partial record (R09).
@@ -28,6 +30,7 @@ from expcore.loop.records import LoopResult, ToolCallRecord, TurnRecord
 from expcore.loop.timer import AgentTimer, Tick
 from expcore.loop.toolbox import ToolBox, ToolRun
 from expcore.models.adapters import ModelBackend, ModelTurn, ToolCall
+from expcore.models.retry import classify
 
 MALFORMED_RAW_LIMIT = 2000  # characters of the model's own arguments kept in a malformed-call event
 
@@ -201,6 +204,9 @@ class _Run:
         ) as exc:  # the conversation outgrew the window: the attempt's own ending, not infrastructure
             raise _End(Outcome("error", str(exc), error_type="ContextOverflow")) from None
         except Exception as exc:
+            if classify(exc) is None:  # not an error the endpoint answered with: a crash in our own code (L08)
+                raise _End(self._defect("the model backend", exc)) from None
+            # A provider error the retry layer passes on unchanged (a plain 400, a 404): the attempt's own ending.
             raise _End(Outcome("error", f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__)) from None
 
     def _model_cut(self, tick: Tick) -> Outcome:

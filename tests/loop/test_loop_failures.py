@@ -47,10 +47,39 @@ def test_a_context_overflow_is_the_attempts_own_ending_not_infrastructure(run):
     assert result.outcome.set_aside is False
 
 
-def test_any_other_backend_exception_is_an_error_named_by_its_class(run):
+class BadRequestError(Exception):
+    """The shape of an SDK error for a plain HTTP 400: the retry layer classifies by status and class name."""
+
+    status_code = 400
+
+
+def test_a_provider_error_the_endpoint_answered_with_is_an_error_named_by_its_class(run):
+    """A plain 400 that is not a context overflow is the attempt's own ending, named by its class."""
+    result = run(StubAdapter([BadRequestError("bad parameter")]), [FakeProvider(ECHO)])
+    assert (result.outcome.name, result.outcome.error_type) == ("error", "BadRequestError")
+    assert "bad parameter" in result.outcome.detail
+    assert result.outcome.set_aside is False
+
+
+def test_l08_any_other_exception_from_the_backend_is_a_harness_defect_never_a_scored_failure(run):
+    """L08: a LookupError from the backend is a crash in our code: set aside with a line-free stack hash."""
     result = run(StubAdapter([LookupError("odd")]), [FakeProvider(ECHO)])
-    assert (result.outcome.name, result.outcome.error_type) == ("error", "LookupError")
+    assert result.outcome.name == "harness_defect"
+    assert result.outcome.set_aside is True
+    assert result.outcome.defect.exception == "LookupError"
+    assert len(result.outcome.defect.stack_sha256) == 64
+    assert "the model backend" in result.outcome.detail
     assert "odd" in result.outcome.detail
+
+
+def test_l08_the_same_backend_defect_gives_the_same_hash_and_another_defect_another(run):
+    """L08: the hash identifies the defect, whatever its message, so a re-run after the fix can be matched to it."""
+
+    def hash_of(error):
+        return run(StubAdapter([error]), [FakeProvider(ECHO)]).outcome.defect.stack_sha256
+
+    assert hash_of(ValueError("one")) == hash_of(ValueError("two"))
+    assert hash_of(ValueError("one")) != hash_of(KeyError("one"))
 
 
 @pytest.mark.parametrize("kind", CORE_KINDS)
