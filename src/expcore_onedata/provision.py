@@ -184,7 +184,7 @@ class Provisioner:
     def verify_space(self) -> str:
         """Read the space's live name and refuse one that differs from the configuration or lies outside the prefixes.
 
-        The name is Onezone's, read by the client (`space_name`, once per client). The client's own gate refuses every
+        The name is Onezone's, read by the client (`space_name`, read again on every call). The client's own gate refuses every
         mutation whose target space lies outside the prefixes; this adds that the space is the configured one.
         """
         try:

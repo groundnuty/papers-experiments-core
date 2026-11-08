@@ -21,9 +21,12 @@ Reads and mutations are separate calls:
   client reads that space's name from Onezone (`space_name`) right before sending and refuses unless the name starts
   with one of the configured prefixes (`[space] prefixes`). The name is read afresh for every mutation and never
   cached, because a space can be renamed out of the study's scope after an earlier read; a cache would go on
-  authorising it. A path that does not lie under a space, a file id or a path of a provider among them, resolves to no
-  space and is refused, so a mistaken or hostile target cannot reach a space outside the study's. What remains is the
-  interval between that read and the platform acting on the request, which a client cannot close;
+  authorising it. A file addressed by id (`/data/{id}`, a transfer job's `fileId`, a range read) is resolved the same
+  way: its space is read from the file's `path` attribute through the provider right before every request, never kept
+  (`file_space_name`), and a path that is not canonical resolves to no space. Anything else, a path of a provider
+  among it, resolves to no space and is refused, so a mistaken or hostile target cannot reach a space outside the
+  study's. What remains is the interval between that read and the platform acting on the request, which a client
+  cannot close;
 - `mint_own_token` is the one operation on credentials: a platform user mints its own temporary token with its own
   password (HTTP Basic), as the earlier code did. It acts on no space, so it has a call of its own; the password is
   registered as a secret when it is read and the minted value before the call returns (R12), and so is the admin token
@@ -183,6 +186,21 @@ def _plain(path: str) -> list[str]:
     return path.split("/")
 
 
+def _space_of_path(path: Any) -> str:
+    """Return the first segment of a file's path as a provider answered it, which is its space's name.
+
+    The path must be canonical: absolute, with no `.` or `..` segment, no empty segment (`//`, or a trailing `/`), no
+    percent-escape and no backslash. A path that is not would let a prefix check pass on its first segment while the
+    path leads into another space (`/{study space}/../{other space}/f`), so it resolves to no space (O09).
+    """
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise OutOfScope("the provider's answer for the target file holds no path, so it resolves to no space")
+    segments = path.split("/")[1:]
+    if "%" in path or "\\" in path or any(part in ("", ".", "..") for part in segments):
+        raise OutOfScope("the provider's path for the target file is not canonical, so it resolves to no space")
+    return segments[0]
+
+
 def _file_target(method: str, path: str, body: Any) -> str | None:
     """Return the file id a request acts on, or None when its path names no file.
 
@@ -220,7 +238,6 @@ class OnezoneClient:
         credential = admin_token if admin_token is not None else config.admin.read(environ)
         register_secret(credential)
         self._admin = {AUTH_HEADER: credential}
-        self._file_spaces: dict[tuple[str, str], str] = {}  # (provider, file id) -> its space's name, read once
 
     def close(self) -> None:
         """Close the connection pool when the client built it."""
@@ -355,30 +372,25 @@ class OnezoneClient:
         return name
 
     def file_space_name(self, file_id: str, provider: str) -> str:
-        """Return the name of the space a file lies in, read once per file from its `path` attribute through a provider.
+        """Return the name of the space a file lies in, read now from its `path` attribute through a provider.
 
-        The first segment of the file's path is its space's name. A file the provider does not know, or an answer
-        without a path, raises OutOfScope; any other failure of the read raises PlatformError. Neither message holds the
-        id or a name. The read is unconfirmed against a real provider (`UNVERIFIED_ENDPOINTS`).
+        Every call reads: nothing is kept, so a file moved or a space renamed since the last call changes the answer
+        (O09). The path must be canonical (`_space_of_path`) and its first segment is its space's name. A file the
+        provider does not know, or an answer without a canonical path, raises OutOfScope; any other failure of the
+        read raises PlatformError. Neither message holds the id or a name. The read is unconfirmed against a real
+        provider (`UNVERIFIED_ENDPOINTS`).
         """
         if not isinstance(file_id, str) or not _FILE_ID.fullmatch(file_id):
             raise OutOfScope("the target file id is not a plain id, so it resolves to no space")
-        key = (provider, file_id)
-        if key not in self._file_spaces:
-            try:
-                answer = self._send(
-                    "GET", f"/data/{file_id}", provider=provider, headers=self._admin, params={"attribute": "path"}
-                )
-            except PlatformError as error:
-                if error.status == 404:
-                    raise OutOfScope("the target file is unknown to its provider, so it resolves to no space") from None
-                raise
-            path = answer.get("path") if isinstance(answer, dict) else None
-            name = path.split("/")[1] if isinstance(path, str) and path.startswith("/") else ""
-            if not name:
-                raise OutOfScope("the provider's answer for the target file holds no path, so it resolves to no space")
-            self._file_spaces[key] = name
-        return self._file_spaces[key]
+        try:
+            answer = self._send(
+                "GET", f"/data/{file_id}", provider=provider, headers=self._admin, params={"attribute": "path"}
+            )
+        except PlatformError as error:
+            if error.status == 404:
+                raise OutOfScope("the target file is unknown to its provider, so it resolves to no space") from None
+            raise
+        return _space_of_path(answer.get("path") if isinstance(answer, dict) else None)
 
     def _target_name(self, method: str, path: str, provider: str | None, body: Any) -> str:
         """Return the name of the space a request acts on: the space in its path, or the space of the file it names."""
