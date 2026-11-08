@@ -29,6 +29,37 @@ def test_a_distribution_of_the_wrong_shape_is_refused_not_read_as_empty():
         P.provider_blocks({"distributionPerProvider": {"a": {"distributionPerStorageBackend": {"s": 5}}}}, "a")
 
 
+UNKNOWN = [
+    pytest.param({}, id="entry without a backend table"),
+    pytest.param(None, id="entry that is null"),
+    pytest.param([], id="entry that is a list"),
+    pytest.param({"distributionPerStorageBackend": None}, id="null backend table"),
+    pytest.param({"distributionPerStorageBackend": {}}, id="empty backend table"),
+    pytest.param({"distributionPerStorageBackend": {"s": {}}}, id="backend without blocks"),
+    pytest.param({"distributionPerStorageBackend": {"s": {"blocks": None}}}, id="backend with null blocks"),
+    pytest.param({"distributionPerStorageBackend": {"s": {"blocks": "0-10"}}}, id="blocks that are text"),
+    pytest.param({"distributionPerStorageBackend": {"s": {"blocks": {"0": 10}}}}, id="blocks that are a table"),
+    pytest.param(
+        {"distributionPerStorageBackend": {"s": {"blocks": [[0, 10]]}, "t": {"physicalSize": 0}}},
+        id="one backend of two without blocks",
+    ),
+]
+
+
+@pytest.mark.parametrize("entry", UNKNOWN)
+def test_o08_a_missing_or_malformed_blocks_field_is_unknown_and_never_an_empty_list(entry):
+    """O01 and O08: a listed provider whose entry or backend gives no list of blocks has an unknown holding, which
+    raises; reading it as [] would let an eviction be confirmed by an answer that says nothing."""
+    with pytest.raises(ValueError, match=r"distributionPerStorageBackend|blocks|not a table"):
+        P.provider_blocks({"distributionPerProvider": {"a": entry}}, "a")
+
+
+def test_o01_an_empty_list_of_blocks_is_an_answer_and_means_nothing_is_held():
+    """O01: only an explicit empty list says a provider holds nothing."""
+    assert P.provider_blocks(distribution(a=[]), "a") == []
+    assert P.provider_blocks(distribution(a=[], b=[[0, 5]]), "b") == [(0, 5)]
+
+
 def test_merging_joins_overlapping_and_adjacent_blocks_and_drops_empty_ones():
     assert P.merged([(10, 5), (0, 10), (12, 10), (50, 0)]) == [(0, 22)]
     assert P.held_bytes([(0, 10), (5, 10)]) == 15

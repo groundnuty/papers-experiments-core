@@ -171,6 +171,22 @@ def test_o08_a_provider_that_cannot_be_read_makes_its_readings_none_and_the_snap
     assert snapshot["files"]["data"]["providers"]["alpha"]["after"]["held_bytes"] == len(DATA)
 
 
+def test_o08_a_block_map_without_a_blocks_field_is_a_failed_probe_with_a_reason_not_an_empty_reading(probes, seeded):
+    """O08 with O01: an answer that gives no blocks is recorded as probe_ok False with a reason, its holdings None; it
+    is not an empty reading that would show a loss, or no gain, from the providers' real holdings."""
+    probes.start({})
+    seeded.omit_blocks = True
+    snapshot = probes.finish()
+    assert snapshot["ok"] is False
+    for provider in ("alpha", "beta"):
+        after = snapshot["files"]["data"]["providers"][provider]["after"]
+        assert after["probe_ok"] is False
+        assert after["error"]
+        assert (after["held_bytes"], after["blocks"]) == (None, None)
+    assert snapshot["files"]["data"]["pairs"] is None
+    assert snapshot["pairs"] is None
+
+
 def test_a_snapshot_without_a_start_has_no_before_and_no_pairs(probes, seeded):
     """Without the reading at the start nothing can be said about growth: the snapshot is incomplete, not zero."""
     snapshot = probes.finish()

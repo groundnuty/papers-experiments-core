@@ -19,21 +19,28 @@ Range = tuple[int, int]
 def provider_blocks(distribution: Mapping[str, Any], provider_id: str) -> list[Range]:
     """Return the sorted `(offset, length)` blocks a provider holds of one file, from a `/distribution` answer.
 
-    A provider absent from the answer holds nothing. The blocks of every storage backend are joined. An answer that
-    does not have the documented shape raises ValueError, so a malformed map is never read as an empty one.
+    A provider absent from the answer holds nothing. A provider that is listed must say what it holds: a table of
+    storage backends, each with a list of blocks, whose union is returned (an empty list is a real answer). An entry
+    without such a table, a backend without a `blocks` list, or any other shape raises ValueError: what is held is
+    unknown then, and an unknown is never read as an empty list (O01, O08), or an eviction could be confirmed by it.
     """
     per_provider = distribution.get("distributionPerProvider")
     if not isinstance(per_provider, Mapping):
         raise ValueError("the distribution answer has no 'distributionPerProvider' table")
-    entry = per_provider.get(provider_id) or {}
+    if provider_id not in per_provider:
+        return []
+    entry = per_provider[provider_id]
     backends = entry.get("distributionPerStorageBackend") if isinstance(entry, Mapping) else None
-    if backends is not None and not isinstance(backends, Mapping):
-        raise ValueError("the distribution answer's 'distributionPerStorageBackend' is not a table")
+    if not isinstance(backends, Mapping) or not backends:
+        raise ValueError("the distribution answer lists the provider but has no 'distributionPerStorageBackend' table")
     out: list[Range] = []
-    for backend in (backends or {}).values():
+    for backend in backends.values():
         if not isinstance(backend, Mapping):
             raise ValueError("the distribution answer's storage backend entry is not a table")
-        for block in backend.get("blocks") or []:
+        blocks = backend.get("blocks")
+        if not isinstance(blocks, list | tuple):
+            raise ValueError("the distribution answer's storage backend has no list of 'blocks'")
+        for block in blocks:
             if not (isinstance(block, list | tuple) and len(block) == 2 and all(isinstance(n, int) for n in block)):
                 raise ValueError("the distribution answer holds a block that is not an [offset, length] pair")
             out.append((block[0], block[1]))

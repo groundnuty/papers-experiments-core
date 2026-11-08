@@ -98,6 +98,7 @@ class FakeData(FakeFederation):
         self.page_size = 1000
         self.id_suffix = ""  # appended to every file id made from now on, for ids with characters like "="
         self.fail_deletes = False  # every DELETE answers 500
+        self.omit_blocks = False  # the block map's storage backends carry no "blocks" field
         self.ignore_deletes = False  # every DELETE answers 204 and removes nothing
         self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat answers 403
         self.resets: list[list] = []
@@ -352,12 +353,10 @@ class FakeData(FakeFederation):
                 waiting[2] -= 1
             self._promote(node.file_id, provider)
             held = self.blocks.get((node.file_id, provider), [])
-            per[provider] = {
-                "virtualSize": len(node.content),
-                "distributionPerStorageBackend": {
-                    "storage-1": {"physicalSize": sum(n for _, n in held), "blocks": [list(b) for b in held]}
-                },
-            }
+            backend: dict = {"physicalSize": sum(n for _, n in held)}
+            if not self.omit_blocks:
+                backend["blocks"] = [list(b) for b in held]
+            per[provider] = {"virtualSize": len(node.content), "distributionPerStorageBackend": {"storage-1": backend}}
         return {"type": node.kind, "distributionPerProvider": per}
 
     def _schedule(self, request: httpx.Request) -> httpx.Response:
