@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 STDLIB = set(sys.stdlib_module_names)
 _DYNAMIC_IMPORTERS = {"import_module", "__import__"}
+_IMPORT_MODULES = {"importlib", "builtins"}
 
 
 def _normalise(name: str) -> str:
@@ -29,20 +30,48 @@ def declared_dependencies(extra: str | None = None) -> set[str]:
     return {_normalise(m.group()) for m in names if m}
 
 
+def _dynamic_importers(tree: ast.AST) -> set[str]:
+    """Return the plain names that stand for import_module or __import__, following aliases and assignments."""
+    names = set(_DYNAMIC_IMPORTERS)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in _IMPORT_MODULES:
+            names.update(a.asname or a.name for a in node.names if a.name in _DYNAMIC_IMPORTERS)
+    for _ in range(3):  # a few rounds follow chains such as `load = import_module; again = load`
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and _is_importer(node.value, names):
+                names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    return names
+
+
+def _is_importer(node: ast.AST, names: set[str]) -> bool:
+    """Tell whether an expression names the dynamic importer: a bound name or any `x.import_module` attribute."""
+    if isinstance(node, ast.Name):
+        return node.id in names
+    return isinstance(node, ast.Attribute) and node.attr in _DYNAMIC_IMPORTERS
+
+
+def _module_argument(call: ast.Call) -> str | None:
+    """Return the module name given as a string constant, positionally or as name=, else None."""
+    argument = call.args[0] if call.args else next((k.value for k in call.keywords if k.arg == "name"), None)
+    if isinstance(argument, ast.Constant) and isinstance(argument.value, str) and not argument.value.startswith("."):
+        return argument.value
+    return None
+
+
 def imported_roots(source: str) -> set[str]:
     """Return the top-level names an absolute import statement or a literal dynamic import pulls in."""
+    tree = ast.parse(source)
+    importers = _dynamic_importers(tree)
     roots: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             roots.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             roots.add(node.module.split(".")[0])
-        elif isinstance(node, ast.Call):
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            first = node.args[0] if node.args else None
-            if name in _DYNAMIC_IMPORTERS and isinstance(first, ast.Constant) and isinstance(first.value, str):
-                roots.add(first.value.split(".")[0])
+        elif isinstance(node, ast.Call) and _is_importer(node.func, importers):
+            name = _module_argument(node)
+            if name:
+                roots.add(name.split(".")[0])
     return roots
 
 
@@ -81,6 +110,17 @@ def test_every_module_respects_the_boundary(package):
         "import importlib\nimportlib.import_module('expcore_onedata.health')\n",
         "__import__('expcore_onedata')\n",
         "import requests\n",
+        "import importlib\nimportlib.import_module(name='expcore_onedata.health')\n",
+        "__import__(name='requests')\n",
+        "from importlib import import_module as load\nload('expcore_onedata')\n",
+        "from importlib import import_module as load\nload(name='requests')\n",
+        "import importlib as il\nil.import_module('expcore_onedata')\n",
+        "import importlib as il\nil.import_module(name='requests.sessions')\n",
+        "import builtins\nbuiltins.__import__('requests')\n",
+        "import importlib\nload = importlib.import_module\nload('expcore_onedata')\n",
+        "from importlib import import_module\nload = import_module\nagain = load\nagain(name='requests')\n",
+        "from builtins import __import__ as imp\nimp('requests')\n",
+        "import importlib\nimportlib.import_module('requests', package='expcore')\n",
     ],
 )
 def test_planted_import_fails_inside_expcore(source):
@@ -98,6 +138,11 @@ def test_planted_import_fails_inside_expcore(source):
         "from . import sibling\n",
         "from .sibling import thing\n",
         "import importlib\nimportlib.import_module('json')\n",
+        "import importlib\nimportlib.import_module('.sibling', package='expcore')\n",
+        "import importlib\nimportlib.import_module(name='json')\n",
+        "from importlib import import_module as load\nload('expcore.loop')\n",
+        "import importlib as il\nil.import_module(name='os.path')\n",
+        "def import_module(x):\n    return x\nimport_module(1)\n",
     ],
 )
 def test_allowed_imports_inside_expcore(source):
