@@ -194,7 +194,7 @@ def test_p01_an_untracked_file_under_a_root_is_dirty_because_the_tree_hash_cover
     found = version(checkout.path, SCOPE)
     assert found["tree_sha256"] != clean["tree_sha256"]
     assert (found["dirty"], found["source"]) == (True, "git")
-    assert "untracked files under the hashed roots: pkg/new.py" in found["why"]
+    assert "hashed files that git does not track: pkg/new.py" in found["why"]
     with pytest.raises(CodeVersionUnknown, match="dirty code"):
         require_known("study run", checkout.path, SCOPE)
     assert require_known("pilot", checkout.path, SCOPE, allow_dirty=True)["dirty"] is True
@@ -202,16 +202,43 @@ def test_p01_an_untracked_file_under_a_root_is_dirty_because_the_tree_hash_cover
     assert version(checkout.path, SCOPE)["dirty"] is False
 
 
-def test_p01_an_untracked_file_outside_the_roots_or_not_hashed_or_ignored_is_not_dirt(checkout):
+def test_p01_a_file_outside_the_roots_or_not_hashed_or_a_cache_is_not_dirt(checkout):
     """P01: Only what the tree hash covers can make the identity differ from the commit."""
     scope = CodeScope.of(SCOPE.roots, not_hashed=[*SCOPE.not_hashed, "data/log.md"])
     for name in ("notes.txt", "other/scratch.py", "data/log.md", "pkg/__pycache__/run.cpython-312.pyc"):
         (checkout.path / name).parent.mkdir(parents=True, exist_ok=True)
         (checkout.path / name).write_text("x\n", encoding="utf-8")
-    assert version(checkout.path, scope)["dirty"] is False
+    found = version(checkout.path, scope)
+    assert (found["dirty"], found["why"]) == (False, None)
+    assert found["tree_sha256"] == tree_hash(checkout.path, scope)
+
+
+def test_p01_a_gitignored_file_under_a_root_is_dirty_because_the_tree_hash_still_covers_it(checkout):
+    """P01: A committed .gitignore naming a data file does not make the file part of the commit."""
+    (checkout.path / ".gitignore").write_text("data/extra.csv\n", encoding="utf-8")
+    checkout.commit("ignore a data file")
+    clean = version(checkout.path, SCOPE)
+    assert clean["dirty"] is False
     (checkout.path / "data" / "extra.csv").write_text("a\n", encoding="utf-8")
-    assert version(checkout.path, scope)["dirty"] is True
-    (checkout.path / ".gitignore").write_text("data/extra.csv\n", encoding="utf-8")  # git is told to disregard it
+    assert checkout.git("status", "--porcelain", "--untracked-files=all") == ""  # git itself reports nothing
+    found = version(checkout.path, SCOPE)
+    assert found["tree_sha256"] != clean["tree_sha256"]
+    assert (found["dirty"], found["why"]) == (True, "hashed files that git does not track: data/extra.csv")
+    with pytest.raises(CodeVersionUnknown, match="dirty code"):
+        require_known("study run", checkout.path, SCOPE)
+    assert require_known("pilot", checkout.path, SCOPE, allow_dirty=True)["dirty"] is True
+    (checkout.path / "data" / "extra.csv").unlink()
+    assert version(checkout.path, SCOPE)["dirty"] is False
+
+
+def test_p01_an_ignored_cache_or_not_hashed_file_under_a_root_stays_out_of_both_sides(checkout):
+    """P01: The caches the tree hash skips are not in the hashed set, so ignoring them does not make them dirt."""
+    scope = CodeScope.of(SCOPE.roots, not_hashed=[*SCOPE.not_hashed, "data/log.md"])
+    (checkout.path / ".gitignore").write_text("__pycache__/\n*.pyc\ndata/log.md\n", encoding="utf-8")
+    checkout.commit("ignore caches and a record")
+    (checkout.path / "pkg" / "__pycache__").mkdir()
+    (checkout.path / "pkg" / "__pycache__" / "run.cpython-312.pyc").write_bytes(b"cache")
+    (checkout.path / "data" / "log.md").write_text("a dated record\n", encoding="utf-8")
     assert version(checkout.path, scope)["dirty"] is False
 
 
@@ -220,7 +247,7 @@ def test_p01_many_untracked_files_are_named_briefly(checkout):
     for number in range(5):
         (checkout.path / "pkg" / f"new{number}.py").write_text("x = 1\n", encoding="utf-8")
     why = version(checkout.path, SCOPE)["why"]
-    assert why == "untracked files under the hashed roots: pkg/new0.py, pkg/new1.py, pkg/new2.py and 2 more"
+    assert why == "hashed files that git does not track: pkg/new0.py, pkg/new1.py, pkg/new2.py and 2 more"
 
 
 def test_p01_a_git_status_that_fails_is_dirty_never_clean(checkout):

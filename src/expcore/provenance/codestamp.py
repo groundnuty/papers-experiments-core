@@ -8,7 +8,8 @@ A run's code identity is its commit plus a hash of the tree under the scope's ro
 code reads (P02). The commit comes from git when it works, else from `.code-stamp.json`, which a snapshot copied
 without `.git` carries (the head and the tree hash, written by `write_stamp` where the repository is), else it is
 UNKNOWN. Unknown counts as dirty, never as clean (P01). So does a git status that cannot be read, a stamp whose
-head is not a git sha, and an untracked file under the roots: the tree hash covers it, the commit does not. A stamp
+head is not a git sha, and any file the tree hash covers that git does not track, ignored or not: the hash includes
+it, the commit does not. A stamp
 whose tree hash does not match the files beside it is stale. The tree hash ignores modification times, caches and
 bytecode (P03). `require_known` refuses to start a study run on unknown, stale or, unless allowed, dirty code.
 
@@ -166,42 +167,44 @@ def read_stamp(root: Path | str) -> dict | None:
     return stamp if ok else None
 
 
-def _untracked_covered(root: Path, scope: CodeScope) -> list[str] | None:
-    """List the untracked files the tree hash covers; None when git cannot list them.
+def _untracked_hashed(root: Path, scope: CodeScope) -> list[str] | None:
+    """List the files the tree hash covers that git does not track, ignored or not; None when git cannot list them.
 
-    A new file under a root changes the hash while `git status --untracked-files=no` stays silent about it.
+    The hashed set minus `git ls-files`. A new file under a root changes the hash while `git status
+    --untracked-files=no` stays silent about it, and so does a file a .gitignore names. Caches and the scope's
+    `not_hashed` files are not in the hashed set, so they are in neither side.
     """
-    listing = _git(root, "ls-files", "-z", "--others", "--exclude-standard")
+    listing = _git(root, "ls-files", "-z")
     if listing is None:
         return None
-    untracked = {name for name in listing.split("\0") if name}
-    return [name for name in (f.relative_to(root).as_posix() for f in _files(root, scope)) if name in untracked]
+    tracked = {name for name in listing.split("\0") if name}
+    return [name for name in (f.relative_to(root).as_posix() for f in _files(root, scope)) if name not in tracked]
 
 
 def _dirty_reason(root: Path, scope: CodeScope) -> str | None:
     """Say why a git checkout is dirty, else None.
 
-    Dirty is a change to a tracked file, an untracked file under the roots, or a git that cannot say.
+    Dirty is a change to a tracked file, a hashed file git does not track, or a git that cannot say.
     """
     status = _git(root, "status", "--porcelain", "--untracked-files=no")
     if status is None:
         return "git status could not be read"
     if status:
         return "uncommitted changes"
-    untracked = _untracked_covered(root, scope)
+    untracked = _untracked_hashed(root, scope)
     if untracked is None:
         return "git status could not be read"
     if untracked:
         more = f" and {len(untracked) - 3} more" if len(untracked) > 3 else ""
-        return f"untracked files under the hashed roots: {', '.join(untracked[:3])}{more}"
+        return f"hashed files that git does not track: {', '.join(untracked[:3])}{more}"
     return None
 
 
 def version(root: Path | str, scope: CodeScope) -> dict:
     """Return the code identity: {"commit", "dirty", "source": git|stamp|none, "stale", "why", "tree_sha256"}.
 
-    Unknown is dirty. A git status that fails is dirty, not clean, and so is an untracked file under the scope's
-    roots. `tree_sha256` is recomputed on every call, so the identity is re-verified each time it is asked for (P02);
+    Unknown is dirty. A git status that fails is dirty, not clean, and so is a hashed file git does not track.
+    `tree_sha256` is recomputed on every call, so the identity is re-verified each time it is asked for (P02);
     it is None only when the version is unknown.
     """
     root = Path(root)
