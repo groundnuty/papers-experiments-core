@@ -62,6 +62,17 @@ class MockOnedata:
         self.space_name, self.zone_host, self.provider_host = space_name, zone_host, provider_host
         self.max_limit, self.token, self.provider_version = max_limit, token, provider_version
         self._index()
+        # The federation's view of the space, as the scope answer shows it. A test changes these to make a federation
+        # with more, fewer or other providers than the one declared.
+        self.providers: dict[str, dict] = {
+            self.PROVIDER_ID: {
+                "name": "mock-provider",
+                "domain": provider_host,
+                "version": provider_version,
+                "online": True,
+            }
+        }
+        self.supports: dict[str, dict] = {self.PROVIDER_ID: {"readonly": False}}
         self.content_delay_s = 0.0  # tests: delay the headers of every content response
         self.requests: list[Request] = []
         self._lock = threading.Lock()
@@ -153,7 +164,7 @@ class MockOnedata:
                     )
                 if self.command == "POST" and u.path.endswith("/onezone/tokens/infer_access_token_scope"):
                     sent = json.loads(body or b"{}").get("token")
-                    if sent != outer.token:
+                    if not outer._accepts(sent):
                         return self._err(401, "unauthorized")
                     return self._json(200, outer._scope())
                 if tok != outer.token:
@@ -250,21 +261,16 @@ class MockOnedata:
             self._httpd.shutdown()
             self._httpd.server_close()
 
+    def _accepts(self, token: str | None) -> bool:
+        """Whether the scope endpoint knows this token; a subclass adds the tokens it issues."""
+        return token == self.token
+
     def _scope(self) -> dict:
         return {
             "validUntil": 0,
             "dataAccessScope": {
                 "readonly": True,
-                "spaces": {
-                    self.SPACE_ID: {"name": self.space_name, "supports": {self.PROVIDER_ID: {"readonly": False}}}
-                },
-                "providers": {
-                    self.PROVIDER_ID: {
-                        "name": "mock-provider",
-                        "domain": self.provider_host,
-                        "version": self.provider_version,
-                        "online": True,
-                    }
-                },
+                "spaces": {self.SPACE_ID: {"name": self.space_name, "supports": self.supports}},
+                "providers": self.providers,
             },
         }
