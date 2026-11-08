@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=2.6.0",
     "httpx>=0.28.1",
+    "mcp>=2.3.0",
     "openai>=3.46.0",
 ]
 
@@ -49,3 +50,8 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
 "src/expcore/models/served.py" = ["E501"]
 "src/expcore/provenance/codestamp.py" = ["E501"]
 "src/expcore/config/models.py" = ["E501"]
+"src/expcore/loop/agent_loop.py" = ["E501"]
+"src/expcore/loop/capping.py" = ["E501"]
+"src/expcore/prompt/templates.py" = ["E501"]
+"src/expcore/tools/mcp_client.py" = ["E501"]
+"src/expcore/tools/manifest.py" = ["E501"]
