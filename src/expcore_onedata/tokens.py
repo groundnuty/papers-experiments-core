@@ -44,6 +44,7 @@ from expcore_onedata.credentials import Principal
 from expcore_onedata.rights import BASELINE_RIGHTS
 from expcore_onedata.tokencheck import (
     CaveatSpec,
+    ExaminationFailed,
     Examined,
     TokenRefused,
     require_distinct,
@@ -171,13 +172,21 @@ class TokenIssuer:
         except (KeyError, TypeError):
             raise TokenRefused("the principal's privileges could not be read") from None
 
+    def check_user(self, spec: PlaneSpec, user_id: str) -> None:
+        """Require the user to hold exactly the plane's rights, direct and effective, as Onezone reports them now.
+
+        An answer that cannot be had raises `ExaminationFailed` (a `TokenRefused` that keeps the cause, so a caller can
+        tell an outage from a refusal); one that differs from the plane's set raises `TokenRefused`.
+        """
+        try:
+            direct, effective = self._read_privileges(user_id)
+        except PlatformError as error:
+            raise ExaminationFailed(f"the principal's privileges could not be read ({error})", error) from None
+        require_privileges(spec.rights, direct=direct, effective=effective)
+
     def check_principal(self, spec: PlaneSpec, principal: Principal) -> None:
         """Require the principal to hold exactly the plane's rights, direct and effective; refuse when unreadable."""
-        try:
-            direct, effective = self._read_privileges(principal.user_id)
-        except PlatformError as error:
-            raise TokenRefused(f"the principal's privileges could not be read ({error})") from None
-        require_privileges(spec.rights, direct=direct, effective=effective)
+        self.check_user(spec, principal.user_id)
 
     def examine(self, value: str, spec: PlaneSpec, user_id: str, window: TokenWindow) -> Examined:
         """Examine a token value against a plane's exact set and the lifetime window; raise TokenRefused otherwise."""

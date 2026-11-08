@@ -9,8 +9,12 @@ platform.toml. Only the token differs per run. The server removes the tools outs
 `ONEDATA_MCP_TOOLS` setting); the client of `expcore.tools.mcp_client` then requires the tools the server shows to equal
 the condition's frozen manifest, and an extra or missing tool fails the start (L13). Nothing here filters tools.
 
-Before it spawns anything the launcher verifies the pinned checkout, when the configuration pins one, and examines the
-token again against the condition's exact set (an unexamined or drifted token cannot start the plane).
+Before it spawns anything the launcher verifies the pinned checkout, when the configuration pins one, examines the token
+again against the condition's exact caveat set, and reads the token's principal's privileges again, direct and
+effective, requiring exactly the condition's declared rights, no more and no less. An unexamined or drifted token, a
+token minted for another condition's rights, and a principal whose privileges changed since the token was minted
+cannot start the plane: the caveats of two conditions that both write are the same, so only the privileges tell them
+apart.
 
 Waits. The only infrastructure wait kind this module uses is `toolserver_lifecycle`, around the start (the pre-checks
 and the spawn) and around the stop. What the agent triggers through the tools, a federation operation or a read of data,
@@ -85,12 +89,14 @@ def _server(config: PlatformConfig) -> ToolServer:
 def _prepare(
     issuer: TokenIssuer, config: PlatformConfig, condition: Condition, token: MintedToken, ceiling_s: float
 ) -> None:
-    """The checks before a spawn: the pinned checkout, and the token examined again against the condition's set."""
+    """The checks before a spawn: the pinned checkout, the token examined again against the condition's caveats, and
+    the principal's privileges read again against the condition's rights. Each must equal the condition's set exactly."""
     if token.plane is not Plane.TOOL_SERVER:
         raise ValueError("the tool server takes the tool-server plane's token, not another plane's")
     verify_configured(_server(config))
     spec = tool_server_spec(config.space.id, condition)
     issuer.examine(token.reveal(), spec, token.subject, token_window(ceiling_s, config.tokens))
+    issuer.check_user(spec, token.subject)
 
 
 def _is_outage(error: Exception) -> bool:
@@ -118,8 +124,9 @@ class ToolServerLauncher:
         """Start the server for a condition and yield its tool provider; stop it on leaving.
 
         The start and the stop are each inside `ctx.infrastructure_wait("toolserver_lifecycle")`. An outage of Onezone
-        while the token is examined is infrastructure of kind `knowledge`; a token it refuses is a `TokenRefused`. `ceiling_s` is the same value the token
-        was minted for, so a token that cannot last the run is refused here.
+        while the token is examined or the principal's privileges are read is infrastructure of kind `knowledge`; a
+        token or principal it refuses is a `TokenRefused`. `ceiling_s` is the same value the token was minted for, so a
+        token that cannot last the run is refused here.
         """
         server, chosen = _server(self._config), self._config.condition(condition)
         env = server_environment(self._config, chosen, token, extra_env)
@@ -137,7 +144,8 @@ class ToolServerLauncher:
             except ExaminationFailed as failed:
                 if _is_outage(failed.error):
                     raise InfraError(
-                        "knowledge", f"the token could not be examined before the start: {failed.error}"
+                        "knowledge",
+                        f"the token or its principal could not be examined before the start: {failed.error}",
                     ) from None
                 raise
             await provider.__aenter__()

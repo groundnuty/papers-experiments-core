@@ -9,7 +9,7 @@ import time
 
 import pytest
 from mcp import StdioServerParameters
-from platform_support import CEILING_S, DATA, FAKE_TOOL_SERVER, MANAGE, NOW, TOOLS, write_platform
+from platform_support import BASELINE, CEILING_S, DATA, FAKE_TOOL_SERVER, MANAGE, NOW, TOOLS, write_platform
 from record_support import make_config
 
 from expcore.config.loading import ConfigError
@@ -199,6 +199,118 @@ def test_o06_a_token_that_cannot_last_the_run_does_not_start_the_server(world, t
     config, issuer, launcher = world
     with pytest.raises(TokenRefused, match="shorter"):
         start(launcher, RecordingContext(), "read", read_token(issuer, config), tmp_path, ceiling_s=7200)
+    assert not (tmp_path / "seen.json").exists()
+
+
+REPLICATION = [*BASELINE, "space_schedule_replication"]
+
+
+def with_replication_condition(data):
+    """A third condition: view and read plus replication scheduling, beside the default read and manage ones."""
+    data["toolserver"]["conditions"]["replicate"] = {
+        "allow": ["echo", "add"],
+        "rights": REPLICATION,
+        "manifest": "manage.manifest.json",  # never read: every launch below is refused before the spawn
+    }
+
+
+@pytest.fixture
+def three_conditions(tmp_path, fake, frozen_manifests):
+    """A launcher over a configuration with the read, manage and replicate conditions, and the issuer it mints with."""
+    use_frozen(tmp_path, frozen_manifests)
+    config = load_platform(write_platform(tmp_path, with_replication_condition))
+    client = OnezoneClient(config, http=fake.client_http())
+    issuer = TokenIssuer(client, config, clock=lambda: NOW)
+    return config, issuer, ToolServerLauncher(config, issuer)
+
+
+def test_o05_o06_a_token_minted_for_one_conditions_rights_does_not_start_another_conditions_server(
+    three_conditions, fake, tmp_path
+):
+    """O05, O06: a token minted for view, read and QoS management, which writes, carries the same caveats as one for
+    view, read and replication, which also writes. Launching it for replication is refused before the spawn because
+    the principal's privileges are not that condition's set; launching it for its own condition still works."""
+    config, issuer, launcher = three_conditions
+    fake.grant(TOOLS.user_id, MANAGE)
+    token = issuer.mint(tool_server_spec(config.space.id, config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    caveats = fake.issued[token.reveal()]["caveats"]
+    assert caveats == tool_server_spec(config.space.id, config.condition("replicate")).caveats.caveats(
+        caveats[0]["validUntil"]
+    )  # the examination of the caveats alone cannot tell the two conditions apart
+    with pytest.raises(TokenRefused, match=r"privileges differ.*lacks space_schedule_replication") as caught:
+        start(launcher, RecordingContext(), "replicate", token, tmp_path)
+    assert "space_manage_qos" in str(caught.value)
+    assert not (tmp_path / "seen.json").exists()
+    tools, _, _ = start(launcher, RecordingContext(), "manage", token, tmp_path)
+    assert tools == ["add", "echo", "fail"]
+
+
+@pytest.mark.parametrize(
+    ("direct", "effective", "reason"),
+    [
+        (MANAGE, MANAGE, "has also space_manage_qos"),
+        (["space_view"], ["space_view"], "lacks space_read_data"),
+        (BASELINE, [*BASELINE, "space_write_data"], r"effective.*has also space_write_data"),
+        ([*BASELINE, "space_write_data"], BASELINE, r"direct.*has also space_write_data"),
+    ],
+    ids=["gained a right", "lost a right", "effective only", "direct only"],
+)
+def test_o05_o06_a_change_of_privileges_between_minting_and_launch_does_not_start_the_server(
+    direct, effective, reason, world, fake, tmp_path
+):
+    """O05, O06: the token passed its examination when it was minted; the principal's privileges at launch are read
+    again, and any difference from the condition's rights, in either direction, refuses the start."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    fake.grant(TOOLS.user_id, direct, effective)
+    with pytest.raises(TokenRefused, match=reason):
+        start(launcher, RecordingContext(), "read", token, tmp_path)
+    assert not (tmp_path / "seen.json").exists()
+
+
+def test_o05_o06_the_privileges_are_read_before_the_spawn_and_after_the_token_is_examined(world, fake, tmp_path):
+    """O05, O06: the launch reads the token's examination and then the principal's two privilege lists, all before the
+    server starts, as admin reads."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    before = len(fake.requests)
+    start(launcher, RecordingContext(), "read", token, tmp_path)
+    launch_paths = [(r.method, r.path) for r in fake.requests[before:]]
+    assert launch_paths == [
+        ("POST", "/api/v3/onezone/tokens/examine"),
+        ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/users/{TOOLS.user_id}/privileges"),
+        ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/effective_users/{TOOLS.user_id}/privileges"),
+    ]
+    assert {r.token for r in fake.requests[before:]} == {fake.ADMIN}
+
+
+def test_o05_o06_a_principal_whose_privileges_cannot_be_read_does_not_start_the_server(world, fake, tmp_path):
+    """O05, O06: unknown is not a pass. A principal Onezone has no privileges for is a refusal, not a start."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    del fake.privileges[(fake.SPACE_ID, TOOLS.user_id)]
+    with pytest.raises(TokenRefused, match="privileges could not be read"):
+        start(launcher, RecordingContext(), "read", token, tmp_path)
+    assert not (tmp_path / "seen.json").exists()
+
+
+def test_a_federation_that_cannot_answer_the_privilege_read_is_infrastructure_of_kind_knowledge(
+    world, fake, tmp_path, monkeypatch
+):
+    """An outage of Onezone while the principal's privileges are read at launch is an infrastructure failure, as it is
+    while the token is examined, and nothing is spawned."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    reads = fake._admin_route
+    monkeypatch.setattr(
+        fake,
+        "_admin_route",
+        lambda method, route, sent: fake._error(503, "x") if method == "GET" else reads(method, route, sent),
+    )
+    with pytest.raises(InfraError) as caught:
+        start(launcher, RecordingContext(), "read", token, tmp_path)
+    assert caught.value.kind == "knowledge"
+    assert token.reveal() not in str(caught.value)
     assert not (tmp_path / "seen.json").exists()
 
 
