@@ -18,7 +18,7 @@ Only warnings, errors and fatals are counted. Each is classified by ORIGIN where
                provider reply, so it is not guessed.
 
 `agent_saw_sidecar_error` is NOT derived here: whether the agent's process received the errno is a fact of the
-agent's file operations (the #9 tracer's errno records), and stays None (unknown) until that is read.
+agent's file operations (the application's own errno records), and stays None (unknown) until that is read.
 """
 
 from __future__ import annotations
@@ -232,7 +232,7 @@ def storage_detection(log_text: str) -> dict:
 
     Each detection has a start line and an end line; a phase is the log-time difference of the two (container clock, so
     the host's load does not enter). `storage_detection_s` is the FIRST complete phase (the one the application's first read
-    waits for: 5.1 s against a 5.59 s first read, #7). `None` with `none_reason` when there is no start line, or the first
+    waits for: 5.1 s against a 5.59 s first read). `None` with `none_reason` when there is no start line, or the first
     start has no end line (a detection that never finished is not a duration), or the stamps do not order. Never 0."""
     year, phases, open_ = FALLBACK_YEAR, [], {}
     for raw in log_text.splitlines():

@@ -41,6 +41,7 @@ def test_the_rest_path_has_a_gate_and_an_agent_on_one_internal_network(world):
 
 
 def test_o03_the_gate_serves_the_zone_and_the_pinned_local_provider_only(world):
+    """O03: The gate serves the zone and the pinned local provider only."""
     sbx = start(world, "via-gate")
     gate_json = json.loads((sbx.dir / "gate.json").read_text())
     served = {name: h["role"] for name, h in gate_json["hosts"].items()}
@@ -51,6 +52,7 @@ def test_o03_the_gate_serves_the_zone_and_the_pinned_local_provider_only(world):
 
 
 def test_o05_the_agent_is_read_only_with_no_capability_and_no_new_privilege(world):
+    """O05: The agent is read only with no capability and no new privilege."""
     sbx = start(world, "via-gate")
     options = world.host.containers[sbx.names.agent].options
     assert options["--read-only"] is True
@@ -77,6 +79,7 @@ def test_o05_a_writable_root_refuses_the_start_and_leaves_nothing_behind(world):
 
 
 def test_o05_a_probe_that_cannot_run_also_refuses_the_start(world):
+    """O05: A probe that cannot run also refuses the start."""
     world.host.exec_handler = lambda container, argv, stdin: CmdResult(1, "", "no python here")
     with pytest.raises(SandboxError, match="not read-only"):
         start(world, "via-gate")
@@ -150,6 +153,7 @@ def test_o13_a_moved_tag_refuses_the_start_before_anything_is_created(world):
 
 
 def test_o13_each_image_the_path_uses_is_checked_and_started_by_its_id(world):
+    """O13: Each image the path uses is checked and started by its id."""
     world.host.add_image(world.s.gate.name, "sha256:" + "8" * 64)
     with pytest.raises(StartRefused, match="gate image no longer"):
         start(world, "via-gate")
@@ -160,6 +164,7 @@ def test_o13_each_image_the_path_uses_is_checked_and_started_by_its_id(world):
 
 
 def test_o13_the_sidecar_image_is_pinned_too(world):
+    """O13: The sidecar image is pinned too."""
     world.host.add_image(world.s.oneclient.name, "sha256:" + "7" * 64)
     with pytest.raises(StartRefused, match="oneclient image no longer"):
         start(world, "mounted")
@@ -185,6 +190,7 @@ def test_a_token_without_a_data_path_or_a_data_path_without_a_token_is_refused(w
 
 
 def test_o14_two_sandboxes_get_two_disjoint_networks_from_the_pool(world):
+    """O14: Two sandboxes get two disjoint networks from the pool."""
     a, b = start(world, "via-gate", run_key="a"), start(world, "isolated", run_key="b")
     nets = [ipaddress.ip_network(world.host.networks[n]["subnet"]) for n in (a.names.net, b.names.net)]
     assert not nets[0].overlaps(nets[1])

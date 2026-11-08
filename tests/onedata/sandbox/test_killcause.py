@@ -41,11 +41,13 @@ def classify(after: str | None, *, running: bool | None = True, duration: float 
 
 
 def test_o17_the_counters_of_the_cell_name_the_containers_own_limit():
+    """O17: The counters of the cell name the containers own limit."""
     got = classify("memory_events_own_limit.txt")
     assert (got["reason"], got["category"]) == ("memory_limit", "agent")
 
 
 def test_o17_a_kill_with_no_rise_of_the_containers_own_counter_is_the_hosts():
+    """O17: A kill with no rise of the containers own counter is the hosts."""
     got = classify("memory_events_host_killer.txt")
     assert (got["reason"], got["category"]) == ("host_oom", "infrastructure")
 
@@ -59,11 +61,13 @@ def test_o17_the_exit_code_decides_nothing():
 
 
 def test_o17_a_dead_container_is_infrastructure_whatever_else_is_on_record():
+    """O17: A dead container is infrastructure whatever else is on record."""
     got = classify("memory_events_own_limit.txt", running=False)
     assert (got["reason"], got["category"]) == ("container_dead", "infrastructure")
 
 
 def test_o17_the_kernel_log_decides_only_for_lines_that_name_this_container():
+    """O17: The kernel log decides only for lines that name this container."""
     own = classify(None, lines=kernel("dmesg_own_limit.txt"))
     assert (own["reason"], own["category"]) == ("memory_limit", "agent")
     host = classify(None, lines=kernel("dmesg_host_killer.txt"))
@@ -79,22 +83,26 @@ def test_o17_conflicting_evidence_is_unknown_never_a_guess():
 
 
 def test_o17_unreadable_counters_with_a_quiet_container_are_unknown():
+    """O17: Unreadable counters with a quiet container are unknown."""
     got = classify(None, running=None)
     assert got["category"] == "unknown"
     assert killcause.parse_events((DATA / "memory_events_malformed.txt").read_text(encoding="utf-8")) is None
 
 
 def test_o17_a_kill_nothing_attributes_is_unknown():
+    """O17: A kill nothing attributes is unknown."""
     got = classify("memory_events_start.txt", duration=3.0)
     assert (got["reason"], got["category"]) == ("killed_other", "unknown")
 
 
 def test_o17_the_kernel_window_keeps_only_lines_after_the_start():
+    """O17: The kernel window keeps only lines after the start."""
     assert len(kernel("dmesg_own_limit.txt", since_s=1000.0)) == 1
     assert kernel("dmesg_own_limit.txt", since_s=5000.0) == []
 
 
 def test_o17_earlyoom_kills_are_infrastructure_and_beat_the_counters():
+    """O17: Earlyoom kills are infrastructure and beat the counters."""
     kills = earlyoom.parse_kills((DATA / "journal_earlyoom.txt").read_text(encoding="utf-8"))
     assert [k.pid for k in kills] == [4321, 4400, 99]
     seen: dict[int, list[list[float]]] = {}
@@ -107,6 +115,7 @@ def test_o17_earlyoom_kills_are_infrastructure_and_beat_the_counters():
 
 
 def test_o17_one_cause_per_run_in_a_fixed_order():
+    """O17: One cause per run in a fixed order."""
     assert killcause.run_cause(["time_limit", "memory_limit"]) == "memory_limit"
     assert killcause.run_cause(["unknown", "host_oom"]) == "host_oom"
     assert killcause.run_cause([]) is None
@@ -117,6 +126,7 @@ def test_o17_one_cause_per_run_in_a_fixed_order():
     ("category", "kind"), [("agent", None), ("infrastructure", "sandbox"), ("unknown", "unattributed_kill")]
 )
 def test_o17_each_category_maps_to_a_kind_of_the_cores_vocabulary(category, kind):
+    """O17: Each category maps to a kind of the cores vocabulary."""
     assert kinds.kind_of(category) == kind
     if kind is not None:
         assert kind in infra_kinds()
@@ -125,12 +135,14 @@ def test_o17_each_category_maps_to_a_kind_of_the_cores_vocabulary(category, kind
 
 
 def test_o17_the_agents_own_kill_is_not_an_infrastructure_error():
+    """O17: The agents own kill is not an infrastructure error."""
     assert kinds.kill_error(classify("memory_events_own_limit.txt")) is None
     assert kinds.kill_error(None) is None
     assert kinds.kill_error({}) is None
 
 
 def test_o17_an_unrecognised_category_is_unknown_and_retried():
+    """O17: An unrecognised category is unknown and retried."""
     assert kinds.kill_error({"category": "novel"}).kind == "unattributed_kill"
 
 
@@ -150,6 +162,7 @@ def inspect_state(name: str) -> dict:
 
 
 def test_o17_a_container_that_ran_throughout_has_no_problem():
+    """O17: A container that ran throughout has no problem."""
     running = {**inspect_state("inspect_running.json"), "oom": 0, "oom_kill": 0}
     assert infradeath.problems("gate", "rest", running, dict(running)) == []
     unreadable = inspect_state("inspect_running.json")  # counters that could not be read: unknown is not clean
@@ -166,6 +179,7 @@ def test_o17_a_container_that_ran_throughout_has_no_problem():
     ],
 )
 def test_o17_the_death_of_a_component_is_infrastructure_and_retried(end, cause, category):
+    """O17: The death of a component is infrastructure and retried."""
     start, now = inspect_state("inspect_running.json"), inspect_state(end)
     assert infradeath.problems("gate", "rest", start, now)
     got = infradeath.cause_of("gate", start, now)
@@ -173,6 +187,7 @@ def test_o17_the_death_of_a_component_is_infrastructure_and_retried(end, cause, 
 
 
 def test_o17_a_death_that_the_host_caused_is_host_pressure():
+    """O17: A death that the host caused is host pressure."""
     start, now = inspect_state("inspect_running.json"), inspect_state("inspect_exited_oom.json")
     got = infradeath.cause_of("gate", start, now, kernel=kernel("dmesg_host_killer.txt"))
     assert got["cause"] == "host_pressure"
@@ -180,6 +195,7 @@ def test_o17_a_death_that_the_host_caused_is_host_pressure():
 
 
 def test_o17_a_death_the_state_cannot_show_is_undetermined_not_clean():
+    """O17: A death the state cannot show is undetermined not clean."""
     start = inspect_state("inspect_running.json")
     assert infradeath.problems("gate", "rest", start, None, "daemon timeout")
     assert infradeath.cause_of("gate", start, None, "daemon timeout")["cause"] == "undetermined"
@@ -187,6 +203,7 @@ def test_o17_a_death_the_state_cannot_show_is_undetermined_not_clean():
 
 
 def test_o17_the_sidecar_hitting_its_own_limit_under_the_agents_reads_is_the_agents_outcome():
+    """O17: The sidecar hitting its own limit under the agents reads is the agents outcome."""
     start, now = inspect_state("inspect_running.json"), inspect_state("inspect_exited_oom.json")
     start["oom"], start["oom_kill"] = 0, 0
     now["oom"], now["oom_kill"] = 1, 1
@@ -196,6 +213,7 @@ def test_o17_the_sidecar_hitting_its_own_limit_under_the_agents_reads_is_the_age
 
 
 def test_o17_a_death_of_infrastructure_makes_a_sandbox_error_that_names_the_cause():
+    """O17: A death of infrastructure makes a sandbox error that names the cause."""
     start, now = inspect_state("inspect_running.json"), inspect_state("inspect_crashed.json")
     problems = infradeath.problems("gate", "rest", start, now)
     death = {**infradeath.cause_of("gate", start, now), "role": "gate", "problems": problems}

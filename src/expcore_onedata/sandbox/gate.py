@@ -159,8 +159,8 @@ def _tcp_facts(sock) -> dict:
 # The gate must never give up before the client would. A client's effective timeouts can be 8 s to connect
 # (TCP and TLS) and 4 h to read; behind the gate the client's 8 s covers only
 # the hop to the gate, and it then waits up to 4 h for the answer. So upstream (Onezone and Oneprovider alike) the gate
-# allows 60 s to connect and hand-shake, plus one transparent retry, and 4 h to read. #8's oracle got a 502 on 1 Nov
-# when the old gate's 8 s bound ran out on a TLS handshake to Onezone under load.
+# allows 60 s to connect and hand-shake, plus one transparent retry, and 4 h to read. An earlier gate with an 8 s
+# bound returned a 502 when a TLS handshake to the zone ran out of it under load.
 CONNECT_TIMEOUT = 60  # gate config `upstream_connect_timeout_s` overrides
 READ_TIMEOUT = 14400  # not below the client's read timeout: the gate must never fail first
 LOCAL_ERRNOS = {

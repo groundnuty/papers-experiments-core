@@ -89,7 +89,7 @@ def test_the_levels_of_the_data_path_factor_decide_the_lease_group_and_the_mode(
 
 
 def test_c19_launch_waits_only_for_the_start_and_the_teardown(stage, tmp_path):
-    """C19, L04: the start and the stop are each inside the sandbox_lifecycle wait; the body is the agent's own time."""
+    """C19: the start and the stop are each inside the sandbox_lifecycle wait; the body is the agent's own time."""
     pool = lease_pool(stage, tmp_path)
     lease = pool.acquire(DATA_USERS, run_key="run-1")
     seen_inside = []
@@ -217,6 +217,7 @@ def test_c19_the_probe_says_exactly_true_only_when_container_network_and_mount_a
 
 
 def test_c19_the_probe_is_about_its_own_key_only(stage, tmp_path):
+    """C19: The probe is about its own key only."""
     _, probe = probe_world(stage, tmp_path)
     stage.host.docker("run", "-d", "--name", "other", "--label", "org.test.lease=login-data2", "agent:1")
     stage.host.mounts[str(stage.s.work_root / "login-data2-0123abcd" / "work")] = "ext4"
@@ -244,6 +245,7 @@ def test_c19_a_probe_that_cannot_ask_fails_safe(stage, tmp_path):
 
 
 def test_c19_the_probe_asks_the_cores_check_whether_the_holder_is_gone(stage):
+    """C19: The probe asks the cores check whether the holder is gone."""
     calls = []
     probe = SandboxProbe(stage.host, stage.s, holder_gone=lambda owner: calls.append(owner) or None)
     assert probe.holder_gone("some-owner") is None

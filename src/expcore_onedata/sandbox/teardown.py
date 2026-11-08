@@ -6,7 +6,7 @@
 Why: the VM froze on 1 Nov at 23:48Z while docker was killing a mount sandbox's agent container (`docker rm -f` at 23:47:59Z,
 "failed to exit within 10s", the direct SIGKILL at 23:48:09Z, then nothing in the kernel log). The old `Sandbox.stop`
 removed the agent container while the sidecar's FUSE mount was still bound into it (rslave), then SIGKILLed the sidecar,
-and unmounted last. Science's order (#2, 2 Nov 00:33Z): stop the reader, unmount (lazily if it must), then the sidecar,
+and unmounted last. The order that works: stop the reader, unmount (lazily if it must), then the sidecar,
 then the agent container.
 
 `ordered_fuse_teardown` does that, every wait bounded and every step logged (one JSONL line per step, fsynced, so a freeze

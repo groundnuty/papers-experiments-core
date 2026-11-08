@@ -1,4 +1,4 @@
-"""Without EXPCORE_LIVE_PLATFORM the live contract tests are skipped as a module, so nothing is built or contacted."""
+"""Without EXPCORE_LIVE_PLATFORM or EXPCORE_LIVE_DOCKER the live tests are skipped as modules: nothing is contacted."""
 
 import os
 import subprocess
@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_the_live_tests_are_skipped_when_no_platform_is_named():
-    env = {k: v for k, v in os.environ.items() if k != "EXPCORE_LIVE_PLATFORM"}
+    env = {k: v for k, v in os.environ.items() if k not in ("EXPCORE_LIVE_PLATFORM", "EXPCORE_LIVE_DOCKER")}
     done = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/live", "-q", "-rs", "-p", "no:cacheprovider"],
         cwd=ROOT,
@@ -21,7 +21,8 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
     )
     assert done.returncode in (0, 5), done.stdout[-500:]  # 5: pytest found no test to run, only a skipped module
     assert "EXPCORE_LIVE_PLATFORM is not set" in done.stdout
-    assert "1 skipped" in done.stdout
+    assert "EXPCORE_LIVE_DOCKER is not set" in done.stdout
+    assert "2 skipped" in done.stdout
 
 
 def test_every_unverified_endpoint_has_a_live_contract_test():

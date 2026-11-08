@@ -47,6 +47,7 @@ def test_o05_every_other_method_on_a_data_path_is_refused(method):
     ],
 )
 def test_o05_metadata_shares_and_other_endpoints_are_refused(path):
+    """O05: Metadata shares and other endpoints are refused."""
     assert not policy.decide("oneprovider", "GET", path).allow
     assert not policy.decide("onezone", "GET", path).allow
 
@@ -62,6 +63,7 @@ def test_o05_metadata_shares_and_other_endpoints_are_refused(path):
     ],
 )
 def test_o05_dot_segments_and_encoded_separators_are_refused(path):
+    """O05: Dot segments and encoded separators are refused."""
     decision = policy.decide("oneprovider", "GET", path)
     assert not decision.allow
     assert "dot segments" in decision.reason

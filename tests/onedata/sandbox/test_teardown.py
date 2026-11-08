@@ -146,6 +146,7 @@ def test_o15_the_orphan_reaper_runs_the_same_order_before_removing_anything(worl
 
 
 def test_o15_a_sidecar_whose_mount_point_cannot_be_found_is_held_not_removed(world):
+    """O15: A sidecar whose mount point cannot be found is held not removed."""
     world.containers[SIDECAR].options["--mount"] = []
     held = teardown.fuse_first(world, [AGENT, SIDECAR], waits=WAITS)
     assert held == {AGENT, SIDECAR}

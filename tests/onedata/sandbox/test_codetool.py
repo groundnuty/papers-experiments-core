@@ -84,6 +84,7 @@ def test_stderr_of_a_successful_run_is_shown_after_its_output():
 
 
 def test_o17_the_agents_own_memory_limit_is_its_outcome_and_is_told_as_such():
+    """O17: The agents own memory limit is its outcome and is told as such."""
     kill = {"reason": "memory_limit", "category": "agent", "basis": "the container limit"}
     out = run(CodeExecutionProvider(ScriptedSandbox(ok("", "", 137, kill=kill))), {"code": "x = [0] * 10**12"})
     assert out.is_error
@@ -92,6 +93,7 @@ def test_o17_the_agents_own_memory_limit_is_its_outcome_and_is_told_as_such():
 
 
 def test_o17_the_agents_own_time_limit_is_a_timeout_result():
+    """O17: The agents own time limit is a timeout result."""
     kill = {"reason": "time_limit", "category": "agent", "basis": "the cell ran to its limit"}
     out = run(
         CodeExecutionProvider(ScriptedSandbox(ok("", "", 137, timed_out=True, kill=kill))), {"code": "while 1: pass"}
