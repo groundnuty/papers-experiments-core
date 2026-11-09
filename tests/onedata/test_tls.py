@@ -9,13 +9,17 @@ import hashlib
 import json
 
 import pytest
-from platform_support import write_platform
+from platform_support import NOW, write_platform
 from sandbox_support import add_sandbox
 from tls_support import ANSWER, HAS_OPENSSL, TlsServer, make_federation_ca
 
+from expcore.campaign.healthgate import read_health
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import load_platform
+from expcore_onedata.health import PlatformHealth
+from expcore_onedata.tls import WARNING
+from expcore_onedata.tokens import TokenIssuer
 
 pytestmark = pytest.mark.skipif(not HAS_OPENSSL, reason="the openssl command makes the federation's test CA")
 
@@ -208,3 +212,38 @@ def test_o05_the_rest_client_checks_the_federations_certificate_as_the_tls_setti
                 assert server.seen == []
         finally:
             client.close()
+
+
+# ---------------------------------------------------------------------------------------------------- health
+
+
+def health_reading(tmp_path, fake, tls, *, healthy=True):
+    """One reading of the platform's health check over a configuration with this `[tls]`."""
+
+    def edit(data):
+        if tls is not None:
+            data["tls"] = tls
+        if not healthy:
+            data["support"]["providers"] = ["alpha", "beta"]  # beta is declared but not reported: unhealthy
+
+    config = load_platform(write_platform(tmp_path, edit))
+    client = OnezoneClient(config, http=fake.client_http())
+    return read_health(
+        PlatformHealth(config, client, TokenIssuer(client, config, clock=lambda: NOW), clock=lambda: NOW)
+    )
+
+
+@pytest.mark.parametrize("healthy", [True, False], ids=["healthy", "unhealthy"])
+def test_o05_health_warns_while_insecure_tls_is_on_and_never_otherwise(tmp_path, fake, federation, healthy):
+    """O05: turning verification off is the one opt-out of the certificate check, so every health reading says so
+    while it is on, whatever its verdict; the default and ca_file read as before."""
+    (tmp_path / CA_NAME).write_bytes(federation.ca.read_bytes())
+    plain = health_reading(tmp_path, fake, None, healthy=healthy)
+    assert plain.ok is healthy
+    assert health_reading(tmp_path, fake, {"ca_file": CA_NAME}, healthy=healthy) == plain
+    insecure = health_reading(tmp_path, fake, {"insecure_tls": True}, healthy=healthy)
+    assert insecure.ok is healthy
+    assert insecure.detail == f"{plain.detail}; {WARNING}"
+    assert "insecure_tls" in WARNING
+    assert "disposable test federation" in WARNING
+    assert "warning" not in plain.detail
