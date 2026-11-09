@@ -18,7 +18,14 @@ from study_support import Campaign, clean_environment, cli, copy_campaign, finis
 from expcore.cli import main
 from expcore.package import build as package_build
 from expcore.package.archive import SUMS_FILE, render_sums
-from expcore.package.build import PACKAGE_FILE, build_package, default_hashes, private_hashes, verify_package
+from expcore.package.build import (
+    PACKAGE_FILE,
+    build_package,
+    default_hashes,
+    private_hashes,
+    private_list_guard,
+    verify_package,
+)
 from expcore.package.spec import PackageError
 from expcore.provenance.hashfile import render_hash_file
 
@@ -191,6 +198,18 @@ def test_an_anonymised_package_hides_the_names_in_its_prose_and_still_passes_its
     assert (unpacked / "README.md").read_text(encoding="utf-8").endswith("\nPrepared by Author A.\n")
     assert json.loads((unpacked / PACKAGE_FILE).read_text(encoding="utf-8"))["anonymised"] == ["README.md"]
     assert verify_package(unpacked) == []
+
+
+def test_k03_an_anonymisation_list_in_the_studys_repository_refuses_the_build(campaign, hashes, repo, tmp_path):
+    """K03: the private list never enters the repository or the output: a list anywhere in the repository that holds
+    the study, not only in the study's own directory, refuses the build before anything is written."""
+    root = copy_campaign(campaign, repo.path / "studies", "study").root
+    listed = anonymisation(repo.path / "anon.toml", {AUTHOR: "Author A"})
+    with pytest.raises(PackageError, match="K03"):
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=listed)
+    assert list((tmp_path / "dist").iterdir()) == []
+    assert private_list_guard(root, None) == [repo.path, root]
+    assert private_list_guard(tmp_path, tmp_path / "dist") == [tmp_path, tmp_path / "dist"]
 
 
 def test_a_listed_term_in_a_code_file_fails_the_build_naming_file_and_line_and_is_never_rewritten(

@@ -1,8 +1,8 @@
 # Provenance: new
 """Anonymisation lists for double-blind submissions: whole words only, and only in the prose and metadata files named.
 
-The list is a TOML file kept outside the study and outside the output directory, because it holds the very names the
-package hides (K03: a private list never enters the repository or the package):
+The list is a TOML file kept outside the study's repository, the study and the output directory, because it holds the
+very names the package hides (K03: a private list never enters the repository or the package):
 
     files = ["README.md"]        # the prose and metadata files whose text is rewritten
     [terms]
@@ -57,7 +57,8 @@ def load_anonymisation(path: Path, *, keep_out_of: Iterable[Path], model_names: 
     for directory in keep_out_of:
         if _inside(path, Path(directory)):
             raise PackageError(
-                f"the anonymisation list lies inside {directory}; keep it outside the study and the output (K03)"
+                f"the anonymisation list lies inside {directory}; keep it outside the repository, the study and the "
+                "output (K03)"
             )
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))

@@ -38,6 +38,7 @@ from expcore.package.anonymise import Anonymisation, find_terms, load_anonymisat
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
 from expcore.package.spec import PackageError, PackageSpec, load_spec, select
 from expcore.provenance.codestamp import STAMP, covered_files, is_sha, write_stamp
+from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.hashfile import Hashes
 from expcore.provenance.scanner import scan_source
 from expcore.provenance.study_tokens import load_hashes
@@ -181,8 +182,9 @@ def collect(
     rewritten: list[str] = []
     terms: Anonymisation | None = None
     if anonymise is not None:
-        keep_out = [study.root] + ([] if out_dir is None else [Path(out_dir)])
-        terms = load_anonymisation(Path(anonymise), keep_out_of=keep_out, model_names=_model_names(study))
+        terms = load_anonymisation(
+            Path(anonymise), keep_out_of=private_list_guard(study.root, out_dir), model_names=_model_names(study)
+        )
         files = rewrite(files, terms, code=set(covered_files(study.root, study.scope)), out_prefix=f"{OUT_DIR}/")
         rewritten = list(terms.files)
     files["Makefile"] = MAKEFILE.encode("utf-8")
@@ -199,6 +201,16 @@ def collect(
     if findings:
         raise PackageError("refusing to build the package:\n  " + "\n  ".join(findings))
     return spec, files
+
+
+def private_list_guard(study_root: Path, out_dir: Path | None) -> list[Path]:
+    """Where an anonymisation list may not lie (K03): the study's repository, if any, the study and the output."""
+    places = [Path(study_root)] + ([] if out_dir is None else [Path(out_dir)])
+    try:
+        top = run_git(Path(study_root), "rev-parse", "--show-toplevel").decode("utf-8").strip()
+    except (GitError, OSError):
+        return places
+    return [Path(top), *places] if top else places
 
 
 def _model_names(study: StudyConfig) -> set[str]:
