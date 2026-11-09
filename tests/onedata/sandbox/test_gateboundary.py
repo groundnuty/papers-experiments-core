@@ -78,11 +78,50 @@ def test_o05_a_header_holds_the_token_raw_or_decoded():
     assert gateboundary.holds_token(b"X-Echo: TOK%2Fgate%2b0123", token) is False  # tokens are case-sensitive
 
 
-def test_o05_the_held_back_bytes_fit_the_longest_form():
-    """O05: six bytes a character (\\uXXXX), twelve for one outside the basic plane, three a byte percent-escaped."""
-    assert gateboundary.held_back("ab") == 12
-    assert gateboundary.held_back("\U0001f600") == 12
+def test_o05_the_held_back_bytes_fit_a_hit_twice_over_in_its_longest_form():
+    """O05: a hit needs 32 letters and digits of the token (all of them when it has fewer); the gate holds back twice
+    the bytes those take in their longest form, six a character as \\uXXXX: 6 x 32 x 2 for a long token."""
+    assert gateboundary.held_back(LONG) == 6 * 32 * 2
+    assert gateboundary.held_back("ab") == 6 * 2 * 2
     assert gateboundary.held_back(None) == 0
+
+
+LONG = "tok" + "".join(f"{n:02d}q" for n in range(21)) + "z"  # invented: 67 letters and digits
+
+
+@pytest.mark.parametrize(
+    ("token", "body"),
+    [
+        ("tok/gate0123", b"x=tok%252Fgate0123"),  # percent-encoded twice
+        ("tok gate0123", b"q=tok+gate0123"),  # a form's + for a space
+        ("a\U0001f600b0123456789", b'{"t": "\\u0061\\ud83d\\ude00b0123456789"}'),  # a surrogate pair after an escape
+        ("tok/gate0123", b"x=tok&#47;gate&#x30;123"),  # HTML numeric entities
+        (LONG, b"part " + LONG[20:52].encode() + b" only"),  # 32 of its characters, on their own
+    ],
+    ids=["nested", "plus", "surrogate-pair", "entities", "fragment"],
+)
+def test_o05_the_detector_finds_the_token_whatever_its_encoding(token, body):
+    """O05: decoded up to four times (percent-escapes with + as a space, JSON escapes with surrogate pairs, HTML
+    numeric entities) and projected to letters and digits, the body holds a run of the token: found as a whole and
+    split at every byte. The token a😀 projects to the single letter a, too short to mean anything, so the surrogate
+    case uses a😀b0123456789, whose projection is ab0123456789."""
+    assert gateboundary.holds_token(body, token)
+    for cut in range(len(body) + 1):
+        sent, stopped = through(gateboundary.BodyWatch(token), [body[:cut], body[cut:]])
+        assert stopped, cut
+        assert len(sent) < len(body), cut
+
+
+def test_o05_31_characters_of_a_long_token_are_not_a_hit_and_32_are():
+    """O05: the run a hit needs is 32 characters of the token's projection."""
+    assert not gateboundary.holds_token(LONG[20:51].encode(), LONG)
+    assert gateboundary.holds_token(LONG[20:52].encode(), LONG)
+
+
+def test_o05_a_lone_surrogate_is_kept_as_text_and_never_paired_with_a_neighbour():
+    """O05: a high surrogate followed by an escape that is no low surrogate stays as it is written."""
+    layers = gateboundary.layers(b"\\ud83d\\u0041")
+    assert layers[1] == b"\\ud83dA"
 
 
 @pytest.mark.parametrize(("status", "redirect"), [(300, True), (301, True), (302, True), (307, True), (304, False)])

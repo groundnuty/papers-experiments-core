@@ -3,8 +3,7 @@
 
 The gate adds its token to every request it forwards, so an answer can carry it back: an error body that echoes the
 request, a redirect's Location, a header echoed back. The boundary detects the token and refuses the answer; it never
-rewrites one, since no list of the token's encodings is complete and a partial rewrite can leave a piece behind.
-Every answer passes it before it reaches the agent:
+rewrites one, since a partial rewrite can leave a piece behind. Every answer passes it before it reaches the agent:
 
   * a redirect (`is_redirect`: a 3xx, but for 304 Not Modified, which has no body and points nowhere) is never passed
     on and never followed: the gate answers 502 with `REDIRECT_DETAILS` (`REDIRECT_REFUSED`);
@@ -13,16 +12,22 @@ Every answer passes it before it reaches the agent:
     `ENCODED_DETAILS`, before any byte of it;
   * a header whose name or value holds the token (`holds_token`) makes the answer a 502 with `CREDENTIAL_DETAILS`,
     before its body; a credential header without it (`CREDENTIAL_HEADERS`) is withheld and the answer passes;
-  * the body streams through `BodyWatch`, which holds back the bytes that could still begin the token in its longest
-    form (`held_back`); when the token appears, in any form, the gate stops forwarding and cuts the transfer, so the
-    agent gets no byte of it, and the line says why (`CREDENTIAL_IN_RESPONSE`).
+  * the body streams through `BodyWatch`, which holds back the bytes a hit can take (`held_back`); on a hit the gate
+    stops forwarding and cuts the transfer, so the agent gets no byte of it, and the line says why
+    (`CREDENTIAL_IN_RESPONSE`).
 
-`holds_token` looks at the bytes as they are and at their decoded view: percent-escapes in either case of hex, and
-JSON escapes (`\\uXXXX`, a surrogate pair as its one character, `\\/`, `\\\\`, `\\"` and the others). The token is
-matched by its exact characters, as Onedata's tokens are case-sensitive.
+Detection does not depend on knowing the encoding. The bytes are decoded again and again, until nothing changes or
+`ROUNDS` rounds have run (`layers`): percent-escapes in either case of hex with `+` as a space, JSON escapes with a
+surrogate pair combined into its character (a lone surrogate is kept as it is written, never paired with a
+neighbour), and HTML numeric entities. The token and every layer, the raw bytes included, are projected to their ASCII
+letters and digits, case kept, and a hit is any `RUN` consecutive characters of the token's projection (the whole of
+it when it is shorter) in any layer's projection. So a nested or unforeseen escape, separators the token never had,
+and a part of the token on its own are all found. The cost is the rare false hit, a cut transfer that ends the run as
+infrastructure (`data_gate_integrity`), never a leak. A token with no ASCII letter or digit is looked for whole, in
+every layer.
 
-Pure functions and one small class over bytes, with the standard library only: `gate.py` loads this file by its path,
-as it does `gatepolicy.py`, since it runs alone in its container.
+Pure functions and two small classes over bytes, with the standard library only: `gate.py` loads this file by its
+path, as it does `gatepolicy.py`, since it runs alone in its container.
 """
 
 from __future__ import annotations
@@ -38,47 +43,131 @@ CREDENTIAL_IN_RESPONSE = "credential_in_response"
 ENCODED_RESPONSE = "encoded_response"
 REDIRECT_REFUSED = "redirect_refused"
 
-_ESCAPE = re.compile(rb"%[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}(?:\\u[0-9A-Fa-f]{4})?|\\[\"\\/bfnrt]")
+RUN = 32  # characters of the token's projection a hit needs; its whole projection when that is shorter
+ROUNDS = 4  # decoding rounds at most
+_BLOCK = RUN // 2  # every RUN-long run of the projection holds one whole block of this length at a multiple of it
+_ALNUM = frozenset(b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+_NOT_ALNUM = bytes(b for b in range(256) if b not in _ALNUM)
+_ESCAPE = re.compile(
+    rb"%[0-9A-Fa-f]{2}"
+    rb"|\+"
+    rb"|\\u[dD][89abAB][0-9A-Fa-f]{2}\\u[dD][c-fC-F][0-9A-Fa-f]{2}"  # a surrogate pair, high then low
+    rb"|\\u[0-9A-Fa-f]{4}"
+    rb"|\\[\"\\/bfnrt]"
+    rb"|&#[xX][0-9A-Fa-f]{1,6};?"
+    rb"|&#[0-9]{1,7};?"
+)
+_LONGEST_ESCAPE = 12  # the surrogate pair
 _JSON_SIMPLE = {b'"': b'"', b"\\": b"\\", b"/": b"/", b"b": b"\b", b"f": b"\f", b"n": b"\n", b"r": b"\r", b"t": b"\t"}
 
 
-def _decoded(escape: bytes) -> bytes:
-    """The bytes one escape stands for."""
+def _character(code: int, written: bytes) -> bytes:
+    """A code point as UTF-8; one that is no character (a lone surrogate, out of range, NUL) stays as written."""
+    if code == 0 or code > 0x10FFFF or 0xD800 <= code < 0xE000:
+        return written
+    return chr(code).encode()
+
+
+def _decoded(found: re.Match[bytes]) -> bytes:
+    escape = found.group(0)
+    if escape == b"+":
+        return b" "
     if escape[:1] == b"%":
         return bytes([int(escape[1:3], 16)])
+    if escape[:2] == b"&#":
+        digits = escape[2:].rstrip(b";")
+        return _character(int(digits[1:], 16) if digits[:1] in b"xX" else int(digits), escape)
     if escape[1:2] != b"u":
         return _JSON_SIMPLE[escape[1:2]]
-    units = [int(escape[i : i + 4], 16) for i in range(2, len(escape), 6)]
-    if len(units) == 2 and 0xD800 <= units[0] < 0xDC00 and 0xDC00 <= units[1] < 0xE000:
-        return chr(0x10000 + ((units[0] - 0xD800) << 10) + (units[1] - 0xDC00)).encode()
-    return b"".join(chr(u).encode("utf-8", "surrogatepass") for u in units)
+    if len(escape) == 12:  # the pattern takes only a high surrogate followed by a low one
+        high, low = int(escape[2:6], 16), int(escape[8:12], 16)
+        return chr(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)).encode()
+    return _character(int(escape[2:6], 16), escape)
 
 
-def decoded_view(data: bytes) -> tuple[bytes, list[tuple[int, int]]]:
-    """`data` with every escape decoded, parsed left to right, and the (start, end) of each escape in `data`."""
-    parts, spans, pos = [], [], 0
-    for found in _ESCAPE.finditer(data):
-        parts += [data[pos : found.start()], _decoded(found.group(0))]
-        spans.append(found.span())
-        pos = found.end()
-    parts.append(data[pos:])
-    return b"".join(parts), spans
+def layers(data: bytes) -> list[bytes]:
+    """`data` and each round of its decoding, until a round changes nothing or `ROUNDS` have run."""
+    out = [data]
+    for _ in range(ROUNDS):
+        decoded = _ESCAPE.sub(_decoded, out[-1])
+        if decoded == out[-1]:
+            break
+        out.append(decoded)
+    return out
 
 
-def holds_token(data: bytes, token: str | None) -> bool:
-    """Whether `data` holds the token, as it is or in its decoded view."""
-    if not token:
-        return False
-    needle = token.encode()
-    return needle in data or needle in decoded_view(data)[0]
+def _maximal(character: str) -> int:
+    """The most bytes one character of the token takes in one round of any encoding the layers undo."""
+    units = 2 if ord(character) > 0xFFFF else 1
+    return max(6 * units, 3 * len(character.encode()), len(f"&#{ord(character)};"))
 
 
 def held_back(token: str | None) -> int:
-    """The bytes the longest form of the token can take: six for a character as `\\uXXXX`, twelve for one outside the
-    basic plane (a surrogate pair), three for each byte of it percent-escaped, whichever is longest."""
+    """The bytes the body watch holds back: twice what the token's widest hit takes in its longest single encoding.
+
+    A hit is `RUN` letters and digits of the token (all of them when it has fewer), with the token's own characters
+    between them, at most six bytes each as `\\uXXXX` (twelve for a pair): 6 x 32 = 192 bytes for a token of letters and
+    digits. Twice that, 384, also holds a hit one layer deeper in most escapes, or with a few separators the token never
+    had; a hit spread wider than that over the raw bytes is found only while it lies within one read and its held
+    bytes. 6 x 32 x 2 is the bound the review called safe, and this is it for the usual token."""
     if not token:
         return 0
-    return sum(max(12 if ord(c) > 0xFFFF else 6, 3 * len(c.encode())) for c in token)
+    letters = [i for i, c in enumerate(token) if c.isascii() and c.isalnum()]
+    width = min(RUN, len(letters))
+    if not width:
+        return 2 * sum(_maximal(c) for c in token)
+    spans = (token[letters[i] : letters[i + width - 1] + 1] for i in range(len(letters) - width + 1))
+    return 2 * max(sum(_maximal(c) for c in span) for span in spans)
+
+
+class Detector:
+    """Whether bytes hold the token, by the projection of each of their layers (see the module's docstring)."""
+
+    def __init__(self, token: str | None) -> None:
+        self._raw = token.encode() if token else b""
+        self._projection = self._raw.translate(None, _NOT_ALNUM)
+        self._blocks = [
+            (k, self._projection[k : k + _BLOCK]) for k in range(0, len(self._projection) - _BLOCK + 1, _BLOCK)
+        ]
+
+    def hit(self, data: bytes) -> bool:
+        if not self._raw:
+            return False
+        for layer in layers(data):
+            if not self._projection:
+                if self._raw in layer:
+                    return True
+            elif self._run_in(layer.translate(None, _NOT_ALNUM)):
+                return True
+        return False
+
+    def _run_in(self, projected: bytes) -> bool:
+        token = self._projection
+        if len(token) <= RUN:
+            return token in projected
+        for k, block in self._blocks:
+            at = projected.find(block)
+            while at != -1:
+                left = 0
+                while left < RUN and k > left and at > left and token[k - left - 1] == projected[at - left - 1]:
+                    left += 1
+                right, end = 0, k + _BLOCK
+                while (
+                    right < RUN
+                    and end + right < len(token)
+                    and at + _BLOCK + right < len(projected)
+                    and token[end + right] == projected[at + _BLOCK + right]
+                ):
+                    right += 1
+                if left + _BLOCK + right >= RUN:
+                    return True
+                at = projected.find(block, at + 1)
+        return False
+
+
+def holds_token(data: bytes, token: str | None) -> bool:
+    """Whether `data` holds a run of the token, in any of its layers."""
+    return Detector(token).hit(data)
 
 
 def readable_encoding(content_encoding: str | None, transfer_encoding: str | None) -> bool:
@@ -96,31 +185,33 @@ def is_redirect(status: int) -> bool:
 
 class BodyWatch:
     """Watches a body read in pieces for the token: `feed` each piece, then `flush` at its end. Each returns the bytes
-    that may go to the agent now, or None once the token has appeared, after which nothing more may go.
+    that may go to the agent now, or None once a hit has appeared, after which nothing more may go.
 
     The held bytes are the last `held_back(token)` of what has arrived, moved back to the start of an escape they cut
-    into, so every look at the decoded view starts where a parse of the whole body would: a token that starts before
-    the held bytes ends inside what has arrived, and is found before any byte of it is let through. Without a token
-    every piece passes as it is."""
+    into, so a hit that starts before them ends inside what has arrived and is found before any byte of it is let
+    through. Without a token every piece passes as it is."""
 
     def __init__(self, token: str | None) -> None:
         self._token, self._hold, self._tail = token, held_back(token), b""
+        self._detector = Detector(token)
 
     def feed(self, piece: bytes) -> bytes | None:
         if not self._token:
             return piece
         data = self._tail + piece
-        view, spans = decoded_view(data)
-        needle = self._token.encode()
-        if needle in data or needle in view:
+        if self._detector.hit(data):
             return None
         cut = max(len(data) - self._hold, 0)
-        # never split an escape between what goes and what is held: the held bytes start where a parse would
-        cut = next((start for start, end in spans if start < cut < end), cut)
+        for found in _ESCAPE.finditer(data, max(cut - _LONGEST_ESCAPE, 0)):
+            if found.start() >= cut:
+                break
+            if found.end() > cut:  # never split an escape between what goes and what is held
+                cut = found.start()
+                break
         self._tail = data[cut:]
         return data[:cut]
 
     def flush(self) -> bytes | None:
-        """What is still held, at the body's end, or None when it completes the token."""
+        """What is still held, at the body's end, or None when it completes a hit."""
         tail, self._tail = self._tail, b""
-        return None if holds_token(tail, self._token) else tail
+        return None if self._detector.hit(tail) else tail

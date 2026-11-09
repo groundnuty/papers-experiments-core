@@ -33,6 +33,8 @@ RUN_HEADER_VALUE = "run-test-1"
 GATE_TOKEN = "tok-gate-0123456789"  # an invented token value: the gate holds it, the client never does
 SCOPE = "/api/v3/onezone/tokens/infer_access_token_scope"
 SLASH_TOKEN = "tok/gate+0123"  # an invented token whose encoded forms differ from it
+SPACE_TOKEN = "tok gate0123"  # an invented token with a space, which a form encodes as +
+LONG_TOKEN = "tok" + "".join(f"{n:02d}q" for n in range(21)) + "z"  # invented: 67 letters and digits
 SPLIT_AT = 4096  # the gate's read size in the tests that split a token between two reads of the upstream's body
 HELD_BACK = 6  # bytes per character of the token the gate holds back: its longest form, \\uXXXX, is six
 
@@ -279,8 +281,10 @@ def read_until_cut(answer) -> bytes:
         (GATE_TOKEN, ("X-Request-Echo", f"you sent {GATE_TOKEN}")),
         (SLASH_TOKEN, ("X-Request-Echo", "you sent tok%2Fgate%2b0123")),  # percent-encoded, hex in both cases
         (SLASH_TOKEN, ("X-Request-Echo", "you sent tok\\/gate\\u002b0123")),  # JSON-escaped
+        (SLASH_TOKEN, ("X-Request-Echo", "you sent tok%252Fgate%252b0123")),  # percent-encoded twice
+        (LONG_TOKEN, ("X-Request-Echo", f"part {LONG_TOKEN[20:52]} only")),  # 32 characters of it
     ],
-    ids=["credential", "echoed", "percent-mixed-case", "json"],
+    ids=["credential", "echoed", "percent-mixed-case", "json", "nested", "fragment"],
 )
 def test_o05_a_token_in_any_header_of_an_answer_is_a_502_before_the_body(world, token, header):
     """O05: a header whose name or value, decoded (percent-escapes in either case of hex, JSON escapes), holds the
@@ -367,8 +371,11 @@ def test_o05_o16_a_platform_redirect_is_a_gate_refusal_and_its_run_is_set_aside_
         (SLASH_TOKEN, b"tok%2Fgate%2b0123"),  # percent-encoded, hex in both cases
         (SLASH_TOKEN, b'{"t": "tok\\/gate\\u002b0123"}'),  # JSON-escaped
         (SLASH_TOKEN, b"tok%2fgate\\u002B0123"),  # both at once
+        (SLASH_TOKEN, b"tok%252Fgate%252b0123"),  # percent-encoded twice
+        (SPACE_TOKEN, b"q=tok+gate0123&x=1"),  # a form's + for the space
+        (LONG_TOKEN, LONG_TOKEN[10:42].encode()),  # 32 characters of it, on their own
     ],
-    ids=["raw", "percent-mixed-case", "json", "mixed"],
+    ids=["raw", "percent-mixed-case", "json", "mixed", "nested", "plus", "fragment"],
 )
 def test_o05_a_token_in_the_body_split_between_two_reads_cuts_the_transfer(world, monkeypatch, token, form):
     """O05, O16: the body streams through a detector over its decoded view, which holds back six bytes per character
