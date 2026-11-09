@@ -35,6 +35,9 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     estimator = "wilcoxon_cluster_bootstrap"
     cluster = "group"          # the task attribute that is the unit of inference
     equivalence_margin = 0.05  # optional: only with a margin can the result be called "equivalent"
+    treatment_outcomes = "scored"  # optional: how treatment attempts enter: "scored" or "excluded" (every pair
+                                   # with one is left out); a member of the Holm family that loses a pair to a
+                                   # treatment attempt scored None is refused without it
 
     [contrasts.gate-effect]    # factor form: a declared factor of the schema and two of its levels
     factor = "gate"
@@ -59,14 +62,23 @@ from expcore.campaign.factors import BUILTIN_FACTORS, FactorSchema
 from expcore.config.loading import ConfigError, Section
 from expcore.stats import estimators
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
-from expcore.stats.pairing import ContrastSpec
+from expcore.stats.pairing import TREATMENT_OUTCOMES, ContrastSpec
 from expcore.stats.power import PowerSettings
 
 OVERRIDE_MARK = "+override"
 DEFAULT_CI_LEVEL = 0.95
 DEFAULT_TARGET_POWER = 0.8
 _TOP_KEYS = ("alpha", "holm_family", "bootstrap", "power", "estimators", "contrasts")
-_CONTRAST_KEYS = ("conditions", "factor", "levels", "outcome", "estimator", "cluster", "equivalence_margin")
+_CONTRAST_KEYS = (
+    "conditions",
+    "factor",
+    "levels",
+    "outcome",
+    "estimator",
+    "cluster",
+    "equivalence_margin",
+    "treatment_outcomes",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,6 +317,16 @@ def _margin(section: Section, alpha: float) -> float | None:
     return margin
 
 
+def _treatment_outcomes(section: Section) -> str | None:
+    """Read the optional declaration of how treatment attempts enter the contrast: "scored" or "excluded"."""
+    if "treatment_outcomes" not in section.data:
+        return None
+    value = section.data["treatment_outcomes"]
+    if not isinstance(value, str) or value not in TREATMENT_OUTCOMES:
+        raise section.fail("treatment_outcomes", f"must be 'scored' or 'excluded', got {value!r}")
+    return value
+
+
 def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, alpha: float) -> ContrastSpec:
     """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
@@ -314,21 +336,21 @@ def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSc
         estimators.get(estimator)
     except UnknownEstimator as error:
         raise section.fail("estimator", str(error)) from None
-    margin = _margin(section, alpha)
+    declared = {"equivalence_margin": _margin(section, alpha), "treatment_outcomes": _treatment_outcomes(section)}
     if "conditions" in table:
         for extra in ("factor", "levels"):
             if extra in table:
                 raise section.fail(extra, "belongs to the factor form; this contrast names conditions")
         conditions = _arms(section, "conditions")
         _check_conditions(section, conditions, schema)
-        return ContrastSpec(name, outcome, estimator, cluster, conditions=conditions, equivalence_margin=margin)
+        return ContrastSpec(name, outcome, estimator, cluster, conditions=conditions, **declared)
     if "factor" not in table:
         raise section.fail("conditions", "is required unless the contrast gives a factor with its levels")
     if "levels" not in table:
         raise section.fail("levels", "is required with a factor")
     factor, levels = section.string("factor"), _arms(section, "levels")
     _check_factor(section, factor, levels, schema)
-    return ContrastSpec(name, outcome, estimator, cluster, factor=factor, levels=levels, equivalence_margin=margin)
+    return ContrastSpec(name, outcome, estimator, cluster, factor=factor, levels=levels, **declared)
 
 
 def _check_conditions(section: Section, conditions: tuple[str, str], schema: FactorSchema) -> None:

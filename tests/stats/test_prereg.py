@@ -404,6 +404,35 @@ def test_a_margin_needs_an_alpha_below_one_half(tmp_path):
     assert load(write(tmp_path, edited("alpha = 0.05", "alpha = 0.5"))).alpha == 0.5  # no margin, no constraint
 
 
+def declaring(value: str) -> str:
+    """The base text with `treatment_outcomes = <value>` (TOML) declared for the contrast a-vs-b."""
+    return edited(
+        'cluster = "group"\n\n[contrasts.gate', f'cluster = "group"\ntreatment_outcomes = {value}\n\n[contrasts.gate'
+    )
+
+
+@pytest.mark.parametrize("word", ["scored", "excluded"])
+def test_s10_a_contrast_may_declare_how_its_treatment_attempts_are_scored_and_the_others_declare_nothing(
+    tmp_path, word
+):
+    """S10: the declaration a confirmatory contrast needs before it may lose a pair to a treatment attempt's None."""
+    prereg = load(write(tmp_path, declaring(f'"{word}"')))
+    assert prereg.contrasts["a-vs-b"].treatment_outcomes == word
+    assert prereg.contrasts["gate-effect"].treatment_outcomes is None
+
+
+@pytest.mark.parametrize("value", ['"dropped"', '""', "true", "1"])
+def test_s10_a_treatment_declaration_other_than_scored_or_excluded_is_refused_with_the_file_and_the_key(
+    tmp_path, value
+):
+    """S10: anything else is refused when the file is loaded, naming the file and the key."""
+    path = write(tmp_path, declaring(value))
+    with pytest.raises(ConfigError) as caught:
+        load(path)
+    assert str(caught.value).startswith(f"{path}: [contrasts.a-vs-b]: key 'treatment_outcomes' ")
+    assert "'scored' or 'excluded'" in str(caught.value)
+
+
 def test_the_target_power_is_a_setting_with_a_default(tmp_path):
     """The power a minimum detectable effect must reach: 0.8 unless the file says otherwise."""
     assert load(write(tmp_path)).power.target_power == 0.8

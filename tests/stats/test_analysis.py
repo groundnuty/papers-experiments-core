@@ -10,7 +10,15 @@ from stats_support import both_arms, make_row
 
 from expcore.campaign.factors import FactorSchema
 from expcore.stats import estimators, power
-from expcore.stats.analysis import CONCLUSIONS, analyse, conclude, pilot_power, power_study, run_contrast
+from expcore.stats.analysis import (
+    CONCLUSIONS,
+    TreatmentOutcomesUndeclared,
+    analyse,
+    conclude,
+    pilot_power,
+    power_study,
+    run_contrast,
+)
 from expcore.stats.estimators import EstimatorResult
 from expcore.stats.pairing import ContrastSpec, pair_rows
 from expcore.stats.prereg import name_digest, parse
@@ -745,3 +753,80 @@ def test_s09_an_estimator_without_a_p_values_function_has_no_minimum_detectable_
     result = analyse(rows, other)
     assert math.isnan(result.contrast("gate-effect").minimum_detectable_effect)
     assert result.contrast("open-vs-shut-at-x").minimum_detectable_effect > 0
+
+
+# --- treatment attempts in a contrast (S10) -----------------------------------------------------------------------
+
+TREATED_TEXT = """\
+alpha = 0.05
+holm_family = ["FAMILY"]
+
+[bootstrap]
+replicates = 50
+seed = 11
+
+[contrasts.a-vs-b]
+conditions = ["cond-a", "cond-b"]
+outcome = "score"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+DECLARATION
+[contrasts.x-vs-y]
+conditions = ["cond-x", "cond-y"]
+outcome = "score"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+"""
+
+
+def treated_prereg(family: str = "a-vs-b", declaration: str | None = None):
+    """A preregistration over ARMS with a-vs-b and x-vs-y; `family` is the one Holm member, a-vs-b may declare."""
+    line = "" if declaration is None else f'treatment_outcomes = "{declaration}"\n'
+    text = TREATED_TEXT.replace("FAMILY", family).replace("DECLARATION\n", line)
+    return parse(tomllib.loads(text), "inline", "e" * 64, ARMS)
+
+
+def treated_rows() -> list[Row]:
+    """Six clusters of ordinary pairs, then two pairs whose cond-a run is a treatment attempt the scorer left None."""
+    rows = []
+    for i in range(6):
+        rows += both_arms(f"t{i}", "model-a", 1, 0.9 - 0.01 * i, 0.5, cluster=f"c{i}")
+    for i in range(2):
+        first, second = both_arms(f"outage-{i}", "model-a", 1, None, 0.5, cluster=f"c{i}")
+        rows += [dataclasses.replace(first, treatment=True), second]
+    return rows
+
+
+def test_s10_a_confirmatory_contrast_that_loses_a_pair_to_a_treatment_attempts_none_is_refused():
+    """S10: the condition's manipulation would silently leave its own contrast; the refusal names the contrast, the
+    count and both ways to fix it."""
+    with pytest.raises(TreatmentOutcomesUndeclared) as caught:
+        analyse(treated_rows(), treated_prereg())
+    message = str(caught.value)
+    assert "confirmatory contrast 'a-vs-b'" in message
+    assert "2 pair(s)" in message
+    assert "outcome 'score'" in message
+    assert 'treatment_outcomes = "scored"' in message
+    assert 'treatment_outcomes = "excluded"' in message
+    assert "[contrasts.a-vs-b]" in message
+
+
+@pytest.mark.parametrize(("declaration", "used", "none", "excluded"), [("scored", 6, 2, 0), ("excluded", 6, 0, 2)])
+def test_s10_either_declaration_lets_the_confirmatory_contrast_through_and_its_drops_are_counted(
+    declaration, used, none, excluded
+):
+    """S10: "scored" keeps the pairs the scorer measured and counts its Nones; "excluded" leaves out every pair with a
+    treatment attempt and counts it. Either way the result says which was declared."""
+    result = analyse(treated_rows(), treated_prereg(declaration=declaration)).contrast("a-vs-b")
+    assert (result.in_family, result.treatment_outcomes) == (True, declaration)
+    assert result.n_pairs == used
+    missing = result.pairs_missing
+    assert (missing["treatment_outcome_none"], missing["treatment_excluded"]) == (none, excluded)
+
+
+def test_s10_an_exploratory_contrast_reports_the_pairs_it_loses_to_a_treatment_attempts_none_and_is_not_refused():
+    """S10: outside the family nothing is claimed confirmatory, so the drop is reported and the analysis goes on."""
+    result = analyse(treated_rows(), treated_prereg(family="x-vs-y")).contrast("a-vs-b")
+    assert (result.exploratory, result.treatment_outcomes) == (True, None)
+    assert result.pairs_missing["treatment_outcome_none"] == 2
+    assert result.n_pairs == 6

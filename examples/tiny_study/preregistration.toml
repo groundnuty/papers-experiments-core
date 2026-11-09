@@ -33,6 +33,10 @@ conditions = ["relay-down", "baseline"]
 outcome = "accuracy"
 estimator = "wilcoxon_cluster_bootstrap"
 cluster = "region"
+# relay-down's manipulation is an infrastructure failure, so some of its runs end as treatment attempts. The scorer
+# returns values for them (no answer is accuracy 0), and this says so. A contrast in the family that lost a pair to a
+# treatment attempt scored None would be refused without it; "excluded" would leave every such pair out instead.
+treatment_outcomes = "scored"
 
 # Not in the family: exploratory, judged by its raw p-value, and labelled so wherever it is shown. A factor contrast
 # varies one factor and pairs on every other.

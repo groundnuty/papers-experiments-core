@@ -12,19 +12,36 @@ and counted, never read as 0 (R10, S05); a cluster left without any pair is drop
 A condition may run on only some of the tasks (a chain design lists the tasks of an arm). A task that has no run in
 one of the contrast's two arms is dropped from that contrast, named and counted in its pairing; it takes no part in
 any other contrast, and the runs of the other conditions are not looked at.
+
+Every pair the contrast could have had is used or missing for exactly one cause (`MISSING_CAUSES`), each counted,
+zeros included (S10, C23). A pair is every pairing key that a run of either arm has, analysed or absent:
+- `treatment_excluded`: the contrast declares `treatment_outcomes = "excluded"` and either run is a treatment attempt.
+  The preregistration decides, not the scorer, so such a pair is left out whatever its outcomes;
+- `treatment_outcome_none`: both runs are analysed and an outcome is missing on a side that is a treatment attempt.
+  The condition's manipulation then leaves its own contrast, which a confirmatory contrast may not do unless it
+  declares how its treatment attempts are scored (`expcore.stats.analysis`);
+- `outcome_none`: both runs are analysed and an outcome is missing on an ordinary run only;
+- `exhausted`: the run of either arm used all its attempts on infrastructure failures;
+- `unpaired_or_left_out`: anything else without both runs analysed: the other run is unfinished, left out of a
+  partial analysis, or not in the plan (a task one arm does not run).
+The absent runs come from the export (`AbsentRun`); without them every pair with one run analysed is
+`unpaired_or_left_out` and a pair with neither is not seen.
 """
 
 from __future__ import annotations
 
 import math
 import numbers
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import numpy as np
 
 from expcore.stats.estimators import PairedDifferences
-from expcore.stats.rows import Row
+from expcore.stats.rows import AbsentRun, Row
+
+TREATMENT_OUTCOMES = ("scored", "excluded")  # how a contrast declares its treatment attempts enter it
+MISSING_CAUSES = ("treatment_outcome_none", "treatment_excluded", "exhausted", "unpaired_or_left_out", "outcome_none")
 
 
 @dataclass(frozen=True)
@@ -33,7 +50,8 @@ class ContrastSpec:
 
     Named-condition form: `conditions = (A, B)`. Factor form: `factor` and `levels = (A, B)`. The contrast is A - B.
     `equivalence_margin`, in the outcome's units, is declared only for a contrast whose preregistration allows the
-    conclusion that the two arms are equivalent.
+    conclusion that the two arms are equivalent. `treatment_outcomes` says how treatment attempts enter the contrast:
+    "scored" (the scorer returns values for them), "excluded" (every pair with one is left out) or None (undeclared).
     """
 
     name: str
@@ -44,13 +62,19 @@ class ContrastSpec:
     factor: str | None = None
     levels: tuple[str, str] | None = None
     equivalence_margin: float | None = None
+    treatment_outcomes: str | None = None
 
     def __post_init__(self) -> None:
-        """Require exactly one form, with two different arms, and a positive finite margin if one is given."""
+        """Require exactly one form, with two different arms, a positive finite margin and a known treatment word."""
         margin = self.equivalence_margin
         number = isinstance(margin, int | float) and not isinstance(margin, bool)
         if margin is not None and not (number and math.isfinite(margin) and margin > 0):
             raise ValueError(f"contrast {self.name!r}: the equivalence margin must be a positive finite number")
+        if self.treatment_outcomes is not None and self.treatment_outcomes not in TREATMENT_OUTCOMES:
+            raise ValueError(
+                f"contrast {self.name!r}: treatment_outcomes must be 'scored' or 'excluded', "
+                f"got {self.treatment_outcomes!r}"
+            )
         if self.conditions is not None and (self.factor is not None or self.levels is not None):
             raise ValueError(f"contrast {self.name!r}: give conditions, or a factor with its levels, not both")
         if self.conditions is None and (self.factor is None or self.levels is None):
@@ -71,9 +95,10 @@ class Pairing:
 
     differences: PairedDifferences
     n_pairs: int  # pairs used
-    n_pairs_missing: int  # pairs excluded because an outcome is missing on either side
-    n_unpaired: int  # run keys present in one arm only
+    n_pairs_missing: int  # pairs excluded because an outcome is missing on either side (both None causes)
+    n_unpaired: int  # run keys analysed in one arm only
     n_clusters_dropped: int  # clusters seen in either arm that were left without a pair
+    missing: Mapping[str, int]  # the pairs missing, by each cause of MISSING_CAUSES, zeros included
     tasks_dropped: tuple[str, ...] = ()  # tasks with runs in one arm only, sorted
 
     @property
@@ -82,7 +107,7 @@ class Pairing:
         return len(self.tasks_dropped)
 
 
-def _arm(row: Row, spec: ContrastSpec) -> int | None:
+def _arm(row: Row | AbsentRun, spec: ContrastSpec) -> int | None:
     """Return 0 for arm A, 1 for arm B, None for a row the contrast does not use."""
     if spec.factor is None:
         selector = row.condition
@@ -94,7 +119,7 @@ def _arm(row: Row, spec: ContrastSpec) -> int | None:
     return arms.index(selector) if selector in arms else None
 
 
-def _key(row: Row, spec: ContrastSpec) -> tuple:
+def _key(row: Row | AbsentRun, spec: ContrastSpec) -> tuple:
     """The pairing key from the run identity: task, model and seed, and for a factor contrast the other factors."""
     base = (row.task, row.model, row.seed)
     if spec.factor is None:
@@ -131,8 +156,53 @@ def _value(row: Row, spec: ContrastSpec) -> float | None:
     return float(value)
 
 
-def pair_rows(rows: Iterable[Row], spec: ContrastSpec) -> Pairing:
-    """Pair the rows of the contrast's two arms and aggregate the differences A - B per cluster and model."""
+def _absent_by_arm(
+    absent: Iterable[AbsentRun], spec: ContrastSpec, analysed: tuple[dict[tuple, Row], dict[tuple, Row]]
+) -> tuple[dict[tuple, str], dict[tuple, str]]:
+    """The reason of each absent run of the two arms by pairing key; a key held twice in one arm is refused."""
+    reasons: tuple[dict[tuple, str], dict[tuple, str]] = ({}, {})
+    for run in absent:
+        arm = _arm(run, spec)
+        if arm is None:
+            continue
+        key = _key(run, spec)
+        if key in analysed[arm] or key in reasons[arm]:
+            raise ValueError(
+                f"contrast {spec.name!r}: two runs of {spec.arms[arm]!r} share one run key ({run.describe()})"
+            )
+        reasons[arm][key] = run.reason
+    return reasons
+
+
+def _paired_cause(row_a: Row, row_b: Row, spec: ContrastSpec) -> tuple[str | None, float]:
+    """For a key both arms analysed: the cause it is missing for, or None and the difference A - B when it is used."""
+    value_a, value_b = _value(row_a, spec), _value(row_b, spec)  # read first, so a bad value is refused either way
+    if spec.treatment_outcomes == "excluded" and (row_a.treatment or row_b.treatment):
+        return "treatment_excluded", math.nan
+    if value_a is None or value_b is None:
+        treated = (value_a is None and row_a.treatment) or (value_b is None and row_b.treatment)
+        return ("treatment_outcome_none" if treated else "outcome_none"), math.nan
+    return None, value_a - value_b
+
+
+def _aggregate(cells: Mapping[tuple[str, str, str], list[float]]) -> PairedDifferences:
+    """Plain means in stages: the pairs of a (cluster, model, task) cell, then the tasks of a (cluster, model)."""
+    per_cell: dict[tuple[str, str], list[float]] = {}
+    for (cluster, model, _task), differences in sorted(cells.items()):
+        per_cell.setdefault((cluster, model), []).append(float(np.mean(differences)))
+    clusters = sorted({cluster for cluster, _ in per_cell})
+    models = sorted({model for _, model in per_cell})
+    matrix = np.full((len(clusters), len(models)), math.nan)
+    for (cluster, model), task_means in per_cell.items():
+        matrix[clusters.index(cluster), models.index(model)] = np.mean(task_means)
+    return PairedDifferences(tuple(clusters), tuple(models), matrix)
+
+
+def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRun] = ()) -> Pairing:
+    """Pair the rows of the contrast's two arms and aggregate the differences A - B per cluster and model.
+
+    `absent` are the planned runs with no analysed attempt; they say why a pair is missing and nothing else.
+    """
     arms: tuple[dict[tuple, Row], dict[tuple, Row]] = ({}, {})
     cluster_of_task: dict[str, str] = {}
     seen: set[str] = set()
@@ -148,30 +218,28 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec) -> Pairing:
             )
         arms[arm][key] = row
     first, second = arms
-    tasks_dropped = tuple(sorted({r.task for r in first.values()} ^ {r.task for r in second.values()}))
+    reasons = _absent_by_arm(absent, spec, arms)
+    missing = dict.fromkeys(MISSING_CAUSES, 0)
     cells: dict[tuple[str, str, str], list[float]] = {}  # (cluster, model, task) -> pair differences
-    used = missing = 0
-    for key in sorted(first.keys() & second.keys()):
-        value_a, value_b = _value(first[key], spec), _value(second[key], spec)
-        if value_a is None or value_b is None:
-            missing += 1
+    paired, used = first.keys() & second.keys(), 0
+    for key in sorted(paired):
+        cause, difference = _paired_cause(first[key], second[key], spec)
+        if cause is not None:
+            missing[cause] += 1
             continue
         used += 1
         row = first[key]
-        cells.setdefault((cluster_of_task[row.task], row.model, row.task), []).append(value_a - value_b)
-    per_cell: dict[tuple[str, str], list[float]] = {}
-    for (cluster, model, _task), differences in sorted(cells.items()):
-        per_cell.setdefault((cluster, model), []).append(float(np.mean(differences)))
-    clusters = sorted({cluster for cluster, _ in per_cell})
-    models = sorted({model for _, model in per_cell})
-    matrix = np.full((len(clusters), len(models)), math.nan)
-    for (cluster, model), task_means in per_cell.items():
-        matrix[clusters.index(cluster), models.index(model)] = np.mean(task_means)
+        cells.setdefault((cluster_of_task[row.task], row.model, row.task), []).append(difference)
+    for key in (first.keys() | second.keys() | reasons[0].keys() | reasons[1].keys()) - paired:
+        exhausted = "exhausted" in (reasons[0].get(key), reasons[1].get(key))
+        missing["exhausted" if exhausted else "unpaired_or_left_out"] += 1
+    differences = _aggregate(cells)
     return Pairing(
-        differences=PairedDifferences(tuple(clusters), tuple(models), matrix),
+        differences=differences,
         n_pairs=used,
-        n_pairs_missing=missing,
+        n_pairs_missing=missing["treatment_outcome_none"] + missing["outcome_none"],
         n_unpaired=len(first.keys() ^ second.keys()),
-        n_clusters_dropped=len(seen) - len(clusters),
-        tasks_dropped=tasks_dropped,
+        n_clusters_dropped=len(seen) - len(differences.clusters),
+        missing=missing,
+        tasks_dropped=tuple(sorted({r.task for r in first.values()} ^ {r.task for r in second.values()})),
     )

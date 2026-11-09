@@ -162,6 +162,8 @@ Groups: [B model backends](#b-model-backends) · [L loop and tools](#l-agent-loo
 
 **C22. Model-level infrastructure faults are confirmed before relabelling.** A trigger only holds a model; a frozen probe confirms the fault. *Learned:* WWW `harness/agent/infra_fault.py:1-80`, `fault_probe.py:1-35` (96 attempts of one model excluded; 5f817def, 21 Oct). Follows in v0.2 ([release boundary](architecture.md#release-boundary)). *Test:* WWW `tests/test_infra_fault.py`.
 
+**C23. The report accounts for every planned run and every pair.** Per condition: the planned runs and how each ended (analysed, exhausted, unfinished, left out) and the attempts set aside; per contrast: the pairs used and the pairs missing by cause (treatment outcome `None`, treatment excluded, exhausted run, unpaired or left out, other `None`); every condition in the infrastructure table, a row of zeros included. The same counts in `analysis.json` and `report.md`, and an export whose run lists do not add up to its plan is refused. *Learned:* the core's own end-to-end test of its example (issue #38): an exhausted run's condition was visible only in the export, a condition with no failure was missing from the infrastructure table, and the pairs a contrast lost were only in `analysis.json`. *Test:* a constructed export gives each condition's counts and zero rows; pairing separates an exhausted run from an unpaired one; the example's `analysis.json` and report agree.
+
 ## P. Provenance
 
 **P01. Unknown code is dirty code, and dirty code does not start a study run.** *Learned:* ICSOC recorded `unknown` silently (`runner.py:373-384`); ICSA read a failed `git status` as a clean tree (`analysis/run.py:30-39`) and fixed it (`icsa/codestamp.py:1-6, 84-111`; f1c242a8, 3 Nov). *Test:* a tree without git or stamp records `unknown`, dirty, and refuses start.
@@ -197,6 +199,8 @@ Groups: [B model backends](#b-model-backends) · [L loop and tools](#l-agent-loo
 **S08. Blind coding sheets cannot leak the condition.** Shuffle rows under opaque ids, keep the key apart, and rename copied files. *Learned:* ICSA `icsa/causes/sampling.py:92-162`. *Test:* no condition or run key appears in the sheet or its file names.
 
 **S09. The power simulator is independent of the pipeline it checks.** *Learned:* ICSA `icsa/analysis/sim.py:3-4, 72-81`. *Test:* an import-graph test, and refusal of parameters that would clip probabilities.
+
+**S10. A treatment attempt never silently leaves its own contrast.** A treatment attempt is scored as its condition's outcome, so a `None` outcome drops its pair from the contrast it was kept for. Count those pairs per contrast; refuse a contrast in the Holm family that has any unless its preregistration declares `treatment_outcomes` (`"scored"`, or `"excluded"`, which leaves every pair with a treatment attempt out whatever its outcome); report the declaration and the count beside the contrast's result. An exploratory contrast reports and is not refused. *Learned:* the core's own end-to-end test of its example (issue #39): the example's scorer and the guide's both returned `None` for every outcome of a treatment attempt, so the manipulated condition's treatment runs left its confirmatory contrast unseen. *Test:* the drop is counted apart from other `None`s; a confirmatory contrast is refused naming the contrast, the count and the fix; either declaration lets it through; an exploratory contrast reports and goes on; an excluded contrast's row names it with its count.
 
 ## O. Platform (Onedata)
 

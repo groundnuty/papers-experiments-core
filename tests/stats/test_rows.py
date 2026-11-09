@@ -54,7 +54,7 @@ def test_s05_s01_an_outcome_that_is_not_a_finite_number_or_none_is_refused_namin
 
 def test_s05_s01_a_row_built_from_the_export_refuses_a_non_finite_score_too():
     """S05, S01: the export boundary goes through the same check as the constructor."""
-    entry = {"run_key": "key", "condition": "cond-a", "factors": FACTORS}
+    entry = {"run_key": "key", "condition": "cond-a", "factors": FACTORS, "treatment": False}
     with pytest.raises(ValueError, match="run 'key': outcome 'score' is not finite"):
         Row.from_export(entry, {"score": math.inf})
     with pytest.raises(ValueError, match="run 'key': outcome 'score' is not finite"):
@@ -91,3 +91,15 @@ def test_from_export_reads_the_fields_the_campaign_export_writes():
     assert (dict(row.outcomes), dict(row.attributes)) == ({"score": 0.5}, {"group": "grp-a"})
     with pytest.raises(ValueError, match="export entry has no 'condition'"):
         Row.from_export({"run_key": "key", "factors": FACTORS}, {})
+
+
+def test_s10_a_row_from_the_export_carries_the_treatment_flag_and_an_entry_without_one_is_refused():
+    """S10: pairing tells a treatment attempt's dropped pair from any other only through this flag, so an analysed
+    attempt must carry it as a boolean; a default of False would hide every such drop."""
+    entry = {"run_key": "key", "condition": "cond-a", "factors": FACTORS, "treatment": True}
+    assert Row.from_export(entry, {"score": None}).treatment is True
+    assert Row("key", "cond-a", FACTORS, {}).treatment is False  # built directly, a row is an ordinary run
+    with pytest.raises(ValueError, match="export entry has no 'treatment'"):
+        Row.from_export({k: v for k, v in entry.items() if k != "treatment"}, {})
+    with pytest.raises(ValueError, match="run 'key': treatment must be true or false"):
+        Row.from_export({**entry, "treatment": 1}, {})

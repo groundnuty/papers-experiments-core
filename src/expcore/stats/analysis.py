@@ -21,6 +21,14 @@ tests at alpha).
 A contrast outside the preregistered Holm family is `exploratory`: nothing controls its multiplicity, it is judged by
 its raw p-value at alpha, and every table or report that shows its conclusion shows that label with it.
 
+A treatment attempt (a run that ended in an infrastructure failure its condition declares as its treatment) is scored
+as its condition's outcome, so a scorer that returns None for it takes its pair out of every contrast on that outcome,
+and the manipulation silently leaves the comparison it was kept for (S10). Each result counts those pairs, with every
+other cause of a missing pair (`pairing.MISSING_CAUSES`). A member of the Holm family that loses any is refused
+(`TreatmentOutcomesUndeclared`) unless its preregistration declares `treatment_outcomes`: "scored" (the scorer returns
+values for treatment attempts, and a None left is reported) or "excluded" (every pair with a treatment attempt is left
+out of the contrast and reported as such). An exploratory contrast reports the count and is not refused.
+
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
 """
 
@@ -35,12 +43,17 @@ import numpy as np
 from expcore.stats import contrasts as kernel
 from expcore.stats import estimators, power
 from expcore.stats.estimators import ModelEstimate, PairedDifferences
-from expcore.stats.pairing import ContrastSpec, pair_rows
+from expcore.stats.pairing import ContrastSpec, Pairing, pair_rows
 from expcore.stats.prereg import Preregistration, name_digest
 from expcore.stats.rejection import rejects
-from expcore.stats.rows import Row
+from expcore.stats.rows import AbsentRun, Row
 
 CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected")
+
+
+class TreatmentOutcomesUndeclared(ValueError):
+    """A confirmatory contrast lost pairs to treatment attempts scored None, and its preregistration does not say how
+    treatment attempts are scored for it."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,9 +73,11 @@ class ContrastResult:
     n_clusters: int
     n_clusters_dropped: int
     n_pairs: int
-    n_pairs_missing: int
-    n_unpaired: int
+    n_pairs_missing: int  # pairs whose outcome is None on either side: pairs_missing's two None causes together
+    n_unpaired: int  # run keys analysed in one arm only
     tasks_dropped: tuple[str, ...]  # tasks one of the two arms did not run, left out of this contrast only
+    treatment_outcomes: str | None  # as preregistered: "scored", "excluded", or None when undeclared
+    pairs_missing: Mapping[str, int]  # every cause of pairing.MISSING_CAUSES with its count, zeros included
     counts: Mapping[str, int]
     per_model: tuple[ModelEstimate, ...]
     in_family: bool  # a member of the Holm family; any other contrast has no multiplicity control
@@ -163,15 +178,36 @@ def _minimum_detectable_effect(
     return power.minimum_detectable_effect(sd, len(differences.clusters), level, prereg.power, rng, p_values)
 
 
+def _refuse_undeclared_treatment_drops(spec: ContrastSpec, prereg: Preregistration, pairing: Pairing) -> None:
+    """Refuse a member of the Holm family that lost a pair to a treatment attempt scored None, unless declared (S10)."""
+    lost = pairing.missing["treatment_outcome_none"]
+    if not lost or spec.name not in prereg.holm_family or spec.treatment_outcomes is not None:
+        return
+    raise TreatmentOutcomesUndeclared(
+        f"{prereg.source}: confirmatory contrast {spec.name!r} drops {lost} pair(s) because a treatment attempt's "
+        f"outcome {spec.outcome!r} is None, so the condition's manipulation silently leaves its own contrast. Make the "
+        "scorer return values for treatment attempts (None only for what could not be measured) and declare "
+        f'treatment_outcomes = "scored" in [contrasts.{spec.name}], or declare treatment_outcomes = "excluded" there '
+        "to leave every pair with a treatment attempt out of this contrast, reported as such"
+    )
+
+
 def run_contrast(
-    rows: Iterable[Row], spec: ContrastSpec, prereg: Preregistration, significant: bool | None = None
+    rows: Iterable[Row],
+    spec: ContrastSpec,
+    prereg: Preregistration,
+    significant: bool | None = None,
+    absent: Iterable[AbsentRun] = (),
 ) -> ContrastResult:
     """Pair the rows for one contrast and run its registered estimator under the preregistration's settings.
 
     `significant` is the decision of the test. `analyse` passes Holm's decision for a member of the family; left out,
-    it is the raw p-value at alpha, with nothing adjusting for the family.
+    it is the raw p-value at alpha, with nothing adjusting for the family. `absent` are the planned runs with no
+    analysed attempt, which say why a pair is missing. A member of the family that loses a pair to a treatment
+    attempt scored None without a `treatment_outcomes` declaration is refused (`TreatmentOutcomesUndeclared`).
     """
-    pairing = pair_rows(rows, spec)
+    pairing = pair_rows(rows, spec, absent)
+    _refuse_undeclared_treatment_drops(spec, prereg, pairing)
     estimate = estimators.get(spec.estimator)(pairing.differences, prereg.estimator_settings(spec))
     in_family = spec.name in prereg.holm_family
     if significant is None:
@@ -194,6 +230,8 @@ def run_contrast(
         n_pairs_missing=pairing.n_pairs_missing,
         n_unpaired=pairing.n_unpaired,
         tasks_dropped=pairing.tasks_dropped,
+        treatment_outcomes=spec.treatment_outcomes,
+        pairs_missing=dict(pairing.missing),
         counts=dict(estimate.counts),
         per_model=estimate.per_model,
         in_family=in_family,
@@ -207,10 +245,13 @@ def run_contrast(
     )
 
 
-def analyse(rows: Iterable[Row], prereg: Preregistration) -> AnalysisResult:
-    """Run every declared contrast, then Holm over the declared family at the preregistered alpha."""
-    rows = list(rows)
-    results = tuple(run_contrast(rows, spec, prereg) for spec in prereg.contrasts.values())
+def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[AbsentRun] = ()) -> AnalysisResult:
+    """Run every declared contrast, then Holm over the declared family at the preregistered alpha.
+
+    `absent` are the planned runs with no analysed attempt (exhausted, unfinished, left out), from the export.
+    """
+    rows, absent = list(rows), list(absent)
+    results = tuple(run_contrast(rows, spec, prereg, absent=absent) for spec in prereg.contrasts.values())
     by_name = {result.name: result for result in results}
     p_values = [by_name[name].p_value for name in prereg.holm_family]
     outcome = kernel.holm(p_values, prereg.alpha)
