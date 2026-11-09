@@ -219,18 +219,19 @@ def test_o11_a_crash_between_inject_and_clear_leaves_no_provider_down_after_the_
 
 
 def test_o11_recovery_leaves_alone_a_provider_a_live_run_holds_down(tmp_path):
-    """O11: recovery settles only injections whose holder is gone, never one a live injector holds on purpose."""
+    """O11: recovery settles only injections whose holder is gone, never one a live injector holds on purpose; while
+    that one is unsettled, no other injection starts, on its target or any other."""
     platform, services = write_faults(tmp_path), FakeServices()
     holder = injector_for(platform, services)
     holder.start(RUN)
     other = injector_for(platform, services, target=LOCAL_TARGET)
-    other.start({**RUN, "run_key": "task=task-b|model=m1|seed=1"})
+    with pytest.raises(InfraError, match="unsettled"):
+        other.start({**RUN, "run_key": "task=task-b|model=m1|seed=1"})
     assert services.running(OUTAGE_SERVICE) is False  # still down: its injector is alive
-    assert services.running(SERVICES["alpha"]) is False
-    with pytest.raises(InfraError, match="held by another run"):
+    assert services.running(SERVICES["alpha"]) is True
+    with pytest.raises(InfraError, match="unsettled"):
         injector_for(platform, services).start({**RUN, "attempt": 2})
     assert holder.finish()["ok"] is True
-    assert other.finish()["ok"] is True
 
 
 def test_o11_an_unreadable_journal_fails_the_start_closed(tmp_path):

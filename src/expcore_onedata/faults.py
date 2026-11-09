@@ -41,33 +41,43 @@ cannot be cleared and verified fails that start as `injector_failure`, so a camp
 left down. The journal names each injection's holder (pid and boot id): a lock held while that holder is gone is
 stuck, and fails the start the same way instead of being skipped as a live run's.
 
+**Baseline (O11).** While any injection is unsettled the federation is not in its baseline state, so no other run may
+start. An injector refuses to start, as `injector_failure`, while the journal holds an injection recovery could not
+settle (one a live injector holds included), and `SettledInjections` is a health check that fails for as long, to be
+composed with the platform's own (`SettledInjections(settings, inner=PlatformHealth(...))`), so the scheduler's gate
+holds back every run, whatever its condition. The platform's check alone would not: it reads only the declared support
+set, which need not hold the provider an outage takes down.
+
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
 
-**Use.** An executor builds the injector for the target its condition declares and runs it around the loop:
+**Use.** An executor builds the injector for the target its condition declares and runs the agent inside `running`:
 
     injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
                              driver=compose_driver(settings))
-    await asyncio.to_thread(start_instruments, [injector], dataclasses.asdict(request.identity))
-    try:
+    async with injector.running(dataclasses.asdict(request.identity)):
         record = await record_run(request, ...)
-    finally:
-        await asyncio.to_thread(injector.clear)
     record = await asyncio.to_thread(finish_instruments, record, [injector])
 
-`finish_instruments` puts the snapshot into the record and derives its treatment flag again from it.
+`running` starts the injector in a worker thread and keeps that thread's future: a cancellation cannot stop the thread,
+so on cancellation it waits for it (shielded, bounded), clears in `finally` and raises the cancellation again. Never
+await `asyncio.to_thread(injector.start, ...)` bare: cancelled, it leaves the thread stopping the provider while the
+code meant to clear it never runs. `start` and `clear` hold the injector's own lock, so a clear waits for a start still
+running in its thread. `finish_instruments` puts the snapshot into the record and derives its treatment flag again from it.
 
 **Names (O12).** Outside the driver and the journal the provider is known only by its label: in the snapshot, in every
 message and in every failure. Identities are recorded as SHA-256 digests. The settings are `[faults]` of
 platform.toml (`expcore_onedata.fault_settings`).
 """
 
+import asyncio
 import contextlib
 import hashlib
 import math
+import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any, Protocol
 
 from expcore.config.loading import ConfigError
@@ -75,7 +85,7 @@ from expcore.errors import InfraError, register_infra_kind
 from expcore.records.injections import FAULT_NAMESPACE
 from expcore_onedata.compose import DriverError, Observation
 from expcore_onedata.config import PlatformConfig
-from expcore_onedata.fault_journal import InjectionJournal, holder, holder_alive
+from expcore_onedata.fault_journal import InjectionJournal, SettledInjections, TargetLock, holder, holder_alive
 from expcore_onedata.fault_settings import FaultSettings, compose_driver, load_faults
 
 __all__ = [
@@ -85,6 +95,7 @@ __all__ = [
     "FaultInjector",
     "FaultRefused",
     "FaultSettings",
+    "SettledInjections",
     "Unsanctioned",
     "compose_driver",
     "load_faults",
@@ -162,7 +173,12 @@ class FaultInjector:
         self.target, self._service, self._driver = target, service, driver
         self._clock, self._sleep = clock, sleep
         self._journal = InjectionJournal(settings.journal)
-        self._lock: int | None = None
+        self._lock: TargetLock | None = None
+        self._mutex = threading.RLock()  # a start and a clear never run at once, in whichever threads
+        rounds = settings.clear_attempts + 2
+        self.cancel_wait_s = (
+            settings.settle_timeout_s + settings.command_timeout_s
+        ) * rounds  # about a start's longest
         self._pending: tuple[str, str] | None = None  # the open injection's journal id and identity digest
         self._run: dict[str, Any] | None = None
         self._steps: list[dict[str, Any]] = []
@@ -193,13 +209,18 @@ class FaultInjector:
 
     def start(self, identity: Mapping[str, Any]) -> None:
         """Recover what an earlier run left open, then take the target down and see it down; raise InfraError of kind
-        `injector_failure` when either fails. Every path after the stop command brings the target back first (O11).
+        `injector_failure` when either fails, or while an injection stays unsettled. Every path after the stop command
+        brings the target back first (O11).
 
         `identity` is the run's identity as a plain mapping with at least its `run_key` and `attempt`, which the snapshot
         names so the treatment rule counts the injection for this attempt only.
         """
+        with self._mutex:
+            self._start(identity)
+
+    def _start(self, identity: Mapping[str, Any]) -> None:
         self._require_sanction()
-        if self._pending is not None and not self.clear():  # an earlier start of this injector was never cleared
+        if self._pending is not None and not self._clear():  # an earlier start of this injector was never cleared
             raise self._fail(f"an earlier injection of {self.target} by this injector is still not cleared")
         run_key, attempt = identity.get("run_key"), identity.get("attempt")
         if not isinstance(run_key, str) or isinstance(attempt, bool) or not isinstance(attempt, int):
@@ -207,7 +228,9 @@ class FaultInjector:
         self._origin, self._steps, self._injection = self._clock(), [], None
         self._run = {"run_key": run_key, "attempt": attempt}
         self._step("sanctioned", True)
-        self.recover()
+        unsettled = self._recover()
+        if unsettled:  # held down by a live injector: the federation is not in its baseline state
+            raise self._fail(f"an injection of {', '.join(unsettled)} is unsettled, so no other run may start")
         self._lock = self._journal.try_lock(self.target)
         if self._lock is None:
             raise self._fail(f"{self.target} is held by another run's fault injector")
@@ -223,7 +246,7 @@ class FaultInjector:
         except BaseException as error:  # whatever broke after the stop, the target is brought back before it is raised
             why = type(error).__name__
             self._step("injected", False, identity_before_sha256=digest, seen_down=self._went_down, error=why)
-            self.clear()
+            self._clear()
             if not isinstance(error, Exception):
                 raise
             raise self._fail(f"{self.target} could not be taken down, seen down and journalled ({why})") from None
@@ -250,6 +273,34 @@ class FaultInjector:
             self._unlock()
             raise self._fail(f"{self.target} could not be read and journalled ({type(error).__name__})") from None
         return digest, entry
+
+    @contextlib.asynccontextmanager
+    async def running(
+        self, identity: Mapping[str, Any], *, cancel_wait_s: float | None = None
+    ) -> AsyncIterator["FaultInjector"]:
+        """Start in a worker thread for the body of an `async with`, and clear in `finally` (O11).
+
+        The start's future is kept: when the body's task is cancelled while the start runs, the thread runs on, so the
+        cancellation waits for it, shielded and at most `cancel_wait_s` (by default `cancel_wait_s` of the injector,
+        about the longest a start takes), then the clear runs and the cancellation is raised again. The clear, in its
+        own thread, waits for a start that is still running, through the injector's lock.
+        """
+        bound = self.cancel_wait_s if cancel_wait_s is None else cancel_wait_s
+        starting = asyncio.ensure_future(asyncio.to_thread(self.start, identity))
+        try:
+            try:
+                await asyncio.shield(starting)
+            except asyncio.CancelledError:
+                await _outlast(starting, bound)
+                raise
+            yield self
+        finally:
+            clearing = asyncio.ensure_future(asyncio.to_thread(self.clear))
+            try:
+                await asyncio.shield(clearing)
+            except asyncio.CancelledError:
+                await _outlast(clearing, bound)
+                raise
 
     def finish(self) -> dict[str, Any]:
         """Bring the target back and verify it (`clear`), then return the snapshot of every step."""
@@ -285,8 +336,13 @@ class FaultInjector:
 
         Returns True when this injector leaves nothing down. Until a restore is verified the injection stays pending,
         with the target's lock held, so a later `clear`, `finish` or `start` tries again; a verified one makes calling
-        it again harmless. A target the injection never took down is found running with its old identity.
+        it again harmless. A target the injection never took down is found running with its old identity. An injector
+        discarded with its restore still unverified lets the lock go when it is collected, so recovery can settle it.
         """
+        with self._mutex:
+            return self._clear()
+
+    def _clear(self) -> bool:
         if self._pending is None:
             return True
         entry, digest = self._pending
@@ -306,9 +362,14 @@ class FaultInjector:
             self._unlock()
         return done
 
-    def recover(self) -> None:
+    def recover(self) -> list[str]:
         """Clear and verify every open injection of the journal that no live injector holds; raise InfraError of kind
-        `injector_failure` when one cannot be."""
+        `injector_failure` when one cannot be. Return the targets of the injections left open, which live injectors
+        hold."""
+        with self._mutex:
+            return self._recover()
+
+    def _recover(self) -> list[str]:
         self._require_sanction()
         try:
             entries = self._journal.open_entries()
@@ -316,20 +377,23 @@ class FaultInjector:
             raise self._fail(f"the injection journal cannot be read: {error}") from None
         except OSError as error:  # an OS error's text holds the journal's path: only its type is told (O12)
             raise self._fail(f"the injection journal cannot be read ({type(error).__name__})") from None
+        held: list[str] = []
         for entry in entries:
             lock = self._journal.try_lock(entry["target"])
             if lock is None:
                 if holder_alive(entry.get("holder")) is False:  # held, yet by no injector the journal knows
                     self._step("recovered", False, target=entry["target"], how="lock_stuck")
                     raise self._fail(f"the lock of {entry['target']} is stuck: its journalled holder is gone")
-                continue  # a live injector holds the target down on purpose
+                held.append(entry["target"])  # a live injector holds the target down on purpose
+                continue
             try:
                 done, how, after = self._settle(entry)
             finally:
-                self._journal.release(lock)
+                lock.close()
             self._step("recovered", done, target=entry["target"], how=how, identity_after_sha256=after)
             if not done:
                 raise self._fail(f"an injection of {entry['target']} that an earlier run left open was not cleared")
+        return sorted(set(held))
 
     def _settle(self, entry: Mapping[str, Any]) -> tuple[bool, str, str | None]:
         """Leave one injection's target up: find it back, find it never went down, or bring it back with a changed
@@ -405,5 +469,13 @@ class FaultInjector:
 
     def _unlock(self) -> None:
         if self._lock is not None:
-            self._journal.release(self._lock)
+            self._lock.close()
             self._lock = None
+
+
+async def _outlast(future: "asyncio.Future[Any]", bound: float) -> None:
+    """Wait, shielded and at most `bound` seconds, for a worker thread's future that a cancellation left running."""
+    with contextlib.suppress(asyncio.CancelledError):  # cancelled again: the thread still runs, the bound still holds
+        await asyncio.wait({future}, timeout=bound)
+    if future.done() and not future.cancelled():
+        future.exception()  # read here: what the thread raised is the clear's to answer, never an unread error
