@@ -17,19 +17,22 @@ An answer that cannot be read is unhealthy, never a crash and never a pass: any 
 exception, becomes `Health(False, reason)`. The reason names positions in the file (`providers[i]`), counts and the
 ids the federation reports, never a token, URL, host or configured name.
 
-When platform.toml has a `[faults]` table the check first runs the fault gate (`expcore_onedata.admission.FaultGate`),
-before it asks Onezone anything: it recovers what a crashed run left open whenever no run is on the federation, waits
-for an outage run in progress as a run's admission does, and fails while an injection stays open, because a provider
-taken down for one condition's run, and not verifiably back, leaves the federation out of its baseline state for every
-other run, including runs of conditions that use no injector. The gate is built in and cannot be left out; `fault_driver` replaces the Compose driver that
-`[faults]` describes, for tests.
+When platform.toml has a `[faults]` table the fault gate (`expcore_onedata.admission.FaultGate`) runs around the whole
+check, before it asks Onezone anything or measures the content type: it recovers what a crashed run left open whenever
+no run is on the federation, then holds the federation shared until the check has answered, so no injection starts in
+the middle of it, and fails while an injection stays open, because a provider taken down for one condition's run, and
+not verifiably back, leaves the federation out of its baseline state for every other run, including runs of conditions
+that use no injector. A check whose bounded wait for the federation runs out, because an outage run holds it, reads
+nothing and answers deferred, a wait that charges no run (`expcore.campaign.healthgate`). The gate is built in and
+cannot be left out; `fault_driver` replaces the Compose driver that `[faults]` describes, for tests.
 
 The check of the earlier study also read one known file back through its provider and compared its checksum with a study manifest. That
 belongs to the study (its data) and not to the platform, so a study adds it with its own check.
 
 **The content type the data gate streams on is part of this check (O05, O11), with no opt-out.** When any level of
 `[sandbox.data_paths]` is REST, the first call measures it (`precampaign.content_type_check`: the provisioned
-`[sandbox] content_check_file`, read whole and by range through the local provider) before anything else, and the
+`[sandbox] content_check_file`, read whole and by range through the local provider) before anything but the fault gate,
+so it never measures through a provider an outage run holds down, and the
 check keeps that verdict for the campaign, since a type once answered does not change: a refusal, or a type that could
 not be measured, answers every call after it with its detail, so the gate stays closed and no run is admitted; a pass
 lets every call answer as the space check does. With no REST data path nothing is read. The composition is
@@ -41,7 +44,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from expcore.campaign.healthgate import Health
+from expcore.campaign.healthgate import Health, HealthCheck
 from expcore.config.loading import ConfigError
 from expcore_onedata.admission import FaultGate, fault_settings_of
 from expcore_onedata.client import OnezoneClient, PlatformError
@@ -112,13 +115,13 @@ def compare(view: SpaceView, config: PlatformConfig) -> Health:
     return Health(True, f"ok: the space is supported by exactly the {len(matched)} declared provider(s)")
 
 
-def _fault_gate(config: PlatformConfig, driver: FaultDriver | None) -> FaultGate | None:
-    """The fault gate when platform.toml has a `[faults]` table, None when it has none; a table that is not valid
-    raises ConfigError here, so a platform with an injector never runs without the gate."""
+def _fault_gate(config: PlatformConfig, driver: FaultDriver | None, inner: HealthCheck) -> FaultGate | None:
+    """The fault gate around `inner` when platform.toml has a `[faults]` table, None when it has none; a table that is
+    not valid raises ConfigError here, so a platform with an injector never runs without the gate."""
     settings = fault_settings_of(config)
     if settings is None:
         return None
-    return FaultGate(settings, driver if driver is not None else compose_driver(settings))
+    return FaultGate(settings, driver if driver is not None else compose_driver(settings), inner)
 
 
 class PlatformHealth:
@@ -140,8 +143,8 @@ class PlatformHealth:
         self._service = config.principals.service
         self._token: MintedToken | None = None
         self._lock = threading.Lock()
-        self._faults = _fault_gate(config, fault_driver)
         self._gate = PreCampaignHealth(self._space, lambda: content_type_check(config, client))
+        self._faults = _fault_gate(config, fault_driver, self._gate)  # outermost: it holds the federation
 
     def _current_token(self) -> MintedToken:
         """Return the cached token, minting a new one when none is left or it is about to expire."""
@@ -153,19 +156,16 @@ class PlatformHealth:
             return token
 
     def __call__(self) -> Health:
-        """Return the platform's health: the content type kept from the first call, then the space; never raise."""
+        """Return the platform's health: with `[faults]`, the fault gate holding the federation around the rest; the
+        content type kept from the first call; then the space. Never raise."""
         try:
-            return self._gate()
+            return self._faults() if self._faults is not None else self._gate()
         except Exception as error:
             return Health(False, f"health check raised {type(error).__name__}")
 
     def _space(self) -> Health:
         """The space as Onezone reports it, against the declared support set; never raise."""
         try:
-            if self._faults is not None:
-                gate = self._faults()
-                if not gate.ok:
-                    return gate
             view = read_space(self._client, self._current_token().reveal(), self._config.space.id)
             return compare(view, self._config)
         except _SAFE as error:

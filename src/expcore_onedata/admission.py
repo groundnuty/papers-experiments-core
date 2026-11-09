@@ -23,17 +23,18 @@ that: every admission, shared or exclusive, first takes `federation.intent` excl
 then lets the turnstile go. An outage run waiting for the main lock holds the turnstile, so runs that arrive after it
 queue behind it, and it gets in once the runs that were on the federation at its arrival have finished.
 
-`FaultGate` is the fault half of the platform's standard health check. Whenever the journal holds an open injection
-and the federation can be taken exclusively (no run is on it), it recovers every injection whose holder is gone,
-verifying each restore, before it considers the journal: so the first check of a campaign settles what a crashed run
-left, and a later one settles an injection whose injector was dropped. Recovery restores and so needs only the
-configuration's half of the sanction. It then takes the federation shared, as a run's admission does, waiting at most
-`health_wait_s`, so it never sees an injection in progress: an outage run holds the federation exclusively, and the
-check waits for it, outside any agent's clock. Under the shared lock it fails for an injection that is still open
-(recovery failed, or its lock is stuck) and for a journal it cannot read, naming targets by their labels only. An
-injection in progress is no fault of the federation and charges no run: a check still waiting at `health_wait_s` passes,
-and the run's own admission waits for the injection and checks the journal again under the lock. Keep `health_wait_s`
-below the campaign's `health_timeout_s`, or the check counts as down before it can pass.
+`FaultGate` is the fault half of the platform's standard health check, and runs around the rest of it. Whenever the
+journal holds an open injection and the federation can be taken exclusively (no run is on it), it recovers every
+injection whose holder is gone, verifying each restore, before it considers the journal: so the first check of a
+campaign settles what a crashed run left, and a later one settles an injection whose injector was dropped. Recovery
+restores and so needs only the configuration's half of the sanction. It then takes the federation shared, as a run's
+admission does, waiting at most `health_wait_s`, and holds it for the whole check, so no injection starts while the
+check runs: under the shared lock it fails for an injection that is still open (recovery failed, or its lock is stuck)
+and for a journal it cannot read, naming targets by their labels only, and otherwise answers as the rest of the check
+(`inner`: the pre-campaign checks and the space). An outage run in progress holds the federation exclusively and is no
+fault of the federation: a check whose wait runs out answers deferred (`Health(..., deferred=True)`), which the core's
+gate treats as a wait that charges no run and leaves a finished run's outcome standing. Keep `health_wait_s` below the
+campaign's `health_timeout_s`, or the check counts as down before it can be deferred.
 """
 
 import asyncio
@@ -48,12 +49,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.healthgate import Health
+from expcore.campaign.healthgate import Health, HealthCheck, read_health
 from expcore.config.loading import ConfigError, load_toml
 from expcore.errors import InfraError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, make_directories
-from expcore_onedata.fault_recovery import FaultDriver, Recovery, failure
+from expcore_onedata.fault_recovery import INJECTOR_FAILURE, FaultDriver, Recovery, failure
 from expcore_onedata.fault_settings import FaultSettings, load_faults
 
 FEDERATION_LOCK = "federation.lock"
@@ -63,6 +64,10 @@ _ADMISSION: ContextVar["Admission | None"] = ContextVar("expcore_onedata_admissi
 
 class AdmissionRefused(ConfigError):
     """A run of a platform with a fault injector would start, or inject, without the admission its condition needs."""
+
+
+class FederationBusy(InfraError):
+    """The bounded wait for the federation ran out: another holds it (kind `injector_failure`, as any failed wait)."""
 
 
 @dataclass(frozen=True)
@@ -129,7 +134,7 @@ class FederationLock:
             if cancel is not None and cancel.is_set():
                 raise failure("the wait for the federation was cancelled")
             if deadline is not None and time.monotonic() >= deadline:
-                raise failure("the federation stayed held past the bound of the wait: another run's injection is on it")
+                raise FederationBusy(INJECTOR_FAILURE, "the federation stayed held past the bound of the wait")
             time.sleep(self._poll_s)
 
     def try_acquire(self, *, exclusive: bool) -> Admission | None:
@@ -250,13 +255,14 @@ def require_admission(config: PlatformConfig) -> None:
 
 
 class FaultGate:
-    """The fault half of the platform's standard health check (see the module docstring)."""
+    """The fault half of the platform's standard health check, around the rest of it (see the module docstring)."""
 
-    def __init__(self, settings: FaultSettings, driver: FaultDriver) -> None:
+    def __init__(self, settings: FaultSettings, driver: FaultDriver, inner: HealthCheck | None = None) -> None:
         self._lock = FederationLock(settings)
         self._recovery = Recovery(settings, driver)
         self._may_recover = settings.sanctioned is True
         self._wait_s = settings.health_wait_s
+        self._inner = inner
 
     def __call__(self) -> Health:
         try:
@@ -269,15 +275,19 @@ class FaultGate:
                         exclusive.close()
             try:
                 shared = self._lock.acquire(exclusive=False, timeout_s=self._wait_s)
-            except InfraError:  # an outage run held it all along: the run's own admission waits for it
-                return Health(True, "an injection is in progress: the run's admission waits for it")
-            try:
+            except FederationBusy:  # an outage run holds it: a wait, which charges no run, never a failure
+                return Health(False, "an outage run holds the federation: the check waits for it", deferred=True)
+            try:  # held shared for the whole check: no injection starts until it has answered
                 entries = self._recovery.entries()
+                if entries:
+                    targets = ", ".join(sorted({entry["target"] for entry in entries}))
+                    return Health(
+                        False, f"an injection of {targets} is unsettled: the federation is not in its baseline state"
+                    )
+                return (
+                    read_health(self._inner) if self._inner is not None else Health(True, "no injection is unsettled")
+                )
             finally:
                 shared.close()
         except InfraError as error:
             return Health(False, error.detail)
-        targets = ", ".join(sorted({entry["target"] for entry in entries}))
-        if entries:
-            return Health(False, f"an injection of {targets} is unsettled: the federation is not in its baseline state")
-        return Health(True, "no injection is unsettled")

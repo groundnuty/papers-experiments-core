@@ -9,12 +9,14 @@ import threading
 import time
 
 from campaign_support import keys_under, planned_store
-from fault_support import FakeServices, injector_for, write_faults
+from fault_support import LOCAL_TARGET, FakeServices, injector_for, write_faults
 from platform_support import NOW
 
 from expcore.campaign.healthgate import FOUND, GO, HealthGate
+from expcore_onedata.admission import FederationLock
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
+from expcore_onedata.faults import load_faults
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.tokens import TokenIssuer
 
@@ -83,3 +85,51 @@ def test_o11_without_a_faults_table_the_standard_check_reads_no_journal(tmp_path
     from platform_support import write_platform
 
     assert standard_health(write_platform(tmp_path), fake)().ok is True
+
+
+def test_o11_a_baseline_check_whose_wait_runs_out_during_an_outage_is_deferred_and_charges_no_run(tmp_path, fake):
+    """O11: an outage run holds the federation with a provider of the support set down. A baseline check whose bounded
+    wait for the federation runs out never goes on to read the space, so the outage is no failure of the check: the
+    run is deferred, the gate stays open and no attempt is charged."""
+    platform = write_faults(tmp_path, health_wait_s=0.2)
+    health = standard_health(platform, fake)
+    gate, store, baseline = gate_for(tmp_path, health)
+    injector = injector_for(platform, FakeServices(), target=LOCAL_TARGET)  # the provider that supports the space
+    injector.start(RUN)
+    fake.providers[fake.PROVIDER_ID]["online"] = False  # the outage, as the federation reports it
+    try:
+        verdict = gate.before_run(baseline)
+    finally:
+        fake.providers[fake.PROVIDER_ID]["online"] = True
+        assert injector.finish()["ok"] is True
+    assert verdict.verdict == "defer", verdict.detail
+    assert gate.closed is False
+    assert store.q("SELECT COUNT(*) FROM attempts")[0][0] == 0
+
+
+class Watched:
+    """A Onezone client that, at every query, notes whether an outage run could take the federation right then."""
+
+    def __init__(self, inner, lock):
+        self.inner, self.lock, self.free = inner, lock, []
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def query(self, *args, **kwargs):
+        taken = self.lock.try_acquire(exclusive=True)
+        self.free.append(taken is not None)
+        if taken is not None:
+            taken.close()
+        return self.inner.query(*args, **kwargs)
+
+
+def test_o11_the_check_holds_the_federation_while_it_reads_the_space(tmp_path, fake):
+    """O11: the check holds the federation shared from before it reads the space until after it compares, so no
+    injection can start in the middle of the check."""
+    platform = write_faults(tmp_path)
+    config = load_platform(platform)
+    client = Watched(OnezoneClient(config, http=fake.client_http()), FederationLock(load_faults(platform, config)))
+    health = PlatformHealth(config, client, TokenIssuer(client.inner, config, clock=lambda: NOW), clock=lambda: NOW)
+    assert health().ok is True
+    assert client.free == [False]  # the read of the space ran while the federation was held

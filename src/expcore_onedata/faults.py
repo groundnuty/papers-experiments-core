@@ -48,8 +48,8 @@ holds none, refuses a shared one, and keeps it until the restore is verified. Ev
 two never overlap; a turnstile in front of the lock keeps a stream of shared holders from starving an outage run. An
 injector also refuses to start, as `injector_failure`, while the journal holds an injection recovery could not
 settle, and the platform's standard health check (`PlatformHealth`), whenever platform.toml has a `[faults]` table,
-recovers what a crashed run left, waits for an outage run in progress as an admission does, and fails only for an
-injection that stays open.
+recovers what a crashed run left, holds the federation shared for the whole check, is deferred (charging no run)
+while an outage run holds it, and fails only for an injection that stays open.
 
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
