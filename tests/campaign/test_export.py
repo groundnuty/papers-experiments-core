@@ -122,6 +122,17 @@ def test_c01_an_infrastructure_failure_is_absent_from_the_analysed_attempts(tmp_
     assert failed not in [r["run_key"] for r in data["analysed_attempts"]]
 
 
+def test_an_analysed_attempt_names_its_directory_within_the_batch_and_not_the_path_it_ran_under(tmp_path):
+    """The export holds no path of the machine the campaign ran on, so a copy of the campaign exports the same bytes."""
+    store, _, manifest = planned_store(tmp_path)
+    key = keys_of(manifest)[0]
+    ran_under = tmp_path / "somewhere" / "out" / "runs" / ("d" * 64) / "try1"
+    run_one(store, key, finished(), run_dir=str(ran_under))
+    (entry,) = export_run_state(store)["analysed_attempts"]
+    assert entry["run_dir"] == f"{'d' * 64}/try1"
+    assert str(tmp_path) not in json.dumps(export_run_state(store))
+
+
 def test_c02_every_infrastructure_kind_keeps_its_own_name_in_the_export(tmp_path):
     """C02: every harness kind appears under its own name, the core's and a platform's alike."""
     register_infra_kind("tool_outage", "a platform's own kind")

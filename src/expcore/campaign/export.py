@@ -24,6 +24,9 @@ file or the new one; it is owner-only (0600), because an export can carry study 
 
 Each analysed attempt also says when and how it began (`dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`), so
 an analysis can check the balance of the conditions over time: holds and unit caps can push one condition's runs late.
+Its `run_dir` is the attempt's directory relative to the campaign's runs directory (`<digest>/try<N>`), never the path
+the store holds: the export says nothing of the directory or host the campaign ran in, so a copy of the campaign, a
+replication package among them, exports the same bytes wherever it lies.
 
 A partial analysis leaves some runs out (`export_run_state(store, excluded=...)`: a run whose final attempt the replay
 check does not cover). The export then carries `partial` (true when anything is left out or an attempt was still
@@ -44,7 +47,7 @@ import sqlite3
 import tempfile
 from collections.abc import Collection, Iterable, Mapping
 from contextlib import AbstractContextManager
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Protocol
 
 from expcore.campaign.factors import FactorSchema, RunKey
@@ -130,7 +133,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
                 {
                     **who,
                     "attempt": done[0]["attempt"],
-                    "run_dir": done[0]["run_dir"],
+                    "run_dir": _batch_relative(done[0]["run_dir"]),
                     "treatment": bool(done[0]["treatment"]),
                     "infra_kind": done[0]["infra_kind"],
                     **_dispatch(done[0]),
@@ -159,6 +162,16 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
     return data
+
+
+def _batch_relative(run_dir: str | None) -> str | None:
+    """Return an attempt's directory as `<digest>/try<N>`, the last two parts of the path the store holds.
+
+    The scheduler lays a campaign out as `runs/<digest>/try<N>`, so these two parts name the attempt within its batch.
+    """
+    if run_dir is None:
+        return None
+    return "/".join(PurePath(run_dir).parts[-2:])
 
 
 def _dispatch(attempt: Any) -> dict[str, Any]:
