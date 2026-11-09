@@ -1,0 +1,201 @@
+# Provenance: new
+"""The wheels a replication package ships, so that its `make check` installs the environment offline (#45, #46).
+
+A package holds one wheel per distribution of the environment its replay check ran under (`provenance.environment`):
+the core, the study's platform and backend packages, and everything they require. `make check` installs them into a
+fresh environment with `pip install --no-index --no-deps --require-hashes`, from `wheels/requirements.txt`, which
+pins each wheel by name, version and SHA-256, so the reader needs neither the network nor an index.
+
+Where a wheel comes from, for each distribution:
+- a wheel the author supplies (`--wheels DIR`), named `<name>-<version>-<tags>.whl` with that name and version in
+  its metadata, is taken byte for byte: the way to ship a public release's own wheel, or the wheel of a distribution
+  installed editable;
+- otherwise the installed files are packed again into a wheel: every file the distribution's RECORD lists inside
+  the site directory, each checked against its RECORD hash, without bytecode and without what the installer added
+  (INSTALLER, REQUESTED, RECORD, direct_url.json and the installer's own records); RECORD is written anew. The wheel
+  is deterministic: entries sorted, dated 1980-01-01, mode 0644 or 0755. Files installed outside the site directory
+  (console scripts, which the installer writes again from the entry points, and data files) are left out;
+- a distribution installed editable is refused: its installed files are a pointer to a checkout, not its code.
+
+A wheel is built for the platform and the Python of the build, as installed; the package says which, and a reader
+needs the same. A distribution installed from an index (no `direct_url.json`) is a public release: its wheel is
+attested by name, version and hash and goes in unscanned, like an `[[opaque]]` file, since a compiled extension is
+binary the scan refuses. Every other wheel, the core's and a study's own packages, can hold the author's names, so
+the package's checks read it like any other file.
+"""
+
+import base64
+import hashlib
+import io
+import re
+import stat
+import zipfile
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from email.parser import HeaderParser
+from importlib import metadata
+from pathlib import Path, PurePosixPath
+
+from expcore.package.spec import WHEELS_DIR, PackageError
+from expcore.provenance.environment import canonical, installed, source_of
+
+REQUIREMENTS = f"{WHEELS_DIR}/requirements.txt"
+ZIP_DATE = (1980, 1, 1, 0, 0, 0)
+INSTALLER_FILES = frozenset({"INSTALLER", "REQUESTED", "RECORD", "direct_url.json", "RECORD.jws", "RECORD.p7s"})
+_INSTALLER_RECORD = re.compile(r"(uv|pip)_[A-Za-z0-9_]*\.json")
+
+
+@dataclass(frozen=True)
+class Wheel:
+    """One vendored wheel: its distribution, its file name and bytes, and whether the package's checks read it."""
+
+    name: str
+    version: str
+    filename: str
+    data: bytes
+    scanned: bool
+
+    @property
+    def path(self) -> str:
+        return f"{WHEELS_DIR}/{self.filename}"
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.data).hexdigest()
+
+
+Vendor = Callable[[Mapping[str, str], "Path | None"], Sequence[Wheel]]
+
+
+def _escaped(name: str) -> str:
+    return re.sub(r"[-_.]+", "_", name).lower()
+
+
+def _wheel_tag(wheel_file: str, name: str) -> str:
+    """The compressed tag set of an installed wheel's `Tag:` lines, as a wheel's file name carries it."""
+    tags = [line.split(":", 1)[1].strip() for line in wheel_file.splitlines() if line.startswith("Tag:")]
+    if not tags or any(tag.count("-") != 2 for tag in tags):
+        raise PackageError(f"{name}: its installed WHEEL file names no tag, so no wheel can be built for it")
+    parts = [list(dict.fromkeys(tag.split("-")[i] for tag in tags)) for i in range(3)]
+    return "-".join(".".join(part) for part in parts)
+
+
+def _record_hash(data: bytes) -> str:
+    return "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
+
+
+def _kept(path: PurePosixPath, info_dir: str) -> bool:
+    """Whether an installed file belongs in the wheel: inside the site directory, not bytecode, not the installer's."""
+    if path.parts[0] == ".." or "__pycache__" in path.parts or path.suffix in (".pyc", ".pyo"):
+        return False
+    if path.parts[0] == info_dir and len(path.parts) == 2:
+        return path.name not in INSTALLER_FILES and not _INSTALLER_RECORD.fullmatch(path.name)
+    return True
+
+
+def _zip(entries: Sequence[tuple[str, bytes, bool]]) -> bytes:
+    """A deterministic zip of (name, bytes, executable) entries, in the order given."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for name, data, executable in entries:
+            info = zipfile.ZipInfo(name, date_time=ZIP_DATE)
+            info.create_system = 3  # unix, so the mode below is read
+            info.external_attr = ((0o755 if executable else 0o644) | stat.S_IFREG) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, data)
+    return buffer.getvalue()
+
+
+def repack(dist: metadata.Distribution) -> tuple[str, bytes]:
+    """Pack an installed distribution's files into a wheel again; return its file name and bytes."""
+    name, version = canonical(dist.metadata["Name"]), str(dist.version)
+    files = dist.files
+    info_dirs = {f.parts[0] for f in files or [] if f.parts and f.parts[0].endswith(".dist-info")}
+    if not files or len(info_dirs) != 1:
+        raise PackageError(f"{name}: its installed files are not listed (no RECORD), so no wheel can be built for it")
+    info_dir = info_dirs.pop()
+    entries: list[tuple[str, bytes, bool]] = []
+    for item in sorted(files, key=lambda f: f.as_posix()):
+        path = PurePosixPath(item.as_posix())
+        if not _kept(path, info_dir):
+            continue
+        located = Path(str(dist.locate_file(item)))
+        try:
+            data = located.read_bytes()
+        except OSError:
+            raise PackageError(f"{name}: its installed file {path} cannot be read; reinstall {name}") from None
+        if item.hash is not None and _record_hash(data) != f"{item.hash.mode}={item.hash.value}":
+            raise PackageError(f"{name}: its installed file {path} differs from its RECORD; reinstall {name}")
+        entries.append((path.as_posix(), data, bool(located.stat().st_mode & 0o111)))
+    meta = [e for e in entries if e[0].startswith(f"{info_dir}/")]
+    wheel_file = next((e[1] for e in meta if e[0] == f"{info_dir}/WHEEL"), None)
+    if wheel_file is None:
+        raise PackageError(f"{name}: it has no installed WHEEL file, so no wheel can be built for it")
+    ordered = [e for e in entries if e not in meta] + meta
+    record = "".join(f"{n},{_record_hash(d)},{len(d)}\n" for n, d, _ in ordered) + f"{info_dir}/RECORD,,\n"
+    ordered.append((f"{info_dir}/RECORD", record.encode("utf-8"), False))
+    tag = _wheel_tag(wheel_file.decode("utf-8"), name)
+    return f"{_escaped(name)}-{version.replace('-', '_')}-{tag}.whl", _zip(ordered)
+
+
+def _metadata_of(data: bytes) -> tuple[str, str] | None:
+    """The name and version a wheel's METADATA gives; None when it has none."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            found = [n for n in archive.namelist() if re.fullmatch(r"[^/]+\.dist-info/METADATA", n)]
+            if len(found) != 1:
+                return None
+            headers = HeaderParser().parsestr(archive.read(found[0]).decode("utf-8"))
+    except (zipfile.BadZipFile, UnicodeDecodeError, KeyError):
+        return None
+    return canonical(headers.get("Name", "")), headers.get("Version", "")
+
+
+def supplied_wheel(directory: Path, name: str, version: str) -> tuple[str, bytes] | None:
+    """The author's wheel of this distribution and version in `directory`; None when there is none."""
+    matches = []
+    for path in sorted(Path(directory).glob("*.whl")):
+        parts = path.name.split("-")
+        if len(parts) >= 5 and canonical(parts[0]) == name and parts[1] == version.replace("-", "_"):
+            matches.append(path)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise PackageError(f"{directory}: holds {len(matches)} wheels of {name} {version}; leave one")
+    data = matches[0].read_bytes()
+    if _metadata_of(data) != (name, version):
+        raise PackageError(f"{matches[0].name}: its metadata does not name {name} {version}")
+    return matches[0].name, data
+
+
+def vendor_wheels(distributions: Mapping[str, str], supplied: Path | None = None) -> list[Wheel]:
+    """One wheel per distribution of the environment, from `supplied` or the installed files, as described above."""
+    found = installed()
+    wheels = []
+    for name, version in sorted(distributions.items()):
+        dist = found.get(name)
+        if dist is None or str(dist.version) != version:
+            raise PackageError(
+                f"{name} {version} is in the environment the check ran under but not installed here; build the "
+                "package in the campaign's environment"
+            )
+        source = source_of(dist)
+        given = supplied_wheel(supplied, name, version) if supplied is not None else None
+        if given is None and source is not None and source.get("editable"):
+            raise PackageError(
+                f"{name} is installed editable, so its installed files are not its code; build its wheel (for example "
+                "`uv build --wheel --out-dir DIR` in its project) and pass `--wheels DIR`"
+            )
+        filename, data = given or repack(dist)
+        wheels.append(Wheel(name, version, filename, data, scanned=source is not None))
+    return wheels
+
+
+def requirements(wheels: Sequence[Wheel]) -> bytes:
+    """`wheels/requirements.txt`: each wheel pinned by name, version and hash, for `pip --require-hashes`."""
+    lines = ["# Generated by `python -m expcore package`: `make check` installs exactly these, from wheels/ only.\n"]
+    lines += [f"{w.name}=={w.version} --hash=sha256:{w.sha256}\n" for w in sorted(wheels, key=lambda w: w.name)]
+    return "".join(lines).encode("utf-8")
+
+
+__all__ = ["REQUIREMENTS", "WHEELS_DIR", "Vendor", "Wheel", "repack", "requirements", "vendor_wheels"]

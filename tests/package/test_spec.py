@@ -117,6 +117,15 @@ def test_a_name_the_build_generates_cannot_be_selected(tree):
         select(tree, spec_with(tree, ["SHA256SUMS"]))
 
 
+def test_k10_no_file_under_wheels_can_come_from_the_study(tree):
+    """K10: the wheels the package's `make check` installs are the ones the build vendors, so a study's own file under
+    wheels/ is refused, wherever the pattern that selects it points."""
+    write(tree, {"wheels/requirements.txt": "evil==1\n", "wheels/evil-1-py3-none-any.whl": "x"})
+    for pattern in ("wheels", "wheels/requirements.txt", "**/*.whl"):
+        with pytest.raises(PackageError, match=r"wheels/.* is a name"):
+            select(tree, spec_with(tree, [pattern]))
+
+
 @pytest.mark.parametrize("name", ["GNUmakefile", "makefile", "Makefile"])
 def test_k07_no_file_make_reads_at_the_package_root_can_come_from_the_study(tree, name):
     """K07: `make check` must run the package's own check, so a file GNU Make would read before or instead of the

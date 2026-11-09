@@ -261,3 +261,5 @@ Groups: [B model backends](#b-model-backends) · [L loop and tools](#l-agent-loo
 **K08. Shipped code parses on the oldest supported Python.** *Learned:* ICSA 8a578931 (6 Nov; 3.12 f-string syntax broke 3.11 nodes). *Test:* a compile pass under the minimum version.
 
 **K09. Temporary credential copies are removed.** *Learned:* ICSOC `harness/panel.py:134-154, 553` never removed per-leg config directories holding a credentials copy. *Test:* teardown deletes every temporary directory it created.
+
+**K10. A package installs the environment it was checked under, offline.** One wheel per distribution of the environment the replay check ran under, pinned by SHA-256; `make check` installs them with no index, and the package's check refuses any other environment. *Learned:* #45 and #46 (a reviewer could not learn which core to install, and a study on a non-core platform failed at the reader's end). *Test:* the install target takes exactly the vendored wheels with an unreachable index configured; a tampered wheel and a version that differs are refused.

@@ -2,7 +2,8 @@
 verified by its own `make check`.
 
 The campaign runs once per module, under a directory named by an invented private name that the test hash file
-lists, so every package built here also shows that no path of the machine reaches the package.
+lists, so every package built here also shows that no path of the machine reaches the package. Every package here
+vendors stand-in wheels (`package_support`); the make target that installs real ones is tested in test_wheels.py.
 """
 
 import hashlib
@@ -15,6 +16,7 @@ import zlib
 from pathlib import Path
 
 import pytest
+from package_support import stand_in, stand_in_vendor
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
 from expcore.cli import main
@@ -29,13 +31,24 @@ from expcore.package.build import (
     verify_package,
 )
 from expcore.package.spec import PackageError
+from expcore.package.wheels import REQUIREMENTS, Wheel
+from expcore.provenance.environment import CORE_DISTRIBUTION
 from expcore.provenance.hashfile import render_hash_file
+from expcore.study import pipeline
 
 PRIVATE = "zarnothwick"  # invented; the test hash file treats it as a name private everywhere
 AUTHOR = "Quillon Varek"  # invented; what an anonymisation list hides
 NAME = "tiny-study-package"
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
+
+
+@pytest.fixture(scope="module", autouse=True)
+def stand_in_wheels():
+    """Every build of this module vendors stand-in wheels, the command line's included."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(package_build, "vendor_wheels", stand_in_vendor)
+        yield
 
 
 @pytest.fixture(scope="module")
@@ -77,7 +90,7 @@ def test_k07_the_unpacked_package_of_the_example_passes_its_own_make_check(built
     package, built from a clean stamped copy, passes it wherever it is unpacked."""
     root = unpack(built, tmp_path)
     done = subprocess.run(
-        ["make", "-C", str(root), "-f", "Makefile", "check", f"PYTHON={sys.executable}"],
+        ["make", "-C", str(root), "-f", "Makefile", "check-installed", f"PYTHON={sys.executable}"],
         capture_output=True,
         text=True,
         env=clean_environment,
@@ -276,3 +289,79 @@ def test_the_command_line_builds_and_checks_a_package(campaign, hashes, tmp_path
     shutil.rmtree(root / "out" / "runs")
     assert main(["package-check", str(root)]) == 1
     assert main(["package", str(tmp_path), "--out", str(tmp_path / "x")]) == 1  # no study there: refused, not a crash
+
+
+# --- the environment and its wheels ----------------------------------------------------------------------------------
+
+
+def test_k10_the_package_records_the_checks_environment_and_vendors_one_pinned_wheel_per_distribution(built, tmp_path):
+    """K10: PACKAGE.json names the environment the replay check ran under, and wheels/ holds one wheel per distribution
+    of it, each listed with its hash in PACKAGE.json, in requirements.txt (what make check installs) and in
+    SHA256SUMS."""
+    root = unpack(built, tmp_path)
+    package = json.loads((root / PACKAGE_FILE).read_text(encoding="utf-8"))
+    check = json.loads((root / "out" / "runs" / "replay-check.json").read_text(encoding="utf-8"))
+    assert package["environment"] == check["environment"] == pipeline.environment()
+    assert CORE_DISTRIBUTION in package["environment"]["distributions"]
+    listed = {wheel["name"]: wheel for wheel in package["wheels"]}
+    assert set(listed) == set(package["environment"]["distributions"])
+    pins = (root / REQUIREMENTS).read_text(encoding="utf-8")
+    sums = (root / SUMS_FILE).read_text(encoding="utf-8")
+    for name, wheel in listed.items():
+        data = (root / wheel["file"]).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == wheel["sha256"]
+        assert f"{name}=={wheel['version']} --hash=sha256:{wheel['sha256']}\n" in pins
+        assert f"{wheel['sha256']}  {wheel['file']}\n" in sums
+        assert wheel["scanned"] == (name == CORE_DISTRIBUTION)
+    makefile = (root / "Makefile").read_text(encoding="utf-8")
+    assert "--no-index" in makefile
+    assert f"Python {package['environment']['python']}" in makefile
+
+
+def test_k10_the_package_check_refuses_an_environment_other_than_the_one_it_names(built, tmp_path, monkeypatch):
+    """K10: a reader whose environment differs from the package's, in one version, is told so and how to install
+    the right one, before any output is derived."""
+    root = unpack(built, tmp_path)
+    changed = pipeline.environment()
+    changed["distributions"]["numpy"] = "0.0.1"
+    monkeypatch.setattr(package_build, "environment", lambda requires=(): changed)
+    [problem] = verify_package(root)
+    assert "is not the one PACKAGE.json names" in problem
+    assert "numpy" in problem
+    assert "`make -f Makefile check` installs it from wheels/" in problem
+
+
+def test_k10_the_cores_wheel_is_read_by_the_token_check_and_a_public_release_goes_in_attested(
+    campaign, hashes, tmp_path
+):
+    """K10: a wheel from a direct-URL install, the core's, is read like any file, so a private name in it refuses the
+    build; a public release's wheel goes in unread, listed as not scanned with its hash."""
+
+    def leaky(distributions, supplied=None):
+        wheels = stand_in_vendor(distributions)
+        core = next(w for w in wheels if w.name == CORE_DISTRIBUTION)
+        name, data = stand_in(core.name, core.version)
+        with_name = data.replace(b"Version: ", f"Summary: built on {PRIVATE}\nVersion: ".encode(), 1)
+        return [w if w is not core else Wheel(w.name, w.version, name, with_name, scanned=True) for w in wheels]
+
+    def public_leak(distributions, supplied=None):
+        return [
+            Wheel(w.name, w.version, w.filename, w.data + PRIVATE.encode(), scanned=False) if w.name == "numpy" else w
+            for w in stand_in_vendor(distributions)
+        ]
+
+    with pytest.raises(PackageError, match=r"wheels/papers_experiments_core-.*\.whl") as refused:
+        build_package(a_copy(campaign, tmp_path / "a"), tmp_path / "dist-a", hashes=hashes, vendor=leaky)
+    assert PRIVATE not in str(refused.value)
+    archive = build_package(a_copy(campaign, tmp_path / "b"), tmp_path / "dist-b", hashes=hashes, vendor=public_leak)
+    package = json.loads((unpack(archive, tmp_path / "unpacked") / PACKAGE_FILE).read_text(encoding="utf-8"))
+    assert {w["name"]: w["scanned"] for w in package["wheels"]}["numpy"] is False
+
+
+def test_k10_a_build_under_another_environment_than_the_checks_is_refused(campaign, hashes, tmp_path, monkeypatch):
+    """K10: the wheels are packed from the build's environment, so it must be the one the check ran under."""
+    changed = pipeline.environment()
+    changed["distributions"]["numpy"] = "0.0.1"
+    monkeypatch.setattr(package_build, "environment", lambda requires=(): changed)
+    with pytest.raises(PackageError, match="another environment than this build's"):
+        build_package(a_copy(campaign, tmp_path), tmp_path / "dist", hashes=hashes)

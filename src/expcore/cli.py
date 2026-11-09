@@ -87,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     package.add_argument("--out", type=Path, required=True, help="where the archive is written")
     package.add_argument("--hashes", type=Path, help="study-token hash file (default: the core's public one)")
     package.add_argument("--anonymise", type=Path, help="anonymisation list, kept outside the study and the output")
+    package.add_argument(
+        "--wheels", type=Path, help="a directory of wheels to vendor instead of packing installed ones"
+    )
     verify = commands.add_parser("package-check", help="package-check PACKAGE: verify an unpacked package")
     verify.add_argument("package", type=Path, help="the directory of an unpacked package")
     example = commands.add_parser("example", help="example DEST: write the example study into a new directory")
@@ -140,7 +143,7 @@ def _report(args: argparse.Namespace) -> int:
 
 
 def _package(args: argparse.Namespace) -> int:
-    archive = build_package(args.study, args.out, hashes=args.hashes, anonymise=args.anonymise)
+    archive = build_package(args.study, args.out, hashes=args.hashes, anonymise=args.anonymise, wheels=args.wheels)
     print(f"wrote {archive} (sha256 {hashlib.sha256(archive.read_bytes()).hexdigest()})")
     return EXIT_OK
 
