@@ -1,7 +1,7 @@
 """O11: on a platform with `[faults]`, a run's sandbox starts only under the federation's admission.
 
-The executor admits a run before it launches anything (shared for a baseline condition, exclusive for an outage run),
-and holds the admission until after the teardown; `SandboxPlatform.launch` refuses to start without one, before it mints
+The campaign admits a run before it launches anything (shared for a baseline condition, exclusive for an outage run),
+and holds it until after the post-run check; `SandboxPlatform.launch` refuses to start without one, before it mints
 a token or enters a wait, so a baseline run's sandbox never starts on a federation an outage run holds.
 """
 

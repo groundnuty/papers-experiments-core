@@ -17,7 +17,7 @@ the check counts as down before its wait can run out.
 restore failed (journalled `clear_failed`) fails the check, naming the target by its label, whoever still holds the
 federation. A live holder, or none recorded, is contention, an outage run in progress, which is no fault of the
 federation: the check answers deferred (`Health(..., deferred=True)`), which the core's gate treats as a wait that
-charges no run and leaves a finished run's outcome standing. A recorded holder that is gone while the lock stays held is
+charges no run. A recorded holder that is gone while the lock stays held is
 stuck: the check recovers, verified, whatever the journal holds open, marks the record `stuck_since` (the first such
 verdict's time) and fails, saying the lock is stuck. The record is never deleted for it, so every later timeout is stuck
 too; only an acquisition of the lock, which proves it usable, clears it.
@@ -30,7 +30,15 @@ from typing import Any
 
 from expcore.campaign.healthgate import Health, HealthCheck, read_health
 from expcore.errors import TARGET_LABEL, InfraError
-from expcore_onedata.admission import INJECTOR, OUTAGE_RUN, RECOVERY, FederationBusy, FederationLock
+from expcore_onedata.admission import (
+    INJECTOR,
+    OUTAGE_RUN,
+    RECOVERY,
+    FederationBusy,
+    FederationLock,
+    current_admission,
+    require_same_federation,
+)
 from expcore_onedata.fault_journal import holder_alive
 from expcore_onedata.fault_recovery import FaultDriver, Recovery
 from expcore_onedata.fault_settings import FaultSettings
@@ -75,6 +83,10 @@ class FaultGate:
 
     def __call__(self) -> Health:
         try:
+            held = current_admission()
+            if held is not None:  # a run's own post-run check, under its admission: no injection but its own can start
+                require_same_federation(held, self._lock.federation)
+                return self._checked()
             if self._recovery.entries() and self._may_recover:
                 exclusive = self._lock.try_acquire(exclusive=True, purpose=RECOVERY)
                 if exclusive is not None:  # no run is on the federation: settle what is left
@@ -87,16 +99,18 @@ class FaultGate:
             except FederationBusy:
                 return self._busy()
             try:  # held shared for the whole check: no injection starts until it has answered
-                entries = self._recovery.entries()
-                if entries:
-                    return _unsettled(entries)
-                return (
-                    read_health(self._inner) if self._inner is not None else Health(True, "no injection is unsettled")
-                )
+                return self._checked()
             finally:
                 shared.close()
         except InfraError as error:
             return Health(False, error.detail)
+
+    def _checked(self) -> Health:
+        """With the federation held: the journal, then the rest of the check."""
+        entries = self._recovery.entries()
+        if entries:
+            return _unsettled(entries)
+        return read_health(self._inner) if self._inner is not None else Health(True, "no injection is unsettled")
 
     def _busy(self) -> Health:
         """The wait for the federation ran out: tell a failed restore, a stuck holder and an outage run on it apart."""

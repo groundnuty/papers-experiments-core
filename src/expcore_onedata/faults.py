@@ -54,17 +54,16 @@ while an outage run holds it, and fails only for an injection that stays open.
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
 
-**Use.** An executor admits its run to the federation before it starts any infrastructure (exclusive when its
-condition uses an injector), builds the injector for the target its condition declares and runs the agent inside
-`running`:
+**Use.** The study's plugin passes the platform's run admission to the campaign (`admission=run_admission(config)`),
+which admits each run to the federation before anything starts (exclusive when its condition declares
+`provider_outage`) and keeps it until after the post-run check. The executor, already admitted, starts the sandbox and
+the tool server, builds the injector for the target its condition declares and runs the agent inside `running`:
 
-    async with FederationLock(settings).admitted(exclusive=True):
-        ...  # the sandbox and the tool server start here, under the admission
-        injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
-                                 driver=compose_driver(settings))
-        async with injector.running(dataclasses.asdict(request.identity)):
-            record = await record_run(request, ...)
-        record = await asyncio.to_thread(finish_instruments, record, [injector])
+    injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
+                             driver=compose_driver(settings))
+    async with injector.running(dataclasses.asdict(request.identity)):
+        record = await record_run(request, ...)
+    record = await asyncio.to_thread(finish_instruments, record, [injector])
 
 `running` starts the injector in a worker thread and keeps that thread's future: a cancellation cannot stop the thread,
 so on cancellation it waits for it (shielded, bounded), clears in `finally` and raises the cancellation again. Never

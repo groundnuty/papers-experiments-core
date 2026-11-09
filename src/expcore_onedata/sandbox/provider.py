@@ -428,9 +428,9 @@ class SandboxPlatform:
         federation held until the thread and its cleanup are done (O11).
 
         On a platform whose platform.toml has `[faults]`, the run must hold the federation's admission
-        (`expcore_onedata.admission`): the executor takes it before it calls `launch`, shared for a baseline condition
-        and exclusive for an outage run, and lets it go after the launch has left, so it covers the start, the run and
-        the teardown. Its wait is before the agent's clock starts. Without it `launch` raises `AdmissionRefused` before
+        (`expcore_onedata.admission`): the campaign takes it through the platform's run admission before the attempt,
+        shared for a baseline condition and exclusive for an outage run, and lets it go after the attempt's post-run
+        check, so it covers the start, the run, the teardown and the check. Its wait is before the agent's clock starts. Without it `launch` raises `AdmissionRefused` before
         it mints a token or enters a wait (O11). An injector's own admission, taken when its run holds none, is not
         the run's: the run must be admitted before it launches.
         """

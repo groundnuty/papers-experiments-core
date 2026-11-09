@@ -2,8 +2,8 @@
 health check recovers what a crashed run left open before it admits anything.
 
 Every run of a platform with `[faults]` holds the federation's lock: shared for a run of a baseline condition, exclusive
-for a run whose condition uses an injector, from before its infrastructure starts until after its teardown. Every test
-runs against `FakeServices`; the lock is real, on the fixture's journal directory.
+for a run whose condition uses an injector, from before its infrastructure starts until after its post-run check.
+Every test runs against `FakeServices`; the lock is real, on the fixture's journal directory.
 """
 
 import asyncio

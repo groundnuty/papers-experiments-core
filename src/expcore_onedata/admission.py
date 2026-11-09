@@ -1,12 +1,14 @@
 # Provenance: new
 """Admission to a federation with a fault injector: outage runs exclusive with every other run (O11).
 
-A provider an outage takes down is down for every run on the federation, not only for the run that took it down. So
-when platform.toml has `[faults]`, every run of the platform holds the federation's reader-writer lock, a `flock` on
-`federation.lock` beside the fault journal, from before its sandbox and tool server start until after their teardown:
-shared for a run of a baseline condition, exclusive for a run whose condition uses an injector (its injection and its
-clear included). An outage run never also takes it shared, so there is no upgrade and no deadlock: the injector
-refuses to start under a shared admission, and takes the exclusive one itself when its run holds none. The tool
+A provider an outage takes down is down for every run on the federation, not only for the run that took it down. So when
+platform.toml has `[faults]`, every run of the platform holds the federation's reader-writer lock, a `flock` on
+`federation.lock` beside the fault journal, from before its sandbox and tool server start until after its post-run
+check: shared for a run of a baseline condition, exclusive for a run whose condition uses an injector (its injection and
+its clear included). The campaign takes it through the platform's run admission (`run_admission`, the study plugin's
+`admission`), around the whole attempt, so no outage run can take the federation between a run's teardown and the
+post-run check that judges it. An outage run never also takes it shared, so there is no upgrade and no deadlock: the
+injector refuses to start under a shared admission, and takes the exclusive one itself when its run holds none. The tool
 server and the sandbox (`SandboxPlatform.launch`) refuse to start without an admission (`require_admission`).
 
 Waiting for the lock is admission, before the agent's loop starts, so it is outside the agent's time and charges it
@@ -44,11 +46,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.attempt import RunAdmission
 from expcore.config.loading import ConfigError, load_toml
 from expcore.errors import InfraError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, make_directories
-from expcore_onedata.fault_recovery import INJECTOR_FAILURE, failure
+from expcore_onedata.fault_recovery import INJECTOR_FAILURE, PROVIDER_OUTAGE, failure
 from expcore_onedata.fault_settings import FaultSettings, load_faults
 
 FEDERATION_LOCK = "federation.lock"
@@ -249,12 +252,17 @@ class FederationLock:
 
     @contextlib.contextmanager
     def held(
-        self, *, exclusive: bool, timeout_s: float | None = None, target: str | None = None
+        self,
+        *,
+        exclusive: bool,
+        timeout_s: float | None = None,
+        target: str | None = None,
+        cancel: threading.Event | None = None,
     ) -> Iterator[Admission]:
         """Hold the lock for the body of a `with`, as the running context's admission (the synchronous form)."""
         if current_admission() is not None:
             raise AdmissionRefused("this run already holds the federation's admission")
-        admission = self.acquire(exclusive=exclusive, timeout_s=timeout_s, target=target)
+        admission = self.acquire(exclusive=exclusive, timeout_s=timeout_s, target=target, cancel=cancel)
         token = _ADMISSION.set(admission)
         try:
             if not exclusive:
@@ -326,6 +334,29 @@ def require_same_federation(admission: Admission, federation: Federation) -> Non
             "the admission held is for another federation (another lock file or another platform.toml) than the one "
             "this run acts on"
         )
+
+
+def run_admission(config: PlatformConfig) -> RunAdmission | None:
+    """The campaign's run admission for a platform with `[faults]` (`StudyPlugin.admission`), None without one.
+
+    The core enters it before an attempt starts and leaves it after the attempt's post-run check: a run whose condition
+    declares `provider_outage` holds the federation exclusively, with its target's label in the holder record, every
+    other run shares it. The wait is bounded by `admission_timeout_s`, ends with the campaign, and runs before the
+    agent's clock starts; one that fails leaves the run unstarted.
+    """
+    settings = fault_settings_of(config)
+    if settings is None:
+        return None
+    lock = FederationLock(settings)
+
+    def admit(
+        treatment_kinds: tuple[str, ...], treatment_targets: Mapping[str, str], cancel: threading.Event
+    ) -> contextlib.AbstractContextManager[Admission]:
+        exclusive = PROVIDER_OUTAGE in treatment_kinds
+        target = treatment_targets.get(PROVIDER_OUTAGE) if exclusive else None
+        return lock.held(exclusive=exclusive, timeout_s=settings.admission_timeout_s, target=target, cancel=cancel)
+
+    return admit
 
 
 def require_admission(config: PlatformConfig) -> None:
