@@ -9,8 +9,9 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
     user; ENOSPC beyond the quota);
   * an INTERNAL docker network from the dedicated pool (no route out) holding the agent container, and in REST mode the
     gate container, the agent's only network peer (O14);
-  * REST data path: the data gate (gate.py, gatepolicy.py), whose files are mounted from this package, read-only. It
-    holds the token, in its environment, and adds it to the requests it forwards; the agent holds no credential;
+  * REST data path: the data gate (gate.py, gatepolicy.py, gateboundary.py), whose files are mounted from this package,
+    read-only. It holds the token, in its environment, and adds it to the requests it forwards, and no answer it passes
+    back holds the token; the agent holds no credential;
   * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
     propagation; the agent has neither the token, nor FUSE, nor a route to any host;
   * no data path: neither;
@@ -64,7 +65,7 @@ from expcore_onedata.sandbox.settings import SandboxSettings
 log = logging.getLogger(__name__)
 
 RUN_KEY = re.compile(r"[\x21-\x7e]{1,200}")  # it becomes an HTTP header value at the gate
-GATE_FILES = Path(__file__).resolve().parent  # gate.py and gatepolicy.py are mounted from here into the gate container
+GATE_FILES = Path(__file__).resolve().parent  # gate.py and its siblings are mounted from here into the gate container
 MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
 MOUNT_WAIT_S = 60.0

@@ -21,7 +21,10 @@ pass-through for the knowledge plane. Every request is logged as one JSON line.
 
 The gate holds the data-path token (from its environment, never from the configuration file or an argument) and adds it
 to every request it forwards; an `X-Auth-Token`, `Authorization` or `Cookie` header the client sent is dropped, and a
-token-scope inference carries the gate's token in its body. So the agent's code holds no credential at all (O05).
+token-scope inference carries the gate's token in its body. So the agent's code holds no credential at all (O05). Every
+answer passes the response boundary (`gateboundary.py`) on its way back, so none hands the token to the agent: credential
+headers and any header holding the token are withheld, a redirect becomes a 502 and is never followed, and every form of
+the token in a body is covered as it streams, at the body's own length.
 
 This file runs alone in the gate container with the standard library only; it imports nothing of the platform layer
 (tests/onedata/sandbox/test_gate.py checks that). It passes only the reads that gatepolicy lists, so the data path
@@ -70,18 +73,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 
-def _load_policy():
-    """The sibling `gatepolicy.py`, loaded by its path: the gate runs alone in its container, where this directory is
-    mounted and nothing is installed, so there is no package to import it from."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gatepolicy.py")
-    spec = importlib.util.spec_from_file_location("gatepolicy", path)
+def _load_sibling(name: str):
+    """A sibling module (`gatepolicy.py`, `gateboundary.py`), loaded by its path: the gate runs alone in its container,
+    where this directory is mounted and nothing is installed, so there is no package to import it from."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["gatepolicy"] = module  # a dataclass looks its module up by name while it is being built
+    sys.modules[name] = module  # a dataclass looks its module up by name while it is being built
     spec.loader.exec_module(module)
     return module
 
 
-gatepolicy = _load_policy()
+gatepolicy = _load_sibling("gatepolicy")
+gateboundary = _load_sibling("gateboundary")  # every answer passes it before it reaches the agent (O05)
 
 CFG: dict = {}
 _LOCK = threading.Lock()
@@ -103,6 +107,7 @@ TOKEN_ENV = (
 )
 AUTH_HEADER = "X-Auth-Token"
 CLIENT_CREDENTIALS = {AUTH_HEADER.lower(), "authorization", "cookie"}  # whatever the agent sends of these is dropped
+UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split between two reads is still covered
 
 
 def _log(rec: dict) -> None:
@@ -776,8 +781,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._abort_client()
                 return
             rec["client_saw"] = "5xx"
+            details = gateboundary.scrub(str(e).encode(), _token_forms()).decode(errors="replace")  # it may echo one
             with contextlib.suppress(OSError):
-                self._answer(rec, 502, {"error": {"id": "badGateway", "details": str(e)}})
+                self._answer(rec, 502, {"error": {"id": "badGateway", "details": details}})
 
     def _fwd_headers(self, headers: dict) -> dict:
         # the run attribution is the gate's: whatever the agent sent under that name is dropped, then ours is added
@@ -805,15 +811,41 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return json.dumps({**document, "token": CFG["token"]}).encode()
 
+    def _refuse_redirect(self, hcfg, resp, rec) -> None:
+        """A redirect is never passed on, and never followed: its Location or its body may hold the token (O05). The
+        upstream connection goes unread, and the agent gets a 502 with a fixed message."""
+        self._drop(hcfg)
+        rec.update(
+            status=502,
+            upstream_status=resp.status,
+            error="the upstream answered with a redirect",
+            error_origin="upstream",
+            client_saw="5xx",
+        )
+        with contextlib.suppress(OSError):  # a client gone meanwhile: the line is logged all the same
+            self._answer(rec, 502, {"error": {"id": "badGateway", "details": gateboundary.REDIRECT_DETAILS}})
+
     def _forward(self, hcfg, url, headers, body, rec) -> None:
         target = url.path + ("?" + url.query if url.query else "")
         resp = self._upstream(hcfg, self.command, target, body, self._fwd_headers(headers), rec)
-        # the length http.client frames the body by (None: chunked, or until EOF), never the raw header
+        if gateboundary.is_redirect(resp.status):
+            self._refuse_redirect(hcfg, resp, rec)
+            return
+        forms = _token_forms()
+        # the length http.client frames the body by (None: chunked, or until EOF), never the raw header; the boundary
+        # keeps a body's length, so it stays true
         declared = None if resp.chunked else resp.length
         self.send_response(resp.status)
+        withheld = []
         for k, v in resp.getheaders():
-            if k.lower() not in _HOP:
+            if k.lower() in _HOP:
+                continue
+            if gateboundary.header_passes(k, v, forms):
                 self.send_header(k, v)
+            else:  # a credential, or the token echoed: the agent never sees it (O05)
+                withheld.append(k.lower())
+        if withheld:
+            rec["withheld_headers"] = sorted(set(withheld))  # their names only
         if resp.status in (204, 304):
             declared = 0  # no body by definition, nothing to frame
         elif declared is not None:
@@ -825,23 +857,25 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
         self.end_headers()
         sent, failure, failure_origin = 0, None, "upstream"
+        scrubber = gateboundary.Scrubber(forms)  # holds back what could begin a token until the next read shows it
         while True:
             try:
-                chunk = resp.read(1 << 20)
+                chunk = resp.read(UPSTREAM_READ_BYTES)
             except (OSError, http.client.HTTPException) as e:
                 failure, failure_origin = repr(e), origin_of(e)  # the gate's own read timeout is the gate's
                 break
-            if not chunk:
-                break
+            out = scrubber.feed(chunk) if chunk else scrubber.flush()  # at the end, what was held back, covered
             try:
-                self.wfile.write(chunk)
+                self.wfile.write(out)
             except OSError as e:
                 if e.errno in LOCAL_ERRNOS:  # the gate's own resources failed the write, not the client
                     failure, failure_origin = repr(e), "gate"
                 else:
                     rec["client_aborted"] = True
                 break
-            sent += len(chunk)
+            sent += len(out)
+            if not chunk:
+                break
         if failure is None and not rec.get("client_aborted") and declared is not None and sent != declared:
             failure = f"upstream sent {sent} of {declared} bytes"  # http.client does not raise on an early EOF here
         if failure or rec.get("client_aborted"):
@@ -870,6 +904,11 @@ class Handler(BaseHTTPRequestHandler):
         self._log(rec)
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _handle
+
+
+def _token_forms() -> tuple[bytes, ...]:
+    """The forms of the gate's token the boundary looks for in an answer (none without a token)."""
+    return gateboundary.token_forms(CFG.get("token"))
 
 
 def _teardown_lines() -> None:

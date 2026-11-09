@@ -14,6 +14,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -29,6 +30,21 @@ BIG = 12 * 1024 * 1024
 RUN_HEADER_VALUE = "run-test-1"
 GATE_TOKEN = "tok-gate-0123456789"  # an invented token value: the gate holds it, the client never does
 SCOPE = "/api/v3/onezone/tokens/infer_access_token_scope"
+SPECIAL_TOKEN = 'tok/gate+"0123'  # an invented token whose percent-encoded and JSON-escaped forms differ from it
+SPLIT_AT = 4096  # the gate's read size in the tests that split a token between two reads of the upstream's body
+
+
+def token_forms(token: str) -> list[bytes]:
+    """The forms a body can hold a token in, made here independently of the gate: raw, percent-encoded, JSON-escaped."""
+    return [token.encode(), quote(token, safe="").encode(), json.dumps(token)[1:-1].encode()]
+
+
+def straddling(forms: list[bytes]) -> bytes:
+    """A body with each form across a boundary between two reads of SPLIT_AT bytes, and filler between them."""
+    body = b""
+    for k, form in enumerate(forms, 1):
+        body += b"a" * (k * SPLIT_AT - len(form) // 2 - len(body)) + form
+    return body + b"b" * 64
 
 
 class Upstream(ThreadingHTTPServer):
@@ -60,6 +76,9 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.seen.append((self.command, self.path, dict(self.headers)))
+        if self.server.mode in ("echo-headers", "redirect", "split"):
+            self._echo(self.headers.get("X-Auth-Token", ""))
+            return
         if self.server.mode == "unavailable":
             self.send_response(503)
             self.send_header("Content-Length", "0")
@@ -77,6 +96,30 @@ class UpstreamHandler(BaseHTTPRequestHandler):
                 self.wfile.write(BODY)
         except OSError:
             pass  # the gate went away mid-body
+
+    def _echo(self, token: str) -> None:
+        """A platform that hands back the token it was sent: in headers, in a redirect, in a body across two reads."""
+        mode, status, headers = self.server.mode, 200, []
+        body = b"{}"
+        if mode == "echo-headers":
+            headers = [
+                ("X-Auth-Token", token),
+                ("Authorization", f"Bearer {token}"),
+                ("Set-Cookie", "session=invented"),
+                ("X-Request-Echo", f"you sent {token}"),
+                ("X-Plain", "kept"),
+            ]
+        elif mode == "redirect":
+            status, headers = 302, [("Location", f"https://elsewhere.test/next?token={quote(token, safe='')}")]
+            body = b'{"moved": "' + token.encode() + b'"}'
+        else:
+            body = straddling(token_forms(token))
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 @pytest.fixture(scope="module")
@@ -218,6 +261,60 @@ def test_o05_the_gate_takes_its_token_from_its_environment_and_removes_it(tmp_pa
     gate.CFG.clear()
 
 
+def test_o05_a_token_the_upstream_echoes_in_a_header_never_reaches_the_agent(world):
+    """O05: an answer's credential headers (X-Auth-Token, Authorization, Set-Cookie) and any header whose value holds
+    the token are withheld at the gate's boundary; the other headers pass."""
+    world.upstream.mode = "echo-headers"
+    conn = connect(world)
+    conn.request("GET", FILE)
+    answer = conn.getresponse()
+    answer.read()
+    headers = {name.lower(): value for name, value in answer.getheaders()}
+    assert answer.status == 200
+    assert GATE_TOKEN not in json.dumps(answer.getheaders())
+    assert {"x-auth-token", "authorization", "set-cookie", "x-request-echo"} & set(headers) == set()
+    assert headers["x-plain"] == "kept"
+    assert world.upstream.seen[0][2]["X-Auth-Token"] == GATE_TOKEN  # the gate did send it
+    conn.close()
+
+
+def test_o05_a_redirect_is_never_passed_on_nor_followed(world):
+    """O05: a 3xx whose Location and body hold the token reaches the agent as a 502 with a fixed message, and the gate
+    does not follow it."""
+    world.upstream.mode = "redirect"
+    conn = connect(world)
+    conn.request("GET", FILE)
+    answer = conn.getresponse()
+    body = answer.read()
+    assert answer.status == 502
+    assert answer.getheader("Location") is None
+    assert GATE_TOKEN.encode() not in body
+    assert GATE_TOKEN not in json.dumps(answer.getheaders())
+    assert len(world.upstream.seen) == 1  # asked once: the redirect was not followed
+    line = wait_for(world, lambda r: r.get("status") == 502)
+    assert (line["upstream_status"], line["error_origin"], line["client_saw"]) == (302, "upstream", "5xx")
+    conn.close()
+
+
+@pytest.mark.parametrize("token", [GATE_TOKEN, SPECIAL_TOKEN], ids=["plain", "special"])
+def test_o05_a_token_split_between_two_reads_of_the_body_never_reaches_the_agent(world, monkeypatch, token):
+    """O05: the body is scrubbed as it streams: each form of the token (raw, percent-encoded, JSON-escaped) across the
+    boundary between two reads of the upstream's body is covered, and the body keeps the length it declared."""
+    monkeypatch.setattr(gate, "UPSTREAM_READ_BYTES", SPLIT_AT, raising=False)
+    gate.CFG["token"] = token
+    world.upstream.mode = "split"
+    conn = connect(world)
+    conn.request("GET", FILE)
+    answer = conn.getresponse()
+    body = answer.read()
+    sent = straddling(token_forms(token))
+    assert answer.status == 200
+    assert [form for form in token_forms(token) if form in body] == []
+    assert len(body) == len(sent) == int(answer.getheader("Content-Length"))
+    assert body.endswith(b"b" * 64)
+    conn.close()
+
+
 @pytest.mark.parametrize("method", ["PUT", "POST", "DELETE", "PATCH"])
 def test_o05_a_write_is_refused_at_the_gate_and_never_reaches_the_upstream(world, method):
     """O05: only read calls pass, so a write the agent attempts is answered 403 by the gate itself."""
@@ -318,8 +415,9 @@ def test_o16_a_dead_upstream_is_the_upstreams_error_not_the_gates(world):
     assert line["client_saw"] == "5xx"
 
 
-def test_the_gate_imports_nothing_but_the_standard_library_and_its_policy():
-    """It runs alone in its container: nothing of the platform layer, no third-party package."""
+def test_the_gate_imports_nothing_but_the_standard_library_and_its_siblings():
+    """It runs alone in its container: nothing of the platform layer, no third-party package, in it or in the siblings
+    it loads by path (its policy and its response boundary)."""
     tree = ast.parse(Path(gate.__file__).read_text(encoding="utf-8"))
     names = set()
     for node in ast.walk(tree):
@@ -330,11 +428,12 @@ def test_the_gate_imports_nothing_but_the_standard_library_and_its_policy():
     import sys
 
     assert names - set(sys.stdlib_module_names) == set()
-    policy = ast.parse((Path(gate.__file__).parent / "gatepolicy.py").read_text(encoding="utf-8"))
-    imported = {
-        a.name.split(".")[0] if isinstance(n, ast.Import) else (n.module or "").split(".")[0]
-        for n in ast.walk(policy)
-        if isinstance(n, ast.Import | ast.ImportFrom)
-        for a in (n.names if isinstance(n, ast.Import) else [n])
-    }
-    assert imported <= set(sys.stdlib_module_names)
+    for sibling in ("gatepolicy.py", "gateboundary.py"):
+        tree = ast.parse((Path(gate.__file__).parent / sibling).read_text(encoding="utf-8"))
+        imported = {
+            a.name.split(".")[0] if isinstance(n, ast.Import) else (n.module or "").split(".")[0]
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Import | ast.ImportFrom)
+            for a in (n.names if isinstance(n, ast.Import) else [n])
+        }
+        assert imported <= set(sys.stdlib_module_names), sibling
