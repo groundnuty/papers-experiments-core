@@ -16,6 +16,8 @@ import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from expcore.campaign.executor import BackendFactory, RunExecutor
@@ -107,9 +109,12 @@ def tools_sha256(specs: Sequence[ToolSpec]) -> str:
     return hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def load_plugin(context: StudyContext) -> StudyPlugin:
-    """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve."""
-    file = context.study.plugin_file
+def import_plugin_module(file: Path) -> ModuleType:
+    """Import the study's plugin module from its file, running its top level, and return it; ConfigError if it cannot.
+
+    `build` is not called, so no model or key is read. What the module registers when imported, the native parser of a
+    backend of the study's own, is then there for a step that needs nothing else of the plugin: the replay check.
+    """
     module_name = f"{PLUGIN_MODULE_PREFIX}{hashlib.sha256(str(file).encode()).hexdigest()[:12]}"
     spec = importlib.util.spec_from_file_location(module_name, file)
     if spec is None or spec.loader is None:
@@ -121,6 +126,13 @@ def load_plugin(context: StudyContext) -> StudyPlugin:
     except Exception as error:
         del sys.modules[module_name]
         raise ConfigError(f"{file}: failed on import ({type(error).__name__}: {error})") from error
+    return module
+
+
+def load_plugin(context: StudyContext) -> StudyPlugin:
+    """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve."""
+    file = context.study.plugin_file
+    module = import_plugin_module(file)
     build = getattr(module, BUILD, None)
     if not callable(build):
         raise ConfigError(f"{file}: must define a function {BUILD}(context) that returns a StudyPlugin")

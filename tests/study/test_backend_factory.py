@@ -1,14 +1,16 @@
 """A model backend of the study's own: named in models.toml, built by the plugin's factory, with no edit to the core."""
 
+import json
 import shutil
 
 import pytest
-from study_support import EXAMPLE, HEAD, clean_environment
+from study_support import EXAMPLE, HEAD, clean_environment, cli
 
 from expcore.campaign.resume import FingerprintMismatch
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
 from expcore.records.redact import REDACTED
+from expcore.replay.check import CHECK_FILE
 from expcore.study.config import load_study
 from expcore.study.pipeline import fingerprint_of, run_study
 from expcore.study.plugin import StudyContext, load_plugin
@@ -191,3 +193,51 @@ def test_r12_the_key_of_a_backend_without_a_spec_that_a_tool_echoes_never_reache
     written = [path.read_text(encoding="utf-8") for path in (copy / "out" / "runs").rglob("*.json")]
     assert any(REDACTED in text for text in written), "the tool's result was not recorded as redacted"
     assert not any(CREDENTIAL in text for text in written)
+
+
+OWN_TRANSCRIPT_NAME = """
+
+from expcore.replay.native import openai_neutral as _openai_neutral, register_native_parser as _register_native_parser
+
+_register_native_parser("toy_relay", _openai_neutral)
+
+
+def _info_under_its_own_name(self):
+    return {**self.inner.info(), "backend": "toy_relay"}
+
+
+RelayBackend.info = _info_under_its_own_name
+"""
+
+
+def test_r03_a_check_in_a_fresh_process_finds_the_native_parser_a_custom_backend_s_plugin_registers(
+    tmp_path, clean_environment
+):
+    """R03: a custom backend names its own transcript format and its plugin module registers the parser for it, so
+    `check`, which replays the records and may be the first thing a new process does, imports that module first."""
+    copy = study_copy(tmp_path, factory=True)
+    plugin = copy / "plugin.py"
+    plugin.write_text(plugin.read_text(encoding="utf-8") + OWN_TRANSCRIPT_NAME, encoding="utf-8")
+    write_stamp(copy, HEAD, load_study(copy).scope)
+    assert run_study(copy).statuses == {"done": len(load_study(copy).manifest.rows)}
+    code, _ = cli(clean_environment, "check", str(copy / "out" / "runs"), process=True)
+    assert code == 0, "the fresh process could not replay the records of the custom backend"
+    check = json.loads((copy / "out" / "runs" / CHECK_FILE).read_text(encoding="utf-8"))
+    assert check["failures"] == []
+    assert check["n_ok"] == check["n_records"] > 0
+
+
+def test_r03_the_check_imports_the_plugin_module_without_needing_a_model_s_key(
+    tmp_path, clean_environment, monkeypatch
+):
+    """R03: importing the module registers the parser and reads no key, so a machine that replays without the study's
+    credentials can still check it, even for a backend whose entry names a key_env that is not set here."""
+    monkeypatch.setenv(CREDENTIAL_VARIABLE, CREDENTIAL)
+    copy = study_copy(tmp_path, factory=True, extra_entry=f'key_env = "{CREDENTIAL_VARIABLE}"\n')
+    plugin = copy / "plugin.py"
+    plugin.write_text(plugin.read_text(encoding="utf-8") + OWN_TRANSCRIPT_NAME, encoding="utf-8")
+    write_stamp(copy, HEAD, load_study(copy).scope)
+    run_study(copy)
+    assert CREDENTIAL_VARIABLE not in clean_environment  # the snapshot of the environment the new process gets
+    code, _ = cli(clean_environment, "check", str(copy / "out" / "runs"), process=True)
+    assert code == 0, "the check needed the model's key"

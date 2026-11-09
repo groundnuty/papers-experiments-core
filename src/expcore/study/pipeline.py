@@ -10,7 +10,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
-  store with attempts still running unless `partial`, which the check records.
+  store with attempts still running unless `partial`, which the check records. Before it replays anything it imports
+  the plugin module (and the study's platforms, as every load does), so a native parser a backend of the study's own
+  registers there is known in a new process; `build` is not called, so no model or key is needed.
 - `analyse_study` refuses unless the batch has a current passing check (R04, R05), and writes nothing. It then uses
   only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once and compared
   with the check's hash, cross-validated against each other. It exports from the snapshot, scores the records in
@@ -54,7 +56,7 @@ from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import StudyConfig, find_study_root, load_study
-from expcore.study.plugin import StudyContext, StudyPlugin, load_plugin
+from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.verified import UNCOVERED, Unverified, load_verified
 
 OUT_DIR = "out"
@@ -201,6 +203,7 @@ def _check_loaded(
     directory = Path(batch)
     if not directory.is_dir():
         raise Refused(f"{directory}: no batch of records here; run the study first")
+    import_plugin_module(study.plugin_file)  # what it registers at import, a backend's parser, the replay needs
     try:
         running = take_snapshot(out_dir(study) / STATE_FILE, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
