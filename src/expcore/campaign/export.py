@@ -24,6 +24,9 @@ file or the new one; it is owner-only (0600), because an export can carry study 
 
 Each analysed attempt also says when and how it began (`dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`), so
 an analysis can check the balance of the conditions over time: holds and unit caps can push one condition's runs late.
+Its `run_dir` is the attempt's directory relative to the campaign's runs directory (`<digest>/try<N>`), never the path
+the store holds: the export says nothing of the directory or host the campaign ran in, so a copy of the campaign, a
+replication package among them, exports the same bytes wherever it lies.
 
 A partial analysis leaves some runs out (`export_run_state(store, excluded=...)`: a run whose final attempt the replay
 check does not cover). The export then carries `partial` (true when anything is left out or an attempt was still
@@ -44,11 +47,11 @@ import sqlite3
 import tempfile
 from collections.abc import Collection, Iterable, Mapping
 from contextlib import AbstractContextManager
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Protocol
 
 from expcore.campaign.factors import FactorSchema, RunKey
-from expcore.errors import infra_kinds
+from expcore.errors import CORE_KINDS
 
 FORMAT = "campaign-export-1"
 RUN_LISTS = ("exhausted_runs", "unfinished_runs", "analysed_attempts")
@@ -130,7 +133,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
                 {
                     **who,
                     "attempt": done[0]["attempt"],
-                    "run_dir": done[0]["run_dir"],
+                    "run_dir": batch_relative(done[0]["run_dir"]),
                     "treatment": bool(done[0]["treatment"]),
                     "infra_kind": done[0]["infra_kind"],
                     **_dispatch(done[0]),
@@ -153,12 +156,22 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         "infrastructure_by_condition": _infrastructure_by_condition(
             identities, attempts, store.schema.treatment_kinds, None if excluded is None else frozenset(left_out)
         ),
-        "kinds": list(infra_kinds()),
+        "kinds": _study_kinds(attempts, store.schema.treatment_kinds),
     }
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
     return data
+
+
+def batch_relative(run_dir: str | None) -> str | None:
+    """Return an attempt's directory as `<digest>/try<N>`, the last two parts of the path the store holds.
+
+    The scheduler lays a campaign out as `runs/<digest>/try<N>`, so these two parts name the attempt within its batch.
+    """
+    if run_dir is None:
+        return None
+    return "/".join(PurePath(run_dir).parts[-2:])
 
 
 def _dispatch(attempt: Any) -> dict[str, Any]:
@@ -186,6 +199,20 @@ def _none_last(item: tuple[tuple, Any]) -> tuple:
     the same way every time.
     """
     return tuple((part is None, "" if part is None else part) for part in item[0])
+
+
+def _study_kinds(attempts: dict[str, list[Any]], declared: dict[str, tuple[str, ...]]) -> list[str]:
+    """The study's vocabulary of infrastructure kinds, from the study alone: the core's kinds in their order, then,
+    sorted, every other kind an attempt of this campaign was counted under or a condition declares as its treatment.
+
+    It never reads the process's registry, which holds whatever platform kinds this process happened to import: an
+    export made where the platform is loaded and one regenerated where it is not (a replication package's
+    `make check`) list the same kinds (K07)."""
+    seen = {kind for kinds in declared.values() for kind in kinds}
+    for tried in attempts.values():
+        for attempt in tried:
+            seen.update(kind for kind in (attempt["infra_kind"], attempt["outage_kind"]) if kind)
+    return [*CORE_KINDS, *sorted(seen - set(CORE_KINDS))]
 
 
 def _kind_of(attempt: Any) -> str | None:
@@ -296,6 +323,11 @@ def write_export(store: RunState, path: Path) -> dict[str, Any]:
     return data
 
 
+def export_text(data: Mapping[str, Any]) -> str:
+    """The text an export is written as: the bytes a regeneration of the export is compared with."""
+    return json.dumps(data, indent=1)
+
+
 def write_export_data(data: dict[str, Any], path: Path) -> None:
     """Write an export that was already built, atomically and owner-only, as `write_export` does."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -303,7 +335,7 @@ def write_export_data(data: dict[str, Any], path: Path) -> None:
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=1)
+            handle.write(export_text(data))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)

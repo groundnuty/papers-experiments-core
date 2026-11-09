@@ -76,6 +76,7 @@ def test_parse_source_repos_rejects_malformed_pairs(spec):
 
 
 def test_a_fresh_import_reproduces(world):
+    """P07: applying the map to the named source blob reproduces the import commit's file, minus the header."""
     assert verify(world) == []
 
 
@@ -174,6 +175,7 @@ def load_map_sha(world) -> str:
 
 
 def test_every_imported_module_reproduces_from_its_source():
+    """P07: every imported module of this tree reproduces from the source blob its header names (maintainer check)."""
     spec = os.environ.get("EXPCORE_SOURCE_REPOS")
     tokens = os.environ.get("EXPCORE_STUDY_TOKENS")
     if not spec or not tokens:

@@ -1,0 +1,24 @@
+# The replication package: `python -m expcore package . --out DIR` writes DIR/tiny-study-package.tar.gz.
+# Only the files these patterns select go in; anything not listed is left out. A pattern is a path relative to this
+# directory: `*` matches within one part, `**` across parts, and a directory takes everything below it.
+
+[package]
+name = "tiny-study-package"
+include = [
+    "README.md",
+    "package.toml",
+    # the configuration and the code the records were made with: everything [study] code names
+    "study.toml",
+    "models.toml",
+    "campaign.toml",
+    "preregistration.toml",
+    "plugin.py",
+    "prompt.txt",
+    # the records, their outcome markers, the snapshot of the campaign store and the replay check
+    "out/runs",
+    # the tables and the report that the package's `make check` regenerates from the records, byte for byte
+    "out/export.json",
+    "out/scores.json",
+    "out/analysis.json",
+    "out/report.md",
+]

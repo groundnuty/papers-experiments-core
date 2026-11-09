@@ -5,7 +5,9 @@
 are the same text: no clock, no path and no random number enters it.
 
 - Contrasts in the Holm family are in one table, contrasts outside it in a table of their own under the heading
-  "Exploratory contrasts": nothing controls their multiplicity.
+  "Exploratory contrasts": nothing controls their multiplicity. Which is which comes from the statistics kernel's own
+  flag (`ContrastResult.exploratory`), never from a guess here, and a result whose flag disagrees with its place in the
+  Holm decisions is refused, so no table or summary line can show an exploratory contrast as confirmatory.
 - A conclusion is never shown without its significance. Each row carries the raw p-value and the Holm-adjusted one
   (or the word "exploratory") beside the conclusion, and the conclusion words already encode the decision:
   `difference`, `trivial_difference`, `equivalent`, `not_detected`. Failing to detect a difference is not a finding of
@@ -55,6 +57,20 @@ def _table(header: Sequence[str], rows: Sequence[Sequence[object]]) -> list[str]
     return lines
 
 
+def _exploratory(result: ContrastResult, adjusted: Mapping[str, float]) -> bool:
+    """Return the kernel's exploratory flag of a contrast; refuse one that disagrees with the Holm decisions.
+
+    A contrast is confirmatory only as a member of the Holm family: flagged not exploratory, in the family and given a
+    Holm decision. Anything else in between is an inconsistent result, and showing it either way would mislabel it.
+    """
+    if result.exploratory == result.in_family or result.exploratory == (result.name in adjusted):
+        raise ValueError(
+            f"contrast {result.name!r}: exploratory={result.exploratory}, in_family={result.in_family}, "
+            f"Holm decision {'present' if result.name in adjusted else 'absent'}; the flags must agree"
+        )
+    return result.exploratory
+
+
 def _arms(result: ContrastResult) -> str:
     first, second = result.arms
     if result.factor is not None:
@@ -76,7 +92,7 @@ def _contrast_table(
     header += ["Clusters", "Tasks dropped"] + (["Min. detectable effect"] if with_mde else [])
     rows = []
     for r in results:
-        exploratory = r.name not in adjusted
+        exploratory = _exploratory(r, adjusted)
         conclusion = f"{r.conclusion} ({EXPLORATORY})" if exploratory else r.conclusion
         row = [
             r.name,
@@ -99,8 +115,8 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         if r.conclusion not in CONCLUSIONS:
             raise ValueError(f"contrast {r.name!r} has conclusion {r.conclusion!r}, not one of {CONCLUSIONS}")
     adjusted = {d.name: d.p_holm for d in result.holm}
-    family = [r for r in result.contrasts if r.name in adjusted]
-    exploratory = [r for r in result.contrasts if r.name not in adjusted]
+    family = [r for r in result.contrasts if not _exploratory(r, adjusted)]
+    exploratory = [r for r in result.contrasts if _exploratory(r, adjusted)]
     with_mde = any(r.minimum_detectable_effect is not None for r in result.contrasts)
     lines = [f"## Preregistered contrasts (Holm family of {len(family)}, alpha = {result.alpha:g})", ""]
     lines += _contrast_table(family, adjusted, level, with_mde=with_mde) if family else ["No contrast in the family."]
@@ -204,7 +220,7 @@ def summary_lines(result: AnalysisResult) -> list[str]:
     adjusted = {d.name: d.p_holm for d in result.holm}
     lines = []
     for r in result.contrasts:
-        member = r.name in adjusted
+        member = not _exploratory(r, adjusted)
         holm = _p(adjusted[r.name]) if member else EXPLORATORY
         word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"
         lines.append(f"{r.name}: estimate {_num(r.estimate)}, p {_p(r.p_value)}, Holm p {holm}, {word}")

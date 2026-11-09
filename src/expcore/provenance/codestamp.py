@@ -90,6 +90,12 @@ def _files(root: Path, scope: CodeScope) -> list[Path]:
     return sorted(kept, key=lambda f: f.relative_to(root).as_posix())
 
 
+def covered_files(root: Path | str, scope: CodeScope) -> list[str]:
+    """Return the relative paths of the files the identity covers, in path order."""
+    root = Path(root)
+    return [f.relative_to(root).as_posix() for f in _files(root, scope)]
+
+
 def tree_hash(root: Path | str, scope: CodeScope) -> str:
     """Return the sha256 over (relative path, sha256 of content) of every covered file, in path order.
 
@@ -139,12 +145,18 @@ def _git(repo: Path, *args: str, raw: bool = False) -> str | None:
 
 
 def write_stamp(
-    dest: Path | str, head: str, scope: CodeScope, tree_root: Path | str | None = None, dirty: bool = False
+    dest: Path | str,
+    head: str,
+    scope: CodeScope,
+    tree_root: Path | str | None = None,
+    dirty: bool = False,
+    created_utc: str | None = None,
 ):
     """Write DEST/.code-stamp.json for the tree at `tree_root` (default DEST) with the given git head.
 
     The head must be a full git sha. `dirty` says the source had uncommitted changes when it was stamped: the files are
-    what is stamped, but they are not the head's.
+    what is stamped, but they are not the head's. `created_utc` is the time the stamp gives, now by default; a
+    replication package passes a time taken from its records, so two builds of one tree write the same stamp.
     """
     dest = Path(dest)
     if not is_sha(head):
@@ -152,7 +164,7 @@ def write_stamp(
     stamp = {
         "head": head,
         "tree_sha256": tree_hash(tree_root or dest, scope),
-        "created_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "created_utc": dt.datetime.now(dt.UTC).isoformat() if created_utc is None else created_utc,
     }
     if dirty:
         stamp["source_dirty"] = True  # absent in a clean stamp and in every older one: both read as clean
@@ -206,15 +218,16 @@ def _dirty_reason(root: Path, scope: CodeScope) -> str | None:
     return None
 
 
-def version(root: Path | str, scope: CodeScope) -> dict:
+def version(root: Path | str, scope: CodeScope, *, use_git: bool = True) -> dict:
     """Return the code identity: {"commit", "dirty", "source": git|stamp|none, "stale", "why", "tree_sha256"}.
 
     Unknown is dirty. A git status that fails is dirty, not clean, and so is a hashed file git does not track.
     `tree_sha256` is recomputed on every call, so the identity is re-verified each time it is asked for (P02);
-    it is None only when the version is unknown.
+    it is None only when the version is unknown. With `use_git` false only the stamp names the commit: a replication
+    package has no repository of its own and may be unpacked inside another one, whose head is not its code.
     """
     root = Path(root)
-    head = _git(root, "rev-parse", "HEAD")
+    head = _git(root, "rev-parse", "HEAD") if use_git else None
     if head:
         why = _dirty_reason(root, scope)
         return {

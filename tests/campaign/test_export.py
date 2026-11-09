@@ -122,6 +122,17 @@ def test_c01_an_infrastructure_failure_is_absent_from_the_analysed_attempts(tmp_
     assert failed not in [r["run_key"] for r in data["analysed_attempts"]]
 
 
+def test_an_analysed_attempt_names_its_directory_within_the_batch_and_not_the_path_it_ran_under(tmp_path):
+    """The export holds no path of the machine the campaign ran on, so a copy of the campaign exports the same bytes."""
+    store, _, manifest = planned_store(tmp_path)
+    key = keys_of(manifest)[0]
+    ran_under = tmp_path / "somewhere" / "out" / "runs" / ("d" * 64) / "try1"
+    run_one(store, key, finished(), run_dir=str(ran_under))
+    (entry,) = export_run_state(store)["analysed_attempts"]
+    assert entry["run_dir"] == f"{'d' * 64}/try1"
+    assert str(tmp_path) not in json.dumps(export_run_state(store))
+
+
 def test_c02_every_infrastructure_kind_keeps_its_own_name_in_the_export(tmp_path):
     """C02: every harness kind appears under its own name, the core's and a platform's alike."""
     register_infra_kind("tool_outage", "a platform's own kind")
@@ -132,7 +143,7 @@ def test_c02_every_infrastructure_kind_keeps_its_own_name_in_the_export(tmp_path
         for _ in range(index + 1):  # a different count for each kind, so a merge could not hide
             run_one(store, keys_of(manifest)[index], infra(kind), max_attempts=10)
     data = export_run_state(store)
-    assert data["kinds"] == list(kinds)
+    assert data["kinds"] == [*CORE_KINDS, "tool_outage"]  # the core's in order, then the study's own, sorted
     per_kind = {}
     for row in data["retries_by_kind"]:
         per_kind[row["kind"]] = per_kind.get(row["kind"], 0) + row["attempts"]
@@ -285,7 +296,7 @@ def test_a_failed_write_leaves_the_earlier_export_whole_and_no_temporary_file(tm
     def broken(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(json, "dump", broken)
+    monkeypatch.setattr(json, "dumps", broken)  # the export's text is made inside the write, after the scratch file
     with pytest.raises(OSError, match="disk full"):
         write_export(store, target)
     assert target.read_text(encoding="utf-8") == before
@@ -554,3 +565,15 @@ def test_a_written_partial_export_reads_back_and_its_runs_still_add_up_to_the_pl
     back = read_export(path)
     assert back["partial"] is True
     assert len(back["excluded_attempts"]) == 1
+
+
+def test_k07_the_exports_kinds_come_from_the_study_never_from_what_this_process_imported(tmp_path):
+    """K07: a platform kind registered in this process but never met by the campaign nor declared by its conditions
+    is not listed, so an export regenerated in a process without the platform loaded is identical."""
+    store, _, manifest = planned_store(tmp_path, tasks=("task-a",))
+    run_one(store, keys_of(manifest)[0], infra("knowledge"), max_attempts=10)
+    before = export_run_state(store)
+    register_infra_kind("imported_elsewhere", "a kind some other module registered")
+    assert export_run_state(store) == before
+    assert "imported_elsewhere" not in before["kinds"]
+    assert before["kinds"] == list(CORE_KINDS)

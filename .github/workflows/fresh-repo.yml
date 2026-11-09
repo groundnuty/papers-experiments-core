@@ -1,0 +1,34 @@
+name: fresh-repo
+
+# A fresh study repository depends on the core by commit and runs the example study end to end, then builds its
+# replication package and runs the package's own `make check` (scripts/fresh_repo.py). It runs after a push to main,
+# when the pushed commit can be fetched from this repository, and by hand for any pushed commit.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit id of the core to depend on (default: the commit this run is on)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-repo:
+    runs-on: ubuntu-latest
+    steps:
+      # The checkout supplies the script only; the study depends on the core through `uv add` at the commit.
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Pinned to the uv that made uv.lock, as in ci.yml.
+          version: "0.11.19"
+          python-version: "3.12"
+      - name: A fresh study repository runs the example from the core at this commit
+        env:
+          SHA: ${{ inputs.sha || github.sha }}
+        run: python3 scripts/fresh_repo.py --sha "$SHA" --python 3.12 --workdir "$RUNNER_TEMP/fresh-study"

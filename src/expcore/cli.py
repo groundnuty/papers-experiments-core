@@ -1,5 +1,7 @@
 # Provenance: new
-"""The command line: `python -m expcore run | check | analyze | report`. A thin shell; the logic is in the packages.
+"""The command line: `python -m expcore run | check | analyze | report | package | package-check | example`.
+
+A thin shell; the logic is in the packages.
 
     run STUDY       load the configuration, open or resume the campaign, run the scheduler
     check BATCH     the replay check over a batch of records (the study is found above the batch), with a copy of
@@ -7,12 +9,19 @@
     analyze STUDY   refuse without a current replay check; then export, scores (derived from the records anew each time,
                     so this is also how a changed scorer is applied) and the preregistered analysis
     report STUDY    the same refusal; then write out/report.md
+    package STUDY --out DIR
+                    build the replication package the study's package.toml lists, as DIR/<name>.tar.gz
+    package-check PACKAGE
+                    what a package's `make check` runs: every file against SHA256SUMS, then the outputs derived anew
+                    from the records and compared byte for byte
+    example DEST    write the example study the core carries into DEST, a new directory, to run it from there
 
 Exit status: 0 done, 1 refused (the message on stderr says why and what to do), 2 usage, 3 `run` ended with runs still
 pending (held by a budget or a stop; the holds are printed).
 """
 
 import argparse
+import hashlib
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -21,22 +30,34 @@ from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.factors import PlanError
 from expcore.campaign.scheduler import CampaignLocked
 from expcore.config.loading import ConfigError
+from expcore.package.build import build_package, verify_package
+from expcore.package.spec import PackageError
 from expcore.provenance.codestamp import CodeVersionUnknown
 from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified
-from expcore.report import render_report, summary_lines
+from expcore.report import summary_lines
+from expcore.study.example import ExampleError, write_example
 from expcore.study.pipeline import (
-    REPORT_FILE,
     Refused,
     StudyAnalysis,
     analyse_study,
     check_batch,
-    out_dir,
     run_study,
     write_analysis,
+    write_report,
 )
 
 EXIT_PENDING = 3
-_REFUSALS = (Refused, ConfigError, CodeVersionUnknown, ResumeRefused, CampaignLocked, PlanError, BatchNotVerified)
+_REFUSALS = (
+    Refused,
+    ConfigError,
+    CodeVersionUnknown,
+    ResumeRefused,
+    CampaignLocked,
+    PlanError,
+    BatchNotVerified,
+    PackageError,
+    ExampleError,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +82,15 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "check":
             command.add_argument("--study", type=Path, help="the study directory (default: the one above the batch)")
+    package = commands.add_parser("package", help="package STUDY: build the replication package package.toml lists")
+    package.add_argument("study", type=Path, help="a study directory with a package.toml")
+    package.add_argument("--out", type=Path, required=True, help="where the archive is written")
+    package.add_argument("--hashes", type=Path, help="study-token hash file (default: the core's public one)")
+    package.add_argument("--anonymise", type=Path, help="anonymisation list, kept outside the study and the output")
+    verify = commands.add_parser("package-check", help="package-check PACKAGE: verify an unpacked package")
+    verify.add_argument("package", type=Path, help="the directory of an unpacked package")
+    example = commands.add_parser("example", help="example DEST: write the example study into a new directory")
+    example.add_argument("dest", type=Path, help="a directory that does not exist yet, or is empty")
     return parser
 
 
@@ -105,18 +135,30 @@ def _analyze(args: argparse.Namespace) -> int:
 def _report(args: argparse.Namespace) -> int:
     analysis = _analysis(args)
     write_analysis(analysis)
-    text = render_report(
-        analysis.result,
-        analysis.export,
-        study=analysis.study.name,
-        code=analysis.code,
-        core_version=analysis.core_version,
-        scorers=analysis.scorers,
-        interval_level=analysis.study.prereg.bootstrap.ci_level,
-    )
-    target = out_dir(analysis.study) / REPORT_FILE
-    target.write_text(text, encoding="utf-8")
-    print(f"wrote {target}")
+    print(f"wrote {write_report(analysis)}")
+    return EXIT_OK
+
+
+def _package(args: argparse.Namespace) -> int:
+    archive = build_package(args.study, args.out, hashes=args.hashes, anonymise=args.anonymise)
+    print(f"wrote {archive} (sha256 {hashlib.sha256(archive.read_bytes()).hexdigest()})")
+    return EXIT_OK
+
+
+def _package_check(args: argparse.Namespace) -> int:
+    sys.dont_write_bytecode = True  # importing the study's plugin must not add files to the package
+    problems = verify_package(args.package)
+    for problem in problems:
+        print(f"FAIL {problem}")
+    if problems:
+        return EXIT_REFUSED
+    print("every file matches SHA256SUMS, and every output regenerates from the records byte for byte")
+    return EXIT_OK
+
+
+def _example(args: argparse.Namespace) -> int:
+    written = write_example(args.dest)
+    print(f"wrote the example study ({len(written)} files) to {args.dest}; run it: python -m expcore run {args.dest}")
     return EXIT_OK
 
 
@@ -129,7 +171,15 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
     try:
         if args.command == "run":
             return _run(args, crash_hook)
-        return {"check": _check, "analyze": _analyze, "report": _report}[args.command](args)
+        commands = {
+            "check": _check,
+            "analyze": _analyze,
+            "report": _report,
+            "package": _package,
+            "package-check": _package_check,
+            "example": _example,
+        }
+        return commands[args.command](args)
     except _REFUSALS as error:
         print(f"refused: {error}", file=sys.stderr)
         return EXIT_REFUSED

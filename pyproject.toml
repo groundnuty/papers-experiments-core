@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "papers-experiments-core"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Reusable core for agentic experiment studies: loop, records, campaigns, statistics and provenance tooling."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -29,7 +29,19 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/expcore", "src/expcore_onedata"]
+# The two packages and the example study, which a study that installs the core writes out with
+# `python -m expcore example DEST`. Ignored files, such as the example's out/, are left out.
+only-include = ["src/expcore", "src/expcore_onedata", "examples/tiny_study"]
+# An editable install puts src/ on the path and reads the example and the hashes from the checkout.
+dev-mode-dirs = ["src"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
+"examples" = "expcore/examples"
+
+# The public study-token hashes: the default list a replication package is checked against.
+[tool.hatch.build.targets.wheel.force-include]
+"tests/data/study_tokens.sha256" = "expcore/provenance/study_tokens.sha256"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

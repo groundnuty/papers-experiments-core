@@ -16,12 +16,13 @@ from typing import Any
 
 import pytest
 from study_crash import KILLED
-from study_support import HEAD, ROOT, Campaign, clean_environment, cli, finish, make_copy, table
+from study_support import HEAD, ROOT, Campaign, clean_environment, cli, copy_campaign, finish, make_copy, table
 
 from expcore.cli import main
 from expcore.records.record import load_record, record_filename
 from expcore.stats.analysis import CONCLUSIONS
 from expcore.study.config import load_study
+from expcore.study.pipeline import OUTPUT_FILES, regenerate
 
 CRASH = ROOT / "tests" / "support" / "study_crash.py"
 TREATMENT, SUBSET = "relay-down", "extended"
@@ -201,6 +202,14 @@ def test_the_analyze_summary_gives_every_conclusion_with_its_holm_p_or_the_word_
         assert lines[name].removesuffix(" (exploratory)").split(", ")[-1] in CONCLUSIONS
 
 
+def test_analysis_json_carries_the_kernels_exploratory_flag_and_holm_decides_only_the_family(resumed):
+    """The machine-readable table labels the contrast outside the family exploratory with the flag the report uses."""
+    analysis = resumed.read("analysis.json")
+    flags = {c["name"]: (c["exploratory"], c["in_family"]) for c in analysis["contrasts"]}
+    assert flags == {name: (flag, not flag) for name, flag in CONTRASTS.items()}
+    assert {d["name"] for d in analysis["holm"]} == {name for name, flag in CONTRASTS.items() if not flag}
+
+
 # --- the report ----------------------------------------------------------------------------------------------------
 
 
@@ -245,3 +254,34 @@ def test_the_report_is_identical_across_two_runs_with_the_same_seeds_and_across_
     assert clean_pair.first.codes == clean_pair.second.codes == {"run": 0, "check": 0, "analyze": 0, "report": 0}
     assert clean_pair.first.report == clean_pair.second.report
     assert "tiny-study" in clean_pair.first.report
+
+
+def test_every_output_regenerates_from_the_records_byte_for_byte_and_regenerating_writes_nothing(clean_pair, tmp_path):
+    """What a replication package's check runs: the four outputs derived anew equal the files, and none is touched."""
+    copy = copy_campaign(clean_pair.second, tmp_path, "copy").root
+    out = copy / "out"
+    before = {name: (out / name).stat().st_mtime_ns for name in OUTPUT_FILES}
+    assert regenerate(copy) == []
+    assert {name: (out / name).stat().st_mtime_ns for name in OUTPUT_FILES} == before
+    (out / "scores.json").write_text("{}\n", encoding="utf-8")
+    assert regenerate(copy) == ["scores.json: differs from what the records give"]
+
+
+@pytest.mark.parametrize("platform_loaded", [False, True], ids=["core-only", "platform-loaded"])
+def test_k07_the_outputs_regenerate_alike_whether_or_not_the_platform_is_loaded(clean_pair, tmp_path, platform_loaded):
+    """K07: the outputs depend on the study, never on which modules a process imported: in a fresh process, with the
+    platform layer's kinds registered or not, every output regenerates byte for byte."""
+    copy = copy_campaign(clean_pair.second, tmp_path, "copy").root
+    preload = (
+        "import expcore_onedata.sandbox.kinds\n"
+        "from expcore.errors import infra_kinds\n"
+        "assert 'data_gate_integrity' in infra_kinds(), 'the platform registered no kind'\n"
+        if platform_loaded
+        else ""
+    )
+    code = preload + (
+        "import sys\nfrom expcore.study.pipeline import regenerate\n"
+        f"problems = regenerate({str(copy)!r})\nprint(problems)\nsys.exit(1 if problems else 0)\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stdout + done.stderr

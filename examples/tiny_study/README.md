@@ -10,6 +10,7 @@ A complete minimal study for the core. Copy this directory, change the names and
 | `preregistration.toml` | two contrasts in the Holm family (one with an equivalence margin), one exploratory contrast outside it, the estimator, power settings |
 | `plugin.py` | the tools (two functions, one waits on tool-server start-up), the scorer, the executor, the health check and the resource probe |
 | `prompt.txt` | the prompt template with its named slots |
+| `package.toml` | the inclusion list of the study's replication package |
 
 The interfaces the plugin implements are described in [`docs/interfaces.md`](../../docs/interfaces.md).
 
@@ -28,6 +29,10 @@ uv run python -m expcore report examples/tiny_study --allow-dirty
 - `check` replays every record offline, copies the campaign store beside them, and stores the result with a hash of each. It refuses a campaign with attempts still running unless `--partial`.
 - `analyze` refuses unless the check is current, then uses only what the check verified (the copy of the store and the replayed records, never the live store) and writes `export.json`, `scores.json` and `analysis.json` under `out/`. It scores every record anew from the record alone, with no model and no platform, and reads no earlier `scores.json`; to apply a changed scorer, stamp the copy again if it has no git, run `check` (the scorer is code, so the identity changed), then `analyze` and `report`. With `--partial` it tolerates attempts that were still running and leaves out a final attempt no replayed record covers. `export.json`, `analysis.json` and the report all say whether the analysis is partial and list what was left out.
 - `report` writes `out/report.md`: every contrast with its estimate, interval, raw and Holm-adjusted p-value and its conclusion, the exploratory contrast apart, the infrastructure failures by condition, and the preregistration hash, the code stamp, the core version and the version of each scorer.
+
+A study that installs the core by tag or commit (`uv add git+https://github.com/groundnuty/papers-experiments-core@v0.1.0`) gets the example from the installed package instead: `uv run python -m expcore example my-study` writes it into a new directory, and the commands above then take `my-study`. `scripts/fresh_repo.py` does exactly that in a new repository.
+
+The replication package: once `report` has run on committed code, `python -m expcore package examples/tiny_study --out dist` writes `dist/tiny-study-package.tar.gz` with what `package.toml` lists, and the package's own `make check` derives the tables and the report anew from the records and compares them byte for byte. A package is built only from a replay check made under a clean commit (or a clean stamp), so the commands above without `--allow-dirty`. See [`docs/study-guide.md`](../../docs/study-guide.md).
 
 `--allow-dirty` accepts uncommitted changes in the code the records are stamped with. Leave it out when the study is committed: the code identity is the commit plus a hash of the files named in `[study] code`, and a clean one is what a published result should carry. A copy made without git needs a stamp instead: `expcore.provenance.codestamp.write_stamp(directory, <commit>, scope)` writes `.code-stamp.json`.
 
