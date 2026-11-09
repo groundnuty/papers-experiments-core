@@ -195,6 +195,7 @@ class PlatformProbes:
                 raise ValueError(f"files[{positions[path]}] and files[{index}] name the same path; track a file once")
             positions[path] = index
         self._files, self._providers = dict(files), list(providers)
+        self._before_ids: dict[str, str] = {}
         self._transfers = transfers if transfers is not None else provisioner.transfers
         self._sleep, self._now = sleep, now
         self._log = TransferLog(
@@ -248,7 +249,8 @@ class PlatformProbes:
     def start(self, identity: Mapping[str, Any]) -> None:
         """Read the block maps before the run; `identity` is not used, since the snapshot is of the platform's state."""
         self._started = self._now()
-        _, self._before = self._read_maps()
+        entries, self._before = self._read_maps()
+        self._before_ids = {label: entry.value.file_id for label, entry in entries.items() if entry.ok}
 
     def _transfer_records(self) -> list[dict[str, Any]]:
         records = []
@@ -296,7 +298,14 @@ class PlatformProbes:
                 }
                 for p in self._providers
             }
-            usable = label in before and all(before[label][p].ok and after[label][p].ok for p in self._providers)
+            # The same file at both ends: a path replaced by another file during the run, or one whose identity was not
+            # read at either end, gives no gained bytes that can be set against its transfers.
+            same_file = file_id is not None and self._before_ids.get(label) == file_id
+            usable = (
+                same_file
+                and label in before
+                and all(before[label][p].ok and after[label][p].ok for p in self._providers)
+            )
             complete = complete and usable
             pairs = (
                 bytes_by_pair(

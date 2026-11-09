@@ -223,3 +223,46 @@ def test_o08_a_file_tracked_twice_is_refused_and_one_file_is_never_counted_twice
     bound for on-demand reads that never happened. The probes refuse to track a path twice."""
     with pytest.raises(ValueError, match=r"files\[0\] and files\[1\] name the same path"):
         PlatformProbes(client, provisioner, {"a": PATH, "b": PATH}, ["alpha", "beta"], sleep=ticker.sleep)
+
+
+def test_o08_a_tracked_path_replaced_by_another_file_during_the_run_gives_no_false_bound(probes, seeded, ticker):
+    """O08: the tracked path names one file at the run's start and another, already held on beta, at its end, with no
+    transfer. The probes compare the file's identity at both ends, so the new file's bytes are never set against the
+    run as on-demand reads: there is no split, rather than a bound of the 4096 bytes the replacement brought."""
+    probes.start({})
+    ticker.sleep(10)
+    seeded._delete(seeded.id_of(MORE))
+    seeded.add_file(MORE, DATA, holder=BETA_ID)
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    assert snapshot["on_demand"] is None  # a file whose identity changed gives no split at all
+
+
+def test_o08_a_harness_transfer_the_listing_does_not_show_leaves_every_bound_unknown(
+    client, provisioner, seeded, ticker
+):
+    """O08: the harness scheduled a replication into beta that the space's listing never shows: the listing is
+    provably incomplete, and what else it misses could be into any provider, so every bound is unknown."""
+    seeded.clock = ticker.clock
+    seeded.add_file(MORE, DATA)
+    scheduled: list[tuple[str, str, str]] = []
+    probes = PlatformProbes(
+        client,
+        provisioner,
+        {"data": PATH, "more": MORE},
+        ["alpha", "beta"],
+        transfers=lambda: list(scheduled),
+        sleep=ticker.sleep,
+        now=ticker.clock,
+    )
+    probes.start({})
+    ticker.sleep(10)
+    tid = tool_plane_replicates(seeded, client, MORE, BETA_ID)
+    seeded.end_transfer(tid)
+    seeded.listing_lag[tid] = 10**6  # never in any listing answer
+    scheduled.append(("beta", tid, "replication"))
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    for provider in ("alpha", "beta"):
+        assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
+        assert "harness_transfer_not_listed" in snapshot["on_demand"][provider]["unknown"]

@@ -46,6 +46,7 @@ DISAGREE = "listings_disagree"
 NOT_SETTLED = "listing_not_settled"
 NEAR_EDGE = "transfer_near_window_edge"
 CLOCK_UNKNOWN = "clock_offset_unknown"
+HARNESS_UNLISTED = "harness_transfer_not_listed"
 
 
 def offset_of(date: str | None, host_now: float) -> float | None:

@@ -46,6 +46,7 @@ from expcore_onedata.transferwindow import (
     CARRIED_OVER,
     CLOCK_UNKNOWN,
     DISAGREE,
+    HARNESS_UNLISTED,
     NEAR_EDGE,
     NOT_SETTLED,
     Edges,
@@ -231,6 +232,12 @@ class TransferLog:
         everywhere = set() if clock["known"] else {CLOCK_UNKNOWN}
         if changed:
             everywhere.add(NOT_SETTLED)
+        # A transfer the harness itself scheduled that the accepted listing does not show proves the listing
+        # incomplete, and what else it misses could be into any provider.
+        listed = {tid for provider in self._providers for tid in observation[provider]}
+        if set(harness) - listed:
+            everywhere.add(HARNESS_UNLISTED)
+            section["harness_unlisted"] = len(set(harness) - listed)
         return Reading(reading.section, reading.inside, reading.flagged, frozenset(everywhere))
 
     def _edges(self, window: Window) -> tuple[Edges, dict[str, Any]]:
