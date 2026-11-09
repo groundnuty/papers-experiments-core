@@ -40,6 +40,14 @@ tokens' own, and the slot is never freed early. A line that cannot be read keeps
 only True frees a key). A mint that fails leaves its provisional line in place, since a token minted and dropped ends no
 later than that line.
 
+**The provisional bound assumes the platform honours the requested time caveat.** Caveats only restrict a token, so a
+token minted with `validUntil` cannot outlive it unless the server disregards it. Every successful mint checks this, and a
+token that breaks it is journalled with the expiry it has, or, when that cannot be read or the request was sent but had no
+usable answer, as indeterminate, which holds the slot until an operator confirms the token has ended and removes the
+line. What the bound does not cover is a server that both disregards the caveat and answers unusably while this host
+cannot write the indeterminate line; treating every unfinished mint as indeterminate would close that, at the price of an
+operator clearing a slot after every crash mid-mint, and the trade was made for availability.
+
 Users are created by the operator, not by this layer: there is no unscoped user creation or deletion here. The privileges
 a slot's users hold are checked, direct and effective, before every token is minted (`tokens.py`).
 """
