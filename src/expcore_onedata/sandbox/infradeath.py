@@ -23,14 +23,16 @@ Whose doing was it? A death is infrastructure only if agent code did not cause i
 
 * `host_pressure` (infrastructure): earlyoom's journal names the kill, or the OOM kill came from the host (the kernel log's CONSTRAINT_NONE or an ancestor's limit, or the cgroup's
   `oom_kill` rising with its own `oom` not rising: killcause.py's reading).
-* `component_defect` (infrastructure): the gate hit its OWN memory limit (whatever the agent asked of it, it must not die), or a component ended by itself (an exit code of its
-  own, or a crash signal).
+* `component_defect` (infrastructure): the gate hit its OWN memory limit (whatever the agent asked of it, it must not die), as the cgroup's counters or the kernel log show.
+  Never from an exit code: a 139 or a 1 says how the container's process ended, not who ended it (O17).
 * `own_limit_agent` (the AGENT's outcome, not retried): the oneclient sidecar hit its own memory limit. a mount's reads are charged to it, as a REST client's memory is charged to the agent's.
-* `undetermined` (infrastructure, retried and listed): anything else, e.g. a SIGKILL or SIGTERM from outside with no OOM counter, no kernel line and no earlyoom record (`docker kill`, `docker stop`,
-  `docker restart`, a daemon restart: a host or operator action, which the agent cannot reach), a restart whose earlier stop left no cause, a limit that the evidence cannot name,
-  a state that could not be read. A replay of the agent's code is never part of this.
+* `undetermined` (infrastructure, retried within the attempt limit and listed): anything else, e.g. a SIGKILL or SIGTERM from outside with no OOM counter, no kernel line and no
+  earlyoom record (`docker kill`, `docker stop`, `docker restart`, a daemon restart: a host or operator action, which the agent cannot reach), an exit code of any value with no
+  such evidence (a crash signal's 139 included: the code alone attributes nothing), a restart whose earlier stop left no cause, a limit that the evidence cannot name, a state
+  that could not be read. A replay of the agent's code is never part of this.
 
-The caller turns the infrastructure deaths into `InfraError("sandbox", ...)` (kinds.py), and records every death, the agent's included, in the run's metadata and its `infra.json`.
+The caller turns the infrastructure deaths into an `InfraError` (kinds.py): `sandbox` when a death has a determined cause, `unattributed_kill` when the run's one cause is
+`undetermined`; and it records every death, the agent's included, in the run's metadata and its `infra.json`.
 """
 
 from __future__ import annotations
@@ -52,7 +54,8 @@ INFRASTRUCTURE = (
     COMPONENT_DEFECT,
     UNDETERMINED,
 )  # retried; the order is the run's one cause when several containers died: the specific before undetermined
-CRASH_EXITS = (132, 134, 135, 136, 139)  # 128 + SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV: a process that crashed itself
+# 128 + SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV: named in a basis, never a cause by themselves (O17)
+CRASH_EXITS = (132, 134, 135, 136, 139)
 
 
 def parse_inspect(text: str) -> dict[str, Any] | None:
@@ -218,18 +221,14 @@ def cause_of(
         return out(UNDETERMINED, f"the container is {end['status']}: nothing says how or why")
     if end["status"] != "running":
         code = end["exit_code"]
-        if isinstance(code, int) and (code in CRASH_EXITS or 1 <= code < 128):
-            return out(
-                COMPONENT_DEFECT,
-                f"the {role} ended by itself with exit code {code}"
-                + (" (a crash signal)" if code in CRASH_EXITS else "")
-                + ": no OOM kill, no host kill on record",
-            )
-        # 0 is what a SIGTERM handler or a plain stop gives; 137 and 143 are SIGKILL and SIGTERM, which `docker kill` and `docker stop` send as much as a killer does
+        # the exit code attributes nothing (O17): 0 is what a SIGTERM handler or a plain stop gives; 137 and 143 are SIGKILL and SIGTERM, which `docker kill` and `docker stop`
+        # send as much as a killer does; a crash signal's code (139) or an error exit (1) says how the process ended, not whether the component or something outside it
+        # brought that about. Without a counter, a kernel line or an earlyoom record nothing names a cause.
+        crash = " (128 + a crash signal)" if code in CRASH_EXITS else ""
         return out(
             UNDETERMINED,
-            f"ended with exit code {code} and no OOM counter, no kernel OOM line and no earlyoom record: a signal sent from outside (docker kill, stop, restart: a host or "
-            "operator action, which agent code cannot do) or a host kill that left nothing",
+            f"ended with exit code {code}{crash} and no OOM counter, no kernel OOM line and no earlyoom record: the exit code alone attributes nothing (a signal "
+            "sent from outside: docker kill, stop, restart, a host or operator action; a host kill that left nothing; or the component's own fault)",
         )
     if end["started_at"] != start["started_at"] or end["restart_count"] > start["restart_count"]:
         return out(

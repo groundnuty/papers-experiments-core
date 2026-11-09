@@ -174,7 +174,7 @@ def test_o17_a_container_that_ran_throughout_has_no_problem():
     [
         ("inspect_exited_oom.json", "undetermined", "infrastructure"),  # an OOM kill whose limit nothing names
         ("inspect_exited_clean.json", "undetermined", "infrastructure"),  # stopped from outside with no cause on record
-        ("inspect_crashed.json", "component_defect", "infrastructure"),  # a crash signal of its own
+        ("inspect_crashed.json", "undetermined", "infrastructure"),  # 139 alone attributes nothing
         ("inspect_restarted.json", "undetermined", "infrastructure"),
     ],
 )
@@ -213,11 +213,37 @@ def test_o17_the_sidecar_hitting_its_own_limit_under_the_agents_reads_is_the_age
 
 
 def test_o17_a_death_of_infrastructure_makes_a_sandbox_error_that_names_the_cause():
-    """O17: A death of infrastructure makes a sandbox error that names the cause."""
-    start, now = inspect_state("inspect_running.json"), inspect_state("inspect_crashed.json")
+    """O17: a death the evidence attributes (here the host's OOM killer, in the kernel log) is kind `sandbox`."""
+    start, now = inspect_state("inspect_running.json"), inspect_state("inspect_exited_oom.json")
     problems = infradeath.problems("gate", "rest", start, now)
-    death = {**infradeath.cause_of("gate", start, now), "role": "gate", "problems": problems}
-    error = kinds.death_error([death])
+    cause = infradeath.cause_of("gate", start, now, kernel=kernel("dmesg_host_killer.txt"))
+    error = kinds.death_error([{**cause, "role": "gate", "problems": problems}])
     assert error.kind == "sandbox"
-    assert str(error).startswith(infradeath.MARKER) or infradeath.MARKER in str(error)
+    assert infradeath.MARKER + "host_pressure)" in str(error)
     assert json.dumps(str(error))  # plain text
+
+
+@pytest.mark.parametrize("code", [139, 134, 1, 2, 0, 137, 143])
+def test_o17_a_component_exit_code_without_further_evidence_is_undetermined_and_unattributed(code):
+    """O17: a gate that exited 139 (or 1, or 137) with no counter, kernel line or earlyoom record was not shown to have
+    crashed by itself: the cause is undetermined, and the attempt's error is an unattributed kill, never a defect."""
+    start = {**inspect_state("inspect_running.json"), "oom": 0, "oom_kill": 0}
+    now = {**inspect_state("inspect_crashed.json"), "exit_code": code, "oom": 0, "oom_kill": 0}
+    problems = infradeath.problems("gate", "rest", start, now)
+    assert problems
+    got = infradeath.cause_of("gate", start, now, kernel=[])
+    assert (got["cause"], got["category"]) == ("undetermined", "infrastructure")
+    assert f"exit code {code}" in got["basis"]
+    error = kinds.death_error([{**got, "role": "gate", "problems": problems}])
+    assert error.kind == "unattributed_kill"
+    assert infradeath.MARKER + "undetermined)" in str(error)
+    assert infradeath.attempt_cause([{**got, "role": "gate"}]) == "undetermined"
+
+
+def test_o17_a_determined_death_beside_an_undetermined_one_makes_the_error_a_sandbox_one():
+    """O17: the run's one cause is the specific one when several containers died, and so is the kind of its error."""
+    start, oom = inspect_state("inspect_running.json"), inspect_state("inspect_exited_oom.json")
+    host = infradeath.cause_of("gate", start, oom, kernel=kernel("dmesg_host_killer.txt"))
+    crashed = infradeath.cause_of("sidecar", start, inspect_state("inspect_crashed.json"))
+    deaths = [{**host, "role": "gate", "problems": ["x"]}, {**crashed, "role": "sidecar", "problems": ["y"]}]
+    assert kinds.death_error(deaths).kind == "sandbox"

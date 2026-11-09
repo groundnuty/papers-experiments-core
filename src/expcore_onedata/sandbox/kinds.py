@@ -5,7 +5,8 @@ The causes come from the kernel's counters and the container's own state (killca
 never from an exit code. Their categories map to the core's vocabulary of infrastructure kinds:
 
 - `agent`: the agent's code hit its own limit (memory, time). The agent's own outcome, not infrastructure.
-- `infrastructure`: the host or a component of the sandbox failed. Infrastructure kind `sandbox`, retried.
+- `infrastructure`: the host or a component of the sandbox failed. Infrastructure kind `sandbox`, retried; a death of a
+  gate or a sidecar whose cause is `undetermined` is a death nothing attributes, kind `unattributed_kill`.
 - `unknown`: counters unreadable, evidence conflicting, or a kill nothing attributes. Infrastructure kind
   `unattributed_kill`, retried within the attempt limit.
 
@@ -46,10 +47,20 @@ def death_error(deaths: Iterable[Mapping[str, Any]]) -> InfraError | None:
     """The error that the death of a gate or a sidecar makes of its attempt, or None when no death was infrastructure.
 
     A death of the agent's own doing (the sidecar hit its own memory limit under the agent's reads) is the agent's
-    outcome. One cause is reported when several containers died, the specific before the undetermined.
+    outcome. One cause is reported when several containers died, the specific before the undetermined. A determined
+    cause (the host's pressure, the gate's own limit) is kind `sandbox`; a run whose one cause is `undetermined` (an
+    exit code with no counter, kernel line or earlyoom record, a state that could not be read) is a death nothing
+    attributes, kind `unattributed_kill`, as an unattributed kill of a cell is (O17).
     """
-    detail = infradeath.infra_detail(list(deaths))
-    return InfraError("sandbox", detail[:600]) if detail else None
+    deaths = list(deaths)
+    detail = infradeath.infra_detail(deaths)
+    if not detail:
+        return None
+    cause = infradeath.run_cause(
+        d.get("cause") for d in deaths if isinstance(d, dict) and d.get("category") == "infrastructure"
+    )
+    kind = "unattributed_kill" if cause == infradeath.UNDETERMINED else "sandbox"
+    return InfraError(kind, detail[:600])
 
 
 __all__ = ["KIND_OF_CATEGORY", "death_error", "kill_error", "kind_of"]
