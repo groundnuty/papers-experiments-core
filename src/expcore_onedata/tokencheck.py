@@ -193,10 +193,25 @@ def require_examined(
     except TokenRefused as refused:
         refused.expires_at = declared
         raise
+    except Exception as error:  # an answer the checks could not even read is a refusal, never a crash
+        refused = TokenRefused(f"the examination answer could not be checked ({type(error).__name__})")
+        refused.expires_at = declared
+        raise refused from None
 
 
 def _declared_expiry(info: Any) -> float | None:
-    """Read the time caveat's expiry leniently, for a token about to be refused; None when it cannot be read."""
+    """Read the time caveat's expiry leniently, for a token about to be refused; None when it cannot be read.
+
+    Never raises: an expiry too large for a float, or any answer it cannot read, is None (unknown).
+    """
+    try:
+        return _read_expiry(info)
+    except Exception:
+        return None
+
+
+def _read_expiry(info: Any) -> float | None:
+    """The body of `_declared_expiry`."""
     caveats = info.get("caveats") if isinstance(info, Mapping) else None
     if not isinstance(caveats, list):
         return None

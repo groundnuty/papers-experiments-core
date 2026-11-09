@@ -233,10 +233,12 @@ class TokenIssuer:
         self.check_principal(spec, principal)
         asked = valid_until if valid_until is not None else int(self._clock()) + window.mint_ttl_s
         value = self._client.mint_own_token(principal, spec.caveats.caveats(asked))
-        try:
+        try:  # from here a token exists: any failure drops it with the expiry it is known to have, or none
             examined = self.examine(value, spec, principal.user_id, window)
         except TokenRefused as refused:
             raise DroppedToken(str(refused), refused.expires_at) from refused
+        except Exception as error:
+            raise DroppedToken(f"the token could not be examined ({type(error).__name__})", None) from None
         if valid_until is not None and examined.valid_until != valid_until:
             raise ExpiryMismatch("the token's expiry is not the one it was minted with", examined.valid_until)
         return MintedToken(spec.plane, principal.user_id, examined.token_id, examined.valid_until, Secret(value))

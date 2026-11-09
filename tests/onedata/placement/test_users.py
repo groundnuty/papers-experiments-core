@@ -492,3 +492,42 @@ def test_c19_a_dropped_token_of_unknown_expiry_holds_the_slot_until_an_operator_
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     assert journal.latest_expiry(lease.key) == float("inf")
     assert SlotProbe(journal, clock=lambda: NOW + 10**9).resource_gone(lease.key, {}) is False
+
+
+@pytest.mark.parametrize(
+    ("hook", "expect_expiry"),
+    [
+        # an expiry too large for a float: unknown, so indeterminate
+        (lambda user, caveats: [{**c, "validUntil": 10**400} if c["type"] == "time" else c for c in caveats], None),
+        # a path caveat the checks cannot decode: the token's readable expiry still reaches the journal
+        (
+            lambda user, caveats: [
+                {**c, "whitelist": ["\u00e9"]}
+                if c["type"] == "data.path"
+                else {**c, "validUntil": c["validUntil"] + 400}
+                if c["type"] == "time"
+                else c
+                for c in caveats
+            ],
+            400,
+        ),
+    ],
+)
+def test_c19_an_examination_answer_the_checks_cannot_read_still_journals_the_dropped_token(
+    slots, client, tmp_path, slot_federation, hook, expect_expiry
+):
+    """C19: answers that once escaped as crashes (an expiry too large for a float, a path caveat that is not
+    base64) are refusals; the token is dropped and its readable expiry, or an indeterminate line, holds the slot."""
+    config, loaded = slots
+    slot_federation.mint_hook = hook
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = TokenJournal(tmp_path / "leases")
+    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    with pytest.raises(TokenRefused):
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
+    if expect_expiry is None:
+        assert journal.latest_expiry(lease.key) == float("inf")
+    else:
+        expected = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s + expect_expiry
+        assert journal.latest_expiry(lease.key) == expected
