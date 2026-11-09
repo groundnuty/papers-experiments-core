@@ -454,7 +454,12 @@ def load_platform(
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
     """
     file = Path(path).resolve()
-    digest = hashlib.sha256(file.read_bytes()).hexdigest()
+    try:  # the same errors load_toml gives, so a missing file is a configuration error, not a crash
+        digest = hashlib.sha256(file.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        raise ConfigError(f"{file}: file not found") from None
+    except OSError as error:
+        raise ConfigError(f"{file}: cannot be read ({type(error).__name__})") from None
     root = Section(load_toml(file), file, "platform.toml")
     root.reject_unknown(
         (
