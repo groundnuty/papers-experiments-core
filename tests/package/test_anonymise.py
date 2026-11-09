@@ -96,19 +96,78 @@ def test_k04_a_term_that_would_change_a_number_or_a_model_name_is_refused(tmp_pa
     assert term not in str(refused.value)
 
 
-def test_k04_a_rewritten_json_file_must_still_parse(tmp_path):
-    """K04: anonymisation must not break a file's parse; a label that would is refused, one that would not is kept."""
-    path = anonymisation_file(tmp_path / "anon.toml", files=("codemeta.json",), terms={"Varek": 'A "quoted" one'})
-    breaking = load_anonymisation(path, keep_out_of=[], model_names=set())
-    with pytest.raises(PackageError, match="no longer parses as JSON"):
-        rewrite({"codemeta.json": b'{"x": "Varek"}'}, breaking, code=set())
-    path = anonymisation_file(tmp_path / "anon.toml", files=("codemeta.json",), terms={"Varek": "Author A"})
-    fine = load_anonymisation(path, keep_out_of=[], model_names=set())
-    rewritten = rewrite({"codemeta.json": b'{"x": "Varek"}'}, fine, code=set())
-    assert json.loads(rewritten["codemeta.json"]) == {"x": "Author A"}
+def test_k04_a_rewritten_json_or_toml_file_must_still_parse(tmp_path):
+    """K04: anonymisation must not break a file's parse. JSON is rewritten in its parsed form, so a label with quotes
+    stays one string; a TOML file that the plain-text rewrite would break is refused, as is JSON that does not parse."""
+    path = anonymisation_file(tmp_path / "anon.toml", terms={"Varek": 'A "quoted" one'})
+    quoted = load_anonymisation(path, keep_out_of=[], model_names=set())
+    rewritten = rewrite({"codemeta.json": b'{"x": "Varek"}'}, named(quoted, "codemeta.json"), code=set())
+    assert json.loads(rewritten["codemeta.json"]) == {"x": 'A "quoted" one'}
+    with pytest.raises(PackageError, match="no longer parses as TOML"):
+        rewrite({"meta.toml": b'x = "Varek"\n'}, named(quoted, "meta.toml"), code=set())
+    with pytest.raises(PackageError, match="does not parse as JSON"):
+        rewrite({"codemeta.json": b'{"x": Varek}'}, named(quoted, "codemeta.json"), code=set())
 
 
 def test_a_label_that_holds_a_term_is_refused(tmp_path):
     path = anonymisation_file(tmp_path / "anon.toml", terms={"Varek": "Varek's group"})
     with pytest.raises(PackageError, match="label contains a term"):
         load_anonymisation(path, keep_out_of=[], model_names=set())
+
+
+def named(listed: Anonymisation, *files: str) -> Anonymisation:
+    return Anonymisation(listed.source, files, listed.terms)
+
+
+ESCAPED_JSON = b'{"author": "\\u0056arek", "Varek": {"place": "Brindlemoor Institute"}, "names": ["Quillon Varek", 3]}'
+
+
+def test_k03_a_named_json_file_is_anonymised_in_its_parsed_keys_and_strings_escapes_included(listed):
+    """K03: the private names never enter the output: a JSON escape such as \\u0056 no longer hides a term from the
+    rewrite, because JSON metadata is parsed, rewritten in its decoded keys and strings, and written out again."""
+    files = rewrite({"codemeta.json": ESCAPED_JSON}, named(listed, "codemeta.json"), code=set())
+    assert json.loads(files["codemeta.json"]) == {
+        "author": "Author A",
+        "Author A": {"place": "Institution A"},
+        "names": ["Author A", 3],
+    }
+    assert find_terms(files, listed) == []
+
+
+def test_k04_a_rewritten_json_file_is_written_out_the_same_way_every_time(listed):
+    """K04: the rewrite keeps the file parseable and its numbers as they were, and its serialisation is fixed."""
+    first = rewrite({"codemeta.json": ESCAPED_JSON}, named(listed, "codemeta.json"), code=set())["codemeta.json"]
+    again = rewrite({"codemeta.json": first}, named(listed, "codemeta.json"), code=set())["codemeta.json"]
+    assert first == again
+    assert first == (json.dumps(json.loads(first), ensure_ascii=False, indent=2) + "\n").encode()
+
+
+def test_k03_an_escaped_term_in_a_file_that_is_not_rewritten_is_found(listed):
+    """K03: a record or any other file that the list does not name is searched in its decoded strings too."""
+    findings = find_terms({"out/runs/x.json": b'{\n "author": "\\u0056arek",\n "n": 1\n}\n'}, listed)
+    assert findings
+    assert not any("varek" in finding.casefold() for finding in findings)
+
+
+@pytest.mark.parametrize("hidden", ["&#86;arek", "&#x56;arek", "%56arek", "\\u0056arek", "&amp;#86;arek"])
+def test_k03_an_escaped_term_left_in_named_markdown_fails_the_build_naming_the_file(listed, hidden):
+    """K03: the rewrite cannot see a term written as an HTML entity, a percent-escape or a backslash escape, so the
+    residual check reads the file decoded, finds it, and the build refuses, naming the file and the line."""
+    files = rewrite({"README.md": f"# Notes\n\nBy {hidden}.\n".encode()}, named(listed, "README.md"), code=set())
+    assert find_terms(files, listed) == [f"README.md:3: {FOUND}"]
+
+
+def test_k03_toml_and_yaml_metadata_may_be_named_but_only_a_plain_text_rewrite_is_done_and_checked(listed):
+    """K03: a format that cannot be rewritten in its parsed form is rewritten as plain text, and refused, naming the
+    file, if its decoded view still holds a term; a rewritten TOML file must still parse (K04)."""
+    plain = b'[project]\nauthors = [{name = "Quillon Varek"}]\n'
+    cff = b"authors:\n  - name: Quillon Varek\n"
+    files = rewrite(
+        {"pyproject.toml": plain, "CITATION.cff": cff}, named(listed, "pyproject.toml", "CITATION.cff"), code=set()
+    )
+    assert b"Author A" in files["pyproject.toml"]
+    assert b"Author A" in files["CITATION.cff"]
+    assert find_terms(files, listed) == []
+    escaped = b'[project]\nauthors = [{name = "Quillon \\u0056arek"}]\n'
+    files = rewrite({"pyproject.toml": escaped}, named(listed, "pyproject.toml"), code=set())
+    assert any(finding.startswith("pyproject.toml") for finding in find_terms(files, listed))

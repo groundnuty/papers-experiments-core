@@ -9,14 +9,20 @@ very names the package hides (K03: a private list never enters the repository or
     "Ada Example" = "Author A"   # a term, and the neutral label that replaces it
 
 - Only the files the list names are rewritten. Each must be prose or metadata (a suffix in `REWRITABLE_SUFFIXES`),
-  outside the code the records were made with and outside out/. Code, configuration, records and generated tables are
+  outside the code the records were made with and outside out/. JSON is parsed, rewritten in its decoded keys and
+  strings, and written out again in one fixed form, so an escape such as `\\u0056` cannot hide a term from the
+  rewrite. A format that cannot be parsed and written out again safely (TOML, YAML, plain text) is rewritten as text,
+  and a TOML file must still parse afterwards. Code, configuration, records and generated tables are
   never rewritten: relabelling them changes what runs and what was measured (relabelling by substring broke an
   earlier study's package: a class name, a network address, an endpoint; see docs/inventory.md).
 - A term is replaced only as a whole word, ignoring case: never inside a longer word, an identifier, or a dotted or
   hyphenated name, so a term `re` stays in `re-run`.
 - Then every file of the package, rewritten ones included, is searched for every term, ignoring case, wherever the
-  term is not part of a longer run of letters and digits. A term found anywhere fails the build, naming the file and
-  the line and never the term (K05); a path that holds a term is not shown. So a term in a code file is reported and
+  term is not part of a longer run of letters and digits: every byte stream it holds, under every encoding, and
+  decoded (its parsed JSON or TOML strings, HTML entities, percent-escapes and backslash escapes; `views`). A term
+  found anywhere fails the build, naming the file and the line and never the term (K05); a path that holds a term is
+  not shown. A term the plain-text rewrite of a TOML or YAML file could not reach, being escaped, is found here, and
+  the build refuses that file. So a term in a code file is reported and
   never rewritten, and one the whole-word rule left inside a hyphenated name is reported too: nothing is relabelled
   by substring, and nothing slips through.
 - A term must not change numbers or model names (K04): a term without a letter, and a term that is a key, API id or
@@ -26,13 +32,15 @@ very names the package hides (K03: a private list never enters the repository or
 import json
 import re
 import tomllib
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from expcore.package.spec import PackageError
+from expcore.package.views import byte_views, decoded_views, streams
+from expcore.study.config import CONFIG_FILES
 
-REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".cff", ".bib", ".json"})
+REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".cff", ".bib", ".json", ".toml", ".yaml", ".yml"})
 FINDING = "a term of the anonymisation list"
 REDACTED_PATH = "<path redacted>"
 
@@ -108,7 +116,8 @@ def rewrite(
         where = f"{anonymisation.source}: `files` names {name}"
         if name not in files:
             raise PackageError(f"{where}, which the package does not include")
-        if name in code or name.startswith(out_prefix) or PurePosixPath(name).suffix.lower() not in REWRITABLE_SUFFIXES:
+        protected = name in code or name in CONFIG_FILES or name.startswith(out_prefix)
+        if protected or PurePosixPath(name).suffix.lower() not in REWRITABLE_SUFFIXES:
             raise PackageError(
                 f"{where}, which is code, configuration, a record or a generated table, never rewritten; "
                 f"only prose and metadata ({', '.join(sorted(REWRITABLE_SUFFIXES))}) outside out/ and the code"
@@ -117,30 +126,72 @@ def rewrite(
             text = files[name].decode("utf-8")
         except UnicodeDecodeError:
             raise PackageError(f"{where}, which is not UTF-8 text") from None
-        for replacer, label in replacers:
-            text = replacer.sub(label, text)
-        if name.lower().endswith(".json"):
+        suffix = PurePosixPath(name).suffix.lower()
+        text = _rewrite_json(text, replacers, where) if suffix == ".json" else _relabel(text, replacers)
+        if suffix == ".toml":
             try:
-                json.loads(text)
-            except ValueError:
-                raise PackageError(f"{where}: after anonymisation it no longer parses as JSON (K04)") from None
+                tomllib.loads(text)
+            except tomllib.TOMLDecodeError:
+                raise PackageError(f"{where}: after anonymisation it no longer parses as TOML (K04)") from None
         result[name] = text.encode("utf-8")
     return result
+
+
+def _relabel(text: str, replacers: Sequence[tuple[re.Pattern[str], str]]) -> str:
+    for replacer, label in replacers:
+        text = replacer.sub(label, text)
+    return text
+
+
+def _rewrite_json(text: str, replacers: Sequence[tuple[re.Pattern[str], str]], where: str) -> str:
+    """Parse, relabel every decoded key and string, and write the result out in one fixed form."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise PackageError(f"{where}, which does not parse as JSON") from None
+
+    def walk(value: object) -> object:
+        if isinstance(value, dict):
+            relabelled = {_relabel(key, replacers): walk(item) for key, item in value.items()}
+            if len(relabelled) != len(value):
+                raise PackageError(f"{where}: anonymisation would merge two keys of one object (K04)")
+            return relabelled
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        return _relabel(value, replacers) if isinstance(value, str) else value
+
+    return json.dumps(walk(data), ensure_ascii=False, indent=2) + "\n"
 
 
 def _longest_first(item: tuple[str, str]) -> tuple[int, str]:
     return (-len(item[0]), item[0].casefold())
 
 
+def _lines(text: str, finders: Sequence[re.Pattern[str]]) -> set[int]:
+    return {text.count("\n", 0, m.start()) + 1 for f in finders for m in f.finditer(text)}
+
+
 def find_terms(files: Mapping[str, bytes], anonymisation: Anonymisation) -> list[str]:
-    """Return one finding per file and line that holds a term, never the term; empty when the package is clean."""
+    """Return one finding per stream and line that holds a term, never the term; empty when the package is clean.
+
+    Every stream of every file is read under every encoding and decoded (`views`). A term found only in the parsed
+    strings of a JSON or TOML stream has no line of its own and is reported for the stream.
+    """
     finders = [_finder(term) for term in anonymisation.terms]
-    findings = []
+    findings: list[str] = []
     for name in sorted(files):
-        shown = REDACTED_PATH if any(f.search(name) for f in finders) else name
-        if shown != name:
-            findings.append(f"{shown}: the path holds {FINDING}")
-        text = files[name].decode("utf-8", errors="replace").replace("\0", "\n")
-        lines = sorted({text.count("\n", 0, m.start()) + 1 for f in finders for m in f.finditer(text)})
-        findings += [f"{shown}:{line}: {FINDING}" for line in lines]
+        for label, data in streams(name, files[name])[0]:  # what cannot be opened is the token check's refusal
+            shown = REDACTED_PATH if any(f.search(label) for f in finders) else label
+            if shown != label:
+                findings.append(f"{shown}: the path holds {FINDING}")
+            lines, parsed = set(), False
+            for _, text in byte_views(data):
+                lines |= _lines(text, finders)
+            for view, text in decoded_views(label, data.decode("utf-8", errors="replace")):
+                hits = _lines(text, finders)
+                parsed = parsed or (view in ("json", "toml") and bool(hits))
+                lines |= hits if view not in ("json", "toml") else set()
+            findings += [f"{shown}:{line}: {FINDING}" for line in sorted(lines)]
+            if parsed and not lines:
+                findings.append(f"{shown}: {FINDING}, in its parsed strings")
     return findings
