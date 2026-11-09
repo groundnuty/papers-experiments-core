@@ -340,3 +340,22 @@ def test_o08_a_record_whose_status_fields_disagree_is_not_final(probes, client, 
     snapshot = probes.finish()
     assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
     assert "transfer_not_ended" in snapshot["on_demand"]["beta"]["unknown"]
+
+
+def test_o08_a_record_with_a_status_field_that_cannot_be_read_is_not_final(probes, client, seeded, ticker):
+    """O08: the replication's record says completed in one status field and holds a list in another: a status that
+    cannot be read establishes nothing, so beta's bound is unknown."""
+    probes.start({})
+    ticker.sleep(10)
+    tid = tool_plane_replicates(seeded, client, MORE, BETA_ID)
+    seeded.end_transfer(tid)
+    for provider in (ALPHA_ID, BETA_ID):
+        seeded.provider_view[(tid, provider)] = {
+            "transferStatus": "completed",
+            "replicationStatus": ["active"],
+            "bytesReplicated": 0,
+        }
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
+    assert "transfer_not_ended" in snapshot["on_demand"]["beta"]["unknown"]

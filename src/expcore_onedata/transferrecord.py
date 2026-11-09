@@ -67,8 +67,12 @@ CONFLICTING = "conflicting"  # the state of a record whose status fields disagre
 
 def _state(body: Mapping[str, Any]) -> str | None:
     """The record's state: what every status field it carries says, `CONFLICTING` when they disagree (a migration
-    whose replication completed and whose eviction is still active, say), or None when it carries none."""
-    states = {body[k] for k in _STATE_KEYS if isinstance(body.get(k), str)}
+    whose replication completed and whose eviction is still active, say) or one cannot be read, or None when it
+    carries none."""
+    present = [body[k] for k in _STATE_KEYS if k in body and body[k] is not None]
+    if any(not isinstance(value, str) for value in present):  # a status field that cannot be read is no state
+        return CONFLICTING
+    states = set(present)
     if not states:
         return None
     return next(iter(states)) if len(states) == 1 else CONFLICTING
