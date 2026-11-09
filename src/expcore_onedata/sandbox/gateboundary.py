@@ -12,9 +12,16 @@ rewrites one, since a partial rewrite can leave a piece behind. Every answer pas
     `ENCODED_DETAILS`, before any byte of it;
   * a header whose name or value holds the token (`holds_token`) makes the answer a 502 with `CREDENTIAL_DETAILS`,
     before its body; a credential header without it (`CREDENTIAL_HEADERS`) is withheld and the answer passes;
-  * the body streams through `BodyWatch`, which holds back the bytes a hit can take (`held_back`); on a hit the gate
-    stops forwarding and cuts the transfer, so the agent gets no byte of it, and the line says why
-    (`CREDENTIAL_IN_RESPONSE`).
+  * an answer that is no file's content (`streams`: any status but 200 or 206, any endpoint but a file's content,
+    any content type but `DATA_CONTENT_TYPE`) is read whole, up to `BUFFER_CAP` (4 MiB), and checked with the full
+    detector before any byte of it goes: a hit is a 502 (`CREDENTIAL_IN_RESPONSE`), and an answer over the cap a 502
+    (`OVERSIZED_RESPONSE`). The way a token comes back is the platform echoing a request in an error or in metadata,
+    and those answers are small; nested encodings outgrow any tail a stream can hold back, a whole answer has none;
+  * a file's content streams through `BodyWatch`, which holds back the bytes a hit can take (`held_back`); on a hit
+    the gate stops forwarding and cuts the transfer, so the agent gets no byte of it, and the line says why
+    (`CREDENTIAL_IN_RESPONSE`). That is the second layer, and it suffices: the token is minted for the run after the
+    study's data was provisioned, and the agent's data path is read-only, so a file's content cannot hold it; the
+    watch is defence in depth, with the bound `held_back` states.
 
 Detection does not depend on knowing the encoding. The bytes are decoded again and again, until nothing changes or
 `ROUNDS` rounds have run (`layers`): percent-escapes in either case of hex with `+` as a space, JSON escapes with a
@@ -42,6 +49,10 @@ CREDENTIAL_IN_HEADER = "credential_in_header"
 CREDENTIAL_IN_RESPONSE = "credential_in_response"
 ENCODED_RESPONSE = "encoded_response"
 REDIRECT_REFUSED = "redirect_refused"
+OVERSIZED_RESPONSE = "oversized_response"
+OVERSIZED_DETAILS = "the upstream's answer is larger than the gate checks whole, so the gate does not pass it on"
+BUFFER_CAP = 4 * 1024 * 1024  # the most of an answer that is no file's content the gate buffers and checks whole
+DATA_CONTENT_TYPE = "application/octet-stream"  # what the content endpoint answers a file's content with
 
 RUN = 32  # characters of the token's projection a hit needs; its whole projection when that is shorter
 ROUNDS = 4  # decoding rounds at most
@@ -176,6 +187,14 @@ def readable_encoding(content_encoding: str | None, transfer_encoding: str | Non
     content = (content_encoding or "identity").strip().lower()
     transfer = (transfer_encoding or "chunked").strip().lower()
     return content == "identity" and transfer == "chunked"
+
+
+def streams(status: int, tag: str | None, content_type: str | None) -> bool:
+    """Whether an answer is a file's content, the only answer the gate streams: a 200 or 206 from the content endpoint
+    (gatepolicy's tag `content`) with the data content type. Every other answer is buffered whole, up to `BUFFER_CAP`,
+    and checked before any byte of it goes."""
+    media = (content_type or "").split(";")[0].strip().lower()
+    return status in (200, 206) and tag == "content" and media == DATA_CONTENT_TYPE
 
 
 def is_redirect(status: int) -> bool:

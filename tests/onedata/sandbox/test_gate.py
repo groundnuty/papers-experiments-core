@@ -36,6 +36,8 @@ SLASH_TOKEN = "tok/gate+0123"  # an invented token whose encoded forms differ fr
 SPACE_TOKEN = "tok gate0123"  # an invented token with a space, which a form encodes as +
 LONG_TOKEN = "tok" + "".join(f"{n:02d}q" for n in range(21)) + "z"  # invented: 67 letters and digits
 SPLIT_AT = 4096  # the gate's read size in the tests that split a token between two reads of the upstream's body
+OCTETS = "application/octet-stream"  # the content type of a file's content: the only answer the gate streams
+CAP = 4 * 1024 * 1024  # the most the gate buffers of any other answer
 HELD_BACK = 6  # bytes per character of the token the gate holds back: its longest form, \\uXXXX, is six
 
 
@@ -54,8 +56,9 @@ class Upstream(ThreadingHTTPServer):
         self.seen: list[tuple[str, str, dict]] = []
         self.bodies: list[bytes] = []
         self.mode = "ok"
-        self.answer_headers: list[tuple[str, str]] = []  # mode "fixed": the answer's extra headers and its body
+        self.answer_headers: list[tuple[str, str]] = []  # mode "fixed": the answer's status, extra headers and body
         self.answer_body = b"{}"
+        self.answer_status = 200
 
 
 class UpstreamHandler(BaseHTTPRequestHandler):
@@ -85,6 +88,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
             return
         size = BIG if self.server.mode == "big" else len(BODY)
         self.send_response(200)
+        self.send_header("Content-Type", OCTETS)  # a file's content, as the content endpoint answers it
         self.send_header("Content-Length", str(size))
         self.end_headers()
         try:
@@ -115,7 +119,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         elif mode == "gzip":  # whatever the gate asked for: a compressed body the gate cannot look into
             headers, body = [("Content-Encoding", "gzip")], gzip.compress(b'{"echo": "' + token.encode() + b'"}')
         else:  # "fixed": what the test set
-            headers, body = self.server.answer_headers, self.server.answer_body
+            status, headers, body = self.server.answer_status, self.server.answer_headers, self.server.answer_body
         self.send_response(status)
         for name, value in headers:
             self.send_header(name, value)
@@ -384,6 +388,7 @@ def test_o05_a_token_in_the_body_split_between_two_reads_cuts_the_transfer(world
     monkeypatch.setattr(gate, "UPSTREAM_READ_BYTES", SPLIT_AT, raising=False)
     gate.CFG["token"] = token
     world.upstream.mode = "fixed"
+    world.upstream.answer_headers = [("Content-Type", OCTETS)]  # file content: it streams through the detector
     world.upstream.answer_body = body = across_reads(form)
     conn = connect(world)
     conn.request("GET", FILE)
@@ -406,12 +411,77 @@ def test_o05_overlapping_tokens_are_found_and_nothing_of_them_is_sent(world, mon
     monkeypatch.setattr(gate, "UPSTREAM_READ_BYTES", cut, raising=False)
     gate.CFG["token"] = "ababa"
     world.upstream.mode = "fixed"
+    world.upstream.answer_headers = [("Content-Type", OCTETS)]
     world.upstream.answer_body = b"abababa"
     conn = connect(world)
     conn.request("GET", FILE)
     received = read_until_cut(conn.getresponse())
     assert received == b""
     assert wait_for(world, lambda r: r.get("cut") is True)["cut_reason"] == "credential_in_response"
+    conn.close()
+
+
+def percent_encoded(data: bytes) -> bytes:
+    """Every byte as %XX."""
+    return "".join(f"%{b:02X}" for b in data).encode()
+
+
+def test_o05_an_error_body_with_a_token_encoded_three_times_across_reads_is_refused_with_nothing_forwarded(
+    world, monkeypatch
+):
+    """O05: an answer that is no file content is buffered whole and checked before any byte of it goes: an error body
+    echoing the token percent-encoded three times, longer than any held-back tail and split between two reads, is a
+    502 with a fixed message, and the agent gets nothing of it."""
+    monkeypatch.setattr(gate, "UPSTREAM_READ_BYTES", SPLIT_AT, raising=False)
+    gate.CFG["token"] = LONG_TOKEN
+    encoded = percent_encoded(percent_encoded(percent_encoded(LONG_TOKEN.encode())))
+    world.upstream.mode, world.upstream.answer_status = "fixed", 400
+    world.upstream.answer_headers = [("Content-Type", "application/json")]
+    world.upstream.answer_body = across_reads(b'{"error": "bad token ' + encoded + b'"}')
+    conn = connect(world)
+    conn.request("GET", FILE)
+    answer = conn.getresponse()
+    body = answer.read()
+    assert answer.status == 502
+    assert b"bad token" not in body
+    assert encoded[:16] not in body
+    line = wait_for(world, lambda r: r.get("status") == 502)
+    assert (line.get("gate_refusal"), line["upstream_status"], line["client_saw"]) == (
+        "credential_in_response",
+        400,
+        "5xx",
+    )
+    conn.close()
+
+
+def test_o05_an_answer_over_the_buffer_cap_that_is_no_file_content_is_refused(world):
+    """O05: an answer the gate must buffer that is larger than its cap is a 502 gate refusal, oversized_response."""
+    world.upstream.mode, world.upstream.answer_status = "fixed", 500
+    world.upstream.answer_headers = [("Content-Type", "application/json")]
+    world.upstream.answer_body = b"x" * (CAP + 1)
+    conn = connect(world)
+    conn.request("GET", FILE)
+    answer = conn.getresponse()
+    body = answer.read()
+    assert answer.status == 502
+    assert b"xxxx" not in body
+    line = wait_for(world, lambda r: r.get("status") == 502)
+    assert (line.get("gate_refusal"), line["upstream_status"]) == ("oversized_response", 500)
+    conn.close()
+
+
+def test_o05_a_file_content_read_larger_than_the_cap_still_streams(world):
+    """O05: a successful read of a file's content, with the data content type, streams through the detector whatever
+    its size: no cap, nothing refused."""
+    world.upstream.mode = "big"
+    conn = connect(world)
+    conn.request("GET", FILE)
+    answer = conn.getresponse()
+    assert answer.status == 200
+    assert len(answer.read()) == BIG
+    line = wait_for(world, lambda r: r.get("status") == 200)
+    assert line["bytes"] == BIG
+    assert "gate_refusal" not in line
     conn.close()
 
 

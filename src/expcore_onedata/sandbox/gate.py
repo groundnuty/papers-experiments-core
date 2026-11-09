@@ -856,14 +856,62 @@ class Handler(BaseHTTPRequestHandler):
                 withheld.append(k.lower())  # a credential of the upstream's, never the agent's
             else:
                 passed.append((k, v))
+        if withheld:
+            rec["withheld_headers"] = sorted(set(withheld))  # their names only
         # the length http.client frames the body by (None: chunked, or until EOF), never the raw header; the boundary
         # never rewrites a body, so it stays true
         declared = None if resp.chunked else resp.length
+        body = None
+        if not gateboundary.streams(resp.status, rec.get("tag"), resp.getheader("Content-Type")):
+            body = self._buffered(hcfg, resp, rec, declared, token)  # no file's content: whole, and checked first
+            if body is None:
+                return  # refused: answered and logged
+            declared = len(body)
+        declared = self._send_head(resp, passed, declared)
+        if body is None:
+            sent, failure, failure_origin = self._stream(resp, rec, token)
+        else:
+            sent, failure, failure_origin = self._write_whole(body, rec)
+        self._finish(hcfg, resp, rec, sent, declared, failure, failure_origin)
+
+    def _buffered(self, hcfg, resp, rec, declared, token) -> bytes | None:
+        """An answer that is no file's content, read whole (up to `gateboundary.BUFFER_CAP`) and checked with the full
+        detector before any byte of it goes (O05): the body, or None when it was refused with a 502 (over the cap,
+        `oversized_response`; holding the token, `credential_in_response`). The answers that echo a request, an error or
+        a file's metadata, are small. A read that fails is the upstream's error, answered as one (`_handle`)."""
+        body = bytearray()
+        while True:
+            try:
+                chunk = resp.read(UPSTREAM_READ_BYTES)
+            except (OSError, http.client.HTTPException) as e:
+                raise _Upstream(e) from e
+            if not chunk:
+                break
+            body += chunk
+            if len(body) > gateboundary.BUFFER_CAP:
+                error, details = "the upstream's answer is larger than the gate buffers", gateboundary.OVERSIZED_DETAILS
+                self._refuse_answer(
+                    hcfg, resp, rec, error=error, details=details, refusal=gateboundary.OVERSIZED_RESPONSE
+                )
+                return None
+        if declared is not None and len(body) != declared:  # http.client does not raise on an early EOF here
+            raise _Upstream(http.client.IncompleteRead(bytes(body[:0]), declared - len(body)))
+        if gateboundary.holds_token(bytes(body), token):
+            error, details = (
+                "the upstream's answer held the gate's credential in its body",
+                gateboundary.CREDENTIAL_DETAILS,
+            )
+            self._refuse_answer(
+                hcfg, resp, rec, error=error, details=details, refusal=gateboundary.CREDENTIAL_IN_RESPONSE
+            )
+            return None
+        return bytes(body)
+
+    def _send_head(self, resp, passed, declared) -> int | None:
+        """The status and the headers that passed, framed by the body's length when it is known; the length framed."""
         self.send_response(resp.status)
         for k, v in passed:
             self.send_header(k, v)
-        if withheld:
-            rec["withheld_headers"] = sorted(set(withheld))  # their names only
         if resp.status in (204, 304):
             declared = 0  # no body by definition, nothing to frame
         elif declared is not None:
@@ -874,6 +922,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.close_connection = True
         self.end_headers()
+        return declared
+
+    def _write_whole(self, body: bytes, rec) -> tuple[int, str | None, str]:
+        """A checked body, in one write: (bytes sent, failure, its origin)."""
+        try:
+            self.wfile.write(body)
+        except OSError as e:
+            if e.errno in LOCAL_ERRNOS:  # the gate's own resources failed the write, not the client
+                return 0, repr(e), "gate"
+            rec["client_aborted"] = True
+            return 0, None, "upstream"
+        return len(body), None, "upstream"
+
+    def _stream(self, resp, rec, token) -> tuple[int, str | None, str]:
+        """A file's content, streamed through the body watch (the boundary's second layer): (bytes sent, failure, its
+        origin). The token is minted for the run after the study's data was provisioned, and the data path is
+        read-only, so a file's content cannot hold it; the watch is defence in depth, with the bound `held_back`
+        gives it."""
         sent, failure, failure_origin = 0, None, "upstream"
         watch = gateboundary.BodyWatch(token)  # holds back what could begin the token until the next read shows it
         while True:
@@ -898,6 +964,11 @@ class Handler(BaseHTTPRequestHandler):
             sent += len(out)
             if not chunk:
                 break
+        return sent, failure, failure_origin
+
+    def _finish(self, hcfg, resp, rec, sent, declared, failure, failure_origin) -> None:
+        """The end of an answer begun: a transfer cut is marked with the bytes the client never got (O16), and the
+        line is logged."""
         if failure is None and not rec.get("client_aborted") and declared is not None and sent != declared:
             failure = f"upstream sent {sent} of {declared} bytes"  # http.client does not raise on an early EOF here
         if failure or rec.get("client_aborted"):
