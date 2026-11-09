@@ -278,8 +278,8 @@ class DockerSandbox:
 
     def _write_mount_record(self) -> None:
         """Write, crash-safely, the lease and the mounts of this sandbox: what a probe finds them by, wherever the
-        directory has gone (C19). A mount is identified by its path and by the mount id and device the kernel gave it,
-        which a rename of the directory above it does not change."""
+        directory has gone (C19). A mount is identified by its path and by its identity in the mount table, the mount
+        id, device, source and type it was made with (`hostops.mount_identity`), which moving it does not change."""
         document = {"sid": self.sid, "lease": self.spec.lease_key, "mounts": self._mount_log}
         target = self._record_file()
         try:
@@ -299,28 +299,52 @@ class DockerSandbox:
         """Register a mount point and record it, before the mount is made."""
         self._register_creation()
         self._mounts.append(path)
-        self._mount_log.append({"path": str(path), "id": None, "dev": None})
+        self._mount_log.append({"path": str(path), "id": None, "dev": None, "source": None, "fstype": None})
         self._write_mount_record()
 
     def _note_mounted(self, path: Path) -> None:
-        """Add the identity the kernel gave the mount just made; a table that cannot be read leaves the path alone."""
+        """Record the identity of the mount just made, as the table shows it now (C19): what the teardown and the probe
+        look for, wherever the mount goes. A mount whose identity cannot be read could not be shown gone once moved, so
+        the start fails."""
         try:
             table = hostops.parse_mountinfo(self.host.read_text("/proc/self/mountinfo"))
         except (OSError, SandboxError) as e:
             log.error("the identity of a new mount could not be read: %s", describe_error(e))
-            return
+            raise SandboxError("the identity of a new mount could not be read") from None
         found = [m for m in table if m["mountpoint"] == str(path)]
-        if found:  # the last one is the one on top
-            entry = next(e for e in self._mount_log if e["path"] == str(path))
-            entry.update(id=found[-1]["id"], dev=found[-1]["dev"])
-            self._write_mount_record()
+        if not found:
+            raise SandboxError("a new mount is not in the mount table")
+        entry = next(e for e in self._mount_log if e["path"] == str(path))
+        top = found[-1]  # the last one is the one on top
+        entry.update(id=top["id"], dev=top["dev"], source=top["source"], fstype=top["fstype"])
+        self._write_mount_record()
 
-    def _drop_mount_record(self) -> None:
-        """The sandbox is verifiably gone with its mounts: the record has nothing left to say."""
+    def _identities(self) -> set[tuple[str, str, str, str]]:
+        """The recorded identities of this sandbox's mounts (those it made; one registered and never made has none)."""
+        return {i for e in self._mount_log if (i := hostops.mount_identity(e)) is not None}
+
+    def _drop_mount_record(self) -> str | None:
+        """Remove the record once nothing it names can be live (C19): the whole mount table, read now, shows none of
+        its identities, wherever those mounts are, never judged by a path. A table that cannot be read, or an identity
+        in it, keeps the record, and the reason the sandbox is not gone is returned. A mount without an identity (its
+        mount command failed) has nothing to look for but its own path, which the teardown has shown clear: the record
+        is kept for the probe, and the stop is not failed for it."""
+        try:
+            table = hostops.parse_mountinfo(self.host.read_text("/proc/self/mountinfo"))
+        except (OSError, SandboxError) as e:
+            log.error("the mount table could not be read, so the record of the mounts is kept: %s", describe_error(e))
+            return "the mount table could not be read, so the sandbox's mounts are not shown gone"
+        ours = self._identities()
+        if any(hostops.mount_identity(m) in ours for m in table):
+            return "a mount of the sandbox is still in the mount table, wherever it is now"
+        if any(hostops.mount_identity(e) is None for e in self._mount_log):
+            log.error("the record of the sandbox's mounts is kept: a mount in it has no identity to look for")
+            return None
         try:
             self._record_file().unlink(missing_ok=True)
         except OSError as e:  # a record that stays only makes the probe look again, at a table with nothing of ours
             log.error("the record of the sandbox's mounts could not be removed: %s", describe_error(e))
+        return None
 
     def _register_container(self, name: str) -> None:
         """Remember a container before it is created, so that no interrupt leaves one that `stop` misses."""
@@ -688,21 +712,26 @@ class DockerSandbox:
         finally:
             with self._created_lock:  # and only if nothing was registered since this teardown began
                 self._stopped = complete and self._created == created
+            if self._stopped and (kept := self._drop_mount_record()) is not None:
+                errors.append(kept)
+                self._stopped = False
             if self._stopped:
-                self._drop_mount_record()
                 TERM.unregister(self)
         if errors:
             raise SandboxError("sandbox cleanup incomplete: " + "; ".join(errors))
 
     def _mounts_may_be_live(self, errors: list[str]) -> bool:
-        """Whether a mount under the run directory may still be live: an unmount that failed, a mount table that cannot
-        be shown whole, or a mount the table still lists there. Unknown is live (C19)."""
+        """Whether a mount of the sandbox may still be live: an unmount that failed, a mount table that cannot be shown
+        whole, a mount the table still lists under the run directory, or one with the identity of a mount the sandbox
+        made anywhere in the table, wherever it was moved to. Unknown is live (C19)."""
         if errors:  # the unmounts above are the only steps that ran since the caller began counting
             return True
         try:
-            return bool(hostops.mounts_under(self.host.read_text("/proc/self/mountinfo"), self.dir))
+            table = hostops.parse_mountinfo(self.host.read_text("/proc/self/mountinfo"))
         except (OSError, SandboxError):
             return True
+        under, ours = str(self.dir).rstrip("/") + "/", self._identities()
+        return any(m["mountpoint"].startswith(under) or hostops.mount_identity(m) in ours for m in table)
 
     def _remove_the_rest(self, errors: list[str]) -> None:
         if self._net:
@@ -720,7 +749,9 @@ class DockerSandbox:
         if self._mounts_may_be_live(unmount_errors):
             # a directory is never moved, renamed or removed while a mount under it may be live: the mount would go with
             # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)
-            errors.append("the run directory is left where it is: a mount under it may be live")
+            errors.append(
+                "the run directory is left where it is: a mount under it may be live, or one of its own elsewhere"
+            )
             return
         if self.keep_evidence:  # the copy failed: the disks hold the only record of the run
             kept = self.s.work_root / "_kept_evidence"

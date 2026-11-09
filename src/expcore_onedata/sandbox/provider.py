@@ -36,7 +36,7 @@ from expcore.plugin import CallContext
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec
-from expcore_onedata.sandbox.hostops import HostOps, parse_mountinfo
+from expcore_onedata.sandbox.hostops import HostOps, mount_identity, parse_mountinfo
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -66,7 +66,7 @@ class _Recorded:
     """What the records say a lease's sandboxes mounted, and the question of whether a mount is one of them."""
 
     paths: tuple[str, ...]
-    identities: frozenset[tuple[str, str]]  # (mount id, device): they do not change when the directory is renamed
+    identities: frozenset[tuple[str, str, str, str]]  # `hostops.mount_identity`: unchanged by a rename or a move
     sids: frozenset[str]
     key_dir: re.Pattern[str]
 
@@ -75,7 +75,7 @@ class _Recorded:
         mounts = [m for r in records for m in r["mounts"]]
         return cls(
             tuple(m["path"] for m in mounts),
-            frozenset((str(m["id"]), str(m["dev"])) for m in mounts if m.get("id") and m.get("dev")),
+            frozenset(i for m in mounts if (i := mount_identity(m)) is not None),
             frozenset(r["sid"] for r in records),
             re.compile(re.escape(key) + r"-[0-9a-f]{8}"),
         )
@@ -85,7 +85,7 @@ class _Recorded:
         parts = path.split("/")
         return (
             any(path == p or path.startswith(p.rstrip("/") + "/") for p in self.paths)
-            or (mount["id"], mount["dev"]) in self.identities
+            or mount_identity(mount) in self.identities
             or any(part in self.sids or self.key_dir.fullmatch(part) for part in parts)
         )
 
@@ -121,7 +121,8 @@ class SandboxProbe:
 
     `resource_gone` answers exactly True only when docker lists no container and no network carrying the lease key's
     label, and the whole mount table shows no mount of the lease. A mount is the lease's by identity, not by where it is
-    now: the sandbox records the mount id and device of each mount it makes, with its path, in a file under the work
+    now: the sandbox records the mount id, device, source and type of each mount it makes (`hostops.mount_identity`),
+    with its path, in a file under the work
     root (`sandbox.MOUNT_RECORDS`), and the probe matches the table against those records, so a directory that was
     relocated or kept as evidence is still seen. A directory of the lease's sandbox id anywhere in a mount's path counts
     too. Anything it cannot read or ask, a record included, is False, so the key stays quarantined. It reads and never

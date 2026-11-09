@@ -345,6 +345,15 @@ def parse_mountinfo(mountinfo: str) -> list[dict[str, str]]:
     return out
 
 
+def mount_identity(mount: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
+    """What a mount is wherever it is now (C19): the id the kernel gave it, its device, its source and its file system
+    type, as mountinfo shows them (`parse_mountinfo`). Renaming or moving the directory above it changes none of them.
+    None for a recorded mount that has no identity: registered before it was made, and never made."""
+    if not mount.get("id"):
+        return None
+    return (str(mount["id"]), str(mount.get("dev")), str(mount.get("source")), str(mount.get("fstype")))
+
+
 def mounted_points(mountinfo: str) -> set[str]:
     """Every mount point in a mountinfo table; `MountTableError` when the table cannot be shown whole."""
     return {m["mountpoint"] for m in parse_mountinfo(mountinfo)}

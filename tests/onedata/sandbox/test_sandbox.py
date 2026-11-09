@@ -574,6 +574,27 @@ def test_c19_the_probe_finds_a_mount_by_its_recorded_identity_wherever_its_direc
     assert not (world.s.work_root / "_mounts" / f"{sbx.sid}.json").exists()  # the record goes with the sandbox
 
 
+def test_o15_c19_a_run_directory_moved_while_mounted_keeps_its_record_and_the_probe_not_true(world):
+    """O15, C19: a run directory moved while mounted takes its mounts to a path no pattern matches; the stop finds them
+    by the identity it recorded when each was made (mount id, source, type), anywhere in the whole mount table, so it
+    fails and keeps the record, and the probe does not say True. Moved back, the stop removes both."""
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    sbx = start(world, "isolated", lease_key=KEY)
+    record = world.s.work_root / "_mounts" / f"{sbx.sid}.json"
+    moved = world.tmp_path / "moved-away"
+    world.host.run(["mv", str(sbx.dir), str(moved)], 60, sudo=True)  # the mounts go with the directory
+    with pytest.raises(SandboxError):
+        sbx.stop()
+    assert record.exists()
+    probe = SandboxProbe(world.host, world.s)
+    assert probe.resource_gone(KEY, {}) is not True
+    world.host.run(["mv", str(moved), str(sbx.dir)], 60, sudo=True)
+    sbx.stop()
+    assert not record.exists()
+    assert probe.resource_gone(KEY, {}) is True
+
+
 def test_c19_a_mount_record_the_probe_cannot_read_is_unknown_and_not_proof(world):
     """C19: an unreadable or malformed record, of any lease, keeps every key from being shown gone."""
     from expcore_onedata.sandbox.provider import SandboxProbe
