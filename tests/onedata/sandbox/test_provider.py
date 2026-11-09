@@ -208,8 +208,9 @@ def test_o05_a_token_the_platform_cannot_vouch_for_refuses_the_run_before_any_co
 def test_c19_a_token_the_platform_lets_outlive_its_request_is_recorded_through_the_platforms_event_sink(
     stage, tmp_path
 ):
-    """C19: the platform hands back a token 50 s longer than asked. The run is refused before any container, and the
-    sink the sandbox platform was given receives `token_expiry_beyond_request` for the leased slot."""
+    """C19 with O12: the platform hands back a token 50 s longer than asked. The run is refused before any container,
+    and the sink the sandbox platform was given receives `token_expiry_beyond_request` for the leased slot, named by
+    its position and never by its configured name."""
     stage.fake.mint_hook = lambda user, caveats: [
         {**c, "validUntil": c["validUntil"] + 50} if c["type"] == "time" else c for c in caveats
     ]
@@ -217,7 +218,8 @@ def test_c19_a_token_the_platform_lets_outlive_its_request_is_recorded_through_t
     with pytest.raises(TokenRefused):
         run_launch(stage, "via-gate", lease)
     assert [kind for kind, _ in stage.events] == ["token_expiry_beyond_request"]
-    assert lease.key in stage.events[0][1]
+    assert f"slots[{stage.slots.keys_of(GROUP).index(lease.key)}]" in stage.events[0][1]
+    assert lease.key not in stage.events[0][1]
     assert not stage.host.containers
 
 

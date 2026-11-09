@@ -14,6 +14,10 @@ user. The core's lease pool (C19) holds the key for the attempt. The `ResourcePr
 `users.SlotProbe(journal, sandbox_gone=SandboxProbe(...).resource_gone)`: a key is freed only when no container,
 network or mount of the sandbox is left and the slot's tokens have ended, by their journalled expiry plus a margin.
 
+`SandboxPlatform` takes a required `events` (a change of interface): the platform's event sink, the one its
+tool-server launcher records through, so that the slots' minting can record `token_expiry_beyond_request`
+(`users.py`). It has no default, because a silent no-op would lose the event.
+
 Waits. Start and teardown (the token mint, the image checks, the containers, the stop) are each inside
 `ctx.infrastructure_wait("sandbox_lifecycle")`. What the agent's code does in the sandbox and its reads of data are the
 agent's own time and are never waits (see `codetool.py`).

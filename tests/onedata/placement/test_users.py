@@ -643,9 +643,9 @@ def mint_recording(slots, client, tmp_path, events):
 def test_c19_a_token_that_outlives_its_requested_expiry_records_the_event_with_the_slot_and_both_expiries(
     slots, client, tmp_path, slot_federation
 ):
-    """C19: the platform hands back a token 50 s longer than asked (ExpiryMismatch, a later expiry). Besides the
-    journal line, `token_expiry_beyond_request` is recorded once, naming the slot key and both expiries and never the
-    token."""
+    """C19 with O12: the platform hands back a token 50 s longer than asked (ExpiryMismatch, a later expiry). Besides
+    the journal line, `token_expiry_beyond_request` is recorded once, naming the slot by its position (`slots[i]`),
+    never by its configured name, with both expiries and never the token."""
     lengthen_every_token(slot_federation, 50)
     events = []
     lease, journal, requested, refused = mint_recording(slots, client, tmp_path, lambda *e: events.append(e))
@@ -653,7 +653,8 @@ def test_c19_a_token_that_outlives_its_requested_expiry_records_the_event_with_t
     assert journal.latest_expiry(lease.key) == requested + 50
     assert [kind for kind, _ in events] == [EVENT_EXPIRY_BEYOND_REQUEST] == ["token_expiry_beyond_request"]
     detail = events[0][1]
-    assert lease.key in detail
+    assert f"slots[{slots[1].keys_of(GROUP).index(lease.key)}]" in detail
+    assert lease.key not in detail
     assert str(requested) in detail
     assert str(requested + 50) in detail
     assert not any(value in detail for value in slot_federation.issued)

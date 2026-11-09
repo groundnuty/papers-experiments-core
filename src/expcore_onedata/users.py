@@ -54,8 +54,13 @@ operator clearing a slot after every crash mid-mint, and the trade was made for 
 was minted with (an `ExpiryMismatch` with a later expiry, or any other `DroppedToken` whose expiry is later) shows the
 platform disregarding the requested time caveat. After its journal line, `SlotTokens` records a
 `token_expiry_beyond_request` event through the platform's event sink (the one `toolserver.ToolServerLauncher` records
-`tool_plane_rights_changed` through) with the slot's lease key and both expiries, never the token. The sink is required,
-so the event cannot go unrecorded by an omission; a sink that fails does not hide the refusal, which is raised from it.
+`tool_plane_rights_changed` through) with the slot by its position (`slots[i]`, never its configured name, O12) and both
+expiries, never the token. A sink that fails does not hide the refusal, which is raised from it.
+
+**`events` is a required argument (a change of interface).** `SlotTokens(..., events=...)` and, through it,
+`sandbox.provider.SandboxPlatform(..., events=...)` take the platform's event sink and have no default: a silent
+no-op would lose the event, so a caller that built either without one must now pass the sink it gives the tool-server
+launcher.
 
 Users are created by the operator, not by this layer: there is no unscoped user creation or deletion here. The privileges
 a slot's users hold are checked, direct and effective, before every token is minted (`tokens.py`).
@@ -106,6 +111,10 @@ class Slots:
         if group != GROUP:
             raise ValueError(f"the platform declares the lease group {GROUP!r}, not {group!r}")
         return [slot.name for slot in self.slots]
+
+    def label(self, key: str) -> str:
+        """Name a slot for a message or an event by its position in the file, `slots[i]`, never by its name (O12)."""
+        return f"slots[{[slot.name for slot in self.slots].index(key)}]"
 
     def get(self, key: str) -> Slot:
         """Return the slot a lease key names."""
@@ -341,19 +350,20 @@ class SlotTokens:
             else:
                 self._journal.record(slot.name, "refused", refused.expires_at)
                 if refused.expires_at > valid_until:
-                    self._beyond_request(slot.name, valid_until, refused)
+                    self._beyond_request(self._slots.label(slot.name), valid_until, refused)
             raise
         latest = max((t for t in (tokens.data_path, tokens.tool_server) if t is not None), key=lambda t: t.expires_at)
         self._journal.record(slot.name, latest.plane.value, latest.expires_at, mint=mint)
         return tokens
 
-    def _beyond_request(self, slot: str, requested: int, refused: DroppedToken) -> None:
-        """Record that the platform gave a token a later expiry than it was minted with: the slot's lease key and both
-        expiries, never the token. A sink that fails raises the refusal from its error, so neither is lost."""
+    def _beyond_request(self, label: str, requested: int, refused: DroppedToken) -> None:
+        """Record that the platform gave a token a later expiry than it was minted with: the slot by its position label
+        and both expiries, never the slot's name or the token. A sink that fails raises the refusal from its error, so
+        neither is lost."""
         examined = refused.expires_at
         shown = int(examined) if examined is not None and float(examined).is_integer() else examined
         detail = (
-            f"slot {slot}: a token minted to expire at {requested} examined as expiring at {shown}, later than asked;"
+            f"{label}: a token minted to expire at {requested} examined as expiring at {shown}, later than asked;"
             " the platform disregarded the requested time caveat"
         )
         try:
