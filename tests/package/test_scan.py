@@ -390,3 +390,16 @@ def test_k03_a_heading_above_an_encoded_block_does_not_hide_it():
     without its first line and line by line."""
     assert found({"attachment.txt": b"Payload\n" + base64.b64encode(zlib.compress(TEXT))})
     assert found({"attachment.txt": b"Payload\n" + base64.encodebytes(zlib.compress(TEXT * 8))})
+
+
+def test_k03_a_damaged_zlib_stream_with_bytes_after_it_is_refused():
+    """K03: the check of a deflate stream is read where the stream ends, so bytes after the trailer (a newline) do
+    not hide a check that fails."""
+    broken = bytearray(zlib.compress(TEXT))
+    broken[-1] ^= 1
+    refused({"record.json": b'{"blob": "' + b64(bytes(broken) + b"\n") + b'"}\n'}, "check fails")
+
+
+def test_k03_several_caption_lines_above_an_encoded_block_do_not_hide_it():
+    """K03: a joined run is also decoded from each line whose width differs from the one before it."""
+    assert found({"attachment.txt": b"Experiment\nResults\nPayload\n" + base64.b64encode(zlib.compress(TEXT))})

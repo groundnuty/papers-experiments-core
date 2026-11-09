@@ -95,6 +95,7 @@ _KNOWN = (  # kinds that are refused, named so the author knows what was found; 
 _BACKSLASH = re.compile(r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2}))")
 _CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 MIN_RUN = 16  # base64 and hex runs from this many characters are decoded
+MAX_HEADINGS = 8  # the most leading lines a joined run is also decoded without
 LONG_RUN = 40  # a run this long that looks compressed but fails to decompress refuses its file
 _SEGMENT = re.compile(r"[A-Za-z0-9+/_-]+(?:={1,2})?")  # one maximal run of the base64 alphabet; no backtracking
 _LINE_BREAK = re.compile(r"[ \t]*\r?\n[ \t]*")  # what may join two lines of one wrapped run
@@ -192,13 +193,14 @@ def _inflate(data: bytes, label: str, budget: _Budget) -> bytes:
     except zlib.error:
         # Deflate data whose trailing check fails is a broken stream, refused like one cut short. It is told from data
         # that is not deflate at all by decompressing without the four-byte trailer: genuine deflate ends exactly there.
-        probe = zlib.decompressobj(-zlib.MAX_WBITS)  # raw deflate, between the two-byte header and the trailer
+        probe = zlib.decompressobj(-zlib.MAX_WBITS)  # raw deflate after the two-byte header, to its final block
         try:
-            partial = probe.decompress(data[2:-4], limit + 1)
+            partial = probe.decompress(data[2:], limit + 1)
         except zlib.error:
             partial = b""
         budget.total += len(partial)
-        if partial and probe.eof and not probe.unused_data:
+        trailer = probe.unused_data[:4]
+        if partial and probe.eof and len(trailer) == 4 and int.from_bytes(trailer, "big") != zlib.adler32(partial):
             raise _Broken(label, "refused, it fails to decompress (a zlib stream whose check fails)") from None
         raise
     budget.total += len(out)
@@ -301,17 +303,17 @@ def _decode_base64(run: str) -> bytes | None:
 
 def _runs(text: str) -> Iterator[tuple[int, str]]:
     """Maximal runs of the base64 alphabet, in one linear pass; a run wrapped over lines (single line breaks, each
-    after a line without padding) is joined into one. A joined run is also given without its first line and without
-    its first two (a heading such as `Payload` above an encoded block would shift its alignment), so each character is
-    in at most three runs."""
+    after a line without padding) is joined into one. A joined run is also given from each line whose width differs
+    from the line before it, up to `MAX_HEADINGS` (caption lines above an encoded block would shift its alignment)."""
 
     def flush(parts: list[tuple[int, str]]) -> Iterator[tuple[int, str]]:
         yield parts[0][0], "".join(part for _, part in parts)
-        # Without one or two heading lines: a line is a heading only when its length differs from the line after it,
-        # since the lines of a wrapped block are all one width, so a plain wrapped block is decoded once.
-        for skip in (1, 2):
-            if len(parts) > skip and len(parts[skip - 1][1]) != len(parts[skip][1]):
-                yield parts[skip][0], "".join(part for _, part in parts[skip:])
+        # Also from every line whose width differs from the line before it, up to MAX_HEADINGS of them: the lines of
+        # a wrapped block are all one width, so a plain block is decoded once, and caption lines above an encoded
+        # block (each of its own width) do not shift its alignment.
+        skips = [k for k in range(1, len(parts)) if len(parts[k - 1][1]) != len(parts[k][1])][:MAX_HEADINGS]
+        for skip in skips:
+            yield parts[skip][0], "".join(part for _, part in parts[skip:])
 
     parts: list[tuple[int, str]] = []
     end = 0
