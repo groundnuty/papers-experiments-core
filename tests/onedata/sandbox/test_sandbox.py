@@ -614,10 +614,11 @@ def test_c19_a_mount_record_without_a_full_identity_is_unknown_and_keeps_the_lea
     assert probe.resource_gone("login-data2", {}) is True
 
 
-def test_c19_a_start_whose_new_mount_cannot_be_identified_fails_and_its_teardown_proves_the_path_clear(world, caplog):
+def test_c19_a_mount_never_identified_holds_its_lease_until_an_operator_clears_its_record(world, caplog, capsys):
     """C19: a mount whose identity could not be read when it was made fails the start; the teardown unmounts it by its
-    path, shows that path clear in the whole table, and only then removes the record, saying so by position, so a
-    failed start does not hold its lease for ever and an unidentified mount is never left out unseen."""
+    path but never removes its record on a path check, so the probe keeps the lease held. An operator who has verified
+    that nothing of it is mounted clears the record with the mount-record tool, which names it by id, and only then is
+    the lease shown gone."""
     from expcore_onedata.sandbox.provider import SandboxProbe
 
     original, reads = world.host.read_text, []
@@ -632,9 +633,22 @@ def test_c19_a_start_whose_new_mount_cannot_be_identified_fails_and_its_teardown
     with caplog.at_level("ERROR"), pytest.raises(SandboxError, match="identity of a new mount"):
         start(world, "isolated", lease_key=KEY)
     assert not world.host.mounts
-    assert not list((world.s.work_root / "_mounts").glob("*.json"))
-    assert "mount 0 of the record had no identity" in caplog.text
-    assert SandboxProbe(world.host, world.s).resource_gone(KEY, {}) is True
+    records = list((world.s.work_root / "_mounts").glob("*.json"))
+    assert len(records) == 1  # kept: a path check never removes it
+    probe = SandboxProbe(world.host, world.s)
+    assert probe.resource_gone(KEY, {}) is False
+    from expcore_onedata.sandbox import mountrecords  # the operator's tool
+
+    record = records[0]
+    record_id = record.stem.rsplit("-", 1)[-1]
+    assert mountrecords.main(["list"], work_root=world.s.work_root, host=world.host) == 0
+    assert f"{record_id} mounts=1 unidentified=1 in_table=0" in capsys.readouterr().out
+    assert mountrecords.main(["clear", record_id], work_root=world.s.work_root, host=world.host) == 2  # not verified
+    assert record.exists()
+    cleared = mountrecords.main(["clear", record_id, "--verified"], work_root=world.s.work_root, host=world.host)
+    assert cleared == 0
+    assert not record.exists()
+    assert probe.resource_gone(KEY, {}) is True
 
 
 def test_c19_a_mount_record_the_probe_cannot_read_is_unknown_and_not_proof(world):

@@ -127,7 +127,8 @@ class SandboxProbe:
     root (`sandbox.MOUNT_RECORDS`), and the probe matches the table against those records, so a directory that was
     relocated or kept as evidence is still seen. A directory of the lease's sandbox id anywhere in a mount's path counts
     too. Anything it cannot read or ask, a record included, is False, so the key stays quarantined; so is a recorded
-    mount of the lease without its full identity, which could be anywhere. It reads and never
+    mount of the lease without its full identity, which could be anywhere: such a record holds the key until an
+    operator has verified that nothing of it is mounted and cleared it (`mountrecords`, its procedure). It reads and never
     removes: the sandbox's own stop, the next start's retry and the orphan reaper remove. While a start thread of the key
     is still running (a cancelled launch that gave up waiting for it) nothing is gone yet, whatever the reads show.
     """

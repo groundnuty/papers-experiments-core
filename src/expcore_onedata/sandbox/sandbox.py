@@ -328,11 +328,10 @@ class DockerSandbox:
     def _drop_mount_record(self) -> str | None:
         """Remove the record once nothing it names can be live (C19): the whole mount table, read now, shows none of
         its identities, wherever those mounts are, never judged by a path. A table that cannot be read, or an identity
-        in it, keeps the record, and the reason the sandbox is not gone is returned. A mount without an identity exists
-        only in a start that failed (its mount command failed, or its table could not be read: `_note_mounted`) and was
-        torn down at once: it has nothing to look for but its own path, so the record goes only when nothing is
-        mounted at or under that path either, and the log names it by position. The probe never leaves such a mount
-        out (`SandboxProbe`): a record kept with one would hold its lease for ever."""
+        in it, keeps the record, and the reason the sandbox is not gone is returned. A mount that was never identified
+        (its mount command failed, or its table could not be read when it was made: `_note_mounted`) has nothing to look
+        for anywhere, and no path check shows where it went: its record is never removed here, so the probe keeps the
+        lease held until an operator has verified that nothing of it is mounted and cleared it (`mountrecords`)."""
         try:
             table = hostops.parse_mountinfo(self.host.read_text("/proc/self/mountinfo"))
         except (OSError, SandboxError) as e:
@@ -341,12 +340,13 @@ class DockerSandbox:
         ours = self._identities()
         if any(hostops.mount_identity(m) in ours for m in table):
             return "a mount of the sandbox is still in the mount table, wherever it is now"
-        unidentified = [n for n, e in enumerate(self._mount_log) if hostops.mount_identity(e) is None]
-        for n in unidentified:
-            path = self._mount_log[n]["path"].rstrip("/")
-            if any(m["mountpoint"] == path or m["mountpoint"].startswith(path + "/") for m in table):
-                return "a mount the sandbox could not identify is still at its path"
-            log.error("mount %d of the record had no identity: its path is shown clear in the whole table", n)
+        if any(hostops.mount_identity(e) is None for e in self._mount_log):
+            log.error(
+                "the mount record %s holds a mount that was never identified: it holds the lease until an operator "
+                "verifies nothing of it is mounted and clears it (python -m expcore_onedata.sandbox.mountrecords)",
+                self.sid.rsplit("-", 1)[-1],
+            )
+            return None
         try:
             self._record_file().unlink(missing_ok=True)
         except OSError as e:  # a record that stays only makes the probe look again, at a table with nothing of ours
