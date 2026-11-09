@@ -81,3 +81,17 @@ def test_every_listed_id_is_a_regression_of_the_list_with_its_title():
         if match:
             assert match.group(1) in titles, f"{match.group(1)} is not in docs/regressions.md"
             assert match.group(2) == titles[match.group(1)].rstrip(".").replace("|", "\\|")
+
+
+def test_every_id_in_the_regression_list_is_guaranteed_or_named_as_not_in_this_release():
+    """Every ID docs/regressions.md defines is either in the release's table of guaranteed regressions or named, in
+    parentheses, on its "Not in this release" line, so no regression is silently left out of a release."""
+    defined = re.findall(r"^\*\*([A-Z]\d{2})\. ", (ROOT / "docs" / "regressions.md").read_text(encoding="utf-8"), re.M)
+    assert defined, "no regression IDs found in docs/regressions.md"
+    entry = release(current_version())
+    not_in = next((line for line in entry.splitlines() if line.startswith("- Not in this release:")), "")
+    deferred = set(re.findall(r"\b([A-Z]\d{2})\b", not_in))
+    unaccounted = [i for i in defined if i not in listed(current_version()) and i not in deferred]
+    assert not unaccounted, f"neither guaranteed nor named as not in this release: {', '.join(unaccounted)}"
+    both = sorted(set(listed(current_version())) & deferred)
+    assert not both, f"both guaranteed and named as not in this release: {', '.join(both)}"
