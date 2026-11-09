@@ -7,9 +7,11 @@ import gzip
 import hashlib
 import io
 import lzma
+import random
 import sqlite3
 import struct
 import tarfile
+import time
 import zipfile
 import zlib
 
@@ -333,3 +335,37 @@ def test_k03_refused_files_under_a_redacted_directory_are_each_named_by_position
         f"file 2 (path sha256 {hashlib.sha256(first.encode()).hexdigest()[:12]})",
         f"file 3 (path sha256 {hashlib.sha256(second.encode()).hexdigest()[:12]})",
     ]
+
+
+def test_k03_a_long_base64_run_that_looks_compressed_but_fails_to_decompress_refuses_the_file():
+    """K03: a decoded run with a gzip, bzip2 or xz magic, or a zlib header, that fails to decompress is treated as an
+    archive member that fails: here a truncated gzip in base64 inside JSON."""
+    truncated = gzip.compress(TEXT * 4, mtime=0)[:-12]
+    refused({"record.json": b'{"blob": "' + b64(truncated) + b'"}\n'}, "fails to decompress")
+
+
+def test_k03_runs_from_16_characters_are_decoded_and_short_ones_refused_for_nothing_weak():
+    """K03: a 28-character base64 run of a zlib stream is decoded and decompressed; a short run is never refused for
+    a magic of fewer than four bytes, nor for a zlib header that does not inflate."""
+    assert found({"config.json": b'{"host":"eJyrSizKyy/JKM9MzgYAHJYEtQ=="}\n'})
+    weak = base64.b64encode(b"\x1f\x9d" + bytes(10)).decode()
+    no_inflate = base64.b64encode(b"\x78\x9c" + b"\xff" * 10).decode()
+    assert found({"x.json": f'{{"a": "{weak}", "b": "{no_inflate}"}}\n'.encode()}) == []
+
+
+@pytest.mark.parametrize("size", [17 * 1024, 2**20])
+def test_k03_base64_output_is_scanned_in_linear_time(size):
+    """K03: the run finder is one linear pass: base64 output of 17 KB and of 1 MB, wrapped as base64 tools wrap it,
+    scans in well under two seconds."""
+    output = base64.encodebytes(random.Random(size).randbytes(size * 3 // 4))
+    start = time.perf_counter()
+    scan_tokens({"out.b64": output}, HASHES)
+    assert time.perf_counter() - start < 2
+
+
+def test_k03_a_decoded_run_that_is_text_is_read_as_text_and_never_refused_for_a_signature():
+    """K03: only decoded bytes that are not text are checked against format signatures: a sentence about the PDF
+    header, in base64, is text, read as text, and refuses nothing."""
+    sentence = b"%PDF- is the standard PDF header that every PDF file starts with, by convention."
+    assert found({"notes.md": b"Encoded: " + b64(sentence) + b"\n"}) == []
+    assert found({"notes.md": b"Encoded: " + b64(sentence + b" " + TEXT) + b"\n"})

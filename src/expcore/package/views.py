@@ -7,10 +7,11 @@ defend against deliberate concealment, and they never read text inside images.
 `streams(path, data)` classifies a file and everything inside it, and stops at the first refusal. A stream may be:
 - text: valid UTF-8 without NUL bytes, or UTF-16 with a byte-order mark, and not a PDF or PostScript file (`%PDF-`,
   `%!PS`), which are refused even when they are pure ASCII. Every base64 run (either alphabet, padding optional, also
-  wrapped over lines as in a `data:` URI) and every hex run of 40 characters or more is decoded, and what it decodes
-  to is walked like any other stream. A run that decodes to bytes of no recognisable kind (a digest, an identifier
-  that only looks like base64) yields those bytes, read raw, and refuses nothing; one that decodes to a kind the
-  checks cannot read refuses the file;
+  wrapped over lines as in a `data:` URI) and every hex run of 16 characters or more is decoded (runs are found in
+  one linear pass), and what it decodes to is classified by `_walk_decoded`: text is read as text, compressed bytes
+  are opened, and bytes of no recognisable kind (a digest, an identifier that only looks like base64) are read for
+  their printable strings and refuse nothing. A decoded run that is not text and has a format magic of four bytes or
+  more, or a long run that looks compressed and fails to decompress, refuses the file;
 - an SQLite database (its magic header): its bytes are read raw, and the database is deserialised into memory,
   read-only, and every value read: the schema's SQL and the TEXT values of each column as text, every BLOB as a byte
   stream under the same allow list, a zlib BLOB decompressed;
@@ -28,8 +29,9 @@ hash (`[[opaque]]` in package.toml) is never given to this module.
 `views(stream)` is what the scans read in a stream. Text is read as it is and decoded: continuations (a backslash, the
 newline and the indentation after it) joined and backslash escapes (`\\xHH`, `\\uXXXX`, `\\UXXXXXXXX`) undone, HTML
 entities and percent-escapes undone, the strings of a JSON or TOML file as parsed, and all of these together until
-nothing changes. A database's or an archive's own bytes, and decoded bytes of no recognisable kind, are read as UTF-8
-(leniently), as UTF-16 in both byte orders and alignments, and as raw bytes.
+nothing changes; identical views are read once. A database's or an archive's own bytes are read as UTF-8
+(leniently), as UTF-16 in both byte orders and alignments, and as raw bytes; other bytes (a decoded run, a compressed
+blob) for their strings of name characters, in UTF-8 and UTF-16.
 """
 
 import base64
@@ -92,9 +94,16 @@ _KNOWN = (  # kinds that are refused, named so the author knows what was found; 
 )
 _BACKSLASH = re.compile(r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2}))")
 _CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
-_BASE64_RUN = re.compile(r"[A-Za-z0-9+/_-]{40,}={0,2}")
-_BASE64_WRAPPED = re.compile(r"(?:[A-Za-z0-9+/_-]{40,}={0,2}[ \t]*\r?\n[ \t]*)+[A-Za-z0-9+/_-]+={0,2}")
-_HEX_RUN = re.compile(r"[0-9a-fA-F]{40,}")
+MIN_RUN = 16  # base64 and hex runs from this many characters are decoded
+LONG_RUN = 40  # a run this long that looks compressed but fails to decompress refuses its file
+_SEGMENT = re.compile(r"[A-Za-z0-9+/_-]+(?:={1,2})?")  # one maximal run of the base64 alphabet; no backtracking
+_LINE_BREAK = re.compile(r"[ \t]*\r?\n[ \t]*")  # what may join two lines of one wrapped run
+_HEX_SUB = re.compile(r"[0-9a-fA-F]{16,}")
+# The strings of bytes that are probably random, as `strings` finds them but only of the characters a name can be
+# made of (letters, digits, `_ . -`, a space, and any non-ASCII letter in UTF-8), in UTF-8 and in UTF-16 either way.
+_UTF8_STRINGS = re.compile(rb"(?:[A-Za-z0-9_.\- ]|[\xc2-\xf4][\x80-\xbf]{1,3}){4,}")
+_UTF16LE_STRINGS = re.compile(rb"(?:[A-Za-z0-9_.\- ]\x00){4,}")
+_UTF16BE_STRINGS = re.compile(rb"(?:\x00[A-Za-z0-9_.\- ]){4,}")
 _ERRORS = (OSError, EOFError, ValueError, RuntimeError, NotImplementedError, zipfile.BadZipFile, tarfile.TarError,
            lzma.LZMAError, zlib.error, sqlite3.Error)  # fmt: skip
 
@@ -184,8 +193,8 @@ def _inflate(data: bytes, label: str, budget: _Budget) -> bytes:
         if limit < MAX_STREAM_BYTES:
             raise _Exhausted(label)
         _refuse(label, f"over the cap of {MAX_STREAM_BYTES} bytes")
-    if not inflater.eof:
-        raise zlib.error("incomplete zlib stream")
+    if not inflater.eof:  # cut short, as opposed to data that is not deflate at all, which raises zlib.error
+        raise _Broken(label, "refused, it fails to decompress (a zlib stream cut short)")
     return out
 
 
@@ -277,19 +286,39 @@ def _decode_base64(run: str) -> bytes | None:
     return None
 
 
-def payloads(text: str) -> Iterator[tuple[str, bytes]]:
-    """Every base64 and hex run of a text, decoded, once each: (what it was, the bytes)."""
-    seen: set[bytes] = set()
-    candidates = [
-        *(("base64", m) for pattern in (_BASE64_RUN, _BASE64_WRAPPED) for m in pattern.finditer(text)),
-        *(("hex", m) for m in _HEX_RUN.finditer(text)),
-    ]
-    for kind, match in candidates:
-        run = match.group(0)
-        decoded = _decode_base64(run) if kind == "base64" else bytes.fromhex(run[: len(run) // 2 * 2])
-        if decoded and decoded not in seen:
-            seen.add(decoded)
-            yield f"{kind}@{match.start()}", decoded
+def _runs(text: str) -> Iterator[tuple[int, str]]:
+    """Maximal runs of the base64 alphabet, in one linear pass; a run wrapped over lines (single line breaks, each
+    after a line without padding) is joined into one."""
+    start, parts, end = 0, [], 0
+    for match in _SEGMENT.finditer(text):
+        if parts and not parts[-1].endswith("=") and _LINE_BREAK.fullmatch(text, end, match.start()):
+            parts.append(match.group(0))
+        else:
+            if parts:
+                yield start, "".join(parts)
+            start, parts = match.start(), [match.group(0)]
+        end = match.end()
+    if parts:
+        yield start, "".join(parts)
+
+
+def payloads(text: str) -> Iterator[tuple[str, bytes, bool]]:
+    """Every base64 run and every hex run of `MIN_RUN` characters or more, decoded, once each: (what it was, the
+    bytes, whether the run was long). Linear in the text."""
+    seen: dict[bytes, bool] = {}
+    for start, run in _runs(text):
+        found = []
+        if len(run) >= MIN_RUN:
+            found.append((f"base64@{start}", _decode_base64(run), len(run) >= LONG_RUN))
+        for match in _HEX_SUB.finditer(run):
+            digits = match.group(0)
+            found.append(
+                (f"hex@{start + match.start()}", bytes.fromhex(digits[: len(digits) // 2 * 2]), len(digits) >= LONG_RUN)
+            )
+        for where, decoded, long in found:
+            if decoded and decoded not in seen:
+                seen[decoded] = long
+                yield where, decoded, long
 
 
 def _texts_of(text: str) -> list[str]:
@@ -303,9 +332,57 @@ def _texts_of(text: str) -> list[str]:
 def _walk_text(label: str, data: bytes, text: str, depth: int, budget: _Budget) -> Iterator[Stream]:
     yield Stream(label, data, TEXT, text)
     for form in _texts_of(text):
-        for where, decoded in payloads(form):
+        for where, decoded, long in payloads(form):
             _spend(budget, label, len(decoded))
-            yield from _walk(f"{label}!({where})", decoded, depth + 1, budget, DECODED)
+            yield from _walk_decoded(f"{label}!({where})", decoded, depth + 1, budget, strict=long)
+
+
+def _walk_decoded(label: str, data: bytes, depth: int, budget: _Budget, *, strict: bool) -> Iterator[Stream]:
+    """Classify the bytes a base64 or hex run decodes to.
+
+    Most runs are digests, identifiers or words, not encodings, so what has no recognisable kind is only bytes, read
+    raw, and refuses nothing. Text is read as text, never refused for a signature (a sentence about `%PDF-` is
+    text). Bytes that are not text are refused for a format magic of four bytes or more. Compressed bytes (a gzip,
+    bzip2 or xz magic, a zip or tar archive, or a zlib header) are opened; when a long run (`strict`) fails to
+    decompress it refuses the file as a failing archive member does, except a zlib header followed by data that is
+    not deflate at all, which one random run in a thousand shows by chance: those bytes are read raw. A short run is
+    never refused for a failure. Below `MAX_DEPTH`, text is read but not decoded further, and anything to open is
+    refused when strict and read raw when not.
+    """
+    text = _text(data)
+    if text is not None:
+        if depth > MAX_DEPTH:
+            yield Stream(label, data, TEXT, text)
+            return
+        yield from _walk_text(label, data, text, depth, budget)
+        return
+    known = _known(data, strong_only=True)
+    if known:
+        _refuse(label, f"{known} content")
+    compression = _compression(data)
+    if compression == "gzip" and data[2:3] != b"\x08":  # a gzip header names deflate; two bytes alone are chance
+        compression = None
+    archive = compression is not None or data.startswith(_ZIP) or _is_tar(data)
+    if not archive and not _zlib(data):
+        yield Stream(label, data, BYTES)
+        return
+    if depth > MAX_DEPTH:
+        if strict:
+            _refuse(label, f"nested deeper than {MAX_DEPTH} levels")
+        yield Stream(label, data, BYTES)
+        return
+    try:
+        yield from _walk_binary(label, data, depth, budget, DECODED, compression, archive, strict=strict)
+    except _Broken:
+        if strict:
+            raise
+        yield Stream(label, data, BYTES)
+    except (_Refused, _Exhausted):
+        raise
+    except _ERRORS as error:
+        if strict and archive:
+            _refuse(label, f"it fails to decompress ({type(error).__name__})")
+        yield Stream(label, data, BYTES)
 
 
 def _sqlite_columns(data: bytes) -> Iterator[tuple[str, str | bytes]]:
@@ -338,11 +415,8 @@ def _sqlite_columns(data: bytes) -> Iterator[tuple[str, str | bytes]]:
 def _walk(label: str, data: bytes, depth: int, budget: _Budget, origin: str = FILE) -> Iterator[Stream]:
     """Classify one stream and walk what it holds (see the module docstring).
 
-    `origin` says where the stream came from. A FILE (a file or an archive member) and a BLOB are refused when they are
-    of no allowed kind; a BLOB that is a zlib stream is decompressed. A DECODED stream (a base64 or hex run) of no
-    recognisable kind is only bytes, read raw: most such runs are digests or names, not encodings; one that is a zlib
-    stream is decompressed, and one of a kind the checks cannot read, told by a magic of four bytes or more, is refused.
-    Below `MAX_DEPTH` only such raw bytes may be found; anything to walk further is refused.
+    `origin` says where the stream came from: a FILE (a file or an archive member) or a BLOB is refused when it is of
+    no allowed kind, and a BLOB that is a zlib stream is decompressed. A decoded run is `_walk_decoded`'s.
     """
     deep = depth > MAX_DEPTH
     if not data.startswith(_ZIP) and zipfile.is_zipfile(io.BytesIO(data)):
@@ -353,14 +427,9 @@ def _walk(label: str, data: bytes, depth: int, budget: _Budget, origin: str = FI
     text = _text(data)
     compression = _compression(data)
     archive = compression is not None or data.startswith(_ZIP) or _is_tar(data)
-    decoded = origin == DECODED
-    known = _known(data, strong_only=decoded)
+    known = _known(data, strong_only=False)
     if known and text is None:
         _refuse(label, f"{known} content")
-    walkable = text is not None or data.startswith(_SQLITE) or archive or (_zlib(data) and origin != FILE)
-    if decoded and not walkable:
-        yield Stream(label, data, BYTES)
-        return
     if deep:
         _refuse(label, f"nested deeper than {MAX_DEPTH} levels")
     if text is not None:
@@ -368,21 +437,22 @@ def _walk(label: str, data: bytes, depth: int, budget: _Budget, origin: str = FI
         return
     try:
         yield from _walk_binary(label, data, depth, budget, origin, compression, archive)
-    except _Broken:
-        if not decoded:
-            raise
-        yield Stream(label, data, BYTES)  # a run that only looked like compressed content: bytes, read raw
     except (_Refused, _Exhausted):
         raise
     except _ERRORS as error:
-        if decoded:  # a run that only looked like a container: bytes, read raw
-            yield Stream(label, data, BYTES)
-            return
         _refuse(label, f"it cannot be opened ({type(error).__name__})")
 
 
 def _walk_binary(
-    label: str, data: bytes, depth: int, budget: _Budget, origin: str, compression: str | None, archive: bool
+    label: str,
+    data: bytes,
+    depth: int,
+    budget: _Budget,
+    origin: str,
+    compression: str | None,
+    archive: bool,
+    *,
+    strict: bool = True,
 ) -> Iterator[Stream]:
     if data.startswith(_SQLITE):
         yield Stream(label, data, SQLITE)
@@ -395,7 +465,10 @@ def _walk_binary(
     if not archive and _zlib(data) and origin != FILE:
         inner = _inflate(data, f"{label}!(zlib)", budget)
         yield Stream(label, data, BYTES)
-        yield from _walk(f"{label}!(zlib)", inner, depth + 1, budget, origin)
+        if origin == DECODED:
+            yield from _walk_decoded(f"{label}!(zlib)", inner, depth + 1, budget, strict=strict)
+        else:
+            yield from _walk(f"{label}!(zlib)", inner, depth + 1, budget, origin)
         return
     if not archive:
         _refuse(label, _detected(data))
@@ -492,8 +565,26 @@ def _text_views(label: str, text: str) -> list[tuple[str, str]]:
     return [*views, ("decoded", _decoded(text))]
 
 
+def _strings_views(data: bytes) -> list[tuple[str, str]]:
+    """The printable strings of bytes that are probably random (a decoded run of no recognisable kind)."""
+    return [
+        ("strings", "\n".join(m.group(0).decode("utf-8", "replace") for m in _UTF8_STRINGS.finditer(data))),
+        ("strings-utf16le", "\n".join(m.group(0).decode("utf-16-le") for m in _UTF16LE_STRINGS.finditer(data))),
+        ("strings-utf16be", "\n".join(m.group(0).decode("utf-16-be") for m in _UTF16BE_STRINGS.finditer(data))),
+    ]
+
+
 def views(stream: Stream) -> list[tuple[str, str]]:
-    """What the scans read in one stream: text and its decodings, or a database's, archive's or decoded run's bytes."""
+    """What the scans read in one stream, each distinct view once: text and its decodings; a database's or an
+    archive's bytes under every encoding; the printable strings of other bytes (a decoded run, a compressed blob)."""
     if stream.text is not None:
-        return _text_views(stream.label, stream.text)
-    return _byte_views(stream.data)
+        found = _text_views(stream.label, stream.text)
+    elif stream.kind == BYTES:
+        found = _strings_views(stream.data)
+    else:
+        found = _byte_views(stream.data)
+    distinct: dict[str, str] = {}
+    for name, text in found:
+        if text not in distinct.values() or name in PARSED:
+            distinct.setdefault(name, text)
+    return list(distinct.items())
