@@ -43,10 +43,10 @@ stuck, and fails the start the same way instead of being skipped as a live run's
 
 **Baseline (O11).** While any injection is unsettled the federation is not in its baseline state, so no other run may
 start. An injector refuses to start, as `injector_failure`, while the journal holds an injection recovery could not
-settle (one a live injector holds included), and `SettledInjections` is a health check that fails for as long, to be
-composed with the platform's own (`SettledInjections(settings, inner=PlatformHealth(...))`), so the scheduler's gate
-holds back every run, whatever its condition. The platform's check alone would not: it reads only the declared support
-set, which need not hold the provider an outage takes down.
+settle (one a live injector holds included), and the platform's standard health check (`PlatformHealth`) fails for
+as long whenever platform.toml has a `[faults]` table, so the scheduler's gate holds back every run, whatever its
+condition, with nothing for a study to remember. Its comparison with the declared support set alone would not: that
+set need not hold the provider an outage takes down.
 
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.

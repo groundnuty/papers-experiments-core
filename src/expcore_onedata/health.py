@@ -17,6 +17,11 @@ An answer that cannot be read is unhealthy, never a crash and never a pass: any 
 exception, becomes `Health(False, reason)`. The reason names positions in the file (`providers[i]`), counts and the
 ids the federation reports, never a token, URL, host or configured name.
 
+When platform.toml has a `[faults]` table the check also fails, before it asks Onezone anything, while the fault
+injector's journal holds an unsettled injection (`expcore_onedata.fault_journal.SettledInjections`): a provider taken
+down for one condition's run, and not yet verifiably back, leaves the federation out of its baseline state for every
+other run, including runs of conditions that use no injector. The check is built in and cannot be left out.
+
 The check of the earlier study also read one known file back through its provider and compared its checksum with a study manifest. That
 belongs to the study (its data) and not to the platform, so a study adds it with its own check.
 
@@ -35,9 +40,11 @@ import time
 from collections.abc import Callable
 
 from expcore.campaign.healthgate import Health
-from expcore.config.loading import ConfigError
+from expcore.config.loading import ConfigError, load_toml
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.fault_journal import SettledInjections
+from expcore_onedata.fault_settings import load_faults
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, read_space
 from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
 from expcore_onedata.tokencheck import TokenRefused
@@ -102,6 +109,14 @@ def compare(view: SpaceView, config: PlatformConfig) -> Health:
     return Health(True, f"ok: the space is supported by exactly the {len(matched)} declared provider(s)")
 
 
+def _settled_injections(config: PlatformConfig) -> SettledInjections | None:
+    """The settled-injection check when platform.toml has a `[faults]` table, None when it has none; a table that is
+    not valid raises ConfigError here, so a platform with an injector never runs without the check."""
+    if "faults" not in load_toml(config.file):
+        return None
+    return SettledInjections(load_faults(config.file, config))
+
+
 class PlatformHealth:
     """The platform's `HealthCheck`; keep one for the campaign so that its token is reused until it nears its end, and
     the content type it measured at its first call is kept for the campaign."""
@@ -120,6 +135,7 @@ class PlatformHealth:
         self._service = config.principals.service
         self._token: MintedToken | None = None
         self._lock = threading.Lock()
+        self._settled = _settled_injections(config)
         self._gate = PreCampaignHealth(self._space, lambda: content_type_check(config, client))
 
     def _current_token(self) -> MintedToken:
@@ -141,6 +157,10 @@ class PlatformHealth:
     def _space(self) -> Health:
         """The space as Onezone reports it, against the declared support set; never raise."""
         try:
+            if self._settled is not None:
+                settled = self._settled()
+                if not settled.ok:
+                    return settled
             view = read_space(self._client, self._current_token().reveal(), self._config.space.id)
             return compare(view, self._config)
         except _SAFE as error:

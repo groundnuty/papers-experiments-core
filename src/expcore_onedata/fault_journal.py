@@ -238,9 +238,9 @@ class InjectionJournal:
 class SettledInjections:
     """A health check that fails while the fault journal holds an unsettled injection, then answers as `inner` does.
 
-    Compose it with the platform's check (`SettledInjections(settings, inner=PlatformHealth(...))`) so the scheduler's
-    gate holds back every run while a provider is down or unverified (`expcore_onedata.faults`, Baseline). Its detail
-    names targets by their labels only.
+    `PlatformHealth` runs it first, built in, whenever platform.toml has a `[faults]` table, so the scheduler's gate
+    holds back every run while a provider is down or unverified (`expcore_onedata.faults`, Baseline). Its detail names
+    targets by their labels only.
     """
 
     def __init__(self, settings: Any, inner: HealthCheck | None = None) -> None:
