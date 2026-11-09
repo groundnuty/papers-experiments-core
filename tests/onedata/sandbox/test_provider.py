@@ -15,7 +15,7 @@ from sandbox_support import FAST
 from expcore.campaign.lease import LeasePool
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, SandboxError
-from expcore_onedata.sandbox.hostops import CmdResult, fuse_mounts
+from expcore_onedata.sandbox.hostops import CmdResult, MountTableError, fuse_mounts, parse_mountinfo
 from expcore_onedata.sandbox.provider import DATA_USERS, SandboxPlatform, SandboxProbe
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.tokens import TokenRefused
@@ -300,6 +300,19 @@ def test_c19_a_mount_table_that_cannot_be_shown_whole_is_not_proof(stage, tmp_pa
     assert probe.resource_gone(KEY, {}) is True  # the control: the whole table, with the sandbox gone
     original = stage.host.read_text
     stage.host.read_text = lambda path: table if str(path) == "/proc/self/mountinfo" else original(path)
+    assert probe.resource_gone(KEY, {}) is False
+
+
+def test_c19_a_root_line_cut_before_its_super_options_makes_the_whole_table_unknown(stage, tmp_path):
+    """C19: a table cut off to its root line, and that line cut before its superblock options, is not a table: every
+    line needs the file system type, the source and the super options after its separator, so the probe says no."""
+    _, probe = probe_world(stage, tmp_path)
+    assert probe.resource_gone(KEY, {}) is True  # the control: the whole table, with the sandbox gone
+    cut = "1 0 8:1 / / rw - ext4 /dev/root\n"
+    with pytest.raises(MountTableError):
+        parse_mountinfo(cut)
+    original = stage.host.read_text
+    stage.host.read_text = lambda path: cut if str(path) == "/proc/self/mountinfo" else original(path)
     assert probe.resource_gone(KEY, {}) is False
 
 

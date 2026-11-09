@@ -279,6 +279,7 @@ class DockerHost:
 _OCTAL = re.compile(r"\\([0-7]{3})")
 _MOUNTINFO_ID = re.compile(r"\d+")
 _MOUNTINFO_DEV = re.compile(r"\d+:\d+")
+_MOUNTINFO_TAG = re.compile(r"[a-z_]+(?::\S+)?")  # an optional field: shared:N, master:N, propagate_from:N, unbindable
 
 
 class MountTableError(SandboxError):
@@ -290,41 +291,55 @@ def _unescape(field: str) -> str:
     return _OCTAL.sub(lambda m: chr(int(m.group(1), 8)), field)
 
 
+def _mountinfo_row(line: str) -> dict[str, str] | None:
+    """One mountinfo line, or None when it is not whole. Fields are separated by single spaces (a space in a path is
+    `\\040`): an id, a parent id, `major:minor`, a root, an absolute mount point, the mount options, any optional fields
+    (`tag[:value]`), the `-` separator, then exactly the file system type, the source and the superblock options. The
+    source may be empty, as the kernel prints a mount made without one; the type and the super options never are."""
+    head, sep, tail = line.partition(" - ")
+    fields, rest = head.split(" "), tail.split(" ")
+    whole = (
+        sep
+        and len(fields) >= 6
+        and _MOUNTINFO_ID.fullmatch(fields[0])
+        and _MOUNTINFO_ID.fullmatch(fields[1])
+        and _MOUNTINFO_DEV.fullmatch(fields[2])
+        and fields[3]
+        and fields[4].startswith("/")
+        and fields[5]
+        and all(_MOUNTINFO_TAG.fullmatch(tag) for tag in fields[6:])
+        and len(rest) == 3
+        and rest[0]
+        and rest[2]
+    )
+    if not whole:
+        return None
+    return {
+        "id": fields[0],
+        "mountpoint": _unescape(fields[4]),
+        "dev": fields[2],
+        "root": _unescape(fields[3]),
+        "fstype": rest[0],
+        "source": rest[1],
+    }
+
+
 def parse_mountinfo(mountinfo: str) -> list[dict[str, str]]:
     """Every mount of a mountinfo table, strictly: `{"id", "mountpoint", "dev", "root", "fstype", "source"}` each.
 
     A table that cannot be shown whole is unknown, and a caller that reads "no mount of mine" from it would free a
-    resource that is still mounted (C19). So an empty table, any line that does not parse (an id and a parent, a
-    `major:minor`, a root, a mount point, the options, the `-` separator, the file system type and its source), or a
-    table without the root mount (the sanity marker: every real table has one, a cut-off one may not) raises
-    `MountTableError`.
+    resource that is still mounted (C19). So an empty table, any line that is not whole (`_mountinfo_row`: a line cut
+    before its superblock options is not), or a table without the root mount (the sanity marker: every real table has
+    one, a cut-off one may not) raises `MountTableError`.
     """
     if not mountinfo.strip():
         raise MountTableError("the mount table is empty")
     out = []
     for number, line in enumerate(mountinfo.splitlines(), 1):
-        head, sep, tail = line.partition(" - ")
-        fields, rest = head.split(), tail.split()
-        ok = (
-            sep
-            and len(fields) >= 6
-            and len(rest) >= 2
-            and _MOUNTINFO_ID.fullmatch(fields[0])
-            and _MOUNTINFO_ID.fullmatch(fields[1])
-            and _MOUNTINFO_DEV.fullmatch(fields[2])
-        )
-        if not ok:
+        row = _mountinfo_row(line)
+        if row is None:
             raise MountTableError(f"line {number} of the mount table does not parse")
-        out.append(
-            {
-                "id": fields[0],
-                "mountpoint": _unescape(fields[4]),
-                "dev": fields[2],
-                "root": _unescape(fields[3]),
-                "fstype": rest[0],
-                "source": rest[1],
-            }
-        )
+        out.append(row)
     if not any(m["mountpoint"] == "/" for m in out):
         raise MountTableError("the mount table has no root mount: it may be cut off")
     return out
