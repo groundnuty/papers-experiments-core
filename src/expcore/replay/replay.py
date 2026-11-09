@@ -45,7 +45,7 @@ from expcore.loop.config import AgentConfig
 from expcore.loop.toolbox import ToolBox
 from expcore.plugin import ToolSpec
 from expcore.prompt.templates import sha256_of
-from expcore.records.build import PromptText, RunIdentity, build_record
+from expcore.records.build import PromptText, RunIdentity, _build_record
 from expcore.records.digest import digest
 from expcore.records.record import RunRecord
 from expcore.records.recording import RecordingBackend
@@ -160,7 +160,7 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
         raise halt.divergence from None
     _check_used(backend, provider, clock)
     try:
-        replayed = build_record(
+        replayed = _build_record(
             result,
             recording,
             identity=RunIdentity(rec.run_key, rec.factors, rec.attempt),

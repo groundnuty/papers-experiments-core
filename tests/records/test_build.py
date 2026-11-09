@@ -335,3 +335,20 @@ def test_R02_a_declared_kind_outside_the_registry_is_refused_when_the_record_is_
     """R02: adds that a typo in the declaration cannot reach a record."""
     with pytest.raises(RecordError, match="unknown infrastructure kind 'wifi' in treatment_kinds"):
         record_run(DOWN, ECHO, record_options={"treatment_kinds": ["wifi"]})
+
+
+def test_c01_a_caller_building_its_own_record_cannot_choose_an_older_version():
+    """C01: build_record, like record_attempt, always writes the current version; a caller that ran the loop itself
+    cannot apply an older treatment rule to a new run. Only a replay of an older record uses its own version."""
+    from expcore.loop.agent_loop import run_agent
+    from expcore.loop.toolbox import ToolBox
+    from expcore.records.schema import CURRENT
+
+    config = make_config()
+    recording = RecordingBackend(StubAdapter(["done"]))
+    box = ToolBox([FakeProvider(ECHO)], cap_chars=config.limits.output_cap_chars)
+    result = asyncio.run(run_agent(recording, box, "s", "u", config, clock=FakeClock(), sleep=never))
+    common = {"identity": IDENTITY, "system": "s", "user": "u", "specs": [], "code": CODE}
+    with pytest.raises(TypeError, match="current record version"):
+        build_record(result, recording, schema_version="expcore-record/1", **common)
+    assert build_record(result, recording, **common).schema_version == CURRENT
