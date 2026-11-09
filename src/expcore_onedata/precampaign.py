@@ -16,9 +16,10 @@ that cannot be measured (the file is missing, the provider fails), refuses the c
 detail names the problem, the provider by its position and the type measured, never a configured value.
 
 Where it runs. The core has no hook at a campaign's start, and a study's `build` must have no side effects, so the
-check runs at the first call of the health gate, which the core makes before any attempt starts: `PreCampaignHealth`
-wraps the platform's `HealthCheck`, runs the checks once, and from then on either answers as the platform's check does
-or, when a check refused, answers that refusal at every call, without measuring again. The core then holds every run
+check runs at the first call of the health gate, which the core makes before any attempt starts. The platform's
+standard health check composes it itself (`health.PlatformHealth`), with no opt-out: `PreCampaignHealth` wraps the
+space check, runs the checks once, and from then on either answers as the space check does or, when a check refused,
+answers that refusal at every call, without measuring again. The core then holds every run
 (a closed health gate, C11) and records the refusal as the outage's detail; the attempt whose pre-run check found it is
 recorded as that outage's, as for any failed pre-run check. The same check is the day-0 check `content_type`, which an
 operator runs before starting a campaign, and which says failed, passed or unknown.

@@ -174,3 +174,77 @@ def test_o05_the_check_is_a_day0_check_too(platform_file, fake, tmp_path):
     found = result()
     assert found.ok is False
     assert_clean(found.summary)
+
+
+SMALL = {"tasks": ("task-a",), "seeds": (1,)}
+
+
+def standard_gate(config, client):
+    """The platform's standard health check, as a study gets it, with nothing composed around it."""
+    from platform_support import NOW
+
+    from expcore_onedata.health import PlatformHealth
+    from expcore_onedata.tokens import TokenIssuer
+
+    return PlatformHealth(config, client, TokenIssuer(client, config, clock=lambda: NOW), clock=lambda: NOW)
+
+
+def run_campaign(tmp_path, health, *, settle_s):
+    """Run a small campaign on the core's scheduler with `health` as its only health check, for at most `settle_s`
+    after its gate first closes; return the executor and the outage records."""
+    import threading
+    import time
+
+    from scheduler_support import FakeExecutor, build, settings_for
+
+    from expcore.campaign.healthgate import META, parse
+
+    executor = FakeExecutor()
+    settings = settings_for(recheck_s=0.01, health_timeout_s=5)
+    with build(tmp_path / "campaign", executor=executor, settings=settings, health=health, plan=SMALL) as scheduler:
+        worker = threading.Thread(target=scheduler.run, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 20
+        while worker.is_alive() and not scheduler.gate.closed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        worker.join(settle_s)  # a campaign the gate admits ends by itself; one it holds is still waiting
+        scheduler.stop.set()
+        worker.join(20)
+        assert not worker.is_alive()
+        outages = parse(scheduler.store.get_meta(META)) or []
+    return executor, outages
+
+
+def test_o05_a_study_with_only_the_standard_gate_and_a_wrong_type_never_admits_a_run(config, client, seeded, tmp_path):
+    """O05, O11: a study that uses the platform's standard health check and nothing else, with a REST data path, gets
+    the content-type check without asking for it: with a wrong type the gate closes at the first pre-run check and
+    stays closed through every recheck, so the executor never runs, and the type is measured once for the campaign."""
+    seeded.content_type = "application/json"
+    executor, outages = run_campaign(tmp_path, standard_gate(config, client), settle_s=0.5)
+    assert executor.requests == []
+    [outage] = outages
+    assert outage["end_utc"] is None
+    assert outage["checks"] >= 3  # rechecked, and refused each time
+    assert "refused" in outage["first_detail"]
+    assert "typed application/json" in outage["last_detail"]  # the core keeps the head of the detail
+    assert_clean(outage["last_detail"])
+    assert len(provider_reads(seeded)) == 2  # once, whole and by range, kept for the campaign
+
+
+def test_o05_the_standard_gate_admits_the_campaign_when_the_type_is_right(config, client, seeded, tmp_path):
+    """O05: the control: with the right type the standard check passes and every run of the campaign is executed."""
+    executor, outages = run_campaign(tmp_path, standard_gate(config, client), settle_s=20)
+    assert len(executor.requests) == 3
+    assert outages == []
+    assert len(provider_reads(seeded)) == 2
+
+
+def test_o05_the_standard_gate_never_reads_the_check_file_without_a_rest_data_path(tmp_path, fake):
+    """O05: with no REST data path the standard check reads no file content and lists no directory, at any call."""
+    config = load_platform(write_platform(tmp_path, lambda d: edit(d, rest=False)))
+    client = OnezoneClient(config, http=fake.client_http())
+    fake.add_file(CHECK_FILE, DATA)
+    fake.content_type = "text/html"
+    health = standard_gate(config, client)
+    assert [health().ok for _ in range(3)] == [True, True, True]
+    assert [c for c in fake.provider_calls if c[2].endswith("/content") or c[2].endswith("/children")] == []
