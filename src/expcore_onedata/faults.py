@@ -72,20 +72,19 @@ platform.toml (`expcore_onedata.fault_settings`).
 
 import asyncio
 import contextlib
-import hashlib
-import math
 import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
-from typing import Any, Protocol
+from typing import Any
 
 from expcore.config.loading import ConfigError
-from expcore.errors import InfraError, register_infra_kind
+from expcore.errors import InfraError
 from expcore.records.injections import FAULT_NAMESPACE
-from expcore_onedata.compose import DriverError, Observation
+from expcore_onedata.compose import DriverError
 from expcore_onedata.config import PlatformConfig
-from expcore_onedata.fault_journal import InjectionJournal, SettledInjections, TargetLock, holder, holder_alive
+from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
+from expcore_onedata.fault_recovery import INJECTOR_FAILURE, PROVIDER_OUTAGE, FaultDriver, Recovery, digest
 from expcore_onedata.fault_settings import FaultSettings, compose_driver, load_faults
 
 __all__ = [
@@ -102,11 +101,6 @@ __all__ = [
     "provider_outage",
 ]
 
-PROVIDER_OUTAGE = "provider_outage"
-INJECTOR_FAILURE = "injector_failure"
-register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable")
-register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
-
 
 class Unsanctioned(ConfigError):
     """The injector was built or run without both halves of the sanction (O10)."""
@@ -120,29 +114,9 @@ class _NotSeenDown(Exception):
     """The stop command returned, but the service was never seen down within the bounded wait."""
 
 
-class FaultDriver(Protocol):
-    """What takes a provider's service down and brings it back (`expcore_onedata.compose.ComposeDriver`)."""
-
-    def observe(self, service: str) -> Observation:
-        """Read whether the service runs and its identity; raise DriverError when it cannot be read."""
-        ...
-
-    def stop(self, service: str) -> None:
-        """Stop the service; raise DriverError when the command fails."""
-        ...
-
-    def start(self, service: str) -> None:
-        """Start the service again; raise DriverError when the command fails."""
-        ...
-
-
 def provider_outage(config: PlatformConfig, name: str, detail: str) -> InfraError:
     """The failure of a provider the platform attributes to it, naming it by its label (`providers[i]`), never by name."""
     return InfraError(PROVIDER_OUTAGE, detail, target=config.provider_label(name))
-
-
-def _digest(identity: str) -> str:
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 class FaultInjector:
@@ -172,8 +146,9 @@ class FaultInjector:
             raise FaultRefused(f"{settings.file}: [faults.services]: no service is declared for {target}")
         self.target, self._service, self._driver = target, service, driver
         self._clock, self._sleep = clock, sleep
-        self._journal = InjectionJournal(settings.journal)
-        self._lock: TargetLock | None = None
+        self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep)
+        self._journal = self._recovery.journal
+        self._lock: HeldLock | None = None
         self._mutex = threading.RLock()  # a start and a clear never run at once, in whichever threads
         rounds = settings.clear_attempts + 2
         self.cancel_wait_s = (
@@ -184,7 +159,6 @@ class FaultInjector:
         self._steps: list[dict[str, Any]] = []
         self._injection: dict[str, Any] | None = None
         self._went_down = False  # the target was seen down during the open injection
-        self._last: Observation | None = None
         self._origin = clock()
 
     # --- the sanction and the readings ------------------------------------------------------------------------
@@ -239,7 +213,7 @@ class FaultInjector:
         self._injection = {"target": self.target, "injected": False, "cleared": False, "verified": False}
         try:
             self._driver.stop(self._service)
-            self._went_down = self._wait(lambda seen: not seen.running) is not None
+            self._went_down = self._recovery.wait(lambda seen: not seen.running, self._service) is not None
             if not self._went_down:
                 raise _NotSeenDown()
             self._journal.append({"event": "injected", "id": entry})
@@ -260,8 +234,13 @@ class FaultInjector:
             before = self._driver.observe(self._service)
             if not before.running or before.identity is None:
                 raise self._fail(f"{self.target} is not running before the injection, so no restore could be confirmed")
-            digest, entry = _digest(before.identity), uuid.uuid4().hex
-            line = {"target": self.target, "service": self._service, "identity_sha256": digest, "holder": holder()}
+            before_sha256, entry = digest(before.identity), uuid.uuid4().hex
+            line = {
+                "target": self.target,
+                "service": self._service,
+                "identity_sha256": before_sha256,
+                "holder": holder(),
+            }
             self._journal.append({"event": "injecting", "id": entry, **line})
         except InfraError:
             self._unlock()
@@ -272,7 +251,7 @@ class FaultInjector:
         except Exception as error:  # nothing was stopped: the lock goes, and only the error's type is told (O12)
             self._unlock()
             raise self._fail(f"{self.target} could not be read and journalled ({type(error).__name__})") from None
-        return digest, entry
+        return before_sha256, entry
 
     @contextlib.asynccontextmanager
     async def running(
@@ -348,7 +327,7 @@ class FaultInjector:
         entry, digest = self._pending
         injection = self._injection if self._injection is not None else {"target": self.target, "injected": False}
         try:
-            done, how, after = self._settle(
+            done, how, after = self._recovery.settle(
                 {"id": entry, "service": self._service, "identity_sha256": digest, "injected": self._went_down}
             )
         except Exception as error:  # never lose the reading: a clear that failed stays pending and open
@@ -371,101 +350,7 @@ class FaultInjector:
 
     def _recover(self) -> list[str]:
         self._require_sanction()
-        try:
-            entries = self._journal.open_entries()
-        except ValueError as error:  # the journal's own complaint: a line number, never its content
-            raise self._fail(f"the injection journal cannot be read: {error}") from None
-        except OSError as error:  # an OS error's text holds the journal's path: only its type is told (O12)
-            raise self._fail(f"the injection journal cannot be read ({type(error).__name__})") from None
-        held: list[str] = []
-        for entry in entries:
-            lock = self._journal.try_lock(entry["target"])
-            if lock is None:
-                if holder_alive(entry.get("holder")) is False:  # held, yet by no injector the journal knows
-                    self._step("recovered", False, target=entry["target"], how="lock_stuck")
-                    raise self._fail(f"the lock of {entry['target']} is stuck: its journalled holder is gone")
-                held.append(entry["target"])  # a live injector holds the target down on purpose
-                continue
-            try:
-                done, how, after = self._settle(entry)
-            finally:
-                lock.close()
-            self._step("recovered", done, target=entry["target"], how=how, identity_after_sha256=after)
-            if not done:
-                raise self._fail(f"an injection of {entry['target']} that an earlier run left open was not cleared")
-        return sorted(set(held))
-
-    def _settle(self, entry: Mapping[str, Any]) -> tuple[bool, str, str | None]:
-        """Leave one injection's target up: find it back, find it never went down, or bring it back with a changed
-        identity; journal it cleared when it is. Return whether it is, how, and the new identity's digest if any.
-
-        A service that cannot be read is started all the same (starting a running service changes nothing), and its
-        restore is then `restore_unverified` unless a later reading shows the new identity.
-        """
-        before = entry["identity_sha256"]
-        try:
-            seen: Observation | None = self._driver.observe(entry["service"])
-        except DriverError:
-            seen = None
-        same = seen is not None and seen.identity is not None and _digest(seen.identity) == before
-        after = None
-        if seen is not None and seen.running and seen.identity is not None and not same:
-            how, after = "found_restored", _digest(seen.identity)
-        elif seen is not None and seen.running and same:
-            if entry["injected"]:  # it was seen down, so it must have started anew: its identity cannot be trusted
-                return False, "identity_unchanged", None
-            how = "never_down"  # the stop never took effect
-        else:
-            restored, after, reason = self._restore(entry["service"], before)
-            if restored:
-                how = "restored"
-            elif reason == "identity_unchanged" and not entry["injected"]:
-                how = "never_down"  # unreadable at first, then running as it was: it never went down
-            else:
-                return False, reason, None
-        self._journal.append({"event": "cleared", "id": entry["id"], "how": how})
-        return True, how, after
-
-    def _restore(self, service: str, before: str) -> tuple[bool, str | None, str]:
-        """Start the service and wait for it to run with an identity whose digest is not `before`, a bounded number of
-        times; return whether it did, the new identity's digest, and why not."""
-        reason = "not_running"
-        for attempt in range(self._settings.clear_attempts):
-            if attempt:
-                self._sleep(self._settings.poll_s)
-            try:
-                self._driver.start(service)
-            except DriverError:
-                reason = "start_failed"
-                continue
-            try:
-                seen = self._wait(
-                    lambda s: s.running and s.identity is not None and _digest(s.identity) != before, service
-                )
-            except DriverError:
-                reason = "restore_unverified"  # started, but no reading shows the new identity
-                continue
-            if seen is not None:
-                return True, _digest(seen.identity or ""), "restored"
-            last = self._last
-            if last is not None and last.running and last.identity is not None and _digest(last.identity) == before:
-                return False, None, "identity_unchanged"  # back with the identity it had: not a restore (O11)
-        return False, None, reason
-
-    def _wait(self, done: Callable[[Observation], bool], service: str | None = None) -> Observation | None:
-        """Read the service until `done` holds, bounded by the settle timeout and by a count; None when it never did."""
-        polls = max(1, math.ceil(self._settings.settle_timeout_s / self._settings.poll_s)) + 1
-        started = self._clock()
-        self._last = None
-        for poll in range(polls):
-            if poll:
-                self._sleep(self._settings.poll_s)
-            self._last = self._driver.observe(service or self._service)
-            if done(self._last):
-                return self._last
-            if self._clock() - started >= self._settings.settle_timeout_s:
-                break
-        return None
+        return self._recovery.recover(self._step)
 
     def _unlock(self) -> None:
         if self._lock is not None:

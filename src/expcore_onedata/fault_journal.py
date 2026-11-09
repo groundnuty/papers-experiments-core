@@ -16,7 +16,7 @@ the journal, held only for that section, so a writer that read a torn tail canno
 Each target also has a lock file in the journal's directory. An injector holds the target's lock, exclusively, for as
 long as it may have the target down; the kernel drops it when the holder dies, so recovery settles only the open
 injections whose holder is gone and never brings back a provider another live run took down on purpose. A held lock is a
-`TargetLock`, closed explicitly or, when its owner is discarded without closing it, by its finalizer, so an injector
+`HeldLock`, closed explicitly or, when its owner is discarded without closing it, by its finalizer, so an injector
 dropped after a failed clear lets the target go. A forked child would inherit the lock and keep it after its parent
 died, so every lock descriptor this process holds is closed in a child right after a fork (`os.register_at_fork`); the
 child must not use an injector of its parent. The `injecting`
@@ -56,7 +56,7 @@ def _close_inherited_locks() -> None:
 
 
 def _release(descriptor: int) -> None:
-    """Drop a target's lock and close its descriptor; run once, by `TargetLock.close` or by its finalizer."""
+    """Drop a held lock and close its descriptor; run once, by `HeldLock.close` or by its finalizer."""
     _HELD.pop(descriptor, None)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -64,8 +64,8 @@ def _release(descriptor: int) -> None:
         os.close(descriptor)
 
 
-class TargetLock:
-    """An exclusive lock on one target, held until `close` or until the object is collected, whichever comes first."""
+class HeldLock:
+    """A lock this process holds (a target's, or the federation's) until `close` or until the object is collected."""
 
     def __init__(self, descriptor: int) -> None:
         self._finalizer = weakref.finalize(self, _release, descriptor)
@@ -222,7 +222,7 @@ class InjectionJournal:
                 raise ValueError(f"line {number} of the injection journal is not an injection event")
         return list(entries.values())
 
-    def try_lock(self, target: str) -> TargetLock | None:
+    def try_lock(self, target: str) -> HeldLock | None:
         """Take the target's exclusive lock without waiting; return it, or None when another holds it."""
         _make_directories(self.directory)
         name = re.sub(r"[^a-z0-9_]+", "-", target).strip("-")
@@ -232,7 +232,7 @@ class InjectionJournal:
         except BlockingIOError:
             os.close(descriptor)
             return None
-        return TargetLock(descriptor)
+        return HeldLock(descriptor)
 
 
 class SettledInjections:
