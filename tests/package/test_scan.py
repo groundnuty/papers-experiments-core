@@ -371,12 +371,12 @@ def test_k03_a_decoded_run_that_is_text_is_read_as_text_and_never_refused_for_a_
     assert found({"notes.md": b"Encoded: " + b64(sentence + b" " + TEXT) + b"\n"})
 
 
-def test_k03_a_zlib_stream_whose_check_fails_refuses_the_file():
-    """K03: deflate data whose trailing check fails is a broken stream, refused like one cut short; it is told from
-    data that is not deflate at all because genuine deflate ends exactly before its four-byte trailer."""
+def test_k03_a_zlib_stream_whose_check_fails_is_still_read():
+    """K03: deflate data whose trailing check fails (a damaged export) still decompresses, and its content is scanned:
+    the name is found."""
     broken = bytearray(zlib.compress(TEXT))
     broken[-1] ^= 1
-    refused({"record.json": b'{"blob": "' + b64(bytes(broken)) + b'"}\n'}, "check fails")
+    assert found({"record.json": b'{"blob": "' + b64(bytes(broken)) + b'"}\n'})
 
 
 def test_k03_an_encoded_sqlite_database_is_opened_as_one(tmp_path):
@@ -392,12 +392,20 @@ def test_k03_a_heading_above_an_encoded_block_does_not_hide_it():
     assert found({"attachment.txt": b"Payload\n" + base64.encodebytes(zlib.compress(TEXT * 8))})
 
 
-def test_k03_a_damaged_zlib_stream_with_bytes_after_it_is_refused():
-    """K03: the check of a deflate stream is read where the stream ends, so bytes after the trailer (a newline) do
-    not hide a check that fails."""
+def test_k03_a_damaged_zlib_stream_with_bytes_after_it_is_still_read():
+    """K03: bytes after a damaged stream's trailer (a newline) do not hide its content: the name is found."""
     broken = bytearray(zlib.compress(TEXT))
     broken[-1] ^= 1
-    refused({"record.json": b'{"blob": "' + b64(bytes(broken) + b"\n") + b'"}\n'}, "check fails")
+    assert found({"record.json": b'{"blob": "' + b64(bytes(broken) + b"\n") + b'"}\n'})
+
+
+def test_k03_a_digest_that_looks_like_a_tiny_deflate_stream_is_never_refused():
+    """K03: random bytes can carry a valid zlib header and a terminating deflate block by chance; such a digest,
+    raw in hex or in base64, refuses nothing."""
+    digest = hashlib.sha256(b"114610").hexdigest()
+    assert found({"record.json": f'{{"sha256": "{digest}"}}\n'.encode()}) == []
+    encoded = base64.b64encode(bytes.fromhex(digest)).decode()
+    assert found({"record.json": f'{{"sha256": "{encoded}"}}\n'.encode()}) == []
 
 
 def test_k03_several_caption_lines_above_an_encoded_block_do_not_hide_it():

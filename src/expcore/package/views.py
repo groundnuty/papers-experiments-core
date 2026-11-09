@@ -191,17 +191,21 @@ def _inflate(data: bytes, label: str, budget: _Budget) -> bytes:
     try:
         out = inflater.decompress(data, limit + 1)
     except zlib.error:
-        # Deflate data whose trailing check fails is a broken stream, refused like one cut short. It is told from data
-        # that is not deflate at all by decompressing without the four-byte trailer: genuine deflate ends exactly there.
+        # A deflate stream whose trailing check fails (a damaged export) still decompresses: its content is returned
+        # and scanned like any other, never refused, since random bytes (a digest) can look like such a stream by
+        # chance and hold no name. Data that is not deflate at all, or does not reach its final block, raises.
         probe = zlib.decompressobj(-zlib.MAX_WBITS)  # raw deflate after the two-byte header, to its final block
         try:
             partial = probe.decompress(data[2:], limit + 1)
         except zlib.error:
             partial = b""
         budget.total += len(partial)
-        trailer = probe.unused_data[:4]
-        if partial and probe.eof and len(trailer) == 4 and int.from_bytes(trailer, "big") != zlib.adler32(partial):
-            raise _Broken(label, "refused, it fails to decompress (a zlib stream whose check fails)") from None
+        if partial and probe.eof:
+            if len(partial) > limit:
+                if limit < MAX_STREAM_BYTES:
+                    raise _Exhausted(label) from None
+                _refuse(label, f"over the cap of {MAX_STREAM_BYTES} bytes")
+            return partial
         raise
     budget.total += len(out)
     if len(out) > limit:
