@@ -243,9 +243,10 @@ def _scan_text(path: str, text: str, hashes: Hashes, kind: str = "text") -> set[
     return found
 
 
-def _scan_python(path: str, text: str, hashes: Hashes) -> set[Finding]:
-    """Scan Python source by token (header block skipped); fall back to plain text if it cannot be tokenised."""
-    body = blank_header(text)
+def _scan_python(path: str, text: str, hashes: Hashes, exempt_header: bool = True) -> set[Finding]:
+    """Scan Python source by token (header block skipped unless `exempt_header` is false); fall back to plain text if
+    it cannot be tokenised."""
+    body = blank_header(text) if exempt_header else text
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(body).readline))
     except (tokenize.TokenError, SyntaxError):
@@ -305,18 +306,23 @@ def is_docs_path(path: str) -> bool:
     return posix.parts[:1] == (DOCS_ROOT,) or posix.suffix.casefold() == ".md"
 
 
-def scan_source(path: str | PathLike[str], text: str, hashes: Hashes) -> list[Finding]:
+def scan_source(
+    path: str | PathLike[str], text: str, hashes: Hashes, *, exempt_header: bool = True, python: bool | None = None
+) -> list[Finding]:
     """Scan one file: its path, then its text (Python by tokens, anything else by line).
 
     Prose (files under docs/ and Markdown anywhere) is checked only against `all`-scope hashes, because it may
     describe a study's design. If the path itself matches, it is reported as a `path` finding and replaced by a
-    placeholder in every finding of the file.
+    placeholder in every finding of the file. A module's provenance header names the source it was imported from and
+    is skipped in this repository's own check; `exempt_header=False` reads it like any line, as a replication
+    package's check does. `python` says whether the text is Python source, by default from the file name.
     """
     name = str(path)
     scoped = hashes.only_all() if is_docs_path(name) else hashes
     path_digests = _path_digests(name, scoped)
     shown = REDACTED_PATH if path_digests else name
-    found = _scan_python(shown, text, scoped) if name.endswith(".py") else _scan_text(shown, text, scoped)
+    as_python = name.endswith(".py") if python is None else python
+    found = _scan_python(shown, text, scoped, exempt_header) if as_python else _scan_text(shown, text, scoped)
     found |= {Finding(shown, 0, "path", digest[:FINDING_PREFIX_CHARS]) for digest in path_digests}
     return sorted(found)
 

@@ -37,6 +37,7 @@ from expcore.models.route import sdk_version
 from expcore.package.anonymise import Anonymisation, find_terms, load_anonymisation, rewrite
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
 from expcore.package.spec import PackageError, PackageSpec, load_spec, select
+from expcore.package.views import byte_views, streams
 from expcore.provenance.codestamp import STAMP, covered_files, is_sha, write_stamp
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.hashfile import Hashes
@@ -84,12 +85,23 @@ def private_hashes(path: Path) -> Hashes:
 
 
 def scan_tokens(files: Mapping[str, bytes], hashes: Hashes) -> list[str]:
-    """Run the study-token scanner over each file's path and content (binary as text); a finding shows no value."""
-    findings = []
+    """Run the study-token scanner over every stream of every file, under every view, with no exemption.
+
+    Each file is opened down to its last compressed or archived member (`views.streams`), and each stream is read as
+    UTF-8, UTF-16 in both byte orders and alignments, and raw bytes. The provenance-header exemption of this
+    repository's own check does not apply. Content the scan cannot read is a finding too. A finding shows a hash
+    prefix and where, never the value.
+    """
+    findings: set[str] = set()
     for path in sorted(files):
-        text = files[path].decode("utf-8", errors="replace").replace("\0", "\n")
-        findings += [str(finding) for finding in scan_source(path, text, hashes)]
-    return findings
+        found, problems = streams(path, files[path])
+        findings.update(problems)
+        for label, data in found:
+            for view, text in byte_views(data):
+                python = view == "utf-8" and label.endswith(".py")
+                hits = scan_source(label, text, hashes, exempt_header=False, python=python)
+                findings.update(f"{hit} ({view})" for hit in hits)
+    return sorted(findings)
 
 
 def _read_json(files: Mapping[str, bytes], path: str, what: str) -> dict:
