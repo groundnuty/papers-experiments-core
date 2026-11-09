@@ -88,7 +88,7 @@ def test_o08_transfers_that_started_before_the_run_window_are_not_recorded(probe
     old = seeded.add_transfer("eviction", PATH, BETA_ID, scheduled=ticker.now - 500, finished=ticker.now - 400)
     provisioner.replicate(PATH, "beta")
     before = next(t for t in seeded.transfers if t != old)
-    ticker.sleep(2)
+    ticker.sleep(60)  # well before the window, past the allowance for clock skew
     probes.start({})
     provisioner.evict(PATH, "beta")
     inside = next(t for t in seeded.transfers if t not in (old, before))

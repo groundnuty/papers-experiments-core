@@ -73,8 +73,8 @@ client test in a source sends it and reads the answer as this layer does.
 - The probes' transfer log (`transferlog.py`) reads `GET /spaces/{space}/transfers` on a provider (query `state`,
   `limit`, `page_token`; answer `transfers`, a list of ids, and `nextPageToken`, followed until empty), confirmed by
   [S10] for the states `ongoing` and `ended`, and each id's `GET /transfers/{id}`, whose `fileId` [S10] and state and
-  counters [S11] are confirmed. The state `waiting` and a record's `type`, provider ids and times are unconfirmed; see
-  `UNVERIFIED_ENDPOINTS`.
+  counters [S11] are confirmed. The state `waiting`, a record's `type`, provider ids and times, and the listing
+  answer's `Date` header (`get_dated`, the provider's clock) are unconfirmed; see `UNVERIFIED_ENDPOINTS`.
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
@@ -139,7 +139,9 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "GET",
         "/spaces/{space}/transfers",
         "a provider call: the state value waiting; running code lists ongoing and ended [S10], and waiting is named "
-        "only by the provider's API description, which [S10]'s client accepts",
+        "only by the provider's API description, which [S10]'s client accepts; and the answer's Date header, from "
+        "which the transfer log estimates the provider's clock offset (`get_dated`): HTTP requires it, and no source "
+        "reads it",
     ),
     (
         "GET",
@@ -355,12 +357,24 @@ class OnezoneClient:
             content=content,
             timeout_s=timeout_s,
         )
+        return self._decoded(response, method, provider)
+
+    def _decoded(self, response: httpx.Response, method: str, provider: str | None) -> Any:
+        """Return an answer's decoded JSON, or a PlatformError without detail when it is not JSON."""
         if not response.content:
             return {}
         try:
             return response.json()
         except ValueError:
             raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON") from None
+
+    def get_dated(
+        self, path: str, *, provider: str | None = None, params: Mapping[str, Any] | None = None
+    ) -> tuple[Any, str | None]:
+        """GET as `get` does with the admin credential, and return with the decoded answer its `Date` header as sent,
+        or None when it has none. The transfer log estimates a provider's clock offset from it (`transferlog.py`)."""
+        response = self._request("GET", path, provider=provider, headers=self._admin, params=params)
+        return self._decoded(response, "GET", provider), response.headers.get("date")
 
     def get(
         self,

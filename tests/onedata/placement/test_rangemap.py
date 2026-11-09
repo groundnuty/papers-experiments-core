@@ -116,6 +116,15 @@ def test_o07_the_transfer_listing_is_waited_out_by_default_for_30_s_and_up_to_4_
     assert (custom.transfer_settle_s, custom.transfer_settle_polls) == (60.0, 6)
 
 
+def test_o08_the_allowance_for_clock_skew_defaults_to_5_s_and_cannot_be_negative(tmp_path):
+    """O08: the run's window is widened by the providers' estimated clock offsets plus an allowance of 5 s by
+    default, which can be set and is never negative."""
+    assert load(tmp_path).settings.clock_skew_allowance_s == 5.0
+    assert load(tmp_path, clock_skew_allowance_s=12).settings.clock_skew_allowance_s == 12.0
+    with pytest.raises(ConfigError, match=r"key 'clock_skew_allowance_s'"):
+        load(tmp_path, clock_skew_allowance_s=-1)
+
+
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [

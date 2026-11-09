@@ -31,7 +31,8 @@ setting is what bounds that.
 **Fail closed.** A page or record that cannot be read, or one not in the documented shape (`transferrecord.py`), makes
 the whole listing `probe_ok` false with the reason and no records, never fewer or no transfers. A listing longer than
 its bound (`MAX_LISTED` distinct ids, or a token that keeps coming back) is unknown in the same way, not truncated.
-`transferwindow.py` places the jobs in the run's window and splits a provider's gained bytes.
+`transferwindow.py` places the jobs in the run's window, moved onto the providers' clocks by the offsets the listing
+answers' Date headers give (recorded under `clock`), and splits a provider's gained bytes.
 """
 
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -41,7 +42,16 @@ from typing import Any, Protocol
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.transferrecord import STATES, UNDECLARED, Job, Unreadable, job_of, page_of, record_of
-from expcore_onedata.transferwindow import CARRIED_OVER, DISAGREE, NOT_SETTLED, Window
+from expcore_onedata.transferwindow import (
+    CARRIED_OVER,
+    CLOCK_UNKNOWN,
+    DISAGREE,
+    NEAR_EDGE,
+    NOT_SETTLED,
+    Edges,
+    Window,
+    offset_of,
+)
 
 PAGE_LIMIT = 1000  # ids asked for per page; the listing takes 1 to 1000
 MAX_LISTED = 2000  # distinct ids read before the listing is unknown: each one costs a read of its record
@@ -58,11 +68,13 @@ class Probed(Protocol):
 @dataclass(frozen=True)
 class Reading:
     """What the transfer log found: the snapshot's section, the jobs in the window (None when the listing is unknown),
-    and `(target id, reason)` of the jobs that leave their target's bound unknown."""
+    `(target id, reason)` of the jobs that leave their target's bound unknown, and the reasons that leave every
+    bound unknown."""
 
     section: dict[str, Any]
     inside: list[Job] | None
     flagged: list[tuple[str, str]] = field(default_factory=list)
+    everywhere: frozenset[str] = frozenset()
 
 
 Observation = dict[str, dict[str, Job]]  # provider name -> transfer id -> the job as that provider has it
@@ -92,15 +104,24 @@ class TransferLog:
         probe: Callable[[Callable[[], Any]], Probed],
         *,
         sleep: Callable[[float], None],
+        now: Callable[[], float],
         page_limit: int = PAGE_LIMIT,
         max_listed: int = MAX_LISTED,
     ) -> None:
-        """List on `providers` (the tracked ones), `page_limit` ids a page; past `max_listed` ids it is unknown."""
+        """List on `providers` (the tracked ones), `page_limit` ids a page; past `max_listed` ids it is unknown. `now`
+        is this host's epoch clock, the one the run's window is on."""
         if not 1 <= page_limit <= PAGE_LIMIT or max_listed < 1:
             raise ValueError(f"a page holds 1 to {PAGE_LIMIT} ids and the listing's bound is at least one")
         self._client, self._provisioner, self._providers, self._probe = client, provisioner, list(providers), probe
-        self._page_limit, self._max_listed, self._sleep = page_limit, max_listed, sleep
+        self._page_limit, self._max_listed, self._sleep, self._now = page_limit, max_listed, sleep, now
         self._pages = 0
+        self._offsets: dict[str, list[float | None]] = {}  # provider -> each listing answer's clock offset, or None
+
+    def _dated_page(self, path: str, provider: str, params: Mapping[str, Any]) -> Any:
+        """Read one page of a provider's listing and keep the provider's clock offset its Date header gives."""
+        answer, date = self._client.get_dated(path, provider=provider, params=params)
+        self._offsets.setdefault(provider, []).append(offset_of(date, self._now()))
+        return answer
 
     def _listed_on(self, provider: str) -> dict[str, str]:
         """List one provider's transfers in every state, page by page; return each id with the furthest state that
@@ -113,7 +134,7 @@ class TransferLog:
             token: str | None = None
             for _ in range(max_pages):
                 params = {"state": state, "limit": self._page_limit, **({"page_token": token} if token else {})}
-                found = self._probe(lambda q=params: self._client.get(path, provider=provider, params=q))
+                found = self._probe(lambda q=params: self._dated_page(path, provider, q))
                 self._pages += 1
                 if not found.ok:
                     raise Unreadable(f"{where}: a page of the {state} listing could not be read: {found.error}")
@@ -196,17 +217,42 @@ class TransferLog:
         }
         if window is None:
             return Reading({**section, "error": "the run's start was not read, so the run has no window"}, None)
+        self._offsets = {}
         try:
             observation, changed, polls = self._settled()
         except Unreadable as error:
             return Reading({**section, "pages": self._pages, "error": str(error)}, None)
         flagged = [(t, NOT_SETTLED) for t in dict.fromkeys(j.target_id for j in changed) if t]
-        section.update(settled=not changed, polls=polls)
-        return self._classified(window, observation, file_ids, harness, section, flagged)
+        edges, clock = self._edges(window)
+        section.update(settled=not changed, polls=polls, clock=clock)
+        reading = self._classified(edges, observation, file_ids, harness, section, flagged)
+        return Reading(
+            reading.section, reading.inside, reading.flagged, frozenset() if clock["known"] else {CLOCK_UNKNOWN}
+        )
+
+    def _edges(self, window: Window) -> tuple[Edges, dict[str, Any]]:
+        """Move the window onto the providers' clocks by the offsets their listing answers gave, and describe that for
+        the snapshot. A provider with an answer whose Date could not be read leaves the clock unknown, and the window
+        is then taken as it is on this host's clock."""
+        allowance = self._provisioner.settings.clock_skew_allowance_s
+        offsets = {p: self._offsets.get(p, []) for p in self._providers}
+        known = all(samples and None not in samples for samples in offsets.values())
+        seen = [o for samples in offsets.values() for o in samples if o is not None]
+        edges = Edges(window, min(seen), max(seen), allowance) if known else Edges(window, 0.0, 0.0, allowance)
+        described = {}
+        for provider, samples in offsets.items():
+            readable = [o for o in samples if o is not None]
+            described[self._client.provider_label(provider)] = {
+                "samples": len(samples),
+                "unreadable": len(samples) - len(readable),
+                "min_s": round(min(readable), 3) if readable else None,
+                "max_s": round(max(readable), 3) if readable else None,
+            }
+        return edges, {"known": known, "offsets": described, **edges.to_json()}
 
     def _classified(
         self,
-        window: Window,
+        edges: Edges,
         observation: Observation,
         file_ids: Mapping[str, str],
         harness: Collection[str],
@@ -217,13 +263,17 @@ class TransferLog:
         inside, records, carried = [], [], 0
         merged = self._merged(observation)
         for provider, job, views in merged:
+            targets = [t for t in dict.fromkeys(v.target_id for v in views) if t]
             agree = len(views) == len(self._providers) and all(v.observed() == job.observed() for v in views)
-            if not agree and any(window.bears_on(v) for v in views):
-                flagged += [(t, DISAGREE) for t in dict.fromkeys(v.target_id for v in views) if t]
-            if window.carried_over(job):
+            if not agree and any(edges.bears_on(v) for v in views):
+                flagged += [(t, DISAGREE) for t in targets]
+            near = any(edges.near_edge(v) for v in views)
+            if near:
+                flagged += [(t, NEAR_EDGE) for t in targets]
+            if edges.carried_over(job):
                 carried += 1
                 flagged += [(job.target_id, CARRIED_OVER)] if job.target_id else []
-            if not window.holds(job.scheduled):
+            if not edges.holds(job.scheduled):
                 continue
             inside.append(job)
             records.append(
@@ -234,6 +284,7 @@ class TransferLog:
                     scheduled_by_harness=job.transfer_id in harness,
                     observed_on=self._client.provider_label(provider),
                     listings_agree=agree,
+                    near_window_edge=near,
                 )
             )
         listed = len(merged)

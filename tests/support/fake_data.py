@@ -34,6 +34,8 @@ waits. A test bends the fake through plain attributes:
   it is in, and its record's status) and record fields such as `bytesReplicated`;
 - `listing_lag`: job id to how many listing answers, counted from the first, leave the job out (its record is read
   at once, as a real provider's is while its listing lags);
+- every data-API answer has a `Date` header of `clock` moved by `provider_skew` (provider id to seconds ahead,
+  negative when behind); `date_override` (provider id to a header value, or None for none) replaces it;
 
 `add_transfer` makes a job that no request to `/transfers` made, as a QoS requirement or another client does, with the
 times and the state a test gives it.
@@ -47,6 +49,7 @@ import itertools
 import json
 import re
 from dataclasses import dataclass, field
+from email.utils import formatdate
 
 import httpx
 from fake_federation import FakeFederation
@@ -137,6 +140,8 @@ class FakeData(FakeFederation):
         self.transfer_list_body: dict | None = None  # replaces every answer of the listing
         self.provider_view: dict[tuple[str, str], dict] = {}  # (job, provider id) -> its listed state, record fields
         self.listing_lag: dict[str, int] = {}  # job id -> listing answers it is left out of, from the first one
+        self.provider_skew: dict[str, float] = {}  # provider id -> seconds its clock runs ahead (negative: behind)
+        self.date_override: dict[str, str | None] = {}  # provider id -> the Date header it sends (None: none)
         self.listings = 0  # the listing answers given
         self._ids = itertools.count(1)
         self._root_polls = 0
@@ -274,7 +279,17 @@ class FakeData(FakeFederation):
         token = request.headers.get("X-Auth-Token")
         if token != self.admin_token and not self._accepts(token):
             return self._error(401, "unauthorized")
-        return self._provider_route(request, provider, route)
+        return self._dated(self._provider_route(request, provider, route), provider)
+
+    def _dated(self, response: httpx.Response, provider: str) -> httpx.Response:
+        """Give an answer the Date header of the provider's clock: the fake's clock moved by the provider's skew, in
+        whole seconds as HTTP has it, or the override a test set (None: no header at all)."""
+        if provider in self.date_override:
+            if self.date_override[provider] is not None:
+                response.headers["Date"] = self.date_override[provider]
+            return response
+        response.headers["Date"] = formatdate(self.clock() + self.provider_skew.get(provider, 0.0), usegmt=True)
+        return response
 
     def _admin_route(self, method: str, route: str, sent: dict) -> httpx.Response:
         """Onezone's calls that need the admin credential: a provider's online flag, then what the federation has."""

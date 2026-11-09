@@ -219,11 +219,17 @@ def listed_transfers(client, config, provider, limit):
 
 def test_the_transfer_listing_answers_every_state_the_probes_read(config, client):
     """O08: the probes list the space's transfers as waiting, ongoing and ended; each state's first page parses as a
-    list of plain ids with a next-page token or none, and a page asked to hold one id holds at most one."""
+    list of plain ids with a next-page token or none, and a page asked to hold one id holds at most one. The answer has
+    a Date header the provider's clock offset is read from, so the run's window can be moved onto that clock."""
     # covers: GET /spaces/{space}/transfers
-    pages = listed_transfers(client, config, config.support.providers[0], 1)
+    from expcore_onedata.transferwindow import offset_of
+
+    provider = config.support.providers[0]
+    pages = listed_transfers(client, config, provider, 1)
     for ids, _ in pages.values():
         assert len(ids) <= 1
+    _, date = client.get_dated(f"/spaces/{config.space.id}/transfers", provider=provider, params={"state": "ended"})
+    assert offset_of(date, time.time()) is not None
 
 
 def test_a_transfer_record_has_the_fields_the_probes_read(config, client):

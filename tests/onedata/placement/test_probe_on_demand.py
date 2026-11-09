@@ -20,13 +20,20 @@ def probes(client, provisioner, ticker, seeded):
     return PlatformProbes(client, provisioner, files, ["alpha", "beta"], sleep=ticker.sleep, now=ticker.clock)
 
 
-def test_o08_the_lower_bound_is_gained_less_the_transfer_bytes_into_the_provider(probes, provisioner, client, seeded):
+INSIDE_S = 10  # seconds a scripted job keeps from the window's edges, past the default 5 s allowance for clock skew
+
+
+def test_o08_the_lower_bound_is_gained_less_the_transfer_bytes_into_the_provider(
+    probes, provisioner, client, seeded, ticker
+):
     """O08: the agent replicates one file to beta through the tool plane (4096 bytes) and reads 1000 bytes of the other
     through beta. Beta gained 5096 bytes, transfers moved 4096 into it, so at least 1000 came on demand; alpha gained
     nothing and nothing moved into it."""
     probes.start({})
+    ticker.sleep(INSIDE_S)
     seeded.end_transfer(tool_plane_replicates(seeded, client, MORE, BETA_ID))
     provisioner.read_through("beta", seeded.id_of(PATH), 0, 1000)
+    ticker.sleep(INSIDE_S)
     snapshot = probes.finish()
     assert snapshot["ok"] is True
     assert snapshot["on_demand"]["beta"] == {
@@ -46,8 +53,10 @@ def test_o08_transfer_bytes_of_a_file_the_study_does_not_track_floor_the_bound_a
     """O08: a QoS replication of an untracked file into beta counts in its transfer bytes, which then exceed what beta
     gained of the tracked files; the bound is zero, never negative, and the unfloored difference shows it."""
     probes.start({})
+    ticker.sleep(INSIDE_S)
     seeded.add_transfer("replication", OTHER, BETA_ID, scheduled=ticker.now)
     provisioner.read_through("beta", seeded.id_of(PATH), 0, 1000)
+    ticker.sleep(INSIDE_S)
     beta = probes.finish()["on_demand"]["beta"]
     assert (beta["gained_bytes"], beta["transfer_bytes_in"]) == (1000, len(DATA))
     assert beta["difference"] == 1000 - len(DATA)
@@ -58,8 +67,10 @@ def test_o08_an_eviction_moves_no_bytes_in_and_a_migration_moves_them_into_its_t
     """O08: only replicating jobs count, into their replicating provider: an eviction from beta adds nothing to beta's
     transfer bytes, and a migration from alpha to beta adds its byte counter to beta's alone."""
     probes.start({})
+    ticker.sleep(INSIDE_S)
     seeded.add_transfer("migration", MORE, BETA_ID, source_id=ALPHA_ID, scheduled=ticker.now)
     seeded.add_transfer("eviction", PATH, BETA_ID, scheduled=ticker.now)
+    ticker.sleep(INSIDE_S)
     split = probes.finish()["on_demand"]
     assert split["beta"]["transfer_bytes_in"] == len(DATA)
     assert split["beta"]["on_demand_lower_bound"] == 0

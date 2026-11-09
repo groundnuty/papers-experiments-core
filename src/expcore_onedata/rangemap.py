@@ -24,6 +24,7 @@ probe_attempts = 3              # tries at a read that fails with a network rese
 probe_backoff_s = 1.0
 transfer_settle_s = 30.0        # the wait between two observations of the transfer listing: at least its lag (O07)
 transfer_settle_polls = 4       # the most observations of the listing before it counts as not settled (2 or more)
+clock_skew_allowance_s = 5.0    # added to the providers' clock offsets that widen the run's window (O08)
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
@@ -66,6 +67,7 @@ class PlacementSettings:
     probe_backoff_s: float = 1.0
     transfer_settle_s: float = 30.0  # at least the lag of a provider's transfer listing behind a new job
     transfer_settle_polls: int = 4
+    clock_skew_allowance_s: float = 5.0  # beyond the providers' estimated clock offsets
 
 
 @dataclass(frozen=True)
@@ -210,6 +212,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "probe_backoff_s",
             "transfer_settle_s",
             "transfer_settle_polls",
+            "clock_skew_allowance_s",
         )
     )
     holder = table.string("holder")
@@ -227,6 +230,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         probe_backoff_s=_number(table, "probe_backoff_s", 1.0, minimum=0),
         transfer_settle_s=_number(table, "transfer_settle_s", 30.0, minimum=0),
         transfer_settle_polls=_number(table, "transfer_settle_polls", 4, minimum=2, integer=True),
+        clock_skew_allowance_s=_number(table, "clock_skew_allowance_s", 5.0, minimum=0),
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))
