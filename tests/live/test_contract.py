@@ -4,7 +4,8 @@
     EXPCORE_LIVE_SLOW=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live   # also the test that waits out a lifetime
 
 They check what the fake can only assume: that the endpoints the layer calls answer in the shape it parses. They read
-(health, discovery, the examination of a token) and mint a short-lived token per plane for the configured fixed users.
+(health, discovery, the examination of a token, and, with EXPCORE_LIVE_CONTENT_PATH naming a provisioned file by its
+path in the space, that file's content) and mint a short-lived token per plane for the configured fixed users.
 Tokens are never revoked, so each one ends with its lifetime. Nothing here changes a space, a file or a privilege, and
 without the variable nothing is constructed or contacted.
 """
@@ -18,16 +19,19 @@ PLATFORM = os.environ.get("EXPCORE_LIVE_PLATFORM")
 if not PLATFORM:
     pytest.skip("EXPCORE_LIVE_PLATFORM is not set; these tests contact a real deployment", allow_module_level=True)
 
+import httpx  # noqa: E402
 from live_support import mint_for_condition  # noqa: E402 -- only once the module is known to run
 
-from expcore_onedata.client import OnezoneClient, PlatformError  # noqa: E402
+from expcore_onedata.client import API_PROVIDER, AUTH_HEADER, OnezoneClient, PlatformError  # noqa: E402
 from expcore_onedata.config import load_platform  # noqa: E402
 from expcore_onedata.federation import pin_local_provider, read_space  # noqa: E402
 from expcore_onedata.health import PlatformHealth  # noqa: E402
+from expcore_onedata.sandbox import gateboundary  # noqa: E402
 from expcore_onedata.tokencheck import CaveatSpec  # noqa: E402
 from expcore_onedata.tokens import TokenIssuer, data_path_spec  # noqa: E402
 
 CEILING_S = 300.0
+CONTENT_PATH = os.environ.get("EXPCORE_LIVE_CONTENT_PATH")  # a provisioned, non-empty file: its path in the space
 EXPIRY_S = 5  # the shortest lifetime the expiry test asks for
 SLOW = pytest.mark.skipif(
     os.environ.get("EXPCORE_LIVE_SLOW") != "1",
@@ -97,6 +101,28 @@ def test_the_health_check_reads_the_declared_support_set(config, client, issuer)
     service_user(config)
     result = PlatformHealth(config, client, issuer)()
     assert result.ok, result.detail
+
+
+def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_streams(config, issuer):
+    """O05: the data gate streams only a 200 or 206 of a file's content with the data content type, and buffers every
+    other answer up to 4 MiB (gateboundary.streams). Read a provisioned file whole and by range through the provider's
+    real content endpoint, with a data-path token, and check that it answers so."""
+    # covers: GET /data/{file}/content
+    if not CONTENT_PATH:
+        pytest.skip(
+            "EXPCORE_LIVE_CONTENT_PATH is not set; it names a provisioned, non-empty file by its path in the space"
+        )
+    token = issuer.mint(data_path_spec(config.space.id), service_user(config), ceiling_s=CEILING_S).reveal()
+    base, headers = config.local_provider.url + API_PROVIDER, {AUTH_HEADER: token}
+    with httpx.Client(timeout=120) as http:
+        found = http.post(f"{base}/lookup-file-id/{config.space.name}/{CONTENT_PATH.strip('/')}", headers=headers)
+        assert found.status_code == 200
+        content = f"{base}/data/{found.json()['fileId']}/content"
+        whole = http.get(content, headers=headers)
+        part = http.get(content, headers={**headers, "Range": "bytes=0-0"})
+    assert (whole.status_code, part.status_code) == (200, 206)
+    for answer in (whole, part):
+        assert gateboundary.streams(answer.status_code, "content", answer.headers.get("content-type"))
 
 
 @pytest.mark.parametrize("index", range(CONDITIONS), ids=lambda index: f"condition{index}")

@@ -173,6 +173,8 @@ ICSA allows exactly one `{ACCESS}` slot (`prompt.py:43-44`); the core generalise
 
 The core keeps only the interface (`SandboxLike`: start, exec, collect, stop, metadata) and a local stand-in for tests. The implementation goes to the platform layer, with the option branches replaced by a per-condition table of data paths (`gatepolicy.decide` already is one). `ExecResult` is defined twice and the copies differ (`sandbox_api.py:25-31` lacks `timed_out`); the core defines it once.
 
+The only basis for the content type of a file's content, which the data gate streams on (`expcore_onedata/sandbox/gateboundary.py`, listed in `UNVERIFIED_ENDPOINTS`), is ICSA's mock of a provider: its content handler answers 200, or 206 for a range, with `application/octet-stream` (`icsa/sandbox/mock_onedata.py:170-195` at 6fc798cf). No source shows a real provider answering so; the live contract test does.
+
 ### 7. Recording, transcripts and replay
 
 | Study | Where | Size, tests | Study-specific | Handles | Verdict |

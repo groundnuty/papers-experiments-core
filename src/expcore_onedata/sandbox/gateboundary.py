@@ -23,6 +23,12 @@ rewrites one, since a partial rewrite can leave a piece behind. Every answer pas
     study's data was provisioned, and the agent's data path is read-only, so a file's content cannot hold it; the
     watch is defence in depth, with the bound `held_back` states.
 
+That a file's content comes as a 200 or 206 with `DATA_CONTENT_TYPE` is an assumption no source confirms: only the
+earlier study's mock of a provider answers so. It is listed in `expcore_onedata.client.UNVERIFIED_ENDPOINTS` and pinned
+by a live contract test (tests/live/test_contract.py). Should a deployment answer with another type, nothing leaks and
+nothing is mis-scored: every read of a file is then buffered, one up to 4 MiB is checked whole and passes, and one over
+4 MiB is refused loudly (`OVERSIZED_RESPONSE`), so its run ends as `data_gate_integrity` and is set aside.
+
 Detection does not depend on knowing the encoding. The bytes are decoded again and again, until nothing changes or
 `ROUNDS` rounds have run (`layers`): percent-escapes in either case of hex with `+` as a space, JSON escapes with a
 surrogate pair combined into its character (a lone surrogate is kept as it is written, never paired with a

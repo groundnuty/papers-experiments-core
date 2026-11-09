@@ -94,6 +94,13 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "/tokens/infer_access_token_scope",
         "the providers' name and online fields; the sources read the space's name and supports and the domain [S6]",
     ),
+    (
+        "GET",
+        "/data/{file}/content",
+        "a provider call: the Content-Type of a file's content read whole (200) and by range (206), "
+        "application/octet-stream, the only answer the data gate streams (sandbox/gateboundary.py); the only basis is "
+        "the earlier study's mock of a provider, its content handler (docs/inventory.md cites it)",
+    ),
 )
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _SPACE_ID = re.compile(r"[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}")  # one plain path segment, never "." or ".."
