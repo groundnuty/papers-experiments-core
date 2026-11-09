@@ -184,18 +184,30 @@ try:
 except urllib.error.HTTPError as error:
     print(error.code)
 """
-TLS_MODES = ("verify-default", "ca_file", "insecure_tls")
+TLS_MODES = ("verify-default", "ca_file", "insecure_tls", "ca_file-of-another-ca")
+REFUSED_MODES = ("verify-default", "ca_file-of-another-ca")  # a ca_file of a CA the federation does not chain to fails
 
 
-def tls_for(config, label):
+def tls_for(config, label, tmp_path):
     """The TLS setting of one mode, against the federation of the platform file. The file must declare a mode other
-    than the default, which says its certificate is one no default trusts, so the default can be shown to fail."""
+    than the default, which says its certificate is one no default trusts, so the default can be shown to fail. The
+    unrelated CA is made here (it needs the openssl command)."""
+    import hashlib
+    import shutil
+
+    from tls_support import make_federation_ca
+
     from expcore_onedata.tls import TlsSettings
 
     if config.tls.mode == "verify":
         pytest.skip("the platform file's [tls] is the default: its federation's certificate is trusted as it is")
     if label == "ca_file" and config.tls.ca_file is None:
         pytest.skip("the platform file's [tls] names no ca_file")
+    if label == "ca_file-of-another-ca":
+        if shutil.which("openssl") is None:
+            pytest.skip("the openssl command makes the unrelated CA")
+        other = make_federation_ca(tmp_path / "unrelated", name="unrelated-test-ca").ca
+        return TlsSettings(ca_file=other, ca_sha256=hashlib.sha256(other.read_bytes()).hexdigest())
     return {"verify-default": TlsSettings(), "ca_file": config.tls, "insecure_tls": TlsSettings(insecure=True)}[label]
 
 
@@ -209,14 +221,14 @@ def level_of(config, mode):
 
 @needs_platform
 @pytest.mark.parametrize("label", TLS_MODES)
-def test_o05_oneclient_in_the_sidecar_mounts_as_the_tls_setting_says(config, host, label):
+def test_o05_oneclient_in_the_sidecar_mounts_as_the_tls_setting_says(config, host, label, tmp_path):
     """O05: against the federation of the platform file, whose certificate no default trusts, the sidecar's oneclient
-    fails to mount by default, and mounts with the CA bundle (mounted read-only, named by SSL_CERT_FILE) or with
-    insecure_tls."""
-    settings = dataclasses.replace(config.sandbox, tls=tls_for(config, label))
+    fails to mount by default and with a ca_file of an unrelated CA, and mounts with the federation's CA bundle (the
+    run's read-only copy, named by SSL_CERT_FILE) or with insecure_tls."""
+    settings = dataclasses.replace(config.sandbox, tls=tls_for(config, label, tmp_path))
     level = level_of(config, DataPathMode.MOUNT)
     spec = spec_for(config, level, f"live-tls-mount-{int(time.time())}")
-    if label == "verify-default":
+    if label in REFUSED_MODES:
         with pytest.raises(SandboxError):
             DockerSandbox.start(host, settings, spec)
         return
@@ -230,18 +242,18 @@ def test_o05_oneclient_in_the_sidecar_mounts_as_the_tls_setting_says(config, hos
 
 @needs_platform
 @pytest.mark.parametrize("label", TLS_MODES)
-def test_o05_the_gates_upstream_reaches_the_zone_as_the_tls_setting_says(config, host, label):
+def test_o05_the_gates_upstream_reaches_the_zone_as_the_tls_setting_says(config, host, label, tmp_path):
     """O05: against the federation of the platform file, whose certificate no default trusts, the gate refuses the
-    zone's certificate by default (the agent's call is answered 502), and reaches the zone with the CA bundle (mounted
-    read-only) or with insecure_tls."""
-    settings = dataclasses.replace(config.sandbox, tls=tls_for(config, label))
+    zone's certificate by default and with a ca_file of an unrelated CA (the agent's call is answered 502), and reaches
+    the zone with the federation's CA bundle (the run's read-only copy) or with insecure_tls."""
+    settings = dataclasses.replace(config.sandbox, tls=tls_for(config, label, tmp_path))
     level = level_of(config, DataPathMode.REST)
     sandbox = DockerSandbox.start(host, settings, spec_for(config, level, f"live-tls-rest-{int(time.time())}"))
     try:
         status = int(sandbox.exec(ZONE_CALL, 120).stdout.strip())
     finally:
         sandbox.stop()
-    if label == "verify-default":
+    if label in REFUSED_MODES:
         assert status == 502
     else:
         assert status < 500
