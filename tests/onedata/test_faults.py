@@ -275,7 +275,7 @@ def test_o12_the_reading_and_the_messages_hold_no_configured_name(tmp_path):
     config = load_platform(platform, require_secrets=False)
     with pytest.raises(FaultRefused) as caught:
         FaultInjector(config, load_faults(platform, config), "providers[7]", sanctioned=True, driver=services)
-    assert "providers[7]" in str(caught.value)
+    assert "providers[7]" not in str(caught.value)  # a rejected target is never echoed
     other = tmp_path / "other"
     other.mkdir()
     unlisted = write_faults(other, services={"alpha": "store-one"})

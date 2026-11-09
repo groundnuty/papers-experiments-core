@@ -121,11 +121,12 @@ class ContextOverflow(Exception):
 
 
 def check_target(target: object) -> str | None:
-    """Return a target label when it is None or one of the form `<table>[<position>]`; raise ValueError otherwise."""
+    """Return a target label when it is None or one of the form `<table>[<position>]`; raise ValueError otherwise.
+
+    The refusal never echoes the rejected value, which may well be a configured name (O12).
+    """
     if target is not None and (not isinstance(target, str) or not TARGET_LABEL.fullmatch(target)):
-        raise ValueError(
-            f"a target is a position label such as 'providers[1]', never a configured name, not {target!r}"
-        )
+        raise ValueError("a target is a position label such as 'providers[1]', never a configured name")
     return target
 
 

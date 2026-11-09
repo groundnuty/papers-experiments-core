@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -131,3 +132,19 @@ def inject_and_die(platform: str, state: str, run_key: str) -> None:
     services = FakeServices(path=Path(state))
     injector_for(Path(platform), services).start({"run_key": run_key, "attempt": 1})
     os._exit(0)  # no finally, no clear: the kernel drops the injector's lock as it would for a killed process
+
+
+def inject_fork_and_die(platform: str, state: str, run_key: str, pid_file: str) -> None:
+    """In a child process: take the target down, fork a grandchild that outlives this process, and die before clearing.
+
+    The grandchild inherits every descriptor of the process, the target's lock included unless the injector closes it
+    after the fork; it writes its pid to `pid_file` and sleeps until it is killed.
+    """
+    services = FakeServices(path=Path(state))
+    injector_for(Path(platform), services).start({"run_key": run_key, "attempt": 1})
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(120)
+        os._exit(0)
+    Path(pid_file).write_text(str(pid), encoding="utf-8")
+    os._exit(0)

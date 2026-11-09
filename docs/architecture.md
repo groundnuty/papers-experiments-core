@@ -45,7 +45,8 @@ src/expcore_onedata/
   users.py       leased platform users (a slot gives a run one user per token plane) and the token journal
   health.py      pre- and post-run checks against the declared support set
   faults.py      the fault injector: one provider taken down per run under a double sanction, journalled first,
-                 cleared in finally and verified by a changed identity; compose.py and fault_journal.py serve it
+                 cleared in finally and verified by a changed identity; compose.py, fault_journal.py and
+                 fault_settings.py serve it
   day0/          registry of checks (reachability, health, tokens, listing, read-only, round trip) and a dated report
 examples/        a toy study using only the public interfaces (#5)
 ```
