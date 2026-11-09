@@ -37,9 +37,9 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -79,20 +79,55 @@ def federation_of(settings: FaultSettings) -> Federation:
     return Federation(str((settings.journal / FEDERATION_LOCK).resolve()), settings.config_sha256)
 
 
+class _Shares:
+    """Who still needs an admission: its owner, and every worker handed a share that may outlive the owner's wait."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.count, self.owner_left = 1, False
+
+
 @dataclass(frozen=True)
 class Admission:
     """The federation's lock as one run holds it, shared or exclusive, and which federation it is; held exclusively,
-    the holder record it wrote beside the lock (`record`), which it removes before it lets the lock go."""
+    the holder record it wrote beside the lock (`record`), which it removes before it lets the lock go.
+
+    The owner's `close` gives up its share; the lock goes when the last share is given up, so a worker the owner
+    handed a share (`retain`) keeps the federation held until it ends, even after the owner has left."""
 
     exclusive: bool
     lock: HeldLock
     federation: Federation
     journal: InjectionJournal | None = None
     record: Mapping[str, Any] | None = None
+    shares: _Shares = field(default_factory=_Shares, compare=False, repr=False)
 
     @property
     def held(self) -> bool:
         return self.lock.held
+
+    def retain(self) -> Callable[[], None]:
+        """Take one more share of the admission for a worker; return the call that gives it up (only the first call
+        counts). A share of an admission no longer held is nothing to give up."""
+        with self.shares.lock:
+            if not self.held or self.shares.count == 0:
+                return lambda: None
+            self.shares.count += 1
+        given_up = threading.Event()
+
+        def give_up() -> None:
+            if not given_up.is_set():
+                given_up.set()
+                self._give_up()
+
+        return give_up
+
+    def _give_up(self) -> None:
+        with self.shares.lock:
+            self.shares.count -= 1
+            last = self.shares.count == 0
+        if last:
+            self._release()
 
     def mark(self, target: str) -> None:
         """Name in the holder record the target this exclusive admission takes down."""
@@ -101,6 +136,14 @@ class Admission:
                 self.journal.write_holder({**self.record, "target": target})
 
     def close(self) -> None:
+        """Give up the owner's share; closing again is harmless. The last share lets the lock go (`_release`)."""
+        with self.shares.lock:
+            if self.shares.owner_left:
+                return
+            self.shares.owner_left = True
+        self._give_up()
+
+    def _release(self) -> None:
         """Let the lock go, its holder record first, so no record outlives a lock let go this way."""
         if self.journal is not None and self.record is not None and self.held:
             with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
@@ -112,6 +155,13 @@ def current_admission() -> Admission | None:
     """The admission the running context holds, if it holds one that is still held."""
     admission = _ADMISSION.get()
     return admission if admission is not None and admission.held else None
+
+
+def retain_admission() -> Callable[[], None]:
+    """A share of the running context's admission for a worker that may outlive it (`Admission.retain`); a call that
+    gives up nothing when the context holds none."""
+    admission = current_admission()
+    return admission.retain() if admission is not None else (lambda: None)
 
 
 class FederationLock:

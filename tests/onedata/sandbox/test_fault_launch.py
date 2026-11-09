@@ -56,12 +56,16 @@ class TimedContext:
 
 @pytest.fixture
 def platform(config, issuer, slots, tmp_path):
+    return build_platform(config, issuer, slots, tmp_path)
+
+
+def build_platform(config, issuer, slots, tmp_path, **options):
     s = config.sandbox
     host = FakeHost()
     for ref in (s.agent, s.gate, s.oneclient):
         host.add_image(ref.name, ref.id)
     host.oneclient_images.add(s.oneclient.id)
-    options = {"waits": FAST, "sample_period_s": None, "sleep": lambda seconds: None}
+    sandbox_options = {"waits": FAST, "sample_period_s": None, "sleep": lambda seconds: None}
     journal = TokenJournal(tmp_path / "leases")
     built = SandboxPlatform(
         config,
@@ -70,8 +74,9 @@ def platform(config, issuer, slots, tmp_path):
         slots=slots,
         journal=journal,
         registry=Registry(),
-        sandbox_options=options,
+        sandbox_options=sandbox_options,
         clock=lambda: NOW,
+        **options,
     )
     return built, host, journal
 
@@ -128,3 +133,54 @@ def test_o11_a_baseline_runs_sandbox_cannot_start_while_an_outage_run_holds_the_
     assert [(e[0], e[1]) for e in ctx.events] == [("enter", "sandbox_lifecycle"), ("exit", "sandbox_lifecycle")] * 2
     assert ctx.events[0][2] >= cleared_at  # the only waits are the start's and the stop's, after the outage
     assert not host.containers
+
+
+def test_o11_a_cancelled_launch_whose_start_thread_outlives_its_wait_keeps_the_federation_until_the_thread_ends(
+    config, issuer, slots, tmp_path
+):
+    """O11: a launch cancelled mid-start gives up waiting for its start thread after its bound, and the run's admission
+    is left; the thread still creates and removes things, so the federation stays held until the thread has ended:
+    no outage run can take it exclusively in the meantime."""
+    built, host, _ = build_platform(config, issuer, slots, tmp_path, cancel_wait_s=0.05)
+    lock = FederationLock(load_faults(config.file, config))
+    pool = LeasePool(tmp_path / "leases", built.lease_keys, built.probe(), clock=lambda: 0.0, sleep=lambda s: None)
+    lease = pool.acquire(GROUP, run_key="run-1")
+    entered, release = threading.Event(), threading.Event()
+    original = host.docker
+
+    def slow(*args, **kwargs):
+        if args[0] == "run" and "--init" in args:  # the agent's `docker run`, inside the start thread
+            entered.set()
+            assert release.wait(20), "the test never released the start thread"
+        return original(*args, **kwargs)
+
+    host.docker = slow
+    seen: list = []
+
+    async def go():
+        async with lock.admitted(exclusive=False):
+            task = asyncio.ensure_future(launched(built, TimedContext(), level="via-gate", lease=lease))
+            assert await asyncio.to_thread(entered.wait, 20)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task  # gave up waiting for the thread after its bound
+        while not release.is_set():  # the run has left its admission; its start thread still runs
+            taken = lock.try_acquire(exclusive=True)
+            seen.append(taken is None)
+            if taken is not None:
+                taken.close()
+            if len(seen) == 5:
+                release.set()
+            await asyncio.sleep(0.02)
+        deadline = time.monotonic() + 20
+        while built._threads.active(lease.key):
+            assert lock.try_acquire(exclusive=True) is None, "taken while the start thread still ran"
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.01)
+        while (taken := lock.try_acquire(exclusive=True)) is None:
+            assert time.monotonic() < deadline, "the thread never let the federation go"
+            await asyncio.sleep(0.01)
+        taken.close()
+
+    asyncio.run(go())
+    assert seen == [True] * 5

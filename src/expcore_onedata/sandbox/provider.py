@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any
 from expcore.campaign.lease import Lease, process_gone
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
-from expcore_onedata.admission import require_admission
+from expcore_onedata.admission import require_admission, retain_admission
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.sandbox import gatelog, kinds
@@ -104,6 +104,36 @@ class _Recorded:
             or mount_identity(mount) in self.identities
             or any(part in self.sids or self.key_dir.fullmatch(part) for part in parts)
         )
+
+
+class _Share:
+    """A start thread's share of the run's admission (`admission.retain_admission`): the thread gives it up when it
+    ends, never the launch that may stop waiting for it; a thread that never began has it given up for it."""
+
+    def __init__(self, give_up: Callable[[], None]) -> None:
+        self._give_up, self._state, self._lock = give_up, "pending", threading.Lock()
+
+    def begin(self) -> bool:
+        """In the thread, first: whether it may run, holding its share."""
+        with self._lock:
+            if self._state != "pending":
+                return False
+            self._state = "running"
+            return True
+
+    def end(self) -> None:
+        """In the thread, last: give the share up."""
+        with self._lock:
+            self._state = "ended"
+        self._give_up()
+
+    def never_ran(self) -> None:
+        """When the thread's task is done: give the share up if the thread never began; one that runs gives up its own."""
+        with self._lock:
+            if self._state != "pending":
+                return
+            self._state = "ended"
+        self._give_up()
 
 
 class _StartThreads:
@@ -271,12 +301,17 @@ class SandboxPlatform:
         return SlotProbe(self._journal, sandbox_gone=self.sandbox_probe().resource_gone, clock=self._clock)
 
     @staticmethod
-    def _begin(sandbox: DockerSandbox, ended: Callable[[], None]) -> None:
-        """Blocking, in the start thread: begin the sandbox, and note that the thread has ended, however it ended."""
+    def _begin(sandbox: DockerSandbox, ended: Callable[[], None], share: _Share) -> None:
+        """Blocking, in the start thread: begin the sandbox, and note that the thread has ended, however it ended; then
+        give up the thread's share of the run's admission, last, so the federation stays held while it runs (O11)."""
+        running = share.begin()
         try:
-            sandbox.begin()
+            if running:  # a thread whose share was already given up for it never starts anything
+                sandbox.begin()
         finally:
             ended()
+            if running:
+                share.end()
 
     # ------------------------------------------------------------------------------------------------ the launch
     def _fixed(self) -> Principal:
@@ -388,7 +423,9 @@ class SandboxPlatform:
         the start, the launch asks the thread to stop creating things, waits for it with a deadline however often it is
         cancelled meanwhile, and then tears down everything the sandbox registered; what a thread that outlives the
         deadline creates afterwards carries the lease labels from the moment it exists, and the thread removes it
-        itself on its way out, or the probe and the orphan reaper find it (O15, C19).
+        itself on its way out, or the probe and the orphan reaper find it (O15, C19). The start thread holds a share of
+        the run's admission and gives it up only when it ends, so a launch that stops waiting for it leaves the
+        federation held until the thread and its cleanup are done (O11).
 
         On a platform whose platform.toml has `[faults]`, the run must hold the federation's admission
         (`expcore_onedata.admission`): the executor takes it before it calls `launch`, shared for a baseline condition
@@ -412,8 +449,10 @@ class SandboxPlatform:
                 tokens = await asyncio.shield(minting)
                 sandbox = self._prepare(run_key, mode, lease, tokens, condition)
                 ended = self._threads.began(lease.key if lease is not None else None)
-                started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended))
+                share = _Share(retain_admission())  # the thread, not this coroutine, lets the federation go (O11)
+                started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended, share))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end
+                started.add_done_callback(lambda _: share.never_ran())
                 await asyncio.shield(started)
         except BaseException:
             if minting is not None and not minting.done():  # cancelled mid-mint: the worker goes on, so wait for it
