@@ -141,6 +141,7 @@ def run_study(
         health=plugin.health,
         leases=leases,
         lease_group=plugin.lease_group,
+        admission=plugin.admission,
         **options,
     ) as scheduler:
         return scheduler.run()

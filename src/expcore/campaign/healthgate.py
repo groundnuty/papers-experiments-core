@@ -34,11 +34,17 @@ post-run check that returns while the gate is still open does not close it; the 
 not look now for a reason that is no fault: a run holds the platform on purpose (an outage run of the study holds the
 federation, and the check's bounded wait for it ran out). A deferral is never a pass and never an outage: a deferred
 pre-run check holds its run (`defer`) without closing the gate, recording an outage or charging an attempt, and the
-run is tried again after `recheck_s`; a deferred post-run check says nothing about the finished run, whose outcome
-stands; and the dispatcher's own check keeps a closed gate closed while it is deferred, since only a pass opens it.
+run is tried again after `recheck_s`; a deferred post-run check verified nothing, so the finished result is never
+scored on it: the attempt is set aside as `post_check_unverified`, a kind no condition may declare; and the
+dispatcher's own check keeps a closed gate closed while it is deferred, since only a pass opens it.
+
+**Every check runs in its caller's context** (`contextvars`), so a post-run check, which runs inside the run's
+admission (`expcore.campaign.attempt`: a platform's hook that holds a resource from before the attempt until after
+its post-run check), can see that the run still holds it.
 """
 
 import contextlib
+import contextvars
 import json
 import threading
 import time
@@ -270,7 +276,8 @@ class HealthGate:
             finally:
                 box["done"].set()
 
-        threading.Thread(target=go, daemon=True, name="health-check").start()
+        context = contextvars.copy_context()  # the caller's: a post-run check sees what the run still holds
+        threading.Thread(target=context.run, args=(go,), daemon=True, name="health-check").start()
         while not box["done"].wait(0.02):  # in slices, so the end of the run is seen at once
             if stop is not None and stop.is_set():
                 return None

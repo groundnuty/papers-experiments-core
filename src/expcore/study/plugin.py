@@ -18,6 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from expcore.campaign.attempt import RunAdmission
 from expcore.campaign.executor import RunExecutor
 from expcore.campaign.healthgate import HealthCheck
 from expcore.campaign.lease import ResourceProbe
@@ -53,6 +54,8 @@ class StudyPlugin:
     - `probe`, `lease_group`, `lease_keys`: the platform's resources. `lease_group` maps a run's factor values to the
       group of leases it needs (None: no lease) and `lease_keys` the keys of a group; `probe` answers for holders and
       resources. Leave them out for a study that shares nothing.
+    - `admission`: the platform's hold on a resource every run shares (`campaign.attempt.RunAdmission`): entered before
+      an attempt starts and left after its post-run check, so the check sees what the run left; None when it has none.
     """
 
     executor: RunExecutor
@@ -63,6 +66,7 @@ class StudyPlugin:
     probe: ResourceProbe | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
+    admission: RunAdmission | None = None
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""

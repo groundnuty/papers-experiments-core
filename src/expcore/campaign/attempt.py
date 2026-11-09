@@ -11,6 +11,10 @@ The order is fixed, and each step is decided by what a kill at that point must l
    unit's pause or the budget may have begun, or the campaign may have been told to end. If any is closed now the
    lease is released cleanly (nothing was launched, so there is no teardown to prove) and the run stays pending with no
    attempt used (C11, C17);
+3a. the platform's **run admission**, when it has one (`Parts.admission`): it holds a shared resource for the run, may
+   wait for it before anything starts (outside the agent's clock), and is left only after the post-run check and the
+   store's record, so what the post-run check sees is what the run left; refused (`InfraError`), the run is left
+   unstarted and uses no attempt;
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`;
 6. the post-run health check and the served-identity check, which can turn the result into infrastructure (C11, C16);
@@ -25,11 +29,13 @@ leaves the 'running' row for recovery (C17).
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import os
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -54,11 +60,15 @@ from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.store import Store
 from expcore.campaign.units import UnitHealth
 from expcore.config.models import ModelTable
+from expcore.errors import POST_CHECK_UNVERIFIED, InfraError
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
 from expcore.records.build import RunIdentity
 
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
+# A platform's run admission: given the run's treatment kinds, its treatment targets and the campaign's end, a context
+# manager that holds what the run needs from before the attempt until after its post-run check (`Parts.admission`).
+RunAdmission = Callable[[tuple[str, ...], Mapping[str, str], threading.Event], AbstractContextManager[Any]]
 
 
 @dataclass
@@ -86,6 +96,7 @@ class Parts:
     health: HealthGate | None = None
     leases: LeasePool | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
+    admission: RunAdmission | None = None  # the platform's hold on a shared resource, around the attempt (step 3a)
     crash_hook: Callable[[str, str], None] = lambda point, run_key: None
 
 
@@ -126,8 +137,11 @@ class AttemptRunner:
             if hold is not None:
                 self._leave_unstarted(row, factors, hold)
                 return 0.0  # the hold decides when it may start again
-            launched = True
-            return self._attempt(row, factors, timer, lease)
+            with self._admitted(row, factors) as admitted:
+                if not admitted:
+                    return p.settings.retry_delay_s  # left unstarted: no attempt row exists, so none is used
+                launched = True
+                return self._attempt(row, factors, timer, lease)
         finally:
             if lease is not None and p.leases is not None:
                 if launched:
@@ -167,6 +181,26 @@ class AttemptRunner:
         if lease.wait_s >= LEASE_WAIT_NOTED_S:
             p.store.event(p.stamp(), "lease_waited", model, f"{key}: waited {lease.wait_s:.1f} s for lease {lease.key}")
         return lease, True
+
+    @contextlib.contextmanager
+    def _admitted(self, row: Any, factors: Mapping[str, Any]) -> Iterator[bool]:
+        """Hold the platform's run admission for the body, if it has one (step 3a); yield whether the run may start."""
+        p = self.p
+        if p.admission is None:
+            yield True
+            return
+        key = row["run_key"]
+        with contextlib.ExitStack() as held:
+            try:
+                held.enter_context(
+                    p.admission(self.treatment_kinds(factors, key), self.treatment_targets(factors, key), p.stop)
+                )
+            except InfraError as refusal:  # never admitted: nothing started, so no attempt is used
+                text = f"{key}: not admitted by the platform, no attempt used: {refusal.detail}"
+                p.store.event(p.stamp(), "run_unstarted", factors["model"], text)
+                yield False
+                return
+            yield True
 
     def _leave_unstarted(self, row: Any, factors: Mapping[str, Any], hold: Hold) -> None:
         """Say that a run which got its lease was held after all: nothing started, no attempt used (C11, C17)."""
@@ -271,9 +305,13 @@ class AttemptRunner:
         p = self.p
         if p.health is not None:
             health, outage = p.health.after_run()
-            if health.deferred:  # the platform was held after the run ended: nothing is said of the run
-                text = f"{key}: {health.detail}; the outcome stands"
+            if health.deferred:  # it verified nothing: the result is never scored on it (C11)
+                text = f"{key}: {health.detail}; the attempt is set aside as {POST_CHECK_UNVERIFIED}"
                 p.store.event(p.stamp(), "post_run_check_deferred", model, text)
+                if not result.outcome.set_aside:
+                    reason = f"post-run health check deferred, so the result is unverified: {health.detail}"
+                    outcome = Outcome("infrastructure", reason, infra_kind=POST_CHECK_UNVERIFIED)
+                    result = dataclasses.replace(result, outcome=outcome)
             elif not health.ok and outage is not None:
                 result = dataclasses.replace(result, outage_kind=p.settings.health_kind)  # the outage's, set aside
                 p.health.note_discard(outage, result.input_tokens, result.output_tokens)

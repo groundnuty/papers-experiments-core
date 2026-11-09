@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.attempt import AttemptRunner, Parts
+from expcore.campaign.attempt import AttemptRunner, Parts, RunAdmission
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.gate import BudgetGate
@@ -99,6 +99,7 @@ class Scheduler:
         health: HealthCheck | None = None,
         leases: LeasePool | None = None,
         lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None,
+        admission: RunAdmission | None = None,
         reservations: Reservations | None = None,
         backend_factory: BackendFactory = default_backend_factory,
         clock: Callable[[], dt.datetime] = utc_now,
@@ -109,6 +110,7 @@ class Scheduler:
         self.executor, self.agent_config, self.models = executor, agent_config, models
         self.endpoints, self.settings = dict(endpoints), settings or SchedulerConfig()
         self.health_check, self.leases, self.lease_group = health, leases, lease_group
+        self.admission = admission
         self.reservations, self.backend_factory = reservations, backend_factory
         self.clock, self.monotonic, self.crash_hook = clock, monotonic, crash_hook
         self.plan_models = sorted({row.key.factors["model"] for row in manifest.rows})
@@ -214,6 +216,7 @@ class Scheduler:
                 health=self.gate,
                 leases=self.leases,
                 lease_group=self.lease_group,
+                admission=self.admission,
                 crash_hook=self.crash_hook,
             )
         )

@@ -22,7 +22,16 @@ def _isolated_registry(monkeypatch):
     monkeypatch.setattr(errors, "_platform_untreatable", {})
 
 
-CORE = {"endpoint", "key_rejected", "sandbox", "knowledge", "unattributed_kill", "ceiling", "tool_plane_integrity"}
+CORE = {
+    "endpoint",
+    "key_rejected",
+    "sandbox",
+    "knowledge",
+    "unattributed_kill",
+    "ceiling",
+    "tool_plane_integrity",
+    "post_check_unverified",
+}
 
 
 @pytest.mark.parametrize("kind", sorted(CORE))
@@ -33,7 +42,7 @@ def test_every_core_kind_is_accepted_and_keeps_its_own_name(kind):
     assert str(error) == f"{kind}: detail"
 
 
-def test_the_core_vocabulary_is_exactly_the_seven_kinds():
+def test_the_core_vocabulary_is_exactly_the_eight_kinds():
     assert set(CORE_KINDS) == CORE
     assert infra_kinds() == CORE_KINDS
 
@@ -85,11 +94,11 @@ def test_context_overflow_keeps_the_status_and_pattern_but_no_provider_text():
     assert str(error) == "context overflow (HTTP 400, prompt_too_long)"
 
 
-def test_o05_only_the_tool_plane_integrity_kind_of_the_core_is_not_treatable():
+def test_o05_only_the_tool_plane_integrity_and_unverified_post_check_kinds_of_the_core_are_not_treatable():
     """O05: every core kind may be a condition's treatment except the one that reports a failed integrity check of the
-    tool plane, which a run must never score as the manipulation."""
-    assert {kind for kind in CORE_KINDS if not is_treatable(kind)} == {"tool_plane_integrity"}
-    assert set(untreatable_kinds()) == {"tool_plane_integrity"}
+    tool plane and the one of a post-run check that verified nothing (C11), which a run must never score."""
+    assert {kind for kind in CORE_KINDS if not is_treatable(kind)} == {"tool_plane_integrity", "post_check_unverified"}
+    assert set(untreatable_kinds()) == {"tool_plane_integrity", "post_check_unverified"}
     assert errors.TOOL_PLANE_INTEGRITY == "tool_plane_integrity"
     assert InfraError("tool_plane_integrity", "detail").kind == "tool_plane_integrity"
 
@@ -103,7 +112,7 @@ def test_o05_a_platform_can_register_a_kind_that_is_not_treatable():
     register_infra_kind("provider_tampered", "a provider whose state was changed", treatable=False)
     assert is_treatable("provider_down") is True
     assert is_treatable("provider_tampered") is False
-    assert set(untreatable_kinds()) == {"tool_plane_integrity", "provider_tampered"}
+    assert set(untreatable_kinds()) == {"tool_plane_integrity", "post_check_unverified", "provider_tampered"}
     assert "state was changed" in untreatable_kinds()["provider_tampered"]
 
 

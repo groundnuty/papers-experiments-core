@@ -11,7 +11,7 @@ code. The campaign decides whether to re-run the attempt.
 Never an InfraError: agent-code exceptions (non-zero exit codes), turn, time or token caps, report outcomes, slowness,
 and a context that outgrew the model's window (`ContextOverflow`).
 
-The kinds form a closed vocabulary: the core's seven, plus whatever a platform registers once at import time with
+The kinds form a closed vocabulary: the core's eight, plus whatever a platform registers once at import time with
 `register_infra_kind`. An unknown kind is a programming error and raises at once, so a typo never reaches a record.
 
 Each kind is treatable or not. A condition whose manipulation is a fault may declare the kind of that fault as its
@@ -35,6 +35,8 @@ import re
 # and no cause was recorded. ceiling: a call was still running when the whole-time ceiling passed, with the agent's
 # own time under its cap, so something other than the agent held it up (L04). tool_plane_integrity: the tool plane
 # failed the checks that it is what the condition declared (its token, its principal's privileges); not treatable.
+# post_check_unverified: the post-run health check was deferred, so the result was never verified (C11); not
+# treatable.
 CORE_KINDS = (
     "endpoint",
     "key_rejected",
@@ -43,11 +45,14 @@ CORE_KINDS = (
     "unattributed_kill",
     "ceiling",
     "tool_plane_integrity",
+    "post_check_unverified",
 )
 TOOL_PLANE_INTEGRITY = "tool_plane_integrity"
+POST_CHECK_UNVERIFIED = "post_check_unverified"
 # The core's kinds that no condition may declare as its treatment, and why.
 CORE_UNTREATABLE: dict[str, str] = {
     TOOL_PLANE_INTEGRITY: "a run whose tool plane failed its integrity checks says nothing about the manipulation",
+    POST_CHECK_UNVERIFIED: "a run whose post-run check verified nothing has a result nobody checked",
 }
 
 _KIND_RE = re.compile(r"[a-z][a-z0-9_]*")
