@@ -17,9 +17,10 @@ from expcore.errors import (
 
 @pytest.fixture(autouse=True)
 def _isolated_registry(monkeypatch):
-    """Every test starts with only the core's kinds and leaves no platform kind behind."""
+    """Every test starts with only the core's kinds and leaves no platform or study kind behind."""
     monkeypatch.setattr(errors, "_platform_kinds", {})
     monkeypatch.setattr(errors, "_platform_untreatable", {})
+    monkeypatch.setattr(errors, "_study_kinds", {})
 
 
 CORE = {"endpoint", "key_rejected", "sandbox", "knowledge", "unattributed_kill", "ceiling", "tool_plane_integrity"}
@@ -119,6 +120,24 @@ def test_o05_a_registered_kind_cannot_be_made_treatable_or_untreatable_by_regist
         register_infra_kind("provider_down", "stronger", treatable=False)
     assert is_treatable("provider_tampered") is False
     assert is_treatable("provider_down") is True
+
+
+def test_c02_a_study_s_own_kind_has_one_owner_and_may_be_declared_again_alike():
+    """C02: a kind a study declares joins the vocabulary like a platform's, but a core or platform kind cannot be
+    declared by a study, a platform cannot register a study's kind, and a second declaration must say the same."""
+    errors.register_study_kind("relay_flap", "the relay restarted", treatable=False)
+    errors.register_study_kind("relay_flap", "the relay restarted", treatable=False)
+    assert "relay_flap" in infra_kinds()
+    assert is_treatable("relay_flap") is False
+    with pytest.raises(ValueError, match="already declared by a study with another description"):
+        errors.register_study_kind("relay_flap", "the relay restarted", treatable=True)
+    with pytest.raises(ValueError, match=r"declared by a study \(\[study.kinds\]\), not a platform's"):
+        register_infra_kind("relay_flap", "the relay restarted", treatable=False)
+    register_infra_kind("provider_down", "a provider that is down")
+    with pytest.raises(ValueError, match="a platform's kind; a study cannot declare it too"):
+        errors.register_study_kind("provider_down", "a provider that is down")
+    with pytest.raises(ValueError, match="core's own kinds"):
+        errors.register_study_kind("endpoint", "the endpoint failed")
 
 
 def test_o05_the_core_s_untreatable_kind_cannot_be_registered_again_as_treatable():

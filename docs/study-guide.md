@@ -38,7 +38,7 @@ All configuration is TOML in the study directory, validated when the study is lo
 
 | File | Holds |
 |---|---|
-| `study.toml` | the study's name, its plugin, the code identity's scope, the factors, the conditions and the tasks |
+| `study.toml` | the study's name, its plugin, the code identity's scope, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the factors, the conditions and the tasks |
 | `models.toml` | the single model table: each model once, with backend, API id, sampling, limits, price and status |
 | `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the budget |
 | `preregistration.toml` | the named contrasts, the Holm family, alpha, the estimators, the bootstrap and the power settings |
@@ -154,6 +154,22 @@ try:
 except ConfigError as error:
     assert "infrastructure_is_treatment" in str(error) and "can never be a treatment" in str(error)
 shutil.rmtree(tampered)
+```
+
+A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused. A kind named nowhere is refused as unknown, and the error lists the treatable kinds.
+
+```python
+from expcore.errors import infra_kinds
+
+own = Path("own-kind-study")
+shutil.copytree("my-study", own)
+toml = own / "study.toml"
+declared = '"prompt.txt"]\n\n[study.kinds]\nrelay_restart = { description = "the relay restarted", treatable = true }\n'
+text = toml.read_text().replace('"prompt.txt"]\n', declared, 1)
+toml.write_text(text.replace('["knowledge"]', '["relay_restart"]'))
+assert load_study(own).schema.treatment_kinds["relay-down"] == ("relay_restart",)
+assert "relay_restart" in infra_kinds()
+shutil.rmtree(own)
 ```
 
 ## 4. Run, record and check

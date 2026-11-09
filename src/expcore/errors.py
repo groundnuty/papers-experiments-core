@@ -12,7 +12,10 @@ Never an InfraError: agent-code exceptions (non-zero exit codes), turn, time or 
 and a context that outgrew the model's window (`ContextOverflow`).
 
 The kinds form a closed vocabulary: the core's seven, plus whatever a platform registers once at import time with
-`register_infra_kind`. An unknown kind is a programming error and raises at once, so a typo never reaches a record.
+`register_infra_kind` and whatever a study declares in its study.toml (`[study.kinds]`, through `register_study_kind`).
+A study lists the platforms whose kinds it names (`[study] platforms`), and the study loader imports them and registers
+the study's kinds before it validates the conditions. An unknown kind is a programming error and raises at once, so a
+typo never reaches a record.
 
 Each kind is treatable or not. A condition whose manipulation is a fault may declare the kind of that fault as its
 treatment, so an attempt that ends in it is scored instead of set aside (`FactorSchema`). A kind that reports a
@@ -47,16 +50,47 @@ CORE_UNTREATABLE: dict[str, str] = {
 }
 
 _KIND_RE = re.compile(r"[a-z][a-z0-9_]*")
-_platform_kinds: dict[str, str] = {}
+_platform_kinds: dict[str, str] = {}  # every registered kind, a platform's or a study's, with its description
 _platform_untreatable: dict[str, str] = {}
+_study_kinds: dict[str, tuple[str, bool]] = {}  # the registered kinds a study declared, with what it declared
 
 
 def register_infra_kind(kind: str, description: str, *, treatable: bool = True) -> None:
     """Add a platform's infrastructure kind to the vocabulary; registering the same kind again is harmless.
 
+    A platform calls it once, when its module is imported. A study that declares one of the kinds as a treatment lists
+    that module in study.toml (`[study] platforms`), so it is imported before the conditions are validated.
+
     A kind registered with `treatable=False` can never be a condition's treatment: the factor schema refuses a
     declaration of it. Registering a kind again with the other answer is refused, so it cannot be made treatable.
+    A kind a study declared (`register_study_kind`) is refused: the two would be one kind with two owners.
     """
+    if kind in _platform_kinds and kind in _study_kinds:
+        raise ValueError(f"infrastructure kind {kind!r} is declared by a study ([study.kinds]), not a platform's")
+    _study_kinds.pop(kind, None)  # a study's entry for a kind no longer registered says nothing
+    _register(kind, description, treatable)
+
+
+def register_study_kind(kind: str, description: str, *, treatable: bool = True) -> None:
+    """Add a kind a study declares in study.toml (`[study.kinds]`); the study loader calls it before validating.
+
+    A core kind or a platform's is refused: a study's kind is its own. Declaring it again with the same description
+    and answer is harmless, so a study loads again in the same process; another description or answer is refused.
+    """
+    if kind in _platform_kinds:
+        held = _study_kinds.get(kind)
+        if held is None:
+            raise ValueError(f"infrastructure kind {kind!r} is a platform's kind; a study cannot declare it too")
+        if held != (description, treatable):
+            raise ValueError(f"infrastructure kind {kind!r} is already declared by a study with another description "
+                             "or treatability")  # fmt: skip
+        return
+    _register(kind, description, treatable)
+    _study_kinds[kind] = (description, treatable)
+
+
+def _register(kind: str, description: str, treatable: bool) -> None:
+    """Check a kind and add it to the vocabulary, whoever declares it."""
     if not _KIND_RE.fullmatch(kind):
         raise ValueError(f"infrastructure kind {kind!r} must be lower-case letters, digits and underscores")
     if kind in CORE_KINDS:
