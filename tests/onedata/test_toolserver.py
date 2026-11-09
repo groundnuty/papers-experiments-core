@@ -13,6 +13,7 @@ import pytest
 from mcp import StdioServerParameters
 from platform_support import BASELINE, CEILING_S, DATA, FAKE_TOOL_SERVER, MANAGE, NOW, TOOLS, write_platform
 from record_support import make_config
+from tls_support import HAS_OPENSSL, TlsServer, make_federation_ca
 
 from expcore.campaign.attempts import classify
 from expcore.campaign.executor import failure_result
@@ -23,6 +24,7 @@ from expcore.tools.manifest import FrozenManifest, ManifestError, live_manifest
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.pin import PinError
+from expcore_onedata.tls import CA_BUNDLE_ENV
 from expcore_onedata.tokens import Plane, TokenIssuer, data_path_spec, token_window, tool_server_spec
 from expcore_onedata.toolserver import (
     ENV_PROVIDER_HOST,
@@ -102,12 +104,12 @@ def read_token(issuer, config):
     return issuer.mint(tool_server_spec(config.space.id, config.condition("read")), TOOLS, ceiling_s=CEILING_S)
 
 
-def start(launcher, ctx, condition, token, tmp_path, *, ceiling_s=CEILING_S, record=True):
-    """Launch, call echo once, leave; return the settings the server saw."""
+def start(launcher, ctx, condition, token, tmp_path, *, ceiling_s=CEILING_S, record=True, extra=None):
+    """Launch, call echo once, leave; return the settings the server saw. `extra` adds to the server's environment."""
     seen = tmp_path / "seen.json"
 
     async def go():
-        env = {"FAKE_MCP_RECORD": str(seen)} if record else None
+        env = {"FAKE_MCP_RECORD": str(seen), **(extra or {})} if record else None
         async with launcher.launch(ctx, condition, token, ceiling_s=ceiling_s, extra_env=env) as provider:
             tools = sorted(t.name for t in provider.tools())
             echoed = await provider.execute("echo", {"text": "hi"}, timeout_s=10, ctx=ctx)
@@ -565,6 +567,47 @@ def test_insecure_tls_is_a_setting_of_the_file(tmp_path, fake, frozen_manifests)
         tool_server_spec(config.space.id, config.condition("read")), TOOLS, ceiling_s=CEILING_S
     )
     assert server_environment(config, config.condition("read"), token)["ONEDATA_ALLOW_INSECURE_TLS"] == "true"
+
+
+@pytest.fixture(scope="module")
+def federation(tmp_path_factory):
+    """A CA made in the test and a certificate for 127.0.0.1 signed by it, which no default trusts."""
+    return make_federation_ca(tmp_path_factory.mktemp("federation"))
+
+
+TLS_MODES = {
+    "verify-default": (None, "refused (ConnectError)"),
+    "ca_file": ({"ca_file": "federation-ca.pem"}, "200"),
+    "insecure_tls": ({"insecure_tls": True}, "200"),
+}
+
+
+@pytest.mark.skipif(not HAS_OPENSSL, reason="the openssl command makes the federation's test CA")
+@pytest.mark.parametrize("label", TLS_MODES)
+def test_o05_the_tool_server_checks_the_federations_certificate_as_the_tls_setting_says(
+    tmp_path, fake, frozen_manifests, events, federation, label
+):
+    """O05: the server, opening the federation as the real one does (httpx, verifying unless told otherwise), fails
+    against a certificate no default trusts, and reaches it with the CA bundle named in its environment as ca_file or
+    with insecure_tls; the caller cannot set either itself."""
+    tls, expected = TLS_MODES[label]
+    use_frozen(tmp_path, frozen_manifests)
+    (tmp_path / "federation-ca.pem").write_bytes(federation.ca.read_bytes())
+    config = load_platform(write_platform(tmp_path, lambda d: d.update(tls=tls) if tls else None))
+    client = OnezoneClient(config, http=fake.client_http())
+    issuer = TokenIssuer(client, config, clock=lambda: NOW)
+    launcher = ToolServerLauncher(config, issuer, events=events)
+    token = read_token(issuer, config)
+    with TlsServer(federation) as server:
+        probe = {"FAKE_MCP_TLS_PROBE": f"{server.url}/api/v3/onezone/configuration"}
+        _, _, seen = start(launcher, RecordingContext(), "read", token, tmp_path, extra=probe)
+    assert seen["tls_probe"] == expected
+    bundle = str((tmp_path / "federation-ca.pem").resolve()) if label == "ca_file" else None
+    assert [seen[name] for name in CA_BUNDLE_ENV] == [bundle] * len(CA_BUNDLE_ENV)
+    assert seen["ONEDATA_ALLOW_INSECURE_TLS"] == ("true" if label == "insecure_tls" else None)
+    for name in (*CA_BUNDLE_ENV, "ONEDATA_ALLOW_INSECURE_TLS"):
+        with pytest.raises(ValueError, match=name):
+            server_environment(config, config.condition("read"), token, {name: "x"})
 
 
 def test_a_pinned_checkout_is_verified_before_the_spawn(world, make_repo, tmp_path, events):

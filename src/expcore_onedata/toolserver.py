@@ -60,6 +60,7 @@ from expcore_onedata.client import PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, ToolServer
 from expcore_onedata.credentials import Principal
 from expcore_onedata.pin import verify_configured
+from expcore_onedata.tls import CA_BUNDLE_ENV
 from expcore_onedata.tokencheck import ExaminationFailed, PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, token_window, tool_server_spec
 
@@ -79,7 +80,15 @@ ENV_PROVIDER_HOST = "ONEDATA_ONEPROVIDER_HOST"
 ENV_PROVIDER_TOKEN = "ONEDATA_ONEPROVIDER_TOKEN"
 ENV_TOOLS = "ONEDATA_MCP_TOOLS"
 ENV_INSECURE_TLS = "ONEDATA_ALLOW_INSECURE_TLS"
-MANAGED_ENV = (ENV_ZONE_HOST, ENV_ZONE_TOKEN, ENV_PROVIDER_HOST, ENV_PROVIDER_TOKEN, ENV_TOOLS, ENV_INSECURE_TLS)
+MANAGED_ENV = (
+    ENV_ZONE_HOST,
+    ENV_ZONE_TOKEN,
+    ENV_PROVIDER_HOST,
+    ENV_PROVIDER_TOKEN,
+    ENV_TOOLS,
+    ENV_INSECURE_TLS,
+    *CA_BUNDLE_ENV,
+)
 
 
 def server_environment(
@@ -89,6 +98,11 @@ def server_environment(
 
     The one token serves the server's Onezone and Oneprovider settings. The provider is the agent's pinned local one.
     The allow-list is the condition's, and a caller cannot set it or any other managed setting.
+
+    Its certificate check is the platform's `[tls]`: by default the server's own (it verifies with httpx's CAs); with
+    `ca_file` the bundle, checked unchanged since the load, is named by the settings a client reads for its CA file
+    (`CA_BUNDLE_ENV`, of which the server's httpx reads `SSL_CERT_FILE`); with `insecure_tls` the server's own flag
+    turns verification off. The server runs on the host, so the bundle is named by its path and never copied.
     """
     _server(config)
     clash = sorted(set(extra or {}) & set(MANAGED_ENV))
@@ -106,6 +120,8 @@ def server_environment(
     )
     if config.tls.insecure:
         env[ENV_INSECURE_TLS] = "true"
+    elif config.tls.ca_file is not None:
+        env.update(dict.fromkeys(CA_BUNDLE_ENV, str(config.tls.bundle())))
     return env
 
 
