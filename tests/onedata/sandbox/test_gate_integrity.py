@@ -111,3 +111,24 @@ def test_o05_declaring_data_gate_integrity_as_treatment_is_refused_at_load(tmp_p
     with pytest.raises(ConfigError) as caught:
         load_factor_schema(write_study(tmp_path, declared))
     assert f"names infrastructure kind '{KIND}', which can never be a treatment" in str(caught.value)
+
+
+def test_o16_a_gate_log_that_cannot_be_read_ends_the_run_as_data_gate_integrity(world):
+    """O16: an unreadable gate log says nothing of the gate's refusals, which is unknown, never none: the cell ends
+    the run as infrastructure of kind data_gate_integrity, with the reason gate_log_unreadable."""
+    sandbox = DockerSandbox.start(world.host, world.s, make_spec(world, "via-gate"), **start_options(world))
+    log = sandbox.dir / "gatelog" / "requests.jsonl"
+
+    def the_log_goes_unreadable(container, argv, stdin):
+        log.unlink(missing_ok=True)
+        log.mkdir()  # reading it now raises IsADirectoryError, an OSError
+        return CmdResult(0, "read", "")
+
+    world.host.exec_handler = the_log_goes_unreadable
+    provider = CodeExecutionProvider(sandbox)
+    with pytest.raises(InfraError) as caught:
+        asyncio.run(provider.execute("python", {"code": "read()"}, timeout_s=30, ctx=NoWaits()))
+    assert caught.value.kind == KIND
+    assert "gate_log_unreadable" in caught.value.detail
+    log.rmdir()
+    sandbox.stop()

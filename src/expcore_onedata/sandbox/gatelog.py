@@ -76,6 +76,9 @@ def errors(records: list[dict]) -> dict[str, int]:
     return out
 
 
+UNREADABLE = "gate_log_unreadable"  # the refusal an unreadable log stands for: its refusals are unknown, never none
+
+
 def refusals(lines: list[str]) -> list[str]:
     """The reason of every answer the gate refused for its own integrity, in the order of the log. A line still being
     written when the log is read (the last, cut short) is no refusal yet."""

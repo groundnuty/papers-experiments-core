@@ -60,7 +60,7 @@ def _gate_log_leaks(root, values: list[str]) -> list[tuple[str, str]]:
     itself, and the exact value of a field the agent's request chose (an API path is the agent's, and a configured
     mount path such as `/data` is a substring of many), as `(where, value)`."""
     leaks = []
-    for written in sorted(root.rglob("*requests.jsonl")):
+    for written in sorted(p for p in root.rglob("*requests.jsonl") if p.is_file()):
         for number, line in enumerate(written.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             record = json.loads(line) if line.strip() else {}
             for key, field in record.items():

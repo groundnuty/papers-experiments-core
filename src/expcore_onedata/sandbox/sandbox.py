@@ -259,6 +259,8 @@ class DockerSandbox:
         self.host.make_ca(self.dir / "tls", list(hosts))
         (self.dir / "gatelog").mkdir()
         (self.dir / "gatelog").chmod(0o777)  # the gate runs as root without DAC_OVERRIDE
+        (self.dir / "gatelog" / "requests.jsonl").touch()  # there from the start: a log that is missing is unreadable
+        (self.dir / "gatelog" / "requests.jsonl").chmod(0o666)
         config = {
             "run_key": self.spec.run_key,
             "verify_ssl": True,
@@ -551,21 +553,30 @@ class DockerSandbox:
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
         res = self._cells.run(code, timeout_s)
-        seen = self.gate_refusals()
-        res.gate_refusals, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
+        lines = self._gate_log_lines()
+        if lines is None:  # unknown is never none
+            res.gate_refusals = (gatelog.UNREADABLE,)
+        else:
+            seen = gatelog.refusals(lines)
+            res.gate_refusals, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
         return res
 
     def gate_refusals(self) -> list[str]:
-        """The reasons of the answers the data gate refused for its own integrity so far (O05), from its log. Empty
-        without a gate; a log that cannot be read is logged, and its summary in the metadata says unknown."""
+        """The reasons of the answers the data gate refused for its own integrity so far (O05), from its log; empty
+        without a gate. A log that cannot be read stands for `gatelog.UNREADABLE`: its refusals are unknown (O16)."""
+        lines = self._gate_log_lines()
+        return [gatelog.UNREADABLE] if lines is None else gatelog.refusals(lines)
+
+    def _gate_log_lines(self) -> list[str] | None:
+        """The gate log's lines; empty without a gate, None when it cannot be read (logged). `_prepare_gate` creates
+        the file, so a missing one is unreadable too."""
         if self.spec.mode is not DataPathMode.REST:
             return []
         try:
-            lines = (self.dir / "gatelog" / "requests.jsonl").read_text(encoding="utf-8").splitlines()
+            return (self.dir / "gatelog" / "requests.jsonl").read_text(encoding="utf-8").splitlines()
         except OSError as e:
             log.error("the gate log could not be read for the gate's refusals: %s", describe_error(e))
-            return []
-        return gatelog.refusals(lines)
+            return None
 
     @property
     def stopped(self) -> bool:
