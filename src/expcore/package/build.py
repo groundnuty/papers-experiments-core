@@ -8,7 +8,8 @@
    and the four outputs (`export.json`, `scores.json`, `analysis.json`, `report.md`);
 3. refuse a check made under code that is not a clean commit, outputs made by another core version, and a check that
    records no environment or another one than the build's (`provenance.environment`);
-4. rewrite the prose and metadata files an anonymisation list names, if one is given (`anonymise`);
+4. with an anonymisation list (`anonymise`), rewrite the prose and metadata files it names, and give the package a
+   code identity by tree hash alone: no commit id and no source URL anywhere (`identity`);
 5. add the generated files: `.code-stamp.json` (the commit and tree hash the check names, dated by the check), one
    wheel per distribution of the check's environment under `wheels/` with `wheels/requirements.txt` pinning each by
    hash (`wheels`), a `Makefile` whose `check` target installs those wheels into a fresh environment, offline, and
@@ -47,10 +48,19 @@ from expcore.config.loading import ConfigError
 from expcore.models.route import sdk_version
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term, load_anonymisation, rewrite
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
+from expcore.package.identity import (
+    anonymise_identity,
+    find_identity,
+    hidden_identity,
+    lay_out,
+    record_commits,
+    replayed_records,
+    stamp_bytes,
+)
 from expcore.package.spec import PackageError, PackageSpec, load_spec, select
 from expcore.package.views import hidden_name, streams, views
 from expcore.package.wheels import REQUIREMENTS, Vendor, Wheel, requirements, vendor_wheels
-from expcore.provenance.codestamp import STAMP, covered_files, is_sha, write_stamp
+from expcore.provenance.codestamp import STAMP, covered_files, is_sha
 from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_environment
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.hashfile import Hashes
@@ -227,6 +237,8 @@ def _package_json(
     rewritten: Sequence[str],
     env: Mapping[str, Any],
     wheels: Sequence[Wheel],
+    *,
+    rewritten_identity: bool,
 ) -> bytes:
     data = {
         "format": PACKAGE_FORMAT,
@@ -234,6 +246,11 @@ def _package_json(
         "study": study.name,
         "core_version": sdk_version(CORE_DISTRIBUTION),
         "code": {"commit": code["commit"], "tree_sha256": code["tree_sha256"]},
+        "code_identity": (
+            "tree hash only: every commit id is the first 40 hexadecimal digits of its tree hash, and no source is kept"
+            if rewritten_identity
+            else "commit and tree hash"
+        ),
         "checked_at": check.get("checked_at"),
         "environment": env,
         "wheels": [
@@ -261,13 +278,6 @@ def _attested(spec: PackageSpec, files: Mapping[str, bytes]) -> frozenset[str]:
                 "attest its new hash, or leave it out"
             )
     return frozenset(spec.opaque)
-
-
-def _lay_out(stage: Path, files: Mapping[str, bytes]) -> None:
-    for path, data in files.items():
-        target = stage / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
 
 
 def collect(
@@ -308,6 +318,7 @@ def collect(
         )
     rewritten: list[str] = []
     terms: Anonymisation | None = None
+    hidden_commits, hidden_urls = frozenset(), frozenset()
     if anonymise is not None:
         terms = load_anonymisation(
             Path(anonymise), keep_out_of=private_list_guard(study.root, out_dir), model_names=_model_names(study)
@@ -315,16 +326,23 @@ def collect(
         never = set(covered_files(study.root, study.scope)) | opaque  # code, and files attested unread
         files = rewrite(files, terms, code=never, out_prefix=f"{OUT_DIR}/")
         rewritten = list(terms.files)
+        hidden_commits, hidden_urls = hidden_identity(
+            study.root, code, env, record_commits(files, replayed_records(check))
+        )
+        files, code, env = anonymise_identity(
+            files, root=study.root, scope=study.scope, check=check, env=env, parent=out_dir
+        )
     vendored = _wheels(env, vendor, wheels)
     files.update({wheel.path: wheel.data for wheel in vendored})
     files[REQUIREMENTS] = requirements(vendored)
     opaque |= {wheel.path for wheel in vendored if not wheel.scanned}  # public releases, attested by name and hash
     files["Makefile"] = _makefile(env)
-    files[PACKAGE_FILE] = _package_json(spec, study, code, check, rewritten, env, vendored)
-    with tempfile.TemporaryDirectory(prefix=".stamp-", dir=out_dir) as scratch:
-        _lay_out(Path(scratch), {p: d for p, d in files.items() if p in covered_files(study.root, study.scope)})
-        write_stamp(scratch, str(code["commit"]), study.scope, created_utc=str(check.get("checked_at")))
-        files[STAMP] = (Path(scratch) / STAMP).read_bytes()
+    files[PACKAGE_FILE] = _package_json(
+        spec, study, code, check, rewritten, env, vendored, rewritten_identity=terms is not None
+    )
+    files[STAMP] = stamp_bytes(
+        files, study.root, study.scope, str(code["commit"]), str(check.get("checked_at")), out_dir
+    )
     if json.loads(files[STAMP])["tree_sha256"] != code["tree_sha256"]:
         raise PackageError(f"{where}: the package's code is not the code the records were checked under")
     files[SUMS_FILE] = render_sums(files)
@@ -333,6 +351,7 @@ def collect(
         files, private_hashes(default_hashes() if hashes is None else Path(hashes)), opaque=opaque, hidden=hidden
     )
     findings += find_terms(files, terms, opaque=opaque) if terms is not None else []
+    findings += find_identity(files, hidden_commits, hidden_urls, opaque=opaque) if terms is not None else []
     if findings:
         raise PackageError("refusing to build the package:\n  " + "\n  ".join(findings))
     return spec, files
@@ -402,7 +421,7 @@ def build_package(
     spec, files = collect(study_root, hashes=hashes, anonymise=anonymise, out_dir=out_dir, vendor=vendor, wheels=wheels)
     with tempfile.TemporaryDirectory(prefix=".staging-", dir=out_dir) as scratch:
         stage = Path(scratch) / spec.name
-        _lay_out(stage, files)
+        lay_out(stage, files)
         problems = verify_package(stage)
     if problems:
         raise PackageError("the package fails its own check:\n  " + "\n  ".join(problems))
