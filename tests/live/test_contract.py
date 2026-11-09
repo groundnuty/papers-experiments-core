@@ -229,10 +229,12 @@ def test_the_transfer_listing_answers_every_state_the_probes_read(config, client
 def test_a_transfer_record_has_the_fields_the_probes_read(config, client):
     """O08: a listed transfer's record has a type of replication, eviction or migration, a schedule time, and for a job
     that replicates its target and byte counter (job_of refuses a record without them), and start and finish times
-    that are numbers. Skipped when the space lists no transfer."""
+    that are numbers. The times are epoch seconds, the unit the run's window is compared in: a time in milliseconds
+    would put every job outside the window and record none. Skipped when the space lists no transfer."""
     # covers: GET /transfers/{id}
     from expcore_onedata.transferlog import TYPES, job_of
 
+    ten_years_s = 10 * 365 * 86400
     provider = config.support.providers[0]
     listed = [(tid, state) for state, (ids, _) in listed_transfers(client, config, provider, 5).items() for tid in ids]
     if not listed:
@@ -243,6 +245,9 @@ def test_a_transfer_record_has_the_fields_the_probes_read(config, client):
         assert job.kind in TYPES
         assert job.started is not None
         assert job.finished is not None
+        assert abs(job.scheduled - time.time()) < ten_years_s
+        for moment in (job.started, job.finished):
+            assert moment == 0 or abs(moment - time.time()) < ten_years_s  # 0 is a time not reached yet
 
 
 @MUTATE
