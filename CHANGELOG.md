@@ -26,7 +26,8 @@ For readers of the commits before this release:
 ### Known limits
 
 - The package's study-token check uses the hashes whose scope is `all`, the names private everywhere (hosts, addresses, users, spaces, providers). A study's own condition, dataset and model names are expected in its own package, so code-scope hashes are not applied. `--hashes` takes another hash file, for example a study's own.
-- Anonymisation relabels only whole words in the prose and metadata files its list names, and fails the build on a listed term anywhere else; it never rewrites code. The scanner and canaries of earlier packages are not in this release.
+- Anonymisation relabels only whole words in the prose and metadata files its list names (JSON in its parsed keys and strings, other formats as text), and fails the build on a listed term anywhere else, escaped or encoded forms included; it never rewrites code. The scanner and canaries of earlier packages are not in this release.
+- The package's checks open gzip, bzip2, xz, zip and tar content and refuse other compressed or archive formats they recognise; PDF and PNG files are read as raw bytes, without opening their own compressed streams.
 - Not in this release: streaming transport (B17), snapshot cut and fetch (C21), confirmed model-level faults (C22), two-host execution, sampling for cause coding, further estimators and fault injection ([`docs/architecture.md`](docs/architecture.md#release-boundary)).
 
 ### Regressions guaranteed
@@ -79,7 +80,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | R11 | Run keys are unique and replicates are real | `tests/campaign/test_factors.py`, `tests/campaign/test_manifest.py`, `tests/campaign/test_resume.py`, `tests/campaign/test_store.py` |
 | R12 | Secrets never reach a record | `tests/onedata/test_credentials.py`, `tests/onedata/test_tokens.py`, `tests/records/test_golden.py`, `tests/records/test_jsontext.py`, `tests/records/test_redact.py`, `tests/replay/test_builder_inputs.py`, `tests/replay/test_redaction.py` |
 | R13 | Re-scoring is offline and versioned | `tests/e2e/test_rescoring.py`, `tests/records/test_rescore.py`, `tests/test_report.py` |
-| C01 | An API failure is never scored as the agent's | `tests/campaign/test_export.py`, `tests/campaign/test_holds.py`, `tests/campaign/test_record_agreement.py`, `tests/campaign/test_scheduler.py`, `tests/campaign/test_store.py`, `tests/campaign/test_treatment_turns.py`, `tests/e2e/test_tiny_study.py`, `tests/onedata/test_toolserver.py`, `tests/records/test_golden.py`, `tests/records/test_schema.py`, `tests/records/test_treatment_versions.py` |
+| C01 | An API failure is never scored as the agent's | `tests/campaign/test_export.py`, `tests/campaign/test_holds.py`, `tests/campaign/test_record_agreement.py`, `tests/campaign/test_scheduler.py`, `tests/campaign/test_store.py`, `tests/campaign/test_treatment_turns.py`, `tests/e2e/test_tiny_study.py`, `tests/onedata/test_toolserver.py`, `tests/records/test_build.py`, `tests/records/test_golden.py`, `tests/records/test_schema.py`, `tests/records/test_treatment_versions.py` |
 | C02 | The infrastructure-kind vocabulary is closed and survives to the export | `tests/campaign/test_export.py`, `tests/campaign/test_factors.py`, `tests/loop/test_loop_failures.py`, `tests/tools/test_mcp_client.py` |
 | C03 | Attempts are charged by cause | `tests/campaign/test_scheduler.py`, `tests/campaign/test_store.py` |
 | C04 | A kill at any point resumes cleanly | `tests/campaign/test_dispatch_position.py`, `tests/campaign/test_legacy_markers.py`, `tests/campaign/test_recovery.py`, `tests/campaign/test_resume.py`, `tests/campaign/test_scheduler.py`, `tests/campaign/test_scheduler_accounting.py`, `tests/campaign/test_store.py`, `tests/e2e/test_tiny_study.py` |
@@ -121,9 +122,9 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | O09 | Mutations are scoped | `tests/onedata/test_client.py` |
 | O12 | Federation names live in configuration only | `tests/onedata/test_config.py`, `tests/onedata/test_messages.py`, `tests/test_no_placeholders.py` |
 | K01 | A check with no input fails | `tests/package/test_archive.py`, `tests/package/test_build.py`, `tests/package/test_spec.py` |
-| K03 | The private name list never enters the repository or the output | `tests/package/test_anonymise.py`, `tests/package/test_build.py` |
+| K03 | The private name list never enters the repository or the output | `tests/package/test_anonymise.py`, `tests/package/test_build.py`, `tests/package/test_scan.py` |
 | K04 | Anonymisation must not change numbers, model names or parseability | `tests/package/test_anonymise.py` |
 | K05 | Findings never carry the matched value | `tests/package/test_anonymise.py`, `tests/package/test_build.py` |
 | K06 | Archives are deterministic | `tests/package/test_archive.py`, `tests/package/test_build.py` |
-| K07 | `make check` regenerates every table from records and compares byte for byte | `tests/package/test_build.py` |
+| K07 | `make check` regenerates every table from records and compares byte for byte | `tests/package/test_build.py`, `tests/package/test_spec.py`, `tests/test_fresh_repo.py` |
 | K08 | Shipped code parses on the oldest supported Python | `tests/test_oldest_python.py` |
