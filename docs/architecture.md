@@ -133,7 +133,7 @@ TOML files in the study's repository, validated at load with messages that name 
 | `study.toml` | factors, conditions, task source, scorers, instruments | |
 | `models.toml` | **the single model table**: key, backend, API id, reported-name aliases, sampling, output limit, reasoning echo field, status | Each model is named once; caps and concurrency refer to these keys (P06). Status `frozen` gates study runs (B08). |
 | `campaign.toml` | caps per concurrency unit, attempt limits, budgets and prices, order seed | The campaign's endpoint and URL are the ones execution uses (C14). |
-| `platform.toml` | zone, providers, spaces, each agent site's local provider, the expected support set, tool-server settings | No platform name appears in code (O12); the agent is pinned to its local provider (O03); health checks the declared support set (O04). |
+| `platform.toml` | zone, providers, spaces, each agent site's local provider, the expected support set, tool-server settings, the one TLS setting all four clients of the federation take (`[tls]`) | No platform name appears in code (O12); the agent is pinned to its local provider (O03); health checks the declared support set (O04). The TLS mode, with a CA bundle's SHA-256, is in each run's record and the campaign fingerprint (C06). |
 | `preregistration.toml` | named contrasts with their outcome, estimator and cluster attribute; the Holm family; alpha, bootstrap replicates, power settings | Its hash goes into every analysis manifest (P04). |
 
 Secrets are referenced by environment variable or file path, never written in configuration, and checked at startup. Every configuration file's hash is recorded in the campaign manifest; resuming with a different hash is refused (C06).
