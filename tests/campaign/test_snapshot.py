@@ -59,6 +59,22 @@ def test_the_copy_has_the_stores_schema_and_is_one_self_contained_file(settled, 
     assert sorted(p.name for p in tmp_path.iterdir() if "snapshot" in p.name) == [SNAPSHOT_FILE]
 
 
+def test_the_copy_names_each_attempts_directory_within_the_batch_and_keeps_no_byte_of_the_path_it_ran_under(tmp_path):
+    """The snapshot is hashed, analysed and shipped in a replication package, so it holds no path of the machine,
+    not even in the free space that keeps old versions of updated rows; the store keeps its absolute paths."""
+    store, _, manifest = planned_store(tmp_path)
+    keys = [row.key.text for row in manifest.rows]
+    for number, key in enumerate(keys[:3]):
+        run_one(store, key, finished(), run_dir=str(tmp_path / "private-place" / f"{number:064d}" / "try1"))
+    destination = tmp_path / SNAPSHOT_FILE
+    take_snapshot(store.path, destination)
+    assert b"private-place" not in destination.read_bytes()
+    snapshot = StoreSnapshot(destination.read_bytes(), make_schema())
+    named = sorted(r["run_dir"] for r in snapshot.q("SELECT run_dir FROM attempts"))
+    assert named == [f"{number:064d}/try1" for number in range(3)]
+    assert all("private-place" in r["run_dir"] for r in store.q("SELECT run_dir FROM attempts"))
+
+
 def test_the_snapshot_is_one_consistent_state_whatever_a_writer_has_open(settled, tmp_path):
     """A transaction another connection has not committed is not in the copy; the copy is not blocked by it."""
     store, keys = settled

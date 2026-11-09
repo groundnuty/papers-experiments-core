@@ -296,7 +296,7 @@ def test_a_failed_write_leaves_the_earlier_export_whole_and_no_temporary_file(tm
     def broken(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(json, "dump", broken)
+    monkeypatch.setattr(json, "dumps", broken)  # the export's text is made inside the write, after the scratch file
     with pytest.raises(OSError, match="disk full"):
         write_export(store, target)
     assert target.read_text(encoding="utf-8") == before

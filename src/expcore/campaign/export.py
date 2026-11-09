@@ -133,7 +133,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
                 {
                     **who,
                     "attempt": done[0]["attempt"],
-                    "run_dir": _batch_relative(done[0]["run_dir"]),
+                    "run_dir": batch_relative(done[0]["run_dir"]),
                     "treatment": bool(done[0]["treatment"]),
                     "infra_kind": done[0]["infra_kind"],
                     **_dispatch(done[0]),
@@ -164,7 +164,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
     return data
 
 
-def _batch_relative(run_dir: str | None) -> str | None:
+def batch_relative(run_dir: str | None) -> str | None:
     """Return an attempt's directory as `<digest>/try<N>`, the last two parts of the path the store holds.
 
     The scheduler lays a campaign out as `runs/<digest>/try<N>`, so these two parts name the attempt within its batch.
@@ -309,6 +309,11 @@ def write_export(store: RunState, path: Path) -> dict[str, Any]:
     return data
 
 
+def export_text(data: Mapping[str, Any]) -> str:
+    """The text an export is written as: the bytes a regeneration of the export is compared with."""
+    return json.dumps(data, indent=1)
+
+
 def write_export_data(data: dict[str, Any], path: Path) -> None:
     """Write an export that was already built, atomically and owner-only, as `write_export` does."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -316,7 +321,7 @@ def write_export_data(data: dict[str, Any], path: Path) -> None:
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=1)
+            handle.write(export_text(data))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
