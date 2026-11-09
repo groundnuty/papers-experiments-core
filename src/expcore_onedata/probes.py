@@ -3,6 +3,7 @@
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
 #   merged: icsoc-2026-code-agent @ c1e76c2, harness/verifier.py:39-45,132-171 (retry resets, never a real answer)
 #   merged: icsoc-2026-code-agent @ c1e76c2, harness/verifier.py:290-302 (a provider's physical size from the block map)
+#   merged: onedata-mcp @ 0cc17ce, benchmark/fixture_runner.py:269-281 (the transfer listing read to its last page)
 #   changes: see git history of this file from its import commit
 """Platform probes as instruments: file distribution, transfer records and bytes per provider pair (O08).
 
@@ -11,7 +12,11 @@
 snapshot and never the live platform (R13). The snapshot holds, for the files the study names:
 
 - each tracked provider's block map before and after (merged blocks, held bytes);
-- the record of every transfer the provisioner scheduled (state and counters as the provider reports them);
+- the record of every transfer the provisioner scheduled (`transfers`: state and counters as the provider reports them);
+- the record of every transfer of the space that started in the run's window, whoever started it: the harness, the
+  agent through the tool plane, or a QoS requirement (`space_transfers`: its type, source and target by position
+  label, state, counters, and schedule, start and end times; `transferlog.py` says how it is read and where it fails
+  closed). An unreadable or unconfirmed listing is `probe_ok` false with a reason and no records, never no transfers;
 - the bytes moved between each pair of providers, from the growth of a provider's block map, attributed to a source
   only where exactly one other provider held those bytes at the start. Bytes that two or more providers held, and
   bytes no other provider held, are counted apart and attributed to nobody. No pair is ever derived from a transfer's
@@ -35,9 +40,21 @@ from typing import Any
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.placement import Range, held_bytes, merged, uncovered
 from expcore_onedata.provision import Provisioner
+from expcore_onedata.transferlog import (
+    MAX_LISTED,
+    PAGE_LIMIT,
+    STATES,
+    UNDECLARED,
+    Job,
+    Unreadable,
+    Window,
+    job_of,
+    page_of,
+    record_of,
+)
 
 NAMESPACE = "platform_probes"
-VERSION = 1
+VERSION = 2
 BLOCKS_SHOWN = 2000  # the most merged blocks recorded per file and provider; the count is always recorded
 
 
@@ -164,14 +181,24 @@ class PlatformProbes:
         transfers: Callable[[], Iterable[tuple[str, str, str]]] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.time,
+        page_limit: int = PAGE_LIMIT,
+        max_listed: int = MAX_LISTED,
     ) -> None:
-        """Track `files` (label to space-relative path) on `providers`; transfers default to the provisioner's log."""
+        """Track `files` (label to space-relative path) on `providers`; transfers default to the provisioner's log.
+
+        `now` is the epoch clock the run's window is read on. `page_limit` ids are asked for per page of the space's
+        transfer listing, and past `max_listed` distinct ids the listing is unknown.
+        """
+        if not 1 <= page_limit <= PAGE_LIMIT or max_listed < 1:
+            raise ValueError(f"a page holds 1 to {PAGE_LIMIT} ids and the listing's bound is at least one")
         self._client, self._provisioner = client, provisioner
         self._files, self._providers = dict(files), list(providers)
         self._transfers = transfers if transfers is not None else provisioner.transfers
         self._sleep, self._now = sleep, now
+        self._page_limit, self._max_listed = page_limit, max_listed
         self._before: dict[str, dict[str, ProbeResult]] | None = None
         self._started: float | None = None
+        self._pages = 0  # the pages of the transfer listing read at the last finish
 
     def _probe(self, read: Callable[[], Any]) -> ProbeResult:
         settings = self._provisioner.settings
@@ -235,9 +262,90 @@ class PlatformProbes:
             )
         return records
 
+    # -- the space's transfer log ------------------------------------------------
+    def _listed(self) -> dict[str, tuple[str, str]]:
+        """List the space's transfers on every tracked provider, every state, page by page; return each id with the
+        provider that listed it first and the furthest state it was listed in. Raise Unreadable when that fails."""
+        listed: dict[str, tuple[str, str]] = {}
+        path = f"/spaces/{self._provisioner.space_id}/transfers"
+        max_pages = self._max_listed // self._page_limit + 1
+        for provider in self._providers:
+            where = self._client.provider_label(provider)
+            for state in STATES:
+                token: str | None = None
+                for _ in range(max_pages):
+                    params = {"state": state, "limit": self._page_limit, **({"page_token": token} if token else {})}
+                    found = self._probe(lambda p=provider, q=params: self._client.get(path, provider=p, params=q))
+                    self._pages += 1
+                    if not found.ok:
+                        raise Unreadable(f"{where}: a page of the {state} listing could not be read: {found.error}")
+                    ids, token = page_of(found.value)
+                    for tid in ids:
+                        first, seen = listed.get(tid, (provider, state))
+                        listed[tid] = (first, max(seen, state, key=STATES.index))
+                    if len(listed) > self._max_listed:
+                        raise Unreadable(
+                            f"the space lists more than {self._max_listed} transfers: the listing is unknown, not cut"
+                        )
+                    if token is None:
+                        break
+                else:
+                    raise Unreadable(f"{where}: the {state} listing did not end within {max_pages} pages")
+        return listed
+
+    def _jobs(self, listed: Mapping[str, tuple[str, str]]) -> list[Job]:
+        """Read the record of every listed id on the provider that listed it; raise Unreadable when one fails."""
+        jobs = []
+        for tid, (provider, state) in listed.items():
+            found = self._probe(lambda p=provider, t=tid: self._client.get(f"/transfers/{t}", provider=p))
+            if not found.ok:
+                raise Unreadable(f"a transfer's record could not be read: {found.error}")
+            jobs.append(job_of(tid, state, found.value))
+        return jobs
+
+    def _label(self, provider_id: str | None) -> str | None:
+        """Name a provider id by its declared provider's position label, or `undeclared`; None stays None."""
+        if provider_id is None:
+            return None
+        name = self._provisioner.provider_named(provider_id)
+        return UNDECLARED if name is None else self._client.provider_label(name)
+
+    def _space_transfers(
+        self, window: Window | None, file_ids: Mapping[str, str]
+    ) -> tuple[dict[str, Any], list[Job] | None, list[Job]]:
+        """Return the snapshot's record of the space's transfers in the window, the jobs in it and those carried over
+        into it; the jobs are None, and the section's probe_ok false with the reason, when the listing is unknown."""
+        self._pages = 0
+        section: dict[str, Any] = {
+            "probe_ok": False,
+            "error": None,
+            "window": None if window is None else window.to_json(),
+            "providers": [self._client.provider_label(p) for p in self._providers],
+            "pages": 0,
+            "listed": None,
+            "records": None,
+            "carried_over": None,
+        }
+        if window is None:
+            return {**section, "error": "the run's start was not read, so the run has no window"}, None, []
+        try:
+            jobs = self._jobs(self._listed())
+        except Unreadable as error:
+            return {**section, "pages": self._pages, "error": str(error)}, None, []
+        harness = {tid for _, tid, _ in self._transfers()}
+        inside = [j for j in jobs if window.holds(j.scheduled)]
+        carried = [j for j in jobs if j.carried_over(window)]
+        records = [
+            record_of(j, label=self._label, file=file_ids.get(j.file_id or ""), harness=j.transfer_id in harness)
+            for j in inside
+        ]
+        section.update(probe_ok=True, pages=self._pages, listed=len(jobs), records=records, carried_over=len(carried))
+        return section, inside, carried
+
     def finish(self) -> dict[str, Any]:
         """Read the block maps again and return the snapshot; everything that rests on a failed probe is None."""
         entries, after = self._read_maps()
+        window = None if self._started is None else Window(self._started, self._now())
         before = self._before or {}
         files: dict[str, Any] = {}
         pair_totals: dict[str, dict[str, Any]] = {}
@@ -273,13 +381,16 @@ class PlatformProbes:
                         total["from"][source] = total["from"].get(source, 0) + n
             files[label] = {"size": size, "entry": entries[label].to_json(), "providers": readings, "pairs": pairs}
         transfers = self._transfer_records()
-        complete = complete and all(t["probe_ok"] for t in transfers)
+        file_ids = {entries[label].value.file_id: label for label in self._files if entries[label].ok}
+        space_transfers, _, _ = self._space_transfers(window, file_ids)
+        ok = complete and all(t["probe_ok"] for t in transfers) and space_transfers["probe_ok"]
         return {
             "version": VERSION,
-            "ok": complete,
+            "ok": ok,
             "providers": list(self._providers),
             "seconds": None if self._started is None else round(self._now() - self._started, 3),
             "files": files,
             "transfers": transfers,
+            "space_transfers": space_transfers,
             "pairs": pair_totals if complete else None,
         }

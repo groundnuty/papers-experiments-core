@@ -211,6 +211,15 @@ class Provisioner:
             raise Refused("the provider's id is unknown: declare it in platform.toml or resolve it from the space view")
         return self._ids[name]
 
+    def provider_named(self, provider_id: str) -> str | None:
+        """Return the declared provider whose Onezone id this is, or None when no declared provider has it."""
+        return next((name for name, known in self._ids.items() if known == provider_id), None)
+
+    @property
+    def space_id(self) -> str:
+        """The configured space's id."""
+        return self._config.space.id
+
     def root(self, *, wait: bool = True) -> str:
         """Return the space's root directory id on the data provider.
 

@@ -207,6 +207,44 @@ def test_a_real_block_map_has_the_documented_shape(day0, client, config):
     assert all(isinstance(provider_blocks(distribution, pid), list) for pid in supporting)
 
 
+def listed_transfers(client, config, provider, limit):
+    """The first page of each state of the space's transfer listing, read as the probes read it."""
+    from expcore_onedata.transferlog import STATES, page_of
+
+    path = f"/spaces/{config.space.id}/transfers"
+    return {
+        state: page_of(client.get(path, provider=provider, params={"state": state, "limit": limit})) for state in STATES
+    }
+
+
+def test_the_transfer_listing_answers_every_state_the_probes_read(config, client):
+    """O08: the probes list the space's transfers as waiting, ongoing and ended; each state's first page parses as a
+    list of plain ids with a next-page token or none, and a page asked to hold one id holds at most one."""
+    # covers: GET /spaces/{space}/transfers
+    pages = listed_transfers(client, config, config.support.providers[0], 1)
+    for ids, _ in pages.values():
+        assert len(ids) <= 1
+
+
+def test_a_transfer_record_has_the_fields_the_probes_read(config, client):
+    """O08: a listed transfer's record has a type of replication, eviction or migration, a schedule time, and for a job
+    that replicates its target and byte counter (job_of refuses a record without them), and start and finish times
+    that are numbers. Skipped when the space lists no transfer."""
+    # covers: GET /transfers/{id}
+    from expcore_onedata.transferlog import TYPES, job_of
+
+    provider = config.support.providers[0]
+    listed = [(tid, state) for state, (ids, _) in listed_transfers(client, config, provider, 5).items() for tid in ids]
+    if not listed:
+        pytest.skip("the space lists no transfer to read the record of")
+    for tid, state in listed:
+        body = client.get(f"/transfers/{tid}", provider=provider)
+        job = job_of(tid, state, body)
+        assert job.kind in TYPES
+        assert job.started is not None
+        assert job.finished is not None
+
+
 @MUTATE
 @pytest.mark.parametrize("name", ["read_only", "round_trip"])
 def test_a_day0_check_that_changes_state_passes_and_shows_its_cleanup(day0, name):
