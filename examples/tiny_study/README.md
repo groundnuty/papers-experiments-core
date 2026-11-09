@@ -7,8 +7,8 @@ A complete minimal study for the core. Copy this directory, change the names and
 | `study.toml` | two factors (`access`, `tools`), three named conditions, four tasks with a `region` attribute. `extended` runs on three of the tasks only. `relay-down` declares the tool server's failure (`knowledge`) as its treatment |
 | `models.toml` | the model table: two priced stub models |
 | `campaign.toml` | the plan (models, seeds, run order seed), the loop's caps, the scheduler's caps and a budget |
-| `preregistration.toml` | two contrasts in the Holm family (one with an equivalence margin), one exploratory contrast outside it, the estimator, power settings |
-| `plugin.py` | the tools (two functions, one waits on tool-server start-up), the scorer, the executor, the health check and the resource probe |
+| `preregistration.toml` | two contrasts in the Holm family (one with an equivalence margin, one declaring that its treatment attempts are scored), one exploratory contrast outside it, the estimator, power settings |
+| `plugin.py` | the tools (two functions, one waits on tool-server start-up), the scorer (which returns values for a treatment attempt), the executor, the health check and the resource probe |
 | `prompt.txt` | the prompt template with its named slots |
 | `package.toml` | the inclusion list of the study's replication package |
 
@@ -28,7 +28,7 @@ uv run python -m expcore report examples/tiny_study --allow-dirty
 - `run` opens the campaign or resumes it, so killing the command and running it again finishes the plan. It exits 3 if runs are left pending (held by the budget or a stop).
 - `check` replays every record offline, copies the campaign store beside them, and stores the result with a hash of each. It refuses a campaign with attempts still running unless `--partial`.
 - `analyze` refuses unless the check is current, then uses only what the check verified (the copy of the store and the replayed records, never the live store) and writes `export.json`, `scores.json` and `analysis.json` under `out/`. It scores every record anew from the record alone, with no model and no platform, and reads no earlier `scores.json`; to apply a changed scorer, stamp the copy again if it has no git, run `check` (the scorer is code, so the identity changed), then `analyze` and `report`. With `--partial` it tolerates attempts that were still running and leaves out a final attempt no replayed record covers. `export.json`, `analysis.json` and the report all say whether the analysis is partial and list what was left out.
-- `report` writes `out/report.md`: every contrast with its estimate, interval, raw and Holm-adjusted p-value and its conclusion, the exploratory contrast apart, the infrastructure failures by condition, and the preregistration hash, the code stamp, the core version and the version of each scorer.
+- `report` writes `out/report.md`: every contrast with its estimate, interval, raw and Holm-adjusted p-value and its conclusion, its pairs used and missing by cause, the exploratory contrast apart, each condition's planned runs and how they ended, the infrastructure failures by condition, and the preregistration hash, the code stamp, the core version and the version of each scorer.
 
 A study that installs the core by tag or commit (`uv add git+https://github.com/groundnuty/papers-experiments-core@v0.1.0`) gets the example from the installed package instead: `uv run python -m expcore example my-study` writes it into a new directory, and the commands above then take `my-study`. `scripts/fresh_repo.py` does exactly that in a new repository.
 
@@ -45,7 +45,7 @@ The script of each run is a pure function of its condition, task and model (`scr
 | most runs | look the fact up, give the answer with the terminal `submit` tool | `finished` |
 | `baseline` on `river` | one call with malformed arguments, then the model recovers | `finished`, one malformed call counted |
 | `baseline` on `hill` | looks things up for ever | `turn_cap` |
-| `relay-down` on `lake` | the tool server fails after the first lookup: `knowledge` infrastructure | scored as treatment, never run again (a failure before the agent's first turn would be set aside and run again) |
+| `relay-down` on `lake` | the tool server fails after the first lookup: `knowledge` infrastructure | scored as treatment (no answer: accuracy 0, one round, one lookup) and kept in `relay-vs-baseline`, never run again (a failure before the agent's first turn would be set aside and run again) |
 | `beta-stub` on a few runs | a wrong answer | `finished`, accuracy 0 |
 
 With four tasks in two regions, a contrast has two clusters, so no difference can reach significance here. The example shows the shape of the output, not a finding.
