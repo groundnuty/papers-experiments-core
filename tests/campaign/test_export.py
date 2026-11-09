@@ -143,7 +143,7 @@ def test_c02_every_infrastructure_kind_keeps_its_own_name_in_the_export(tmp_path
         for _ in range(index + 1):  # a different count for each kind, so a merge could not hide
             run_one(store, keys_of(manifest)[index], infra(kind), max_attempts=10)
     data = export_run_state(store)
-    assert data["kinds"] == list(kinds)
+    assert data["kinds"] == [*CORE_KINDS, "tool_outage"]  # the core's in order, then the study's own, sorted
     per_kind = {}
     for row in data["retries_by_kind"]:
         per_kind[row["kind"]] = per_kind.get(row["kind"], 0) + row["attempts"]
@@ -565,3 +565,15 @@ def test_a_written_partial_export_reads_back_and_its_runs_still_add_up_to_the_pl
     back = read_export(path)
     assert back["partial"] is True
     assert len(back["excluded_attempts"]) == 1
+
+
+def test_k07_the_exports_kinds_come_from_the_study_never_from_what_this_process_imported(tmp_path):
+    """K07: a platform kind registered in this process but never met by the campaign nor declared by its conditions
+    is not listed, so an export regenerated in a process without the platform loaded is identical."""
+    store, _, manifest = planned_store(tmp_path, tasks=("task-a",))
+    run_one(store, keys_of(manifest)[0], infra("knowledge"), max_attempts=10)
+    before = export_run_state(store)
+    register_infra_kind("imported_elsewhere", "a kind some other module registered")
+    assert export_run_state(store) == before
+    assert "imported_elsewhere" not in before["kinds"]
+    assert before["kinds"] == list(CORE_KINDS)

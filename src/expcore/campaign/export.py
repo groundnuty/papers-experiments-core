@@ -51,7 +51,7 @@ from pathlib import Path, PurePath
 from typing import Any, Protocol
 
 from expcore.campaign.factors import FactorSchema, RunKey
-from expcore.errors import infra_kinds
+from expcore.errors import CORE_KINDS
 
 FORMAT = "campaign-export-1"
 RUN_LISTS = ("exhausted_runs", "unfinished_runs", "analysed_attempts")
@@ -156,7 +156,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         "infrastructure_by_condition": _infrastructure_by_condition(
             identities, attempts, store.schema.treatment_kinds, None if excluded is None else frozenset(left_out)
         ),
-        "kinds": list(infra_kinds()),
+        "kinds": _study_kinds(attempts, store.schema.treatment_kinds),
     }
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
@@ -199,6 +199,20 @@ def _none_last(item: tuple[tuple, Any]) -> tuple:
     the same way every time.
     """
     return tuple((part is None, "" if part is None else part) for part in item[0])
+
+
+def _study_kinds(attempts: dict[str, list[Any]], declared: dict[str, tuple[str, ...]]) -> list[str]:
+    """The study's vocabulary of infrastructure kinds, from the study alone: the core's kinds in their order, then,
+    sorted, every other kind an attempt of this campaign was counted under or a condition declares as its treatment.
+
+    It never reads the process's registry, which holds whatever platform kinds this process happened to import: an
+    export made where the platform is loaded and one regenerated where it is not (a replication package's
+    `make check`) list the same kinds (K07)."""
+    seen = {kind for kinds in declared.values() for kind in kinds}
+    for tried in attempts.values():
+        for attempt in tried:
+            seen.update(kind for kind in (attempt["infra_kind"], attempt["outage_kind"]) if kind)
+    return [*CORE_KINDS, *sorted(seen - set(CORE_KINDS))]
 
 
 def _kind_of(attempt: Any) -> str | None:
