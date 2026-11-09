@@ -743,3 +743,130 @@ def test_o05_a_client_that_stops_reading_a_buffered_answer_frees_its_slot(world,
     line = wait_for(world, lambda r: r.get("client_stalled") is True)
     assert line["client_aborted"] is True
     stalled.close()
+
+
+LISTING = "/api/v3/oneprovider/data/f1/children"
+
+
+@pytest.mark.parametrize(
+    ("query", "body"),
+    [("?limit=1001", None), ("?limit=10000", None), ("", b'{"limit": 5000}')],
+    ids=["query", "server-maximum", "json-body"],
+)
+def test_o05_a_listing_above_the_maximum_is_the_agents_4xx_and_nothing_is_forwarded(world, query, body):
+    """O05, O16: a listing whose limit is above MAX_LIST_LIMIT is refused before anything goes upstream, with a 400
+    whose reason the agent reads; the line is a policy refusal (the agent's own outcome), never a refusal of the
+    gate's integrity, so the run is not set aside for it."""
+    from expcore_onedata.sandbox import gatelog, gatepolicy, kinds
+
+    conn = connect(world)
+    headers = {"Content-Type": "application/json"} if body else {}
+    conn.request("GET", LISTING + query, body=body, headers=headers)
+    answer = conn.getresponse()
+    details = json.loads(answer.read())["error"]["details"]
+    assert answer.status == 400
+    assert str(gatepolicy.MAX_LIST_LIMIT) in details
+    assert "nextPageToken" in details
+    assert world.upstream.seen == []
+    line = wait_for(world, lambda r: r.get("path") == LISTING)
+    assert (line["decision"], line["status"], line["tag"]) == ("deny", 400, "children")
+    assert "gate_refusal" not in line
+    assert "error_origin" not in line
+    lines = world.log.read_text().splitlines()
+    assert kinds.gate_error(gatelog.refusals(lines)) is None
+    assert gatelog.summarize(lines)["refused_requests"] == 1
+    conn.close()
+
+
+def test_o05_a_listing_without_a_limit_passes_unchanged(world):
+    """O05: the official client and an agent may leave the page size to the server; such a listing is forwarded as it
+    came, and so is one at the maximum."""
+    world.upstream.mode = "fixed"
+    world.upstream.answer_headers = [("Content-Type", "application/json")]
+    world.upstream.answer_body = b'{"children": [], "isLast": true, "nextPageToken": null}'
+    conn = connect(world)
+    for target in (LISTING, LISTING + "?limit=1000"):
+        conn.request("GET", target)
+        answer = conn.getresponse()
+        answer.read()
+        assert answer.status == 200
+    assert [path for _, path, _ in world.upstream.seen] == [LISTING, LISTING + "?limit=1000"]
+    conn.close()
+
+
+def _widest_names(count: int) -> list[str]:
+    """`count` distinct names of 255 control characters each: JSON writes each as six bytes, the widest a name gets."""
+    digits = [chr(c) for c in range(1, 32)]
+    names = []
+    for index in range(count):
+        tail, n = "", index
+        while True:
+            tail, n = digits[n % 31] + tail, n // 31
+            if n == 0:
+                break
+        names.append(tail.rjust(255, "\x01"))
+    return names
+
+
+def test_o05_the_fakes_widest_listing_at_the_maximum_stays_under_the_cap_and_is_served(world):
+    """O05, O16: a page of MAX_LIST_LIMIT entries, each with every attribute the fake has (a path included), names of
+    255 control characters and the fake's longest top-level file id, is under the gate's buffer cap, so the gate checks
+    it whole and serves it, and the next page is reached by its token."""
+    from fake_onedata import MockOnedata
+
+    from expcore_onedata.sandbox import gateboundary, gatepolicy
+
+    mock = MockOnedata(
+        dict.fromkeys(_widest_names(gatepolicy.MAX_LIST_LIMIT + 1), b""),
+        space_name="invented-space",
+        token=GATE_TOKEN,
+    ).start(host="127.0.0.1")
+    try:
+        gate.CFG["hosts"][PROVIDER]["port"] = mock.port
+        root = f"/api/v3/oneprovider/data/{MockOnedata.SPACE_ID}/children"
+        conn = connect(world)
+        conn.request("GET", f"{root}?limit={gatepolicy.MAX_LIST_LIMIT}")
+        answer = conn.getresponse()
+        body = answer.read()
+        assert answer.status == 200
+        page = json.loads(body)
+        assert len(page["children"]) == gatepolicy.MAX_LIST_LIMIT
+        assert page["isLast"] is False
+        assert set(page["children"][0]) >= {"fileId", "name", "path", "type", "size", "mtime", "posixPermissions"}
+        assert 3_000_000 < len(body) < gateboundary.BUFFER_CAP
+        conn.close()
+    finally:
+        mock.stop()
+
+
+def test_o05_every_other_non_content_answer_is_one_bounded_object_far_under_the_cap(world):
+    """O05, O16: the scope of the token, a file id looked up and one file's attributes are each one object whose size
+    does not grow with a request; the fake's widest (a name of 255 control characters, every attribute) is a few
+    kilobytes, served whole after the check."""
+    from fake_onedata import MockOnedata
+
+    from expcore_onedata.sandbox import gateboundary, gatepolicy
+
+    name = _widest_names(1)[0]
+    plain = "n" * 255  # a name the lookup takes as it is written: the fake's longest top-level file id
+    mock = MockOnedata({name: b"x", plain: b"x"}, space_name="invented-space", token=GATE_TOKEN).start(host="127.0.0.1")
+    try:
+        for host in (ZONE, PROVIDER):
+            gate.CFG["hosts"][host]["port"] = mock.port
+        file_id = "f" + name.encode().hex()
+        calls = [
+            (ZONE, "POST", SCOPE, b"{}"),
+            (PROVIDER, "POST", f"/api/v3/oneprovider/lookup-file-id/{MockOnedata.SPACE_ID}/{plain}", None),
+            (PROVIDER, "GET", f"/api/v3/oneprovider/data/{file_id}", None),
+        ]
+        per_entry = gatepolicy.NAME_JSON_BYTES + gatepolicy.FILE_ID_BYTES + gatepolicy.ENTRY_REST_BYTES
+        for host, method, path, body in calls:
+            conn = connect(world, host)
+            conn.request(method, path, body=body, headers={"Content-Type": "application/json"} if body else {})
+            answer = conn.getresponse()
+            served = answer.read()
+            assert answer.status == 200, path
+            assert len(served) < 2 * per_entry < gateboundary.BUFFER_CAP
+            conn.close()
+    finally:
+        mock.stop()
