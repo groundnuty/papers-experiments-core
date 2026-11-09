@@ -10,6 +10,10 @@ resolves to the same entry. Nothing is read lazily: `load_models` validates ever
 entries share (P06), refuses settings that cannot work together (B16), and names the file and the key of every
 problem. The model's status gates study runs: only `frozen` settings may start one (B08).
 
+`backend` names one of the core's adapters (`BACKENDS`) or a backend of the study's own, a plain lower-case name. The
+core's rules for its own adapters apply only to them. The core cannot build a study's own backend: the study's plugin
+supplies a `backend_factory` that serves it, and a plugin without one is refused at load (`expcore.study.plugin`).
+
 Secrets never appear here. An entry points at an environment variable (`key_env`) or a file (`key_file`), and the
 key is read when a request is built, not when the table is loaded.
 """
@@ -27,12 +31,13 @@ from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
 from expcore.config.prices import Price
 
-BACKENDS = ("openai_compat", "anthropic", "stub")
+BACKENDS = ("openai_compat", "anthropic", "stub")  # the backends the core builds; a plugin's factory serves others
 STATUSES = ("frozen", "draft")
 CACHE_TTLS = ("5m", "1h")
 
 _KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_BACKEND_RE = re.compile(r"[a-z][a-z0-9_]*")
 # Request fields each adapter sets itself; a model entry that names one would be overridden or would override it.
 _OWNED_FIELDS = {
     "openai_compat": frozenset(
@@ -95,7 +100,7 @@ class ModelSpec:
     """One model: how to reach it, what to send it, and whether its settings are frozen for study runs."""
 
     key: str
-    backend: str  # one of BACKENDS
+    backend: str  # one of BACKENDS, or a backend of the study's own that its plugin's factory serves
     api_id: str  # the id sent to the endpoint
     status: str  # "frozen" once the vendor settings are collected, else "draft"
     base_url: str | None = None
@@ -125,6 +130,11 @@ class ModelSpec:
     def priced(self) -> bool:
         """Tell whether the cost of its tokens is known: it has a price, or its entry says it is free (C12)."""
         return self.free or self.price is not None
+
+    @property
+    def core_backend(self) -> bool:
+        """Tell whether the core builds the entry's backend; a backend of the study's own is its plugin's to build."""
+        return self.backend in BACKENDS
 
     @property
     def seed_supported(self) -> bool:
@@ -163,8 +173,12 @@ def _rule_problems(spec: ModelSpec) -> list[str]:
     problems: list[str] = []
     if not _KEY_RE.fullmatch(spec.key):
         problems.append("key must be letters, digits, dot, dash and underscore, starting with a letter or digit")
-    if spec.backend not in BACKENDS:
-        return [*problems, f"backend must be one of {', '.join(BACKENDS)}, got {spec.backend!r}"]
+    if not spec.core_backend and not _BACKEND_RE.fullmatch(spec.backend):
+        return [
+            *problems,
+            f"backend must be one of {', '.join(BACKENDS)}, or the plain lower-case name of a backend the study's "
+            f"plugin serves, got {spec.backend!r}",
+        ]
     if spec.status not in STATUSES:
         problems.append(f"status must be one of {', '.join(STATUSES)}, got {spec.status!r}")
     if not spec.api_id.strip():
@@ -182,7 +196,8 @@ def _endpoint_problems(spec: ModelSpec) -> list[str]:
         if spec.base_url or spec.key_env or spec.key_file:
             problems.append("a stub model takes no base_url, key_env or key_file")
         return problems
-    problems += base_url_problems(spec.base_url)
+    if spec.core_backend or spec.base_url is not None:  # a study's own backend may need no URL; one it gives is checked
+        problems += base_url_problems(spec.base_url)
     if spec.key_env and spec.key_file:
         problems.append("give key_env or key_file, not both")
     if spec.backend == "anthropic" and not (spec.key_env or spec.key_file):
@@ -211,7 +226,7 @@ def _request_problems(spec: ModelSpec) -> list[str]:
         *sampling_problems(spec.sampling),
         *thinking_problems(spec.backend, spec.extra_body, spec.max_output_tokens),
     ]
-    owned = _OWNED_FIELDS[spec.backend]
+    owned = _OWNED_FIELDS.get(spec.backend, frozenset())  # a study's own backend: its factory knows what it sets
     for where, table in (("sampling", spec.sampling), ("extra_body", spec.extra_body)):
         problems += [f"{where} sets '{name}', which the adapter sets itself" for name in sorted(owned & table.keys())]
     if (spec.sampling.keys() | spec.extra_body.keys()) & {"stream"}:

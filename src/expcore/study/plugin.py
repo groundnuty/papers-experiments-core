@@ -18,10 +18,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from expcore.campaign.executor import RunExecutor
+from expcore.campaign.executor import BackendFactory, RunExecutor
 from expcore.campaign.healthgate import HealthCheck
 from expcore.campaign.lease import ResourceProbe
-from expcore.config.loading import ConfigError
+from expcore.config.loading import ConfigError, Section
+from expcore.config.models import BACKENDS
 from expcore.plugin import ToolSpec
 from expcore.records.rescore import Scorer, scorer_name, scorer_version
 from expcore.study.config import StudyConfig
@@ -56,6 +57,10 @@ class StudyPlugin:
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
       Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash). They go into the campaign
       fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
+    - `backend_factory`: builds the backend of every model, for admission and for each run, in place of the core's
+      `default_backend_factory`; None keeps the core's. A model whose backend the core does not build
+      (`config.models.BACKENDS`) needs one, and the factory decides which models it serves: it hands the others to
+      `default_backend_factory`.
     """
 
     executor: RunExecutor
@@ -67,6 +72,7 @@ class StudyPlugin:
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
     platform: Mapping[str, Any] = field(default_factory=dict)
+    backend_factory: BackendFactory | None = None
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
@@ -109,7 +115,8 @@ def load_plugin(context: StudyContext) -> StudyPlugin:
 
 
 def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
-    """Refuse a plugin that does not cover the study: a scorer twice, a condition without a prompt or tool hash."""
+    """Refuse a plugin that does not cover the study: a scorer twice, a condition without a prompt or tool hash, a
+    model whose backend nothing can build."""
     names = [scorer_name(s) for s in plugin.scorers]
     if not names or len(set(names)) != len(names):
         raise ConfigError(f"{file}: the plugin needs at least one scorer, and their names must differ: {names}")
@@ -120,3 +127,17 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
     if not isinstance(plugin.platform, Mapping):
         kind = type(plugin.platform).__name__
         raise ConfigError(f"{file}: the plugin's platform must be a mapping of plain data, not a {kind}")
+    if plugin.backend_factory is None:
+        _check_backends(study)
+
+
+def _check_backends(study: StudyConfig) -> None:
+    """Without a factory of the plugin's, every model of the table must name a backend the core builds."""
+    for key in study.models:
+        spec = study.models.resolve(key)
+        if not spec.core_backend:
+            raise Section({}, study.models.source, f"[models.{key}]").fail(
+                "backend",
+                f"names {spec.backend!r}, a backend the core does not build ({', '.join(BACKENDS)}); the plugin "
+                "must supply a backend_factory that serves it",
+            )

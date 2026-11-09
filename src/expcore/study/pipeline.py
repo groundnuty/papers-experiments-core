@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.accounting import condition_accounting
+from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import build_fingerprint
@@ -120,8 +121,9 @@ def run_study(
 
     Refuses code that cannot be vouched for (unknown, stale, or dirty unless `allow_dirty`). The scheduler returns when
     no run is in flight and every pending run is held by something that will not end by itself (a budget, a stop):
-    a command line has no one to release it. `crash_hook` is the scheduler's own test seam for killing the process at
-    a chosen point of an attempt.
+    a command line has no one to release it. Every backend is built by the plugin's `backend_factory`, or the core's
+    when it supplies none. `crash_hook` is the scheduler's own test seam for killing the process at a chosen point of
+    an attempt.
     """
     study = load_study(path)
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
@@ -143,6 +145,7 @@ def run_study(
         health=plugin.health,
         leases=leases,
         lease_group=plugin.lease_group,
+        backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
         **options,
     ) as scheduler:
         return scheduler.run()

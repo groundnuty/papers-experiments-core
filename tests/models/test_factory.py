@@ -26,6 +26,17 @@ def test_b08_a_pilot_may_ask_for_an_unfrozen_model(make_spec, limits, fake_clien
     assert isinstance(backend, OpenAICompatAdapter)
 
 
+def test_b16_the_core_refuses_to_build_a_backend_of_the_study_s_own_instead_of_sending_it_as_its_own(
+    make_spec, limits, fake_client
+):
+    """B16: a backend the core does not know is never built as an OpenAI-compatible one; only a plugin's factory
+    builds it, and the refusal names the model, before any request."""
+    client = fake_client()
+    with pytest.raises(ConfigError, match=r"model 'test-model': the core builds no backend 'toy_relay'.*factory"):
+        build_backend(make_spec(backend="toy_relay"), seed=1, limits=limits, client=client)
+    assert client.requests == []
+
+
 def test_the_entrys_backend_name_picks_the_adapter(make_spec, limits, fake_client):
     env = {"TEST_CLAUDE_KEY": "k"}
     assert isinstance(build_backend(make_spec(), seed=1, limits=limits, client=fake_client()), OpenAICompatAdapter)

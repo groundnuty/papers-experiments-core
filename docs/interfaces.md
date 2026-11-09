@@ -39,6 +39,7 @@ class StudyPlugin:
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
     platform: Mapping[str, Any] = field(default_factory=dict)  # the platform's settings that make one experiment
+    backend_factory: BackendFactory | None = None  # None: the core's default_backend_factory
 ```
 
 The core guarantees: the code identity is computed once, from the study directory and the `[study] code` roots, and refused if it is unknown, stale or (without `--allow-dirty`) dirty; the plugin is rejected at load if a condition has no prompt or tool hash, two scorers share a name, or `platform` is not a mapping; `prompts`, `tools`, the scorers' names and versions, the hash of each configuration file and, when not empty, `platform` go into the campaign fingerprint, so a resume under any change is refused (C06). A study on the Onedata layer passes `platform=config.fingerprint()`, the platform file's TLS mode with the CA bundle's SHA-256, so a resume under another mode or bundle is refused.
@@ -51,7 +52,7 @@ What the analysis may use. `check` replays every record and also copies the camp
 
 ## ModelBackend
 
-`expcore.models.adapters.ModelBackend`; built by the core, never by the executor.
+`expcore.models.adapters.ModelBackend`; built by the core, never by the executor. The core builds three backends, named by `backend` in `models.toml`: `openai_compat`, `anthropic` and `stub` (`expcore.config.models.BACKENDS`). A study plugs in a backend of its own without editing the core: its model entries name it with a plain lower-case `backend` value, and the plugin supplies the `backend_factory` that builds it ([BackendFactory](#backendfactory)).
 
 ```python
 class ModelBackend(Protocol):
@@ -77,6 +78,7 @@ Implementer must guarantee:
 - `step` returns one reply per call. A token count the reply did not report is `None`, never 0 (R10).
 - A failure of the endpoint that outlasts the retries is raised as `InfraError("endpoint", ...)`; a refused key as `InfraError("key_rejected", ...)`. A reply cut at the output limit sets `stop_reason` to a limit stop.
 - `info()` and `transcript()` never contain a credential; the base URL has none (R12).
+- An executor that needs more than the protocol (the example's executor scripts the stub with `use`) checks for that method, never for a class, so a backend that wraps or replaces the stub serves it too.
 
 ### BackendFactory
 
@@ -86,7 +88,11 @@ class BackendFactory(Protocol):
                  time_left: Callable[[], float | None] | None) -> ModelBackend
 ```
 
-The scheduler calls it for admission and for every run with the same `base_url`. The default builds the adapter the model entry names.
+The scheduler calls it for admission and for every run with the same `base_url`. The default, `expcore.campaign.executor.default_backend_factory`, builds the adapter the model entry names and refuses a backend the core does not build. A study replaces it with `StudyPlugin.backend_factory`, which `run_study` passes to the scheduler.
+
+The core guarantees: a model entry whose `backend` the core does not build is accepted by `models.toml` only as a plain lower-case name, and only the core's rules that are not about its own adapters apply to it (its `base_url`, if given, its key reference, its limits, its sampling); the plugin is refused at load, naming `models.toml` and the key, when such a model is in the table and the plugin supplies no factory.
+
+The implementer must guarantee: the factory decides which models it serves and passes every other model to `default_backend_factory`, so the core's backends keep their own rules (B08, B16); the backend it returns meets the `ModelBackend` contract above; a backend whose transcript is not in a core format registers its parser with `expcore.replay.native.register_native_parser`, under the name its `info()` gives, or the replay check cannot read its records.
 
 ## ToolProvider and CallContext
 
