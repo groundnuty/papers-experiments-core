@@ -1,5 +1,7 @@
 # Provenance: new
-"""The command line: `python -m expcore run | check | analyze | report | package | package-check`. A thin shell.
+"""The command line: `python -m expcore run | check | analyze | report | package | package-check | example`.
+
+A thin shell; the logic is in the packages.
 
     run STUDY       load the configuration, open or resume the campaign, run the scheduler
     check BATCH     the replay check over a batch of records (the study is found above the batch), with a copy of
@@ -12,6 +14,7 @@
     package-check PACKAGE
                     what a package's `make check` runs: every file against SHA256SUMS, then the outputs derived anew
                     from the records and compared byte for byte
+    example DEST    write the example study the core carries into DEST, a new directory, to run it from there
 
 Exit status: 0 done, 1 refused (the message on stderr says why and what to do), 2 usage, 3 `run` ended with runs still
 pending (held by a budget or a stop; the holds are printed).
@@ -32,6 +35,7 @@ from expcore.package.spec import PackageError
 from expcore.provenance.codestamp import CodeVersionUnknown
 from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified
 from expcore.report import summary_lines
+from expcore.study.example import ExampleError, write_example
 from expcore.study.pipeline import (
     Refused,
     StudyAnalysis,
@@ -52,6 +56,7 @@ _REFUSALS = (
     PlanError,
     BatchNotVerified,
     PackageError,
+    ExampleError,
 )
 
 
@@ -84,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     package.add_argument("--anonymise", type=Path, help="anonymisation list, kept outside the study and the output")
     verify = commands.add_parser("package-check", help="package-check PACKAGE: verify an unpacked package")
     verify.add_argument("package", type=Path, help="the directory of an unpacked package")
+    example = commands.add_parser("example", help="example DEST: write the example study into a new directory")
+    example.add_argument("dest", type=Path, help="a directory that does not exist yet, or is empty")
     return parser
 
 
@@ -149,6 +156,12 @@ def _package_check(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _example(args: argparse.Namespace) -> int:
+    written = write_example(args.dest)
+    print(f"wrote the example study ({len(written)} files) to {args.dest}; run it: python -m expcore run {args.dest}")
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], None] | None = None) -> int:
     """Run one command; return its exit status. `crash_hook` is for tests that kill `run` at a chosen point."""
     try:
@@ -164,6 +177,7 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
             "report": _report,
             "package": _package,
             "package-check": _package_check,
+            "example": _example,
         }
         return commands[args.command](args)
     except _REFUSALS as error:
