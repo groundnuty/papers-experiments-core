@@ -591,3 +591,22 @@ def test_a_pinned_checkout_is_verified_before_the_spawn(world, make_repo, tmp_pa
     assert other != commit
     with pytest.raises(PinError, match="not at the pinned commit"):
         start(launcher, RecordingContext(), "read", read_token(issuer, config), tmp_path)
+
+
+def test_c19_a_token_of_another_user_than_the_leased_slots_tool_server_user_starts_nothing(world, tmp_path):
+    """C19: the launcher is told the leased slot's tool-server user; a token minted for any other user is refused
+    before any check, wait or spawn, and the slot's own token starts the server."""
+    from expcore_onedata.credentials import Principal
+
+    config, issuer, launcher = world
+    token = read_token(issuer, config)  # minted by the tool-server user TOOLS
+    ctx = RecordingContext()
+
+    async def go(principal):
+        async with launcher.launch(ctx, "read", token, ceiling_s=CEILING_S, principal=principal) as provider:
+            return sorted(t.name for t in provider.tools())
+
+    with pytest.raises(ValueError, match="leased slot"):
+        asyncio.run(go(Principal("slot-x-tools", "u-slot-x-tools")))
+    assert ctx.events == []
+    assert asyncio.run(go(TOOLS)) == ["add", "echo"]

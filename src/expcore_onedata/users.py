@@ -21,7 +21,9 @@ user_id = "..."
 
 The leases are the core's (`expcore.campaign.lease`): the plugin hands the scheduler `lease_group` (the constant `GROUP`)
 and `lease_keys` (`Slots.keys_of`), and the scheduler takes, holds and releases the key. `Slots.users_of(lease)` then says
-which two users the run has.
+which two users the run has. The slots are the only pool of leased users: the sandbox platform
+(`sandbox/provider.py`) leases a slot for every run that needs a data-path token or a tool server, mints both through
+`SlotTokens`, and its probe is a `SlotProbe` whose `sandbox_gone` is the sandbox's own probe.
 
 **A slot is free again only when its tokens have ended.** No token is ever revoked, so a token minted for a slot stays
 good until its lifetime ends, and a run that died may have left a sandbox using it. `SlotTokens.mint` fixes the end of
@@ -291,9 +293,10 @@ class SlotTokens:
         self._issuer, self._config, self._slots, self._journal, self._clock = issuer, config, slots, journal, clock
 
     def mint(
-        self, lease: Lease, *, ceiling_s: float, condition: str | None = None, interface: str = "rest"
+        self, lease: Lease, *, ceiling_s: float, condition: str | None = None, interface: str | None = "rest"
     ) -> RunTokens:
-        """Mint the data path's token and, for a condition with a tool server, the tool server's, on the slot's users.
+        """Mint the data path's token (none when `interface` is None: a run without a data path) and, for a condition
+        with a tool server, the tool server's, on the slot's users; a run that needs neither takes no slot.
 
         A ceiling the window refuses (O06) mints and journals nothing. Otherwise the absolute expiry is computed once,
         journalled as a provisional line (durably), and both tokens are minted with exactly that expiry. A token whose
@@ -301,15 +304,17 @@ class SlotTokens:
         the provisional one before the tokens are returned. Any other failure leaves the provisional line.
         """
         slot = self._slots.users_of(lease)
+        if interface is None and condition is None:
+            raise ValueError("a run with neither a data path nor a tool server takes no slot and mints no token")
         window = token_window(ceiling_s, self._config.tokens)
         mint = secrets.token_hex(8)
         valid_until = int(self._clock()) + window.mint_ttl_s
         self._journal.record(slot.name, "provisional", valid_until, mint=mint, provisional=True)
         try:
             tokens = self._issuer.mint_run_tokens(
-                data=slot.data_path,
+                data=slot.data_path if interface is not None else None,
                 ceiling_s=ceiling_s,
-                interface=interface,
+                interface=interface or "rest",
                 tool_server=(slot.tool_server, condition) if condition is not None else None,
                 valid_until=valid_until,
             )

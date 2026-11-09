@@ -2,12 +2,13 @@
 
 import json
 import logging
+import os
 from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from platform_support import configured_values, write_platform
-from sandbox_support import add_sandbox, configured_sandbox_values
+from platform_support import BASELINE, CREDENTIALS_DIR, configured_values, write_platform
+from sandbox_support import SLOT_USERS, add_sandbox, configured_sandbox_values
 
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
@@ -17,12 +18,27 @@ from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 from expcore_onedata.tokencheck import TokenRefused
+from expcore_onedata.users import Slots, load_slots
 
 
 @pytest.fixture
 def config(tmp_path, fake) -> PlatformConfig:
     """The platform document of this directory has the sandbox table; it replaces the parent's `config`."""
     return load_platform(write_platform(tmp_path, add_sandbox))
+
+
+@pytest.fixture
+def slots(config, fake) -> Slots:
+    """The slots of the platform document, their users known to the fake federation with view and read, and each user's
+    credential file beside the others."""
+    directory = config.file.parent / CREDENTIALS_DIR
+    for login, (password, user_id) in SLOT_USERS.items():
+        file = directory / f"{login}.pass"
+        file.write_text(password + "\n", encoding="utf-8")
+        os.chmod(file, 0o600)
+        fake.add_user(login, password, user_id)
+        fake.grant(user_id, BASELINE)
+    return load_slots(config.file, config)
 
 
 @pytest.fixture

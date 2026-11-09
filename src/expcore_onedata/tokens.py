@@ -111,9 +111,9 @@ class MintedToken:
 
 @dataclass(frozen=True)
 class RunTokens:
-    """The tokens of one run: the data path's, and the tool server's when the condition has a tool server."""
+    """The tokens of one run: the data path's when it has a data path, the tool server's when it has a tool server."""
 
-    data_path: MintedToken
+    data_path: MintedToken | None
     tool_server: MintedToken | None
 
 
@@ -251,23 +251,32 @@ class TokenIssuer:
     def mint_run_tokens(
         self,
         *,
-        data: Principal,
+        data: Principal | None,
         ceiling_s: float,
         interface: str = "rest",
         tool_server: tuple[Principal, str] | None = None,
         valid_until: int | None = None,
     ) -> RunTokens:
-        """Mint the data path's token and, given `(principal, condition name)`, the tool server's, on separate users.
+        """Mint, given its principal, the data path's token and, given `(principal, condition name)`, the tool server's,
+        on separate users; a run with neither plane is refused, since it needs no token.
 
         The two users must differ by name and by id; the two tokens are checked to be different after minting. A
         refusal returns neither. With `valid_until` both tokens are minted with exactly that expiry (see `mint`).
         """
         space = self._config.space.id
-        if tool_server is not None and (
-            tool_server[0].username == data.username or tool_server[0].user_id == data.user_id
+        if data is None and tool_server is None:
+            raise ValueError("a run with neither a data path nor a tool server needs no token")
+        if (
+            data is not None
+            and tool_server is not None
+            and (tool_server[0].username == data.username or tool_server[0].user_id == data.user_id)
         ):
             raise TokenRefused("the two planes share a principal")
-        data_token = self.mint(data_path_spec(space, interface), data, ceiling_s=ceiling_s, valid_until=valid_until)
+        data_token = (
+            None
+            if data is None
+            else self.mint(data_path_spec(space, interface), data, ceiling_s=ceiling_s, valid_until=valid_until)
+        )
         if tool_server is None:
             return RunTokens(data_token, None)
         principal, condition = tool_server
@@ -277,6 +286,8 @@ class TokenIssuer:
             ceiling_s=ceiling_s,
             valid_until=valid_until,
         )
+        if data_token is None:
+            return RunTokens(None, tool)
         require_distinct(
             Examined(data_token.token_id, data_token.subject, data_token.expires_at, ()),
             Examined(tool.token_id, tool.subject, tool.expires_at, ()),

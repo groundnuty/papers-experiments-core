@@ -548,3 +548,26 @@ def test_c19_a_token_request_with_no_usable_answer_holds_the_slot_as_indetermina
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     assert slot_federation.issued  # a token does exist on the server
     assert journal.latest_expiry(lease.key) == float("inf")
+
+
+def test_c19_a_run_without_a_data_path_mints_only_its_tool_servers_token_and_one_that_needs_neither_mints_nothing(
+    slots, client, tmp_path, fake
+):
+    """C19: a slot serves a run with a tool server and no data path by minting only the tool server's token, on the
+    slot's tool-server user, journalled as any other; a run that needs neither plane takes no slot, so a mint for it is
+    refused before anything is journalled or minted."""
+    config, loaded = slots
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = TokenJournal(tmp_path / "leases")
+    tokens = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    with pytest.raises(ValueError, match="neither"):
+        tokens.mint(lease, ceiling_s=CEILING_S, condition=None, interface=None)
+    assert journal.latest_expiry(lease.key) is None
+    assert fake.issued == {}
+    minted = tokens.mint(lease, ceiling_s=CEILING_S, condition="read", interface=None)
+    assert minted.data_path is None
+    assert minted.tool_server is not None
+    assert minted.tool_server.subject == loaded.users_of(lease).tool_server.user_id
+    assert journal.latest_expiry(lease.key) == minted.tool_server.expires_at
+    assert [token["subject"]["id"] for token in fake.issued.values()] == [loaded.users_of(lease).tool_server.user_id]

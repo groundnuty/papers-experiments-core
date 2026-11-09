@@ -248,11 +248,15 @@ class HostOps(Protocol):            # hostops.py: every effect on the host, so a
     ...                                   # unmount, image_id, host_facts
 
 class SandboxPlatform:              # provider.py
+    def __init__(self, config, issuer, host, *, slots: Slots, journal: TokenJournal,
+                 tool_condition=lambda factors: None, tool_server: ToolServerLauncher | None = None, ...)
     def mode(self, factors) -> DataPathMode
-    def lease_group(self, factors) -> str | None
-    def lease_keys(self, group: str) -> Sequence[str]
-    def probe(self) -> SandboxProbe                                  # a ResourceProbe
-    def launch(self, ctx, *, run_key, level, ceiling_s, lease=None)  # async context manager yielding a DockerSandbox
+    def lease_group(self, factors) -> str | None                     # users.GROUP, or None when a run needs no slot
+    def lease_keys(self, group: str) -> Sequence[str]                # the names of [slots]
+    def probe(self) -> SlotProbe                                     # the ResourceProbe (see below)
+    def sandbox_probe(self) -> SandboxProbe                          # its sandbox half
+    def launch(self, ctx, *, run_key, level, ceiling_s, lease=None, condition=None)  # yields a DockerSandbox
+    def tool_server(self, ctx, sandbox, *, ceiling_s, extra_env=None)  # yields the run's McpToolProvider
 
 class CodeExecutionProvider:        # codetool.py: a ToolProvider with one tool that runs Python
     def __init__(self, sandbox: Sandbox, *, name="python", description=...)
@@ -260,7 +264,9 @@ class CodeExecutionProvider:        # codetool.py: a ToolProvider with one tool 
 
 **Data paths.** The study's `data_path` factor names its levels in its own words; `[sandbox.data_paths]` maps each to one of three kinds, `mount`, `rest` or `none`. A `mount` run has a read-only FUSE mount made by a oneclient sidecar that holds the data-path token; the agent holds no token and no FUSE. A `rest` run reaches the zone and its pinned local provider only through the data gate, which holds the token and adds it to the requests it forwards (a token the agent sends is dropped); the agent holds no token in its environment, its files or its process arguments. A `none` run has neither. The data path is read-only in every condition at four points: the token (4a: read-only, scoped to the space, one interface), the gate (only the five read calls pass), the mount, and the agent's root filesystem. `start` proves the last two by trying to write from inside the agent and requiring the refusal.
 
-Core guarantees: `ctx.infrastructure_wait` is given a kind of `WAIT_KINDS`; the lease the platform declared for the run is held for the whole attempt and freed through `SandboxProbe.resource_gone`.
+**One pool of leased users (C19).** A run that needs a data-path token or a tool server leases one slot of `[slots.<name>]` (`users.py`), and one that needs neither takes none (`lease_group` is None). The slot gives the run both planes' users: `launch` mints the run's tokens through `users.SlotTokens` at once, with one journalled expiry, the data path's on the slot's data-path user and, when `condition` names the run's tool-server condition, the tool server's on its tool-server user; `tool_server` then starts the server with that token, and the launcher refuses a token whose subject is not that slot user. A run with a tool server and no lease is refused; a run without a lease and with a data path (a live check) mints as the fixed `[principals.data_path]` user. The platform's `ResourceProbe` is `SlotProbe(journal, sandbox_gone=SandboxProbe(...).resource_gone)`: a key is freed only when the sandbox is proven gone and the slot's tokens have ended, by their journalled expiry plus a margin. A `[sandbox.users]` table, the second pool of earlier versions, is refused at load with a message that points to `[slots]`.
+
+Core guarantees: `ctx.infrastructure_wait` is given a kind of `WAIT_KINDS`; the lease the platform declared for the run is held for the whole attempt and freed through the platform's probe, `SlotProbe.resource_gone`, whose sandbox half is `SandboxProbe.resource_gone`.
 
 Implementer (the platform layer) guarantees:
 - `launch` opens `ctx.infrastructure_wait("sandbox_lifecycle")` around the start (the token mint, the image checks, the containers) and around the stop, and nowhere else. Executing the agent's code and its reads of data are never waits.
