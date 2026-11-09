@@ -1,4 +1,4 @@
-"""O05: the gate's response boundary covers every form of its token wherever a body is split, and keeps the length."""
+"""O05: the gate's response boundary finds its token in any form wherever a body is split, and lets none of it go."""
 
 import json
 from urllib.parse import quote
@@ -11,57 +11,78 @@ TOKENS = ["tok-plain-0123456789", 'tok/gate+"0123', "tok gate é/1"]  # invented
 
 
 def forms_made_here(token: str) -> list[bytes]:
-    """Raw, percent-encoded and JSON-escaped, made independently of the module under test."""
-    return [token.encode(), quote(token, safe="").encode(), json.dumps(token)[1:-1].encode()]
+    """Raw, percent-encoded in both cases of hex, JSON-escaped (with an escaped solidus, and every character as
+    \\uXXXX), made independently of the module under test."""
+    percent = quote(token, safe="")
+    every = "".join(f"\\u{ord(c):04x}" for c in token)
+    return [
+        token.encode(),
+        percent.encode(),
+        percent.lower().encode(),
+        json.dumps(token)[1:-1].replace("/", "\\/").encode(),
+        every.encode(),
+    ]
 
 
-def through(scrubber: gateboundary.Scrubber, pieces: list[bytes]) -> bytes:
-    return b"".join(scrubber.feed(piece) for piece in pieces) + scrubber.flush()
+def through(watch: gateboundary.BodyWatch, pieces: list[bytes]) -> tuple[bytes, bool]:
+    """What the watch lets go of the pieces, and whether it stopped them."""
+    sent = b""
+    for piece in [*pieces, None]:
+        out = watch.feed(piece) if piece is not None else watch.flush()
+        if out is None:
+            return sent, True
+        sent += out
+    return sent, False
 
 
 @pytest.mark.parametrize("token", TOKENS)
-def test_o05_a_token_split_at_any_byte_between_two_reads_is_covered_at_its_own_length(token):
-    """O05: each form of the token, cut between two reads at every position, never comes out whole, and the body that
-    comes out is exactly as long as the one that went in."""
-    forms = gateboundary.token_forms(token)
+def test_o05_a_token_in_any_form_split_at_any_byte_is_found_before_any_of_it_goes(token):
+    """O05: each form of the token, cut between two reads at every position, stops the body, and what went before
+    holds no byte of it."""
     for form in forms_made_here(token):
         body = b"head " + form + b" tail"
         for cut in range(len(body) + 1):
-            out = through(gateboundary.Scrubber(forms), [body[:cut], body[cut:]])
-            assert form not in out, (form, cut)
-            assert len(out) == len(body)
-            assert out.startswith(b"head ")
-            assert out.endswith(b" tail")
+            sent, stopped = through(gateboundary.BodyWatch(token), [body[:cut], body[cut:]])
+            assert stopped, (form, cut)
+            assert len(sent) <= len(b"head "), (form, cut)
 
 
-def test_o05_a_body_of_tiny_reads_with_tokens_back_to_back_is_covered():
-    """O05: one byte per read, two tokens touching and one at the very end: all covered, nothing else changed."""
+def test_o05_overlapping_tokens_stop_the_body_with_nothing_of_them_sent():
+    """O05: token ababa, body abababa, one byte per read: stopped, and not one byte of it went."""
+    sent, stopped = through(gateboundary.BodyWatch("ababa"), [bytes([b]) for b in b"abababa"])
+    assert (sent, stopped) == (b"", True)
+
+
+def test_o05_a_body_without_the_token_goes_whole_and_unchanged_whatever_its_escapes():
+    """O05: the boundary never rewrites: a body with escapes and pieces of the token, but not the token, goes as it
+    came, every byte, at its end."""
     token = TOKENS[1]
-    raw, percent = token.encode(), quote(token, safe="").encode()
-    body = b"x" + raw * 2 + b"y" + percent
-    out = through(gateboundary.Scrubber(gateboundary.token_forms(token)), [body[i : i + 1] for i in range(len(body))])
-    assert raw not in out
-    assert percent not in out
-    assert len(out) == len(body)
-    assert out[0:1] + out[1 + 2 * len(raw) : 2 + 2 * len(raw)] == b"xy"  # the bytes around the tokens are untouched
+    body = b"%2F \\u0074ok/gate+ %zz \\" + token[:-1].encode() + b" \\uD83D\\uDE00 end"
+    for size in (1, 3, 7, 64):
+        sent, stopped = through(gateboundary.BodyWatch(token), [body[i : i + size] for i in range(0, len(body), size)])
+        assert (sent, stopped) == (body, False)
 
 
 def test_o05_without_a_token_the_boundary_passes_everything_as_it_is():
-    """O05: a gate with no token has nothing to cover."""
-    scrubber = gateboundary.Scrubber(gateboundary.token_forms(None))
-    assert through(scrubber, [b"abc", b"def"]) == b"abcdef"
+    """O05: a gate with no token has nothing to look for."""
+    assert through(gateboundary.BodyWatch(None), [b"abc", b"def"]) == (b"abcdef", False)
+    assert gateboundary.holds_token(b"anything", None) is False
 
 
-def test_o05_credential_headers_and_headers_holding_the_token_are_withheld():
-    """O05: X-Auth-Token, Authorization, Proxy-Authorization and Set-Cookie never pass; any other header passes unless
-    it holds a form of the token."""
-    token = TOKENS[1]
-    forms = gateboundary.token_forms(token)
-    for name in ("X-Auth-Token", "Authorization", "Proxy-Authorization", "Set-Cookie"):
-        assert gateboundary.header_passes(name, "anything", forms) is False
-    assert gateboundary.header_passes("Location", f"/next?t={quote(token, safe='')}", forms) is False
-    assert gateboundary.header_passes("X-Echo", token, forms) is False
-    assert gateboundary.header_passes("Content-Type", "application/json", forms) is True
+def test_o05_a_header_holds_the_token_raw_or_decoded():
+    """O05: the header check reads the decoded view: percent-escapes in either case of hex, and JSON escapes."""
+    token = "tok/gate+0123"
+    for text in (b"tok/gate+0123", b"tok%2Fgate%2b0123", b"tok\\/gate\\u002b0123", b"x=tok%2fgate\\u002B0123"):
+        assert gateboundary.holds_token(b"X-Echo: " + text, token), text
+    assert gateboundary.holds_token(b"X-Echo: tok%2Fgate%2b012", token) is False
+    assert gateboundary.holds_token(b"X-Echo: TOK%2Fgate%2b0123", token) is False  # tokens are case-sensitive
+
+
+def test_o05_the_held_back_bytes_fit_the_longest_form():
+    """O05: six bytes a character (\\uXXXX), twelve for one outside the basic plane, three a byte percent-escaped."""
+    assert gateboundary.held_back("ab") == 12
+    assert gateboundary.held_back("\U0001f600") == 12
+    assert gateboundary.held_back(None) == 0
 
 
 @pytest.mark.parametrize(("status", "redirect"), [(300, True), (301, True), (302, True), (307, True), (304, False)])

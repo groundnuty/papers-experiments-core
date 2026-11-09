@@ -22,9 +22,10 @@ pass-through for the knowledge plane. Every request is logged as one JSON line.
 The gate holds the data-path token (from its environment, never from the configuration file or an argument) and adds it
 to every request it forwards; an `X-Auth-Token`, `Authorization` or `Cookie` header the client sent is dropped, and a
 token-scope inference carries the gate's token in its body. So the agent's code holds no credential at all (O05). Every
-answer passes the response boundary (`gateboundary.py`) on its way back, so none hands the token to the agent: credential
-headers and any header holding the token are withheld, a redirect becomes a 502 and is never followed, and every form of
-the token in a body is covered as it streams, at the body's own length.
+answer passes the response boundary (`gateboundary.py`) on its way back, so none hands the token to the agent: a redirect
+or an encoded body becomes a 502 and is never followed or passed on, a header holding the token in any form makes the
+answer a 502, a credential header without it is withheld, and a body in which the token appears is cut before any byte
+of it goes. The boundary detects; it never rewrites an answer.
 
 This file runs alone in the gate container with the standard library only; it imports nothing of the platform layer
 (tests/onedata/sandbox/test_gate.py checks that). It passes only the reads that gatepolicy lists, so the data path
@@ -108,7 +109,7 @@ TOKEN_ENV = (
 )
 AUTH_HEADER = "X-Auth-Token"
 CLIENT_CREDENTIALS = {AUTH_HEADER.lower(), "authorization", "cookie"}  # whatever the agent sends of these is dropped
-UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split between two reads is still covered
+UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split between two reads is still found
 
 
 def _log(rec: dict) -> None:
@@ -782,7 +783,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._abort_client()
                 return
             rec["client_saw"] = "5xx"
-            details = gateboundary.scrub(str(e).encode(), _token_forms()).decode(errors="replace")  # it may echo one
+            details = str(e)
+            if gateboundary.holds_token(details.encode(errors="replace"), CFG.get("token")):  # an upstream's echo
+                details = gateboundary.CREDENTIAL_DETAILS
             with contextlib.suppress(OSError):
                 self._answer(rec, 502, {"error": {"id": "badGateway", "details": details}})
 
@@ -833,21 +836,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not gateboundary.readable_encoding(resp.getheader("Content-Encoding"), resp.getheader("Transfer-Encoding")):
             error, details = "the upstream answered with an encoded body", gateboundary.ENCODED_DETAILS
-            self._refuse_answer(hcfg, resp, rec, error=error, details=details, refusal="encoded_response")
+            self._refuse_answer(hcfg, resp, rec, error=error, details=details, refusal=gateboundary.ENCODED_RESPONSE)
             return
-        forms = _token_forms()
-        # the length http.client frames the body by (None: chunked, or until EOF), never the raw header; the boundary
-        # keeps a body's length, so it stays true
-        declared = None if resp.chunked else resp.length
-        self.send_response(resp.status)
-        withheld = []
+        token = CFG.get("token")
+        passed, withheld = [], []
         for k, v in resp.getheaders():
             if k.lower() in _HOP:
                 continue
-            if gateboundary.header_passes(k, v, forms):
-                self.send_header(k, v)
-            else:  # a credential, or the token echoed: the agent never sees it (O05)
-                withheld.append(k.lower())
+            if gateboundary.holds_token(f"{k}: {v}".encode("latin-1", "replace"), token):  # no part of it goes
+                error, details = (
+                    "the upstream's answer held the gate's credential in a header",
+                    gateboundary.CREDENTIAL_DETAILS,
+                )
+                self._refuse_answer(
+                    hcfg, resp, rec, error=error, details=details, refusal=gateboundary.CREDENTIAL_IN_HEADER
+                )
+                return
+            if k.lower() in gateboundary.CREDENTIAL_HEADERS:
+                withheld.append(k.lower())  # a credential of the upstream's, never the agent's
+            else:
+                passed.append((k, v))
+        # the length http.client frames the body by (None: chunked, or until EOF), never the raw header; the boundary
+        # never rewrites a body, so it stays true
+        declared = None if resp.chunked else resp.length
+        self.send_response(resp.status)
+        for k, v in passed:
+            self.send_header(k, v)
         if withheld:
             rec["withheld_headers"] = sorted(set(withheld))  # their names only
         if resp.status in (204, 304):
@@ -861,14 +875,18 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
         self.end_headers()
         sent, failure, failure_origin = 0, None, "upstream"
-        scrubber = gateboundary.Scrubber(forms)  # holds back what could begin a token until the next read shows it
+        watch = gateboundary.BodyWatch(token)  # holds back what could begin the token until the next read shows it
         while True:
             try:
                 chunk = resp.read(UPSTREAM_READ_BYTES)
             except (OSError, http.client.HTTPException) as e:
                 failure, failure_origin = repr(e), origin_of(e)  # the gate's own read timeout is the gate's
                 break
-            out = scrubber.feed(chunk) if chunk else scrubber.flush()  # at the end, what was held back, covered
+            out = watch.feed(chunk) if chunk else watch.flush()  # at the end, what was held back
+            if out is None:  # the token, in some form: nothing more of this answer reaches the agent (O05)
+                failure = "the upstream's answer held the gate's credential in its body"
+                rec["cut_reason"] = rec["gate_refusal"] = gateboundary.CREDENTIAL_IN_RESPONSE
+                break
             try:
                 self.wfile.write(out)
             except OSError as e:
@@ -908,11 +926,6 @@ class Handler(BaseHTTPRequestHandler):
         self._log(rec)
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _handle
-
-
-def _token_forms() -> tuple[bytes, ...]:
-    """The forms of the gate's token the boundary looks for in an answer (none without a token)."""
-    return gateboundary.token_forms(CFG.get("token"))
 
 
 def _teardown_lines() -> None:

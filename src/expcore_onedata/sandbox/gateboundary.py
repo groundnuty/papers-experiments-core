@@ -2,20 +2,24 @@
 """The data gate's response boundary (O05): no upstream answer hands the gate's token to the agent.
 
 The gate adds its token to every request it forwards, so an answer can carry it back: an error body that echoes the
-request, a redirect's Location, a header echoed back. Every answer passes here before it reaches the agent:
+request, a redirect's Location, a header echoed back. The boundary detects the token and refuses the answer; it never
+rewrites one, since no list of the token's encodings is complete and a partial rewrite can leave a piece behind.
+Every answer passes it before it reaches the agent:
 
-  * a header that is a credential (`CREDENTIAL_HEADERS`), or whose name or value holds the token in any of its forms,
-    is withheld (`header_passes`);
   * a redirect (`is_redirect`: a 3xx, but for 304 Not Modified, which has no body and points nowhere) is never passed
     on and never followed: the gate answers 502 with `REDIRECT_DETAILS`;
   * a body the boundary cannot read as it arrives (`readable_encoding`: a Content-Encoding other than identity, which
     the gate asks the upstream for, or a Transfer-Encoding other than chunked) is never passed on: 502 with
     `ENCODED_DETAILS`, before any byte of it;
-  * every form of the token in the body (`token_forms`: raw, percent-encoded, JSON-escaped) is covered by the marker
-    as the body streams (`Scrubber`): each read's last len(longest form) - 1 bytes are held back and scanned with the
-    next read, so a token split between two reads is still found. A cover is exactly as long as what it covers, so the
-    body keeps its length: the Content-Length the upstream declared, and a Content-Range, stay true, and the framing of
-    the response is untouched.
+  * a header whose name or value holds the token (`holds_token`) makes the answer a 502 with `CREDENTIAL_DETAILS`,
+    before its body; a credential header without it (`CREDENTIAL_HEADERS`) is withheld and the answer passes;
+  * the body streams through `BodyWatch`, which holds back the bytes that could still begin the token in its longest
+    form (`held_back`); when the token appears, in any form, the gate stops forwarding and cuts the transfer, so the
+    agent gets no byte of it, and the line says why (`CREDENTIAL_IN_RESPONSE`).
+
+`holds_token` looks at the bytes as they are and at their decoded view: percent-escapes in either case of hex, and
+JSON escapes (`\\uXXXX`, a surrogate pair as its one character, `\\/`, `\\\\`, `\\"` and the others). The token is
+matched by its exact characters, as Onedata's tokens are case-sensitive.
 
 Pure functions and one small class over bytes, with the standard library only: `gate.py` loads this file by its path,
 as it does `gatepolicy.py`, since it runs alone in its container.
@@ -23,51 +27,57 @@ as it does `gatepolicy.py`, since it runs alone in its container.
 
 from __future__ import annotations
 
-import functools
-import json
 import re
-from collections.abc import Iterable
-from urllib.parse import quote, quote_plus
 
-MARKER = b"[withheld-by-gate]"  # repeated, and cut, to the length of what it covers
 CREDENTIAL_HEADERS = frozenset({"x-auth-token", "authorization", "proxy-authorization", "set-cookie", "set-cookie2"})
 REDIRECT_DETAILS = "the upstream answered with a redirect, which the gate does not pass on or follow"
 ENCODED_DETAILS = "the upstream answered with an encoded body, which the gate cannot look into and does not pass on"
-_HEX = re.compile(rb"%[0-9A-F]{2}")
+CREDENTIAL_DETAILS = "the upstream's answer held the gate's credential, so the gate does not pass it on"
+CREDENTIAL_IN_HEADER = "credential_in_header"
+CREDENTIAL_IN_RESPONSE = "credential_in_response"
+ENCODED_RESPONSE = "encoded_response"
+
+_ESCAPE = re.compile(rb"%[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}(?:\\u[0-9A-Fa-f]{4})?|\\[\"\\/bfnrt]")
+_JSON_SIMPLE = {b'"': b'"', b"\\": b"\\", b"/": b"/", b"b": b"\b", b"f": b"\f", b"n": b"\n", b"r": b"\r", b"t": b"\t"}
 
 
-@functools.cache
-def token_forms(token: str | None) -> tuple[bytes, ...]:
-    """Every form a body or a header can hold the token in, longest first: raw, percent-encoded (either case of hex,
-    with `+` or `%20` for a space), JSON-escaped (with and without an escaped solidus, non-ASCII escaped or not).
-    Empty when there is no token."""
+def _decoded(escape: bytes) -> bytes:
+    """The bytes one escape stands for."""
+    if escape[:1] == b"%":
+        return bytes([int(escape[1:3], 16)])
+    if escape[1:2] != b"u":
+        return _JSON_SIMPLE[escape[1:2]]
+    units = [int(escape[i : i + 4], 16) for i in range(2, len(escape), 6)]
+    if len(units) == 2 and 0xD800 <= units[0] < 0xDC00 and 0xDC00 <= units[1] < 0xE000:
+        return chr(0x10000 + ((units[0] - 0xD800) << 10) + (units[1] - 0xDC00)).encode()
+    return b"".join(chr(u).encode("utf-8", "surrogatepass") for u in units)
+
+
+def decoded_view(data: bytes) -> tuple[bytes, list[tuple[int, int]]]:
+    """`data` with every escape decoded, parsed left to right, and the (start, end) of each escape in `data`."""
+    parts, spans, pos = [], [], 0
+    for found in _ESCAPE.finditer(data):
+        parts += [data[pos : found.start()], _decoded(found.group(0))]
+        spans.append(found.span())
+        pos = found.end()
+    parts.append(data[pos:])
+    return b"".join(parts), spans
+
+
+def holds_token(data: bytes, token: str | None) -> bool:
+    """Whether `data` holds the token, as it is or in its decoded view."""
     if not token:
-        return ()
-    escaped = json.dumps(token)[1:-1]
-    forms = {
-        token.encode(),
-        quote(token, safe="").encode(),
-        quote_plus(token, safe="").encode(),
-        escaped.encode(),
-        escaped.replace("/", "\\/").encode(),
-        json.dumps(token, ensure_ascii=False)[1:-1].encode(),
-    }
-    forms |= {_HEX.sub(lambda m: m.group(0).lower(), f) for f in forms}
-    return tuple(sorted(forms, key=lambda f: (-len(f), f)))
-
-
-def cover(n: int) -> bytes:
-    """The marker as long as `n` bytes."""
-    return (MARKER * (n // len(MARKER) + 1))[:n]
-
-
-def header_passes(name: str, value: str, forms: Iterable[bytes]) -> bool:
-    """Whether an answer's header may reach the agent: not a credential, and holding no form of the token. http.client
-    gives header text decoded as latin-1, so it is compared as those bytes."""
-    if name.lower() in CREDENTIAL_HEADERS:
         return False
-    line = f"{name}: {value}".encode("latin-1", "replace")
-    return not any(form in line for form in forms)
+    needle = token.encode()
+    return needle in data or needle in decoded_view(data)[0]
+
+
+def held_back(token: str | None) -> int:
+    """The bytes the longest form of the token can take: six for a character as `\\uXXXX`, twelve for one outside the
+    basic plane (a surrogate pair), three for each byte of it percent-escaped, whichever is longest."""
+    if not token:
+        return 0
+    return sum(max(12 if ord(c) > 0xFFFF else 6, 3 * len(c.encode())) for c in token)
 
 
 def readable_encoding(content_encoding: str | None, transfer_encoding: str | None) -> bool:
@@ -83,45 +93,33 @@ def is_redirect(status: int) -> bool:
     return 300 <= status < 400 and status != 304
 
 
-class Scrubber:
-    """Covers every form of the token in a body read in pieces (`feed` each piece, then `flush` at its end).
+class BodyWatch:
+    """Watches a body read in pieces for the token: `feed` each piece, then `flush` at its end. Each returns the bytes
+    that may go to the agent now, or None once the token has appeared, after which nothing more may go.
 
-    A form that starts in one piece and ends in the next is found because each `feed` holds back the bytes that could
-    begin one: up to len(longest form) - 1, never fewer. What `feed` returns is final; the held bytes come out with the
-    next piece, or from `flush`. Without forms (no token) every piece passes as it is. The output is as long as the
-    input, held bytes aside."""
+    The held bytes are the last `held_back(token)` of what has arrived, moved back to the start of an escape they cut
+    into, so every look at the decoded view starts where a parse of the whole body would: a token that starts before
+    the held bytes ends inside what has arrived, and is found before any byte of it is let through. Without a token
+    every piece passes as it is."""
 
-    def __init__(self, forms: Iterable[bytes]) -> None:
-        ordered = sorted({f for f in forms if f}, key=lambda f: (-len(f), f))  # longest first: it wins a tie
-        self._pattern = re.compile(b"|".join(re.escape(f) for f in ordered)) if ordered else None
-        self._keep = max((len(f) for f in ordered), default=1) - 1
-        self._tail = b""
+    def __init__(self, token: str | None) -> None:
+        self._token, self._hold, self._tail = token, held_back(token), b""
 
-    def feed(self, piece: bytes) -> bytes:
-        if self._pattern is None:
+    def feed(self, piece: bytes) -> bytes | None:
+        if not self._token:
             return piece
         data = self._tail + piece
-        # a form that starts before `safe` ends inside `data`, so it is found now; one that starts after may not be
-        safe, pos, out = max(len(data) - self._keep, 0), 0, []
-        for found in self._pattern.finditer(data):
-            if found.start() >= safe:
-                break
-            out += [data[pos : found.start()], cover(found.end() - found.start())]
-            pos = found.end()
-            safe = max(safe, pos)
-        out.append(data[pos:safe])
-        self._tail = data[safe:]
-        return b"".join(out)
+        view, spans = decoded_view(data)
+        needle = self._token.encode()
+        if needle in data or needle in view:
+            return None
+        cut = max(len(data) - self._hold, 0)
+        # never split an escape between what goes and what is held: the held bytes start where a parse would
+        cut = next((start for start, end in spans if start < cut < end), cut)
+        self._tail = data[cut:]
+        return data[:cut]
 
-    def flush(self) -> bytes:
-        """The held bytes, covered: the body has ended."""
+    def flush(self) -> bytes | None:
+        """What is still held, at the body's end, or None when it completes the token."""
         tail, self._tail = self._tail, b""
-        if self._pattern is None:
-            return tail
-        return self._pattern.sub(lambda found: cover(len(found.group(0))), tail)
-
-
-def scrub(data: bytes, forms: Iterable[bytes]) -> bytes:
-    """A whole text with every form of the token covered."""
-    scrubber = Scrubber(forms)
-    return scrubber.feed(data) + scrubber.flush()
+        return None if holds_token(tail, self._token) else tail

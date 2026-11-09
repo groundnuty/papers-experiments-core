@@ -31,21 +31,14 @@ BIG = 12 * 1024 * 1024
 RUN_HEADER_VALUE = "run-test-1"
 GATE_TOKEN = "tok-gate-0123456789"  # an invented token value: the gate holds it, the client never does
 SCOPE = "/api/v3/onezone/tokens/infer_access_token_scope"
-SPECIAL_TOKEN = 'tok/gate+"0123'  # an invented token whose percent-encoded and JSON-escaped forms differ from it
+SLASH_TOKEN = "tok/gate+0123"  # an invented token whose encoded forms differ from it
 SPLIT_AT = 4096  # the gate's read size in the tests that split a token between two reads of the upstream's body
+HELD_BACK = 6  # bytes per character of the token the gate holds back: its longest form, \\uXXXX, is six
 
 
-def token_forms(token: str) -> list[bytes]:
-    """The forms a body can hold a token in, made here independently of the gate: raw, percent-encoded, JSON-escaped."""
-    return [token.encode(), quote(token, safe="").encode(), json.dumps(token)[1:-1].encode()]
-
-
-def straddling(forms: list[bytes]) -> bytes:
-    """A body with each form across a boundary between two reads of SPLIT_AT bytes, and filler between them."""
-    body = b""
-    for k, form in enumerate(forms, 1):
-        body += b"a" * (k * SPLIT_AT - len(form) // 2 - len(body)) + form
-    return body + b"b" * 64
+def across_reads(form: bytes) -> bytes:
+    """A body with `form` across the boundary between the gate's first two reads, and filler round it."""
+    return b"a" * (SPLIT_AT - len(form) // 2) + form + b"b" * 64
 
 
 class Upstream(ThreadingHTTPServer):
@@ -58,6 +51,8 @@ class Upstream(ThreadingHTTPServer):
         self.seen: list[tuple[str, str, dict]] = []
         self.bodies: list[bytes] = []
         self.mode = "ok"
+        self.answer_headers: list[tuple[str, str]] = []  # mode "fixed": the answer's extra headers and its body
+        self.answer_body = b"{}"
 
 
 class UpstreamHandler(BaseHTTPRequestHandler):
@@ -77,7 +72,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.seen.append((self.command, self.path, dict(self.headers)))
-        if self.server.mode in ("echo-headers", "redirect", "split", "gzip"):
+        if self.server.mode in ("echo-headers", "redirect", "gzip", "fixed"):
             self._echo(self.headers.get("X-Auth-Token", ""))
             return
         if self.server.mode == "unavailable":
@@ -99,7 +94,8 @@ class UpstreamHandler(BaseHTTPRequestHandler):
             pass  # the gate went away mid-body
 
     def _echo(self, token: str) -> None:
-        """A platform that hands back the token it was sent: in headers, in a redirect, in a body across two reads."""
+        """A platform that hands back the token it was sent (in headers, in a redirect, compressed), or the answer the
+        test set."""
         mode, status, headers = self.server.mode, 200, []
         body = b"{}"
         if mode == "echo-headers":
@@ -115,8 +111,8 @@ class UpstreamHandler(BaseHTTPRequestHandler):
             body = b'{"moved": "' + token.encode() + b'"}'
         elif mode == "gzip":  # whatever the gate asked for: a compressed body the gate cannot look into
             headers, body = [("Content-Encoding", "gzip")], gzip.compress(b'{"echo": "' + token.encode() + b'"}')
-        else:
-            body = straddling(token_forms(token))
+        else:  # "fixed": what the test set
+            headers, body = self.server.answer_headers, self.server.answer_body
         self.send_response(status)
         for name, value in headers:
             self.send_header(name, value)
@@ -264,20 +260,63 @@ def test_o05_the_gate_takes_its_token_from_its_environment_and_removes_it(tmp_pa
     gate.CFG.clear()
 
 
-def test_o05_a_token_the_upstream_echoes_in_a_header_never_reaches_the_agent(world):
-    """O05: an answer's credential headers (X-Auth-Token, Authorization, Set-Cookie) and any header whose value holds
-    the token are withheld at the gate's boundary; the other headers pass."""
-    world.upstream.mode = "echo-headers"
+def read_until_cut(answer) -> bytes:
+    """What the client received of a body, whether the gate finished it or cut it."""
+    received = b""
+    try:
+        while piece := answer.read(1024):
+            received += piece
+    except (http.client.IncompleteRead, ConnectionError, ssl.SSLError) as cut:
+        received += getattr(cut, "partial", b"")
+    return received
+
+
+@pytest.mark.parametrize(
+    ("token", "header"),
+    [
+        (GATE_TOKEN, ("X-Auth-Token", GATE_TOKEN)),
+        (GATE_TOKEN, ("X-Request-Echo", f"you sent {GATE_TOKEN}")),
+        (SLASH_TOKEN, ("X-Request-Echo", "you sent tok%2Fgate%2b0123")),  # percent-encoded, hex in both cases
+        (SLASH_TOKEN, ("X-Request-Echo", "you sent tok\\/gate\\u002b0123")),  # JSON-escaped
+    ],
+    ids=["credential", "echoed", "percent-mixed-case", "json"],
+)
+def test_o05_a_token_in_any_header_of_an_answer_is_a_502_before_the_body(world, token, header):
+    """O05: a header whose name or value, decoded (percent-escapes in either case of hex, JSON escapes), holds the
+    gate's token makes the whole answer a 502 with a fixed message, before any byte of its body."""
+    gate.CFG["token"] = token
+    world.upstream.mode = "fixed"
+    world.upstream.answer_headers, world.upstream.answer_body = [header], b'{"body": "plain"}'
+    conn = connect(world)
+    conn.request("GET", FILE)
+    answer = conn.getresponse()
+    body = answer.read()
+    assert answer.status == 502
+    assert b"plain" not in body
+    assert header[1] not in json.dumps(answer.getheaders())
+    line = wait_for(world, lambda r: r.get("status") == 502)
+    assert (line.get("gate_refusal"), line["upstream_status"], line["client_saw"]) == (
+        "credential_in_header",
+        200,
+        "5xx",
+    )
+    conn.close()
+
+
+def test_o05_credential_headers_without_the_token_are_withheld_and_the_rest_pass(world):
+    """O05: an answer's Authorization, Proxy-Authorization and Set-Cookie never reach the agent, token or not; the
+    other headers pass, and so does the answer."""
+    world.upstream.mode = "fixed"
+    world.upstream.answer_headers = [("Set-Cookie", "session=invented"), ("Authorization", "Basic invented")]
+    world.upstream.answer_headers += [("X-Plain", "kept")]
     conn = connect(world)
     conn.request("GET", FILE)
     answer = conn.getresponse()
     answer.read()
     headers = {name.lower(): value for name, value in answer.getheaders()}
     assert answer.status == 200
-    assert GATE_TOKEN not in json.dumps(answer.getheaders())
-    assert {"x-auth-token", "authorization", "set-cookie", "x-request-echo"} & set(headers) == set()
+    assert {"set-cookie", "authorization"} & set(headers) == set()
     assert headers["x-plain"] == "kept"
-    assert world.upstream.seen[0][2]["X-Auth-Token"] == GATE_TOKEN  # the gate did send it
     conn.close()
 
 
@@ -299,22 +338,51 @@ def test_o05_a_redirect_is_never_passed_on_nor_followed(world):
     conn.close()
 
 
-@pytest.mark.parametrize("token", [GATE_TOKEN, SPECIAL_TOKEN], ids=["plain", "special"])
-def test_o05_a_token_split_between_two_reads_of_the_body_never_reaches_the_agent(world, monkeypatch, token):
-    """O05: the body is scrubbed as it streams: each form of the token (raw, percent-encoded, JSON-escaped) across the
-    boundary between two reads of the upstream's body is covered, and the body keeps the length it declared."""
+@pytest.mark.parametrize(
+    ("token", "form"),
+    [
+        (GATE_TOKEN, GATE_TOKEN.encode()),
+        (SLASH_TOKEN, b"tok%2Fgate%2b0123"),  # percent-encoded, hex in both cases
+        (SLASH_TOKEN, b'{"t": "tok\\/gate\\u002b0123"}'),  # JSON-escaped
+        (SLASH_TOKEN, b"tok%2fgate\\u002B0123"),  # both at once
+    ],
+    ids=["raw", "percent-mixed-case", "json", "mixed"],
+)
+def test_o05_a_token_in_the_body_split_between_two_reads_cuts_the_transfer(world, monkeypatch, token, form):
+    """O05, O16: the body streams through a detector over its decoded view, which holds back six bytes per character
+    of the token: a token in any form across the boundary between two reads is found before any byte of it is sent,
+    the transfer is cut (the client's connection reset), and its line says so, with the reason."""
     monkeypatch.setattr(gate, "UPSTREAM_READ_BYTES", SPLIT_AT, raising=False)
     gate.CFG["token"] = token
-    world.upstream.mode = "split"
+    world.upstream.mode = "fixed"
+    world.upstream.answer_body = body = across_reads(form)
     conn = connect(world)
     conn.request("GET", FILE)
     answer = conn.getresponse()
-    body = answer.read()
-    sent = straddling(token_forms(token))
-    assert answer.status == 200
-    assert [form for form in token_forms(token) if form in body] == []
-    assert len(body) == len(sent) == int(answer.getheader("Content-Length"))
-    assert body.endswith(b"b" * 64)
+    received = read_until_cut(answer)
+    assert answer.status == 200  # the head went out before the body showed the token
+    assert len(received) < len(body)
+    assert received == body[: len(received)]
+    assert len(received) <= body.index(form)  # nothing of the token's form, not a piece of it
+    line = wait_for(world, lambda r: r.get("cut") is True)
+    assert (line.get("cut_reason"), line.get("gate_refusal")) == ("credential_in_response", "credential_in_response")
+    assert (line["client_saw"], line["unread_bytes"]) == ("reset", len(body) - line["bytes"])
+    conn.close()
+
+
+@pytest.mark.parametrize("cut", [1, 2, 3, 5, 7])
+def test_o05_overlapping_tokens_are_found_and_nothing_of_them_is_sent(world, monkeypatch, cut):
+    """O05: with the token ababa, a body abababa holds it twice, overlapping: the transfer is cut, and the agent gets no
+    piece of either, wherever the reads split it."""
+    monkeypatch.setattr(gate, "UPSTREAM_READ_BYTES", cut, raising=False)
+    gate.CFG["token"] = "ababa"
+    world.upstream.mode = "fixed"
+    world.upstream.answer_body = b"abababa"
+    conn = connect(world)
+    conn.request("GET", FILE)
+    received = read_until_cut(conn.getresponse())
+    assert received == b""
+    assert wait_for(world, lambda r: r.get("cut") is True)["cut_reason"] == "credential_in_response"
     conn.close()
 
 
