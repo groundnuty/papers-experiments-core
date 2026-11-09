@@ -89,6 +89,7 @@ from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.records.injections import FAULT_NAMESPACE
 from expcore_onedata.admission import (
+    INJECTOR,
     Admission,
     AdmissionRefused,
     FederationLock,
@@ -256,14 +257,17 @@ class FaultInjector:
         held = current_admission()
         if held is not None:
             require_same_federation(held, self._federation.federation)  # another federation's admission is none
-        if held is not None and not held.exclusive:
-            raise AdmissionRefused(
-                "an outage run holds the federation exclusively for its whole run and never shared: no upgrade"
-            )
-        if held is None and (self._admission is None or not self._admission.held):
-            timeout_s = self._settings.admission_timeout_s
+            if not held.exclusive:
+                raise AdmissionRefused(
+                    "an outage run holds the federation exclusively for its whole run and never shared: no upgrade"
+                )
+            held.mark(self.target)  # the run's holder record names the target it takes down
+        elif self._admission is None or not self._admission.held:
+            timeout_s, cancel = self._settings.admission_timeout_s, self._cancel
             try:
-                self._admission = self._federation.acquire(exclusive=True, timeout_s=timeout_s, cancel=self._cancel)
+                self._admission = self._federation.acquire(
+                    exclusive=True, timeout_s=timeout_s, cancel=cancel, purpose=INJECTOR, target=self.target
+                )
             except InfraError as error:
                 raise self._fail(error.detail) from None
 

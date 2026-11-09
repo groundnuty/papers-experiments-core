@@ -24,6 +24,11 @@ line also names its holder, the pid and the boot id (`holder`), so that recovery
 a lock that someone holds while the holder named in the journal is gone is stuck, and the start fails closed instead of
 skipping a provider nobody will bring back. A pid reused by an unrelated process still reads as alive, so the stuck
 lock is then skipped as a live one; the boot id rules out a holder from before a reboot.
+
+A restore that failed is journalled too (`clear_failed`, with how it failed), so an injection that is still open after
+a failed clear can be told from one in progress. Beside the journal, whoever holds the federation exclusively keeps a
+holder record (`federation.holder`, written whole and fsynced by `write_holder`; `expcore_onedata.admission`): its pid
+and boot id, its purpose, the target's label and the time it took the lock.
 """
 
 import contextlib
@@ -41,6 +46,7 @@ from expcore.errors import TARGET_LABEL
 
 JOURNAL = "injections.jsonl"
 JOURNAL_LOCK = "journal.lock"
+HOLDER = "federation.holder"  # who holds the federation exclusively: written by the holder, read when a wait runs out
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 _HELD: dict[int, weakref.finalize] = {}  # the lock descriptors this process holds, with the finalizer of each
 
@@ -216,11 +222,60 @@ class InjectionJournal:
                 entries[key] = {**line, "injected": False}
             elif event == "injected" and key in entries:
                 entries[key]["injected"] = True
+            elif event == "clear_failed" and key in entries:
+                entries[key]["clear_failed"] = str(line.get("how"))  # still open: its restore failed
             elif event == "cleared":
                 entries.pop(key, None)
             else:
                 raise ValueError(f"line {number} of the injection journal is not an injection event")
         return list(entries.values())
+
+    # --- the federation's holder record ---------------------------------------------------------------------------
+
+    def write_holder(self, record: Mapping[str, Any]) -> None:
+        """Write the record of whoever holds the federation exclusively, whole or not at all: to a file of its own,
+        fsynced, renamed over the record and the rename made durable, under the journal-wide lock."""
+        make_directories(self.directory)
+        path = self.directory / HOLDER
+        draft = self.directory / f"{HOLDER}.draft"  # one writer at a time: the section is held
+        with self._section():
+            with open(draft, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(dict(record), sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(draft, path)
+            _fsync_directory(self.directory)
+
+    def read_holder(self) -> dict[str, Any] | None:
+        """The holder record, or None when there is none or it is not a record (it then names no holder)."""
+        path = self.directory / HOLDER
+        if not path.exists():
+            return None
+        with self._section(fcntl.LOCK_SH):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                return None
+        return record if isinstance(record, dict) else None
+
+    def clear_holder(self, token: str | None) -> bool:
+        """Remove the holder record if it is the one `token` names (any record when None); whether one was removed. The
+        read and the removal are one critical section, so a record written since it was read is never removed."""
+        path = self.directory / HOLDER
+        if not path.exists():
+            return False
+        with self._section():
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return False
+            except ValueError:
+                record = None  # not a record: whoever wrote it, it names no holder
+            if token is not None and (not isinstance(record, dict) or record.get("token") != token):
+                return False
+            path.unlink()
+            _fsync_directory(self.directory)
+        return True
 
     def try_lock(self, target: str) -> HeldLock | None:
         """Take the target's exclusive lock without waiting; return it, or None when another holds it."""

@@ -10,6 +10,7 @@ read is started all the same (starting a running service changes nothing), and i
 reports a lock held while its journalled holder is gone as stuck, and returns the targets live injectors hold.
 """
 
+import contextlib
 import hashlib
 import math
 import time
@@ -105,7 +106,22 @@ class Recovery:
 
     def settle(self, entry: Mapping[str, Any]) -> tuple[bool, str, str | None]:
         """Leave one injection's target up: find it back, find it never went down, or bring it back with a changed
-        identity; journal it cleared when it is. Return whether it is, how, and the new identity's digest if any."""
+        identity; journal it cleared when it is, and its clear failed when it is not, or when settling raised. Return
+        whether it is, how, and the new identity's digest if any."""
+        try:
+            done, how, after = self._settle(entry)
+        except Exception as error:
+            self._clear_failed(entry, type(error).__name__)
+            raise
+        if not done:
+            self._clear_failed(entry, how)
+        return done, how, after
+
+    def _clear_failed(self, entry: Mapping[str, Any], how: str) -> None:
+        with contextlib.suppress(OSError):  # the journal may be what failed: the injection stays open all the same
+            self.journal.append({"event": "clear_failed", "id": entry["id"], "how": how})
+
+    def _settle(self, entry: Mapping[str, Any]) -> tuple[bool, str, str | None]:
         before = entry["identity_sha256"]
         try:
             seen: Observation | None = self._driver.observe(entry["service"])
