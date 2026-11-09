@@ -214,3 +214,22 @@ def test_c11_a_campaign_whose_check_stays_deferred_past_the_bound_stops_dispatch
         [outage] = parse(scheduler.store.get_meta(META))
         assert outage["blocking"] is True
         assert "providers[1]" in outage["first_detail"]
+
+
+def test_c11_a_closed_gate_whose_own_checks_stay_deferred_past_the_bound_becomes_blocking(tmp_path):
+    """C11: a gate closed by an ordinary failure is re-checked by the dispatcher alone; when those checks stay
+    deferred past max_defer_s, because a holder wedged the platform meanwhile, the outage becomes blocking too, so the
+    campaign is not left waiting for ever on a temporary hold."""
+    store, _, _ = planned_store(tmp_path)
+    check = Answers(Health(False, "down"), WEDGED, WEDGED)
+    gate = HealthGate(store, check, clock_from([1, 2, 3, 10, 100]), max_defer_s=3000)
+    gate.load()
+    assert gate.before_run("run-a").verdict == FOUND  # an ordinary failure: a temporary hold
+    assert (gate.closed, gate.blocking) == (True, False)
+    assert gate.poll() is False  # deferred, under the bound
+    assert gate.blocking is False
+    assert gate.poll() is False  # deferred past it
+    assert gate.blocking is True
+    [outage] = parse(store.get_meta(META))
+    assert outage["blocking"] is True
+    assert "providers[1]" in outage["last_detail"]

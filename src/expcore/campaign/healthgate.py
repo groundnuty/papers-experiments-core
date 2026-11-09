@@ -40,7 +40,8 @@ dispatcher's own check keeps a closed gate closed while it is deferred, since on
 bounded.** Its start is kept in the store (`expcore.campaign.deferral`), so a restart keeps its age, and it is in the
 status; a pass ends it. A pre-run check deferred longer than `max_defer_s` fails: it closes the gate as any failure
 does, charging the run that found it, and the outage is `blocking`, a hold that does not end by itself, so a campaign
-that exits when blocked stops instead of waiting on a holder that may never let go.
+that exits when blocked stops instead of waiting on a holder that may never let go. A gate already closed is checked
+by the dispatcher alone, and its deferred checks count the same way: past the bound its outage becomes blocking too.
 
 **Every check runs in its caller's context** (`contextvars`), so a post-run check, which runs inside the run's
 admission (`expcore.campaign.attempt`: a platform's hook that holds a resource from before the attempt until after
@@ -379,7 +380,11 @@ class HealthGate:
                 record["end_utc"], record["how"] = now, HOW_PASSED
                 self._open = None
                 self.deferral.end()
+            blocked = health.deferred and self._past_bound(record, health.detail)
             self.store.put_meta(META, dump(self._outages), now)
+            if blocked:
+                text = f"the dispatcher's own check stayed deferred past max_defer_s ({health.detail[:200]}): blocking"
+                self.store.event(now, "health_gate_blocking", None, text)
             if health.ok:
                 survived = f" and survived {record['restarts']} restart(s)" if record.get("restarts") else ""
                 self.store.event(
@@ -390,6 +395,14 @@ class HealthGate:
                     f"check(s); the outage began {record['start_utc']}{survived}: dispatch resumes",
                 )
         return health.ok
+
+    def _past_bound(self, record: dict[str, Any], detail: str) -> bool:
+        """Count a deferred check of the dispatcher's own; once the deferral is past `max_defer_s`, the open outage
+        becomes blocking. Return whether it just did."""
+        if self.deferral.note(detail) <= self.max_defer_s or record.get("blocking"):
+            return False
+        record["blocking"] = True
+        return True
 
     def _timed(self, stop: threading.Event | None) -> Health:
         """One check of the dispatcher's own, with a timeout: see `_ask`. The end of the campaign reads as down."""
