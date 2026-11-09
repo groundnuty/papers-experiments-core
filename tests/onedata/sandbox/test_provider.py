@@ -53,12 +53,18 @@ def stage(config, issuer, fake, slots, tmp_path):
     registry = Registry()
     journal = TokenJournal(tmp_path / "leases")
     now = [NOW]
+    events: list[tuple[str, str]] = []
+
+    def record_event(kind, detail):
+        events.append((kind, detail))
+
     platform = SandboxPlatform(
         config,
         issuer,
         host,
         slots=slots,
         journal=journal,
+        events=record_event,
         registry=registry,
         sandbox_options=options,
         clock=lambda: now[0],
@@ -72,6 +78,8 @@ def stage(config, issuer, fake, slots, tmp_path):
         registry=registry,
         slots=slots,
         journal=journal,
+        events=events,
+        record_event=record_event,
         now=now,
         issuer=issuer,
         leases=tmp_path / "leases",
@@ -195,6 +203,22 @@ def test_o05_a_token_the_platform_cannot_vouch_for_refuses_the_run_before_any_co
         run_launch(stage, "via-gate", lease)
     assert not stage.host.containers
     assert not stage.host.networks
+
+
+def test_c19_a_token_the_platform_lets_outlive_its_request_is_recorded_through_the_platforms_event_sink(
+    stage, tmp_path
+):
+    """C19: the platform hands back a token 50 s longer than asked. The run is refused before any container, and the
+    sink the sandbox platform was given receives `token_expiry_beyond_request` for the leased slot."""
+    stage.fake.mint_hook = lambda user, caveats: [
+        {**c, "validUntil": c["validUntil"] + 50} if c["type"] == "time" else c for c in caveats
+    ]
+    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    with pytest.raises(TokenRefused):
+        run_launch(stage, "via-gate", lease)
+    assert [kind for kind, _ in stage.events] == ["token_expiry_beyond_request"]
+    assert lease.key in stage.events[0][1]
+    assert not stage.host.containers
 
 
 def test_a_teardown_that_leaves_something_raises_a_sandbox_error_and_keeps_the_lease_quarantined(stage, tmp_path):
@@ -483,6 +507,7 @@ def test_o15_a_cancelled_launch_that_gives_up_waiting_leaves_the_probe_not_true_
         stage.host,
         slots=stage.slots,
         journal=stage.journal,
+        events=stage.record_event,
         clock=lambda: stage.now[0],
         registry=stage.registry,
         sandbox_options={"waits": FAST, "sample_period_s": None, "sleep": lambda seconds: None},
@@ -541,6 +566,7 @@ def with_tools(stage):
         stage.host,
         slots=stage.slots,
         journal=stage.journal,
+        events=stage.record_event,
         tool_condition=lambda factors: factors.get("tools"),
         tool_server=launcher,
         clock=lambda: stage.now[0],

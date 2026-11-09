@@ -67,8 +67,10 @@ WAIT_KIND = "toolserver_lifecycle"
 INTEGRITY_KIND = TOOL_PLANE_INTEGRITY  # the kind of every failure of the plane's integrity checks; not treatable
 EVENT_RIGHTS_CHANGED = "tool_plane_rights_changed"
 
-# Where the launcher records an event: called with the event's kind and a detail that holds no configured name, token or
-# id. The campaign binds it to its event log (with the time and the model); a test collects the pairs.
+# Where the platform records an event: called with the event's kind and a detail that holds no token, and no configured
+# name or id except a slot's lease key, which `users.SlotTokens`'s `token_expiry_beyond_request` names. The launcher
+# and the slots' minting share one. The campaign binds it to its event log (with the time and the model); a test
+# collects the pairs.
 EventSink = Callable[[str, str], None]
 
 # The settings of the published tool server (its environment), not names of any federation.

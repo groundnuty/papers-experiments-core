@@ -52,7 +52,7 @@ from expcore_onedata.users import GROUP, SlotProbe, Slots, SlotTokens, TokenJour
 
 if TYPE_CHECKING:
     from expcore.tools.mcp_client import McpToolProvider
-    from expcore_onedata.toolserver import ToolServerLauncher
+    from expcore_onedata.toolserver import EventSink, ToolServerLauncher
 
 log = logging.getLogger(__name__)
 
@@ -210,8 +210,10 @@ class SandboxPlatform:
     """The sandbox half of the platform for a study: which data path a run has, which slot it leases, and the launch.
 
     `slots` are the leasable slots of platform.toml (`users.load_slots`) and `journal` the expiry journal beside the
-    leases. `tool_condition` tells from a run's factors the tool-server condition it has, or None; `tool_server` starts
-    that server (`toolserver.ToolServerLauncher`) when a run has one.
+    leases. `events` is the platform's event sink, the one the tool-server launcher is given: the slots' minting records
+    `token_expiry_beyond_request` through it (`users.SlotTokens`). `tool_condition` tells from a run's factors the
+    tool-server condition it has, or None; `tool_server` starts that server (`toolserver.ToolServerLauncher`) when a
+    run has one.
     """
 
     def __init__(
@@ -222,6 +224,7 @@ class SandboxPlatform:
         *,
         slots: Slots,
         journal: TokenJournal,
+        events: EventSink,
         tool_condition: Callable[[Mapping[str, Any]], str | None] = lambda factors: None,
         tool_server: ToolServerLauncher | None = None,
         registry: Registry = DEFAULT,
@@ -233,7 +236,7 @@ class SandboxPlatform:
             raise ValueError(f"{config.file}: has no [sandbox] section")
         self._config, self._s, self._issuer, self._host = config, config.sandbox, issuer, host
         self._slots, self._journal, self._clock = slots, journal, clock
-        self._tokens = SlotTokens(issuer, config, slots, journal, clock=clock)
+        self._tokens = SlotTokens(issuer, config, slots, journal, events=events, clock=clock)
         self._tool_condition, self._launcher = tool_condition, tool_server
         self._registry, self._options = registry, dict(sandbox_options or {})
         self._cancel_wait_s = cancel_wait_s

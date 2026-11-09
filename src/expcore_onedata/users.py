@@ -50,6 +50,13 @@ line. What the bound does not cover is a server that both disregards the caveat 
 cannot write the indeterminate line; treating every unfinished mint as indeterminate would close that, at the price of an
 operator clearing a slot after every crash mid-mint, and the trade was made for availability.
 
+**That residual risk is recorded when it is seen.** A refused token whose expiry can be read and is later than the one it
+was minted with (an `ExpiryMismatch` with a later expiry, or any other `DroppedToken` whose expiry is later) shows the
+platform disregarding the requested time caveat. After its journal line, `SlotTokens` records a
+`token_expiry_beyond_request` event through the platform's event sink (the one `toolserver.ToolServerLauncher` records
+`tool_plane_rights_changed` through) with the slot's lease key and both expiries, never the token. The sink is required,
+so the event cannot go unrecorded by an omission; a sink that fails does not hide the refusal, which is raised from it.
+
 Users are created by the operator, not by this layer: there is no unscoped user creation or deletion here. The privileges
 a slot's users hold are checked, direct and effective, before every token is minted (`tokens.py`).
 """
@@ -62,7 +69,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError, Section, load_toml
@@ -70,7 +77,11 @@ from expcore_onedata.config import NAME, PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.tokens import DroppedToken, RunTokens, TokenIssuer, token_window
 
+if TYPE_CHECKING:
+    from expcore_onedata.toolserver import EventSink
+
 GROUP = "platform_users"
+EVENT_EXPIRY_BEYOND_REQUEST = "token_expiry_beyond_request"
 JOURNAL = "tokens.jsonl"
 SAFETY_MARGIN_S = 60.0  # seconds past a journalled end before a slot counts as free: clock skew and whole-second expiry
 
@@ -279,7 +290,11 @@ class SlotProbe:
 
 
 class SlotTokens:
-    """Mints the tokens of both planes for a leased slot, and journals when they end once they are minted."""
+    """Mints the tokens of both planes for a leased slot, and journals when they end once they are minted.
+
+    `events` is the platform's event sink; it receives `token_expiry_beyond_request` when a refused token's expiry is
+    later than the one it was minted with.
+    """
 
     def __init__(
         self,
@@ -288,9 +303,11 @@ class SlotTokens:
         slots: Slots,
         journal: TokenJournal,
         *,
+        events: "EventSink",
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._issuer, self._config, self._slots, self._journal, self._clock = issuer, config, slots, journal, clock
+        self._events = events
 
     def mint(
         self, lease: Lease, *, ceiling_s: float, condition: str | None = None, interface: str | None = "rest"
@@ -323,7 +340,23 @@ class SlotTokens:
                 self._journal.record_indeterminate(slot.name)
             else:
                 self._journal.record(slot.name, "refused", refused.expires_at)
+                if refused.expires_at > valid_until:
+                    self._beyond_request(slot.name, valid_until, refused)
             raise
         latest = max((t for t in (tokens.data_path, tokens.tool_server) if t is not None), key=lambda t: t.expires_at)
         self._journal.record(slot.name, latest.plane.value, latest.expires_at, mint=mint)
         return tokens
+
+    def _beyond_request(self, slot: str, requested: int, refused: DroppedToken) -> None:
+        """Record that the platform gave a token a later expiry than it was minted with: the slot's lease key and both
+        expiries, never the token. A sink that fails raises the refusal from its error, so neither is lost."""
+        examined = refused.expires_at
+        shown = int(examined) if examined is not None and float(examined).is_integer() else examined
+        detail = (
+            f"slot {slot}: a token minted to expire at {requested} examined as expiring at {shown}, later than asked;"
+            " the platform disregarded the requested time caveat"
+        )
+        try:
+            self._events(EVENT_EXPIRY_BEYOND_REQUEST, detail)
+        except Exception as sink_error:  # the refusal stands whether or not the event could be written
+            raise refused from sink_error
