@@ -189,6 +189,11 @@ class PlatformProbes:
         transfer listing, and past `max_listed` distinct ids the listing is unknown.
         """
         self._client, self._provisioner = client, provisioner
+        positions: dict[str, int] = {}
+        for index, path in enumerate(files.values()):  # one file tracked twice would count its gained bytes twice
+            if path in positions:
+                raise ValueError(f"files[{positions[path]}] and files[{index}] name the same path; track a file once")
+            positions[path] = index
         self._files, self._providers = dict(files), list(providers)
         self._transfers = transfers if transfers is not None else provisioner.transfers
         self._sleep, self._now = sleep, now
@@ -275,8 +280,15 @@ class PlatformProbes:
         files: dict[str, Any] = {}
         pair_totals: dict[str, dict[str, Any]] = {}
         complete = self._before is not None
+        counted: dict[str, str] = {}  # file id -> the label its bytes were counted under, so no file counts twice
         for label in self._files:
             size = entries[label].value.size if entries[label].ok else None
+            file_id = entries[label].value.file_id if entries[label].ok else None
+            if file_id is not None and file_id in counted:
+                files[label] = {"size": size, "entry": entries[label].to_json(), "duplicate_of": counted[file_id]}
+                continue
+            if file_id is not None:
+                counted[file_id] = label
             readings = {
                 p: {
                     "before": _blocks_json(before[label][p]) if label in before else None,

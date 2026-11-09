@@ -216,3 +216,10 @@ def test_o08_readings_that_name_different_targets_make_both_bounds_unknown(probe
     for provider in ("alpha", "beta"):
         assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
         assert "listings_disagree" in snapshot["on_demand"][provider]["unknown"]
+
+
+def test_o08_a_file_tracked_twice_is_refused_and_one_file_is_never_counted_twice(client, provisioner, ticker, seeded):
+    """O08: two labels naming one path would count its gained bytes twice against its one transfer, giving a known
+    bound for on-demand reads that never happened. The probes refuse to track a path twice."""
+    with pytest.raises(ValueError, match=r"files\[0\] and files\[1\] name the same path"):
+        PlatformProbes(client, provisioner, {"a": PATH, "b": PATH}, ["alpha", "beta"], sleep=ticker.sleep)
