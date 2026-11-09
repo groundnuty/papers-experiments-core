@@ -23,7 +23,7 @@ from expcore_onedata.sandbox.hostops import DockerHost
 
 pytestmark = pytest.mark.skipif(shutil.which("openssl") is None, reason="the openssl command makes the run CA")
 
-ZONE, PROVIDER = "zone.test", "provider.test"
+ZONE, PROVIDER = "zone.test", "alpha.test"  # the zone and a provider of the test platform document: configured values
 FILE = "/api/v3/oneprovider/data/f1/content"
 BODY = bytes(range(256)) * 64  # 16 KiB
 BIG = 12 * 1024 * 1024
@@ -315,6 +315,21 @@ def test_o05_a_token_split_between_two_reads_of_the_body_never_reaches_the_agent
     conn.close()
 
 
+def test_o12_the_gate_log_names_a_host_by_its_role_never_by_its_name(world):
+    """O12: a request's line names the host it was for by the role the gate serves it in (the zone, the pinned
+    provider), or as not configured, never by the configured name the agent's request carried."""
+    for host, path in ((PROVIDER, FILE), (ZONE, SCOPE)):
+        conn = connect(world, host)
+        conn.request("GET" if host == PROVIDER else "POST", path, body=None if host == PROVIDER else b"{}")
+        conn.getresponse().read()
+        conn.close()
+    lines = [wait_for(world, lambda r, n=n: r.get("conn_request") == 1 and r.get("path") == n) for n in (FILE, SCOPE)]
+    assert [line["host"] for line in lines] == ["oneprovider", "onezone"]
+    text = world.log.read_text(encoding="utf-8")
+    assert PROVIDER not in text
+    assert ZONE not in text
+
+
 @pytest.mark.parametrize("method", ["PUT", "POST", "DELETE", "PATCH"])
 def test_o05_a_write_is_refused_at_the_gate_and_never_reaches_the_upstream(world, method):
     """O05: only read calls pass, so a write the agent attempts is answered 403 by the gate itself."""
@@ -341,6 +356,7 @@ def test_o05_a_host_the_gate_was_not_configured_for_is_refused(world, tls):
     answer.read()
     assert answer.status == 403
     assert world.upstream.seen == []
+    assert wait_for(world, lambda r: r.get("status") == 403)["host"] == "not_configured"
 
 
 def test_o16_concurrent_reads_give_no_gate_origin_5xx(world):

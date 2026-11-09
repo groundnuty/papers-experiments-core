@@ -38,7 +38,8 @@ connection is served by its own thread and owns its upstream connections: nothin
 TLS context and the log.
 
 Every line the handler of a client connection logs carries that connection's `conn` (unique in this process), and a request's line carries
-`req_headers`: the few request headers that say what client it was (REQ_HEADERS_LOGGED), never any other. When a connection ends after a response without a
+`req_headers`: the few request headers that say what client it was (REQ_HEADERS_LOGGED), never any other. A request's `host` is the role the
+gate serves that host in (`onezone`, `oneprovider`), or `not_configured`, never the host's configured name (O12). When a connection ends after a response without a
 request following, one `conn_close` event line says how (see `Handler._peer_gone`), with the kernel's counters of that connection at that moment: a response's
 `body_bytes` counts what the gate's socket accepted, which says nothing of what the client read, and the close is what shows it. When the gate itself is stopped
 (SIGTERM or SIGINT: `serve`; or the server closed: `GateServer.server_close`), every connection still open gets that line with `ended` "teardown", before the process
@@ -713,7 +714,7 @@ class Handler(BaseHTTPRequestHandler):
         url = urlsplit(self.path)
         headers = {k.lower(): v for k, v in self.headers.items()}
         rec = {
-            "host": host,
+            "host": hcfg["role"] if hcfg is not None else "not_configured",  # the role it is served in, never its name
             "method": self.command,
             "path": url.path,
             "query": url.query,

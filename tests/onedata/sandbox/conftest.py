@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from platform_support import write_platform
+from platform_support import configured_values, write_platform
 from sandbox_support import add_sandbox, configured_sandbox_values
 
 from expcore.config.loading import ConfigError
@@ -52,6 +52,28 @@ class _Logged(logging.Handler):
         self.sink.append(("a log line", self.format(record)))
 
 
+GATE_REQUEST_FIELDS = ("path", "query", "range", "request_line", "req_headers")  # what the agent asked for
+
+
+def _gate_log_leaks(root, values: list[str]) -> list[tuple[str, str]]:
+    """The fields of the gate's request logs that hold a configured value: a substring of any field the gate writes
+    itself, and the exact value of a field the agent's request chose (an API path is the agent's, and a configured
+    mount path such as `/data` is a substring of many), as `(where, value)`."""
+    leaks = []
+    for written in sorted(root.rglob("*requests.jsonl")):
+        for number, line in enumerate(written.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            record = json.loads(line) if line.strip() else {}
+            for key, field in record.items():
+                if key in GATE_REQUEST_FIELDS:
+                    asked = [str(v) for v in field.values()] if isinstance(field, dict) else [str(field)]
+                    hits = [v for v in values if v in asked]
+                else:
+                    text = json.dumps(field).lower()
+                    hits = [v for v in values if v.lower() in text]
+                leaks += [(f"the gate log {written.name}, line {number}, field {key}", v) for v in hits]
+    return leaks
+
+
 def _written_logs_and_records(root):
     """The files the sandbox code writes as logs and records, wherever a test put them: the teardown logs and the
     reaper's records. (The gate's request log is not among them: it holds the paths the agent asked for, its own.)"""
@@ -62,8 +84,9 @@ def _written_logs_and_records(root):
 @pytest.fixture(autouse=True)
 def _no_sandbox_output_holds_a_configured_value(monkeypatch, tmp_path):
     """O12: record every message of an exception the sandbox code builds, every line it logs, the metadata of every
-    sandbox, every step of its teardown log, and the teardown logs and reaper records it wrote to disk
-    (`_written_logs_and_records`), and fail the test if one holds a value of the `[sandbox]` table (an
+    sandbox, every step of its teardown log, the teardown logs and reaper records it wrote to disk
+    (`_written_logs_and_records`) and the gate's request logs (`_gate_log_leaks`, which also looks for the platform's
+    hosts), and fail the test if one holds a value of the `[sandbox]` table (an
     image, a pool, a path, a login, a level). They name keys, roles and positions instead, and a tool's stderr by its
     size and SHA-256."""
     found: list[tuple[str, str]] = []
@@ -111,4 +134,6 @@ def _no_sandbox_output_holds_a_configured_value(monkeypatch, tmp_path):
         for what, text in found
         if (hit := [v for v in values if v.lower() in text.lower()])
     }
+    for where, value in _gate_log_leaks(tmp_path, values + configured_values(tmp_path)):  # the hosts it serves too
+        leaks.setdefault(where, []).append(value)
     assert not leaks, f"the output of the sandbox code holds configured values: {leaks}"

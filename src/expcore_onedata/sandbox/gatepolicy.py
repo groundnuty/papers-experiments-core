@@ -51,4 +51,4 @@ def decide(role: str, method: str, path: str) -> Decision:
     for r_role, r_method, rx, tag in _RULES:
         if r_role == role and r_method == method and rx.match(path):
             return Decision(True, "allowed", tag)
-    return Decision(False, f"{method} {path} is not an allowed read call")
+    return Decision(False, "not an allowed read call")  # the line has the method and the path, as the agent sent them
