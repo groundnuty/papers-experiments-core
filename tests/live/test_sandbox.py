@@ -94,20 +94,22 @@ def spec_for(config, level, run_key, lease_key=None):
 
 
 @needs_platform
-def test_each_configured_data_path_starts_runs_code_refuses_a_write_and_is_gone_after_stop(config, host):
+@pytest.mark.parametrize("level", LEVELS)
+def test_each_configured_data_path_starts_runs_code_refuses_a_write_and_is_gone_after_stop(config, host, level):
+    """C19: one test per level of the data path, so a level that cannot run here (no principal to mint its token)
+    skips itself and never the others; each proves its own teardown with the lease key's probe."""
     probe = SandboxProbe(host, config.sandbox)
-    for level in levels(config):
-        key = "live-check"  # a label for the probe; no lease is taken
-        sandbox = DockerSandbox.start(host, config.sandbox, spec_for(config, level, f"live-{int(time.time())}", key))
-        try:
-            assert sandbox.metadata()["read_only_verified"]["root"] is True
-            result = sandbox.exec("print(6 * 7)", 60)
-            assert result.stdout.strip() == "42"
-            assert result.kill is None
-        finally:
-            sandbox.stop()
-        assert sandbox.stopped
-        assert probe.resource_gone(key, {}) is True
+    key = "live-check"  # a label for the probe; no lease is taken
+    sandbox = DockerSandbox.start(host, config.sandbox, spec_for(config, level, f"live-{int(time.time())}", key))
+    try:
+        assert sandbox.metadata()["read_only_verified"]["root"] is True
+        result = sandbox.exec("print(6 * 7)", 60)
+        assert result.stdout.strip() == "42"
+        assert result.kill is None
+    finally:
+        sandbox.stop()
+    assert sandbox.stopped
+    assert probe.resource_gone(key, {}) is True
 
 
 @needs_platform
