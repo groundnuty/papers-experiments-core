@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.attempts import classify
+from expcore.campaign.attempts import classify, unverified
 from expcore.campaign.executor import (
     BackendFactory,
     Endpoint,
@@ -60,7 +60,7 @@ from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.store import Store
 from expcore.campaign.units import UnitHealth
 from expcore.config.models import ModelTable
-from expcore.errors import POST_CHECK_UNVERIFIED, InfraError
+from expcore.errors import InfraError
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
 from expcore.records.build import RunIdentity
@@ -305,13 +305,10 @@ class AttemptRunner:
         p = self.p
         if p.health is not None:
             health, outage = p.health.after_run()
-            if health.deferred:  # it verified nothing: the result is never scored on it (C11)
-                text = f"{key}: {health.detail}; the attempt is set aside as {POST_CHECK_UNVERIFIED}"
+            if health.deferred:  # it verified nothing: no result is scored on it, treatment included (C11)
+                result = unverified(result, health.detail)
+                text = f"{key}: {health.detail}; nothing is scored on it ({result.outcome.infra_kind or 'set aside'})"
                 p.store.event(p.stamp(), "post_run_check_deferred", model, text)
-                if not result.outcome.set_aside:
-                    reason = f"post-run health check deferred, so the result is unverified: {health.detail}"
-                    outcome = Outcome("infrastructure", reason, infra_kind=POST_CHECK_UNVERIFIED)
-                    result = dataclasses.replace(result, outcome=outcome)
             elif not health.ok and outage is not None:
                 result = dataclasses.replace(result, outage_kind=p.settings.health_kind)  # the outage's, set aside
                 p.health.note_discard(outage, result.input_tokens, result.output_tokens)

@@ -34,8 +34,8 @@ post-run check that returns while the gate is still open does not close it; the 
 not look now for a reason that is no fault: a run holds the platform on purpose (an outage run of the study holds the
 federation, and the check's bounded wait for it ran out). A deferral is never a pass and never an outage: a deferred
 pre-run check holds its run (`defer`) without closing the gate, recording an outage or charging an attempt, and the
-run is tried again after `recheck_s`; a deferred post-run check verified nothing, so the finished result is never
-scored on it: the attempt is set aside as `post_check_unverified`, a kind no condition may declare; and the
+run is tried again after `recheck_s`; a deferred post-run check verified nothing, so no finished result, treatment
+included, is scored on it: the attempt is set aside as `post_check_unverified`, a kind no condition may declare; and the
 dispatcher's own check keeps a closed gate closed while it is deferred, since only a pass opens it. **A deferral is
 bounded.** Its start is kept in the store (`expcore.campaign.deferral`), so a restart keeps its age, and it is in the
 status; a pass ends it. A pre-run check deferred longer than `max_defer_s` fails: it closes the gate as any failure

@@ -6,12 +6,14 @@ check holds its run without closing the gate or charging an attempt, and a defer
 outcome as it stands (C11).
 """
 
+import collections
 import contextlib
 import contextvars
 import datetime as dt
+import threading
 
-from campaign_support import planned_store
-from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, settings_for
+from campaign_support import planned_store, treatment_schema
+from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, key_of, settings_for
 
 from expcore.campaign.deferral import DEFERRAL_META
 from expcore.campaign.healthgate import DEFER, FOUND, GO, META, Health, HealthGate, alarms, fact, parse, read_health
@@ -233,3 +235,34 @@ def test_c11_a_closed_gate_whose_own_checks_stay_deferred_past_the_bound_becomes
     [outage] = parse(store.get_meta(META))
     assert outage["blocking"] is True
     assert "providers[1]" in outage["last_detail"]
+
+
+def test_c11_a_treatment_failure_whose_post_run_check_is_deferred_is_never_scored(tmp_path):
+    """C11: a treatment-kind failure is a scored final attempt only once a post-run check has verified the platform; a
+    deferred one verified nothing, so the attempt is set aside as post_check_unverified, never done, and run again."""
+    schema = treatment_schema(("endpoint",), "api-none")
+    treated = key_of(schema, "api-none")
+    executor = FakeExecutor()
+    after_treated = threading.Event()
+
+    async def fail_as_treatment(request):
+        after_treated.set()  # the post-run check that follows this attempt is deferred
+        return await executor._run(request, ("infra_after_turn", "endpoint"))
+
+    executor.behaviours[treated] = collections.deque([fail_as_treatment])
+
+    def health():
+        if after_treated.is_set():
+            after_treated.clear()
+            return DEFERRED
+        return Health(True, "fine")
+
+    settings = settings_for(recheck_s=0.01, health_timeout_s=5, workers=1, identity_kind="knowledge")
+    with build(tmp_path, schema=schema, executor=executor, settings=settings, health=health, plan=SMALL) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+        rows = scheduler.store.q(
+            "SELECT state, treatment, infra_kind FROM attempts WHERE run_key=? ORDER BY id", (treated,)
+        )
+    first = rows[0]
+    assert (first["state"], first["treatment"], first["infra_kind"]) == ("infra_fail", 0, "post_check_unverified")
+    assert [r["state"] for r in rows] == ["infra_fail", "done"]

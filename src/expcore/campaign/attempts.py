@@ -16,13 +16,21 @@ the record's schema version 2; a result from a version-1 record or from a schema
 Version 3 adds the target rule: a condition that declares a kind with a target (`FactorSchema.treatment_targets`) is
 scored only for a failure that names that target while the run's fault injector held it down; another target's
 failure, a failure naming none and an injection that did not happen are set aside too.
+
+Verification (C11). A result is scored only once a post-run check has looked at the platform. A deferred post-run
+check verified nothing, so `unverified` turns every result `classify` would score, treatment included, into
+infrastructure of the untreatable kind `post_check_unverified`, set aside and run again: the one decision, by
+`classify` itself, so the deferral path and the store never disagree on what is scored.
 """
 
+import dataclasses
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
 from expcore.campaign.markers import AttemptResult
+from expcore.errors import POST_CHECK_UNVERIFIED
+from expcore.loop.outcomes import Outcome
 
 STATES = ("running", "done", "infra_fail", "outage_discarded", "interrupted", "harness_error")
 RUN_STATUSES = ("pending", "done", "infra_exhausted", "harness_error")
@@ -111,3 +119,17 @@ def classify(
     if outcome.name == "harness_defect":
         return Classified("harness_error", False)
     return Classified("done", False)
+
+
+def unverified(result: AttemptResult, detail: str) -> AttemptResult:
+    """The result of an attempt whose post-run check verified nothing (C11): never scored, treatment included.
+
+    A result `classify` would score becomes infrastructure of kind `post_check_unverified`, which no condition may
+    declare, so `classify` sets it aside and the run goes again. The record's own treatment flag was decided before the
+    check and is superseded (`recorded_treatment` is left unset). Any other result is set aside already and stands.
+    """
+    if classify(result, result.treatment_kinds, result.treatment_targets).state != "done":
+        return result
+    reason = f"post-run health check deferred, so the result is unverified: {detail}"
+    outcome = Outcome("infrastructure", reason, infra_kind=POST_CHECK_UNVERIFIED)
+    return dataclasses.replace(result, outcome=outcome, recorded_treatment=None)
