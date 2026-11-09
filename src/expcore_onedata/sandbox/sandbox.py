@@ -469,13 +469,17 @@ class DockerSandbox:
         host while the containers are up, never from the agent's output. A container with no problem ran throughout."""
         found, containers = [], {}
         for role, w in self._watched.items():
-            end, why = self.obs.state(w["container"])
+            # a container the harness stopped itself is judged by its state just before that stop: the stop is no death
+            on_purpose = w.get("stopped_by_harness")
+            end, why = (on_purpose["end"], on_purpose["why"]) if on_purpose else self.obs.state(w["container"])
             probs = ID.problems(role, self.spec.mode.value, w["start"], end, why)
             containers[role] = {
                 "start": w["start"],
                 "end": end,
                 "problems": probs,
             }  # by role: a name holds the lease key
+            if on_purpose:
+                containers[role]["stopped_by_harness"] = True
             if probs:
                 found.append((role, probs, w["start"], end, why))
         deaths: list[dict] = []
@@ -568,11 +572,26 @@ class DockerSandbox:
         (dest / "metadata.json").write_text(json.dumps(self.metadata(), indent=1, default=str), encoding="utf-8")
         return result
 
+    def _stop_on_purpose(self, role: str) -> None:
+        """Note that the harness itself is about to stop a watched container: its state read now, just before, stands as
+        its last state of the run, so the stop that follows is never counted as a death of infrastructure (O16, O17).
+        A death before this moment still shows in that state."""
+        w = self._watched.get(role)
+        if w is None or "stopped_by_harness" in w:
+            return
+        try:
+            end, why = self.obs.state(w["container"])
+        except Exception as e:  # unknown, never clean: the state that cannot be shown is a problem of its own
+            end, why = None, f"its state could not be read before the harness stopped it ({type(e).__name__})"
+        w["stopped_by_harness"] = {"end": end, "why": why}
+
     def _stop_gate(self) -> None:
         """SIGTERM the gate and wait for it to exit, so that it writes its close line for every client connection still
-        open before its log is copied (`docker rm -f` is a SIGKILL and leaves no line). Never costs the collection."""
+        open before its log is copied (`docker rm -f` is a SIGKILL and leaves no line). Never costs the collection. The
+        stop is the harness's own, marked as such before the signal, so the run's record does not call it a death."""
         note = self._meta["gate_stop"] = {"signalled": False}
         try:
+            self._stop_on_purpose("gate")
             r = self.host.docker("kill", "-s", "TERM", self.names.gate, check=False, timeout=30)
             note["signalled"] = r.returncode == 0
             deadline = time.monotonic() + GATE_STOP_WAIT_S

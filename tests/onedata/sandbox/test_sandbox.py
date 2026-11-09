@@ -370,6 +370,39 @@ def test_a_collection_copies_the_named_outputs_and_the_gate_log(world, tmp_path)
     sbx.stop()
 
 
+def test_o16_the_harnesss_own_stop_of_the_gate_is_no_death_in_a_healthy_rest_run(world, tmp_path):
+    """O16: the collection stops the gate itself, so that it writes its close lines; that stop is the harness's own,
+    and a healthy REST run records no container death and no infrastructure death, in the file or after."""
+    sbx = start(world, "via-gate")
+    (sbx.dir / "gatelog" / "requests.jsonl").write_text(
+        json.dumps({"tag": "content", "decision": "allow", "status": 200, "bytes": 7}) + "\n", encoding="utf-8"
+    )
+    got = sbx.collect(tmp_path / "evidence")
+    assert got["deaths"] == []
+    assert world.host.containers[sbx.names.gate].running is False  # the gate was stopped, by the harness
+    written = json.loads((tmp_path / "evidence" / "metadata.json").read_text())
+    for meta in (written, sbx.metadata()):
+        assert (meta["container_deaths"], meta["infra_death"]) == ([], [])
+    check = sbx.infra_container_check()
+    assert check["containers"]["gate"]["stopped_by_harness"] is True
+    assert check["containers"]["gate"]["end"]["status"] == "running"  # its state just before the harness's stop
+    sbx.stop()
+
+
+def test_o17_a_gate_that_died_before_the_harness_stopped_it_is_still_a_death(world, tmp_path):
+    """O17: the mark covers the harness's own stop only: a gate that had already exited when the collection came to
+    stop it is a death of infrastructure, in the record as before."""
+    sbx = start(world, "via-gate")
+    (sbx.dir / "gatelog" / "requests.jsonl").write_text("", encoding="utf-8")
+    gate = world.host.containers[sbx.names.gate]
+    gate.running, gate.exit_code = False, 139
+    sbx.collect(tmp_path / "evidence")
+    meta = json.loads((tmp_path / "evidence" / "metadata.json").read_text())
+    assert [death["role"] for death in meta["container_deaths"]] == ["gate"]
+    assert meta["infra_death"]
+    sbx.stop()
+
+
 def test_a_collection_refuses_an_output_outside_the_working_directory(world, tmp_path):
     sbx = start(world, "isolated")
     for bad in ("../x", "/etc/passwd"):
