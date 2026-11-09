@@ -94,7 +94,7 @@ class StudyPlugin:
         named = factory if hasattr(factory, "__qualname__") else type(factory)
         module = str(named.__module__)
         name = named.__qualname__ if module.startswith(PLUGIN_MODULE_PREFIX) else f"{module}.{named.__qualname__}"
-        return {"name": name, "version": getattr(factory, "version")}  # noqa: B009
+        return {"name": name, "version": factory.version}
 
 
 def tools_sha256(specs: Sequence[ToolSpec]) -> str:
