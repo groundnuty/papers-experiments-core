@@ -11,9 +11,10 @@ import json
 import pytest
 from platform_support import write_platform
 from sandbox_support import add_sandbox
-from tls_support import HAS_OPENSSL, make_federation_ca
+from tls_support import ANSWER, HAS_OPENSSL, TlsServer, make_federation_ca
 
 from expcore.config.loading import ConfigError
+from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import load_platform
 
 pytestmark = pytest.mark.skipif(not HAS_OPENSSL, reason="the openssl command makes the federation's test CA")
@@ -169,3 +170,41 @@ def test_o12_a_bundle_that_changed_since_the_load_is_refused_before_a_client_use
     (tmp_path / CA_NAME).unlink()
     with pytest.raises(ConfigError, match="can no longer be read"):
         config.tls.bundle()
+
+
+# ---------------------------------------------------------------------------------------------------- the REST client
+
+ADMIN = "admin-test-0123"  # an invented admin token
+
+
+@pytest.mark.parametrize(
+    ("tls", "bundle", "answered"),
+    [
+        (None, None, False),  # the default: the client's own CAs, which do not hold the federation's
+        ({"ca_file": CA_NAME}, "federation", True),
+        ({"ca_file": CA_NAME}, "stranger", False),  # verification stays on: another CA's bundle does not do
+        ({"insecure_tls": True}, None, True),
+    ],
+    ids=["verify-default", "ca_file", "ca_file-of-another-ca", "insecure_tls"],
+)
+def test_o05_the_rest_client_checks_the_federations_certificate_as_the_tls_setting_says(
+    tmp_path, fake, federation, stranger, tls, bundle, answered
+):
+    """O05: against a certificate no default trusts, the REST client fails by default and with another CA's bundle,
+    and reaches the server with the federation's CA as ca_file or with insecure_tls; a failure names no address."""
+    ca = {"federation": federation.ca, "stranger": stranger.ca, None: None}[bundle]
+    with TlsServer(federation) as server:
+        config = load(tmp_path, tls, ca=ca, zone_url=server.url)
+        client = OnezoneClient(config, admin_token=ADMIN)  # as a run builds it: no transport injected
+        try:
+            if answered:
+                assert client.get("/spaces/sp-test") == ANSWER
+                assert server.seen == [("GET", "/api/v3/onezone/spaces/sp-test")]
+            else:
+                with pytest.raises(PlatformError) as caught:
+                    client.get("/spaces/sp-test")
+                assert caught.value.transport is True  # no answer came: the handshake was refused
+                assert "127.0.0.1" not in str(caught.value)
+                assert server.seen == []
+        finally:
+            client.close()
