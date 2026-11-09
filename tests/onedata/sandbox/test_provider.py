@@ -195,6 +195,21 @@ def test_o05_c01_a_gate_refusal_no_cell_reported_ends_the_run_as_data_gate_integ
     assert not stage.host.containers
 
 
+def test_o16_a_gate_log_that_is_not_utf8_at_the_runs_end_is_data_gate_integrity_and_the_sandbox_still_stops(stage):
+    """O16: bytes that are not UTF-8 in the gate log at the end of the run's body leave its refusals unknown: the run
+    ends as data_gate_integrity (gate_log_unreadable), and the sandbox is stopped all the same."""
+
+    async def body(sandbox):
+        with open(sandbox.dir / "gatelog" / "requests.jsonl", "ab") as f:
+            f.write(b"\xff\xfe not utf-8\n")
+
+    with pytest.raises(InfraError) as caught:
+        run_launch(stage, "via-gate", body=body)
+    assert caught.value.kind == "data_gate_integrity"
+    assert "gate_log_unreadable" in caught.value.detail
+    assert not stage.host.containers
+
+
 def test_a_body_that_fails_still_stops_the_sandbox_and_the_error_is_the_bodys(stage):
     async def body(sandbox):
         raise RuntimeError("the agent's loop failed")

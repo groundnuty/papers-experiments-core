@@ -62,7 +62,10 @@ def _gate_log_leaks(root, values: list[str]) -> list[tuple[str, str]]:
     leaks = []
     for written in sorted(p for p in root.rglob("*requests.jsonl") if p.is_file()):
         for number, line in enumerate(written.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            record = json.loads(line) if line.strip() else {}
+            try:
+                record = json.loads(line) if line.strip() else {}
+            except ValueError:  # a line that is no JSON (a test's damaged log) is scanned as it is
+                record = {"unparsed_line": line}
             for key, field in record.items():
                 if key in GATE_REQUEST_FIELDS:
                     asked = [str(v) for v in field.values()] if isinstance(field, dict) else [str(field)]

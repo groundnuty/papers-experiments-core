@@ -132,3 +132,23 @@ def test_o16_a_gate_log_that_cannot_be_read_ends_the_run_as_data_gate_integrity(
     assert "gate_log_unreadable" in caught.value.detail
     log.rmdir()
     sandbox.stop()
+
+
+def test_o16_a_gate_log_that_is_not_utf8_is_unreadable_and_ends_the_run_as_data_gate_integrity(world):
+    """O16: a gate log holding bytes that are not UTF-8 cannot be read for its refusals, which is unknown, never none:
+    gate_log_unreadable, and the cell ends the run as data_gate_integrity."""
+    sandbox = DockerSandbox.start(world.host, world.s, make_spec(world, "via-gate"), **start_options(world))
+    log = sandbox.dir / "gatelog" / "requests.jsonl"
+
+    def the_log_goes_bad(container, argv, stdin):
+        with open(log, "ab") as f:
+            f.write(b'{"status": 200}\n\xff\xfe not utf-8\n')
+        return CmdResult(0, "read", "")
+
+    world.host.exec_handler = the_log_goes_bad
+    provider = CodeExecutionProvider(sandbox)
+    with pytest.raises(InfraError) as caught:
+        asyncio.run(provider.execute("python", {"code": "read()"}, timeout_s=30, ctx=NoWaits()))
+    assert caught.value.kind == KIND
+    assert "gate_log_unreadable" in caught.value.detail
+    sandbox.stop()

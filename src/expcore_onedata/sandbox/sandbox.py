@@ -568,13 +568,13 @@ class DockerSandbox:
         return [gatelog.UNREADABLE] if lines is None else gatelog.refusals(lines)
 
     def _gate_log_lines(self) -> list[str] | None:
-        """The gate log's lines; empty without a gate, None when it cannot be read (logged). `_prepare_gate` creates
-        the file, so a missing one is unreadable too."""
+        """The gate log's lines; empty without a gate, None when it cannot be read (logged): an OS error, or bytes that
+        are not UTF-8. `_prepare_gate` creates the file, so a missing one is unreadable too."""
         if self.spec.mode is not DataPathMode.REST:
             return []
         try:
             return (self.dir / "gatelog" / "requests.jsonl").read_text(encoding="utf-8").splitlines()
-        except OSError as e:
+        except (OSError, ValueError) as e:  # UnicodeDecodeError is a ValueError
             log.error("the gate log could not be read for the gate's refusals: %s", describe_error(e))
             return None
 

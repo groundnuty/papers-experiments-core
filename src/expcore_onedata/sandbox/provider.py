@@ -35,9 +35,9 @@ from expcore.errors import InfraError
 from expcore.plugin import CallContext
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
-from expcore_onedata.sandbox import kinds
+from expcore_onedata.sandbox import gatelog, kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec
-from expcore_onedata.sandbox.hostops import HostOps, mount_identity, parse_mountinfo
+from expcore_onedata.sandbox.hostops import HostOps, describe_error, mount_identity, parse_mountinfo
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -317,7 +317,7 @@ class SandboxPlatform:
         try:
             yield sandbox
         except Exception:
-            refused = kinds.gate_error(await asyncio.to_thread(sandbox.gate_refusals))
+            refused = await self._gate_refused(sandbox)
             await self._stop(ctx, sandbox, quiet=True)
             if refused is not None:  # the gate cut the condition's read: that, not the body's failure, ends the run
                 raise refused from None
@@ -325,11 +325,21 @@ class SandboxPlatform:
         except BaseException:
             await self._stop(ctx, sandbox, quiet=True)
             raise
-        refused = kinds.gate_error(await asyncio.to_thread(sandbox.gate_refusals))
+        refused = await self._gate_refused(sandbox)
         if refused is not None:  # a refusal no cell reported (a read the agent's code left running): the same end
             await self._stop(ctx, sandbox, quiet=True)
             raise refused
         await self._stop(ctx, sandbox, quiet=False)
+
+    @staticmethod
+    async def _gate_refused(sandbox: DockerSandbox) -> InfraError | None:
+        """The error the data gate's refusals make of the run, or None; never raises, so the stop always follows. A
+        check that fails is unknown, never none: it stands for an unreadable gate log (O16)."""
+        try:
+            return kinds.gate_error(await asyncio.to_thread(sandbox.gate_refusals))
+        except Exception as e:
+            log.error("the gate's refusals could not be read: %s", describe_error(e))
+            return kinds.gate_error([gatelog.UNREADABLE])
 
     async def _settle_start(self, sandbox: DockerSandbox, started: asyncio.Future[None]) -> None:
         """Ask the start thread to stop and wait for it, at most `cancel_wait_s`, through any further cancellation."""
