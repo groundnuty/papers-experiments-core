@@ -47,6 +47,7 @@ from expcore_onedata.transferwindow import (
     CLOCK_UNKNOWN,
     DISAGREE,
     HARNESS_UNLISTED,
+    LISTING_DROPPED,
     NEAR_EDGE,
     NOT_SETTLED,
     Edges,
@@ -117,6 +118,7 @@ class TransferLog:
         self._page_limit, self._max_listed, self._sleep, self._now = page_limit, max_listed, sleep, now
         self._pages = 0
         self._offsets: dict[str, list[float | None]] = {}  # provider -> each listing answer's clock offset, or None
+        self._seen: set[str] = set()  # every job id any observation of the current reading showed
 
     def _dated_page(self, path: str, provider: str, params: Mapping[str, Any]) -> Any:
         """Read one page of a provider's listing and keep the provider's clock offset its Date header gives."""
@@ -188,10 +190,12 @@ class TransferLog:
         (none when the listing settled), and how many observations were made. Raise Unreadable when one fails."""
         settings = self._provisioner.settings
         previous = self._observe()
+        self._seen = set(_ids(previous, self._providers))
         changed: list[Job] = []
         for polls in range(2, settings.transfer_settle_polls + 1):
             self._sleep(settings.transfer_settle_s)
             current = self._observe()
+            self._seen |= _ids(current, self._providers)
             changed = changed_between(previous, current)
             if not changed:
                 return current, [], polls
@@ -234,7 +238,12 @@ class TransferLog:
             everywhere.add(NOT_SETTLED)
         # A transfer the harness itself scheduled that the accepted listing does not show proves the listing
         # incomplete, and what else it misses could be into any provider.
-        listed = {tid for provider in self._providers for tid in observation[provider]}
+        listed = _ids(observation, self._providers)
+        # A job an earlier observation showed that the accepted one does not: the listing dropped it, so it is not to
+        # be trusted to hold every job, and what it dropped could be into any provider.
+        if self._seen - listed:
+            everywhere.add(LISTING_DROPPED)
+            section["left_listing"] = len(self._seen - listed)
         if set(harness) - listed:
             everywhere.add(HARNESS_UNLISTED)
             section["harness_unlisted"] = len(set(harness) - listed)
@@ -313,3 +322,8 @@ def _placement(edges: Edges, job: Job) -> str:
     if edges.holds(job.scheduled):
         return "inside"
     return "carried" if edges.carried_over(job) else "outside"
+
+
+def _ids(observation: Observation, providers: Sequence[str]) -> set[str]:
+    """Every job id an observation shows, on any provider."""
+    return {tid for provider in providers for tid in observation[provider]}

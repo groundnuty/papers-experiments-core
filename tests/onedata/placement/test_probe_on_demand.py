@@ -266,3 +266,27 @@ def test_o08_a_harness_transfer_the_listing_does_not_show_leaves_every_bound_unk
     for provider in ("alpha", "beta"):
         assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
         assert "harness_transfer_not_listed" in snapshot["on_demand"][provider]["unknown"]
+
+
+def test_o07_a_transfer_the_listing_showed_and_then_dropped_leaves_every_bound_unknown(probes, client, seeded, ticker):
+    """O07 with O08: a replication into beta shows in the first observation and in no later one, so the later ones
+    agree without it. A listing that drops a job it showed is not trusted to hold every job: every bound is unknown."""
+    probes.start({})
+    ticker.sleep(10)
+    tid = tool_plane_replicates(seeded, client, MORE, BETA_ID)
+    seeded.end_transfer(tid)
+    shown = {"answers": 0}
+    real = seeded._list_transfers
+
+    def first_answer_only(space, query, provider):
+        shown["answers"] += 1
+        if shown["answers"] > ONE_OBSERVATION:  # every answer after the first observation leaves the job out
+            seeded.listing_lag[tid] = 10**6
+        return real(space, query, provider)
+
+    seeded._list_transfers = first_answer_only
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    for provider in ("alpha", "beta"):
+        assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
+        assert "transfer_left_listing" in snapshot["on_demand"][provider]["unknown"]
