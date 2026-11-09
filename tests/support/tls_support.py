@@ -52,6 +52,27 @@ def make_federation_ca(directory: Path, name: str = "federation-test-ca") -> Sim
     return SimpleNamespace(ca=ca, key=key, cert=cert, directory=directory)
 
 
+def swap_after_check(monkeypatch, original: Path, replacement: bytes) -> list[int]:
+    """Replace the configured CA bundle with other bytes right after its check passes, the first time it is checked.
+
+    This is the race a client must not lose: the bundle verified against the hash a record holds, then swapped before
+    the client reads it. The returned list counts the checks made."""
+    from expcore_onedata.tls import TlsSettings
+
+    checked = TlsSettings.bundle
+    calls: list[int] = []
+
+    def bundle_then_swap(self):
+        calls.append(1)
+        verified = checked(self)
+        if len(calls) == 1:
+            original.write_bytes(replacement)
+        return verified
+
+    monkeypatch.setattr(TlsSettings, "bundle", bundle_then_swap)
+    return calls
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 

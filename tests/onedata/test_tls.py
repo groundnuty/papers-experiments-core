@@ -12,7 +12,7 @@ import pytest
 from campaign_support import make_fingerprint, make_manifest, make_schema
 from platform_support import NOW, write_platform
 from sandbox_support import add_sandbox
-from tls_support import ANSWER, HAS_OPENSSL, TlsServer, make_federation_ca
+from tls_support import ANSWER, HAS_OPENSSL, TlsServer, make_federation_ca, swap_after_check
 
 from expcore.campaign.healthgate import read_health
 from expcore.campaign.resume import FingerprintMismatch, open_campaign
@@ -39,24 +39,27 @@ def stranger(tmp_path_factory):
     return make_federation_ca(tmp_path_factory.mktemp("stranger"), name="unrelated-test-ca")
 
 
-def with_tls(tls, *, zone_url=None):
-    """An edit of the platform document that sets `[tls]` (and, when given, the zone's URL)."""
+def with_tls(tls, *, zone_url=None, beta_url=None):
+    """An edit of the platform document that sets `[tls]` (and, when given, the zone's and provider beta's URLs)."""
 
     def edit(data):
         if tls is not None:
             data["tls"] = tls
         if zone_url is not None:
             data["zone"]["url"] = zone_url
+        if beta_url is not None:
+            data["providers"]["beta"]["url"] = beta_url
 
     return edit
 
 
-def load(tmp_path, tls=None, *, ca=None, zone_url=None, require_secrets=True):
+def load(tmp_path, tls=None, *, ca=None, zone_url=None, beta_url=None, require_secrets=True):
     """Load the default platform document with `[tls]` set, the CA bundle (when given) copied beside it."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     if ca is not None:
         (tmp_path / CA_NAME).write_bytes(ca.read_bytes())
-    return load_platform(write_platform(tmp_path, with_tls(tls, zone_url=zone_url)), require_secrets=require_secrets)
+    edit = with_tls(tls, zone_url=zone_url, beta_url=beta_url)
+    return load_platform(write_platform(tmp_path, edit), require_secrets=require_secrets)
 
 
 # ---------------------------------------------------------------------------------------------------- the setting
@@ -167,9 +170,10 @@ def test_o12_the_per_client_tls_keys_of_earlier_versions_are_refused_with_a_poin
 def test_o12_a_bundle_that_changed_since_the_load_is_refused_before_a_client_uses_it(
     tmp_path, fake, federation, stranger
 ):
-    """O12: a client gets the bundle only while it is the one the record names; a replaced bundle is refused."""
+    """O12: a client gets the bundle's bytes only while they are the ones the record names; a replaced bundle is
+    refused."""
     config = load(tmp_path, {"ca_file": CA_NAME}, ca=federation.ca)
-    assert config.tls.bundle() == (tmp_path / CA_NAME).resolve()
+    assert config.tls.bundle() == federation.ca.read_bytes()
     (tmp_path / CA_NAME).write_bytes(stranger.ca.read_bytes())
     with pytest.raises(ConfigError, match="changed since") as caught:
         config.tls.bundle()
@@ -215,6 +219,30 @@ def test_o05_the_rest_client_checks_the_federations_certificate_as_the_tls_setti
                 assert server.seen == []
         finally:
             client.close()
+
+
+def test_o05_the_rest_client_trusts_the_verified_bytes_and_never_a_bundle_swapped_after_the_check(
+    tmp_path, fake, monkeypatch, federation, stranger
+):
+    """O05: the bundle swapped for another CA's right after its check is not what the REST client trusts: it reaches
+    the federation, whose CA was hashed, and refuses a server of the swapped-in CA; a client built after the swap is
+    refused, since the bundle no longer has the recorded hash."""
+    with TlsServer(federation) as genuine, TlsServer(stranger) as impostor:
+        config = load(tmp_path, {"ca_file": CA_NAME}, ca=federation.ca, zone_url=genuine.url, beta_url=impostor.url)
+        checks = swap_after_check(monkeypatch, tmp_path / CA_NAME, stranger.ca.read_bytes())
+        client = OnezoneClient(config, admin_token=ADMIN)
+        try:
+            assert (tmp_path / CA_NAME).read_bytes() == stranger.ca.read_bytes()  # swapped once checked
+            assert client.get("/spaces/sp-test") == ANSWER
+            with pytest.raises(PlatformError) as caught:
+                client.get("/spaces", provider="beta")
+            assert caught.value.transport is True
+            assert impostor.seen == []
+        finally:
+            client.close()
+        with pytest.raises(ConfigError, match="changed since"):
+            OnezoneClient(config, admin_token=ADMIN)
+        assert len(checks) == 2
 
 
 # ---------------------------------------------------------------------------------------------------- health

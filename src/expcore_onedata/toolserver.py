@@ -51,7 +51,9 @@ import contextlib
 import dataclasses
 import os
 import sys
-from collections.abc import AsyncIterator, Callable, Mapping
+import tempfile
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from pathlib import Path
 
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
@@ -60,7 +62,7 @@ from expcore_onedata.client import PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, ToolServer
 from expcore_onedata.credentials import Principal
 from expcore_onedata.pin import verify_configured
-from expcore_onedata.tls import CA_BUNDLE_ENV
+from expcore_onedata.tls import CA_BUNDLE_ENV, write_private_copy
 from expcore_onedata.tokencheck import ExaminationFailed, PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, token_window, tool_server_spec
 
@@ -92,7 +94,12 @@ MANAGED_ENV = (
 
 
 def server_environment(
-    config: PlatformConfig, condition: Condition, token: MintedToken, extra: Mapping[str, str] | None = None
+    config: PlatformConfig,
+    condition: Condition,
+    token: MintedToken,
+    extra: Mapping[str, str] | None = None,
+    *,
+    ca_copy: Path | None = None,
 ) -> dict[str, str]:
     """Return the environment of the server child.
 
@@ -100,14 +107,16 @@ def server_environment(
     The allow-list is the condition's, and a caller cannot set it or any other managed setting.
 
     Its certificate check is the platform's `[tls]`: by default the server's own (it verifies with httpx's CAs); with
-    `ca_file` the bundle, checked unchanged since the load, is named by the settings a client reads for its CA file
-    (`CA_BUNDLE_ENV`, of which the server's httpx reads `SSL_CERT_FILE`); with `insecure_tls` the server's own flag
-    turns verification off. The server runs on the host, so the bundle is named by its path and never copied.
+    `ca_file`, `ca_copy`, the run's own read-only copy of the verified bundle (`tls.write_private_copy`), never the
+    configured file, is named by the settings a client reads for its CA file (`CA_BUNDLE_ENV`, of which the server's
+    httpx reads `SSL_CERT_FILE`); with `insecure_tls` the server's own flag turns verification off.
     """
     _server(config)
     clash = sorted(set(extra or {}) & set(MANAGED_ENV))
     if clash:
         raise ValueError(f"the tool server's own settings are fixed by the condition: {', '.join(clash)}")
+    if config.tls.ca_file is not None and ca_copy is None:
+        raise ValueError("the platform's ca_file needs the run's own copy of the verified bundle (ca_copy)")
     env = {**(extra or {}), "FASTMCP_LOG_LEVEL": "WARNING", "PATH": os.environ.get("PATH", "")}
     env.update(
         {
@@ -120,9 +129,21 @@ def server_environment(
     )
     if config.tls.insecure:
         env[ENV_INSECURE_TLS] = "true"
-    elif config.tls.ca_file is not None:
-        env.update(dict.fromkeys(CA_BUNDLE_ENV, str(config.tls.bundle())))
+    elif ca_copy is not None:
+        env.update(dict.fromkeys(CA_BUNDLE_ENV, str(ca_copy)))
     return env
+
+
+@contextlib.contextmanager
+def _private_bundle(config: PlatformConfig) -> Iterator[Path | None]:
+    """With the platform's `ca_file`: the verified bytes, read once and written to a read-only copy in a directory of
+    this launch's own (mode 0700), removed with it when the server has stopped. Nothing without it."""
+    if config.tls.ca_file is None:
+        yield None
+        return
+    content = config.tls.bundle()
+    with tempfile.TemporaryDirectory(prefix="expcore-tls-") as directory:
+        yield write_private_copy(content, Path(directory))
 
 
 def _server(config: PlatformConfig) -> ToolServer:
@@ -231,26 +252,28 @@ class ToolServerLauncher:
         if principal is not None and token.subject != principal.user_id:
             raise ValueError("the tool-server token was not minted for the leased slot's tool-server user")
         server, chosen = _server(self._config), self._config.condition(condition)
-        env = server_environment(self._config, chosen, token, extra_env)
-        provider = McpToolProvider(
-            server.command,
-            server.args,
-            frozen=chosen.manifest,
-            env=env,
-            allowed_tools=chosen.allow,
-            start_timeout_s=server.start_timeout_s,
-        )
-        async with ctx.infrastructure_wait(WAIT_KIND):
-            try:
-                await asyncio.to_thread(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
-            except TokenRefused as refused:
-                raise _integrity_failure(self._config.condition_label(condition), "before the start", refused) from None
-            await provider.__aenter__()
-        try:
-            yield provider
-        finally:
+        with _private_bundle(self._config) as ca_copy:  # the run's copy of the verified CA bytes, gone with the server
+            env = server_environment(self._config, chosen, token, extra_env, ca_copy=ca_copy)
+            provider = McpToolProvider(
+                server.command,
+                server.args,
+                frozen=chosen.manifest,
+                env=env,
+                allowed_tools=chosen.allow,
+                start_timeout_s=server.start_timeout_s,
+            )
             async with ctx.infrastructure_wait(WAIT_KIND):
                 try:
-                    await provider.__aexit__(*sys.exc_info())
-                finally:
-                    await self._verify_plane(condition, chosen, token, ceiling_s)
+                    await asyncio.to_thread(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
+                except TokenRefused as refused:
+                    label = self._config.condition_label(condition)
+                    raise _integrity_failure(label, "before the start", refused) from None
+                await provider.__aenter__()
+            try:
+                yield provider
+            finally:
+                async with ctx.infrastructure_wait(WAIT_KIND):
+                    try:
+                        await provider.__aexit__(*sys.exc_info())
+                    finally:
+                        await self._verify_plane(condition, chosen, token, ceiling_s)

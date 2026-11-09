@@ -3,17 +3,22 @@
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import json
+import os
 import re
+import shlex
 import shutil
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 from mcp import StdioServerParameters
 from platform_support import BASELINE, CEILING_S, DATA, FAKE_TOOL_SERVER, MANAGE, NOW, TOOLS, write_platform
 from record_support import make_config
-from tls_support import HAS_OPENSSL, TlsServer, make_federation_ca
+from tls_support import HAS_OPENSSL, TlsServer, make_federation_ca, swap_after_check
 
 from expcore.campaign.attempts import classify
 from expcore.campaign.executor import failure_result
@@ -575,39 +580,135 @@ def federation(tmp_path_factory):
     return make_federation_ca(tmp_path_factory.mktemp("federation"))
 
 
-TLS_MODES = {
-    "verify-default": (None, "refused (ConnectError)"),
-    "ca_file": ({"ca_file": "federation-ca.pem"}, "200"),
-    "insecure_tls": ({"insecure_tls": True}, "200"),
+@pytest.fixture(scope="module")
+def stranger(tmp_path_factory):
+    """Another CA, which the federation's certificate does not chain to."""
+    return make_federation_ca(tmp_path_factory.mktemp("stranger"), name="unrelated-test-ca")
+
+
+CA_NAME = "federation-ca.pem"
+REFUSED = "refused (ConnectError)"
+TLS_MODES = {  # the setting, the CA its bundle holds, and what the server's request to the federation comes to
+    "verify-default": (None, "federation", REFUSED),
+    "ca_file": ({"ca_file": CA_NAME}, "federation", "200"),
+    "insecure_tls": ({"insecure_tls": True}, "federation", "200"),
+    "ca_file-of-another-ca": ({"ca_file": CA_NAME}, "stranger", REFUSED),
 }
+
+
+def tls_launcher(tmp_path, fake, frozen_manifests, events, tls, ca):
+    """A configuration with `[tls]` (its bundle the CA of `ca`), its issuer, launcher and a read condition's token."""
+    use_frozen(tmp_path, frozen_manifests)
+    (tmp_path / CA_NAME).write_bytes(ca.ca.read_bytes())
+    config = load_platform(write_platform(tmp_path, lambda d: d.update(tls=tls) if tls else None))
+    client = OnezoneClient(config, http=fake.client_http())
+    issuer = TokenIssuer(client, config, clock=lambda: NOW)
+    return config, ToolServerLauncher(config, issuer, events=events), read_token(issuer, config)
 
 
 @pytest.mark.skipif(not HAS_OPENSSL, reason="the openssl command makes the federation's test CA")
 @pytest.mark.parametrize("label", TLS_MODES)
-def test_o05_the_tool_server_checks_the_federations_certificate_as_the_tls_setting_says(
-    tmp_path, fake, frozen_manifests, events, federation, label
+def test_o05_the_tool_server_is_given_the_tls_setting_as_the_federation_requires(
+    tmp_path, fake, frozen_manifests, events, federation, stranger, label
 ):
-    """O05: the server, opening the federation as the real one does (httpx, verifying unless told otherwise), fails
-    against a certificate no default trusts, and reaches it with the CA bundle named in its environment as ca_file or
-    with insecure_tls; the caller cannot set either itself."""
-    tls, expected = TLS_MODES[label]
-    use_frozen(tmp_path, frozen_manifests)
-    (tmp_path / "federation-ca.pem").write_bytes(federation.ca.read_bytes())
-    config = load_platform(write_platform(tmp_path, lambda d: d.update(tls=tls) if tls else None))
-    client = OnezoneClient(config, http=fake.client_http())
-    issuer = TokenIssuer(client, config, clock=lambda: NOW)
-    launcher = ToolServerLauncher(config, issuer, events=events)
-    token = read_token(issuer, config)
+    """O05: what the launcher passes makes a client that opens the federation as the real server does (httpx,
+    verifying unless the insecure flag says otherwise) fail against a certificate no default trusts, and the same
+    with a ca_file of an unrelated CA, and reach it with its own CA as ca_file or with insecure_tls. The bundle is the
+    run's own read-only copy of the hashed bytes, removed when the server stops; the caller cannot set either."""
+    tls, ca, expected = TLS_MODES[label]
+    authority = {"federation": federation, "stranger": stranger}[ca]
+    config, launcher, token = tls_launcher(tmp_path, fake, frozen_manifests, events, tls, authority)
     with TlsServer(federation) as server:
         probe = {"FAKE_MCP_TLS_PROBE": f"{server.url}/api/v3/onezone/configuration"}
         _, _, seen = start(launcher, RecordingContext(), "read", token, tmp_path, extra=probe)
     assert seen["tls_probe"] == expected
-    bundle = str((tmp_path / "federation-ca.pem").resolve()) if label == "ca_file" else None
-    assert [seen[name] for name in CA_BUNDLE_ENV] == [bundle] * len(CA_BUNDLE_ENV)
+    copies = {seen[name] for name in CA_BUNDLE_ENV}
+    assert len(copies) == 1
+    if tls and "ca_file" in tls:
+        copy = copies.pop()
+        assert copy != str((tmp_path / CA_NAME).resolve())
+        assert seen["ssl_cert_file_mode"] == "0o444"
+        assert seen["ssl_cert_file_sha256"] == hashlib.sha256(authority.ca.read_bytes()).hexdigest()
+        assert not os.path.exists(copy)  # the run's copy is gone with the server
+    else:
+        assert copies == {None}
     assert seen["ONEDATA_ALLOW_INSECURE_TLS"] == ("true" if label == "insecure_tls" else None)
     for name in (*CA_BUNDLE_ENV, "ONEDATA_ALLOW_INSECURE_TLS"):
         with pytest.raises(ValueError, match=name):
             server_environment(config, config.condition("read"), token, {name: "x"})
+
+
+@pytest.mark.skipif(not HAS_OPENSSL, reason="the openssl command makes the federation's test CA")
+def test_o05_the_tool_server_is_given_the_verified_bytes_and_never_a_bundle_swapped_after_the_check(
+    tmp_path, fake, frozen_manifests, events, monkeypatch, federation, stranger
+):
+    """O05: the bundle swapped for another CA's right after its check is not what the server is given: it refuses a
+    server of the swapped-in CA and reaches the federation, whose CA was hashed."""
+    config, launcher, token = tls_launcher(tmp_path, fake, frozen_manifests, events, {"ca_file": CA_NAME}, federation)
+    swap_after_check(monkeypatch, tmp_path / CA_NAME, stranger.ca.read_bytes())
+    with TlsServer(stranger) as impostor, TlsServer(federation) as genuine:
+        probe = {"FAKE_MCP_TLS_PROBE": f"{impostor.url}/a,{genuine.url}/b"}
+        _, _, seen = start(launcher, RecordingContext(), "read", token, tmp_path, extra=probe)
+        reached = (impostor.seen, genuine.seen)
+    assert (tmp_path / CA_NAME).read_bytes() == stranger.ca.read_bytes()  # swapped once checked
+    assert seen["tls_probe"] == f"{REFUSED},200"
+    assert reached == ([], [("GET", "/b")])
+    assert seen["ssl_cert_file_sha256"] == config.tls.ca_sha256
+
+
+LIVE_SERVER = os.environ.get("EXPCORE_LIVE_TOOLSERVER")  # the real tool server's command line
+LIVE_TOOL = os.environ.get("EXPCORE_LIVE_TOOLSERVER_TOOL")  # one of its tools that reads from the zone or provider
+
+
+@pytest.mark.skipif(
+    not (LIVE_SERVER and LIVE_TOOL and HAS_OPENSSL),
+    reason="EXPCORE_LIVE_TOOLSERVER (the real server's command) and EXPCORE_LIVE_TOOLSERVER_TOOL are not set",
+)
+@pytest.mark.parametrize("label", ["ca_file", "ca_file-of-another-ca"])
+def test_o05_the_real_tool_server_trusts_the_ca_file_it_is_given_and_no_other(
+    tmp_path, fake, events, federation, stranger, label
+):
+    """O05: the real server, launched as a run launches it with the zone and its provider at a TLS server whose
+    certificate chains to the federation's CA, sends its tool's request there with that CA as ca_file, and sends
+    nothing with an unrelated CA's (its handshake refused). Arguments of the tool: EXPCORE_LIVE_TOOLSERVER_ARGS, as
+    JSON (default {})."""
+    from expcore_onedata.tls import write_private_copy
+
+    command, *args = shlex.split(LIVE_SERVER)
+    arguments = json.loads(os.environ.get("EXPCORE_LIVE_TOOLSERVER_ARGS", "{}"))
+    authority = {"ca_file": federation, "ca_file-of-another-ca": stranger}[label]
+    (tmp_path / CA_NAME).write_bytes(authority.ca.read_bytes())
+    with TlsServer(federation) as server:
+
+        def edit(data):
+            data["tls"] = {"ca_file": CA_NAME}
+            data["zone"]["url"] = data["providers"]["alpha"]["url"] = server.url
+            data["toolserver"].update(command=command, args=args)
+            data["toolserver"]["conditions"]["read"]["allow"] = [LIVE_TOOL]
+
+        config = load_platform(write_platform(tmp_path, edit))
+        client = OnezoneClient(config, http=fake.client_http())
+        issuer = TokenIssuer(client, config, clock=lambda: NOW)
+        token = read_token(issuer, config)
+        with tempfile.TemporaryDirectory() as private:
+            ca_copy = write_private_copy(config.tls.bundle(), Path(private))
+            env = server_environment(config, config.condition("read"), token, ca_copy=ca_copy)
+            params = StdioServerParameters(command=command, args=args, env=env)
+            config.condition("read").manifest.write_text(
+                FrozenManifest.from_live(asyncio.run(live_manifest(params))).dump(), encoding="utf-8"
+            )
+        launcher = ToolServerLauncher(config, issuer, events=events)
+
+        async def call():
+            async with launcher.launch(RecordingContext(), "read", token, ceiling_s=CEILING_S) as provider:
+                await provider.execute(LIVE_TOOL, arguments, timeout_s=60, ctx=RecordingContext())
+
+        asyncio.run(call())
+        reached = list(server.seen)
+    if label == "ca_file":
+        assert reached, "the real server sent nothing to the federation it was given the CA of"
+    else:
+        assert reached == []
 
 
 def test_a_pinned_checkout_is_verified_before_the_spawn(world, make_repo, tmp_path, events):

@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.config.loading import ConfigError
+from expcore_onedata import tls
 from expcore_onedata.sandbox import gatelog, hostops, netpool
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
@@ -125,6 +126,8 @@ class DockerSandbox:
         self._created, self._created_lock = 0, threading.Lock()  # counts what was registered; a stop compares it
         self._sampler_stop = threading.Event()
         self._cells: CellRunner | None = None
+        self._ca_bytes: bytes | None = None  # the verified bytes of the platform's CA bundle, when a data path takes it
+        self._ca_copy: Path | None = None  # the run's own read-only copy of them, which the containers mount
         self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
         self._uptime0: float | None = None
@@ -188,8 +191,8 @@ class DockerSandbox:
         if sp.mode is DataPathMode.MOUNT and (s.mount is None or s.oneclient is None):
             raise StartRefused("a mount data path needs [sandbox.mount] and the oneclient image")
         if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
-            try:  # a container is given the bundle only while it is the one the record names by its hash
-                s.tls.bundle()
+            try:  # the bytes the record names by their hash, read once: the containers get these and never the path
+                self._ca_bytes = s.tls.bundle()
             except ConfigError as error:
                 raise StartRefused(str(error)) from None
 
@@ -227,6 +230,8 @@ class DockerSandbox:
         self._write_mount_record()  # before anything exists: a mount is never made that the probe cannot be told of
         self._register_creation()
         self.dir.mkdir(parents=True, exist_ok=False)
+        if self._ca_bytes is not None:  # written once, from the bytes that were hashed, before any container exists
+            self._ca_copy = tls.write_private_copy(self._ca_bytes, self.dir)
         self._started = time.time()
         self._meta.update(host=self.host.host_facts(), started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         work = self.dir / "work"
@@ -273,16 +278,16 @@ class DockerSandbox:
         (self.dir / "gatelog").chmod(0o777)  # the gate runs as root without DAC_OVERRIDE
         (self.dir / "gatelog" / "requests.jsonl").touch()  # there from the start: a log that is missing is unreadable
         (self.dir / "gatelog" / "requests.jsonl").chmod(0o666)
-        tls = self.s.tls  # the platform's [tls]: the gate's upstream checks the federation's certificate as it says
+        check = self.s.tls  # the platform's [tls]: the gate's upstream checks the federation's certificate as it says
         config = {
             "run_key": self.spec.run_key,
-            "verify_ssl": not tls.insecure,
+            "verify_ssl": not check.insecure,
             "log": "/var/gate/requests.jsonl",
             "tls_dir": "/etc/gate/tls",
             "hosts": hosts,
         }
-        if tls.ca_file is not None:
-            config["upstream_ca_file"] = GATE_CA_PATH  # the bundle, which `gate_run_args` mounts there read-only
+        if self._ca_copy is not None:
+            config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only
         (self.dir / "gate.json").write_text(json.dumps(config), encoding="utf-8")
 
     def _pool_position(self, subnet: str) -> int | None:
@@ -396,7 +401,7 @@ class DockerSandbox:
         self._register_container(
             names.gate
         )  # registered before it is created: an interrupt cannot leave one `stop` misses
-        args = gate_run_args(s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id)
+        args = gate_run_args(s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id, ca_copy=self._ca_copy)
         self.host.docker(
             *args, env={ENV_GATE_TOKEN: self.spec.token.reveal()}
         )  # the gate holds the token, not the agent
@@ -438,7 +443,7 @@ class DockerSandbox:
         }
         self._register_container(names.sidecar)
         t0 = time.monotonic()
-        args = sidecar_run_args(s, names, self._label_args(), share, s.oneclient.id, host_name)
+        args = sidecar_run_args(s, names, self._label_args(), share, s.oneclient.id, host_name, ca_copy=self._ca_copy)
         self.host.docker(*args, env={ENV_ACCESS_TOKEN: sp.token.reveal()})
         deadline = time.monotonic() + MOUNT_WAIT_S
         while not hostops.is_fuse_mounted(self.host.read_text("/proc/self/mountinfo"), str(share)):

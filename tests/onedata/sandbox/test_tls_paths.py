@@ -14,14 +14,16 @@ import http.client
 import json
 import socket
 import ssl
+import stat
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
 from platform_support import write_platform
 from sandbox_support import TOKEN, add_sandbox, make_spec, start_options
-from tls_support import HAS_OPENSSL, TlsServer, make_federation_ca
+from tls_support import HAS_OPENSSL, TlsServer, make_federation_ca, swap_after_check
 
 from expcore_onedata.config import load_platform
 from expcore_onedata.sandbox import containers as C
@@ -40,11 +42,26 @@ MODES = {
     "ca_file": {"ca_file": CA_NAME},
     "insecure_tls": {"insecure_tls": True},
 }
+# Each mode with the CA its bundle holds; the last is a ca_file of a CA the federation's certificate does not chain to,
+# which must fail as the default does, so a ca_file that turned verification off would show.
+CASES = {
+    "verify-default": (None, "federation"),
+    "ca_file": ({"ca_file": CA_NAME}, "federation"),
+    "insecure_tls": ({"insecure_tls": True}, "federation"),
+    "ca_file-of-another-ca": ({"ca_file": CA_NAME}, "stranger"),
+}
+REACHED = {"verify-default": False, "ca_file": True, "insecure_tls": True, "ca_file-of-another-ca": False}
 
 
 @pytest.fixture(scope="module")
 def federation(tmp_path_factory):
     return make_federation_ca(tmp_path_factory.mktemp("federation"))
+
+
+@pytest.fixture(scope="module")
+def stranger(tmp_path_factory):
+    """Another CA, which the federation's certificate does not chain to."""
+    return make_federation_ca(tmp_path_factory.mktemp("stranger"), name="unrelated-test-ca")
 
 
 @pytest.fixture(scope="module")
@@ -56,7 +73,8 @@ def run_ca(tmp_path_factory):
 
 
 def world_with(tmp_path, tls, federation):
-    """A platform document with the sandbox table and `[tls]`, an in-memory host that knows the images."""
+    """A platform document with the sandbox table and `[tls]`, its bundle the CA of `federation`, and an in-memory
+    host that knows the images."""
 
     def edit(data):
         add_sandbox(data)
@@ -137,13 +155,23 @@ def read_through(port, run_ca, path=ATTRS) -> int:
 # ---------------------------------------------------------------------------------------------------- the data gate
 
 
-@pytest.mark.parametrize("label", MODES)
+def the_run_copy(sbx, source: str) -> bytes:
+    """The bytes of a mounted CA bundle, which must be the run's own read-only copy in its directory."""
+    copy = Path(source)
+    assert copy.parent == sbx.dir
+    assert stat.S_IMODE(copy.stat().st_mode) == 0o444
+    return copy.read_bytes()
+
+
+@pytest.mark.parametrize("label", CASES)
 def test_o05_the_gates_upstream_checks_the_federations_certificate_as_the_tls_setting_says(
-    tmp_path, federation, run_ca, label
+    tmp_path, federation, stranger, run_ca, label
 ):
-    """O05: the gate the sandbox configures refuses a certificate no default trusts (the agent gets a 502), and
-    reaches the federation with its CA as ca_file, read from a read-only mount, or with insecure_tls."""
-    world = world_with(tmp_path, MODES[label], federation)
+    """O05: the gate the sandbox configures refuses a certificate no default trusts (the agent gets a 502), and the
+    same with a ca_file of an unrelated CA, and reaches the federation with its own CA as ca_file, read from a
+    read-only mount, or with insecure_tls."""
+    tls, ca = CASES[label]
+    world = world_with(tmp_path, tls, {"federation": federation, "stranger": stranger}[ca])
     sbx = start(world, "via-gate")
     try:
         with TlsServer(federation) as upstream, gate_as_started(sbx, world, upstream, run_ca, tmp_path / "log") as port:
@@ -151,57 +179,98 @@ def test_o05_the_gates_upstream_checks_the_federations_certificate_as_the_tls_se
             reached = list(upstream.seen)
     finally:
         sbx.stop()
-    if label == "verify-default":
-        assert (status, reached) == (502, [])
-    else:
+    if REACHED[label]:
         assert (status, reached) == (200, [("GET", ATTRS)])
+    else:
+        assert (status, reached) == (502, [])
 
 
-def test_o05_the_gate_is_given_the_tls_setting_and_the_bundle_read_only_and_the_agent_neither(tmp_path, federation):
-    """O05: the gate's configuration and mounts carry the setting: the bundle mounted read-only at the path its
-    configuration names, verification off only with insecure_tls; the agent keeps trusting the run's CA alone."""
+def test_o05_the_gate_is_given_the_tls_setting_and_the_runs_copy_read_only_and_the_agent_neither(tmp_path, federation):
+    """O05: the gate's configuration and mounts carry the setting: the run's own read-only copy of the bundle, never
+    the configured file, mounted read-only at the path its configuration names, verification off only with
+    insecure_tls; the agent keeps trusting the run's CA alone."""
     seen = {}
     for label, tls in MODES.items():
         world = world_with(tmp_path / label, tls, federation)
         sbx = start(world, "via-gate")
         config = json.loads((sbx.dir / "gate.json").read_text(encoding="utf-8"))
-        gate_mounts = mounts_of(world.host.containers[sbx.names.gate])
-        agent = world.host.containers[sbx.names.agent]
-        seen[label] = (config["verify_ssl"], config.get("upstream_ca_file"), gate_mounts.get(C.GATE_CA_PATH))
-        assert str(world.config.tls.ca_file) not in json.dumps(agent.options, default=str)
+        mounted = mounts_of(world.host.containers[sbx.names.gate]).get(C.GATE_CA_PATH)
+        copy = the_run_copy(sbx, mounted[0]) if mounted else None
+        seen[label] = (config["verify_ssl"], config.get("upstream_ca_file"), mounted and mounted[1], copy)
+        agent = json.dumps(world.host.containers[sbx.names.agent].options, default=str)
+        assert CA_NAME not in agent
+        assert str(world.config.tls.ca_file) not in json.dumps(world.host.containers[sbx.names.gate].options)
         sbx.stop()
-    bundle = str((tmp_path / "ca_file" / CA_NAME).resolve())
     assert seen == {
-        "verify-default": (True, None, None),
-        "ca_file": (True, C.GATE_CA_PATH, (bundle, "ro")),
-        "insecure_tls": (False, None, None),
+        "verify-default": (True, None, None, None),
+        "ca_file": (True, C.GATE_CA_PATH, "ro", federation.ca.read_bytes()),
+        "insecure_tls": (False, None, None, None),
     }
+
+
+def test_o05_the_gate_trusts_the_verified_bytes_and_never_a_bundle_swapped_after_the_check(
+    tmp_path, monkeypatch, federation, stranger, run_ca
+):
+    """O05: the bundle swapped for another CA's right after its check is not what the gate trusts: it refuses a
+    server of the swapped-in CA (the agent gets a 502) and reaches the federation, whose CA was hashed."""
+    world = world_with(tmp_path, MODES["ca_file"], federation)
+    swap_after_check(monkeypatch, tmp_path / CA_NAME, stranger.ca.read_bytes())
+    sbx = start(world, "via-gate")
+    assert (tmp_path / CA_NAME).read_bytes() == stranger.ca.read_bytes()  # swapped once checked
+    statuses = {}
+    try:
+        for name, server in (("impostor", stranger), ("federation", federation)):
+            with TlsServer(server) as upstream, gate_as_started(sbx, world, upstream, run_ca, tmp_path / name) as port:
+                statuses[name] = (read_through(port, run_ca), len(upstream.seen))
+    finally:
+        sbx.stop()
+    assert statuses == {"impostor": (502, 0), "federation": (200, 1)}
 
 
 # ---------------------------------------------------------------------------------------------------- oneclient
 
 
-@pytest.mark.parametrize("label", MODES)
-def test_o05_oneclient_is_given_the_tls_setting_and_the_bundle_read_only(tmp_path, federation, label):
-    """O05: the sidecar's oneclient verifies by default, against the bundle mounted read-only (named to it by the
-    OpenSSL setting SSL_CERT_FILE) with ca_file, and runs `--insecure` only with insecure_tls."""
-    world = world_with(tmp_path, MODES[label], federation)
+@pytest.mark.parametrize("label", CASES)
+def test_o05_oneclient_is_given_the_tls_setting_and_the_bundle_read_only(tmp_path, federation, stranger, label):
+    """O05: the sidecar's oneclient verifies by default; with ca_file, against the run's read-only copy of exactly the
+    configured bundle, an unrelated CA's included, named to it by the OpenSSL setting SSL_CERT_FILE, with verification
+    still on; and it runs `--insecure` only with insecure_tls."""
+    tls, ca = CASES[label]
+    bundle = {"federation": federation, "stranger": stranger}[ca].ca.read_bytes()
+    world = world_with(tmp_path, tls, {"federation": federation, "stranger": stranger}[ca])
     sbx = start(world, "mounted")
     sidecar = world.host.containers[sbx.names.sidecar]
     command, mounts = sidecar.command, mounts_of(sidecar)
     binary = command.index(C.ONECLIENT_BIN)
     settings = command[:binary]  # what `env` sets and unsets before it runs oneclient
+    copy = the_run_copy(sbx, mounts[C.SIDECAR_CA_PATH][0]) if C.SIDECAR_CA_PATH in mounts else None
     sbx.stop()
     assert settings[:2] == ["-u", "ONECLIENT_INSECURE"]  # the image's own skip-verification flag is always removed
-    bundle = str((tmp_path / CA_NAME).resolve())
-    if label == "ca_file":
+    if tls and "ca_file" in tls:
         assert settings[2:] == [f"SSL_CERT_FILE={C.SIDECAR_CA_PATH}"]
-        assert mounts[C.SIDECAR_CA_PATH] == (bundle, "ro")
+        assert mounts[C.SIDECAR_CA_PATH][1] == "ro"
+        assert copy == bundle
     else:
         assert settings[2:] == []
         assert C.SIDECAR_CA_PATH not in mounts
     assert ("--insecure" in command) is (label == "insecure_tls")
-    assert bundle not in json.dumps(sidecar.options.get("_env", {}))
+    assert str((tmp_path / CA_NAME).resolve()) not in json.dumps(sidecar.options, default=str) + " ".join(command)
+
+
+def test_o05_oneclient_is_given_the_verified_bytes_and_never_a_bundle_swapped_after_the_check(
+    tmp_path, monkeypatch, federation, stranger
+):
+    """O05: the bundle swapped for another CA's right after its check is not what oneclient is given: its mount holds
+    the bytes that were hashed."""
+    world = world_with(tmp_path, MODES["ca_file"], federation)
+    swap_after_check(monkeypatch, tmp_path / CA_NAME, stranger.ca.read_bytes())
+    sbx = start(world, "mounted")
+    sidecar = world.host.containers[sbx.names.sidecar]
+    given = the_run_copy(sbx, mounts_of(sidecar)[C.SIDECAR_CA_PATH][0])
+    sbx.stop()
+    assert (tmp_path / CA_NAME).read_bytes() == stranger.ca.read_bytes()  # swapped once checked
+    assert given == federation.ca.read_bytes()
+    assert hashlib.sha256(given).hexdigest() == world.config.tls.ca_sha256
 
 
 # ---------------------------------------------------------------------------------------------------- both

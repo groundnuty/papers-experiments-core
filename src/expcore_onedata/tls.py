@@ -16,12 +16,18 @@ insecure_tls = true             # or: verification off, for a disposable test fe
 
 The bundle is read, checked to hold certificates and no private key, and hashed when the file is loaded. A record and
 the campaign fingerprint name the setting by `record()`: `{"mode": "verify"}`, `{"mode": "ca_file", "ca_sha256": ...}`
-or `{"mode": "insecure"}`, never by the bundle's path or by anything of its contents beyond that hash. A client is
-handed the bundle by `bundle()`, which hashes it again and refuses one that changed since the load, so the hash a record
-holds is the bundle the clients used. A container gets it bind-mounted read-only; nothing copies it.
+or `{"mode": "insecure"}`, never by the bundle's path or by anything of its contents beyond that hash.
+
+No client reads the configured file. `bundle()` reads it once, refuses it unless its bytes have the hash the record
+holds, and returns those bytes; a client uses them and never the path, which anyone who can write the file could swap
+after the check. The REST client loads them into its context (`cadata`). A run that hands them to another process
+writes them once, with `write_private_copy`, to a read-only file of its own in a directory of its own, and gives that
+process the copy: the sandbox's gate and sidecar get it bind-mounted read-only, the tool server gets its path. So what
+every client trusts is the bytes that were hashed, and a bundle swapped after the check is never trusted.
 """
 
 import hashlib
+import os
 import ssl
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +44,8 @@ WARNING = (
     "disposable test federation only"
 )
 _UNSAFE_PATH = (":", ",")  # characters docker's mount syntax splits on: a bundle mounted by such a path would break
+CA_COPY_NAME = "federation-ca.pem"  # the run's own read-only copy of the verified bytes, in the run's directory
+CA_COPY_MODE = 0o444
 
 
 @dataclass(frozen=True)
@@ -63,28 +71,49 @@ class TlsSettings:
         """The setting as a record and the fingerprint hold it: the mode, and with ca_file the bundle's SHA-256."""
         return {"mode": self.mode, "ca_sha256": self.ca_sha256} if self.ca_file is not None else {"mode": self.mode}
 
-    def bundle(self) -> Path:
-        """The CA bundle's path, once it is shown to be the bundle that was loaded; ConfigError when it is not.
-
-        The message names the key, never the path."""
+    def bundle(self) -> bytes:
+        """The CA bundle's bytes, read once and returned only when they have the hash the record holds; ConfigError
+        when they do not. A client uses these bytes, never the configured path. The message names the key only."""
         if self.ca_file is None:
             raise ValueError("the TLS setting has no CA bundle")
         try:
-            digest = hashlib.sha256(self.ca_file.read_bytes()).hexdigest()
+            content = self.ca_file.read_bytes()
         except OSError as error:
             raise ConfigError(f"[tls] ca_file: the CA bundle can no longer be read ({type(error).__name__})") from None
-        if digest != self.ca_sha256:
+        if hashlib.sha256(content).hexdigest() != self.ca_sha256:
             raise ConfigError("[tls] ca_file: the CA bundle changed since platform.toml was loaded; load it again")
-        return self.ca_file
+        return content
 
     def client_verify(self) -> ssl.SSLContext | bool:
-        """What a Python HTTP client takes as its `verify`: True (its own default CAs), a context that trusts the bundle
-        alone, or False (no verification)."""
+        """What a Python HTTP client takes as its `verify`: True (its own default CAs), a context that trusts the
+        verified bytes of the bundle alone, loaded from memory, or False (no verification)."""
         if self.insecure:
             return False
         if self.ca_file is None:
             return True
-        return ssl.create_default_context(cafile=str(self.bundle()))
+        return ssl.create_default_context(cadata=_pem_text(self.bundle()))
+
+
+def _pem_text(content: bytes) -> str:
+    """The bundle as the text `cadata` takes; ValueError when it is not ASCII, as PEM is."""
+    return content.decode("ascii")
+
+
+def write_private_copy(content: bytes, directory: Path) -> Path:
+    """Write verified bundle bytes once to `directory`, a directory of the run's own, as a new read-only file (mode
+    0444) that the run owns; return its path. An existing file there is refused, so nothing is written over."""
+    target = directory / CA_COPY_NAME
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), CA_COPY_MODE)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    os.chmod(target, CA_COPY_MODE)  # whatever the umask took away, the copy is readable by every container's user
+    return target
 
 
 def _ca_file(section: Section, base: Path) -> TlsSettings:
@@ -98,8 +127,8 @@ def _ca_file(section: Section, base: Path) -> TlsSettings:
         raise section.fail("ca_file", f"cannot be read ({type(error).__name__})") from None
     if b"PRIVATE KEY" in content:
         raise section.fail("ca_file", "holds a private key; it must hold the CA's certificates only")
-    try:
-        loaded = ssl.create_default_context(cafile=str(path)).cert_store_stats()["x509"]
+    try:  # loaded from the bytes, as the REST client loads them
+        loaded = ssl.create_default_context(cadata=_pem_text(content)).cert_store_stats()["x509"]
     except (ssl.SSLError, ValueError):
         loaded = 0
     if not loaded:
