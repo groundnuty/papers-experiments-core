@@ -260,7 +260,7 @@ class DockerHost:
             self.run(argv, 60, sudo=True)
             if str(path) not in mounted_points(self.read_text("/proc/self/mountinfo")):
                 return
-        log.error("%s is still mounted after an unmount and a lazy unmount", path)
+        log.error("a mount (%s) is still mounted after an unmount and a lazy unmount", name_digest(path))  # O12
         raise SandboxError("a mount is still mounted after an unmount and a lazy unmount")
 
     def image_id(self, reference: str) -> str:

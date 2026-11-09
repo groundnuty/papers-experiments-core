@@ -12,7 +12,7 @@ from sandbox_support import add_sandbox, configured_sandbox_values
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore_onedata.config import PlatformConfig, load_platform
-from expcore_onedata.sandbox import teardown
+from expcore_onedata.sandbox import reap, teardown
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.sandbox.sandbox import DockerSandbox
@@ -52,10 +52,18 @@ class _Logged(logging.Handler):
         self.sink.append(("a log line", self.format(record)))
 
 
+def _written_logs_and_records(root):
+    """The files the sandbox code writes as logs and records, wherever a test put them: the teardown logs and the
+    reaper's records. (The gate's request log is not among them: it holds the paths the agent asked for, its own.)"""
+    teardown_logs = (p for p in root.rglob("*.jsonl") if p.parent.name == teardown.TEARDOWN_LOG_DIR)
+    return sorted({*teardown_logs, *root.rglob(reap.REAPED)})
+
+
 @pytest.fixture(autouse=True)
 def _no_sandbox_output_holds_a_configured_value(monkeypatch, tmp_path):
     """O12: record every message of an exception the sandbox code builds, every line it logs, the metadata of every
-    sandbox and every step of its teardown log, and fail the test if one holds a value of the `[sandbox]` table (an
+    sandbox, every step of its teardown log, and the teardown logs and reaper records it wrote to disk
+    (`_written_logs_and_records`), and fail the test if one holds a value of the `[sandbox]` table (an
     image, a pool, a path, a login, a level). They name keys, roles and positions instead, and a tool's stderr by its
     size and SHA-256."""
     found: list[tuple[str, str]] = []
@@ -93,6 +101,8 @@ def _no_sandbox_output_holds_a_configured_value(monkeypatch, tmp_path):
     yield
     logger.removeHandler(handler)
     logger.setLevel(level)
+    for written in _written_logs_and_records(tmp_path):
+        found.append((f"the file {written.name}", written.read_text(encoding="utf-8", errors="replace")))
     values = [
         v for v in configured_sandbox_values(tmp_path) if not v.startswith("sha256:")
     ]  # ids: recorded by design (O13)

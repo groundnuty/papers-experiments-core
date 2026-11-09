@@ -1,5 +1,6 @@
 """The smaller modules of the sandbox: the gate log summary, earlyoom's host checks, the reaper, the registry."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -173,6 +174,50 @@ def test_reaping_a_dead_run_copies_checks_and_only_then_removes_the_directory(wo
     assert (kept / "gatelog" / "requests.jsonl").exists()
     record = json.loads((log_dir / reap.REAPED).read_text().splitlines()[0])
     assert [k["what"] for k in record["kept"]] == ["out", "gate log"]
+
+
+def test_o12_the_reapers_record_names_a_directory_by_its_id_and_digest_and_its_mounts_by_label(
+    world, dead_run, tmp_path
+):
+    """O12: the record of what the reaper removed holds no configured value: the directory's name holds the lease's
+    login and its path the work root, so it is named by its id and the SHA-256 of its name, a mount by its place."""
+    run_handlers(world.host)
+    world.host.mounts[str(dead_run / "work")] = "ext4"
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    assert reap.reap_run(world.host, world.s, "login-data", log_dir=log_dir, outputs=["out"]) is True
+    text = (log_dir / reap.REAPED).read_text(encoding="utf-8")
+    assert "login-data" not in text
+    assert str(world.s.work_root) not in text
+    record = json.loads(text.splitlines()[0])
+    assert record["dir"] == {"id": "0123abcd", "sha256": hashlib.sha256(dead_run.name.encode()).hexdigest()}
+    assert record["mounts"] == ["work"]
+
+
+def test_o12_a_reaper_that_cannot_ask_docker_logs_the_directory_by_its_id(world, dead_run, tmp_path, caplog):
+    """O12: the line that says a directory is not shown clear of containers names it by its id, never its name."""
+    world.host.docker = lambda *args, **kwargs: CmdResult(1, "", "daemon down")
+    with caplog.at_level("ERROR"):
+        assert reap.reap_dirs(world.host, tmp_path, world.s.work_root, reap.sid_pattern("login-data"), "x") is False
+    assert "login-data" not in caplog.text
+    assert "0123abcd" in caplog.text
+
+
+def test_o12_a_mount_that_will_not_go_is_logged_by_its_digest_never_its_path(world, caplog, monkeypatch):
+    """O12: a real host's unmount that leaves a mount in place logs it by the digest of its path, which holds the
+    configured work root, never by the path."""
+    from expcore_onedata.sandbox.api import SandboxError
+    from expcore_onedata.sandbox.hostops import DockerHost, name_digest
+
+    path = world.s.work_root / "login-data-0123abcd" / "work"
+    host = DockerHost()
+    table = f"1 0 8:1 / / rw - ext4 /dev/root rw\n40 1 7:3 / {path} rw - ext4 /dev/loop3 rw\n"
+    monkeypatch.setattr(host, "read_text", lambda which: table)
+    monkeypatch.setattr(host, "run", lambda argv, timeout_s, **kwargs: CmdResult(0))
+    with caplog.at_level("ERROR"), pytest.raises(SandboxError):
+        host.unmount(path)
+    assert str(path) not in caplog.text
+    assert name_digest(path) in caplog.text
 
 
 def test_a_directory_with_a_container_or_a_young_one_is_left_alone(world, dead_run, tmp_path):

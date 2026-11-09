@@ -9,7 +9,8 @@ Called by an operator tool, or by whatever frees a lease key whose last holder d
 run's cell never keeps reading under a user that is now another run's. No run output is deleted without the operator's
 word, and a dead attempt's disks hold its only record: the files the caller names (`outputs`, relative to the working
 directory) and the gate log are copied out first and the copy checked by file count and bytes, then what goes is logged,
-and only then do the mounts and scratch go. A copy or a log that fails keeps the disks, as does anything still there (a
+and only then do the mounts and scratch go. The log and the record name a directory by its id and the SHA-256 of its
+name, and a mount by its place in the directory, never by a configured value (O12). A copy or a log that fails keeps the disks, as does anything still there (a
 FUSE mount that could not be released keeps its containers, by design), and the caller tries again.
 
 Every host effect goes through the `HostOps` passed in.
@@ -17,6 +18,7 @@ Every host effect goes through the `HostOps` passed in.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -43,6 +45,12 @@ class CollectFailed(SandboxError):
 def sid_pattern(key: str) -> re.Pattern[str]:
     """The names of the sandbox directories of a lease key or a run key, as `DockerSandbox` names them (key, id)."""
     return re.compile(re.escape(re.sub(r"[^A-Za-z0-9_.-]", "_", key)[:48]) + r"-[0-9a-f]{8}")
+
+
+def _named(x: Path) -> dict[str, str]:
+    """A sandbox directory as a log or a record names it (O12): its name holds the lease key or run key and its path the
+    work root, both configured values, so by the id that ends its name and the SHA-256 of the name, to match on."""
+    return {"id": x.name.rsplit("-", 1)[-1], "sha256": hashlib.sha256(x.name.encode("utf-8", "replace")).hexdigest()}
 
 
 def mounts_under(host: HostOps, x: Path) -> list[Path]:
@@ -120,7 +128,13 @@ def reap_dirs(
     for x in dirs:
         ps = host.docker("ps", "-a", "-q", "--filter", f"label={dir_label}={x}", check=False)
         if ps.returncode != 0:  # a docker that did not answer lists no containers: that is not "none left"
-            log.error("reap: docker ps failed (%s), so %s is not shown clear of containers", ps.returncode, x.name)
+            named = _named(x)
+            log.error(
+                "reap: docker ps failed (%s), so directory %s (sha256 %s) is not shown clear of containers",
+                ps.returncode,
+                named["id"],
+                named["sha256"],
+            )
             return False
         if ps.stdout.split() or now - x.stat().st_mtime < young_s:
             return False
@@ -134,8 +148,9 @@ def _reap_one(host: HostOps, log_dir: Path, x: Path, outputs: Sequence[str]) -> 
         kept = collect(host, x, keep, outputs)
         sizes = {f.name: f.stat().st_blocks * 512 for f in x.iterdir() if f.is_file() and not f.is_symlink()}
         with open(Path(log_dir) / REAPED, "a") as f:
-            record = {"t": time.time(), "dir": x.name, "kept": kept, "allocated_bytes": sizes}
-            f.write(json.dumps(record | {"mounts": [str(m) for m in mounts_under(host, x)]}) + "\n")
+            record = {"t": time.time(), "dir": _named(x), "kept": kept, "allocated_bytes": sizes}
+            mounts = [str(m.relative_to(x)) for m in mounts_under(host, x)]  # by their place in it, never the path
+            f.write(json.dumps(record | {"mounts": mounts}) + "\n")
             f.flush()
             os.fsync(f.fileno())
     except (OSError, SandboxError) as e:
