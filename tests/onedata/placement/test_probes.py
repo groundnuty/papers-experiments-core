@@ -210,7 +210,7 @@ def test_o08_a_reset_inside_the_resolution_is_retried_and_counted_in_the_probes_
     snapshot = probes.finish()
     assert snapshot["files"]["data"]["entry"]["probe_ok"] is True
     assert snapshot["files"]["data"]["entry"]["attempts"] == 3
-    assert len(ticker.slept) == 2
+    assert ticker.slept.count(0.0) == 2  # the probe's backoff; the 30 s are the transfer listing's settle wait
 
 
 def test_o08_a_provider_the_block_map_leaves_out_is_a_failed_probe_with_a_reason_not_an_empty_reading(probes, seeded):

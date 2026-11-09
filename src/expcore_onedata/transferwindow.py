@@ -18,8 +18,9 @@ or not, so the bound only errs low; `difference` keeps the unfloored value so th
 
 **A bound is known only when every input to it is established.** Otherwise it is None and `unknown` lists the reasons:
 `transfer_not_ended` (a job into the provider had not ended at run end, so its counter was not final),
-`transfer_carried_over` (a job into it from before the run was still running when the run began) and
-`listings_disagree` (the tracked providers do not list and answer a job into it alike, `transferlog.py`).
+`transfer_carried_over` (a job into it from before the run was still running when the run began),
+`listings_disagree` (the tracked providers do not list and answer a job into it alike, `transferlog.py`) and
+`listing_not_settled` (a job into it still changed between the last two observations of the listing).
 """
 
 import math
@@ -32,6 +33,7 @@ from expcore_onedata.transferrecord import Job
 NOT_ENDED = "transfer_not_ended"
 CARRIED_OVER = "transfer_carried_over"
 DISAGREE = "listings_disagree"
+NOT_SETTLED = "listing_not_settled"
 
 
 @dataclass(frozen=True)

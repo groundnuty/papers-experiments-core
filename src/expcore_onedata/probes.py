@@ -193,7 +193,7 @@ class PlatformProbes:
         self._transfers = transfers if transfers is not None else provisioner.transfers
         self._sleep, self._now = sleep, now
         self._log = TransferLog(
-            client, provisioner, self._providers, self._probe, page_limit=page_limit, max_listed=max_listed
+            client, provisioner, self._providers, self._probe, sleep=sleep, page_limit=page_limit, max_listed=max_listed
         )
         self._before: dict[str, dict[str, ProbeResult]] | None = None
         self._started: float | None = None

@@ -32,6 +32,8 @@ waits. A test bends the fake through plain attributes:
 - `transfer_omit`: field names a job's record leaves out; `transfer_list_body`: an answer that replaces the listing's;
 - `provider_view`: `(job id, provider id)` to what that provider says of the job where it differs: `state` (the list
   it is in, and its record's status) and record fields such as `bytesReplicated`;
+- `listing_lag`: job id to how many listing answers, counted from the first, leave the job out (its record is read
+  at once, as a real provider's is while its listing lags);
 
 `add_transfer` makes a job that no request to `/transfers` made, as a QoS requirement or another client does, with the
 times and the state a test gives it.
@@ -134,6 +136,8 @@ class FakeData(FakeFederation):
         self.transfer_omit: set[str] = set()  # fields a job's record leaves out
         self.transfer_list_body: dict | None = None  # replaces every answer of the listing
         self.provider_view: dict[tuple[str, str], dict] = {}  # (job, provider id) -> its listed state, record fields
+        self.listing_lag: dict[str, int] = {}  # job id -> listing answers it is left out of, from the first one
+        self.listings = 0  # the listing answers given
         self._ids = itertools.count(1)
         self._root_polls = 0
 
@@ -458,12 +462,14 @@ class FakeData(FakeFederation):
             return self._error(404, "notFound")
         if query.get("state") not in ("waiting", "ongoing", "ended"):
             return self._error(400, "badValueNotAllowed")
+        self.listings += 1
         if self.transfer_list_body is not None:
             return httpx.Response(200, json=self.transfer_list_body)
         ids = [
             tid
             for tid, t in self.transfers.items()
             if self._view(tid, provider).get("state", t.state) == query["state"]
+            and self.listings > self.listing_lag.get(tid, 0)
         ]
         start = int(query.get("page_token") or "0")
         end = start + int(query.get("limit", "100"))

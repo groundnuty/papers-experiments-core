@@ -75,6 +75,7 @@ def test_o08_a_job_still_waiting_at_run_end_is_recorded_by_when_it_was_scheduled
     waiting, not dropped."""
     probes.start({})
     ticker.sleep(1)
+    seeded.transfer_flip_after = 99  # reading its record does not start or end it
     tid = seeded.add_transfer("replication", PATH, BETA_ID, scheduled=ticker.now, ended=False, waiting=True)
     record = records_of(probes.finish())[tid]
     assert record["listed_as"] == "waiting"

@@ -70,6 +70,7 @@ def test_o08_a_transfer_into_a_provider_still_running_at_run_end_makes_its_bound
     """O08: a job into beta that has not ended has a byte counter that is not final, so beta's bound is None with a
     reason; alpha's, which no such job touches, is still given."""
     probes.start({})
+    seeded.transfer_flip_after = 99  # reading its record does not end it, as polling does in the fake
     seeded.add_transfer("replication", MORE, BETA_ID, scheduled=ticker.now, ended=False)
     split = probes.finish()["on_demand"]
     assert split["beta"]["on_demand_lower_bound"] is None
@@ -127,3 +128,45 @@ def test_o08_without_the_block_maps_there_is_no_split(probes, seeded):
     snapshot = probes.finish()
     assert snapshot["space_transfers"]["probe_ok"] is True
     assert snapshot["on_demand"] is None
+
+
+ONE_OBSERVATION = 6  # listing answers in one observation: two tracked providers, three states, one page each
+
+
+def test_o07_a_transfer_that_appears_only_in_the_second_poll_is_counted_and_the_bound_is_right(
+    probes, provisioner, client, seeded, ticker
+):
+    """O07 with O08: the agent's replication into beta lags in the listing, absent from the first observation and
+    present from the second. The log waits the settle time and observes again until two observations in a row are the
+    same, so the job is counted: 4096 transfer bytes into beta, and of its 5096 gained bytes at least 1000 on demand."""
+    probes.start({})
+    ticker.sleep(10)
+    tid = tool_plane_replicates(seeded, client, MORE, BETA_ID)
+    seeded.end_transfer(tid)
+    seeded.listing_lag[tid] = ONE_OBSERVATION
+    provisioner.read_through("beta", seeded.id_of(PATH), 0, 1000)
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    section = snapshot["space_transfers"]
+    assert (section["settled"], section["polls"]) == (True, 3)
+    assert tid in {r["transfer_id"] for r in section["records"]}
+    beta = snapshot["on_demand"]["beta"]
+    assert (beta["transfer_bytes_in"], beta["on_demand_lower_bound"], beta["unknown"]) == (len(DATA), 1000, None)
+    assert ticker.slept.count(30.0) == 2  # the default settle time, between the three observations
+
+
+def test_o07_a_listing_that_keeps_changing_leaves_the_bounds_it_touches_unknown(probes, seeded, ticker):
+    """O07 with O08: a new job into beta shows in every observation, so no two in a row are the same within the
+    bound of four. The listing has not settled: beta's bound is unknown, listing_not_settled, while alpha's, which no
+    changing job touches, is still given."""
+    probes.start({})
+    ticker.sleep(10)
+    for n in range(1, 4):
+        tid = seeded.add_transfer("replication", MORE, BETA_ID, scheduled=ticker.now)
+        seeded.listing_lag[tid] = n * ONE_OBSERVATION
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    assert (snapshot["space_transfers"]["settled"], snapshot["space_transfers"]["polls"]) == (False, 4)
+    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
+    assert "listing_not_settled" in snapshot["on_demand"]["beta"]["unknown"]
+    assert snapshot["on_demand"]["alpha"]["on_demand_lower_bound"] == 0

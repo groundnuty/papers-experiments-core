@@ -19,6 +19,15 @@ space. The record keeps the observation of the first tracked provider that lists
 tracked providers do not all list the job with the same list, state and counters (`listings_agree` false), the job's
 target's bound is unknown, `listings_disagree`, provided the job can bear on the run (in its window or carried over).
 
+**Settled before it is believed (O07).** One observation can miss a job the listing has not shown yet. So the log
+observes every tracked provider, waits `[placement] transfer_settle_s` (30 s by default, which must be at least the
+listing's lag) and observes again, until two observations in a row are the same (the same ids, each listed alike with
+the same state and counters on each provider), within `transfer_settle_polls` observations (4 by default). The section
+records `settled` and `polls`. When the bound is reached first, every job that still changed between the last two
+observations leaves its target's bound unknown, `listing_not_settled`. The wait happens at run end, outside the agent's
+time. A job that lags for longer than the settle time and also stays out of the next observation is not seen; the
+setting is what bounds that.
+
 **Fail closed.** A page or record that cannot be read, or one not in the documented shape (`transferrecord.py`), makes
 the whole listing `probe_ok` false with the reason and no records, never fewer or no transfers. A listing longer than
 its bound (`MAX_LISTED` distinct ids, or a token that keeps coming back) is unknown in the same way, not truncated.
@@ -32,7 +41,7 @@ from typing import Any, Protocol
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.transferrecord import STATES, UNDECLARED, Job, Unreadable, job_of, page_of, record_of
-from expcore_onedata.transferwindow import CARRIED_OVER, DISAGREE, Window
+from expcore_onedata.transferwindow import CARRIED_OVER, DISAGREE, NOT_SETTLED, Window
 
 PAGE_LIMIT = 1000  # ids asked for per page; the listing takes 1 to 1000
 MAX_LISTED = 2000  # distinct ids read before the listing is unknown: each one costs a read of its record
@@ -59,6 +68,19 @@ class Reading:
 Observation = dict[str, dict[str, Job]]  # provider name -> transfer id -> the job as that provider has it
 
 
+def changed_between(previous: Observation, current: Observation) -> list[Job]:
+    """Return every reading of a job that two observations do not share: one provider listed it in one of them only,
+    or with another list, state or counters. None of them means the two are the same observation."""
+    changed: list[Job] = []
+    for provider in current.keys() | previous.keys():
+        before, after = previous.get(provider, {}), current.get(provider, {})
+        for tid in before.keys() | after.keys():
+            old, new = before.get(tid), after.get(tid)
+            if old is None or new is None or old.observed() != new.observed():
+                changed += [job for job in (old, new) if job is not None]
+    return changed
+
+
 class TransferLog:
     """Reads the space's transfer listing and each listed record through the probes' own probe, at run end."""
 
@@ -69,6 +91,7 @@ class TransferLog:
         providers: Sequence[str],
         probe: Callable[[Callable[[], Any]], Probed],
         *,
+        sleep: Callable[[float], None],
         page_limit: int = PAGE_LIMIT,
         max_listed: int = MAX_LISTED,
     ) -> None:
@@ -76,7 +99,7 @@ class TransferLog:
         if not 1 <= page_limit <= PAGE_LIMIT or max_listed < 1:
             raise ValueError(f"a page holds 1 to {PAGE_LIMIT} ids and the listing's bound is at least one")
         self._client, self._provisioner, self._providers, self._probe = client, provisioner, list(providers), probe
-        self._page_limit, self._max_listed = page_limit, max_listed
+        self._page_limit, self._max_listed, self._sleep = page_limit, max_listed, sleep
         self._pages = 0
 
     def _listed_on(self, provider: str) -> dict[str, str]:
@@ -137,6 +160,22 @@ class TransferLog:
             merged.append((views[0][0], views[0][1], [job for _, job in views]))
         return merged
 
+    def _settled(self) -> tuple[Observation, list[Job], int]:
+        """Observe, wait the settle time and observe again, until two observations in a row are the same or the bound
+        on observations is reached. Return the last observation, the readings that still changed between the last two
+        (none when the listing settled), and how many observations were made. Raise Unreadable when one fails."""
+        settings = self._provisioner.settings
+        previous = self._observe()
+        changed: list[Job] = []
+        for polls in range(2, settings.transfer_settle_polls + 1):
+            self._sleep(settings.transfer_settle_s)
+            current = self._observe()
+            changed = changed_between(previous, current)
+            if not changed:
+                return current, [], polls
+            previous = current
+        return previous, changed, settings.transfer_settle_polls
+
     def read(self, window: Window | None, file_ids: Mapping[str, str], harness: Collection[str]) -> Reading:
         """Return the snapshot's record of the space's transfers in the window, with the jobs in it and those that leave
         a bound unknown. `file_ids` labels a tracked file's id, and `harness` holds the ids the provisioner scheduled.
@@ -148,6 +187,9 @@ class TransferLog:
             "window": None if window is None else window.to_json(),
             "providers": [self._client.provider_label(p) for p in self._providers],
             "pages": 0,
+            "settle_s": self._provisioner.settings.transfer_settle_s,
+            "settled": None,
+            "polls": None,
             "listed": None,
             "records": None,
             "carried_over": None,
@@ -155,10 +197,24 @@ class TransferLog:
         if window is None:
             return Reading({**section, "error": "the run's start was not read, so the run has no window"}, None)
         try:
-            observation = self._observe()
+            observation, changed, polls = self._settled()
         except Unreadable as error:
             return Reading({**section, "pages": self._pages, "error": str(error)}, None)
-        inside, records, flagged, carried = [], [], [], 0
+        flagged = [(t, NOT_SETTLED) for t in dict.fromkeys(j.target_id for j in changed) if t]
+        section.update(settled=not changed, polls=polls)
+        return self._classified(window, observation, file_ids, harness, section, flagged)
+
+    def _classified(
+        self,
+        window: Window,
+        observation: Observation,
+        file_ids: Mapping[str, str],
+        harness: Collection[str],
+        section: dict[str, Any],
+        flagged: list[tuple[str, str]],
+    ) -> Reading:
+        """Place each job in or out of the window, record those in it and flag those that leave a bound unknown."""
+        inside, records, carried = [], [], 0
         merged = self._merged(observation)
         for provider, job, views in merged:
             agree = len(views) == len(self._providers) and all(v.observed() == job.observed() for v in views)
