@@ -49,7 +49,7 @@ class Timeline(FakeServices):
 def federation(tmp_path):
     platform = write_faults(tmp_path)
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
-    return platform, FederationLock(settings.journal)
+    return platform, FederationLock(settings)
 
 
 def in_thread(work):
@@ -164,6 +164,40 @@ def test_o11_an_injector_under_a_shared_admission_refuses_instead_of_upgrading(t
     with pytest.raises(AdmissionRefused, match="exclusive"):
         asyncio.run(outage_run_admitted_shared())
     assert services.running(OUTAGE_SERVICE) is True
+
+
+def two_federations(tmp_path, **second):
+    """Two platform documents with `[faults]`, each in a directory of its own; `second` changes the second's table."""
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    return write_faults(tmp_path / "one"), write_faults(tmp_path / "two", **second)
+
+
+def test_o11_an_admission_for_one_federation_does_not_admit_a_run_of_another(tmp_path):
+    """O11: an admission names the federation it holds (its lock file and its configuration's digest); held for one,
+    it does not let a run of another start its infrastructure, nor an injector of another inject."""
+    _, second = two_federations(tmp_path)
+    lock = federation(tmp_path / "one")[1]
+    config = load_platform(second, require_secrets=False)
+    services = FakeServices()
+    with lock.held(exclusive=True):
+        with pytest.raises(AdmissionRefused, match="another federation"):
+            require_admission(config)
+        with pytest.raises(AdmissionRefused, match="another federation"):
+            injector_for(second, services).start(RUN)
+    assert services.running(OUTAGE_SERVICE) is True
+    assert ("stop", OUTAGE_SERVICE) not in services.calls
+
+
+def test_o11_one_lock_file_under_two_configurations_is_two_federations(tmp_path):
+    """O11: a configuration that shares another's journal directory, and so its lock file, is still another
+    federation: its digest differs, so the admission of the first does not admit it."""
+    first, second = two_federations(tmp_path, journal="../one/fault-journal")
+    lock = federation(tmp_path / "one")[1]
+    with lock.held(exclusive=False):
+        require_admission(load_platform(first, require_secrets=False))  # its own federation: admitted
+        with pytest.raises(AdmissionRefused, match="another federation"):
+            require_admission(load_platform(second, require_secrets=False))
 
 
 def test_o11_a_tool_server_of_a_platform_with_faults_starts_only_under_an_admission(tmp_path, fake):

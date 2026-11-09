@@ -69,6 +69,7 @@ class FaultSettings:
     clear_attempts: int = 3
     admission_timeout_s: float = 3600.0
     health_wait_s: float = 30.0
+    config_sha256: str = ""  # the digest of the platform.toml it was read from: part of the federation's identity
 
 
 def _number(table: Section, key: str, default: float, minimum: float, *, integer: bool = False) -> float:
@@ -117,6 +118,7 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         clear_attempts=_number(table, "clear_attempts", 3, 1, integer=True),
         admission_timeout_s=_number(table, "admission_timeout_s", 3600.0, 0),
         health_wait_s=_number(table, "health_wait_s", 30.0, 0),
+        config_sha256=config.sha256,
     )
 
 

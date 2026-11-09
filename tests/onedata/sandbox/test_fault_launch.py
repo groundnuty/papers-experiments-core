@@ -106,7 +106,7 @@ def test_o11_a_baseline_runs_sandbox_cannot_start_while_an_outage_run_holds_the_
     landed: list = []
 
     async def baseline_run():
-        async with FederationLock(settings.journal).admitted(exclusive=False, timeout_s=10):
+        async with FederationLock(settings).admitted(exclusive=False, timeout_s=10):
             return await launched(built, ctx)
 
     def run():

@@ -14,7 +14,9 @@ nothing, as a lease taken before the run is. Taken inside a tool call instead, i
 The wait is a poll of a non-blocking lock with a bound (`admission_timeout_s`), which a cancellation stops. Under a
 shared admission the journal must show no unsettled injection, checked while the lock is held, or the run is refused
 as `injector_failure`. A held admission is a `HeldLock`: closed by its finalizer when its owner is dropped, and closed
-in a forked child.
+in a forked child. An admission names the federation it holds (`Federation`: the lock file's resolved path and the
+digest of platform.toml), and `require_admission` and the injector refuse one held for another federation, so a run
+of one platform is never admitted by a lock of another.
 
 `flock` is not fair, so a steady stream of shared holders could keep an outage run out for ever. A turnstile prevents
 that: every admission, shared or exclusive, first takes `federation.intent` exclusively, then the main lock, and only
@@ -64,11 +66,26 @@ class AdmissionRefused(ConfigError):
 
 
 @dataclass(frozen=True)
+class Federation:
+    """Which federation an admission is for: its lock file's resolved path and the digest of its platform.toml. Two
+    configurations that share a lock file but differ are two federations, and so are two with one file but two locks."""
+
+    lock_file: str
+    config_sha256: str
+
+
+def federation_of(settings: FaultSettings) -> Federation:
+    """The identity of the federation `[faults]` describes."""
+    return Federation(str((settings.journal / FEDERATION_LOCK).resolve()), settings.config_sha256)
+
+
+@dataclass(frozen=True)
 class Admission:
-    """The federation's lock as one run holds it, shared or exclusive."""
+    """The federation's lock as one run holds it, shared or exclusive, and which federation it is."""
 
     exclusive: bool
     lock: HeldLock
+    federation: Federation
 
     @property
     def held(self) -> bool:
@@ -85,10 +102,12 @@ def current_admission() -> Admission | None:
 
 
 class FederationLock:
-    """The reader-writer lock of one federation, on `federation.lock` in the fault journal's directory."""
+    """The reader-writer lock of one federation, on `federation.lock` in the fault journal's directory of `[faults]`;
+    each admission it grants names that federation (`Federation`)."""
 
-    def __init__(self, directory: Path, *, poll_s: float = 0.05) -> None:
-        self.directory, self._poll_s = Path(directory), poll_s
+    def __init__(self, settings: FaultSettings, *, poll_s: float = 0.05) -> None:
+        self.directory, self._poll_s = Path(settings.journal), poll_s
+        self.federation = federation_of(settings)
 
     def _try(self, name: str, mode: int) -> HeldLock | None:
         """Take one of the two lock files in `mode` without waiting; None when another holds it in a conflicting one."""
@@ -122,7 +141,7 @@ class FederationLock:
             main = self._try(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         finally:
             intent.close()
-        return None if main is None else Admission(exclusive, main)
+        return None if main is None else Admission(exclusive, main, self.federation)
 
     def acquire(
         self, *, exclusive: bool, timeout_s: float | None = None, cancel: threading.Event | None = None
@@ -135,7 +154,7 @@ class FederationLock:
             main = self._wait(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, deadline, cancel)
         finally:
             intent.close()  # whoever waits behind it may now queue for the main lock
-        return Admission(exclusive, main)
+        return Admission(exclusive, main, self.federation)
 
     @contextlib.contextmanager
     def held(self, *, exclusive: bool, timeout_s: float | None = None) -> Iterator[Admission]:
@@ -207,20 +226,34 @@ def fault_settings_of(config: PlatformConfig) -> FaultSettings | None:
     return load_faults(config.file, config)
 
 
+def require_same_federation(admission: Admission, federation: Federation) -> None:
+    """Refuse an admission held for another federation than `federation`; the message names neither (O12)."""
+    if admission.federation != federation:
+        raise AdmissionRefused(
+            "the admission held is for another federation (another lock file or another platform.toml) than the one "
+            "this run acts on"
+        )
+
+
 def require_admission(config: PlatformConfig) -> None:
-    """Refuse to start a run's infrastructure on a platform with `[faults]` unless the run holds the federation."""
-    if fault_settings_of(config) is not None and current_admission() is None:
+    """Refuse to start a run's infrastructure on a platform with `[faults]` unless the run holds that federation."""
+    settings = fault_settings_of(config)
+    if settings is None:
+        return
+    admission = current_admission()
+    if admission is None:
         raise AdmissionRefused(
             f"{config.file}: [faults]: a run's infrastructure starts only under the federation's admission "
             "(FederationLock.admitted, shared for a baseline run, exclusive for an outage run)"
         )
+    require_same_federation(admission, federation_of(settings))
 
 
 class FaultGate:
     """The fault half of the platform's standard health check (see the module docstring)."""
 
     def __init__(self, settings: FaultSettings, driver: FaultDriver) -> None:
-        self._lock = FederationLock(settings.journal)
+        self._lock = FederationLock(settings)
         self._recovery = Recovery(settings, driver)
         self._may_recover = settings.sanctioned is True
         self._wait_s = settings.health_wait_s

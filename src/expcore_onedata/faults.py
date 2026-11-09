@@ -58,7 +58,7 @@ labelled with the seconds on the injector's clock since `start`, so replay serve
 condition uses an injector), builds the injector for the target its condition declares and runs the agent inside
 `running`:
 
-    async with FederationLock(settings.journal).admitted(exclusive=True):
+    async with FederationLock(settings).admitted(exclusive=True):
         ...  # the sandbox and the tool server start here, under the admission
         injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
                                  driver=compose_driver(settings))
@@ -88,7 +88,13 @@ from typing import Any
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.records.injections import FAULT_NAMESPACE
-from expcore_onedata.admission import Admission, AdmissionRefused, FederationLock, current_admission
+from expcore_onedata.admission import (
+    Admission,
+    AdmissionRefused,
+    FederationLock,
+    current_admission,
+    require_same_federation,
+)
 from expcore_onedata.compose import DriverError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
@@ -157,7 +163,7 @@ class FaultInjector:
         self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep)
         self._journal = self._recovery.journal
         self._lock: HeldLock | None = None
-        self._federation = FederationLock(settings.journal)
+        self._federation = FederationLock(settings)
         self._admission: Admission | None = None  # the exclusive admission it took itself, when its run held none
         self._cancel = threading.Event()  # set when `running` is cancelled: an admission still awaited is given up
         self._mutex = threading.RLock()  # a start and a clear never run at once, in whichever threads
@@ -248,6 +254,8 @@ class FaultInjector:
         """Hold the federation exclusively for the whole injection: the run's own admission, which must then be
         exclusive, or one taken here and kept until the restore is verified."""
         held = current_admission()
+        if held is not None:
+            require_same_federation(held, self._federation.federation)  # another federation's admission is none
         if held is not None and not held.exclusive:
             raise AdmissionRefused(
                 "an outage run holds the federation exclusively for its whole run and never shared: no upgrade"
