@@ -52,7 +52,8 @@ from expcore.study.config import load_study
 study = load_study("my-study")
 assert study.name == "tiny-study"
 assert sorted(study.config_sha256) == ["campaign.toml", "models.toml", "preregistration.toml", "study.toml"]
-assert {key: study.models.resolve(key).status for key in study.models} == {"alpha-stub": "frozen", "beta-stub": "frozen"}
+statuses = {key: study.models.resolve(key).status for key in study.models}
+assert statuses == {"alpha-stub": "frozen", "beta-stub": "frozen"}  # only frozen settings may start a study run
 ```
 
 ## 3. Declare the design
