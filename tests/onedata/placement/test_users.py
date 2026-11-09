@@ -531,3 +531,20 @@ def test_c19_an_examination_answer_the_checks_cannot_read_still_journals_the_dro
     else:
         expected = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s + expect_expiry
         assert journal.latest_expiry(lease.key) == expected
+
+
+def test_c19_a_token_request_with_no_usable_answer_holds_the_slot_as_indeterminate(
+    slots, client, tmp_path, slot_federation
+):
+    """C19: the server creates a token but answers without it; the token may live as long as the server chose, so
+    the journal records it as indeterminate and the slot is never freed by the clock."""
+    config, loaded = slots
+    slot_federation.blank_mint_answer = True
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = TokenJournal(tmp_path / "leases")
+    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    with pytest.raises(TokenRefused, match="no usable answer"):
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
+    assert slot_federation.issued  # a token does exist on the server
+    assert journal.latest_expiry(lease.key) == float("inf")

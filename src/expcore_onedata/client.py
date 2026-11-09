@@ -145,6 +145,10 @@ class PlatformError(RuntimeError):
         self.transport = transport  # True only when no answer came back: a reset, a refusal or a timeout (O08)
 
 
+class MintNotSent(PlatformError):
+    """A token request failed before it was sent (no credential for the user), so no token can exist."""
+
+
 class OutOfScope(PlatformError):
     """A mutation's target is no study space, or a path leaves the API; the mutation was not sent."""
 
@@ -492,11 +496,11 @@ class OnezoneClient:
         """
         users = self._config.users
         if users is None:
-            raise PlatformError("zone: platform.toml declares no [credentials.users], so no user can mint a token")
+            raise MintNotSent("zone: platform.toml declares no [credentials.users], so no user can mint a token")
         try:
             password = users.read(principal.username, self._environ)
         except ConfigError as error:
-            raise PlatformError(f"zone: a user's credential cannot be used ({error})") from None
+            raise MintNotSent(f"zone: a user's credential cannot be used ({error})") from None
         basic = base64.b64encode(f"{principal.username}:{password}".encode()).decode()
         body = {"type": {"accessToken": {}}, "caveats": [dict(c) for c in caveats]}
         answer = self._send(

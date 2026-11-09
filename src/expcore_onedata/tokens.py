@@ -38,7 +38,7 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import quote
 
-from expcore_onedata.client import OnezoneClient, PlatformError
+from expcore_onedata.client import MintNotSent, OnezoneClient, PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, TokenSettings
 from expcore_onedata.credentials import Principal
 from expcore_onedata.rights import BASELINE_RIGHTS
@@ -232,7 +232,12 @@ class TokenIssuer:
         window = token_window(ceiling_s, self._config.tokens)
         self.check_principal(spec, principal)
         asked = valid_until if valid_until is not None else int(self._clock()) + window.mint_ttl_s
-        value = self._client.mint_own_token(principal, spec.caveats.caveats(asked))
+        try:
+            value = self._client.mint_own_token(principal, spec.caveats.caveats(asked))
+        except MintNotSent:
+            raise  # nothing was sent, so no token exists
+        except Exception as error:  # the request was sent: a token may exist whose expiry nothing told us
+            raise DroppedToken(f"the token request had no usable answer ({type(error).__name__})", None) from None
         try:  # from here a token exists: any failure drops it with the expiry it is known to have, or none
             examined = self.examine(value, spec, principal.user_id, window)
         except TokenRefused as refused:
