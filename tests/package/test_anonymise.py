@@ -157,17 +157,28 @@ def test_k03_an_escaped_term_left_in_named_markdown_fails_the_build_naming_the_f
     assert find_terms(files, listed) == [f"README.md:3: {FOUND}"]
 
 
-def test_k03_toml_and_yaml_metadata_may_be_named_but_only_a_plain_text_rewrite_is_done_and_checked(listed):
-    """K03: a format that cannot be rewritten in its parsed form is rewritten as plain text, and refused, naming the
-    file, if its decoded view still holds a term; a rewritten TOML file must still parse (K04)."""
+def test_k03_toml_metadata_may_be_named_and_is_rewritten_as_text_then_checked(listed):
+    """K03: TOML is rewritten as plain text and refused, naming the file, if its decoded view still holds a term; a
+    rewritten TOML file must still parse (K04)."""
     plain = b'[project]\nauthors = [{name = "Quillon Varek"}]\n'
-    cff = b"authors:\n  - name: Quillon Varek\n"
-    files = rewrite(
-        {"pyproject.toml": plain, "CITATION.cff": cff}, named(listed, "pyproject.toml", "CITATION.cff"), code=set()
-    )
+    files = rewrite({"pyproject.toml": plain}, named(listed, "pyproject.toml"), code=set())
     assert b"Author A" in files["pyproject.toml"]
-    assert b"Author A" in files["CITATION.cff"]
     assert find_terms(files, listed) == []
     escaped = b'[project]\nauthors = [{name = "Quillon \\u0056arek"}]\n'
     files = rewrite({"pyproject.toml": escaped}, named(listed, "pyproject.toml"), code=set())
     assert any(finding.startswith("pyproject.toml") for finding in find_terms(files, listed))
+
+
+@pytest.mark.parametrize("name", ["CITATION.cff", "meta.yaml", "meta.yml"])
+def test_k04_yaml_cannot_be_named_because_its_rewrite_cannot_be_checked(listed, name):
+    """K04: without a YAML parser the rewrite of a YAML file can be neither checked for its parse nor read decoded,
+    so naming one is refused, saying how to ship it instead."""
+    with pytest.raises(PackageError, match="YAML") as refusal:
+        rewrite({name: b"authors:\n  - name: Quillon Varek\n"}, named(listed, name), code=set())
+    assert "anonymised copy" in str(refusal.value)
+
+
+def test_k03_a_term_split_by_a_continuation_or_escaped_in_code_is_found(listed):
+    """K03: the term check reads every text file normalised as well: continuations joined, escapes decoded."""
+    files = {"run.sh": b'echo "Quillon Var\\\nek"\n', "tool.py": b'AUTHOR = "\\x56arek"\n'}
+    assert find_terms(files, listed) == [f"run.sh:1: {FOUND}", f"tool.py:1: {FOUND}"]

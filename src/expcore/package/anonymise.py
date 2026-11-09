@@ -9,9 +9,11 @@ very names the package hides (K03: a private list never enters the repository or
     "Ada Example" = "Author A"   # a term, and the neutral label that replaces it
 
 - Only the files the list names are rewritten. Each must be prose or metadata (a suffix in `REWRITABLE_SUFFIXES`),
-  outside the code the records were made with and outside out/. JSON is parsed, rewritten in its decoded keys and
+  outside the code the records were made with and outside out/. YAML (`.yml`, `.yaml`, `CITATION.cff`) is refused:
+  with no YAML parser its rewrite could not be checked, so the author leaves it out or ships an anonymised copy from
+  another path. JSON is parsed, rewritten in its decoded keys and
   strings, and written out again in one fixed form, so an escape such as `\\u0056` cannot hide a term from the
-  rewrite. A format that cannot be parsed and written out again safely (TOML, YAML, plain text) is rewritten as text,
+  rewrite. A format that cannot be parsed and written out again safely (TOML, plain text) is rewritten as text,
   and a TOML file must still parse afterwards. Code, configuration, records and generated tables are
   never rewritten: relabelling them changes what runs and what was measured (relabelling by substring broke an
   earlier study's package: a class name, a network address, an endpoint; see docs/inventory.md).
@@ -21,7 +23,7 @@ very names the package hides (K03: a private list never enters the repository or
   term is not part of a longer run of letters and digits: every byte stream it holds, under every encoding, and
   decoded (its parsed JSON or TOML strings, HTML entities, percent-escapes and backslash escapes; `views`). A term
   found anywhere fails the build, naming the file and the line and never the term (K05); a path that holds a term is
-  not shown. A term the plain-text rewrite of a TOML or YAML file could not reach, being escaped, is found here, and
+  not shown. A term the plain-text rewrite of a TOML file could not reach, being escaped, is found here, and
   the build refuses that file. So a term in a code file is reported and
   never rewritten, and one the whole-word rule left inside a hyphenated name is reported too: nothing is relabelled
   by substring, and nothing slips through.
@@ -40,7 +42,8 @@ from expcore.package.spec import PackageError
 from expcore.package.views import PARSED, streams, views
 from expcore.study.config import CONFIG_FILES
 
-REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".cff", ".bib", ".json", ".toml", ".yaml", ".yml"})
+REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".bib", ".json", ".toml"})
+YAML_SUFFIXES = frozenset({".yml", ".yaml", ".cff"})  # CITATION.cff is YAML
 FINDING = "a term of the anonymisation list"
 REDACTED_PATH = "<path redacted>"
 
@@ -116,6 +119,11 @@ def rewrite(
         where = f"{anonymisation.source}: `files` names {name}"
         if name not in files:
             raise PackageError(f"{where}, which the package does not include")
+        if PurePosixPath(name).suffix.lower() in YAML_SUFFIXES:
+            raise PackageError(
+                f"{where}, which is YAML: without a YAML parser its rewrite can be neither parsed nor read decoded, so "
+                "it is not rewritten. Leave it out of the package, or include an anonymised copy from another path"
+            )
         protected = name in code or name in CONFIG_FILES or name.startswith(out_prefix)
         if protected or PurePosixPath(name).suffix.lower() not in REWRITABLE_SUFFIXES:
             raise PackageError(
