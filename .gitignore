@@ -42,6 +42,7 @@ k8s-mcp.toml
 # Logs
 *.log
 !.claude/audit.log
+!tests/data/sandbox/*.log
 
 # Claude local-only state
 .claude/settings.local.json

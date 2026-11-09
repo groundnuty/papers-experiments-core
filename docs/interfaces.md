@@ -9,7 +9,7 @@ All of them are `typing.Protocol`s, so a test double needs no inheritance. Signa
 | Architecture name | In v0.1 |
 |---|---|
 | `Study` | the study directory (`study.toml` and its siblings) plus one plugin module whose `build(context)` returns a `StudyPlugin` ([below](#the-study-plugin)) |
-| `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` and its own `ToolProvider`s through the same `StudyPlugin` |
+| `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` and its own `ToolProvider`s through the same `StudyPlugin`; its sandbox is [described below](#the-platform-layers-sandbox) |
 | `ToolProvider`, `Scorer`, `Instrument` | [`ToolProvider`](#toolprovider-and-callcontext) and [`Scorer`](#scorer) are protocols. `Instrument` is **not yet a protocol**: see [Instrument](#instrument) |
 | `ModelBackend`, `RunExecutor`, `HealthCheck`, `ResourceProbe` | protocols, below |
 
@@ -198,6 +198,54 @@ class ResourceProbe(Protocol):
 Core guarantees: a lease is an exclusive file lock per key, dropped by the kernel when its holder dies; a key whose last holder did not release it goes to nobody until `resource_gone` answers `True` for it (C19). `holder_gone` returning `None` or raising is treated like gone; `resource_gone` frees a key only by returning exactly `True` (an identity test: `1`, `"unknown"` or any other truthy value does not count), on every path: at the end of a run, when a quarantine is settled and for a dead holder's key. Anything else, or raising, keeps the key quarantined and counted against its unit's cap.
 
 Implementer must guarantee: `True` from `resource_gone` means everything the holder started with that key (its sandbox, processes, mounts) is shown gone, never "probably". `lease_group` and `lease_keys` in the plugin name the keys; a key is letters, digits, dot, dash and underscore.
+
+## The platform layer's sandbox
+
+`expcore_onedata.sandbox`. Nothing in `expcore` knows it; a study reaches it through the platform layer's objects, which take their names from `platform.toml` (`[sandbox]`, loaded with the rest of the file by `load_platform`).
+
+```python
+class Sandbox(Protocol):            # api.py
+    def exec(self, code: str, timeout_s: float) -> ExecResult
+    def collect(self, dest_dir: str | Path) -> dict[str, Any]
+    def stop(self) -> None
+    def metadata(self) -> dict[str, Any]
+
+class DockerSandbox:                # sandbox.py
+    @classmethod
+    def start(cls, host: HostOps, settings: SandboxSettings, spec: SandboxSpec, **options) -> DockerSandbox
+    def collect(self, dest_dir, outputs: Sequence[str] = ()) -> dict      # outputs: files of /work to copy
+
+class HostOps(Protocol):            # hostops.py: every effect on the host, so a test supplies a fake
+    def docker(self, *args, check=True, timeout=None, env=None, input=None) -> CmdResult
+    def run(self, argv, timeout_s, *, sudo=False, input=None) -> CmdResult
+    def read_text(self, path) -> str      # also readlink, exists, process_alive, make_quota_dir, make_ca,
+    ...                                   # unmount, image_id, host_facts
+
+class SandboxPlatform:              # provider.py
+    def mode(self, factors) -> DataPathMode
+    def lease_group(self, factors) -> str | None
+    def lease_keys(self, group: str) -> Sequence[str]
+    def probe(self) -> SandboxProbe                                  # a ResourceProbe
+    def launch(self, ctx, *, run_key, level, ceiling_s, lease=None)  # async context manager yielding a DockerSandbox
+
+class CodeExecutionProvider:        # codetool.py: a ToolProvider with one tool that runs Python
+    def __init__(self, sandbox: Sandbox, *, name="python", description=...)
+```
+
+**Data paths.** The study's `data_path` factor names its levels in its own words; `[sandbox.data_paths]` maps each to one of three kinds, `mount`, `rest` or `none`. A `mount` run has a read-only FUSE mount made by a oneclient sidecar that holds the data-path token; the agent holds no token and no FUSE. A `rest` run reaches the zone and its pinned local provider only through the data gate, which holds the token and adds it to the requests it forwards (a token the agent sends is dropped); the agent holds no token in its environment, its files or its process arguments. A `none` run has neither. The data path is read-only in every condition at four points: the token (4a: read-only, scoped to the space, one interface), the gate (only the five read calls pass), the mount, and the agent's root filesystem. `start` proves the last two by trying to write from inside the agent and requiring the refusal.
+
+Core guarantees: `ctx.infrastructure_wait` is given a kind of `WAIT_KINDS`; the lease the platform declared for the run is held for the whole attempt and freed through `SandboxProbe.resource_gone`.
+
+Implementer (the platform layer) guarantees:
+- `launch` opens `ctx.infrastructure_wait("sandbox_lifecycle")` around the start (the token mint, the image checks, the containers) and around the stop, and nowhere else. Executing the agent's code and its reads of data are never waits.
+- Every image is started by the id it is pinned to in `platform.toml`; a tag that now resolves elsewhere raises `StartRefused` before anything exists (O13). Each sandbox gets its own small network from the configured pool, whose ranges are strict networks checked at load (O14).
+- Teardown runs on every path that ends a sandbox, in the order readers, unmount, sidecar, agent, and verifies that each step took effect; a sandbox that is not verifiably gone makes `stop` raise `SandboxError` and `launch` raise `InfraError("sandbox")`, and the probe keeps the lease key quarantined (O15, C19).
+- `SandboxProbe.resource_gone(key, note)` answers exactly `True` only when docker lists no container and no network labelled with the key and the mount table shows no mount in a directory of the key; any failed read is `False`.
+- The gate passes only reads, answers a refusal as 4xx and never as an error, and marks a transfer it cut (`cut`, `unread_bytes`) so it is told from an error of the gate (`error_origin: gate`) or of the platform (`upstream`) (O16).
+- A killed cell's cause comes from the cgroup counters, the kernel log, the host killer's journal and the container's state, never from the exit code. The agent's own limit is its outcome; a failure of the host or a component raises `InfraError("sandbox")`; a kill nothing attributes raises `InfraError("unattributed_kill")`, which the core retries within the attempt limit (O17). Errors the agent causes through the mount (ENOENT, EROFS, EISDIR) are not counted against the platform (O18).
+- A message of any exception names roles, keys and positions, never a configured value (image, pool, path, login, level) or the tail of a tool's stderr (which goes to the log).
+
+Not carried over from the earlier study: the gate's whole-file and merged-listing modes (that study's manipulated variables), the tracer and its checks, the capacity probes tied to two data layouts, and the replication branch of its fourth condition.
 
 ## Other protocols the core defines
 

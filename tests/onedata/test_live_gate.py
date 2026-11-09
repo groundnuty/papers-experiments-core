@@ -1,4 +1,4 @@
-"""Without EXPCORE_LIVE_PLATFORM the live contract tests are skipped as a module, so nothing is built or contacted."""
+"""Without EXPCORE_LIVE_PLATFORM or EXPCORE_LIVE_DOCKER the live tests are skipped as modules: nothing is contacted."""
 
 import os
 import subprocess
@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_the_live_tests_are_skipped_when_no_platform_is_named():
-    env = {k: v for k, v in os.environ.items() if k != "EXPCORE_LIVE_PLATFORM"}
+    env = {k: v for k, v in os.environ.items() if k not in ("EXPCORE_LIVE_PLATFORM", "EXPCORE_LIVE_DOCKER")}
     done = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/live", "-q", "-rs", "-p", "no:cacheprovider"],
         cwd=ROOT,
@@ -21,7 +21,8 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
     )
     assert done.returncode in (0, 5), done.stdout[-500:]  # 5: pytest found no test to run, only a skipped module
     assert "EXPCORE_LIVE_PLATFORM is not set" in done.stdout
-    assert "1 skipped" in done.stdout
+    assert "EXPCORE_LIVE_DOCKER is not set" in done.stdout
+    assert "2 skipped" in done.stdout
 
 
 def test_every_unverified_endpoint_has_a_live_contract_test():
@@ -34,20 +35,24 @@ def test_every_unverified_endpoint_has_a_live_contract_test():
     assert not missing, f"no live test covers: {missing}"
 
 
-def test_the_unconfirmed_calls_and_details_are_exactly_the_space_read_and_two_answer_details():
-    """The list holds the space-details read the mutation gate relies on, and the two answer details no source
-    confirms (the subject of an examination, and the providers' name and online fields); nothing else."""
+def test_the_unconfirmed_calls_and_details_are_exactly_the_space_read_and_three_answer_details():
+    """O05: the list holds the space-details read the mutation gate relies on, and the three answer details no source
+    confirms (the subject of an examination, the providers' name and online fields, and the content type of a file's
+    content, which the data gate streams on); nothing else."""
     from expcore_onedata.client import UNVERIFIED_ENDPOINTS
 
     assert {(m, p) for m, p, _ in UNVERIFIED_ENDPOINTS} == {
         ("GET", "/spaces/{space}"),
         ("POST", "/tokens/examine"),
         ("POST", "/tokens/infer_access_token_scope"),
+        ("GET", "/data/{file}/content"),
     }
     what = " ".join(w for _, _, w in UNVERIFIED_ENDPOINTS)
     assert "subject" in what
     assert "name and online" in what
     assert "name field" in what
+    assert "application/octet-stream" in what
+    assert "mock" in what  # the only basis there is
 
 
 def test_the_slow_live_expiry_test_needs_its_own_switch():

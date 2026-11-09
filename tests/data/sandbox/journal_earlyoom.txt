@@ -1,0 +1,4 @@
+1790000100.250 host earlyoom[900]: mem avail:   300 of 32000 MiB ( 1.00%), swap free: 0 of 0 MiB ( 0.00%)
+1790000100.300 host earlyoom[900]: sending SIGTERM to process 4321 uid 10001 "python": oom_score 800, oom_score_adj 1000, VmRSS 900 MiB
+1790000100.900 host earlyoom[900]: sending SIGKILL to process 4400 uid 0 "python": oom_score 700, oom_score_adj 0, VmRSS 120 MiB
+1790000000.000 host earlyoom[900]: sending SIGTERM to process 99 uid 10001 "python": oom_score 800, oom_score_adj 1000, VmRSS 10 MiB

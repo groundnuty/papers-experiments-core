@@ -1,0 +1,276 @@
+"""O17: kill causes come from the kernel's counters and the container's state, never from the exit code.
+
+Fixture files under tests/data/sandbox hold invented content in the formats the kernel and docker print.
+"""
+
+import inspect
+import json
+from pathlib import Path
+
+import pytest
+from campaign_support import infra, planned_store, run_one
+
+from expcore.errors import InfraError, infra_kinds
+from expcore_onedata.sandbox import earlyoom, infradeath, killcause, kinds
+
+DATA = Path(__file__).resolve().parents[2] / "data" / "sandbox"
+CID = "ab12" * 16
+LIMIT_S = 60.0
+
+
+def events(name: str) -> dict[str, int] | None:
+    return killcause.parse_events((DATA / name).read_text(encoding="utf-8"))
+
+
+def kernel(name: str, since_s: float | None = None) -> list[dict]:
+    return killcause.parse_kernel_oom((DATA / name).read_text(encoding="utf-8"), since_s=since_s)
+
+
+def classify(after: str | None, *, running: bool | None = True, fired: bool = False, lines=None):
+    """What the harness would conclude from this evidence. There is no exit code to pass: it is no input of the
+    classification, and test_cells.py shows whole cells with different exit codes and the same evidence agreeing."""
+    before = events("memory_events_start.txt")
+    return killcause.classify(
+        before,
+        events(after) if after else None,
+        container_running=running,
+        timer_fired=fired,
+        timeout_s=LIMIT_S,
+        kernel=lines,
+        container_id=CID,
+    )
+
+
+def test_o17_the_counters_of_the_cell_name_the_containers_own_limit():
+    """O17: The counters of the cell name the containers own limit."""
+    got = classify("memory_events_own_limit.txt")
+    assert (got["reason"], got["category"]) == ("memory_limit", "agent")
+
+
+def test_o17_a_kill_with_no_rise_of_the_containers_own_counter_is_the_hosts():
+    """O17: A kill with no rise of the containers own counter is the hosts."""
+    got = classify("memory_events_host_killer.txt")
+    assert (got["reason"], got["category"]) == ("host_oom", "infrastructure")
+
+
+def test_o17_the_exit_code_is_no_input_of_the_classification():
+    """O17: the cause comes from the counters, the container's state, the kernel log and the harness's timer; the
+    classification has no parameter an exit code could reach it through."""
+    assert not {"exit_code", "rc", "returncode"} & set(inspect.signature(killcause.classify).parameters)
+
+
+def test_o17_a_time_limit_is_the_harnesss_timer_firing_never_the_elapsed_time():
+    """O17: only the harness's record that its timer fired makes a time limit; there is no duration to infer one from,
+    and a fired timer does not hide an OOM kill or a dead container."""
+    fired = classify("memory_events_start.txt", fired=True)
+    assert (fired["reason"], fired["category"], fired["timer_fired"]) == ("time_limit", "agent", True)
+    unfired = classify("memory_events_start.txt", fired=False)
+    assert (unfired["reason"], unfired["category"], unfired["timer_fired"]) == ("killed_other", "unknown", False)
+    assert classify("memory_events_own_limit.txt", fired=True)["reason"] == "memory_limit"
+    assert classify("memory_events_start.txt", running=False, fired=True)["reason"] == "container_dead"
+    assert classify(None, running=True, fired=True)["reason"] == "time_limit"  # counters unreadable: the record holds
+
+
+@pytest.mark.parametrize(
+    ("running", "reason", "kind"),
+    [
+        (False, "container_dead", "sandbox"),
+        (True, "killed_other", "unattributed_kill"),
+        (None, "unknown", "unattributed_kill"),  # nothing readable: the counters, the container, the kernel log
+    ],
+)
+def test_o17_a_docker_failure_without_the_timers_flag_is_infrastructure_or_unattributed(running, reason, kind):
+    """O17: docker exec failing is no time limit unless the harness's timer fired: a container that is gone makes it
+    infrastructure (`sandbox`), one that runs or cannot be read a kill nothing attributes (`unattributed_kill`)."""
+    got = classify("memory_events_start.txt" if running is not None else None, running=running, fired=False)
+    assert got["reason"] == reason
+    assert kinds.kill_error(got).kind == kind
+
+
+def test_o17_a_dead_container_is_infrastructure_whatever_else_is_on_record():
+    """O17: A dead container is infrastructure whatever else is on record."""
+    got = classify("memory_events_own_limit.txt", running=False)
+    assert (got["reason"], got["category"]) == ("container_dead", "infrastructure")
+
+
+def test_o17_the_kernel_log_decides_only_for_lines_that_name_this_container():
+    """O17: The kernel log decides only for lines that name this container."""
+    own = classify(None, lines=kernel("dmesg_own_limit.txt"))
+    assert (own["reason"], own["category"]) == ("memory_limit", "agent")
+    host = classify(None, lines=kernel("dmesg_host_killer.txt"))
+    assert (host["reason"], host["category"]) == ("host_oom", "infrastructure")
+    other = classify(None, lines=kernel("dmesg_other_container.txt"))
+    assert other["category"] == "unknown"  # another container's kill says nothing about this cell
+
+
+def test_o17_conflicting_evidence_is_unknown_never_a_guess():
+    """O17: counters that say the container's limit and a log that says the host's name nothing."""
+    got = classify("memory_events_own_limit.txt", lines=kernel("dmesg_host_killer.txt"))
+    assert (got["reason"], got["category"]) == ("unknown", "unknown")
+
+
+def test_o17_unreadable_counters_with_a_quiet_container_are_unknown():
+    """O17: Unreadable counters with a quiet container are unknown."""
+    got = classify(None, running=None)
+    assert got["category"] == "unknown"
+    assert killcause.parse_events((DATA / "memory_events_malformed.txt").read_text(encoding="utf-8")) is None
+
+
+def test_o17_a_kill_nothing_attributes_is_unknown():
+    """O17: A kill nothing attributes is unknown."""
+    got = classify("memory_events_start.txt")
+    assert (got["reason"], got["category"]) == ("killed_other", "unknown")
+
+
+def test_o17_the_kernel_window_keeps_only_lines_after_the_start():
+    """O17: The kernel window keeps only lines after the start."""
+    assert len(kernel("dmesg_own_limit.txt", since_s=1000.0)) == 1
+    assert kernel("dmesg_own_limit.txt", since_s=5000.0) == []
+
+
+def test_o17_earlyoom_kills_are_infrastructure_and_beat_the_counters():
+    """O17: Earlyoom kills are infrastructure and beat the counters."""
+    kills = earlyoom.parse_kills((DATA / "journal_earlyoom.txt").read_text(encoding="utf-8"))
+    assert [k.pid for k in kills] == [4321, 4400, 99]
+    seen: dict[int, list[list[float]]] = {}
+    earlyoom.note_pids(seen, "4321\n4322\n", 1790000099.0)
+    mine = earlyoom.attribute(kills, {"agent": seen})
+    assert [(k["pid"], k["role"]) for k in mine] == [(4321, "agent")]  # 4400 and 99 were nobody's here
+    cause = killcause.earlyoom_cause(mine)
+    assert (cause["reason"], cause["category"]) == ("earlyoom", "infrastructure")
+    assert killcause.run_cause(["memory_limit", "earlyoom", "time_limit"]) == "earlyoom"
+
+
+def test_o17_one_cause_per_run_in_a_fixed_order():
+    """O17: One cause per run in a fixed order."""
+    assert killcause.run_cause(["time_limit", "memory_limit"]) == "memory_limit"
+    assert killcause.run_cause(["unknown", "host_oom"]) == "host_oom"
+    assert killcause.run_cause([]) is None
+    assert killcause.run_cause(["something new"]) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("category", "kind"), [("agent", None), ("infrastructure", "sandbox"), ("unknown", "unattributed_kill")]
+)
+def test_o17_each_category_maps_to_a_kind_of_the_cores_vocabulary(category, kind):
+    """O17: Each category maps to a kind of the cores vocabulary."""
+    assert kinds.kind_of(category) == kind
+    if kind is not None:
+        assert kind in infra_kinds()
+    error = kinds.kill_error({"category": category, "reason": "x", "basis": "y"})
+    assert (error.kind if error else None) == kind
+
+
+def test_o17_the_agents_own_kill_is_not_an_infrastructure_error():
+    """O17: The agents own kill is not an infrastructure error."""
+    assert kinds.kill_error(classify("memory_events_own_limit.txt")) is None
+    assert kinds.kill_error(None) is None
+    assert kinds.kill_error({}) is None
+
+
+def test_o17_an_unrecognised_category_is_unknown_and_retried():
+    """O17: An unrecognised category is unknown and retried."""
+    assert kinds.kill_error({"category": "novel"}).kind == "unattributed_kill"
+
+
+def test_o17_unknown_is_retried_within_the_attempt_limit(tmp_path):
+    """O17: a kill nothing attributes ends the attempt as infrastructure, and the run is retried to the limit."""
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    error = kinds.kill_error(classify("memory_events_start.txt"))
+    assert isinstance(error, InfraError)
+    statuses = [run_one(store, key, infra(error.kind, str(error)), max_attempts=3) for _ in range(3)]
+    assert statuses == ["pending", "pending", "infra_exhausted"]
+    assert store.charged_attempts(key) == 3
+
+
+def inspect_state(name: str) -> dict:
+    return infradeath.parse_inspect((DATA / name).read_text(encoding="utf-8"))
+
+
+def test_o17_a_container_that_ran_throughout_has_no_problem():
+    """O17: A container that ran throughout has no problem."""
+    running = {**inspect_state("inspect_running.json"), "oom": 0, "oom_kill": 0}
+    assert infradeath.problems("gate", "rest", running, dict(running)) == []
+    unreadable = inspect_state("inspect_running.json")  # counters that could not be read: unknown is not clean
+    assert infradeath.problems("gate", "rest", unreadable, dict(unreadable))
+
+
+@pytest.mark.parametrize(
+    ("end", "cause", "category"),
+    [
+        ("inspect_exited_oom.json", "undetermined", "infrastructure"),  # an OOM kill whose limit nothing names
+        ("inspect_exited_clean.json", "undetermined", "infrastructure"),  # stopped from outside with no cause on record
+        ("inspect_crashed.json", "undetermined", "infrastructure"),  # 139 alone attributes nothing
+        ("inspect_restarted.json", "undetermined", "infrastructure"),
+    ],
+)
+def test_o17_the_death_of_a_component_is_infrastructure_and_retried(end, cause, category):
+    """O17: The death of a component is infrastructure and retried."""
+    start, now = inspect_state("inspect_running.json"), inspect_state(end)
+    assert infradeath.problems("gate", "rest", start, now)
+    got = infradeath.cause_of("gate", start, now)
+    assert (got["cause"], got["category"]) == (cause, category)
+
+
+def test_o17_a_death_that_the_host_caused_is_host_pressure():
+    """O17: A death that the host caused is host pressure."""
+    start, now = inspect_state("inspect_running.json"), inspect_state("inspect_exited_oom.json")
+    got = infradeath.cause_of("gate", start, now, kernel=kernel("dmesg_host_killer.txt"))
+    assert got["cause"] == "host_pressure"
+    assert infradeath.cause_of("gate", start, now, earlyoom=True)["cause"] == "host_pressure"
+
+
+def test_o17_a_death_the_state_cannot_show_is_undetermined_not_clean():
+    """O17: A death the state cannot show is undetermined not clean."""
+    start = inspect_state("inspect_running.json")
+    assert infradeath.problems("gate", "rest", start, None, "daemon timeout")
+    assert infradeath.cause_of("gate", start, None, "daemon timeout")["cause"] == "undetermined"
+    assert infradeath.parse_inspect("not json") is None
+
+
+def test_o17_the_sidecar_hitting_its_own_limit_under_the_agents_reads_is_the_agents_outcome():
+    """O17: The sidecar hitting its own limit under the agents reads is the agents outcome."""
+    start, now = inspect_state("inspect_running.json"), inspect_state("inspect_exited_oom.json")
+    start["oom"], start["oom_kill"] = 0, 0
+    now["oom"], now["oom_kill"] = 1, 1
+    got = infradeath.cause_of("sidecar", start, now)
+    assert (got["cause"], got["category"]) == ("own_limit_agent", "agent")
+    assert kinds.death_error([{**got, "role": "sidecar", "problems": ["x"]}]) is None
+
+
+def test_o17_a_death_of_infrastructure_makes_a_sandbox_error_that_names_the_cause():
+    """O17: a death the evidence attributes (here the host's OOM killer, in the kernel log) is kind `sandbox`."""
+    start, now = inspect_state("inspect_running.json"), inspect_state("inspect_exited_oom.json")
+    problems = infradeath.problems("gate", "rest", start, now)
+    cause = infradeath.cause_of("gate", start, now, kernel=kernel("dmesg_host_killer.txt"))
+    error = kinds.death_error([{**cause, "role": "gate", "problems": problems}])
+    assert error.kind == "sandbox"
+    assert infradeath.MARKER + "host_pressure)" in str(error)
+    assert json.dumps(str(error))  # plain text
+
+
+@pytest.mark.parametrize("code", [139, 134, 1, 2, 0, 137, 143])
+def test_o17_a_component_exit_code_without_further_evidence_is_undetermined_and_unattributed(code):
+    """O17: a gate that exited 139 (or 1, or 137) with no counter, kernel line or earlyoom record was not shown to have
+    crashed by itself: the cause is undetermined, and the attempt's error is an unattributed kill, never a defect."""
+    start = {**inspect_state("inspect_running.json"), "oom": 0, "oom_kill": 0}
+    now = {**inspect_state("inspect_crashed.json"), "exit_code": code, "oom": 0, "oom_kill": 0}
+    problems = infradeath.problems("gate", "rest", start, now)
+    assert problems
+    got = infradeath.cause_of("gate", start, now, kernel=[])
+    assert (got["cause"], got["category"]) == ("undetermined", "infrastructure")
+    assert f"exit code {code}" in got["basis"]
+    error = kinds.death_error([{**got, "role": "gate", "problems": problems}])
+    assert error.kind == "unattributed_kill"
+    assert infradeath.MARKER + "undetermined)" in str(error)
+    assert infradeath.attempt_cause([{**got, "role": "gate"}]) == "undetermined"
+
+
+def test_o17_a_determined_death_beside_an_undetermined_one_makes_the_error_a_sandbox_one():
+    """O17: the run's one cause is the specific one when several containers died, and so is the kind of its error."""
+    start, oom = inspect_state("inspect_running.json"), inspect_state("inspect_exited_oom.json")
+    host = infradeath.cause_of("gate", start, oom, kernel=kernel("dmesg_host_killer.txt"))
+    crashed = infradeath.cause_of("sidecar", start, inspect_state("inspect_crashed.json"))
+    deaths = [{**host, "role": "gate", "problems": ["x"]}, {**crashed, "role": "sidecar", "problems": ["y"]}]
+    assert kinds.death_error(deaths).kind == "sandbox"

@@ -1,0 +1,10 @@
+Log file created at: 2026/11/03 10:00:00
+I1103 10:00:01.000100 12 oneclient.cc:10] starting
+E1103 10:00:02.000200 13 connectionPool.cc:55] Failed to establish connection to the provider: timeout
+E1103 10:00:03.000300 14 fsOperations.cc:116] Fuse error exception: No such file or directory
+E1103 10:00:03.100300 14 fsOperations.cc:116] Fuse error exception: Read-only file system
+E1103 10:00:03.200300 14 fsOperations.cc:116] Fuse error exception: Is a directory
+E1103 10:00:04.000400 14 fsOperations.cc:116] Fuse error exception: Input/output error
+W1103 10:00:05.000500 15 fsOperations.cc:200] Fuse error exception: Permission denied
+I1103 10:00:06.000600 16 helpersCache.h:467] Performing automatic storage access type detection for storage st1 for file f1 with forced proxy io mode: 0
+I1103 10:00:08.500600 16 helpersCache.h:752] Storage 'st1' is not directly accessible to the client.

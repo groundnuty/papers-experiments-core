@@ -1,0 +1,1 @@
+[ 1234.567890] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=x,mems_allowed=0,oom_memcg=/,task_memcg=/system.slice/docker-ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12.scope,task=python,pid=4321,uid=10001

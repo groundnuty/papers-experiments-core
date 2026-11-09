@@ -57,9 +57,12 @@ commit = "..."
 allow = ["tool", ...]           # the server-side allow-list of this condition
 rights = ["space_view", ...]    # the platform privileges of its principal and the caveats of its token
 manifest = "path.json"          # the frozen manifest the client checks the server against (L13)
+
+[sandbox]                       # optional: images, network pool, limits, mount, data paths (see sandbox/settings.py)
 ```
 """
 
+import hashlib
 import math
 import os
 import re
@@ -72,6 +75,7 @@ from urllib.parse import urlsplit
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.rights import BASELINE_RIGHTS, KNOWN_RIGHTS, declares_write
+from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
@@ -182,6 +186,8 @@ class PlatformConfig:
     tokens: TokenSettings
     principals: Principals
     toolserver: ToolServer | None
+    sandbox: SandboxSettings | None = None
+    sha256: str = ""  # of the file as loaded: a record names the configuration by this, never by a value in it
 
     @property
     def local_provider(self) -> Provider:
@@ -444,8 +450,11 @@ def load_platform(
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
     """
     file = Path(path).resolve()
+    digest = hashlib.sha256(file.read_bytes()).hexdigest()
     root = Section(load_toml(file), file, "platform.toml")
-    root.reject_unknown(("zone", "providers", "space", "support", "credentials", "tokens", "principals", "toolserver"))
+    root.reject_unknown(
+        ("zone", "providers", "space", "support", "credentials", "tokens", "principals", "toolserver", "sandbox")
+    )
     zone = root.section("zone")
     zone.reject_unknown(("name", "url"))
     providers = _providers(root)
@@ -466,4 +475,8 @@ def load_platform(
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),
         principals=principals,
         toolserver=_toolserver(root.section("toolserver"), file.parent) if "toolserver" in root.data else None,
+        sandbox=load_sandbox(Section(root.table("sandbox"), file, "[sandbox]"), file.parent)
+        if "sandbox" in root.data
+        else None,
+        sha256=digest,
     )
