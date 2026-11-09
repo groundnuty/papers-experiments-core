@@ -201,6 +201,14 @@ def test_the_analyze_summary_gives_every_conclusion_with_its_holm_p_or_the_word_
         assert lines[name].removesuffix(" (exploratory)").split(", ")[-1] in CONCLUSIONS
 
 
+def test_analysis_json_carries_the_kernels_exploratory_flag_and_holm_decides_only_the_family(resumed):
+    """The machine-readable table labels the contrast outside the family exploratory with the flag the report uses."""
+    analysis = resumed.read("analysis.json")
+    flags = {c["name"]: (c["exploratory"], c["in_family"]) for c in analysis["contrasts"]}
+    assert flags == {name: (flag, not flag) for name, flag in CONTRASTS.items()}
+    assert {d["name"] for d in analysis["holm"]} == {name for name, flag in CONTRASTS.items() if not flag}
+
+
 # --- the report ----------------------------------------------------------------------------------------------------
 
 

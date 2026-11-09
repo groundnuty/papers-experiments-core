@@ -96,6 +96,25 @@ def test_a_contrast_outside_the_family_is_exploratory_in_a_section_of_its_own_an
     assert (cells[6], cells[7]) == ("exploratory", "difference (exploratory)")  # never a bare conclusion
 
 
+def test_the_kernels_flag_decides_and_a_result_whose_flags_disagree_with_the_holm_decisions_is_refused():
+    """No table or summary line can show an exploratory contrast as confirmatory, or the other way round."""
+    member = contrast("in-family", "difference")
+    outside = contrast("extra", "difference", in_family=False, exploratory=True)
+    given_a_decision = AnalysisResult(
+        (member, outside),
+        tuple(HolmDecision(n, 0.01, 0.02, 0.025, True) for n in ("in-family", "extra")),
+        0.05,
+        dict(MANIFEST),
+    )
+    unflagged = analysis(member, dataclasses.replace(outside, exploratory=False), family=["in-family"])
+    flagged_in_family = analysis(dataclasses.replace(member, exploratory=True), outside, family=["in-family"])
+    for result in (given_a_decision, unflagged, flagged_in_family):
+        with pytest.raises(ValueError, match="the flags must agree"):
+            render(result)
+        with pytest.raises(ValueError, match="the flags must agree"):
+            summary_lines(result)
+
+
 def test_without_an_exploratory_contrast_the_section_says_none_declared():
     report = render(analysis(contrast("primary", "not_detected")))
     assert (
@@ -104,7 +123,7 @@ def test_without_an_exploratory_contrast_the_section_says_none_declared():
 
 
 def test_a_factor_contrast_names_the_factor_and_its_levels():
-    factor = contrast("by-factor", "difference", arms=("high", "low"), factor="gate", in_family=False)
+    factor = contrast("by-factor", "difference", arms=("high", "low"), factor="gate", in_family=False, exploratory=True)
     assert row(render(analysis(factor, family=[])), "by-factor")[1] == "factor gate: high vs low"
 
 
@@ -140,8 +159,8 @@ def test_the_terminal_summary_gives_each_conclusion_with_its_basis_and_labels_th
 
 
 def test_the_header_names_the_preregistration_hash_with_its_override_mark_the_code_and_the_core_version():
-    marked = AnalysisResult(
-        (contrast("primary", "difference"),), (), 0.05, {"preregistration_sha256": "e" * 64 + "+override"}
+    marked = dataclasses.replace(
+        analysis(contrast("primary", "difference")), manifest={"preregistration_sha256": "e" * 64 + "+override"}
     )
     report = render(marked)
     assert f"`{'e' * 64}+override`" in report
