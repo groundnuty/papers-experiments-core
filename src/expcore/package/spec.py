@@ -13,7 +13,9 @@ that names nothing would pass for any package (K01), and so is a pattern that is
 Never selected, whatever the patterns say: version-control and cache directories, compiled Python, and the live
 campaign under out/ (the store, its lock and its leases), since the package's analysis reads the snapshot of the store
 that the replay check keeps in the batch. A selected symbolic link is refused, since it could point out of the study.
-The names the build writes at the package root (`GENERATED`) cannot be selected.
+The names the build writes at the package root (`GENERATED`) cannot be selected, nor can the other names GNU Make
+reads there (`GNUmakefile`, `makefile`), which would take the place of the generated Makefile; the generated
+instructions run `make -f Makefile check` as well.
 """
 
 import os
@@ -24,6 +26,7 @@ from pathlib import Path
 
 SPEC_FILE = "package.toml"
 GENERATED = ("Makefile", "SHA256SUMS", "PACKAGE.json", ".code-stamp.json")
+RESERVED = (*GENERATED, "GNUmakefile", "makefile")  # GNU Make reads GNUmakefile, then makefile, then Makefile
 SKIPPED_PARTS = frozenset({".git", "__pycache__", ".venv", "venv", ".pytest_cache", ".ruff_cache", ".mypy_cache"})
 SKIPPED_SUFFIXES = frozenset({".pyc", ".pyo"})
 LIVE_CAMPAIGN = ("out/state.sqlite", "out/campaign.lock", "out/leases")
@@ -125,8 +128,10 @@ def select(root: Path, spec: PackageSpec) -> list[str]:
             continue
         if path.is_symlink():
             raise PackageError(f"{spec.source}: {rel} is a symbolic link; a package holds regular files only")
-        if rel in GENERATED:
-            raise PackageError(f"{spec.source}: {rel} is a name the build generates; leave it out of the list")
+        if rel in RESERVED:
+            raise PackageError(
+                f"{spec.source}: {rel} is a name the build generates or make reads at the package root; leave it out"
+            )
         for pattern in matched:
             hits[pattern] += 1
         chosen.append(rel)

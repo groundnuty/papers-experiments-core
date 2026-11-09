@@ -264,9 +264,9 @@ name = "tiny-study-package"
 ```sh
 uv run python -m expcore package my-study --out dist
 tar -xzf dist/tiny-study-package.tar.gz -C dist
-make -C dist/tiny-study-package check PYTHON="uv run python"
+make -C dist/tiny-study-package -f Makefile check PYTHON="uv run python"
 ```
 
-The build refuses a check made under code that is not a clean commit, outputs made by another core version, a file the package's check needs and the list leaves out, and any path or content that matches a name private everywhere in the core's study-token hashes (`--hashes` takes another hash file). Before it writes the archive it runs the package's own check on the staged files: every file against `SHA256SUMS`, then `export.json`, `scores.json`, `analysis.json` and `report.md` derived anew from the records and compared byte for byte. That check is what `make check` runs for a reader. The archive is deterministic: two builds of one tree are the same bytes.
+The build refuses a check made under code that is not a clean commit, outputs made by another core version, a file the package's check needs and the list leaves out, and any path or content that matches a name private everywhere in the core's study-token hashes (`--hashes` takes another hash file). Before it writes the archive it runs the package's own check on the staged files: every file against `SHA256SUMS`, then `export.json`, `scores.json`, `analysis.json` and `report.md` derived anew from the records and compared byte for byte. That check is what `make -f Makefile check` runs for a reader; naming the Makefile matters, because the package may hold no other file make would read first, and the build refuses one, but a reader's copy could. The archive is deterministic: two builds of one tree are the same bytes.
 
 For a double-blind submission, `--anonymise LIST` takes an anonymisation list, kept outside the study's repository and the output. It names the prose and metadata files to rewrite (`files = [...]`) and each term with its label (`[terms]`). A term is replaced only as a whole word, only in those files, and a term found anywhere else, code and records included, fails the build naming the file and the line, never the term. Code is never rewritten.

@@ -6,9 +6,9 @@
 It makes an empty git repository and a bare project, adds the core by commit with
 `uv add git+https://github.com/groundnuty/papers-experiments-core@<sha>`, writes the example study the installed core
 carries (`python -m expcore example study`), commits it, and runs it end to end: `run`, `check`, `analyze`, `report`,
-then builds the replication package and runs the package's own `make check`. No file is copied from a checkout of
-the core: everything the study runs comes from the installed package. A step that fails ends the check with its exit
-status, after printing what it ran.
+then builds the replication package and runs the package's own `make -f Makefile check`. No file is copied from a
+checkout of the core: everything the study runs comes from the installed package. A step that fails ends the check
+with its exit status, after printing what it ran.
 
 `--source` names another place to depend on (a local path or a file URL; with `--sha`, a commit of a local
 repository); `--runner` and `--skip-install` run the study steps with an interpreter that already has the core; and
@@ -94,7 +94,8 @@ def study_steps(runner: Sequence[str], python_for_make: str, project: Sequence[s
         Step("build the replication package", (*core, "package", STUDY, "--out", "dist")),
         Step("unpack it", (*runner, "-c", _UNPACK, f"dist/{PACKAGE}.tar.gz", "unpacked")),
         Step(
-            "run the package's make check", ("make", "-C", f"unpacked/{PACKAGE}", "check", f"PYTHON={python_for_make}")
+            "run the package's make check",
+            ("make", "-C", f"unpacked/{PACKAGE}", "-f", "Makefile", "check", f"PYTHON={python_for_make}"),
         ),
     ]
 

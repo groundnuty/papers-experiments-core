@@ -112,6 +112,16 @@ def test_a_selected_symbolic_link_is_refused_and_an_unselected_one_is_ignored(tr
 
 
 def test_a_name_the_build_generates_cannot_be_selected(tree):
-    write(tree, {"Makefile": "all:\n"})
-    with pytest.raises(PackageError, match="Makefile is a name the build generates"):
-        select(tree, spec_with(tree, ["Makefile"]))
+    write(tree, {"SHA256SUMS": "x\n"})
+    with pytest.raises(PackageError, match="SHA256SUMS is a name"):
+        select(tree, spec_with(tree, ["SHA256SUMS"]))
+
+
+@pytest.mark.parametrize("name", ["GNUmakefile", "makefile", "Makefile"])
+def test_k07_no_file_make_reads_at_the_package_root_can_come_from_the_study(tree, name):
+    """K07: `make check` must run the package's own check, so a file GNU Make would read before or instead of the
+    generated Makefile (GNUmakefile, makefile) is refused like the Makefile itself; one in a subdirectory is not."""
+    write(tree, {name: "check:\n\ttrue\n", f"sub/{name}": "all:\n"})
+    with pytest.raises(PackageError, match=f"{name} is a name"):
+        select(tree, spec_with(tree, [name]))
+    assert select(tree, spec_with(tree, [f"sub/{name}"])) == [f"sub/{name}"]

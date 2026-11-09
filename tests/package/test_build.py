@@ -75,13 +75,16 @@ def test_k07_the_unpacked_package_of_the_example_passes_its_own_make_check(built
     package, built from a clean stamped copy, passes it wherever it is unpacked."""
     root = unpack(built, tmp_path)
     done = subprocess.run(
-        ["make", "-C", str(root), "check", f"PYTHON={sys.executable}"],
+        ["make", "-C", str(root), "-f", "Makefile", "check", f"PYTHON={sys.executable}"],
         capture_output=True,
         text=True,
         env=clean_environment,
     )
     assert done.returncode == 0, done.stdout + done.stderr
     assert "every output regenerates from the records byte for byte" in done.stdout
+    # the instructions name the Makefile, so no other file make would read first can stand in for it
+    assert json.loads((root / PACKAGE_FILE).read_text(encoding="utf-8"))["check"].startswith("make -f Makefile check")
+    assert "`make -f Makefile check`" in (root / "Makefile").read_text(encoding="utf-8")
     assert not (root / "__pycache__").exists()  # the check leaves the package as it found it
 
 

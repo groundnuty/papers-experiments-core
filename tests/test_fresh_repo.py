@@ -62,7 +62,7 @@ def test_the_plan_adds_the_core_by_commit_writes_the_example_from_it_and_copies_
     assert "git add -- study pyproject.toml uv.lock" in lines
     for command in ("run study", "check study/out/runs", "analyze study", "report study"):
         assert f"uv run python -m expcore {command}" in lines
-    assert lines[-1].startswith("make -C unpacked/tiny-study-package check PYTHON=")
+    assert lines[-1].startswith("make -C unpacked/tiny-study-package -f Makefile check PYTHON=")
     assert not any(str(ROOT) in line for line in lines)  # nothing names the checkout these tests run from
     assert not any(line.split()[0] in ("cp", "rsync", "install") for line in lines)
     assert not (tmp_path / "fresh").exists()  # a dry run makes nothing
