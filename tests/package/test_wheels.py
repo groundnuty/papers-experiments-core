@@ -12,9 +12,17 @@ import pytest
 from package_support import installed_distribution, stand_in
 
 from expcore.package import wheels as wheels_module
-from expcore.package.build import MAKEFILE, _makefile
 from expcore.package.spec import PackageError
-from expcore.package.wheels import REQUIREMENTS, Wheel, repack, requirements, supplied_wheel, vendor_wheels
+from expcore.package.wheels import (
+    MAKEFILE,
+    REQUIREMENTS,
+    Wheel,
+    makefile,
+    repack,
+    requirements,
+    supplied_wheel,
+    vendor_wheels,
+)
 
 CODE = {"toy_platform/__init__.py": b"WIRE = 'blue'\n", "toy_platform/data/table.txt": b"one\ntwo\n"}
 
@@ -122,7 +130,7 @@ def test_k10_the_make_environment_target_installs_exactly_the_vendored_wheels_of
     (package / wheel.path).write_bytes(wheel.data)
     (package / REQUIREMENTS).write_bytes(requirements([wheel]))
     python = f"{sys.version_info.major}.{sys.version_info.minor}"
-    (package / "Makefile").write_bytes(_makefile({"python": python, "distributions": {}}))
+    (package / "Makefile").write_bytes(makefile({"python": python, "distributions": {}}))
     assert "--no-index" in MAKEFILE
     assert "--require-hashes" in MAKEFILE
     venv = tmp_path / "fresh"

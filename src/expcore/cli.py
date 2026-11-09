@@ -90,6 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
     package.add_argument(
         "--wheels", type=Path, help="a directory of wheels to vendor instead of packing installed ones"
     )
+    package.add_argument(
+        "--allow-uncommitted", action="store_true", help="let an anonymised package include files no commit holds"
+    )
     verify = commands.add_parser("package-check", help="package-check PACKAGE: verify an unpacked package")
     verify.add_argument("package", type=Path, help="the directory of an unpacked package")
     example = commands.add_parser("example", help="example DEST: write the example study into a new directory")
@@ -143,7 +146,14 @@ def _report(args: argparse.Namespace) -> int:
 
 
 def _package(args: argparse.Namespace) -> int:
-    archive = build_package(args.study, args.out, hashes=args.hashes, anonymise=args.anonymise, wheels=args.wheels)
+    archive = build_package(
+        args.study,
+        args.out,
+        hashes=args.hashes,
+        anonymise=args.anonymise,
+        wheels=args.wheels,
+        allow_uncommitted=args.allow_uncommitted,
+    )
     print(f"wrote {archive} (sha256 {hashlib.sha256(archive.read_bytes()).hexdigest()})")
     return EXIT_OK
 

@@ -160,3 +160,4 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | K08 | Shipped code parses on the oldest supported Python | `tests/test_oldest_python.py` |
 | K10 | A package installs the environment it was checked under, offline | `tests/package/test_build.py`, `tests/package/test_spec.py`, `tests/package/test_wheels.py` |
 | K11 | An anonymised package holds no commit id and no source URL, and passes its own check | `tests/package/test_anonymised.py` |
+| K12 | A package lists every included file no commit holds | `tests/package/test_tracking.py` |
