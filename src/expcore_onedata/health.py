@@ -17,10 +17,12 @@ An answer that cannot be read is unhealthy, never a crash and never a pass: any 
 exception, becomes `Health(False, reason)`. The reason names positions in the file (`providers[i]`), counts and the
 ids the federation reports, never a token, URL, host or configured name.
 
-When platform.toml has a `[faults]` table the check also fails, before it asks Onezone anything, while the fault
-injector's journal holds an unsettled injection (`expcore_onedata.fault_journal.SettledInjections`): a provider taken
-down for one condition's run, and not yet verifiably back, leaves the federation out of its baseline state for every
-other run, including runs of conditions that use no injector. The check is built in and cannot be left out.
+When platform.toml has a `[faults]` table the check first runs the fault gate (`expcore_onedata.admission.FaultGate`),
+before it asks Onezone anything: it recovers what a crashed run left open whenever no run is on the federation, then
+fails while an injection is in progress or unsettled, because a provider taken down for one condition's run, and not
+yet verifiably back, leaves the federation out of its baseline state for every other run, including runs of conditions
+that use no injector. The gate is built in and cannot be left out; `fault_driver` replaces the Compose driver that
+`[faults]` describes, for tests.
 
 The check of the earlier study also read one known file back through its provider and compared its checksum with a study manifest. That
 belongs to the study (its data) and not to the platform, so a study adds it with its own check.
@@ -40,11 +42,12 @@ import time
 from collections.abc import Callable
 
 from expcore.campaign.healthgate import Health
-from expcore.config.loading import ConfigError, load_toml
+from expcore.config.loading import ConfigError
+from expcore_onedata.admission import FaultGate, fault_settings_of
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
-from expcore_onedata.fault_journal import SettledInjections
-from expcore_onedata.fault_settings import load_faults
+from expcore_onedata.fault_recovery import FaultDriver
+from expcore_onedata.fault_settings import compose_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, read_space
 from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
 from expcore_onedata.tokencheck import TokenRefused
@@ -109,12 +112,13 @@ def compare(view: SpaceView, config: PlatformConfig) -> Health:
     return Health(True, f"ok: the space is supported by exactly the {len(matched)} declared provider(s)")
 
 
-def _settled_injections(config: PlatformConfig) -> SettledInjections | None:
-    """The settled-injection check when platform.toml has a `[faults]` table, None when it has none; a table that is
-    not valid raises ConfigError here, so a platform with an injector never runs without the check."""
-    if "faults" not in load_toml(config.file):
+def _fault_gate(config: PlatformConfig, driver: FaultDriver | None) -> FaultGate | None:
+    """The fault gate when platform.toml has a `[faults]` table, None when it has none; a table that is not valid
+    raises ConfigError here, so a platform with an injector never runs without the gate."""
+    settings = fault_settings_of(config)
+    if settings is None:
         return None
-    return SettledInjections(load_faults(config.file, config))
+    return FaultGate(settings, driver if driver is not None else compose_driver(settings))
 
 
 class PlatformHealth:
@@ -128,6 +132,7 @@ class PlatformHealth:
         issuer: TokenIssuer,
         *,
         clock: Callable[[], float] = time.time,
+        fault_driver: FaultDriver | None = None,
     ) -> None:
         if config.principals.service is None:
             raise ConfigError(f"{config.file}: [principals]: key 'service' is required for the health check")
@@ -135,7 +140,7 @@ class PlatformHealth:
         self._service = config.principals.service
         self._token: MintedToken | None = None
         self._lock = threading.Lock()
-        self._settled = _settled_injections(config)
+        self._faults = _fault_gate(config, fault_driver)
         self._gate = PreCampaignHealth(self._space, lambda: content_type_check(config, client))
 
     def _current_token(self) -> MintedToken:
@@ -157,10 +162,10 @@ class PlatformHealth:
     def _space(self) -> Health:
         """The space as Onezone reports it, against the declared support set; never raise."""
         try:
-            if self._settled is not None:
-                settled = self._settled()
-                if not settled.ok:
-                    return settled
+            if self._faults is not None:
+                gate = self._faults()
+                if not gate.ok:
+                    return gate
             view = read_space(self._client, self._current_token().reveal(), self._config.space.id)
             return compare(view, self._config)
         except _SAFE as error:

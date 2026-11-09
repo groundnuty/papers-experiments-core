@@ -41,23 +41,28 @@ cannot be cleared and verified fails that start as `injector_failure`, so a camp
 left down. The journal names each injection's holder (pid and boot id): a lock held while that holder is gone is
 stuck, and fails the start the same way instead of being skipped as a live run's.
 
-**Baseline (O11).** While any injection is unsettled the federation is not in its baseline state, so no other run may
-start. An injector refuses to start, as `injector_failure`, while the journal holds an injection recovery could not
-settle (one a live injector holds included), and the platform's standard health check (`PlatformHealth`) fails for
-as long whenever platform.toml has a `[faults]` table, so the scheduler's gate holds back every run, whatever its
-condition, with nothing for a study to remember. Its comparison with the declared support set alone would not: that
-set need not hold the provider an outage takes down.
+**Baseline (O11).** While an injection proceeds or is unsettled the federation is not in its baseline state, so no
+other run may be on it. An outage run holds the federation's lock exclusively for its whole run, inject and clear
+included (`expcore_onedata.admission`): the injector uses its run's exclusive admission, takes one itself when the run
+holds none, refuses a shared one, and keeps it until the restore is verified. Every other run holds it shared, so the
+two never overlap. An injector also refuses to start, as `injector_failure`, while the journal holds an injection
+recovery could not settle, and the platform's standard health check (`PlatformHealth`) recovers what a crashed run
+left and fails while an injection is in progress or unsettled, whenever platform.toml has a `[faults]` table.
 
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
 
-**Use.** An executor builds the injector for the target its condition declares and runs the agent inside `running`:
+**Use.** An executor admits its run to the federation before it starts any infrastructure (exclusive when its
+condition uses an injector), builds the injector for the target its condition declares and runs the agent inside
+`running`:
 
-    injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
-                             driver=compose_driver(settings))
-    async with injector.running(dataclasses.asdict(request.identity)):
-        record = await record_run(request, ...)
-    record = await asyncio.to_thread(finish_instruments, record, [injector])
+    async with FederationLock(settings.journal).admitted(exclusive=True):
+        ...  # the sandbox and the tool server start here, under the admission
+        injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
+                                 driver=compose_driver(settings))
+        async with injector.running(dataclasses.asdict(request.identity)):
+            record = await record_run(request, ...)
+        record = await asyncio.to_thread(finish_instruments, record, [injector])
 
 `running` starts the injector in a worker thread and keeps that thread's future: a cancellation cannot stop the thread,
 so on cancellation it waits for it (shielded, bounded), clears in `finally` and raises the cancellation again. Never
@@ -81,6 +86,7 @@ from typing import Any
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.records.injections import FAULT_NAMESPACE
+from expcore_onedata.admission import Admission, AdmissionRefused, FederationLock, current_admission
 from expcore_onedata.compose import DriverError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
@@ -149,6 +155,9 @@ class FaultInjector:
         self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep)
         self._journal = self._recovery.journal
         self._lock: HeldLock | None = None
+        self._federation = FederationLock(settings.journal)
+        self._admission: Admission | None = None  # the exclusive admission it took itself, when its run held none
+        self._cancel = threading.Event()  # set when `running` is cancelled: an admission still awaited is given up
         self._mutex = threading.RLock()  # a start and a clear never run at once, in whichever threads
         rounds = settings.clear_attempts + 2
         self.cancel_wait_s = (
@@ -190,7 +199,12 @@ class FaultInjector:
         names so the treatment rule counts the injection for this attempt only.
         """
         with self._mutex:
-            self._start(identity)
+            try:
+                self._start(identity)
+            except BaseException:
+                if self._pending is None:  # nothing is down: the federation goes back to the other runs
+                    self._release_admission()
+                raise
 
     def _start(self, identity: Mapping[str, Any]) -> None:
         self._require_sanction()
@@ -201,6 +215,7 @@ class FaultInjector:
             raise FaultRefused("a fault injector is started with the run's identity: its run_key and attempt")
         self._origin, self._steps, self._injection = self._clock(), [], None
         self._run = {"run_key": run_key, "attempt": attempt}
+        self._admit()
         self._step("sanctioned", True)
         unsettled = self._recover()
         if unsettled:  # held down by a live injector: the federation is not in its baseline state
@@ -226,6 +241,26 @@ class FaultInjector:
             raise self._fail(f"{self.target} could not be taken down, seen down and journalled ({why})") from None
         self._injection["injected"] = True
         self._step("injected", True, identity_before_sha256=digest)
+
+    def _admit(self) -> None:
+        """Hold the federation exclusively for the whole injection: the run's own admission, which must then be
+        exclusive, or one taken here and kept until the restore is verified."""
+        held = current_admission()
+        if held is not None and not held.exclusive:
+            raise AdmissionRefused(
+                "an outage run holds the federation exclusively for its whole run and never shared: no upgrade"
+            )
+        if held is None and (self._admission is None or not self._admission.held):
+            timeout_s = self._settings.admission_timeout_s
+            try:
+                self._admission = self._federation.acquire(exclusive=True, timeout_s=timeout_s, cancel=self._cancel)
+            except InfraError as error:
+                raise self._fail(error.detail) from None
+
+    def _release_admission(self) -> None:
+        if self._admission is not None:
+            self._admission.close()
+            self._admission = None
 
     def _journal_injection(self) -> tuple[str, str]:
         """Read the target's identity and journal the injection durably, before anything stops it; on any failure
@@ -265,11 +300,13 @@ class FaultInjector:
         own thread, waits for a start that is still running, through the injector's lock.
         """
         bound = self.cancel_wait_s if cancel_wait_s is None else cancel_wait_s
+        self._cancel = threading.Event()
         starting = asyncio.ensure_future(asyncio.to_thread(self.start, identity))
         try:
             try:
                 await asyncio.shield(starting)
             except asyncio.CancelledError:
+                self._cancel.set()  # a start still waiting for the federation gives up instead of injecting
                 await _outlast(starting, bound)
                 raise
             yield self
@@ -339,6 +376,7 @@ class FaultInjector:
         if done:
             self._pending = None
             self._unlock()
+            self._release_admission()
         return done
 
     def recover(self) -> list[str]:

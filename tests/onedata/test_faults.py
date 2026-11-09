@@ -225,11 +225,11 @@ def test_o11_recovery_leaves_alone_a_provider_a_live_run_holds_down(tmp_path):
     holder = injector_for(platform, services)
     holder.start(RUN)
     other = injector_for(platform, services, target=LOCAL_TARGET)
-    with pytest.raises(InfraError, match="unsettled"):
+    with pytest.raises(InfraError, match=r"unsettled|held"):
         other.start({**RUN, "run_key": "task=task-b|model=m1|seed=1"})
     assert services.running(OUTAGE_SERVICE) is False  # still down: its injector is alive
     assert services.running(SERVICES["alpha"]) is True
-    with pytest.raises(InfraError, match="unsettled"):
+    with pytest.raises(InfraError, match=r"unsettled|held"):
         injector_for(platform, services).start({**RUN, "attempt": 2})
     assert holder.finish()["ok"] is True
 

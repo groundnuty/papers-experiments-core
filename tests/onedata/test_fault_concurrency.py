@@ -139,7 +139,7 @@ def test_o11_while_an_injection_is_unsettled_no_other_injection_starts_and_the_h
     assert OUTAGE_TARGET in health.detail
     assert OUTAGE_SERVICE not in health.detail
     other = injector_for(platform, services, target=LOCAL_TARGET)
-    with pytest.raises(InfraError, match="unsettled") as caught:
+    with pytest.raises(InfraError, match=r"unsettled|held") as caught:
         other.start({**RUN, "run_key": "task=task-b|model=m1|seed=1"})
     assert caught.value.kind == INJECTOR_FAILURE
     assert services.running(SERVICES["alpha"]) is True  # its own target was never touched

@@ -91,6 +91,7 @@ def faults_table(**changes: Any) -> dict[str, Any]:
         "poll_s": 1,
         "settle_timeout_s": 5,
         "clear_attempts": 2,
+        "admission_timeout_s": 1,
         "services": dict(SERVICES),
     }
     table.update(changes)

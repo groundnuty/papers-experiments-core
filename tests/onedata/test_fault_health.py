@@ -42,7 +42,7 @@ def test_o11_a_baseline_run_is_refused_by_the_standard_health_gate_while_an_inje
     injector.start(RUN)
     refused = gate.before_run(baseline)
     assert refused.verdict == FOUND
-    assert "unsettled" in refused.detail
+    assert "in progress" in refused.detail
     assert "providers[1]" in refused.detail
     assert injector.finish()["ok"] is True
     assert health().ok is True

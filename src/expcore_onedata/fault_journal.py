@@ -126,7 +126,7 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _make_directories(directory: Path) -> None:
+def make_directories(directory: Path) -> None:
     """Create the directory and its missing parents, outermost first, each made durable in its parent."""
     missing = []
     current = directory
@@ -164,7 +164,7 @@ class InjectionJournal:
     def append(self, line: Mapping[str, Any]) -> None:
         """Append one line durably: under the journal-wide lock, an incomplete last line cut off first, then the line
         written, flushed and fsynced, with the directory fsynced when the line created the file."""
-        _make_directories(self.directory)
+        make_directories(self.directory)
         with self._section():
             self._cut_incomplete_line()
             new_file = not self.path.exists()
@@ -224,7 +224,7 @@ class InjectionJournal:
 
     def try_lock(self, target: str) -> HeldLock | None:
         """Take the target's exclusive lock without waiting; return it, or None when another holds it."""
-        _make_directories(self.directory)
+        make_directories(self.directory)
         name = re.sub(r"[^a-z0-9_]+", "-", target).strip("-")
         descriptor = os.open(self.directory / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
