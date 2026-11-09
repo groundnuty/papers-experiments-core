@@ -23,11 +23,12 @@ class SchedulerConfig:
       run whose endpoint changed its served identity (C16). Neither may be a kind any condition declares as its
       treatment, because a run that never started, or that the wrong endpoint served, must not be scored as its fault.
     - `recheck_s`, `health_timeout_s`: how often the closed gate is checked (and how long a run whose check was
-      deferred waits before it is tried again), and how long a check may take.
+      deferred waits before it is tried again), and how long a check may take. `max_defer_s`: how long the platform's
+      check may stay deferred (a run holds the platform on purpose) before the gate fails and blocks dispatch (C11).
     - `lease_timeout_s`: how long a run waits for a lease before it is left unstarted; None: for ever.
     - `harness_stop`, `budget`: the harness-error stops (C10) and the budget gate (C12); no budget runs without one.
     - `exit_when_blocked`: `run` returns, instead of waiting, when nothing is in flight and every pending run is
-      held by a hold that will not end by itself (a stop, a budget, a model not admitted).
+      held by a hold that will not end by itself (a stop, a budget, a model not admitted, a deferral past its bound).
     - `allow_growth`: the plan may add whole tasks, models, seeds or conditions to a store that already holds a run.
     - `refuse_unpriced`: with a budget, refuse to open the campaign when a planned model has no price and is not free
       (C12). Without it such a model is held at the budget gate instead.
@@ -44,6 +45,7 @@ class SchedulerConfig:
     identity_kind: str = "endpoint"
     recheck_s: float = 30.0
     health_timeout_s: float = 60.0
+    max_defer_s: float = 3600.0
     lease_timeout_s: float | None = 600.0
     harness_stop: HarnessStopConfig = field(default_factory=HarnessStopConfig)
     budget: Budget | None = None
@@ -58,8 +60,10 @@ class SchedulerConfig:
             problems.append("max_attempts, workers and unit_fail_threshold must be at least 1")
         if any(cap < 1 for cap in self.unit_caps.values()):
             problems.append("a unit cap must be at least 1")
-        if min(self.unit_pause_s, self.recheck_s, self.health_timeout_s, self.poll_interval_s) <= 0:
-            problems.append("unit_pause_s, recheck_s, health_timeout_s and poll_interval_s must be positive")
+        if min(self.unit_pause_s, self.recheck_s, self.health_timeout_s, self.poll_interval_s, self.max_defer_s) <= 0:
+            problems.append(
+                "unit_pause_s, recheck_s, health_timeout_s, poll_interval_s and max_defer_s must be positive"
+            )
         if self.retry_delay_s < 0 or (self.lease_timeout_s is not None and self.lease_timeout_s <= 0):
             problems.append("retry_delay_s must not be negative and lease_timeout_s must be positive")
         if problems:

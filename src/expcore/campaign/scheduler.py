@@ -188,7 +188,12 @@ class Scheduler:
         self.gate = None
         if self.health_check is not None:
             self.gate = HealthGate(
-                store, self.health_check, self.stamp, recheck_s=cfg.recheck_s, timeout_s=cfg.health_timeout_s
+                store,
+                self.health_check,
+                self.stamp,
+                recheck_s=cfg.recheck_s,
+                timeout_s=cfg.health_timeout_s,
+                max_defer_s=cfg.max_defer_s,
             )
             self.gate.load()
         self._admit_models()
@@ -359,6 +364,9 @@ class Scheduler:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
         if stopped_all:
             return Hold("harness_errors", "dispatch of every model is stopped by harness errors", temporary=False)
+        if self.gate is not None and self.gate.blocking:  # a deferral past its bound: it may never end by itself
+            why = "the health gate is closed: the platform's check stayed deferred past max_defer_s"
+            return Hold("health_gate", why, temporary=False)
         if self.gate is not None and self.gate.closed:
             return Hold("health_gate", "the health gate is closed: no run starts until a check passes", temporary=True)
         return None
@@ -419,6 +427,8 @@ class Scheduler:
             key, model = row["run_key"], row[column_for("model")]
             if key in self._inflight:
                 continue
+            if all_hold is not None and not all_hold.temporary:
+                continue  # nothing starts until someone looks: no run is waiting for its time
             if self._not_before.get(key, 0.0) > mono:
                 waiting = True
                 continue

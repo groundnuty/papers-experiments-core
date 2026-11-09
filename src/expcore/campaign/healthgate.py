@@ -36,7 +36,11 @@ federation, and the check's bounded wait for it ran out). A deferral is never a 
 pre-run check holds its run (`defer`) without closing the gate, recording an outage or charging an attempt, and the
 run is tried again after `recheck_s`; a deferred post-run check verified nothing, so the finished result is never
 scored on it: the attempt is set aside as `post_check_unverified`, a kind no condition may declare; and the
-dispatcher's own check keeps a closed gate closed while it is deferred, since only a pass opens it.
+dispatcher's own check keeps a closed gate closed while it is deferred, since only a pass opens it. **A deferral is
+bounded.** Its start is kept in the store (`expcore.campaign.deferral`), so a restart keeps its age, and it is in the
+status; a pass ends it. A pre-run check deferred longer than `max_defer_s` fails: it closes the gate as any failure
+does, charging the run that found it, and the outage is `blocking`, a hold that does not end by itself, so a campaign
+that exits when blocked stops instead of waiting on a holder that may never let go.
 
 **Every check runs in its caller's context** (`contextvars`), so a post-run check, which runs inside the run's
 admission (`expcore.campaign.attempt`: a platform's hook that holds a resource from before the attempt until after
@@ -52,6 +56,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
+from expcore.campaign.deferral import Deferral, deferral_alarms, parse_deferral
 from expcore.campaign.store import Store
 
 META = "health_outages"
@@ -115,15 +120,21 @@ def dump(outages: list[dict[str, Any]]) -> str:
     return json.dumps({"outages": outages[-KEEP:]}, sort_keys=True)
 
 
-def fact(raw: str | None) -> dict[str, Any]:
-    """Return the status fact: readable, the outages, and the open one. An unreadable record lists none, never []."""
+def fact(raw: str | None, deferral_raw: str | None = None) -> dict[str, Any]:
+    """Return the status fact: readable, the outages, the open one, and the current deferral (`deferral_raw` is the
+    store's `health_deferral`). An unreadable record lists none, never []."""
+    try:
+        deferral = parse_deferral(deferral_raw)
+    except (ValueError, TypeError):
+        deferral = None
     outages = parse(raw)
     if outages is None:
-        return {"readable": False, "outages": None, "open": None}
+        return {"readable": False, "outages": None, "open": None, "deferral": deferral}
     return {
         "readable": True,
         "outages": outages,
         "open": next((o for o in reversed(outages) if o.get("end_utc") is None), None),
+        "deferral": deferral,
     }
 
 
@@ -136,7 +147,7 @@ def alarms(state: dict[str, Any], every_s: float) -> list[str]:
         ]
     outage = state["open"]
     if outage is None:
-        return []
+        return deferral_alarms(state.get("deferral"))
     last = outage.get("last_detail") or outage.get("first_detail") or "no detail"
     return [
         f"HEALTH GATE CLOSED since {outage['start_utc']}: no run starts; the dispatcher re-checks every {every_s:g} s "
@@ -167,11 +178,13 @@ class HealthGate:
         *,
         recheck_s: float = 30.0,
         timeout_s: float = 60.0,
+        max_defer_s: float = 3600.0,
     ):
-        if recheck_s <= 0 or timeout_s <= 0:
-            raise ValueError("recheck_s and timeout_s must be positive")
+        if recheck_s <= 0 or timeout_s <= 0 or max_defer_s <= 0:
+            raise ValueError("recheck_s, timeout_s and max_defer_s must be positive")
         self.store, self.check, self.clock = store, check, clock
-        self.recheck_s, self.timeout_s = recheck_s, timeout_s
+        self.recheck_s, self.timeout_s, self.max_defer_s = recheck_s, timeout_s, max_defer_s
+        self.deferral = Deferral(store, clock)
         self._open: dict[str, Any] | None = None  # the open outage's record; None: the gate is open
         self._outages: list[dict[str, Any]] = []
         self._lock = threading.Lock()  # "who found it" and the record's writes are one step each
@@ -189,9 +202,16 @@ class HealthGate:
         """Tell whether the gate is closed now."""
         return self._open is not None
 
+    @property
+    def blocking(self) -> bool:
+        """Tell whether the gate is closed by a failure that does not end by itself: a deferral past its bound."""
+        outage = self._open
+        return outage is not None and bool(outage.get("blocking"))
+
     def load(self) -> None:
         """Restore the outage list at a start. A gate closed when the last process ended is closed again and checked at
         once; a record that cannot be read reads as closed too, until a check passes. Nothing is charged for it."""
+        self.deferral.load()
         now = self.clock()
         raw = self.store.get_meta(META)
         outages = parse(raw)
@@ -223,8 +243,9 @@ class HealthGate:
                 "checked at once; no attempt is charged for the restart",
             )
 
-    def _close(self, run_key: str, detail: str) -> bool:
-        """Close the gate for a failed check. True: this run found the outage and is its one attempt."""
+    def _close(self, run_key: str, detail: str, *, blocking: bool = False) -> bool:
+        """Close the gate for a failed check. True: this run found the outage and is its one attempt. A `blocking`
+        outage, a deferral past its bound, is a hold that does not end by itself."""
         with self._lock:
             if self._open is not None:
                 return False
@@ -239,6 +260,8 @@ class HealthGate:
                 "first_detail": detail[:200],
                 "last_detail": detail[:200],
             }
+            if blocking:
+                record["blocking"] = True
             self._open = record
             self._outages.append(record)
             self.store.put_meta(META, dump(self._outages), now)
@@ -314,12 +337,18 @@ class HealthGate:
         if closed is not None:
             return PreRun(HOLD, "the gate closed while this check was out")
         if health.ok:
+            self.deferral.end()
             return PreRun(GO, health.detail)
+        blocking, detail = False, health.detail
         if health.deferred:
-            return PreRun(DEFER, health.detail)  # a wait, not a failure: nothing is closed or charged
-        if not self._close(run_key, health.detail):
+            age = self.deferral.note(health.detail)
+            if age <= self.max_defer_s:
+                return PreRun(DEFER, health.detail)  # a wait, not a failure: nothing is closed or charged
+            blocking = True  # a wait past its bound: the holder may never let go
+            detail = f"{detail} (deferred for {age:.0f} s, past max_defer_s of {self.max_defer_s:g} s)"
+        if not self._close(run_key, detail, blocking=blocking):
             return PreRun(HOLD, "another run's failed check closed the gate first")
-        return PreRun(FOUND, health.detail)
+        return PreRun(FOUND, detail)
 
     def after_run(self) -> tuple[Health, dict[str, Any] | None]:
         """Check after an attempt: the health, and the outage record if the gate was closed when the check returned."""
@@ -349,6 +378,7 @@ class HealthGate:
             if health.ok:
                 record["end_utc"], record["how"] = now, HOW_PASSED
                 self._open = None
+                self.deferral.end()
             self.store.put_meta(META, dump(self._outages), now)
             if health.ok:
                 survived = f" and survived {record['restarts']} restart(s)" if record.get("restarts") else ""

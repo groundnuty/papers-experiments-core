@@ -8,11 +8,13 @@ outcome as it stands (C11).
 
 import contextlib
 import contextvars
+import datetime as dt
 
 from campaign_support import planned_store
 from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, settings_for
 
-from expcore.campaign.healthgate import DEFER, GO, META, Health, HealthGate, parse, read_health
+from expcore.campaign.deferral import DEFERRAL_META
+from expcore.campaign.healthgate import DEFER, FOUND, GO, META, Health, HealthGate, alarms, fact, parse, read_health
 from expcore.errors import is_treatable
 
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
@@ -144,3 +146,71 @@ def test_c11_the_runs_admission_covers_its_attempt_and_its_post_run_check(tmp_pa
         assert scheduler.run().statuses == {"done": 3}
     assert held.events == ["enter", "leave"] * 3
     assert calls == [False, True] * 3  # each pre-run check outside the admission, each post-run check inside it
+
+
+WEDGED = Health(
+    False, "an outage run of providers[1] since 2026-01-01T00:00:00+00:00 holds the federation", deferred=True
+)
+
+
+def clock_from(minutes):
+    """A gate clock that reads the given minutes past midnight, one per reading, then stays on the last."""
+    stamps = [f"2026-01-01T{m // 60:02d}:{m % 60:02d}:00Z" for m in minutes]
+    return lambda: stamps.pop(0) if len(stamps) > 1 else stamps[0]
+
+
+def test_c11_a_deferral_is_kept_in_the_store_and_a_restart_keeps_its_age(tmp_path):
+    """C11: the start of the current deferral is in the store's meta and in the status; a gate opened again on the
+    same store counts its age from that start, and once the age passes max_defer_s the gate fails, naming the holder's
+    purpose and the target, as an outage that blocks dispatch until someone looks."""
+    store, _, _ = planned_store(tmp_path)
+    first = HealthGate(store, Answers(WEDGED), clock_from([1]), max_defer_s=3000)
+    first.load()
+    assert first.before_run("run-a").verdict == DEFER
+    status = fact(store.get_meta(META), store.get_meta(DEFERRAL_META))
+    assert status["deferral"]["since_utc"] == "2026-01-01T00:01:00Z"
+    assert any("DEFERRED since 2026-01-01T00:01:00Z" in alarm for alarm in alarms(status, 30))
+    again = HealthGate(store, Answers(WEDGED, WEDGED), clock_from([40, 40, 52]), max_defer_s=3000)  # a restart
+    again.load()
+    assert again.before_run("run-a").verdict == DEFER  # 39 minutes deferred: under the bound
+    assert again.closed is False
+    found = again.before_run("run-a")  # 51 minutes: past it
+    assert found.verdict == FOUND
+    assert "max_defer_s" in found.detail
+    assert "an outage run of providers[1]" in found.detail
+    assert (again.closed, again.blocking) == (True, True)
+
+
+def test_c11_a_passing_check_ends_the_deferral(tmp_path):
+    """C11: a check that passes ends the current deferral, so the next one counts from its own start."""
+    store, _, _ = planned_store(tmp_path)
+    gate = HealthGate(store, Answers(WEDGED, Health(True, "fine"), WEDGED), clock_from([1, 2, 59]), max_defer_s=3000)
+    gate.load()
+    assert gate.before_run("run-a").verdict == DEFER
+    assert gate.before_run("run-a").verdict == GO
+    assert store.get_meta(DEFERRAL_META) in (None, "null")
+    assert gate.before_run("run-a").verdict == DEFER  # 59 minutes after the first, but a new deferral
+
+
+def test_c11_a_campaign_whose_check_stays_deferred_past_the_bound_stops_dispatch_as_blocked(tmp_path):
+    """C11: a wedged holder keeps every check deferred; past max_defer_s the gate fails, one attempt is charged to the
+    run that found it, and the hold is not temporary, so a campaign that exits when blocked stops."""
+    moments = iter(dt.datetime(2026, 1, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=40 * n) for n in range(10_000))
+    settings = settings_for(recheck_s=0.01, health_timeout_s=5, max_defer_s=100, workers=1)
+    with build(
+        tmp_path,
+        executor=FakeExecutor(),
+        settings=settings,
+        health=lambda: WEDGED,
+        plan=SMALL,
+        clock=lambda: next(moments),
+    ) as scheduler:
+        summary = scheduler.run()
+        kinds = event_kinds(scheduler.store)
+        assert kinds.count("health_gate_closed") == 1
+        assert summary.statuses.get("done", 0) == 0
+        charged = scheduler.store.q("SELECT COUNT(*) FROM attempts WHERE charged=1")[0][0]
+        assert charged == 1
+        [outage] = parse(scheduler.store.get_meta(META))
+        assert outage["blocking"] is True
+        assert "providers[1]" in outage["first_detail"]
