@@ -30,7 +30,13 @@ _TYPE_LIMIT = 40
 
 
 class TokenRefused(RuntimeError):
-    """A token or its principal failed examination; the message holds no value."""
+    """A token or its principal failed examination; the message holds no value.
+
+    `expires_at` is the refused token's expiry when the examination could read its time caveat, else None. A token
+    is dropped, never revoked, so a caller holding a resource for it needs that expiry (or must assume the worst).
+    """
+
+    expires_at: float | None = None
 
 
 class PrivilegesMismatch(TokenRefused):
@@ -181,6 +187,30 @@ def require_examined(
         raise ExaminationFailed(
             f"the token could not be examined ({type(error).__name__}); refusing it", error
         ) from None
+    declared = _declared_expiry(info)
+    try:
+        return _require(info, spec, subject=subject, min_ttl_s=min_ttl_s, max_ttl_s=max_ttl_s, now=now)
+    except TokenRefused as refused:
+        refused.expires_at = declared
+        raise
+
+
+def _declared_expiry(info: Any) -> float | None:
+    """Read the time caveat's expiry leniently, for a token about to be refused; None when it cannot be read."""
+    caveats = info.get("caveats") if isinstance(info, Mapping) else None
+    if not isinstance(caveats, list):
+        return None
+    times = [c.get("validUntil") for c in caveats if isinstance(c, Mapping) and c.get("type") == "time"]
+    if len(times) != 1:
+        return None
+    value = times[0]
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _require(info: Any, spec: CaveatSpec, *, subject: str, min_ttl_s: float, max_ttl_s: float, now: float) -> Examined:
+    """The checks of `require_examined` on an examination answer."""
     token_id, found_subject, caveats = _parse(info)
     if found_subject != subject:
         raise TokenRefused("the token belongs to another principal than the one it was minted for")

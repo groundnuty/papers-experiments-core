@@ -339,9 +339,9 @@ def watch_fsync(monkeypatch, events):
 
 
 def test_c19_the_provisional_line_is_durable_before_anything_is_minted(slots, client, tmp_path, monkeypatch):
-    """C19: the line is written, flushed and fsynced before the mint, and the directory is fsynced when the line
-    created the file (and the directory's parent when it created the directory); the exact line, written to a file
-    that exists, is fsynced too."""
+    """C19: the line is written, flushed and fsynced before the mint; the directory holding the new file is fsynced,
+    and so is the parent of every directory the append created (here two, so three directory syncs); the exact line,
+    written to a file that exists, is fsynced too."""
     config, loaded = slots
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
@@ -357,7 +357,7 @@ def test_c19_the_provisional_line_is_durable_before_anything_is_minted(slots, cl
     watch_fsync(monkeypatch, events)
     journal = TokenJournal(tmp_path / "fresh" / "journal")  # neither the directory nor the file exists yet
     SlotTokens(issuer, config, loaded, journal, clock=lambda: NOW).mint(lease, ceiling_s=CEILING_S, condition="read")
-    assert events == ["fsync file", "fsync directory", "fsync directory", "mint", "fsync file"]
+    assert events == ["fsync file", "fsync directory", "fsync directory", "fsync directory", "mint", "fsync file"]
 
 
 def test_c19_a_journal_line_that_cannot_be_made_durable_stops_the_mint(slots, client, tmp_path, fake, monkeypatch):
@@ -456,3 +456,39 @@ def test_the_holder_question_is_the_cores(tmp_path):
     from expcore.campaign.lease import process_owner
 
     assert SlotProbe(TokenJournal(tmp_path)).holder_gone(process_owner()) is False  # this process is alive
+
+
+def test_c19_a_token_refused_for_its_lifetime_still_has_its_expiry_journalled(slots, client, tmp_path, slot_federation):
+    """C19: the platform hands back a token far longer-lived than allowed, so examination refuses it for its lifetime
+    before any expiry comparison; it is dropped, not revoked, and the expiry it really has holds the slot."""
+    config, loaded = slots
+    extra = 400
+    slot_federation.mint_hook = lambda user, caveats: [
+        {**c, "validUntil": c["validUntil"] + extra} if c["type"] == "time" else c for c in caveats
+    ]
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = TokenJournal(tmp_path / "leases")
+    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    with pytest.raises(TokenRefused, match="longer than"):
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
+    actual = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s + extra
+    assert journal.latest_expiry(lease.key) == actual
+    assert SlotProbe(journal, clock=lambda: actual + SAFETY_MARGIN_S).resource_gone(lease.key, {}) is False
+
+
+def test_c19_a_dropped_token_of_unknown_expiry_holds_the_slot_until_an_operator_clears_it(
+    slots, client, tmp_path, slot_federation
+):
+    """C19: the token is minted but its examination answer has no readable time caveat, so its expiry is unknown;
+    the journal records it as indeterminate and no clock ever frees the slot."""
+    config, loaded = slots
+    slot_federation.mint_hook = lambda user, caveats: [c for c in caveats if c["type"] != "time"]
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = TokenJournal(tmp_path / "leases")
+    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    with pytest.raises(TokenRefused):
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
+    assert journal.latest_expiry(lease.key) == float("inf")
+    assert SlotProbe(journal, clock=lambda: NOW + 10**9).resource_gone(lease.key, {}) is False

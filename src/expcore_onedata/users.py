@@ -45,6 +45,7 @@ a slot's users hold are checked, direct and effective, before every token is min
 """
 
 import json
+import math
 import os
 import secrets
 import time
@@ -57,7 +58,7 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.config import NAME, PlatformConfig
 from expcore_onedata.credentials import Principal
-from expcore_onedata.tokens import ExpiryMismatch, RunTokens, TokenIssuer, token_window
+from expcore_onedata.tokens import DroppedToken, RunTokens, TokenIssuer, token_window
 
 GROUP = "platform_users"
 JOURNAL = "tokens.jsonl"
@@ -181,8 +182,22 @@ class TokenJournal:
             line["mint"] = mint
         if provisional:
             line["provisional"] = True
+        self._append(line)
+
+    def record_indeterminate(self, slot: str) -> None:
+        """Record that a slot holds a dropped token whose expiry is unknown: the slot is held until an operator
+        removes this line, having made sure the token has ended."""
+        self._append({"slot": slot, "plane": "refused", "indeterminate": True})
+
+    def _append(self, line: Mapping[str, Any]) -> None:
+        """Append one line durably: the file, and every directory this append created and the one holding it."""
         directory = self._path.parent
-        new_directory, new_file = not directory.exists(), not self._path.exists()
+        created: list[Path] = []
+        missing = directory
+        while not missing.exists():
+            created.append(missing)
+            missing = missing.parent
+        new_file = not self._path.exists()
         directory.mkdir(parents=True, exist_ok=True)
         with open(self._path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(line) + "\n")
@@ -190,8 +205,8 @@ class TokenJournal:
             os.fsync(handle.fileno())
         if new_file:
             _fsync_directory(directory)
-        if new_directory:
-            _fsync_directory(directory.parent)
+        for made in created:  # deepest first: each new directory's entry lives in its parent
+            _fsync_directory(made.parent)
 
     def latest_expiry(self, slot: str) -> float | None:
         """Return the latest end journalled for a slot, or None when none was; raise if the journal is unreadable.
@@ -209,6 +224,8 @@ class TokenJournal:
             line = json.loads(text)
             if line["slot"] != slot:
                 continue
+            if line.get("indeterminate") is True:
+                return math.inf  # a dropped token of unknown expiry: never free until an operator clears it
             expires_at = float(line["expires_at"])
             if line.get("provisional") is True:
                 open_lines[line["mint"]] = expires_at  # a provisional line without its mint id is unreadable
@@ -288,8 +305,11 @@ class SlotTokens:
                 tool_server=(slot.tool_server, condition) if condition is not None else None,
                 valid_until=valid_until,
             )
-        except ExpiryMismatch as refused:
-            self._journal.record(slot.name, "refused", refused.expires_at)  # the expiry the dropped token really has
+        except DroppedToken as refused:  # a token exists, dropped but not revoked: the slot is held until it ends
+            if refused.expires_at is None:
+                self._journal.record_indeterminate(slot.name)
+            else:
+                self._journal.record(slot.name, "refused", refused.expires_at)
             raise
         latest = max((t for t in (tokens.data_path, tokens.tool_server) if t is not None), key=lambda t: t.expires_at)
         self._journal.record(slot.name, latest.plane.value, latest.expires_at, mint=mint)

@@ -78,13 +78,20 @@ class Secret:
     __str__ = __repr__
 
 
-class ExpiryMismatch(TokenRefused):
-    """A token's examined expiry is not the one it was minted with; `expires_at` is the one it has, which is when
-    the token, dropped but not revoked, stops working."""
+class DroppedToken(TokenRefused):
+    """A token was minted and then refused; it is dropped, never revoked. `expires_at` is when it stops working,
+    or None when its examination could not read that, in which case nothing may assume it has ended."""
 
-    def __init__(self, message: str, expires_at: float) -> None:
+    def __init__(self, message: str, expires_at: float | None) -> None:
         super().__init__(message)
         self.expires_at = expires_at
+
+
+class ExpiryMismatch(DroppedToken):
+    """A token's examined expiry is not the one it was minted with; `expires_at` is the one it has."""
+
+    def __init__(self, message: str, expires_at: float) -> None:
+        super().__init__(message, expires_at)
 
 
 @dataclass(frozen=True)
@@ -226,7 +233,10 @@ class TokenIssuer:
         self.check_principal(spec, principal)
         asked = valid_until if valid_until is not None else int(self._clock()) + window.mint_ttl_s
         value = self._client.mint_own_token(principal, spec.caveats.caveats(asked))
-        examined = self.examine(value, spec, principal.user_id, window)
+        try:
+            examined = self.examine(value, spec, principal.user_id, window)
+        except TokenRefused as refused:
+            raise DroppedToken(str(refused), refused.expires_at) from refused
         if valid_until is not None and examined.valid_until != valid_until:
             raise ExpiryMismatch("the token's expiry is not the one it was minted with", examined.valid_until)
         return MintedToken(spec.plane, principal.user_id, examined.token_id, examined.valid_until, Secret(value))
