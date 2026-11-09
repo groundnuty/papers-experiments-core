@@ -12,7 +12,7 @@ record names another endpoint than the one admitted is the fault C14 describes.
 """
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -21,15 +21,16 @@ from expcore.campaign.markers import AttemptResult
 from expcore.config.models import Limits, ModelSpec
 from expcore.errors import InfraError
 from expcore.loop.config import AgentConfig
-from expcore.loop.outcomes import HarnessDefect, Outcome, harness_defect_of
+from expcore.loop.outcomes import Outcome, harness_defect_of
 from expcore.loop.timer import AgentTimer
 from expcore.models.adapters import ModelBackend
 from expcore.models.factory import build_backend
 from expcore.plugin import ToolProvider
 from expcore.prompt.templates import RenderedPrompt
 from expcore.records.build import PromptText, RunIdentity, record_attempt
+from expcore.records.injections import injected_targets
 from expcore.records.record import RunRecord
-from expcore.records.schema import first_turn_rule
+from expcore.records.schema import first_turn_rule, outcome_from_entry, target_rule
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,8 @@ class RunRequest:
     - `treatment_kinds`: the infrastructure kinds the run's condition declares as its treatment. The record must carry
       exactly these, or the store refuses the result.
     - `lease`: the lease the platform's resources require, held for the whole attempt; None without one.
+    - `treatment_targets`: the target the condition declares for any of its treatment kinds (a position label such as
+      `providers[1]`), which the run's fault injector takes down; the record must carry exactly these too.
     """
 
     identity: RunIdentity
@@ -93,6 +96,7 @@ class RunRequest:
     clock: Callable[[], float]
     treatment_kinds: tuple[str, ...]
     lease: Lease | None = None
+    treatment_targets: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def run_key(self) -> str:
@@ -124,8 +128,8 @@ async def record_run(
 ) -> RunRecord:
     """Run the attempt through the loop with the request's backend, timer and treatment kinds, and return the record.
 
-    The way an executor calls `record_attempt`: it cannot forget the treatment kinds, which the store checks, or build
-    a backend of its own.
+    The way an executor calls `record_attempt`: it cannot forget the treatment kinds and targets, which the store
+    checks, or build a backend of its own.
     """
     return await record_attempt(
         request.backend,
@@ -136,6 +140,7 @@ async def record_run(
         request.identity,
         code=code,
         treatment_kinds=request.treatment_kinds,
+        treatment_targets=request.treatment_targets,
         timer=request.timer,
         clock=request.clock,
         **options,
@@ -149,20 +154,14 @@ def _total(turns: Sequence[Mapping[str, Any]], name: str) -> int | None:
 
 
 def outcome_of(entry: Mapping[str, Any]) -> Outcome:
-    """Rebuild an outcome from the record's outcome section."""
-    defect = entry.get("defect")
-    return Outcome(
-        name=entry["name"],
-        detail=entry.get("detail") or "",
-        infra_kind=entry.get("infra_kind"),
-        error_type=entry.get("error_type"),
-        defect=None if defect is None else HarnessDefect(defect["exception"], defect["stack_sha256"]),
-    )
+    """Rebuild an outcome from the record's outcome section, its target included (none before version 3)."""
+    return outcome_from_entry(entry)
 
 
 def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | None = None) -> AttemptResult:
-    """Return the store's result for a record: its outcome, tokens as the turns reported them, its treatment kinds, the
-    turns it completed and the treatment flag it carries (the store checks that flag against its own decision).
+    """Return the store's result for a record: its outcome, tokens as the turns reported them, its treatment kinds and
+    targets, the turns it completed, the targets its fault injector recorded as injected in this attempt, and the
+    treatment flag it carries (the store checks that flag against its own decision).
 
     A count no turn reported is unknown, and totals the loop knows to be short are marked incomplete (C05). The wall
     time is the record's elapsed time unless the caller gives one.
@@ -182,20 +181,33 @@ def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | Non
         model_turns=len(turns),
         recorded_treatment=bool(record.outcome["treatment"]),
         first_turn_rule=first_turn_rule(record.schema_version),
+        target_rule=target_rule(record.schema_version),
+        treatment_targets=dict(record.treatment_targets),
+        injected_targets=tuple(injected_targets(record.instruments, record.run_key, record.attempt)),
     )
 
 
 def failure_result(
-    error: BaseException, *, ended_utc: str, wall_s: float, treatment_kinds: Sequence[str] = ()
+    error: BaseException,
+    *,
+    ended_utc: str,
+    wall_s: float,
+    treatment_kinds: Sequence[str] = (),
+    treatment_targets: Mapping[str, str] | None = None,
 ) -> AttemptResult:
     """Return the result of an executor that raised instead of returning a record; no usage is known.
 
-    An `InfraError` is infrastructure of its kind. Anything else is a crash in our own code: a harness defect, named by
-    its class and a line-free stack hash, never by the exception's text, which may carry a secret.
+    An `InfraError` is infrastructure of its kind, naming its target. Anything else is a crash in our own code: a
+    harness defect, named by its class and a line-free stack hash, never by the exception's text, which may carry a
+    secret. With no record there is no completed turn, so neither is treatment.
     """
-    unknown = {"usage_complete": False, "treatment_kinds": tuple(treatment_kinds)}
+    unknown = {
+        "usage_complete": False,
+        "treatment_kinds": tuple(treatment_kinds),
+        "treatment_targets": dict(treatment_targets or {}),
+    }
     if isinstance(error, InfraError):
-        outcome = Outcome("infrastructure", error.detail, infra_kind=error.kind)
+        outcome = Outcome("infrastructure", error.detail, infra_kind=error.kind, infra_target=error.target)
     else:
         outcome = Outcome("harness_defect", type(error).__name__, defect=harness_defect_of(error))
     return AttemptResult(outcome, ended_utc, wall_s, **unknown)

@@ -1,0 +1,352 @@
+{
+ "schema_version": "expcore-record/3",
+ "run_key": "task=task-a|access=relay|model=m1|seed=1",
+ "factors": {
+  "task": "task-a",
+  "access": "relay",
+  "model": "m1",
+  "seed": 1
+ },
+ "attempt": 1,
+ "treatment_kinds": [
+  "knowledge"
+ ],
+ "route": {
+  "backend": "stub",
+  "model": "stub",
+  "base_url": null,
+  "seed": 0,
+  "seed_honoured": false,
+  "synthetic_tokens": true,
+  "settings_sent_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "settings": {
+   "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a": {}
+  }
+ },
+ "prompt": {
+  "system": {
+   "text": "be brief",
+   "sha256": "b0d336336bae9756708102764ccc977778d8c408df38d7050d69f9e4d22c9a43",
+   "template_sha256": null,
+   "slots": null
+  },
+  "user": {
+   "text": "do the task",
+   "sha256": "abe1e9e3f801509e9c0712b32eb6f7b1bfd3a910e1c38eaa578c884790dc08e8",
+   "template_sha256": null,
+   "slots": null
+  },
+  "tools_sha256": "a2fde5c56e9eb315b23e06f4563d8c95c4a3f1e20bbc601c162b6eecdd870fb1"
+ },
+ "tools": [
+  {
+   "name": "fetch",
+   "description": "The fetch tool.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "x": {
+      "type": "string"
+     }
+    }
+   },
+   "terminal": false
+  }
+ ],
+ "agent_config": {
+  "limits": {
+   "max_tool_rounds": 10,
+   "time_cap_s": 300.0,
+   "token_budget": 100000,
+   "output_cap_chars": 200,
+   "max_output_tokens": 4096
+  },
+  "malformed_policy": "report",
+  "ceiling_s": 900.0,
+  "ceiling_kind": "ceiling",
+  "min_call_s": 1.0,
+  "ceiling_factor": 3.0,
+  "cleanup_deadline_s": 10.0,
+  "terminal_tools": []
+ },
+ "agent_config_sha256": "a9cf99524acc335363aa15b8da24e1089e41cebc92eab3d081bad28d17ba0ee6",
+ "code": {
+  "commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "dirty": false,
+  "source": "git",
+  "stale": false,
+  "why": null,
+  "tree_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+ },
+ "core_version": "0.1.0",
+ "transcript": [
+  {
+   "index": 0,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_1_0",
+      "name": "fetch",
+      "arguments": {
+       "x": "1"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1_0",
+      "type": "function",
+      "function": {
+       "name": "fetch",
+       "arguments": "{\"x\": \"1\"}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_1_0",
+     "content": "the first part"
+    }
+   ],
+   "request_sha256": "f86f4da3c86618770cf5929aaba0accd8bd097e6421f5f69ad7ec16f2fb3edc3",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 4,
+    "output_tokens": 3,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  },
+  {
+   "index": 1,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_2_0",
+      "name": "fetch",
+      "arguments": {
+       "x": "2"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_2_0",
+      "type": "function",
+      "function": {
+       "name": "fetch",
+       "arguments": "{\"x\": \"2\"}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_2_0",
+     "content": "skipped: not completed: this call failed and the attempt ended"
+    }
+   ],
+   "request_sha256": "effec9833677e6447f4e223528100e72b1d123a6c16945093c247b19bb0c49d1",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 10,
+    "output_tokens": 3,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  }
+ ],
+ "failed_request": null,
+ "tool_calls": [
+  {
+   "turn": 0,
+   "round": 1,
+   "call_id": "call_1_0",
+   "name": "fetch",
+   "arguments": {
+    "x": "1"
+   },
+   "status": "ok",
+   "text": "the first part",
+   "raw_text": "the first part",
+   "raw_chars": 14,
+   "truncated": false,
+   "error_class": null,
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  },
+  {
+   "turn": 1,
+   "round": 2,
+   "call_id": "call_2_0",
+   "name": "fetch",
+   "arguments": {
+    "x": "2"
+   },
+   "status": "failed",
+   "text": "skipped: not completed: this call failed and the attempt ended",
+   "raw_text": "skipped: not completed: this call failed and the attempt ended",
+   "raw_chars": 62,
+   "truncated": false,
+   "error_class": "skipped",
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "infrastructure: knowledge",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  }
+ ],
+ "clock": [
+  [
+   "start",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "end",
+   1000.0
+  ]
+ ],
+ "outcome": {
+  "name": "infrastructure",
+  "detail": "the tool server went down",
+  "infra_kind": "knowledge",
+  "error_type": null,
+  "defect": null,
+  "treatment": true,
+  "infra_target": "servers[1]"
+ },
+ "totals": {
+  "rounds": 2,
+  "malformed_calls": 0,
+  "malformed_events": [],
+  "tokens_used": 20,
+  "usage_incomplete": false,
+  "agent_s": 0.0,
+  "elapsed_s": 0.0,
+  "infra_wait_s": 0.0,
+  "infra_wait_by_kind": {},
+  "cleanup_s": 0.0,
+  "cleanup_timed_out": false,
+  "abandoned_threads": 0,
+  "final_text": null
+ },
+ "instruments": {
+  "fault_injector": {
+   "ok": true,
+   "run_key": "task=task-a|access=relay|model=m1|seed=1",
+   "attempt": 1,
+   "target": "servers[1]",
+   "injections": [
+    {
+     "target": "servers[1]",
+     "injected": true,
+     "cleared": true,
+     "verified": true
+    }
+   ],
+   "steps": [
+    {
+     "step": "sanctioned",
+     "at_s": 0.0,
+     "target": "servers[1]",
+     "ok": true
+    },
+    {
+     "step": "injected",
+     "at_s": 1.5,
+     "target": "servers[1]",
+     "ok": true
+    },
+    {
+     "step": "cleared",
+     "at_s": 40.0,
+     "target": "servers[1]",
+     "ok": true
+    },
+    {
+     "step": "verified",
+     "at_s": 52.5,
+     "target": "servers[1]",
+     "ok": true
+    }
+   ]
+  }
+ },
+ "scores": {},
+ "redacted_paths": [],
+ "treatment_targets": {
+  "knowledge": "servers[1]"
+ }
+}

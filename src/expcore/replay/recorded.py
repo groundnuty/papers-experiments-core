@@ -194,8 +194,9 @@ class RecordedBackend:
         kind = failed["kind"]
         if kind == "cut":
             await asyncio.Event().wait()
-        if kind == "infra":
-            raise InfraError(failed["infra_kind"], failed["detail"] or "")
+        if kind == "infra":  # the target the failure named is the outcome's (none before version 3)
+            target = self._outcome.get("infra_target") if self._outcome["name"] == "infrastructure" else None
+            raise InfraError(failed["infra_kind"], failed["detail"] or "", target=target)
         if kind == "context_overflow":
             raise ContextOverflow(failed["status"], failed["pattern"] or "")
         if kind == "abandoned":
@@ -327,7 +328,7 @@ class RecordedToolProvider:
         """Raise what the provider raised: an infrastructure failure of the recorded kind, or a crash by class name."""
         outcome = self._outcome
         if outcome["name"] == "infrastructure":
-            raise InfraError(outcome["infra_kind"], outcome["detail"])
+            raise InfraError(outcome["infra_kind"], outcome["detail"], target=outcome.get("infra_target"))
         if outcome["name"] == "harness_defect":
             raise exception_named(outcome["defect"]["exception"])()
         stop(f"tool_calls[{j}].status", "a call is recorded as failed but the outcome records no failure of a tool")

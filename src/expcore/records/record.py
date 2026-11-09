@@ -5,7 +5,7 @@
 """The run record: one JSON file per attempt, written atomically and read back byte for byte (R01).
 
 A record holds what is needed to audit, re-score and replay an attempt offline: who it was (run key, factor values,
-attempt, and the infrastructure kinds its condition declares as treatment), the route and the settings each request carried, the prompts and tools the model was given, the agent
+attempt, and the infrastructure kinds, and from version 3 the targets, its condition declares as treatment), the route and the settings each request carried, the prompts and tools the model was given, the agent
 configuration as resolved for the run, the code stamp, the transcript turn by turn with the neutral and the native
 message, every tool call with the exact text shown and the raw result, the clock readings, the outcome, the instrument
 outputs under their namespaces, and the scores, kept apart. The sections and their fields are in `schema.py`.
@@ -36,6 +36,7 @@ from expcore.records.schema import (
     RecordError,
     SchemaVersion,
     added_after,
+    derived_treatment,
     validate,
 )
 from expcore.records.seal import mark_unverified, seal
@@ -74,6 +75,7 @@ class RunRecord:
     instruments: dict[str, Any] = field(default_factory=dict)
     scores: dict[str, Any] = field(default_factory=dict)
     redacted_paths: list[str] = field(default_factory=list)
+    treatment_targets: dict[str, str] = field(default_factory=dict)
     schema_version: str = CURRENT
 
     @property
@@ -91,8 +93,17 @@ class RunRecord:
         return self.outcome["name"] in SET_ASIDE_OUTCOMES and not self.outcome["treatment"]
 
     def with_instrument(self, namespace: str, data: dict[str, Any]) -> "RunRecord":
-        """Return a copy that also holds an instrument's output under its namespace."""
-        return dataclasses.replace(self, instruments={**self.instruments, namespace: data})
+        """Return a copy that also holds an instrument's output under its namespace, its treatment flag derived again.
+
+        The fault injector is an instrument, and under version 3 its reading decides whether a declared target was held
+        down in this attempt, so the flag the loop's record carried before the snapshot arrived is taken anew from the
+        record's own parts (`derived_treatment`), the rule its validation holds it to.
+        """
+        record = dataclasses.replace(self, instruments={**self.instruments, namespace: data})
+        flag = derived_treatment(vars(record), record.schema_version)
+        if flag is record.outcome["treatment"]:
+            return record
+        return dataclasses.replace(record, outcome={**record.outcome, "treatment": flag})
 
     def to_json(self, schemas: tuple[SchemaVersion, ...] = SCHEMAS) -> dict[str, Any]:
         """Return the record as a dictionary in file order, without the fields a later schema added.

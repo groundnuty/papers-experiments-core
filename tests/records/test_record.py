@@ -21,7 +21,7 @@ TABLE = (V1, V2)
 
 def older_record() -> RunRecord:
     """A record of the older version of TABLE: the fields version 2 added are left out, as they were then."""
-    base = hand_made(schema_version="expcore-record/1")
+    base = hand_made(schema_version="expcore-record/1", outcome=hand_made().outcome)  # TABLE predates no target
     turn = {k: v for k, v in base.transcript[0].items() if k != "request_sha256"}
     config = {k: v for k, v in base.agent_config.items() if k != "cleanup_deadline_s"}  # a setting version 2 added
     return RunRecord(**{**base.__dict__, "transcript": [turn], "agent_config": config})

@@ -99,6 +99,10 @@ class AttemptRunner:
         """Return the infrastructure kinds the run's condition declares as its treatment."""
         return self.p.schema.treatment_kinds[self.p.schema.condition_named(factors, run_key)]
 
+    def treatment_targets(self, factors: Mapping[str, Any], run_key: str) -> dict[str, str]:
+        """Return the target the run's condition declares for any of its treatment kinds."""
+        return self.p.schema.treatment_targets[self.p.schema.condition_named(factors, run_key)]
+
     def work(self, row: Any) -> float:
         """Run one attempt of the row's run, end to end. Return the seconds before the run may start again."""
         p = self.p
@@ -195,7 +199,13 @@ class AttemptRunner:
         begun, run_dir = self._begin(row)
         outcome = Outcome("infrastructure", f"pre-run health check failed: {detail}", infra_kind=p.settings.health_kind)
         result = AttemptResult(
-            outcome, p.stamp(), 0.0, input_tokens=0, output_tokens=0, treatment_kinds=self.treatment_kinds(factors, key)
+            outcome,
+            p.stamp(),
+            0.0,
+            input_tokens=0,
+            output_tokens=0,
+            treatment_kinds=self.treatment_kinds(factors, key),
+            treatment_targets=self.treatment_targets(factors, key),
         )
         self._finish(begun, run_dir, key, result)
         return p.settings.retry_delay_s
@@ -205,6 +215,7 @@ class AttemptRunner:
         p = self.p
         key, model = row["run_key"], factors["model"]
         endpoint, kinds = p.endpoints[model], self.treatment_kinds(factors, key)
+        targets = self.treatment_targets(factors, key)
         backend = p.backend_factory(
             p.models.resolve(model),
             seed=factors["seed"],
@@ -214,7 +225,15 @@ class AttemptRunner:
         )
         begun, run_dir = self._begin(row, lease)
         request = RunRequest(
-            RunIdentity(key, factors, begun.number), run_dir, endpoint, backend, timer, p.monotonic, kinds, lease
+            RunIdentity(key, factors, begun.number),
+            run_dir,
+            endpoint,
+            backend,
+            timer,
+            p.monotonic,
+            kinds,
+            lease,
+            treatment_targets=targets,
         )
 
         async def go() -> Any:
@@ -229,11 +248,17 @@ class AttemptRunner:
             record = asyncio.run(go())
             result = result_from_record(record, ended_utc=p.stamp())
         except Exception as error:  # the executor's: infrastructure or a defect of ours, classified by what it is
-            result = failure_result(error, ended_utc=p.stamp(), wall_s=p.monotonic() - started, treatment_kinds=kinds)
+            result = failure_result(
+                error,
+                ended_utc=p.stamp(),
+                wall_s=p.monotonic() - started,
+                treatment_kinds=kinds,
+                treatment_targets=targets,
+            )
         result, moved = self._judge(result, record, model, key)
 
         def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
-            self._bookkeeping(model, endpoint, key, result, kinds, moved)
+            self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
 
         status = self._finish(begun, run_dir, key, result, bookkeeping)
         return p.settings.retry_delay_s if status == "pending" else 0.0
@@ -278,11 +303,18 @@ class AttemptRunner:
         return status
 
     def _bookkeeping(
-        self, model: str, endpoint: Endpoint, key: str, result: AttemptResult, kinds: tuple[str, ...], moved: bool
+        self,
+        model: str,
+        endpoint: Endpoint,
+        key: str,
+        result: AttemptResult,
+        kinds: tuple[str, ...],
+        targets: Mapping[str, str],
+        moved: bool,
     ) -> None:
         """Count the unit's failure or success (C15) and the harness error (C10), as the result's cause says."""
         p = self.p
-        classified = classify(result, kinds)
+        classified = classify(result, kinds, targets)
         if classified.treatment:
             return  # the outage is the manipulation: it neither pauses the unit nor clears its pause
         outcome = result.outcome

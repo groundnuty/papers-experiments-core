@@ -24,10 +24,10 @@ def record_as(version, script):
     return record_run(script, ECHO, record_options={"treatment_kinds": ["knowledge"], "schema_version": version})
 
 
-def test_c01_new_records_are_version_two():
-    """C01: the current version is 2, and records are built as the current version."""
-    assert CURRENT == V2
-    assert record_run(AFTER_A_TURN, ECHO).schema_version == V2
+def test_c01_new_records_are_version_three():
+    """C01: the current version is 3, and records are built as the current version."""
+    assert CURRENT == "expcore-record/3"
+    assert record_run(AFTER_A_TURN, ECHO).schema_version == CURRENT
 
 
 def test_c01_a_version_one_record_flags_treatment_by_the_declared_kind_alone():

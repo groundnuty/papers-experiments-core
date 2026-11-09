@@ -454,10 +454,10 @@ class Store:
         The state, the charge and the treatment mark follow from the cause and the run's condition (`classify`). A run is
         done on an agent outcome or a treatment fault, exhausted when its charged attempts reach `max_attempts`, set
         aside as a harness error when our own code crashed, and otherwise pending again. An attempt that is not running is refused: its result would be recorded twice. So is a
-        result whose `treatment_kinds` differ from the condition's declaration, or whose record's treatment flag differs
-        from the store's own decision from the outcome, the declared kinds and the completed turns, taken with the
-        first-turn rule of the record's schema version (both are TreatmentKindsMismatch), and the attempt then stays
-        running.
+        result whose `treatment_kinds` or `treatment_targets` differ from the condition's declaration, or whose record's
+        treatment flag differs from the store's own decision from the outcome, the declared kinds and targets, the
+        completed turns and the injected targets, taken with the rules of the record's schema version (both are
+        TreatmentKindsMismatch), and the attempt then stays running.
         """
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
@@ -475,17 +475,23 @@ class Store:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so its result is not recorded")
             condition = self.schema.condition_named(json.loads(row["factors"]), row["run_key"])
             declared = self.schema.treatment_kinds[condition]
+            targets = self.schema.treatment_targets[condition]
             if result.treatment_kinds != declared:
                 raise TreatmentKindsMismatch(
                     f"{row['run_key']}: the record carries treatment kinds {list(result.treatment_kinds)} but "
                     f"condition {condition!r} declares {list(declared)}; the attempt stays running"
                 )
-            state, charged, treatment = classify(result, declared)
+            if dict(result.treatment_targets) != targets:
+                raise TreatmentKindsMismatch(
+                    f"{row['run_key']}: the record carries treatment targets {dict(result.treatment_targets)} but "
+                    f"condition {condition!r} declares {targets}; the attempt stays running"
+                )
+            state, charged, treatment = classify(result, declared, targets)
             if result.recorded_treatment is not None and result.recorded_treatment != treatment:
                 raise TreatmentKindsMismatch(
                     f"{row['run_key']}: the record says treatment={result.recorded_treatment} but the store decides "
-                    f"{treatment} for the outcome, the declared kinds and the {result.model_turns} completed turn(s); "
-                    "the attempt stays running"
+                    f"{treatment} for the outcome, the declared kinds and targets, the injected targets and the "
+                    f"{result.model_turns} completed turn(s); the attempt stays running"
                 )
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"

@@ -13,9 +13,12 @@ treatment: a kind the registry marks as not treatable (the schema refuses to dec
 agent's first turn, which happened before the agent met the condition (`Outcome.is_treatment`: at least one completed
 model turn is needed). Both are set aside and run again as any other infrastructure failure. The first-turn rule is
 the record's schema version 2; a result from a version-1 record or from a schema-1 marker is decided without it.
+Version 3 adds the target rule: a condition that declares a kind with a target (`FactorSchema.treatment_targets`) is
+scored only for a failure that names that target while the run's fault injector held it down; another target's
+failure, a failure naming none and an injection that did not happen are set aside too.
 """
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -78,17 +81,28 @@ class Classified(NamedTuple):
     treatment: bool = False
 
 
-def classify(result: AttemptResult, treatment_kinds: Collection[str] = ()) -> Classified:
+def classify(
+    result: AttemptResult, treatment_kinds: Collection[str] = (), treatment_targets: Mapping[str, str] | None = None
+) -> Classified:
     """Return the state an attempt ends in, whether it is charged and whether it is treatment, by cause (C01, C03).
 
     An infrastructure outcome is never scored as the agent's: it is set aside and run again, unless its kind is one
-    the run's condition declares as its treatment and the model completed a turn, when it is a scored final attempt
-    (see the module docstring). A
-    crash in our own code is set aside and not charged. Any other outcome, a cap or an answer, is the agent's own and
-    ends the run. An outage the caller flags on an attempt that did not end as infrastructure sets its result aside.
+    the run's condition declares as its treatment, the model completed a turn and, where the condition declares a
+    target for the kind (`treatment_targets`), the failure names it and the attempt's fault injector held it down
+    (`AttemptResult.injected_targets`); then it is a scored final attempt (see the module docstring). A crash in our
+    own code is set aside and not charged. Any other outcome, a cap or an answer, is the agent's own and ends the run.
+    An outage the caller flags on an attempt that did not end as infrastructure sets its result aside.
     """
     outcome = result.outcome
-    if outcome.is_treatment(treatment_kinds, result.model_turns, first_turn_rule=result.first_turn_rule):
+    treated = outcome.is_treatment(
+        treatment_kinds,
+        result.model_turns,
+        first_turn_rule=result.first_turn_rule,
+        target_rule=result.target_rule,
+        treatment_targets=treatment_targets,
+        injected=result.injected_targets,
+    )
+    if treated:
         return Classified("done", False, True)
     if result.outage_kind is not None:
         return Classified("outage_discarded", False)

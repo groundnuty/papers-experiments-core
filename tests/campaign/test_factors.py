@@ -269,8 +269,11 @@ def test_c02_a_kind_a_platform_registered_is_accepted_and_refused_before_it_is(t
     ("declaration", "message"),
     [
         ('["endpoint", "endpoint"]', "key 'infrastructure_is_treatment' repeats 'endpoint'"),
-        ('"endpoint"', "key 'infrastructure_is_treatment' must be an array of non-empty strings"),
-        ("[1]", "key 'infrastructure_is_treatment' must be an array of non-empty strings"),
+        (
+            '"endpoint"',
+            "key 'infrastructure_is_treatment' must be an array of infrastructure kinds, each a name or a table",
+        ),
+        ("[1]", "key 'infrastructure_is_treatment' must be an array of infrastructure kinds, each a name or a table"),
     ],
 )
 def test_c02_a_malformed_treatment_declaration_is_refused(tmp_path, registry, declaration, message):

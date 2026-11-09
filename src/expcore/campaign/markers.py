@@ -13,19 +13,25 @@ Schema 2 added the model turns the attempt completed and the treatment rule of i
 are still read, since a campaign killed between its marker and the store must resume after an upgrade: they have no
 turn count, so they are read under the version-1 rule (treatment by the declared kind alone) and marked
 `legacy_marker`, which recovery records as an event.
+
+Schema 3 added the target of a fault: the outcome's target, the targets the record's condition declares, the targets
+its fault injector recorded as injected in the attempt, and the target rule of its record's version. A schema-2 marker
+holds a version-2 record, which declares no target, and is read under the rules of version 2.
 """
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from expcore.errors import infra_kinds
+from expcore.errors import check_target, infra_kinds
 from expcore.loop.outcomes import HarnessDefect, Outcome
 
 MARKER_NAME = "attempt-marker.json"
-MARKER_SCHEMA = 2  # 2: the result carries the model turns completed, the treatment flag of its record and the rule
+MARKER_SCHEMA = 3  # 3: the result carries the fault's target, the declared and injected targets and the target rule
+SCHEMA_2 = 2  # still readable: the model turns, the record's flag and the first-turn rule, and no target
 LEGACY_MARKER_SCHEMA = 1  # still readable: it has no model-turn count, so it is read under the version-1 rule
 _RESULT_FIELDS = (
     "ended_utc",
@@ -40,7 +46,12 @@ _RESULT_FIELDS = (
     "model_turns",
     "recorded_treatment",
     "first_turn_rule",
+    "target_rule",
+    "treatment_targets",
+    "injected_targets",
 )
+# What a schema-2 marker holds of a result; the target fields take their version-2 values.
+_SCHEMA_2_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("target_rule")]
 # What a schema-1 marker holds of a result; the rest take their defaults under the version-1 rule.
 _LEGACY_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("model_turns")]
 
@@ -70,6 +81,12 @@ class AttemptResult:
     - `first_turn_rule`: whether the record's schema version requires a completed turn for treatment (version 2 does,
       version 1 does not); the store decides with the rule of the record's version. A result with no record is new
       work and takes the rule.
+    - `target_rule`: whether the record's version holds a declared target to the fault's target and to the injector's
+      reading (version 3 does); a result with no record takes it.
+    - `treatment_targets`: the target the record's condition declares for any of its treatment kinds; the store
+      refuses the result when they differ from the condition's own declaration.
+    - `injected_targets`: the targets the attempt's fault injector recorded as injected in this attempt, from the
+      record's instrument reading (`expcore.records.injections`); none without a record.
     - `legacy_marker`: True for a result read from a schema-1 marker, which has no model-turn count. It is never
       written; recovery applies the version-1 rule to such a result (first_turn_rule False, the declared kind alone
       decides) and records a `legacy_marker` event.
@@ -89,19 +106,31 @@ class AttemptResult:
     recorded_treatment: bool | None = None
     first_turn_rule: bool = True
     legacy_marker: bool = False
+    target_rule: bool = True
+    treatment_targets: Mapping[str, str] = field(default_factory=dict)
+    injected_targets: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """Refuse a kind outside the closed vocabulary, so a typo never reaches the store; keep the kinds sorted."""
+        """Refuse a kind or target outside the vocabulary, so a typo never reaches the store; keep each list sorted."""
         if isinstance(self.model_turns, bool) or not isinstance(self.model_turns, int) or self.model_turns < 0:
             raise ValueError("model_turns must be a count of completed turns, zero or more")
         if self.recorded_treatment is not None and not isinstance(self.recorded_treatment, bool):
             raise ValueError("recorded_treatment must be True, False or None")
-        if not isinstance(self.first_turn_rule, bool) or not isinstance(self.legacy_marker, bool):
-            raise ValueError("first_turn_rule and legacy_marker must be True or False")
+        if not all(isinstance(flag, bool) for flag in (self.first_turn_rule, self.legacy_marker, self.target_rule)):
+            raise ValueError("first_turn_rule, target_rule and legacy_marker must be True or False")
         for kind in (*(() if self.outage_kind is None else (self.outage_kind,)), *self.treatment_kinds):
             if kind not in infra_kinds():
                 raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")
         object.__setattr__(self, "treatment_kinds", tuple(sorted(set(self.treatment_kinds))))
+        stray = [k for k in self.treatment_targets if k not in self.treatment_kinds]
+        if stray:
+            raise ValueError(f"a target is declared for {stray[0]!r}, which is not a declared treatment kind")
+        for target in (*self.treatment_targets.values(), *self.injected_targets):
+            if target is None:
+                raise ValueError("a declared or injected target is a position label, never None")
+            check_target(target)
+        object.__setattr__(self, "treatment_targets", dict(sorted(self.treatment_targets.items())))
+        object.__setattr__(self, "injected_targets", tuple(sorted(set(self.injected_targets))))
 
 
 def _outcome_json(outcome: Outcome) -> dict[str, Any]:
@@ -112,11 +141,12 @@ def _outcome_json(outcome: Outcome) -> dict[str, Any]:
         "infra_kind": outcome.infra_kind,
         "error_type": outcome.error_type,
         "defect": None if outcome.defect is None else asdict(outcome.defect),
+        "infra_target": outcome.infra_target,
     }
 
 
 def _outcome_from(data: dict[str, Any]) -> Outcome:
-    """Rebuild an outcome; its own checks refuse an unknown name or kind."""
+    """Rebuild an outcome; its own checks refuse an unknown name, kind or target (none before schema 3)."""
     defect = data.get("defect")
     return Outcome(
         name=data["name"],
@@ -124,6 +154,7 @@ def _outcome_from(data: dict[str, Any]) -> Outcome:
         infra_kind=data["infra_kind"],
         error_type=data["error_type"],
         defect=None if defect is None else HarnessDefect(**defect),
+        infra_target=data.get("infra_target"),
     )
 
 
@@ -136,8 +167,10 @@ def write_marker(run_dir: Path, run_key: str, attempt_id: int, result: AttemptRe
         "attempt_id": attempt_id,
         "result": {
             "outcome": _outcome_json(result.outcome),
-            **{f: getattr(result, f) for f in _RESULT_FIELDS if f != "treatment_kinds"},
+            **{f: getattr(result, f) for f in _RESULT_FIELDS},
             "treatment_kinds": list(result.treatment_kinds),
+            "treatment_targets": dict(result.treatment_targets),
+            "injected_targets": list(result.injected_targets),
         },
     }
     target = run_dir / MARKER_NAME
@@ -171,21 +204,27 @@ def read_marker(run_dir: Path, run_key: str, attempt_id: int) -> AttemptResult |
     try:
         body = json.loads(text)
         schema = body["schema"]
-        if isinstance(schema, bool) or schema not in (LEGACY_MARKER_SCHEMA, MARKER_SCHEMA):
+        if isinstance(schema, bool) or schema not in (LEGACY_MARKER_SCHEMA, SCHEMA_2, MARKER_SCHEMA):
             raise MarkerError(f"{path}: unknown marker schema {schema!r}")
         if body["run_key"] != run_key or body["attempt_id"] != attempt_id:
             return None
         data = body["result"]
-        fields = _LEGACY_FIELDS if schema == LEGACY_MARKER_SCHEMA else _RESULT_FIELDS
+        fields = {LEGACY_MARKER_SCHEMA: _LEGACY_FIELDS, SCHEMA_2: _SCHEMA_2_FIELDS}.get(schema, _RESULT_FIELDS)
         extra = set(data) - {"outcome", *fields}
         if extra:
             raise MarkerError(f"{path}: unknown result fields: {', '.join(sorted(extra))}")
+        if schema < MARKER_SCHEMA and data["outcome"].get("infra_target") is not None:
+            raise MarkerError(f"{path}: a schema-{schema} marker names a target, which its schema predates")
         # A schema-2 marker written before `first_turn_rule` was added holds a version-2 record: read it as such.
-        kept = {f: data[f] for f in fields if f != "first_turn_rule" or f in data}
-        if schema == MARKER_SCHEMA:
+        optional = ("first_turn_rule",) if schema == SCHEMA_2 else ()
+        kept = {f: data[f] for f in fields if f not in optional or f in data}
+        if schema == SCHEMA_2:  # a version-2 record: the first-turn rule, and no target
             kept.setdefault("first_turn_rule", True)
+            kept["target_rule"] = False
         if schema == LEGACY_MARKER_SCHEMA:  # no turn count to hold it to: the rule of the time, and a mark for recovery
-            kept.update(first_turn_rule=False, legacy_marker=True)
+            kept.update(first_turn_rule=False, target_rule=False, legacy_marker=True)
+        if "injected_targets" in kept:
+            kept["injected_targets"] = tuple(kept["injected_targets"])
         return AttemptResult(outcome=_outcome_from(data["outcome"]), **kept)
     except (ValueError, KeyError, TypeError) as error:
         raise MarkerError(f"{path}: not a valid marker ({type(error).__name__}: {error})") from None

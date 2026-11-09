@@ -20,6 +20,10 @@ failure of the harness's own integrity checks must never be scored that way, bec
 nothing about the manipulation: `tool_plane_integrity` is not treatable, and a platform registers further kinds
 that are not with `register_infra_kind(kind, description, treatable=False)`. The factor schema refuses to load a
 condition that declares one, and the scheduler refuses a campaign whose health or identity kind a condition declares.
+
+A failure may name its target, what failed, by a position label from the platform's configuration (`providers[1]`,
+`TARGET_LABEL`). A condition whose manipulation takes one target down declares the kind with that target, and only a
+failure of that target, while the run's fault injector held it down, is its treatment (`Outcome.is_treatment`).
 """
 
 from __future__ import annotations
@@ -47,6 +51,9 @@ CORE_UNTREATABLE: dict[str, str] = {
 }
 
 _KIND_RE = re.compile(r"[a-z][a-z0-9_]*")
+# What an infrastructure failure may name as its target: a table and a position in it, as the platform's
+# configuration orders its entries (`providers[1]`). A configured name never fits, so none can reach a record.
+TARGET_LABEL = re.compile(r"[a-z][a-z0-9_]*\[(0|[1-9][0-9]*)\]")
 _platform_kinds: dict[str, str] = {}
 _platform_untreatable: dict[str, str] = {}
 
@@ -113,15 +120,31 @@ class ContextOverflow(Exception):
         self.pattern = pattern
 
 
-class InfraError(RuntimeError):
-    """An infrastructure failure of one of the registered kinds, with a short detail that never holds a secret."""
+def check_target(target: object) -> str | None:
+    """Return a target label when it is None or one of the form `<table>[<position>]`; raise ValueError otherwise."""
+    if target is not None and (not isinstance(target, str) or not TARGET_LABEL.fullmatch(target)):
+        raise ValueError(
+            f"a target is a position label such as 'providers[1]', never a configured name, not {target!r}"
+        )
+    return target
 
-    def __init__(self, kind: str, detail: str):
+
+class InfraError(RuntimeError):
+    """An infrastructure failure of one of the registered kinds, with a short detail that never holds a secret.
+
+    `target` names what failed when the platform can attribute the failure, as an opaque position label from its
+    configuration (`providers[1]`), never as the name it is configured under. A condition that declares a kind with a
+    target is scored only for a failure of that target while the run's fault injector held it down (`Outcome`).
+    """
+
+    def __init__(self, kind: str, detail: str, *, target: str | None = None):
         if kind not in infra_kinds():
             raise ValueError(
                 f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())} "
                 "(a platform adds its own with register_infra_kind)"
             )
-        super().__init__(f"{kind}: {detail}")
+        check_target(target)
+        super().__init__(f"{kind}: {detail}" if target is None else f"{kind} ({target}): {detail}")
         self.kind = kind
         self.detail = detail
+        self.target = target

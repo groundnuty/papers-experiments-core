@@ -106,7 +106,7 @@ Core guarantees:
 - `timeout_s` is the agent's time left; the loop cuts a call that outlasts it and ends the run as a time cap (L05). The tool box caps what the model sees (L06) and records the full result beside the capped text.
 - `ctx.infrastructure_wait(kind)` pauses the agent's clock while it is open and measures the wait live, per kind. A kind outside `WAIT_KINDS` raises at once.
 - A malformed call is not executed: the model gets the error and the raw arguments are recorded (L01).
-- An `InfraError` raised by the provider ends the attempt as infrastructure of that kind (C02); any other exception is a harness defect: the attempt is set aside (L08).
+- An `InfraError` raised by the provider ends the attempt as infrastructure of that kind (C02), naming the target it carries (`InfraError(kind, detail, target="providers[1]")`, a position label, never a configured name); any other exception is a harness defect: the attempt is set aside (L08).
 
 Implementer must guarantee:
 - `tools()` does not change during a run.
@@ -127,7 +127,7 @@ class Scorer(Protocol):
 
 Core guarantees:
 - A scorer receives a deep copy of the record. The result is kept in `record.scores[name] = {"version", "result"}`, apart from instrument output, and a scorer without `version` is versioned by the hash of its source file.
-- An attempt that is set aside (infrastructure not declared as treatment, or a harness defect) is never scored. An attempt that ends in a declared treatment kind, after the model completed at least one turn, is, so the scorer must handle a partial record; the same kind before the first turn is set aside.
+- An attempt that is set aside (infrastructure not declared as treatment, or a harness defect) is never scored. An attempt that ends in a declared treatment kind, after the model completed at least one turn, is, so the scorer must handle a partial record; the same kind before the first turn is set aside. Where the condition declares the kind with a target (record version 3), only a failure of that target while the fault injector held it down is scored; any other is set aside.
 - The analysis reads `result["outcomes"]` and nothing else (`expcore.study.pipeline`). The pipeline scores in memory and never writes into a checked batch. `analyze` derives every score anew from the verified records and reads no stored score, so it is the re-scoring command (R13): after a scorer changes, `check` again (the scorer is code, so the code identity changed), then `analyze` and `report`. `scores.json` and the report name each scorer's version.
 
 Implementer must guarantee:
@@ -165,6 +165,8 @@ Implementer must guarantee:
 
 The platform's own instrument is `expcore_onedata.probes.PlatformProbes` (namespace `platform_probes`): the block map of each tracked file on each tracked provider before and after the run, the records of the transfers the provisioner scheduled, the record of every transfer of the space that started in the run's window whoever started it (`space_transfers`), the bytes moved between provider pairs, attributed to a source only where exactly one other provider held those bytes at the start, and per receiving provider the transfer bytes into it and a lower bound on the bytes fetched on demand (`on_demand`). A provider's `gained_bytes` is placement gained: the bytes of the blocks a provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire. See its module docstring and `expcore_onedata.transferlog` for the snapshot's fields.
 
+One namespace is read by the core: a fault injector writes under `fault_injector` (`expcore.records.injections.FAULT_NAMESPACE`) a snapshot holding the run key, the attempt and a list of `injections`, each with its `target` and `injected` (true only once the injector verified the target was down). Under a condition that declares a kind with a target, the treatment flag needs that target in this list for this run and attempt; a missing, failed or stale snapshot gives none, so the attempt is set aside.
+
 ## RunExecutor
 
 `expcore.campaign.executor.RunExecutor`.
@@ -183,6 +185,7 @@ class RunRequest:
     clock: Callable[[], float]
     treatment_kinds: tuple[str, ...]
     lease: Lease | None = None
+    treatment_targets: Mapping[str, str] = {}  # kind -> the target the condition declares for it
 ```
 
 `record_run(request, providers, system, user, config, *, code, **options)` runs the loop with the request's backend, timer and treatment kinds and returns the record.
@@ -190,12 +193,13 @@ class RunRequest:
 Core guarantees:
 - The gates (health, harness stop, budget, unit pause) were passed, the lease the platform declared for the run is held for the whole attempt, and the timer is not started: the loop starts it. The attempt has a row (`running`) before the executor is called, so a kill leaves a run that the next start settles (C04).
 - `InfraError` raised by the executor is recorded as infrastructure of its kind; any other exception as a harness defect (C10). The result is written as a marker, then to the store in one transaction.
-- The record's treatment kinds must equal the condition's, and its treatment flag the store's own decision from the outcome, the kinds and the completed turns (`AttemptResult.model_turns`, `recorded_treatment` and `first_turn_rule`, all set by `result_from_record` from the record and its schema version), or the store refuses the result (C01). Record schema 2 added the first-turn rule and no field; schema-1 records and schema-1 outcome markers stay readable and are decided without it.
+- The record's treatment kinds and targets must equal the condition's, and its treatment flag the store's own decision from the outcome, the kinds and targets, the completed turns and the targets the fault injector recorded as injected (`AttemptResult.model_turns`, `recorded_treatment`, `first_turn_rule`, `target_rule` and `injected_targets`, all set by `result_from_record` from the record and its schema version), or the store refuses the result (C01). Record schema 2 added the first-turn rule and no field; schema 3 added the target of a fault and the target rule. Older records and outcome markers stay readable and are decided under their own rules.
 
 Implementer must guarantee:
 - Return the record `record_run` produced, and **write it to `request.run_dir`** (`record.write(request.run_dir)`) before returning: the core reads, checks and exports records from disk and does not write them for you.
 - Script or configure the backend through the request; never build one.
-- Pass `request.treatment_kinds` unchanged (`record_run` does) and the code identity from `StudyContext.code`.
+- Pass `request.treatment_kinds` and `request.treatment_targets` unchanged (`record_run` does) and the code identity from `StudyContext.code`.
+- Add the instruments' snapshots with `finish_instruments` before writing the record: it derives the treatment flag again, because under a declared target the fault injector's reading decides it.
 - Close nothing the core owns (backend, timer, lease).
 
 ## HealthCheck

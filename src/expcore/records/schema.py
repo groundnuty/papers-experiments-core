@@ -15,7 +15,13 @@ were read from (R01), and are replayed with the defaults of their time.
 A version may also change a rule that the format does not show. Version 2 is that: no field was added, but an
 infrastructure outcome is flagged as treatment only after the model completed a turn (`first_turn_rule`). A record
 is validated, and replayed, under the rule of its own version, so a version-1 record that flags treatment with no
-completed turn stays valid, and every new record is written as version 2.
+completed turn stays valid.
+
+Version 3 adds the target of a fault: the outcome names the target an infrastructure failure was attributed to
+(`infra_target`, a position label such as `providers[1]`), the record carries the targets its condition declares per
+kind (`treatment_targets`), and the treatment rule gains its target clause (`target_rule`): where the declaration names
+a target, the failure must name it and the run's fault injector must have held it down in this attempt
+(`expcore.records.injections`). Every new record is written as version 3.
 
 Every section is a table of field name to the types the field may hold, in the order the file writes them. Numbers are
 finite: a count the run did not obtain is `None`, never 0 and never NaN (R10).
@@ -29,11 +35,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore.config.models import Limits
-from expcore.errors import infra_kinds
+from expcore.errors import TARGET_LABEL, infra_kinds
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
 from expcore.plugin import WAIT_KINDS
+from expcore.records.injections import injected_targets
 
 SCHEMA_PREFIX = "expcore-record/"
 NONE = type(None)
@@ -63,6 +70,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "instruments": (dict,),
         "scores": (dict,),
         "redacted_paths": (list,),
+        "treatment_targets": (dict,),
     },
     "prompt": {"system": (dict,), "user": (dict,), "tools_sha256": (str,)},
     "prompt_part": {"text": (str,), "sha256": (str,), "template_sha256": (str, NONE), "slots": (dict, NONE)},
@@ -138,6 +146,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "error_type": (str, NONE),
         "defect": (dict, NONE),
         "treatment": (bool,),
+        "infra_target": (str, NONE),
     },
     "totals": {
         "rounds": (int,),
@@ -172,13 +181,15 @@ class SchemaVersion:
     `added` maps a section name to the fields this version introduced into it. `config_before` maps a setting this
     version added to the agent configuration to the value that was in force before it existed. `first_turn_rule` says
     whether a record of this version flags an infrastructure outcome as treatment only after a completed model turn;
-    the first version predates the rule.
+    the first version predates the rule. `target_rule` says whether a declared target must be the failure's and must
+    have been injected in the attempt; versions before 3 predate it and declare no target.
     """
 
     name: str
     added: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     config_before: Mapping[str, Any] = field(default_factory=dict)
     first_turn_rule: bool = False
+    target_rule: bool = False
 
     def __post_init__(self) -> None:
         """Refuse a name outside the schema family and a table that lists a section or field the format lacks."""
@@ -195,10 +206,17 @@ class SchemaVersion:
 # its shape is the one that ships, and a change to it breaks every record written since. After that push, a
 # change to the format is a new version in this table that lists what it added, never an edit of version 1.
 # `tests/data/golden-record-v1.json` is a record of version 1 that must keep loading and writing back byte for byte;
-# `golden-record-v2.json` is the same for version 2, which adds no field but the first-turn rule for treatment.
+# `golden-record-v2.json` is the same for version 2, which adds no field but the first-turn rule for treatment, and
+# `golden-record-v3.json` for version 3, which adds the target of a fault and the target rule.
 SCHEMAS: tuple[SchemaVersion, ...] = (
     SchemaVersion(f"{SCHEMA_PREFIX}1"),
     SchemaVersion(f"{SCHEMA_PREFIX}2", first_turn_rule=True),
+    SchemaVersion(
+        f"{SCHEMA_PREFIX}3",
+        added={"record": ("treatment_targets",), "outcome": ("infra_target",)},
+        first_turn_rule=True,
+        target_rule=True,
+    ),
 )
 CURRENT = SCHEMAS[-1].name
 
@@ -219,6 +237,11 @@ def position(version: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> int:
 def first_turn_rule(version: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> bool:
     """Tell whether a record of `version` flags treatment only after a completed model turn."""
     return schemas[position(version, schemas)].first_turn_rule
+
+
+def target_rule(version: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> bool:
+    """Tell whether a record of `version` holds a declared target to the failure's target and the injector's reading."""
+    return schemas[position(version, schemas)].target_rule
 
 
 def added_after(version: str, section: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> frozenset[str]:
@@ -311,31 +334,56 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
         _check_keys(f"{where}.retries[{i}]", retry, RETRY_FIELDS, required=())
 
 
-def _check_outcome(
-    outcome: dict, treatment_kinds: Any, completed_turns: int, first_turn_rule: bool, where: str
-) -> None:
-    """Build the outcome through the loop's own vocabulary check, so a name or kind outside it is refused here too.
-
-    The `treatment` flag must be what the outcome, the record's `treatment_kinds` and its transcript make it: true
-    exactly when the outcome is infrastructure of a kind in the list that can be a treatment and, under the first-turn
-    rule of the record's version, the transcript holds at least one completed turn. A record whose flag says
-    otherwise contradicts itself (R02).
-    """
+def outcome_from_entry(outcome: Mapping[str, Any]) -> Outcome:
+    """Rebuild an outcome from a record's outcome section; the loop's own checks refuse a name, kind or target outside
+    the vocabulary (ValueError, KeyError or TypeError). The target is absent before version 3."""
     defect = outcome["defect"]
-    if defect is not None:
-        _check_keys(f"{where}.defect", defect, ("exception", "stack_sha256"))
+    held = None if defect is None else HarnessDefect(defect["exception"], defect["stack_sha256"])
+    return Outcome(
+        outcome["name"],
+        outcome["detail"],
+        outcome["infra_kind"],
+        outcome["error_type"],
+        held,
+        outcome.get("infra_target"),
+    )
+
+
+def derived_treatment(body: Mapping[str, Any], version: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> bool:
+    """Return the treatment flag a record's own parts make under the rules of its version (`Outcome.is_treatment`).
+
+    The parts are the outcome, the declared `treatment_kinds` and `treatment_targets`, the completed turns of the
+    transcript, and the targets the fault injector's reading records as injected in this attempt
+    (`expcore.records.injections`). The record's validation, the record built after its instruments finished and the
+    store's result all take the flag from here, so they cannot disagree.
+    """
+    return outcome_from_entry(body["outcome"]).is_treatment(
+        body["treatment_kinds"],
+        len(body["transcript"]),
+        first_turn_rule=first_turn_rule(version, schemas),
+        target_rule=target_rule(version, schemas),
+        treatment_targets=body.get("treatment_targets") or {},
+        injected=injected_targets(body.get("instruments") or {}, body["run_key"], body["attempt"]),
+    )
+
+
+def _check_outcome(body: dict, version: str, schemas: Sequence[SchemaVersion], where: str) -> None:
+    """Build the outcome through the loop's own vocabulary check, so a name, kind or target outside it is refused here.
+
+    The `treatment` flag must be what the record's own parts make it under the rules of its version
+    (`derived_treatment`). A record whose flag says otherwise contradicts itself (R02).
+    """
+    outcome = body["outcome"]
+    if outcome["defect"] is not None:
+        _check_keys(f"{where}.defect", outcome["defect"], ("exception", "stack_sha256"))
     try:
-        held = None
-        if defect is not None:
-            held = HarnessDefect(defect["exception"], defect["stack_sha256"])
-        built = Outcome(outcome["name"], outcome["detail"], outcome["infra_kind"], outcome["error_type"], held)
+        expected = derived_treatment(body, version, schemas)
     except (KeyError, TypeError, ValueError) as exc:
         raise RecordError(f"{where}: {type(exc).__name__}: {exc}") from None
-    expected = built.is_treatment(treatment_kinds, completed_turns, first_turn_rule=first_turn_rule)
     if outcome["treatment"] is not expected:
         raise RecordError(
-            f"{where}.treatment: is {outcome['treatment']} but the outcome, treatment_kinds and the {completed_turns} "
-            f"completed turn(s) make it {expected}"
+            f"{where}.treatment: is {outcome['treatment']} but the outcome, treatment_kinds, treatment_targets, the "
+            f"fault injector's reading and the {len(body['transcript'])} completed turn(s) make it {expected}"
         )
 
 
@@ -350,6 +398,20 @@ def _check_treatment_kinds(kinds: Any) -> None:
         )
     if kinds != sorted(set(kinds)):
         raise RecordError("treatment_kinds: the kinds are written sorted, each once")
+
+
+def _check_treatment_targets(targets: Any, kinds: list[str]) -> None:
+    """Check the declared targets: each names a declared treatment kind and a position label, written sorted by kind."""
+    if not isinstance(targets, dict):
+        raise RecordError("treatment_targets: an object of declared treatment kind to target")
+    stray = [k for k in targets if k not in kinds]
+    if stray:
+        raise RecordError(f"treatment_targets: {stray[0]!r} is not one of the record's treatment_kinds")
+    bad = [k for k, t in targets.items() if not isinstance(t, str) or not TARGET_LABEL.fullmatch(t)]
+    if bad:
+        raise RecordError(f"treatment_targets.{bad[0]}: a target is a position label such as 'providers[1]'")
+    if list(targets) != sorted(targets):
+        raise RecordError("treatment_targets: the kinds are written sorted")
 
 
 def _check_configuration(config: Any, version: str, schemas: Sequence[SchemaVersion]) -> None:
@@ -411,10 +473,14 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
         if not ok:
             raise RecordError(f"clock[{i}]: expected [label, seconds]")
     _check_treatment_kinds(body["treatment_kinds"])
+    _check_treatment_targets(body.get("treatment_targets", {}), body["treatment_kinds"])  # absent before version 3
     check_section("outcome", body["outcome"], version, "outcome", schemas)
-    _check_outcome(
-        body["outcome"], body["treatment_kinds"], len(body["transcript"]), first_turn_rule(version, schemas), "outcome"
-    )
+    for place in ("instruments", "scores"):
+        held = body.get(place, {})  # absent from a record of a version that predates it
+        bad = [k for k in held if not _NAMESPACE.fullmatch(k) or not isinstance(held[k], dict)]
+        if bad:
+            raise RecordError(f"{place}: each entry is an object under a lower-case namespace, not {bad}")
+    _check_outcome(body, version, schemas, "outcome")
     check_section("totals", body["totals"], version, "totals", schemas)
     _check_waited(body["totals"]["infra_wait_by_kind"], "totals.infra_wait_by_kind")
     for i, event in enumerate(body["totals"]["malformed_events"]):
@@ -424,9 +490,4 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
     _check_route(body["route"])
     if any(not isinstance(p, str) for p in body.get("redacted_paths", ())):
         raise RecordError("redacted_paths: a list of field paths")
-    for place in ("instruments", "scores"):
-        held = body.get(place, {})  # absent from a record of a version that predates it
-        bad = [k for k in held if not _NAMESPACE.fullmatch(k) or not isinstance(held[k], dict)]
-        if bad:
-            raise RecordError(f"{place}: each entry is an object under a lower-case namespace, not {bad}")
     return version

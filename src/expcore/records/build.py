@@ -21,7 +21,7 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore.config.models import ModelTable
-from expcore.errors import infra_kinds
+from expcore.errors import TARGET_LABEL, infra_kinds
 from expcore.loop.agent_loop import run_agent
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
@@ -33,10 +33,19 @@ from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
 from expcore.prompt.templates import RenderedPrompt, sha256_of
 from expcore.records.digest import digest, plain
+from expcore.records.injections import injected_targets
 from expcore.records.record import RunRecord
 from expcore.records.recording import Captured, RecordingBackend
 from expcore.records.redact import Redactor
-from expcore.records.schema import CURRENT, RecordError, first_turn_rule
+from expcore.records.schema import (
+    CURRENT,
+    SCHEMAS,
+    RecordError,
+    SchemaVersion,
+    fields_of,
+    first_turn_rule,
+    target_rule,
+)
 from expcore.records.seal import mark_unverified, seal
 
 CORE_DISTRIBUTION = "papers-experiments-core"
@@ -103,25 +112,47 @@ def stable_call_detail(status: str, detail: str) -> str:
 
 
 def outcome_entry(
-    outcome: Outcome, treatment_kinds: Collection[str] = (), *, completed_turns: int, first_turn_rule: bool = True
+    outcome: Outcome,
+    treatment_kinds: Collection[str] = (),
+    *,
+    completed_turns: int,
+    first_turn_rule: bool = True,
+    target_rule: bool = True,
+    treatment_targets: Mapping[str, str] | None = None,
+    injected: Collection[str] = (),
+    with_target: bool = True,
 ) -> dict[str, Any]:
     """Return the outcome as the record keeps it.
 
-    `treatment` is true exactly when the outcome is infrastructure of a kind the attempt's condition declares as its
-    treatment, the kind can be one, and the model completed at least one turn (`completed_turns`, the record's
-    transcript): then it is a scored final attempt and the record is not set aside. A failure before the first turn
-    is never treatment, except under `first_turn_rule=False`, the rule of schema version 1, which a replay of a
-    version-1 record keeps.
+    `treatment` is `Outcome.is_treatment`: true exactly when the outcome is infrastructure of a kind the attempt's
+    condition declares as its treatment, the kind can be one, the model completed at least one turn
+    (`completed_turns`, the record's transcript) and, where the declaration names a target, the failure names it and
+    the fault injector recorded it as injected (`injected`). Then it is a scored final attempt and the record is not
+    set aside. A failure before the first turn is never treatment, except under `first_turn_rule=False`, the rule of
+    schema version 1, which a replay of a version-1 record keeps. `with_target` is False for a version before 3, whose
+    outcome has no target field.
     """
     defect = outcome.defect
-    return {
+    entry = {
         "name": outcome.name,
         "detail": stable_detail(outcome),
         "infra_kind": outcome.infra_kind,
         "error_type": outcome.error_type,
         "defect": None if defect is None else {"exception": defect.exception, "stack_sha256": defect.stack_sha256},
-        "treatment": outcome.is_treatment(treatment_kinds, completed_turns, first_turn_rule=first_turn_rule),
+        "treatment": outcome.is_treatment(
+            treatment_kinds,
+            completed_turns,
+            first_turn_rule=first_turn_rule,
+            target_rule=target_rule,
+            treatment_targets=treatment_targets,
+            injected=injected,
+        ),
     }
+    if with_target:
+        entry["infra_target"] = outcome.infra_target
+    elif outcome.infra_target is not None:
+        raise RecordError("the outcome names a target, which a record of a version before 3 cannot hold")
+    return entry
 
 
 def treatment_list(treatment_kinds: Iterable[str]) -> list[str]:
@@ -133,6 +164,18 @@ def treatment_list(treatment_kinds: Iterable[str]) -> list[str]:
             f"unknown infrastructure kind {unknown[0]!r} in treatment_kinds; known: {', '.join(infra_kinds())}"
         )
     return kinds
+
+
+def target_table(treatment_targets: Mapping[str, str] | None, kinds: Collection[str]) -> dict[str, str]:
+    """Return the declared targets sorted by kind; refuse a kind that is not declared and a target that is no label."""
+    targets = dict(sorted((treatment_targets or {}).items()))
+    stray = [k for k in targets if k not in kinds]
+    if stray:
+        raise RecordError(f"treatment_targets: {stray[0]!r} is not one of the declared treatment kinds")
+    bad = [k for k, t in targets.items() if not isinstance(t, str) or not TARGET_LABEL.fullmatch(t)]
+    if bad:
+        raise RecordError(f"treatment_targets.{bad[0]}: a target is a position label such as 'providers[1]'")
+    return targets
 
 
 def tool_entry(spec: ToolSpec) -> dict[str, Any]:
@@ -264,7 +307,9 @@ def _build_record(
     core_version: str | None = None,
     instruments: Mapping[str, Any] | None = None,
     treatment_kinds: Iterable[str] = (),
+    treatment_targets: Mapping[str, str] | None = None,
     schema_version: str = CURRENT,
+    schemas: Sequence[SchemaVersion] = SCHEMAS,
     redactor: Redactor | None = None,
     secrets: Iterable[str] = (),
     secret_env: Iterable[str] = (),
@@ -280,11 +325,14 @@ def _build_record(
     `treatment_kinds` are the infrastructure kinds the attempt's condition declares as its treatment; the campaign
     passes `FactorSchema.treatment_kinds_of(key)`. They are kept in the record's identity, and the outcome's `treatment`
     flag is derived from them: an infrastructure failure of a listed kind, after the model completed a turn, is a scored
-    final attempt, not set aside.
+    final attempt, not set aside. `treatment_targets` map a declared kind to the target the condition manipulates
+    (`FactorSchema.treatment_targets`): a failure of that kind is treatment only if it names that target and the fault
+    injector's reading among `instruments` records the target as injected in this attempt.
 
-    The record is written as `schema_version`, and its outcome's treatment flag follows the rule of that version.
-    Private: only a replay of an older record (its own version) and tests building older records choose a version;
-    a live run goes through `build_record`, which always writes the current one.
+    The record is written as `schema_version`, and its outcome's treatment flag follows the rules of that version in
+    `schemas`. Private: only a replay of an older record (its own version) and tests building older records choose a
+    version; a live run goes through `build_record`, which always writes the current one. The loop's record usually
+    has no instruments yet; `RunRecord.with_instrument` derives the flag again when they are added.
 
     Secrets are redacted here, before any digest is taken: the digests the record pins (prompt texts, the
     conversation each request carried, the settings each sent, the configuration) are those of the redacted
@@ -295,6 +343,9 @@ def _build_record(
     """
     secrets, secret_env = tuple(secrets), tuple(secret_env)
     kinds = treatment_list(treatment_kinds)
+    targets = target_table(treatment_targets, kinds)
+    if targets and not target_rule(schema_version, schemas):
+        raise RecordError(f"treatment_targets: {schema_version} predates declared targets")
     sys_prompt, user_prompt = PromptText.of(system), PromptText.of(user)
     captured = recording.captured
     if len(captured) != len(result.turns):
@@ -334,7 +385,14 @@ def _build_record(
         "tool_calls": [call_entry(c) for c in result.tool_calls],
         "clock": [[label, value] for label, value in result.clock_readings],
         "outcome": outcome_entry(
-            result.outcome, kinds, completed_turns=len(turns), first_turn_rule=first_turn_rule(schema_version)
+            result.outcome,
+            kinds,
+            completed_turns=len(turns),
+            first_turn_rule=first_turn_rule(schema_version, schemas),
+            target_rule=target_rule(schema_version, schemas),
+            treatment_targets=targets,
+            injected=injected_targets(instruments or {}, identity.run_key, identity.attempt),
+            with_target="infra_target" in fields_of("outcome", schema_version, schemas),
         ),
         "totals": {
             "rounds": result.rounds,
@@ -353,6 +411,7 @@ def _build_record(
         },
         "instruments": plain(dict(instruments or {})),
         "scores": {},
+        "treatment_targets": targets,
     }
     if redactor is None:
         redactor = redactor_for(recording.inner, environ=environ, secrets=secrets, secret_env=secret_env, models=models)
@@ -372,8 +431,8 @@ def build_record(result: LoopResult, recording: RecordingBackend, **options: Any
 
     A live run cannot choose an older record version: that would apply an older treatment rule to a new run. The
     keyword options are those of `_build_record` (`identity`, `system`, `user`, `specs`, `code`, `core_version`,
-    `instruments`, `treatment_kinds`, `redactor`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is
-    refused.
+    `instruments`, `treatment_kinds`, `treatment_targets`, `redactor`, `secrets`, `secret_env`, `models`, `environ`);
+    `schema_version` is refused.
     """
     if "schema_version" in options:
         raise TypeError("build_record writes the current record version; a live run cannot choose another")
@@ -391,6 +450,7 @@ async def _record_attempt(
     code: Mapping[str, Any],
     core_version: str | None = None,
     treatment_kinds: Iterable[str] = (),
+    treatment_targets: Mapping[str, str] | None = None,
     schema_version: str = CURRENT,
     timer: AgentTimer | None = None,
     clock: Callable[[], float] = time.monotonic,
@@ -408,8 +468,8 @@ async def _record_attempt(
     The tool box takes its cap from the configuration, so the record's configuration describes what the model saw.
     `code` is the code identity, for example `expcore.provenance.codestamp.version(root, scope)`, and `core_version`
     defaults to the installed version of the core. `treatment_kinds` are the infrastructure kinds the condition declares
-    as its treatment (see `build_record`). The caller builds the backend (passing it `timer.time_left` when
-    it uses the loop's time) and closes it.
+    as its treatment, and `treatment_targets` the target it declares for any of them (see `build_record`). The caller
+    builds the backend (passing it `timer.time_left` when it uses the loop's time) and closes it.
 
     Secrets are redacted from the record (R12): those of environment variables named like one, the variables
     named in `secret_env`, the key variables of the backend's model and of the `models` table, the ones registered
@@ -436,6 +496,7 @@ async def _record_attempt(
         code=code,
         core_version=core_version if core_version is not None else sdk_version(CORE_DISTRIBUTION),
         treatment_kinds=treatment_kinds,
+        treatment_targets=treatment_targets,
         schema_version=schema_version,
         secrets=secrets,
         secret_env=secret_env,
@@ -457,7 +518,8 @@ async def record_attempt(
 
     A live run cannot choose an older record version: that would apply an older treatment rule to a new run.
     The keyword options are those of the private `_record_attempt` (`code`, `core_version`, `treatment_kinds`,
-    `timer`, `clock`, `sleep`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is refused.
+    `treatment_targets`, `timer`, `clock`, `sleep`, `secrets`, `secret_env`, `models`, `environ`); `schema_version`
+    is refused.
     """
     if "schema_version" in options:
         raise TypeError("record_attempt writes the current record version; a live run cannot choose another")
