@@ -2,7 +2,7 @@
 
 Every release of `papers-experiments-core`. Versions follow semantic versioning with tags `vMAJOR.MINOR.PATCH`; while the version is 0.x, a minor release may break interfaces, and its entry says which.
 
-## 0.1.0
+## 0.1.0 (unreleased)
 
 The first release: what a study needs to run end to end on the core (agent loop, model backends, tools, prompts, records and replay, the campaign kernel, the statistics kernel, provenance and replication packages), with the Onedata platform layer: configuration, token planes, tool-server launch, health, the sandbox and its data paths, the data gate, provisioning and placement, platform probes, leased platform users and day-0 checks. A study depends on it by tag and copies nothing; [`docs/study-guide.md`](docs/study-guide.md) shows how. What the release guarantees is the list of regressions at the end of this entry: each has a test on this tree, named beside it, whose docstring starts with the ID. An ID of [`docs/regressions.md`](docs/regressions.md) that is not in the list is not guaranteed yet.
 

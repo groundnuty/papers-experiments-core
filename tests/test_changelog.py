@@ -33,7 +33,9 @@ def backed_ids() -> dict[str, set[str]]:
 def release(version: str) -> str:
     """The changelog entry of one version: from its heading to the next one."""
     text = CHANGELOG.read_text(encoding="utf-8")
-    start = text.index(f"\n## {version}\n")
+    heading = re.search(rf"\n## {re.escape(version)}(?: \(unreleased\))?\n", text)
+    assert heading, f"no changelog entry for {version}"
+    start = heading.start()
     following = text.find("\n## ", start + 1)
     return text[start : following if following != -1 else len(text)]
 
@@ -54,7 +56,9 @@ def current_version() -> str:
 
 
 def test_the_changelog_has_an_entry_for_the_version_the_distribution_carries():
-    assert f"\n## {current_version()}\n" in CHANGELOG.read_text(encoding="utf-8")
+    """The entry is headed by the version, marked "(unreleased)" until the release is tagged."""
+    text = CHANGELOG.read_text(encoding="utf-8")
+    assert re.search(rf"\n## {re.escape(current_version())}(?: \(unreleased\))?\n", text)
 
 
 def test_every_id_the_changelog_lists_has_a_test_whose_docstring_starts_with_it_in_each_file_named():
