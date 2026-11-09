@@ -5,6 +5,7 @@ speak TLS to the gate with the run's test CA. Host names are invented (`.test`);
 """
 
 import ast
+import dataclasses
 import gzip
 import http.client
 import json
@@ -336,6 +337,27 @@ def test_o05_a_redirect_is_never_passed_on_nor_followed(world):
     line = wait_for(world, lambda r: r.get("status") == 502)
     assert (line["upstream_status"], line["error_origin"], line["client_saw"]) == (302, "upstream", "5xx")
     conn.close()
+
+
+def test_o05_o16_a_platform_redirect_is_a_gate_refusal_and_its_run_is_set_aside_never_scored(world):
+    """O05, O16, C01: the gate's 502 for a redirect is its own refusal (redirect_refused), so the run ends as
+    data_gate_integrity: set aside, never scored, even under a condition that treats sandbox failures."""
+    from expcore.campaign.attempts import classify
+    from expcore.campaign.executor import failure_result
+    from expcore_onedata.sandbox import gatelog, kinds
+
+    world.upstream.mode = "redirect"
+    conn = connect(world)
+    conn.request("GET", FILE)
+    conn.getresponse().read()
+    conn.close()
+    line = wait_for(world, lambda r: r.get("status") == 502)
+    assert line.get("gate_refusal") == "redirect_refused"
+    error = kinds.gate_error(gatelog.refusals(world.log.read_text(encoding="utf-8").splitlines()))
+    assert error is not None
+    assert error.kind == "data_gate_integrity"
+    result = failure_result(error, ended_utc="2026-01-01T00:00:00Z", wall_s=1.0, treatment_kinds=("sandbox",))
+    assert classify(dataclasses.replace(result, model_turns=3), ("sandbox",)) == ("infra_fail", True, False)
 
 
 @pytest.mark.parametrize(

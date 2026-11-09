@@ -7,7 +7,7 @@ rewrites one, since no list of the token's encodings is complete and a partial r
 Every answer passes it before it reaches the agent:
 
   * a redirect (`is_redirect`: a 3xx, but for 304 Not Modified, which has no body and points nowhere) is never passed
-    on and never followed: the gate answers 502 with `REDIRECT_DETAILS`;
+    on and never followed: the gate answers 502 with `REDIRECT_DETAILS` (`REDIRECT_REFUSED`);
   * a body the boundary cannot read as it arrives (`readable_encoding`: a Content-Encoding other than identity, which
     the gate asks the upstream for, or a Transfer-Encoding other than chunked) is never passed on: 502 with
     `ENCODED_DETAILS`, before any byte of it;
@@ -36,6 +36,7 @@ CREDENTIAL_DETAILS = "the upstream's answer held the gate's credential, so the g
 CREDENTIAL_IN_HEADER = "credential_in_header"
 CREDENTIAL_IN_RESPONSE = "credential_in_response"
 ENCODED_RESPONSE = "encoded_response"
+REDIRECT_REFUSED = "redirect_refused"
 
 _ESCAPE = re.compile(rb"%[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}(?:\\u[0-9A-Fa-f]{4})?|\\[\"\\/bfnrt]")
 _JSON_SIMPLE = {b'"': b'"', b"\\": b"\\", b"/": b"/", b"b": b"\b", b"f": b"\f", b"n": b"\n", b"r": b"\r", b"t": b"\t"}

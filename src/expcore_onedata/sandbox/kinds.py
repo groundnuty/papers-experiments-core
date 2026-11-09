@@ -12,7 +12,8 @@ never from an exit code. Their categories map to the core's vocabulary of infras
 
 Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). One kind is the platform's own, registered
 here, when this module is first imported: `data_gate_integrity`, the data gate's refusal of an answer it cannot pass to
-the agent (an encoded body, its token in a header, its token in a body: `gate_error`). Such a run is neither the agent's
+the agent (a redirect, an encoded body, its token in a header, its token in a body) or a gate log that cannot be read
+(`gate_error`). Such a run is neither the agent's
 doing nor a condition's manipulation, so the kind is not treatable: the run is set aside and counted per condition, and
 the factor schema refuses a condition that declares the kind (O05, O16, C01).
 """
@@ -26,8 +27,9 @@ from expcore_onedata.sandbox import infradeath
 DATA_GATE_INTEGRITY = "data_gate_integrity"
 register_infra_kind(
     DATA_GATE_INTEGRITY,
-    "the data gate refused an answer of the platform it could not pass to the agent (an encoded body, or its token in "
-    "a header or a body): the run says nothing about the agent or the manipulation",
+    "the data gate refused an answer of the platform it could not pass to the agent (a redirect, an encoded body, or "
+    "its token in a header or a body), or its log could not be read: the run says nothing about the agent or the "
+    "manipulation",
     treatable=False,
 )
 

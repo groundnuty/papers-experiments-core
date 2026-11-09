@@ -818,8 +818,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _refuse_answer(self, hcfg, resp, rec, *, error: str, details: str, refusal: str | None = None) -> None:
         """An answer the gate does not pass on (O05): the upstream connection goes unread, and the agent gets a 502 with
-        a fixed message before any byte of the answer. `refusal` names a refusal of the boundary itself in the line
-        (`gate_refusal`): an answer the gate cannot look into, or one that holds its token."""
+        a fixed message before any byte of the answer. `refusal` names the boundary's refusal in the line
+        (`gate_refusal`): a redirect, an answer the gate cannot look into, or one that holds its token."""
         self._drop(hcfg)
         rec.update(status=502, upstream_status=resp.status, error=error, error_origin="upstream", client_saw="5xx")
         if refusal is not None:
@@ -832,7 +832,7 @@ class Handler(BaseHTTPRequestHandler):
         resp = self._upstream(hcfg, self.command, target, body, self._fwd_headers(headers), rec)
         if gateboundary.is_redirect(resp.status):  # its Location or its body may hold the token: never followed
             error, details = "the upstream answered with a redirect", gateboundary.REDIRECT_DETAILS
-            self._refuse_answer(hcfg, resp, rec, error=error, details=details)
+            self._refuse_answer(hcfg, resp, rec, error=error, details=details, refusal=gateboundary.REDIRECT_REFUSED)
             return
         if not gateboundary.readable_encoding(resp.getheader("Content-Encoding"), resp.getheader("Transfer-Encoding")):
             error, details = "the upstream answered with an encoded body", gateboundary.ENCODED_DETAILS
