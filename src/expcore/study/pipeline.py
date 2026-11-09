@@ -42,6 +42,7 @@ from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import build_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
@@ -132,6 +133,17 @@ def run_study(
     an attempt.
     """
     study = load_study(path)
+    with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
+        return _run_campaign(study, allow_dirty, code_root, crash_hook)
+
+
+def _run_campaign(
+    study: StudyConfig,
+    allow_dirty: bool,
+    code_root: str | os.PathLike[str] | None,
+    crash_hook: Callable[[str, str], None] | None,
+) -> RunSummary:
+    """Run the campaign of a loaded study, with its own infrastructure kinds in scope."""
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
     plugin = load_plugin(StudyContext(study, code))
     out = out_dir(study)
@@ -173,6 +185,18 @@ def check_batch(
     how many were running and that a partial snapshot was asked for.
     """
     study = load_study(find_study_root(study_root if study_root is not None else batch))
+    with study_kinds(study.kinds):  # a replayed record may end in one of the study's own kinds
+        return _check_loaded(study, batch, allow_dirty, code_root, partial)
+
+
+def _check_loaded(
+    study: StudyConfig,
+    batch: str | os.PathLike[str],
+    allow_dirty: bool,
+    code_root: str | os.PathLike[str] | None,
+    partial: bool,
+) -> dict[str, Any]:
+    """Snapshot the store and replay the batch of a loaded study, with its own infrastructure kinds in scope."""
     code = require_known("replay check", code_root or study.root, study.scope, allow_dirty=allow_dirty)
     directory = Path(batch)
     if not directory.is_dir():
@@ -259,6 +283,18 @@ def analyse_study(
     the study and never from a repository around it, as in a replication package.
     """
     study = load_study(path)
+    with study_kinds(study.kinds):  # the snapshot's attempts and the records may end in one of the study's own kinds
+        return _analyse_loaded(study, allow_dirty, code_root, partial, stamped)
+
+
+def _analyse_loaded(
+    study: StudyConfig,
+    allow_dirty: bool,
+    code_root: str | os.PathLike[str] | None,
+    partial: bool,
+    stamped: bool,
+) -> StudyAnalysis:
+    """Analyse the records of a loaded study, with its own infrastructure kinds in scope."""
     out = out_dir(study)
     batch = out / RUNS_DIR
     if not batch.is_dir():

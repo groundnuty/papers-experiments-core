@@ -21,8 +21,10 @@ Two optional keys of `[study]` widen the infrastructure kinds a condition may de
     [study.kinds]                         # the study's own kinds; treatable is true unless it says false
     relay_flap = { description = "the relay restarted under the run", treatable = true }
 
-A module that cannot be imported is refused, as is a study kind that is a core kind or a platform's. Neither key is part
-of the factor schema; study.toml's hash is in the campaign fingerprint, as it always is.
+A module that cannot be imported is refused, as is a study kind that is a core kind or a platform's. A platform's kinds
+are the process's once imported. A study's own last only while it is loaded and while the pipeline works on it
+(`errors.study_kinds(study.kinds)`), so one study's kinds never reach another. Neither key is part of the factor schema;
+study.toml's hash is in the campaign fingerprint, as it always is.
 
 Everything is validated when it is loaded, with messages that name the file and the key: the models of the plan are in
 the model table, and the cluster each preregistered contrast names is an attribute of every task. Nothing is run.
@@ -32,7 +34,7 @@ import hashlib
 import importlib
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from expcore.campaign.config import CampaignConfig, load_campaign
@@ -40,7 +42,7 @@ from expcore.campaign.factors import FactorSchema, load_factor_schema
 from expcore.campaign.manifest import Manifest, build_manifest
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.models import ModelTable, load_models
-from expcore.errors import register_study_kind
+from expcore.errors import StudyKind, check_study_kind, study_kinds
 from expcore.provenance.codestamp import CodeScope, CodeScopeError
 from expcore.stats import prereg
 from expcore.stats.prereg import Preregistration
@@ -76,6 +78,7 @@ class StudyConfig:
     plugin_file: Path
     scope: CodeScope
     config_sha256: Mapping[str, str]
+    kinds: Mapping[str, StudyKind] = field(default_factory=dict)  # `[study.kinds]`, for `errors.study_kinds`
 
     @property
     def manifest(self) -> Manifest:
@@ -125,8 +128,8 @@ def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope]:
     return name, plugin_file, scope
 
 
-def _widen_kinds(top: Section) -> None:
-    """Import the platforms `[study] platforms` names and register the kinds of `[study.kinds]`, in that order."""
+def _import_platforms(top: Section) -> None:
+    """Import the modules `[study] platforms` names, so the kinds they register are known for the whole process."""
     section = Section(top.section("study").data, top.file, "[study]")
     for module in section.strings(PLATFORMS_KEY):
         try:
@@ -136,7 +139,13 @@ def _widen_kinds(top: Section) -> None:
             raise section.fail(
                 PLATFORMS_KEY, f"names module {module!r}, which cannot be imported ({type(error).__name__})"
             ) from None
+
+
+def _declared_kinds(top: Section) -> dict[str, StudyKind]:
+    """Read and check the study's own kinds (`[study.kinds]`); a platform's are known by now, so a clash is seen."""
+    section = Section(top.section("study").data, top.file, "[study]")
     kinds = Section(section.table(KINDS_KEY), top.file, f"[study.{KINDS_KEY}]")
+    declared = {}
     for kind in kinds.data:
         entry = kinds.section(kind)
         entry.reject_unknown(KIND_KEYS)
@@ -145,9 +154,11 @@ def _widen_kinds(top: Section) -> None:
         if not isinstance(treatable, bool):
             raise entry.fail("treatable", f"must be true or false, got {type(treatable).__name__}")
         try:
-            register_study_kind(kind, description, treatable=treatable)
+            check_study_kind(kind, description)
         except ValueError as error:
             raise kinds.fail(kind, f"cannot be declared: {error}") from None
+        declared[kind] = StudyKind(description, treatable)
+    return declared
 
 
 def _check_clusters(study: str, tasks: Mapping[str, Task], loaded: Preregistration) -> None:
@@ -167,15 +178,19 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
     study_file = root / STUDY_FILE
     top = Section(load_toml(study_file), study_file, "top level")
     name, plugin_file, scope = _study_table(top, root)
-    _widen_kinds(top)  # before anything names a kind: the conditions here, the campaign's kinds below
-    schema = load_factor_schema(study_file)
-    tasks = _tasks(top, study_file)
-    models = load_models(root / MODELS_FILE)
-    campaign = load_campaign(root / CAMPAIGN_FILE)
-    unknown = [m for m in campaign.models if m not in models]
-    if unknown:
-        raise ConfigError(f"{campaign.source}: key 'models' names {unknown[0]!r}, which {MODELS_FILE} does not define")
-    loaded = prereg.load(root / PREREG_FILE, schema)
-    _check_clusters(name, tasks, loaded)
+    _import_platforms(top)  # before anything names a kind: the conditions here, the campaign's kinds below
+    kinds = _declared_kinds(top)
+    with study_kinds(kinds):  # held for this load only: a failed load, or the next study, finds none of them
+        schema = load_factor_schema(study_file)
+        tasks = _tasks(top, study_file)
+        models = load_models(root / MODELS_FILE)
+        campaign = load_campaign(root / CAMPAIGN_FILE)
+        unknown = [m for m in campaign.models if m not in models]
+        if unknown:
+            raise ConfigError(
+                f"{campaign.source}: key 'models' names {unknown[0]!r}, which {MODELS_FILE} does not define"
+            )
+        loaded = prereg.load(root / PREREG_FILE, schema)
+        _check_clusters(name, tasks, loaded)
     hashes = {file: hashlib.sha256((root / file).read_bytes()).hexdigest() for file in CONFIG_FILES}
-    return StudyConfig(root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes)
+    return StudyConfig(root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds)

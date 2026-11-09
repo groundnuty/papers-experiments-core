@@ -122,22 +122,44 @@ def test_o05_a_registered_kind_cannot_be_made_treatable_or_untreatable_by_regist
     assert is_treatable("provider_down") is True
 
 
-def test_c02_a_study_s_own_kind_has_one_owner_and_may_be_declared_again_alike():
-    """C02: a kind a study declares joins the vocabulary like a platform's, but a core or platform kind cannot be
-    declared by a study, a platform cannot register a study's kind, and a second declaration must say the same."""
-    errors.register_study_kind("relay_flap", "the relay restarted", treatable=False)
-    errors.register_study_kind("relay_flap", "the relay restarted", treatable=False)
+def test_c02_a_study_s_own_kinds_hold_only_for_its_scope_however_the_scope_ends():
+    """C02: a study's kinds join the vocabulary for the block that enters them, one scope at a time, and the vocabulary
+    is what it was afterwards, whether the block returned or raised; a platform cannot register a kind in scope."""
+    kinds = {"relay_flap": errors.StudyKind("the relay restarted", treatable=False)}
+    with errors.study_kinds(kinds):
+        assert "relay_flap" in infra_kinds()
+        assert is_treatable("relay_flap") is False
+        assert untreatable_kinds()["relay_flap"] == "the relay restarted"
+        with pytest.raises(ValueError, match=r"declared by the study in scope \(\[study.kinds\]\)"):
+            register_infra_kind("relay_flap", "the relay restarted", treatable=False)
+        with errors.study_kinds({}):
+            assert "relay_flap" not in infra_kinds()
+        assert "relay_flap" in infra_kinds()
+    assert infra_kinds() == CORE_KINDS
+    with pytest.raises(RuntimeError, match="boom"), errors.study_kinds(kinds):
+        raise RuntimeError("boom")
+    assert infra_kinds() == CORE_KINDS
+    register_infra_kind("relay_flap", "now a platform's, once no study holds the name")
     assert "relay_flap" in infra_kinds()
-    assert is_treatable("relay_flap") is False
-    with pytest.raises(ValueError, match="already declared by a study with another description"):
-        errors.register_study_kind("relay_flap", "the relay restarted", treatable=True)
-    with pytest.raises(ValueError, match=r"declared by a study \(\[study.kinds\]\), not a platform's"):
-        register_infra_kind("relay_flap", "the relay restarted", treatable=False)
+
+
+@pytest.mark.parametrize(
+    ("kind", "description", "message"),
+    [
+        ("endpoint", "the endpoint failed", "core's own kinds"),
+        ("provider_down", "a provider that is down", "a platform's kind; a study cannot declare it too"),
+        ("Bad-Kind", "described", "must be lower-case"),
+        ("relay_flap", "  ", "needs a description"),
+    ],
+)
+def test_c02_a_study_cannot_declare_a_core_or_a_platform_kind_nor_a_malformed_one(kind, description, message):
+    """C02: a study's kind is its own: the check is the same when the study is read and when its scope is entered, since
+    a platform imported in between may have taken the name."""
     register_infra_kind("provider_down", "a provider that is down")
-    with pytest.raises(ValueError, match="a platform's kind; a study cannot declare it too"):
-        errors.register_study_kind("provider_down", "a provider that is down")
-    with pytest.raises(ValueError, match="core's own kinds"):
-        errors.register_study_kind("endpoint", "the endpoint failed")
+    with pytest.raises(ValueError, match=message):
+        errors.check_study_kind(kind, description)
+    with pytest.raises(ValueError, match=message), errors.study_kinds({kind: errors.StudyKind(description)}):
+        pass
 
 
 def test_o05_the_core_s_untreatable_kind_cannot_be_registered_again_as_treatable():

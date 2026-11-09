@@ -156,7 +156,7 @@ except ConfigError as error:
 shutil.rmtree(tampered)
 ```
 
-A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused. A kind named nowhere is refused as unknown, and the error lists the treatable kinds.
+A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run, so it never reaches another study in the process. A kind named nowhere is refused as unknown, and the error lists the treatable kinds.
 
 ```python
 from expcore.errors import infra_kinds
@@ -168,7 +168,7 @@ declared = '"prompt.txt"]\n\n[study.kinds]\nrelay_restart = { description = "the
 text = toml.read_text().replace('"prompt.txt"]\n', declared, 1)
 toml.write_text(text.replace('["knowledge"]', '["relay_restart"]'))
 assert load_study(own).schema.treatment_kinds["relay-down"] == ("relay_restart",)
-assert "relay_restart" in infra_kinds()
+assert "relay_restart" not in infra_kinds()  # the kind lasts only while its study is loaded or run
 shutil.rmtree(own)
 ```
 

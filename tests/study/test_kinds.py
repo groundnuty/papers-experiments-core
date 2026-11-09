@@ -9,10 +9,15 @@ import uuid
 from pathlib import Path
 
 import pytest
+from study_support import HEAD, clean_environment, cli
 
 from expcore import errors
 from expcore.config.loading import ConfigError
+from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
+from expcore.study.pipeline import analyse_study, run_study
+
+__all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "tiny_study"
 PLUGIN_LINE = 'plugin = "plugin.py"\n'  # inside [study]
@@ -90,14 +95,79 @@ def test_c02_a_platform_module_named_in_platforms_makes_its_treatable_kind_decla
 
 
 def test_c02_a_study_declares_its_own_kind_in_study_kinds_and_may_load_again(study_dir, registry):
-    """C02: a kind the study declares is registered before its conditions are validated, so it can be a treatment;
-    loading the same study again in one process is not a clash with itself."""
+    """C02: a kind the study declares is known while its conditions are validated, so it can be a treatment; loading
+    the same study again in one process is not a clash with itself, and the loaded study carries what it declared."""
     declare(study_dir, "relay_flap")
     add_kinds(study_dir, 'relay_flap = { description = "the relay restarted", treatable = true }')
     first = load_study(study_dir)
     assert first.schema.treatment_kinds["relay-down"] == ("relay_flap",)
-    assert errors.is_treatable("relay_flap")
+    assert first.kinds == {"relay_flap": errors.StudyKind("the relay restarted", True)}
     assert load_study(study_dir).schema.digest == first.schema.digest
+
+
+def another_study(tmp_path: Path, name: str) -> Path:
+    return Path(shutil.copytree(EXAMPLE, tmp_path / name, ignore=shutil.ignore_patterns("out", "__pycache__")))
+
+
+def test_c02_a_study_s_own_kind_is_unknown_to_another_study_in_the_same_process(study_dir, tmp_path, registry):
+    """C02: a study's kinds are its own: when it has loaded they are gone, so a second study in the process that names
+    one without declaring it is refused as it would be alone."""
+    declare(study_dir, "relay_flap")
+    add_kinds(study_dir, 'relay_flap = { description = "the relay restarted" }')
+    load_study(study_dir)
+    assert "relay_flap" not in errors.infra_kinds()
+    other = another_study(tmp_path, "other")
+    declare(other, "relay_flap")
+    assert "unknown infrastructure kind 'relay_flap'" in refused(other)
+
+
+def test_c02_two_studies_in_a_process_may_declare_one_name_each_with_its_own_meaning(study_dir, tmp_path, registry):
+    """C02: nothing of one study's declaration binds another: the same name may have another description and another
+    answer, and each study is refused or loaded by its own."""
+    declare(study_dir, "relay_flap")
+    add_kinds(study_dir, 'relay_flap = { description = "the relay restarted", treatable = true }')
+    assert load_study(study_dir).schema.treatment_kinds["relay-down"] == ("relay_flap",)
+    other = another_study(tmp_path, "other")
+    declare(other, "relay_flap")
+    add_kinds(other, 'relay_flap = { description = "the relay failed its audit", treatable = false }')
+    assert "'relay_flap', which can never be a treatment: the relay failed its audit" in refused(other)
+    third = another_study(tmp_path, "third")
+    declare(third, "relay_flap")
+    add_kinds(third, 'relay_flap = { description = "the relay was rebuilt", treatable = true }')
+    assert load_study(third).kinds["relay_flap"].description == "the relay was rebuilt"
+
+
+@pytest.mark.parametrize("failure", ["condition", "models"])
+def test_c02_a_failed_load_leaves_none_of_the_study_s_kinds_behind(study_dir, registry, failure):
+    """C02: whichever file refuses the study, what it declared is gone with the failed load."""
+    add_kinds(study_dir, 'relay_flap = { description = "the relay restarted" }')
+    if failure == "condition":
+        declare(study_dir, "wifi")
+    else:
+        (study_dir / "models.toml").write_text("[models]\n", encoding="utf-8")
+    refused(study_dir)
+    assert errors.infra_kinds() == errors.CORE_KINDS
+
+
+def test_c02_a_study_s_own_kind_is_a_treatment_through_run_check_and_analyze_and_is_gone_after(
+    study_dir, registry, clean_environment
+):
+    """C02: every step of the pipeline holds the study's kinds for as long as it works: a run ends in the kind, the
+    replay check in a fresh process accepts the record, the analysis scores it, and none of them leaves the kind."""
+    plugin = study_dir / "plugin.py"
+    text = plugin.read_text(encoding="utf-8")
+    assert 'InfraError("knowledge"' in text
+    plugin.write_text(text.replace('InfraError("knowledge"', 'InfraError("relay_flap"'), encoding="utf-8")
+    declare(study_dir, "relay_flap")
+    add_kinds(study_dir, 'relay_flap = { description = "the relay restarted", treatable = true }')
+    write_stamp(study_dir, HEAD, load_study(study_dir).scope)
+    summary = run_study(study_dir)
+    assert summary.statuses == {"done": len(load_study(study_dir).manifest.rows)}, summary.statuses
+    assert errors.infra_kinds() == errors.CORE_KINDS
+    code, stderr = cli(clean_environment, "check", str(study_dir / "out" / "runs"), process=True)
+    assert code == 0, stderr
+    assert analyse_study(study_dir).rows
+    assert errors.infra_kinds() == errors.CORE_KINDS
 
 
 @pytest.mark.parametrize(
