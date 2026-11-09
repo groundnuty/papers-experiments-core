@@ -18,12 +18,14 @@ restore failed (journalled `clear_failed`) fails the check, naming the target by
 federation. A live holder, or none recorded, is contention, an outage run in progress, which is no fault of the
 federation: the check answers deferred (`Health(..., deferred=True)`), which the core's gate treats as a wait that
 charges no run and leaves a finished run's outcome standing. A recorded holder that is gone while the lock stays held is
-stuck: the check recovers, verified, whatever the journal holds open (or, with nothing open, only clears the record) and
-fails, saying the lock is stuck.
+stuck: the check recovers, verified, whatever the journal holds open, marks the record `stuck_since` (the first such
+verdict's time) and fails, saying the lock is stuck. The record is never deleted for it, so every later timeout is stuck
+too; only an acquisition of the lock, which proves it usable, clears it.
 """
 
 import re
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from expcore.campaign.healthgate import Health, HealthCheck, read_health
@@ -104,15 +106,18 @@ class FaultGate:
         record = self._journal.read_holder()
         if record is None or holder_alive(record) is not False:  # contention: a wait, which charges no run
             return Health(False, f"{_named(record)} holds the federation: the check waits for it", deferred=True)
-        done = "its record is cleared"
+        since = datetime.now(UTC).isoformat(timespec="seconds")
+        marked = self._journal.mark_holder_stuck(record.get("token"), since) or record
+        stuck = marked.get("stuck_since")
+        at = f" since {stuck}" if isinstance(stuck, str) and _STAMP.fullmatch(stuck) else ""
+        done = "its record stays until an acquisition of the lock proves it usable"
         if entries:  # it left something open: bring it back, verified, before anything else
             if not self._may_recover:
                 return Health(
-                    False, f"the federation's lock is stuck: {_named(record)} is gone and left an injection open"
+                    False, f"the federation's lock is stuck{at}: {_named(record)} is gone and left an injection open"
                 )
             self._recovery.recover()  # raises InfraError naming the target when one cannot be settled
-            done = "what it left open is recovered and its record cleared"
-        self._journal.clear_holder(record.get("token"))
+            done = f"what it left open is recovered; {done}"
         return Health(
-            False, f"the federation's lock is stuck: {_named(record)} is gone, yet the lock stays held; {done}"
+            False, f"the federation's lock is stuck{at}: {_named(record)} is gone, yet the lock stays held; {done}"
         )

@@ -80,20 +80,30 @@ def test_o11_an_outage_run_on_the_federation_is_named_by_its_holder_record_and_t
     assert not (settings.journal / HOLDER).exists()
 
 
-def test_o11_a_lock_held_while_its_recorded_holder_is_gone_is_stuck_and_its_record_is_cleared(tmp_path):
+def test_o11_a_lock_held_while_its_recorded_holder_is_gone_stays_stuck_until_an_acquisition_proves_it_usable(tmp_path):
     """O11: the federation stays held, but the holder its record names is gone and the journal has nothing open: the
-    lock is stuck, not contended. The check fails, saying so, and clears the record."""
+    lock is stuck, not contended. The check fails, saying so, and marks the record stuck instead of deleting it, so
+    the next timeout is still stuck; only an acquisition of the lock clears the record."""
     platform = write_faults(tmp_path, health_wait_s=0.2)
     settings = settings_of(platform)
+    path = settings.journal / HOLDER
     write_record(settings, dead_pid())
     descriptor = leaked_lock(settings)
     try:
-        health = fault_gate(platform, FakeServices())()
+        first = fault_gate(platform, FakeServices())()
+        marked = json.loads(path.read_text(encoding="utf-8"))
+        second = fault_gate(platform, FakeServices())()
+        again = json.loads(path.read_text(encoding="utf-8"))
     finally:
         os.close(descriptor)
-    assert (health.ok, health.deferred) == (False, False)
-    assert "stuck" in health.detail
-    assert not (settings.journal / HOLDER).exists()
+    for health in (first, second):
+        assert (health.ok, health.deferred) == (False, False)
+        assert "stuck" in health.detail
+    assert isinstance(marked.get("stuck_since"), str)
+    assert again["stuck_since"] == marked["stuck_since"]  # the first verdict's time, kept
+    with FederationLock(settings).held(exclusive=False):
+        pass
+    assert not path.exists()  # the lock was acquired: it is usable again
 
 
 def test_o11_a_stuck_holder_that_left_its_target_down_is_recovered_by_the_check(tmp_path):

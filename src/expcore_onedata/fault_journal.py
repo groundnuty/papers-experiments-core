@@ -236,15 +236,18 @@ class InjectionJournal:
         """Write the record of whoever holds the federation exclusively, whole or not at all: to a file of its own,
         fsynced, renamed over the record and the rename made durable, under the journal-wide lock."""
         make_directories(self.directory)
-        path = self.directory / HOLDER
-        draft = self.directory / f"{HOLDER}.draft"  # one writer at a time: the section is held
         with self._section():
-            with open(draft, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(dict(record), sort_keys=True))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(draft, path)
-            _fsync_directory(self.directory)
+            self._replace_holder(record)
+
+    def _replace_holder(self, record: Mapping[str, Any]) -> None:
+        """Under the section: write the record to a draft, fsynced, rename it over the record and sync the rename."""
+        draft = self.directory / f"{HOLDER}.draft"  # one writer at a time: the section is held
+        with open(draft, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(record), sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(draft, self.directory / HOLDER)
+        _fsync_directory(self.directory)
 
     def read_holder(self) -> dict[str, Any] | None:
         """The holder record, or None when there is none or it is not a record (it then names no holder)."""
@@ -276,6 +279,23 @@ class InjectionJournal:
             path.unlink()
             _fsync_directory(self.directory)
         return True
+
+    def mark_holder_stuck(self, token: str | None, since: str) -> dict[str, Any] | None:
+        """Mark the holder record `token` names (any record when None) stuck since `since`, unless it is marked
+        already; return the record as it now stands, or None when it is not that record. One critical section."""
+        path = self.directory / HOLDER
+        with self._section():
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                return None
+            if not isinstance(record, dict) or (token is not None and record.get("token") != token):
+                return None
+            if "stuck_since" in record:
+                return record
+            record["stuck_since"] = since
+            self._replace_holder(record)
+        return record
 
     def try_lock(self, target: str) -> HeldLock | None:
         """Take the target's exclusive lock without waiting; return it, or None when another holds it."""
