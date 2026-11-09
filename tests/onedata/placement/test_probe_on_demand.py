@@ -321,3 +321,22 @@ def test_o08_a_job_from_before_the_run_listed_ended_but_still_active_is_carried_
     snapshot = probes.finish()
     assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
     assert "transfer_carried_over" in snapshot["on_demand"]["beta"]["unknown"]
+
+
+def test_o08_a_record_whose_status_fields_disagree_is_not_final(probes, client, seeded, ticker):
+    """O08: the replication's record says completed in one status field and active in another: its counters are not
+    established, so beta's bound is unknown rather than taken from a counter still at zero."""
+    probes.start({})
+    ticker.sleep(10)
+    tid = tool_plane_replicates(seeded, client, MORE, BETA_ID)
+    seeded.end_transfer(tid)
+    for provider in (ALPHA_ID, BETA_ID):
+        seeded.provider_view[(tid, provider)] = {
+            "transferStatus": "completed",
+            "replicationStatus": "active",
+            "bytesReplicated": 0,
+        }
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
+    assert "transfer_not_ended" in snapshot["on_demand"]["beta"]["unknown"]

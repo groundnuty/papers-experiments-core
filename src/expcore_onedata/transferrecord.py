@@ -62,6 +62,18 @@ class Job:
         return (*what, self.listed_as, self.state, *counters)
 
 
+CONFLICTING = "conflicting"  # the state of a record whose status fields disagree: never a final one
+
+
+def _state(body: Mapping[str, Any]) -> str | None:
+    """The record's state: what every status field it carries says, `CONFLICTING` when they disagree (a migration
+    whose replication completed and whose eviction is still active, say), or None when it carries none."""
+    states = {body[k] for k in _STATE_KEYS if isinstance(body.get(k), str)}
+    if not states:
+        return None
+    return next(iter(states)) if len(states) == 1 else CONFLICTING
+
+
 def page_of(answer: Any) -> tuple[list[str], str | None]:
     """Read one page of the listing: its ids, and the token of the next page or None on the last."""
     if not isinstance(answer, dict) or not isinstance(answer.get("transfers"), list):
@@ -116,7 +128,7 @@ def job_of(transfer_id: str, listed_as: str, body: Any) -> Job:
         file_id=_provider(body, "fileId"),
         target_id=target,
         source_id=_provider(body, "evictingProviderId") if kind != "replication" else None,
-        state=next((body[k] for k in _STATE_KEYS if isinstance(body.get(k), str)), None),
+        state=_state(body),
         bytes_replicated=moved,
         files_replicated=_count(body, "filesReplicated"),
         files_evicted=_count(body, evicted),
