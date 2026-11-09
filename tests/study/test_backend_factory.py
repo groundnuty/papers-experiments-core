@@ -5,10 +5,11 @@ import shutil
 import pytest
 from study_support import EXAMPLE, HEAD, clean_environment
 
+from expcore.campaign.resume import FingerprintMismatch
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
-from expcore.study.pipeline import run_study
+from expcore.study.pipeline import fingerprint_of, run_study
 from expcore.study.plugin import StudyContext, load_plugin
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
@@ -44,6 +45,7 @@ def relay_factory(spec, *, seed, limits, base_url, time_left):
     return RelayBackend(stub)
 
 
+relay_factory.version = "1"
 _build_without_factory = build
 
 
@@ -101,3 +103,57 @@ def test_c14_a_toy_backend_wrapping_the_stub_runs_the_example_study_through_the_
     planned = len(load_study(copy).manifest.rows)
     assert summary.statuses == {"done": planned}, summary.statuses
     assert summary.dispatched >= planned
+
+
+def edit_plugin(study, old: str, new: str) -> None:
+    """Change the plugin and stamp the study again, as a commit of the change would."""
+    plugin = study / "plugin.py"
+    text = plugin.read_text(encoding="utf-8")
+    assert old in text, old
+    plugin.write_text(text.replace(old, new), encoding="utf-8")
+    shutil.rmtree(study / "__pycache__", ignore_errors=True)  # a same-size edit within a second keeps the cached code
+    write_stamp(study, HEAD, load_study(study).scope)
+
+
+def test_c06_a_resume_under_another_backend_factory_or_another_version_of_it_is_refused(tmp_path, clean_environment):
+    """C06: the backend builds every request of a run, so a campaign started with one factory never resumes under
+    another: its name and its version are in the fingerprint, and the same factory at the same version resumes."""
+    copy = study_copy(tmp_path, factory=True)
+    write_stamp(copy, HEAD, load_study(copy).scope)
+    run_study(copy)
+    edit_plugin(copy, 'relay_factory.version = "1"', 'relay_factory.version = "2"')
+    with pytest.raises(FingerprintMismatch, match=r"backend_factory\.version: recorded '1', now '2'"):
+        run_study(copy)
+    edit_plugin(copy, 'relay_factory.version = "2"', 'relay_factory.version = "1"')
+    assert run_study(copy).dispatched == 0  # nothing left to run, and not refused
+    edit_plugin(copy, "relay_factory", "other_factory")
+    with pytest.raises(
+        FingerprintMismatch, match=r"backend_factory\.name: recorded 'relay_factory', now 'other_factory'"
+    ):
+        run_study(copy)
+
+
+def test_c06_only_a_supplied_factory_is_in_the_fingerprint_and_its_identity_holds_no_path(tmp_path):
+    """C06: a study without a factory keeps the fingerprint it had; one with a factory in its plugin has the same
+    identity wherever the study directory is, because the module name of a plugin holds the path."""
+    plain = study_copy(tmp_path / "plain", factory=False)
+    shutil.copy(EXAMPLE / "models.toml", plain / "models.toml")
+    study = load_study(plain)
+    assert "backend_factory" not in fingerprint_of(study, load_plugin(StudyContext(study, {"commit": HEAD})))
+    identities = []
+    for name in ("here", "there"):
+        study = load_study(study_copy(tmp_path / name, factory=True))
+        identities.append(fingerprint_of(study, load_plugin(StudyContext(study, {"commit": HEAD})))["backend_factory"])
+    assert identities == [{"name": "relay_factory", "version": "1"}] * 2
+
+
+@pytest.mark.parametrize("replacement", ['relay_factory.version = "  "', "relay_factory.version = 1", "pass"])
+def test_c06_a_backend_factory_without_a_version_is_refused_when_the_plugin_is_loaded(tmp_path, replacement):
+    """C06: a factory whose behaviour can change without a version would make the fingerprint say nothing, so a plugin
+    that supplies one must version it; the refusal names the plugin file and the attribute."""
+    copy = study_copy(tmp_path, factory=True)
+    plugin = copy / "plugin.py"
+    text = plugin.read_text(encoding="utf-8")
+    plugin.write_text(text.replace('relay_factory.version = "1"', replacement), encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"plugin\.py: the plugin's backend_factory needs a 'version' attribute"):
+        load_plugin(StudyContext(load_study(copy), {"commit": HEAD}))

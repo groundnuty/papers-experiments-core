@@ -95,7 +95,12 @@ def _digest(value: Any) -> str:
 
 
 def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
-    """The campaign fingerprint: what makes two starts one experiment (C06), from the study and its plugin."""
+    """The campaign fingerprint: what makes two starts one experiment (C06), from the study and its plugin.
+
+    A plugin's `backend_factory` enters as its name and its `version`. Code that lives in the study directory is
+    already covered by the code identity every record carries; the version is what speaks for a factory that lives
+    in an installed package, and it changes when the factory's behaviour does.
+    """
     return build_fingerprint(
         study.schema,
         tasks={task.id: _digest(dict(task.attributes)) for task in study.tasks.values()},
@@ -107,6 +112,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
         scorer_digest=plugin.scorer_digest(),
         configs=study.config_sha256,
         platform=plugin.platform,
+        backend_factory=plugin.backend_factory_identity(),
     )
 
 
