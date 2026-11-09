@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 from expcore.campaign.lease import Lease, process_gone
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
+from expcore_onedata.admission import require_admission
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.sandbox import gatelog, kinds
@@ -388,7 +389,15 @@ class SandboxPlatform:
         cancelled meanwhile, and then tears down everything the sandbox registered; what a thread that outlives the
         deadline creates afterwards carries the lease labels from the moment it exists, and the thread removes it
         itself on its way out, or the probe and the orphan reaper find it (O15, C19).
+
+        On a platform whose platform.toml has `[faults]`, the run must hold the federation's admission
+        (`expcore_onedata.admission`): the executor takes it before it calls `launch`, shared for a baseline condition
+        and exclusive for an outage run, and lets it go after the launch has left, so it covers the start, the run and
+        the teardown. Its wait is before the agent's clock starts. Without it `launch` raises `AdmissionRefused` before
+        it mints a token or enters a wait (O11). An injector's own admission, taken when its run holds none, is not
+        the run's: the run must be admitted before it launches.
         """
+        require_admission(self._config)  # first: a refused run mints, journals and starts nothing (O11)
         mode = self._s.mode_of(level)
         sandbox: DockerSandbox | None = None
         started: asyncio.Future[None] | None = None

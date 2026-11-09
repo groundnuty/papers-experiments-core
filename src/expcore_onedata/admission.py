@@ -7,7 +7,7 @@ when platform.toml has `[faults]`, every run of the platform holds the federatio
 shared for a run of a baseline condition, exclusive for a run whose condition uses an injector (its injection and its
 clear included). An outage run never also takes it shared, so there is no upgrade and no deadlock: the injector
 refuses to start under a shared admission, and takes the exclusive one itself when its run holds none. The tool
-server refuses to start without an admission (`require_admission`); a sandbox start must do the same.
+server and the sandbox (`SandboxPlatform.launch`) refuse to start without an admission (`require_admission`).
 
 Waiting for the lock is admission, before the agent's loop starts, so it is outside the agent's time and charges it
 nothing, as a lease taken before the run is. Taken inside a tool call instead, it is a `lease_queue` wait (`waits=`).
