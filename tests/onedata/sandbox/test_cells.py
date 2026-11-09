@@ -45,7 +45,7 @@ def test_o17_a_cell_the_harnesss_timer_ended_is_a_time_limit(world, sbx):
 
     cells._kill_at_the_cap = the_harness_kills
     world.host.exec_handler = runs_until_killed
-    result = sbx.exec("while True: pass", 1.2)  # the least that starts a cell: a second is left after preparing it
+    result = sbx.exec("while True: pass", 2.5)  # enough that a second is left to start it after preparing it
     assert result.exit_code == 137  # the cell ran, and the harness's kill ended it
     assert result.timed_out is True
     assert (result.kill["reason"], result.kill["category"], result.kill["timer_fired"]) == ("time_limit", "agent", True)
@@ -75,14 +75,16 @@ def test_o17_a_timer_that_the_cell_outran_never_fires_and_never_kills():
     """O17: the cell's end and the timer's firing are decided under one lock: a cell that ended first has no fired
     timer, and the timer does nothing afterwards."""
     kills = []
-    timer = CellTimer(0.05, lambda: kills.append(1))
+    timer = CellTimer(60, lambda: kills.append(1))
     timer.start()
     assert timer.end() is False
-    time.sleep(0.1)
+    timer._fire()  # a firing that raced the cell's end: it finds the cell ended and does nothing
     assert kills == []
     fired = CellTimer(0.0, lambda: kills.append(2))
     fired.start()
-    time.sleep(0.05)
+    deadline = time.monotonic() + 10
+    while not kills and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert fired.end() is True
     assert kills == [2]
 
