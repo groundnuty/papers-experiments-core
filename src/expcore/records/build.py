@@ -252,7 +252,7 @@ def expected_conversation(system: str, user: str, captured: Sequence[Captured]) 
     return messages
 
 
-def build_record(
+def _build_record(
     result: LoopResult,
     recording: RecordingBackend,
     *,
@@ -282,8 +282,9 @@ def build_record(
     flag is derived from them: an infrastructure failure of a listed kind, after the model completed a turn, is a scored
     final attempt, not set aside.
 
-    The record is written as `schema_version` (the current one unless a replay of an older record asks for its own),
-    and its outcome's treatment flag follows the first-turn rule of that version.
+    The record is written as `schema_version`, and its outcome's treatment flag follows the rule of that version.
+    Private: only a replay of an older record (its own version) and tests building older records choose a version;
+    a live run goes through `build_record`, which always writes the current one.
 
     Secrets are redacted here, before any digest is taken: the digests the record pins (prompt texts, the
     conversation each request carried, the settings each sent, the configuration) are those of the redacted
@@ -366,6 +367,19 @@ def build_record(
     return RunRecord(**seal(redacted), redacted_paths=paths, schema_version=schema_version)
 
 
+def build_record(result: LoopResult, recording: RecordingBackend, **options: Any) -> RunRecord:
+    """Build the record of a finished attempt, always as the current schema version (see `_build_record`).
+
+    A live run cannot choose an older record version: that would apply an older treatment rule to a new run. The
+    keyword options are those of `_build_record` (`identity`, `system`, `user`, `specs`, `code`, `core_version`,
+    `instruments`, `treatment_kinds`, `redactor`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is
+    refused.
+    """
+    if "schema_version" in options:
+        raise TypeError("build_record writes the current record version; a live run cannot choose another")
+    return _build_record(result, recording, **options)
+
+
 async def _record_attempt(
     backend: ModelBackend,
     providers: Sequence[ToolProvider],
@@ -412,7 +426,7 @@ async def _record_attempt(
     result = await run_agent(
         recording, box, prompts[0].text, prompts[1].text, config, timer=timer, clock=clock, sleep=sleep
     )
-    return build_record(
+    return _build_record(
         result,
         recording,
         identity=identity,
