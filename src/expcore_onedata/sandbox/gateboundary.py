@@ -40,6 +40,7 @@ path, as it does `gatepolicy.py`, since it runs alone in its container.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 
 CREDENTIAL_HEADERS = frozenset({"x-auth-token", "authorization", "proxy-authorization", "set-cookie", "set-cookie2"})
 REDIRECT_DETAILS = "the upstream answered with a redirect, which the gate does not pass on or follow"
@@ -96,15 +97,22 @@ def _decoded(found: re.Match[bytes]) -> bytes:
     return _character(int(escape[2:6], 16), escape)
 
 
-def layers(data: bytes) -> list[bytes]:
-    """`data` and each round of its decoding, until a round changes nothing or `ROUNDS` have run."""
-    out = [data]
+def each_layer(data: bytes) -> Iterator[bytes]:
+    """`data` and each round of its decoding, until a round changes nothing or `ROUNDS` have run, one at a time: a
+    check holds no more than two layers at once."""
+    layer = data
+    yield layer
     for _ in range(ROUNDS):
-        decoded = _ESCAPE.sub(_decoded, out[-1])
-        if decoded == out[-1]:
-            break
-        out.append(decoded)
-    return out
+        decoded = _ESCAPE.sub(_decoded, layer)
+        if decoded == layer:
+            return
+        layer = decoded
+        yield layer
+
+
+def layers(data: bytes) -> list[bytes]:
+    """`data` and each round of its decoding, all of them (`each_layer`)."""
+    return list(each_layer(data))
 
 
 def _maximal(character: str) -> int:
@@ -144,7 +152,7 @@ class Detector:
     def hit(self, data: bytes) -> bool:
         if not self._raw:
             return False
-        for layer in layers(data):
+        for layer in each_layer(data):
             if not self._projection:
                 if self._raw in layer:
                     return True

@@ -59,6 +59,7 @@ class Upstream(ThreadingHTTPServer):
         self.answer_headers: list[tuple[str, str]] = []  # mode "fixed": the answer's status, extra headers and body
         self.answer_body = b"{}"
         self.answer_status = 200
+        self.release = threading.Event()  # mode "stall": the second half of each answer waits for it
 
 
 class UpstreamHandler(BaseHTTPRequestHandler):
@@ -78,6 +79,9 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.seen.append((self.command, self.path, dict(self.headers)))
+        if self.server.mode == "stall":
+            self._stall()
+            return
         if self.server.mode in ("echo-headers", "redirect", "gzip", "fixed"):
             self._echo(self.headers.get("X-Auth-Token", ""))
             return
@@ -99,6 +103,19 @@ class UpstreamHandler(BaseHTTPRequestHandler):
                 self.wfile.write(BODY)
         except OSError:
             pass  # the gate went away mid-body
+
+    def _stall(self) -> None:
+        """A small answer that is no file content, its second half held back until the test releases it."""
+        half = b'{"pad": "' + b"p" * 1000 + b'", '
+        rest = b'"end": 1}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(half) + len(rest)))
+        self.end_headers()
+        self.wfile.write(half)
+        self.wfile.flush()
+        self.server.release.wait(30)
+        self.wfile.write(rest)
 
     def _echo(self, token: str) -> None:
         """A platform that hands back the token it was sent (in headers, in a redirect, compressed), or the answer the
@@ -483,6 +500,57 @@ def test_o05_a_file_content_read_larger_than_the_cap_still_streams(world):
     assert line["bytes"] == BIG
     assert "gate_refusal" not in line
     conn.close()
+
+
+class Slots:
+    """The gate's buffer slots with a count of the held and the waiting, for the budget test."""
+
+    def __init__(self, n: int) -> None:
+        self._slots, self._lock = threading.BoundedSemaphore(n), threading.Lock()
+        self.held = self.most = self.waiting = 0
+
+    def __enter__(self):
+        with self._lock:
+            self.waiting += 1
+        self._slots.acquire()
+        with self._lock:
+            self.waiting -= 1
+            self.held += 1
+            self.most = max(self.most, self.held)
+        return self
+
+    def __exit__(self, *exc):
+        with self._lock:
+            self.held -= 1
+        self._slots.release()
+
+
+def test_o05_buffered_answers_share_a_budget_and_a_third_waits_for_a_free_slot(world, monkeypatch):
+    """O05: with two buffer slots, two answers that must be buffered are read at once and a third waits for a slot to
+    free before it is read; the gate never holds more than two buffers, and all three answers arrive whole."""
+    slots = Slots(2)
+    monkeypatch.setattr(gate, "_BUFFER_SLOTS", slots, raising=False)
+    world.upstream.mode = "stall"
+    answers: list[int] = []
+
+    def client():
+        conn = connect(world)
+        conn.request("GET", FILE)
+        answer = conn.getresponse()
+        answer.read()
+        answers.append(answer.status)
+        conn.close()
+
+    threads = [threading.Thread(target=client) for _ in range(3)]
+    [t.start() for t in threads]
+    deadline = time.monotonic() + 10
+    while (slots.held, slots.waiting) != (2, 1) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert (slots.held, slots.waiting) == (2, 1)  # two read their answers, the third waits for a slot
+    world.upstream.release.set()
+    [t.join(timeout=30) for t in threads]
+    assert answers == [200, 200, 200]
+    assert slots.most == 2
 
 
 def test_o05_a_compressed_answer_is_refused_before_any_byte_reaches_the_agent(world):

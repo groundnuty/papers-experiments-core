@@ -110,6 +110,13 @@ TOKEN_ENV = (
 AUTH_HEADER = "X-Auth-Token"
 CLIENT_CREDENTIALS = {AUTH_HEADER.lower(), "authorization", "cookie"}  # whatever the agent sends of these is dropped
 UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split between two reads is still found
+# How many answers the gate buffers at once (O05): an answer that is no file content is read whole, up to
+# gateboundary.BUFFER_CAP (4 MiB), and checked before it goes. At most 16 such buffers are held, 64 MiB, and a check
+# holds about four times its buffer at its peak (the raw bytes, a decoded layer, the next, a projection), so the whole
+# stays well under the gate's memory limit (sandbox.limits.gate_memory_bytes, 1 GiB by default). An answer that must be
+# buffered waits for a slot: the wait is the agent's own concurrency, on the agent's time.
+BUFFER_SLOTS = 16
+_BUFFER_SLOTS = threading.BoundedSemaphore(BUFFER_SLOTS)
 
 
 def _log(rec: dict) -> None:
@@ -861,17 +868,20 @@ class Handler(BaseHTTPRequestHandler):
         # the length http.client frames the body by (None: chunked, or until EOF), never the raw header; the boundary
         # never rewrites a body, so it stays true
         declared = None if resp.chunked else resp.length
-        body = None
-        if not gateboundary.streams(resp.status, rec.get("tag"), resp.getheader("Content-Type")):
-            body = self._buffered(hcfg, resp, rec, declared, token)  # no file's content: whole, and checked first
-            if body is None:
-                return  # refused: answered and logged
-            declared = len(body)
-        declared = self._send_head(resp, passed, declared)
-        if body is None:
+        if gateboundary.streams(resp.status, rec.get("tag"), resp.getheader("Content-Type")):
+            declared = self._send_head(resp, passed, declared)
             sent, failure, failure_origin = self._stream(resp, rec, token)
-        else:
-            sent, failure, failure_origin = self._write_whole(body, rec)
+        else:  # no file's content: whole, and checked before any byte goes, in one of the shared buffer slots
+            waited = time.monotonic()
+            with _BUFFER_SLOTS:
+                if (wait := time.monotonic() - waited) > 0.001:
+                    rec["buffer_wait_s"] = round(wait, 3)  # the agent's own concurrency: other answers held the slots
+                body = self._buffered(hcfg, resp, rec, declared, token)
+                if body is None:
+                    return  # refused: answered and logged
+                declared = self._send_head(resp, passed, len(body))
+                sent, failure, failure_origin = self._write_whole(body, rec)
+                del body  # the slot is free once its buffer is gone
         self._finish(hcfg, resp, rec, sent, declared, failure, failure_origin)
 
     def _buffered(self, hcfg, resp, rec, declared, token) -> bytes | None:
@@ -881,8 +891,8 @@ class Handler(BaseHTTPRequestHandler):
         a file's metadata, are small. A read that fails is the upstream's error, answered as one (`_handle`)."""
         body = bytearray()
         while True:
-            try:
-                chunk = resp.read(UPSTREAM_READ_BYTES)
+            try:  # never more than one byte over the cap, so a refused answer is not held whole
+                chunk = resp.read(min(UPSTREAM_READ_BYTES, gateboundary.BUFFER_CAP + 1 - len(body)))
             except (OSError, http.client.HTTPException) as e:
                 raise _Upstream(e) from e
             if not chunk:
@@ -896,7 +906,8 @@ class Handler(BaseHTTPRequestHandler):
                 return None
         if declared is not None and len(body) != declared:  # http.client does not raise on an early EOF here
             raise _Upstream(http.client.IncompleteRead(bytes(body[:0]), declared - len(body)))
-        if gateboundary.holds_token(bytes(body), token):
+        body = bytes(body)  # one copy of it from here on
+        if gateboundary.holds_token(body, token):
             error, details = (
                 "the upstream's answer held the gate's credential in its body",
                 gateboundary.CREDENTIAL_DETAILS,
@@ -905,7 +916,7 @@ class Handler(BaseHTTPRequestHandler):
                 hcfg, resp, rec, error=error, details=details, refusal=gateboundary.CREDENTIAL_IN_RESPONSE
             )
             return None
-        return bytes(body)
+        return body
 
     def _send_head(self, resp, passed, declared) -> int | None:
         """The status and the headers that passed, framed by the body's length when it is known; the length framed."""
