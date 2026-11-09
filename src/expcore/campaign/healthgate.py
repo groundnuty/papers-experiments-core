@@ -38,7 +38,7 @@ run is tried again after `recheck_s`; a deferred post-run check verified nothing
 included, is scored on it: the attempt is set aside as `post_check_unverified`, a kind no condition may declare; and the
 dispatcher's own check keeps a closed gate closed while it is deferred, since only a pass opens it. **A deferral is
 bounded.** Its start is kept in the store (`expcore.campaign.deferral`), so a restart keeps its age, and it is in the
-status; a pass ends it. A pre-run check deferred longer than `max_defer_s` fails: it closes the gate as any failure
+status; a pass, before or after a run, ends it. A pre-run check deferred longer than `max_defer_s` fails: it closes the gate as any failure
 does, charging the run that found it, and the outage is `blocking`, a hold that does not end by itself, so a campaign
 that exits when blocked stops instead of waiting on a holder that may never let go. A gate already closed is checked
 by the dispatcher alone, and its deferred checks count the same way: past the bound its outage becomes blocking too.
@@ -352,8 +352,12 @@ class HealthGate:
         return PreRun(FOUND, detail)
 
     def after_run(self) -> tuple[Health, dict[str, Any] | None]:
-        """Check after an attempt: the health, and the outage record if the gate was closed when the check returned."""
-        return self._read_at_gate()
+        """Check after an attempt: the health, and the outage record if the gate was closed when the check returned. A
+        check that passes ends the current deferral, as a pre-run pass does, so a later one counts from its own start."""
+        health, outage = self._read_at_gate()
+        if health.ok:
+            self.deferral.end()
+        return health, outage
 
     def note_discard(self, outage: dict[str, Any], input_tokens: int | None, output_tokens: int | None) -> None:
         """Count a post-run attempt the outage discarded, and its tokens (counted apart where unknown, never as zero)."""

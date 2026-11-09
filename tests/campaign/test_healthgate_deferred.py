@@ -266,3 +266,17 @@ def test_c11_a_treatment_failure_whose_post_run_check_is_deferred_is_never_score
     first = rows[0]
     assert (first["state"], first["treatment"], first["infra_kind"]) == ("infra_fail", 0, "post_check_unverified")
     assert [r["state"] for r in rows] == ["infra_fail", "done"]
+
+
+def test_c11_a_passing_post_run_check_ends_the_deferral_so_a_later_one_counts_from_its_own_start(tmp_path):
+    """C11: a deferral, then a post-run check that passes, then a deferral again: the second counts its age from its
+    own start, so it is not past the bound at once."""
+    store, _, _ = planned_store(tmp_path)
+    answers = Answers(WEDGED, Health(True, "fine"), WEDGED)
+    gate = HealthGate(store, answers, clock_from([0, 1, 30, 59]), max_defer_s=3000)  # the first: load
+    gate.load()
+    assert gate.before_run("run-a").verdict == DEFER  # since 00:01
+    health, outage = gate.after_run()  # 00:30: the platform passes
+    assert (health.ok, outage) == (True, None)
+    assert store.get_meta(DEFERRAL_META) in (None, "null")
+    assert gate.before_run("run-a").verdict == DEFER  # 00:59: a new deferral, not 58 minutes old
