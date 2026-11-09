@@ -226,12 +226,12 @@ class TransferLog:
         edges, clock = self._edges(window)
         section.update(settled=not changed, polls=polls, clock=clock)
         reading = self._classified(edges, observation, file_ids, harness, section, flagged)
-        return Reading(
-            reading.section,
-            reading.inside,
-            reading.flagged,
-            frozenset() if clock["known"] else frozenset({CLOCK_UNKNOWN}),
-        )
+        # A listing that never settled may still be missing a transfer that has not appeared in any reading, and such a
+        # transfer could be into any tracked provider: every bound is then unknown, not only those of the changed jobs.
+        everywhere = set() if clock["known"] else {CLOCK_UNKNOWN}
+        if changed:
+            everywhere.add(NOT_SETTLED)
+        return Reading(reading.section, reading.inside, reading.flagged, frozenset(everywhere))
 
     def _edges(self, window: Window) -> tuple[Edges, dict[str, Any]]:
         """Move the window onto the providers' clocks by the offsets their listing answers gave, and describe that for

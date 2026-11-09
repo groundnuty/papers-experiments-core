@@ -166,10 +166,10 @@ def test_o07_a_transfer_that_appears_only_in_the_second_poll_is_counted_and_the_
     assert ticker.slept.count(30.0) == 2  # the default settle time, between the three observations
 
 
-def test_o07_a_listing_that_keeps_changing_leaves_the_bounds_it_touches_unknown(probes, seeded, ticker):
+def test_o07_a_listing_that_keeps_changing_leaves_every_bound_unknown(probes, seeded, ticker):
     """O07 with O08: a new job into beta shows in every observation, so no two in a row are the same within the
-    bound of four. The listing has not settled: beta's bound is unknown, listing_not_settled, while alpha's, which no
-    changing job touches, is still given."""
+    bound of four. The listing has not settled, and a transfer that never appeared could be into any provider: every
+    bound is unknown, listing_not_settled, alpha's too, though no changing job touches it."""
     probes.start({})
     ticker.sleep(10)
     for n in range(1, 4):
@@ -180,4 +180,5 @@ def test_o07_a_listing_that_keeps_changing_leaves_the_bounds_it_touches_unknown(
     assert (snapshot["space_transfers"]["settled"], snapshot["space_transfers"]["polls"]) == (False, 4)
     assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
     assert "listing_not_settled" in snapshot["on_demand"]["beta"]["unknown"]
-    assert snapshot["on_demand"]["alpha"]["on_demand_lower_bound"] == 0
+    assert snapshot["on_demand"]["alpha"]["on_demand_lower_bound"] is None
+    assert "listing_not_settled" in snapshot["on_demand"]["alpha"]["unknown"]
