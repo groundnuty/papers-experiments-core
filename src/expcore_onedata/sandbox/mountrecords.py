@@ -18,7 +18,8 @@ The procedure, with the platform file the campaign runs with:
      record is all that is left.
   3. `python -m expcore_onedata.sandbox.mountrecords --platform platform.toml clear <id> --verified` removes the
      record. It refuses without `--verified`, for an id that names no record or more than one, when the mount table
-     cannot be read, and while the table still shows a mount of the record.
+     cannot be read, while the table still shows a mount of the record, and for a record it cannot read or that is
+     not one: such a record says nothing of what is mounted, so the operator inspects it and fixes it by hand.
 
 Exit codes: 0 done, 1 refused, 2 a usage error. The output names records by id and counts only, never a path, a lease
 key or any other configured value (O12).
@@ -103,7 +104,10 @@ def _clear(files: list[Path], host: HostOps, record_id: str, verified: bool) -> 
         print("refused: the mount table cannot be read")
         return 1
     document = _read(named[0])
-    if document is not None and (shown := _shown(document, table)):
+    if document is None:  # it says nothing of what is mounted: never cleared by this tool
+        print(f"refused: record {record_id} cannot be read or is not a record: inspect it and fix it by hand")
+        return 1
+    if shown := _shown(document, table):
         print(f"refused: the mount table still shows {shown} mount(s) of record {record_id}")
         return 1
     named[0].unlink()

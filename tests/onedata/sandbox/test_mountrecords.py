@@ -37,3 +37,18 @@ def test_c19_the_tool_names_records_by_id_and_refuses_an_id_that_names_none(worl
     out = capsys.readouterr().out
     assert out == "0123abcd mounts=0 unidentified=0 in_table=0\n"
     assert mountrecords.main(["clear", "ffffffff", "--verified"], work_root=world.s.work_root, host=world.host) == 1
+
+
+def test_c19_an_unreadable_or_malformed_record_is_never_cleared_even_when_verified(world, capsys):
+    """C19: a record the tool cannot read, or that is not a record, says nothing of what is mounted, so the tool never
+    clears it, with a live mount in the table or not: it tells the operator to inspect it and fix it by hand."""
+    path = str(world.s.work_root / "login-data-0123abcd" / "work")
+    world.host.mounts[path] = "ext4"
+    directory = world.s.work_root / "_mounts"
+    directory.mkdir(parents=True)
+    for text in ("{not json", '{"sid": "login-data-0123abcd", "mounts": [{"id": 1}]}'):
+        record = directory / "login-data-0123abcd.json"
+        record.write_text(text, encoding="utf-8")
+        assert mountrecords.main(["clear", "0123abcd", "--verified"], work_root=world.s.work_root, host=world.host) == 1
+        assert record.exists()
+        assert "inspect it and fix it by hand" in capsys.readouterr().out
