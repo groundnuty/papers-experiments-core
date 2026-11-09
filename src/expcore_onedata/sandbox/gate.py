@@ -791,9 +791,10 @@ class Handler(BaseHTTPRequestHandler):
         out = {
             k: v
             for k, v in headers.items()
-            if k not in _HOP and k != RUN_HEADER.lower() and k not in CLIENT_CREDENTIALS
+            if k not in _HOP and k != RUN_HEADER.lower() and k not in CLIENT_CREDENTIALS and k != "accept-encoding"
         }
         out["Host"] = headers.get("host", "")
+        out["Accept-Encoding"] = "identity"  # a body the boundary can read: never compressed, whatever the agent asked
         if CFG.get("run_key"):
             out[RUN_HEADER] = CFG["run_key"]
         if CFG.get("token"):  # the credential is the gate's: the agent holds none, and any it sent is gone (O05)
@@ -812,25 +813,27 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return json.dumps({**document, "token": CFG["token"]}).encode()
 
-    def _refuse_redirect(self, hcfg, resp, rec) -> None:
-        """A redirect is never passed on, and never followed: its Location or its body may hold the token (O05). The
-        upstream connection goes unread, and the agent gets a 502 with a fixed message."""
+    def _refuse_answer(self, hcfg, resp, rec, *, error: str, details: str, refusal: str | None = None) -> None:
+        """An answer the gate does not pass on (O05): the upstream connection goes unread, and the agent gets a 502 with
+        a fixed message before any byte of the answer. `refusal` names a refusal of the boundary itself in the line
+        (`gate_refusal`): an answer the gate cannot look into, or one that holds its token."""
         self._drop(hcfg)
-        rec.update(
-            status=502,
-            upstream_status=resp.status,
-            error="the upstream answered with a redirect",
-            error_origin="upstream",
-            client_saw="5xx",
-        )
+        rec.update(status=502, upstream_status=resp.status, error=error, error_origin="upstream", client_saw="5xx")
+        if refusal is not None:
+            rec["gate_refusal"] = refusal
         with contextlib.suppress(OSError):  # a client gone meanwhile: the line is logged all the same
-            self._answer(rec, 502, {"error": {"id": "badGateway", "details": gateboundary.REDIRECT_DETAILS}})
+            self._answer(rec, 502, {"error": {"id": "badGateway", "details": details}})
 
     def _forward(self, hcfg, url, headers, body, rec) -> None:
         target = url.path + ("?" + url.query if url.query else "")
         resp = self._upstream(hcfg, self.command, target, body, self._fwd_headers(headers), rec)
-        if gateboundary.is_redirect(resp.status):
-            self._refuse_redirect(hcfg, resp, rec)
+        if gateboundary.is_redirect(resp.status):  # its Location or its body may hold the token: never followed
+            error, details = "the upstream answered with a redirect", gateboundary.REDIRECT_DETAILS
+            self._refuse_answer(hcfg, resp, rec, error=error, details=details)
+            return
+        if not gateboundary.readable_encoding(resp.getheader("Content-Encoding"), resp.getheader("Transfer-Encoding")):
+            error, details = "the upstream answered with an encoded body", gateboundary.ENCODED_DETAILS
+            self._refuse_answer(hcfg, resp, rec, error=error, details=details, refusal="encoded_response")
             return
         forms = _token_forms()
         # the length http.client frames the body by (None: chunked, or until EOF), never the raw header; the boundary

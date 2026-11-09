@@ -5,6 +5,7 @@ speak TLS to the gate with the run's test CA. Host names are invented (`.test`);
 """
 
 import ast
+import gzip
 import http.client
 import json
 import shutil
@@ -76,7 +77,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.seen.append((self.command, self.path, dict(self.headers)))
-        if self.server.mode in ("echo-headers", "redirect", "split"):
+        if self.server.mode in ("echo-headers", "redirect", "split", "gzip"):
             self._echo(self.headers.get("X-Auth-Token", ""))
             return
         if self.server.mode == "unavailable":
@@ -112,6 +113,8 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         elif mode == "redirect":
             status, headers = 302, [("Location", f"https://elsewhere.test/next?token={quote(token, safe='')}")]
             body = b'{"moved": "' + token.encode() + b'"}'
+        elif mode == "gzip":  # whatever the gate asked for: a compressed body the gate cannot look into
+            headers, body = [("Content-Encoding", "gzip")], gzip.compress(b'{"echo": "' + token.encode() + b'"}')
         else:
             body = straddling(token_forms(token))
         self.send_response(status)
@@ -312,6 +315,25 @@ def test_o05_a_token_split_between_two_reads_of_the_body_never_reaches_the_agent
     assert [form for form in token_forms(token) if form in body] == []
     assert len(body) == len(sent) == int(answer.getheader("Content-Length"))
     assert body.endswith(b"b" * 64)
+    conn.close()
+
+
+def test_o05_a_compressed_answer_is_refused_before_any_byte_reaches_the_agent(world):
+    """O05: the gate asks the upstream for an unencoded body, whatever the agent asked for, and refuses an answer with
+    any other Content-Encoding with a 502 and a fixed message, since it cannot look into it: a gzip body that echoes
+    the token never reaches the agent."""
+    world.upstream.mode = "gzip"
+    conn = connect(world)
+    conn.request("GET", FILE, headers={"Accept-Encoding": "gzip"})
+    answer = conn.getresponse()
+    body = answer.read()
+    assert world.upstream.seen[0][2].get("Accept-Encoding") == "identity"
+    assert answer.status == 502
+    assert answer.getheader("Content-Encoding") is None
+    assert not body.startswith(b"\x1f\x8b")
+    assert GATE_TOKEN.encode() not in body
+    line = wait_for(world, lambda r: r.get("status") == 502)
+    assert (line["upstream_status"], line["gate_refusal"], line["client_saw"]) == (200, "encoded_response", "5xx")
     conn.close()
 
 

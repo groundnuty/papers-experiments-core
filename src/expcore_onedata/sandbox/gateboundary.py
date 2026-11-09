@@ -8,6 +8,9 @@ request, a redirect's Location, a header echoed back. Every answer passes here b
     is withheld (`header_passes`);
   * a redirect (`is_redirect`: a 3xx, but for 304 Not Modified, which has no body and points nowhere) is never passed
     on and never followed: the gate answers 502 with `REDIRECT_DETAILS`;
+  * a body the boundary cannot read as it arrives (`readable_encoding`: a Content-Encoding other than identity, which
+    the gate asks the upstream for, or a Transfer-Encoding other than chunked) is never passed on: 502 with
+    `ENCODED_DETAILS`, before any byte of it;
   * every form of the token in the body (`token_forms`: raw, percent-encoded, JSON-escaped) is covered by the marker
     as the body streams (`Scrubber`): each read's last len(longest form) - 1 bytes are held back and scanned with the
     next read, so a token split between two reads is still found. A cover is exactly as long as what it covers, so the
@@ -29,6 +32,7 @@ from urllib.parse import quote, quote_plus
 MARKER = b"[withheld-by-gate]"  # repeated, and cut, to the length of what it covers
 CREDENTIAL_HEADERS = frozenset({"x-auth-token", "authorization", "proxy-authorization", "set-cookie", "set-cookie2"})
 REDIRECT_DETAILS = "the upstream answered with a redirect, which the gate does not pass on or follow"
+ENCODED_DETAILS = "the upstream answered with an encoded body, which the gate cannot look into and does not pass on"
 _HEX = re.compile(rb"%[0-9A-F]{2}")
 
 
@@ -64,6 +68,14 @@ def header_passes(name: str, value: str, forms: Iterable[bytes]) -> bool:
         return False
     line = f"{name}: {value}".encode("latin-1", "replace")
     return not any(form in line for form in forms)
+
+
+def readable_encoding(content_encoding: str | None, transfer_encoding: str | None) -> bool:
+    """Whether the boundary can read a body as it arrives: no Content-Encoding but identity (the gate asks for that),
+    and no Transfer-Encoding but chunked, which http.client undoes. Anything else, gzip included, is refused."""
+    content = (content_encoding or "identity").strip().lower()
+    transfer = (transfer_encoding or "chunked").strip().lower()
+    return content == "identity" and transfer == "chunked"
 
 
 def is_redirect(status: int) -> bool:
