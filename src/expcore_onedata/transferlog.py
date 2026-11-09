@@ -227,7 +227,10 @@ class TransferLog:
         section.update(settled=not changed, polls=polls, clock=clock)
         reading = self._classified(edges, observation, file_ids, harness, section, flagged)
         return Reading(
-            reading.section, reading.inside, reading.flagged, frozenset() if clock["known"] else {CLOCK_UNKNOWN}
+            reading.section,
+            reading.inside,
+            reading.flagged,
+            frozenset() if clock["known"] else frozenset({CLOCK_UNKNOWN}),
         )
 
     def _edges(self, window: Window) -> tuple[Edges, dict[str, Any]]:
@@ -236,7 +239,7 @@ class TransferLog:
         is then taken as it is on this host's clock."""
         allowance = self._provisioner.settings.clock_skew_allowance_s
         offsets = {p: self._offsets.get(p, []) for p in self._providers}
-        known = all(samples and None not in samples for samples in offsets.values())
+        known = bool(offsets) and all(samples and None not in samples for samples in offsets.values())
         seen = [o for samples in offsets.values() for o in samples if o is not None]
         edges = Edges(window, min(seen), max(seen), allowance) if known else Edges(window, 0.0, 0.0, allowance)
         described = {}

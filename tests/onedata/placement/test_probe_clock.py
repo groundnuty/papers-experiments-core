@@ -67,3 +67,11 @@ def test_o08_a_provider_whose_clock_cannot_be_read_makes_every_bound_unknown(pro
         assert "clock_offset_unknown" in snapshot["on_demand"][provider]["unknown"]
     assert snapshot["space_transfers"]["clock"]["known"] is False
     assert snapshot["space_transfers"]["records"]
+
+
+def test_o08_with_no_tracked_provider_no_clock_is_read_so_it_is_unknown_not_a_crash(client, provisioner, ticker):
+    """O08: tracking no provider lists nothing and reads no Date header; the clock is unknown, never assumed."""
+    probes = PlatformProbes(client, provisioner, {}, [], sleep=ticker.sleep, now=ticker.clock)
+    probes.start({})
+    section = probes.finish()["space_transfers"]
+    assert section["clock"]["known"] is False
