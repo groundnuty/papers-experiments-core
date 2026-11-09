@@ -10,14 +10,26 @@ never from an exit code. Their categories map to the core's vocabulary of infras
 - `unknown`: counters unreadable, evidence conflicting, or a kill nothing attributes. Infrastructure kind
   `unattributed_kill`, retried within the attempt limit.
 
-Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`), so no kind is registered here.
+Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). One kind is the platform's own, registered
+here, when this module is first imported: `data_gate_integrity`, the data gate's refusal of an answer it cannot pass to
+the agent (an encoded body, its token in a header, its token in a body: `gate_error`). Such a run is neither the agent's
+doing nor a condition's manipulation, so the kind is not treatable: the run is set aside and counted per condition, and
+the factor schema refuses a condition that declares the kind (O05, O16, C01).
 """
 
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from expcore.errors import InfraError
+from expcore.errors import InfraError, register_infra_kind
 from expcore_onedata.sandbox import infradeath
+
+DATA_GATE_INTEGRITY = "data_gate_integrity"
+register_infra_kind(
+    DATA_GATE_INTEGRITY,
+    "the data gate refused an answer of the platform it could not pass to the agent (an encoded body, or its token in "
+    "a header or a body): the run says nothing about the agent or the manipulation",
+    treatable=False,
+)
 
 KIND_OF_CATEGORY: Mapping[str, str | None] = {
     "agent": None,
@@ -63,4 +75,17 @@ def death_error(deaths: Iterable[Mapping[str, Any]]) -> InfraError | None:
     return InfraError(kind, detail[:600])
 
 
-__all__ = ["KIND_OF_CATEGORY", "death_error", "kill_error", "kind_of"]
+def gate_error(refusals: Iterable[str]) -> InfraError | None:
+    """The error the data gate's own refusals make of an attempt (`gatelog.refusals`), or None when there were none:
+    the condition's data read was cut or refused by the gate, never by the agent."""
+    reasons = sorted(set(refusals))
+    if not reasons:
+        return None
+    return InfraError(
+        DATA_GATE_INTEGRITY,
+        f"the data gate refused the platform's answer to the condition's data read ({', '.join(reasons)}): the read "
+        "was cut by the gate, not by the agent",
+    )
+
+
+__all__ = ["DATA_GATE_INTEGRITY", "KIND_OF_CATEGORY", "death_error", "gate_error", "kill_error", "kind_of"]

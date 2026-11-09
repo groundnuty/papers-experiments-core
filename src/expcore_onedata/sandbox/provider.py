@@ -35,6 +35,7 @@ from expcore.errors import InfraError
 from expcore.plugin import CallContext
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
+from expcore_onedata.sandbox import kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec
 from expcore_onedata.sandbox.hostops import HostOps, mount_identity, parse_mountinfo
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
@@ -286,6 +287,8 @@ class SandboxPlatform:
         The start and the stop are each inside `ctx.infrastructure_wait("sandbox_lifecycle")`; the body is the agent's
         own time. A teardown that leaves something behind raises `InfraError("sandbox")` when nothing else is in
         flight, and the lease's probe then keeps the key quarantined. `ceiling_s` is the run's whole-time ceiling (O06).
+        When the data gate refused an answer for its own integrity during the run, the run ends in `InfraError` of
+        kind `data_gate_integrity` (`kinds.gate_error`), whatever its body raised or returned (O05, C01).
 
         The start runs in a thread, and cancelling the launch does not stop a thread: it goes on creating the sandbox.
         So the sandbox is built before the thread begins, and the launch holds it. On cancellation, or any failure of
@@ -312,9 +315,19 @@ class SandboxPlatform:
             raise
         try:
             yield sandbox
+        except Exception:
+            refused = kinds.gate_error(await asyncio.to_thread(sandbox.gate_refusals))
+            await self._stop(ctx, sandbox, quiet=True)
+            if refused is not None:  # the gate cut the condition's read: that, not the body's failure, ends the run
+                raise refused from None
+            raise
         except BaseException:
             await self._stop(ctx, sandbox, quiet=True)
             raise
+        refused = kinds.gate_error(await asyncio.to_thread(sandbox.gate_refusals))
+        if refused is not None:  # a refusal no cell reported (a read the agent's code left running): the same end
+            await self._stop(ctx, sandbox, quiet=True)
+            raise refused
         await self._stop(ctx, sandbox, quiet=False)
 
     async def _settle_start(self, sandbox: DockerSandbox, started: asyncio.Future[None]) -> None:

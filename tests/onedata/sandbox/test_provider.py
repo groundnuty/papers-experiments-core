@@ -175,6 +175,26 @@ def test_a_teardown_that_leaves_something_raises_a_sandbox_error_and_keeps_the_l
     assert pool.settle_quarantines() == [KEY]
 
 
+@pytest.mark.parametrize("body_fails", [False, True], ids=["returns", "raises"])
+def test_o05_c01_a_gate_refusal_no_cell_reported_ends_the_run_as_data_gate_integrity(stage, body_fails):
+    """O05, C01: a refusal of the data gate in its log when the run's body ends (a read the agent's code left running)
+    ends the run as infrastructure of kind data_gate_integrity, in place of whatever the body raised, and the
+    sandbox is stopped all the same."""
+    refusal = {"status": 502, "upstream_status": 200, "gate_refusal": "credential_in_header", "client_saw": "5xx"}
+
+    async def body(sandbox):
+        with open(sandbox.dir / "gatelog" / "requests.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(refusal) + "\n")
+        if body_fails:
+            raise RuntimeError("the agent's run failed after the refusal")
+
+    with pytest.raises(InfraError) as caught:
+        run_launch(stage, "via-gate", body=body)
+    assert caught.value.kind == "data_gate_integrity"
+    assert "credential_in_header" in caught.value.detail
+    assert not stage.host.containers
+
+
 def test_a_body_that_fails_still_stops_the_sandbox_and_the_error_is_the_bodys(stage):
     async def body(sandbox):
         raise RuntimeError("the agent's loop failed")

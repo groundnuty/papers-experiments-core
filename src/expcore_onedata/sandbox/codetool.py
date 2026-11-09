@@ -16,7 +16,9 @@ killed (L15).
 What the model sees. The code's output, and for a failure its exit code and error stream. A kill the kernel's counters
 attribute to the agent (its own memory limit, its own time limit) is the agent's outcome and is told to the model as
 such. A kill the counters attribute to the host or a component, or that nothing attributes, is infrastructure: it
-raises `InfraError` of kind `sandbox` or `unattributed_kill` and ends the attempt (O17).
+raises `InfraError` of kind `sandbox` or `unattributed_kill` and ends the attempt (O17). A cell during which the data
+gate refused an answer for its own integrity raises `InfraError` of kind `data_gate_integrity`, which no condition can
+treat (O05, C01).
 """
 
 import asyncio
@@ -60,8 +62,8 @@ class CodeExecutionProvider:
                 "the argument 'code' must be a non-empty string", is_error=True, error_class="bad_arguments"
             )
         result = await asyncio.to_thread(self._sandbox.exec, code, max(float(timeout_s), MIN_TIMEOUT_S))
-        failure = kinds.kill_error(result.kill)
-        if failure is not None:
+        failure = kinds.gate_error(result.gate_refusals) or kinds.kill_error(result.kill)
+        if failure is not None:  # the gate's refusal first: whatever the cell did after, its read was cut by the gate
             raise failure
         return self._output(result)
 

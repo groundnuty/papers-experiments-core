@@ -6,7 +6,10 @@
 One JSON line per request or event. The summary separates three things that must never be added together: a policy
 refusal (4xx, the enforcement working), an error the gate made itself (origin `gate`) and an error the platform made
 (origin `upstream`). A transfer the gate cut, because the client went away or an upstream failed mid-body, carries
-`cut` and `unread_bytes`. A log that cannot be read is unknown, never zero errors.
+`cut` and `unread_bytes`; one it cut because the body held its token carries `cut_reason` too. An answer the gate
+refused for its own integrity (an encoded body, its token in a header or a body) carries `gate_refusal`, its reason
+(`refusals`): the gate cut the condition's read, the agent did not read less. A log that cannot be read is unknown,
+never zero errors.
 """
 
 import json
@@ -22,7 +25,9 @@ def unknown(why: str) -> dict[str, Any]:
         "bytes_to_sandbox": None,
         "refused_requests": None,
         "cut_transfers": None,
+        "cut_reasons": None,
         "unread_bytes": None,
+        "gate_refusals": None,
         "errors": None,
         "agent_saw_gate_error": None,
         "agent_saw_upstream_error": None,
@@ -71,6 +76,24 @@ def errors(records: list[dict]) -> dict[str, int]:
     return out
 
 
+def refusals(lines: list[str]) -> list[str]:
+    """The reason of every answer the gate refused for its own integrity, in the order of the log. A line still being
+    written when the log is read (the last, cut short) is no refusal yet."""
+    out = []
+    for line in lines:
+        try:
+            record = json.loads(line) if line.strip() else {}
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("gate_refusal"):
+            out.append(str(record["gate_refusal"]))
+    return out
+
+
+def _counted(values: list[str]) -> dict[str, int]:
+    return {v: values.count(v) for v in sorted(set(values))}
+
+
 def summarize(lines: list[str]) -> dict[str, Any]:
     """Content transfers and errors seen by the gate so far."""
     records = [json.loads(x) for x in lines if x.strip()]
@@ -84,7 +107,9 @@ def summarize(lines: list[str]) -> dict[str, Any]:
         "bytes_to_sandbox": sum(r.get("bytes", 0) for r in content),
         "refused_requests": sum(1 for r in records if r.get("decision") == "deny"),
         "cut_transfers": len(cut),
+        "cut_reasons": _counted([str(r["cut_reason"]) for r in cut if r.get("cut_reason")]),  # the gate's own cuts
         "unread_bytes": sum(r.get("unread_bytes", 0) for r in cut),
+        "gate_refusals": _counted([str(r["gate_refusal"]) for r in records if r.get("gate_refusal")]),
         "errors": counts,
         # an error the gate made itself is one only a gate option can see; an upstream one is the platform's, which
         # every data path meets in some form

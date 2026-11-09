@@ -104,6 +104,7 @@ class DockerSandbox:
         self.obs = Observer(host, settings.agent_uid)
         self._mounts: list[Path] = []
         self._mount_log: list[dict[str, Any]] = []  # what the record file holds: each mount's path and identity
+        self._refusals_seen = 0  # the data gate's refusals already handed back with a cell
         self._containers: list[str] = []
         self._net: str | None = None
         self._watched: dict[str, dict[str, Any]] = {}
@@ -545,10 +546,26 @@ class DockerSandbox:
 
     # ------------------------------------------------------------------------------------------------ the API
     def exec(self, code: str, timeout_s: float) -> ExecResult:
-        """Run Python source as the unprivileged user. See `CellRunner.run`."""
+        """Run Python source as the unprivileged user (see `CellRunner.run`), with the data gate's refusals that came
+        while it ran (`gate_refusals`)."""
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
-        return self._cells.run(code, timeout_s)
+        res = self._cells.run(code, timeout_s)
+        seen = self.gate_refusals()
+        res.gate_refusals, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
+        return res
+
+    def gate_refusals(self) -> list[str]:
+        """The reasons of the answers the data gate refused for its own integrity so far (O05), from its log. Empty
+        without a gate; a log that cannot be read is logged, and its summary in the metadata says unknown."""
+        if self.spec.mode is not DataPathMode.REST:
+            return []
+        try:
+            lines = (self.dir / "gatelog" / "requests.jsonl").read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            log.error("the gate log could not be read for the gate's refusals: %s", describe_error(e))
+            return []
+        return gatelog.refusals(lines)
 
     @property
     def stopped(self) -> bool:

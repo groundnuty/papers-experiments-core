@@ -98,6 +98,7 @@ class ExecResult:
     timed_out: bool = False
     kill: dict[str, Any] | None = None  # the cause of a kill or timeout, from the kernel's counters (killcause.py)
     status: str = RAN
+    gate_refusals: tuple[str, ...] = ()  # the data gate's own refusals during the cell (gatelog.refusals)
 
 
 @runtime_checkable
