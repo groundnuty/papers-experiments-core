@@ -1,21 +1,23 @@
 # Provenance: new
-"""What a package's checks read in a file: every byte stream it holds, each under several text views.
+"""What a package's checks read in a file, failing closed: only kinds of content they can read in full are allowed.
 
-- `streams(path, data)` returns the file's bytes and, recursively, what gzip, bzip2 and xz content decompresses to and
-  what the members of zip and tar archives hold, each labelled `path!member` (a member's own name is part of its
-  label, so the label is checked as a path). Content is recognised by its magic bytes, whatever the file is called.
-  Another compressed or archive format recognised by its magic bytes (zstd, 7z, rar, lz4, lzip, lzop, compress,
-  lzma, cabinet, xar, ar, cpio, rpm, squashfs), an encrypted or unreadable member, a stream larger than
-  `MAX_STREAM_BYTES`, more than `MAX_TOTAL_BYTES` in all, or nesting deeper than `MAX_DEPTH` is not read in part:
-  it is returned as a problem, and the build refuses the package as unscannable.
-- `byte_views(data)` decodes one stream as UTF-8 (leniently), as UTF-16 little- and big-endian at both byte
-  alignments, and as raw bytes (Latin-1, one character per byte), so a name in any of those encodings is text to the
-  scanner.
-- `decoded_views(name, text)` undoes what hides a name in text without changing it: the strings of a JSON or TOML
-  file as parsed, HTML entities, percent-escapes and backslash escapes (`\\uXXXX`, `\\UXXXXXXXX`, `\\xXX`), each alone
-  and all of them together until nothing changes.
+`streams(path, data)` classifies a file and everything inside it. A stream may be:
+- text: valid UTF-8 without NUL bytes, or UTF-16 with a byte-order mark;
+- an SQLite database (its magic header), which stores text uncompressed, so its bytes are read as they are;
+- a gzip, bzip2, xz, zip or tar archive, whose members are classified in turn, recursively; its own bytes are read as
+  well (a gzip header's file name, a zip comment).
+Anything else is refused, named with the kind detected: a PDF, a PNG, a raw zlib stream, another compressed or archive
+format, text the check cannot tell from binary, or unknown binary. A zip is recognised only at offset 0; any other
+stream that the zip reader would still open (a zip prefixed by, or appended to, other bytes) is refused. Nesting
+deeper than `MAX_DEPTH`, a stream larger than `MAX_STREAM_BYTES`, an archive of more than `MAX_MEMBERS` members, and
+decompressing more than `MAX_TOTAL_BYTES` for one file are refused too; when the total budget runs out the walk stops
+at once, and no read asks for more than what is left of it. A file a package attests by hash (`[[opaque]]` in
+package.toml) is never given to this module.
 
-PDF and PNG files are read as raw bytes only: their own compressed streams are not opened.
+`views(stream)` is what the scans read in a stream. Text is read as it is and decoded: continuations joined and
+backslash escapes (`\\xHH`, `\\uXXXX`, `\\UXXXXXXXX`) undone, HTML entities and percent-escapes undone, the strings of
+a JSON or TOML file as parsed, and all of these together until nothing changes. A database or an archive's own bytes
+are read as UTF-8 (leniently), as UTF-16 in both byte orders and alignments, and as raw bytes.
 """
 
 import bz2
@@ -36,14 +38,18 @@ from urllib.parse import unquote
 MAX_DEPTH = 4
 MAX_STREAM_BYTES = 256 * 2**20
 MAX_TOTAL_BYTES = 1024 * 2**20
+MAX_MEMBERS = 100_000
+TEXT, SQLITE, ARCHIVE = "text", "sqlite", "archive"
 _DECODE_ROUNDS = 4
-_COMPRESSED = (
-    (b"\x1f\x8b", "gzip", gzip.open),
-    (b"BZh", "bzip2", bz2.open),
-    (b"\xfd7zXZ\x00", "xz", lzma.open),
-)
-_ZIP = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-_UNSCANNABLE = (
+_SQLITE = b"SQLite format 3\x00"
+_ZIP = (b"PK\x03\x04", b"PK\x05\x06")
+_BOMS = (b"\xff\xfe", b"\xfe\xff")
+_COMPRESSED = {"gzip": gzip.open, "bzip2": bz2.open, "xz": lzma.open}
+_KNOWN = (  # kinds that are refused, named so the author knows what was found
+    (b"%PDF", "PDF"),
+    (b"\x89PNG\r\n\x1a\n", "PNG"),
+    (b"\xff\xd8\xff", "JPEG"),
+    (b"GIF8", "GIF"),
     (b"\x28\xb5\x2f\xfd", "zstd"),
     (b"7z\xbc\xaf\x27\x1c", "7z"),
     (b"Rar!\x1a\x07", "rar"),
@@ -64,95 +70,186 @@ _UNSCANNABLE = (
     (b"hsqs", "squashfs"),
 )
 _BACKSLASH = re.compile(r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2}))")
+_CONTINUATION = re.compile(r"\\\r?\n")
+
+
+@dataclass(frozen=True)
+class Stream:
+    """One stream of a file: where it is, its bytes, its kind, and its text when it is text."""
+
+    label: str
+    data: bytes
+    kind: str
+    text: str | None = None
+
+
+class _Exhausted(Exception):
+    """The total budget ran out at this stream; the walk stops."""
+
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.label = label
 
 
 @dataclass
 class _Budget:
-    """What has been decompressed so far; shared by one file's whole recursion, so it is mutated on purpose."""
+    """What one file's walk has decompressed so far; shared by the whole recursion, so it is mutated on purpose."""
 
     total: int = 0
-    problems: list[str] = field(default_factory=list)
+    problems: list[tuple[str, str]] = field(default_factory=list)  # (label, why), so a caller can redact the label
 
 
-def _capped(stream: io.BufferedIOBase, label: str, budget: _Budget) -> bytes | None:
-    """Read a stream up to the cap; None (and a problem) when it is larger, or the total is spent."""
-    data = stream.read(MAX_STREAM_BYTES + 1)
-    if len(data) > MAX_STREAM_BYTES:
-        budget.problems.append(f"{label}: unscannable, over the cap of {MAX_STREAM_BYTES} bytes")
-        return None
-    budget.total += len(data)
-    if budget.total > MAX_TOTAL_BYTES:
-        budget.problems.append(f"{label}: unscannable, over the total cap of {MAX_TOTAL_BYTES} bytes")
-        return None
-    return data
+def _refuse(label: str, why: str) -> tuple[str, str]:
+    return label, f"refused, {why}; only text, SQLite databases and archives of them can be checked"
+
+
+def _read(stream: io.BufferedIOBase, label: str, budget: _Budget) -> bytes | None:
+    """Read a stream within both caps; None (and a problem) when it is over the stream cap."""
+    remaining = MAX_TOTAL_BYTES - budget.total
+    if remaining <= 0:
+        raise _Exhausted(label)
+    limit = min(MAX_STREAM_BYTES, remaining)
+    data = stream.read(limit + 1)
+    budget.total += len(data)  # an oversized read counts too
+    if len(data) <= limit:
+        return data
+    if limit < MAX_STREAM_BYTES:
+        raise _Exhausted(label)
+    budget.problems.append(_refuse(label, f"over the cap of {MAX_STREAM_BYTES} bytes"))
+    return None
+
+
+def _compression(data: bytes) -> str | None:
+    if data.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if data.startswith(b"BZh") and data[3:4].isdigit():
+        return "bzip2"
+    if data.startswith(b"\xfd7zXZ\x00"):
+        return "xz"
+    return None
 
 
 def _is_tar(data: bytes) -> bool:
     return len(data) > 262 and data[257:262] == b"ustar"
 
 
+def _zlib(data: bytes) -> bool:
+    return len(data) > 2 and data[0] & 0x0F == 8 and data[0] >> 4 <= 7 and (data[0] * 256 + data[1]) % 31 == 0
+
+
+def _text(data: bytes) -> str | None:
+    """The text of UTF-8 without NUL bytes or of UTF-16 with a byte-order mark; None for anything else."""
+    if data.startswith(_BOMS):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            return None
+    if b"\x00" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _detected(data: bytes) -> str:
+    """The kind of a refused stream, as far as it can be told."""
+    named = next((kind for magic, kind in _KNOWN if data.startswith(magic)), None)
+    if named:
+        return f"{named} content"
+    if _zlib(data):
+        return "a raw zlib stream"
+    if data.startswith(_BOMS) or b"\x00" not in data[:4096]:
+        return "not text: neither UTF-8 without NUL bytes nor UTF-16 with a byte-order mark"
+    return "unknown binary content, not text: neither UTF-8 without NUL bytes nor UTF-16 with a byte-order mark"
+
+
 def _members(label: str, data: bytes, budget: _Budget) -> Iterator[tuple[str, bytes]]:
-    """The members of a zip or tar archive, each read under the cap."""
+    """The members of a zip or tar archive, each read within the caps; a link's target is a member of its own."""
     if data.startswith(_ZIP):
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            for info in archive.infolist():
+            infos = archive.infolist()
+            if len(infos) > MAX_MEMBERS:
+                budget.problems.append(_refuse(label, f"more than {MAX_MEMBERS} members"))
+                return
+            if archive.comment:
+                yield "(comment)", archive.comment
+            for info in infos:
+                if info.comment:
+                    yield f"{info.filename}(comment)", info.comment
                 if info.is_dir():
                     continue
                 with archive.open(info) as member:
-                    read = _capped(member, f"{label}!{info.filename}", budget)
+                    read = _read(member, f"{label}!{info.filename}", budget)
                 if read is not None:
                     yield info.filename, read
         return
     with tarfile.open(fileobj=io.BytesIO(data)) as archive:
-        for info in archive.getmembers():
+        infos = archive.getmembers()
+        if len(infos) > MAX_MEMBERS:
+            budget.problems.append(_refuse(label, f"more than {MAX_MEMBERS} members"))
+            return
+        for info in infos:
             if info.isfile():
                 handle = archive.extractfile(info)
-                read = None if handle is None else _capped(handle, f"{label}!{info.name}", budget)
+                read = None if handle is None else _read(handle, f"{label}!{info.name}", budget)
                 if read is not None:
                     yield info.name, read
             elif not info.isdir():
-                yield info.name, info.linkname.encode("utf-8")  # a link or a device: its name and target are text
+                yield info.name, info.linkname.encode("utf-8")
 
 
-def _walk(label: str, data: bytes, depth: int, budget: _Budget) -> Iterator[tuple[str, bytes]]:
-    yield label, data
-    unscannable = next((kind for magic, kind in _UNSCANNABLE if data.startswith(magic)), None)
-    if unscannable:
-        budget.problems.append(f"{label}: unscannable {unscannable} content; a package holds only what its checks read")
+def _walk(label: str, data: bytes, depth: int, budget: _Budget) -> Iterator[Stream]:
+    if not data.startswith(_ZIP) and zipfile.is_zipfile(io.BytesIO(data)):
+        budget.problems.append(_refuse(label, "a zip archive that does not start at offset 0 (prefixed or appended)"))
         return
-    compressed = next(((kind, opener) for magic, kind, opener in _COMPRESSED if data.startswith(magic)), None)
-    if compressed and compressed[0] == "bzip2" and not data[3:4].isdigit():
-        compressed = None  # "BZh" opens bzip2 only with its block size, 1 to 9, after it
-    archive = data.startswith(_ZIP) or _is_tar(data)
-    if not compressed and not archive:
+    text = _text(data)
+    if text is not None:
+        yield Stream(label, data, TEXT, text)
         return
+    if data.startswith(_SQLITE):
+        yield Stream(label, data, SQLITE)
+        return
+    compression = _compression(data)
+    if compression is None and not data.startswith(_ZIP) and not _is_tar(data):
+        budget.problems.append(_refuse(label, _detected(data)))
+        return
+    yield Stream(label, data, ARCHIVE)
     if depth >= MAX_DEPTH:
-        budget.problems.append(f"{label}: unscannable, nested deeper than {MAX_DEPTH} levels")
+        budget.problems.append(_refuse(label, f"nested deeper than {MAX_DEPTH} levels"))
         return
     try:
-        if compressed:
-            kind, opener = compressed
-            with opener(io.BytesIO(data)) as stream:
-                inner = _capped(stream, f"{label}!({kind})", budget)
+        if compression:
+            with _COMPRESSED[compression](io.BytesIO(data)) as stream:
+                inner = _read(stream, f"{label}!({compression})", budget)
             if inner is not None:
-                yield from _walk(f"{label}!({kind})", inner, depth + 1, budget)
+                yield from _walk(f"{label}!({compression})", inner, depth + 1, budget)
             return
-        for name, inner in list(_members(label, data, budget)):
+        for name, inner in _members(label, data, budget):
             yield from _walk(f"{label}!{name}", inner, depth + 1, budget)
+    except _Exhausted:
+        raise
     except (OSError, EOFError, ValueError, RuntimeError, NotImplementedError, zipfile.BadZipFile, tarfile.TarError,
             lzma.LZMAError) as error:  # fmt: skip
-        budget.problems.append(f"{label}: unscannable, cannot be opened ({type(error).__name__})")
+        budget.problems.append(_refuse(label, f"it cannot be opened ({type(error).__name__})"))
 
 
-def streams(path: str, data: bytes) -> tuple[list[tuple[str, bytes]], list[str]]:
-    """Every byte stream of a file with its label, and the problems that make part of it unscannable."""
+def streams(path: str, data: bytes) -> tuple[list[Stream], list[tuple[str, str]]]:
+    """Every stream of a file, and the problems that refuse it, each as (label, why); the walk stops when the total
+    budget runs out."""
     budget = _Budget()
-    found = list(_walk(path, data, 0, budget))
+    found: list[Stream] = []
+    try:
+        for stream in _walk(path, data, 0, budget):
+            found.append(stream)
+    except _Exhausted as exhausted:
+        budget.problems.append(
+            _refuse(exhausted.label, f"the file decompresses to over {MAX_TOTAL_BYTES} bytes in total; scan stopped")
+        )
     return found, budget.problems
 
 
-def byte_views(data: bytes) -> list[tuple[str, str]]:
-    """One stream as text under every encoding the checks read, NUL bytes as line breaks."""
+def _byte_views(data: bytes) -> list[tuple[str, str]]:
     views = [
         ("utf-8", data.decode("utf-8", errors="replace")),
         ("utf-16le", data.decode("utf-16-le", errors="replace")),
@@ -185,18 +282,32 @@ def _backslash(text: str) -> str:
     return _BACKSLASH.sub(char, text)
 
 
-def decoded_views(name: str, text: str) -> list[tuple[str, str]]:
-    """The text with what can hide a name undone: parsed strings, entities, percent- and backslash escapes."""
-    views = []
+def normalise(text: str) -> str:
+    """Continuations joined and backslash escapes decoded."""
+    return _backslash(_CONTINUATION.sub("", text))
+
+
+PARSED = ("json", "toml")  # views without the file's own lines
+
+
+def _text_views(label: str, text: str) -> list[tuple[str, str]]:
+    views = [("text", text), ("normalised", normalise(text))]
     for parser, kind in ((json.loads, "json"), (tomllib.loads, "toml")):
-        if name.lower().endswith(f".{kind}") or kind == "json":
-            with contextlib.suppress(ValueError, RecursionError):  # not that format: its other views still apply
+        if kind == "json" or label.lower().endswith(".toml"):
+            with contextlib.suppress(ValueError, RecursionError):  # not that format: the other views still apply
                 views.append((kind, "\n".join(_strings(parser(text)))))
-    views += [("entities", html.unescape(text)), ("percent", unquote(text)), ("backslash", _backslash(text))]
+    views += [("entities", html.unescape(text)), ("percent", unquote(text))]
     combined = text
     for _ in range(_DECODE_ROUNDS):
-        decoded = _backslash(unquote(html.unescape(combined)))
+        decoded = normalise(unquote(html.unescape(combined)))
         if decoded == combined:
             break
         combined = decoded
     return [*views, ("decoded", combined)]
+
+
+def views(stream: Stream) -> list[tuple[str, str]]:
+    """What the scans read in one stream: text and its decodings, or a database's or archive's bytes as text."""
+    if stream.text is not None:
+        return _text_views(stream.label, stream.text)
+    return _byte_views(stream.data)

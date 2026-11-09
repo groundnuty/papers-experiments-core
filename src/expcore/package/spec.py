@@ -16,12 +16,26 @@ that the replay check keeps in the batch. A selected symbolic link is refused, s
 The names the build writes at the package root (`GENERATED`) cannot be selected, nor can the other names GNU Make
 reads there (`GNUmakefile`, `makefile`), which would take the place of the generated Makefile; the generated
 instructions run `make -f Makefile check` as well.
+
+The package's checks read only what they can read in full (text, SQLite databases and archives of them; see `views`)
+and refuse everything else. A file they cannot read, a PDF figure for instance, goes in only when the author attests
+it, having inspected it by hand:
+
+    [[opaque]]
+    path = "figures/flow.pdf"   # one file the patterns select
+    sha256 = "<its 64 hexadecimal digits>"
+    reason = "a figure drawn by hand; read page by page, no name in it"
+
+The build then includes that exact file unscanned, refuses it if its bytes no longer have that hash, and lists the
+attestation in PACKAGE.json.
 """
 
 import os
 import re
+import string
 import tomllib
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
 SPEC_FILE = "package.toml"
@@ -38,12 +52,23 @@ class PackageError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class Opaque:
+    """A file the author attests by hand: the package includes exactly these bytes unscanned."""
+
+    path: str
+    sha256: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class PackageSpec:
-    """What a package holds: its name (the archive's top directory) and the patterns that select its files."""
+    """What a package holds: its name (the archive's top directory), the patterns that select its files, and the
+    files the author attests by hash because the checks cannot read them."""
 
     source: Path
     name: str
     include: tuple[str, ...]
+    opaque: Mapping[str, Opaque] = field(default_factory=dict)
 
 
 def _check_pattern(source: Path, pattern: object) -> str:
@@ -69,7 +94,7 @@ def load_spec(study_root: Path) -> PackageSpec:
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise PackageError(f"{source}: cannot be read ({type(error).__name__}: {error})") from None
     table = raw.get("package")
-    unknown = sorted(set(raw) - {"package"}) + sorted(set(table or {}) - {"name", "include"})
+    unknown = sorted(set(raw) - {"package", "opaque"}) + sorted(set(table or {}) - {"name", "include"})
     if not isinstance(table, dict) or unknown:
         raise PackageError(f"{source}: needs a [package] table with `name` and `include` only (unknown: {unknown})")
     name = table.get("name")
@@ -81,7 +106,30 @@ def load_spec(study_root: Path) -> PackageSpec:
     patterns = tuple(_check_pattern(source, pattern) for pattern in include)
     if len(set(patterns)) != len(patterns):
         raise PackageError(f"{source}: [package] include lists a pattern twice")
-    return PackageSpec(source, name, patterns)
+    return PackageSpec(source, name, patterns, _load_opaque(source, raw.get("opaque", [])))
+
+
+def _load_opaque(source: Path, entries: object) -> dict[str, Opaque]:
+    """The [[opaque]] attestations: each one included file, its full SHA-256 and a reason, and no path twice."""
+    if not isinstance(entries, list):
+        raise PackageError(f"{source}: [[opaque]] must be an array of tables")
+    attested: dict[str, Opaque] = {}
+    for number, entry in enumerate(entries, start=1):
+        where = f"{source}: [[opaque]] entry {number}"
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "reason"}:
+            raise PackageError(f"{where} needs exactly `path`, `sha256` and `reason`")
+        path, digest, reason = entry["path"], entry["sha256"], entry["reason"]
+        _check_pattern(source, path)
+        if any(c in path for c in "*?"):
+            raise PackageError(f"{where}: `path` must name one file, not a pattern")
+        if not isinstance(digest, str) or len(digest) != 64 or set(digest) - set(string.hexdigits.lower()):
+            raise PackageError(f"{where}: `sha256` must be the file's 64 lowercase hexadecimal digits")
+        if not isinstance(reason, str) or not reason.strip():
+            raise PackageError(f"{where}: `reason` must say why the file goes in unscanned")
+        if path in attested:
+            raise PackageError(f"{where}: attests {path} twice")
+        attested[path] = Opaque(path, digest, reason)
+    return attested
 
 
 def pattern_regex(pattern: str) -> re.Pattern[str]:
@@ -138,4 +186,7 @@ def select(root: Path, spec: PackageSpec) -> list[str]:
     empty = [pattern for pattern, count in hits.items() if not count]
     if empty:
         raise PackageError(f"{spec.source}: [package] include {empty[0]!r} selects no file")
+    stray = sorted(set(spec.opaque) - set(chosen))
+    if stray:
+        raise PackageError(f"{spec.source}: [[opaque]] attests {stray[0]}, which the package does not include")
     return chosen

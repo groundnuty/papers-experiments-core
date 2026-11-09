@@ -14,7 +14,9 @@
 6. refuse the package if a path or content of any file matches a study token, or holds a term of the anonymisation
    list. The token check is `expcore.provenance.study_tokens`' own scanner with the hashes of names that are private
    everywhere (hosts, addresses, users, spaces, providers: the `all` scope): a study's own condition, dataset or model
-   names belong in its own package;
+   names belong in its own package. Both checks fail closed: a file goes in only if they can read all of it (text,
+   SQLite databases and archives of them, `views`); anything else is refused, unless package.toml attests that exact
+   file by its SHA-256 with a reason (`[[opaque]]`), and then it goes in unread;
 7. lay the package out in a scratch directory and run its check there: every file against `SHA256SUMS`, then the four
    outputs derived anew from the records and compared byte for byte (K07);
 8. write the deterministic archive `<out>/<name>.tar.gz` (K06).
@@ -24,24 +26,26 @@ path of the build machine is added. The campaign snapshot keeps the attempt dire
 replay check hashed them; the token check reads it like any file.
 """
 
+import dataclasses
+import hashlib
 import importlib.resources
 import json
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 
 import expcore
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.config.loading import ConfigError
 from expcore.models.route import sdk_version
-from expcore.package.anonymise import Anonymisation, find_terms, load_anonymisation, rewrite
+from expcore.package.anonymise import Anonymisation, find_terms, holds_term, load_anonymisation, rewrite
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
 from expcore.package.spec import PackageError, PackageSpec, load_spec, select
-from expcore.package.views import byte_views, streams
+from expcore.package.views import streams, views
 from expcore.provenance.codestamp import STAMP, covered_files, is_sha, write_stamp
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.hashfile import Hashes
-from expcore.provenance.scanner import scan_source
+from expcore.provenance.scanner import REDACTED_PATH, scan_source
 from expcore.provenance.study_tokens import load_hashes
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.replay.check import CHECK_FILE, BatchNotVerified
@@ -84,22 +88,32 @@ def private_hashes(path: Path) -> Hashes:
     return hashes
 
 
-def scan_tokens(files: Mapping[str, bytes], hashes: Hashes) -> list[str]:
+def scan_tokens(
+    files: Mapping[str, bytes],
+    hashes: Hashes,
+    *,
+    opaque: Collection[str] = frozenset(),
+    hidden: Callable[[str], bool] = lambda label: False,
+) -> list[str]:
     """Run the study-token scanner over every stream of every file, under every view, with no exemption.
 
-    Each file is opened down to its last compressed or archived member (`views.streams`), and each stream is read as
-    UTF-8, UTF-16 in both byte orders and alignments, and raw bytes. The provenance-header exemption of this
-    repository's own check does not apply. Content the scan cannot read is a finding too. A finding shows a hash
-    prefix and where, never the value.
+    Each file is classified and opened down to its last archived member (`views.streams`); a file of a kind the scan
+    cannot read in full is a finding, a refusal. Text is read as it is and decoded, a database's or archive's bytes
+    under every encoding (`views.views`). The provenance-header exemption of this repository's own check does not
+    apply. The files in `opaque` were attested by hash and are not read. A finding shows a hash prefix and where,
+    never the value; a refused stream whose label holds a private name, or for which `hidden` is true (a term of an
+    anonymisation list), is shown redacted.
     """
     findings: set[str] = set()
-    for path in sorted(files):
+    for path in sorted(set(files) - set(opaque)):
         found, problems = streams(path, files[path])
-        findings.update(problems)
-        for label, data in found:
-            for view, text in byte_views(data):
-                python = view == "utf-8" and label.endswith(".py")
-                hits = scan_source(label, text, hashes, exempt_header=False, python=python)
+        for label, why in problems:
+            private = hidden(label) or any(hit.kind == "path" for hit in scan_source(label, "", hashes))
+            findings.add(f"{REDACTED_PATH if private else label}: {why}")
+        for stream in found:
+            for view, text in views(stream):
+                python = view == "text" and stream.label.endswith(".py")
+                hits = scan_source(stream.label, text, hashes, exempt_header=False, python=python)
                 findings.update(f"{hit} ({view})" for hit in hits)
     return sorted(findings)
 
@@ -155,9 +169,21 @@ def _package_json(spec: PackageSpec, study: StudyConfig, code: Mapping, check: M
         "include": list(spec.include),
         "outputs": [f"{OUT_DIR}/{name}" for name in OUTPUT_FILES],
         "anonymised": list(rewritten),
+        "opaque": [dataclasses.asdict(spec.opaque[path]) for path in sorted(spec.opaque)],
         "check": "make -f Makefile check: each file against SHA256SUMS, then each output anew from the records",
     }
     return (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _attested(spec: PackageSpec, files: Mapping[str, bytes]) -> frozenset[str]:
+    """The files package.toml attests by hash, each checked to be exactly the attested bytes."""
+    for path, entry in sorted(spec.opaque.items()):
+        if hashlib.sha256(files[path]).hexdigest() != entry.sha256:
+            raise PackageError(
+                f"{path}: its SHA-256 is not the one [[opaque]] attests in {spec.source}; inspect the file again and "
+                "attest its new hash, or leave it out"
+            )
+    return frozenset(spec.opaque)
 
 
 def _lay_out(stage: Path, files: Mapping[str, bytes]) -> None:
@@ -184,6 +210,7 @@ def collect(
     if missing:
         more = f" and {len(missing) - 1} more" if len(missing) > 1 else ""
         raise PackageError(f"{spec.source}: the package's check needs {missing[0]}{more}; add it to [package] include")
+    opaque = _attested(spec, files)
     code = _clean_code(check, where)
     made_with = _read_json(files, f"{OUT_DIR}/{ANALYSIS_FILE}", "the analysis").get("core_version")
     if made_with != sdk_version(CORE_DISTRIBUTION):
@@ -197,7 +224,8 @@ def collect(
         terms = load_anonymisation(
             Path(anonymise), keep_out_of=private_list_guard(study.root, out_dir), model_names=_model_names(study)
         )
-        files = rewrite(files, terms, code=set(covered_files(study.root, study.scope)), out_prefix=f"{OUT_DIR}/")
+        never = set(covered_files(study.root, study.scope)) | opaque  # code, and files attested unread
+        files = rewrite(files, terms, code=never, out_prefix=f"{OUT_DIR}/")
         rewritten = list(terms.files)
     files["Makefile"] = MAKEFILE.encode("utf-8")
     files[PACKAGE_FILE] = _package_json(spec, study, code, check, rewritten)
@@ -208,8 +236,11 @@ def collect(
     if json.loads(files[STAMP])["tree_sha256"] != code["tree_sha256"]:
         raise PackageError(f"{where}: the package's code is not the code the records were checked under")
     files[SUMS_FILE] = render_sums(files)
-    findings = scan_tokens(files, private_hashes(default_hashes() if hashes is None else Path(hashes)))
-    findings += find_terms(files, terms) if terms is not None else []
+    hidden = (lambda label: holds_term(terms, label)) if terms is not None else (lambda label: False)
+    findings = scan_tokens(
+        files, private_hashes(default_hashes() if hashes is None else Path(hashes)), opaque=opaque, hidden=hidden
+    )
+    findings += find_terms(files, terms, opaque=opaque) if terms is not None else []
     if findings:
         raise PackageError("refusing to build the package:\n  " + "\n  ".join(findings))
     return spec, files

@@ -5,11 +5,13 @@ The campaign runs once per module, under a directory named by an invented privat
 lists, so every package built here also shows that no path of the machine reaches the package.
 """
 
+import hashlib
 import json
 import shutil
 import subprocess
 import sys
 import tarfile
+import zlib
 from pathlib import Path
 
 import pytest
@@ -230,6 +232,40 @@ def test_a_listed_term_in_a_code_file_fails_the_build_naming_file_and_line_and_i
         )
     assert "lookup" not in str(refused.value)
     assert (root / "plugin.py").read_bytes() == before
+
+
+FIGURE = b"%PDF-1.4\n<< /Filter /FlateDecode >>\nstream\n" + zlib.compress(b"a drawn figure") + b"\nendstream\n"
+
+
+def with_figure(campaign: Campaign, tmp_path: Path, attested: str | None) -> Path:
+    """A copy of the study that includes a PDF figure, attested with the given SHA-256 or not at all."""
+    root = a_copy(campaign, tmp_path)
+    (root / "figure.pdf").write_bytes(FIGURE)
+    spec = root / "package.toml"
+    text = spec.read_text(encoding="utf-8").replace('    "README.md",\n', '    "README.md",\n    "figure.pdf",\n')
+    if attested is not None:
+        text += f'\n[[opaque]]\npath = "figure.pdf"\nsha256 = "{attested}"\nreason = "a figure, read by hand"\n'
+    spec.write_text(text, encoding="utf-8")
+    return root
+
+
+def test_k03_a_pdf_the_scan_cannot_read_is_refused_unless_attested_by_its_exact_hash(campaign, hashes, tmp_path):
+    """K03: the scan fails closed: a PDF is refused, and goes in unscanned only when package.toml attests that exact
+    file by its SHA-256 with a reason; a file that differs from the attested one is refused."""
+    with pytest.raises(PackageError, match=r"figure\.pdf: refused, PDF content"):
+        build_package(with_figure(campaign, tmp_path / "plain", None), tmp_path / "dist-plain", hashes=hashes)
+    wrong = with_figure(campaign, tmp_path / "wrong", "0" * 64)
+    with pytest.raises(PackageError, match=r"figure\.pdf: its SHA-256 is not the one \[\[opaque\]\] attests"):
+        build_package(wrong, tmp_path / "dist-wrong", hashes=hashes)
+    right = with_figure(campaign, tmp_path / "right", hashlib.sha256(FIGURE).hexdigest())
+    archive = build_package(right, tmp_path / "dist-right", hashes=hashes)
+    unpacked = unpack(archive, tmp_path / "unpacked")
+    assert (unpacked / "figure.pdf").read_bytes() == FIGURE
+    attested = json.loads((unpacked / PACKAGE_FILE).read_text(encoding="utf-8"))["opaque"]
+    assert attested == [
+        {"path": "figure.pdf", "sha256": hashlib.sha256(FIGURE).hexdigest(), "reason": "a figure, read by hand"}
+    ]
+    assert verify_package(unpacked) == []
 
 
 def test_the_command_line_builds_and_checks_a_package(campaign, hashes, tmp_path, capsys):

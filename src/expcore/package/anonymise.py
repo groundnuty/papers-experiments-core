@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from expcore.package.spec import PackageError
-from expcore.package.views import byte_views, decoded_views, streams
+from expcore.package.views import PARSED, streams, views
 from expcore.study.config import CONFIG_FILES
 
 REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".cff", ".bib", ".json", ".toml", ".yaml", ".yml"})
@@ -171,26 +171,35 @@ def _lines(text: str, finders: Sequence[re.Pattern[str]]) -> set[int]:
     return {text.count("\n", 0, m.start()) + 1 for f in finders for m in f.finditer(text)}
 
 
-def find_terms(files: Mapping[str, bytes], anonymisation: Anonymisation) -> list[str]:
+def holds_term(anonymisation: Anonymisation, text: str) -> bool:
+    """Whether a text, a path for instance, holds a term of the list anywhere the residual check would find it."""
+    return any(_finder(term).search(text) for term in anonymisation.terms)
+
+
+def find_terms(
+    files: Mapping[str, bytes], anonymisation: Anonymisation, *, opaque: Collection[str] = frozenset()
+) -> list[str]:
     """Return one finding per stream and line that holds a term, never the term; empty when the package is clean.
 
-    Every stream of every file is read under every encoding and decoded (`views`). A term found only in the parsed
-    strings of a JSON or TOML stream has no line of its own and is reported for the stream.
+    Every stream of every file is read as the token check reads it (`views`): text as it is and decoded, a database's
+    or archive's bytes under every encoding. A term found only in the parsed strings of a JSON or TOML stream has no
+    line of its own and is reported for the stream. What the token check refuses is its finding, not one of these;
+    the files in `opaque` were attested by hash and are not read.
     """
     finders = [_finder(term) for term in anonymisation.terms]
     findings: list[str] = []
-    for name in sorted(files):
-        for label, data in streams(name, files[name])[0]:  # what cannot be opened is the token check's refusal
-            shown = REDACTED_PATH if any(f.search(label) for f in finders) else label
-            if shown != label:
+    for name in sorted(set(files) - set(opaque)):
+        for stream in streams(name, files[name])[0]:
+            shown = REDACTED_PATH if any(f.search(stream.label) for f in finders) else stream.label
+            if shown != stream.label:
                 findings.append(f"{shown}: the path holds {FINDING}")
             lines, parsed = set(), False
-            for _, text in byte_views(data):
-                lines |= _lines(text, finders)
-            for view, text in decoded_views(label, data.decode("utf-8", errors="replace")):
+            for view, text in views(stream):
                 hits = _lines(text, finders)
-                parsed = parsed or (view in ("json", "toml") and bool(hits))
-                lines |= hits if view not in ("json", "toml") else set()
+                if view in PARSED:
+                    parsed = parsed or bool(hits)
+                else:
+                    lines |= hits
             findings += [f"{shown}:{line}: {FINDING}" for line in sorted(lines)]
             if parsed and not lines:
                 findings.append(f"{shown}: {FINDING}, in its parsed strings")
