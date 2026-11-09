@@ -559,7 +559,7 @@ def test_the_allow_list_and_the_other_managed_settings_cannot_be_set_by_the_call
 
 def test_insecure_tls_is_a_setting_of_the_file(tmp_path, fake, frozen_manifests):
     use_frozen(tmp_path, frozen_manifests)
-    config = load_platform(write_platform(tmp_path, lambda d: d["toolserver"].update(insecure_tls=True)))
+    config = load_platform(write_platform(tmp_path, lambda d: d.update(tls={"insecure_tls": True})))
     client = OnezoneClient(config, http=fake.client_http())
     token = TokenIssuer(client, config, clock=lambda: NOW).mint(
         tool_server_spec(config.space.id, config.condition("read")), TOOLS, ceiling_s=CEILING_S

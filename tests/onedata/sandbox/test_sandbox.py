@@ -435,7 +435,7 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     sbx = start(world, "mounted")
     meta = sbx.metadata()
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
-    assert set(meta["mount"]) == {"tls", "io_mode", "log_dir_from", "wait_s"}
+    assert set(meta["mount"]) == {"io_mode", "log_dir_from", "wait_s"}
     assert meta["mount"]["log_dir_from"] == "default"
     text = json.dumps(meta, default=str)
     assert world.s.network.pools[0] not in text

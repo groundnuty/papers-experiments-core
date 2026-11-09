@@ -63,7 +63,7 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     return [
         *("-u", "ONECLIENT_INSECURE", ONECLIENT_BIN, "-f", "-H", provider_host),
         *("-o", "ro,allow_other", *io),
-        *(["--insecure"] if mount.tls == "insecure" else []),
+        *(["--insecure"] if settings.tls.insecure else []),
         *mount.extra_args,
         SIDECAR_MOUNT,
     ]

@@ -90,7 +90,7 @@ def server_environment(
     The one token serves the server's Onezone and Oneprovider settings. The provider is the agent's pinned local one.
     The allow-list is the condition's, and a caller cannot set it or any other managed setting.
     """
-    server = _server(config)
+    _server(config)
     clash = sorted(set(extra or {}) & set(MANAGED_ENV))
     if clash:
         raise ValueError(f"the tool server's own settings are fixed by the condition: {', '.join(clash)}")
@@ -104,7 +104,7 @@ def server_environment(
             ENV_TOOLS: ",".join(condition.allow),
         }
     )
-    if server.insecure_tls:
+    if config.tls.insecure:
         env[ENV_INSECURE_TLS] = "true"
     return env
 

@@ -153,7 +153,6 @@ def test_the_tls_flag_cannot_be_smuggled_through_the_extra_arguments(tmp_path):
     ("table", "key", "value", "named"),
     [
         ("data_paths", "mounted", "elsewhere", "entry 0"),  # a level is the study's word: named by position
-        ("mount", "tls", "maybe", "tls"),
         ("mount", "path", "/", "path"),
         ("mount", "io_mode", "x", "io_mode"),
     ],

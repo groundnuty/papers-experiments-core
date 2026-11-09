@@ -42,13 +42,16 @@ gate_memory_bytes = 1073741824  # optional
 
 [sandbox.mount]                 # required when a data path is a mount
 path = "/data"                  # where the agent sees the space, read-only
-tls = "verify"                  # or "insecure"
 io_mode = "direct"              # optional: "direct" or "proxy"
 extra_args = []                 # further oneclient arguments, never one that changes the TLS mode
 
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
 <level> = "rest"
 ```
+
+The certificate check of the data gate's upstream and of oneclient is not declared here either: it is the platform's one
+`[tls]` setting (`tls.py`), which `load_platform` hands to `load_sandbox` and which every client of the federation
+takes. A `tls` key in `[sandbox.mount]`, oneclient's own setting in earlier versions, is refused with a pointer to it.
 
 The platform users a run leases are not declared here: a run that needs a data-path token or a tool server leases one
 slot of `[slots.<name>]` (`users.py`), which gives it both planes' users, so there is one pool of leased users. The
@@ -59,22 +62,22 @@ import itertools
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 
 from expcore.config.loading import ConfigError, Section
 from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.hostops import strict_networks
+from expcore_onedata.tls import TlsSettings, moved
 
 PREFIX_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 NAMESPACE_RE = re.compile(r"[a-z][a-z0-9.-]{0,63}")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
 SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under the space root
-TLS_MODES = ("verify", "insecure")
 IO_MODES = ("direct", "proxy")
-FORBIDDEN_ARGS = {"-i", "--insecure"}  # TLS is set by `tls` only
+FORBIDDEN_ARGS = {"-i", "--insecure"}  # TLS is set by the platform's [tls] only
 
 
 @dataclass(frozen=True)
@@ -110,10 +113,9 @@ class NetworkSettings:
 
 @dataclass(frozen=True)
 class MountSettings:
-    """How the oneclient sidecar mounts the space and where the agent sees it."""
+    """How the oneclient sidecar mounts the space and where the agent sees it; its TLS is `SandboxSettings.tls`."""
 
     path: str
-    tls: str
     io_mode: str | None = None
     extra_args: tuple[str, ...] = ()
 
@@ -138,6 +140,7 @@ class SandboxSettings:
     earlyoom_comm: str | None = None
     trust_paths: tuple[str, ...] = ()
     content_check_file: str | None = None  # the file the pre-campaign check reads (`precampaign.py`)
+    tls: TlsSettings = field(default_factory=TlsSettings)  # the platform's [tls]: the gate's upstream and oneclient
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -217,20 +220,20 @@ def _limits(section: Section) -> Limits:
 
 
 def _mount(section: Section) -> MountSettings:
-    """Read [sandbox.mount]: the path in the agent, the TLS mode and the oneclient options."""
-    section.reject_unknown(("path", "tls", "io_mode", "extra_args"))
-    path, tls = section.string("path"), section.string("tls")
+    """Read [sandbox.mount]: the path in the agent and the oneclient options; TLS is the platform's [tls]."""
+    if "tls" in section.data:
+        raise moved(section, "tls")
+    section.reject_unknown(("path", "io_mode", "extra_args"))
+    path = section.string("path")
     if not path.startswith("/") or path == "/" or ".." in path.split("/") or any(c.isspace() for c in path):
         raise section.fail("path", "must be an absolute path inside the agent, not the root")
-    if tls not in TLS_MODES:
-        raise section.fail("tls", f"must be one of: {', '.join(TLS_MODES)}")
     io_mode = section.optional_string("io_mode")
     if io_mode is not None and io_mode not in IO_MODES:
         raise section.fail("io_mode", f"must be one of: {', '.join(IO_MODES)}")
     extra = section.strings("extra_args") if "extra_args" in section.data else ()
     if any(a in FORBIDDEN_ARGS or (a.startswith("-") and not a.startswith("--") and "i" in a[1:]) for a in extra):
-        raise section.fail("extra_args", "must not carry the TLS flag: 'tls' alone sets it")
-    return MountSettings(path, tls, io_mode, tuple(extra))
+        raise section.fail("extra_args", "must not carry the TLS flag: the platform's [tls] alone sets it")
+    return MountSettings(path, io_mode, tuple(extra))
 
 
 def _entry_string(section: Section, key: str, position: int) -> str:
@@ -278,8 +281,10 @@ def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, .
     return tuple(words)
 
 
-def load_sandbox(section: Section, base: Path) -> SandboxSettings:
-    """Validate the `[sandbox]` table; raise ConfigError naming the file and key, never a value."""
+def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None) -> SandboxSettings:
+    """Validate the `[sandbox]` table; raise ConfigError naming the file and key, never a value.
+
+    `tls` is the platform's `[tls]`, already loaded; without it the sandbox's clients verify against their defaults."""
     keys = (
         "work_root",
         "name_prefix",
@@ -337,6 +342,7 @@ def load_sandbox(section: Section, base: Path) -> SandboxSettings:
         earlyoom_comm=comm,
         trust_paths=_words(section, "trust_paths", ()),
         content_check_file=check_file,
+        tls=tls if tls is not None else TlsSettings(),
     )
 
 

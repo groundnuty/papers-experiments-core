@@ -108,7 +108,12 @@ class DockerSandbox:
         self._containers: list[str] = []
         self._net: str | None = None
         self._watched: dict[str, dict[str, Any]] = {}
-        self._meta: dict[str, Any] = {"run_key": spec.run_key, "data_path": spec.mode.value, "images": {}}
+        self._meta: dict[str, Any] = {
+            "run_key": spec.run_key,
+            "data_path": spec.mode.value,
+            "images": {},
+            "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
+        }
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
         self._stopped, self._stop_lock = True, threading.Lock()
@@ -417,8 +422,7 @@ class DockerSandbox:
         host_name = sp.provider.host
         command = sidecar_command(host_name, s)
         self._log_dir = effective_log_dir(command)
-        self._meta["mount"] = {  # the keys that set it, never a path (O12)
-            "tls": s.mount.tls,
+        self._meta["mount"] = {  # the keys that set it, never a path (O12); its TLS is the run's `tls`
             "io_mode": s.mount.io_mode,
             "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != ONECLIENT_LOG_DIR else "default",
         }
