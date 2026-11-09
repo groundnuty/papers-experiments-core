@@ -209,6 +209,40 @@ assert scored.scores["lookups"] == {
 }
 ```
 
+### Unknown platform estimates are data
+
+A study on the Onedata platform reads the run-end platform probes from each record's instruments (`platform_probes`). Per tracked provider they give `gained_bytes` (net placement growth: the bytes the provider holds at run end minus at run start, from the block map, not bytes on the wire), `transfer_bytes_in` (what the transfers in the run window moved into it), and `on_demand_lower_bound`, which is `None` whenever one of its inputs is not established, with each reason in `unknown` (`transfer_not_ended`, `transfer_carried_over`, `listing_not_settled`, ...).
+
+That missingness is informative. An estimate is unknown exactly when, for example, the agent starts a transfer and its run ends first, which is likelier under conditions that encourage placement, so dropping the unknowns would bias a comparison between conditions. Count them per condition and reason, and report the counts beside any analysis of the bound; never drop them silently. Either analyse a measure that is always defined (`gained_bytes`, `transfer_bytes_in`), or analyse the bound and state its missingness as a limitation. A study without the platform has no probes, and the count is empty:
+
+```python
+from collections import Counter
+
+
+def unknown_on_demand(export, runs):
+    """Count the on-demand estimates that are unknown, by condition, provider and reason, over the analysed attempts.
+    An attempt whose probes give no split at all counts once under the reason "no_split"."""
+    counts = Counter()
+    for entry in export["analysed_attempts"]:
+        record = load_record(runs / entry["run_dir"] / record_filename(entry["run_key"], entry["attempt"]))
+        probes = record.instruments.get("platform_probes")
+        if probes is None:  # no platform: nothing to count
+            continue
+        if probes.get("on_demand") is None:
+            counts[entry["condition"], None, "no_split"] += 1
+            continue
+        for provider, split in probes["on_demand"].items():
+            for reason in split["unknown"] or ():
+                counts[entry["condition"], provider, reason] += 1
+    return counts
+
+
+counts = unknown_on_demand(export, Path("my-study/out/runs"))
+for (condition, provider, reason), n in sorted(counts.items(), key=str):
+    print(condition, provider, reason, n)
+assert counts == Counter()  # the example study runs without the platform
+```
+
 ## 6. What a conclusion may say
 
 Every contrast ends in one of four words, `difference`, `trivial_difference`, `equivalent` or `not_detected`, and never in "no difference". Only `equivalent` may be read as no difference, and only a contrast with an `equivalence_margin` in the preregistration can reach it: the interval at 1 - 2 alpha lies inside plus or minus the margin and the test is not significant. `not_detected` is the absence of evidence, never evidence of absence; without a margin, it is the most a non-significant result can say.
