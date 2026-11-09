@@ -71,6 +71,41 @@ def test_o14_a_pool_that_is_not_a_strict_network_fails_at_load(tmp_path, pools, 
     assert "10.77.0.5" not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    "pools",
+    [
+        ["192.0.2.0/24", "192.0.2.128/25"],  # the second nested in the first
+        ["198.51.100.0/25", "203.0.113.0/24", "198.51.100.0/24"],  # the first nested in the third, apart in the list
+    ],
+)
+def test_o14_overlapping_pools_are_refused_at_load_by_position(tmp_path, pools):
+    """O14: two pools that share addresses could hand two sandboxes the same network; the message names the entries by
+    their position, never by their value."""
+
+    def edit(data):
+        data["sandbox"]["network"]["pools"] = pools
+        data["sandbox"]["network"]["prefix"] = 28
+
+    with pytest.raises(ConfigError, match="overlap") as caught:
+        load(tmp_path, edit)
+    message = str(caught.value)
+    assert "pools" in message
+    first, second = (0, 1) if len(pools) == 2 else (0, 2)
+    assert f"entries {first} and {second} overlap" in message
+    for value in pools:
+        assert value.split("/")[0] not in message
+
+
+def test_o14_pools_that_only_touch_are_not_an_overlap(tmp_path):
+    """O14: adjacent pools share no address, so they load."""
+
+    def edit(data):
+        data["sandbox"]["network"]["pools"] = ["192.0.2.0/25", "192.0.2.128/25"]
+        data["sandbox"]["network"]["prefix"] = 28
+
+    assert load(tmp_path, edit).network.pools == ("192.0.2.0/25", "192.0.2.128/25")
+
+
 def test_o14_the_prefix_must_fit_inside_every_pool(tmp_path):
     """O14: a sandbox network larger than its pool is refused at load."""
 

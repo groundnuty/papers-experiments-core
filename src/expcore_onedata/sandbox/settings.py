@@ -23,7 +23,8 @@ id = "sha256:..."               # the pinned id; a tag that now resolves elsewhe
 [sandbox.images.oneclient]      # required when a data path is a mount
 
 [sandbox.network]
-pools = ["10.0.0.0/13"]         # one or more IPv4 networks in strict mode; each sandbox gets its own small network
+pools = ["10.0.0.0/13"]         # one or more IPv4 networks in strict mode, none overlapping another; each sandbox
+                                # gets its own small network
 prefix = 28                     # size of that network (a sandbox needs two addresses)
 max_attempts = 64
 
@@ -51,6 +52,7 @@ extra_args = []                 # further oneclient arguments, never one that ch
 ```
 """
 
+import itertools
 import math
 import re
 from collections.abc import Mapping
@@ -182,7 +184,9 @@ def _images(section: Section) -> tuple[ImageRef, ImageRef, ImageRef | None]:
 
 
 def _network(section: Section) -> NetworkSettings:
-    """Read [sandbox.network]; every pool must be a network in strict mode, checked at load (O14)."""
+    """Read [sandbox.network]; every pool must be a network in strict mode, and no two may overlap: a sandbox network
+    drawn from one would then be drawn from the other too, and two sandboxes could get the same addresses. Checked at
+    load, with the pools named by their position (O14)."""
     section.reject_unknown(("pools", "prefix", "max_attempts"))
     pools = section.strings("pools")
     if not pools or len(set(pools)) != len(pools):
@@ -192,6 +196,9 @@ def _network(section: Section) -> NetworkSettings:
         nets = strict_networks(pools)
     except ValueError as error:
         raise section.fail("pools", str(error)) from None
+    for (i, a), (j, b) in itertools.combinations(enumerate(nets), 2):
+        if a.overlaps(b):  # by position: a range is a configured value, never echoed
+            raise section.fail("pools", f"entries {i} and {j} overlap: each address must belong to one pool only")
     if any(net.prefixlen > prefix for net in nets) or prefix > 30:
         raise section.fail("prefix", "must be at most 30 and no smaller than the prefix of every pool")
     attempts = int(_number(section, "max_attempts", minimum=1, integer=True, default=64))
