@@ -148,7 +148,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.skip_install and not args.runner:
         print("--skip-install needs --runner: without the install no environment has the core", file=sys.stderr)
         return 2
-    workdir = args.workdir or Path(tempfile.mkdtemp(prefix="fresh-study-"))
+    # Absolute, because the package's make check runs inside the unpacked package with the interpreter named here.
+    workdir = (args.workdir or Path(tempfile.mkdtemp(prefix="fresh-study-"))).resolve()
     try:
         steps = plan(args, workdir)
     except ValueError as error:

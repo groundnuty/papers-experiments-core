@@ -77,6 +77,17 @@ def test_the_script_refuses_a_bad_commit_a_workdir_that_holds_anything_and_a_ski
     assert "not empty" in capsys.readouterr().err
 
 
+def test_k07_a_relative_work_directory_still_gives_make_an_absolute_interpreter(tmp_path, monkeypatch, capsys):
+    """K07: the package's make check runs inside the unpacked package, so the interpreter it is given must not be
+    relative to the directory the script was started in."""
+    monkeypatch.chdir(tmp_path)
+    assert fresh.main(["--sha", SHA, "--dry-run", "--workdir", "fresh"]) == 0
+    make = capsys.readouterr().out.splitlines()[-1]
+    interpreter = Path(make.split("PYTHON=", 1)[1])
+    assert interpreter.is_absolute()
+    assert interpreter == tmp_path.resolve() / "fresh" / ".venv" / "bin" / "python"
+
+
 def test_the_commands_never_inherit_another_repository_or_environment():
     env = {"GIT_DIR": "/elsewhere/.git", "VIRTUAL_ENV": "/elsewhere", "UV_PROJECT_ENVIRONMENT": "/v", "PATH": "/bin"}
     assert fresh.clean_environment(env) == {"PATH": "/bin"}
