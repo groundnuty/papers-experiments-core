@@ -3,26 +3,81 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      simulate_uv_failure:
+        description: "Make the first uv installation attempt fail, to exercise the retry"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+env:
+  # Pinned to the uv that made uv.lock, so CI does not look up "latest" on every run.
+  UV_VERSION: "0.11.19"
+  # The interpreter comes from actions/setup-python (the runner's tool cache); uv must not download one.
+  UV_PYTHON_DOWNLOADS: never
+
 jobs:
   check:
+    name: check (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
         with:
           # The commit check walks the pushed range, so history must be present.
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        id: python
         with:
-          # Pinned to the uv that made uv.lock, so CI does not look up "latest" on every run.
-          version: "0.11.19"
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+      - name: Use that interpreter for uv
+        run: echo "UV_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
+
+      # Installing uv downloads it from GitHub, which has failed with 504s before any test ran. A transient
+      # failure is retried once after a pause, then uv is installed from PyPI at the same pinned version.
+      # A dispatch with simulate_uv_failure makes the first attempt ask for a version that does not exist.
+      - name: Install uv
+        id: uv1
+        continue-on-error: true
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ inputs.simulate_uv_failure && '0.0.0-simulated-failure' || env.UV_VERSION }}
+      - name: Wait before retrying the uv installation
+        if: steps.uv1.outcome == 'failure'
+        run: sleep 30
+      - name: Install uv (retry)
+        id: uv2
+        if: steps.uv1.outcome == 'failure'
+        continue-on-error: true
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Install uv from PyPI (fallback)
+        id: uv3
+        if: steps.uv1.outcome == 'failure' && steps.uv2.outcome == 'failure'
+        continue-on-error: true
+        run: python -m pip install "uv==${UV_VERSION}"
+      - name: Stop with an infrastructure failure
+        if: steps.uv1.outcome == 'failure' && steps.uv2.outcome == 'failure' && steps.uv3.outcome == 'failure'
+        run: |
+          echo "::error title=Infrastructure failure, not a test failure::uv ${UV_VERSION} could not be installed (two attempts from GitHub, one from PyPI); no test ran."
+          exit 1
+      - name: Show the uv in use
+        run: |
+          test "$(uv --version | cut -d' ' -f2)" = "$UV_VERSION"
+          uv --version
+
       - run: uv sync --frozen
       - run: make check
       - name: Study-token check over every commit this event adds
+        # The commits are the same under either interpreter; check them once. A manual dispatch adds none.
+        if: matrix.python == '3.12' && github.event_name != 'workflow_dispatch'
         env:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
