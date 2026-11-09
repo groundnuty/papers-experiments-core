@@ -126,7 +126,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
                     **who,
                     "attempts": len(charged),
                     "reasons": [f"{a['infra_kind']}: {a['detail']}" for a in charged],
-                    "admissions": [a["admission"] for a in charged],
+                    "admissions": [_admission(a) for a in charged],
                 }
             )
         elif run["status"] in ("pending", "harness_error"):
@@ -141,7 +141,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
                         **who,
                         "attempt": done[0]["attempt"],
                         "reason": left_out[run["run_key"]],
-                        "admission": done[0]["admission"],
+                        "admission": _admission(done[0]),
                     }
                 )
                 continue
@@ -206,8 +206,15 @@ def _dispatch(attempt: Any) -> dict[str, Any]:
         "started_at": attempt["started_utc"],
         "lease_wait_s": attempt["lease_wait_s"],
         "lease_outcome": attempt["lease_outcome"],
-        "admission": attempt["admission"],
+        "admission": _admission(attempt),
     }
+
+
+def _admission(attempt: Any) -> str | None:
+    """What an attempt held of the platform's run admission, or None (unknown) when its row comes from a store, or a
+    snapshot of one, made before the column existed: a snapshot is read as it was written, never migrated."""
+    # a sqlite3.Row's `in` tests its values, not its column names, so the names are asked for explicitly
+    return attempt["admission"] if "admission" in attempt.keys() else None  # noqa: SIM118
 
 
 def _none_last(item: tuple[tuple, Any]) -> tuple:

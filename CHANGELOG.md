@@ -77,7 +77,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | R01 | Records are written atomically and read back byte for byte | `tests/records/test_golden.py`, `tests/records/test_record.py`, `tests/replay/test_divergence.py` |
 | R02 | Unknown schema versions and fields are refused | `tests/records/test_build.py`, `tests/records/test_golden.py`, `tests/records/test_record.py`, `tests/records/test_schema.py`, `tests/records/test_treatment_targets.py` |
 | R03 | Replay re-derives every derived field without a model call | `tests/records/test_golden.py`, `tests/replay/test_divergence.py`, `tests/replay/test_native.py`, `tests/replay/test_raw_chars.py`, `tests/replay/test_redaction.py`, `tests/replay/test_replay.py`, `tests/replay/test_waits.py` |
-| R04 | Analysis refuses records without a current replay check | `tests/e2e/test_verified_analysis.py`, `tests/replay/test_check.py` |
+| R04 | Analysis refuses records without a current replay check | `tests/campaign/test_snapshot.py`, `tests/e2e/test_verified_analysis.py`, `tests/replay/test_check.py` |
 | R05 | Decisions served during replay are recomputed offline | `tests/replay/test_check.py` |
 | R06 | The echoed request is pinned by a digest | `tests/records/test_build.py`, `tests/replay/test_divergence.py` |
 | R07 | Records hold no interpreter-specific text | `tests/records/test_build.py` |
