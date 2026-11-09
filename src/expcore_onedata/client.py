@@ -9,6 +9,9 @@
 #   merged: [S8] icsa-2027-experiments @ 6fc798cf, icsa/scripted/provision.py:114-139,170-171,246-247
 #   merged: [S8] icsa-2027-experiments @ 6fc798cf, icsa/scripted/mplus.py:144-152
 #   merged: [S9] icsa-2027-experiments @ 6fc798cf, icsa/sandbox/mock_onedata.py:78-95
+#   merged: [S10] onedata-mcp @ 0cc17ce, onedata_mcp/api/transfers.py:28-63, benchmark/fixture_runner.py:269-281
+#   merged: [S10] onedata-mcp @ 0cc17ce, benchmark/oracles/placement.py:432-440
+#   merged: [S11] icsa-2027-experiments @ 6fc798cf, icsa/scripted/provision.py:215-216,236-240
 """The one HTTP client of the platform layer, and the gate every mutation goes through (O09).
 
 Every request the layer sends leaves through `OnezoneClient`; no other module imports httpx (a test holds that). The
@@ -39,7 +42,7 @@ A failure raises `PlatformError` with the status and Onedata's error id only. Th
 header, and names a provider by its position (`providers[1]`), so neither a token nor a federation name reaches a log
 or a record through it.
 
-Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S7]` are the
+Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S11]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
 client test in a source sends it and reads the answer as this layer does.
 
@@ -67,6 +70,11 @@ client test in a source sends it and reads the answer as this layer does.
 - `file_space_name`: `GET /data/{id}` with the query `attribute=path`, the answer key `path`, whose first segment is
   the name of the space the file lies in. Unconfirmed against a real provider: [S9] is the earlier study's mock of what
   the official client calls, and it answers `path` as `/{space name}/...`; see `UNVERIFIED_ENDPOINTS`.
+- The probes' transfer log (`transferlog.py`) reads `GET /spaces/{space}/transfers` on a provider (query `state`,
+  `limit`, `page_token`; answer `transfers`, a list of ids, and `nextPageToken`, followed until empty), confirmed by
+  [S10] for the states `ongoing` and `ended`, and each id's `GET /transfers/{id}`, whose `fileId` [S10] and state and
+  counters [S11] are confirmed. The state `waiting`, a record's `type`, provider ids and times, and the listing
+  answer's `Date` header (`get_dated`, the provider's clock) are unconfirmed; see `UNVERIFIED_ENDPOINTS`.
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
@@ -126,6 +134,23 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "a provider call: the Content-Type of a file's content read whole (200) and by range (206), "
         "application/octet-stream, the only answer the data gate streams (sandbox/gateboundary.py); the only basis is "
         "the earlier study's mock of a provider, its content handler (docs/inventory.md cites it)",
+    ),
+    (
+        "GET",
+        "/spaces/{space}/transfers",
+        "a provider call: the state value waiting; running code lists ongoing and ended [S10], and waiting is named "
+        "only by the provider's API description, which [S10]'s client accepts; and the answer's Date header, from "
+        "which the transfer log estimates the provider's clock offset (`get_dated`): HTTP requires it, and no source "
+        "reads it",
+    ),
+    (
+        "GET",
+        "/transfers/{id}",
+        "a provider call: a record's type, replicatingProviderId, evictingProviderId, scheduleTime, startTime and "
+        "finishTime; running code reads only the state and counters [S11] and fileId [S10], and the rest is named only "
+        "by the API description and a mocked client test of [S10], which also names the eviction counter "
+        "fileReplicasEvicted where [S11] reads filesEvicted, and the state transferState where [S11] reads "
+        "transferStatus",
     ),
 )
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -332,12 +357,24 @@ class OnezoneClient:
             content=content,
             timeout_s=timeout_s,
         )
+        return self._decoded(response, method, provider)
+
+    def _decoded(self, response: httpx.Response, method: str, provider: str | None) -> Any:
+        """Return an answer's decoded JSON, or a PlatformError without detail when it is not JSON."""
         if not response.content:
             return {}
         try:
             return response.json()
         except ValueError:
             raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON") from None
+
+    def get_dated(
+        self, path: str, *, provider: str | None = None, params: Mapping[str, Any] | None = None
+    ) -> tuple[Any, str | None]:
+        """GET as `get` does with the admin credential, and return with the decoded answer its `Date` header as sent,
+        or None when it has none. The transfer log estimates a provider's clock offset from it (`transferlog.py`)."""
+        response = self._request("GET", path, provider=provider, headers=self._admin, params=params)
+        return self._decoded(response, "GET", provider), response.headers.get("date")
 
     def get(
         self,

@@ -207,6 +207,55 @@ def test_a_real_block_map_has_the_documented_shape(day0, client, config):
     assert all(isinstance(provider_blocks(distribution, pid), list) for pid in supporting)
 
 
+def listed_transfers(client, config, provider, limit):
+    """The first page of each state of the space's transfer listing, read as the probes read it."""
+    from expcore_onedata.transferrecord import STATES, page_of
+
+    path = f"/spaces/{config.space.id}/transfers"
+    return {
+        state: page_of(client.get(path, provider=provider, params={"state": state, "limit": limit})) for state in STATES
+    }
+
+
+def test_the_transfer_listing_answers_every_state_the_probes_read(config, client):
+    """O08: the probes list the space's transfers as waiting, ongoing and ended; each state's first page parses as a
+    list of plain ids with a next-page token or none, and a page asked to hold one id holds at most one. The answer has
+    a Date header the provider's clock offset is read from, so the run's window can be moved onto that clock."""
+    # covers: GET /spaces/{space}/transfers
+    from expcore_onedata.transferwindow import offset_of
+
+    provider = config.support.providers[0]
+    pages = listed_transfers(client, config, provider, 1)
+    for ids, _ in pages.values():
+        assert len(ids) <= 1
+    _, date = client.get_dated(f"/spaces/{config.space.id}/transfers", provider=provider, params={"state": "ended"})
+    assert offset_of(date, time.time()) is not None
+
+
+def test_a_transfer_record_has_the_fields_the_probes_read(config, client):
+    """O08: a listed transfer's record has a type of replication, eviction or migration, a schedule time, and for a job
+    that replicates its target and byte counter (job_of refuses a record without them), and start and finish times
+    that are numbers. The times are epoch seconds, the unit the run's window is compared in: a time in milliseconds
+    would put every job outside the window and record none. Skipped when the space lists no transfer."""
+    # covers: GET /transfers/{id}
+    from expcore_onedata.transferrecord import TYPES, job_of
+
+    ten_years_s = 10 * 365 * 86400
+    provider = config.support.providers[0]
+    listed = [(tid, state) for state, (ids, _) in listed_transfers(client, config, provider, 5).items() for tid in ids]
+    if not listed:
+        pytest.skip("the space lists no transfer to read the record of")
+    for tid, state in listed:
+        body = client.get(f"/transfers/{tid}", provider=provider)
+        job = job_of(tid, state, body)
+        assert job.kind in TYPES
+        assert job.started is not None
+        assert job.finished is not None
+        assert abs(job.scheduled - time.time()) < ten_years_s
+        for moment in (job.started, job.finished):
+            assert moment == 0 or abs(moment - time.time()) < ten_years_s  # 0 is a time not reached yet
+
+
 @MUTATE
 @pytest.mark.parametrize("name", ["read_only", "round_trip"])
 def test_a_day0_check_that_changes_state_passes_and_shows_its_cleanup(day0, name):

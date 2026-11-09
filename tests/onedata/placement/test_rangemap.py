@@ -107,6 +107,38 @@ def test_o07_two_consecutive_polls_and_more_are_accepted(tmp_path):
     assert load(tmp_path, consecutive_polls=5).settings.consecutive_polls == 5
 
 
+def test_o07_the_transfer_listing_is_waited_out_by_default_for_30_s_and_up_to_4_observations(tmp_path):
+    """O07: the wait between two observations of the transfer listing defaults to 30 s, at least the listing's lag,
+    and the observations to 4; both can be set."""
+    settings = load(tmp_path).settings
+    assert (settings.transfer_settle_s, settings.transfer_settle_polls) == (30.0, 4)
+    custom = load(tmp_path, transfer_settle_s=60, transfer_settle_polls=6).settings
+    assert (custom.transfer_settle_s, custom.transfer_settle_polls) == (60.0, 6)
+
+
+def test_o08_the_allowance_for_clock_skew_defaults_to_5_s_and_cannot_be_negative(tmp_path):
+    """O08: the run's window is widened by the providers' estimated clock offsets plus an allowance of 5 s by
+    default, which can be set and is never negative."""
+    assert load(tmp_path).settings.clock_skew_allowance_s == 5.0
+    assert load(tmp_path, clock_skew_allowance_s=12).settings.clock_skew_allowance_s == 12.0
+    with pytest.raises(ConfigError, match=r"key 'clock_skew_allowance_s'"):
+        load(tmp_path, clock_skew_allowance_s=-1)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("transfer_settle_s", -1, r"key 'transfer_settle_s'"),
+        ("transfer_settle_polls", 1, r"key 'transfer_settle_polls'.*integer of at least 2"),
+        ("transfer_settle_polls", 2.5, r"key 'transfer_settle_polls'.*integer"),
+    ],
+)
+def test_o07_a_listing_settle_that_could_not_show_two_alike_observations_is_refused(tmp_path, key, value, message):
+    """O07: one observation is not convergence, so fewer than two is refused, as is a negative wait."""
+    with pytest.raises(ConfigError, match=message):
+        load(tmp_path, **{key: value})
+
+
 def test_safe_path_accepts_plain_relative_paths_only():
     assert safe_path("a/b.bin") == ("a", "b.bin")
     for bad in ("", "/a", "a/", "a//b", "a/../b", "./a", "a\\b"):

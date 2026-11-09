@@ -11,8 +11,16 @@ from expcore.campaign.lease import LeasePool
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
 from expcore_onedata.tokencheck import TokenRefused
-from expcore_onedata.tokens import ExpiryMismatch, TokenIssuer, token_window
-from expcore_onedata.users import GROUP, SAFETY_MARGIN_S, SlotProbe, SlotTokens, TokenJournal, load_slots
+from expcore_onedata.tokens import DroppedToken, ExpiryMismatch, TokenIssuer, token_window
+from expcore_onedata.users import (
+    EVENT_EXPIRY_BEYOND_REQUEST,
+    GROUP,
+    SAFETY_MARGIN_S,
+    SlotProbe,
+    SlotTokens,
+    TokenJournal,
+    load_slots,
+)
 
 LOGINS = {  # login name -> (password, user id)
     "slot-one-data": ("pw-1d", "u-1d"),
@@ -20,6 +28,10 @@ LOGINS = {  # login name -> (password, user id)
     "slot-two-data": ("pw-2d", "u-2d"),
     "slot-two-tool": ("pw-2t", "u-2t"),
 }
+
+
+def no_events(kind, detail):
+    """The event sink of a test that is not about events."""
 
 
 def declare(data, *, second_data="slot-two-data", second_tool="slot-two-tool"):
@@ -173,7 +185,7 @@ def test_tokens_of_a_leased_slot_are_minted_on_its_two_users_and_their_end_is_jo
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = SpyJournal(tmp_path / "leases", fake)
     tokens = SlotTokens(
-        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
     ).mint(lease, ceiling_s=CEILING_S, condition="read")
     slot = loaded.users_of(lease)
     assert tokens.data_path.subject == slot.data_path.user_id
@@ -198,7 +210,9 @@ def test_c19_a_crash_after_minting_leaves_the_provisional_end_and_the_slot_stays
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = SpyJournal(tmp_path / "leases", fake, crash_on_exact=True)
-    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
+    )
     with pytest.raises(SystemExit):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     assert len(fake.issued) == 2  # both tokens exist
@@ -239,7 +253,12 @@ def test_c19_a_pause_before_the_mint_cannot_push_a_tokens_expiry_past_its_journa
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
     tokens = SlotTokens(
-        TokenIssuer(client, config, clock=lambda: now[0]), config, loaded, journal, clock=lambda: now[0]
+        TokenIssuer(client, config, clock=lambda: now[0]),
+        config,
+        loaded,
+        journal,
+        events=no_events,
+        clock=lambda: now[0],
     ).mint(lease, ceiling_s=CEILING_S, condition="read")
     assert tokens.tool_server is not None
     journalled = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s
@@ -265,7 +284,12 @@ def test_c19_a_pause_so_long_that_a_token_would_be_too_short_refuses_it_and_the_
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
     minter = SlotTokens(
-        TokenIssuer(client, config, clock=lambda: now[0]), config, loaded, journal, clock=lambda: now[0]
+        TokenIssuer(client, config, clock=lambda: now[0]),
+        config,
+        loaded,
+        journal,
+        events=no_events,
+        clock=lambda: now[0],
     )
     with pytest.raises(TokenRefused, match="shorter"):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
@@ -287,7 +311,9 @@ def test_c19_a_token_that_lives_longer_than_the_journalled_expiry_is_refused_and
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
-    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
+    )
     with pytest.raises(ExpiryMismatch):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     journalled = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s
@@ -306,7 +332,9 @@ def test_c19_a_mint_that_fails_after_a_token_exists_leaves_a_journal_line_that_c
     lease = pool.acquire(GROUP, timeout_s=0)
     slot_federation.grant(loaded.users_of(lease).tool_server.user_id, MANAGE)
     journal = TokenJournal(tmp_path / "leases")
-    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
+    )
     with pytest.raises(TokenRefused):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     expiry = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s
@@ -320,7 +348,9 @@ def test_a_ceiling_the_window_refuses_journals_and_mints_nothing(slots, client, 
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
-    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
+    )
     with pytest.raises(TokenRefused, match="finite number"):
         minter.mint(lease, ceiling_s=float("inf"), condition="read")
     assert journal.latest_expiry(lease.key) is None
@@ -356,7 +386,9 @@ def test_c19_the_provisional_line_is_durable_before_anything_is_minted(slots, cl
     monkeypatch.setattr(issuer, "mint_run_tokens", mint)
     watch_fsync(monkeypatch, events)
     journal = TokenJournal(tmp_path / "fresh" / "journal")  # neither the directory nor the file exists yet
-    SlotTokens(issuer, config, loaded, journal, clock=lambda: NOW).mint(lease, ceiling_s=CEILING_S, condition="read")
+    SlotTokens(issuer, config, loaded, journal, events=no_events, clock=lambda: NOW).mint(
+        lease, ceiling_s=CEILING_S, condition="read"
+    )
     assert events == ["fsync file", "fsync directory", "fsync directory", "fsync directory", "mint", "fsync file"]
 
 
@@ -376,6 +408,7 @@ def test_c19_a_journal_line_that_cannot_be_made_durable_stops_the_mint(slots, cl
         config,
         loaded,
         TokenJournal(tmp_path / "journal"),
+        events=no_events,
         clock=lambda: NOW,
     )
     with pytest.raises(OSError, match="refused"):
@@ -469,7 +502,9 @@ def test_c19_a_token_refused_for_its_lifetime_still_has_its_expiry_journalled(sl
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
-    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
+    )
     with pytest.raises(TokenRefused, match="longer than"):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     actual = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s + extra
@@ -487,7 +522,9 @@ def test_c19_a_dropped_token_of_unknown_expiry_holds_the_slot_until_an_operator_
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
-    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
+    )
     with pytest.raises(TokenRefused):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     assert journal.latest_expiry(lease.key) == float("inf")
@@ -523,7 +560,9 @@ def test_c19_an_examination_answer_the_checks_cannot_read_still_journals_the_dro
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
-    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
+    )
     with pytest.raises(TokenRefused):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     if expect_expiry is None:
@@ -543,7 +582,9 @@ def test_c19_a_token_request_with_no_usable_answer_holds_the_slot_as_indetermina
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
-    minter = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    minter = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
+    )
     with pytest.raises(TokenRefused, match="no usable answer"):
         minter.mint(lease, ceiling_s=CEILING_S, condition="read")
     assert slot_federation.issued  # a token does exist on the server
@@ -560,7 +601,9 @@ def test_c19_a_run_without_a_data_path_mints_only_its_tool_servers_token_and_one
     pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
     lease = pool.acquire(GROUP, timeout_s=0)
     journal = TokenJournal(tmp_path / "leases")
-    tokens = SlotTokens(TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, clock=lambda: NOW)
+    tokens = SlotTokens(
+        TokenIssuer(client, config, clock=lambda: NOW), config, loaded, journal, events=no_events, clock=lambda: NOW
+    )
     with pytest.raises(ValueError, match="neither"):
         tokens.mint(lease, ceiling_s=CEILING_S, condition=None, interface=None)
     assert journal.latest_expiry(lease.key) is None
@@ -571,3 +614,87 @@ def test_c19_a_run_without_a_data_path_mints_only_its_tool_servers_token_and_one
     assert minted.tool_server.subject == loaded.users_of(lease).tool_server.user_id
     assert journal.latest_expiry(lease.key) == minted.tool_server.expires_at
     assert [token["subject"]["id"] for token in fake.issued.values()] == [loaded.users_of(lease).tool_server.user_id]
+
+
+def lengthen_every_token(federation, seconds):
+    """The platform disregards the requested time caveat: every token it mints lives `seconds` longer than asked."""
+    federation.mint_hook = lambda user, caveats: [
+        {**c, "validUntil": c["validUntil"] + seconds} if c["type"] == "time" else c for c in caveats
+    ]
+
+
+def mint_recording(slots, client, tmp_path, events):
+    """Lease a slot and mint its tokens for the `read` condition, events going to `events`; return the lease, the
+    journal and the expiry the tokens were asked for, and the refusal if the mint was refused."""
+    config, loaded = slots
+    pool = LeasePool(tmp_path / "leases", loaded.keys_of, SlotProbe(TokenJournal(tmp_path / "leases")))
+    lease = pool.acquire(GROUP, timeout_s=0)
+    journal = TokenJournal(tmp_path / "leases")
+    issuer = TokenIssuer(client, config, clock=lambda: NOW)
+    minter = SlotTokens(issuer, config, loaded, journal, events=events, clock=lambda: NOW)
+    requested = int(NOW) + token_window(CEILING_S, config.tokens).mint_ttl_s
+    try:
+        minter.mint(lease, ceiling_s=CEILING_S, condition="read")
+    except DroppedToken as refused:
+        return lease, journal, requested, refused
+    return lease, journal, requested, None
+
+
+def test_c19_a_token_that_outlives_its_requested_expiry_records_the_event_with_the_slot_and_both_expiries(
+    slots, client, tmp_path, slot_federation
+):
+    """C19 with O12: the platform hands back a token 50 s longer than asked (ExpiryMismatch, a later expiry). Besides
+    the journal line, `token_expiry_beyond_request` is recorded once, naming the slot by its position (`slots[i]`),
+    never by its configured name, with both expiries and never the token."""
+    lengthen_every_token(slot_federation, 50)
+    events = []
+    lease, journal, requested, refused = mint_recording(slots, client, tmp_path, lambda *e: events.append(e))
+    assert isinstance(refused, ExpiryMismatch)
+    assert journal.latest_expiry(lease.key) == requested + 50
+    assert [kind for kind, _ in events] == [EVENT_EXPIRY_BEYOND_REQUEST] == ["token_expiry_beyond_request"]
+    detail = events[0][1]
+    assert f"slots[{slots[1].keys_of(GROUP).index(lease.key)}]" in detail
+    assert lease.key not in detail
+    assert str(requested) in detail
+    assert str(requested + 50) in detail
+    assert not any(value in detail for value in slot_federation.issued)
+
+
+def test_c19_a_dropped_token_whose_readable_expiry_is_later_records_the_event(slots, client, tmp_path, slot_federation):
+    """C19: a token so much longer-lived than asked that examination refuses it for its lifetime is a DroppedToken
+    that is not an ExpiryMismatch; its readable expiry is later than requested, so the event is recorded."""
+    lengthen_every_token(slot_federation, 400)
+    events = []
+    _, _, requested, refused = mint_recording(slots, client, tmp_path, lambda *e: events.append(e))
+    assert isinstance(refused, DroppedToken)
+    assert not isinstance(refused, ExpiryMismatch)
+    assert [kind for kind, _ in events] == [EVENT_EXPIRY_BEYOND_REQUEST]
+    assert str(requested + 400) in events[0][1]
+
+
+@pytest.mark.parametrize("seconds", [0, -5])
+def test_c19_a_token_that_ends_no_later_than_requested_records_no_event(
+    slots, client, tmp_path, slot_federation, seconds
+):
+    """C19: a token minted with exactly the expiry asked for, or refused with an earlier one, is no sign that the
+    platform disregarded the caveat; no event is recorded."""
+    lengthen_every_token(slot_federation, seconds)
+    events = []
+    mint_recording(slots, client, tmp_path, lambda *e: events.append(e))
+    assert events == []
+
+
+def test_c19_an_event_sink_that_fails_does_not_hide_the_refusal_or_the_journal_line(
+    slots, client, tmp_path, slot_federation
+):
+    """C19: the event cannot be written; the token is still refused, as the refusal it is, and the expiry it has is
+    still journalled, so the slot is held."""
+    lengthen_every_token(slot_federation, 50)
+
+    def broken(kind, detail):
+        raise OSError("the event log is gone")
+
+    lease, journal, requested, refused = mint_recording(slots, client, tmp_path, broken)
+    assert isinstance(refused, ExpiryMismatch)
+    assert isinstance(refused.__cause__, OSError)
+    assert journal.latest_expiry(lease.key) == requested + 50

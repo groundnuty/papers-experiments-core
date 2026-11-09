@@ -10,7 +10,8 @@
   GET    /data/{id}/content  (Range)            206; a provider lacking the bytes fetches them on the fly
   GET    /data/{id}/distribution                the block map of every provider
   DELETE /data/{id}                             remove a file or a directory with what is under it
-  POST   /transfers, GET /transfers/{id}        replication and eviction jobs
+  POST   /transfers, GET /transfers/{id}        replication, eviction and migration jobs
+  GET    /spaces/{space}/transfers              the ids of the space's jobs in one state, paged by `limit`, `page_token`
 
 and, from Onezone, `GET /spaces/{space}` (the live name). Time is counted in calls, never in seconds, so a test never
 waits. A test bends the fake through plain attributes:
@@ -27,6 +28,17 @@ waits. A test bends the fake through plain attributes:
 - `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
 - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status.
 - `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out).
+- `clock`: the epoch seconds a job's schedule, start and finish times are taken from (a test binds its own clock);
+- `transfer_omit`: field names a job's record leaves out; `transfer_list_body`: an answer that replaces the listing's;
+- `provider_view`: `(job id, provider id)` to what that provider says of the job where it differs: `state` (the list
+  it is in, and its record's status) and record fields such as `bytesReplicated`;
+- `listing_lag`: job id to how many listing answers, counted from the first, leave the job out (its record is read
+  at once, as a real provider's is while its listing lags);
+- every data-API answer has a `Date` header of `clock` moved by `provider_skew` (provider id to seconds ahead,
+  negative when behind); `date_override` (provider id to a header value, or None for none) replaces it;
+
+`add_transfer` makes a job that no request to `/transfers` made, as a QoS requirement or another client does, with the
+times and the state a test gives it.
 
 `provider_calls` lists `(provider id, method, route)` of every provider call, so a test can assert what was sent where.
 """
@@ -37,6 +49,7 @@ import itertools
 import json
 import re
 from dataclasses import dataclass, field
+from email.utils import formatdate
 
 import httpx
 from fake_federation import FakeFederation
@@ -59,13 +72,29 @@ class Node:
 
 @dataclass
 class Transfer:
-    """A replication or eviction job and how many times it has been asked about."""
+    """A replication, eviction or migration job, when it was scheduled, started and ended, and how often it was asked
+    about. `provider_id` is the replicating provider (replication, migration) or the evicting one (eviction);
+    `source_id` is a migration's evicting provider."""
 
     kind: str
     file_id: str
     provider_id: str
     asked: int = 0
     ended: bool = False
+    source_id: str | None = None
+    scheduled: int = 0
+    started: int = 0
+    finished: int = 0
+    waiting: bool = False
+    bytes_replicated: int | None = None  # the counter the record reports, when a test scripts it
+
+    @property
+    def replicates(self) -> bool:
+        return self.kind in ("replication", "migration")
+
+    @property
+    def state(self) -> str:
+        return "ended" if self.ended else "waiting" if self.waiting else "ongoing"
 
 
 def _merge(blocks: list[list[int]]) -> list[list[int]]:
@@ -106,6 +135,14 @@ class FakeData(FakeFederation):
         self.resets: list[list] = []
         self.statuses: list[list] = []
         self.content_type: str | None = "application/octet-stream"  # of a file's content, whole or by range
+        self.clock = lambda: 0.0  # epoch seconds of a job's schedule, start and finish times
+        self.transfer_omit: set[str] = set()  # fields a job's record leaves out
+        self.transfer_list_body: dict | None = None  # replaces every answer of the listing
+        self.provider_view: dict[tuple[str, str], dict] = {}  # (job, provider id) -> its listed state, record fields
+        self.listing_lag: dict[str, int] = {}  # job id -> listing answers it is left out of, from the first one
+        self.provider_skew: dict[str, float] = {}  # provider id -> seconds its clock runs ahead (negative: behind)
+        self.date_override: dict[str, str | None] = {}  # provider id -> the Date header it sends (None: none)
+        self.listings = 0  # the listing answers given
         self._ids = itertools.count(1)
         self._root_polls = 0
 
@@ -148,6 +185,44 @@ class FakeData(FakeFederation):
         except KeyError:
             return False
         return True
+
+    def add_transfer(
+        self,
+        kind: str,
+        path: str,
+        provider_id: str,
+        *,
+        scheduled: float,
+        source_id: str | None = None,
+        ended: bool = True,
+        waiting: bool = False,
+        finished: float | None = None,
+        bytes_replicated: int | None = None,
+    ) -> str:
+        """Make a job no request to `/transfers` made (a QoS requirement's, another client's) and return its id; one
+        that has ended has placed or removed its blocks, and finished at `finished` (default: when it was scheduled)."""
+        tid = f"tid-{next(self._ids):04d}"
+        self.transfers[tid] = Transfer(
+            kind,
+            self.id_of(path),
+            provider_id,
+            source_id=source_id,
+            scheduled=int(scheduled),
+            started=0 if waiting else int(scheduled),
+            waiting=waiting,
+            bytes_replicated=bytes_replicated,
+        )
+        if ended:
+            self.end_transfer(tid, at=scheduled if finished is None else finished)
+        return tid
+
+    def end_transfer(self, tid: str, *, at: float | None = None) -> None:
+        """End a job now (or at `at`): a replication places the file's blocks, an eviction removes them."""
+        transfer = self.transfers[tid]
+        transfer.ended, transfer.waiting = True, False
+        transfer.started = transfer.started or transfer.scheduled
+        transfer.finished = int(self.clock() if at is None else at)
+        self._finish(transfer)
 
     # -- tree ------------------------------------------------------------------
     def _child(self, parent: str, name: str) -> str | None:
@@ -204,7 +279,17 @@ class FakeData(FakeFederation):
         token = request.headers.get("X-Auth-Token")
         if token != self.admin_token and not self._accepts(token):
             return self._error(401, "unauthorized")
-        return self._provider_route(request, provider, route)
+        return self._dated(self._provider_route(request, provider, route), provider)
+
+    def _dated(self, response: httpx.Response, provider: str) -> httpx.Response:
+        """Give an answer the Date header of the provider's clock: the fake's clock moved by the provider's skew, in
+        whole seconds as HTTP has it, or the override a test set (None: no header at all)."""
+        if provider in self.date_override:
+            if self.date_override[provider] is not None:
+                response.headers["Date"] = self.date_override[provider]
+            return response
+        response.headers["Date"] = formatdate(self.clock() + self.provider_skew.get(provider, 0.0), usegmt=True)
+        return response
 
     def _admin_route(self, method: str, route: str, sent: dict) -> httpx.Response:
         """Onezone's calls that need the admin credential: a provider's online flag, then what the federation has."""
@@ -255,9 +340,12 @@ class FakeData(FakeFederation):
                 return httpx.Response(200, json=self._distribution(node))
         if route == "/transfers" and method == "POST":
             return self._schedule(request)
+        found = re.fullmatch(r"/spaces/([^/]+)/transfers", route)
+        if found and method == "GET":
+            return self._list_transfers(found.group(1), query, provider)
         found = re.fullmatch(r"/transfers/([^/]+)", route)
         if found and method == "GET":
-            return self._transfer(found.group(1))
+            return self._transfer(found.group(1), provider)
         return self._error(404, "notFound")
 
     def _space_root(self, space: str) -> httpx.Response:
@@ -370,14 +458,40 @@ class FakeData(FakeFederation):
     def _schedule(self, request: httpx.Request) -> httpx.Response:
         sent = json.loads(request.content or b"{}")
         kind = sent.get("type")
-        provider = sent.get("replicatingProviderId" if kind == "replication" else "evictingProviderId")
-        if kind not in ("replication", "eviction") or sent.get("fileId") not in self.nodes or provider is None:
+        provider = sent.get("evictingProviderId" if kind == "eviction" else "replicatingProviderId")
+        source = sent.get("evictingProviderId") if kind == "migration" else None
+        if (
+            kind not in ("replication", "eviction", "migration")
+            or sent.get("fileId") not in self.nodes
+            or provider is None
+            or (kind == "migration" and source is None)
+        ):
             return self._error(400, "badValueNotAllowed")
         tid = f"tid-{next(self._ids):04d}"
-        self.transfers[tid] = Transfer(kind, sent["fileId"], provider)
+        now = int(self.clock())
+        self.transfers[tid] = Transfer(kind, sent["fileId"], provider, source_id=source, scheduled=now, started=now)
         return httpx.Response(201, json={"transferId": tid})
 
-    def _transfer(self, tid: str) -> httpx.Response:
+    def _list_transfers(self, space: str, query: httpx.QueryParams, provider: str) -> httpx.Response:
+        if space != self.SPACE_ID:
+            return self._error(404, "notFound")
+        if query.get("state") not in ("waiting", "ongoing", "ended"):
+            return self._error(400, "badValueNotAllowed")
+        self.listings += 1
+        if self.transfer_list_body is not None:
+            return httpx.Response(200, json=self.transfer_list_body)
+        ids = [
+            tid
+            for tid, t in self.transfers.items()
+            if self._view(tid, provider).get("state", t.state) == query["state"]
+            and self.listings > self.listing_lag.get(tid, 0)
+        ]
+        start = int(query.get("page_token") or "0")
+        end = start + int(query.get("limit", "100"))
+        token = str(end) if end < len(ids) else None
+        return httpx.Response(200, json={"transfers": ids[start:end], "nextPageToken": token})
+
+    def _transfer(self, tid: str, provider: str) -> httpx.Response:
         transfer = self.transfers.get(tid)
         if transfer is None:
             return self._error(404, "notFound")
@@ -385,31 +499,45 @@ class FakeData(FakeFederation):
         if transfer.asked <= self.transfer_visible_after:
             return self._error(404, "notFound")
         if not transfer.ended and transfer.asked > self.transfer_visible_after + self.transfer_flip_after:
-            transfer.ended = True
-            self._finish(transfer)
-        state = "completed" if transfer.ended else "active"
+            self.end_transfer(tid)
+        state = "completed" if transfer.ended else "scheduled" if transfer.waiting else "active"
         size = len(self.nodes[transfer.file_id].content) if transfer.file_id in self.nodes else 0
-        field_name = "replicationStatus" if transfer.kind == "replication" else "evictionStatus"
-        return httpx.Response(
-            200,
-            json={
-                field_name: state,
-                "bytesReplicated": size if transfer.ended and transfer.kind == "replication" else 0,
-                "filesReplicated": 1 if transfer.ended and transfer.kind == "replication" else 0,
-                "filesEvicted": 1 if transfer.ended and transfer.kind == "eviction" else 0,
-                "filesFailed": 0,
-            },
-        )
+        moved = transfer.bytes_replicated if transfer.bytes_replicated is not None else size
+        answer = {
+            "evictionStatus" if transfer.kind == "eviction" else "replicationStatus": state,
+            "type": transfer.kind,
+            "fileId": transfer.file_id,
+            "replicatingProviderId": transfer.provider_id if transfer.replicates else None,
+            "evictingProviderId": transfer.provider_id if transfer.kind == "eviction" else transfer.source_id,
+            "scheduleTime": transfer.scheduled,
+            "startTime": transfer.started,
+            "finishTime": transfer.finished,
+            "bytesReplicated": moved if transfer.ended and transfer.replicates else 0,
+            "filesReplicated": 1 if transfer.ended and transfer.replicates else 0,
+            "filesEvicted": 1 if transfer.ended and transfer.kind != "replication" else 0,
+            "filesFailed": 0,
+        }
+        view = self._view(tid, provider)
+        if "state" in view:  # this provider lists the job in another state, and its record says so
+            status = "evictionStatus" if transfer.kind == "eviction" else "replicationStatus"
+            answer[status] = {"ended": "completed", "ongoing": "active", "waiting": "scheduled"}[view["state"]]
+        answer.update({k: v for k, v in view.items() if k != "state"})
+        return httpx.Response(200, json={k: v for k, v in answer.items() if k not in self.transfer_omit})
+
+    def _view(self, tid: str, provider: str) -> dict:
+        """What one provider says of a job where it differs from the job itself: its listed state, record fields."""
+        return self.provider_view.get((tid, provider), {})
 
     def _finish(self, transfer: Transfer) -> None:
         key = (transfer.file_id, transfer.provider_id)
-        if transfer.kind == "replication" and self.transfers_place_blocks and transfer.file_id in self.nodes:
+        if transfer.replicates and self.transfers_place_blocks and transfer.file_id in self.nodes:
             size = len(self.nodes[transfer.file_id].content)
             self.pending.setdefault(key, []).append([0, size, self.fetch_lag])
             self._promote(*key)
-        if transfer.kind == "eviction" and self.evictions_remove_blocks:
-            self.blocks.pop(key, None)
-            self.pending.pop(key, None)
+        evicted = (transfer.file_id, transfer.source_id) if transfer.kind == "migration" else key
+        if transfer.kind != "replication" and self.evictions_remove_blocks:
+            self.blocks.pop(evicted, None)
+            self.pending.pop(evicted, None)
 
 
 __all__ = ["PROVIDER", "ROOT_ID", "FakeData"]

@@ -35,10 +35,11 @@ def test_every_unverified_endpoint_has_a_live_contract_test():
     assert not missing, f"no live test covers: {missing}"
 
 
-def test_the_unconfirmed_calls_and_details_are_exactly_the_two_gate_reads_and_three_answer_details():
-    """O05: the list holds the two reads the mutation gate relies on (a space's details, a file's path attribute) and
+def test_the_unconfirmed_calls_and_details_are_exactly_the_gate_reads_the_answer_details_and_the_transfer_log():
+    """O05, O08: the list holds the two reads the mutation gate relies on (a space's details, a file's path attribute),
     the three answer details no source confirms (the subject of an examination, the providers' name and online fields,
-    and the content type of a file's content, which the data gate streams on); nothing else."""
+    and the content type of a file's content, which the data gate streams on), and the two details of the probes'
+    transfer log (the waiting state of the listing, a record's type, provider ids and times); nothing else."""
     from expcore_onedata.client import UNVERIFIED_ENDPOINTS
 
     assert {(m, p) for m, p, _ in UNVERIFIED_ENDPOINTS} == {
@@ -47,6 +48,8 @@ def test_the_unconfirmed_calls_and_details_are_exactly_the_two_gate_reads_and_th
         ("POST", "/tokens/examine"),
         ("POST", "/tokens/infer_access_token_scope"),
         ("GET", "/data/{file}/content"),
+        ("GET", "/spaces/{space}/transfers"),
+        ("GET", "/transfers/{id}"),
     }
     what = " ".join(w for _, _, w in UNVERIFIED_ENDPOINTS)
     assert "subject" in what
@@ -54,6 +57,8 @@ def test_the_unconfirmed_calls_and_details_are_exactly_the_two_gate_reads_and_th
     assert "name field" in what
     assert "application/octet-stream" in what
     assert "mock" in what  # the only basis there is
+    assert "waiting" in what
+    assert all(field in what for field in ("type", "replicatingProviderId", "scheduleTime", "finishTime"))
 
 
 def test_the_slow_live_expiry_test_needs_its_own_switch():

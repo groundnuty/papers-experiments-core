@@ -11,9 +11,13 @@ from expcore_onedata.rangemap import Placement, load_placement
 
 
 @pytest.fixture
-def fake(monkeypatch) -> FakeData:
-    """A federation with the study space, the data provider `alpha`, a second provider `beta`, and the three users."""
+def fake(monkeypatch, ticker) -> FakeData:
+    """A federation with the study space, the data provider `alpha`, a second provider `beta`, and the three users.
+
+    Its clock is the test's ticker, so its jobs' times and its providers' Date headers agree with the probes' clock
+    unless a test skews a provider."""
     federation = FakeData(space_name=SPACE_NAME)
+    federation.clock = ticker.clock
     federation.add_provider(BETA_ID, "beta.test", supports=False)
     monkeypatch.setenv(ADMIN_ENV, federation.admin_token)
     for login, (password, user_id) in USERS.items():
