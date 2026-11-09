@@ -23,7 +23,7 @@ snapshot and never the live platform (R13). The snapshot holds, for the files th
   status (O01);
 - per tracked receiving provider, its gained bytes split (`on_demand`): `transfer_bytes_in`, the byte counters of the
   jobs in the window that replicate into it, and `on_demand_lower_bound`, the gained bytes less those, floored at zero
-  and only a lower bound (`transferlog.py` names the conditions); None when the block maps or the listing are unknown.
+  and only a lower bound (`transferwindow.py` names the conditions); None when the block maps or the listing are unknown.
 
 **`gained_bytes` is net placement growth, not bytes on the wire.** It is the bytes a provider holds at run end minus
 those it held at run start, from its block map (`GET /data/{id}/distribution`) at those two moments: the bytes the map
@@ -49,13 +49,8 @@ from typing import Any
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.placement import Range, held_bytes, merged, uncovered
 from expcore_onedata.provision import Provisioner
-from expcore_onedata.transferlog import (
-    MAX_LISTED,
-    PAGE_LIMIT,
-    TransferLog,
-    Window,
-    split_gained,
-)
+from expcore_onedata.transferlog import MAX_LISTED, PAGE_LIMIT, TransferLog
+from expcore_onedata.transferwindow import Window, split_gained
 
 NAMESPACE = "platform_probes"
 VERSION = 2
@@ -306,8 +301,8 @@ class PlatformProbes:
         transfers = self._transfer_records()
         file_ids = {entries[label].value.file_id: label for label in self._files if entries[label].ok}
         harness = {tid for _, tid, _ in self._transfers()}
-        space_transfers, inside, carried = self._log.read(window, file_ids, harness)
-        ok = complete and all(t["probe_ok"] for t in transfers) and space_transfers["probe_ok"]
+        log = self._log.read(window, file_ids, harness)
+        ok = complete and all(t["probe_ok"] for t in transfers) and log.section["probe_ok"]
         gained = {p: row["gained_bytes"] for p, row in pair_totals.items()}
         return {
             "version": VERSION,
@@ -316,11 +311,11 @@ class PlatformProbes:
             "seconds": None if self._started is None else round(self._now() - self._started, 3),
             "files": files,
             "transfers": transfers,
-            "space_transfers": space_transfers,
+            "space_transfers": log.section,
             "pairs": pair_totals if complete else None,
             "on_demand": (
-                split_gained(gained, inside, carried, self._provisioner.provider_named)
-                if complete and inside is not None
+                split_gained(gained, log.inside, self._provisioner.provider_named, flagged=log.flagged)
+                if complete and log.inside is not None
                 else None
             ),
         }

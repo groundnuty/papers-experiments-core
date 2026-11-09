@@ -209,7 +209,7 @@ def test_a_real_block_map_has_the_documented_shape(day0, client, config):
 
 def listed_transfers(client, config, provider, limit):
     """The first page of each state of the space's transfer listing, read as the probes read it."""
-    from expcore_onedata.transferlog import STATES, page_of
+    from expcore_onedata.transferrecord import STATES, page_of
 
     path = f"/spaces/{config.space.id}/transfers"
     return {
@@ -232,7 +232,7 @@ def test_a_transfer_record_has_the_fields_the_probes_read(config, client):
     that are numbers. The times are epoch seconds, the unit the run's window is compared in: a time in milliseconds
     would put every job outside the window and record none. Skipped when the space lists no transfer."""
     # covers: GET /transfers/{id}
-    from expcore_onedata.transferlog import TYPES, job_of
+    from expcore_onedata.transferrecord import TYPES, job_of
 
     ten_years_s = 10 * 365 * 86400
     provider = config.support.providers[0]

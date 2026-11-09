@@ -29,7 +29,9 @@ waits. A test bends the fake through plain attributes:
 - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status.
 - `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out).
 - `clock`: the epoch seconds a job's schedule, start and finish times are taken from (a test binds its own clock);
-- `transfer_omit`: field names a job's record leaves out; `transfer_list_body`: an answer that replaces the listing's.
+- `transfer_omit`: field names a job's record leaves out; `transfer_list_body`: an answer that replaces the listing's;
+- `provider_view`: `(job id, provider id)` to what that provider says of the job where it differs: `state` (the list
+  it is in, and its record's status) and record fields such as `bytesReplicated`;
 
 `add_transfer` makes a job that no request to `/transfers` made, as a QoS requirement or another client does, with the
 times and the state a test gives it.
@@ -131,6 +133,7 @@ class FakeData(FakeFederation):
         self.clock = lambda: 0.0  # epoch seconds of a job's schedule, start and finish times
         self.transfer_omit: set[str] = set()  # fields a job's record leaves out
         self.transfer_list_body: dict | None = None  # replaces every answer of the listing
+        self.provider_view: dict[tuple[str, str], dict] = {}  # (job, provider id) -> its listed state, record fields
         self._ids = itertools.count(1)
         self._root_polls = 0
 
@@ -320,10 +323,10 @@ class FakeData(FakeFederation):
             return self._schedule(request)
         found = re.fullmatch(r"/spaces/([^/]+)/transfers", route)
         if found and method == "GET":
-            return self._list_transfers(found.group(1), query)
+            return self._list_transfers(found.group(1), query, provider)
         found = re.fullmatch(r"/transfers/([^/]+)", route)
         if found and method == "GET":
-            return self._transfer(found.group(1))
+            return self._transfer(found.group(1), provider)
         return self._error(404, "notFound")
 
     def _space_root(self, space: str) -> httpx.Response:
@@ -450,20 +453,24 @@ class FakeData(FakeFederation):
         self.transfers[tid] = Transfer(kind, sent["fileId"], provider, source_id=source, scheduled=now, started=now)
         return httpx.Response(201, json={"transferId": tid})
 
-    def _list_transfers(self, space: str, query: httpx.QueryParams) -> httpx.Response:
+    def _list_transfers(self, space: str, query: httpx.QueryParams, provider: str) -> httpx.Response:
         if space != self.SPACE_ID:
             return self._error(404, "notFound")
         if query.get("state") not in ("waiting", "ongoing", "ended"):
             return self._error(400, "badValueNotAllowed")
         if self.transfer_list_body is not None:
             return httpx.Response(200, json=self.transfer_list_body)
-        ids = [tid for tid, t in self.transfers.items() if t.state == query["state"]]
+        ids = [
+            tid
+            for tid, t in self.transfers.items()
+            if self._view(tid, provider).get("state", t.state) == query["state"]
+        ]
         start = int(query.get("page_token") or "0")
         end = start + int(query.get("limit", "100"))
         token = str(end) if end < len(ids) else None
         return httpx.Response(200, json={"transfers": ids[start:end], "nextPageToken": token})
 
-    def _transfer(self, tid: str) -> httpx.Response:
+    def _transfer(self, tid: str, provider: str) -> httpx.Response:
         transfer = self.transfers.get(tid)
         if transfer is None:
             return self._error(404, "notFound")
@@ -489,7 +496,16 @@ class FakeData(FakeFederation):
             "filesEvicted": 1 if transfer.ended and transfer.kind != "replication" else 0,
             "filesFailed": 0,
         }
+        view = self._view(tid, provider)
+        if "state" in view:  # this provider lists the job in another state, and its record says so
+            status = "evictionStatus" if transfer.kind == "eviction" else "replicationStatus"
+            answer[status] = {"ended": "completed", "ongoing": "active", "waiting": "scheduled"}[view["state"]]
+        answer.update({k: v for k, v in view.items() if k != "state"})
         return httpx.Response(200, json={k: v for k, v in answer.items() if k not in self.transfer_omit})
+
+    def _view(self, tid: str, provider: str) -> dict:
+        """What one provider says of a job where it differs from the job itself: its listed state, record fields."""
+        return self.provider_view.get((tid, provider), {})
 
     def _finish(self, transfer: Transfer) -> None:
         key = (transfer.file_id, transfer.provider_id)

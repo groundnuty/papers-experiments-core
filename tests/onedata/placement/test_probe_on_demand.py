@@ -73,7 +73,7 @@ def test_o08_a_transfer_into_a_provider_still_running_at_run_end_makes_its_bound
     seeded.add_transfer("replication", MORE, BETA_ID, scheduled=ticker.now, ended=False)
     split = probes.finish()["on_demand"]
     assert split["beta"]["on_demand_lower_bound"] is None
-    assert "not ended" in split["beta"]["unknown"]
+    assert "transfer_not_ended" in split["beta"]["unknown"]
     assert split["alpha"]["on_demand_lower_bound"] == 0
 
 
@@ -88,7 +88,27 @@ def test_o08_a_transfer_from_before_the_run_that_went_on_into_it_makes_its_targe
     assert snapshot["space_transfers"]["records"] == []
     assert snapshot["space_transfers"]["carried_over"] == 1
     assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
-    assert snapshot["on_demand"]["beta"]["unknown"]
+    assert "transfer_carried_over" in snapshot["on_demand"]["beta"]["unknown"]
+
+
+def test_o08_providers_that_disagree_on_a_transfer_make_its_targets_bound_unknown(probes, client, seeded, ticker):
+    """O08: one provider lists the agent's replication into beta as ongoing with no bytes moved, the other as ended
+    with 4096. State and counters are never taken from different providers' answers, and the disagreement leaves
+    beta's bound unknown with the reason listings_disagree, not a bound built from either side or from a mix."""
+    probes.start({})
+    ticker.sleep(10)
+    tid = tool_plane_replicates(seeded, client, MORE, BETA_ID)
+    seeded.end_transfer(tid)
+    seeded.provider_view[(tid, ALPHA_ID)] = {"state": "ongoing", "bytesReplicated": 0, "finishTime": 0}
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    beta = snapshot["on_demand"]["beta"]
+    assert beta["on_demand_lower_bound"] is None
+    assert "listings_disagree" in beta["unknown"]
+    record = {r["transfer_id"]: r for r in snapshot["space_transfers"]["records"]}[tid]
+    assert record["listings_agree"] is False
+    assert (record["listed_as"], record["bytes_replicated"]) in {("ongoing", 0), ("ended", len(DATA))}
+    assert snapshot["on_demand"]["alpha"]["on_demand_lower_bound"] == 0
 
 
 def test_o08_without_the_listing_there_is_no_split(probes, seeded):

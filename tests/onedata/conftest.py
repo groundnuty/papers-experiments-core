@@ -16,7 +16,7 @@ from expcore_onedata.pin import PinError
 from expcore_onedata.provision import NotPlaced, ProvisionError, Refused
 from expcore_onedata.tokencheck import ExaminationFailed, TokenRefused
 from expcore_onedata.tokens import TokenIssuer
-from expcore_onedata.transferlog import Unreadable
+from expcore_onedata.transferrecord import Unreadable
 
 __all__ = ["no_secrets_in_the_environment"]
 
