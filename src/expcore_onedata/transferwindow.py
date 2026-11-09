@@ -112,7 +112,12 @@ class Edges:
 
     def carried_over(self, job: Job) -> bool:
         """Tell whether a job scheduled before the widened window may have gone on into it."""
-        ended_before = job.listed_as == "ended" and job.finished is not None and 0 < job.finished < self.first
+        ended_before = (
+            job.listed_as == "ended"
+            and job.state in FINAL_STATES  # the record must say it ended too, or its counters are still open
+            and job.finished is not None
+            and 0 < job.finished < self.first
+        )
         return job.scheduled < self.first and not ended_before
 
     def bears_on(self, job: Job) -> bool:

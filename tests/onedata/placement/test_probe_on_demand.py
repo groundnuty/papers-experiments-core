@@ -307,3 +307,17 @@ def test_o08_a_job_listed_as_ended_whose_record_is_still_active_leaves_its_bound
     snapshot = probes.finish()
     assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
     assert "transfer_not_ended" in snapshot["on_demand"]["beta"]["unknown"]
+
+
+def test_o08_a_job_from_before_the_run_listed_ended_but_still_active_is_carried_over(probes, seeded, ticker):
+    """O08: a replication into beta scheduled and listed as ended before the run, with an old finish time, whose
+    record still says active, may have placed bytes during the run: it is carried over and beta's bound is unknown."""
+    start = ticker.now
+    tid = seeded.add_transfer("replication", MORE, BETA_ID, scheduled=start - 60, finished=start - 50)
+    for provider in (ALPHA_ID, BETA_ID):
+        seeded.provider_view[(tid, provider)] = {"replicationStatus": "active"}
+    probes.start({})
+    ticker.sleep(20)
+    snapshot = probes.finish()
+    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
+    assert "transfer_carried_over" in snapshot["on_demand"]["beta"]["unknown"]
