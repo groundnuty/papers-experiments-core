@@ -102,7 +102,8 @@ class _Recorded:
 
 
 class _StartThreads:
-    """The start threads of the platform that have not ended, by lease key: the probe says nothing is gone while one runs."""
+    """The mint and start threads of the platform that have not ended, by lease key: the probe says nothing is gone
+    while one runs."""
 
     def __init__(self) -> None:
         self._lock, self._running = threading.Lock(), {}
@@ -139,8 +140,9 @@ class SandboxProbe:
     too. Anything it cannot read or ask, a record included, is False, so the key stays quarantined; so is a recorded
     mount of the lease without its full identity, which could be anywhere: such a record holds the key until an
     operator has verified that nothing of it is mounted and cleared it (`mountrecords`, its procedure). It reads and never
-    removes: the sandbox's own stop, the next start's retry and the orphan reaper remove. While a start thread of the key
-    is still running (a cancelled launch that gave up waiting for it) nothing is gone yet, whatever the reads show.
+    removes: the sandbox's own stop, the next start's retry and the orphan reaper remove. While a mint or start thread of
+    the key is still running (a cancelled launch that gave up waiting for it) nothing is gone yet, whatever the reads
+    show.
     """
 
     def __init__(
@@ -305,6 +307,20 @@ class SandboxPlatform:
             return None  # a run that needs neither plane mints nothing, whatever it holds
         return self._tokens.mint(lease, ceiling_s=ceiling_s, condition=condition, interface=mode.interface)
 
+    def _mint_tracked(
+        self,
+        mode: DataPathMode,
+        lease: Lease | None,
+        ceiling_s: float,
+        condition: str | None,
+        ended: Callable[[], None],
+    ) -> RunTokens | None:
+        """Blocking, in the mint thread: mint the run's tokens, and note that the thread has ended, however it ended."""
+        try:
+            return self._mint(mode, lease, ceiling_s, condition)
+        finally:
+            ended()
+
     def _prepare(
         self, run_key: str, mode: DataPathMode, lease: Lease | None, tokens: RunTokens | None, condition: str | None
     ) -> DockerSandbox:
@@ -353,6 +369,12 @@ class SandboxPlatform:
         When the data gate refused an answer for its own integrity during the run, the run ends in `InfraError` of
         kind `data_gate_integrity` (`kinds.gate_error`), whatever its body raised or returned (O05, C01).
 
+        The mint runs in a thread too, which a cancellation does not stop either: it is tracked as a start thread of
+        the key from before it is dispatched, so the probe shows nothing gone while it runs, and a launch cancelled or
+        failed during the mint waits for it, however often it is cancelled meanwhile, with the same deadline, before it
+        re-raises. Its tokens are journalled by `SlotTokens` as they are minted, so a slot whose run was cancelled
+        stays held until they have ended (C19).
+
         The start runs in a thread, and cancelling the launch does not stop a thread: it goes on creating the sandbox.
         So the sandbox is built before the thread begins, and the launch holds it. On cancellation, or any failure of
         the start, the launch asks the thread to stop creating things, waits for it with a deadline however often it is
@@ -363,15 +385,24 @@ class SandboxPlatform:
         mode = self._s.mode_of(level)
         sandbox: DockerSandbox | None = None
         started: asyncio.Future[None] | None = None
+        minting: asyncio.Future[RunTokens | None] | None = None
         try:
             async with ctx.infrastructure_wait(WAIT_KIND):
-                tokens = await asyncio.to_thread(self._mint, mode, lease, ceiling_s, condition)
+                minted = self._threads.began(lease.key if lease is not None else None)  # before the thread exists
+                minting = asyncio.ensure_future(
+                    asyncio.to_thread(self._mint_tracked, mode, lease, ceiling_s, condition, minted)
+                )
+                minting.add_done_callback(lambda _: minted())  # a task that never got to run has no thread to end
+                tokens = await asyncio.shield(minting)
                 sandbox = self._prepare(run_key, mode, lease, tokens, condition)
                 ended = self._threads.began(lease.key if lease is not None else None)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end
                 await asyncio.shield(started)
         except BaseException:
+            if minting is not None and not minting.done():  # cancelled mid-mint: the worker goes on, so wait for it
+                minting.add_done_callback(lambda f: f.cancelled() or f.exception())  # its failure is not unretrieved
+                await _wait_through_cancellation(minting, self._cancel_wait_s)
             if sandbox is not None and started is not None:
                 await self._settle_start(sandbox, started)
                 await self._stop(ctx, sandbox, quiet=True)

@@ -667,3 +667,51 @@ def test_c19_a_key_is_not_freed_while_its_sandbox_remains_or_a_token_of_its_slot
     stage.host.docker("rm", "-f", "leftover")
     assert probe.resource_gone(KEY, {}) is True
     assert pool.settle_quarantines() == [KEY]
+
+
+def test_c19_a_launch_cancelled_while_its_mint_is_blocked_holds_the_slot_until_the_worker_has_journalled(
+    stage, tmp_path
+):
+    """C19: the mint runs in a thread, which a cancellation does not stop. Cancelled while the mint is blocked before
+    its provisional line, the launch waits for the worker before it ends, and while the worker runs the probe shows
+    nothing gone; once it has ended its tokens are journalled, so the slot stays held until they have ended too, and a
+    finished lease is never released while the worker still mints on the slot's users."""
+    pool = lease_pool(stage, tmp_path)
+    lease = pool.acquire(GROUP, run_key="run-1")
+    entered, release = threading.Event(), threading.Event()
+    record = stage.journal.record
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(20), "the test never released the mint"
+        return record(*args, **kwargs)
+
+    stage.journal.record = blocked  # the journal SlotTokens writes: its first line is the provisional one
+    probe = stage.platform.probe()
+
+    async def go():
+        async def launch():
+            async with stage.platform.launch(
+                RecordingContext(), run_key="run-1", level="via-gate", ceiling_s=CEILING_S, lease=lease
+            ):
+                pytest.fail("a cancelled launch must not hand out a sandbox")
+
+        task = asyncio.ensure_future(launch())
+        assert await asyncio.to_thread(entered.wait, 20)  # the worker is inside the mint, before any line
+        task.cancel()
+        await asyncio.sleep(0.05)
+        during = probe.resource_gone(KEY, {})
+        threading.Timer(0.2, release.set).start()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return during
+
+    during = asyncio.run(go())
+    assert during is False  # nothing is shown gone while the worker runs
+    assert stage.journal.latest_expiry(KEY) is not None  # the launch ended only after the worker journalled
+    assert len(stage.fake.issued) == 1
+    assert probe.resource_gone(KEY, {}) is False
+    assert pool.finish(lease) is False
+    tokens_ended(stage)
+    assert probe.resource_gone(KEY, {}) is True
+    assert pool.settle_quarantines() == [KEY]
