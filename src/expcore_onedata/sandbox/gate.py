@@ -117,6 +117,9 @@ UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split bet
 # buffered waits for a slot: the wait is the agent's own concurrency, on the agent's time.
 BUFFER_SLOTS = 16
 _BUFFER_SLOTS = threading.BoundedSemaphore(BUFFER_SLOTS)
+# A buffered answer is written to the agent within this, or its connection is closed (the agent stopped reading): a
+# client that holds its socket open without reading cannot keep a buffer slot, so it cannot stall the others.
+CLIENT_WRITE_TIMEOUT_S = 60
 
 
 def _log(rec: dict) -> None:
@@ -879,8 +882,16 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._buffered(hcfg, resp, rec, declared, token)
                 if body is None:
                     return  # refused: answered and logged
-                declared = self._send_head(resp, passed, len(body))
-                sent, failure, failure_origin = self._write_whole(body, rec)
+                self.connection.settimeout(CLIENT_WRITE_TIMEOUT_S)  # a client that stops reading frees its slot
+                try:
+                    declared = self._send_head(resp, passed, len(body))
+                    sent, failure, failure_origin = self._write_whole(body, rec)
+                except TimeoutError:  # the head did not go: the agent stopped reading
+                    rec["client_stalled"] = rec["client_aborted"] = True
+                    self.close_connection = True
+                    declared, sent, failure, failure_origin = len(body), 0, None, "upstream"
+                finally:
+                    self.connection.settimeout(None)
                 del body  # the slot is free once its buffer is gone
         self._finish(hcfg, resp, rec, sent, declared, failure, failure_origin)
 
@@ -943,6 +954,9 @@ class Handler(BaseHTTPRequestHandler):
             if e.errno in LOCAL_ERRNOS:  # the gate's own resources failed the write, not the client
                 return 0, repr(e), "gate"
             rec["client_aborted"] = True
+            if isinstance(e, TimeoutError):  # the agent stopped reading: its connection goes, its slot is freed
+                rec["client_stalled"] = True
+                self.close_connection = True
             return 0, None, "upstream"
         return len(body), None, "upstream"
 

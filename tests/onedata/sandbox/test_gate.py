@@ -710,3 +710,36 @@ def test_the_gate_imports_nothing_but_the_standard_library_and_its_siblings():
             for a in (n.names if isinstance(n, ast.Import) else [n])
         }
         assert imported <= set(sys.stdlib_module_names), sibling
+
+
+def test_o05_a_client_that_stops_reading_a_buffered_answer_frees_its_slot(world, monkeypatch):
+    """O05: an agent that asks for an answer the gate buffers and then holds its socket open without reading cannot
+    keep the buffer slot: the write is bounded, the stalled connection is closed and logged, and the next buffered
+    answer is served."""
+    slots = Slots(1)
+    monkeypatch.setattr(gate, "_BUFFER_SLOTS", slots, raising=False)
+    monkeypatch.setattr(gate, "CLIENT_WRITE_TIMEOUT_S", 0.5)
+    world.upstream.mode = "fixed"
+    world.upstream.answer_status = 200
+    world.upstream.answer_headers = [("Content-Type", "application/json")]
+    world.upstream.answer_body = b'{"pad": "' + b"p" * (CAP - 64) + b'"}'
+    stalled = connect(world)
+    stalled.request("GET", FILE)  # and never reads the answer
+    time.sleep(0.2)
+    served: list[int] = []
+
+    def client():
+        conn = connect(world)
+        conn.request("GET", FILE)
+        answer = conn.getresponse()
+        answer.read()
+        served.append(answer.status)
+        conn.close()
+
+    other = threading.Thread(target=client)
+    other.start()
+    other.join(timeout=20)
+    assert served == [200]
+    line = wait_for(world, lambda r: r.get("client_stalled") is True)
+    assert line["client_aborted"] is True
+    stalled.close()
