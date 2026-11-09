@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import threading
+import time
 
 import pytest
 from campaign_support import NOW, make_schema
@@ -135,6 +136,39 @@ def test_c11_an_unreadable_gate_state_at_restart_opens_closed_and_blocks_dispatc
         assert scheduler.run().statuses == {"done": 3}
         assert "health_gate_record_unreadable" in event_kinds(scheduler.store)
         assert "health_gate_opened" in event_kinds(scheduler.store)
+
+
+def test_c11_a_restored_blocking_outage_waits_for_the_first_check_before_dispatch_exits_as_blocked(tmp_path):
+    """C11: a campaign stopped by a blocking outage is resumed on a platform that is healthy again; the restored gate's
+    first check is slow, and dispatch waits for its answer (bounded by its own timeout) instead of exiting as blocked
+    at once and discarding it: the check passes, the gate opens and every run is done."""
+    from scheduler_support import seed_store
+
+    seed_store(tmp_path, SCHEMA)
+    store = Store(tmp_path / "state.sqlite", SCHEMA)
+    outage = {
+        "start_utc": NOW,
+        "end_utc": None,
+        "how": None,
+        "checks": 3,
+        "restarts": 0,
+        "last_check_utc": NOW,
+        "first_detail": "deferred past max_defer_s",
+        "last_detail": "deferred past max_defer_s",
+        "blocking": True,
+    }
+    store.put_meta(HEALTH_META, json.dumps({"outages": [outage]}), NOW)
+    store.close()
+
+    def slow_and_healthy():
+        time.sleep(0.5)
+        return Health(True, "fine")
+
+    settings = settings_for(recheck_s=0.01, health_timeout_s=5)
+    with build(tmp_path, health=slow_and_healthy, settings=settings, plan=SMALL) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+        [restored] = parse(scheduler.store.get_meta(HEALTH_META))
+        assert restored["how"] == "check_passed"
 
 
 class OneAtATime:

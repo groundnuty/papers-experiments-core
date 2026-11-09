@@ -22,7 +22,9 @@ it opens, so a restart in the outage restores it (`restarts` counts those) and t
      "last_detail"}
 
 **A gate state that cannot be read at a restart opens closed**: whether the platform is up is then unknown, and the
-first passing check ends it. Nothing is charged for a restart.
+first passing check ends it. Nothing is charged for a restart. A restored outage that was blocking does not block
+until the restored gate's first check has answered (bounded by its timeout), so a platform that is healthy again
+reopens a campaign that exits when blocked.
 
 Post-run checks. A run whose post-run check fails **while the gate is closed at the instant the check returns** (it
 began after the gate closed, or was in flight as it closed) is retried without the attempt counting: it is kept with its
@@ -195,6 +197,7 @@ class HealthGate:
         self._stop: threading.Event | None = None  # the campaign's end, set by `start`
         self._thread: threading.Thread | None = None
         self.check_now = False  # a gate restored by a restart is checked at once, not after a period
+        self._restored = threading.Event()  # set while a restored gate's first check has not answered
 
     # --- state ----------------------------------------------------------------------------------------------------
 
@@ -205,9 +208,11 @@ class HealthGate:
 
     @property
     def blocking(self) -> bool:
-        """Tell whether the gate is closed by a failure that does not end by itself: a deferral past its bound."""
+        """Tell whether the gate is closed by a failure that does not end by itself: a deferral past its bound. A gate a
+        restart restored is not, until its first check has answered (bounded by its timeout): the platform may be
+        healthy again, and that answer must not be thrown away by a campaign that exits as blocked."""
         outage = self._open
-        return outage is not None and bool(outage.get("blocking"))
+        return outage is not None and bool(outage.get("blocking")) and not self._restored.is_set()
 
     def load(self) -> None:
         """Restore the outage list at a start. A gate closed when the last process ended is closed again and checked at
@@ -235,6 +240,7 @@ class HealthGate:
         if open_one is not None:
             open_one["restarts"] = int(open_one.get("restarts", 0)) + 1
             self._open, self.check_now = open_one, True
+            self._restored.set()
             self.store.put_meta(META, dump(self._outages), now)
             self.store.event(
                 now,
@@ -435,7 +441,11 @@ class HealthGate:
                 self.check_now = False
                 if stop.wait(wait):
                     break
-                if self.poll(stop):
+                try:
+                    opened = self.poll(stop)
+                finally:
+                    self._restored.clear()  # answered, or timed out: a blocking outage blocks again
+                if opened:
                     on_open()
             except Exception as error:
                 with contextlib.suppress(Exception):  # the store may be gone: the campaign is ending
