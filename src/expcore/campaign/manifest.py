@@ -12,8 +12,8 @@ same order exactly. The order seed and the rule are pinned in the store; a resum
 
 Fingerprint (C06). A plain, JSON-ready dictionary of everything that makes two starts one experiment: the factor
 schema, the tasks, the models and the seeds (the built-in factors of every run), the caps, the prompt and tool hashes
-of each condition, the scorer digest and the hash of every configuration file. Only hashes and numbers go in, never a
-secret. A resume must present the same fingerprint, and a manifest that is not the plan the fingerprint declares is
+of each condition, the scorer digest, the hash of every configuration file, and the platform's own settings when it
+gives any (its TLS mode, say). Only hashes, numbers and plain names go in, never a secret. A resume must present the same fingerprint, and a manifest that is not the plan the fingerprint declares is
 refused. The plan may grow, but only by whole tasks, models, seeds or conditions, and only when the caller allows it;
 changing or removing anything already recorded is refused.
 """
@@ -140,6 +140,7 @@ def build_fingerprint(
     tools: Mapping[str, str],
     scorer_digest: str,
     configs: Mapping[str, str],
+    platform: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the fingerprint of an experiment.
 
@@ -152,6 +153,9 @@ def build_fingerprint(
     - `prompts` and `tools`: for each condition, the hash of its prompt template and of its frozen tool manifest.
     - `scorer_digest`: the digest of the scorers a resume must keep.
     - `configs`: the hash of every configuration file, by file name.
+    - `platform`: the settings the platform says make two starts one experiment, as plain data without a secret (the
+      Onedata layer's is its TLS mode and CA bundle hash, `PlatformConfig.fingerprint`). It is a section only when
+      given and not empty, so a study without a platform keeps the fingerprint it had; no change to it is growth.
     """
     if not isinstance(scorer_digest, str) or not _HEX64.fullmatch(scorer_digest):
         raise PlanError("fingerprint scorer_digest must be a 64-character lower-case hex digest")
@@ -173,6 +177,8 @@ def build_fingerprint(
         "scorer_digest": scorer_digest,
         "configs": _digest_map("configs", configs),
     }
+    if platform:
+        fingerprint["platform"] = _plain("platform", platform)
     return json.loads(json.dumps(fingerprint, sort_keys=True, allow_nan=False))
 
 

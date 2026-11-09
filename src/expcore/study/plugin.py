@@ -15,7 +15,7 @@ import importlib.util
 import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from expcore.campaign.executor import RunExecutor
@@ -53,6 +53,9 @@ class StudyPlugin:
     - `probe`, `lease_group`, `lease_keys`: the platform's resources. `lease_group` maps a run's factor values to the
       group of leases it needs (None: no lease) and `lease_keys` the keys of a group; `probe` answers for holders and
       resources. Leave them out for a study that shares nothing.
+    - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
+      Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash). They go into the campaign
+      fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
     """
 
     executor: RunExecutor
@@ -63,6 +66,7 @@ class StudyPlugin:
     probe: ResourceProbe | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
+    platform: Mapping[str, Any] = field(default_factory=dict)
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
@@ -113,3 +117,6 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
         missing = [c for c in study.schema.conditions if c not in hashes]
         if missing:
             raise ConfigError(f"{file}: the plugin's {label} has no entry for condition {missing[0]!r}")
+    if not isinstance(plugin.platform, Mapping):
+        kind = type(plugin.platform).__name__
+        raise ConfigError(f"{file}: the plugin's platform must be a mapping of plain data, not a {kind}")

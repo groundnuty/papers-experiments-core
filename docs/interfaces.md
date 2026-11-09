@@ -38,9 +38,10 @@ class StudyPlugin:
     probe: ResourceProbe | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
+    platform: Mapping[str, Any] = field(default_factory=dict)  # the platform's settings that make one experiment
 ```
 
-The core guarantees: the code identity is computed once, from the study directory and the `[study] code` roots, and refused if it is unknown, stale or (without `--allow-dirty`) dirty; the plugin is rejected at load if a condition has no prompt or tool hash, or two scorers share a name; `prompts`, `tools`, the scorers' names and versions and the hash of each configuration file go into the campaign fingerprint, so a resume under any change is refused (C06).
+The core guarantees: the code identity is computed once, from the study directory and the `[study] code` roots, and refused if it is unknown, stale or (without `--allow-dirty`) dirty; the plugin is rejected at load if a condition has no prompt or tool hash, two scorers share a name, or `platform` is not a mapping; `prompts`, `tools`, the scorers' names and versions, the hash of each configuration file and, when not empty, `platform` go into the campaign fingerprint, so a resume under any change is refused (C06). A study on the Onedata layer passes `platform=config.fingerprint()`, the platform file's TLS mode with the CA bundle's SHA-256, so a resume under another mode or bundle is refused.
 
 The implementer must guarantee: `build` has no side effects beyond constructing objects; the hashes describe what the model sees under each condition; nothing is named by the core, so every name lives in the study.
 

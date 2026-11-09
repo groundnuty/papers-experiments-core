@@ -1,5 +1,6 @@
 """A study directory: the four files loaded and checked against each other, and the plugin module found and checked."""
 
+import dataclasses
 import shutil
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from expcore.config.loading import ConfigError
 from expcore.plugin import ToolSpec
 from expcore.study.config import find_study_root, load_study
+from expcore.study.pipeline import fingerprint_of
 from expcore.study.plugin import StudyContext, load_plugin, tools_sha256
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "tiny_study"
@@ -155,6 +157,22 @@ def test_a_plugin_that_repeats_a_scorer_or_leaves_a_condition_out_is_refused(stu
     source = STUB_PLUGIN.replace("SCORERS", scorers).replace("PROMPTS", prompts)
     (study_dir / "plugin.py").write_text(source, encoding="utf-8")
     with pytest.raises(ConfigError, match=fragment):
+        load_plugin(context(study_dir))
+
+
+def test_c06_the_plugins_platform_settings_reach_the_campaign_fingerprint(study_dir):
+    """C06: what the platform says makes two starts one experiment reaches the fingerprint through the plugin's
+    `platform`; the example gives none, which leaves the fingerprint as it was, and a value that is no mapping is
+    refused when the plugin is loaded, naming the file."""
+    study, plugin = load_study(study_dir), load_plugin(context(study_dir))
+    assert plugin.platform == {}
+    assert "platform" not in fingerprint_of(study, plugin)
+    given = dataclasses.replace(plugin, platform={"tls": {"mode": "insecure"}})
+    assert fingerprint_of(study, given)["platform"] == {"tls": {"mode": "insecure"}}
+    source = STUB_PLUGIN.replace("SCORERS", "[Scorer()]").replace("PROMPTS", "None")
+    source = source.replace("tools=hashes)", 'tools=hashes, platform=["tls"])')
+    (study_dir / "plugin.py").write_text(source, encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"plugin\.py: the plugin's platform must be a mapping"):
         load_plugin(context(study_dir))
 
 

@@ -9,11 +9,13 @@ import hashlib
 import json
 
 import pytest
+from campaign_support import make_fingerprint, make_manifest, make_schema
 from platform_support import NOW, write_platform
 from sandbox_support import add_sandbox
 from tls_support import ANSWER, HAS_OPENSSL, TlsServer, make_federation_ca
 
 from expcore.campaign.healthgate import read_health
+from expcore.campaign.resume import FingerprintMismatch, open_campaign
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import load_platform
@@ -51,6 +53,7 @@ def with_tls(tls, *, zone_url=None):
 
 def load(tmp_path, tls=None, *, ca=None, zone_url=None, require_secrets=True):
     """Load the default platform document with `[tls]` set, the CA bundle (when given) copied beside it."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
     if ca is not None:
         (tmp_path / CA_NAME).write_bytes(ca.read_bytes())
     return load_platform(write_platform(tmp_path, with_tls(tls, zone_url=zone_url)), require_secrets=require_secrets)
@@ -247,3 +250,31 @@ def test_o05_health_warns_while_insecure_tls_is_on_and_never_otherwise(tmp_path,
     assert "insecure_tls" in WARNING
     assert "disposable test federation" in WARNING
     assert "warning" not in plain.detail
+
+
+# ---------------------------------------------------------------------------------------------------- the campaign
+
+
+def test_c06_a_campaign_does_not_resume_under_another_tls_setting_of_its_platform(tmp_path, fake, federation, stranger):
+    """C06: through the platform's half of the fingerprint, a campaign started under one TLS setting is refused a
+    resume under another mode or under another CA bundle at the same path; the same setting resumes."""
+    schema, manifest = make_schema(), make_manifest(make_schema())
+    configs = {
+        "ca_file": load(tmp_path / "a", {"ca_file": CA_NAME}, ca=federation.ca),
+        "another bundle": load(tmp_path / "b", {"ca_file": CA_NAME}, ca=stranger.ca),
+        "insecure_tls": load(tmp_path / "c", {"insecure_tls": True}),
+        "verify-default": load(tmp_path / "d"),
+    }
+
+    def resume(config):
+        fingerprint = make_fingerprint(schema, platform=config.fingerprint())
+        store, _ = open_campaign(tmp_path / "campaign.db", schema, manifest, fingerprint, now=NOW, max_attempts=3)
+        store.close()
+
+    resume(configs["ca_file"])
+    for label in ("another bundle", "insecure_tls", "verify-default"):
+        with pytest.raises(FingerprintMismatch) as caught:
+            resume(configs[label])
+        assert all(line.startswith("platform.tls") for line in caught.value.differences), label
+        assert CA_NAME not in str(caught.value)
+    resume(configs["ca_file"])
