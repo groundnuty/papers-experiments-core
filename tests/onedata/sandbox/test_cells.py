@@ -2,6 +2,7 @@
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from sandbox_support import make_spec, start_options
@@ -12,6 +13,8 @@ from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 
 DOCKER_REFUSED = "Error response from daemon: container agent is not running"
+DATA = Path(__file__).resolve().parents[2] / "data" / "sandbox"
+FIXTURE_CID = "ab12" * 16  # the container id the kernel-log fixtures name
 
 
 @pytest.fixture
@@ -107,3 +110,40 @@ def test_o17_137_and_143_with_the_containers_evidence_are_the_same_kill(world, s
     assert (result.kill["reason"], result.kill["category"]) == ("container_dead", "infrastructure")
     assert result.timed_out is False
     agent_of(world, sbx).running = True  # so that the teardown runs as usual
+
+
+EVIDENCE = {  # the counters that rise under the cell, the kernel log of its window, and the cause they make
+    "own_limit": (("oom", "oom_kill"), "dmesg_own_limit.txt", ("memory_limit", "agent"), (1, 0)),
+    "host_killer": (("oom_kill",), "dmesg_host_killer.txt", ("host_oom", "infrastructure"), (0, 1)),
+}
+
+
+@pytest.mark.parametrize("evidence", sorted(EVIDENCE))
+def test_o17_identical_kernel_evidence_with_different_exit_codes_classifies_the_same(world, sbx, evidence):
+    """O17: whole cells that exit 137, 143, 124, 1 and 0, each with the same rise of the cgroup's counters and the same
+    kernel line naming this container, get one and the same cause: the exit code changes nothing."""
+    rising, log, cause, lines = EVIDENCE[evidence]
+    agent = agent_of(world, sbx)
+    events_file = next(path for path in world.host.files if agent.id in path and path.endswith("/memory.events"))
+    world.host.dmesg = (DATA / log).read_text(encoding="utf-8").replace(FIXTURE_CID, agent.id)
+    counters = dict.fromkeys(("low", "high", "max", "oom", "oom_kill"), 0)
+
+    def exits_with(code):
+        def handler(container, argv, stdin):
+            for key in rising:
+                counters[key] += 1
+            world.host.files[events_file] = "".join(f"{key} {value}\n" for key, value in counters.items())
+            return CmdResult(code, "", "")
+
+        return handler
+
+    kills = []
+    for code in (137, 143, 124, 1, 0):
+        world.host.exec_handler = exits_with(code)
+        result = sbx.exec("x = bytearray(1 << 40)", 30)
+        assert result.exit_code == code
+        kills.append(result.kill)
+    assert {(kill["reason"], kill["category"]) for kill in kills} == {cause}
+    assert len({kill["basis"] for kill in kills}) == 1
+    assert {(kill["kernel_memcg_own"], kill["kernel_host"]) for kill in kills} == {lines}  # each saw the kernel's line
+    assert all(kill["events_delta"] == kills[0]["events_delta"] for kill in kills)

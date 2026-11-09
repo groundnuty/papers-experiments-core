@@ -3,6 +3,7 @@
 Fixture files under tests/data/sandbox hold invented content in the formats the kernel and docker print.
 """
 
+import inspect
 import json
 from pathlib import Path
 
@@ -25,9 +26,9 @@ def kernel(name: str, since_s: float | None = None) -> list[dict]:
     return killcause.parse_kernel_oom((DATA / name).read_text(encoding="utf-8"), since_s=since_s)
 
 
-def classify(after: str | None, *, running: bool | None = True, fired: bool = False, lines=None, exit_code=137):
-    """What the harness would conclude for a cell that exited with `exit_code`: the exit code is not an input."""
-    del exit_code  # the point of O17: the same exit code, whatever it is, gives the cause the evidence gives
+def classify(after: str | None, *, running: bool | None = True, fired: bool = False, lines=None):
+    """What the harness would conclude from this evidence. There is no exit code to pass: it is no input of the
+    classification, and test_cells.py shows whole cells with different exit codes and the same evidence agreeing."""
     before = events("memory_events_start.txt")
     return killcause.classify(
         before,
@@ -52,12 +53,10 @@ def test_o17_a_kill_with_no_rise_of_the_containers_own_counter_is_the_hosts():
     assert (got["reason"], got["category"]) == ("host_oom", "infrastructure")
 
 
-def test_o17_the_exit_code_decides_nothing():
-    """O17: 137, 124, 143 or 0 with the same counters is the same cause; a cell at its limit is the agent's."""
-    causes = {classify("memory_events_host_killer.txt", exit_code=code)["reason"] for code in (137, 124, 143, 0, 1)}
-    assert causes == {"host_oom"}
-    got = classify("memory_events_start.txt", fired=True)
-    assert (got["reason"], got["category"]) == ("time_limit", "agent")
+def test_o17_the_exit_code_is_no_input_of_the_classification():
+    """O17: the cause comes from the counters, the container's state, the kernel log and the harness's timer; the
+    classification has no parameter an exit code could reach it through."""
+    assert not {"exit_code", "rc", "returncode"} & set(inspect.signature(killcause.classify).parameters)
 
 
 def test_o17_a_time_limit_is_the_harnesss_timer_firing_never_the_elapsed_time():
