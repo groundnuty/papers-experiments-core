@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from expcore.package.spec import PackageError
-from expcore.package.views import PARSED, streams, views
+from expcore.package.views import PARSED, hidden_name, streams, views
 from expcore.study.config import CONFIG_FILES
 
 REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".bib", ".json", ".toml"})
@@ -216,9 +216,12 @@ def find_terms(
     """
     finders = [_finder(term) for term in anonymisation.terms]
     findings: list[str] = []
-    for name in sorted(set(files) - set(opaque)):
+    for position, name in enumerate(sorted(files), start=1):
+        if name in opaque:
+            continue
         for stream in streams(name, files[name])[0]:
-            shown = REDACTED_PATH if any(f.search(stream.label) for f in finders) else stream.label
+            held = any(f.search(stream.label) for f in finders)
+            shown = hidden_name(position, stream.label) if held else stream.label
             if shown != stream.label:
                 findings.append(f"{shown}: the path holds {FINDING}")
             lines, parsed = set(), False

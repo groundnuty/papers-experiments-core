@@ -1,11 +1,13 @@
 """Anonymisation lists: whole words only, only in the prose and metadata named, and never a term in a finding."""
 
 import json
+import sqlite3
 
 import pytest
 
-from expcore.package.anonymise import REDACTED_PATH, Anonymisation, find_terms, load_anonymisation, rewrite
+from expcore.package.anonymise import Anonymisation, find_terms, load_anonymisation, rewrite
 from expcore.package.spec import PackageError
+from expcore.package.views import hidden_name
 
 TERMS = {"Quillon Varek": "Author A", "Varek": "Author A", "Brindlemoor Institute": "Institution A", "orvo": "Site A"}
 FOUND = "a term of the anonymisation list"
@@ -57,7 +59,8 @@ def test_k05_a_term_the_whole_word_rule_left_inside_a_hyphenated_name_is_found_a
     """K05: nothing slips past the whole-word rule, and a path that holds a term is never shown."""
     files = rewrite({"README.md": b"See the Varek-lab notes.\n"}, listed, code=set())
     files["notes/varek/data.csv"] = b"1,2\n"
-    assert find_terms(files, listed) == [f"README.md:1: {FOUND}", f"{REDACTED_PATH}: the path holds {FOUND}"]
+    hidden = hidden_name(2, "notes/varek/data.csv")  # never the path itself: its place and the start of its hash
+    assert find_terms(files, listed) == [f"README.md:1: {FOUND}", f"{hidden}: the path holds {FOUND}"]
 
 
 @pytest.mark.parametrize(
@@ -186,3 +189,19 @@ def test_k03_a_term_split_by_a_continuation_or_escaped_in_code_is_found(listed):
     """K03: the term check reads every text file normalised as well: continuations joined, escapes decoded."""
     files = {"run.sh": b'echo "Quillon Var\\\nek"\n', "tool.py": b'AUTHOR = "\\x56arek"\n'}
     assert find_terms(files, listed) == [f"run.sh:1: {FOUND}", f"tool.py:1: {FOUND}"]
+
+
+def test_k03_a_term_split_by_an_indented_yaml_continuation_is_found(listed):
+    """K03: the continuation joins the backslash, the newline and the indentation after it."""
+    assert find_terms({"meta.yml": b'author: "Var\\\n  ek"\n'}, listed) == [f"meta.yml:1: {FOUND}"]
+
+
+def test_k03_a_term_in_an_sqlite_text_value_written_with_an_escape_is_found(listed, tmp_path):
+    """K03: a database's TEXT values are read through the text views, so an escaped term in one is found."""
+    path = tmp_path / "store.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE t (x TEXT)")
+    connection.execute("INSERT INTO t VALUES (?)", ("by \\u0056arek",))
+    connection.commit()
+    connection.close()
+    assert find_terms({"store.sqlite": path.read_bytes()}, listed)

@@ -1,8 +1,10 @@
 """The package's token check fails closed: only text, SQLite databases and archives of them may enter a package, every
 one is read in full, with no exemption, and anything else is refused unless the author attests it by hash."""
 
+import base64
 import bz2
 import gzip
+import hashlib
 import io
 import lzma
 import sqlite3
@@ -14,6 +16,7 @@ import zlib
 import pytest
 
 from expcore.package.build import scan_tokens
+from expcore.package.views import hidden_name
 from expcore.provenance.hashfile import hashes_from_tokens
 
 PRIVATE = "zarnothwick"  # invented; private everywhere in these tests
@@ -111,7 +114,8 @@ def test_k03_a_zip_member_and_a_member_name_are_found_and_the_name_is_redacted()
     """K03: zip members are opened; a member whose own name holds the private name is shown redacted."""
     assert found({"bundle.zip": zipped({"inner/notes.txt": TEXT})})
     named = found({"bundle.zip": zipped({f"{PRIVATE}/notes.txt": b"plain\n"})})
-    assert any(finding.startswith("<path redacted>") for finding in named)  # the member, besides the raw zip
+    member = hidden_name(1, f"bundle.zip!{PRIVATE}/notes.txt")  # the member, named by place and hash, besides the zip
+    assert any(finding.startswith(member) for finding in named)
 
 
 def test_k03_nested_archives_are_opened_down_to_the_depth_cap():
@@ -206,3 +210,126 @@ def test_k03_a_python_files_provenance_header_is_scanned_like_any_other_line():
 def test_k03_a_name_split_by_a_continuation_or_written_with_escapes_is_found(hidden):
     """K03: every text file is also read normalised: continuations joined and backslash escapes decoded."""
     assert found({"run.sh": f'echo "{hidden}"\n'.encode()})
+
+
+def test_k03_a_pdf_or_postscript_file_is_refused_even_when_it_is_ascii():
+    """K03: a format signature is checked before the text test: an ASCIIHex-encoded Flate stream keeps a PDF pure
+    ASCII, and a PDF or PostScript file is refused all the same."""
+    stream = zlib.compress(TEXT).hex().encode() + b">"
+    pdf = b"%PDF-1.4\n<< /Filter [/ASCIIHexDecode /FlateDecode] >>\nstream\n" + stream + b"\nendstream\n%%EOF\n"
+    refused({"figure.pdf": pdf}, "PDF")
+    refused({"figure.ps": b"%!PS-Adobe-3.0\n(a page) show\n"}, "PostScript")
+
+
+def b64(data: bytes) -> bytes:
+    return base64.b64encode(data)
+
+
+def b64url_unpadded(data: bytes) -> bytes:
+    return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+
+def hexed(data: bytes) -> bytes:
+    return data.hex().encode()
+
+
+@pytest.mark.parametrize("encode", [b64, b64url_unpadded, hexed])
+def test_k03_a_name_in_compressed_bytes_written_as_base64_or_hex_in_text_is_found(encode):
+    """K03: base64 (either alphabet, padded or not) and hex runs of 40 characters or more are decoded, and what they
+    decode to goes through the same allow list: here a zlib stream, decompressed."""
+    assert found({"notes.txt": b"blob: " + encode(zlib.compress(TEXT)) + b"\n"})
+
+
+def test_k03_a_data_uri_in_an_svg_is_decoded_wrapped_or_not():
+    """K03: a data: URI's base64, also when it is wrapped over lines, is decoded and read."""
+    inline = b'<svg><image href="data:application/octet-stream;base64,' + b64(zlib.compress(TEXT)) + b'"/></svg>\n'
+    assert found({"figure.svg": inline})
+    encoded = b64(gzip.compress(TEXT * 8, mtime=0))
+    wrapped = b"\n".join(encoded[i : i + 64] for i in range(0, len(encoded), 64))
+    assert found({"figure.svg": b'<svg><image href="data:application/gzip;base64,\n' + wrapped + b'\n"/></svg>\n'})
+
+
+def test_k03_a_decoded_payload_the_check_cannot_read_refuses_the_file():
+    """K03: an image inside a data: URI is content the check cannot read, so the file holding it is refused."""
+    png = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", b"\x00" * 13) + png_chunk(b"IEND", b"")
+    refused({"figure.svg": b'<svg><image href="data:image/png;base64,' + b64(png) + b'"/></svg>\n'}, "PNG")
+
+
+def test_k03_digests_and_long_identifiers_decode_harmlessly_and_refuse_nothing():
+    """K03: a SHA-256 or a git commit in hex, a digest in base64 and a long identifier are decoded too; they are not
+    an encoding of anything, so they yield nothing and refuse nothing."""
+    text = (
+        '{"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", '
+        '"commit": "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3", '
+        f'"b64": "{base64.b64encode(bytes(range(32))).decode()}", '
+        '"name": "test_the_contrast_that_left_a_task_out_names_it_in_its_row"}\n'
+    )
+    assert found({"record.json": text.encode()}) == []
+
+
+def sqlite_with(path, *values) -> bytes:
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE t (x)")
+    connection.executemany("INSERT INTO t VALUES (?)", [(value,) for value in values])
+    connection.commit()
+    connection.close()
+    return path.read_bytes()
+
+
+def test_k03_sqlite_values_are_read_a_compressed_blob_and_an_escaped_text_value_found(tmp_path):
+    """K03: besides its raw bytes, a database is opened read-only and every value read: TEXT through the text views
+    and their escape decoding, BLOB through the byte-stream allow list (a zlib BLOB is decompressed)."""
+    assert found({"store.sqlite": sqlite_with(tmp_path / "blob.sqlite", zlib.compress(TEXT))})
+    escaped = f"ran on \\u{ord(PRIVATE[0]):04x}{PRIVATE[1:]}"
+    assert found({"store.sqlite": sqlite_with(tmp_path / "text.sqlite", escaped)})
+
+
+def test_k03_an_sqlite_blob_the_check_cannot_read_refuses_the_database(tmp_path):
+    """K03: a BLOB is a byte stream like any other: one the check cannot read refuses the file."""
+    refused({"store.sqlite": sqlite_with(tmp_path / "zstd.sqlite", b"\x28\xb5\x2f\xfd" + b"\x00" * 32)}, "zstd")
+
+
+def test_k03_a_continuation_with_indentation_is_joined():
+    """K03: a YAML or shell continuation joins the backslash, the newline and the indentation that follows."""
+    assert found({"meta.yml": f'author: "{PRIVATE[:4]}\\\n    {PRIVATE[4:]}"\n'.encode()})
+
+
+def corrupt_crc(archive: bytes) -> bytes:
+    """Flip the CRC-32 of every member in its local header and in the central directory."""
+    data = bytearray(archive)
+    for signature, offset in ((b"PK\x03\x04", 14), (b"PK\x01\x02", 16)):
+        start = data.find(signature)
+        while start != -1:
+            data[start + offset] ^= 0xFF
+            start = data.find(signature, start + 4)
+    return bytes(data)
+
+
+def test_k03_a_member_that_fails_to_decompress_refuses_the_file_at_once():
+    """K03: a member whose CRC does not match, or a stream cut short, refuses the whole file the moment it fails; the
+    walk does not go on to the next member or archive."""
+    from expcore.package import views
+
+    inner = corrupt_crc(zipped({"bad.txt": b"z" * 5000}))
+    outer = zipped({f"inner{n}.zip": inner for n in range(6)})
+    streams, problems = views.streams("outer.zip", outer)
+    assert len(problems) == 1
+    label, why = problems[0]
+    assert label == "outer.zip!inner0.zip!bad.txt"
+    assert "BadZipFile" in why
+    assert [s.label for s in streams] == ["outer.zip", "outer.zip!inner0.zip"]
+    streams, problems = views.streams("cut.gz", gzip.compress(TEXT * 50)[:-30])
+    assert len(problems) == 1
+    assert [s.label for s in streams] == ["cut.gz"]
+
+
+def test_k03_refused_files_under_a_redacted_directory_are_each_named_by_position_and_path_hash():
+    """K03: a refusal whose path holds a private name is never shown, and never folded into another: each names the
+    file's position in the package and the start of its path's SHA-256."""
+    first, second = f"{PRIVATE}/a.pdf", f"{PRIVATE}/b.pdf"
+    findings = found({"README.md": b"plain\n", first: b"%PDF-1.4\n", second: b"%PDF-1.4\n"})
+    named = [finding.split(": refused", 1)[0] for finding in findings if "refused" in finding]
+    assert named == [
+        f"file 2 (path sha256 {hashlib.sha256(first.encode()).hexdigest()[:12]})",
+        f"file 3 (path sha256 {hashlib.sha256(second.encode()).hexdigest()[:12]})",
+    ]

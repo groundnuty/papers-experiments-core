@@ -41,7 +41,7 @@ from expcore.models.route import sdk_version
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term, load_anonymisation, rewrite
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
 from expcore.package.spec import PackageError, PackageSpec, load_spec, select
-from expcore.package.views import streams, views
+from expcore.package.views import hidden_name, streams, views
 from expcore.provenance.codestamp import STAMP, covered_files, is_sha, write_stamp
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.hashfile import Hashes
@@ -101,20 +101,27 @@ def scan_tokens(
     cannot read in full is a finding, a refusal. Text is read as it is and decoded, a database's or archive's bytes
     under every encoding (`views.views`). The provenance-header exemption of this repository's own check does not
     apply. The files in `opaque` were attested by hash and are not read. A finding shows a hash prefix and where,
-    never the value; a refused stream whose label holds a private name, or for which `hidden` is true (a term of an
-    anonymisation list), is shown redacted.
+    never the value. A stream whose label holds a private name, or for which `hidden` is true (a term of an
+    anonymisation list), is named by its file's position in the package and the start of its label's SHA-256
+    (`views.hidden_name`), so that two such findings never fold into one.
     """
     findings: set[str] = set()
-    for path in sorted(set(files) - set(opaque)):
+    for position, path in enumerate(sorted(files), start=1):
+        if path in opaque:
+            continue
         found, problems = streams(path, files[path])
         for label, why in problems:
             private = hidden(label) or any(hit.kind == "path" for hit in scan_source(label, "", hashes))
-            findings.add(f"{REDACTED_PATH if private else label}: {why}")
+            findings.add(f"{hidden_name(position, label) if private else label}: {why}")
         for stream in found:
+            shown = hidden_name(position, stream.label) if hidden(stream.label) else None
             for view, text in views(stream):
                 python = view == "text" and stream.label.endswith(".py")
-                hits = scan_source(stream.label, text, hashes, exempt_header=False, python=python)
-                findings.update(f"{hit} ({view})" for hit in hits)
+                for hit in scan_source(stream.label, text, hashes, exempt_header=False, python=python):
+                    line = str(hit)
+                    if hit.path == REDACTED_PATH or shown:
+                        line = f"{shown or hidden_name(position, stream.label)}{line[len(hit.path) :]}"
+                    findings.add(f"{line} ({view})")
     return sorted(findings)
 
 
