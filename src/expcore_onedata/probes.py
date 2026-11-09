@@ -25,10 +25,10 @@ snapshot and never the live platform (R13). The snapshot holds, for the files th
   jobs in the window that replicate into it, and `on_demand_lower_bound`, the gained bytes less those, floored at zero
   and only a lower bound (`transferwindow.py` names the conditions); None when the block maps or the listing are unknown.
 
-**`gained_bytes` is net placement growth, not bytes on the wire.** It is the bytes a provider holds at run end minus
-those it held at run start, from its block map (`GET /data/{id}/distribution`) at those two moments: the bytes the map
-shows at the end that it did not show at the start, while what it showed at the start and no longer does is
-`lost_bytes`. Bytes fetched and evicted again during the run, bytes read through a provider that did not keep them,
+**`gained_bytes` is placement gained, not a net change and not bytes on the wire.** It is the bytes of the blocks a
+provider's block map (`GET /data/{id}/distribution`) shows at run end that it did not show at run start; what the map
+showed at the start and no longer does is `lost_bytes`, kept apart, so replacing 100 bytes with 100 others gains 100
+and loses 100. Bytes fetched and evicted again during the run, bytes read through a provider that did not keep them,
 and bytes moved more than once leave no trace in it, and it says nothing of what crossed the network.
 
 **A probe that fails is recorded as failed and its value is `None`, never guessed (O08).** `run_probe` sends the read

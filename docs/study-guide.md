@@ -211,20 +211,29 @@ assert scored.scores["lookups"] == {
 
 ### Unknown platform estimates are data
 
-A study on the Onedata platform reads the run-end platform probes from each record's instruments (`platform_probes`). Per tracked provider they give `gained_bytes` (net placement growth: the bytes the provider holds at run end minus at run start, from the block map, not bytes on the wire), `transfer_bytes_in` (what the transfers in the run window moved into it), and `on_demand_lower_bound`, which is `None` whenever one of its inputs is not established, with each reason in `unknown` (`transfer_not_ended`, `transfer_carried_over`, `listing_not_settled`, ...).
+A study on the Onedata platform reads the run-end platform probes from each record's instruments (`platform_probes`). Per tracked provider they give `gained_bytes` (placement gained: the bytes of the blocks the provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire), `transfer_bytes_in` (what the transfers in the run window moved into it), and `on_demand_lower_bound`, which is `None` whenever one of its inputs is not established, with each reason in `unknown` (`transfer_not_ended`, `transfer_carried_over`, `listing_not_settled`, ...).
 
-That missingness is informative. An estimate is unknown exactly when, for example, the agent starts a transfer and its run ends first, which is likelier under conditions that encourage placement, so dropping the unknowns would bias a comparison between conditions. Count them per condition and reason, and report the counts beside any analysis of the bound; never drop them silently. Either analyse a measure that is always defined (`gained_bytes`, `transfer_bytes_in`), or analyse the bound and state its missingness as a limitation. A study without the platform has no probes, and the count is empty:
+That missingness is informative. An estimate is unknown exactly when, for example, the agent starts a transfer and its run ends first, which is likelier under conditions that encourage placement, so dropping the unknowns would bias a comparison between conditions. Count them per condition and reason over every attempt, set-aside and excluded ones as well as those analysed, and report the counts beside any analysis of the bound; never drop them silently. `gained_bytes` and `transfer_bytes_in` are missing far less often, only when a block map or the transfer listing could not be read, but they too can be missing (the split is then `None`), so count those as well, under `no_split`, whichever measure you analyse; or analyse the bound and state its missingness as a limitation. A study without the platform has no probes, and the count is empty:
 
 ```python
 from collections import Counter
 
 
 def unknown_on_demand(export, runs):
-    """Count the on-demand estimates that are unknown, by condition, provider and reason, over the analysed attempts.
-    An attempt whose probes give no split at all counts once under the reason "no_split"."""
+    """Count the on-demand estimates that are unknown, by condition, provider and reason, over every attempt's record
+    under `runs`, analysed, set aside or excluded. An attempt whose probes give no split at all counts once under the
+    reason "no_split"."""
+    condition_of = {
+        entry["run_key"]: entry["condition"]
+        for part in ("analysed_attempts", "exhausted_runs", "unfinished_runs", "excluded_attempts")
+        for entry in export.get(part, [])
+    }
     counts = Counter()
-    for entry in export["analysed_attempts"]:
-        record = load_record(runs / entry["run_dir"] / record_filename(entry["run_key"], entry["attempt"]))
+    for path in sorted(runs.glob("*/try*/*.json")):
+        if not path.name.split(".")[0].isalnum() or path.name.count(".") != 2:
+            continue  # only record files, named <sha256 of the run key>.<attempt>.json
+        record = load_record(path)
+        entry = {"condition": condition_of.get(record.run_key, "unknown condition")}
         probes = record.instruments.get("platform_probes")
         if probes is None:  # no platform: nothing to count
             continue
@@ -240,6 +249,8 @@ def unknown_on_demand(export, runs):
 counts = unknown_on_demand(export, Path("my-study/out/runs"))
 for (condition, provider, reason), n in sorted(counts.items(), key=str):
     print(condition, provider, reason, n)
+records = [p for p in Path("my-study/out/runs").glob("*/try*/*.json") if p.name.count(".") == 2]
+assert records and all(load_record(p).run_key for p in records)  # every attempt's record is read
 assert counts == Counter()  # the example study runs without the platform
 ```
 
