@@ -147,6 +147,12 @@ class Observer:
         return EO.read_kills(self.host, since)
 
     # ------------------------------------------------------------------------------------------------ kills
+    def running(self, container: str) -> bool | None:
+        """Whether a container is running, from `docker inspect`; None when docker cannot say (unknown, not stopped)."""
+        info = inspect(self.host, container)
+        value = ((info or {}).get("State") or {}).get("Running")
+        return value if isinstance(value, bool) else None
+
     def kill_facts(
         self,
         agent: str,

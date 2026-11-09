@@ -3,8 +3,9 @@
 #   changes: the cell runner is its own class over HostOps; the earlier study's tracer and cell tags are not carried
 """Running the agent's code in the sandbox, and saying why a cell was killed (O17).
 
-One cause per cell, whatever the exit code: the cgroup's counters are read after every cell, because a killed worker
-may leave a parent that exits 1, or 0; the journal of the host's out-of-memory killer likewise. A cell that printed
+One cause per cell, whatever the exit code: the cgroup's counters and the container's state are read after every cell,
+because a killed worker may leave a parent that exits 1, or 0, and a cell may exit 137 or 143 by itself; the journal of
+the host's out-of-memory killer likewise. An exit code alone never makes a kill. A cell that printed
 bytes that are not UTF-8 is the agent's own outcome: they are replaced, never an exception. The only time limit is the
 `timeout_s` the caller sets, so no hidden per-cell limit can creep back.
 """
@@ -258,7 +259,14 @@ class CellRunner:
         if events is None:  # not known whether anything of this cell was killed
             self._meta.setdefault("oom_counters_unreadable_cells", []).append(entry["cell"])
         killed = (events or {}).get("oom_kill", 0) > (before or {}).get("oom_kill", 0)
-        if gave_up or fired or rc in (137, -9) or killed or docker_failed(rc, res.stderr):
+        running = self._obs.running(self._names.agent)  # the container's own state, after every cell, whatever its code
+        if running is None:  # not known whether the container died under this cell
+            self._meta.setdefault("container_state_unreadable_cells", []).append(entry["cell"])
+        # a kill only on the kernel's or the container's evidence, or the harness's own: an OOM kill counted, a
+        # container that stopped, the harness's timer or its giving up, docker saying it could not run the cell. Never
+        # the exit code alone: `sys.exit(137)` with the counters unchanged and the container running is the agent's
+        # own exit (O17)
+        if gave_up or fired or killed or running is False or docker_failed(rc, res.stderr):
             # when the harness gave up, the cell had all the time it could have: `used` may be less
             kill = self._obs.kill_facts(
                 self._names.agent, before, timeout_s if gave_up else used, timeout_s, up0, timer_fired=fired

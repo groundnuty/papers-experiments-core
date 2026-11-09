@@ -82,3 +82,28 @@ def test_o17_a_timer_that_the_cell_outran_never_fires_and_never_kills():
     time.sleep(0.05)
     assert fired.end() is True
     assert kills == [2]
+
+
+@pytest.mark.parametrize("code", [137, 143, -9, 124, 1])
+def test_o17_an_exit_code_alone_is_the_agents_own_exit(world, sbx, code):
+    """O17: a cell that exits 137 by itself (`sys.exit(137)`), with the counters unchanged and the container running,
+    was not killed: 137 and 143 are treated alike, as any other code, and none of them is a kill or a time limit."""
+    world.host.exec_handler = lambda container, argv, stdin: CmdResult(code, "", "")
+    result = sbx.exec("import sys; sys.exit(137)", 30)
+    assert (result.exit_code, result.kill, result.timed_out) == (code, None, False)
+    assert "cell_kills" not in sbx.metadata()
+
+
+@pytest.mark.parametrize("code", [137, 143])
+def test_o17_137_and_143_with_the_containers_evidence_are_the_same_kill(world, sbx, code):
+    """O17: with the container's evidence (it stopped under the cell) both codes are the same kill, from it."""
+
+    def dies(container, argv, stdin):
+        container.running = False
+        return CmdResult(code, "", "")
+
+    world.host.exec_handler = dies
+    result = sbx.exec("print(1)", 30)
+    assert (result.kill["reason"], result.kill["category"]) == ("container_dead", "infrastructure")
+    assert result.timed_out is False
+    agent_of(world, sbx).running = True  # so that the teardown runs as usual
