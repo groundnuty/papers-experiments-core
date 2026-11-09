@@ -61,7 +61,9 @@ client test in a source sends it and reads the answer as this layer does.
   `fileId`), `PUT /data/{id}/content` (query `offset`, an octet-stream body), `GET /data/{id}`, `DELETE /data/{id}`,
   `GET /data/{id}/distribution`, `POST /transfers` (body `type`, `fileId`, `replicatingProviderId` or
   `evictingProviderId`) and `GET /transfers/{id}`. `read_range` is `GET /data/{id}/content` with a `Range` header,
-  answered with a 206 and a `Content-Range`.
+  answered with a 206 and a `Content-Range`. `content_answer` is the same call whole or with `Range: bytes=0-0`, of
+  which only the status and the `Content-Type` are read: the type is the unconfirmed detail it measures
+  (`precampaign.py`).
 - `file_space_name`: `GET /data/{id}` with the query `attribute=path`, the answer key `path`, whose first segment is
   the name of the space the file lies in. Unconfirmed against a real provider: [S9] is the earlier study's mock of what
   the official client calls, and it answers `path` as `/{space name}/...`; see `UNVERIFIED_ENDPOINTS`.
@@ -487,6 +489,37 @@ class OnezoneClient:
         ):
             raise PlatformError(f"{label}: a range read was answered with another range than the one asked for")
         return body
+
+    def content_answer(
+        self, path: str, *, provider: str, first_byte: bool, timeout_s: float | None = None
+    ) -> tuple[int, str | None]:
+        """Ask a provider for a file's content, whole or its first byte; return the answer's status and Content-Type.
+
+        The body is never read: the answer is closed once its head has arrived, so a large file costs nothing. It passes
+        the same gate as `read_range`, since a read through a provider that lacks the bytes fetches them: the path must
+        be `/data/{id}/content` and the file's space must have a configured prefix, or nothing is sent. A transport
+        failure or a status of 400 or more is a `PlatformError`. The pre-campaign check is its caller (O05).
+        """
+        parts = _plain(path)
+        if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
+            raise OutOfScope("a content read is of /data/{id}/content only")
+        path = _check_path(path)
+        base, label = self._base(provider)
+        self._require_in_scope(self._target_name("GET", path, provider, None))
+        headers = {**self._admin, **({"Range": "bytes=0-0"} if first_byte else {})}
+        try:
+            with self._http.stream(
+                "GET", base + path, headers=headers, timeout=timeout_s if timeout_s is not None else self._timeout_s
+            ) as response:
+                status, content_type = response.status_code, response.headers.get("Content-Type")
+                code = _error_code(response) if status >= 400 and response.read() is not None else None
+        except httpx.HTTPError as error:
+            raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
+        if status >= 400:
+            raise PlatformError(
+                f"{label}: GET answered {status}" + (f" ({code})" if code else ""), status=status, code=code
+            )
+        return status, content_type
 
     def mint_own_token(self, principal: Principal, caveats: Sequence[Mapping[str, Any]]) -> str:
         """Mint a temporary access token for a user, as that user, with exactly these caveats; return the value.

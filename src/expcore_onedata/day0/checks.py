@@ -196,6 +196,18 @@ def _names(ctx: Context, provider: str, root: str, limit: int) -> tuple[list[str
             raise PlatformError("a listing is not on its last page but names no next page")
 
 
+@register("content_type", "The content type of a file's content, read whole and by range on the local provider")
+def content_type(ctx: Context) -> Result:
+    """The pre-campaign check (`precampaign.content_type_check`): the type the data gate streams on, when a data path is
+    REST. A type that differs fails; one that cannot be measured is unknown, which is not a pass."""
+    from expcore_onedata.precampaign import content_type_check
+
+    verdict = content_type_check(ctx.config, ctx.client)
+    if verdict.ok:
+        return passed(verdict.detail)
+    return unknown(verdict.detail) if "could not be measured" in verdict.detail else failed(verdict.detail)
+
+
 @register("listing", "Listing of the space root on each supporting provider")
 def listing(ctx: Context) -> Result:
     """The root lists on every provider in the support set, and a paged walk agrees with the single read."""

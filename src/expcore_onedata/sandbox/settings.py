@@ -15,6 +15,8 @@ python = "python"               # the interpreter in the agent image that runs t
 sudo = ["sudo", "-n"]           # the privilege command for host steps; [] when the driver runs as root
 earlyoom_comm = "expcore-drv"   # optional: the process name the host's earlyoom is told to spare
 trust_paths = []                # optional: paths in the agent image of CA bundles that must also trust the run's CA
+content_check_file = "dir/f"    # a provisioned file under the space root, read once before a campaign to confirm
+                                # the content type the gate streams on (`precampaign.py`); required with a rest level
 
 [sandbox.images.agent]          # also the gate's image unless [sandbox.images.gate] names another
 name = "image:tag"              # a tag or an id, only ever resolved to the id below
@@ -70,6 +72,7 @@ NAMESPACE_RE = re.compile(r"[a-z][a-z0-9.-]{0,63}")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 LEASE_KEY = re.compile(r"[A-Za-z0-9._-]{1,64}")
 COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
+SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under the space root
 TLS_MODES = ("verify", "insecure")
 IO_MODES = ("direct", "proxy")
 FORBIDDEN_ARGS = {"-i", "--insecure"}  # TLS is set by `tls` only
@@ -136,6 +139,7 @@ class SandboxSettings:
     users: Mapping[str, str]
     earlyoom_comm: str | None = None
     trust_paths: tuple[str, ...] = ()
+    content_check_file: str | None = None  # the file the pre-campaign check reads (`precampaign.py`)
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -274,6 +278,17 @@ def _users(section: Section) -> Mapping[str, str]:
     return MappingProxyType(out)
 
 
+def _space_path(section: Section, key: str) -> str | None:
+    """Read an optional path under the space root: plain names joined by '/', none of them '.' or '..'."""
+    if key not in section.data:
+        return None
+    value = section.data[key]
+    parts = value.split("/") if isinstance(value, str) and value else []
+    if not parts or any(part in (".", "..") or not SPACE_PART.fullmatch(part) for part in parts):
+        raise section.fail(key, "must be a path under the space root: plain names joined by '/', no '.' or '..'")
+    return value
+
+
 def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
     """Read an optional list of command words (a path or an option), with no space or control character."""
     words = section.strings(key) if key in section.data else default
@@ -293,6 +308,7 @@ def load_sandbox(section: Section, base: Path) -> SandboxSettings:
         "sudo",
         "earlyoom_comm",
         "trust_paths",
+        "content_check_file",
     )
     section.reject_unknown((*keys, "images", "network", "limits", "mount", "data_paths", "users"))
     work_root = (base / section.string("work_root")).resolve()
@@ -307,6 +323,13 @@ def load_sandbox(section: Section, base: Path) -> SandboxSettings:
     mount = _mount(section.section("mount")) if "mount" in section.data else None
     if DataPathMode.MOUNT in data_paths.values() and (mount is None or oneclient is None):
         raise section.fail("mount", "and [sandbox.images.oneclient] are required when a data path is a mount")
+    check_file = _space_path(section, "content_check_file")
+    if DataPathMode.REST in data_paths.values() and check_file is None:
+        raise section.fail(
+            "content_check_file",
+            "is required when a data path is rest: the provisioned file read before a campaign to confirm the content "
+            "type the data gate streams on",
+        )
     comm = section.optional_string("earlyoom_comm")
     if comm is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,15}", comm):
         raise section.fail("earlyoom_comm", "must be 1 to 15 letters, digits, '_' and '-' (the kernel's comm limit)")
@@ -327,6 +350,7 @@ def load_sandbox(section: Section, base: Path) -> SandboxSettings:
         users=_users(section.section("users")) if "users" in section.data else {},
         earlyoom_comm=comm,
         trust_paths=_words(section, "trust_paths", ()),
+        content_check_file=check_file,
     )
 
 

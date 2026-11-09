@@ -26,6 +26,7 @@ waits. A test bends the fake through plain attributes:
 - `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
 - `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
 - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status.
+- `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out).
 
 `provider_calls` lists `(provider id, method, route)` of every provider call, so a test can assert what was sent where.
 """
@@ -104,6 +105,7 @@ class FakeData(FakeFederation):
         self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat answers 403
         self.resets: list[list] = []
         self.statuses: list[list] = []
+        self.content_type: str | None = "application/octet-stream"  # of a file's content, whole or by range
         self._ids = itertools.count(1)
         self._root_polls = 0
 
@@ -317,8 +319,9 @@ class FakeData(FakeFederation):
 
     def _read(self, node: Node, provider: str, header: str | None) -> httpx.Response:
         found = re.fullmatch(r"bytes=(\d+)-(\d+)", header or "")
+        typed = {} if self.content_type is None else {"Content-Type": self.content_type}
         if found is None:
-            return httpx.Response(200, content=bytes(node.content))
+            return httpx.Response(200, content=bytes(node.content), headers=typed)
         first, last = int(found.group(1)), min(int(found.group(2)), len(node.content) - 1)
         if first > last:
             return self._error(416, "rangeNotSatisfiable")
@@ -329,7 +332,7 @@ class FakeData(FakeFederation):
         return httpx.Response(
             206,
             content=bytes(node.content[first : last + 1]),
-            headers={"Content-Range": f"bytes {first}-{last}/{len(node.content)}"},
+            headers={"Content-Range": f"bytes {first}-{last}/{len(node.content)}", **typed},
         )
 
     def _holds(self, file_id: str, provider: str, offset: int, length: int) -> bool:

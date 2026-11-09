@@ -1,0 +1,176 @@
+"""The pre-campaign check of the content type the data gate streams on (O05, O11), run once before any run starts."""
+
+import pytest
+from placement_support import DATA, with_placement
+from platform_support import SPACE_NAME, write_platform
+from sandbox_support import add_sandbox
+
+from expcore.campaign.healthgate import Health
+from expcore.config.loading import ConfigError
+from expcore_onedata.client import OnezoneClient
+from expcore_onedata.config import load_platform
+from expcore_onedata.day0.registry import REGISTRY
+from expcore_onedata.day0.runner import build_context
+from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
+
+CHECK_FILE = "study/probe.bin"  # an invented path under the space root
+CONFIGURED = ("probe.bin", "study/", "alpha", SPACE_NAME, ".test")  # what a message must never hold (O12)
+
+
+def edit(data, *, rest=True):
+    with_placement(data)
+    add_sandbox(data)
+    data["sandbox"]["content_check_file"] = CHECK_FILE
+    if not rest:
+        data["sandbox"]["data_paths"] = {"mounted": "mount", "isolated": "none"}
+        del data["sandbox"]["content_check_file"]
+
+
+@pytest.fixture
+def platform_file(tmp_path):
+    return write_platform(tmp_path, edit)
+
+
+@pytest.fixture
+def seeded(fake):
+    fake.add_file(CHECK_FILE, DATA)  # held by the data provider, which is the agent's local one
+    return fake
+
+
+def provider_reads(fake):
+    return [call for call in fake.provider_calls if call[2].endswith("/content")]
+
+
+class Inner:
+    """The platform's own health check, counting its calls."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return Health(True, "the platform is up")
+
+
+def assert_clean(detail):
+    assert not [value for value in CONFIGURED if value in detail], detail
+
+
+@pytest.mark.parametrize("wrong", ["application/json", "text/plain; charset=utf-8", None])
+def test_o05_a_content_type_other_than_octet_stream_refuses_the_campaign_before_any_run(config, client, seeded, wrong):
+    """O05, O11: when the content endpoint answers a file's content with another type, every REST read over 4 MiB would
+    be refused mid-campaign and set aside, clustering in the REST condition; so the first health call refuses the
+    campaign, names the problem without a configured value, and keeps refusing without asking again."""
+    seeded.content_type = wrong
+    inner = Inner()
+    health = PreCampaignHealth(inner, lambda: content_type_check(config, client))
+    first = health()
+    reads = len(provider_reads(seeded))
+    assert first.ok is False
+    assert "application/octet-stream" in first.detail
+    assert "refused" in first.detail
+    assert_clean(first.detail)
+    assert inner.calls == 0
+    assert health().ok is False
+    assert len(provider_reads(seeded)) == reads == 2  # measured once, whole and by range, before any run
+    ranges = [r.range for r in seeded.requests if r.path.endswith("/content")]
+    assert ranges == [None, "bytes=0-0"]
+
+
+def test_o05_the_right_content_type_admits_the_campaign_and_the_platform_check_runs(config, client, seeded):
+    """O05: a whole read answered 200 and a read by range answered 206, both application/octet-stream, admit the
+    campaign; after that the platform's own check decides, at every call, and the content is not read again."""
+    inner = Inner()
+    health = PreCampaignHealth(inner, lambda: content_type_check(config, client))
+    assert health() == Health(True, "the platform is up")
+    assert health().ok is True
+    assert inner.calls == 2
+    assert len(provider_reads(seeded)) == 2
+    assert content_type_check(config, client).ok is True
+
+
+@pytest.mark.parametrize("fault", ["missing", "server-error", "reset", "status"])
+def test_o05_a_content_type_that_cannot_be_measured_refuses_the_campaign(config, client, fake, fault):
+    """O05: unknown is not a pass. A check file that is not there, a provider that fails or resets, or a whole read that
+    is not answered 200, refuses the campaign, naming the problem and no configured value."""
+    if fault != "missing":
+        fake.add_file(CHECK_FILE, DATA)
+    if fault == "server-error":
+        fake.statuses.append(["/content", 1, 500])
+    if fault == "reset":
+        fake.resets.append(["/content", 2])
+    verdict = content_type_check(config, client)
+    if fault == "status":  # a server that answers a read by range with the whole file
+        fake.statuses.clear()
+        verdict = content_type_check(config, OnezoneClient(config, http=_whole_for_ranges(fake)))
+    assert verdict.ok is False
+    assert "refused" in verdict.detail
+    assert_clean(verdict.detail)
+    health = PreCampaignHealth(Inner(), lambda: verdict)
+    assert health().ok is False
+
+
+def _whole_for_ranges(fake):
+    """An HTTP client to the fake that drops the Range header, so a read by range is answered 200 with the file."""
+    import httpx
+
+    def handler(request):
+        if request.url.path.endswith("/content"):
+            request.headers.pop("Range", None)
+        return fake.respond(request)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_o05_no_rest_condition_skips_the_check_and_reads_nothing(tmp_path, fake):
+    """O05: with no data path over REST the gate streams nothing, so nothing is read and the campaign is admitted."""
+    config = load_platform(write_platform(tmp_path, lambda d: edit(d, rest=False)))
+    client = OnezoneClient(config, http=fake.client_http())
+    fake.content_type = "text/html"
+    verdict = content_type_check(config, client)
+    assert verdict.ok is True
+    assert fake.provider_calls == []
+    assert PreCampaignHealth(Inner(), lambda: verdict)().ok is True
+
+
+def test_o05_a_rest_data_path_without_a_check_file_is_refused_at_load(tmp_path):
+    """O05: the check needs a provisioned file to read, so a platform.toml with a REST data path names one, or loading
+    it fails naming the key."""
+
+    def without(data):
+        edit(data)
+        del data["sandbox"]["content_check_file"]
+
+    with pytest.raises(ConfigError, match="content_check_file"):
+        load_platform(write_platform(tmp_path, without), require_secrets=False)
+
+
+@pytest.mark.parametrize("bad", ["/abs/file.bin", "a/../b", "", "a//b"])
+def test_o05_a_check_file_outside_the_space_is_refused_at_load(tmp_path, bad):
+    """O05: the check file is a plain path under the space root."""
+
+    def outside(data):
+        edit(data)
+        data["sandbox"]["content_check_file"] = bad
+
+    with pytest.raises(ConfigError, match="content_check_file"):
+        load_platform(write_platform(tmp_path, outside), require_secrets=False)
+
+
+def test_o05_the_check_is_a_day0_check_too(platform_file, fake, tmp_path):
+    """O05: an operator runs the same check before a campaign: failed on a wrong type, passed on the right one, and
+    unknown (not a pass) when it cannot be measured."""
+    assert "content_type" in REGISTRY
+    assert REGISTRY["content_type"].mutates is False
+
+    def result():
+        client = OnezoneClient(load_platform(platform_file), http=fake.client_http())
+        return REGISTRY["content_type"].run(build_context(platform_file, tmp_path / "out", client=client))
+
+    assert result().ok is None
+    fake.add_file(CHECK_FILE, DATA)
+    assert result().ok is True
+    fake.content_type = "application/json"
+    found = result()
+    assert found.ok is False
+    assert_clean(found.summary)

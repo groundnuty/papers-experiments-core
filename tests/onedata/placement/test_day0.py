@@ -22,7 +22,7 @@ from expcore_onedata.day0.runner import (
     run_checks,
 )
 
-NAMES = ("reachability", "health", "tokens", "listing", "read_only", "round_trip")
+NAMES = ("reachability", "health", "tokens", "content_type", "listing", "read_only", "round_trip")
 
 
 def edit(data):
@@ -286,7 +286,7 @@ def test_run_writes_a_dated_report_in_json_and_markdown_with_unknown_apart(platf
     assert json_path.name == "day0-20270115T080000Z.json"
     assert md_path.name == "day0-20270115T080000Z.md"
     report = json.loads(json_path.read_text())
-    assert report["counts"] == {"pass": 3, "fail": 0, "unknown": 3}
+    assert report["counts"] == {"pass": 4, "fail": 0, "unknown": 3}  # content_type passes: no data path is REST
     assert [c["name"] for c in report["checks"]] == list(NAMES)
     text = md_path.read_text()
     assert "## Blocked or unknown" in text

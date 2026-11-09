@@ -18,6 +18,7 @@ ONECLIENT_IMAGE_ID = "sha256:" + "c" * 64
 POOL = "10.77.0.0/24"
 MOUNT_PATH = "/data"
 LEVELS = {"mounted": "mount", "via-gate": "rest", "isolated": "none"}  # invented levels of a data_path factor
+CHECK_FILE = "checks/content.bin"  # an invented file under the space root, read by the pre-campaign check
 FAST = teardown.Waits(
     reader_term_s=0.05,
     reader_kill_s=0.05,
@@ -56,6 +57,7 @@ def sandbox_data() -> dict[str, Any]:
         },
         "mount": {"path": MOUNT_PATH, "tls": "verify"},
         "data_paths": dict(LEVELS),
+        "content_check_file": CHECK_FILE,
         "users": {"login-data": "u-data", "login-data2": "u-data2"},
     }
 
@@ -77,6 +79,7 @@ def configured_sandbox_values(tmp_path: Path) -> list[str]:
     values += [document["name_prefix"] + "-", str(tmp_path / document["work_root"]), str((tmp_path / "work").resolve())]
     values += [*document["users"], *document["users"].values()]
     values += [repr(level) for level in document["data_paths"]]
+    values += [document["content_check_file"]]
     return values
 
 
