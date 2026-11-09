@@ -273,10 +273,16 @@ class TransferLog:
             near = any(edges.near_edge(v) for v in views)
             if near:
                 flagged += [(t, NEAR_EDGE) for t in targets]
-            if edges.carried_over(job):
+            # Each provider's reading is placed against the window on its own: readings whose times put the job on
+            # different sides (one inside, one before the run, or carried over) leave its targets unknown. A job any
+            # reading places in the window is counted, since counting it can only lower the bound.
+            placements = {_placement(edges, v) for v in views}
+            if len(placements) > 1:
+                flagged += [(t, DISAGREE) for t in targets]
+            if "carried" in placements:
                 carried += 1
-                flagged += [(job.target_id, CARRIED_OVER)] if job.target_id else []
-            if not edges.holds(job.scheduled):
+                flagged += [(t, CARRIED_OVER) for t in targets]
+            if "inside" not in placements:
                 continue
             inside.append(job)
             records.append(
@@ -293,3 +299,10 @@ class TransferLog:
         listed = len(merged)
         section.update(probe_ok=True, pages=self._pages, listed=listed, records=records, carried_over=carried)
         return Reading(section, inside, flagged)
+
+
+def _placement(edges: Edges, job: Job) -> str:
+    """Where one reading of a job falls against the run's window: inside it, carried over into it, or outside it."""
+    if edges.holds(job.scheduled):
+        return "inside"
+    return "carried" if edges.carried_over(job) else "outside"

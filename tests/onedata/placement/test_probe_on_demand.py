@@ -182,3 +182,22 @@ def test_o07_a_listing_that_keeps_changing_leaves_every_bound_unknown(probes, se
     assert "listing_not_settled" in snapshot["on_demand"]["beta"]["unknown"]
     assert snapshot["on_demand"]["alpha"]["on_demand_lower_bound"] is None
     assert "listing_not_settled" in snapshot["on_demand"]["alpha"]["unknown"]
+
+
+def test_o08_readings_that_place_a_transfer_on_different_sides_of_the_window_make_its_bound_unknown(
+    probes, seeded, ticker
+):
+    """O08: two providers agree on a replication's state and counters but not on when it finished: one says before
+    the run, the other during it. Each reading is placed against the window on its own, so the job is neither dropped
+    as before the run nor counted on one provider's say: beta's bound is unknown."""
+    start = ticker.now
+    tid = seeded.add_transfer("replication", MORE, BETA_ID, scheduled=start - 60, finished=start - 50)
+    probes.start({})
+    ticker.sleep(10)
+    seeded.provider_view[(tid, ALPHA_ID)] = {"finishTime": int(start - 50)}
+    seeded.provider_view[(tid, BETA_ID)] = {"finishTime": int(start + 5)}
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    beta = snapshot["on_demand"]["beta"]
+    assert beta["on_demand_lower_bound"] is None
+    assert {"listings_disagree", "transfer_carried_over"} & set(beta["unknown"])
