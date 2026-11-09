@@ -173,3 +173,33 @@ def test_o05_the_listing_maximum_is_the_servers_default_page_and_fits_the_gates_
 def test_o05_a_limit_on_a_call_that_is_no_listing_is_left_to_the_server(tag_path):
     """O05: only a listing has a page whose size the request sets; other reads pass whatever their query says."""
     assert policy.decide("oneprovider", "GET", tag_path, "limit=50000", None).allow
+
+
+DEEP = b"[" * 100_000 + b"]" * 100_000  # a body the standard parser cannot read without running out of stack
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        DEEP,
+        b'{"limit": 5, "a": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
+        b'{"a": ' + b'{"b": ' * 40 + b"1" + b"}" * 40 + b"}",  # deeper than the bound, though a parser could read it
+    ],
+    ids=["list", "inside-an-object", "over-the-bound"],
+)
+def test_o05_a_listing_body_nested_too_deep_is_the_agents_400_and_never_an_error(body):
+    """O05, O16: a body nested deeper than the gate reads is refused before it is parsed, as a 400 the agent reads,
+    never as an exception that would reset the connection as an error of the gate's own."""
+    decision = policy.decide("oneprovider", "GET", CHILDREN, "", body)
+    assert not decision.allow
+    assert decision.status == 400
+    assert decision.tag == "children"
+
+
+def test_o05_the_nesting_bound_counts_brackets_outside_strings_only():
+    """O05: brackets inside a JSON string are text, so a name full of them does not count towards the bound."""
+    name = "[" * 200 + "{" * 200
+    body = ('{"attributes": ["name"], "index": "' + name + '"}').encode()
+    assert policy.decide("oneprovider", "GET", CHILDREN, "", body).allow
+    escaped = ('{"index": "\\"' + "[" * 200 + '"}').encode()  # an escaped quote does not end the string
+    assert policy.decide("oneprovider", "GET", CHILDREN, "", escaped).allow

@@ -870,3 +870,27 @@ def test_o05_every_other_non_content_answer_is_one_bounded_object_far_under_the_
             conn.close()
     finally:
         mock.stop()
+
+
+def test_o05_a_listing_body_nested_100000_deep_is_the_agents_400_logged_as_a_policy_refusal(world):
+    """O05, O16: a listing whose JSON body is nested 100,000 levels deep is refused before anything is forwarded, with
+    a 400 the agent reads; the line is a policy refusal, never an error of the gate (which a parser that runs out of
+    stack would make, resetting the connection)."""
+    from expcore_onedata.sandbox import gatelog, kinds
+
+    body = b"[" * 100_000 + b"]" * 100_000
+    conn = connect(world)
+    conn.request("GET", LISTING, body=body, headers={"Content-Type": "application/json"})
+    answer = conn.getresponse()
+    error = json.loads(answer.read())["error"]
+    assert answer.status == 400
+    assert error["id"] == "badRequest"
+    assert world.upstream.seen == []
+    line = wait_for(world, lambda r: r.get("path") == LISTING)
+    assert (line["decision"], line["status"], line["tag"]) == ("deny", 400, "children")
+    assert "gate_refusal" not in line
+    assert "error_origin" not in line
+    lines = world.log.read_text().splitlines()
+    assert kinds.gate_error(gatelog.refusals(lines)) is None
+    assert gatelog.errors([json.loads(x) for x in lines])["policy_refusals"] == 1
+    conn.close()

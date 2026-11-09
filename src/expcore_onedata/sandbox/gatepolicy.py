@@ -27,7 +27,9 @@ the gate, up to `gateboundary.BUFFER_CAP` (4 MiB), and an answer over it is refu
 So a listing whose explicit `limit` is above `MAX_LIST_LIMIT` is refused before anything is forwarded, with a 400 the
 agent reads (a policy refusal, the agent's own outcome, never the gate's), in the query string or in a JSON body (the
 server takes its options from either since 21.02.5), and so is a limit that is not a plain whole number or a listing
-body that is not one JSON object, which the gate could not check. A listing without a limit passes unchanged.
+body that is not one JSON object, which the gate could not check. A body nested deeper than `MAX_BODY_DEPTH` is refused
+the same way before it is parsed, found by a linear scan, so no body can make the parser exhaust the stack and reset
+the connection as an error of the gate's. A listing without a limit passes unchanged.
 
 `MAX_LIST_LIMIT` is 1000. It is the server's own default page: the earlier study read the server's code
 (`DEFAULT_LIST_ENTRIES 1000`, `MAX_LIST_ENTRIES 10000`, the second `merged:` line) and measured a listing without a
@@ -80,6 +82,8 @@ FILE_ID_BYTES = 512  # a file id: 180 characters measured, 512 allowed
 ENTRY_REST_BYTES = 256  # type, size, mtime, posixPermissions, the keys and the separators of one entry
 PAGE_ENVELOPE_BYTES = 4096  # the page's own keys, isLast and the nextPageToken
 _WHOLE_NUMBER = re.compile(r"[+-]?[0-9]{1,18}")
+MAX_BODY_DEPTH = 32  # the deepest a listing's JSON body may nest; the official client's nests two levels
+_STRUCTURE = re.compile(rb'["\\\[\]{}]')  # the bytes that open or close a string, an array or an object, and escapes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,6 +117,31 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return dict(pairs)
 
 
+def _nested_deeper(body: bytes, bound: int) -> bool:
+    """Whether a JSON text nests arrays and objects deeper than `bound`, found in one linear pass that looks at no
+    byte twice and keeps no stack, so no body can make it recurse; a bracket inside a string is text, not nesting."""
+    depth, in_string, skip = 0, False, -1
+    for found in _STRUCTURE.finditer(body):
+        at = found.start()
+        if at == skip:  # the byte after a backslash in a string is escaped, whatever it is
+            continue
+        char = body[at : at + 1]
+        if in_string:
+            if char == b"\\":
+                skip = at + 1
+            elif char == b'"':
+                in_string = False
+        elif char == b'"':
+            in_string = True
+        elif char in (b"[", b"{"):
+            depth += 1
+            if depth > bound:
+                return True
+        elif char in (b"]", b"}"):
+            depth -= 1
+    return False
+
+
 def _listing_refusal(query: str, body: bytes | None) -> str | None:
     """Why a listing is refused for the size of the page it asks for, or None when it may pass.
 
@@ -120,9 +149,11 @@ def _listing_refusal(query: str, body: bytes | None) -> str | None:
     server reads is not known; a listing with none passes, and the server answers its default page."""
     limits: list[object] = list(parse_qs(query, keep_blank_values=True).get("limit", []))
     if body:
+        if _nested_deeper(body, MAX_BODY_DEPTH):  # refused before the parser, which recurses once per level
+            return f"a listing's body may nest at most {MAX_BODY_DEPTH} levels of arrays and objects"
         try:
             options = json.loads(body, object_pairs_hook=_unique_keys)
-        except ValueError:
+        except Exception:  # any failure of the parser, RecursionError included, is the agent's malformed request
             options = None
         if not isinstance(options, dict):
             return "a listing's body must be one JSON object with each key once"
