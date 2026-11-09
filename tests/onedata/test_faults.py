@@ -309,3 +309,17 @@ def test_o10_the_live_fault_test_needs_its_own_switch_beside_the_platform():
     live = (Path(__file__).resolve().parents[1] / "live" / "test_contract.py").read_text(encoding="utf-8")
     assert 'os.environ.get("EXPCORE_LIVE_FAULTS") != "1"' in live
     assert "@FAULTS\ndef test_a_provider_taken_down" in live
+
+
+def test_o11_a_start_command_that_keeps_failing_is_recorded_as_such_and_left_open(tmp_path):
+    """O11: the restore is tried the configured number of times; the reading says the start failed, and the journal
+    keeps the injection open for the next start to settle."""
+    services = FakeServices()
+    injector = injector_for(write_faults(tmp_path), services)
+    injector.start(RUN)
+    services.knobs["start_fails"] = True
+    snapshot = injector.finish()
+    assert [call for call, _ in services.calls].count("start") == 2  # clear_attempts in the fixture
+    cleared = next(step for step in snapshot["steps"] if step["step"] == "cleared")
+    assert (cleared["ok"], cleared["how"], snapshot["ok"]) == (False, "start_failed", False)
+    assert len(open_injections(tmp_path)) == 1

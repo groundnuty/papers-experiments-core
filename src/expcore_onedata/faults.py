@@ -429,6 +429,10 @@ class FaultInjector:
                 self._sleep(self._settings.poll_s)
             try:
                 self._driver.start(service)
+            except DriverError:
+                reason = "start_failed"
+                continue
+            try:
                 seen = self._wait(
                     lambda s: s.running and s.identity is not None and _digest(s.identity) != before, service
                 )
