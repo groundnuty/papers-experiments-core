@@ -134,12 +134,16 @@ def test_k03_a_named_json_file_is_anonymised_in_its_parsed_keys_and_strings_esca
     assert find_terms(files, listed) == []
 
 
-def test_k04_a_rewritten_json_file_is_written_out_the_same_way_every_time(listed):
-    """K04: the rewrite keeps the file parseable and its numbers as they were, and its serialisation is fixed."""
-    first = rewrite({"codemeta.json": ESCAPED_JSON}, named(listed, "codemeta.json"), code=set())["codemeta.json"]
-    again = rewrite({"codemeta.json": first}, named(listed, "codemeta.json"), code=set())["codemeta.json"]
-    assert first == again
-    assert first == (json.dumps(json.loads(first), ensure_ascii=False, indent=2) + "\n").encode()
+def test_k04_a_rewritten_json_file_keeps_every_byte_outside_the_strings_it_relabels(listed):
+    """K04: anonymisation must not change numbers: JSON is rewritten lexically, one string token at a time, so a
+    number keeps its exact spelling (a parse and re-serialisation would round 0.123456789012345678901), and the
+    spacing, the order and every untouched string stay byte for byte."""
+    source = b'{\n  "precision":   0.123456789012345678901,\n  "big": 1e400,\n'
+    source += b'  "who": "\\u0056arek",  "x": "\\u00e9"\n}\n'
+    rewritten = rewrite({"codemeta.json": source}, named(listed, "codemeta.json"), code=set())["codemeta.json"]
+    assert rewritten == source.replace(b'"\\u0056arek"', b'"Author A"')
+    again = rewrite({"codemeta.json": rewritten}, named(listed, "codemeta.json"), code=set())["codemeta.json"]
+    assert again == rewritten
 
 
 def test_k03_an_escaped_term_in_a_file_that_is_not_rewritten_is_found(listed):

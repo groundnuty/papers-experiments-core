@@ -11,11 +11,11 @@ very names the package hides (K03: a private list never enters the repository or
 - Only the files the list names are rewritten. Each must be prose or metadata (a suffix in `REWRITABLE_SUFFIXES`),
   outside the code the records were made with and outside out/. YAML (`.yml`, `.yaml`, `CITATION.cff`) is refused:
   with no YAML parser its rewrite could not be checked, so the author leaves it out or ships an anonymised copy from
-  another path. JSON is parsed, rewritten in its decoded keys and
-  strings, and written out again in one fixed form, so an escape such as `\\u0056` cannot hide a term from the
-  rewrite. A format that cannot be parsed and written out again safely (TOML, plain text) is rewritten as text,
-  and a TOML file must still parse afterwards. Code, configuration, records and generated tables are
-  never rewritten: relabelling them changes what runs and what was measured (relabelling by substring broke an
+  another path. JSON is rewritten lexically: each string token, key or value, is decoded, relabelled and re-encoded
+  if it changed, so an escape such as `\\u0056` cannot hide a term from the rewrite, and every other byte, numbers
+  with their exact spelling included, stays as it was; the result must still parse. TOML and plain text are
+  rewritten as text, and a TOML file must still parse afterwards. Code, configuration, records and generated tables
+  are never rewritten: relabelling them changes what runs and what was measured (relabelling by substring broke an
   earlier study's package: a class name, a network address, an endpoint; see docs/inventory.md).
 - A term is replaced only as a whole word, ignoring case: never inside a longer word, an identifier, or a dotted or
   hyphenated name, so a term `re` stays in `re-run`.
@@ -44,6 +44,7 @@ from expcore.study.config import CONFIG_FILES
 
 REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".bib", ".json", ".toml"})
 YAML_SUFFIXES = frozenset({".yml", ".yaml", ".cff"})  # CITATION.cff is YAML
+_JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)  # in valid JSON, every quote outside a string starts one
 FINDING = "a term of the anonymisation list"
 REDACTED_PATH = "<path redacted>"
 
@@ -151,24 +152,43 @@ def _relabel(text: str, replacers: Sequence[tuple[re.Pattern[str], str]]) -> str
     return text
 
 
+def _duplicate_keys(text: str) -> int:
+    """Parse JSON and count the keys that repeat within an object; raise ValueError when it does not parse."""
+    repeated = 0
+
+    def count(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        nonlocal repeated
+        repeated += len(pairs) - len({key for key, _ in pairs})
+        return dict(pairs)
+
+    json.loads(text, object_pairs_hook=count)
+    return repeated
+
+
 def _rewrite_json(text: str, replacers: Sequence[tuple[re.Pattern[str], str]], where: str) -> str:
-    """Parse, relabel every decoded key and string, and write the result out in one fixed form."""
+    """Relabel JSON lexically: decode each string token, key or value, and re-encode only a token that changed.
+
+    Every other byte (numbers with their exact spelling, spacing, order, untouched strings) stays as it was. The
+    result must parse, and no two keys of one object may become one.
+    """
     try:
-        data = json.loads(text)
+        before = _duplicate_keys(text)
     except ValueError:
         raise PackageError(f"{where}, which does not parse as JSON") from None
 
-    def walk(value: object) -> object:
-        if isinstance(value, dict):
-            relabelled = {_relabel(key, replacers): walk(item) for key, item in value.items()}
-            if len(relabelled) != len(value):
-                raise PackageError(f"{where}: anonymisation would merge two keys of one object (K04)")
-            return relabelled
-        if isinstance(value, list):
-            return [walk(item) for item in value]
-        return _relabel(value, replacers) if isinstance(value, str) else value
+    def token(match: re.Match[str]) -> str:
+        decoded = json.loads(match.group(0))
+        relabelled = _relabel(decoded, replacers)
+        return match.group(0) if relabelled == decoded else json.dumps(relabelled, ensure_ascii=False)
 
-    return json.dumps(walk(data), ensure_ascii=False, indent=2) + "\n"
+    result = _JSON_STRING.sub(token, text)
+    try:
+        after = _duplicate_keys(result)
+    except ValueError:
+        raise PackageError(f"{where}: after anonymisation it no longer parses as JSON (K04)") from None
+    if after > before:
+        raise PackageError(f"{where}: anonymisation would merge two keys of one object (K04)")
+    return result
 
 
 def _longest_first(item: tuple[str, str]) -> tuple[int, str]:
