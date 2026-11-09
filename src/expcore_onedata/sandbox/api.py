@@ -80,9 +80,16 @@ class SandboxSpec:
     lease_key: str | None = None
 
 
+RAN = "ran"  # the cell was started: its exit code, timeout and kill say how it ended
+NOT_STARTED = "not_started"  # too little of its time was left to start it: no exit, no timer fired, no timeout (O17)
+
+
 @dataclasses.dataclass
 class ExecResult:
-    """What the agent's code did: its output, its exit code, how long it ran, and, when it was killed, why."""
+    """What the agent's code did: its output, its exit code, how long it ran, and, when it was killed, why.
+
+    `status` is `RAN`, or `NOT_STARTED` for a cell that too little time was left to start: it ran nothing, so it has no
+    timeout and no kill, and what the time running out means is the loop's own rule."""
 
     stdout: str
     stderr: str
@@ -90,6 +97,7 @@ class ExecResult:
     duration_s: float
     timed_out: bool = False
     kill: dict[str, Any] | None = None  # the cause of a kill or timeout, from the kernel's counters (killcause.py)
+    status: str = RAN
 
 
 @runtime_checkable

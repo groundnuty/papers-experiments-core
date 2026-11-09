@@ -25,7 +25,7 @@ from typing import Any
 
 from expcore.plugin import CallContext, ToolOutput, ToolSpec
 from expcore_onedata.sandbox import kinds
-from expcore_onedata.sandbox.api import ExecResult, Sandbox
+from expcore_onedata.sandbox.api import NOT_STARTED, ExecResult, Sandbox
 
 DEFAULT_NAME = "python"
 DEFAULT_DESCRIPTION = "Run Python code in the sandbox and return what it printed. State does not carry between calls."
@@ -67,7 +67,11 @@ class CodeExecutionProvider:
 
     @staticmethod
     def _output(result: ExecResult) -> ToolOutput:
-        """The text the model sees for a finished cell."""
+        """The text the model sees for a finished cell, or for one too little time was left to start."""
+        if result.status == NOT_STARTED:  # it ran nothing: no timeout, no exit; the loop's time rule decides the rest
+            return ToolOutput(
+                "the code was not started: too little of the time was left", is_error=True, error_class="not_started"
+            )
         if result.timed_out:
             return ToolOutput(
                 _with(result.stdout, "the code did not finish within the time limit and was stopped"),

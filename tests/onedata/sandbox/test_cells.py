@@ -1,5 +1,6 @@
 """O17: how a cell of the agent's code is said to have been killed, from the evidence the host keeps (a fake host)."""
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -50,6 +51,28 @@ def test_o17_a_cell_the_harnesss_timer_ended_is_a_time_limit(world, sbx):
     assert result.timed_out is True
     assert (result.kill["reason"], result.kill["category"], result.kill["timer_fired"]) == ("time_limit", "agent", True)
     assert kinds.kill_error(result.kill) is None  # the agent's own outcome
+
+
+def test_o17_a_cell_left_too_little_time_is_not_started_and_no_timer_fired(world, sbx):
+    """O17: a one-second limit with 10 ms of it spent preparing leaves less than the second a cell needs: the cell is
+    not started, a status of its own, with no timer fired, no timeout and no kill, and nothing is run; what the run's
+    time means is the loop's own rule."""
+    cells = sbx._cells
+    uptime = cells._obs.uptime
+
+    def slow_uptime():  # the preparation takes 10 ms of the cell's second
+        time.sleep(0.01)
+        return uptime()
+
+    cells._obs.uptime = slow_uptime
+    execs = len([c for c in world.host.calls if c[:2] == ("docker", "exec")])
+    result = sbx.exec("print(1)", 1.0)
+    assert (result.timed_out, result.kill) == (False, None)
+    assert getattr(result, "status", None) == "not_started"
+    assert len([c for c in world.host.calls if c[:2] == ("docker", "exec")]) == execs  # nothing was run
+    assert cells.cells[-1]["status"] == "not_started"
+    assert "timer_fired" not in json.dumps(cells.cells[-1])
+    assert "cell_kills" not in sbx.metadata()
 
 
 @pytest.mark.parametrize(("stopped", "kind"), [(True, "sandbox"), (False, "unattributed_kill")])

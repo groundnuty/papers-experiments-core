@@ -21,7 +21,7 @@ from typing import Any
 from expcore_onedata.sandbox import earlyoom as EO
 from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox import teardown as TD
-from expcore_onedata.sandbox.api import ExecResult
+from expcore_onedata.sandbox.api import NOT_STARTED, RAN, ExecResult
 from expcore_onedata.sandbox.containers import Names
 from expcore_onedata.sandbox.hostops import TIMED_OUT, HostOps, describe_error
 from expcore_onedata.sandbox.observe import Observer
@@ -194,6 +194,8 @@ class CellRunner:
         timer records that it fired and kills every process of the agent's container, a detached worker included; the
         container and the run's evidence stay. `timeout` inside the container is only a backstop, `CAP_MARGIN_S` later,
         should that kill not land. A time limit is that record and nothing else: never the elapsed time, nor 137 (O17).
+        A cell left less than a second once it is prepared is not started at all (`NOT_STARTED`): no timer ran, so none
+        fired, and it is no timeout; the loop's own time rule says what the run's time running out means.
         """
         if not timeout_s >= 1:
             raise ValueError("timeout_s must be at least 1 second (GNU timeout treats 0 as no limit)")
@@ -218,27 +220,41 @@ class CellRunner:
             self._s.python,
             "-",
         ]
+        if remaining < 1:  # too little left to start it: nothing runs, no timer was started, so none fired
+            return self._not_started(record)
         t0, wall0 = time.monotonic(), time.time()
-        timer = CellTimer(max(0.0, remaining), self._kill_at_the_cap)
+        timer = CellTimer(remaining, self._kill_at_the_cap)
         gave_up = fired = False
         try:
-            if remaining < 1:  # used up before it could start: the harness's clock ran out, so its timer ended it
-                rc, out, err = 124, "", "the cell was not started: its time ran out during preparation"
-                gave_up = fired = True
-            else:
-                if record:  # the probes kill nothing of the agent's
-                    timer.start()
-                done = self._host.docker(*argv, input=code, timeout=remaining + HOST_CALL_MARGIN_S, check=False)
-                fired = timer.end()
-                rc, out, err = done.returncode, done.stdout, done.stderr
-                if rc == TIMED_OUT and err.startswith("timed out after"):
-                    gave_up, err = True, "docker exec did not return"
+            if record:  # the probes kill nothing of the agent's
+                timer.start()
+            done = self._host.docker(*argv, input=code, timeout=remaining + HOST_CALL_MARGIN_S, check=False)
+            fired = timer.end()
+            rc, out, err = done.returncode, done.stdout, done.stderr
+            if rc == TIMED_OUT and err.startswith("timed out after"):
+                gave_up, err = True, "docker exec did not return"
             used = time.monotonic() - entered
             res = ExecResult(out, err, rc, time.monotonic() - t0, timed_out=gave_up or fired)
             if record:
                 self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, wall0)
         finally:  # whatever was raised: a timer that has not fired must not kill the next cell's processes
             timer.end()
+        return res
+
+    def _not_started(self, record: bool) -> ExecResult:
+        """A cell its time ran out for while it was being prepared: `NOT_STARTED`, with no exit, no timeout and no kill.
+        Only the `CellTimer` firing makes a time limit; a timer that never ran fired nothing (O17)."""
+        res = ExecResult("", "the cell was not started: too little of its time was left", -1, 0.0, status=NOT_STARTED)
+        if record:
+            self.cells.append(
+                {
+                    "cell": len(self.cells) + 1,
+                    "status": NOT_STARTED,
+                    "exit_code": None,
+                    "duration_s": 0.0,
+                    "timed_out": False,
+                }
+            )
         return res
 
     def _record_cell(
@@ -254,7 +270,12 @@ class CellRunner:
         wall0: float,
     ) -> None:
         rc = res.exit_code
-        entry: dict[str, Any] = {"cell": len(self.cells) + 1, "exit_code": rc, "duration_s": res.duration_s}
+        entry: dict[str, Any] = {
+            "cell": len(self.cells) + 1,
+            "status": RAN,
+            "exit_code": rc,
+            "duration_s": res.duration_s,
+        }
         events = self._obs.memory_facts(self._names.agent)["events"]
         if events is None:  # not known whether anything of this cell was killed
             self._meta.setdefault("oom_counters_unreadable_cells", []).append(entry["cell"])

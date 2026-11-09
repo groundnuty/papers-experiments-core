@@ -130,3 +130,12 @@ def test_the_waits_it_never_opens_are_still_kinds_of_the_cores_vocabulary():
     NO_WAITS.infrastructure_wait("sandbox_lifecycle")
     with pytest.raises(ValueError, match="unknown infrastructure wait kind"):
         NO_WAITS.infrastructure_wait("code_execution")
+
+
+def test_o17_a_cell_that_was_not_started_is_told_as_such_never_as_a_timeout():
+    """O17: a cell too little time was left to start ran nothing: the model is told it was not started, with an error
+    class of its own, not a timeout and not an exit status."""
+    output = run(CodeExecutionProvider(ScriptedSandbox(ok(exit_code=-1, status="not_started"))), {"code": "print(1)"})
+    assert output.is_error is True
+    assert output.error_class == "not_started"
+    assert "not started" in output.text
