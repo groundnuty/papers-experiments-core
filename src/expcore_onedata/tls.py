@@ -91,12 +91,17 @@ class TlsSettings:
             return False
         if self.ca_file is None:
             return True
-        return ssl.create_default_context(cadata=_pem_text(self.bundle()))
+        return _trusting(self.bundle())
 
 
-def _pem_text(content: bytes) -> str:
-    """The bundle as the text `cadata` takes; ValueError when it is not ASCII, as PEM is."""
-    return content.decode("ascii")
+def _trusting(content: bytes) -> ssl.SSLContext:
+    """A client context that trusts the bundle's certificates alone, loaded from these bytes; ValueError when they are
+    not ASCII, as PEM is, or hold nothing. An empty `cadata` would not do: before Python 3.13 the default context
+    takes it for none given and loads the system's CAs instead."""
+    text = content.decode("ascii")
+    if not text.strip():
+        raise ValueError("the CA bundle is empty")
+    return ssl.create_default_context(cadata=text)
 
 
 def write_private_copy(content: bytes, directory: Path) -> Path:
@@ -128,7 +133,7 @@ def _ca_file(section: Section, base: Path) -> TlsSettings:
     if b"PRIVATE KEY" in content:
         raise section.fail("ca_file", "holds a private key; it must hold the CA's certificates only")
     try:  # loaded from the bytes, as the REST client loads them
-        loaded = ssl.create_default_context(cadata=_pem_text(content)).cert_store_stats()["x509"]
+        loaded = _trusting(content).cert_store_stats()["x509"]
     except (ssl.SSLError, ValueError):
         loaded = 0
     if not loaded:
