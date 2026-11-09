@@ -132,9 +132,10 @@ def _widen_kinds(top: Section) -> None:
         try:
             importlib.import_module(module)
         except Exception as error:  # an import may fail in any way; each is a platform the study cannot use
+            # The module is the study's own declaration. The exception's text may hold a credential, so it stays out.
             raise section.fail(
-                PLATFORMS_KEY, f"names module {module!r}, which cannot be imported ({type(error).__name__}: {error})"
-            ) from error
+                PLATFORMS_KEY, f"names module {module!r}, which cannot be imported ({type(error).__name__})"
+            ) from None
     kinds = Section(section.table(KINDS_KEY), top.file, f"[study.{KINDS_KEY}]")
     for kind in kinds.data:
         entry = kinds.section(kind)

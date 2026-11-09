@@ -161,6 +161,23 @@ def test_c02_a_platform_module_that_cannot_be_imported_is_refused_naming_the_fil
     assert "key 'platforms' must be an array of non-empty strings" in refused(study_dir)
 
 
+def test_r12_a_platform_import_failure_reports_the_module_and_the_exception_type_and_never_its_message(
+    study_dir, tmp_path, monkeypatch, registry
+):
+    """R12: the text of an exception raised while a platform is imported can echo a credential, and a refusal is printed
+    and logged, so it names the module as study.toml declares it and the exception's type, and keeps no cause."""
+    credential = "toy-platform-credential-0123456789"
+    module = toy_platform(tmp_path, monkeypatch, f'raise RuntimeError("login refused for {credential}")')
+    list_platforms(study_dir, module)
+    with pytest.raises(ConfigError) as caught:
+        load_study(study_dir)
+    message = str(caught.value)
+    assert f"key 'platforms' names module {module!r}, which cannot be imported (RuntimeError)" in message
+    assert credential not in message
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+
+
 def test_c06_a_study_that_lists_platforms_and_kinds_but_declares_none_keeps_its_schema_digest(study_dir, registry):
     """C06: the two keys add to the vocabulary and are not part of the factor schema, so a study that uses neither,
     or lists them without declaring one of their kinds, has the schema digest it had."""
