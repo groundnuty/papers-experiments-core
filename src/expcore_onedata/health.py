@@ -19,6 +19,14 @@ ids the federation reports, never a token, URL, host or configured name.
 
 The check of the earlier study also read one known file back through its provider and compared its checksum with a study manifest. That
 belongs to the study (its data) and not to the platform, so a study adds it with its own check.
+
+**The content type the data gate streams on is part of this check (O05, O11), with no opt-out.** When any level of
+`[sandbox.data_paths]` is REST, the first call measures it (`precampaign.content_type_check`: the provisioned
+`[sandbox] content_check_file`, read whole and by range through the local provider) before anything else, and the
+check keeps that verdict for the campaign, since a type once answered does not change: a refusal, or a type that could
+not be measured, answers every call after it with its detail, so the gate stays closed and no run is admitted; a pass
+lets every call answer as the space check does. With no REST data path nothing is read. The composition is
+`precampaign.PreCampaignHealth`, built here, so a study that uses this check cannot leave the measurement out.
 """
 
 import re
@@ -31,6 +39,7 @@ from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, read_space
+from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
 from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import MintedToken, TokenIssuer, data_path_spec
 
@@ -94,7 +103,8 @@ def compare(view: SpaceView, config: PlatformConfig) -> Health:
 
 
 class PlatformHealth:
-    """The platform's `HealthCheck`; keep one for the campaign so that its token is reused until it nears its end."""
+    """The platform's `HealthCheck`; keep one for the campaign so that its token is reused until it nears its end, and
+    the content type it measured at its first call is kept for the campaign."""
 
     def __init__(
         self,
@@ -110,6 +120,7 @@ class PlatformHealth:
         self._service = config.principals.service
         self._token: MintedToken | None = None
         self._lock = threading.Lock()
+        self._gate = PreCampaignHealth(self._space, lambda: content_type_check(config, client))
 
     def _current_token(self) -> MintedToken:
         """Return the cached token, minting a new one when none is left or it is about to expire."""
@@ -121,7 +132,14 @@ class PlatformHealth:
             return token
 
     def __call__(self) -> Health:
-        """Return the platform's health; never raise."""
+        """Return the platform's health: the content type kept from the first call, then the space; never raise."""
+        try:
+            return self._gate()
+        except Exception as error:
+            return Health(False, f"health check raised {type(error).__name__}")
+
+    def _space(self) -> Health:
+        """The space as Onezone reports it, against the declared support set; never raise."""
         try:
             view = read_space(self._client, self._current_token().reveal(), self._config.space.id)
             return compare(view, self._config)

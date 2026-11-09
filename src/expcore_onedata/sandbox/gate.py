@@ -757,7 +757,7 @@ class Handler(BaseHTTPRequestHandler):
             rec.update(decision="deny", reason="host not allowed", status=403)
             self._answer(rec, 403, {"error": {"id": "forbidden", "details": "host not allowed"}})
             return
-        dec = gatepolicy.decide(hcfg["role"], self.command, url.path)
+        dec = gatepolicy.decide(hcfg["role"], self.command, url.path, url.query, body)  # a listing's limit: O05
         rec.update(decision="allow" if dec.allow else "deny", reason=dec.reason, tag=dec.tag)
         if not dec.allow:
             rec["status"] = dec.status

@@ -7,7 +7,7 @@ tool: the core has no built-in tool of its own.
 """
 
 import re
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -143,4 +143,29 @@ class ToolProvider(Protocol):
 
     async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
         """Run one call. `timeout_s` is the agent's time left: the call has no other limit (L05). `ctx` marks waits."""
+        ...
+
+
+@runtime_checkable
+class Instrument(Protocol):
+    """A measurement taken around a run, written into the record under its own namespace.
+
+    `start` is called once before the run with the run's identity; `finish` once after it, and returns a JSON object
+    that goes into `RunRecord.instruments[namespace]`. A platform's probes are instruments (file distribution,
+    transfer records, bytes per provider pair), and so is anything a study measures about the state a run leaves.
+
+    The record is the only thing a scorer reads, so an instrument that needs live state reads it in `finish`, once,
+    and records what it read: replay then serves the snapshot and never asks the platform again. An instrument whose
+    reading fails records the failure (`"ok": False`) and never a guessed value (O08). It runs outside the agent's
+    time, before the loop starts and after it ends, so none of its waits is a wait kind.
+    """
+
+    namespace: str
+
+    def start(self, identity: Mapping[str, Any]) -> None:
+        """Take the reading that `finish` compares with, if any; `identity` is the run's identity as a plain mapping."""
+        ...
+
+    def finish(self) -> Mapping[str, Any]:
+        """Return the snapshot as a JSON object."""
         ...

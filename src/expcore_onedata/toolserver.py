@@ -58,6 +58,7 @@ from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, ToolServer
+from expcore_onedata.credentials import Principal
 from expcore_onedata.pin import verify_configured
 from expcore_onedata.tokencheck import ExaminationFailed, PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, token_window, tool_server_spec
@@ -192,8 +193,12 @@ class ToolServerLauncher:
         *,
         ceiling_s: float,
         extra_env: Mapping[str, str] | None = None,
+        principal: Principal | None = None,
     ) -> AsyncIterator[McpToolProvider]:
         """Start the server for a condition and yield its tool provider; stop it on leaving.
+
+        `principal` is the leased slot's tool-server user (`SandboxPlatform.tool_server` passes it): a token minted for
+        any other user is refused before anything starts, so the plane's principal is the run's own slot's (C19).
 
         The start and the stop are each inside `ctx.infrastructure_wait("toolserver_lifecycle")`. A token that fails its
         examination, a principal whose privileges differ from the condition's rights, and a read of either that fails
@@ -206,6 +211,8 @@ class ToolServerLauncher:
         `tool_plane_integrity`, which replaces any exception of the run's body, because the run is set aside whatever
         it did.
         """
+        if principal is not None and token.subject != principal.user_id:
+            raise ValueError("the tool-server token was not minted for the leased slot's tool-server user")
         server, chosen = _server(self._config), self._config.condition(condition)
         env = server_environment(self._config, chosen, token, extra_env)
         provider = McpToolProvider(

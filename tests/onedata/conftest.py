@@ -10,8 +10,10 @@ from expcore.errors import InfraError
 from expcore_onedata import health
 from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
 from expcore_onedata.config import PlatformConfig, load_platform
+from expcore_onedata.consistency import WaitTimeout
 from expcore_onedata.federation import FederationUnreadable, PinRefused
 from expcore_onedata.pin import PinError
+from expcore_onedata.provision import NotPlaced, ProvisionError, Refused
 from expcore_onedata.tokencheck import ExaminationFailed, TokenRefused
 from expcore_onedata.tokens import TokenIssuer
 
@@ -61,6 +63,10 @@ LAYER_EXCEPTIONS = (
     TokenRefused,
     ExaminationFailed,
     InfraError,
+    ProvisionError,
+    Refused,
+    NotPlaced,
+    WaitTimeout,
 )
 
 

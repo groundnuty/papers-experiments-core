@@ -38,7 +38,7 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import quote
 
-from expcore_onedata.client import OnezoneClient, PlatformError
+from expcore_onedata.client import MintNotSent, OnezoneClient, PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, TokenSettings
 from expcore_onedata.credentials import Principal
 from expcore_onedata.rights import BASELINE_RIGHTS
@@ -78,6 +78,22 @@ class Secret:
     __str__ = __repr__
 
 
+class DroppedToken(TokenRefused):
+    """A token was minted and then refused; it is dropped, never revoked. `expires_at` is when it stops working,
+    or None when its examination could not read that, in which case nothing may assume it has ended."""
+
+    def __init__(self, message: str, expires_at: float | None) -> None:
+        super().__init__(message)
+        self.expires_at = expires_at
+
+
+class ExpiryMismatch(DroppedToken):
+    """A token's examined expiry is not the one it was minted with; `expires_at` is the one it has."""
+
+    def __init__(self, message: str, expires_at: float) -> None:
+        super().__init__(message, expires_at)
+
+
 @dataclass(frozen=True)
 class MintedToken:
     """A token that passed examination, with what the examination established; the value is in `secret`."""
@@ -95,9 +111,9 @@ class MintedToken:
 
 @dataclass(frozen=True)
 class RunTokens:
-    """The tokens of one run: the data path's, and the tool server's when the condition has a tool server."""
+    """The tokens of one run: the data path's when it has a data path, the tool server's when it has a tool server."""
 
-    data_path: MintedToken
+    data_path: MintedToken | None
     tool_server: MintedToken | None
 
 
@@ -200,42 +216,78 @@ class TokenIssuer:
             now=self._clock(),
         )
 
-    def mint(self, spec: PlaneSpec, principal: Principal, *, ceiling_s: float) -> MintedToken:
+    def mint(
+        self, spec: PlaneSpec, principal: Principal, *, ceiling_s: float, valid_until: int | None = None
+    ) -> MintedToken:
         """Mint a plane's token as its principal, with the principal's own credential, and return it only if it passes.
+
+        The token's time caveat is `validUntil`, an absolute time in whole seconds. By default it is the clock at this
+        moment plus the window's lifetime, taken after the privileges are read. A caller that must know the expiry
+        before minting (a journal line that outlasts every token) passes `valid_until`: the token is minted with
+        exactly that, and refused with `ExpiryMismatch` if its examination shows another expiry.
 
         A token that fails examination is dropped and never returned. Nothing revokes it: no source revokes a token,
         and it ends with its lifetime, which derives from `ceiling_s` (O06).
         """
         window = token_window(ceiling_s, self._config.tokens)
         self.check_principal(spec, principal)
-        valid_until = int(self._clock()) + window.mint_ttl_s
-        value = self._client.mint_own_token(principal, spec.caveats.caveats(valid_until))
-        examined = self.examine(value, spec, principal.user_id, window)
+        asked = valid_until if valid_until is not None else int(self._clock()) + window.mint_ttl_s
+        try:
+            value = self._client.mint_own_token(principal, spec.caveats.caveats(asked))
+        except MintNotSent:
+            raise  # nothing was sent, so no token exists
+        except Exception as error:  # the request was sent: a token may exist whose expiry nothing told us
+            raise DroppedToken(f"the token request had no usable answer ({type(error).__name__})", None) from None
+        try:  # from here a token exists: any failure drops it with the expiry it is known to have, or none
+            examined = self.examine(value, spec, principal.user_id, window)
+        except TokenRefused as refused:
+            raise DroppedToken(str(refused), refused.expires_at) from refused
+        except Exception as error:
+            raise DroppedToken(f"the token could not be examined ({type(error).__name__})", None) from None
+        if valid_until is not None and examined.valid_until != valid_until:
+            raise ExpiryMismatch("the token's expiry is not the one it was minted with", examined.valid_until)
         return MintedToken(spec.plane, principal.user_id, examined.token_id, examined.valid_until, Secret(value))
 
     def mint_run_tokens(
         self,
         *,
-        data: Principal,
+        data: Principal | None,
         ceiling_s: float,
         interface: str = "rest",
         tool_server: tuple[Principal, str] | None = None,
+        valid_until: int | None = None,
     ) -> RunTokens:
-        """Mint the data path's token and, given `(principal, condition name)`, the tool server's, on separate users.
+        """Mint, given its principal, the data path's token and, given `(principal, condition name)`, the tool server's,
+        on separate users; a run with neither plane is refused, since it needs no token.
 
         The two users must differ by name and by id; the two tokens are checked to be different after minting. A
-        refusal returns neither.
+        refusal returns neither. With `valid_until` both tokens are minted with exactly that expiry (see `mint`).
         """
         space = self._config.space.id
-        if tool_server is not None and (
-            tool_server[0].username == data.username or tool_server[0].user_id == data.user_id
+        if data is None and tool_server is None:
+            raise ValueError("a run with neither a data path nor a tool server needs no token")
+        if (
+            data is not None
+            and tool_server is not None
+            and (tool_server[0].username == data.username or tool_server[0].user_id == data.user_id)
         ):
             raise TokenRefused("the two planes share a principal")
-        data_token = self.mint(data_path_spec(space, interface), data, ceiling_s=ceiling_s)
+        data_token = (
+            None
+            if data is None
+            else self.mint(data_path_spec(space, interface), data, ceiling_s=ceiling_s, valid_until=valid_until)
+        )
         if tool_server is None:
             return RunTokens(data_token, None)
         principal, condition = tool_server
-        tool = self.mint(tool_server_spec(space, self._config.condition(condition)), principal, ceiling_s=ceiling_s)
+        tool = self.mint(
+            tool_server_spec(space, self._config.condition(condition)),
+            principal,
+            ceiling_s=ceiling_s,
+            valid_until=valid_until,
+        )
+        if data_token is None:
+            return RunTokens(None, tool)
         require_distinct(
             Examined(data_token.token_id, data_token.subject, data_token.expires_at, ()),
             Examined(tool.token_id, tool.subject, tool.expires_at, ()),

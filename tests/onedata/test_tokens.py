@@ -13,13 +13,48 @@ from expcore_onedata.client import PlatformError
 from expcore_onedata.config import TokenSettings
 from expcore_onedata.credentials import Principal
 from expcore_onedata.tokencheck import TokenRefused
-from expcore_onedata.tokens import Plane, Secret, TokenIssuer, data_path_spec, token_window, tool_server_spec
+from expcore_onedata.tokens import (
+    ExpiryMismatch,
+    Plane,
+    Secret,
+    TokenIssuer,
+    data_path_spec,
+    token_window,
+    tool_server_spec,
+)
 
 SETTINGS = TokenSettings()  # margin 900, excess 600, headroom 300
 
 
 def types(fake, token):
     return [c["type"] for c in fake.issued[token.reveal()]["caveats"]]
+
+
+def time_caveat(fake, token):
+    return next(c["validUntil"] for c in fake.issued[token.reveal()]["caveats"] if c["type"] == "time")
+
+
+def test_c19_a_token_is_minted_with_exactly_the_absolute_expiry_it_is_given(issuer, fake):
+    """C19: a caller that journals the end of a token before minting passes the absolute expiry, and the token's time
+    caveat (validUntil) and its examined expiry are exactly that, not a clock read after the privilege reads."""
+    asked = int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s + 7
+    token = issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S, valid_until=asked)
+    assert time_caveat(fake, token) == asked
+    assert token.expires_at == asked
+
+
+def test_c19_a_token_whose_examined_expiry_is_not_the_one_it_was_given_is_refused_with_the_expiry_it_has(issuer, fake):
+    """C19: the platform hands back a token that lives 50 s longer than asked for. It is refused, never returned, and
+    the error carries the expiry the dropped token has, which is when it stops working."""
+    asked = int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s
+    fake.mint_hook = lambda user, caveats: [
+        {**c, "validUntil": c["validUntil"] + 50} if c["type"] == "time" else c for c in caveats
+    ]
+    with pytest.raises(ExpiryMismatch) as refused:
+        issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S, valid_until=asked)
+    assert refused.value.expires_at == asked + 50
+    token = issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)  # no expiry given: unchanged
+    assert time_caveat(fake, token) == int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s + 50
 
 
 def test_o05_the_data_path_token_is_read_only_and_scoped_to_the_space(issuer, fake):

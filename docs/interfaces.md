@@ -9,8 +9,8 @@ All of them are `typing.Protocol`s, so a test double needs no inheritance. Signa
 | Architecture name | In v0.1 |
 |---|---|
 | `Study` | the study directory (`study.toml` and its siblings) plus one plugin module whose `build(context)` returns a `StudyPlugin` ([below](#the-study-plugin)) |
-| `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` and its own `ToolProvider`s through the same `StudyPlugin`; its sandbox is [described below](#the-platform-layers-sandbox) |
-| `ToolProvider`, `Scorer`, `Instrument` | [`ToolProvider`](#toolprovider-and-callcontext) and [`Scorer`](#scorer) are protocols. `Instrument` is **not yet a protocol**: see [Instrument](#instrument) |
+| `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` (leased platform users), its own `ToolProvider`s and an `Instrument` (the platform probes) through the same `StudyPlugin`; its sandbox is [described below](#the-platform-layers-sandbox) |
+| `ToolProvider`, `Scorer`, `Instrument` | protocols: [`ToolProvider`](#toolprovider-and-callcontext), [`Scorer`](#scorer) and [`Instrument`](#instrument) (a protocol since step 4b2) |
 | `ModelBackend`, `RunExecutor`, `HealthCheck`, `ResourceProbe` | protocols, below |
 
 ## The study plugin
@@ -137,7 +137,33 @@ Implementer must guarantee:
 
 ## Instrument
 
-Not yet a protocol. [`architecture.md`](architecture.md#plugin-interfaces) describes it: hooks at run start and end that write into the record under their own namespace. In v0.1 the record has the place for it (`RunRecord.instruments`, `RunRecord.with_instrument(namespace, data)`, a namespace of lower-case letters, digits and underscores, data a JSON object) and nothing calls an instrument for you. Platform probes (4b) will define the protocol; a study that needs one before then writes its snapshot with `with_instrument` in its executor.
+`expcore.plugin.Instrument`, defined in step 4b2. Hooks at the start and the end of a run that write into the record under their own namespace.
+
+```python
+class Instrument(Protocol):
+    namespace: str
+    def start(self, identity: Mapping[str, Any]) -> None
+    def finish(self) -> Mapping[str, Any]
+```
+
+The study's executor calls them; nothing in the loop does. `expcore.records.instruments` has the two helpers an executor uses:
+
+```python
+def start_instruments(instruments: Sequence[Instrument], identity: Mapping[str, Any]) -> None
+def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> RunRecord
+```
+
+Core guarantees:
+- `check_instruments` runs first on both: a namespace that is not lower-case letters, digits and underscores, and two instruments with one namespace, raise before anything runs.
+- `finish_instruments` returns a new record with each snapshot in `RunRecord.instruments[namespace]`, a JSON object (NaN and values JSON cannot hold are refused). An instrument whose `finish` raises, or returns anything but a JSON object, is recorded as `{"ok": false, "error": <class name>}`: the attempt keeps its record and a scorer that needs the snapshot sees that it failed (O08).
+- The snapshot is the only platform state a scorer reads (R13); replay serves it and asks the platform nothing.
+
+Implementer must guarantee:
+- `start` and `finish` run outside the agent's time: before the loop starts and after it ends. They do blocking I/O, so an async executor calls them with `asyncio.to_thread`. The platform's waits for the federation to settle (`expcore_onedata.consistency`) are not a declared wait kind and refuse to run on the thread of a running event loop.
+- `finish` records what it read and never guesses: a reading that failed is `None` (with the failure beside it), not zero, and anything derived from it is `None` too (R10).
+- The snapshot holds no secret and no identifier of the deployment beyond the labels the study's configuration gives.
+
+The platform's own instrument is `expcore_onedata.probes.PlatformProbes` (namespace `platform_probes`): the block map of each tracked file on each tracked provider before and after the run, the records of the transfers the provisioner scheduled, and the bytes moved between provider pairs, attributed to a source only where exactly one other provider held those bytes at the start. See its module docstring for the snapshot's fields.
 
 ## RunExecutor
 
@@ -222,11 +248,15 @@ class HostOps(Protocol):            # hostops.py: every effect on the host, so a
     ...                                   # unmount, image_id, host_facts
 
 class SandboxPlatform:              # provider.py
+    def __init__(self, config, issuer, host, *, slots: Slots, journal: TokenJournal,
+                 tool_condition=lambda factors: None, tool_server: ToolServerLauncher | None = None, ...)
     def mode(self, factors) -> DataPathMode
-    def lease_group(self, factors) -> str | None
-    def lease_keys(self, group: str) -> Sequence[str]
-    def probe(self) -> SandboxProbe                                  # a ResourceProbe
-    def launch(self, ctx, *, run_key, level, ceiling_s, lease=None)  # async context manager yielding a DockerSandbox
+    def lease_group(self, factors) -> str | None                     # users.GROUP, or None when a run needs no slot
+    def lease_keys(self, group: str) -> Sequence[str]                # the names of [slots]
+    def probe(self) -> SlotProbe                                     # the ResourceProbe (see below)
+    def sandbox_probe(self) -> SandboxProbe                          # its sandbox half
+    def launch(self, ctx, *, run_key, level, ceiling_s, lease=None, condition=None)  # yields a DockerSandbox
+    def tool_server(self, ctx, sandbox, *, ceiling_s, extra_env=None)  # yields the run's McpToolProvider
 
 class CodeExecutionProvider:        # codetool.py: a ToolProvider with one tool that runs Python
     def __init__(self, sandbox: Sandbox, *, name="python", description=...)
@@ -234,7 +264,9 @@ class CodeExecutionProvider:        # codetool.py: a ToolProvider with one tool 
 
 **Data paths.** The study's `data_path` factor names its levels in its own words; `[sandbox.data_paths]` maps each to one of three kinds, `mount`, `rest` or `none`. A `mount` run has a read-only FUSE mount made by a oneclient sidecar that holds the data-path token; the agent holds no token and no FUSE. A `rest` run reaches the zone and its pinned local provider only through the data gate, which holds the token and adds it to the requests it forwards (a token the agent sends is dropped); the agent holds no token in its environment, its files or its process arguments. A `none` run has neither. The data path is read-only in every condition at four points: the token (4a: read-only, scoped to the space, one interface), the gate (only the five read calls pass), the mount, and the agent's root filesystem. `start` proves the last two by trying to write from inside the agent and requiring the refusal.
 
-Core guarantees: `ctx.infrastructure_wait` is given a kind of `WAIT_KINDS`; the lease the platform declared for the run is held for the whole attempt and freed through `SandboxProbe.resource_gone`.
+**One pool of leased users (C19).** A run that needs a data-path token or a tool server leases one slot of `[slots.<name>]` (`users.py`), and one that needs neither takes none (`lease_group` is None). The slot gives the run both planes' users: `launch` mints the run's tokens through `users.SlotTokens` at once, with one journalled expiry, the data path's on the slot's data-path user and, when `condition` names the run's tool-server condition, the tool server's on its tool-server user; `tool_server` then starts the server with that token, and the launcher refuses a token whose subject is not that slot user. A run with a tool server and no lease is refused; a run without a lease and with a data path (a live check) mints as the fixed `[principals.data_path]` user. The platform's `ResourceProbe` is `SlotProbe(journal, sandbox_gone=SandboxProbe(...).resource_gone)`: a key is freed only when the sandbox is proven gone and the slot's tokens have ended, by their journalled expiry plus a margin. A `[sandbox.users]` table, the second pool of earlier versions, is refused at load with a message that points to `[slots]`.
+
+Core guarantees: `ctx.infrastructure_wait` is given a kind of `WAIT_KINDS`; the lease the platform declared for the run is held for the whole attempt and freed through the platform's probe, `SlotProbe.resource_gone`, whose sandbox half is `SandboxProbe.resource_gone`.
 
 Implementer (the platform layer) guarantees:
 - `launch` opens `ctx.infrastructure_wait("sandbox_lifecycle")` around the start (the token mint, the image checks, the containers) and around the stop, and nowhere else. Executing the agent's code and its reads of data are never waits.
@@ -242,6 +274,8 @@ Implementer (the platform layer) guarantees:
 - Teardown runs on every path that ends a sandbox, in the order readers, unmount, sidecar, agent, and verifies that each step took effect; a sandbox that is not verifiably gone makes `stop` raise `SandboxError` and `launch` raise `InfraError("sandbox")`, and the probe keeps the lease key quarantined (O15, C19).
 - `SandboxProbe.resource_gone(key, note)` answers exactly `True` only when docker lists no container and no network labelled with the key and the mount table shows no mount in a directory of the key; any failed read is `False`.
 - The gate passes only reads, answers a refusal as 4xx and never as an error, and marks a transfer it cut (`cut`, `unread_bytes`) so it is told from an error of the gate (`error_origin: gate`) or of the platform (`upstream`) (O16).
+- Before a campaign admits its first run, the platform's standard health check (`health.PlatformHealth`, which composes `precampaign.PreCampaignHealth` itself, with no opt-out) measures the content type the gate streams on when a data path is REST: it reads `[sandbox] content_check_file` (required with a REST level) through the local provider, whole and by its first byte, and a type other than `application/octet-stream` with 200 and 206, or one it cannot measure, refuses the campaign: the verdict is kept for the campaign, so the health gate stays closed with the refusal as its detail and no run is admitted; with no REST data path the file is never read. The day-0 check `content_type` is the same check, for the operator (O05, O11).
+- Every answer that is no file's content is buffered whole up to 4 MiB, so each is bounded by the request: a listing whose explicit `limit` (in the query or a JSON body) is above `gatepolicy.MAX_LIST_LIMIT`, 1000, the server's own default page, is refused before anything is forwarded, as a 400 the agent reads; a listing without a limit passes unchanged. The worst case of a page of 1000, and the bound on the other non-content answers, are worked out in `gatepolicy.py` (O05, O16).
 - A killed cell's cause comes from the cgroup counters, the kernel log, the host killer's journal and the container's state, never from the exit code. The agent's own limit is its outcome; a failure of the host or a component raises `InfraError("sandbox")`; a kill nothing attributes raises `InfraError("unattributed_kill")`, which the core retries within the attempt limit (O17). Errors the agent causes through the mount (ENOENT, EROFS, EISDIR) are not counted against the platform (O18).
 - A message of any exception names roles, keys and positions, never a configured value (image, pool, path, login, level) or the tail of a tool's stderr (which goes to the log).
 

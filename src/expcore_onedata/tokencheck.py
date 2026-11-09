@@ -30,7 +30,13 @@ _TYPE_LIMIT = 40
 
 
 class TokenRefused(RuntimeError):
-    """A token or its principal failed examination; the message holds no value."""
+    """A token or its principal failed examination; the message holds no value.
+
+    `expires_at` is the refused token's expiry when the examination could read its time caveat, else None. A token
+    is dropped, never revoked, so a caller holding a resource for it needs that expiry (or must assume the worst).
+    """
+
+    expires_at: float | None = None
 
 
 class PrivilegesMismatch(TokenRefused):
@@ -181,18 +187,58 @@ def require_examined(
         raise ExaminationFailed(
             f"the token could not be examined ({type(error).__name__}); refusing it", error
         ) from None
+    declared = _declared_expiry(info)
+    try:
+        return _require(info, spec, subject=subject, min_ttl_s=min_ttl_s, max_ttl_s=max_ttl_s, now=now)
+    except TokenRefused as refused:
+        refused.expires_at = declared
+        raise
+    except Exception as error:  # an answer the checks could not even read is a refusal, never a crash
+        refused = TokenRefused(f"the examination answer could not be checked ({type(error).__name__})")
+        refused.expires_at = declared
+        raise refused from None
+
+
+def _declared_expiry(info: Any) -> float | None:
+    """Read the time caveat's expiry leniently, for a token about to be refused; None when it cannot be read.
+
+    Never raises: an expiry too large for a float, or any answer it cannot read, is None (unknown).
+    """
+    try:
+        return _read_expiry(info)
+    except Exception:
+        return None
+
+
+def _read_expiry(info: Any) -> float | None:
+    """The body of `_declared_expiry`."""
+    caveats = info.get("caveats") if isinstance(info, Mapping) else None
+    if not isinstance(caveats, list):
+        return None
+    times = [c.get("validUntil") for c in caveats if isinstance(c, Mapping) and c.get("type") == "time"]
+    if len(times) != 1:
+        return None
+    value = times[0]
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _require(info: Any, spec: CaveatSpec, *, subject: str, min_ttl_s: float, max_ttl_s: float, now: float) -> Examined:
+    """The checks of `require_examined` on an examination answer."""
     token_id, found_subject, caveats = _parse(info)
     if found_subject != subject:
         raise TokenRefused("the token belongs to another principal than the one it was minted for")
     _check_shape(caveats, spec)
-    left = _check_values(caveats, spec) - now
+    expiry = _check_values(caveats, spec)
+    left = expiry - now
     if left <= 0:
         raise TokenRefused("the token has already expired")
     if left < min_ttl_s:
         raise TokenRefused(f"the token lives {left:.0f} s, shorter than the {min_ttl_s:.0f} s the run needs")
     if left > max_ttl_s:
         raise TokenRefused(f"the token lives {left:.0f} s, longer than the {max_ttl_s:.0f} s allowed")
-    return Examined(token_id, found_subject, now + left, tuple(sorted(c["type"] for c in caveats)))
+    return Examined(token_id, found_subject, expiry, tuple(sorted(c["type"] for c in caveats)))
 
 
 def _rights(values: Any, what: str) -> set[str]:

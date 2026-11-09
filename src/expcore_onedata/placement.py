@@ -1,0 +1,112 @@
+# Provenance:
+#   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/scripted/placement.py, blob 5b4173d17d74ec745cefca9176e8f0ab89bcd6b1
+#   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
+#   changes: see git history of this file from its import commit
+"""Block placement on a provider: `GET /data/{id}/distribution`, the only placement evidence the layer accepts (O01).
+
+A transfer's own status is not evidence: Onedata 25.0 reports `completed` for a replication that placed zero bytes and
+for an eviction that removed none. Every claim about where data is comes from the block map. These are pure functions
+on the JSON, so a unit test hands them a hand-written map. A range is `(offset, length)` in bytes and a provider's
+blocks are the ranges it holds.
+"""
+
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+Range = tuple[int, int]
+
+
+def _block(block: Any) -> Range:
+    """Return one block as `(offset, length)`, or raise ValueError unless it is a pair of integers (a bool is none)
+    with a non-negative offset and a positive length: anything else makes the provider's answer unknown."""
+    if (
+        not isinstance(block, list | tuple)
+        or len(block) != 2
+        or not all(isinstance(n, int) and not isinstance(n, bool) for n in block)
+    ):
+        raise ValueError("the distribution answer holds a block that is not an [offset, length] pair of integers")
+    offset, length = block
+    if offset < 0 or length <= 0:
+        raise ValueError("the distribution answer holds a block with a negative offset or a length below one")
+    return offset, length
+
+
+def provider_blocks(distribution: Mapping[str, Any], provider_id: str) -> list[Range]:
+    """Return the sorted `(offset, length)` blocks a provider holds of one file, from a `/distribution` answer.
+
+    Only an explicit empty list says a provider holds nothing. A provider that is absent from the answer is unknown, as
+    is a listed one without a table of storage backends, a backend without a `blocks` list, or any other shape: each
+    raises ValueError, as does any block that is not a pair of integers (a bool is none) with an offset of zero or more
+    and a length of one or more. The answer may be partial, so absence is not proof of an empty holding, and an unknown is never
+    read as an empty list (O01, O08), or an eviction could be confirmed by it.
+    """
+    per_provider = distribution.get("distributionPerProvider")
+    if not isinstance(per_provider, Mapping):
+        raise ValueError("the distribution answer has no 'distributionPerProvider' table")
+    if provider_id not in per_provider:
+        raise ValueError("the distribution answer does not list the provider, so what it holds is unknown")
+    entry = per_provider[provider_id]
+    backends = entry.get("distributionPerStorageBackend") if isinstance(entry, Mapping) else None
+    if not isinstance(backends, Mapping) or not backends:
+        raise ValueError("the distribution answer lists the provider but has no 'distributionPerStorageBackend' table")
+    out: list[Range] = []
+    for backend in backends.values():
+        if not isinstance(backend, Mapping):
+            raise ValueError("the distribution answer's storage backend entry is not a table")
+        blocks = backend.get("blocks")
+        if not isinstance(blocks, list | tuple):
+            raise ValueError("the distribution answer's storage backend has no list of 'blocks'")
+        for block in blocks:
+            out.append(_block(block))
+    return sorted(out)
+
+
+def merged(blocks: Iterable[Range]) -> list[Range]:
+    """Return the blocks with overlapping or adjacent ones joined and empty ones dropped."""
+    joined: list[list[int]] = []
+    for offset, length in sorted(blocks):
+        if length <= 0:
+            continue
+        if joined and offset <= joined[-1][0] + joined[-1][1]:
+            joined[-1][1] = max(joined[-1][1], offset + length - joined[-1][0])
+        else:
+            joined.append([offset, length])
+    return [(a, b) for a, b in joined]
+
+
+def held_bytes(blocks: Iterable[Range]) -> int:
+    """Return how many bytes the blocks hold, each byte once."""
+    return sum(length for _, length in merged(blocks))
+
+
+def uncovered(blocks: Iterable[Range], ranges: Iterable[Range]) -> list[Range]:
+    """Return the parts of `ranges` the blocks do not hold; empty means fully placed."""
+    held = merged(blocks)
+    gaps: list[Range] = []
+    for offset, length in merged(ranges):
+        position, end = offset, offset + length
+        for block_offset, block_length in held:
+            block_end = block_offset + block_length
+            if block_end <= position:
+                continue
+            if block_offset >= end:
+                break
+            if block_offset > position:
+                gaps.append((position, block_offset - position))
+            position = max(position, block_end)
+            if position >= end:
+                break
+        if position < end:
+            gaps.append((position, end - position))
+    return gaps
+
+
+def covers(blocks: Iterable[Range], ranges: Iterable[Range]) -> bool:
+    """Tell whether the blocks hold every byte of every range, and at least one range was asked for."""
+    wanted = list(ranges)
+    return bool(merged(wanted)) and not uncovered(blocks, wanted)
+
+
+def file_fully_placed(blocks: Iterable[Range], size: int) -> bool:
+    """Tell whether the blocks hold the whole file; an empty file is placed by definition."""
+    return not uncovered(blocks, [(0, size)]) if size > 0 else True

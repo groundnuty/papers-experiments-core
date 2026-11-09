@@ -20,7 +20,13 @@ if not PLATFORM:
     pytest.skip("EXPCORE_LIVE_PLATFORM is not set; these tests contact a real deployment", allow_module_level=True)
 
 import httpx  # noqa: E402
-from live_support import mint_for_condition  # noqa: E402 -- only once the module is known to run
+from live_support import (  # noqa: E402 -- only once the module is known to run
+    mint_for_condition,
+    prerequisite_missing,
+    require_cleaned,
+    require_every_provider_refused,
+    require_passed,
+)
 
 from expcore_onedata.client import API_PROVIDER, AUTH_HEADER, OnezoneClient, PlatformError  # noqa: E402
 from expcore_onedata.config import load_platform  # noqa: E402
@@ -82,6 +88,13 @@ def test_a_user_mints_its_own_token_and_it_examines_cleanly(config, issuer):
 def test_the_study_space_resolves_to_its_declared_name(config, client):
     # covers: GET /spaces/{space}
     assert client.space_name(config.space.id) == config.space.name  # the name the mutation gate checks the prefixes of
+
+
+def test_a_file_resolves_to_its_space_through_its_path_attribute(config, client):
+    # covers: GET /data/{id}
+    provider = config.support.providers[0]
+    root = client.get(f"/spaces/{config.space.id}", provider=provider)["fileId"]
+    assert client.file_space_name(root, provider) == config.space.name  # the name a mutation by file id is gated on
 
 
 def test_discovery_finds_the_space_and_the_declared_local_provider(config, issuer, client):
@@ -147,3 +160,68 @@ def test_a_token_stops_working_when_its_lifetime_ends(config, client):
     with pytest.raises(PlatformError) as refused:
         read_space(client, value, config.space.id)
     assert refused.value.status in (401, 403)
+
+
+# -- step 4b2: placement, probes and day-0 checks ----------------------------------------------------------------------
+# These read a real deployment's providers (the listing, a block map, the public configuration). The two that change
+# state, the read-only enforcement and the placement round trip on a scratch file under the configured prefixes, also
+# need EXPCORE_LIVE_MUTATE=1.
+
+MUTATE = pytest.mark.skipif(
+    os.environ.get("EXPCORE_LIVE_MUTATE") != "1",
+    reason="EXPCORE_LIVE_MUTATE=1 is not set; this test changes state in the configured space",
+)
+
+
+@pytest.fixture(scope="module")
+def day0(tmp_path_factory):
+    from expcore_onedata.day0.runner import build_context
+
+    return build_context(PLATFORM, tmp_path_factory.mktemp("day0"))
+
+
+def test_the_read_only_day0_checks_do_not_fail_on_the_real_deployment(day0):
+    from expcore_onedata.day0.runner import run_checks
+
+    entries = run_checks(day0, ["reachability", "health", "tokens", "listing"])
+    failures = {e.name: e.summary for e in entries if e.ok is False}
+    assert not failures, failures
+
+
+def test_a_real_block_map_has_the_documented_shape(day0, client, config):
+    """The distribution answer parses; a regular file is found by listing the first supporting provider's root."""
+    from expcore_onedata import consistency
+    from expcore_onedata.placement import provider_blocks
+
+    provider = config.support.providers[0]
+    root = consistency.space_root(client, provider, config.space.id)
+    params = {"limit": 50, "attribute": ["file_id", "type"]}
+    entries = client.get(f"/data/{root}/children", provider=provider, params=params)
+    files = [c for c in entries["children"] if c.get("type") == "REG"]
+    if not files:
+        pytest.skip("the space root holds no regular file to read a block map of")
+    distribution = client.get(f"/data/{files[0]['file_id']}/distribution", provider=provider)
+    # a provider that does not support the space is not listed in the answer, and an unlisted provider is unknown
+    supporting = [day0.provider_ids[name] for name in config.support.providers]
+    assert supporting
+    assert all(isinstance(provider_blocks(distribution, pid), list) for pid in supporting)
+
+
+@MUTATE
+@pytest.mark.parametrize("name", ["read_only", "round_trip"])
+def test_a_day0_check_that_changes_state_passes_and_shows_its_cleanup(day0, name):
+    """Each state-changing check passes (`ok is True`; an unknown ran nothing) and the one that makes a scratch file
+    reports its cleanup explicitly as true. It is skipped only when platform.toml lacks what it needs, and the skip
+    names that."""
+    from expcore_onedata.day0.runner import run_checks
+
+    missing = prerequisite_missing(name, day0)
+    if missing is not None:
+        pytest.skip(missing)
+    day0.allow_mutation = True
+    entry = {e.name: e for e in run_checks(day0, [name])}[name]
+    require_passed(entry)
+    if name == "round_trip":
+        require_cleaned(entry)
+    else:
+        require_every_provider_refused(entry)

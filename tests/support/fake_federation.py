@@ -43,6 +43,7 @@ class FakeFederation(MockOnedata):
         self.issued: dict[str, dict] = {}
         self.privileges: dict[tuple[str, str], dict[str, list[str]]] = {}
         self.mint_hook: Callable[[str, list[dict]], list[dict]] | None = None
+        self.blank_mint_answer = False  # store the token but answer without it, as a broken server might
         self.examine_hook: Callable[[dict], Any] | None = None
         self.status_override: int | None = None
         self.other_spaces: dict[str, str] = {}  # id -> name of the spaces besides the study space that Onezone knows
@@ -155,6 +156,8 @@ class FakeFederation(MockOnedata):
             "subject": {"type": "user", "id": user},
             "caveats": stored,
         }
+        if self.blank_mint_answer:
+            return httpx.Response(201, json={})
         return httpx.Response(200, json={"token": value})
 
     def _examine(self, value: Any) -> httpx.Response:

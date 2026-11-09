@@ -1,0 +1,118 @@
+# Provenance: new
+"""Build the context of a day-0 run from a platform.toml, run the registered checks, and write the report."""
+
+import os
+import time
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
+
+from expcore.config.loading import ConfigError, load_toml
+from expcore_onedata.client import OnezoneClient, tcp_connect
+from expcore_onedata.config import load_platform
+from expcore_onedata.day0 import checks as _checks  # noqa: F401 -- importing registers the checks
+from expcore_onedata.day0 import mutating as _mutating  # noqa: F401
+from expcore_onedata.day0.registry import REGISTRY, Context, Result, failed
+from expcore_onedata.day0.report import Entry, build_report, stamp, write_report
+from expcore_onedata.provision import resolve_provider_ids
+from expcore_onedata.rangemap import load_placement
+from expcore_onedata.tokens import TokenIssuer
+
+MUTATE_VARIABLE = "EXPCORE_LIVE_MUTATE"
+EXIT_PASS, EXIT_FAIL, EXIT_UNKNOWN, EXIT_USAGE = 0, 1, 3, 2
+
+
+def mutation_allowed(environ: Mapping[str, str] | None = None) -> bool:
+    """The caller has allowed the checks that change state when EXPCORE_LIVE_MUTATE is exactly "1"."""
+    return (os.environ if environ is None else environ).get(MUTATE_VARIABLE) == "1"
+
+
+def build_context(
+    platform: str | Path,
+    out_dir: str | Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    allow_mutation: bool | None = None,
+    client: OnezoneClient | None = None,
+    ceiling_s: float = 300.0,
+    samples: int = 5,
+    tcp: Callable[[str, int, float], float] | None = tcp_connect,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.time,
+) -> Context:
+    """Load the target configuration, which must be named, and build the client and the issuer for it.
+
+    The configuration is validated with its secrets present. `[placement]` is read when the file has it. A client may be
+    handed in (a test's fake); otherwise one is built that talks to the configured federation.
+    """
+    path = Path(platform)
+    config = load_platform(path, environ=environ)
+    placement = load_placement(path, config) if "placement" in load_toml(path) else None
+    client = client or OnezoneClient(config, environ=environ)
+    ctx = Context(
+        config=config,
+        client=client,
+        issuer=TokenIssuer(client, config, clock=now),
+        out_dir=Path(out_dir),
+        placement=placement,
+        allow_mutation=mutation_allowed(environ) if allow_mutation is None else allow_mutation,
+        ceiling_s=ceiling_s,
+        samples=samples,
+        tcp_connect=tcp,
+        clock=clock,
+        sleep=sleep,
+        now=now,
+    )
+    ctx.provider_ids = resolve_provider_ids(config)
+    return ctx
+
+
+def run_checks(ctx: Context, names: Iterable[str] | None = None) -> list[Entry]:
+    """Run the named checks (all, in registration order, by default) and return their results.
+
+    A check that raises is recorded as failed, with the exception's class and no message; one that is not registered
+    is a usage error.
+    """
+    wanted = list(names) if names else list(REGISTRY)
+    unknown_names = [n for n in wanted if n not in REGISTRY]
+    if unknown_names:
+        raise ConfigError(f"unknown day-0 check(s): {', '.join(unknown_names)}; known: {', '.join(REGISTRY)}")
+    entries = []
+    for name in wanted:
+        check = REGISTRY[name]
+        began = ctx.clock()
+        try:
+            result: Result = check.run(ctx)
+        except Exception as error:  # a check that crashes is a failed check, never a pass
+            result = failed(f"the check raised {type(error).__name__}")
+        entries.append(
+            Entry(
+                name, check.title, check.mutates, result.ok, result.summary, result.facts, round(ctx.clock() - began, 3)
+            )
+        )
+    return entries
+
+
+def exit_code(entries: list[Entry]) -> int:
+    """0 when every check passed, 1 when any failed, 3 when none failed but some are unknown."""
+    if any(e.ok is False for e in entries):
+        return EXIT_FAIL
+    return EXIT_UNKNOWN if any(e.ok is None for e in entries) else EXIT_PASS
+
+
+def run(
+    platform: str | Path,
+    out_dir: str | Path,
+    *,
+    names: Iterable[str] | None = None,
+    **options,
+) -> tuple[int, Path, Path]:
+    """Run the checks against a platform.toml and write the dated report; return the exit code and the two paths."""
+    ctx = build_context(platform, out_dir, **options)
+    entries = run_checks(ctx, names)
+    code = exit_code(entries)
+    report = build_report(
+        entries, ctx.config, utc=stamp(ctx.now()), mutation_allowed=ctx.allow_mutation, exit_code=code
+    )
+    json_path, md_path = write_report(Path(out_dir), report)
+    return code, json_path, md_path

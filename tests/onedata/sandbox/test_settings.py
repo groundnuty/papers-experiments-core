@@ -29,7 +29,6 @@ def test_the_default_document_loads_with_every_value_from_the_file(tmp_path):
     assert sandbox.mount.path == "/data"
     assert sandbox.work_root == (tmp_path / "work").resolve()
     assert sandbox.label("sandbox") == "org.test.sandbox"
-    assert dict(sandbox.users) == {"login-data": "u-data", "login-data2": "u-data2"}
 
 
 def test_a_platform_file_without_the_table_has_no_sandbox(tmp_path):
@@ -177,17 +176,24 @@ def test_an_unknown_key_is_refused_so_a_misspelling_cannot_do_nothing(tmp_path):
         load(tmp_path, edit)
 
 
-def test_two_logins_cannot_share_a_user_id(tmp_path):
+def test_c19_a_users_table_in_the_sandbox_is_refused_and_points_to_the_slots(tmp_path):
+    """C19: there is one pool of leased users, the slots. A `[sandbox.users]` table, which made a second pool that could
+    lease a user a slot also holds, is refused at load, naming the key and pointing to `[slots]`, never echoing a
+    login or an id."""
+
     def edit(data):
-        data["sandbox"]["users"] = {"login-a": "u-same", "login-b": "u-same"}
+        data["sandbox"]["users"] = {"login-old": "u-old"}
 
-    with pytest.raises(ConfigError, match="same user id"):
+    with pytest.raises(ConfigError, match=r"\[sandbox\]: key 'users'") as caught:
         load(tmp_path, edit)
+    assert "[slots" in str(caught.value)
+    assert "login-old" not in str(caught.value)
+    assert "u-old" not in str(caught.value)
 
 
-@pytest.mark.parametrize(("table", "key"), [("data_paths", "mounted"), ("users", "login-data")])
-def test_o12_a_level_or_login_with_a_bad_value_is_named_by_position_and_never_by_itself(tmp_path, table, key):
-    """O12: the key of these tables is itself a configured value (a level, a login), so the message cannot echo it."""
+@pytest.mark.parametrize(("table", "key"), [("data_paths", "mounted")])
+def test_o12_a_level_with_a_bad_value_is_named_by_position_and_never_by_itself(tmp_path, table, key):
+    """O12: the key of this table is itself a configured value (a level), so the message cannot echo it."""
 
     def edit(data):
         data["sandbox"][table][key] = 7

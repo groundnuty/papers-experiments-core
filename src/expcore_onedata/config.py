@@ -60,6 +60,10 @@ manifest = "path.json"          # the frozen manifest the client checks the serv
 
 [sandbox]                       # optional: images, network pool, limits, mount, data paths (see sandbox/settings.py)
 ```
+
+Two more tables are accepted here and read by the modules that use them, each validated against this file's providers:
+`[placement]` (the data provider, the bounds of placement and the declared range map; `rangemap.load_placement`) and
+`[slots.<name>]` (the leased platform users, one per token plane; `users.load_slots`).
 """
 
 import hashlib
@@ -450,10 +454,27 @@ def load_platform(
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
     """
     file = Path(path).resolve()
-    digest = hashlib.sha256(file.read_bytes()).hexdigest()
+    try:  # the same errors load_toml gives, so a missing file is a configuration error, not a crash
+        digest = hashlib.sha256(file.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        raise ConfigError(f"{file}: file not found") from None
+    except OSError as error:
+        raise ConfigError(f"{file}: cannot be read ({type(error).__name__})") from None
     root = Section(load_toml(file), file, "platform.toml")
     root.reject_unknown(
-        ("zone", "providers", "space", "support", "credentials", "tokens", "principals", "toolserver", "sandbox")
+        (
+            "zone",
+            "providers",
+            "space",
+            "support",
+            "credentials",
+            "tokens",
+            "principals",
+            "toolserver",
+            "sandbox",
+            "placement",  # read by rangemap.load_placement
+            "slots",  # read by users.load_slots
+        )
     )
     zone = root.section("zone")
     zone.reject_unknown(("name", "url"))

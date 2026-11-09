@@ -2,20 +2,24 @@
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/harness/real_sandbox.py, blob 021a144aa05994ecd37086bcab409a40a8615e15
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
 #   changes: see the history of this file from its import commit
-"""The platform's sandbox for a run: a leased user, its data-path token, a sandbox, and the proof that it is gone.
+"""The platform's sandbox for a run: a leased slot, its tokens, a sandbox, and the proof that it is gone.
 
-Per run (never per campaign): the run's leased platform user mints its own data-path token (`tokens.TokenIssuer`, read-only
-and scoped to the study space, with the interface of the run's data path, a lifetime from the run's whole-time ceiling),
-and the sandbox starts with it. The core's lease pool (C19) holds the user and the sandbox's resources for the attempt;
-`SandboxProbe` is the `ResourceProbe` that proves them gone, so a key is freed only when no container, network or mount
-of the sandbox is left.
+Per run (never per campaign) the run leases one slot of `[slots.<name>]` (`users.py`) when it needs a data-path token or
+a tool server, and none when it needs neither. A slot gives the run both planes' users, so there is one pool of leased
+users and one lease key per run. `users.SlotTokens` mints the run's tokens on the slot's users at once, with one
+journalled expiry: the data path's (read-only and scoped to the study space, with the interface of the run's data path)
+and, for a condition with a tool server, the tool server's, each with a lifetime from the run's whole-time ceiling. The
+sandbox starts with the first; the tool server (`tool_server`) starts with the second, on the same slot's tool-server
+user. The core's lease pool (C19) holds the key for the attempt. The `ResourceProbe` (`probe`) is
+`users.SlotProbe(journal, sandbox_gone=SandboxProbe(...).resource_gone)`: a key is freed only when no container,
+network or mount of the sandbox is left and the slot's tokens have ended, by their journalled expiry plus a margin.
 
 Waits. Start and teardown (the token mint, the image checks, the containers, the stop) are each inside
 `ctx.infrastructure_wait("sandbox_lifecycle")`. What the agent's code does in the sandbox and its reads of data are the
 agent's own time and are never waits (see `codetool.py`).
 
 The study's `data_path` factor names its levels in the study's words; `[sandbox.data_paths]` of platform.toml maps each to
-mount, rest or none, and `[sandbox.users]` lists the platform users a run may lease.
+mount, rest or none. Which runs have a tool server, and of which condition, is the study's to say (`tool_condition`).
 """
 
 from __future__ import annotations
@@ -27,8 +31,10 @@ import json
 import logging
 import re
 import threading
+import time
+import weakref
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.lease import Lease, process_gone
 from expcore.errors import InfraError
@@ -41,14 +47,18 @@ from expcore_onedata.sandbox.hostops import HostOps, describe_error, mount_ident
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
 from expcore_onedata.sandbox.settings import SandboxSettings
-from expcore_onedata.tokens import MintedToken, TokenIssuer, data_path_spec
+from expcore_onedata.tokens import MintedToken, RunTokens, TokenIssuer, data_path_spec
+from expcore_onedata.users import GROUP, SlotProbe, Slots, SlotTokens, TokenJournal
+
+if TYPE_CHECKING:
+    from expcore.tools.mcp_client import McpToolProvider
+    from expcore_onedata.toolserver import ToolServerLauncher
 
 log = logging.getLogger(__name__)
 
 WAIT_KIND = "sandbox_lifecycle"
 CANCEL_WAIT_S = 120.0  # how long a cancelled launch waits for its start thread to notice and clean up, before it stops
 DATA_PATH_FACTOR = "data_path"  # the study's factor whose levels [sandbox.data_paths] maps
-DATA_USERS = "data_users"  # the lease group of the platform users a data path leases
 
 
 def _well_formed(document: Any) -> bool:
@@ -92,7 +102,8 @@ class _Recorded:
 
 
 class _StartThreads:
-    """The start threads of the platform that have not ended, by lease key: the probe says nothing is gone while one runs."""
+    """The mint and start threads of the platform that have not ended, by lease key: the probe says nothing is gone
+    while one runs."""
 
     def __init__(self) -> None:
         self._lock, self._running = threading.Lock(), {}
@@ -129,8 +140,9 @@ class SandboxProbe:
     too. Anything it cannot read or ask, a record included, is False, so the key stays quarantined; so is a recorded
     mount of the lease without its full identity, which could be anywhere: such a record holds the key until an
     operator has verified that nothing of it is mounted and cleared it (`mountrecords`, its procedure). It reads and never
-    removes: the sandbox's own stop, the next start's retry and the orphan reaper remove. While a start thread of the key
-    is still running (a cancelled launch that gave up waiting for it) nothing is gone yet, whatever the reads show.
+    removes: the sandbox's own stop, the next start's retry and the orphan reaper remove. While a mint or start thread of
+    the key is still running (a cancelled launch that gave up waiting for it) nothing is gone yet, whatever the reads
+    show.
     """
 
     def __init__(
@@ -185,8 +197,22 @@ class SandboxProbe:
         return [d for d in documents if d["lease"] == key]
 
 
+@dataclasses.dataclass(frozen=True)
+class _ToolPlane:
+    """What a run's tool server starts with: its condition, its token, and the slot user the token must be."""
+
+    condition: str
+    token: MintedToken
+    principal: Principal
+
+
 class SandboxPlatform:
-    """The sandbox half of the platform for a study: which data path a condition has, who may be leased, and the launch."""
+    """The sandbox half of the platform for a study: which data path a run has, which slot it leases, and the launch.
+
+    `slots` are the leasable slots of platform.toml (`users.load_slots`) and `journal` the expiry journal beside the
+    leases. `tool_condition` tells from a run's factors the tool-server condition it has, or None; `tool_server` starts
+    that server (`toolserver.ToolServerLauncher`) when a run has one.
+    """
 
     def __init__(
         self,
@@ -194,16 +220,25 @@ class SandboxPlatform:
         issuer: TokenIssuer,
         host: HostOps,
         *,
+        slots: Slots,
+        journal: TokenJournal,
+        tool_condition: Callable[[Mapping[str, Any]], str | None] = lambda factors: None,
+        tool_server: ToolServerLauncher | None = None,
         registry: Registry = DEFAULT,
         sandbox_options: Mapping[str, Any] | None = None,
         cancel_wait_s: float = CANCEL_WAIT_S,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if config.sandbox is None:
             raise ValueError(f"{config.file}: has no [sandbox] section")
         self._config, self._s, self._issuer, self._host = config, config.sandbox, issuer, host
+        self._slots, self._journal, self._clock = slots, journal, clock
+        self._tokens = SlotTokens(issuer, config, slots, journal, clock=clock)
+        self._tool_condition, self._launcher = tool_condition, tool_server
         self._registry, self._options = registry, dict(sandbox_options or {})
         self._cancel_wait_s = cancel_wait_s
         self._threads = _StartThreads()
+        self._planes: weakref.WeakKeyDictionary[DockerSandbox, _ToolPlane] = weakref.WeakKeyDictionary()
 
     # ------------------------------------------------------------------------------------------------ the plugin's hooks
     def mode(self, factors: Mapping[str, Any]) -> DataPathMode:
@@ -211,16 +246,21 @@ class SandboxPlatform:
         return self._s.mode_of(str(factors[DATA_PATH_FACTOR]))
 
     def lease_group(self, factors: Mapping[str, Any]) -> str | None:
-        """The lease group of a run: the platform users, when its data path takes a token; None when it takes none."""
-        return None if self.mode(factors) is DataPathMode.NONE else DATA_USERS
+        """The lease group of a run: the slots, when it needs a data-path token or a tool server; None when neither."""
+        needs = self.mode(factors) is not DataPathMode.NONE or self._tool_condition(factors) is not None
+        return GROUP if needs else None
 
     def lease_keys(self, group: str) -> Sequence[str]:
-        """The keys of a lease group: the logins of `[sandbox.users]`."""
-        return sorted(self._s.users) if group == DATA_USERS else ()
+        """The keys of a lease group: the names of `[slots]`; a group this layer does not declare is refused."""
+        return self._slots.keys_of(group)
 
-    def probe(self) -> SandboxProbe:
-        """The `ResourceProbe` for the plugin."""
+    def sandbox_probe(self) -> SandboxProbe:
+        """The probe that proves a key's sandbox gone: no container, network or mount of it is left."""
         return SandboxProbe(self._host, self._s, starting=self._threads.active)
+
+    def probe(self) -> SlotProbe:
+        """The `ResourceProbe` for the plugin: a key is free once its sandbox is proven gone and its tokens have ended."""
+        return SlotProbe(self._journal, sandbox_gone=self.sandbox_probe().resource_gone, clock=self._clock)
 
     @staticmethod
     def _begin(sandbox: DockerSandbox, ended: Callable[[], None]) -> None:
@@ -231,15 +271,11 @@ class SandboxPlatform:
             ended()
 
     # ------------------------------------------------------------------------------------------------ the launch
-    def _principal(self, lease: Lease | None) -> Principal:
-        """The user whose credential mints the data-path token: the leased one, else the configured fixed one."""
-        if lease is not None:
-            if lease.key not in self._s.users:
-                raise ValueError("the lease key is not a login of [sandbox.users]")
-            return Principal(lease.key, self._s.users[lease.key])
+    def _fixed(self) -> Principal:
+        """The user whose credential mints the data-path token of a run that leases no slot (a live check)."""
         fixed = self._config.principals.data_path
         if fixed is None:
-            raise ValueError("a run with a data path needs a leased user, or [principals.data_path] for a fixed one")
+            raise ValueError("a run with a data path needs a leased slot, or [principals.data_path] for a fixed user")
         return fixed
 
     def _spec(self, run_key: str, mode: DataPathMode, token: MintedToken | None, lease: Lease | None) -> SandboxSpec:
@@ -254,42 +290,90 @@ class SandboxPlatform:
             lease_key=lease.key if lease else None,
         )
 
-    def _mint(self, mode: DataPathMode, lease: Lease | None, ceiling_s: float) -> MintedToken | None:
-        """Blocking: mint the data-path token as the leased user. Nothing exists yet, so nothing needs undoing."""
-        if mode is DataPathMode.NONE:
-            return None
-        spec = data_path_spec(self._config.space.id, mode.interface or "rest")
-        return self._issuer.mint(spec, self._principal(lease), ceiling_s=ceiling_s)
+    def _mint(
+        self, mode: DataPathMode, lease: Lease | None, ceiling_s: float, condition: str | None
+    ) -> RunTokens | None:
+        """Blocking: mint the run's tokens. With a lease, both planes' through the slot (`SlotTokens`), with one
+        journalled expiry; without one, only a data path's, as the fixed user. Nothing exists yet, so nothing needs
+        undoing."""
+        if lease is None:
+            if condition is not None:
+                raise ValueError("a run with a tool server needs a leased slot: its tool-server user is the slot's")
+            if mode is DataPathMode.NONE:
+                return None
+            spec = data_path_spec(self._config.space.id, mode.interface or "rest")
+            return RunTokens(self._issuer.mint(spec, self._fixed(), ceiling_s=ceiling_s), None)
+        if mode is DataPathMode.NONE and condition is None:
+            return None  # a run that needs neither plane mints nothing, whatever it holds
+        return self._tokens.mint(lease, ceiling_s=ceiling_s, condition=condition, interface=mode.interface)
+
+    def _mint_tracked(
+        self,
+        mode: DataPathMode,
+        lease: Lease | None,
+        ceiling_s: float,
+        condition: str | None,
+        ended: Callable[[], None],
+    ) -> RunTokens | None:
+        """Blocking, in the mint thread: mint the run's tokens, and note that the thread has ended, however it ended."""
+        try:
+            return self._mint(mode, lease, ceiling_s, condition)
+        finally:
+            ended()
 
     def _prepare(
-        self, run_key: str, mode: DataPathMode, lease: Lease | None, token: MintedToken | None
+        self, run_key: str, mode: DataPathMode, lease: Lease | None, tokens: RunTokens | None, condition: str | None
     ) -> DockerSandbox:
         """The sandbox of a run, built and not started: it has no effect on the host, so a launch holds it, and can stop
         it, from before the first resource exists."""
+        data = tokens.data_path if tokens is not None else None
         sandbox = DockerSandbox(
             self._host,
             self._s,
-            self._spec(run_key, mode, token, lease),
+            self._spec(run_key, mode, data, lease),
             registry=self._registry,
             config_sha256=self._config.sha256,
             **self._options,
         )
-        if token is not None:  # never the value, and the user by its place in the file, not by its id (O12)
-            user = list(self._s.users).index(lease.key) if lease is not None else "principals.data_path"
-            sandbox.record(data_path_token={"user": user, "expires_at": token.expires_at})
+        # never a value, and the slot by its place in the file, never by its name (O12)
+        slot = self._slots.keys_of(GROUP).index(lease.key) if lease is not None else "principals.data_path"
+        if data is not None:
+            sandbox.record(data_path_token={"slot": slot, "expires_at": data.expires_at})
+        if tokens is not None and tokens.tool_server is not None and lease is not None:
+            sandbox.record(tool_server_token={"slot": slot, "expires_at": tokens.tool_server.expires_at})
+            principal = self._slots.users_of(lease).tool_server
+            self._planes[sandbox] = _ToolPlane(str(condition), tokens.tool_server, principal)
         return sandbox
 
     @contextlib.asynccontextmanager
     async def launch(
-        self, ctx: CallContext, *, run_key: str, level: str, ceiling_s: float, lease: Lease | None = None
+        self,
+        ctx: CallContext,
+        *,
+        run_key: str,
+        level: str,
+        ceiling_s: float,
+        lease: Lease | None = None,
+        condition: str | None = None,
     ) -> AsyncIterator[DockerSandbox]:
         """Start the sandbox of a run and yield it; stop it, verified, on leaving.
+
+        A run with a lease has its tokens minted through its slot (`users.SlotTokens`): the data path's, and the tool
+        server's when `condition` names the run's tool-server condition, which `tool_server` then starts the server
+        with. A run with a tool server needs a lease; one without a lease (a live check) mints its data-path token as
+        the fixed `[principals.data_path]` user and is never journalled.
 
         The start and the stop are each inside `ctx.infrastructure_wait("sandbox_lifecycle")`; the body is the agent's
         own time. A teardown that leaves something behind raises `InfraError("sandbox")` when nothing else is in
         flight, and the lease's probe then keeps the key quarantined. `ceiling_s` is the run's whole-time ceiling (O06).
         When the data gate refused an answer for its own integrity during the run, the run ends in `InfraError` of
         kind `data_gate_integrity` (`kinds.gate_error`), whatever its body raised or returned (O05, C01).
+
+        The mint runs in a thread too, which a cancellation does not stop either: it is tracked as a start thread of
+        the key from before it is dispatched, so the probe shows nothing gone while it runs, and a launch cancelled or
+        failed during the mint waits for it, however often it is cancelled meanwhile, with the same deadline, before it
+        re-raises. Its tokens are journalled by `SlotTokens` as they are minted, so a slot whose run was cancelled
+        stays held until they have ended (C19).
 
         The start runs in a thread, and cancelling the launch does not stop a thread: it goes on creating the sandbox.
         So the sandbox is built before the thread begins, and the launch holds it. On cancellation, or any failure of
@@ -301,15 +385,24 @@ class SandboxPlatform:
         mode = self._s.mode_of(level)
         sandbox: DockerSandbox | None = None
         started: asyncio.Future[None] | None = None
+        minting: asyncio.Future[RunTokens | None] | None = None
         try:
             async with ctx.infrastructure_wait(WAIT_KIND):
-                token = await asyncio.to_thread(self._mint, mode, lease, ceiling_s)
-                sandbox = self._prepare(run_key, mode, lease, token)
+                minted = self._threads.began(lease.key if lease is not None else None)  # before the thread exists
+                minting = asyncio.ensure_future(
+                    asyncio.to_thread(self._mint_tracked, mode, lease, ceiling_s, condition, minted)
+                )
+                minting.add_done_callback(lambda _: minted())  # a task that never got to run has no thread to end
+                tokens = await asyncio.shield(minting)
+                sandbox = self._prepare(run_key, mode, lease, tokens, condition)
                 ended = self._threads.began(lease.key if lease is not None else None)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end
                 await asyncio.shield(started)
         except BaseException:
+            if minting is not None and not minting.done():  # cancelled mid-mint: the worker goes on, so wait for it
+                minting.add_done_callback(lambda f: f.cancelled() or f.exception())  # its failure is not unretrieved
+                await _wait_through_cancellation(minting, self._cancel_wait_s)
             if sandbox is not None and started is not None:
                 await self._settle_start(sandbox, started)
                 await self._stop(ctx, sandbox, quiet=True)
@@ -330,6 +423,27 @@ class SandboxPlatform:
             await self._stop(ctx, sandbox, quiet=True)
             raise refused
         await self._stop(ctx, sandbox, quiet=False)
+
+    @contextlib.asynccontextmanager
+    async def tool_server(
+        self, ctx: CallContext, sandbox: DockerSandbox, *, ceiling_s: float, extra_env: Mapping[str, str] | None = None
+    ) -> AsyncIterator[McpToolProvider]:
+        """Start the tool server of a run whose sandbox `launch` yielded, and yield its tool provider; stop it on leaving.
+
+        The server takes the tool-server token minted with the run's data-path token on the same leased slot, and the
+        launcher requires that token's subject to be the slot's tool-server user; nothing else can give it a token.
+        """
+        plane = self._planes.get(sandbox)
+        if plane is None:
+            raise ValueError(
+                "this sandbox's run was launched without a tool-server condition, so it has no tool server"
+            )
+        if self._launcher is None:
+            raise ValueError("the platform was built without a tool-server launcher")
+        async with self._launcher.launch(
+            ctx, plane.condition, plane.token, ceiling_s=ceiling_s, extra_env=extra_env, principal=plane.principal
+        ) as provider:
+            yield provider
 
     @staticmethod
     async def _gate_refused(sandbox: DockerSandbox) -> InfraError | None:
@@ -384,4 +498,4 @@ async def _complete(work: Any) -> None:
         raise asyncio.CancelledError
 
 
-__all__ = ["DATA_PATH_FACTOR", "DATA_USERS", "SandboxPlatform", "SandboxProbe"]
+__all__ = ["DATA_PATH_FACTOR", "SandboxPlatform", "SandboxProbe"]

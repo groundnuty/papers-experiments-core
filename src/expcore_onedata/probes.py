@@ -1,0 +1,285 @@
+# Provenance:
+#   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/scripted/metrics.py, blob bc25531c7aac74a09ff74c730fceabd8119cd2c5
+#   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
+#   merged: icsoc-2026-code-agent @ c1e76c2, harness/verifier.py:39-45,132-171 (retry resets, never a real answer)
+#   merged: icsoc-2026-code-agent @ c1e76c2, harness/verifier.py:290-302 (a provider's physical size from the block map)
+#   changes: see git history of this file from its import commit
+"""Platform probes as instruments: file distribution, transfer records and bytes per provider pair (O08).
+
+`PlatformProbes` is an `expcore.plugin.Instrument`. It reads the platform at the start of a run and again at its end, and
+`finish` returns one snapshot that goes into the run record under the namespace `platform_probes`. A scorer reads that
+snapshot and never the live platform (R13). The snapshot holds, for the files the study names:
+
+- each tracked provider's block map before and after (merged blocks, held bytes);
+- the record of every transfer the provisioner scheduled (state and counters as the provider reports them);
+- the bytes moved between each pair of providers, from the growth of a provider's block map, attributed to a source
+  only where exactly one other provider held those bytes at the start. Bytes that two or more providers held, and
+  bytes no other provider held, are counted apart and attributed to nobody. No pair is ever derived from a transfer's
+  status (O01).
+
+**A probe that fails is recorded as failed and its value is `None`, never guessed (O08).** `run_probe` sends the read
+once when the provider answers, whatever it answers (a 404 is an answer); it retries only a transport failure (no
+answer came back), a bounded number of times. Anything that depends on a failed probe is `None` in the snapshot and the
+snapshot says it is incomplete, so a scorer cannot mistake a missing reading for a zero.
+
+The probes run outside the agent's time, before the loop starts and after it ends. The per-container counters of the
+earlier study (network interfaces, cgroups, gate logs) belong to the sandbox and are not here.
+"""
+
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from itertools import pairwise
+from typing import Any
+
+from expcore_onedata.client import OnezoneClient, PlatformError
+from expcore_onedata.placement import Range, held_bytes, merged, uncovered
+from expcore_onedata.provision import Provisioner
+
+NAMESPACE = "platform_probes"
+VERSION = 1
+BLOCKS_SHOWN = 2000  # the most merged blocks recorded per file and provider; the count is always recorded
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """What a probe found: the value when it worked, and otherwise why not; the value of a failed probe is None."""
+
+    ok: bool
+    value: Any
+    attempts: int
+    status: int | None = None
+    error: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        """Return the result without its value, as plain JSON."""
+        return {"probe_ok": self.ok, "attempts": self.attempts, "status": self.status, "error": self.error}
+
+
+def run_probe(
+    read: Callable[[], Any],
+    *,
+    attempts: int = 3,
+    backoff_s: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> ProbeResult:
+    """Run a read-only probe: one request when the provider answers, up to `attempts` when no answer comes back.
+
+    A real HTTP answer, a 404 or a 500 included, is final: it is recorded as the probe's failure and not retried. A
+    transport failure (a reset, a refusal, a timeout) is retried with `backoff_s` between tries, and after the last the
+    probe is failed with no value. Anything else the read raises is a defect and propagates.
+    """
+    if attempts < 1:
+        raise ValueError("a probe makes at least one attempt")
+    for attempt in range(1, attempts + 1):
+        try:
+            return ProbeResult(True, read(), attempt)
+        except PlatformError as error:
+            if not error.transport:
+                answered = f"the provider answered {error.status}" if error.status else "the answer was unusable"
+                return ProbeResult(False, None, attempt, status=error.status, error=answered)
+            if attempt == attempts:
+                return ProbeResult(False, None, attempt, error=f"no answer after {attempts} attempt(s)")
+            sleep(backoff_s)
+    raise AssertionError("unreachable")  # pragma: no cover - the loop returns
+
+
+def _intersection(first: Iterable[Range], second: Iterable[Range]) -> list[Range]:
+    """Return the parts of `first` that `second` also holds."""
+    first = merged(first)
+    return merged(uncovered(uncovered(second, first), first))
+
+
+def _split_by_holders(gained: list[Range], holders: Mapping[str, list[Range]]) -> tuple[dict[str, int], int, int]:
+    """Count the gained bytes held by exactly one source, by two or more, and by none; the first is per source."""
+    points = sorted(
+        {edge for off, length in gained for edge in (off, off + length)}
+        | {edge for held in holders.values() for off, length in held for edge in (off, off + length)}
+    )
+    sole: dict[str, int] = {}
+    shared = unheld = 0
+    for start, end in pairwise(points):
+        if not any(off <= start and end <= off + length for off, length in gained):
+            continue
+        covering = [
+            s for s, held in holders.items() if any(off <= start and end <= off + length for off, length in held)
+        ]
+        if len(covering) == 1:
+            sole[covering[0]] = sole.get(covering[0], 0) + end - start
+        elif covering:
+            shared += end - start
+        else:
+            unheld += end - start
+    return sole, shared, unheld
+
+
+def bytes_by_pair(before: Mapping[str, list[Range]], after: Mapping[str, list[Range]]) -> dict[str, Any]:
+    """Describe how each provider's holdings changed, and which provider the new bytes came from, from block maps alone.
+
+    For each destination the bytes it gained are split by who held them at the start: exactly one other provider (the
+    source of those bytes), two or more (`ambiguous_bytes`), or none (`unattributed_bytes`). Bytes it lost are `lost`.
+    """
+    out: dict[str, Any] = {}
+    for destination, now in after.items():
+        was = before.get(destination, [])
+        gained = merged(uncovered(was, now))
+        others = {s: _intersection(gained, held) for s, held in before.items() if s != destination}
+        sole, shared, unheld = _split_by_holders(gained, others)
+        out[destination] = {
+            "gained_bytes": held_bytes(gained),
+            "from": sole,
+            "ambiguous_bytes": shared,
+            "unattributed_bytes": unheld,
+            "lost_bytes": held_bytes(uncovered(now, was)),
+        }
+    return out
+
+
+def _blocks_json(result: ProbeResult) -> dict[str, Any]:
+    """Return one block-map reading as JSON: the blocks (capped) and the bytes, or the failure with nulls."""
+    if not result.ok:
+        return {**result.to_json(), "held_bytes": None, "block_count": None, "blocks": None, "blocks_truncated": None}
+    blocks = merged(result.value)
+    return {
+        **result.to_json(),
+        "held_bytes": held_bytes(blocks),
+        "block_count": len(blocks),
+        "blocks": [list(b) for b in blocks[:BLOCKS_SHOWN]],
+        "blocks_truncated": len(blocks) > BLOCKS_SHOWN,
+    }
+
+
+class PlatformProbes:
+    """The platform's instrument: the files' block maps before and after a run, the transfer records, bytes per pair."""
+
+    namespace = NAMESPACE
+
+    def __init__(
+        self,
+        client: OnezoneClient,
+        provisioner: Provisioner,
+        files: Mapping[str, str],
+        providers: Sequence[str],
+        *,
+        transfers: Callable[[], Iterable[tuple[str, str, str]]] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        now: Callable[[], float] = time.time,
+    ) -> None:
+        """Track `files` (label to space-relative path) on `providers`; transfers default to the provisioner's log."""
+        self._client, self._provisioner = client, provisioner
+        self._files, self._providers = dict(files), list(providers)
+        self._transfers = transfers if transfers is not None else provisioner.transfers
+        self._sleep, self._now = sleep, now
+        self._before: dict[str, dict[str, ProbeResult]] | None = None
+        self._started: float | None = None
+
+    def _probe(self, read: Callable[[], Any]) -> ProbeResult:
+        settings = self._provisioner.settings
+        return run_probe(read, attempts=settings.probe_attempts, backoff_s=settings.probe_backoff_s, sleep=self._sleep)
+
+    def _file_id(self, path: str) -> ProbeResult:
+        """Resolve a path to its entry; a path that is no longer there is a failed probe, not an exception.
+
+        The read does not wait: the provisioner's wait for a new space root would retry a real 404 inside one attempt,
+        out of sight of the probe (O08). The only retry is the probe's own, of a network reset, and it is counted.
+        """
+
+        def read() -> Any:
+            try:
+                return self._provisioner.resolve(path, wait=False)
+            except KeyError:
+                raise PlatformError("the tracked file is not in the space", status=404) from None
+
+        return self._probe(read)
+
+    def _read_maps(self) -> tuple[dict[str, ProbeResult], dict[str, dict[str, ProbeResult]]]:
+        """Read every tracked file's entry and each tracked provider's block map of it."""
+        entries: dict[str, ProbeResult] = {}
+        maps: dict[str, dict[str, ProbeResult]] = {}
+        for label, path in self._files.items():
+            entries[label] = entry = self._file_id(path)
+            maps[label] = {}
+            for provider in self._providers:
+                if entry.ok:
+                    maps[label][provider] = self._probe(
+                        lambda p=provider, e=entry.value: self._provisioner.blocks(e.file_id, p)
+                    )
+                else:
+                    maps[label][provider] = ProbeResult(False, None, 0, entry.status, "the file could not be resolved")
+        return entries, maps
+
+    def start(self, identity: Mapping[str, Any]) -> None:
+        """Read the block maps before the run; `identity` is not used, since the snapshot is of the platform's state."""
+        self._started = self._now()
+        _, self._before = self._read_maps()
+
+    def _transfer_records(self) -> list[dict[str, Any]]:
+        records = []
+        for provider, tid, kind in self._transfers():
+            found = self._probe(lambda p=provider, t=tid: self._client.get(f"/transfers/{t}", provider=p))
+            body = found.value if found.ok and isinstance(found.value, dict) else {}
+            records.append(
+                {
+                    "provider": provider,
+                    "transfer_id": tid,
+                    "kind": kind,
+                    **found.to_json(),
+                    "state": next(
+                        (body[k] for k in ("transferStatus", "replicationStatus", "evictionStatus") if k in body), None
+                    ),
+                    "bytes_replicated": body.get("bytesReplicated"),
+                    "files_replicated": body.get("filesReplicated"),
+                    "files_evicted": body.get("filesEvicted"),
+                    "files_failed": body.get("filesFailed"),
+                }
+            )
+        return records
+
+    def finish(self) -> dict[str, Any]:
+        """Read the block maps again and return the snapshot; everything that rests on a failed probe is None."""
+        entries, after = self._read_maps()
+        before = self._before or {}
+        files: dict[str, Any] = {}
+        pair_totals: dict[str, dict[str, Any]] = {}
+        complete = self._before is not None
+        for label in self._files:
+            size = entries[label].value.size if entries[label].ok else None
+            readings = {
+                p: {
+                    "before": _blocks_json(before[label][p]) if label in before else None,
+                    "after": _blocks_json(after[label][p]),
+                }
+                for p in self._providers
+            }
+            usable = label in before and all(before[label][p].ok and after[label][p].ok for p in self._providers)
+            complete = complete and usable
+            pairs = (
+                bytes_by_pair(
+                    {p: merged(before[label][p].value) for p in self._providers},
+                    {p: merged(after[label][p].value) for p in self._providers},
+                )
+                if usable
+                else None
+            )
+            if pairs:
+                for destination, row in pairs.items():
+                    total = pair_totals.setdefault(
+                        destination,
+                        {"gained_bytes": 0, "from": {}, "ambiguous_bytes": 0, "unattributed_bytes": 0, "lost_bytes": 0},
+                    )
+                    for key in ("gained_bytes", "ambiguous_bytes", "unattributed_bytes", "lost_bytes"):
+                        total[key] += row[key]
+                    for source, n in row["from"].items():
+                        total["from"][source] = total["from"].get(source, 0) + n
+            files[label] = {"size": size, "entry": entries[label].to_json(), "providers": readings, "pairs": pairs}
+        transfers = self._transfer_records()
+        complete = complete and all(t["probe_ok"] for t in transfers)
+        return {
+            "version": VERSION,
+            "ok": complete,
+            "providers": list(self._providers),
+            "seconds": None if self._started is None else round(self._now() - self._started, 3),
+            "files": files,
+            "transfers": transfers,
+            "pairs": pair_totals if complete else None,
+        }

@@ -15,6 +15,8 @@ python = "python"               # the interpreter in the agent image that runs t
 sudo = ["sudo", "-n"]           # the privilege command for host steps; [] when the driver runs as root
 earlyoom_comm = "expcore-drv"   # optional: the process name the host's earlyoom is told to spare
 trust_paths = []                # optional: paths in the agent image of CA bundles that must also trust the run's CA
+content_check_file = "dir/f"    # a provisioned file under the space root, read once before a campaign to confirm
+                                # the content type the gate streams on (`precampaign.py`); required with a rest level
 
 [sandbox.images.agent]          # also the gate's image unless [sandbox.images.gate] names another
 name = "image:tag"              # a tag or an id, only ever resolved to the id below
@@ -46,10 +48,11 @@ extra_args = []                 # further oneclient arguments, never one that ch
 
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
 <level> = "rest"
-
-[sandbox.users]                 # the platform users a run may lease, by login name
-<login> = "<Onezone user id>"
 ```
+
+The platform users a run leases are not declared here: a run that needs a data-path token or a tool server leases one
+slot of `[slots.<name>]` (`users.py`), which gives it both planes' users, so there is one pool of leased users. The
+table `[sandbox.users]` of earlier versions is refused at load, with a message that points to `[slots]`.
 """
 
 import itertools
@@ -61,15 +64,14 @@ from pathlib import Path
 from types import MappingProxyType
 
 from expcore.config.loading import ConfigError, Section
-from expcore_onedata.credentials import PLAIN_ID
 from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.hostops import strict_networks
 
 PREFIX_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 NAMESPACE_RE = re.compile(r"[a-z][a-z0-9.-]{0,63}")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
-LEASE_KEY = re.compile(r"[A-Za-z0-9._-]{1,64}")
 COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
+SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under the space root
 TLS_MODES = ("verify", "insecure")
 IO_MODES = ("direct", "proxy")
 FORBIDDEN_ARGS = {"-i", "--insecure"}  # TLS is set by `tls` only
@@ -133,9 +135,9 @@ class SandboxSettings:
     limits: Limits
     mount: MountSettings | None
     data_paths: Mapping[str, DataPathMode]
-    users: Mapping[str, str]
     earlyoom_comm: str | None = None
     trust_paths: tuple[str, ...] = ()
+    content_check_file: str | None = None  # the file the pre-campaign check reads (`precampaign.py`)
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -257,21 +259,15 @@ def _data_paths(section: Section) -> Mapping[str, DataPathMode]:
     return MappingProxyType(out)
 
 
-def _users(section: Section) -> Mapping[str, str]:
-    """Read [sandbox.users]: login name -> Onezone user id. A login is also a lease key, so it is a plain file name."""
-    out = {}
-    for position, login in enumerate(section.data):  # a login is a configured value: it is named by position
-        user_id = _entry_string(section, login, position)
-        if not LEASE_KEY.fullmatch(login):
-            raise section.fail(
-                None, f"entry {position}: a login must be letters, digits, '.', '-' and '_' to serve as a lease key"
-            )
-        if not PLAIN_ID.fullmatch(user_id):
-            raise section.fail(None, f"entry {position}: must be a plain user id of letters, digits and _.@-")
-        out[login] = user_id
-    if len(set(out.values())) != len(out):
-        raise section.fail(None, "two logins have the same user id")
-    return MappingProxyType(out)
+def _space_path(section: Section, key: str) -> str | None:
+    """Read an optional path under the space root: plain names joined by '/', none of them '.' or '..'."""
+    if key not in section.data:
+        return None
+    value = section.data[key]
+    parts = value.split("/") if isinstance(value, str) and value else []
+    if not parts or any(part in (".", "..") or not SPACE_PART.fullmatch(part) for part in parts):
+        raise section.fail(key, "must be a path under the space root: plain names joined by '/', no '.' or '..'")
+    return value
 
 
 def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -293,8 +289,15 @@ def load_sandbox(section: Section, base: Path) -> SandboxSettings:
         "sudo",
         "earlyoom_comm",
         "trust_paths",
+        "content_check_file",
     )
-    section.reject_unknown((*keys, "images", "network", "limits", "mount", "data_paths", "users"))
+    if "users" in section.data:  # one pool of leased users: a second one here would lease a user the slots also hold
+        raise section.fail(
+            "users",
+            "is no longer read: declare the platform users a run leases as [slots.<name>], each with a data_path and "
+            "a toolserver user, so one lease key gives a run both planes' users (C19)",
+        )
+    section.reject_unknown((*keys, "images", "network", "limits", "mount", "data_paths"))
     work_root = (base / section.string("work_root")).resolve()
     prefix = section.optional_string("name_prefix") or "sbx"
     namespace = section.optional_string("label_namespace") or "org.expcore"
@@ -307,6 +310,13 @@ def load_sandbox(section: Section, base: Path) -> SandboxSettings:
     mount = _mount(section.section("mount")) if "mount" in section.data else None
     if DataPathMode.MOUNT in data_paths.values() and (mount is None or oneclient is None):
         raise section.fail("mount", "and [sandbox.images.oneclient] are required when a data path is a mount")
+    check_file = _space_path(section, "content_check_file")
+    if DataPathMode.REST in data_paths.values() and check_file is None:
+        raise section.fail(
+            "content_check_file",
+            "is required when a data path is rest: the provisioned file read before a campaign to confirm the content "
+            "type the data gate streams on",
+        )
     comm = section.optional_string("earlyoom_comm")
     if comm is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,15}", comm):
         raise section.fail("earlyoom_comm", "must be 1 to 15 letters, digits, '_' and '-' (the kernel's comm limit)")
@@ -324,9 +334,9 @@ def load_sandbox(section: Section, base: Path) -> SandboxSettings:
         limits=_limits(section.section("limits")),
         mount=mount,
         data_paths=data_paths,
-        users=_users(section.section("users")) if "users" in section.data else {},
         earlyoom_comm=comm,
         trust_paths=_words(section, "trust_paths", ()),
+        content_check_file=check_file,
     )
 
 
