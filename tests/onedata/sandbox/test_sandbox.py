@@ -595,6 +595,48 @@ def test_o15_c19_a_run_directory_moved_while_mounted_keeps_its_record_and_the_pr
     assert probe.resource_gone(KEY, {}) is True
 
 
+def test_c19_a_mount_record_without_a_full_identity_is_unknown_and_keeps_the_lease_held(world, caplog):
+    """C19: a recorded mount with only a path, an id and a device (no source, no type) cannot be found by its identity
+    wherever it went, so it is unknown: the probe answers not True for its lease, and says why; another lease's answer
+    does not change."""
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    probe = SandboxProbe(world.host, world.s)
+    records = world.s.work_root / "_mounts"
+    records.mkdir(parents=True)
+    assert probe.resource_gone(KEY, {}) is True
+    partial = {"path": "/srv/elsewhere/gone/work", "id": "41", "dev": "0:101"}
+    document = {"sid": f"{KEY}-0123abcd", "lease": KEY, "mounts": [partial]}
+    (records / f"{KEY}-0123abcd.json").write_text(json.dumps(document), encoding="utf-8")
+    with caplog.at_level("ERROR"):
+        assert probe.resource_gone(KEY, {}) is not True
+    assert "full identity" in caplog.text
+    assert probe.resource_gone("login-data2", {}) is True
+
+
+def test_c19_a_start_whose_new_mount_cannot_be_identified_fails_and_its_teardown_proves_the_path_clear(world, caplog):
+    """C19: a mount whose identity could not be read when it was made fails the start; the teardown unmounts it by its
+    path, shows that path clear in the whole table, and only then removes the record, saying so by position, so a
+    failed start does not hold its lease for ever and an unidentified mount is never left out unseen."""
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    original, reads = world.host.read_text, []
+
+    def first_table_unreadable(path):
+        if str(path) == "/proc/self/mountinfo" and not reads:
+            reads.append(path)
+            raise PermissionError(13, "Permission denied")
+        return original(path)
+
+    world.host.read_text = first_table_unreadable
+    with caplog.at_level("ERROR"), pytest.raises(SandboxError, match="identity of a new mount"):
+        start(world, "isolated", lease_key=KEY)
+    assert not world.host.mounts
+    assert not list((world.s.work_root / "_mounts").glob("*.json"))
+    assert "mount 0 of the record had no identity" in caplog.text
+    assert SandboxProbe(world.host, world.s).resource_gone(KEY, {}) is True
+
+
 def test_c19_a_mount_record_the_probe_cannot_read_is_unknown_and_not_proof(world):
     """C19: an unreadable or malformed record, of any lease, keeps every key from being shown gone."""
     from expcore_onedata.sandbox.provider import SandboxProbe

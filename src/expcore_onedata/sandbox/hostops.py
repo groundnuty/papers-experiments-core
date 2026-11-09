@@ -345,13 +345,19 @@ def parse_mountinfo(mountinfo: str) -> list[dict[str, str]]:
     return out
 
 
+IDENTITY_FIELDS = ("id", "dev", "source", "fstype")
+
+
 def mount_identity(mount: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
     """What a mount is wherever it is now (C19): the id the kernel gave it, its device, its source and its file system
     type, as mountinfo shows them (`parse_mountinfo`). Renaming or moving the directory above it changes none of them.
-    None for a recorded mount that has no identity: registered before it was made, and never made."""
-    if not mount.get("id"):
+    None unless all four are there (a source may be empty, as the kernel prints one made without it): a recorded mount
+    registered before it was made, or one recorded with part of its identity, cannot be found by it anywhere."""
+    if any(mount.get(field) is None for field in IDENTITY_FIELDS) or not all(
+        str(mount[field]) for field in ("id", "dev", "fstype")
+    ):
         return None
-    return (str(mount["id"]), str(mount.get("dev")), str(mount.get("source")), str(mount.get("fstype")))
+    return (str(mount["id"]), str(mount["dev"]), str(mount["source"]), str(mount["fstype"]))
 
 
 def mounted_points(mountinfo: str) -> set[str]:

@@ -75,7 +75,7 @@ class _Recorded:
         mounts = [m for r in records for m in r["mounts"]]
         return cls(
             tuple(m["path"] for m in mounts),
-            frozenset(i for m in mounts if (i := mount_identity(m)) is not None),
+            frozenset(i for m in mounts if (i := mount_identity(m)) is not None),  # all of them: the probe checks first
             frozenset(r["sid"] for r in records),
             re.compile(re.escape(key) + r"-[0-9a-f]{8}"),
         )
@@ -125,7 +125,8 @@ class SandboxProbe:
     with its path, in a file under the work
     root (`sandbox.MOUNT_RECORDS`), and the probe matches the table against those records, so a directory that was
     relocated or kept as evidence is still seen. A directory of the lease's sandbox id anywhere in a mount's path counts
-    too. Anything it cannot read or ask, a record included, is False, so the key stays quarantined. It reads and never
+    too. Anything it cannot read or ask, a record included, is False, so the key stays quarantined; so is a recorded
+    mount of the lease without its full identity, which could be anywhere. It reads and never
     removes: the sandbox's own stop, the next start's retry and the orphan reaper remove. While a start thread of the key
     is still running (a cancelled launch that gave up waiting for it) nothing is gone yet, whatever the reads show.
     """
@@ -161,6 +162,10 @@ class SandboxProbe:
         except (OSError, SandboxError):
             return False
         if records is None:
+            return False
+        partial = sum(1 for r in records for m in r["mounts"] if mount_identity(m) is None)
+        if partial:  # never left out: a mount without its identity could be anywhere now, so nothing is shown gone
+            log.error("%d recorded mount(s) of the lease have no full identity (id, device, source, type)", partial)
             return False
         recorded = _Recorded.of(records, key)
         return not any(recorded.owns(m) for m in mounts)
