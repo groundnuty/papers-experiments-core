@@ -187,7 +187,20 @@ def _inflate(data: bytes, label: str, budget: _Budget) -> bytes:
         raise _Exhausted(label)
     limit = min(MAX_STREAM_BYTES, remaining)
     inflater = zlib.decompressobj()
-    out = inflater.decompress(data, limit + 1)
+    try:
+        out = inflater.decompress(data, limit + 1)
+    except zlib.error:
+        # Deflate data whose trailing check fails is a broken stream, refused like one cut short. It is told from data
+        # that is not deflate at all by decompressing without the four-byte trailer: genuine deflate ends exactly there.
+        probe = zlib.decompressobj(-zlib.MAX_WBITS)  # raw deflate, between the two-byte header and the trailer
+        try:
+            partial = probe.decompress(data[2:-4], limit + 1)
+        except zlib.error:
+            partial = b""
+        budget.total += len(partial)
+        if partial and probe.eof and not probe.unused_data:
+            raise _Broken(label, "refused, it fails to decompress (a zlib stream whose check fails)") from None
+        raise
     budget.total += len(out)
     if len(out) > limit:
         if limit < MAX_STREAM_BYTES:
@@ -288,18 +301,30 @@ def _decode_base64(run: str) -> bytes | None:
 
 def _runs(text: str) -> Iterator[tuple[int, str]]:
     """Maximal runs of the base64 alphabet, in one linear pass; a run wrapped over lines (single line breaks, each
-    after a line without padding) is joined into one."""
-    start, parts, end = 0, [], 0
+    after a line without padding) is joined into one. A joined run is also given without its first line and without
+    its first two (a heading such as `Payload` above an encoded block would shift its alignment), so each character is
+    in at most three runs."""
+
+    def flush(parts: list[tuple[int, str]]) -> Iterator[tuple[int, str]]:
+        yield parts[0][0], "".join(part for _, part in parts)
+        # Without one or two heading lines: a line is a heading only when its length differs from the line after it,
+        # since the lines of a wrapped block are all one width, so a plain wrapped block is decoded once.
+        for skip in (1, 2):
+            if len(parts) > skip and len(parts[skip - 1][1]) != len(parts[skip][1]):
+                yield parts[skip][0], "".join(part for _, part in parts[skip:])
+
+    parts: list[tuple[int, str]] = []
+    end = 0
     for match in _SEGMENT.finditer(text):
-        if parts and not parts[-1].endswith("=") and _LINE_BREAK.fullmatch(text, end, match.start()):
-            parts.append(match.group(0))
+        if parts and not parts[-1][1].endswith("=") and _LINE_BREAK.fullmatch(text, end, match.start()):
+            parts.append((match.start(), match.group(0)))
         else:
             if parts:
-                yield start, "".join(parts)
-            start, parts = match.start(), [match.group(0)]
+                yield from flush(parts)
+            parts = [(match.start(), match.group(0))]
         end = match.end()
     if parts:
-        yield start, "".join(parts)
+        yield from flush(parts)
 
 
 def payloads(text: str) -> Iterator[tuple[str, bytes, bool]]:
@@ -362,7 +387,8 @@ def _walk_decoded(label: str, data: bytes, depth: int, budget: _Budget, *, stric
     compression = _compression(data)
     if compression == "gzip" and data[2:3] != b"\x08":  # a gzip header names deflate; two bytes alone are chance
         compression = None
-    archive = compression is not None or data.startswith(_ZIP) or _is_tar(data)
+    # an encoded SQLite database is opened as one, like a file: its compressed or escaped values are read
+    archive = compression is not None or data.startswith(_ZIP) or data.startswith(_SQLITE) or _is_tar(data)
     if not archive and not _zlib(data):
         yield Stream(label, data, BYTES)
         return

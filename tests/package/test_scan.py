@@ -369,3 +369,24 @@ def test_k03_a_decoded_run_that_is_text_is_read_as_text_and_never_refused_for_a_
     sentence = b"%PDF- is the standard PDF header that every PDF file starts with, by convention."
     assert found({"notes.md": b"Encoded: " + b64(sentence) + b"\n"}) == []
     assert found({"notes.md": b"Encoded: " + b64(sentence + b" " + TEXT) + b"\n"})
+
+
+def test_k03_a_zlib_stream_whose_check_fails_refuses_the_file():
+    """K03: deflate data whose trailing check fails is a broken stream, refused like one cut short; it is told from
+    data that is not deflate at all because genuine deflate ends exactly before its four-byte trailer."""
+    broken = bytearray(zlib.compress(TEXT))
+    broken[-1] ^= 1
+    refused({"record.json": b'{"blob": "' + b64(bytes(broken)) + b'"}\n'}, "check fails")
+
+
+def test_k03_an_encoded_sqlite_database_is_opened_as_one(tmp_path):
+    """K03: a base64-exported SQLite database is opened like a file, so a compressed BLOB inside it is read."""
+    database = sqlite_with(tmp_path / "exported.sqlite", zlib.compress(TEXT))
+    assert found({"export.txt": base64.encodebytes(database)})
+
+
+def test_k03_a_heading_above_an_encoded_block_does_not_hide_it():
+    """K03: a heading line joined to the base64 block below it shifts its alignment, so a joined run is also decoded
+    without its first line and line by line."""
+    assert found({"attachment.txt": b"Payload\n" + base64.b64encode(zlib.compress(TEXT))})
+    assert found({"attachment.txt": b"Payload\n" + base64.encodebytes(zlib.compress(TEXT * 8))})
