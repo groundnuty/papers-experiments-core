@@ -200,9 +200,12 @@ def test_an_anonymised_package_hides_the_names_in_its_prose_and_still_passes_its
     assert verify_package(unpacked) == []
 
 
-def test_k03_an_anonymisation_list_in_the_studys_repository_refuses_the_build(campaign, hashes, repo, tmp_path):
+def test_k03_an_anonymisation_list_in_the_studys_repository_refuses_the_build(
+    campaign, hashes, repo, tmp_path, monkeypatch
+):
     """K03: the private list never enters the repository or the output: a list anywhere in the repository that holds
     the study, not only in the study's own directory, refuses the build before anything is written."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))  # no repository above this test's directory
     root = copy_campaign(campaign, repo.path / "studies", "study").root
     listed = anonymisation(repo.path / "anon.toml", {AUTHOR: "Author A"})
     with pytest.raises(PackageError, match="K03"):
