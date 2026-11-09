@@ -107,6 +107,22 @@ def test_c06_changing_any_fingerprinted_input_refuses_the_resume(tmp_path, label
     assert state_of(again) == before
 
 
+def test_c06_a_resume_under_another_platform_tls_mode_is_refused_growth_allowed_or_not(tmp_path):
+    """C06: a campaign started with one TLS mode of its platform does not resume under another, nor under another CA
+    bundle, nor without the platform's settings; the store is left as it was, and the same mode resumes."""
+    verify = {"tls": {"mode": "verify"}}
+    store, _ = start(tmp_path, platform=verify)
+    before = state_of(store)
+    store.close()
+    for other in ({"tls": {"mode": "insecure"}}, {"tls": {"mode": "ca_file", "ca_sha256": sha("bundle")}}, None):
+        with pytest.raises(FingerprintMismatch) as caught:
+            start(tmp_path, platform=other, allow_growth=True)
+        assert caught.value.differences
+        assert all(line.startswith("platform.tls") for line in caught.value.differences)
+    again, _ = start(tmp_path, platform=verify)
+    assert state_of(again) == before
+
+
 def test_c06_a_condition_that_changed_is_a_different_experiment(tmp_path):
     """C06: the conditions are part of the experiment."""
     schema = make_schema()

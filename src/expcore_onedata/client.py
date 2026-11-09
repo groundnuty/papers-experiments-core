@@ -260,9 +260,12 @@ class OnezoneClient:
         environ: Mapping[str, str] | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> None:
-        """Build the client; the admin credential comes from `admin_token` or else from the configured source."""
+        """Build the client; the admin credential comes from `admin_token` or else from the configured source.
+
+        The client it builds checks certificates as the platform's `[tls]` says (`tls.py`): its own default CAs, the
+        configured CA bundle alone, or not at all. An injected `http` is the caller's, with its own TLS."""
         self._config = config
-        self._http = http if http is not None else httpx.Client(timeout=timeout_s)
+        self._http = http if http is not None else httpx.Client(timeout=timeout_s, verify=config.tls.client_verify())
         self._owns_http = http is None
         self._timeout_s = timeout_s
         self._environ = environ

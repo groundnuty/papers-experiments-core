@@ -104,6 +104,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
         tools=plugin.tools,
         scorer_digest=plugin.scorer_digest(),
         configs=study.config_sha256,
+        platform=plugin.platform,
     )
 
 

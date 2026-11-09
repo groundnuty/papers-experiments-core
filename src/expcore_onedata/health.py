@@ -27,6 +27,10 @@ check keeps that verdict for the campaign, since a type once answered does not c
 not be measured, answers every call after it with its detail, so the gate stays closed and no run is admitted; a pass
 lets every call answer as the space check does. With no REST data path nothing is read. The composition is
 `precampaign.PreCampaignHealth`, built here, so a study that uses this check cannot leave the measurement out.
+
+**While `[tls] insecure_tls` is on, every reading warns** that no client of the federation checks its certificate, a
+setting for disposable test federations only (`tls.py`). The warning is appended to the detail, so the campaign's
+health record and day-0's report carry it; it does not change the verdict.
 """
 
 import re
@@ -40,6 +44,7 @@ from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, read_space
 from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
+from expcore_onedata.tls import WARNING
 from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import MintedToken, TokenIssuer, data_path_spec
 
@@ -132,11 +137,17 @@ class PlatformHealth:
             return token
 
     def __call__(self) -> Health:
-        """Return the platform's health: the content type kept from the first call, then the space; never raise."""
+        """Return the platform's health: the content type kept from the first call, then the space; never raise.
+
+        While `[tls] insecure_tls` is on, every reading, healthy or not, ends with a warning that no client of the
+        federation checks its certificate (`tls.WARNING`); the verdict is unchanged."""
         try:
-            return self._gate()
+            verdict = self._gate()
         except Exception as error:
-            return Health(False, f"health check raised {type(error).__name__}")
+            verdict = Health(False, f"health check raised {type(error).__name__}")
+        if self._config.tls.insecure:
+            return Health(verdict.ok, f"{verdict.detail}; {WARNING}")
+        return verdict
 
     def _space(self) -> Health:
         """The space as Onezone reports it, against the declared support set; never raise."""

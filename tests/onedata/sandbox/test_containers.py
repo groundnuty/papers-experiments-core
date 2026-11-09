@@ -6,6 +6,7 @@ import pytest
 
 from expcore_onedata.sandbox import containers as C
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.tls import TlsSettings
 
 LABELS = ["--label", "org.test.sandbox=1"]
 
@@ -100,7 +101,7 @@ def test_o05_the_gate_takes_the_token_by_name_and_it_is_the_name_the_gate_reads(
 
 def test_the_sidecar_command_sets_tls_from_the_settings_alone(s):
     assert "--insecure" not in C.sidecar_command("p.test", s)
-    insecure = s.__class__(**{**s.__dict__, "mount": s.mount.__class__("/data", "insecure")})
+    insecure = s.__class__(**{**s.__dict__, "tls": TlsSettings(insecure=True)})
     command = C.sidecar_command("p.test", insecure)
     assert command.count("--insecure") == 1
     assert command[:2] == ["-u", "ONECLIENT_INSECURE"]  # the image's own skip-verification flag is removed

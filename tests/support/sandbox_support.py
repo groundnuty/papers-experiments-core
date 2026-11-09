@@ -72,7 +72,7 @@ def sandbox_data() -> dict[str, Any]:
             "shm_bytes": 1 << 26,
             "work_disk_bytes": 1 << 28,
         },
-        "mount": {"path": MOUNT_PATH, "tls": "verify"},
+        "mount": {"path": MOUNT_PATH},
         "data_paths": dict(LEVELS),
         "content_check_file": CHECK_FILE,
     }

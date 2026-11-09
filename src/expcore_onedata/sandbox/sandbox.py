@@ -39,6 +39,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from expcore.config.loading import ConfigError
+from expcore_onedata import tls
 from expcore_onedata.sandbox import gatelog, hostops, netpool
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
@@ -48,6 +50,7 @@ from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
     ENV_ACCESS_TOKEN,
     ENV_GATE_TOKEN,
+    GATE_CA_PATH,
     ONECLIENT_LOG_DIR,
     Names,
     agent_run_args,
@@ -108,7 +111,12 @@ class DockerSandbox:
         self._containers: list[str] = []
         self._net: str | None = None
         self._watched: dict[str, dict[str, Any]] = {}
-        self._meta: dict[str, Any] = {"run_key": spec.run_key, "data_path": spec.mode.value, "images": {}}
+        self._meta: dict[str, Any] = {
+            "run_key": spec.run_key,
+            "data_path": spec.mode.value,
+            "images": {},
+            "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
+        }
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
         self._stopped, self._stop_lock = True, threading.Lock()
@@ -118,6 +126,8 @@ class DockerSandbox:
         self._created, self._created_lock = 0, threading.Lock()  # counts what was registered; a stop compares it
         self._sampler_stop = threading.Event()
         self._cells: CellRunner | None = None
+        self._ca_bytes: bytes | None = None  # the verified bytes of the platform's CA bundle, when a data path takes it
+        self._ca_copy: Path | None = None  # the run's own read-only copy of them, which the containers mount
         self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
         self._uptime0: float | None = None
@@ -180,6 +190,11 @@ class DockerSandbox:
             raise StartRefused("a REST data path needs the zone")
         if sp.mode is DataPathMode.MOUNT and (s.mount is None or s.oneclient is None):
             raise StartRefused("a mount data path needs [sandbox.mount] and the oneclient image")
+        if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
+            try:  # the bytes the record names by their hash, read once: the containers get these and never the path
+                self._ca_bytes = s.tls.bundle()
+            except ConfigError as error:
+                raise StartRefused(str(error)) from None
 
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
@@ -215,6 +230,8 @@ class DockerSandbox:
         self._write_mount_record()  # before anything exists: a mount is never made that the probe cannot be told of
         self._register_creation()
         self.dir.mkdir(parents=True, exist_ok=False)
+        if self._ca_bytes is not None:  # written once, from the bytes that were hashed, before any container exists
+            self._ca_copy = tls.write_private_copy(self._ca_bytes, self.dir)
         self._started = time.time()
         self._meta.update(host=self.host.host_facts(), started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         work = self.dir / "work"
@@ -261,13 +278,16 @@ class DockerSandbox:
         (self.dir / "gatelog").chmod(0o777)  # the gate runs as root without DAC_OVERRIDE
         (self.dir / "gatelog" / "requests.jsonl").touch()  # there from the start: a log that is missing is unreadable
         (self.dir / "gatelog" / "requests.jsonl").chmod(0o666)
+        check = self.s.tls  # the platform's [tls]: the gate's upstream checks the federation's certificate as it says
         config = {
             "run_key": self.spec.run_key,
-            "verify_ssl": True,
+            "verify_ssl": not check.insecure,
             "log": "/var/gate/requests.jsonl",
             "tls_dir": "/etc/gate/tls",
             "hosts": hosts,
         }
+        if self._ca_copy is not None:
+            config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only
         (self.dir / "gate.json").write_text(json.dumps(config), encoding="utf-8")
 
     def _pool_position(self, subnet: str) -> int | None:
@@ -381,7 +401,7 @@ class DockerSandbox:
         self._register_container(
             names.gate
         )  # registered before it is created: an interrupt cannot leave one `stop` misses
-        args = gate_run_args(s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id)
+        args = gate_run_args(s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id, ca_copy=self._ca_copy)
         self.host.docker(
             *args, env={ENV_GATE_TOKEN: self.spec.token.reveal()}
         )  # the gate holds the token, not the agent
@@ -417,14 +437,13 @@ class DockerSandbox:
         host_name = sp.provider.host
         command = sidecar_command(host_name, s)
         self._log_dir = effective_log_dir(command)
-        self._meta["mount"] = {  # the keys that set it, never a path (O12)
-            "tls": s.mount.tls,
+        self._meta["mount"] = {  # the keys that set it, never a path (O12); its TLS is the run's `tls`
             "io_mode": s.mount.io_mode,
             "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != ONECLIENT_LOG_DIR else "default",
         }
         self._register_container(names.sidecar)
         t0 = time.monotonic()
-        args = sidecar_run_args(s, names, self._label_args(), share, s.oneclient.id, host_name)
+        args = sidecar_run_args(s, names, self._label_args(), share, s.oneclient.id, host_name, ca_copy=self._ca_copy)
         self.host.docker(*args, env={ENV_ACCESS_TOKEN: sp.token.reveal()})
         deadline = time.monotonic() + MOUNT_WAIT_S
         while not hostops.is_fuse_mounted(self.host.read_text("/proc/self/mountinfo"), str(share)):
@@ -788,6 +807,10 @@ class DockerSandbox:
             )
             return
         if self.keep_evidence:  # the copy failed: the disks hold the only record of the run
+            if self._ca_copy is not None:  # the CA bundle is configuration, not evidence: it is never kept with the run
+                self._step(errors, lambda: self.host.run(["rm", "-f", str(self._ca_copy)], 20, sudo=True))
+                if self._ca_copy.exists():
+                    errors.append("the run's copy of the CA bundle could not be removed before the evidence was kept")
             kept = self.s.work_root / "_kept_evidence"
             self._step(errors, lambda: self.host.run(["mkdir", "-p", str(kept)], 20, sudo=True))
             self._step(errors, lambda: self.host.run(["mv", str(self.dir), str(kept / self.sid)], 60, sudo=True))

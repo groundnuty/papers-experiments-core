@@ -45,11 +45,14 @@ user_id = "..."                 # the id Onezone gives the user: its privileges,
 [principals.toolserver]         # likewise; never the same user as data_path
 [principals.service]            # likewise; the health check's own user
 
+[tls]                           # optional: the certificate check of every client of the federation (tls.py)
+ca_file = "federation-ca.pem"   # a CA bundle the federation's certificate chains to; verification stays on
+insecure_tls = true             # or: verification off, for a disposable test federation only; never both
+
 [toolserver]
 command = "path/to/executable"
 args = []
 start_timeout_s = 120
-insecure_tls = false            # optional: the server accepts a certificate it cannot verify
 clone = "path"                  # optional, with commit: the checkout the server runs from, verified clean
 commit = "..."
 
@@ -74,12 +77,14 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.rights import BASELINE_RIGHTS, KNOWN_RIGHTS, declares_write
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
+from expcore_onedata.tls import TlsSettings, load_tls, moved
 
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
@@ -172,7 +177,6 @@ class ToolServer:
     start_timeout_s: float
     clone: Path | None
     commit: str | None
-    insecure_tls: bool = False
     conditions: Mapping[str, Condition] = field(default_factory=dict)
 
 
@@ -192,6 +196,7 @@ class PlatformConfig:
     toolserver: ToolServer | None
     sandbox: SandboxSettings | None = None
     sha256: str = ""  # of the file as loaded: a record names the configuration by this, never by a value in it
+    tls: TlsSettings = field(default_factory=TlsSettings)  # every client's one certificate check (`[tls]`)
 
     @property
     def local_provider(self) -> Provider:
@@ -206,6 +211,12 @@ class PlatformConfig:
         """Name several declared providers, in the file's order, joined for a message."""
         order = list(self.providers)
         return ", ".join(self.provider_label(n) for n in sorted(set(names), key=order.index))
+
+    def fingerprint(self) -> dict[str, Any]:
+        """The platform's half of the campaign fingerprint (`StudyPlugin.platform`): what a resume must not change.
+
+        It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12)."""
+        return {"tls": self.tls.record()}
 
     def condition_label(self, name: str) -> str:
         """Name a declared condition for a message by its position in the file, `conditions[i]`, never by its name."""
@@ -259,14 +270,6 @@ def _number(section: Section, key: str, default: float, *, minimum: float, integ
     if isinstance(value, bool) or not isinstance(value, kind) or not math.isfinite(value) or value < minimum:
         noun = "an integer" if integer else "a number"
         raise section.fail(key, f"must be {noun} of at least {minimum:g}")
-    return value
-
-
-def _boolean(section: Section, key: str) -> bool:
-    """Read an optional boolean that defaults to false."""
-    value = section.data.get(key, False)
-    if not isinstance(value, bool):
-        raise section.fail(key, "must be true or false")
     return value
 
 
@@ -424,7 +427,9 @@ def _condition(name: str, section: Section, base: Path) -> Condition:
 
 def _toolserver(section: Section, base: Path) -> ToolServer:
     """Read [toolserver] and its conditions."""
-    section.reject_unknown(("command", "args", "start_timeout_s", "insecure_tls", "clone", "commit", "conditions"))
+    if "insecure_tls" in section.data:
+        raise moved(section, "insecure_tls")
+    section.reject_unknown(("command", "args", "start_timeout_s", "clone", "commit", "conditions"))
     clone, commit = section.optional_string("clone"), section.optional_string("commit")
     if (clone is None) != (commit is None):
         raise section.fail("commit" if commit is None else "clone", "is needed beside the other: both or neither")
@@ -437,7 +442,6 @@ def _toolserver(section: Section, base: Path) -> ToolServer:
         float(_number(section, "start_timeout_s", 120.0, minimum=1)),
         (base / clone).resolve() if clone else None,
         commit,
-        _boolean(section, "insecure_tls"),
         MappingProxyType(
             {n: _condition(n, _entry(conditions, index, n), base) for index, n in enumerate(conditions.data)}
         ),
@@ -471,6 +475,7 @@ def load_platform(
             "tokens",
             "principals",
             "toolserver",
+            "tls",
             "sandbox",
             "placement",  # read by rangemap.load_placement
             "slots",  # read by users.load_slots
@@ -483,6 +488,7 @@ def load_platform(
     credentials.reject_unknown(("admin", "users"))
     users = _user_credentials(credentials.section("users"), file.parent) if "users" in credentials.data else None
     principals = _principals(Section(root.table("principals"), file, "[principals]"))
+    tls = load_tls(Section(root.table("tls"), file, "[tls]"), file.parent)
     if require_secrets:
         _check_fixed_users(users, principals, file, environ)
     return PlatformConfig(
@@ -496,8 +502,9 @@ def load_platform(
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),
         principals=principals,
         toolserver=_toolserver(root.section("toolserver"), file.parent) if "toolserver" in root.data else None,
-        sandbox=load_sandbox(Section(root.table("sandbox"), file, "[sandbox]"), file.parent)
+        sandbox=load_sandbox(Section(root.table("sandbox"), file, "[sandbox]"), file.parent, tls=tls)
         if "sandbox" in root.data
         else None,
         sha256=digest,
+        tls=tls,
     )

@@ -140,6 +140,32 @@ CHANGES = {
 }
 
 
+def test_c06_a_platforms_settings_are_a_section_of_the_fingerprint_that_a_resume_cannot_change():
+    """C06: the settings a platform says make two starts one experiment (its TLS mode, say) go in as plain data when
+    the plugin gives them; a change, adding or dropping them included, is refused and never growth, and a plugin that
+    gives none leaves the fingerprint as it was."""
+    schema = make_schema()
+    plain = make_fingerprint(schema)
+    assert "platform" not in plain
+    assert make_fingerprint(schema, platform={}) == plain
+    verify = make_fingerprint(schema, platform={"tls": {"mode": "verify"}})
+    assert verify["platform"] == {"tls": {"mode": "verify"}}
+    assert compare_fingerprints(verify, make_fingerprint(schema, platform={"tls": {"mode": "verify"}})).same
+    others = (
+        plain,
+        make_fingerprint(schema, platform={"tls": {"mode": "insecure"}}),
+        make_fingerprint(schema, platform={"tls": {"mode": "ca_file", "ca_sha256": sha("a bundle")}}),
+    )
+    for other in others:
+        for recorded, now in ((verify, other), (other, verify)):
+            comparison = compare_fingerprints(recorded, now)
+            assert comparison.refused
+            assert not comparison.grown
+            assert all(line.startswith("platform.tls") for line in comparison.refused)
+    with pytest.raises(PlanError, match="not plain data"):
+        make_fingerprint(schema, platform={"tls": object()})
+
+
 @pytest.mark.parametrize("label", CHANGES)
 def test_c06_changing_any_fingerprinted_input_is_refused(label):
     """C06: changing any fingerprinted input refuses the resume."""
