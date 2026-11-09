@@ -206,14 +206,14 @@ Implementer must guarantee:
 
 ## HealthCheck
 
-`expcore.campaign.healthgate.HealthCheck`; `Health` is a named tuple `(ok: bool, detail: str)`.
+`expcore.campaign.healthgate.HealthCheck`; `Health` is a named tuple `(ok: bool, detail: str, deferred: bool = False)`.
 
 ```python
 class HealthCheck(Protocol):
     def __call__(self) -> Health
 ```
 
-Core guarantees: it is asked before an attempt starts and after it ends, and again at an interval while the gate is closed. A check that raises, or answers anything other than a `Health` (or an `(ok, detail)` pair with a real boolean), counts as a failed check, never as a pass or a crash. A failed pre-run check closes the gate, holds dispatch, and the run that found it is recorded as the outage's attempt, an infrastructure failure of `SchedulerConfig.health_kind` (C11). A failed post-run check turns an attempt that would have been scored into an infrastructure failure of that kind, or discards it as the open outage's.
+Core guarantees: it is asked before an attempt starts and after it ends, and again at an interval while the gate is closed. A check that raises, or answers anything other than a `Health` (or an `(ok, detail)` pair with a real boolean), counts as a failed check, never as a pass or a crash. A failed pre-run check closes the gate, holds dispatch, and the run that found it is recorded as the outage's attempt, an infrastructure failure of `SchedulerConfig.health_kind` (C11). A failed post-run check turns an attempt that would have been scored into an infrastructure failure of that kind, or discards it as the open outage's. A deferred check (`Health(False, detail, deferred=True)`: the platform is held on purpose, by a run, and could not be looked at now) is a wait, never a pass or an outage: a deferred pre-run check holds its run for `recheck_s` without closing the gate or charging an attempt (event `run_deferred`), a deferred post-run check leaves the outcome standing (event `post_run_check_deferred`), and only a passing check opens a closed gate.
 
 Implementer must guarantee: it is quick (bounded by `health_timeout_s`), side-effect free, and `detail` holds no secret. `health_kind` must not be a kind any condition declares as its treatment. Each infrastructure kind is treatable or not: `tool_plane_integrity` and any kind a platform registers with `treatable=False` cannot be declared in `infrastructure_is_treatment`, and the factor schema refuses to load a condition that does, naming the file and the key; the scheduler refuses, at its start, a campaign whose health or identity kind a condition declares.
 

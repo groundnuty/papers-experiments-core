@@ -29,6 +29,13 @@ began after the gate closed, or was in flight as it closed) is retried without t
 tokens as an outage-discarded attempt, and the outage's record counts it (`discarded`, `discarded_input_tokens`,
 `discarded_output_tokens`, `discarded_usage_unknown`). The definition is by order, with no clock window. A failed
 post-run check that returns while the gate is still open does not close it; the next pre-run check that fails does.
+
+**A deferred check is a wait, not a failure.** A platform answers `Health(False, detail, deferred=True)` when it could
+not look now for a reason that is no fault: a run holds the platform on purpose (an outage run of the study holds the
+federation, and the check's bounded wait for it ran out). A deferral is never a pass and never an outage: a deferred
+pre-run check holds its run (`defer`) without closing the gate, recording an outage or charging an attempt, and the
+run is tried again after `recheck_s`; a deferred post-run check says nothing about the finished run, whose outcome
+stands; and the dispatcher's own check keeps a closed gate closed while it is deferred, since only a pass opens it.
 """
 
 import contextlib
@@ -44,15 +51,17 @@ from expcore.campaign.store import Store
 META = "health_outages"
 HOW_PASSED = "check_passed"  # the dispatcher's own health check passed: dispatch resumed by itself
 KEEP = 200  # the newest this many outages are kept
-GO, HOLD, FOUND = "go", "hold", "found"  # what a pre-run check lets a run do
+GO, HOLD, FOUND, DEFER = "go", "hold", "found", "defer"  # what a pre-run check lets a run do
 UNREADABLE_DETAIL = "the stored outage record was unreadable"
 
 
 class Health(NamedTuple):
-    """One reading of the platform: whether it is healthy, and in what words."""
+    """One reading of the platform: whether it is healthy, in what words, and whether the reading was deferred (the
+    platform is held on purpose and could not be looked at now; never ok, see the module docstring)."""
 
     ok: bool
     detail: str
+    deferred: bool = False
 
 
 class HealthCheck(Protocol):
@@ -65,11 +74,14 @@ class HealthCheck(Protocol):
 
 def read_health(check: Callable[[], Any]) -> Health:
     """Run a check and return what it said. One that raises, or answers something other than a `Health` or an
-    (ok, detail) pair with a real boolean, is a failed check, never a crash and never a pass."""
+    (ok, detail) pair with a real boolean, is a failed check, never a crash and never a pass. A deferred `Health` stays
+    deferred and is never ok, whatever its `ok` says."""
     try:
         answer = check()
     except Exception as error:
         return Health(False, f"health check raised {type(error).__name__}")
+    if isinstance(answer, Health) and isinstance(answer.ok, bool) and isinstance(answer.deferred, bool):
+        return Health(answer.ok and not answer.deferred, str(answer.detail), answer.deferred)
     if isinstance(answer, tuple | list) and len(answer) == 2 and isinstance(answer[0], bool):
         return Health(answer[0], str(answer[1]))
     return Health(False, f"health check answered {str(answer)[:80]!r}, not (ok, detail)")
@@ -130,7 +142,8 @@ def alarms(state: dict[str, Any], every_s: float) -> list[str]:
 
 @dataclass(frozen=True)
 class PreRun:
-    """What a pre-run check lets the run do: `go`, `hold` (stay pending, charge nothing) or `found` (this run found a
+    """What a pre-run check lets the run do: `go`, `hold` (stay pending, charge nothing), `defer` (the check was
+    deferred: stay pending, charge nothing, try again after `recheck_s`, the gate left open) or `found` (this run found a
     new outage and is charged its one attempt)."""
 
     verdict: str
@@ -280,8 +293,8 @@ class HealthGate:
 
     def before_run(self, run_key: str) -> PreRun:
         """Check before an attempt. A closed gate holds the run without a check; a passing check lets it go unless the
-        gate closed while the check was out; a failing check closes the gate and charges this run, or, if another run
-        closed it first, holds this one."""
+        gate closed while the check was out; a deferred check defers the run and leaves the gate as it is; a failing
+        check closes the gate and charges this run, or, if another run closed it first, holds this one."""
         if self._open is not None:
             return PreRun(HOLD, "the gate is closed")
         if self._stop is not None and self._stop.is_set():
@@ -295,6 +308,8 @@ class HealthGate:
             return PreRun(HOLD, "the gate closed while this check was out")
         if health.ok:
             return PreRun(GO, health.detail)
+        if health.deferred:
+            return PreRun(DEFER, health.detail)  # a wait, not a failure: nothing is closed or charged
         if not self._close(run_key, health.detail):
             return PreRun(HOLD, "another run's failed check closed the gate first")
         return PreRun(FOUND, health.detail)

@@ -45,7 +45,7 @@ from expcore.campaign.executor import (
 )
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.harness_stop import HarnessStops, kind_of
-from expcore.campaign.healthgate import FOUND, HOLD, HealthGate
+from expcore.campaign.healthgate import DEFER, FOUND, HOLD, HealthGate
 from expcore.campaign.holds import Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import Lease, LeaseCancelled, LeasePool, LeaseRefused
@@ -111,6 +111,9 @@ class AttemptRunner:
             pre = p.health.before_run(key)
             if pre.verdict == HOLD:
                 return 0.0  # nothing is tried, charged or recorded; the gate holds dispatch
+            if pre.verdict == DEFER:  # the platform is held on purpose: a wait, so nothing is tried or charged
+                p.store.event(p.stamp(), "run_deferred", factors["model"], f"{key}: {pre.detail}; no attempt used")
+                return p.settings.recheck_s
             if pre.verdict == FOUND:
                 return self._charge_outage(row, factors, pre.detail)
         timer = p.agent_config.timer(p.monotonic)
@@ -268,7 +271,10 @@ class AttemptRunner:
         p = self.p
         if p.health is not None:
             health, outage = p.health.after_run()
-            if not health.ok and outage is not None:
+            if health.deferred:  # the platform was held after the run ended: nothing is said of the run
+                text = f"{key}: {health.detail}; the outcome stands"
+                p.store.event(p.stamp(), "post_run_check_deferred", model, text)
+            elif not health.ok and outage is not None:
                 result = dataclasses.replace(result, outage_kind=p.settings.health_kind)  # the outage's, set aside
                 p.health.note_discard(outage, result.input_tokens, result.output_tokens)
             elif not health.ok and not result.outcome.set_aside:

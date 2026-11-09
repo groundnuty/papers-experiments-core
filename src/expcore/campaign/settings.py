@@ -22,7 +22,8 @@ class SchedulerConfig:
     - `health_kind`: the infrastructure kind a failed health check is charged as (C11); `identity_kind`: the kind of a
       run whose endpoint changed its served identity (C16). Neither may be a kind any condition declares as its
       treatment, because a run that never started, or that the wrong endpoint served, must not be scored as its fault.
-    - `recheck_s`, `health_timeout_s`: how often the closed gate is checked, and how long a check may take.
+    - `recheck_s`, `health_timeout_s`: how often the closed gate is checked (and how long a run whose check was
+      deferred waits before it is tried again), and how long a check may take.
     - `lease_timeout_s`: how long a run waits for a lease before it is left unstarted; None: for ever.
     - `harness_stop`, `budget`: the harness-error stops (C10) and the budget gate (C12); no budget runs without one.
     - `exit_when_blocked`: `run` returns, instead of waiting, when nothing is in flight and every pending run is
