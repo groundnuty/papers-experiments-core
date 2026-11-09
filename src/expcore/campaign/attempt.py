@@ -14,7 +14,8 @@ The order is fixed, and each step is decided by what a kill at that point must l
 3a. the platform's **run admission**, when it has one (`Parts.admission`): it holds a shared resource for the run, may
    wait for it before anything starts (outside the agent's clock), and is left only after the post-run check and the
    store's record, so what the post-run check sees is what the run left; refused (`InfraError`), the run is left
-   unstarted and uses no attempt;
+   unstarted and uses no attempt. Its wait can be long too, so once admitted the run **looks at the gates again**, as
+   after its lease: if one is closed now the admission is let go and the run stays pending, uncharged;
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`;
 6. the post-run health check and the served-identity check, which can turn the result into infrastructure (C11, C16);
@@ -140,6 +141,10 @@ class AttemptRunner:
             with self._admitted(row, factors) as admitted:
                 if not admitted:
                     return p.settings.retry_delay_s  # left unstarted: no attempt row exists, so none is used
+                hold = p.recheck(row) if p.admission is not None else None  # the wait may have been long: look again
+                if hold is not None:
+                    self._leave_unstarted(row, factors, hold, waited_for="the platform's admission")
+                    return 0.0  # leaving the block lets the admission go; the hold decides when it may start
                 launched = True
                 return self._attempt(row, factors, timer, lease)
         finally:
@@ -202,15 +207,19 @@ class AttemptRunner:
                 return
             yield True
 
-    def _leave_unstarted(self, row: Any, factors: Mapping[str, Any], hold: Hold) -> None:
-        """Say that a run which got its lease was held after all: nothing started, no attempt used (C11, C17)."""
+    def _leave_unstarted(
+        self, row: Any, factors: Mapping[str, Any], hold: Hold, *, waited_for: str = "its lease"
+    ) -> None:
+        """Say that a run which got its lease (or its admission) was held after all: nothing started, no attempt used
+        (C11, C17)."""
         key = row["run_key"]
+        released = "lease" if waited_for == "its lease" else "admission"
         self.p.store.event(
             self.p.stamp(),
             "run_unstarted",
             factors["model"],
-            f"{key}: a {hold.kind} hold began while it waited for its lease; the lease is released, no attempt used: "
-            f"{hold.reason}",
+            f"{key}: a {hold.kind} hold began while it waited for {waited_for}; the {released} is released, no attempt "
+            f"used: {hold.reason}",
         )
 
     def _begin(self, row: Any, lease: Lease | None = None) -> tuple[Any, Path]:

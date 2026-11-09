@@ -1,7 +1,10 @@
 """The gates around an attempt, through the scheduler: harness stops, health, budgets, units, identity, leases."""
 
+import asyncio
+import contextlib
 import json
 import os
+import threading
 
 import pytest
 from campaign_support import NOW, make_schema
@@ -132,6 +135,43 @@ def test_c11_an_unreadable_gate_state_at_restart_opens_closed_and_blocks_dispatc
         assert scheduler.run().statuses == {"done": 3}
         assert "health_gate_record_unreadable" in event_kinds(scheduler.store)
         assert "health_gate_opened" in event_kinds(scheduler.store)
+
+
+class OneAtATime:
+    """A run admission that lets one run in at a time, and notes when a second run waits for it."""
+
+    def __init__(self):
+        self.lock, self.waiting = threading.Lock(), threading.Event()
+
+    @contextlib.contextmanager
+    def __call__(self, treatment_kinds, treatment_targets, cancel):
+        if not self.lock.acquire(blocking=False):
+            self.waiting.set()
+            self.lock.acquire()
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+
+def test_c10_a_run_that_waited_for_admission_does_not_start_once_a_harness_stop_began_meanwhile(tmp_path):
+    """C10, C17: run B waits for the platform's admission while run A holds it; A ends with a harness defect that
+    stops dispatch of the model. B, admitted after it, looks at the gates again: it never starts and uses no attempt."""
+    admission = OneAtATime()
+
+    async def defect_once_the_other_waits(request):
+        assert await asyncio.to_thread(admission.waiting.wait, 10), "the other run never waited for admission"
+        raise ValueError("a crash in our own code")
+
+    executor = FakeExecutor(default=defect_once_the_other_waits)
+    settings = settings_for(workers=2, harness_stop=HarnessStopConfig(stop_after=1, models_stop=1))
+    with build(tmp_path, executor=executor, settings=settings, plan=SMALL, admission=admission) as scheduler:
+        scheduler.run()
+        kinds = event_kinds(scheduler.store)
+        attempts = scheduler.store.q("SELECT state FROM attempts")
+    assert len(executor.requests) == 1  # B never started
+    assert [r["state"] for r in attempts] == ["harness_error"]
+    assert "run_unstarted" in kinds
 
 
 # --- C12 and C13: the budget ------------------------------------------------------------------------------------------
