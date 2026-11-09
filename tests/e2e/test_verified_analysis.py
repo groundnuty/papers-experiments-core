@@ -75,6 +75,75 @@ def table_row(report: str, heading: str, first_cell: str) -> list[str]:
     return [cell.strip() for cell in line.strip("|").split(" | ")]
 
 
+# --- the environment -------------------------------------------------------------------------------------------------
+
+
+def another_environment(monkeypatch, distribution: str = "numpy", version: str = "0.0.1") -> dict:
+    """Make the environment in use differ from the campaign's in one distribution's version; return it."""
+    changed = pipeline.environment()
+    changed["distributions"][distribution] = version
+    monkeypatch.setattr(pipeline, "environment", lambda requires=(): json.loads(json.dumps(changed)))
+    return changed
+
+
+def test_r04_the_check_records_the_environment_it_ran_under_which_is_the_campaigns(finished):
+    """R04: the check is bound to the environment as to the code: it records the one it ran under, and that is the
+    environment the campaign's fingerprint holds in the snapshot a package ships."""
+    check = stored_check(finished)
+    assert check["environment"] == pipeline.environment()
+    assert "papers-experiments-core" in check["environment"]["distributions"]
+    snapshot = sqlite3.connect(finished.runs / SNAPSHOT_FILE)
+    fingerprint = json.loads(snapshot.execute("SELECT value FROM meta WHERE key = 'fingerprint'").fetchone()[0])
+    snapshot.close()
+    assert fingerprint["environment"] == check["environment"]
+
+
+def test_r04_a_changed_environment_invalidates_the_check_and_analysis_refuses_until_it_is_run_again(
+    copy, clean_environment, monkeypatch
+):
+    """R04: after a distribution changes version, analyze and report refuse, naming it; a check under the changed
+    environment is refused too, since the campaign ran under the other one; back under the campaign's environment,
+    the check runs again and the analysis goes through."""
+    before = (copy.root / "out" / "report.md").read_bytes()
+    with monkeypatch.context() as patch:
+        another_environment(patch)
+        for command in ("analyze", "report"):
+            code, errors = cli(clean_environment, command, str(copy.root))
+            assert code == 1, command
+            assert "another environment than the one in use" in errors
+            assert "numpy" in errors
+            assert "0.0.1 in use" in errors
+        code, errors = cli(clean_environment, "check", str(copy.runs))
+        assert code == 1
+        assert "the campaign ran under another environment" in errors
+    assert cli(clean_environment, "check", str(copy.runs))[0] == 0
+    assert cli(clean_environment, "report", str(copy.root))[0] == 0
+    assert (copy.root / "out" / "report.md").read_bytes() == before
+
+
+def test_r04_a_check_that_records_another_environment_than_the_campaigns_is_refused(
+    copy, clean_environment, monkeypatch
+):
+    """R04: a check whose recorded environment is the one in use, but not the one the campaign's snapshot holds, does
+    not authorise the analysis."""
+    check = stored_check(copy)
+    check["environment"] = another_environment(monkeypatch)
+    (copy.runs / "replay-check.json").write_text(json.dumps(check), encoding="utf-8")
+    code, errors = cli(clean_environment, "analyze", str(copy.root))
+    assert code == 1
+    assert "the replay check ran under another environment than the campaign's" in errors
+
+
+def test_c06_a_resume_under_another_environment_is_refused_and_runs_nothing(copy, clean_environment, monkeypatch):
+    """C06: the study's environment is in the campaign fingerprint, so `run` under another one is refused."""
+    attempts = copy.sql("SELECT COUNT(*) AS n FROM attempts")[0]["n"]
+    another_environment(monkeypatch)
+    code, errors = cli(clean_environment, "run", str(copy.root))
+    assert code != 0
+    assert "environment.distributions.numpy" in errors
+    assert copy.sql("SELECT COUNT(*) AS n FROM attempts")[0]["n"] == attempts
+
+
 # --- the snapshot ----------------------------------------------------------------------------------------------------
 
 

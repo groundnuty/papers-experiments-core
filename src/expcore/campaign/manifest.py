@@ -12,8 +12,10 @@ same order exactly. The order seed and the rule are pinned in the store; a resum
 
 Fingerprint (C06). A plain, JSON-ready dictionary of everything that makes two starts one experiment: the factor
 schema, the tasks, the models and the seeds (the built-in factors of every run), the caps, the prompt and tool hashes
-of each condition, the scorer digest, the hash of every configuration file, and the platform's own settings when it
-gives any (its TLS mode, say). Only hashes, numbers and plain names go in, never a secret. A resume must present the same fingerprint, and a manifest that is not the plan the fingerprint declares is
+of each condition, the scorer digest, the hash of every configuration file, the platform's own settings when it
+gives any (its TLS mode, say) and, for a study, the environment: the distributions the study's code imports with
+their versions and sources (`expcore.provenance.environment`). Only hashes, names, versions and numbers go in, never
+a secret or a path of the machine. A resume must present the same fingerprint, and a manifest that is not the plan the fingerprint declares is
 refused. The plan may grow, but only by whole tasks, models, seeds or conditions, and only when the caller allows it;
 changing or removing anything already recorded is refused.
 """
@@ -142,6 +144,7 @@ def build_fingerprint(
     configs: Mapping[str, str],
     platform: Mapping[str, Any] | None = None,
     backend_factory: Mapping[str, str] | None = None,
+    environment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the fingerprint of an experiment.
 
@@ -159,6 +162,9 @@ def build_fingerprint(
       given and not empty, so a study without a platform keeps the fingerprint it had; no change to it is growth.
     - `backend_factory`: the name and version of the factory a study's plugin builds its backends with. It is a section
       only when given, so a study on the core's factory keeps the fingerprint it had; no change to it is growth.
+    - `environment`: the environment the campaign runs in (`expcore.provenance.environment.environment`). A resume under
+      another one is refused like any other change: a distribution added, removed, at another version or from another
+      source.
     """
     if not isinstance(scorer_digest, str) or not _HEX64.fullmatch(scorer_digest):
         raise PlanError("fingerprint scorer_digest must be a 64-character lower-case hex digest")
@@ -184,6 +190,8 @@ def build_fingerprint(
         fingerprint["platform"] = _plain("platform", platform)
     if backend_factory:
         fingerprint["backend_factory"] = _plain("backend_factory", backend_factory)
+    if environment is not None:
+        fingerprint["environment"] = _plain("environment", environment)
     return json.loads(json.dumps(fingerprint, sort_keys=True, allow_nan=False))
 
 

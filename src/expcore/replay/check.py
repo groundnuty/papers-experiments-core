@@ -9,7 +9,8 @@ offline through the real loop. The result is written beside the records as `repl
 
     {"schema": "replay-check/1", "record_schema", "checked_at", "code": {the code identity},
      "hashed_only_patterns", "n_records", "n_ok", "failures": [{"file", "stage", "error"}], "hashed_only": [paths],
-     "recompute": [{"name", "version", "records", "decisions", "failures"}], "inputs": {path: sha256}, "inputs_sha256"}
+     "recompute": [{"name", "version", "records", "decisions", "failures"}], "inputs": {path: sha256}, "inputs_sha256",
+     "environment": {the environment, when the caller gives one}}
 
 `replayed` lists the records that loaded, wrote back and replayed. A run record is never hashed only: a pattern
 that names one is refused when the check is made (`HashedOnlyRecord`), and `require_current_check` refuses a stored
@@ -23,7 +24,8 @@ reads. A `.json` file that is not a record must therefore be named in `hashed_on
 The code identity is the one `expcore.provenance.codestamp.version` returns for the code the check covers. The analysis
 accepts a batch only while `require_current_check` finds that its check passed, that no input was added, removed or
 changed, that the check was made under the code in use (the same commit and tree hash, neither unknown nor stale nor,
-unless allowed, dirty), and that it was made under the schemas in use. Otherwise the check runs again.
+unless allowed, dirty), that it was made under the schemas in use and, when the caller names the environment in use
+(`expcore.provenance.environment`), under that environment. Otherwise the check runs again.
 
 Decisions served during replay (R05): the core records none yet. A study that records a decision and serves it back
 from the record passes `recompute`, hooks that each have a `name` and a `version` and take the loaded record, return
@@ -53,6 +55,7 @@ from expcore.config.loading import ConfigError
 from expcore.errors import infra_kinds
 from expcore.provenance.codestamp import UNKNOWN, CodeScope, CodeVersionUnknown, require_known
 from expcore.provenance.codestamp import version as code_version
+from expcore.provenance.environment import differences
 from expcore.records.record import RunRecord, decode
 from expcore.records.redact import redact_text
 from expcore.records.schema import SCHEMA_PREFIX, SCHEMAS, RecordError, SchemaVersion
@@ -253,10 +256,11 @@ def verify_batch(
     hashed_only: Sequence[str] = (),
     recompute: Sequence[Recompute] = (),
     schemas: Sequence[SchemaVersion] = SCHEMAS,
+    environment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Check every record of a batch and return the check, which `write_check` stores.
 
-    `code` is the identity of the code the check covers. The bytes hashed are the bytes checked. Each of the `recompute`
+    `code` is the identity of the code the check covers, and `environment`, if given, the environment it runs under. The bytes hashed are the bytes checked. Each of the `recompute`
     hooks runs on every record that loads, writes back and replays, and the check says which ran, on how many records,
     and how many decisions each recomputed.
     """
@@ -285,7 +289,7 @@ def verify_batch(
     _refuse_hashed_records(root, hashed)
     for rel in hashed:
         hashes[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
-    return {
+    check = {
         "schema": CHECK_SCHEMA,
         "record_schema": schemas[-1].name,
         "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -300,6 +304,9 @@ def verify_batch(
         "inputs": dict(sorted(hashes.items())),
         "inputs_sha256": inputs_sha256(hashes),
     }
+    if environment is not None:
+        check["environment"] = json.loads(json.dumps(environment, sort_keys=True))
+    return check
 
 
 def write_check(batch: str | os.PathLike[str], check: Mapping[str, Any]) -> Path:
@@ -385,6 +392,8 @@ def require_current_check(
     required_recompute: Sequence[str] = (),
     schemas: Sequence[SchemaVersion] = SCHEMAS,
     rerun_command: str | None = None,
+    environment: Mapping[str, Any] | None = None,
+    compare_sources: bool = True,
 ) -> dict[str, Any]:
     """Return the batch's stored check when it passed and is current; else raise BatchNotVerified saying why (R04).
 
@@ -395,7 +404,9 @@ def require_current_check(
     failures; inputs added, removed or changed since; a check made under another commit or tree hash than `code`, the
     identity of the code in use; code that is unknown, stale or, unless `allow_dirty`, dirty; and, for each name in
     `required_recompute`, a check that did not run that recompute hook, ran it on fewer records than the batch holds,
-    or whose hook disagreed with a record (R05).
+    or whose hook disagreed with a record (R05). With `environment`, the environment in use, a check made under
+    another one, or that records none, is refused too; `compare_sources` false compares only the Python version and
+    the distributions' versions, as a replication package installed from its own wheels does.
     """
     root = Path(batch)
     rerun = f"run `{rerun_command or f'python -m expcore.replay.check {root}'}` first"
@@ -440,6 +451,13 @@ def require_current_check(
         problem = f"the check was made under code tree {made['tree_sha256'][:12]}, the code in use has {code['tree_sha256'][:12]}"
     if problem:
         raise BatchNotVerified(f"{root}: {problem}; {rerun}")
+    if environment is not None:
+        changed = differences(check.get("environment"), environment, sources=compare_sources)
+        if changed:
+            raise BatchNotVerified(
+                f"{root}: the check was made under another environment than the one in use ({'; '.join(changed[:5])}"
+                f"{' and more' if len(changed) > 5 else ''}); {rerun}"
+            )
     return check
 
 

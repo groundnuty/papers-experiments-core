@@ -86,6 +86,8 @@ TASKS = "".join(f'[tasks.{task}]\nregion = "{region}"\n\n' for task, region in P
         ('"plugin.py", "prompt.txt"]', '"plugin.py", "nothing.txt"]', ("[study]", "code", "nothing.txt")),
         ('code = ["study.toml",', 'code = ["/etc/hosts", "study.toml",', ("[study]", "code", "relative path")),
         ('name = "tiny-study"\n', "", ("[study]", "name", "is required")),
+        ('plugin = "plugin.py"', 'plugin = "plugin.py"\nrequires = ["toy-platform>=2"]', ("[study]", "requires")),
+        ('plugin = "plugin.py"', 'plugin = "plugin.py"\nrequires = ["toy", "toy"]', ("[study]", "requires", "once")),
         (TASKS, "", ("tasks", "at least one task")),
         ('[tasks.lake]\nregion = "north"', "[tasks.lake]\nregion = 4", ("[tasks.lake]", "region", "non-empty string")),
     ],

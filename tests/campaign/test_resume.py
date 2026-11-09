@@ -122,6 +122,37 @@ def test_c06_a_resume_under_another_platform_tls_mode_is_refused_growth_allowed_
     again, _ = start(tmp_path, platform=verify)
     assert state_of(again) == before
 
+ENVIRONMENT = {
+    "python": "3.12",
+    "distributions": {"papers-experiments-core": "0.1.0", "numlib": "1.4.2", "toy-platform": "2.0.0"},
+    "sources": {"papers-experiments-core": {"kind": "vcs", "vcs": "git", "commit": "c" * 40}},
+}
+
+
+@pytest.mark.parametrize(
+    ("change", "path"),
+    [
+        (lambda env: env["distributions"].update({"numlib": "1.5.0"}), "environment.distributions.numlib"),
+        (lambda env: env["distributions"].pop("toy-platform"), "environment.distributions.toy-platform"),
+        (lambda env: env["distributions"].update({"new-lib": "1.0"}), "environment.distributions.new-lib"),
+        (lambda env: env["sources"]["papers-experiments-core"].update({"commit": "d" * 40}), "environment.sources"),
+        (lambda env: env.update({"python": "3.13"}), "environment.python"),
+    ],
+)
+def test_c06_a_resume_under_another_environment_is_refused(tmp_path, change, path):
+    """C06: the environment is part of the experiment: a distribution at another version, removed, added or from
+    another source (the core moved to another commit under the same version), or another Python, refuses the resume,
+    even with growth allowed."""
+    store, _ = start(tmp_path, environment=ENVIRONMENT)
+    store.close()
+    changed = json.loads(json.dumps(ENVIRONMENT))
+    change(changed)
+    with pytest.raises(FingerprintMismatch) as caught:
+        start(tmp_path, environment=changed, allow_growth=True)
+    assert any(line.startswith(path) for line in caught.value.differences)
+    again, _ = start(tmp_path, environment=ENVIRONMENT)
+    again.close()
+
 
 def test_c06_a_condition_that_changed_is_a_different_experiment(tmp_path):
     """C06: the conditions are part of the experiment."""

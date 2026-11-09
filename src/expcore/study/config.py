@@ -8,6 +8,7 @@ study knows, beside the factors, the identity order and the conditions (`campaig
     name = "tiny-study"
     plugin = "plugin.py"                  # the module that supplies the executor and the scorers, relative to this file
     code = ["study.toml", "plugin.py"]    # what the code identity covers (`provenance.codestamp.CodeScope`)
+    requires = ["toy-platform"]           # optional: distributions beyond the core the study's code imports
 
     [tasks.task-1]                        # one table per task; every key is a text attribute of the task
     region = "north"
@@ -44,6 +45,7 @@ from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.models import ModelTable, load_models
 from expcore.errors import StudyKind, check_study_kind, study_kinds
 from expcore.provenance.codestamp import CodeScope, CodeScopeError
+from expcore.provenance.environment import is_requirement_name
 from expcore.stats import prereg
 from expcore.stats.prereg import Preregistration
 
@@ -79,6 +81,7 @@ class StudyConfig:
     scope: CodeScope
     config_sha256: Mapping[str, str]
     kinds: Mapping[str, StudyKind] = field(default_factory=dict)  # `[study.kinds]`, for `errors.study_kinds`
+    requires: tuple[str, ...] = ()  # distributions beyond the core: part of the campaign's environment
 
     @property
     def manifest(self) -> Manifest:
@@ -97,6 +100,7 @@ class StudyIdentity:
     scope: CodeScope
     platforms: tuple[str, ...]
     kinds: Mapping[str, StudyKind]
+    requires: tuple[str, ...]  # distributions beyond the core: what the check compares with the campaign's environment
 
 
 def find_study_root(start: str | os.PathLike[str]) -> Path:
@@ -120,9 +124,9 @@ def _tasks(top: Section, file: Path) -> dict[str, Task]:
     return tasks
 
 
-def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope]:
+def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope, tuple[str, ...]]:
     section = Section(top.section("study").data, top.file, "[study]")
-    section.reject_unknown(["name", "plugin", "code", PLATFORMS_KEY, KINDS_KEY])
+    section.reject_unknown(["name", "plugin", "code", PLATFORMS_KEY, KINDS_KEY, "requires"])
     name, plugin = section.string("name"), section.string("plugin")
     plugin_file = (root / plugin).resolve()
     if not plugin_file.is_file() or root.resolve() not in plugin_file.parents:
@@ -137,7 +141,11 @@ def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope]:
     missing = [r for r in roots if not (root / r).exists()]
     if missing:
         raise section.fail("code", f"names {missing[0]!r}, which is not in the study directory")
-    return name, plugin_file, scope
+    requires = section.strings("requires")
+    bad = [r for r in requires if not is_requirement_name(r)]
+    if bad or len(set(requires)) != len(requires):
+        raise section.fail("requires", "must name installed distributions, each once, with no version")
+    return name, plugin_file, scope, requires
 
 
 def _platforms(top: Section) -> tuple[str, ...]:
@@ -198,8 +206,8 @@ def read_study_identity(path: str | os.PathLike[str]) -> StudyIdentity:
     root = Path(path).resolve()
     study_file = root / STUDY_FILE
     top = Section(load_toml(study_file), study_file, "top level")
-    _, plugin_file, scope = _study_table(top, root)
-    return StudyIdentity(root, study_file, plugin_file, scope, _platforms(top), _declared_kinds(top))
+    _, plugin_file, scope, requires = _study_table(top, root)
+    return StudyIdentity(root, study_file, plugin_file, scope, _platforms(top), _declared_kinds(top), requires)
 
 
 def load_study(path: str | os.PathLike[str]) -> StudyConfig:
@@ -207,7 +215,7 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
     root = Path(path).resolve()
     study_file = root / STUDY_FILE
     top = Section(load_toml(study_file), study_file, "top level")
-    name, plugin_file, scope = _study_table(top, root)
+    name, plugin_file, scope, requires = _study_table(top, root)
     import_platforms(study_file, _platforms(top))  # before anything names a kind: the conditions, the campaign's kinds
     kinds = _declared_kinds(top)
     with study_kinds(kinds):  # held for this load only: a failed load, or the next study, finds none of them
@@ -223,4 +231,4 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
         loaded = prereg.load(root / PREREG_FILE, schema)
         _check_clusters(name, tasks, loaded)
     hashes = {file: hashlib.sha256((root / file).read_bytes()).hexdigest() for file in CONFIG_FILES}
-    return StudyConfig(root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds)
+    return StudyConfig(root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds, requires)
