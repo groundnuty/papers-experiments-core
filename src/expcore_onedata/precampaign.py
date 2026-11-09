@@ -22,6 +22,11 @@ or, when a check refused, answers that refusal at every call, without measuring 
 (a closed health gate, C11) and records the refusal as the outage's detail; the attempt whose pre-run check found it is
 recorded as that outage's, as for any failed pre-run check. The same check is the day-0 check `content_type`, which an
 operator runs before starting a campaign, and which says failed, passed or unknown.
+
+Its time. The first call makes a few requests in sequence (the space's root, a listing page per part of the file's
+path, and for each of the two reads the file's space and the read's head), each bounded by the client's timeout (15 s
+by default). The core's `health_timeout_s` (60 s by default) should exceed their sum; a first call that outlives it
+reads unhealthy once, closing the gate, and the verdict it keeps when it ends answers every call after it.
 """
 
 import re

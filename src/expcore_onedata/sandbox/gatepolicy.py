@@ -37,7 +37,7 @@ maximum would bound nothing: a listing without a limit gets the default page. Th
 
   * a name is at most 255 bytes, and JSON writes a byte as at most six (`\\u00XX` for a control character): 1530 bytes
     (`NAME_JSON_BYTES`);
-  * a file id was 180 characters in each of the 19 the earlier study recorded on a real federation (the third
+  * a file id was 180 characters in each of the 17 the earlier study logged on a real federation (the third
     `merged:` line); 512 is allowed (`FILE_ID_BYTES`), the bound the platform client puts on a file id;
   * the rest of an entry with the attributes the official client asks for (type, size, mtime, posixPermissions), keys,
     quotes and separators included, is about 140 bytes; 256 are allowed (`ENTRY_REST_BYTES`);
