@@ -254,6 +254,49 @@ assert records and all(load_record(p).run_key for p in records)  # every attempt
 assert counts == Counter()  # the example study runs without the platform
 ```
 
+### Fault injection: compare like isolation with like
+
+On the Onedata platform a condition whose manipulation is a provider outage (`infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]`, with `[faults]` in platform.toml) runs alone on the federation: its run admission is exclusive, so no other run shares the federation while the provider is down. A control that shares the federation with concurrent runs differs from it in load as well as in the fault, and a contrast between the two confounds them. Either give the control the same isolation, a condition with no fault that declares `exclusive = true`, or restrict the contrast to measures that do not depend on the federation's load. `exclusive = true` needs a run admission to hold: on a platform without `[faults]` it is refused at the start, naming the file and the key. Before analysing, check what each compared attempt actually held: the export's `admission` is `shared`, `exclusive`, or `none` for a study without admission, as stored when the attempt was admitted, never inferred from its condition.
+
+```python
+import expcore_onedata.fault_recovery  # registers the platform's fault kinds, as the platform layer does on import
+from expcore.campaign.factors import load_factor_schema
+
+design = Path("isolated-design.toml")
+design.write_text(
+    """
+[factors.fault]
+levels = ["outage", "none"]
+
+[identity]
+order = ["task", "fault", "model", "seed"]
+
+[conditions.outage]
+fault = "outage"
+infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]
+
+[conditions.matched-control]
+fault = "none"
+exclusive = true
+"""
+)
+isolated = load_factor_schema(design)
+assert isolated.exclusive == {"outage": False, "matched-control": True}
+
+
+def admission_by_condition(export):
+    """The admission modes each condition's analysed attempts held."""
+    held = {}
+    for entry in export["analysed_attempts"]:
+        held.setdefault(entry["condition"], set()).add(entry["admission"])
+    return held
+
+
+held = admission_by_condition(export)
+assert all(len(modes) == 1 for modes in held.values())  # each condition ran under one isolation
+assert held == dict.fromkeys(held, {"none"})  # the example study has no run admission
+```
+
 ## 6. What a conclusion may say
 
 Every contrast ends in one of four words, `difference`, `trivial_difference`, `equivalent` or `not_detected`, and never in "no difference". Only `equivalent` may be read as no difference, and only a contrast with an `equivalence_margin` in the preregistration can reach it: the interval at 1 - 2 alpha lies inside plus or minus the margin and the test is not significant. `not_detected` is the absence of evidence, never evidence of absence; without a margin, it is the most a non-significant result can say.
