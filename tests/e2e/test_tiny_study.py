@@ -16,12 +16,13 @@ from typing import Any
 
 import pytest
 from study_crash import KILLED
-from study_support import HEAD, ROOT, Campaign, clean_environment, cli, finish, make_copy, table
+from study_support import HEAD, ROOT, Campaign, clean_environment, cli, copy_campaign, finish, make_copy, table
 
 from expcore.cli import main
 from expcore.records.record import load_record, record_filename
 from expcore.stats.analysis import CONCLUSIONS
 from expcore.study.config import load_study
+from expcore.study.pipeline import OUTPUT_FILES, regenerate
 
 CRASH = ROOT / "tests" / "support" / "study_crash.py"
 TREATMENT, SUBSET = "relay-down", "extended"
@@ -253,3 +254,14 @@ def test_the_report_is_identical_across_two_runs_with_the_same_seeds_and_across_
     assert clean_pair.first.codes == clean_pair.second.codes == {"run": 0, "check": 0, "analyze": 0, "report": 0}
     assert clean_pair.first.report == clean_pair.second.report
     assert "tiny-study" in clean_pair.first.report
+
+
+def test_every_output_regenerates_from_the_records_byte_for_byte_and_regenerating_writes_nothing(clean_pair, tmp_path):
+    """What a replication package's check runs: the four outputs derived anew equal the files, and none is touched."""
+    copy = copy_campaign(clean_pair.second, tmp_path, "copy").root
+    out = copy / "out"
+    before = {name: (out / name).stat().st_mtime_ns for name in OUTPUT_FILES}
+    assert regenerate(copy) == []
+    assert {name: (out / name).stat().st_mtime_ns for name in OUTPUT_FILES} == before
+    (out / "scores.json").write_text("{}\n", encoding="utf-8")
+    assert regenerate(copy) == ["scores.json: differs from what the records give"]

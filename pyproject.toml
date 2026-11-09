@@ -31,6 +31,11 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/expcore", "src/expcore_onedata"]
 
+# The public study-token hashes: the default list a replication package is checked against. An editable install
+# reads them from the checkout.
+[tool.hatch.build.targets.wheel.force-include]
+"tests/data/study_tokens.sha256" = "expcore/provenance/study_tokens.sha256"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --import-mode=importlib"

@@ -11,12 +11,17 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
   store with attempts still running unless `partial`, which the check records.
-- `analyse_study` refuses unless the batch has a current passing check (R04, R05). It then uses only bytes the check
-  verified (`study.verified`): the snapshot and the replayed records, each read once and compared with the check's
-  hash, cross-validated against each other. It exports from the snapshot, scores the records in memory (a record is
-  never written after its check, since that would change its hash) and runs the preregistered analysis. Every score is
+- `analyse_study` refuses unless the batch has a current passing check (R04, R05), and writes nothing. It then uses
+  only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once and compared
+  with the check's hash, cross-validated against each other. It exports from the snapshot, scores the records in
+  memory (a record is never written after its check, since that would change its hash) and runs the preregistered
+  analysis. Every score is
   derived anew from a record on each call and none is read back: `scores.json` is an output, so `analyze` is how a
   study is re-scored (R13), offline, after a change to a scorer and a new check (a scorer is code the identity covers).
+- `output_bytes` is the one place the bytes of `export.json`, `scores.json`, `analysis.json` and `report.md` are made;
+  `write_analysis` and `write_report` write them and `regenerate` compares them with the files in `out/`, which is
+  what a replication package's `make check` runs. Every time in them comes from the records and the store, every
+  list has a defined order, and no path of the machine appears, so the same records give the same bytes anywhere.
 """
 
 import dataclasses
@@ -30,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.export import export_run_state, write_export_data
+from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import build_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
@@ -42,6 +47,7 @@ from expcore.records.build import CORE_DISTRIBUTION
 from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore, scorer_name, scorer_version
 from expcore.replay.check import BatchNotVerified, require_current_check, verify_batch, write_check
+from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, analyse
 from expcore.stats.rows import Row
 from expcore.study.config import StudyConfig, find_study_root, load_study
@@ -55,6 +61,7 @@ EXPORT_FILE = "export.json"
 SCORES_FILE = "scores.json"
 ANALYSIS_FILE = "analysis.json"
 REPORT_FILE = "report.md"
+OUTPUT_FILES = (EXPORT_FILE, SCORES_FILE, ANALYSIS_FILE, REPORT_FILE)  # what `analyze` and `report` write to out/
 SNAPSHOT_KEY = "snapshot"  # the key of the check that says what its snapshot of the store held
 
 
@@ -169,9 +176,14 @@ def check_batch(
     return check
 
 
-def _write_json(path: Path, data: Any) -> None:
-    """Write JSON atomically, with no non-finite number (a missing value is null)."""
-    text = json.dumps(_finite(data), indent=1, sort_keys=True, allow_nan=False) + "\n"
+def _json_text(data: Any) -> str:
+    """JSON with sorted keys and no non-finite number (a missing value is null), ending with a newline."""
+    return json.dumps(_finite(data), indent=1, sort_keys=True, allow_nan=False) + "\n"
+
+
+def _write_text(path: Path, text: str) -> None:
+    """Write a file atomically and owner-only: a temporary file in its directory, then a rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -217,20 +229,22 @@ def analyse_study(
     allow_dirty: bool = False,
     code_root: str | os.PathLike[str] | None = None,
     partial: bool = False,
+    stamped: bool = False,
 ) -> StudyAnalysis:
     """Export the campaign, score its records and run the preregistered analysis; refuse without a current check.
 
     Only bytes the check verified are used: the snapshot of the store and the replayed records, each read once and
-    compared with the check's hash (`study.verified`). Nothing is written into the batch. The export is written to
-    `out/export.json`. With `partial`, attempts still running at the check are tolerated and a final attempt that no
-    replayed record covers is left out of the analysis and named in the result.
+    compared with the check's hash (`study.verified`). Nothing is written, into the batch or anywhere else. With
+    `partial`, attempts still running at the check are tolerated and a final attempt that no replayed record covers is
+    left out of the analysis and named in the result. With `stamped`, the code identity comes from the stamp beside
+    the study and never from a repository around it, as in a replication package.
     """
     study = load_study(path)
     out = out_dir(study)
     batch = out / RUNS_DIR
     if not batch.is_dir():
         raise Refused(f"{out}: no campaign here; run the study first")
-    code = code_version(code_root or study.root, study.scope)
+    code = code_version(code_root or study.root, study.scope, use_git=not stamped)
     try:
         check = require_current_check(
             batch, code=code, allow_dirty=allow_dirty, rerun_command=f"python -m expcore check {batch}"
@@ -243,7 +257,6 @@ def analyse_study(
         export = export_run_state(verified.snapshot, excluded=dict.fromkeys(verified.excluded, UNCOVERED))
     finally:
         verified.snapshot.close()
-    write_export_data(export, out / EXPORT_FILE)
     rows, scores = [], {}
     for entry in export["analysed_attempts"]:
         record = verified.record_for(entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
@@ -258,10 +271,9 @@ def analyse_study(
     return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)
 
 
-def write_analysis(analysis: StudyAnalysis) -> list[Path]:
-    """Write the scores and the analysis beside the export; return the files written."""
-    out = out_dir(analysis.study)
-    summary = {
+def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds: the preregistration, the code, the core and each contrast with its Holm decision."""
+    return {
         "preregistration": dict(analysis.result.manifest),
         "alpha": analysis.result.alpha,
         "code": {key: analysis.code.get(key) for key in ("commit", "tree_sha256", "dirty")},
@@ -273,6 +285,62 @@ def write_analysis(analysis: StudyAnalysis) -> list[Path]:
         "contrasts": analysis.result.contrasts,
         "holm": analysis.result.holm,
     }
-    _write_json(out / SCORES_FILE, analysis.scores)
-    _write_json(out / ANALYSIS_FILE, summary)
-    return [out / EXPORT_FILE, out / SCORES_FILE, out / ANALYSIS_FILE]
+
+
+def report_text(analysis: StudyAnalysis) -> str:
+    """The Markdown report of an analysis (`expcore.report`)."""
+    return render_report(
+        analysis.result,
+        analysis.export,
+        study=analysis.study.name,
+        code=analysis.code,
+        core_version=analysis.core_version,
+        scorers=analysis.scorers,
+        interval_level=analysis.study.prereg.bootstrap.ci_level,
+    )
+
+
+def output_bytes(analysis: StudyAnalysis) -> dict[str, bytes]:
+    """The bytes of every file `analyze` and `report` write to out/, by file name, in OUTPUT_FILES order."""
+    texts = {
+        EXPORT_FILE: export_text(analysis.export),
+        SCORES_FILE: _json_text(analysis.scores),
+        ANALYSIS_FILE: _json_text(_summary(analysis)),
+        REPORT_FILE: report_text(analysis),
+    }
+    return {name: texts[name].encode("utf-8") for name in OUTPUT_FILES}
+
+
+def write_analysis(analysis: StudyAnalysis) -> list[Path]:
+    """Write the export, the scores and the analysis to out/, each atomically and owner-only; return the files."""
+    out, made = out_dir(analysis.study), output_bytes(analysis)
+    written = [out / name for name in (EXPORT_FILE, SCORES_FILE, ANALYSIS_FILE)]
+    for path in written:
+        _write_text(path, made[path.name].decode("utf-8"))
+    return written
+
+
+def write_report(analysis: StudyAnalysis) -> Path:
+    """Write out/report.md and return it."""
+    target = out_dir(analysis.study) / REPORT_FILE
+    target.write_text(report_text(analysis), encoding="utf-8")
+    return target
+
+
+def regenerate(
+    path: str | os.PathLike[str], *, allow_dirty: bool = False, partial: bool = False, stamped: bool = False
+) -> list[str]:
+    """Derive every output anew from the records and compare it byte for byte with the file in out/; write nothing.
+
+    Returns one line per output that is missing or differs, empty when all four match. The refusals of
+    `analyse_study` (no current check, records changed since) are raised as they are.
+    """
+    analysis = analyse_study(path, allow_dirty=allow_dirty, partial=partial, stamped=stamped)
+    out, problems = out_dir(analysis.study), []
+    for name, made in output_bytes(analysis).items():
+        target = out / name
+        if not target.is_file():
+            problems.append(f"{name}: missing")
+        elif target.read_bytes() != made:
+            problems.append(f"{name}: differs from what the records give")
+    return problems

@@ -289,6 +289,24 @@ def test_a_stamp_stands_in_for_git_in_a_copied_tree_and_names_the_stamped_head(t
     assert require_known("study run", tree, SCOPE)["commit"] == SHA
 
 
+def test_a_stamp_can_take_its_time_from_the_caller_so_two_stamps_of_one_tree_are_the_same_bytes(tree):
+    """A replication package dates its stamp by its records, so building it twice writes the same stamp."""
+    when = "2026-01-02T03:04:05+00:00"
+    write_stamp(tree, SHA, SCOPE, created_utc=when)
+    first = (tree / STAMP).read_bytes()
+    write_stamp(tree, SHA, SCOPE, created_utc=when)
+    assert (tree / STAMP).read_bytes() == first
+    assert read_stamp(tree)["created_utc"] == when
+
+
+def test_without_git_the_stamp_names_the_code_even_inside_a_checkout(checkout):
+    """A package unpacked inside another repository: its stamp, never that repository's head, names its code."""
+    write_stamp(checkout.path, SHA, SCOPE)
+    assert version(checkout.path, SCOPE)["source"] == "git"
+    found = version(checkout.path, SCOPE, use_git=False)
+    assert (found["commit"], found["source"], found["dirty"], found["stale"]) == (SHA, "stamp", False, False)
+
+
 def test_p02_a_stamp_is_re_verified_against_the_files_beside_it_and_a_data_edit_makes_it_stale(tree):
     """P02: A stamp is re verified against the files beside it and a data edit makes it stale."""
     write_stamp(tree, SHA, SCOPE)
