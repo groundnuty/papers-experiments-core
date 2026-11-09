@@ -39,6 +39,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from expcore.config.loading import ConfigError
 from expcore_onedata.sandbox import gatelog, hostops, netpool
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
@@ -48,6 +49,7 @@ from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
     ENV_ACCESS_TOKEN,
     ENV_GATE_TOKEN,
+    GATE_CA_PATH,
     ONECLIENT_LOG_DIR,
     Names,
     agent_run_args,
@@ -185,6 +187,11 @@ class DockerSandbox:
             raise StartRefused("a REST data path needs the zone")
         if sp.mode is DataPathMode.MOUNT and (s.mount is None or s.oneclient is None):
             raise StartRefused("a mount data path needs [sandbox.mount] and the oneclient image")
+        if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
+            try:  # a container is given the bundle only while it is the one the record names by its hash
+                s.tls.bundle()
+            except ConfigError as error:
+                raise StartRefused(str(error)) from None
 
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
@@ -266,13 +273,16 @@ class DockerSandbox:
         (self.dir / "gatelog").chmod(0o777)  # the gate runs as root without DAC_OVERRIDE
         (self.dir / "gatelog" / "requests.jsonl").touch()  # there from the start: a log that is missing is unreadable
         (self.dir / "gatelog" / "requests.jsonl").chmod(0o666)
+        tls = self.s.tls  # the platform's [tls]: the gate's upstream checks the federation's certificate as it says
         config = {
             "run_key": self.spec.run_key,
-            "verify_ssl": True,
+            "verify_ssl": not tls.insecure,
             "log": "/var/gate/requests.jsonl",
             "tls_dir": "/etc/gate/tls",
             "hosts": hosts,
         }
+        if tls.ca_file is not None:
+            config["upstream_ca_file"] = GATE_CA_PATH  # the bundle, which `gate_run_args` mounts there read-only
         (self.dir / "gate.json").write_text(json.dumps(config), encoding="utf-8")
 
     def _pool_position(self, subnet: str) -> int | None:

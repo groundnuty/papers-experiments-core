@@ -23,6 +23,11 @@ from expcore_onedata.sandbox.teardown import SIDECAR_MOUNT, SIDECAR_SUFFIX
 AGENT_OOM_SCORE_ADJ = 1000  # the host's out-of-memory killers take the agent's processes before anything else
 GATE_DIR = "/opt/gate"  # where the gate's two files are mounted, read-only, in the gate container
 CA_PATH = "/etc/sandbox/ca.pem"  # the run's certificate authority in the agent
+# The platform's [tls] CA bundle, where it is bind-mounted read-only for the federation's two clients in containers: the
+# gate's upstream connection and oneclient. The agent never gets it: it trusts the run's CA, the gate's, alone.
+GATE_CA_PATH = "/etc/gate/federation-ca.pem"
+SIDECAR_CA_PATH = "/etc/expcore/federation-ca.pem"
+ENV_SSL_CERT_FILE = "SSL_CERT_FILE"  # OpenSSL's setting of the CA file its default verify paths load
 ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image's binary
 ONECLIENT_LOG_DIR = "/tmp/oneclient/0"  # where it writes its log unless told otherwise
 # The published REST client's settings (its environment), not names of any federation.
@@ -53,15 +58,19 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     """The arguments after the sidecar's image name, run with `--entrypoint env`.
 
     The published image sets an environment flag that makes the client skip TLS verification, so the default entrypoint
-    would run unverified whatever is passed. `env -u` removes the flag, and `--insecure` is passed only when the
-    settings say "insecure". `-f` keeps the client in the foreground. The mount is read-only (`-o ro`).
+    would run unverified whatever is passed. `env -u` removes the flag, and the platform's `[tls]` alone decides the
+    check: by default oneclient verifies against the image's CAs; with `ca_file`, `env` sets `SSL_CERT_FILE` to the
+    bundle that `sidecar_run_args` mounts read-only, the CA file OpenSSL's default verify paths load (oneclient has no
+    option of its own for a CA, and `tests/live/test_sandbox.py` checks the image honours it); `--insecure` is passed
+    only with `insecure_tls`. `-f` keeps the client in the foreground. The mount is read-only (`-o ro`).
     """
     mount = settings.mount
     if mount is None:
         raise ValueError("a mount data path needs [sandbox.mount]")
     io = {"direct": ["--force-direct-io"], "proxy": ["--force-proxy-io"]}.get(mount.io_mode or "", [])
+    trust = [f"{ENV_SSL_CERT_FILE}={SIDECAR_CA_PATH}"] if settings.tls.ca_file is not None else []
     return [
-        *("-u", "ONECLIENT_INSECURE", ONECLIENT_BIN, "-f", "-H", provider_host),
+        *("-u", "ONECLIENT_INSECURE", *trust, ONECLIENT_BIN, "-f", "-H", provider_host),
         *("-o", "ro,allow_other", *io),
         *(["--insecure"] if settings.tls.insecure else []),
         *mount.extra_args,
@@ -86,12 +95,14 @@ def gate_run_args(
     """`docker run` for the gate: read-only root, one capability (to bind its port), its files mounted read-only.
 
     The gate holds the data-path token and adds it to the requests it forwards (O05): it is named with `-e NAME`, and
-    its value travels in the environment of the docker client, as the sidecar's does."""
+    its value travels in the environment of the docker client, as the sidecar's does. With the platform's `ca_file` the
+    bundle is mounted read-only at `GATE_CA_PATH`, which the gate's configuration names as its upstream CA file."""
     return [
         *("run", "-d", "--name", names.gate, "--network", "bridge", *labels, "-e", ENV_GATE_TOKEN),
         *("--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", "--security-opt", "no-new-privileges"),
         *("--read-only", "--user", "0", "--pids-limit", "512", "--memory", str(s.limits.gate_memory_bytes)),
         *("-v", f"{sdir / 'tls'}:/etc/gate/tls:ro", "-v", f"{sdir / 'gate.json'}:/etc/gate/gate.json:ro"),
+        *(("-v", f"{s.tls.ca_file}:{GATE_CA_PATH}:ro") if s.tls.ca_file is not None else ()),
         *("-v", f"{gate_files}:{GATE_DIR}:ro", "-v", f"{sdir / 'gatelog'}:/var/gate"),
         *("--entrypoint", "python", image_id, f"{GATE_DIR}/gate.py", "/etc/gate/gate.json"),
     ]
@@ -100,13 +111,15 @@ def gate_run_args(
 def sidecar_run_args(
     s: SandboxSettings, names: Names, labels: Sequence[str], share: Path, image_id: str, provider_host: str
 ) -> list[str]:
-    """`docker run` for the mount sidecar: it owns the mount and the token; the agent gets neither, nor FUSE."""
+    """`docker run` for the mount sidecar: it owns the mount and the token; the agent gets neither, nor FUSE. With the
+    platform's `ca_file` the bundle is mounted read-only at `SIDECAR_CA_PATH` (see `sidecar_command`)."""
     lim = s.limits
     return [
         *("run", "-d", "--name", names.sidecar, "--network", "bridge", *labels),
         *("--cpus", str(lim.cpus), "--memory", str(lim.memory_bytes), "--memory-swap", str(lim.memory_bytes)),
         *("--pids-limit", str(lim.pids), "--cap-add", "SYS_ADMIN", "--device", "/dev/fuse"),
         *("--security-opt", "apparmor:unconfined", "--tmpfs", "/root/.local:size=1g"),
+        *(("-v", f"{s.tls.ca_file}:{SIDECAR_CA_PATH}:ro") if s.tls.ca_file is not None else ()),
         *("-e", ENV_ACCESS_TOKEN),
         *("--mount", f"type=bind,src={share},dst={SIDECAR_MOUNT},bind-propagation=rshared"),
         *("--entrypoint", "env", image_id, *sidecar_command(provider_host, s)),
