@@ -269,4 +269,16 @@ make -C dist/tiny-study-package -f Makefile check PYTHON="uv run python"
 
 The build refuses a check made under code that is not a clean commit, outputs made by another core version, a file the package's check needs and the list leaves out, and any path or content that matches a name private everywhere in the core's study-token hashes (`--hashes` takes another hash file). Before it writes the archive it runs the package's own check on the staged files: every file against `SHA256SUMS`, then `export.json`, `scores.json`, `analysis.json` and `report.md` derived anew from the records and compared byte for byte. That check is what `make -f Makefile check` runs for a reader; naming the Makefile matters, because the package may hold no other file make would read first, and the build refuses one, but a reader's copy could. The archive is deterministic: two builds of one tree are the same bytes.
 
-For a double-blind submission, `--anonymise LIST` takes an anonymisation list, kept outside the study's repository and the output. It names the prose and metadata files to rewrite (`files = [...]`) and each term with its label (`[terms]`). A term is replaced only as a whole word, only in those files: JSON in its parsed keys and strings, then written out again; TOML, YAML and text as text. A term found anywhere else, code and records included, fails the build naming the file and the line, never the term, and so does one that an HTML entity, a percent-escape or a backslash escape hid from the rewrite. The token and term checks also read inside gzip, bzip2, xz, zip and tar content and every UTF-16 encoding, and the build refuses another compressed or archive format as unscannable. Code is never rewritten.
+For a double-blind submission, `--anonymise LIST` takes an anonymisation list, kept outside the study's repository and the output. It names the prose and metadata files to rewrite (`files = [...]`) and each term with its label (`[terms]`). A term is replaced only as a whole word, only in those files: JSON lexically, one string at a time, so every other byte, numbers included, stays as it was; TOML and text as text. YAML cannot be named, because without a YAML parser its rewrite cannot be checked: leave it out, or include an anonymised copy from another path. A term found anywhere else, code and records included, fails the build naming the file and the line, never the term, and so does one that an HTML entity, a percent-escape, a backslash escape or a line continuation hid from the rewrite. Code is never rewritten.
+
+The token and term checks fail closed: a file goes in only if they can read all of it. That is text (UTF-8 without NUL bytes, or UTF-16 with a byte-order mark), an SQLite database, or a gzip, bzip2, xz, zip or tar archive of such files, opened down to its last member. Anything else is refused, naming the file and what was found in it: a PDF, a PNG, a raw zlib stream, unknown binary. A file you have inspected by hand, a figure for instance, can go in unscanned if `package.toml` attests that exact file by its SHA-256 (`sha256sum figures/flow.pdf`):
+
+```toml
+# an [[opaque]] entry of package.toml
+[[opaque]]
+path = "figures/flow.pdf"
+sha256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+reason = "a figure drawn by hand; read page by page, no name in it"
+```
+
+The build checks the hash, refuses the file if its bytes changed, and lists every attestation in `PACKAGE.json`, so a reader sees which files rest on the author's word rather than on the checks.

@@ -26,8 +26,8 @@ For readers of the commits before this release:
 ### Known limits
 
 - The package's study-token check uses the hashes whose scope is `all`, the names private everywhere (hosts, addresses, users, spaces, providers). A study's own condition, dataset and model names are expected in its own package, so code-scope hashes are not applied. `--hashes` takes another hash file, for example a study's own.
-- Anonymisation relabels only whole words in the prose and metadata files its list names (JSON in its parsed keys and strings, other formats as text), and fails the build on a listed term anywhere else, escaped or encoded forms included; it never rewrites code. The scanner and canaries of earlier packages are not in this release.
-- The package's checks open gzip, bzip2, xz, zip and tar content and refuse other compressed or archive formats they recognise; PDF and PNG files are read as raw bytes, without opening their own compressed streams.
+- Anonymisation relabels only whole words in the prose and metadata files its list names (JSON lexically, string by string, TOML and text as text; YAML is refused, since without a parser its rewrite cannot be checked), and fails the build on a listed term anywhere else, escaped or encoded forms included; it never rewrites code. The scanner and canaries of earlier packages are not in this release.
+- The package's checks fail closed. A file goes in only if they can read all of it: UTF-8 text without NUL bytes, UTF-16 text with a byte-order mark, an SQLite database, or a gzip, bzip2, xz, zip or tar archive of such files. Anything else (a PDF, a PNG, a raw zlib stream, unknown binary) is refused unless `package.toml` attests that exact file by its SHA-256 with a reason in an `[[opaque]]` entry; it then goes in unscanned, on the author's word that it was inspected by hand.
 - Not in this release: streaming transport (B17), snapshot cut and fetch (C21), confirmed model-level faults (C22), two-host execution, sampling for cause coding, further estimators and fault injection ([`docs/architecture.md`](docs/architecture.md#release-boundary)).
 
 ### Regressions guaranteed
@@ -122,7 +122,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | O09 | Mutations are scoped | `tests/onedata/test_client.py` |
 | O12 | Federation names live in configuration only | `tests/onedata/test_config.py`, `tests/onedata/test_messages.py`, `tests/test_no_placeholders.py` |
 | K01 | A check with no input fails | `tests/package/test_archive.py`, `tests/package/test_build.py`, `tests/package/test_spec.py` |
-| K03 | The private name list never enters the repository or the output | `tests/package/test_anonymise.py`, `tests/package/test_build.py`, `tests/package/test_scan.py` |
+| K03 | The private name list never enters the repository or the output | `tests/package/test_anonymise.py`, `tests/package/test_build.py`, `tests/package/test_scan.py`, `tests/package/test_spec.py` |
 | K04 | Anonymisation must not change numbers, model names or parseability | `tests/package/test_anonymise.py` |
 | K05 | Findings never carry the matched value | `tests/package/test_anonymise.py`, `tests/package/test_build.py` |
 | K06 | Archives are deterministic | `tests/package/test_archive.py`, `tests/package/test_build.py` |

@@ -2,7 +2,8 @@
 
 Every fenced block of docs/study-guide.md is taken in order, in one new directory: an `sh` line runs (`uv run python`
 becomes this interpreter, and `python -m expcore` runs in this process), a `python` block is executed in one namespace
-shared by all of them, and a `toml` block must agree with the file of the example it names on its first line. The two
+shared by all of them, and a `toml` block must agree with the file of the example it names on its first line, or, if
+it shows an `[[opaque]]` entry, load as one through the package's own inclusion-list loader. The two
 lines that make the project and add the core cannot run here, where the core is already installed: the `uv add` line
 must be exactly what depends on this version's tag, and scripts/fresh_repo.py runs both (tests/test_fresh_repo.py).
 """
@@ -21,11 +22,13 @@ import pytest
 from study_support import clean_environment
 
 from expcore.cli import main
+from expcore.package.spec import load_spec
 
 ROOT = Path(__file__).resolve().parents[1]
 GUIDE = ROOT / "docs" / "study-guide.md"
 BLOCK = re.compile(r"^```(\w*)\n(.*?)^```$", re.M | re.S)
 NAMED_FILE = re.compile(r"# (\S+\.toml)\n")
+OPAQUE_ENTRY = "# an [[opaque]] entry of package.toml\n"
 RUNNABLE = ("git", "tar", "make")
 
 __all__ = ["clean_environment"]  # a fixture the test uses, imported from the support module
@@ -81,6 +84,11 @@ def test_every_block_of_the_study_guide_runs_in_order_in_a_new_directory(tmp_pat
                     run_line(line)
         elif language == "python":
             exec(compile(body, f"{GUIDE.name}, block {number}", "exec"), namespace)
+        elif language == "toml" and body.startswith(OPAQUE_ENTRY):
+            attest = tmp_path / "attest"
+            attest.mkdir()
+            (attest / "package.toml").write_text(f'[package]\nname = "p"\ninclude = ["x"]\n\n{body}', "utf-8")
+            assert load_spec(attest).opaque, number
         elif language == "toml":
             named = NAMED_FILE.match(body)
             assert named, f"block {number}: a toml block names the file of the example it shows on its first line"
