@@ -6,13 +6,14 @@
 #   merged: icsa-2027-experiments @ 6fc798cf, icsa/scripted/provision.py:215-216,236-240 (state and counters)
 """Every transfer of the space in a run's window, whoever started it, read from the space's transfer listing (O08).
 
-The probes (`probes.py`) list the space's transfers at run end on every tracked provider, `GET
-/spaces/{space}/transfers` with `state` waiting, ongoing and ended in that order (a job only moves forward, so one that
-moves on while the lists are read is found in a later one) and `limit`, following `nextPageToken` until it is empty.
-Each distinct id is then read with `GET /transfers/{id}` on the provider that listed it. A provider lists a job in its
-listing only after a lag (a source waits up to 60 s for a fresh one to show, `fixture_runner.py:226-245` of the first
-`merged:` repository), and a job posted on one provider reaches another's listing later still, so every tracked
-provider's listing is read and their ids are merged. This module reads those answers; the requests are the probes'.
+At run end `TransferLog` lists the space's transfers on every tracked provider, `GET /spaces/{space}/transfers` with
+`state` waiting, ongoing and ended in that order (a job only moves forward, so one that moves on while the lists are
+read is found in a later one) and `limit`, following `nextPageToken` until it is empty. Each distinct id is then read
+with `GET /transfers/{id}` on the provider that listed it. Every request goes through the probes' own probe
+(`probes.run_probe`): a real answer is final and only a missing one is retried, a bounded number of times. A provider
+lists a job only after a lag (a source waits up to 60 s for a fresh one to show, `fixture_runner.py:226-245` of the
+first `merged:` repository), and a job posted on one provider reaches another's listing later still, so every tracked
+provider's listing is read and their ids are merged; a tracked provider must therefore support the space.
 
 What is confirmed. The listing's path, `state` ongoing and ended, `limit`, `page_token`, the answer's `transfers` (ids)
 and `nextPageToken` are what running code of the sources in the header sent and read; so are a record's state and
@@ -33,14 +34,30 @@ one included, and it says when someone (the harness, the agent through the tool 
 The run's times are this host's clock and the job's the provider's; the two are compared as they are, and a skew
 between them moves a job across the edge. A job scheduled before the window that had not ended by its start (listed
 as waiting or ongoing, or ended at or after the start's whole second, or with no finish time) is not in the record,
-but it may have placed bytes during the run, so the probes count it (`carried_over`).
+but it may have placed bytes during the run, so the probes count it (`carried_over`) and it makes its target's bound
+unknown.
+
+**The split.** `split_gained` gives, per tracked receiving provider, `transfer_bytes_in`: the `bytesReplicated` of every
+job in the window that replicates into it (a replication's or a migration's `replicatingProviderId`; an eviction moves
+nothing in), and `on_demand_lower_bound` = `gained_bytes` - `transfer_bytes_in`, floored at zero. `gained_bytes` is
+net placement growth from the block maps (`probes.py`), not bytes on the wire. The bound is a lower bound on the bytes
+the provider came to hold that no transfer placed (fetched on demand by a read through it), under two conditions it
+cannot check: the listing is complete (a job missing from it, as the listing's lag can make one, makes the sum too
+small and the number no longer a bound), and a job's byte counter does not under-report what it placed (O01: a job's
+report is a report). The sum counts every file a job moved, tracked or not, so otherwise the bound only errs low;
+`difference` keeps the unfloored value so that a negative stays visible. A job into the provider that had not ended at
+run end (its counter is not final) or that carried over makes that provider's bound None, with the reason in
+`unknown`.
 """
 
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
+
+from expcore_onedata.client import OnezoneClient
+from expcore_onedata.provision import Provisioner
 
 TYPES = ("replication", "eviction", "migration")
 REPLICATING = ("replication", "migration")
@@ -54,6 +71,14 @@ _STATE_KEYS = ("transferStatus", "transferState", "replicationStatus", "eviction
 
 class Unreadable(ValueError):
     """The listing or a record is not in the shape this module reads; the message names a field, never a value."""
+
+
+class Probed(Protocol):
+    """What a probe of the probes returns (`probes.ProbeResult`): whether it worked, its value, and why not."""
+
+    ok: bool
+    value: Any
+    error: str | None
 
 
 @dataclass(frozen=True)
@@ -181,3 +206,140 @@ def record_of(job: Job, *, label: Callable[[str | None], str | None], file: str 
         "file": file,
         "scheduled_by_harness": harness,
     }
+
+
+NOT_FINAL = "a transfer into it had not ended at run end, so its byte counter was not final"
+CARRIED = "a transfer into it scheduled before the run had not ended when the run began"
+
+
+def split_gained(
+    gained: Mapping[str, int],
+    jobs: Iterable[Job],
+    carried: Iterable[Job],
+    name_of: Callable[[str], str | None],
+) -> dict[str, dict[str, Any]]:
+    """Split each tracked provider's gained bytes into what jobs in the window moved into it and a lower bound on the
+    rest; `name_of` names the declared provider of an id, and a job into no tracked provider counts for none."""
+    into = dict.fromkeys(gained, 0)
+    unknown: dict[str, str] = {}
+    for job in jobs:
+        name = name_of(job.target_id) if job.target_id else None
+        if name in into:
+            into[name] += job.bytes_replicated or 0
+            if job.listed_as != "ended":
+                unknown.setdefault(name, NOT_FINAL)
+    for job in carried:
+        name = name_of(job.target_id) if job.target_id else None
+        if name in into:
+            unknown.setdefault(name, CARRIED)
+    out: dict[str, dict[str, Any]] = {}
+    for provider, bytes_gained in gained.items():
+        difference = bytes_gained - into[provider]
+        out[provider] = {
+            "gained_bytes": bytes_gained,
+            "transfer_bytes_in": into[provider],
+            "difference": difference,
+            "on_demand_lower_bound": None if provider in unknown else max(0, difference),
+            "unknown": unknown.get(provider),
+        }
+    return out
+
+
+class TransferLog:
+    """Reads the space's transfer listing and each listed record through the probes' own probe, at run end."""
+
+    def __init__(
+        self,
+        client: OnezoneClient,
+        provisioner: Provisioner,
+        providers: Sequence[str],
+        probe: Callable[[Callable[[], Any]], Probed],
+        *,
+        page_limit: int = PAGE_LIMIT,
+        max_listed: int = MAX_LISTED,
+    ) -> None:
+        """List on `providers` (the tracked ones), `page_limit` ids a page; past `max_listed` ids it is unknown."""
+        if not 1 <= page_limit <= PAGE_LIMIT or max_listed < 1:
+            raise ValueError(f"a page holds 1 to {PAGE_LIMIT} ids and the listing's bound is at least one")
+        self._client, self._provisioner, self._providers, self._probe = client, provisioner, list(providers), probe
+        self._page_limit, self._max_listed = page_limit, max_listed
+        self._pages = 0
+
+    def _listed(self) -> dict[str, tuple[str, str]]:
+        """List every tracked provider's transfers in every state, page by page; return each id with the provider that
+        listed it first and the furthest state it was listed in. Raise Unreadable when that fails."""
+        listed: dict[str, tuple[str, str]] = {}
+        path = f"/spaces/{self._provisioner.space_id}/transfers"
+        max_pages = self._max_listed // self._page_limit + 1
+        for provider in self._providers:
+            where = self._client.provider_label(provider)
+            for state in STATES:
+                token: str | None = None
+                for _ in range(max_pages):
+                    params = {"state": state, "limit": self._page_limit, **({"page_token": token} if token else {})}
+                    found = self._probe(lambda p=provider, q=params: self._client.get(path, provider=p, params=q))
+                    self._pages += 1
+                    if not found.ok:
+                        raise Unreadable(f"{where}: a page of the {state} listing could not be read: {found.error}")
+                    ids, token = page_of(found.value)
+                    for tid in ids:
+                        first, seen = listed.get(tid, (provider, state))
+                        listed[tid] = (first, max(seen, state, key=STATES.index))
+                    if len(listed) > self._max_listed:
+                        raise Unreadable(
+                            f"the space lists more than {self._max_listed} transfers: the listing is unknown, not cut"
+                        )
+                    if token is None:
+                        break
+                else:
+                    raise Unreadable(f"{where}: the {state} listing did not end within {max_pages} pages")
+        return listed
+
+    def _jobs(self, listed: Mapping[str, tuple[str, str]]) -> list[Job]:
+        """Read the record of every listed id on the provider that listed it; raise Unreadable when one fails."""
+        jobs = []
+        for tid, (provider, state) in listed.items():
+            found = self._probe(lambda p=provider, t=tid: self._client.get(f"/transfers/{t}", provider=p))
+            if not found.ok:
+                raise Unreadable(f"a transfer's record could not be read: {found.error}")
+            jobs.append(job_of(tid, state, found.value))
+        return jobs
+
+    def _label(self, provider_id: str | None) -> str | None:
+        """Name a provider id by its declared provider's position label, or `undeclared`; None stays None."""
+        if provider_id is None:
+            return None
+        name = self._provisioner.provider_named(provider_id)
+        return UNDECLARED if name is None else self._client.provider_label(name)
+
+    def read(
+        self, window: Window | None, file_ids: Mapping[str, str], harness: Collection[str]
+    ) -> tuple[dict[str, Any], list[Job] | None, list[Job]]:
+        """Return the snapshot's record of the space's transfers in the window, the jobs in it and those carried over
+        into it. `file_ids` labels a tracked file's id, and `harness` holds the ids the provisioner scheduled. When the
+        listing is unknown the jobs are None and the section's `probe_ok` is false with the reason."""
+        self._pages = 0
+        section: dict[str, Any] = {
+            "probe_ok": False,
+            "error": None,
+            "window": None if window is None else window.to_json(),
+            "providers": [self._client.provider_label(p) for p in self._providers],
+            "pages": 0,
+            "listed": None,
+            "records": None,
+            "carried_over": None,
+        }
+        if window is None:
+            return {**section, "error": "the run's start was not read, so the run has no window"}, None, []
+        try:
+            jobs = self._jobs(self._listed())
+        except Unreadable as error:
+            return {**section, "pages": self._pages, "error": str(error)}, None, []
+        inside = [j for j in jobs if window.holds(j.scheduled)]
+        carried = [j for j in jobs if j.carried_over(window)]
+        records = [
+            record_of(j, label=self._label, file=file_ids.get(j.file_id or ""), harness=j.transfer_id in harness)
+            for j in inside
+        ]
+        section.update(probe_ok=True, pages=self._pages, listed=len(jobs), records=records, carried_over=len(carried))
+        return section, inside, carried

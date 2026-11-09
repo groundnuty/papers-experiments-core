@@ -6,8 +6,13 @@ Every name is a test name (`.test` hosts, `alpha` and `beta`), never a federatio
 from pathlib import Path
 from typing import Any
 
-from platform_support import ALPHA_ID, BETA_ID, write_platform
+import httpx
+from fake_data import PROVIDER
+from platform_support import ALPHA_ID, BETA_ID, TOOLS, write_platform
 
+from expcore_onedata.client import AUTH_HEADER
+
+LATER = 2_000_000_000  # a time caveat far in the future
 SETTINGS = {
     "holder": "alpha",
     "poll_s": 1.0,
@@ -22,7 +27,36 @@ SETTINGS = {
 DATA = bytes(range(256)) * 16  # 4096 bytes, so every offset has its own value
 
 
-__all__ = ["ALPHA_ID", "BETA_ID", "DATA", "SETTINGS", "Ticker", "with_placement", "write_with_placement"]
+__all__ = [
+    "ALPHA_ID",
+    "BETA_ID",
+    "DATA",
+    "SETTINGS",
+    "Ticker",
+    "tool_plane_replicates",
+    "with_placement",
+    "write_with_placement",
+]
+
+
+def tool_plane_replicates(fake: Any, client: Any, path: str, target_id: str) -> str:
+    """The agent's replication through the tool plane: the tool server posts the job to the provider with its own
+    user's token, as schedule_file_replication does, and nothing of the harness sends it. Return the job's id."""
+    token = client.mint_own_token(TOOLS, [{"type": "time", "validUntil": LATER}])
+    request = httpx.Request(
+        "POST",
+        f"https://alpha.test{PROVIDER}/transfers",
+        headers={AUTH_HEADER: token},
+        json={
+            "type": "replication",
+            "replicatingProviderId": target_id,
+            "dataSourceType": "file",
+            "fileId": fake.id_of(path),
+        },
+    )
+    answer = fake.respond(request)
+    assert answer.status_code == 201
+    return answer.json()["transferId"]
 
 
 class Ticker:

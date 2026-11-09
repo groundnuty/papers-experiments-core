@@ -1,16 +1,11 @@
 """The probes record every transfer of the space that started in the run's window, whoever started it (O08)."""
 
-import httpx
 import pytest
-from fake_data import PROVIDER
-from placement_support import ALPHA_ID, BETA_ID, DATA
-from platform_support import TOOLS
+from placement_support import ALPHA_ID, BETA_ID, DATA, tool_plane_replicates
 
-from expcore_onedata.client import AUTH_HEADER
 from expcore_onedata.probes import PlatformProbes
 
 PATH = "study/data.bin"
-LATER = 2_000_000_000  # a time caveat far in the future
 
 
 @pytest.fixture
@@ -23,26 +18,6 @@ def made_with(client, provisioner, ticker, **bounds):
     return PlatformProbes(
         client, provisioner, {"data": PATH}, ["alpha", "beta"], sleep=ticker.sleep, now=ticker.clock, **bounds
     )
-
-
-def tool_plane_replicates(fake, client, path, target_id):
-    """The agent's replication through the tool plane: the tool server posts the job with its own user's token, as
-    schedule_file_replication does; nothing of the harness sends it."""
-    token = client.mint_own_token(TOOLS, [{"type": "time", "validUntil": LATER}])
-    request = httpx.Request(
-        "POST",
-        f"https://alpha.test{PROVIDER}/transfers",
-        headers={AUTH_HEADER: token},
-        json={
-            "type": "replication",
-            "replicatingProviderId": target_id,
-            "dataSourceType": "file",
-            "fileId": fake.id_of(path),
-        },
-    )
-    answer = fake.respond(request)
-    assert answer.status_code == 201
-    return answer.json()["transferId"]
 
 
 def records_of(snapshot):
