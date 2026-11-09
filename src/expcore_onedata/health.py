@@ -17,7 +17,7 @@ An answer that cannot be read is unhealthy, never a crash and never a pass: any 
 exception, becomes `Health(False, reason)`. The reason names positions in the file (`providers[i]`), counts and the
 ids the federation reports, never a token, URL, host or configured name.
 
-When platform.toml has a `[faults]` table the fault gate (`expcore_onedata.admission.FaultGate`) runs around the whole
+When platform.toml has a `[faults]` table the fault gate (`expcore_onedata.fault_gate.FaultGate`) runs around the whole
 check, before it asks Onezone anything or measures the content type: it recovers what a crashed run left open whenever
 no run is on the federation, then holds the federation shared until the check has answered, so no injection starts in
 the middle of it, and fails while an injection stays open, because a provider taken down for one condition's run, and
@@ -46,9 +46,10 @@ from collections.abc import Callable
 
 from expcore.campaign.healthgate import Health, HealthCheck
 from expcore.config.loading import ConfigError
-from expcore_onedata.admission import FaultGate, fault_settings_of
+from expcore_onedata.admission import fault_settings_of
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_recovery import FaultDriver
 from expcore_onedata.fault_settings import compose_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, read_space

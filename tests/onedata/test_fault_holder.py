@@ -18,8 +18,9 @@ import time
 import pytest
 from fault_support import OUTAGE_TARGET, SERVICES, FakeServices, inject_and_die, injector_for, write_faults
 
-from expcore_onedata.admission import FaultGate, FederationLock
+from expcore_onedata.admission import FederationLock
 from expcore_onedata.config import load_platform
+from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import boot_id
 from expcore_onedata.faults import load_faults
 
