@@ -60,6 +60,7 @@ def platform(config, issuer, slots, tmp_path):
 
 
 def build_platform(config, issuer, slots, tmp_path, **options):
+    """A sandbox platform on a fake host; `events` collects what the platform records (it is required)."""
     s = config.sandbox
     host = FakeHost()
     for ref in (s.agent, s.gate, s.oneclient):
@@ -76,7 +77,7 @@ def build_platform(config, issuer, slots, tmp_path, **options):
         registry=Registry(),
         sandbox_options=sandbox_options,
         clock=lambda: NOW,
-        **options,
+        **{"events": lambda kind, detail: None, **options},
     )
     return built, host, journal
 

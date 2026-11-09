@@ -231,7 +231,7 @@ v0.1 holds what a study needs to run end to end; the rest follows in v0.2. Each 
 | statistics kernel: named contrasts, the first estimator, Holm, cluster bootstrap, power simulation | further estimators |
 | provenance headers, code stamp, study-token test | |
 | replication packages: inclusion list, checksums, study-token check, anonymisation lists (whole words, prose and metadata only), deterministic archive, `make check` (needed by #5's release) | replication packages: scanner, canaries |
-| platform: federation configuration, tokens on both planes, sandbox and data paths, tool-server launch, provisioning, probes, health, day-0 checks (#4) | fault injection |
+| platform: federation configuration, tokens on both planes, sandbox and data paths, tool-server launch, provisioning, probes, health, day-0 checks (#4); fault injection with target-matched treatment (#17) | |
 
 ## Decisions on review
 
