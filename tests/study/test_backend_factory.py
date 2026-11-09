@@ -8,6 +8,7 @@ from study_support import EXAMPLE, HEAD, clean_environment
 from expcore.campaign.resume import FingerprintMismatch
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
+from expcore.records.redact import REDACTED
 from expcore.study.config import load_study
 from expcore.study.pipeline import fingerprint_of, run_study
 from expcore.study.plugin import StudyContext, load_plugin
@@ -41,8 +42,8 @@ def relay_factory(spec, *, seed, limits, base_url, time_left):
     """Serve the study's own backend and leave every other model to the core's factory."""
     if spec.backend != "toy_relay":
         return _default_factory(spec, seed=seed, limits=limits, base_url=base_url, time_left=time_left)
-    stub = _build_backend(_dataclasses.replace(spec, backend="stub"), seed=seed, limits=limits, time_left=time_left)
-    return RelayBackend(stub)
+    as_stub = _dataclasses.replace(spec, backend="stub", key_env=None)  # a stub reads no key
+    return RelayBackend(_build_backend(as_stub, seed=seed, limits=limits, time_left=time_left))
 
 
 relay_factory.version = "1"
@@ -54,7 +55,7 @@ def build(context):
 '''
 
 
-def study_copy(tmp_path, *, factory: bool):
+def study_copy(tmp_path, *, factory: bool, extra_entry: str = ""):
     """The example with alpha-stub moved to the study's own backend, and the plugin's factory when asked."""
     copy = tmp_path / "study"
     shutil.copytree(EXAMPLE, copy, ignore=shutil.ignore_patterns("out", "__pycache__"))
@@ -63,7 +64,7 @@ def study_copy(tmp_path, *, factory: bool):
     assert entry in models.read_text(encoding="utf-8")
     models.write_text(
         models.read_text(encoding="utf-8").replace(
-            entry, f'[models.alpha-stub]\nbackend = "{TOY_BACKEND}"\napi_id = "alpha-stub"\n'
+            entry, f'[models.alpha-stub]\nbackend = "{TOY_BACKEND}"\napi_id = "alpha-stub"\n{extra_entry}'
         ),
         encoding="utf-8",
     )
@@ -157,3 +158,36 @@ def test_c06_a_backend_factory_without_a_version_is_refused_when_the_plugin_is_l
     plugin.write_text(text.replace('relay_factory.version = "1"', replacement), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"plugin\.py: the plugin's backend_factory needs a 'version' attribute"):
         load_plugin(StudyContext(load_study(copy), {"commit": HEAD}))
+
+
+CREDENTIAL_VARIABLE = "TOY_RELAY_CREDENTIAL"  # not a name the environment's own redaction matches
+CREDENTIAL = "toy-relay-credential-value-0123456789"
+LEAKING_TOOL = '''
+
+import os as _os
+
+_lookup_without_the_key = lookup
+
+
+def lookup(arguments, *, timeout_s, ctx):
+    """A careless tool: it echoes the backend's key in its result."""
+    plain = _lookup_without_the_key(arguments, timeout_s=timeout_s, ctx=ctx)
+    return _dataclasses.replace(plain, text=f"{plain.text} {_os.environ['TOY_RELAY_CREDENTIAL']}")
+'''
+
+
+def test_r12_the_key_of_a_backend_without_a_spec_that_a_tool_echoes_never_reaches_a_record(
+    tmp_path, clean_environment, monkeypatch
+):
+    """R12: the protocol does not require a backend to hold its model entry, so a run is recorded with the study's
+    whole model table: a tool that echoes the key_env value of a custom backend leaves it out of every written file."""
+    monkeypatch.setenv(CREDENTIAL_VARIABLE, CREDENTIAL)
+    copy = study_copy(tmp_path, factory=True, extra_entry=f'key_env = "{CREDENTIAL_VARIABLE}"\n')
+    plugin = copy / "plugin.py"
+    plugin.write_text(plugin.read_text(encoding="utf-8") + LEAKING_TOOL, encoding="utf-8")
+    write_stamp(copy, HEAD, load_study(copy).scope)
+    summary = run_study(copy)
+    assert summary.statuses == {"done": len(load_study(copy).manifest.rows)}, summary.statuses
+    written = [path.read_text(encoding="utf-8") for path in (copy / "out" / "runs").rglob("*.json")]
+    assert any(REDACTED in text for text in written), "the tool's result was not recorded as redacted"
+    assert not any(CREDENTIAL in text for text in written)

@@ -191,9 +191,10 @@ class RunRequest:
     clock: Callable[[], float]
     treatment_kinds: tuple[str, ...]
     lease: Lease | None = None
+    models: ModelTable | None = None
 ```
 
-`record_run(request, providers, system, user, config, *, code, **options)` runs the loop with the request's backend, timer and treatment kinds and returns the record.
+`record_run(request, providers, system, user, config, *, code, **options)` runs the loop with the request's backend, timer and treatment kinds and returns the record. It records with the request's model table, which the scheduler fills in for every run, so the key of each model in `models.toml` is redacted whatever the backend (R12).
 
 Core guarantees:
 - The gates (health, harness stop, budget, unit pause) were passed, the lease the platform declared for the run is held for the whole attempt, and the timer is not started: the loop starts it. The attempt has a row (`running`) before the executor is called, so a kill leaves a run that the next start settles (C04).
