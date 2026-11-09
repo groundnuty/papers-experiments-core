@@ -54,9 +54,12 @@ class Job:
     finished: float | None
 
     def observed(self) -> tuple[Any, ...]:
-        """What two readings of the job must share to be the same observation: its list, state and counters."""
+        """What two readings of the job must share to be the same observation: what it is (its kind, file, source and
+        target, which no clock affects), its list, state and counters. Its times are not compared here, since the
+        providers' clocks differ; each reading is placed against the window on its own instead."""
+        what = (self.kind, self.file_id, self.source_id, self.target_id)
         counters = (self.bytes_replicated, self.files_replicated, self.files_evicted, self.files_failed)
-        return (self.listed_as, self.state, *counters)
+        return (*what, self.listed_as, self.state, *counters)
 
 
 def page_of(answer: Any) -> tuple[list[str], str | None]:

@@ -201,3 +201,18 @@ def test_o08_readings_that_place_a_transfer_on_different_sides_of_the_window_mak
     beta = snapshot["on_demand"]["beta"]
     assert beta["on_demand_lower_bound"] is None
     assert {"listings_disagree", "transfer_carried_over"} & set(beta["unknown"])
+
+
+def test_o08_readings_that_name_different_targets_make_both_bounds_unknown(probes, client, seeded, ticker):
+    """O08: both providers list the agent's replication as ended with the same counters, but one names beta as its
+    target and the other alpha. Which provider gained its bytes is not established, so neither bound is known."""
+    probes.start({})
+    ticker.sleep(10)
+    tid = tool_plane_replicates(seeded, client, MORE, BETA_ID)
+    seeded.end_transfer(tid)
+    seeded.provider_view[(tid, ALPHA_ID)] = {"replicatingProviderId": ALPHA_ID}
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    for provider in ("alpha", "beta"):
+        assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
+        assert "listings_disagree" in snapshot["on_demand"][provider]["unknown"]
