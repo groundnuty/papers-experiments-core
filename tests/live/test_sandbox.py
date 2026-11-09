@@ -8,8 +8,14 @@ The first checks need only a docker daemon. The ones that start a sandbox need `
 data-path levels mint a read-only token for a fixed user (`[principals.data_path]`). They start a sandbox for each
 configured level, run a line of code in it, prove it refuses a write, stop it, and require that the lease key's
 probe then answers True. Nothing here writes to a space; without the variables nothing is constructed or contacted.
+
+The TLS checks need a platform file whose `[tls]` is not the default, because its federation's certificate chains to a
+CA no default trusts (a self-signed one): with each of the three modes in turn, oneclient must fail to mount by default
+and mount with `ca_file` or `insecure_tls`, and the gate's upstream must refuse the zone by default and reach it with
+either. With `insecure_tls` in the file, the `ca_file` cases skip.
 """
 
+import dataclasses
 import os
 import time
 
@@ -18,7 +24,7 @@ import pytest
 if os.environ.get("EXPCORE_LIVE_DOCKER") != "1":
     pytest.skip("EXPCORE_LIVE_DOCKER is not set; these tests use a real docker daemon", allow_module_level=True)
 
-from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxSpec
+from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec
 from expcore_onedata.sandbox.hostops import DockerHost
 from expcore_onedata.sandbox.provider import SandboxProbe
 from expcore_onedata.sandbox.sandbox import DockerSandbox
@@ -165,3 +171,77 @@ def test_no_credential_is_visible_inside_the_agent_on_the_data_path_of_this_leve
         assert result.stdout.strip() == "clean"
     finally:
         sandbox.stop()
+
+
+# The agent's read of the zone through the gate: a call the gate passes, whose answer's status says whether the gate's
+# upstream connection was made (any answer of the federation) or refused (the gate's 502).
+ZONE_CALL = """
+import os, urllib.error, urllib.request
+url = "https://" + os.environ["ONEDATA_ONEZONE_HOST"] + "/api/v3/onezone/tokens/infer_access_token_scope"
+request = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+try:
+    print(urllib.request.urlopen(request, timeout=60).status)
+except urllib.error.HTTPError as error:
+    print(error.code)
+"""
+TLS_MODES = ("verify-default", "ca_file", "insecure_tls")
+
+
+def tls_for(config, label):
+    """The TLS setting of one mode, against the federation of the platform file. The file must declare a mode other
+    than the default, which says its certificate is one no default trusts, so the default can be shown to fail."""
+    from expcore_onedata.tls import TlsSettings
+
+    if config.tls.mode == "verify":
+        pytest.skip("the platform file's [tls] is the default: its federation's certificate is trusted as it is")
+    if label == "ca_file" and config.tls.ca_file is None:
+        pytest.skip("the platform file's [tls] names no ca_file")
+    return {"verify-default": TlsSettings(), "ca_file": config.tls, "insecure_tls": TlsSettings(insecure=True)}[label]
+
+
+def level_of(config, mode):
+    """A configured level of the data path that is this mode, or a skip."""
+    found = [level for level in levels(config) if config.sandbox.mode_of(level) is mode]
+    if not found:
+        pytest.skip(f"[sandbox.data_paths] maps no level to {mode.value}")
+    return found[0]
+
+
+@needs_platform
+@pytest.mark.parametrize("label", TLS_MODES)
+def test_o05_oneclient_in_the_sidecar_mounts_as_the_tls_setting_says(config, host, label):
+    """O05: against the federation of the platform file, whose certificate no default trusts, the sidecar's oneclient
+    fails to mount by default, and mounts with the CA bundle (mounted read-only, named by SSL_CERT_FILE) or with
+    insecure_tls."""
+    settings = dataclasses.replace(config.sandbox, tls=tls_for(config, label))
+    level = level_of(config, DataPathMode.MOUNT)
+    spec = spec_for(config, level, f"live-tls-mount-{int(time.time())}")
+    if label == "verify-default":
+        with pytest.raises(SandboxError):
+            DockerSandbox.start(host, settings, spec)
+        return
+    sandbox = DockerSandbox.start(host, settings, spec)
+    try:
+        assert sandbox.metadata()["read_only_verified"] == {"root": True, "mount": True}
+        assert sandbox.metadata()["tls"] == settings.tls.record()
+    finally:
+        sandbox.stop()
+
+
+@needs_platform
+@pytest.mark.parametrize("label", TLS_MODES)
+def test_o05_the_gates_upstream_reaches_the_zone_as_the_tls_setting_says(config, host, label):
+    """O05: against the federation of the platform file, whose certificate no default trusts, the gate refuses the
+    zone's certificate by default (the agent's call is answered 502), and reaches the zone with the CA bundle (mounted
+    read-only) or with insecure_tls."""
+    settings = dataclasses.replace(config.sandbox, tls=tls_for(config, label))
+    level = level_of(config, DataPathMode.REST)
+    sandbox = DockerSandbox.start(host, settings, spec_for(config, level, f"live-tls-rest-{int(time.time())}"))
+    try:
+        status = int(sandbox.exec(ZONE_CALL, 120).stdout.strip())
+    finally:
+        sandbox.stop()
+    if label == "verify-default":
+        assert status == 502
+    else:
+        assert status < 500
