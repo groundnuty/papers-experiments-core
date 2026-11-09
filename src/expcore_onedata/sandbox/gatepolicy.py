@@ -83,7 +83,9 @@ ENTRY_REST_BYTES = 256  # type, size, mtime, posixPermissions, the keys and the 
 PAGE_ENVELOPE_BYTES = 4096  # the page's own keys, isLast and the nextPageToken
 _WHOLE_NUMBER = re.compile(r"[+-]?[0-9]{1,18}")
 MAX_BODY_DEPTH = 32  # the deepest a listing's JSON body may nest; the official client's nests two levels
-_STRUCTURE = re.compile(rb'["\\\[\]{}]')  # the bytes that open or close a string, an array or an object, and escapes
+_STRUCTURE = re.compile(
+    r'["\\\[\]{}]'
+)  # the characters that open or close a string, an array or an object, and escapes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -117,27 +119,28 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return dict(pairs)
 
 
-def _nested_deeper(body: bytes, bound: int) -> bool:
+def _nested_deeper(text: str, bound: int) -> bool:
     """Whether a JSON text nests arrays and objects deeper than `bound`, found in one linear pass that looks at no
-    byte twice and keeps no stack, so no body can make it recurse; a bracket inside a string is text, not nesting."""
+    character twice and keeps no stack, so no body can make it recurse; a bracket inside a string is text, not nesting.
+    It reads the decoded text, so a body in UTF-16 or UTF-32 is scanned as the parser reads it."""
     depth, in_string, skip = 0, False, -1
-    for found in _STRUCTURE.finditer(body):
+    for found in _STRUCTURE.finditer(text):
         at = found.start()
-        if at == skip:  # the byte after a backslash in a string is escaped, whatever it is
+        if at == skip:  # the character after a backslash in a string is escaped, whatever it is
             continue
-        char = body[at : at + 1]
+        char = text[at]
         if in_string:
-            if char == b"\\":
+            if char == "\\":
                 skip = at + 1
-            elif char == b'"':
+            elif char == '"':
                 in_string = False
-        elif char == b'"':
+        elif char == '"':
             in_string = True
-        elif char in (b"[", b"{"):
+        elif char in "[{":
             depth += 1
             if depth > bound:
                 return True
-        elif char in (b"]", b"}"):
+        elif char in "]}":
             depth -= 1
     return False
 
@@ -149,10 +152,14 @@ def _listing_refusal(query: str, body: bytes | None) -> str | None:
     server reads is not known; a listing with none passes, and the server answers its default page."""
     limits: list[object] = list(parse_qs(query, keep_blank_values=True).get("limit", []))
     if body:
-        if _nested_deeper(body, MAX_BODY_DEPTH):  # refused before the parser, which recurses once per level
+        try:  # decoded as the parser decodes bytes (UTF-8, -16 or -32, found from the first bytes)
+            text = body.decode(json.detect_encoding(body), "surrogatepass")
+        except (UnicodeDecodeError, LookupError):
+            return "a listing's body must be one JSON object with each key once"
+        if _nested_deeper(text, MAX_BODY_DEPTH):  # refused before the parser, which recurses once per level
             return f"a listing's body may nest at most {MAX_BODY_DEPTH} levels of arrays and objects"
         try:
-            options = json.loads(body, object_pairs_hook=_unique_keys)
+            options = json.loads(text, object_pairs_hook=_unique_keys)
         except Exception:  # any failure of the parser, RecursionError included, is the agent's malformed request
             options = None
         if not isinstance(options, dict):

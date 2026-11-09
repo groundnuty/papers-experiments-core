@@ -1,5 +1,7 @@
 """O05, O16: only read calls pass the data gate; everything else is refused as a decision, not an error."""
 
+import json
+
 import pytest
 
 from expcore_onedata.sandbox import gatepolicy as policy
@@ -203,3 +205,13 @@ def test_o05_the_nesting_bound_counts_brackets_outside_strings_only():
     assert policy.decide("oneprovider", "GET", CHILDREN, "", body).allow
     escaped = ('{"index": "\\"' + "[" * 200 + '"}').encode()  # an escaped quote does not end the string
     assert policy.decide("oneprovider", "GET", CHILDREN, "", escaped).allow
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le"])
+def test_o05_the_nesting_bound_reads_the_body_as_the_parser_decodes_it(encoding):
+    """O05: a body in UTF-16 or UTF-32 is decoded as the parser decodes it before its depth is counted, so an escaped
+    quote and the brackets inside a string are read as the parser reads them, and a depth-one object passes."""
+    body = json.dumps({"index": '"' + "[" * 40}).encode(encoding)
+    assert policy.decide("oneprovider", "GET", CHILDREN, "", body).allow
+    deep = ('{"a": ' + "[" * 40 + "]" * 40 + "}").encode(encoding)
+    assert policy.decide("oneprovider", "GET", CHILDREN, "", deep).status == 400
