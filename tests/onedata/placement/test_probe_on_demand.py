@@ -290,3 +290,20 @@ def test_o07_a_transfer_the_listing_showed_and_then_dropped_leaves_every_bound_u
     for provider in ("alpha", "beta"):
         assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
         assert "transfer_left_listing" in snapshot["on_demand"][provider]["unknown"]
+
+
+def test_o08_a_job_listed_as_ended_whose_record_is_still_active_leaves_its_bound_unknown(
+    probes, client, seeded, ticker
+):
+    """O08: every provider lists the replication as ended, but its record still says active with no bytes moved. The
+    counters are final only when the list and the record both say so: beta's bound is unknown."""
+    probes.start({})
+    ticker.sleep(10)
+    tid = tool_plane_replicates(seeded, client, MORE, BETA_ID)
+    seeded.end_transfer(tid)
+    for provider in (ALPHA_ID, BETA_ID):
+        seeded.provider_view[(tid, provider)] = {"replicationStatus": "active", "bytesReplicated": 0}
+    ticker.sleep(10)
+    snapshot = probes.finish()
+    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
+    assert "transfer_not_ended" in snapshot["on_demand"]["beta"]["unknown"]

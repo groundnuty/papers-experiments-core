@@ -41,6 +41,8 @@ from typing import Any
 from expcore_onedata.transferrecord import Job
 
 NOT_ENDED = "transfer_not_ended"
+# The record states after which a job moves no more bytes; any other, or none, leaves its counters open.
+FINAL_STATES = frozenset({"completed", "failed", "cancelled", "skipped"})
 CARRIED_OVER = "transfer_carried_over"
 DISAGREE = "listings_disagree"
 NOT_SETTLED = "listing_not_settled"
@@ -139,7 +141,7 @@ def split_gained(
         name = name_of(job.target_id) if job.target_id else None
         if name in into:
             into[name] += job.bytes_replicated or 0
-            if job.listed_as != "ended":
+            if job.listed_as != "ended" or job.state not in FINAL_STATES:  # both must say its counters are final
                 reasons[name].add(NOT_ENDED)
     for target_id, reason in flagged:
         name = name_of(target_id)
