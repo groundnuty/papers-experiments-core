@@ -15,7 +15,7 @@ from sandbox_support import FAST
 from expcore.campaign.lease import LeasePool
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, SandboxError
-from expcore_onedata.sandbox.hostops import CmdResult
+from expcore_onedata.sandbox.hostops import CmdResult, fuse_mounts
 from expcore_onedata.sandbox.provider import DATA_USERS, SandboxPlatform, SandboxProbe
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.tokens import TokenRefused
@@ -234,6 +234,31 @@ def test_c19_the_probe_is_about_its_own_key_only(stage, tmp_path):
     assert probe.resource_gone("login-data2", {}) is False
     stage.host.mounts[str(stage.s.work_root / "login-data-extra-0123abcd" / "work")] = "ext4"
     assert probe.resource_gone(KEY, {}) is True  # a key that merely starts with this one is another key
+
+
+def test_o15_an_unreadable_proc_state_at_the_teardown_keeps_the_mount_sandbox_and_its_key_held(stage, tmp_path):
+    """O15: when /proc refuses the state of the agent's and the sidecar's processes, and their namespaces cannot be
+    read, nothing proves their copies of the FUSE mount gone: the teardown removes neither container, the launch fails
+    as infrastructure, and the probe does not answer True, so the key stays quarantined."""
+    pool = lease_pool(stage, tmp_path)
+    lease = pool.acquire(DATA_USERS, run_key="run-1")
+
+    async def body(sandbox):
+        host = stage.host
+        for m in fuse_mounts(host.mountinfo()):  # the connection exists, and its abort is refused
+            host.files[f"/sys/fs/fuse/connections/{m['dev'].split(':')[1]}"] = ""
+        host.run_handlers["sh"] = lambda argv: CmdResult(1, "", "denied")
+        for name in (sandbox.names.agent, sandbox.names.sidecar):
+            host.denied.add(f"/proc/{host.containers[name].pid}/stat")
+
+    with pytest.raises(InfraError) as caught:
+        run_launch(stage, "mounted", lease, body)
+    assert caught.value.kind == "sandbox"
+    assert {c.labels.get("org.test.lease") for c in stage.host.containers.values()} == {KEY}
+    assert len(stage.host.containers) == 2  # the agent and the sidecar, held
+    assert stage.platform.probe().resource_gone(KEY, {}) is not True
+    assert pool.finish(lease) is False
+    assert lease.quarantined
 
 
 def test_c19_a_probe_that_cannot_ask_fails_safe(stage, tmp_path):

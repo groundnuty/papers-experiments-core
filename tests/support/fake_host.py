@@ -126,6 +126,7 @@ class FakeHost:
         self.fail_run: set[str] = set()
         self.fail_network_create: list[str] = []
         self.stuck_mounts: set[str] = set()
+        self.denied: set[str] = set()  # files whose read raises PermissionError, as /proc does with hidepid
         self.mount_ids: dict[str, int] = {}  # a mount keeps its id when the directory above it is renamed
         self.one_shots: list[FakeContainer] = []  # the `--rm` containers that were run, as they were labelled
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
@@ -185,6 +186,8 @@ class FakeHost:
 
     def read_text(self, path: str | Path) -> str:
         path = str(path)
+        if path in self.denied:
+            raise PermissionError(13, "Permission denied", path)
         if path == "/proc/self/mountinfo":
             return self.mountinfo()
         if path in self.files:

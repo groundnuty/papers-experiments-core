@@ -157,20 +157,49 @@ class _StepLog:
 
 
 # ------------------------------------------------------------------------------------------------ processes
-def _stat(host: HostOps, pid: int) -> dict | None:
-    """State, parent, command name and start time of a process (/proc/<pid>/stat); None when it is gone or a zombie."""
+UNKNOWN = "unknown"  # what `_stat` says of a process whose /proc state cannot be read or parsed: neither alive nor gone
+
+
+def _stat_text(host: HostOps, pid: int) -> str | None:
+    """The /proc/<pid>/stat line; None only when the process is gone, which only ENOENT on its /proc entry proves (O15).
+    Any other failure (a PermissionError where /proc hides other users' processes, EIO, ESRCH in a race) raises
+    `OSError`: the process may well be alive, and the caller must treat it as unknown."""
     try:
-        s = host.read_text(PROC / str(pid) / "stat")
-    except (OSError, ValueError):
+        return host.read_text(PROC / str(pid) / "stat")
+    except FileNotFoundError:
         return None
-    rest = s[s.rfind(")") + 2 :].split()
-    if len(rest) < 20 or rest[0] in ("Z", "X", "x"):
+
+
+def _gone(host: HostOps, pid: int) -> bool:
+    """Whether a process is proved gone, and with it the hold its mount namespace kept on a copy of the FUSE mount: only
+    ENOENT on its /proc entry proves that (O15). An entry that cannot be read is unknown, and unknown is never gone."""
+    try:
+        return _stat_text(host, pid) is None
+    except OSError:
+        return False
+
+
+def _stat(host: HostOps, pid: int) -> dict | str | None:
+    """State, parent, command name and start time of a process (/proc/<pid>/stat). None when it is gone (ENOENT) or a
+    zombie (it holds no file and waits on no request); `UNKNOWN` when its entry cannot be read (a PermissionError, any
+    other OSError) or parsed: it may be alive, so it is never taken for gone (O15)."""
+    try:
+        s = _stat_text(host, pid)
+    except OSError:
+        return UNKNOWN
+    if s is None:
+        return None
+    close = s.rfind(")")
+    rest = s[close + 2 :].split()
+    if close < 0 or len(rest) < 20 or not rest[1].lstrip("-").isdigit():
+        return UNKNOWN
+    if rest[0] in ("Z", "X", "x"):
         return None
     return {
         "pid": pid,
         "state": rest[0],
         "ppid": int(rest[1]),
-        "comm": s[s.find("(") + 1 : s.rfind(")")],
+        "comm": s[s.find("(") + 1 : close],
         "start": rest[19],
     }
 
@@ -216,25 +245,33 @@ def _cgroup_procs(host: HostOps, cid: str) -> list[int] | None:
 
 def _readers(host: HostOps, agent: dict) -> list[dict] | None:
     """The agent container's processes except its init and the init's `sleep infinity` (keeping those keeps the container,
-    and with it its mount namespace, alive until step 4). None when the container's cgroup cannot be read."""
+    and with it its mount namespace, alive until step 4). None when the container's cgroup cannot be read, or the state
+    of one of its processes cannot: it could be a reader as well as the init's `sleep`, so the list is unknown (O15)."""
     procs = _cgroup_procs(host, agent["id"])
     if procs is None:
         return None
     out = []
     for pid in procs:
+        if pid == agent["pid"]:
+            continue
         st = _stat(host, pid)
-        if st is None or pid == agent["pid"] or (st["ppid"] == agent["pid"] and st["comm"] == "sleep"):
+        if st == UNKNOWN:
+            return None
+        if not isinstance(st, dict) or (st["ppid"] == agent["pid"] and st["comm"] == "sleep"):
             continue
         out.append(st)
     return out
 
 
 def _alive(host: HostOps, procs: list[dict]) -> list[dict]:
-    """The ones still alive (same pid AND start time: a reused pid is not a survivor)."""
+    """The ones still alive (same pid AND start time: a reused pid is not a survivor). One whose state can no longer be
+    read is kept as it was last seen, with `unknown` set: unknown is never gone (O15)."""
     out = []
     for p in procs:
         st = _stat(host, p["pid"])
-        if st is not None and st["start"] == p["start"]:
+        if st == UNKNOWN:
+            out.append({**p, "unknown": True})
+        elif isinstance(st, dict) and st["start"] == p["start"]:
             out.append(st)
     return out
 
@@ -408,8 +445,8 @@ def _unmount_namespaces(host: HostOps, targets: list[tuple[str, int]], waits: Wa
     clean = True
     for who, pid in targets:
         copies = _ns_copies(host, pid, waits)
-        if copies is None:  # unknown is not clean, unless the process and so its namespace have gone
-            gone = _stat(host, pid) is None
+        if copies is None:  # unknown is not clean, unless the process and so its namespace have gone (ENOENT only)
+            gone = _gone(host, pid)
             L(
                 "unmount_ns",
                 who=who,
@@ -427,7 +464,7 @@ def _unmount_namespaces(host: HostOps, targets: list[tuple[str, int]], waits: Wa
                 host, "nsenter", "-t", str(pid), "-m", "-p", "umount", "-l", m["mountpoint"], timeout_s=waits.command_s
             )
         again = _ns_copies(host, pid, waits)
-        ok = again == [] or (again is None and _stat(host, pid) is None)
+        ok = again == [] or (again is None and _gone(host, pid))
         L(
             "unmount_ns",
             who=who,

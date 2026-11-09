@@ -164,3 +164,51 @@ def test_reaping_an_orphan_with_a_live_mount_goes_through_the_ordered_teardown(w
     out = netpool.reap_orphans(world, netpool.Labels("org.test"))
     assert sorted(out["held"]) == []
     assert world.containers == {}
+
+
+def only_the_namespaces_can_prove_it(host):
+    """The host's copy of the mount unmounts; neither container's own mount table can be read; the FUSE connection's
+    abort is refused. Whether a container still holds a copy then rests on whether its process is gone."""
+    for n in range(100, 104):
+        host.files[f"/sys/fs/fuse/connections/{n}"] = ""
+    host.run_handlers["sh"] = lambda argv: CmdResult(1, "", "denied")
+
+
+def test_o15_a_process_whose_proc_state_cannot_be_read_is_unknown_and_its_containers_are_held(world):
+    """O15: a PermissionError on /proc/<pid>/stat says nothing about the process; its namespace may hold a live copy of
+    the FUSE mount, so the teardown removes no container and tells the caller to hold them."""
+    only_the_namespaces_can_prove_it(world)
+    for name in (AGENT, SIDECAR):
+        world.denied.add(f"/proc/{world.containers[name].pid}/stat")
+    result = run_teardown(world)
+    assert next(r for r in result.log if r["step"] == "unmount")["verified"] is True  # the host's copy went
+    assert [r["outcome"] for r in result.log if r["step"] == "unmount_ns"] == ["unreadable", "unreadable"]
+    assert result.fuse_safe is False
+    assert set(world.containers) == {AGENT, SIDECAR}
+    assert [kind for kind, _ in effects(world) if kind in ("stop", "remove")] == []
+
+
+def test_o15_only_enoent_on_the_proc_entry_proves_the_process_gone(world):
+    """O15: the control: the same teardown with the /proc entries absent (ENOENT) proves both processes gone, so their
+    namespaces hold no copy and the containers go, in order."""
+    only_the_namespaces_can_prove_it(world)
+    for name in (AGENT, SIDECAR):
+        world.files.pop(f"/proc/{world.containers[name].pid}/stat")
+    result = run_teardown(world)
+    assert [r["outcome"] for r in result.log if r["step"] == "unmount_ns"] == ["gone", "gone"]
+    assert result.fuse_safe is True
+    assert [name for kind, name in effects(world) if kind == "remove"] == [SIDECAR, AGENT]
+
+
+def test_o15_a_reader_whose_state_cannot_be_read_is_never_counted_gone(world):
+    """O15: a process of the agent whose /proc state is refused makes the reader list unknown (it may be a reader as
+    well as the init's sleep), and a signalled reader that can no longer be read is still a survivor."""
+    agent = teardown._inspect(world, AGENT, WAITS)
+    readers = teardown._readers(world, agent)
+    assert [p["pid"] for p in readers] == [22, 23]
+    world.denied.add("/proc/23/stat")
+    assert teardown._readers(world, agent) is None
+    left = teardown._alive(world, readers)
+    assert [(p["pid"], p.get("unknown", False)) for p in left] == [(22, False), (23, True)]
+    world.files["/proc/22/stat"] = "22 (python) S 1"  # cut off: unparsable is unknown too
+    assert [p["pid"] for p in teardown._alive(world, readers)] == [22, 23]
