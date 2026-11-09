@@ -38,7 +38,7 @@ from typing import Any
 
 from expcore.campaign.attempt import AttemptRunner, Parts, RunAdmission
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
-from expcore.campaign.factors import FactorSchema
+from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.harness_stop import HarnessStops
 from expcore.campaign.healthgate import HealthCheck, HealthGate
@@ -53,6 +53,7 @@ from expcore.campaign.resume import open_campaign
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.store import Store, column_for
 from expcore.campaign.units import UnitHealth, history_from_attempts
+from expcore.config.loading import Section
 from expcore.config.models import ModelTable
 from expcore.loop.config import AgentConfig
 from expcore.models.admission import admit
@@ -118,6 +119,12 @@ class Scheduler:
         if missing:
             raise ValueError(f"the plan runs model(s) {', '.join(missing)} that have no admitted endpoint")
         self.settings.check_kinds(schema)
+        exclusive = [name for name, value in schema.exclusive.items() if value]
+        if exclusive and admission is None:  # nothing would hold the platform exclusively: refuse, never pretend
+            raise Section({}, schema.file, f"[conditions.{exclusive[0]}]").fail(
+                EXCLUSIVE_KEY,
+                "declares an exclusive run, but the platform gives the campaign no run admission to hold exclusively",
+            )
         self.store: Store | None = None
         self.recovery: Recovery | None = None
         self.not_admitted: dict[str, str] = {}

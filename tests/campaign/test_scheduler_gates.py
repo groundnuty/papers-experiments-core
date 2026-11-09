@@ -178,12 +178,12 @@ class OneAtATime:
         self.lock, self.waiting = threading.Lock(), threading.Event()
 
     @contextlib.contextmanager
-    def __call__(self, treatment_kinds, treatment_targets, cancel):
+    def __call__(self, treatment_kinds, treatment_targets, cancel, exclusive):
         if not self.lock.acquire(blocking=False):
             self.waiting.set()
             self.lock.acquire()
         try:
-            yield
+            yield "exclusive"
         finally:
             self.lock.release()
 

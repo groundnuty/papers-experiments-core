@@ -122,11 +122,11 @@ class Held:
         self.events, self.seen = [], []
 
     @contextlib.contextmanager
-    def __call__(self, treatment_kinds, treatment_targets, cancel):
+    def __call__(self, treatment_kinds, treatment_targets, cancel, exclusive):
         self.events.append("enter")
         token = HOLDING.set(True)
         try:
-            yield
+            yield "shared"
         finally:
             HOLDING.reset(token)
             self.events.append("leave")

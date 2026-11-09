@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.attempts import (
+    ADMISSION_MODES,
     LEASE_OUTCOMES,
     AttemptRefused,
     BegunAttempt,
@@ -77,6 +78,11 @@ _ADDED_COLUMNS = (
     ("attempts", "dispatch_seq", "INTEGER"),  # place in the campaign's dispatch sequence; grows with every attempt
     ("attempts", "lease_wait_s", "REAL"),  # seconds waited for the lease the attempt ran under; NULL: none or unknown
     ("attempts", "lease_outcome", "TEXT"),  # how the lease was obtained (attempts.LEASE_OUTCOMES); NULL: unknown
+    (
+        "attempts",
+        "admission",
+        "TEXT",
+    ),  # what of the run admission the attempt held (attempts.ADMISSION_MODES); NULL: unknown
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -405,6 +411,7 @@ class Store:
         *,
         lease_wait_s: float | None = None,
         lease_outcome: str = "none",
+        admission: str = "none",
     ) -> BegunAttempt:
         """Insert the 'running' row before the run starts; refuse in the transaction a run that is not pending.
 
@@ -412,10 +419,12 @@ class Store:
         run again under the number it had. The row also takes the next place in the campaign's dispatch sequence (one
         more than the largest so far, in the same write transaction, so it grows with every attempt and a restart
         carries on from where the dead process stopped) and the lease it runs under: how long it waited for it and
-        how it was obtained (`LEASE_OUTCOMES`).
+        how it was obtained (`LEASE_OUTCOMES`), and what it held of the platform's run admission (`ADMISSION_MODES`).
         """
         if lease_outcome not in LEASE_OUTCOMES:
             raise ValueError(f"lease_outcome {lease_outcome!r} must be one of: {', '.join(LEASE_OUTCOMES)}")
+        if admission not in ADMISSION_MODES:
+            raise ValueError(f"admission {admission!r} must be one of: {', '.join(ADMISSION_MODES)}")
 
         def go() -> BegunAttempt:
             run = self.db.execute("SELECT status FROM runs WHERE run_key=?", (run_key,)).fetchone()
@@ -431,8 +440,8 @@ class Store:
             sequence = self.db.execute("SELECT COALESCE(MAX(dispatch_seq),0)+1 FROM attempts").fetchone()[0]
             cursor = self.db.execute(
                 "INSERT INTO attempts(run_key,attempt,state,started_utc,pid,run_dir,dispatch_seq,lease_wait_s,"
-                "lease_outcome) VALUES(?,?,?,?,?,?,?,?,?)",
-                (run_key, number, "running", started, pid, run_dir, sequence, lease_wait_s, lease_outcome),
+                "lease_outcome,admission) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (run_key, number, "running", started, pid, run_dir, sequence, lease_wait_s, lease_outcome, admission),
             )
             return BegunAttempt(int(cursor.lastrowid), number, int(sequence))
 

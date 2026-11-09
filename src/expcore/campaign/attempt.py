@@ -67,9 +67,11 @@ from expcore.loop.outcomes import Outcome
 from expcore.records.build import RunIdentity
 
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
-# A platform's run admission: given the run's treatment kinds, its treatment targets and the campaign's end, a context
-# manager that holds what the run needs from before the attempt until after its post-run check (`Parts.admission`).
-RunAdmission = Callable[[tuple[str, ...], Mapping[str, str], threading.Event], AbstractContextManager[Any]]
+# A platform's run admission: given the run's treatment kinds, its treatment targets, the campaign's end and whether its
+# condition declares `exclusive = true`, a context manager that holds what the run needs from before the attempt until
+# after its post-run check (`Parts.admission`), and yields what it holds: "shared" or "exclusive".
+RunAdmission = Callable[[tuple[str, ...], Mapping[str, str], threading.Event, bool], AbstractContextManager[str]]
+HELD_MODES = ("shared", "exclusive")  # what a run admission may yield
 
 
 @dataclass
@@ -139,14 +141,14 @@ class AttemptRunner:
                 self._leave_unstarted(row, factors, hold)
                 return 0.0  # the hold decides when it may start again
             with self._admitted(row, factors) as admitted:
-                if not admitted:
+                if admitted is None:
                     return p.settings.retry_delay_s  # left unstarted: no attempt row exists, so none is used
                 hold = p.recheck(row) if p.admission is not None else None  # the wait may have been long: look again
                 if hold is not None:
                     self._leave_unstarted(row, factors, hold, waited_for="the platform's admission")
                     return 0.0  # leaving the block lets the admission go; the hold decides when it may start
                 launched = True
-                return self._attempt(row, factors, timer, lease)
+                return self._attempt(row, factors, timer, lease, admitted)
         finally:
             if lease is not None and p.leases is not None:
                 if launched:
@@ -188,24 +190,28 @@ class AttemptRunner:
         return lease, True
 
     @contextlib.contextmanager
-    def _admitted(self, row: Any, factors: Mapping[str, Any]) -> Iterator[bool]:
-        """Hold the platform's run admission for the body, if it has one (step 3a); yield whether the run may start."""
+    def _admitted(self, row: Any, factors: Mapping[str, Any]) -> Iterator[str | None]:
+        """Hold the platform's run admission for the body, if it has one (step 3a); yield what the run holds of it
+        ("shared", "exclusive", or "none" with no admission), as the platform says it admitted it, or None when the run
+        may not start. An admission that yields anything else is a defect of the platform, and raises."""
         p = self.p
         if p.admission is None:
-            yield True
+            yield "none"
             return
         key = row["run_key"]
+        kinds, targets = self.treatment_kinds(factors, key), self.treatment_targets(factors, key)
+        exclusive = p.schema.exclusive[p.schema.condition_named(factors, key)]
         with contextlib.ExitStack() as held:
             try:
-                held.enter_context(
-                    p.admission(self.treatment_kinds(factors, key), self.treatment_targets(factors, key), p.stop)
-                )
+                mode = held.enter_context(p.admission(kinds, targets, p.stop, exclusive))
             except InfraError as refusal:  # never admitted: nothing started, so no attempt is used
                 text = f"{key}: not admitted by the platform, no attempt used: {refusal.detail}"
                 p.store.event(p.stamp(), "run_unstarted", factors["model"], text)
-                yield False
+                yield None
                 return
-            yield True
+            if mode not in HELD_MODES:
+                raise ValueError(f"{key}: the run admission yielded {mode!r}, not one of {', '.join(HELD_MODES)}")
+            yield mode
 
     def _leave_unstarted(
         self, row: Any, factors: Mapping[str, Any], hold: Hold, *, waited_for: str = "its lease"
@@ -222,8 +228,9 @@ class AttemptRunner:
             f"used: {hold.reason}",
         )
 
-    def _begin(self, row: Any, lease: Lease | None = None) -> tuple[Any, Path]:
-        """Insert the 'running' row, with a directory of its own for this try, and the lease it runs under."""
+    def _begin(self, row: Any, lease: Lease | None = None, admission: str = "none") -> tuple[Any, Path]:
+        """Insert the 'running' row, with a directory of its own for this try, the lease it runs under and what it holds
+        of the run admission."""
         p = self.p
         tries = len(p.store.q("SELECT 1 FROM attempts WHERE run_key=?", (row["run_key"],))) + 1
         run_dir = p.root / "runs" / row["digest"] / f"try{tries}"
@@ -235,6 +242,7 @@ class AttemptRunner:
             str(run_dir),
             lease_wait_s=None if lease is None else lease.wait_s,
             lease_outcome="none" if lease is None else "granted",
+            admission=admission,
         )
         return begun, run_dir
 
@@ -256,7 +264,9 @@ class AttemptRunner:
         self._finish(begun, run_dir, key, result)
         return p.settings.retry_delay_s
 
-    def _attempt(self, row: Any, factors: Mapping[str, Any], timer: Any, lease: Lease | None) -> float:
+    def _attempt(
+        self, row: Any, factors: Mapping[str, Any], timer: Any, lease: Lease | None, admission: str = "none"
+    ) -> float:
         """Run the attempt the lease (or none) holds the resources for, record its result and do the bookkeeping."""
         p = self.p
         key, model = row["run_key"], factors["model"]
@@ -269,7 +279,7 @@ class AttemptRunner:
             base_url=endpoint.base_url,
             time_left=timer.time_left,
         )
-        begun, run_dir = self._begin(row, lease)
+        begun, run_dir = self._begin(row, lease, admission)
         request = RunRequest(
             RunIdentity(key, factors, begun.number),
             run_dir,

@@ -7,6 +7,7 @@ Every test runs against `FakeServices`; the lock is real, on the fixture's journ
 """
 
 import asyncio
+import json
 import threading
 import time
 
@@ -14,8 +15,10 @@ import pytest
 from fault_support import LOCAL_TARGET, OUTAGE_TARGET, SERVICES, FakeServices, injector_for, write_faults
 from platform_support import NOW
 
+from expcore.campaign.factors import load_factor_schema
+from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
-from expcore_onedata.admission import AdmissionRefused, FederationLock, require_admission
+from expcore_onedata.admission import AdmissionRefused, FederationLock, require_admission, run_admission
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import INJECTOR_FAILURE, load_faults
@@ -325,3 +328,71 @@ def test_o11_a_failed_recovery_keeps_every_run_blocked_naming_the_target(tmp_pat
     assert OUTAGE_TARGET in verdict.detail
     assert OUTAGE_SERVICE not in verdict.detail
     assert services.running(OUTAGE_SERVICE) is False
+
+
+def matched_design(tmp_path):
+    """A study file with an outage condition and a control that declares `exclusive = true`, and its schema."""
+    path = tmp_path / "study.toml"
+    path.write_text(
+        "[factors.fault]\nlevels = ['outage', 'none', 'baseline']\n\n"
+        "[identity]\norder = ['task', 'fault', 'model', 'seed']\n\n"
+        "[conditions.outage]\nfault = 'outage'\n"
+        "infrastructure_is_treatment = [{ kind = 'provider_outage', target = 'providers[1]' }]\n\n"
+        "[conditions.control]\nfault = 'none'\nexclusive = true\n\n"
+        "[conditions.baseline]\nfault = 'baseline'\n",
+        encoding="utf-8",
+    )
+    return path, load_factor_schema(path)
+
+
+def test_o11_an_exclusive_control_holds_the_federation_exclusively_and_never_overlaps_another_run(tmp_path):
+    """O11: a condition that declares `exclusive = true` runs alone on the federation, as an outage run does, with no
+    fault: its admission is exclusive and named as an exclusive run in the holder record, a baseline run waits for it,
+    and it waits for a baseline run already on the federation."""
+    platform, _ = federation(tmp_path)
+    config = load_platform(platform, require_secrets=False)
+    _, schema = matched_design(tmp_path)
+    admit = run_admission(config, schema)
+    settings = load_faults(platform, config)
+    timeline: list[tuple[str, str, float]] = []
+
+    def run(name, exclusive, hold_s):
+        with admit((), {}, threading.Event(), exclusive) as mode:
+            timeline.append((name, "in", time.monotonic()))
+            if exclusive:
+                record = json.loads((settings.journal / "federation.holder").read_text(encoding="utf-8"))
+                timeline.append((name, f"{mode}:{record['purpose']}", time.monotonic()))
+            time.sleep(hold_s)
+            timeline.append((name, "out", time.monotonic()))
+        return mode
+
+    control, landed = in_thread(lambda: run("control", True, 0.4))
+    time.sleep(0.1)
+    baseline, after = in_thread(lambda: run("baseline", False, 0.1))
+    control.join(10)
+    baseline.join(10)
+    assert landed == ["exclusive"]
+    assert after == ["shared"]
+    marks = {(name, what): at for name, what, at in timeline}
+    assert ("control", "exclusive:exclusive_run") in marks
+    assert marks["baseline", "in"] >= marks["control", "out"]  # it waited for the control to leave
+
+    first, _ = in_thread(lambda: run("baseline", False, 0.4))
+    time.sleep(0.1)
+    second, _ = in_thread(lambda: run("control", True, 0.1))
+    first.join(10)
+    second.join(10)
+    marks = {(name, what): at for name, what, at in timeline[-5:]}
+    assert marks["control", "in"] >= marks["baseline", "out"]  # the control waited for the run already on it
+
+
+def test_o11_an_exclusive_condition_on_a_platform_without_faults_is_refused_naming_the_file_and_key(tmp_path):
+    """O11: without `[faults]` there is no federation lock to hold, so a condition that declares `exclusive = true` is
+    refused, naming the study file and the key."""
+    from platform_support import write_platform
+
+    config = load_platform(write_platform(tmp_path), require_secrets=False)
+    _, schema = matched_design(tmp_path)
+    with pytest.raises(ConfigError, match=r"study\.toml.*\[conditions\.control\].*exclusive.*\[faults\]"):
+        run_admission(config, schema)
+    assert run_admission(config) is None  # no schema asked for: no lock, and nothing to refuse

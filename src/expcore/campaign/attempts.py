@@ -39,6 +39,9 @@ UNCHARGED_KINDS = frozenset({"key_rejected"})
 # How the lease an attempt ran under was obtained. A refused lease (every key quarantined, a timeout) starts no attempt
 # and so has no row: it is in the lease wait log and the event log. `none`: the run's condition needs no lease.
 LEASE_OUTCOMES = ("granted", "none")
+# What an attempt held of the platform's run admission as it was admitted: the shared resource shared with other runs,
+# held exclusively, or nothing, for a study whose platform has no run admission (and an attempt that ran nothing).
+ADMISSION_MODES = ("shared", "exclusive", "none")
 
 
 class AttemptRefused(RuntimeError):

@@ -48,6 +48,19 @@ treatment; another target's failure, a failure that names none and an injection 
 (`Outcome.is_treatment`, record version 3). A plain name declares the kind with no target: any failure of the kind is
 the treatment, whatever it names. The targets are part of the schema too (`treatment_targets`).
 
+A condition may run exclusive, with no fault of its own:
+
+    [conditions.matched-control]
+    data_path = "api"
+    exclusive = true
+
+An outage run holds a shared platform (a federation) exclusively, so it never shares it with another run; its control
+shares it with whatever else runs. `exclusive = true` asks the platform's run admission to hold it exclusively for this
+condition's runs too, so a study can run a matched control under the same isolation. It must be `true` or `false`; a
+campaign whose platform gives no run admission refuses a condition that declares it (`expcore.campaign.scheduler`).
+The setting is part of the schema, and a schema that declares no condition exclusive has the digest it had before the
+setting existed.
+
 A condition may also name the tasks it runs on:
 
     [conditions.chain-c]
@@ -77,6 +90,7 @@ from expcore.errors import TARGET_LABEL, infra_kinds, is_treatable, untreatable_
 BUILTIN_FACTORS = ("task", "model", "seed")
 TREATMENT_KEY = "infrastructure_is_treatment"
 TASKS_KEY = "tasks"
+EXCLUSIVE_KEY = "exclusive"
 # A factor name becomes part of a SQL column name in the store, so it is held to a plain identifier.
 _NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _SEPARATOR = "|"
@@ -137,13 +151,15 @@ class FactorSchema:
         *,
         treatment: Mapping[str, Sequence[str | Mapping[str, str]]] | None = None,
         tasks: Mapping[str, Sequence[str]] | None = None,
+        exclusive: Mapping[str, bool] | None = None,
         file: str | os.PathLike[str] = "<schema>",
     ) -> None:
         """Validate and keep copies of the declared levels, the identity order, the conditions and their settings.
 
         `treatment` maps a condition to the infrastructure kinds that are its treatment, each a kind's name or a table
         `{kind, target}` naming the target the condition manipulates, and `tasks` maps a condition to the tasks it runs
-        on; a condition not in `tasks` runs on every task (see the module docstring).
+        on; a condition not in `tasks` runs on every task, and `exclusive` maps a condition to whether its runs hold the
+        platform exclusively (see the module docstring).
         """
         self.file = str(file)
         self.declared: dict[str, tuple[str, ...]] = {name: tuple(levels) for name, levels in declared.items()}
@@ -155,6 +171,7 @@ class FactorSchema:
         self.treatment_targets: dict[str, dict[str, str]] = {name: {} for name in self.conditions}
         self.treatment_kinds: dict[str, tuple[str, ...]] = self._check_treatment(treatment or {})
         self.condition_tasks: dict[str, tuple[str, ...] | None] = self._check_condition_tasks(tasks or {})
+        self.exclusive: dict[str, bool] = self._check_exclusive(exclusive or {})
         self._by_levels = {tuple(c[f] for f in self.declared): name for name, c in self.conditions.items()}
 
     # --- validation ---------------------------------------------------------------------------------------------
@@ -165,7 +182,7 @@ class FactorSchema:
             where = Section({"levels": list(levels)}, self.file, f"[factors.{name}]")
             if name in BUILTIN_FACTORS:
                 raise Section({}, self.file, "[factors]").fail(name, "is built in and cannot be declared")
-            if name in (TREATMENT_KEY, TASKS_KEY):
+            if name in (TREATMENT_KEY, TASKS_KEY, EXCLUSIVE_KEY):
                 raise Section({}, self.file, "[factors]").fail(name, "is reserved for a condition's setting")
             if not _NAME_RE.fullmatch(name):
                 raise Section({}, self.file, "[factors]").fail(
@@ -303,6 +320,17 @@ class FactorSchema:
             out[name] = listed
         return out
 
+    def _check_exclusive(self, declared: Mapping[str, bool]) -> dict[str, bool]:
+        """Check each condition's exclusive setting; return it by condition, False where none is declared."""
+        out = dict.fromkeys(self.conditions, False)
+        for name, value in declared.items():
+            if name not in self.conditions:
+                raise Section({}, self.file, "[conditions]").fail(name, f"declares {EXCLUSIVE_KEY} but is no condition")
+            if not isinstance(value, bool):
+                raise Section({}, self.file, f"[conditions.{name}]").fail(EXCLUSIVE_KEY, "must be true or false")
+            out[name] = value
+        return out
+
     # --- keys and plans -----------------------------------------------------------------------------------------
 
     def key(self, condition: str, task: str, model: str, seed: int) -> RunKey:
@@ -368,6 +396,10 @@ class FactorSchema:
         """
         return self.treatment_kinds[self.condition_of(key)]
 
+    def exclusive_of(self, key: RunKey) -> bool:
+        """Return whether the condition of a run key holds the platform exclusively."""
+        return self.exclusive[self.condition_of(key)]
+
     def condition_of(self, key: RunKey) -> str:
         """Return the name of the condition a key belongs to; refuse a key whose levels fit none."""
         return self.condition_named(key.factors, key.text)
@@ -382,8 +414,11 @@ class FactorSchema:
     # --- identity of the schema itself --------------------------------------------------------------------------
 
     def to_json(self) -> dict[str, Any]:
-        """Return the schema as plain data, the form that is fingerprinted and pinned."""
+        """Return the schema as plain data, the form that is fingerprinted and pinned. The exclusive conditions are in
+        it only when there are any, so a schema without them has the form, and the digest, it had before."""
+        exclusive = sorted(name for name, value in self.exclusive.items() if value)
         return {
+            **({EXCLUSIVE_KEY: exclusive} if exclusive else {}),
             "factors": {name: list(levels) for name, levels in self.declared.items()},
             "order": list(self.order),
             "conditions": {name: dict(c) for name, c in self.conditions.items()},
@@ -449,12 +484,15 @@ def load_factor_schema(path: str | os.PathLike[str]) -> FactorSchema:
                 raise table.fail("levels", "is required")
             declared[name] = table.strings("levels")
     order = _table(top, "identity", "[identity]").strings("order")
-    conditions, treatment, tasks = {}, {}, {}
+    conditions, treatment, tasks, exclusive = {}, {}, {}, {}
+    settings = (TREATMENT_KEY, TASKS_KEY, EXCLUSIVE_KEY)
     all_conditions = _table(top, "conditions", "[conditions]")
     for name in all_conditions.data:
         section = _table(all_conditions, name, f"[conditions.{name}]")
-        conditions[name] = {f: section.string(f) for f in section.data if f not in (TREATMENT_KEY, TASKS_KEY)}
+        conditions[name] = {f: section.string(f) for f in section.data if f not in settings}
         treatment[name] = _treatment_value(section)
         if TASKS_KEY in section.data:
             tasks[name] = section.strings(TASKS_KEY)
-    return FactorSchema(declared, order, conditions, treatment=treatment, tasks=tasks, file=path)
+        if EXCLUSIVE_KEY in section.data:
+            exclusive[name] = section.data[EXCLUSIVE_KEY]
+    return FactorSchema(declared, order, conditions, treatment=treatment, tasks=tasks, exclusive=exclusive, file=path)

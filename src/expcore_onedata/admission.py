@@ -47,7 +47,8 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.attempt import RunAdmission
-from expcore.config.loading import ConfigError, load_toml
+from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
+from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.errors import InfraError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, make_directories
@@ -57,6 +58,7 @@ from expcore_onedata.fault_settings import FaultSettings, load_faults
 FEDERATION_LOCK = "federation.lock"
 FEDERATION_INTENT = "federation.intent"  # the turnstile every admission passes before the main lock
 OUTAGE_RUN, INJECTOR, RECOVERY = "outage_run", "injector", "recovery"  # why the federation is held exclusively
+EXCLUSIVE_RUN = "exclusive_run"  # a run whose condition declares `exclusive = true`: a matched control, no fault
 _ADMISSION: ContextVar["Admission | None"] = ContextVar("expcore_onedata_admission", default=None)
 
 
@@ -258,11 +260,14 @@ class FederationLock:
         timeout_s: float | None = None,
         target: str | None = None,
         cancel: threading.Event | None = None,
+        purpose: str = OUTAGE_RUN,
     ) -> Iterator[Admission]:
         """Hold the lock for the body of a `with`, as the running context's admission (the synchronous form)."""
         if current_admission() is not None:
             raise AdmissionRefused("this run already holds the federation's admission")
-        admission = self.acquire(exclusive=exclusive, timeout_s=timeout_s, target=target, cancel=cancel)
+        admission = self.acquire(
+            exclusive=exclusive, timeout_s=timeout_s, target=target, cancel=cancel, purpose=purpose
+        )
         token = _ADMISSION.set(admission)
         try:
             if not exclusive:
@@ -336,25 +341,41 @@ def require_same_federation(admission: Admission, federation: Federation) -> Non
         )
 
 
-def run_admission(config: PlatformConfig) -> RunAdmission | None:
+def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) -> RunAdmission | None:
     """The campaign's run admission for a platform with `[faults]` (`StudyPlugin.admission`), None without one.
 
     The core enters it before an attempt starts and leaves it after the attempt's post-run check: a run whose condition
-    declares `provider_outage` holds the federation exclusively, with its target's label in the holder record, every
-    other run shares it. The wait is bounded by `admission_timeout_s`, ends with the campaign, and runs before the
-    agent's clock starts; one that fails leaves the run unstarted.
+    declares `provider_outage` holds the federation exclusively, with its target's label in the holder record, and so
+    does a run whose condition declares `exclusive = true` (a matched control, named an exclusive run in the record);
+    every other run shares it. It yields what it holds, `shared` or `exclusive`, from the admission it took. The wait is
+    bounded by `admission_timeout_s`, ends with the campaign, and runs before the agent's clock starts; one that fails
+    leaves the run unstarted.
+
+    Given the study's `schema`, a condition that declares `exclusive = true` on a platform without `[faults]` is
+    refused, naming the study file and the key: there is no federation lock to hold.
     """
     settings = fault_settings_of(config)
     if settings is None:
+        exclusive = [name for name, value in (schema.exclusive if schema is not None else {}).items() if value]
+        if schema is not None and exclusive:
+            raise Section({}, schema.file, f"[conditions.{exclusive[0]}]").fail(
+                EXCLUSIVE_KEY, f"needs a federation lock to hold, and {config.file} has no [faults] table"
+            )
         return None
     lock = FederationLock(settings)
 
+    @contextlib.contextmanager
     def admit(
-        treatment_kinds: tuple[str, ...], treatment_targets: Mapping[str, str], cancel: threading.Event
-    ) -> contextlib.AbstractContextManager[Admission]:
-        exclusive = PROVIDER_OUTAGE in treatment_kinds
-        target = treatment_targets.get(PROVIDER_OUTAGE) if exclusive else None
-        return lock.held(exclusive=exclusive, timeout_s=settings.admission_timeout_s, target=target, cancel=cancel)
+        treatment_kinds: tuple[str, ...], treatment_targets: Mapping[str, str], cancel: threading.Event, exclusive: bool
+    ) -> Iterator[str]:
+        outage = PROVIDER_OUTAGE in treatment_kinds
+        target = treatment_targets.get(PROVIDER_OUTAGE) if outage else None
+        purpose = OUTAGE_RUN if outage else EXCLUSIVE_RUN
+        timeout_s = settings.admission_timeout_s
+        with lock.held(
+            exclusive=outage or exclusive, timeout_s=timeout_s, target=target, cancel=cancel, purpose=purpose
+        ) as admission:
+            yield "exclusive" if admission.exclusive else "shared"  # what it took, never what was asked
 
     return admit
 

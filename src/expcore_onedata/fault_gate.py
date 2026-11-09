@@ -31,6 +31,7 @@ from typing import Any
 from expcore.campaign.healthgate import Health, HealthCheck, read_health
 from expcore.errors import TARGET_LABEL, InfraError
 from expcore_onedata.admission import (
+    EXCLUSIVE_RUN,
     INJECTOR,
     OUTAGE_RUN,
     RECOVERY,
@@ -43,7 +44,12 @@ from expcore_onedata.fault_journal import holder_alive
 from expcore_onedata.fault_recovery import FaultDriver, Recovery
 from expcore_onedata.fault_settings import FaultSettings
 
-_PURPOSES = {OUTAGE_RUN: "an outage run", INJECTOR: "an injector", RECOVERY: "the recovery of the health check"}
+_PURPOSES = {
+    OUTAGE_RUN: "an outage run",
+    EXCLUSIVE_RUN: "an exclusive run",
+    INJECTOR: "an injector",
+    RECOVERY: "the recovery of the health check",
+}
 _STAMP = re.compile(r"[0-9T:+.-]{10,40}")
 _WORD = re.compile(r"[A-Za-z_]{1,40}")
 

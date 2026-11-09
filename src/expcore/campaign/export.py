@@ -24,6 +24,10 @@ file or the new one; it is owner-only (0600), because an export can carry study 
 
 Each analysed attempt also says when and how it began (`dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`), so
 an analysis can check the balance of the conditions over time: holds and unit caps can push one condition's runs late.
+It says too what it held of the platform's run admission (`admission`: `shared`, `exclusive`, or `none`), as the store
+recorded it when the attempt was admitted, and so does each excluded attempt and, one per charged attempt beside its
+reason, each exhausted run (`admissions`): an outage run holds the platform exclusively, so a contrast with a control
+that shared it compares two isolations as well as two conditions.
 Its `run_dir` is the attempt's directory relative to the campaign's runs directory (`<digest>/try<N>`), never the path
 the store holds: the export says nothing of the directory or host the campaign ran in, so a copy of the campaign, a
 replication package among them, exports the same bytes wherever it lies.
@@ -118,7 +122,12 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         if run["status"] == "infra_exhausted":
             charged = [a for a in tried if a["charged"]]
             exhausted.append(
-                {**who, "attempts": len(charged), "reasons": [f"{a['infra_kind']}: {a['detail']}" for a in charged]}
+                {
+                    **who,
+                    "attempts": len(charged),
+                    "reasons": [f"{a['infra_kind']}: {a['detail']}" for a in charged],
+                    "admissions": [a["admission"] for a in charged],
+                }
             )
         elif run["status"] in ("pending", "harness_error"):
             unfinished.append({**who, "status": run["status"]})
@@ -127,7 +136,14 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
             if len(done) != 1:
                 raise ExportError(f"run {run['run_key']} is done but has {len(done)} done attempts")
             if run["run_key"] in left_out:
-                left.append({**who, "attempt": done[0]["attempt"], "reason": left_out[run["run_key"]]})
+                left.append(
+                    {
+                        **who,
+                        "attempt": done[0]["attempt"],
+                        "reason": left_out[run["run_key"]],
+                        "admission": done[0]["admission"],
+                    }
+                )
                 continue
             analysed.append(
                 {
@@ -180,14 +196,17 @@ def _dispatch(attempt: Any) -> dict[str, Any]:
     `dispatch_seq` is its place in the campaign's dispatch sequence (it grows with every attempt, and carries on across
     a restart), `started_at` the time it began (whole seconds, UTC), `lease_wait_s` the seconds it waited for its lease
     and `lease_outcome` how the lease was obtained: `granted`, or `none` for a run that needs no lease. A refused lease
-    starts no attempt, so it has no row here; it is in the lease wait log and the event log. A value a database from
-    before the column did not keep is `None`: unknown, never zero.
+    starts no attempt, so it has no row here; it is in the lease wait log and the event log. `admission` is what the
+    attempt held of the platform's run admission, as stored when it was admitted: `shared`, `exclusive`, or `none` for
+    a study whose platform has none. A value a database from before the column did not keep is `None`: unknown, never
+    zero.
     """
     return {
         "dispatch_seq": attempt["dispatch_seq"],
         "started_at": attempt["started_utc"],
         "lease_wait_s": attempt["lease_wait_s"],
         "lease_outcome": attempt["lease_outcome"],
+        "admission": attempt["admission"],
     }
 
 
