@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from expcore_onedata.sandbox import earlyoom as EO
@@ -29,7 +30,7 @@ from expcore_onedata.sandbox.settings import SandboxSettings
 log = logging.getLogger(__name__)
 
 SIGNAL_EXITS = (137, 143, -9, -15)  # a cell that ended by SIGKILL or SIGTERM, what earlyoom sends
-CAP_MARGIN_S = 1.0  # past `timeout`'s own kill inside the container, for what Docker takes to start it
+CAP_MARGIN_S = 1.0  # `timeout` inside the container is the backstop: it fires this long after the harness's own timer
 QUIESCE_ROUNDS = (
     5  # a forking worker can start a child between the listing and the kill: listed again until none is new
 )
@@ -43,6 +44,40 @@ def docker_failed(rc: int, err: str) -> bool:
     if rc == 0 or not any(m in err for m in ("Error response from daemon", "OCI runtime", "docker: ", "timeout: ")):
         return False
     return rc in (125, 126) or "is not running" in err or "No such container" in err
+
+
+class CellTimer:
+    """The harness's own timer of a cell, the one that decides `time_limit` (O17). At the cell's limit it records that
+    it fired, then kills what runs; the record and the cell's end are taken under one lock, so a cell that ended first
+    never has a fired timer, and one this timer ended always has. No time limit is inferred from how long a cell ran."""
+
+    def __init__(self, seconds: float, kill: Callable[[], None]) -> None:
+        self._lock = threading.Lock()
+        self._ended = self._fired = False
+        self._kill = kill
+        self._timer = threading.Timer(seconds, self._fire)
+        self._timer.daemon = True
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def _fire(self) -> None:
+        with self._lock:
+            if self._ended:
+                return
+            self._fired = True
+        self._kill()
+
+    def end(self) -> bool:
+        """The cell has ended: from now on the timer does nothing. Whether it fired, after its kill has finished, so
+        that what is read next is read after it."""
+        with self._lock:
+            self._ended = True
+            fired = self._fired
+        self._timer.cancel()
+        if fired and self._timer.is_alive():
+            self._timer.join()
+        return fired
 
 
 class CellRunner:
@@ -143,8 +178,8 @@ class CellRunner:
         return state["killed"] is not None and not [p for p in state["left"] if p["state"] not in ("D", "Z")]
 
     def _kill_at_the_cap(self) -> None:
-        """In a thread, when a cell's time runs out: `timeout` in the container ends the cell's own process group, and
-        this ends the rest. It never raises."""
+        """In the timer's thread, when a cell's time runs out: every process of the agent's except its init and `sleep`,
+        the cell's own and any worker it detached. It never raises."""
         try:
             self.quiesce("time cap")
         except Exception as e:
@@ -154,8 +189,10 @@ class CellRunner:
     def run(self, code: str, timeout_s: float, *, record: bool = True) -> ExecResult:
         """Run Python source in the container as the unprivileged user (cwd /work); the only time limit is `timeout_s`.
 
-        Its clock starts here, not when Docker gets round to starting the process. When it runs out, every process
-        of the agent's container is killed, a detached worker included; the container and the run's evidence stay.
+        Its clock starts here, not when Docker gets round to starting the process. When it runs out, the harness's own
+        timer records that it fired and kills every process of the agent's container, a detached worker included; the
+        container and the run's evidence stay. `timeout` inside the container is only a backstop, `CAP_MARGIN_S` later,
+        should that kill not land. A time limit is that record and nothing else: never the elapsed time, nor 137 (O17).
         """
         if not timeout_s >= 1:
             raise ValueError("timeout_s must be at least 1 second (GNU timeout treats 0 as no limit)")
@@ -164,7 +201,7 @@ class CellRunner:
         before = (self._events_seen or self._obs.memory_facts(agent)["events"]) if record else None
         up0 = self._obs.uptime() if record else None
         remaining = timeout_s - (time.monotonic() - entered)
-        limit = f"{max(remaining, 1.0):.3f}"
+        limit = f"{max(remaining, 1.0) + CAP_MARGIN_S:.3f}"  # the backstop; the harness's timer below comes first
         argv = [
             "exec",
             "-i",
@@ -181,29 +218,26 @@ class CellRunner:
             "-",
         ]
         t0, wall0 = time.monotonic(), time.time()
-        cap = threading.Timer(max(0.0, remaining) + CAP_MARGIN_S, self._kill_at_the_cap)
-        cap.daemon = True
-        started = gave_up = False
+        timer = CellTimer(max(0.0, remaining), self._kill_at_the_cap)
+        gave_up = fired = False
         try:
-            if remaining < 1:  # used up before it could start
-                rc, out, err, gave_up = 124, "", "the cell was not started: its time ran out during preparation", True
+            if remaining < 1:  # used up before it could start: the harness's clock ran out, so its timer ended it
+                rc, out, err = 124, "", "the cell was not started: its time ran out during preparation"
+                gave_up = fired = True
             else:
                 if record:  # the probes kill nothing of the agent's
-                    cap.start()
-                    started = True
+                    timer.start()
                 done = self._host.docker(*argv, input=code, timeout=remaining + HOST_CALL_MARGIN_S, check=False)
+                fired = timer.end()
                 rc, out, err = done.returncode, done.stdout, done.stderr
                 if rc == TIMED_OUT and err.startswith("timed out after"):
                     gave_up, err = True, "docker exec did not return"
             used = time.monotonic() - entered
-            # 124 is the harness's own only when it says so: `timeout -s KILL` exits 137; otherwise the agent chose it
-            at_limit = rc in (137, -9) and used >= timeout_s - KC.AT_THE_LIMIT_S
-            res = ExecResult(out, err, rc, time.monotonic() - t0, timed_out=gave_up or at_limit)
+            res = ExecResult(out, err, rc, time.monotonic() - t0, timed_out=gave_up or fired)
             if record:
-                self._record_cell(code, res, before, up0, used, timeout_s, gave_up, wall0)
-        finally:  # past the post-processing: a worker that outlived its cell must not go on computing
-            if started:
-                cap.cancel()
+                self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, wall0)
+        finally:  # whatever was raised: a timer that has not fired must not kill the next cell's processes
+            timer.end()
         return res
 
     def _record_cell(
@@ -215,6 +249,7 @@ class CellRunner:
         used: float,
         timeout_s: float,
         gave_up: bool,
+        fired: bool,
         wall0: float,
     ) -> None:
         rc = res.exit_code
@@ -223,13 +258,15 @@ class CellRunner:
         if events is None:  # not known whether anything of this cell was killed
             self._meta.setdefault("oom_counters_unreadable_cells", []).append(entry["cell"])
         killed = (events or {}).get("oom_kill", 0) > (before or {}).get("oom_kill", 0)
-        if gave_up or rc in (137, -9) or killed or docker_failed(rc, res.stderr):
+        if gave_up or fired or rc in (137, -9) or killed or docker_failed(rc, res.stderr):
             # when the harness gave up, the cell had all the time it could have: `used` may be less
-            kill = self._obs.kill_facts(self._names.agent, before, timeout_s if gave_up else used, timeout_s, up0)
+            kill = self._obs.kill_facts(
+                self._names.agent, before, timeout_s if gave_up else used, timeout_s, up0, timer_fired=fired
+            )
             entry["kill"] = res.kill = kill
             self._meta.setdefault("cell_kills", []).append({"cell": entry["cell"], **kill})
         self._events_seen = events
-        res.kill = self._with_earlyoom(res, entry, before, up0, used, timeout_s, gave_up, wall0)
+        res.kill = self._with_earlyoom(res, entry, before, up0, used, timeout_s, gave_up, fired, wall0)
         if res.kill:  # from what caused it, not from an exit code that a memory kill shares
             res.timed_out = entry["timed_out"] = gave_up or res.kill["reason"] == "time_limit"
         entry["timed_out"] = res.timed_out
@@ -237,7 +274,7 @@ class CellRunner:
             self.quiesce("time cap")
         self.cells.append(entry)
 
-    def _with_earlyoom(self, res, entry, before, up0, used, timeout_s, gave_up, wall0) -> dict[str, Any] | None:
+    def _with_earlyoom(self, res, entry, before, up0, used, timeout_s, gave_up, fired, wall0) -> dict[str, Any] | None:
         """Whatever the exit code, the host's killer's victim may be another container of the run, and the cell may
         survive that; when it does hit this cell its cause is infrastructure."""
         try:
@@ -259,7 +296,7 @@ class CellRunner:
             return res.kill
         self._earlyoom_seen = len(found)
         facts = entry.get("kill") or self._obs.kill_facts(
-            self._names.agent, before, timeout_s if gave_up else used, timeout_s, up0
+            self._names.agent, before, timeout_s if gave_up else used, timeout_s, up0, timer_fired=fired
         )
         kill = {**facts, **KC.earlyoom_cause(new), "oom_killed": True}
         cell_kills = self._meta.setdefault("cell_kills", [])

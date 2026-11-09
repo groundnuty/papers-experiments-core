@@ -154,10 +154,14 @@ class Observer:
         duration_s: float,
         timeout_s: float,
         uptime_before: float | None,
+        *,
+        timer_fired: bool,
     ) -> dict[str, Any]:
         """The facts about a cell that ended with a kill or a timeout, read from the host before any teardown, and the
         classification (killcause): `reason` is memory_limit, host_oom, container_dead, time_limit, killed_other or
         unknown, and `category` agent, infrastructure or unknown. Docker's sticky OOMKilled flag is recorded, not used.
+        `timer_fired` is the harness's record that its own timer ended the cell, the only way to `time_limit`; the
+        duration is recorded, never used for one.
         """
         facts = self.memory_facts(agent)
         info = inspect(self.host, agent)
@@ -175,7 +179,7 @@ class Observer:
             dict(before) if before is not None else None,
             events,
             container_running=running,
-            duration_s=duration_s,
+            timer_fired=timer_fired,
             timeout_s=timeout_s,
             kernel=kernel,
             container_id=str((info or {}).get("Id", "")) or None,

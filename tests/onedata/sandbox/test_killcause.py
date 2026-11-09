@@ -25,7 +25,7 @@ def kernel(name: str, since_s: float | None = None) -> list[dict]:
     return killcause.parse_kernel_oom((DATA / name).read_text(encoding="utf-8"), since_s=since_s)
 
 
-def classify(after: str | None, *, running: bool | None = True, duration: float = 5.0, lines=None, exit_code=137):
+def classify(after: str | None, *, running: bool | None = True, fired: bool = False, lines=None, exit_code=137):
     """What the harness would conclude for a cell that exited with `exit_code`: the exit code is not an input."""
     del exit_code  # the point of O17: the same exit code, whatever it is, gives the cause the evidence gives
     before = events("memory_events_start.txt")
@@ -33,7 +33,7 @@ def classify(after: str | None, *, running: bool | None = True, duration: float 
         before,
         events(after) if after else None,
         container_running=running,
-        duration_s=duration,
+        timer_fired=fired,
         timeout_s=LIMIT_S,
         kernel=lines,
         container_id=CID,
@@ -56,8 +56,36 @@ def test_o17_the_exit_code_decides_nothing():
     """O17: 137, 124, 143 or 0 with the same counters is the same cause; a cell at its limit is the agent's."""
     causes = {classify("memory_events_host_killer.txt", exit_code=code)["reason"] for code in (137, 124, 143, 0, 1)}
     assert causes == {"host_oom"}
-    got = classify("memory_events_start.txt", duration=LIMIT_S)
+    got = classify("memory_events_start.txt", fired=True)
     assert (got["reason"], got["category"]) == ("time_limit", "agent")
+
+
+def test_o17_a_time_limit_is_the_harnesss_timer_firing_never_the_elapsed_time():
+    """O17: only the harness's record that its timer fired makes a time limit; there is no duration to infer one from,
+    and a fired timer does not hide an OOM kill or a dead container."""
+    fired = classify("memory_events_start.txt", fired=True)
+    assert (fired["reason"], fired["category"], fired["timer_fired"]) == ("time_limit", "agent", True)
+    unfired = classify("memory_events_start.txt", fired=False)
+    assert (unfired["reason"], unfired["category"], unfired["timer_fired"]) == ("killed_other", "unknown", False)
+    assert classify("memory_events_own_limit.txt", fired=True)["reason"] == "memory_limit"
+    assert classify("memory_events_start.txt", running=False, fired=True)["reason"] == "container_dead"
+    assert classify(None, running=True, fired=True)["reason"] == "time_limit"  # counters unreadable: the record holds
+
+
+@pytest.mark.parametrize(
+    ("running", "reason", "kind"),
+    [
+        (False, "container_dead", "sandbox"),
+        (True, "killed_other", "unattributed_kill"),
+        (None, "unknown", "unattributed_kill"),  # nothing readable: the counters, the container, the kernel log
+    ],
+)
+def test_o17_a_docker_failure_without_the_timers_flag_is_infrastructure_or_unattributed(running, reason, kind):
+    """O17: docker exec failing is no time limit unless the harness's timer fired: a container that is gone makes it
+    infrastructure (`sandbox`), one that runs or cannot be read a kill nothing attributes (`unattributed_kill`)."""
+    got = classify("memory_events_start.txt" if running is not None else None, running=running, fired=False)
+    assert got["reason"] == reason
+    assert kinds.kill_error(got).kind == kind
 
 
 def test_o17_a_dead_container_is_infrastructure_whatever_else_is_on_record():
@@ -91,7 +119,7 @@ def test_o17_unreadable_counters_with_a_quiet_container_are_unknown():
 
 def test_o17_a_kill_nothing_attributes_is_unknown():
     """O17: A kill nothing attributes is unknown."""
-    got = classify("memory_events_start.txt", duration=3.0)
+    got = classify("memory_events_start.txt")
     assert (got["reason"], got["category"]) == ("killed_other", "unknown")
 
 
@@ -150,7 +178,7 @@ def test_o17_unknown_is_retried_within_the_attempt_limit(tmp_path):
     """O17: a kill nothing attributes ends the attempt as infrastructure, and the run is retried to the limit."""
     store, _, manifest = planned_store(tmp_path)
     key = manifest.rows[0].key.text
-    error = kinds.kill_error(classify("memory_events_start.txt", duration=3.0))
+    error = kinds.kill_error(classify("memory_events_start.txt"))
     assert isinstance(error, InfraError)
     statuses = [run_one(store, key, infra(error.kind, str(error)), max_attempts=3) for _ in range(3)]
     assert statuses == ["pending", "pending", "infra_exhausted"]

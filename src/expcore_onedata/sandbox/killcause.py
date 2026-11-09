@@ -19,6 +19,10 @@ Categories: `agent` (the agent's own doing: a run outcome, never retried), `infr
 evidence, a kill nothing attributes. Retried too, within the attempt limit, as the core's `unattributed_kill`; since that can discard an agent's own outcome, the export counts these
 attempts per condition and model).
 
+`time_limit` is the harness's own timer, never an inference: only a cell whose timer the harness recorded as fired (cells.py)
+is one, whatever its elapsed time, since a cell killed by something else just before its limit has run as long. A failure of
+docker itself without that flag is no time limit either: a dead container is infrastructure, anything else nothing attributes.
+
 One cause per run, in this order (kills can correlate with the condition, since a download may be charged to memory twice, so a cause must not depend on which
 was looked at first): `earlyoom` (its journal, whatever the counters and the exit code), `container_dead`, `host_oom`, `memory_limit`, `time_limit`, `killed_other`,
 `unknown`. An infrastructure cause ends the run and retries it; the agent's own cause, or an exception in its code, is its outcome and is kept. `run_cause` applies the
@@ -41,7 +45,6 @@ CATEGORY = {
 }
 
 
-AT_THE_LIMIT_S = 0.25  # a cell's time, from before its launch, against its limit: `timeout` itself starts later than that clock, so this is only for a coarse clock
 PRECEDENCE = ("earlyoom", "container_dead", "host_oom", "memory_limit", "time_limit", "killed_other", "unknown")
 
 
@@ -103,15 +106,17 @@ def classify(
     after: dict[str, int] | None,
     *,
     container_running: bool | None,
-    duration_s: float,
+    timer_fired: bool,
     timeout_s: float,
     kernel: list[dict] | None = None,
     container_id: str | None = None,
 ) -> dict:
-    """The cause of a cell that ended with 137/124. Returns {"reason", "category", "basis", ...deltas}.
+    """The cause of a cell that the harness has evidence was killed. Returns {"reason", "category", "basis", ...deltas}.
 
-    `kernel` is the OOM-kill lines of the cell's window (None: the log could not be read). Never guesses: conflicting or missing
-    evidence gives `unknown`, with the evidence that was available in `basis`.
+    `timer_fired`: the harness's own timer ended the cell (recorded when it fired); the only way to `time_limit`, and how long
+    the cell ran is no input at all (the caller records it). `kernel` is the OOM-kill lines of the cell's window (None: the log
+    could not be read). Never guesses: conflicting or missing evidence gives `unknown`, with the evidence that was available in
+    `basis`.
     """
     d = {}
     if before is not None and after is not None:
@@ -129,6 +134,7 @@ def classify(
         or (k["constraint"] == "CONSTRAINT_MEMCG" and container_id not in k.get("oom_memcg", ""))
     ]
     facts = {
+        "timer_fired": timer_fired,
         "events_delta": d or None,
         "kernel_lines": None if kernel is None else len(kernel),
         "kernel_memcg_own": len(own),
@@ -173,12 +179,14 @@ def classify(
                 "host_oom", "kernel log: CONSTRAINT_NONE killing a process of this container (memory.events unreadable)"
             )
         return out("unknown", "memory.events unreadable and the kernel log has no unambiguous line for this container")
-    if (
-        duration_s >= timeout_s - AT_THE_LIMIT_S
-    ):  # `timeout -s KILL` fires at the time left; a cell that ended earlier did not hit it
-        return out("time_limit", "the cell ran to its time limit" + ("" if d else " (memory.events unreadable)"))
+    if timer_fired:  # recorded by the harness when its timer fired: never inferred from how long the cell ran
+        return out(
+            "time_limit",
+            f"the harness's timer fired at the cell's limit of {timeout_s:g} s"
+            + ("" if d else " (memory.events unreadable)"),
+        )
     if not d and container_running is None:
         return out("unknown", "nothing could be read: memory.events, the container state, the kernel log")
     if not d:
-        return out("unknown", "memory.events unreadable; the time limit was not reached")
-    return out("killed_other", "no OOM kill counted, the container runs, the time limit was not reached")
+        return out("unknown", "memory.events unreadable; the harness's timer did not fire")
+    return out("killed_other", "no OOM kill counted, the container runs, the harness's timer did not fire")
