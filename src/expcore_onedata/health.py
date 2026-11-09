@@ -18,10 +18,10 @@ exception, becomes `Health(False, reason)`. The reason names positions in the fi
 ids the federation reports, never a token, URL, host or configured name.
 
 When platform.toml has a `[faults]` table the check first runs the fault gate (`expcore_onedata.admission.FaultGate`),
-before it asks Onezone anything: it recovers what a crashed run left open whenever no run is on the federation, then
-fails while an injection is in progress or unsettled, because a provider taken down for one condition's run, and not
-yet verifiably back, leaves the federation out of its baseline state for every other run, including runs of conditions
-that use no injector. The gate is built in and cannot be left out; `fault_driver` replaces the Compose driver that
+before it asks Onezone anything: it recovers what a crashed run left open whenever no run is on the federation, waits
+for an outage run in progress as a run's admission does, and fails while an injection stays open, because a provider
+taken down for one condition's run, and not verifiably back, leaves the federation out of its baseline state for every
+other run, including runs of conditions that use no injector. The gate is built in and cannot be left out; `fault_driver` replaces the Compose driver that
 `[faults]` describes, for tests.
 
 The check of the earlier study also read one known file back through its provider and compared its checksum with a study manifest. That

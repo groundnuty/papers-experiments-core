@@ -45,9 +45,11 @@ stuck, and fails the start the same way instead of being skipped as a live run's
 other run may be on it. An outage run holds the federation's lock exclusively for its whole run, inject and clear
 included (`expcore_onedata.admission`): the injector uses its run's exclusive admission, takes one itself when the run
 holds none, refuses a shared one, and keeps it until the restore is verified. Every other run holds it shared, so the
-two never overlap. An injector also refuses to start, as `injector_failure`, while the journal holds an injection
-recovery could not settle, and the platform's standard health check (`PlatformHealth`) recovers what a crashed run
-left and fails while an injection is in progress or unsettled, whenever platform.toml has a `[faults]` table.
+two never overlap; a turnstile in front of the lock keeps a stream of shared holders from starving an outage run. An
+injector also refuses to start, as `injector_failure`, while the journal holds an injection recovery could not
+settle, and the platform's standard health check (`PlatformHealth`), whenever platform.toml has a `[faults]` table,
+recovers what a crashed run left, waits for an outage run in progress as an admission does, and fails only for an
+injection that stays open.
 
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.

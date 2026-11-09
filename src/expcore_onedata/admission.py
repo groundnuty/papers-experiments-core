@@ -16,13 +16,22 @@ shared admission the journal must show no unsettled injection, checked while the
 as `injector_failure`. A held admission is a `HeldLock`: closed by its finalizer when its owner is dropped, and closed
 in a forked child.
 
+`flock` is not fair, so a steady stream of shared holders could keep an outage run out for ever. A turnstile prevents
+that: every admission, shared or exclusive, first takes `federation.intent` exclusively, then the main lock, and only
+then lets the turnstile go. An outage run waiting for the main lock holds the turnstile, so runs that arrive after it
+queue behind it, and it gets in once the runs that were on the federation at its arrival have finished.
+
 `FaultGate` is the fault half of the platform's standard health check. Whenever the journal holds an open injection
 and the federation can be taken exclusively (no run is on it), it recovers every injection whose holder is gone,
 verifying each restore, before it considers the journal: so the first check of a campaign settles what a crashed run
-left, and a later one settles an injection whose injector was dropped. It then fails while the federation is held
-exclusively (an injection is in progress), while an injection is unsettled (a live injector holds it, or recovery
-failed), and while the journal cannot be read, naming targets by their labels only. Recovery restores and so needs only
-the configuration's half of the sanction.
+left, and a later one settles an injection whose injector was dropped. Recovery restores and so needs only the
+configuration's half of the sanction. It then takes the federation shared, as a run's admission does, waiting at most
+`health_wait_s`, so it never sees an injection in progress: an outage run holds the federation exclusively, and the
+check waits for it, outside any agent's clock. Under the shared lock it fails for an injection that is still open
+(recovery failed, or its lock is stuck) and for a journal it cannot read, naming targets by their labels only. An
+injection in progress is no fault of the federation and charges no run: a check still waiting at `health_wait_s` passes,
+and the run's own admission waits for the injection and checks the journal again under the lock. Keep `health_wait_s`
+below the campaign's `health_timeout_s`, or the check counts as down before it can pass.
 """
 
 import asyncio
@@ -46,6 +55,7 @@ from expcore_onedata.fault_recovery import FaultDriver, Recovery, failure
 from expcore_onedata.fault_settings import FaultSettings, load_faults
 
 FEDERATION_LOCK = "federation.lock"
+FEDERATION_INTENT = "federation.intent"  # the turnstile every admission passes before the main lock
 _ADMISSION: ContextVar["Admission | None"] = ContextVar("expcore_onedata_admission", default=None)
 
 
@@ -80,32 +90,52 @@ class FederationLock:
     def __init__(self, directory: Path, *, poll_s: float = 0.05) -> None:
         self.directory, self._poll_s = Path(directory), poll_s
 
-    def try_acquire(self, *, exclusive: bool) -> Admission | None:
-        """Take the lock without waiting; None when the other mode holds it."""
+    def _try(self, name: str, mode: int) -> HeldLock | None:
+        """Take one of the two lock files in `mode` without waiting; None when another holds it in a conflicting one."""
         make_directories(self.directory)
-        descriptor = os.open(self.directory / FEDERATION_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        descriptor = os.open(self.directory / name, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(descriptor, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(descriptor)
             return None
-        return Admission(exclusive, HeldLock(descriptor))
+        return HeldLock(descriptor)
+
+    def _wait(self, name: str, mode: int, deadline: float | None, cancel: threading.Event | None) -> HeldLock:
+        """Poll for one of the two lock files until the deadline or the cancellation."""
+        while True:
+            held = self._try(name, mode)
+            if held is not None:
+                return held
+            if cancel is not None and cancel.is_set():
+                raise failure("the wait for the federation was cancelled")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise failure("the federation stayed held past the bound of the wait: another run's injection is on it")
+            time.sleep(self._poll_s)
+
+    def try_acquire(self, *, exclusive: bool) -> Admission | None:
+        """Pass the turnstile and take the lock without waiting; None when either is held against it."""
+        intent = self._try(FEDERATION_INTENT, fcntl.LOCK_EX)
+        if intent is None:
+            return None
+        try:
+            main = self._try(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        finally:
+            intent.close()
+        return None if main is None else Admission(exclusive, main)
 
     def acquire(
         self, *, exclusive: bool, timeout_s: float | None = None, cancel: threading.Event | None = None
     ) -> Admission:
-        """Wait for the lock, polling, at most `timeout_s` and until `cancel` is set; raise InfraError of kind
-        `injector_failure` when it could not be had."""
+        """Pass the turnstile, then wait for the lock while holding it, polling, at most `timeout_s` in all and until
+        `cancel` is set; raise InfraError of kind `injector_failure` when it could not be had."""
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
-        while True:
-            admission = self.try_acquire(exclusive=exclusive)
-            if admission is not None:
-                return admission
-            if cancel is not None and cancel.is_set():
-                raise failure("the wait for the federation was cancelled")
-            if deadline is not None and time.monotonic() >= deadline:
-                raise failure(f"the federation stayed held for {timeout_s:g} s: another run's injection is in progress")
-            time.sleep(self._poll_s)
+        intent = self._wait(FEDERATION_INTENT, fcntl.LOCK_EX, deadline, cancel)
+        try:
+            main = self._wait(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, deadline, cancel)
+        finally:
+            intent.close()  # whoever waits behind it may now queue for the main lock
+        return Admission(exclusive, main)
 
     @contextlib.contextmanager
     def held(self, *, exclusive: bool, timeout_s: float | None = None) -> Iterator[Admission]:
@@ -193,6 +223,7 @@ class FaultGate:
         self._lock = FederationLock(settings.journal)
         self._recovery = Recovery(settings, driver)
         self._may_recover = settings.sanctioned is True
+        self._wait_s = settings.health_wait_s
 
     def __call__(self) -> Health:
         try:
@@ -203,18 +234,17 @@ class FaultGate:
                         self._recovery.recover()
                     finally:
                         exclusive.close()
-            shared = self._lock.try_acquire(exclusive=False)
+            try:
+                shared = self._lock.acquire(exclusive=False, timeout_s=self._wait_s)
+            except InfraError:  # an outage run held it all along: the run's own admission waits for it
+                return Health(True, "an injection is in progress: the run's admission waits for it")
             try:
                 entries = self._recovery.entries()
             finally:
-                if shared is not None:
-                    shared.close()
+                shared.close()
         except InfraError as error:
             return Health(False, error.detail)
         targets = ", ".join(sorted({entry["target"] for entry in entries}))
-        if shared is None:
-            named = f" of {targets}" if targets else ""
-            return Health(False, f"an injection{named} is in progress: the federation is held exclusively")
         if entries:
             return Health(False, f"an injection of {targets} is unsettled: the federation is not in its baseline state")
         return Health(True, "no injection is unsettled")

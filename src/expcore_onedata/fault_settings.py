@@ -16,6 +16,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     command_timeout_s = 120          # optional: the longest one command may take
     clear_attempts = 3               # optional: how many times a restore is tried
     admission_timeout_s = 3600       # optional: the longest a run waits for the federation's lock
+    health_wait_s = 30               # optional: the longest the health check waits for it; below health_timeout_s
 
     [faults.services]
     <provider name> = "<service>"    # each provider that may be taken down, by its name in [providers]
@@ -45,6 +46,7 @@ _KEYS = (
     "command_timeout_s",
     "clear_attempts",
     "admission_timeout_s",
+    "health_wait_s",
     "services",
 )
 
@@ -66,6 +68,7 @@ class FaultSettings:
     command_timeout_s: float = 120.0
     clear_attempts: int = 3
     admission_timeout_s: float = 3600.0
+    health_wait_s: float = 30.0
 
 
 def _number(table: Section, key: str, default: float, minimum: float, *, integer: bool = False) -> float:
@@ -113,6 +116,7 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         command_timeout_s=_number(table, "command_timeout_s", 120.0, 1),
         clear_attempts=_number(table, "clear_attempts", 3, 1, integer=True),
         admission_timeout_s=_number(table, "admission_timeout_s", 3600.0, 0),
+        health_wait_s=_number(table, "health_wait_s", 30.0, 0),
     )
 
 

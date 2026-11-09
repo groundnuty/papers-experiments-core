@@ -204,9 +204,9 @@ def standard_health(platform, fake, **options):
     return PlatformHealth(config, client, TokenIssuer(client, config, clock=lambda: NOW), clock=lambda: NOW, **options)
 
 
-def test_o11_a_baseline_health_check_cannot_pass_while_an_injection_proceeds(tmp_path, fake):
-    """O11: an injector that holds the federation has not journalled anything yet; the health check still fails,
-    because it cannot take the federation shared while an injection proceeds."""
+def test_o11_a_baseline_health_check_waits_for_an_injection_in_progress_and_passes_after_it(tmp_path, fake):
+    """O11: an injector that holds the federation has not journalled anything yet; the health check takes the
+    federation shared, so it waits for the injection and its clear and only then reads the journal and passes."""
     platform = write_faults(tmp_path)
     services = SlowRead()
     health = standard_health(platform, fake, fault_driver=services)
@@ -214,14 +214,47 @@ def test_o11_a_baseline_health_check_cannot_pass_while_an_injection_proceeds(tmp
     injector = injector_for(platform, services)
     thread, landed = in_thread(lambda: injector.start(RUN))
     assert services.reading.wait(10)
-    verdict = health()
+    checking, verdicts = in_thread(health)
+    time.sleep(0.3)
+    assert verdicts == []  # waiting: an injection proceeds
     services.release.set()
     thread.join(10)
     assert landed == [None]
-    assert verdict.ok is False
-    assert "in progress" in verdict.detail
     assert injector.finish()["ok"] is True
-    assert health().ok is True
+    checking.join(10)
+    assert verdicts[0].ok is True, verdicts[0].detail
+
+
+def test_o11_a_writer_is_admitted_once_the_readers_at_its_arrival_finish_and_later_readers_wait_for_it(tmp_path):
+    """O11: a turnstile in front of the federation's lock: readers present when an outage run arrives finish, the
+    outage run gets in, and readers arriving after it wait for it, so a steady stream of readers cannot starve it."""
+    _, lock = federation(tmp_path)
+    times: dict[str, float] = {}
+
+    def reader(name, hold_s):
+        def run():
+            with lock.held(exclusive=False, timeout_s=10):
+                times[f"{name} in"] = time.monotonic()
+                time.sleep(hold_s)
+                times[f"{name} out"] = time.monotonic()
+
+        return run
+
+    def writer():
+        with lock.held(exclusive=True, timeout_s=10):
+            times["writer in"] = time.monotonic()
+            time.sleep(0.2)
+            times["writer out"] = time.monotonic()
+
+    present = [in_thread(reader("first", 0.4))[0], in_thread(reader("second", 0.6))[0]]
+    time.sleep(0.1)
+    arrived = [in_thread(writer)[0]]
+    time.sleep(0.1)
+    later = [in_thread(reader(f"later{i}", 0.4))[0] for i in range(3)]
+    for thread in present + arrived + later:
+        thread.join(15)
+    assert times["writer in"] >= max(times["first out"], times["second out"])
+    assert all(times[f"later{i} in"] >= times["writer out"] for i in range(3)), times
 
 
 def test_o11_the_first_health_check_recovers_a_crashed_runs_injection_and_admits_runs(tmp_path, fake):
