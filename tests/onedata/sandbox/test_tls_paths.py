@@ -308,3 +308,21 @@ def test_o12_the_run_record_names_the_tls_mode_and_a_bundle_by_its_sha256_alone(
     assert CA_NAME not in text
     assert str(tmp_path) not in text
     assert not any(line in text for line in federation.ca.read_text().splitlines() if "-----" not in line)
+
+
+def test_o05_the_runs_copy_of_the_bundle_is_never_kept_with_the_evidence(tmp_path, federation):
+    """O05: when collection fails and the run directory is kept as evidence, the run's copy of the CA bundle is
+    removed first: the bundle is configuration, not evidence of the run."""
+    from expcore_onedata.sandbox.hostops import CmdResult
+
+    world = world_with(tmp_path / "kept", MODES["ca_file"], federation)
+    sbx = start(world, "via-gate")
+    assert any(p.read_bytes() == federation.ca.read_bytes() for p in sbx.dir.glob("*.pem"))
+    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
+    with contextlib.suppress(Exception):
+        sbx.collect(tmp_path / "e", outputs=["out.txt"])
+    world.host.run_handlers.pop("cp")
+    sbx.stop()
+    kept = world.s.work_root / "_kept_evidence" / sbx.sid
+    assert kept.exists()
+    assert not [p for p in kept.rglob("*") if p.is_file() and p.read_bytes() == federation.ca.read_bytes()]

@@ -285,6 +285,9 @@ class FakeHost:
             case "rm" if "-rf" in argv:
                 shutil.rmtree(argv[-1], ignore_errors=True)
                 return CmdResult(0)
+            case "rm" if "-f" in argv:  # one file; a missing one is not an error, as with the real command
+                Path(argv[-1]).unlink(missing_ok=True)
+                return CmdResult(0)
             case "mkdir":
                 Path(argv[-1]).mkdir(parents=True, exist_ok=True)
                 return CmdResult(0)

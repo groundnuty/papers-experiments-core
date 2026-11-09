@@ -807,6 +807,10 @@ class DockerSandbox:
             )
             return
         if self.keep_evidence:  # the copy failed: the disks hold the only record of the run
+            if self._ca_copy is not None:  # the CA bundle is configuration, not evidence: it is never kept with the run
+                self._step(errors, lambda: self.host.run(["rm", "-f", str(self._ca_copy)], 20, sudo=True))
+                if self._ca_copy.exists():
+                    errors.append("the run's copy of the CA bundle could not be removed before the evidence was kept")
             kept = self.s.work_root / "_kept_evidence"
             self._step(errors, lambda: self.host.run(["mkdir", "-p", str(kept)], 20, sudo=True))
             self._step(errors, lambda: self.host.run(["mv", str(self.dir), str(kept / self.sid)], 60, sudo=True))
