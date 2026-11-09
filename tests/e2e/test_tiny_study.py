@@ -325,6 +325,43 @@ def test_s10_a_scorer_that_leaves_treatment_attempts_none_is_refused_until_the_c
     assert table(report, "## Preregistered contrasts")["relay-vs-baseline"][10] == "excluded (2 pair(s) left out)"
 
 
+def test_c23_an_exhausted_run_is_counted_under_its_condition_and_as_the_cause_of_the_pairs_it_costs(
+    tmp_path, clean_environment
+):
+    """C23: through the command line: a run that fails on infrastructure at every attempt is seen under its own
+    condition, and each contrast that needed it counts the pair as missing because of the exhausted run."""
+    campaign = Campaign(make_copy(tmp_path, "study"))
+    edit_once(
+        campaign.root / "plugin.py", "SPECIAL = {\n", 'SPECIAL = {\n    ("baseline", "dune"): "infrastructure",\n'
+    )
+    write_stamp(campaign.root, HEAD, load_study(campaign.root).scope)
+    campaign.codes["run"], _ = cli(clean_environment, "run", str(campaign.root))
+    finish(clean_environment, campaign)
+    assert campaign.codes == {"run": 0, "check": 0, "analyze": 0, "report": 0}
+    analysis = campaign.read("analysis.json")
+    baseline = next(c for c in analysis["conditions"] if c["condition"] == "baseline")
+    assert baseline == {
+        "condition": "baseline",
+        "planned": 8,
+        "analysed": 6,
+        "exhausted": 2,  # the task under both models
+        "unfinished": 0,
+        "left_out": 0,
+        "set_aside": 6,  # three charged attempts each
+    }
+    zero = dict.fromkeys(MISSING_CAUSES, 0)
+    assert {c["name"]: (c["n_pairs"], c["pairs_missing"]) for c in analysis["contrasts"]} == {
+        "extended-vs-baseline": (6, {**zero, "exhausted": 2}),
+        "relay-vs-baseline": (6, {**zero, "exhausted": 2}),
+        "tools-effect-on-rounds": (6, {**zero, "exhausted": 2, "unpaired_or_left_out": 8}),
+    }
+    assert table(campaign.report, "## Conditions")["baseline"][1:7] == ["8", "6", "2", "0", "0", "6"]
+    assert table(campaign.report, "### Pairs of the family's contrasts")["relay-vs-baseline"][1:] == [
+        "6",
+        *(str({**zero, "exhausted": 2}[cause]) for cause in MISSING_CAUSES),
+    ]
+
+
 def test_the_contrast_that_left_a_task_out_names_it(resumed):
     row = table(resumed.report, "## Preregistered contrasts")["extended-vs-baseline"]
     assert "dune" in row  # the subset condition did not run it
