@@ -63,7 +63,8 @@ manifest = "path.json"          # the frozen manifest the client checks the serv
 
 Two more tables are accepted here and read by the modules that use them, each validated against this file's providers:
 `[placement]` (the data provider, the bounds of placement and the declared range map; `rangemap.load_placement`) and
-`[slots.<name>]` (the leased platform users, one per token plane; `users.load_slots`).
+`[slots.<name>]` (the leased platform users, one per token plane; `users.load_slots`). `[faults]` (the sanction, journal
+and services of the fault injector; `faults.load_faults`) is read the same way.
 """
 
 import hashlib
@@ -474,6 +475,7 @@ def load_platform(
             "sandbox",
             "placement",  # read by rangemap.load_placement
             "slots",  # read by users.load_slots
+            "faults",  # read by faults.load_faults
         )
     )
     zone = root.section("zone")

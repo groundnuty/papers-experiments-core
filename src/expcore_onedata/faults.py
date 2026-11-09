@@ -1,384 +1,463 @@
 # Provenance:
 #   source: icsoc-2026-code-agent @ c1e76c2e1b7cea56a88ad70efca2d5048aa9a4ea, harness/provider_restart.py, blob 9c1013c507a9bfae7e318ba6c69bc80f68c6097b
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
-"""Provider-restart helper for the dataset_77 harness — OFFLINE-TESTABLE automation
-of the operator-verified "restart the mesh together" transfer-wedge recovery
-(see the `dataset-188` memory + `onedata-issues/0001`).
+#   merged: icsoc-2026-code-agent @ c1e76c2, harness/sweep_driver.py:130-131 (the fault is cleared in finally)
+#   merged: icsoc-2026-code-agent @ c1e76c2, harness/netem.py:85-86,337-348,362-392,401-416 (verified inject, bounded verified clear, fail-closed)
+#   changes: see git history of this file from its import commit
+"""Taking one provider offline for a run and bringing it back, as an instrument (O10, O11, O12).
 
-Mechanism (verified live 2026-07-06): SSH to the ops host — the SAME host +
-option shape the harness already uses for the verifier's REST-token mint (see
-`harness/verifier.py::SSH_HOST` / `KNOWN_HOSTS_PATH` + `Verifier._mint_token_ssh`).
-On the ops host, each provider has a kubeconfig at `$HOME/.kube/<cfg>`, a
-namespace, a single `oneprovider-0` pod, an `oneprovider` container, and an
-`oneprovider` StatefulSet. Restarting ONE provider is
-`kubectl delete pod oneprovider-0` — the StatefulSet recreates it
-(ArgoCD-safe). Restarting the MESH (multiple providers TOGETHER) is REQUIRED
-for transfer-wedge recovery: restarting one provider alone does NOT reliably
-clear a wedge (live-observed 2026-07-06: both providers Ready ~65s after
-delete, when deleted together).
+A condition whose manipulation is a provider outage declares the kind `provider_outage` with the provider's position
+label as its target, in study.toml: `infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]"
+}]`. The run's `FaultInjector`, built for that label, takes the provider down in `start`, before the agent's loop starts,
+and brings it back in `finish`, after the loop ends; neither happens in the agent's timed window, so neither is a wait
+kind. Its snapshot (namespace `fault_injector`, `expcore.records.injections`) records the injection, and the core scores
+the attempt as treatment only if the failure that ended it names the same label (`provider_outage` builds such a
+failure) and the snapshot shows that label injected in this attempt. Another provider's failure, the agent's own
+included, is set aside.
 
-Sequencing is load-bearing: `restart_providers` issues a `--wait=false`
-delete for EVERY named provider FIRST, then polls ALL of them for
-readiness — never delete-then-poll-then-delete-next, which would let an
-earlier provider finish recovering while a later one hasn't even gone down
-yet, defeating the "together" requirement.
+**Sanction (O10).** Taking a provider down is destructive, so nothing here acts on two halves of a sanction short of
+both: `sanctioned = true` in `[faults]` of platform.toml, and `sanctioned=True` passed by the code that builds the
+injector. Anything else raises `Unsanctioned` when the injector is built, and again before it recovers or injects.
 
-This module is destructive (it deletes live provider pods) and is NEVER
-auto-run: the `__main__` CLI requires explicit provider names and refuses to
-default to "all providers" or run with none.
+**Inject (O11).** The provider's identity is read first, the injection is journalled durably (the line written, flushed
+and fsynced, and the directory fsynced when the journal is new) before the stop command runs, and the provider must
+then be seen down within a bounded wait. Otherwise it is brought back and `start` fails as `injector_failure`, a kind
+no condition may declare, so the attempt is set aside and run again.
 
-Stdlib-only. No top-level side effects on import; no network at import — the
-default SSH runner is a callable FACTORY (mirrors `harness/netem.py::ssh_runner`
-exactly: an injected `remote_cmd -> (rc, stdout, stderr)` callable), never
-invoked at import or module-definition time. Kubeconfig CONTENTS are never
-read or handled by this module — only the kubeconfig FILENAME is ever
-embedded into a remote command (the ops host resolves it).
+**Clear (O11).** `clear` brings the provider back and counts a restore only when the provider runs with an identity
+other than the one read before the injection (`ComposeDriver`: the container's id and start time). Readiness alone is
+not a restore, and a provider back with the same identity is a failed restore. The start is tried a bounded number of
+times. `clear` never raises: a failed restore is in the snapshot (`verified: false`) and stays open in the journal.
+`finish` calls it, `session` calls it in a `finally` around the agent's run, and `start` calls it before failing.
+
+**Recovery (O11).** Before it injects, `start` (like `recover`) clears and verifies every injection the journal holds
+open whose target no live injector holds: each injector holds an exclusive lock on its target's lock file for as long
+as it may have the target down, and the kernel drops the lock when its holder dies. A crash between inject and clear
+therefore leaves no provider down after the next start, and an open injection that cannot be cleared and verified
+fails that start as `injector_failure`, so a campaign never runs on with a provider it left down.
+
+**Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
+labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
+
+**Use.** An executor builds the injector for the target its condition declares and runs it around the loop:
+
+    injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
+                             driver=compose_driver(settings))
+    await asyncio.to_thread(start_instruments, [injector], dataclasses.asdict(request.identity))
+    try:
+        record = await record_run(request, ...)
+    finally:
+        await asyncio.to_thread(injector.clear)
+    record = await asyncio.to_thread(finish_instruments, record, [injector])
+
+`finish_instruments` puts the snapshot into the record and derives its treatment flag again from it.
+
+**Names (O12).** Outside the driver and the journal the provider is known only by its label: in the snapshot, in every
+message and in every failure. Identities are recorded as SHA-256 digests. The settings, read by `load_faults`:
+
+    [faults]
+    sanctioned = true                # the configuration's half of the sanction; false or absent refuses
+    journal = "fault-journal"        # directory of the injection journal and the targets' lock files
+    compose_file = "compose.yaml"    # the Compose file that declares the providers' services
+    project = "..."                  # optional: the Compose project name
+    command = ["docker", "compose"]  # optional: the Compose command
+    docker = ["docker"]              # optional: the command that inspects a container
+    poll_s = 2                       # optional: between two readings of a service
+    settle_timeout_s = 180           # optional: the longest a service may take to go down or to come back
+    command_timeout_s = 120          # optional: the longest one command may take
+    clear_attempts = 3               # optional: how many times a restore is tried
+
+    [faults.services]
+    <provider name> = "<service>"    # each provider that may be taken down, by its name in [providers]
 """
-from __future__ import annotations
 
-import dataclasses
+import contextlib
+import hashlib
 import math
-import subprocess
+import os
+import re
 import time
-from typing import Callable, Dict, Optional
+import uuid
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
 
-from . import verifier
+from expcore.config.loading import ConfigError, Section, load_toml
+from expcore.errors import InfraError, register_infra_kind
+from expcore.records.injections import FAULT_NAMESPACE
+from expcore_onedata.compose import CommandRunner, ComposeDriver, DriverError, Observation, run_command
+from expcore_onedata.config import PlatformConfig
+from expcore_onedata.fault_journal import InjectionJournal
 
-
-class ProviderRestartError(RuntimeError):
-    """Raised for a missing operator sanction (`operator_sanctioned` not exactly
-    `True`), an unknown provider name, or an empty `providers` sequence. NEVER
-    raised for a provider that fails to become ready within `wait_timeout_s` —
-    that is a normal, reportable outcome (see the `ready: False` field
-    `restart_providers` returns), not an error."""
-
-
-@dataclasses.dataclass(frozen=True)
-class ProviderCluster:
-    """Where + how to reach one provider's kubeconfig context on the ops host.
-
-    `kubeconfig` is the FILENAME only (e.g. "de-config") — the remote command
-    always builds the full path as `$HOME/.kube/<kubeconfig>`, embedded
-    UNQUOTED so the remote shell expands `$HOME` itself. This is the opposite
-    convention from `netem.py`'s `ProviderTarget.kubeconfig` (which requires
-    an ABSOLUTE path precisely BECAUSE its commands single-quote the value,
-    which kills `~`/`$HOME` expansion on the remote host — see that module's
-    docstring). Do NOT single-quote `$HOME/.kube/<kubeconfig>` here, or the
-    remote shell will look for a literal path named `$HOME/.kube/...` and
-    kubectl will fail."""
-    provider: str
-    kubeconfig: str
-    namespace: str
-    pod: str = "oneprovider-0"
-    container: str = "oneprovider"
-    statefulset: str = "oneprovider"
-
-
-# Verified live 2026-07-06 provider -> (kubeconfig filename, namespace) map.
-PROVIDER_CLUSTERS: Dict[str, ProviderCluster] = {
-    "provider_f": ProviderCluster(provider="provider_f", kubeconfig="de-config", namespace="provider-r"),
-    "provider-a": ProviderCluster(
-        provider="provider-a", kubeconfig="provider-a-config", namespace="provider-t-pl"
-    ),
-    "provider_e": ProviderCluster(provider="provider_e", kubeconfig="fr-config", namespace="provider-s"),
-    "provider_d": ProviderCluster(provider="provider_d", kubeconfig="provider_d-config", namespace="provider-u"),
-    "cloud": ProviderCluster(provider="cloud", kubeconfig="cloud-config", namespace="provider-t"),
-}
-
-# jsonpath to capture a pod's IDENTITY (uid) BEFORE a restart delete. After
-# the delete we require this uid to CHANGE before calling a provider ready.
-# WHY (live-caught 2026-07-06): a `kubectl delete pod --wait=false` leaves the
-# OLD pod `phase=Running, ready=true` for its termination grace period (a few
-# seconds) BEFORE it goes Terminating. A phase:ready-only poll sees that OLD,
-# still-Running pod and reports "ready" in ~4-5s WITHOUT the genuine restart
-# ever happening — the real restart (fresh pod Running:true) took ~45-65s. The
-# uid-change check is the race-free confirmation that we are looking at the
-# NEW pod, not the lingering old one.
-_IDENTITY_JSONPATH = "{.metadata.uid}"
-
-# jsonpath to poll AFTER the delete: the pod's uid + phase + container-ready in
-# ONE shot. Readiness = uid differs from the pre-delete capture AND the
-# `<phase>:<ready>` tail == _READY_VALUE. A k8s uid contains no colon, so the
-# combined output `<uid>:<phase>:<ready>` splits unambiguously on the FIRST
-# colon (see `_is_genuinely_restarted`).
-_STATUS_JSONPATH = "{.metadata.uid}:{.status.phase}:{.status.containerStatuses[0].ready}"
-
-# The `<phase>:<ready>` tail (after the uid) that means the pod is up.
-_READY_VALUE = "Running:true"
+PROVIDER_OUTAGE = "provider_outage"
+INJECTOR_FAILURE = "injector_failure"
+register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable")
+register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
+SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_KEYS = (
+    "sanctioned",
+    "journal",
+    "compose_file",
+    "project",
+    "command",
+    "docker",
+    "poll_s",
+    "settle_timeout_s",
+    "command_timeout_s",
+    "clear_attempts",
+    "services",
+)
 
 
-def _kubeconfig_expr(cluster: ProviderCluster) -> str:
-    """`$HOME/.kube/<cfg>` — UNQUOTED (see `ProviderCluster.kubeconfig`
-    docstring for why quoting it would break remote `$HOME` expansion)."""
-    return f"$HOME/.kube/{cluster.kubeconfig}"
+class Unsanctioned(ConfigError):
+    """The injector was built or run without both halves of the sanction (O10)."""
 
 
-def build_delete_pod_cmd(cluster: ProviderCluster) -> str:
-    """Remote shell command: delete the provider's pod WITHOUT waiting for
-    termination (`--wait=false`) — load-bearing for a mesh restart. ALL named
-    providers' deletes must be issued before ANY readiness poll, so the pods
-    go down together rather than one recovering before the next goes down.
-    The StatefulSet recreates the pod (ArgoCD-safe, self-serve)."""
-    return (
-        f"KUBECONFIG={_kubeconfig_expr(cluster)} kubectl -n {cluster.namespace} "
-        f"delete pod {cluster.pod} --wait=false"
-    )
+class FaultRefused(ConfigError):
+    """The injector was asked to act on a target platform.toml does not let it take down, or for no run."""
 
 
-def build_pod_identity_cmd(cluster: ProviderCluster) -> str:
-    """Remote shell command: read-only capture of the pod's current identity
-    (`{.metadata.uid}`) BEFORE a restart delete. The post-delete poll requires
-    this uid to change before reporting ready — see `_STATUS_JSONPATH` /
-    `_is_genuinely_restarted` for why (the --wait=false grace-period race)."""
-    return (
-        f"KUBECONFIG={_kubeconfig_expr(cluster)} kubectl -n {cluster.namespace} "
-        f"get pod {cluster.pod} -o jsonpath='{_IDENTITY_JSONPATH}'"
-    )
+class FaultDriver(Protocol):
+    """What takes a provider's service down and brings it back (`expcore_onedata.compose.ComposeDriver`)."""
+
+    def observe(self, service: str) -> Observation:
+        """Read whether the service runs and its identity; raise DriverError when it cannot be read."""
+        ...
+
+    def stop(self, service: str) -> None:
+        """Stop the service; raise DriverError when the command fails."""
+        ...
+
+    def start(self, service: str) -> None:
+        """Start the service again; raise DriverError when the command fails."""
+        ...
 
 
-def build_pod_status_cmd(cluster: ProviderCluster) -> str:
-    """Remote shell command: read-only uid + pod-phase + container-ready check
-    used to poll for a GENUINE restart after a delete. Returns
-    `<uid>:<phase>:<ready>` so the poller can require the uid to differ from the
-    pre-delete capture AND `<phase>:<ready>` == `Running:true` (guards the
-    grace-period race — see `_STATUS_JSONPATH`)."""
-    return (
-        f"KUBECONFIG={_kubeconfig_expr(cluster)} kubectl -n {cluster.namespace} "
-        f"get pod {cluster.pod} -o jsonpath='{_STATUS_JSONPATH}'"
-    )
+def provider_outage(config: PlatformConfig, name: str, detail: str) -> InfraError:
+    """The failure of a provider the platform attributes to it, naming it by its label (`providers[i]`), never by name."""
+    return InfraError(PROVIDER_OUTAGE, detail, target=config.provider_label(name))
 
 
-def ssh_runner(
-    ssh_host: Optional[str] = None,
-    known_hosts_path: Optional[str] = None,
-    timeout_s: int = 90,
-) -> Callable:
-    """Default runner: SSH to the ops host and run a remote shell command,
-    returning (rc, stdout, stderr). Mirrors `netem.py::ssh_runner`'s exact
-    factory contract (a callable taking one remote-command string, returning
-    a (rc, stdout, stderr) tuple) so the two modules' runners are
-    interchangeable — but additionally pins `StrictHostKeyChecking=yes` +
-    `UserKnownHostsFile=<KNOWN_HOSTS_PATH>`, the fuller invocation shape
-    `verifier.py` already uses for its own SSH calls (see
-    `Verifier._mint_token_ssh`). Defaults come from `harness.verifier.SSH_HOST`
-    / `KNOWN_HOSTS_PATH` — never hardcoded here. Kept separate + injectable so
-    tests never touch SSH; never invoked at import or definition time (this
-    factory only builds the closure — no subprocess runs until the returned
-    callable is actually called)."""
-    host = ssh_host or verifier.SSH_HOST
-    known_hosts = known_hosts_path or verifier.KNOWN_HOSTS_PATH
+@dataclass(frozen=True)
+class FaultSettings:
+    """`[faults]` of platform.toml, validated: the sanction, the journal, the Compose settings and the services."""
 
-    def _run(remote_cmd: str):
-        proc = subprocess.run(
-            [
-                "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-                "-o", f"UserKnownHostsFile={known_hosts}", host, remote_cmd,
-            ],
-            capture_output=True, text=True, timeout=timeout_s,
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-
-    return _run
+    file: Path
+    sanctioned: bool
+    journal: Path
+    compose_file: Path
+    services: Mapping[str, str]
+    project: str | None = None
+    command: tuple[str, ...] = ("docker", "compose")
+    docker: tuple[str, ...] = ("docker",)
+    poll_s: float = 2.0
+    settle_timeout_s: float = 180.0
+    command_timeout_s: float = 120.0
+    clear_attempts: int = 3
 
 
-def _is_ready(phase_ready: str) -> bool:
-    """True when the `<phase>:<ready>` tail is exactly `Running:true`."""
-    return phase_ready.strip() == _READY_VALUE
+def _number(table: Section, key: str, default: float, minimum: float, *, integer: bool = False) -> float:
+    """Read an optional finite number at or above a minimum."""
+    value = table.data.get(key, default)
+    kind = int if integer else (int, float)
+    if isinstance(value, bool) or not isinstance(value, kind) or not math.isfinite(value) or value < minimum:
+        raise table.fail(key, f"must be {'an integer' if integer else 'a number'} of at least {minimum:g}")
+    return value
 
 
-def _is_genuinely_restarted(status_output: str, pre_uid: str) -> bool:
-    """True only when the polled pod is a GENUINELY NEW pod — its uid differs
-    from the pre-delete capture `pre_uid` AND it is `Running:true`. This is the
-    race-free guard against the `--wait=false` grace-period window where the OLD
-    pod still reports `Running:true` for a few seconds before it goes
-    Terminating (live-caught 2026-07-06 — see `_IDENTITY_JSONPATH`).
+def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSettings:
+    """Read `[faults]` of a platform.toml against its loaded configuration; raise ConfigError naming the file and key.
 
-    `status_output` is `<uid>:<phase>:<ready>`; a k8s uid contains no colon, so
-    partitioning on the FIRST colon yields the uid and the `<phase>:<ready>`
-    tail cleanly.
-
-    If `pre_uid` is empty (the pre-delete identity capture failed — e.g. the pod
-    was momentarily absent), the uid-change gate degrades to the phase:ready-only
-    check for the first observed pod: no worse than the pre-fix behaviour, and
-    the pre-capture normally succeeds because the pod being restarted exists."""
-    new_uid, _sep, phase_ready = status_output.strip().partition(":")
-    if not new_uid or new_uid == pre_uid:
-        return False
-    return _is_ready(phase_ready)
-
-
-def restart_providers(
-    providers,
-    *,
-    operator_sanctioned: bool = False,
-    runner: Optional[Callable] = None,
-    wait_timeout_s: float = 360.0,
-    poll_interval_s: float = 5.0,
-    sleep_fn: Callable[[float], None] = time.sleep,
-    now_fn: Callable[[], float] = time.time,
-) -> Dict[str, Dict[str, object]]:
-    """Mesh-restart ALL of `providers` TOGETHER — the verified remedy for an
-    inter-provider transfer wedge (restarting one provider alone does NOT
-    reliably clear it; see the `dataset-188` memory +
-    `onedata-issues/0001`).
-
-    **Operator-sanction gate (structural, mirrors
-    `sweep.LiveFaultInjector(operator_sanctioned=True)`):** `operator_sanctioned`
-    is REQUIRED to be exactly `True` — if it is `False`, omitted, or any other
-    value, this raises `ProviderRestartError` BEFORE any runner invocation and
-    before any pod is deleted. Restarting Onedata providers is destructive and
-    NEVER-without-operator-sanction (see `.claude/CLAUDE.md`); making the gate a
-    structural precondition (rather than a positional accident of the module not
-    being wired anywhere) means a future "auto-recover the wedge" driver that
-    calls this without sanction fails LOUD at the boundary, not on reviewer
-    memory.
-
-    Sequencing: captures each pod's pre-delete identity (uid), issues a
-    `--wait=false` delete for EVERY named provider FIRST, then polls ALL of
-    them for readiness — see module docstring for why the delete-before-poll
-    order is load-bearing.
-
-    Readiness = a GENUINE restart, not just phase:ready. A provider is ready
-    only when its pod's uid DIFFERS from the pre-delete capture AND it is
-    `Running:true`. This guards the `--wait=false` grace-period race where the
-    OLD pod lingers `Running:true` for a few seconds before going Terminating —
-    a phase:ready-only check would report ready in ~4-5s without the genuine
-    restart happening (live-caught 2026-07-06; real restart took ~45-65s).
-
-    Never raises on a provider that fails to become ready within
-    `wait_timeout_s` — that is a normal, reportable outcome (`ready: False`
-    in the return value). Never hangs unbounded: the poll loop is bounded
-    BOTH by wall-clock (`now_fn`) AND by iteration count. The iteration-count
-    bound matters independently of whether `sleep_fn` actually advances
-    `now_fn` — a fully-deterministic offline test can inject a no-op
-    `sleep_fn` alongside a fake `now_fn` and still get a bounded, finite
-    number of runner calls rather than a busy-loop.
-
-    Returns
-    `{provider: {"terminated": bool, "ready": bool, "identity_confirmed": bool, "elapsed_s": float}}`.
-    `terminated` reflects whether the delete command itself was issued
-    successfully (`rc == 0`) — NOT confirmed pod termination, since the
-    delete is `--wait=false` by design (see `build_delete_pod_cmd`).
-
-    `identity_confirmed` disambiguates the TWO strengths a `ready: True` can
-    have (surfacing the degraded-mode mini silent-fallback):
-      - `True`  — readiness confirmed via a genuine uid CHANGE (the pre-delete
-        uid was captured non-empty AND the polled pod's uid differs). Full
-        confidence that a real restart happened.
-      - `False` — the pre-delete uid capture failed (empty `pre_uid`), so the
-        gate degraded to phase:ready-only for this provider; `ready: True` is
-        lower-confidence (it could in principle be a lingering old pod).
-    `identity_confirmed` is only meaningful when `ready: True`; it stays
-    `False` for a not-ready provider.
-
-    Raises `ProviderRestartError` for a missing operator sanction, an unknown
-    provider name, or an empty `providers` sequence — NEVER for a
-    not-ready-in-time provider.
-
-    Never reads, prints, or returns kubeconfig file CONTENTS — only the
-    kubeconfig FILENAME (`ProviderCluster.kubeconfig`) is ever embedded into
-    a remote command; the ops host resolves the file itself.
+    A message names a service entry by its position, never by the provider's or the service's name.
     """
-    # Operator-sanction gate FIRST — before any runner call / any delete.
-    # `is not True` rejects False, omission (default False), and truthy
-    # non-True values (e.g. 1, "yes") — sanction must be the explicit bool True.
-    if operator_sanctioned is not True:
-        raise ProviderRestartError(
-            "restart_providers refuses to run without explicit operator sanction; "
-            "pass operator_sanctioned=True (restarting Onedata providers is destructive "
-            "and NEVER-without-operator-sanction — see .claude/CLAUDE.md)"
+    file = Path(path).resolve()
+    table = Section(load_toml(file), file, "platform.toml").section("faults")
+    table.reject_unknown(_KEYS)
+    sanctioned = table.data.get("sanctioned", False)
+    if not isinstance(sanctioned, bool):
+        raise table.fail("sanctioned", "must be true or false")
+    services = Section(table.table("services"), file, "[faults.services]")
+    if not services.data:
+        raise services.fail(None, "must name the service of at least one provider")
+    for index, (name, service) in enumerate(services.data.items()):
+        if name not in config.providers:
+            raise services.fail(None, f"entry {index} is not a provider declared in [providers]")
+        if not isinstance(service, str) or not SERVICE.fullmatch(service):
+            raise services.fail(None, f"entry {index} must be a service name: letters, digits, '_', '.' and '-'")
+    words = {}
+    for key, default in (("command", ("docker", "compose")), ("docker", ("docker",))):
+        words[key] = tuple(table.strings(key)) or default
+    return FaultSettings(
+        file=file,
+        sanctioned=sanctioned,
+        journal=(file.parent / table.string("journal")).resolve(),
+        compose_file=(file.parent / table.string("compose_file")).resolve(),
+        services=dict(services.data),
+        project=table.optional_string("project"),
+        command=words["command"],
+        docker=words["docker"],
+        poll_s=_number(table, "poll_s", 2.0, 0.001),
+        settle_timeout_s=_number(table, "settle_timeout_s", 180.0, 0),
+        command_timeout_s=_number(table, "command_timeout_s", 120.0, 1),
+        clear_attempts=_number(table, "clear_attempts", 3, 1, integer=True),
+    )
+
+
+def compose_driver(settings: FaultSettings, runner: CommandRunner = run_command) -> ComposeDriver:
+    """The Compose driver `[faults]` describes, running its commands through `runner`."""
+    return ComposeDriver(
+        settings.compose_file,
+        project=settings.project,
+        command=settings.command,
+        docker=settings.docker,
+        runner=runner,
+        timeout_s=settings.command_timeout_s,
+    )
+
+
+def _digest(identity: str) -> str:
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+class FaultInjector:
+    """The instrument that takes one provider down for a run and brings it back (see the module docstring)."""
+
+    namespace = FAULT_NAMESPACE
+
+    def __init__(
+        self,
+        config: PlatformConfig,
+        settings: FaultSettings,
+        target: str,
+        *,
+        sanctioned: bool = False,
+        driver: FaultDriver,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Check the sanction and the target; act on nothing yet. `target` is a provider's label (`providers[1]`)."""
+        self._settings, self._sanctioned = settings, sanctioned
+        self._require_sanction()
+        names = {config.provider_label(name): name for name in config.providers}
+        if target not in names:
+            raise FaultRefused(f"{settings.file}: [faults]: the target {target!r} is not a provider label")
+        service = settings.services.get(names[target])
+        if service is None:
+            raise FaultRefused(f"{settings.file}: [faults.services]: no service is declared for {target}")
+        self.target, self._service, self._driver = target, service, driver
+        self._clock, self._sleep = clock, sleep
+        self._journal = InjectionJournal(settings.journal)
+        self._lock: int | None = None
+        self._pending: tuple[str, str] | None = None  # the open injection's journal id and identity digest
+        self._run: dict[str, Any] | None = None
+        self._steps: list[dict[str, Any]] = []
+        self._injection: dict[str, Any] | None = None
+        self._last: Observation | None = None
+        self._origin = clock()
+
+    # --- the sanction and the readings ------------------------------------------------------------------------
+
+    def _require_sanction(self) -> None:
+        """Refuse unless platform.toml and the caller both sanction the injector, each with exactly True (O10)."""
+        if self._settings.sanctioned is not True or self._sanctioned is not True:
+            raise Unsanctioned(
+                f"{self._settings.file}: [faults]: a fault injector takes a provider down and needs both "
+                "'sanctioned = true' in platform.toml and sanctioned=True from its caller"
+            )
+
+    def _step(self, step: str, ok: bool, target: str | None = None, **extra: Any) -> None:
+        self._steps.append(
+            {"step": step, "at_s": self._clock() - self._origin, "target": target or self.target, "ok": ok, **extra}
         )
-    if not providers:
-        raise ProviderRestartError("restart_providers requires at least one explicit provider name")
-    unknown = sorted(set(providers) - set(PROVIDER_CLUSTERS))
-    if unknown:
-        raise ProviderRestartError(
-            f"unknown provider(s) {unknown!r}; known providers: {sorted(PROVIDER_CLUSTERS)}"
-        )
 
-    run = runner if runner is not None else ssh_runner()
+    def _fail(self, detail: str) -> InfraError:
+        return InfraError(INJECTOR_FAILURE, detail, target=self.target)
 
-    # Phase 0 — capture each pod's pre-delete identity (uid) so Phase 2 can
-    # confirm a GENUINE restart (new uid) rather than the OLD pod lingering
-    # `Running:true` through its --wait=false grace period. Best-effort: a
-    # failed capture (rc != 0) records an empty uid, which degrades the Phase-2
-    # gate to phase:ready-only for that provider (see `_is_genuinely_restarted`).
-    pre_uid: Dict[str, str] = {}
-    for p in providers:
-        rc, out, _err = run(build_pod_identity_cmd(PROVIDER_CLUSTERS[p]))
-        pre_uid[p] = out.strip() if rc == 0 else ""
+    # --- the instrument -----------------------------------------------------------------------------------------
 
-    start = now_fn()
+    def start(self, identity: Mapping[str, Any]) -> None:
+        """Recover what an earlier run left open, then take the target down and see it down; raise InfraError of kind
+        `injector_failure` when either fails, with the target brought back first.
 
-    # Phase 1 — issue ALL deletes before ANY readiness poll (mesh-together).
-    result: Dict[str, Dict[str, object]] = {}
-    for p in providers:
-        rc, _out, _err = run(build_delete_pod_cmd(PROVIDER_CLUSTERS[p]))
-        result[p] = {
-            "terminated": rc == 0, "ready": False,
-            "identity_confirmed": False, "elapsed_s": 0.0,
+        `identity` is the run's identity as a plain mapping with at least its `run_key` and `attempt`, which the snapshot
+        names so the treatment rule counts the injection for this attempt only.
+        """
+        self._require_sanction()
+        if self._pending is not None:  # an earlier start of this injector was never cleared
+            self.clear()
+        run_key, attempt = identity.get("run_key"), identity.get("attempt")
+        if not isinstance(run_key, str) or isinstance(attempt, bool) or not isinstance(attempt, int):
+            raise FaultRefused("a fault injector is started with the run's identity: its run_key and attempt")
+        self._origin, self._steps, self._injection = self._clock(), [], None
+        self._run = {"run_key": run_key, "attempt": attempt}
+        self._step("sanctioned", True)
+        self.recover()
+        self._lock = self._journal.try_lock(self.target)
+        if self._lock is None:
+            raise self._fail(f"{self.target} is held by another run's fault injector")
+        try:
+            before = self._driver.observe(self._service)
+        except DriverError as error:
+            self._unlock()
+            raise self._fail(f"{self.target} could not be read before the injection: {error}") from None
+        if not before.running or before.identity is None:
+            self._unlock()
+            raise self._fail(f"{self.target} is not running before the injection, so no restore could be confirmed")
+        entry, digest = uuid.uuid4().hex, _digest(before.identity)
+        line = {"target": self.target, "service": self._service, "identity_sha256": digest}
+        self._journal.append({"event": "injecting", "id": entry, **line})
+        self._pending = (entry, digest)
+        self._injection = {"target": self.target, "injected": False, "cleared": False, "verified": False}
+        try:
+            self._driver.stop(self._service)
+            down = self._wait(lambda seen: not seen.running)
+        except DriverError:
+            down = None
+        if down is None:
+            self._step("injected", False, identity_before_sha256=digest)
+            self.clear()
+            raise self._fail(f"{self.target} could not be taken down and seen down; it was brought back")
+        self._journal.append({"event": "injected", "id": entry})
+        self._injection["injected"] = True
+        self._step("injected", True, identity_before_sha256=digest)
+
+    def finish(self) -> dict[str, Any]:
+        """Bring the target back and verify it (`clear`), then return the snapshot of every step."""
+        self.clear()
+        return self.snapshot()
+
+    @contextlib.contextmanager
+    def session(self, identity: Mapping[str, Any]) -> Iterator["FaultInjector"]:
+        """Inject for the body of a `with` and clear in `finally`, whatever the body raises (O11)."""
+        self.start(identity)
+        try:
+            yield self
+        finally:
+            self.clear()
+
+    def snapshot(self) -> dict[str, Any]:
+        """The reading the record keeps: the run, the target, the injection and every step; `ok` only when the target
+        was injected and its restore verified."""
+        injection = None if self._injection is None else dict(self._injection)
+        return {
+            "ok": bool(injection and injection["injected"] and injection["verified"]),
+            **(self._run or {"run_key": None, "attempt": None}),
+            "kind": PROVIDER_OUTAGE,
+            "target": self.target,
+            "injections": [] if injection is None else [injection],
+            "steps": [dict(step) for step in self._steps],
         }
 
-    # Phase 2 — poll ALL pending providers for a GENUINE restart (uid changed
-    # from the pre-delete capture AND Running:true), bounded by BOTH wall-clock
-    # AND iteration count (see docstring above for why both).
-    max_polls = max(1, math.ceil(wait_timeout_s / poll_interval_s)) if poll_interval_s > 0 else 1
-    pending = dict.fromkeys(providers)  # ordered "set" (insertion order, values unused)
-    for _poll in range(max_polls):
-        for p in list(pending):
-            rc, out, _err = run(build_pod_status_cmd(PROVIDER_CLUSTERS[p]))
-            if rc == 0 and _is_genuinely_restarted(out, pre_uid[p]):
-                del pending[p]
-                result[p]["ready"] = True
-                # Full confidence only when a non-empty pre-delete uid was
-                # captured (so readiness came from a genuine uid CHANGE). An
-                # empty pre_uid means the gate degraded to phase:ready-only.
-                result[p]["identity_confirmed"] = bool(pre_uid[p])
-                result[p]["elapsed_s"] = now_fn() - start
-        if not pending:
-            break
-        if now_fn() - start >= wait_timeout_s:
-            break
-        sleep_fn(poll_interval_s)
+    # --- clearing and recovery --------------------------------------------------------------------------------
 
-    for p in pending:
-        result[p]["elapsed_s"] = now_fn() - start
-    return result
+    def clear(self) -> bool:
+        """Bring the target back and verify its identity changed; record the outcome and never raise for it.
 
+        Returns True when this injector leaves nothing down. Calling it again after it ran is harmless. A target the
+        injection never took down (the stop failed) is found running with its old identity and needs no restore.
+        """
+        if self._pending is None:
+            return True
+        entry, digest = self._pending
+        self._pending = None
+        injection = self._injection if self._injection is not None else {"target": self.target, "injected": False}
+        try:
+            done, how, after = self._settle(
+                {"id": entry, "service": self._service, "identity_sha256": digest, "injected": injection["injected"]}
+            )
+        except Exception as error:  # never lose the reading: a clear that failed stays open for recovery
+            done, how, after = False, type(error).__name__, None
+        finally:
+            self._unlock()
+        verified = done and how in ("restored", "found_restored")
+        self._injection = {**injection, "cleared": done, "verified": verified}
+        self._step("cleared", done, how=how)
+        self._step("verified", verified, identity_changed=after is not None, identity_after_sha256=after)
+        return done
 
-def _cli(argv, **restart_kwargs) -> int:
-    """Argv-driving core, factored out of `__main__` so tests can inject a
-    fake `runner` (+ optionally `wait_timeout_s`/`poll_interval_s`/`sleep_fn`/
-    `now_fn`) without touching SSH. `python -m harness.provider_restart`
-    calls this with no `restart_kwargs`, so the real default SSH runner is
-    used.
+    def recover(self) -> None:
+        """Clear and verify every open injection of the journal that no live injector holds; raise InfraError of kind
+        `injector_failure` when one cannot be."""
+        self._require_sanction()
+        try:
+            entries = self._journal.open_entries()
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            raise self._fail(f"the injection journal cannot be read: {error}") from None
+        for entry in entries:
+            lock = self._journal.try_lock(entry["target"])
+            if lock is None:
+                continue  # a live injector holds the target down on purpose
+            try:
+                done, how, after = self._settle(entry)
+            finally:
+                self._journal.release(lock)
+            self._step("recovered", done, target=entry["target"], how=how, identity_after_sha256=after)
+            if not done:
+                raise self._fail(f"an injection of {entry['target']} that an earlier run left open was not cleared")
 
-    Operator sanction is opt-in ONLY via the explicit `--operator-sanctioned`
-    flag in argv — absent, the sanction gate in `restart_providers` raises and
-    a bare `python -m harness.provider_restart de provider-a` refuses. This
-    mirrors the module-level policy: destructive, explicit, never-by-default."""
-    argv = list(argv)
-    sanctioned = "--operator-sanctioned" in argv
-    providers = [a for a in argv if not a.startswith("--")]
-    if not providers:
-        print("usage: python -m harness.provider_restart --operator-sanctioned <provider> [<provider> ...]")
-        print(f"known providers: {', '.join(sorted(PROVIDER_CLUSTERS))}")
-        print("DESTRUCTIVE — restarts live provider pods together. No default-all; name explicit providers.")
-        print("Requires --operator-sanctioned (restarting Onedata providers is never-without-operator-sanction).")
-        return 2
-    try:
-        result = restart_providers(providers, operator_sanctioned=sanctioned, **restart_kwargs)
-    except ProviderRestartError as e:
-        print(f"error: {e}")
-        return 2
-    all_ready = True
-    for p in providers:
-        info = result[p]
-        print(f"{p}: terminated={info['terminated']} ready={info['ready']} elapsed_s={info['elapsed_s']:.1f}")
-        all_ready = all_ready and bool(info["ready"])
-    return 0 if all_ready else 1
+    def _settle(self, entry: Mapping[str, Any]) -> tuple[bool, str, str | None]:
+        """Leave one injection's target up: find it back, find it never went down, or bring it back with a changed
+        identity; journal it cleared when it is. Return whether it is, how, and the new identity's digest if any."""
+        before = entry["identity_sha256"]
+        try:
+            seen = self._driver.observe(entry["service"])
+        except DriverError:
+            return False, "unreadable", None
+        same = seen.identity is not None and _digest(seen.identity) == before
+        after = None
+        if seen.running and seen.identity is not None and not same:
+            how, after = "found_restored", _digest(seen.identity)
+        elif seen.running and same:
+            if entry["injected"]:  # it was seen down, so it must have started anew: its identity cannot be trusted
+                return False, "identity_unchanged", None
+            how = "never_down"  # the stop never took effect
+        else:
+            restored, after, reason = self._restore(entry["service"], before)
+            if not restored:
+                return False, reason, None
+            how = "restored"
+        self._journal.append({"event": "cleared", "id": entry["id"], "how": how})
+        return True, how, after
 
+    def _restore(self, service: str, before: str) -> tuple[bool, str | None, str]:
+        """Start the service and wait for it to run with an identity whose digest is not `before`, a bounded number of
+        times; return whether it did, the new identity's digest, and why not."""
+        reason = "not_running"
+        for attempt in range(self._settings.clear_attempts):
+            if attempt:
+                self._sleep(self._settings.poll_s)
+            try:
+                self._driver.start(service)
+                seen = self._wait(
+                    lambda s: s.running and s.identity is not None and _digest(s.identity) != before, service
+                )
+            except DriverError:
+                reason = "unreadable"
+                continue
+            if seen is not None:
+                return True, _digest(seen.identity or ""), "restored"
+            last = self._last
+            if last is not None and last.running and last.identity is not None and _digest(last.identity) == before:
+                return False, None, "identity_unchanged"  # back with the identity it had: not a restore (O11)
+        return False, None, reason
 
-if __name__ == "__main__":
-    import sys
-    sys.exit(_cli(sys.argv[1:]))
+    def _wait(self, done: Callable[[Observation], bool], service: str | None = None) -> Observation | None:
+        """Read the service until `done` holds, bounded by the settle timeout and by a count; None when it never did."""
+        polls = max(1, math.ceil(self._settings.settle_timeout_s / self._settings.poll_s)) + 1
+        started = self._clock()
+        self._last = None
+        for poll in range(polls):
+            if poll:
+                self._sleep(self._settings.poll_s)
+            self._last = self._driver.observe(service or self._service)
+            if done(self._last):
+                return self._last
+            if self._clock() - started >= self._settings.settle_timeout_s:
+                break
+        return None
+
+    def _unlock(self) -> None:
+        if self._lock is not None:
+            self._journal.release(self._lock)
+            self._lock = None

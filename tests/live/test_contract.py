@@ -2,12 +2,14 @@
 
     EXPCORE_LIVE_PLATFORM=/path/to/platform.toml uv run pytest tests/live
     EXPCORE_LIVE_SLOW=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live   # also the test that waits out a lifetime
+    EXPCORE_LIVE_FAULTS=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live  # also the test that takes a provider down
 
 They check what the fake can only assume: that the endpoints the layer calls answer in the shape it parses. They read
 (health, discovery, the examination of a token, and, with EXPCORE_LIVE_CONTENT_PATH naming a provisioned file by its
 path in the space, that file's content) and mint a short-lived token per plane for the configured fixed users.
 Tokens are never revoked, so each one ends with its lifetime. Nothing here changes a space, a file or a privilege, and
-without the variable nothing is constructed or contacted.
+without the variable nothing is constructed or contacted. Only with EXPCORE_LIVE_FAULTS=1 as well does the fault test
+take a provider declared in `[faults]` down and bring it back.
 """
 
 import os
@@ -274,3 +276,28 @@ def test_a_day0_check_that_changes_state_passes_and_shows_its_cleanup(day0, name
         require_cleaned(entry)
     else:
         require_every_provider_refused(entry)
+
+
+FAULTS = pytest.mark.skipif(
+    os.environ.get("EXPCORE_LIVE_FAULTS") != "1",
+    reason="EXPCORE_LIVE_FAULTS=1 is not set; this test takes a provider of the deployment down",
+)
+
+
+@FAULTS
+def test_a_provider_taken_down_is_seen_down_and_comes_back_with_a_new_identity(config):
+    """O11: the injector takes a provider of `[faults.services]` down (EXPCORE_LIVE_FAULT_TARGET, a label such as
+    providers[1], or the first that is not the agent's own), sees it down, and brings it back with a changed identity,
+    leaving no injection open in the journal."""
+    from expcore_onedata.faults import FaultInjector, compose_driver, load_faults
+
+    settings = load_faults(PLATFORM, config)
+    remote = [name for name in settings.services if name != config.support.local] or list(settings.services)
+    target = os.environ.get("EXPCORE_LIVE_FAULT_TARGET") or config.provider_label(remote[0])
+    injector = FaultInjector(config, settings, target, sanctioned=True, driver=compose_driver(settings))
+    with injector.session({"run_key": "live-fault-check", "attempt": 1}):
+        steps = [s["step"] for s in injector.snapshot()["steps"]]
+        assert "injected" in steps
+    snapshot = injector.finish()
+    assert snapshot["ok"] is True, snapshot["steps"]
+    assert snapshot["injections"] == [{"target": target, "injected": True, "cleared": True, "verified": True}]
