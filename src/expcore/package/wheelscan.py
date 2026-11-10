@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term, term_lines
 from expcore.package.identity import FOUND_COMMIT, FOUND_URL, commit_lines, find_identity, url_lines
-from expcore.package.leaks import scan_tokens
+from expcore.package.leaks import describe_hit, scan_tokens
 from expcore.package.spec import Opaque, PackageError
 from expcore.package.wheels import Wheel
 from expcore.provenance.hashfile import Hashes
@@ -73,9 +73,8 @@ def as_text(data: bytes) -> str | None:
 def _plain(label: str, text: str, tokens: Hashes | None, terms: Anonymisation | None, hidden) -> list[str]:
     """Read a member of a release as it is: the token list line by line (unless the release is exempt from it), and
     the terms and identity if anonymised."""
-    found = (
-        [] if tokens is None else [str(h) for h in scan_source(label, text, tokens, exempt_header=False, python=False)]
-    )
+    hits = [] if tokens is None else scan_source(label, text, tokens, exempt_header=False, python=False)
+    found = [describe_hit(hit.path, hit) for hit in hits]  # the path is the label, or redacted when it holds a name
     if terms is not None:
         commits, urls = hidden
         found += [f"{label}:{line}: a term of the anonymisation list" for line in sorted(term_lines(text, terms))]

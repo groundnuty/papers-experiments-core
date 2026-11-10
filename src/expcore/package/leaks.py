@@ -13,12 +13,14 @@ import expcore
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term
 from expcore.package.identity import find_identity
 from expcore.package.spec import PackageError
-from expcore.package.views import hidden_name, streams, views
+from expcore.package.views import PARSED, Stream, hidden_name, streams, views
 from expcore.provenance.hashfile import Hashes
-from expcore.provenance.scanner import REDACTED_PATH, scan_source
+from expcore.provenance.scanner import Finding, scan_source
 from expcore.provenance.study_tokens import load_hashes
 
 HASHES_NAME = "study_tokens.sha256"
+PRIVATE_NAME = "a private name"
+PLAIN_VIEWS = frozenset({"text"})  # the views whose line numbers are the stream's own lines
 
 
 def default_hashes() -> Path:
@@ -42,6 +44,54 @@ def private_hashes(path: Path) -> Hashes:
     return hashes
 
 
+def named(prefix: str) -> str:
+    """What a study-token finding says it found: never the name, only the start of its hash."""
+    return f"{PRIVATE_NAME} (study token {prefix})"
+
+
+def describe_hit(shown: str, hit: Finding) -> str:
+    """One scanner finding in the words of the package's checks: `<where>:<line>: a private name (study token ...)`,
+    or `<where>: the path holds ...` for a path."""
+    if hit.kind == "path":
+        return f"{shown}: the path holds {named(hit.hash_prefix)}"
+    return f"{shown}:{hit.line}: {named(hit.hash_prefix)}"
+
+
+def _path_prefixes(label: str, hashes: Hashes) -> set[str]:
+    """The hash prefixes of the private names a path or a stream's label holds."""
+    return {hit.hash_prefix for hit in scan_source(label, "", hashes) if hit.kind == "path"}
+
+
+def _stream_findings(stream: Stream, shown: str, hashes: Hashes, reported_paths: set[str]) -> set[str]:
+    """The findings of one stream, each once: a name at a line of the text as it is; one only a decoded view shows,
+    at its line of the decoded text; one only parsed strings or raw bytes show, which have no lines, without one.
+    A name its label holds is reported unless `reported_paths` (its file's own path) already holds it."""
+    plain: set[tuple[int, str]] = set()
+    decoded: set[tuple[int, str]] = set()
+    unlined: dict[str, str] = {}
+    for view, text in views(stream):
+        python = view == "text" and stream.label.endswith(".py")
+        for hit in scan_source(stream.label, text, hashes, exempt_header=False, python=python):
+            if hit.kind == "path":
+                continue
+            if view in PLAIN_VIEWS:
+                plain.add((hit.line, hit.hash_prefix))
+            elif view in PARSED:
+                unlined.setdefault(hit.hash_prefix, "in its parsed strings")
+            elif stream.text is None:  # a database's or archive's bytes, or the bytes a run decodes to
+                unlined.setdefault(hit.hash_prefix, "in its raw bytes")
+            else:
+                decoded.add((hit.line, hit.hash_prefix))
+    lined = {prefix for _, prefix in plain}
+    decoded = {(line, prefix) for line, prefix in decoded if prefix not in lined}
+    lined |= {prefix for _, prefix in decoded}
+    found = {f"{shown}: the path holds {named(p)}" for p in _path_prefixes(stream.label, hashes) - reported_paths}
+    found |= {f"{shown}:{line}: {named(prefix)}" for line, prefix in plain}
+    found |= {f"{shown}:{line}: {named(prefix)}, once decoded" for line, prefix in decoded}
+    found |= {f"{shown}: {named(prefix)}, {where}" for prefix, where in unlined.items() if prefix not in lined}
+    return found
+
+
 def scan_tokens(
     files: Mapping[str, bytes],
     hashes: Hashes,
@@ -54,10 +104,12 @@ def scan_tokens(
     Each file is classified and opened down to its last archived member (`views.streams`); a file of a kind the scan
     cannot read in full is a finding, a refusal. Text is read as it is and decoded, a database's or archive's bytes
     under every encoding (`views.views`). The provenance-header exemption of this repository's own check does not
-    apply. The files in `opaque` were attested by hash and are not read. A finding shows a hash prefix and where,
+    apply. The files in `opaque` were attested by hash and are not read. A finding reads `<where>:<line>: a private
+    name (study token <hash prefix>)`, once per stream, line and name whichever views found it (`_stream_findings`),
     never the value. A stream whose label holds a private name, or for which `hidden` is true (a term of an
     anonymisation list), is named by its file's position in the package and the start of its label's SHA-256
-    (`views.hidden_name`), so that two such findings never fold into one.
+    (`views.hidden_name`), so that two such findings never fold into one; a name the file's path holds is reported
+    once, for the file, not again for each stream inside it.
     """
     findings: set[str] = set()
     for position, path in enumerate(sorted(files), start=1):
@@ -65,17 +117,13 @@ def scan_tokens(
             continue
         found, problems = streams(path, files[path])
         for label, why in problems:
-            private = hidden(label) or any(hit.kind == "path" for hit in scan_source(label, "", hashes))
+            private = hidden(label) or bool(_path_prefixes(label, hashes))
             findings.add(f"{hidden_name(position, label) if private else label}: {why}")
+        own = _path_prefixes(path, hashes)
         for stream in found:
-            shown = hidden_name(position, stream.label) if hidden(stream.label) else None
-            for view, text in views(stream):
-                python = view == "text" and stream.label.endswith(".py")
-                for hit in scan_source(stream.label, text, hashes, exempt_header=False, python=python):
-                    line = str(hit)
-                    if hit.path == REDACTED_PATH or shown:
-                        line = f"{shown or hidden_name(position, stream.label)}{line[len(hit.path) :]}"
-                    findings.add(f"{line} ({view})")
+            private = hidden(stream.label) or bool(_path_prefixes(stream.label, hashes))
+            shown = hidden_name(position, stream.label) if private else stream.label
+            findings |= _stream_findings(stream, shown, hashes, own if stream.label != path else set())
     return sorted(findings)
 
 

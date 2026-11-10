@@ -6,6 +6,7 @@ import bz2
 import gzip
 import hashlib
 import io
+import json
 import lzma
 import random
 import sqlite3
@@ -19,6 +20,7 @@ import pytest
 
 from expcore.package.build import scan_tokens
 from expcore.package.views import hidden_name
+from expcore.provenance.candidates import token_hash
 from expcore.provenance.hashfile import hashes_from_tokens
 
 PRIVATE = "zarnothwick"  # invented; private everywhere in these tests
@@ -411,3 +413,51 @@ def test_k03_a_digest_that_looks_like_a_tiny_deflate_stream_is_never_refused():
 def test_k03_several_caption_lines_above_an_encoded_block_do_not_hide_it():
     """K03: a joined run is also decoded from each line whose width differs from the one before it."""
     assert found({"attachment.txt": b"Experiment\nResults\nPayload\n" + base64.b64encode(zlib.compress(TEXT))})
+
+
+# --- how a finding reads ----------------------------------------------------------------------------------------------
+
+NAMED = f"a private name (study token {token_hash(PRIVATE)[:12]})"
+
+
+def test_k05_a_finding_says_it_is_a_private_name_and_gives_the_line_once():
+    """K05: a finding reads like the term check's, naming the study token by a hash prefix, once per line, whatever
+    views found it."""
+    assert found({"notes.txt": b"first line\n" + TEXT}) == [f"notes.txt:2: {NAMED}"]
+    assert found({"tool.py": f'HOST = "{PRIVATE}"  # {PRIVATE}\n'.encode()}) == [f"tool.py:1: {NAMED}"]
+
+
+def test_k05_a_one_line_json_file_is_reported_at_its_one_line_and_never_again_for_its_parsed_strings():
+    """K05: the parsed strings of a JSON or TOML file have no lines of their own; a name the text shows is reported at
+    its line alone."""
+    mirror = json.dumps({"a": 1, "b": "x", "host": f"{PRIVATE}.example"}).encode()
+    assert found({"extra/mirror.json": mirror}) == [f"extra/mirror.json:1: {NAMED}"]
+    assert found({"conf.toml": f'name = "{PRIVATE}"\n'.encode()}) == [f"conf.toml:1: {NAMED}"]
+
+
+def test_k05_a_name_seen_only_once_decoded_says_so():
+    """K05: a name only a decoded view shows is reported at its line of the decoded text, marked as such."""
+    hidden = PRIVATE[:4] + "%" + PRIVATE[4].encode().hex() + PRIVATE[5:]
+    assert found({"notes.txt": f"plain\nran on {hidden}\n".encode()}) == [f"notes.txt:2: {NAMED}, once decoded"]
+
+
+def test_k05_a_base64_run_is_reported_once_whichever_forms_of_the_text_show_it():
+    """K05: a run the text shows as it is and again in its parsed strings is decoded and reported once, at its offset
+    in the text."""
+    record = b'{"k": "' + b64(TEXT) + b'"}'
+    assert found({"record.json": record}) == [f"record.json!(base64@7):1: {NAMED}"]
+
+
+def test_k05_raw_bytes_have_no_lines_and_a_path_is_reported_once_for_its_file():
+    """K05: a name in an archive's raw bytes is reported without a line; a name in a directory is reported once, for
+    the file, not again for each stream inside it."""
+    stored = io.BytesIO()
+    with zipfile.ZipFile(stored, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("notes.txt", TEXT)
+    assert found({"bundle.zip": stored.getvalue()}) == [
+        f"bundle.zip!notes.txt:1: {NAMED}",
+        f"bundle.zip: {NAMED}, in its raw bytes",
+    ]
+    path = f"{PRIVATE}/bundle.zip"
+    findings = found({path: zipped({"notes.txt": b"plain\n"})})
+    assert findings == [f"{hidden_name(1, path)}: the path holds {NAMED}"]

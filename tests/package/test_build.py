@@ -143,7 +143,7 @@ def test_k05_a_private_name_in_an_included_file_refuses_the_build_showing_only_a
     root = a_copy(campaign, tmp_path)
     with (root / "README.md").open("a", encoding="utf-8") as readme:
         readme.write(f"\nRun on the {PRIVATE} cluster.\n")
-    with pytest.raises(PackageError, match=r"README\.md:\d+ text [0-9a-f]{12}") as refused:
+    with pytest.raises(PackageError, match=r"README\.md:\d+: a private name \(study token [0-9a-f]{12}\)") as refused:
         build_package(root, tmp_path / "dist", hashes=hashes)
     assert PRIVATE not in str(refused.value)
     assert not (tmp_path / "dist").exists() or not any((tmp_path / "dist").iterdir())
@@ -374,7 +374,7 @@ def test_k10_every_wheel_is_read_and_a_member_holding_a_private_name_is_refused_
             for w in stand_in_vendor(distributions)
         ]
 
-    with pytest.raises(PackageError, match=r"wheels/numpy-[^/]+\.whl/numpy/_tuning\.py:1 text") as refused:
+    with pytest.raises(PackageError, match=r"wheels/numpy-[^/]+\.whl/numpy/_tuning\.py:1: a private name") as refused:
         build_package(a_copy(campaign, tmp_path / "a"), tmp_path / "dist-a", hashes=hashes, vendor=vendor)
     assert PRIVATE not in str(refused.value)
     hint = next(line for line in str(refused.value).splitlines() if "[[opaque]] path" in line)

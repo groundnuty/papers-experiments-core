@@ -333,10 +333,11 @@ def _runs(text: str) -> Iterator[tuple[int, str]]:
         yield from flush(parts)
 
 
-def payloads(text: str) -> Iterator[tuple[str, bytes, bool]]:
+def payloads(text: str, seen: set[bytes] | None = None) -> Iterator[tuple[str, bytes, bool]]:
     """Every base64 run and every hex run of `MIN_RUN` characters or more, decoded, once each: (what it was, the
-    bytes, whether the run was long). Linear in the text."""
-    seen: dict[bytes, bool] = {}
+    bytes, whether the run was long). Linear in the text. `seen` holds what earlier calls decoded, to be skipped; it
+    is shared across calls, and updated, on purpose."""
+    seen = set() if seen is None else seen
     for start, run in _runs(text):
         found = []
         if len(run) >= MIN_RUN:
@@ -348,7 +349,7 @@ def payloads(text: str) -> Iterator[tuple[str, bytes, bool]]:
             )
         for where, decoded, long in found:
             if decoded and decoded not in seen:
-                seen[decoded] = long
+                seen.add(decoded)
                 yield where, decoded, long
 
 
@@ -361,9 +362,12 @@ def _texts_of(text: str) -> list[str]:
 
 
 def _walk_text(label: str, data: bytes, text: str, depth: int, budget: _Budget) -> Iterator[Stream]:
+    """The text, then what each encoded run in it decodes to, once per run however many forms of the text show it;
+    a run is named by its offset in the first form that shows it (the text as it is, if it does)."""
     yield Stream(label, data, TEXT, text)
+    seen: set[bytes] = set()
     for form in _texts_of(text):
-        for where, decoded, long in payloads(form):
+        for where, decoded, long in payloads(form, seen):
             _spend(budget, label, len(decoded))
             yield from _walk_decoded(f"{label}!({where})", decoded, depth + 1, budget, strict=long)
 

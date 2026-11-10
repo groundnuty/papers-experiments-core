@@ -132,10 +132,10 @@ def test_k11_without_a_lock_beside_or_above_the_study_no_wheel_is_exempt(campaig
     version = versions[RELEASE]
     filename, data = release(version, f"tuned on {PRIVATE}\n")
     vendor = replacing({RELEASE: (filename, data)})
-    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/{NOTES}:1 "):
+    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/{NOTES}:1: a private name"):
         collect(root, hashes=hashes, vendor=vendor)
     write_lock(tmp_path, (RELEASE, version, PYPI, sha(data)))
-    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/{NOTES}:1 "):
+    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/{NOTES}:1: a private name"):
         collect(root, hashes=hashes, vendor=vendor)
 
 
@@ -156,7 +156,7 @@ def test_k11_a_matching_name_and_version_alone_is_no_exemption(campaign, version
         recorded["registry"] = "https://pypi.example.org/simple"
     write_lock(root, tuple(recorded.values()))  # type: ignore[arg-type]
     vendor = replacing({RELEASE: (filename, data)}, direct=case == "direct install")
-    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/{NOTES}:1 "):
+    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/{NOTES}:1: a private name"):
         collect(root, hashes=hashes, vendor=vendor)
 
 
@@ -166,7 +166,7 @@ def test_k11_the_cores_own_wheel_is_never_exempt(campaign, versions, hashes, tmp
     version = versions[CORE_DISTRIBUTION]
     filename, data = wheel_of(CORE_DISTRIBUTION, version, {"expcore/notes.txt": f"tuned on {PRIVATE}\n".encode()})
     write_lock(root, (CORE_DISTRIBUTION, version, PYPI, sha(data)))
-    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/expcore/notes\.txt:1 "):
+    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/expcore/notes\.txt:1: a private name"):
         collect(root, hashes=hashes, vendor=replacing({CORE_DISTRIBUTION: (filename, data)}))
 
 
@@ -261,5 +261,5 @@ def test_k11_a_lock_that_cannot_be_read_exempts_nothing_and_refuses_nothing_on_i
         f"{LOCK_FILE}: cannot be read (TOMLDecodeError), so no wheel is exempt from the study-token list"
     )
     filename, data = release(versions[RELEASE], f"tuned on {PRIVATE}\n")
-    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/{NOTES}:1 "):
+    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/{NOTES}:1: a private name"):
         collect(root, hashes=hashes, vendor=replacing({RELEASE: (filename, data)}), warn=said.append)
