@@ -36,12 +36,12 @@ category = "space"
 [[entry]]
 token = "zq"
 replacement = "xx"
-category = "option"
+category = "conditions"
 
 [[entry]]
 token = "10.99.0.0/16"
 replacement = "192.0.2.0/24"
-category = "network"
+category = "addresses"
 """
 
 SOURCE = '''#!/usr/bin/env python3
@@ -162,8 +162,59 @@ def test_result_compiles_and_the_checker_finds_no_listed_token(token_map):
 
 
 def test_replacement_that_is_not_an_identifier_is_refused_with_file_and_line(token_map):
-    with pytest.raises(sn.SanitiseError, match=r"mod\.py:2: .*not a valid identifier"):
+    with pytest.raises(sn.SanitiseError, match=r"mod\.py:2: map entry #1: .*must itself be an identifier"):
         sn.sanitise_python("x = 1\nsecret_space = 1\n", _entries("secret_space", "space-a"), filename="mod.py")
+
+
+def test_an_identifier_error_names_the_entry_by_number_never_its_token_or_replacement():
+    """P07: the map is private, so a refusal names the entry by its number alone, never its token or replacement."""
+    entries = parse_map(_map_with(("brindle-gate", "gate-a"), ("brindle_gate", "gate-b"), ("other_gate", "gate-c")))
+    with pytest.raises(sn.SanitiseError) as refused:
+        sn.sanitise_python("x = 1\nother_gate = 1\n", entries.entries, filename="mod.py")
+    message = str(refused.value)
+    assert message.startswith("mod.py:2: map entry #3: its 'replacement' is used inside an identifier")
+    assert "must itself be an identifier" in message
+    assert "other_gate" not in message
+    assert "gate-c" not in message
+
+
+@pytest.mark.parametrize(
+    ("entries", "shown"),
+    [
+        ([("brindle-gate", "gate-a"), ("BRINDLE-GATE", "gate-b")], "entry #2: 'token' repeats entry #1"),
+        ([("brindle-gate", 'gate"a')], "entry #1: 'replacement' has quotes"),
+        ([("brindle-gate", "gate-a"), ("gate-b", "x-brindle-gate")], "entry #2: 'replacement' contains a mapped"),
+        ([("brindle-gate", "BRINDLE-GATE")], "entry #1: 'replacement' equals a mapped token"),
+    ],
+)
+def test_a_map_error_names_the_entry_by_number_and_the_field_by_name_never_a_value(entries, shown):
+    """P07: a map refusal names the entry by its number and the field by its name; no token, replacement or category
+    appears."""
+    with pytest.raises(MapError) as refused:
+        parse_map(_map_with(*entries), "map.toml")
+    message = str(refused.value)
+    assert f"map.toml: {shown}" in message
+    assert "brindle" not in message.casefold()
+    assert "gate-" not in message
+    assert "hosts" not in message
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [("brindle", " brindlex")],  # inside a longer word, which no check of the map reads as the token
+        [("Ada Example", "Author A"), ("ada example", "Ada Example 2")],  # a name of two words
+    ],
+)
+def test_a_map_error_never_shows_a_replacement_that_holds_its_own_token(entries):
+    """P07: a replacement can hold its own token in ways the checks of the map do not catch (inside a longer word, as
+    a name of several words); whatever the error, the message shows neither."""
+    with pytest.raises(MapError) as refused:
+        parse_map(_map_with(*entries), "map.toml")
+    message = str(refused.value).casefold()
+    assert "map.toml: entry #" in message
+    assert "brindle" not in message
+    assert "example" not in message
 
 
 def test_a_replacement_that_breaks_the_syntax_is_reported_with_the_file_name():
@@ -178,7 +229,7 @@ def test_source_that_does_not_compile_is_reported_with_the_file_name(token_map):
 
 def _entries(token: str, replacement: str):
     return parse_map(
-        f'version = 1\n[[entry]]\ntoken = "{token}"\nreplacement = "{replacement}"\ncategory = "c"\n'.encode()
+        f'version = 1\n[[entry]]\ntoken = "{token}"\nreplacement = "{replacement}"\ncategory = "hosts"\n'.encode()
     ).entries
 
 
@@ -186,20 +237,20 @@ def _entries(token: str, replacement: str):
 
 
 def _map_with(*entries: tuple[str, str]) -> bytes:
-    body = "".join(f"[[entry]]\ntoken = '{t}'\nreplacement = '{r}'\ncategory = 'c'\n\n" for t, r in entries)
+    body = "".join(f"[[entry]]\ntoken = '{t}'\nreplacement = '{r}'\ncategory = 'hosts'\n\n" for t, r in entries)
     return ("version = 1\n\n" + body).encode()
 
 
 @pytest.mark.parametrize(
     ("entries", "message"),
     [
-        ([("alpha-one", "beta-one"), ("ALPHA-ONE", "beta-two")], r"entry #2 .*token repeats entry #1"),
-        ([("alpha-one", "beta-one"), ("alpha-two", "Beta-One")], r"entry #2 .*replacement repeats entry #1"),
-        ([("alpha-one", "alpha-one")], r"entry #1 .*replacement equals a mapped token"),
-        ([("alpha-one", "ALPHA-ONE")], r"entry #1 .*replacement equals a mapped token"),
-        ([("alpha-one", "beta-one"), ("beta-one", "gamma-one")], r"entry #1 .*replacement equals a mapped token"),
-        ([("alpha", "x-alpha-y")], r"entry #1 .*contains a mapped token on a component boundary"),
-        ([("alpha-one", 'bad"quote')], r"entry #1 .*quotes, backslashes"),
+        ([("alpha-one", "beta-one"), ("ALPHA-ONE", "beta-two")], r"entry #2: 'token' repeats entry #1"),
+        ([("alpha-one", "beta-one"), ("alpha-two", "Beta-One")], r"entry #2: 'replacement' repeats entry #1"),
+        ([("alpha-one", "alpha-one")], r"entry #1: 'replacement' equals a mapped token"),
+        ([("alpha-one", "ALPHA-ONE")], r"entry #1: 'replacement' equals a mapped token"),
+        ([("alpha-one", "beta-one"), ("beta-one", "gamma-one")], r"entry #1: 'replacement' equals a mapped token"),
+        ([("alpha", "x-alpha-y")], r"entry #1: 'replacement' contains a mapped token on a component boundary"),
+        ([("alpha-one", 'bad"quote')], r"entry #1: 'replacement' has quotes, backslashes"),
     ],
 )
 def test_invalid_maps_name_the_entry(entries, message):
@@ -216,7 +267,10 @@ def test_invalid_maps_name_the_entry(entries, message):
             "version = 1\n[[entry]]\ntoken = 'alpha-one'\nreplacement = 'beta-one'\n",
             r"entry #1: missing keys \['category'\]",
         ),
-        ("version = 1\n[[entry]]\ntoken='a'\nreplacement='b'\ncategory='c'\nextra=1\n", r"entry #1: unknown keys"),
+        (
+            "version = 1\n[[entry]]\ntoken='a'\nreplacement='b'\ncategory='c'\nextra=1\n",
+            r"entry #1: 1 unknown key\(s\)",
+        ),
         ("version = 1\n[[entry]]\ntoken=''\nreplacement='b'\ncategory='c'\n", r"entry #1: 'token' must be"),
         ("version = [", r"not valid TOML"),
     ],
@@ -224,6 +278,90 @@ def test_invalid_maps_name_the_entry(entries, message):
 def test_malformed_maps_are_refused(text, message):
     with pytest.raises(MapError, match=message):
         parse_map(text.encode(), "map.toml")
+
+
+def test_a_category_outside_the_documented_ones_is_refused_naming_only_the_entry():
+    """P07: a category is free text, which could be a token typed in the wrong field: one that is none of the
+    documented words refuses the map when it loads, naming the entry by its number and never the category."""
+    text = "version = 1\n[[entry]]\ntoken = 'brindle-gate'\nreplacement = 'gate-a'\ncategory = 'hosts'\n"
+    odd = "[[entry]]\ntoken = 'other-gate'\nreplacement = 'gate-b'\ncategory = 'orchard-hosts'\n"
+    with pytest.raises(MapError) as refused:
+        parse_map((text + odd).encode(), "map.toml")
+    assert str(refused.value).startswith("map.toml: entry #2: 'category' is none of the documented ones: conditions,")
+    assert "orchard" not in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    ("written", "read"),
+    [
+        ("env-vars", "env-vars"),
+        ("Env_Var", "env-vars"),
+        ("environment variable", "environment-variables"),
+        ("Hosts", "hosts"),
+    ],
+)
+def test_env_vars_is_a_documented_category_and_each_is_read_in_any_of_its_spellings(written, read):
+    """P07: environment names are a category of the token list under `env-vars` too, the name the maintainers' own
+    map uses; a singular, capitals, `_` or a space are read as the same word."""
+    text = f"version = 1\n[[entry]]\ntoken = 'BRINDLE_HOME'\nreplacement = 'STUDY_HOME'\ncategory = '{written}'\n"
+    assert parse_map(text.encode(), "map.toml").entries[0].category == read
+
+
+@pytest.mark.parametrize(
+    ("text", "shown", "hidden"),
+    [
+        (
+            "version = 1\n[[entry]]\ntoken='a-b'\nreplacement='c-d'\ncategory='hosts'\nbrindle-gate=1\n",
+            "1 unknown key",
+            "brindle",
+        ),
+        ("version = 1\nbrindle-gate = = 'x'\n", "not valid TOML (at line 2, column", "brindle"),
+        ("version = 1\n'brindle-gate\n", "not valid TOML (at the end of the file)", "brindle"),
+    ],
+)
+def test_a_map_error_shows_no_key_and_no_toml_text_of_the_map(text, shown, hidden):
+    """P07: an unknown key is counted, never shown, and a file that is not TOML is named by its line and column alone,
+    since the parser's own message can quote the map."""
+    with pytest.raises(MapError) as refused:
+        parse_map(text.encode(), "map.toml")
+    assert shown in str(refused.value)
+    assert hidden not in str(refused.value)
+
+
+def test_an_invalid_source_field_is_named_never_echoed(map_file, tmp_path, capsys):
+    """P07: the source repository and path are the earlier study's; a refusal names the field and never its value."""
+    blob = tmp_path / "blob.py"
+    blob.write_text("x = 1\n", encoding="utf-8")
+    argv = ["import", "--map", str(map_file), "--commit", "0123abc", str(blob), str(tmp_path / "out.py")]
+    assert sn.main([*argv[:3], "--source-repo", "https://orchardrepo.example/x", "--path", "a.py", *argv[3:]]) == 2
+    assert sn.main([*argv[:3], "--source-repo", "old", "--path", "/orchardrepo/a.py", *argv[3:]]) == 2
+    err = capsys.readouterr().err
+    assert "the source repository must be a name" in err
+    assert "the source path must be a relative path" in err
+    assert "orchardrepo" not in err
+
+
+def test_p07_an_exception_the_import_does_not_expect_is_caught_and_never_shows_a_mapped_name(
+    map_file, tmp_path, capsys, monkeypatch
+):
+    """P07: the command catches every exception at the top, not only the ones it expects. With the map loaded an
+    unexpected one is shown by its kind with its text through the redactor of the map's tokens; when the map cannot
+    be loaded, by its kind alone."""
+    blob = tmp_path / "blob.py"
+    blob.write_text("x = 1\n", encoding="utf-8")
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("cannot read /data/secret-space/blob.py")
+
+    monkeypatch.setattr(sn, "import_module", broken)
+    assert run_import(map_file, blob, tmp_path / "out.py") == 2
+    err = capsys.readouterr().err
+    assert "error: RuntimeError: cannot read <hidden " in err
+    assert "secret-space" not in err
+    monkeypatch.setattr(sn, "load_map", broken)
+    assert sn.main(["verify", "--map", str(map_file), "--source", str(blob), "--module", str(blob)]) == 2
+    err = capsys.readouterr().err
+    assert err == "error: RuntimeError (its message is not shown: no list is loaded yet to check it against)\n"
 
 
 def test_the_map_hash_is_the_sha256_of_the_file(map_file, token_map):
@@ -323,7 +461,7 @@ def test_verify_fails_when_the_map_or_the_source_changed_since_the_import(map_fi
     dest = tmp_path / "mod.py"
     assert run_import(map_file, src, dest) == 0
     other_map = tmp_path / "other.toml"
-    extra = '\n[[entry]]\ntoken = "unrelated-name"\nreplacement = "other-name"\ncategory = "x"\n'
+    extra = '\n[[entry]]\ntoken = "unrelated-name"\nreplacement = "other-name"\ncategory = "hosts"\n'
     other_map.write_text(MAP_TEXT + extra)
     assert verify(other_map, src, dest) == 1
     assert "map hash does not match" in capsys.readouterr().out

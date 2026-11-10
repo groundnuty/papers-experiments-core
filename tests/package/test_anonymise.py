@@ -5,9 +5,11 @@ import sqlite3
 
 import pytest
 
-from expcore.package.anonymise import Anonymisation, find_terms, load_anonymisation, rewrite
+from expcore.package.anonymise import Anonymisation, find_terms, holds_term, load_anonymisation, rewrite
+from expcore.package.identity import FOUND_COMMIT, find_identity
 from expcore.package.spec import PackageError
-from expcore.package.views import hidden_name
+from expcore.provenance.hashfile import hashes_from_tokens
+from expcore.provenance.redact import Redactor, hidden_name
 
 TERMS = {"Quillon Varek": "Author A", "Varek": "Author A", "Brindlemoor Institute": "Institution A", "orvo": "Site A"}
 FOUND = "a term of the anonymisation list"
@@ -55,11 +57,23 @@ def test_k05_a_term_in_a_code_file_or_a_record_fails_naming_the_file_and_line_ne
     assert not any(term.casefold() in "".join(findings).casefold() for term in TERMS)
 
 
+def test_k05_the_term_and_identity_checks_hide_a_path_the_token_check_hides(listed):
+    """K05: every check names a path through one redactor, so a path that holds a private name, and no term, is hidden
+    in a term finding and in an identity finding as it is in a token finding."""
+    private = "zarnothwick"  # invented; a private name of the study-token list
+    path = f"notes/{private}/data.txt"
+    files = {path: b"Varek ran it at 1a2b3c4d5e6f7a8b\n"}
+    one = Redactor(hashes_from_tokens([private]), lambda text: holds_term(listed, text))
+    assert find_terms(files, listed, redactor=one) == [f"{hidden_name(path)}:1: {FOUND}"]
+    identity = find_identity(files, frozenset({"1a2b3c4d5e6f"}), frozenset(), opaque=(), redactor=one)
+    assert identity == [f"{hidden_name(path)}:1: {FOUND_COMMIT}"]
+
+
 def test_k05_a_term_the_whole_word_rule_left_inside_a_hyphenated_name_is_found_and_a_path_is_redacted(listed):
     """K05: nothing slips past the whole-word rule, and a path that holds a term is never shown."""
     files = rewrite({"README.md": b"See the Varek-lab notes.\n"}, listed, code=set())
     files["notes/varek/data.csv"] = b"1,2\n"
-    hidden = hidden_name(2, "notes/varek/data.csv")  # never the path itself: its place and the start of its hash
+    hidden = hidden_name("notes/varek/data.csv")  # never the path itself: the start of its hash
     assert find_terms(files, listed) == [f"README.md:1: {FOUND}", f"{hidden}: the path holds {FOUND}"]
 
 

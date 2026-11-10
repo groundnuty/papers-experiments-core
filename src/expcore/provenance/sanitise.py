@@ -7,6 +7,7 @@ the map's own tokens, and the import is refused if anything is left.
 """
 
 import argparse
+import contextlib
 import io
 import re
 import sys
@@ -26,6 +27,7 @@ from expcore.provenance.headers import (
     split_lines,
     strip_header,
 )
+from expcore.provenance.redact import QuietParser, Redactor, failure, stopped
 from expcore.provenance.sanitise_map import Entry, MapError, load_map, matches_on_components
 from expcore.provenance.scanner import (
     FSTRING_END_TYPES,
@@ -95,11 +97,19 @@ class _Replacer:
 
 
 def _name(replacer: _Replacer, name: str) -> str:
-    """Return the sanitised form of an identifier; it must stay an identifier."""
+    """Return the sanitised form of an identifier; it must stay an identifier.
+
+    A refusal names the map entry by its number alone, never its token, its replacement or the identifier.
+    """
     entry = replacer.whole(name)
     new, used = (entry.replacement, [entry]) if entry else replacer.within(name, escapes=False)
     if used and not new.isidentifier():
-        raise SanitiseError(f"replacement for token of category {used[0].category!r} is not a valid identifier")
+        bad = next((e for e in used if not e.replacement.isidentifier()), used[0])
+        raise SanitiseError(
+            f"map entry #{bad.number}: its 'replacement' is used inside an identifier here, so it must itself be an "
+            "identifier (letters, digits and underscores, not starting with a digit); give the spelling with "
+            "underscores an entry of its own"
+        )
     return new
 
 
@@ -220,16 +230,19 @@ def sanitise_checked(text: str, entries: Iterable[Entry], *, filename: str = "<s
 
 
 def validate_source(source_repo: str, commit: str, source_path: str) -> str:
-    """Check the three header fields of an import and return the commit in lower case; raise SanitiseError if bad."""
+    """Check the three header fields of an import and return the commit in lower case; raise SanitiseError if bad.
+
+    The repository and the path are the earlier study's, private, so an error names the field and never its value.
+    """
     if not _REPO_RE.fullmatch(source_repo) or {".", ".."} & set(source_repo.split("/")):
-        raise SanitiseError(f"source repository {source_repo!r} must be a name or owner/name, never a URL")
+        raise SanitiseError("the source repository must be a name or owner/name, never a URL")
     if not _COMMIT_RE.fullmatch(commit):
-        raise SanitiseError(f"commit {commit!r} must be 7 to 40 hexadecimal characters")
+        raise SanitiseError("the commit must be 7 to 40 hexadecimal characters")
     pure = PurePosixPath(source_path)
     if not source_path or not source_path.isprintable() or "\\" in source_path or pure.is_absolute():
-        raise SanitiseError(f"source path {source_path!r} must be a relative path inside the source repository")
+        raise SanitiseError("the source path must be a relative path inside the source repository")
     if ".." in pure.parts:
-        raise SanitiseError(f"source path {source_path!r} must not contain '..'")
+        raise SanitiseError("the source path must not contain '..'")
     return commit.lower()
 
 
@@ -313,7 +326,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command line parser."""
-    parser = argparse.ArgumentParser(prog="python -m expcore.provenance.sanitise", description=__doc__)
+    parser = QuietParser(prog="python -m expcore.provenance.sanitise", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     imp = sub.add_parser("import", help="sanitise SRC into DEST with a provenance header")
     imp.add_argument("--map", type=Path, required=True)
@@ -331,14 +344,41 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the command line; return 0 on success, 1 when verify fails, 2 on an error."""
-    args = build_parser().parse_args(argv)
+def _redactor(map_path: Path) -> Redactor | None:
+    """The redactor every line of the command goes through: it knows the map's tokens; None when the map does not
+    load (the load fails again in the command, with a message that holds no value of the map)."""
     try:
-        return args.run(args)
-    except (OSError, SanitiseError, MapError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return EXIT_ERROR
+        entries = load_map(map_path).entries
+    except Exception:  # whatever it is, the command meets it again and the last guard shows it
+        return None
+    return Redactor(hashes_from_tokens(entry.token for entry in entries))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command line; return 0 on success, 1 when verify fails, 2 on an error.
+
+    Every line it prints goes through one redactor that knows the map's tokens (`provenance.redact`): a file name, a
+    path or an error that holds a name the map hides is never shown. Every exception ends here, the last guard; when
+    the map did not load, only a map error, which names an entry by its number and nothing it holds, is shown, and any
+    other exception by its kind.
+    """
+    args = build_parser().parse_args(argv)
+    redactor = _redactor(args.map)
+    out = io.StringIO()
+    try:
+        try:
+            with contextlib.redirect_stdout(out):
+                status = args.run(args)
+        except (KeyboardInterrupt, SystemExit) as stop:
+            status = stopped(stop, redactor)
+        except Exception as error:
+            status = EXIT_ERROR
+            shown = failure(error, redactor, expected=(OSError, SanitiseError, MapError), fixed=(MapError,))
+            print(f"error: {shown}", file=sys.stderr)
+    finally:  # what the command printed before it ended, an exit passed on included
+        if out.getvalue():
+            print((redactor or Redactor()).scrub(out.getvalue().rstrip("\n")))
+    return status
 
 
 if __name__ == "__main__":
