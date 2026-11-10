@@ -122,6 +122,7 @@ def test_c06_a_resume_under_another_platform_tls_mode_is_refused_growth_allowed_
     again, _ = start(tmp_path, platform=verify)
     assert state_of(again) == before
 
+
 ENVIRONMENT = {
     "python": "3.12",
     "distributions": {"papers-experiments-core": "0.1.0", "numlib": "1.4.2", "toy-platform": "2.0.0"},
