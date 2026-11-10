@@ -280,6 +280,46 @@ def absent(task, condition, reason, *, model="model-a", seed=1):
     return AbsentRun(f"task={task}|model={model}|seed={seed}|condition={condition}", condition, factors, reason)
 
 
+@pytest.mark.parametrize("reason", ["exhausted", "unfinished"])
+def test_s10_a_treatment_attempt_left_none_is_counted_as_such_whatever_became_of_its_partner(reason):
+    """S10: the manipulation left its contrast because of the scorer, so the partner's fate must not hide it."""
+    first, _ = treated("task-a", "model-a", 1, None, 0.5)
+    pairing = pair_rows([first], named(), [absent("task-a", "cond-b", reason)])
+    assert pairing.missing["treatment_outcome_none"] == 1
+    assert (pairing.missing["exhausted"], pairing.missing["unpaired_or_left_out"]) == (0, 0)
+    assert (pairing.n_pairs, pairing.n_treatment_pairs) == (0, 0)
+
+
+def test_s10_a_measured_treatment_attempt_or_an_ordinary_none_beside_an_exhausted_partner_stays_exhausted():
+    """S10: the scorer did nothing wrong there, so the pair is missing because of the exhausted run."""
+    measured, _ = treated("task-a", "model-a", 1, 0.2, 0.5)
+    ordinary, _ = both_arms("task-b", "model-a", 1, None, 0.5)
+    partners = [absent("task-a", "cond-b", "exhausted"), absent("task-b", "cond-b", "exhausted")]
+    pairing = pair_rows([measured, ordinary], named(), partners)
+    assert (pairing.missing["exhausted"], pairing.missing["treatment_outcome_none"]) == (2, 0)
+
+
+def test_s10_under_excluded_a_treatment_attempt_with_no_partner_is_not_counted_as_a_loss_to_its_none():
+    """S10: an excluded contrast does not use the scorer's value for a treatment attempt, so None costs it nothing."""
+    first, _ = treated("task-a", "model-a", 1, None, 0.5)
+    spec = dataclasses.replace(named(), treatment_outcomes="excluded")
+    pairing = pair_rows([first], spec, [absent("task-a", "cond-b", "exhausted")])
+    assert (pairing.missing["treatment_outcome_none"], pairing.missing["exhausted"]) == (0, 1)
+
+
+def test_s10_a_run_without_the_contrasts_outcome_is_refused_even_when_it_has_no_partner():
+    """S10: a contrast on an outcome the scorer never gives is refused, not concluded on no pairs."""
+    first, _ = both_arms("task-a", "model-a", 1, 0.5, 0.5)
+    with pytest.raises(ValueError, match="has no outcome 'score'"):
+        pair_rows([dataclasses.replace(first, outcomes={})], named())
+
+
+def test_s10_the_pairs_used_that_hold_a_treatment_attempt_are_counted():
+    """S10: what tells a contrast that measured some of its treatment attempts from one that measured none."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5) + treated("task-b", "model-a", 1, 0.0, 0.5)
+    assert (pair_rows(rows, named()).n_pairs, pair_rows(rows, named()).n_treatment_pairs) == (2, 1)
+
+
 def test_s10_a_pair_dropped_because_a_treatment_attempts_outcome_is_none_is_counted_apart():
     """S10: a treatment attempt scored None takes its pair out of the contrast, and that drop is counted under its own
     cause, apart from a None on an ordinary run; a scored treatment attempt is paired like any other run."""

@@ -182,19 +182,36 @@ def _minimum_detectable_effect(
 
 
 def _refuse_lost_treatment_pairs(spec: ContrastSpec, prereg: Preregistration, pairing: Pairing) -> None:
-    """Refuse a member of the Holm family that lost a pair to a treatment attempt scored None (S10): "excluded" loses
-    none this way, and "scored" is a claim checked here, not a switch that turns the check off."""
+    """Refuse a member of the Holm family whose treatment attempts left it unseen (S10). "scored" is a claim checked
+    here, not a switch that turns the check off, and a tolerance cannot cover every treatment attempt. "excluded" loses
+    no pair this way, but may not leave the contrast with no pair, whose conclusion would read as no effect detected."""
+    if spec.name not in prereg.holm_family:
+        return
+    if spec.treatment_outcomes == "excluded":
+        removed = pairing.missing["treatment_excluded"]
+        if removed and not pairing.n_pairs:
+            raise TreatmentOutcomesRefused(
+                f'{prereg.source}: confirmatory contrast {spec.name!r} declares treatment_outcomes = "excluded", which '
+                f"leaves it no pair: all {removed} are treatment attempts, so nothing is estimated and its conclusion "
+                'would read as no effect detected. Declare treatment_outcomes = "scored" and score them, or take the '
+                "contrast out of holm_family"
+            )
+        return
     lost = pairing.missing["treatment_outcome_none"]
-    if not lost or spec.name not in prereg.holm_family or lost <= spec.max_unscored_treatment:
+    if not lost:
         return
     if spec.treatment_outcomes == "scored":
+        within = lost <= spec.max_unscored_treatment
+        if within and pairing.n_treatment_pairs:
+            return
+        unmeasured = "; no treatment attempt of the contrast was measured, which no tolerance excuses" if within else ""
         raise TreatmentOutcomesRefused(
             f'{prereg.source}: confirmatory contrast {spec.name!r} declares treatment_outcomes = "scored", but {lost} '
             f"pair(s) have a treatment attempt whose outcome {spec.outcome!r} is None "
-            f"(max_unscored_treatment is {spec.max_unscored_treatment}). Make the scorer return values for treatment "
-            f"attempts; preregister max_unscored_treatment in [contrasts.{spec.name}] only for attempts that genuinely "
-            'could not be measured; or declare treatment_outcomes = "excluded" to leave every pair with a treatment '
-            "attempt out of this contrast, reported as such"
+            f"(max_unscored_treatment is {spec.max_unscored_treatment}{unmeasured}). Make the scorer return values for "
+            f"treatment attempts; preregister max_unscored_treatment in [contrasts.{spec.name}] only for attempts "
+            'that genuinely could not be measured; or declare treatment_outcomes = "excluded" to leave every pair '
+            "with a treatment attempt out of this contrast, reported as such"
         )
     raise TreatmentOutcomesRefused(
         f"{prereg.source}: confirmatory contrast {spec.name!r} drops {lost} pair(s) because a treatment attempt's "

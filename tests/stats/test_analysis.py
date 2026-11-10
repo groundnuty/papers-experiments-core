@@ -22,7 +22,7 @@ from expcore.stats.analysis import (
 from expcore.stats.estimators import EstimatorResult
 from expcore.stats.pairing import ContrastSpec, pair_rows
 from expcore.stats.prereg import name_digest, parse
-from expcore.stats.rows import Row
+from expcore.stats.rows import AbsentRun, Row
 from expcore.stats.sim import OutcomeSpec, SimSpec, simulate
 
 TEXT = """\
@@ -825,14 +825,46 @@ def test_s10_declaring_scored_does_not_excuse_a_scorer_that_leaves_every_treatme
     assert "[contrasts.a-vs-b]" in message
 
 
+def measured_treatment_pair() -> list[Row]:
+    """One pair whose cond-a run is a treatment attempt the scorer did measure."""
+    first, second = both_arms("outage-measured", "model-a", 1, 0.2, 0.5, cluster="c0")
+    return [dataclasses.replace(first, treatment=True), second]
+
+
 def test_s10_a_preregistered_tolerance_allows_exactly_that_many_unscored_treatment_pairs():
     """S10: for a rare genuine "could not be measured", a member may lose as many pairs as its preregistration set
     beforehand, and the result says so; one more than that is refused."""
-    result = analyse(treated_rows(), treated_prereg(declaration="scored", tolerance=2)).contrast("a-vs-b")
+    rows = treated_rows() + measured_treatment_pair()
+    result = analyse(rows, treated_prereg(declaration="scored", tolerance=2)).contrast("a-vs-b")
     assert (result.in_family, result.treatment_outcomes, result.max_unscored_treatment) == (True, "scored", 2)
-    assert (result.n_pairs, result.pairs_missing["treatment_outcome_none"]) == (6, 2)
+    assert (result.n_pairs, result.pairs_missing["treatment_outcome_none"]) == (7, 2)
     with pytest.raises(TreatmentOutcomesRefused, match="max_unscored_treatment is 1"):
-        analyse(treated_rows(), treated_prereg(declaration="scored", tolerance=1))
+        analyse(rows, treated_prereg(declaration="scored", tolerance=1))
+
+
+@pytest.mark.parametrize("tolerance", [2, 100])
+def test_s10_no_tolerance_excuses_a_contrast_in_which_no_treatment_attempt_was_measured(tolerance):
+    """S10: a tolerance is for the rare attempt, so a large one cannot bring back the original bug of a scorer that
+    leaves every outage None."""
+    with pytest.raises(TreatmentOutcomesRefused, match="no treatment attempt of the contrast was measured"):
+        analyse(treated_rows(), treated_prereg(declaration="scored", tolerance=tolerance))
+
+
+def test_s10_a_treatment_attempt_left_none_beside_an_exhausted_partner_is_refused_too():
+    """S10: the partner's exhaustion must not hide that the scorer left the manipulation None."""
+    rows = treated_rows()[:12]
+    first, _ = both_arms("outage-0", "model-a", 1, None, 0.5, cluster="c0")
+    factors = {"task": "outage-0", "model": "model-a", "seed": 1}
+    partner = AbsentRun("task=outage-0|model=model-a|seed=1|condition=cond-b", "cond-b", factors, "exhausted")
+    with pytest.raises(TreatmentOutcomesRefused, match="1 pair"):
+        analyse([*rows, dataclasses.replace(first, treatment=True)], treated_prereg(declaration="scored"), [partner])
+
+
+def test_s10_excluded_may_not_leave_a_confirmatory_contrast_with_no_pair():
+    """S10: with every pair a treatment attempt, "excluded" leaves nothing to estimate, and a conclusion of "not
+    detected" would read as no outage effect."""
+    with pytest.raises(TreatmentOutcomesRefused, match="leaves it no pair: all 2 are treatment attempts"):
+        analyse(treated_rows()[-4:], treated_prereg(declaration="excluded"))
 
 
 def test_s10_excluded_lets_the_confirmatory_contrast_through_and_counts_what_it_left_out():

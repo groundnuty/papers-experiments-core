@@ -17,9 +17,9 @@ Every pair the contrast could have had is used or missing for exactly one cause 
 zeros included (S10, C23). A pair is every pairing key that a run of either arm has, analysed or absent:
 - `treatment_excluded`: the contrast declares `treatment_outcomes = "excluded"` and either run is a treatment attempt.
   The preregistration decides, not the scorer, so such a pair is left out whatever its outcomes;
-- `treatment_outcome_none`: both runs are analysed and an outcome is missing on a side that is a treatment attempt.
-  The condition's manipulation then leaves its own contrast, which a confirmatory contrast may not do unless it
-  declares how its treatment attempts are scored (`expcore.stats.analysis`);
+- `treatment_outcome_none`: an outcome is missing on a run that is a treatment attempt, whatever happened to the other
+  run. The condition's manipulation then leaves its own contrast, which a confirmatory contrast may not do
+  (`expcore.stats.analysis`);
 - `outcome_none`: both runs are analysed and an outcome is missing on an ordinary run only;
 - `exhausted`: the run of either arm used all its attempts on infrastructure failures;
 - `unpaired_or_left_out`: anything else without both runs analysed: the other run is unfinished, left out of a
@@ -103,6 +103,7 @@ class Pairing:
 
     differences: PairedDifferences
     n_pairs: int  # pairs used
+    n_treatment_pairs: int  # of those, the pairs with a treatment attempt on either side
     n_pairs_missing: int  # pairs excluded because an outcome is missing on either side (both None causes)
     n_unpaired: int  # run keys analysed in one arm only
     n_clusters_dropped: int  # clusters seen in either arm that were left without a pair
@@ -193,6 +194,19 @@ def _paired_cause(row_a: Row, row_b: Row, spec: ContrastSpec) -> tuple[str | Non
     return None, value_a - value_b
 
 
+def _unpaired_cause(
+    rows: tuple[Row | None, Row | None], reasons: tuple[str | None, str | None], spec: ContrastSpec
+) -> str:
+    """For a key at most one arm analysed: the cause it is missing for. A treatment attempt left None comes first: the
+    manipulation left its contrast whatever became of the other run, and an exhausted partner must not hide that."""
+    present = [row for row in rows if row is not None]
+    values = [_value(row, spec) for row in present]  # read first, so a bad value is refused either way
+    scored_none = any(row.treatment and value is None for row, value in zip(present, values, strict=True))
+    if scored_none and spec.treatment_outcomes != "excluded":
+        return "treatment_outcome_none"
+    return "exhausted" if "exhausted" in reasons else "unpaired_or_left_out"
+
+
 def _aggregate(cells: Mapping[tuple[str, str, str], list[float]]) -> PairedDifferences:
     """Plain means in stages: the pairs of a (cluster, model, task) cell, then the tasks of a (cluster, model)."""
     per_cell: dict[tuple[str, str], list[float]] = {}
@@ -229,7 +243,7 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRu
     reasons = _absent_by_arm(absent, spec, arms)
     missing = dict.fromkeys(MISSING_CAUSES, 0)
     cells: dict[tuple[str, str, str], list[float]] = {}  # (cluster, model, task) -> pair differences
-    paired, used = first.keys() & second.keys(), 0
+    paired, used, treated = first.keys() & second.keys(), 0, 0
     for key in sorted(paired):
         cause, difference = _paired_cause(first[key], second[key], spec)
         if cause is not None:
@@ -237,14 +251,16 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRu
             continue
         used += 1
         row = first[key]
+        treated += row.treatment or second[key].treatment
         cells.setdefault((cluster_of_task[row.task], row.model, row.task), []).append(difference)
     for key in (first.keys() | second.keys() | reasons[0].keys() | reasons[1].keys()) - paired:
-        exhausted = "exhausted" in (reasons[0].get(key), reasons[1].get(key))
-        missing["exhausted" if exhausted else "unpaired_or_left_out"] += 1
+        cause = _unpaired_cause((first.get(key), second.get(key)), (reasons[0].get(key), reasons[1].get(key)), spec)
+        missing[cause] += 1
     differences = _aggregate(cells)
     return Pairing(
         differences=differences,
         n_pairs=used,
+        n_treatment_pairs=treated,
         n_pairs_missing=missing["treatment_outcome_none"] + missing["outcome_none"],
         n_unpaired=len(first.keys() ^ second.keys()),
         n_clusters_dropped=len(seen) - len(differences.clusters),
