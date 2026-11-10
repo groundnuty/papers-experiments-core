@@ -33,17 +33,45 @@ def _modules(core: Path, root: str) -> list[str]:
     return sorted(name for name in listing.decode("utf-8").split("\0") if name.endswith(".py"))
 
 
+def _renamed_from(core: Path, commit: str, path: str) -> str | None:
+    """Return the path a commit renamed to `path`: one it deleted in the same commit, never a file it kept.
+
+    Rename detection only (`-M`, no `-C`), over the whole tree, so a new file that resembles one that stays is a new
+    file, whatever git's copy detection would say.
+    """
+    out = run_git(core, "diff-tree", "-r", "-M", "--root", "--no-commit-id", "--name-status", "-z", commit)
+    fields = out.decode("utf-8").split("\0")
+    index = 0
+    while index < len(fields) and fields[index]:
+        status = fields[index]
+        if status[:1] in "RC":
+            old, new = fields[index + 1], fields[index + 2]
+            if status[0] == "R" and new == path:
+                return old
+            index += 3
+        else:
+            index += 2
+    return None
+
+
 def _import_commit(core: Path, path: str) -> tuple[str, str] | None:
-    """Return (commit, path at that commit) of the commit that first added the file, following renames."""
-    log = run_git(core, "log", "--follow", "--diff-filter=A", "--name-only", "--format=@@%H", "--", path)
-    added: list[tuple[str, str]] = []
-    commit = ""
-    for line in log.decode("utf-8").splitlines():
-        if line.startswith("@@"):
-            commit = line[2:]
-        elif line.strip() and commit:
-            added.append((commit, line.strip()))
-    return added[-1] if added else None
+    """Return (commit, path at that commit) of the commit that started the file's history at HEAD.
+
+    That is the latest commit that added the path, or, when that commit renamed it from a path it deleted, the commit
+    that started the earlier path's history, and so on. Git's copy detection (`--follow`) is not used: it would trace
+    a hand-edited copy of an imported module to the clean import it resembles (#55).
+    """
+    rev, current = "HEAD", path
+    while True:  # each round starts from an older commit, so the walk ends
+        log = run_git(core, "log", "--topo-order", "--no-renames", "--diff-filter=A", "--format=%H", rev, "--", current)
+        commits = log.decode("ascii").split()
+        if not commits:
+            return None
+        commit = commits[0]
+        earlier = _renamed_from(core, commit, current)
+        if earlier is None:
+            return commit, current
+        rev, current = f"{commit}^", earlier
 
 
 def _source_blob(repo: Path, commit: str, path: str) -> str | None:

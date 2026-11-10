@@ -94,6 +94,57 @@ def test_a_renamed_module_is_still_traced_to_its_import_commit(world):
     assert verify(world) == []
 
 
+def test_a_hand_edited_near_copy_of_an_imported_module_is_reported(world, map_file, tmp_path):
+    """P07: a second import of the same source under another name, edited by hand, is checked at its own adding commit.
+
+    Git's copy detection would trace the new file to the clean module it resembles, which is no evidence for it.
+    """
+    core, _, source_commit, _, _ = world
+    staged = tmp_path / "again.py"
+    staged.write_text(SOURCE, encoding="utf-8")
+    copy = core.path / "src/expcore/tools_copy.py"
+    sn.import_module(map_file, "origin-repo", source_commit[:12], SOURCE_PATH, staged, copy)
+    copy.write_text(copy.read_text(encoding="utf-8").replace('"space-a"', '"space-b"'), encoding="utf-8")
+    core.commit("import again, with one default changed by hand")
+    problems = verify(world)
+    assert len(problems) == 1
+    assert problems[0].startswith("src/expcore/tools_copy.py: import commit ")
+    assert "differs from the sanitised source blob" in problems[0]
+
+
+def test_an_exact_second_import_under_another_name_reproduces(world, map_file, tmp_path):
+    core, _, source_commit, _, _ = world
+    staged = tmp_path / "again.py"
+    staged.write_text(SOURCE, encoding="utf-8")
+    sn.import_module(map_file, "origin-repo", source_commit[:12], SOURCE_PATH, staged, core.path / "src/expcore/b.py")
+    core.commit("import again, unchanged")
+    assert verify(world) == []
+
+
+def test_a_module_deleted_and_added_again_by_hand_is_checked_at_its_new_adding_commit(world):
+    """P07: once a module is deleted, the commit that adds it again starts its history; the old import says nothing."""
+    core, *_ = world
+    before = (core.path / MODULE).read_text(encoding="utf-8")
+    core.git("rm", "--quiet", MODULE)
+    core.commit("drop the module")
+    core.write(MODULE, before.replace('"space-a"', '"space-b"'))
+    core.commit("bring it back, edited")
+    problems = verify(world)
+    assert len(problems) == 1
+    assert "differs from the sanitised source blob" in problems[0]
+
+
+def test_a_rename_with_an_edit_in_the_same_commit_is_traced_to_the_import(world):
+    """P07: a rename deletes the earlier path in the same commit, so the history follows it to the import; the edit is
+    a later change, which the history shows."""
+    core, *_ = world
+    before = (core.path / MODULE).read_text(encoding="utf-8")
+    core.git("rm", "--quiet", MODULE)
+    core.write("src/expcore/moved.py", before + "\n\nEXTRA = 1\n")
+    core.commit("move and extend")
+    assert verify(world) == []
+
+
 def test_new_modules_are_not_checked_against_a_source(world):
     core, *_ = world
     core.write("src/expcore/fresh.py", "# Provenance: new\nx = 1\n")
