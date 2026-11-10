@@ -44,6 +44,7 @@ For readers of the commits before this release:
 - The example measures with an instrument. Its executor makes a fresh `FactsServed` for every run, starts it before `record_run`, finishes it after, and writes the record `finish_instruments` returns; the scorer reads the instrument's count as a fourth outcome, `served`, which is `None` when the snapshot failed. Every record of the example holds `instruments.facts`, and `scores.json` gains the outcome; the contrasts and the report's tables are unchanged.
 - The README that `python -m expcore example` writes no longer links `../../docs/`, which leads nowhere outside the core's checkout, and leads with the study's own commands without `--allow-dirty`, saying where that option belongs. The command's hint says to commit the study before running it.
 - `run` reports what it dispatched as attempts of the campaign's runs (`dispatched 65 attempts of 62 runs`), not as runs. A refusal on the command line names the command (`report refused: ...`), and the analysis's refusals no longer begin with "refusing to analyse".
+- A replay that finds a recorded reply the model's raw reply does not give names the part in plain words: `the recorded tool call does not match the model's raw reply in that turn (transcript[k].native): the record was changed after it was written, or the backend now reads that reply differently`, in place of a sentence about the "neutral turn" and the "native message". The study guide says what replay compares.
 
 ### Known limits
 

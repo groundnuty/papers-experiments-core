@@ -404,10 +404,7 @@ def _analyse_loaded(
     changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])
     if changed:
         verified.snapshot.close()
-        raise Refused(
-            "the replay check ran under another environment than the campaign's:\n  "
-            + "\n  ".join(changed)
-        )
+        raise Refused("the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed))
     plugin = load_plugin(StudyContext(study, code))
     try:
         export = export_run_state(verified.snapshot, excluded=dict.fromkeys(verified.excluded, UNCOVERED))
