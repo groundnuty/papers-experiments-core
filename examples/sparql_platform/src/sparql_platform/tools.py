@@ -25,12 +25,16 @@ QUERY_TOOL = "sparql_query"
 SCHEMA_TOOL = "list_predicates"
 PREDICATES = "SELECT ?predicate (COUNT(*) AS ?uses) WHERE { ?s ?predicate ?o } GROUP BY ?predicate ORDER BY ?predicate"
 
-# Text the refusal checks must not look into: strings, IRIs and comments.
+# Text the update hint does not look into: strings, IRIs and comments. It only words a syntax error, never a refusal.
 _OPAQUE = re.compile(
-    r'"""(?:.|\n)*?"""|\'\'\'(?:.|\n)*?\'\'\'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|<[^<>\s]*>|#[^\n]*'
+    r'"""(?:.|\n)*?"""|\'\'\'(?:.|\n)*?\'\'\'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|<[^<>\s]*>|#[^\r\n]*'
 )
-# SERVICE sends part of a query to another endpoint over HTTP, which pyoxigraph would do: never allowed here.
-_SERVICE = re.compile(r"\bSERVICE\b", re.IGNORECASE)
+# SERVICE sends part of a query to another endpoint over HTTP, which pyoxigraph would do: never allowed here. The word
+# is refused anywhere in the query, a string or a comment included, once SPARQL's codepoint escapes are decoded:
+# telling a keyword from a string or a comment needs the parser's own tokenizer, and a guard that gets that wrong lets
+# a query reach the network. A query that only mentions the word in a literal is refused too, by design.
+_SERVICE = re.compile(r"service", re.IGNORECASE)
+_CODEPOINT = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
 _UPDATE = re.compile(r"\b(INSERT|DELETE|LOAD|CLEAR|CREATE|DROP|COPY|MOVE|ADD|WITH)\b", re.IGNORECASE)
 
 
@@ -88,8 +92,11 @@ class SparqlTools:
         text = arguments.get("query")
         if not isinstance(text, str) or not text.strip():
             return self._refuse("the query argument must be the text of a SPARQL query", "MissingQuery")
-        if _SERVICE.search(_OPAQUE.sub(" ", text)):
-            return self._refuse("SERVICE is refused: this tool queries only the local graph", "ServiceRefused")
+        if _SERVICE.search(_decoded(text)):
+            return self._refuse(
+                "SERVICE is refused, and so is the word anywhere in a query: this tool queries only the local graph",
+                "ServiceRefused",
+            )
         return self._run(text, time.monotonic() + timeout_s)
 
     def predicates(self, arguments: dict[str, Any], *, timeout_s: float) -> ToolOutput:
@@ -106,10 +113,15 @@ class SparqlTools:
             if _UPDATE.search(_OPAQUE.sub(" ", text)):
                 return self._refuse("updates are refused: this tool runs read-only queries", "ReadOnly")
             return self._refuse(f"not a valid SPARQL query: {error}", "QuerySyntax")
+        except TimeoutError:  # before OSError, of which it is a subclass: a slow query is the model's, not the store's
+            return self._refuse("the query's results took longer than the time left", "QueryTimeout")
+        except _BlankResult:
+            return self._refuse(
+                "results with blank nodes are refused: their labels differ on every run; select IRIs or literals",
+                "BlankNodeResult",
+            )
         except OSError as error:
             raise InfraError(STORE_KIND, f"the store could not be read ({type(error).__name__})") from error
-        except TimeoutError:
-            return self._refuse("the query's results took longer than the time left", "QueryTimeout")
         self.log.queries += 1
         self.log.rows_served += len(rows)
         self.log.truncated += cut
@@ -140,10 +152,29 @@ class SparqlTools:
         return ToolOutput(message, is_error=True, error_class=error_class)
 
 
+class _BlankResult(Exception):
+    """A result holds a blank node, whose label a query mints afresh on every run."""
+
+
+def _decoded(text: str) -> str:
+    """The query with SPARQL's codepoint escapes decoded, as the parser reads it."""
+    return _CODEPOINT.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), text)
+
+
+def _term(term: Any) -> str:
+    """A term in N-Triples syntax; a blank node, or a quoted triple holding one, is refused (its label is random)."""
+    if isinstance(term, pyoxigraph.BlankNode):
+        raise _BlankResult
+    if isinstance(term, pyoxigraph.Triple):
+        for part in (term.subject, term.predicate, term.object):
+            _term(part)
+    return str(term)
+
+
 def _solution_row(solution: pyoxigraph.QuerySolution) -> list[str]:
     """A SELECT row in N-Triples syntax; an unbound variable is an empty cell."""
-    return ["" if term is None else str(term) for term in solution]
+    return ["" if term is None else _term(term) for term in solution]
 
 
 def _triple_row(triple: pyoxigraph.Triple) -> list[str]:
-    return [str(triple.subject), str(triple.predicate), str(triple.object)]
+    return [_term(triple.subject), _term(triple.predicate), _term(triple.object)]

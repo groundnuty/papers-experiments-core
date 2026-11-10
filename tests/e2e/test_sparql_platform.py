@@ -230,19 +230,40 @@ def test_a_result_longer_than_the_cap_is_cut_and_marked_and_a_shorter_one_is_not
     assert tools.log.as_dict() == {"queries": 3, "rows_served": 3, "truncated": 1, "refused": 0}
 
 
-def test_service_and_updates_are_refused_and_the_word_inside_a_string_or_an_iri_is_not(graph):
+def test_service_is_refused_anywhere_in_a_query_however_it_is_hidden_and_updates_are_refused(graph):
+    """Telling the keyword from a string or a comment needs the parser's tokenizer; a guard that gets it wrong lets a
+    query reach the network. So the word is refused anywhere, after decoding codepoint escapes, by design."""
     tools = tools_over(graph)
-    for remote in ("SELECT * { SERVICE <http://elsewhere.example/q> { ?s ?p ?o } }", "select * { service <x:y> {} }"):
-        assert tools.query({"query": remote}, timeout_s=5).error_class == "ServiceRefused"
-    harmless = "SELECT ?s WHERE { ?s ?p ?o FILTER(?o != 'SERVICE' && ?s != <http://x.example/SERVICE>) }"
-    assert not tools.query({"query": harmless}, timeout_s=5).is_error
+    hidden = (
+        "SELECT * { SERVICE <http://elsewhere.example/q> { ?s ?p ?o } }",
+        "select * { service <x:y> {} }",
+        "SELECT * WHERE { #note\r SERVICE <http://elsewhere.example/q> { ?s ?p ?o } }",  # CR ends a comment
+        "SELECT * WHERE { \\u0053ERVICE <http://elsewhere.example/q> { ?s ?p ?o } }",  # a codepoint escape
+        "SELECT ?s WHERE { ?s ?p ?o FILTER(?o != 'service') }",  # the word in a literal: refused too
+    )
+    for remote in hidden:
+        assert tools.query({"query": remote}, timeout_s=5).error_class == "ServiceRefused", remote
     update = tools.query({"query": "INSERT DATA { <x:a> <x:b> <x:c> }"}, timeout_s=5)
     assert update.is_error
     assert update.error_class == "ReadOnly"
     assert tools.query({"query": "SELEC ?x"}, timeout_s=5).error_class == "QuerySyntax"
     assert tools.query({}, timeout_s=5).error_class == "MissingQuery"
     assert tools.store.triples() == 4
-    assert tools.log.refused == 5
+    assert tools.log.refused == 8
+
+
+def test_a_query_that_mints_blank_nodes_is_refused_because_its_labels_differ_on_every_run(graph):
+    """A blank node a query creates gets a fresh label each time, so the tool's output would differ between runs."""
+    tools = tools_over(graph)
+    for minted in ("SELECT (BNODE() AS ?b) WHERE {}", "CONSTRUCT { [] <urn:p> <urn:o> } WHERE {}"):
+        assert tools.query({"query": minted}, timeout_s=5).error_class == "BlankNodeResult", minted
+
+
+def test_a_result_that_takes_longer_than_the_time_left_is_the_models_tool_error_not_the_stores_failure(graph):
+    """Reading results past the deadline is a slow query, not a broken store: a tool error, never InfraError."""
+    tools = tools_over(graph)
+    late = tools.query({"query": "SELECT ?s WHERE { ?s ?p ?o }"}, timeout_s=-1)
+    assert late.error_class == "QueryTimeout"
 
 
 class FailingStore:
