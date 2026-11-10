@@ -71,8 +71,9 @@ def test_a_run_that_ends_with_runs_held_exits_with_the_pending_status_and_prints
 
 
 def test_c23_run_counts_what_it_dispatched_in_attempts_of_the_campaigns_runs(tmp_path, monkeypatch, capsys):
-    """C23: three attempts were run again, so 65 attempts dispatched are 62 runs, none of them lost."""
-    summary = RunSummary(65, {}, {"done": 61, "infra_exhausted": 1})
+    """C23: three runs were run again, so 65 attempts begun are 62 runs, none of them lost; the five workers that began
+    no attempt (a lease that timed out, a gate that closed while one waited) are not counted."""
+    summary = RunSummary(70, {}, {"done": 61, "infra_exhausted": 1}, attempts=65)
     monkeypatch.setattr("expcore.cli.run_study", lambda *args, **kwargs: summary)
     assert main(["run", str(tmp_path)]) == 0
     out = capsys.readouterr().out

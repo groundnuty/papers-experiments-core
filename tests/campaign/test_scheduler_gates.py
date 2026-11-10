@@ -358,7 +358,8 @@ def test_c19_a_run_left_unstarted_after_waiting_for_a_lease_says_how_long_it_wai
     with build(
         tmp_path / "c", executor=executor, leases=pool, lease_group=lambda f: "g", settings=settings, plan=SMALL
     ) as scheduler:
-        assert scheduler.run(max_dispatch=1).dispatched == 1
+        summary = scheduler.run(max_dispatch=1)
+        assert (summary.dispatched, summary.attempts) == (1, 0)  # a worker started, and it began no attempt
         rows = scheduler.store.q("SELECT detail FROM events WHERE kind='run_unstarted'")
         assert len(rows) == 1
         assert "after waiting 10.0 s" in rows[0]["detail"]

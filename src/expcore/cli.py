@@ -18,7 +18,8 @@ A thin shell; the logic is in the packages.
 
 Exit status: 0 done, 1 refused (the message on stderr names the command, says why and what to do), 2 usage, 3 `run`
 ended with runs still pending (held by a budget or a stop; the holds are printed). `run` counts what it dispatched in
-attempts, of the campaign's runs: a run set aside and run again is one run of two attempts.
+attempts it began, of the campaign's runs: a run set aside and run again is one run of two attempts, and a run that got
+no lease began none.
 """
 
 import argparse
@@ -105,7 +106,7 @@ def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None
     summary = run_study(args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, crash_hook=crash_hook)
     runs = sum(summary.statuses.values())
     statuses = dict(sorted(summary.statuses.items()))
-    print(f"dispatched {summary.dispatched} attempts of {runs} runs; runs by status: {statuses}")
+    print(f"dispatched {summary.attempts} attempts of {runs} runs; runs by status: {statuses}")
     pending = summary.statuses.get("pending", 0)
     for subject, hold in sorted(summary.holds.items()):
         print(f"hold on {subject}: {hold.reason}")

@@ -76,13 +76,15 @@ def iso(moment: dt.datetime) -> str:
 
 @dataclass(frozen=True)
 class RunSummary:
-    """How a call to `run` ended: attempts dispatched, the holds still in force, the runs by status, and the local log
-    of harness defects' tracebacks when there is one (`defect_log`)."""
+    """How a call to `run` ended: the workers it started (`dispatched`, what `max_dispatch` bounds), the holds still
+    in force, the runs by status, the local log of harness defects' tracebacks when there is one (`defect_log`), and
+    the attempts it began: a worker that got no lease, or found a gate closed once it had one, began none."""
 
     dispatched: int
     holds: Mapping[str, Hold] = field(default_factory=dict)
     statuses: Mapping[str, int] = field(default_factory=dict)
     harness_log: Path | None = None
+    attempts: int = 0
 
 
 class Scheduler:
@@ -478,6 +480,7 @@ class Scheduler:
         if self.gate is not None:
             self.gate.start(self.stop, on_open=self._wake)
         dispatched = 0
+        before = store.q("SELECT COALESCE(MAX(id), 0) AS last FROM attempts")[0]["last"]  # the rows this call begins
         with self._cv:
             self._run_thread = threading.current_thread()
         try:
@@ -512,7 +515,8 @@ class Scheduler:
             raise RuntimeError(f"campaign stopped by an unexpected error: {self._fatal!r}") from self._fatal
         statuses = {r["status"]: r["n"] for r in store.q("SELECT status, COUNT(*) AS n FROM runs GROUP BY status")}
         log = log_path(self.root)
-        return RunSummary(dispatched, self.holds.current(), statuses, log if log.is_file() else None)
+        begun = store.q("SELECT COUNT(*) AS n FROM attempts WHERE id > ?", (before,))[0]["n"]
+        return RunSummary(dispatched, self.holds.current(), statuses, log if log.is_file() else None, begun)
 
     def _announce(self, subject: str, before: Hold | None, after: Hold | None) -> None:
         """Say, once, that a hold began, changed or ended, with its reason and when dispatch resumes."""
