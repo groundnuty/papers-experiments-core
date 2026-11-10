@@ -70,6 +70,15 @@ def test_a_run_that_ends_with_runs_held_exits_with_the_pending_status_and_prints
     assert "22 runs are still pending" in captured.err
 
 
+def test_c12_run_says_a_hold_on_stderr_as_it_begins_once_with_whether_it_ends_by_itself(study, capsys):
+    """C12: the budget holds every run of the model; the command says so as it happens, not only in its summary."""
+    assert main(["run", str(study)]) == EXIT_PENDING
+    said = [line for line in capsys.readouterr().err.splitlines() if line.startswith("run: hold on alpha-stub")]
+    assert len(said) == 1
+    assert said[0].startswith("run: hold on alpha-stub (budget): ")
+    assert said[0].endswith("; it does not end by itself: its runs stay pending until someone looks")
+
+
 def test_a_resume_under_a_changed_configuration_is_refused_by_the_command(study, capsys):
     assert main(["run", str(study)]) == EXIT_PENDING
     capsys.readouterr()

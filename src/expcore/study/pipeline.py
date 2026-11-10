@@ -8,7 +8,8 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 - `run_study` opens or resumes the campaign and runs the scheduler. Its code identity is computed once, from the study
   directory and the scope study.toml names, and every record carries it. Its environment (the distributions the
   study's code imports, `provenance.environment`) goes into the campaign fingerprint, so a resume under another one
-  is refused (C06).
+  is refused (C06). Each hold is said on stderr once, as it begins, changes or ends, with when dispatch resumes, so a
+  run waiting out a pause is not silent.
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
@@ -205,9 +206,15 @@ def _run_campaign(
         leases=leases,
         lease_group=plugin.lease_group,
         backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
+        on_hold=_say_hold,
         **options,
     ) as scheduler:
         return scheduler.run()
+
+
+def _say_hold(line: str) -> None:
+    """Say a hold of the campaign as it begins, changes or ends, on stderr."""
+    print(f"run: {line}", file=sys.stderr)
 
 
 def check_batch(

@@ -13,7 +13,8 @@ options with the dispatch. This is the generic kernel and nothing else:
 - **dispatch** (`Scheduler.run`): walk the pending runs in manifest order; a run starts when no hold applies to it and
   no cap is full. Every reason it may not is a `Hold` on a subject (all runs, a model, a unit), written to the event log
   when it changes (`holds`): a harness-error stop (C10), a closed health gate (C11), a budget (C12), an unadmitted model,
-  a unit's pause (C15).
+  a unit's pause (C15). With `on_hold`, each change is also said as one line as it happens, with when dispatch resumes,
+  so a command line is not silent through a pause.
 - **a worker per run** (`attempt.AttemptRunner`): the gates, a lease, the study's `RunExecutor` through
   `record_attempt`, the marker, the store (C04, C16, C19). An exception in that bookkeeping stops dispatch loudly and
   leaves the run for recovery (C17).
@@ -107,8 +108,10 @@ class Scheduler:
         clock: Callable[[], dt.datetime] = utc_now,
         monotonic: Callable[[], float] = time.monotonic,
         crash_hook: Callable[[str, str], None] = lambda point, run_key: None,
+        on_hold: Callable[[str], None] | None = None,
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
+        self.on_hold = on_hold  # takes one line per hold that begins, changes or ends; never one per pass
         self.executor, self.agent_config, self.models = executor, agent_config, models
         self.endpoints, self.settings = dict(endpoints), settings or SchedulerConfig()
         self.health_check, self.leases, self.lease_group = health, leases, lease_group
@@ -169,7 +172,7 @@ class Scheduler:
             allow_growth=cfg.allow_growth,
         )
         store = self.store
-        self.holds = HoldRegistry(store, self.stamp)
+        self.holds = HoldRegistry(store, self.stamp, None if self.on_hold is None else self._announce)
         self.units = UnitHealth(
             store,
             fail_threshold=cfg.unit_fail_threshold,
@@ -510,6 +513,26 @@ class Scheduler:
         statuses = {r["status"]: r["n"] for r in store.q("SELECT status, COUNT(*) AS n FROM runs GROUP BY status")}
         log = log_path(self.root)
         return RunSummary(dispatched, self.holds.current(), statuses, log if log.is_file() else None)
+
+    def _announce(self, subject: str, before: Hold | None, after: Hold | None) -> None:
+        """Say, once, that a hold began, changed or ended, with its reason and when dispatch resumes."""
+        assert self.on_hold is not None
+        if after is None:
+            kind = before.kind if before is not None else "a"
+            self.on_hold(f"hold on {subject} ended ({kind}); dispatch of its runs resumes")
+            return
+        self.on_hold(f"hold on {subject} ({after.kind}): {after.reason}; {self._resumes(subject, after)}")
+
+    def _resumes(self, subject: str, hold: Hold) -> str:
+        """When dispatch held by `hold` resumes, as far as the scheduler knows."""
+        if hold.kind == "unit_paused" and subject.startswith("unit:"):
+            until = dt.datetime.fromtimestamp(self.units.paused_until(subject.split(":", 1)[1]), dt.UTC)
+            return f"dispatch on it resumes at {iso(until)}, when one run may probe it"
+        if hold.kind == "health_gate":
+            return f"dispatch resumes when a health check passes (checked every {self.settings.recheck_s:g} s)"
+        if hold.temporary:
+            return "dispatch resumes when it ends by itself"
+        return "it does not end by itself: its runs stay pending until someone looks"
 
     def _wake(self) -> None:
         with self._cv:
