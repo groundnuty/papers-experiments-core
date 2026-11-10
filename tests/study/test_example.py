@@ -1,5 +1,6 @@
 """The example study as the installed core carries it: `python -m expcore example DEST` writes it out."""
 
+import json
 import shutil
 import tomllib
 from pathlib import Path
@@ -8,7 +9,7 @@ import pytest
 
 from expcore.cli import main
 from expcore.study import example
-from expcore.study.example import ExampleError, example_source, write_example
+from expcore.study.example import REPOSITORY, ExampleError, example_source, write_example
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -28,6 +29,53 @@ def test_the_example_is_written_into_a_new_directory_with_every_file_and_without
     assert not (tmp_path / "study" / "out").exists()
     assert not (tmp_path / "study" / "__pycache__").exists()
     assert (tmp_path / "study" / "plugin.py").read_bytes() == (source / "plugin.py").read_bytes()
+
+
+class InstalledCore:
+    """A stand-in for the core's installed distribution: its version and its `direct_url.json`, if any."""
+
+    def __init__(self, version: str, direct_url: dict | None = None):
+        self.version = version
+        self.direct_url = direct_url
+
+    def read_text(self, name: str) -> str | None:
+        return json.dumps(self.direct_url) if name == "direct_url.json" and self.direct_url is not None else None
+
+
+def test_the_readme_written_out_links_the_published_docs_and_leads_with_the_studys_own_clean_commands(tmp_path):
+    source = (example_source() / "README.md").read_text(encoding="utf-8")
+    assert "](../../docs/interfaces.md)" in source  # in the checkout, the links are relative
+    write_example(tmp_path / "study")
+    readme = (tmp_path / "study" / "README.md").read_text(encoding="utf-8")
+    assert "../../docs" not in readme
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    assert f"]({REPOSITORY}/blob/v{version}/docs/interfaces.md)" in readme  # an editable install knows no commit
+    assert f"]({REPOSITORY}/blob/v{version}/docs/study-guide.md#8-ship-a-replication-package)" in readme
+    first_block = readme.split("```")[1]
+    assert "uv run python -m expcore run my-study" in first_block
+    assert "--allow-dirty" not in first_block
+    assert readme.replace(f"{REPOSITORY}/blob/v{version}/docs/", "../../docs/") == source  # nothing else changes
+
+
+def test_the_docs_are_linked_at_the_commit_the_core_was_installed_from_else_its_tag_else_the_default_branch(
+    monkeypatch,
+):
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    installs = {
+        "git": InstalledCore("0.1.0", {"url": "https://example.invalid/core.git", "vcs_info": {"commit_id": commit}}),
+        "index": InstalledCore("0.1.0+local.7"),
+        "garbled": InstalledCore("0.2.0", {"vcs_info": {"commit_id": "not a commit"}}),
+    }
+    expected = {"git": commit, "index": "v0.1.0", "garbled": "v0.2.0"}
+    for name, dist in installs.items():
+        monkeypatch.setattr(example.metadata, "distribution", lambda _name, dist=dist: dist)
+        assert example.docs_url() == f"{REPOSITORY}/blob/{expected[name]}/docs/", name
+
+    def missing(name):
+        raise example.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(example.metadata, "distribution", missing)
+    assert example.docs_url() == f"{REPOSITORY}/blob/main/docs/"
 
 
 def test_the_example_is_never_written_over_a_directory_that_holds_anything(tmp_path):

@@ -171,7 +171,10 @@ def _package_check(args: argparse.Namespace) -> int:
 
 def _example(args: argparse.Namespace) -> int:
     written = write_example(args.dest)
-    print(f"wrote the example study ({len(written)} files) to {args.dest}; run it: python -m expcore run {args.dest}")
+    print(
+        f"wrote the example study ({len(written)} files) to {args.dest}; "
+        f"commit it, then run it: python -m expcore run {args.dest}"
+    )
     return EXIT_OK
 
 
