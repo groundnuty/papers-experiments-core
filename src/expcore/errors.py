@@ -131,6 +131,12 @@ def study_kinds(declared: Mapping[str, StudyKind]) -> Iterator[None]:
     While two studies overlap in one process each can see the other's kinds. That is accepted: it can only widen
     validation for that overlap and never rejects a valid record. The vocabulary is held for the process and not in a
     `ContextVar`, because a plain thread would not inherit one and a valid `InfraError` raised in it would be rejected.
+
+    The contract that keeps readers consistent: a kind leaves only when no scope holds it, and every step of the
+    pipeline validates a study's records inside that study's scope, so its kinds cannot leave mid-check; a platform's
+    kinds never leave. Each reader takes one view (`vocabulary` gives the kinds and their treatability together). A
+    caller that reads twice outside any scope while another study's scope changes can at worst refuse, or name the
+    kinds of a different moment in its message; it can never accept a kind it should refuse.
     """
     held = dict(declared)  # what was entered is what is left, whatever the caller does with its mapping
     _enter_scope(held)
