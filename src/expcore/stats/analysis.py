@@ -202,7 +202,7 @@ def _refuse_lost_treatment_pairs(spec: ContrastSpec, prereg: Preregistration, pa
         return
     if spec.treatment_outcomes == "scored":
         within = lost <= spec.max_unscored_treatment
-        if within and pairing.n_treatment_pairs:
+        if within and pairing.n_treatment_measured:
             return
         unmeasured = "; no treatment attempt of the contrast was measured, which no tolerance excuses" if within else ""
         raise TreatmentOutcomesRefused(

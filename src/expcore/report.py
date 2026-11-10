@@ -202,7 +202,7 @@ _MISSING_PAIRS = [
     "A pair is two runs that differ only in the contrast's arm. Each pair is used or is missing for one cause, counted",
     "in the pairs tables above:",
     "",
-    "- *Treatment outcome None*: the outcome is None on a treatment attempt, whatever became of the other run.",
+    "- *Treatment outcome None*: the outcome is None on a treatment attempt, whatever became of the other planned run.",
     "- *Treatment excluded*: a run is a treatment attempt and the preregistration declares "
     '`treatment_outcomes = "excluded"` for the contrast; left out whatever its outcome.',
     "- *Exhausted run*: the run of either arm used all its attempts on infrastructure failures.",

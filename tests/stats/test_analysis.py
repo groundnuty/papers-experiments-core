@@ -860,6 +860,39 @@ def test_s10_a_treatment_attempt_left_none_beside_an_exhausted_partner_is_refuse
         analyse([*rows, dataclasses.replace(first, treatment=True)], treated_prereg(declaration="scored"), [partner])
 
 
+def unfinished_partner(task: str) -> AbsentRun:
+    """The cond-b run of `task`, planned, with no analysed attempt."""
+    factors = {"task": task, "model": "model-a", "seed": 1}
+    return AbsentRun(f"task={task}|model=model-a|seed=1|condition=cond-b", "cond-b", factors, "unfinished")
+
+
+def test_s10_a_measured_treatment_attempt_whose_partner_is_unfinished_still_counts_as_measured():
+    """S10: the tolerance refuses a contrast that measured none of its treatment attempts, not one whose measured
+    attempt lost its partner to something else."""
+    first, _ = both_arms("outage-measured", "model-a", 1, 0.2, 0.5, cluster="c0")
+    rows = [*treated_rows(), dataclasses.replace(first, treatment=True)]
+    prereg = treated_prereg(declaration="scored", tolerance=2)
+    result = analyse(rows, prereg, [unfinished_partner("outage-measured")]).contrast("a-vs-b")
+    assert (result.n_pairs, result.pairs_missing["treatment_outcome_none"]) == (6, 2)
+
+
+def test_s10_a_treatment_attempt_on_a_task_one_arm_never_runs_does_not_refuse_the_contrast():
+    """S10: in a chain design the extra task is outside the contrast's pairs, so a None there costs it nothing."""
+    first, _ = both_arms("extra-task", "model-a", 1, None, 0.5, cluster="c0")
+    rows = [*treated_rows()[:12], dataclasses.replace(first, treatment=True)]
+    result = analyse(rows, treated_prereg()).contrast("a-vs-b")
+    assert (result.n_pairs, result.pairs_missing["treatment_outcome_none"]) == (6, 0)
+    assert result.pairs_missing["unpaired_or_left_out"] == 1
+
+
+def test_s10_excluded_is_refused_when_only_treatment_attempts_without_analysed_partners_remain():
+    """S10: an excluded attempt with an unfinished partner still counts as excluded, so the empty contrast is seen."""
+    first, _ = both_arms("outage-0", "model-a", 1, None, 0.5, cluster="c0")
+    rows = [dataclasses.replace(first, treatment=True)]
+    with pytest.raises(TreatmentOutcomesRefused, match="leaves it no pair: all 1 are treatment attempts"):
+        analyse(rows, treated_prereg(declaration="excluded"), [unfinished_partner("outage-0")])
+
+
 def test_s10_excluded_may_not_leave_a_confirmatory_contrast_with_no_pair():
     """S10: with every pair a treatment attempt, "excluded" leaves nothing to estimate, and a conclusion of "not
     detected" would read as no outage effect."""
