@@ -17,14 +17,14 @@ import time
 import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from expcore.config.loading import ConfigError
 from expcore.config.models import ModelTable
 from expcore.errors import infra_kinds
 from expcore.loop.agent_loop import run_agent
 from expcore.loop.config import AgentConfig
-from expcore.loop.outcomes import Outcome
+from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import LoopResult, TurnRecord
 from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
@@ -232,15 +232,18 @@ def redactor_for(
     secrets: Iterable[str] = (),
     secret_env: Iterable[str] = (),
     models: ModelTable | None = None,
+    short_tokens: bool = False,
 ) -> Redactor:
     """Build the redactor of a record: the environment's secrets, the variables named in `secret_env`, the key
     variables of the models in use (added automatically), the registered secrets and `secrets`.
 
-    Raises ConfigError, naming the variable, when a secret is too short to redact (see `expcore.records.redact`).
+    Raises ConfigError, naming the variable, when a secret is too short to redact (see `expcore.records.redact`);
+    `short_tokens` replaces such a secret where it stands as a token of its own instead, for a diagnostic on the
+    author's terminal (`Redactor.from_environment`).
     """
     secrets, secret_env = tuple(secrets), tuple(secret_env)  # whatever iterable the caller gave is read once
     names, keys = model_secrets(backend, models, environ)
-    return Redactor.from_environment(environ, [*secrets, *keys], [*secret_env, *names])
+    return Redactor.from_environment(environ, [*secrets, *keys], [*secret_env, *names], short_tokens=short_tokens)
 
 
 def expected_conversation(system: str, user: str, captured: Sequence[Captured]) -> list[dict[str, Any]]:
@@ -380,6 +383,21 @@ def build_record(result: LoopResult, recording: RecordingBackend, **options: Any
     return _build_record(result, recording, **options)
 
 
+class DefectSink(Protocol):
+    """Where the traceback of a harness defect goes (the campaign's `defect_log.DefectLog`). `record_attempt` hands it
+    the attempt's whole redaction context first, and calls it with each crash the loop turns into a defect. Calling it
+    should not raise, since the loop calls it before the record exists; if it does, the loop carries the exception
+    forward and `record_attempt` hands it to `on_sink_failure` once the record is built."""
+
+    def redact_with(self, redactor: Callable[[], Redactor]) -> None:
+        """Use this redactor, built when an entry is written, for the attempt's entries from now on."""
+        ...
+
+    def __call__(self, error: BaseException, defect: HarnessDefect) -> object:
+        """Write the redacted traceback of a crash the loop caught, with the defect its outcome carries."""
+        ...
+
+
 async def _record_attempt(
     backend: ModelBackend,
     providers: Sequence[ToolProvider],
@@ -399,6 +417,8 @@ async def _record_attempt(
     secret_env: Iterable[str] = (),
     models: ModelTable | None = None,
     environ: Mapping[str, str] | None = None,
+    defect_log: DefectSink | None = None,
+    on_sink_failure: Callable[[Exception], object] | None = None,
 ) -> RunRecord:
     """Run one attempt through the loop, recording it as `schema_version`, and return its record.
 
@@ -416,17 +436,36 @@ async def _record_attempt(
     with `expcore.records.redact.register_secret` (a platform that mints a token registers it), and `secrets`.
     A secret too short to redact raises ConfigError before the run starts. The secrets are read again when the record
     is built, after the run, so one registered during the run (a token a provider minted) is redacted too.
+
+    `defect_log` (the campaign passes one through `record_run`) gets the same redaction context before anything can
+    crash, so a traceback in it is redacted with these secrets too, and each crash the loop turns into a harness defect.
+    What the sink raises is handed to `on_sink_failure` once the record is built (`record_run` passes the attempt's
+    log, which reports it once the result is stored), or, with no one to hand it to, warned of.
     """
     secrets, secret_env = tuple(secrets), tuple(secret_env)  # read once: the early check would use up an iterator
-    redactor_for(backend, environ=environ, secrets=secrets, secret_env=secret_env, models=models)  # fail early
+
+    def redactor() -> Redactor:
+        return redactor_for(backend, environ=environ, secrets=secrets, secret_env=secret_env, models=models)
+
+    if defect_log is not None:
+        defect_log.redact_with(redactor)
+    redactor()  # fail early
     recording = RecordingBackend(backend)
     box = ToolBox(list(providers), cap_chars=config.limits.output_cap_chars)
     specs = [spec for provider in providers for spec in provider.tools()]
     prompts = (PromptText.of(system), PromptText.of(user))
     result = await run_agent(
-        recording, box, prompts[0].text, prompts[1].text, config, timer=timer, clock=clock, sleep=sleep
+        recording,
+        box,
+        prompts[0].text,
+        prompts[1].text,
+        config,
+        timer=timer,
+        clock=clock,
+        sleep=sleep,
+        on_defect=defect_log,
     )
-    return _build_record(
+    record = _build_record(
         result,
         recording,
         identity=identity,
@@ -442,6 +481,12 @@ async def _record_attempt(
         models=models,
         environ=environ,
     )
+    if result.sink_failure is not None:  # the record exists: now the sink's failure can be reported
+        if on_sink_failure is None:
+            warnings.warn(f"the defect sink failed: {type(result.sink_failure).__name__}", RuntimeWarning, stacklevel=2)
+        else:
+            on_sink_failure(result.sink_failure)
+    return record
 
 
 async def record_attempt(
@@ -457,7 +502,8 @@ async def record_attempt(
 
     A live run cannot choose an older record version: that would apply an older treatment rule to a new run.
     The keyword options are those of the private `_record_attempt` (`code`, `core_version`, `treatment_kinds`,
-    `timer`, `clock`, `sleep`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is refused.
+    `timer`, `clock`, `sleep`, `secrets`, `secret_env`, `models`, `environ`, `defect_log`, `on_sink_failure`);
+    `schema_version` is refused.
     """
     if "schema_version" in options:
         raise TypeError("record_attempt writes the current record version; a live run cannot choose another")

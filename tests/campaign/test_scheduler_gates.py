@@ -1,7 +1,9 @@
 """The gates around an attempt, through the scheduler: harness stops, health, budgets, units, identity, leases."""
 
+import datetime as dt
 import json
 import os
+import re
 
 import pytest
 from campaign_support import NOW, make_schema
@@ -118,6 +120,20 @@ def test_c11_an_unhealthy_or_unreadable_check_holds_all_dispatch_for_one_attempt
         assert executor.calls_of(first) == 1  # the run that found the outage was not executed for it
 
 
+def test_c11_a_closed_gate_is_said_once_with_how_dispatch_resumes_and_once_when_it_opens(tmp_path):
+    """C11: a campaign held by an outage says so as it begins, not once per pass of the dispatcher while it waits."""
+    lines = []
+    settings = settings_for(recheck_s=0.01, health_timeout_s=5)
+    with build(tmp_path, settings=settings, health=Healthy(down=3), plan=SMALL, on_hold=lines.append) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+    closed = [line for line in lines if line.startswith("hold on all (health_gate)")]
+    assert closed == [
+        "hold on all (health_gate): the health gate is closed: no run starts until a check passes; dispatch resumes "
+        "when a health check passes (checked every 0.01 s)"
+    ]
+    assert lines.count("hold on all ended (health_gate); dispatch of its runs resumes") == 1
+
+
 def test_c11_an_unreadable_gate_state_at_restart_opens_closed_and_blocks_dispatch_until_a_check_passes(tmp_path):
     """C11: the record of outages cannot be read, so the gate starts closed; the first passing check opens it."""
     from scheduler_support import seed_store
@@ -205,6 +221,41 @@ def test_c15_n_failures_pause_the_unit_and_one_success_clears_it(tmp_path):
         kinds = [k for k in event_kinds(scheduler.store) if k.startswith("unit_")]
         assert kinds == ["unit_paused", "unit_recovered"]  # paused at the second failure, cleared by a success
         assert scheduler.units.down("unit-m1") is False
+
+
+def test_c15_a_unit_pause_is_said_once_with_when_dispatch_resumes_and_once_when_it_ends(tmp_path):
+    """C15: a run waiting out a pause is not silent, and the dispatcher's passes during the pause add nothing."""
+    flaky = key_of(SCHEMA, "mount-read")
+    executor = FakeExecutor({flaky: [("infra", "endpoint")] * 2})
+    settings = settings_for(unit_fail_threshold=2, unit_pause_s=0.3, max_attempts=5)
+    lines = []
+    with build(tmp_path, executor=executor, settings=settings, plan=SMALL, on_hold=lines.append) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+    [paused] = [line for line in lines if line.startswith("hold on unit:unit-m1 (unit_paused)")]
+    assert "is paused after repeated failures; only a success clears it" in paused
+    assert re.search(r"; dispatch on it resumes at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ, when one run may probe it$", paused)
+    assert lines.count("hold on unit:unit-m1 ended (unit_paused); dispatch of its runs resumes") == 1
+
+
+def test_c15_a_pause_extended_while_it_holds_is_said_again_once_with_its_new_end(tmp_path):
+    """C15: a unit already down that fails again is paused again from that moment; the time said first is stale, so
+    the extension is a change of the hold, said once, and the dispatcher's later passes add nothing."""
+    now = [dt.datetime(2026, 11, 10, 12, 0, tzinfo=dt.UTC)]
+    lines = []
+    settings = settings_for(unit_pause_s=60)
+    with build(tmp_path, settings=settings, plan=SMALL, on_hold=lines.append, clock=lambda: now[0]) as scheduler:
+        scheduler.units.failure("unit-m1", immediate=True)
+        scheduler.next_dispatch()
+        scheduler.next_dispatch()
+        now[0] += dt.timedelta(seconds=30)
+        scheduler.units.failure("unit-m1", immediate=True)  # down already: paused again, from now
+        scheduler.next_dispatch()
+        scheduler.next_dispatch()
+    said = [line.split("resumes at ")[1] for line in lines if line.startswith("hold on unit:unit-m1 (unit_paused)")]
+    assert said == [
+        "2026-11-10T12:01:00Z, when one run may probe it",
+        "2026-11-10T12:01:30Z, when one run may probe it",
+    ]
 
 
 def test_c15_a_paused_unit_holds_its_runs_and_leaves_other_units_alone(tmp_path):
@@ -307,7 +358,8 @@ def test_c19_a_run_left_unstarted_after_waiting_for_a_lease_says_how_long_it_wai
     with build(
         tmp_path / "c", executor=executor, leases=pool, lease_group=lambda f: "g", settings=settings, plan=SMALL
     ) as scheduler:
-        assert scheduler.run(max_dispatch=1).dispatched == 1
+        summary = scheduler.run(max_dispatch=1)
+        assert (summary.dispatched, summary.attempts) == (1, 0)  # a worker started, and it began no attempt
         rows = scheduler.store.q("SELECT detail FROM events WHERE kind='run_unstarted'")
         assert len(rows) == 1
         assert "after waiting 10.0 s" in rows[0]["detail"]

@@ -184,6 +184,19 @@ def test_c18_a_schema_with_two_conditions_that_assign_the_same_levels_is_refused
         FactorSchema({"x": ["1", "2"]}, ["task", "x", "model", "seed"], {"a": {"x": "1"}, "b": {"x": "1"}})
 
 
+def test_c18_a_condition_that_leaves_a_factor_out_is_refused_naming_the_levels_it_could_assign():
+    """C18: every condition assigns every factor, which keeps their keys apart; the error lists the factor's levels."""
+    with pytest.raises(ConfigError) as caught:
+        FactorSchema(
+            {"x": ["1", "2"], "gate": ["open", "shut"]},
+            ["task", "x", "gate", "model", "seed"],
+            {"a": {"x": "1", "gate": "open"}, "b": {"x": "2"}},
+        )
+    assert str(caught.value).endswith(
+        "[conditions.b]: key 'gate' is missing; a condition assigns every declared factor; levels of 'gate': open, shut"
+    )
+
+
 def test_the_condition_of_a_key_is_found_from_its_levels():
     schema = make_schema()
     for name in schema.conditions:

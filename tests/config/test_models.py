@@ -130,6 +130,15 @@ def test_p06_an_unknown_name_is_refused_and_the_table_is_listed(tmp_path):
         table.resolve("gamma")
 
 
+def test_p06_an_unknown_name_close_to_a_key_is_refused_with_the_key_it_was_likely_meant_to_be(tmp_path):
+    """P06: the table is listed, and the closest key is named."""
+    table = load_models(write(tmp_path, TABLE))
+    with pytest.raises(
+        ConfigError, match=r"unknown model 'alpah' \(did you mean 'alpha'\?\); the table holds: alpha, beta"
+    ):
+        table.resolve("alpah")
+
+
 def test_b08_unfrozen_settings_raise_before_any_request(tmp_path):
     """B08: only a frozen model may start a study run."""
     table = load_models(write(tmp_path, TABLE))
@@ -191,6 +200,67 @@ def test_b16_an_incompatible_combination_is_refused_at_configuration(overrides, 
     """B16: each incompatible per-model rule raises when the entry is built, before any request can exist."""
     with pytest.raises(RuleViolation, match=message):
         spec(**overrides)
+
+
+def test_b16_an_unknown_backend_is_said_before_a_missing_api_id_naming_the_factory_that_would_serve_it(tmp_path):
+    """B16: a plugin's factory may serve any plain backend name, so the entry is not refused for it; but when the entry
+    has a problem, that the core does not build its backend comes first, so a missing api_id does not hide it."""
+    path = write(tmp_path, '[models.toy-model]\nbackend = "toy"\n')
+    with pytest.raises(ConfigError) as caught:
+        load_models(path)
+    assert str(caught.value) == (
+        f"{path}: [models.toy-model]: key 'backend' names 'toy', a backend the core does not build (openai_compat, "
+        "anthropic, stub); the plugin must supply a backend_factory that serves it; key 'api_id' is required"
+    )
+
+
+@pytest.mark.parametrize(
+    ("entry", "first", "last"),
+    [
+        (
+            'backend = "openai_compta"\napi_id = "x"\nbase_url = "ftp://x.invalid"',
+            "key 'backend' names 'openai_compta' (did you mean 'openai_compat'?), a backend the core does not build",
+            "base_url must be an http or https URL",
+        ),
+        (
+            'backend = "OpenAI_Compat"',
+            "backend must be one of openai_compat, anthropic, stub, or the plain lower-case name of a backend the "
+            "study's plugin serves, got 'OpenAI_Compat' (did you mean 'openai_compat'?)",
+            "key 'api_id' is required",
+        ),
+    ],
+)
+def test_b16_a_backend_name_close_to_a_cores_is_said_first_with_the_name_it_was_likely_meant_to_be(
+    tmp_path, entry, first, last
+):
+    """B16: a misspelt core backend is said first, before a rule or a missing key, with the closest core backend."""
+    with pytest.raises(ConfigError) as caught:
+        load_models(write(tmp_path, f"[models.m]\n{entry}\n"))
+    problems = str(caught.value).split(": [models.m]: ", 1)[1].split("; ")
+    assert problems[0].startswith(first)
+    assert problems[-1].startswith(last)
+
+
+@pytest.mark.parametrize(
+    ("entry", "then"),
+    [
+        ("api_id = 5", "key 'api_id' must be"),
+        ('api_id = "x"\nmax_output_tokens = "many"', "key 'max_output_tokens' must be"),
+        ('api_id = "x"\ncolour = "blue"', "key 'colour' is not a known key"),
+        ('api_id = "x"\n[models.m.price]\ninput_per_mtok = "cheap"', "key 'input_per_mtok' must be a number"),
+    ],
+    ids=["type", "integer", "unknown-key", "price"],
+)
+def test_b16_the_backend_and_its_suggestion_come_first_whatever_key_fails_to_read(tmp_path, entry, then):
+    """B16: a key that cannot even be read (a wrong type, an unknown key, a bad price) does not hide that the core does
+    not build the backend, or the core backend it was likely meant to be."""
+    path = write(tmp_path, f'[models.m]\nbackend = "openai_compta"\n{entry}\n')
+    with pytest.raises(ConfigError) as caught:
+        load_models(path)
+    message = str(caught.value)
+    first = f"{path}: [models.m]: key 'backend' names 'openai_compta' (did you mean 'openai_compat'?), a backend"
+    assert message.startswith(first)
+    assert then in message.split("backend_factory that serves it; ", 1)[1]
 
 
 def test_b16_a_backend_of_the_study_s_own_is_an_entry_the_core_does_not_build_and_needs_no_url():

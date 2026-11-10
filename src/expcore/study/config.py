@@ -41,7 +41,7 @@ from pathlib import Path
 from expcore.campaign.config import CampaignConfig, load_campaign
 from expcore.campaign.factors import FactorSchema, load_factor_schema
 from expcore.campaign.manifest import Manifest, build_manifest
-from expcore.config.loading import ConfigError, Section, load_toml
+from expcore.config.loading import ConfigError, Section, close_match, load_toml
 from expcore.config.models import ModelTable, load_models
 from expcore.errors import StudyKind, check_study_kind, study_kinds
 from expcore.provenance.codestamp import CodeScope, CodeScopeError
@@ -53,6 +53,7 @@ STUDY_FILE = "study.toml"
 MODELS_FILE = "models.toml"
 CAMPAIGN_FILE = "campaign.toml"
 PREREG_FILE = "preregistration.toml"
+OUT_DIR = "out"  # everything a study produces goes below it (`study.pipeline`)
 CONFIG_FILES = (STUDY_FILE, MODELS_FILE, CAMPAIGN_FILE, PREREG_FILE)
 PLATFORMS_KEY, KINDS_KEY = "platforms", "kinds"
 KIND_KEYS = ("description", "treatable")
@@ -226,7 +227,8 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
         unknown = [m for m in campaign.models if m not in models]
         if unknown:
             raise ConfigError(
-                f"{campaign.source}: key 'models' names {unknown[0]!r}, which {MODELS_FILE} does not define"
+                f"{campaign.source}: key 'models' names {unknown[0]!r}{close_match(unknown[0], models)}, which "
+                f"{MODELS_FILE} does not define; it defines: {', '.join(models)}"
             )
         loaded = prereg.load(root / PREREG_FILE, schema)
         _check_clusters(name, tasks, loaded)

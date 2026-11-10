@@ -10,24 +10,28 @@ The module is the study's own code and lives in the study directory, so the code
 imports a study by name.
 """
 
+import datetime as dt
 import hashlib
 import importlib.util
 import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from expcore.campaign.defect_log import write_failure
 from expcore.campaign.executor import BackendFactory, RunExecutor
 from expcore.campaign.healthgate import HealthCheck
 from expcore.campaign.lease import ResourceProbe
 from expcore.config.loading import ConfigError, Section
-from expcore.config.models import BACKENDS
+from expcore.config.models import ModelTable, not_built_by_core
 from expcore.plugin import ToolSpec
+from expcore.records.build import redactor_for
 from expcore.records.rescore import Scorer, scorer_name, scorer_version
-from expcore.study.config import StudyConfig
+from expcore.study.config import OUT_DIR, StudyConfig
 
 BUILD = "build"
 PLUGIN_MODULE_PREFIX = "expcore_study_plugin_"  # the rest of a plugin's module name is a hash of its path
@@ -115,13 +119,19 @@ def tools_sha256(specs: Sequence[ToolSpec]) -> str:
     return hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def import_plugin_module(file: Path, *, error_text: bool = True) -> ModuleType:
+def import_plugin_module(
+    file: Path, *, error_text: bool = True, models: ModelTable | None = None, log_root: Path | None = None
+) -> ModuleType:
     """Import the study's plugin module from its file, running its top level, and return it; ConfigError if it cannot.
 
     `build` is not called, so no model or key is read. What the module registers when imported, the native parser of a
     backend of the study's own, is then there for a step that needs nothing else of the plugin: the replay check. That
     step passes `error_text=False`, so a refusal names the file and the exception's type and never its text, which can
-    hold a credential.
+    hold a credential. Otherwise the text is shown redacted as a record is, with the secrets of the environment, the
+    registered ones and the keys of `models` (the value of each `key_env`, the contents of each `key_file`); a value
+    too short to redact everywhere is redacted where it stands as a token of its own, so it cannot wipe the rest of
+    the diagnostic; and with `log_root` (a study's `out/`) the redacted
+    traceback goes to the harness-error log there, which the message names.
     """
     module_name = f"{PLUGIN_MODULE_PREFIX}{hashlib.sha256(str(file).encode()).hexdigest()[:12]}"
     spec = importlib.util.spec_from_file_location(module_name, file)
@@ -135,14 +145,21 @@ def import_plugin_module(file: Path, *, error_text: bool = True) -> ModuleType:
         del sys.modules[module_name]
         if not error_text:
             raise ConfigError(f"{file}: failed on import ({type(error).__name__})") from None
-        raise ConfigError(f"{file}: failed on import ({type(error).__name__}: {error})") from error
+        redactor = partial(redactor_for, None, models=models, short_tokens=True)
+        message = f"{file}: failed on import ({type(error).__name__}: {redactor().with_lines().text(str(error))})"
+        if log_root is not None:
+            stamp = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+            title = f"importing {file.name}: {type(error).__name__}"
+            logged = write_failure(log_root, error, title=title, stamp=stamp, redactor=redactor)
+            message += f"; its traceback, redacted, is in {logged}"
+        raise ConfigError(message) from error
     return module
 
 
 def load_plugin(context: StudyContext) -> StudyPlugin:
     """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve."""
     file = context.study.plugin_file
-    module = import_plugin_module(file)
+    module = import_plugin_module(file, models=context.study.models, log_root=context.study.root / OUT_DIR)
     build = getattr(module, BUILD, None)
     if not callable(build):
         raise ConfigError(f"{file}: must define a function {BUILD}(context) that returns a StudyPlugin")
@@ -182,8 +199,4 @@ def _check_backends(study: StudyConfig) -> None:
     for key in study.models:
         spec = study.models.resolve(key)
         if not spec.core_backend:
-            raise Section({}, study.models.source, f"[models.{key}]").fail(
-                "backend",
-                f"names {spec.backend!r}, a backend the core does not build ({', '.join(BACKENDS)}); the plugin "
-                "must supply a backend_factory that serves it",
-            )
+            raise Section({}, study.models.source, f"[models.{key}]").fail("backend", not_built_by_core(spec.backend))

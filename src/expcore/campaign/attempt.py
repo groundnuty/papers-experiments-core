@@ -19,9 +19,11 @@ The order is fixed, and each step is decided by what a kill at that point must l
    lose the stop or the failure it caused; the lease ends after it. A result committed from its marker at the next
    start has no bookkeeping of its own: the scheduler derives the stops and the units from the stored attempts then.
 
-An exception in the executor is the study's: `InfraError` is infrastructure, anything else is a harness defect. An
-exception in the steps around it is our own bookkeeping failing, and propagates: the scheduler stops dispatch loudly and
-leaves the 'running' row for recovery (C17).
+An exception in the executor is the study's: `InfraError` is infrastructure, anything else is a harness defect, whose
+redacted traceback goes to the campaign's local log (`defect_log`) and nowhere else; the request carries that log, so a
+crash the loop catches inside `record_run` is logged too, redacted with the secrets the executor passed it. An
+exception in the steps around it is our own bookkeeping failing, and propagates: the scheduler stops dispatch loudly
+and leaves the 'running' row for recovery (C17).
 """
 
 import asyncio
@@ -35,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.attempts import classify
+from expcore.campaign.defect_log import DefectLog
 from expcore.campaign.executor import (
     BackendFactory,
     Endpoint,
@@ -56,7 +59,7 @@ from expcore.campaign.units import UnitHealth
 from expcore.config.models import ModelTable
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
-from expcore.records.build import RunIdentity
+from expcore.records.build import RunIdentity, redactor_for
 
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
 
@@ -213,6 +216,7 @@ class AttemptRunner:
             time_left=timer.time_left,
         )
         begun, run_dir = self._begin(row, lease)
+        defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
         request = RunRequest(
             RunIdentity(key, factors, begun.number),
             run_dir,
@@ -223,6 +227,7 @@ class AttemptRunner:
             kinds,
             lease,
             p.models,
+            defects,
         )
 
         async def go() -> Any:
@@ -238,12 +243,15 @@ class AttemptRunner:
             result = result_from_record(record, ended_utc=p.stamp())
         except Exception as error:  # the executor's: infrastructure or a defect of ours, classified by what it is
             result = failure_result(error, ended_utc=p.stamp(), wall_s=p.monotonic() - started, treatment_kinds=kinds)
+            if result.outcome.defect is not None:  # the attempt keeps the class and the stack hash; the log the rest
+                defects(error, result.outcome.defect)
         result, moved = self._judge(result, record, model, key)
 
         def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
             self._bookkeeping(model, endpoint, key, result, kinds, moved)
 
         status = self._finish(begun, run_dir, key, result, bookkeeping)
+        defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
         return p.settings.retry_delay_s if status == "pending" else 0.0
 
     def _judge(self, result: AttemptResult, record: Any, model: str, key: str) -> tuple[AttemptResult, bool]:

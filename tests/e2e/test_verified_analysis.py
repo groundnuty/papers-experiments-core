@@ -192,7 +192,7 @@ def test_r04_a_store_that_disagrees_with_its_records_is_refused_by_analyze_namin
     )  # the records still replay; it is the pair that is wrong
     code, errors = cli(clean_environment, "analyze", str(copy.root))
     assert code == 1
-    assert "refusing to analyse" in errors
+    assert "analyze refused: " in errors
     assert fragment in errors
 
 

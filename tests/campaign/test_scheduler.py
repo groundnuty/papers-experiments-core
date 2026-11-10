@@ -27,7 +27,7 @@ def test_the_pending_runs_are_dispatched_in_the_manifests_seeded_order_and_all_f
         summary = scheduler.run()
         assert [r.run_key for r in executor.requests] == keys()
         assert summary.statuses == {"done": 3}
-        assert summary.dispatched == 3
+        assert summary.dispatched == summary.attempts == 3
         assert all(attempts_of(scheduler.store, k) == [("done", 0, 1)] for k in keys())
 
 

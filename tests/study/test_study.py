@@ -69,6 +69,16 @@ def test_a_model_of_the_plan_that_the_model_table_lacks_is_refused_naming_it(stu
     refused(study_dir, "campaign.toml", "'models'", "gamma-stub", "models.toml")
 
 
+def test_p06_a_model_of_the_plan_the_table_lacks_is_refused_listing_the_table_with_the_closest_name(study_dir):
+    """P06: the plan names a model by its key in the one table; a misspelt key is refused with the keys it could be."""
+    edit(study_dir, "campaign.toml", '"beta-stub"]', '"beta-stbu"]')
+    text = refused(study_dir, "campaign.toml")
+    assert text.endswith(
+        "key 'models' names 'beta-stbu' (did you mean 'beta-stub'?), which models.toml does not define; it defines: "
+        "alpha-stub, beta-stub"
+    )
+
+
 def test_a_cluster_that_a_task_lacks_is_refused_naming_the_contrast_and_the_task(study_dir):
     edit(study_dir, "study.toml", '[tasks.dune]\nregion = "south"', '[tasks.dune]\nzone = "south"')
     refused(study_dir, "preregistration.toml", "extended-vs-baseline", "'region'", "'dune'")
@@ -127,6 +137,82 @@ def test_a_module_that_fails_on_import_is_refused_naming_the_file_and_the_error(
     (study_dir / "plugin.py").write_text("raise ZeroDivisionError('boom')\n", encoding="utf-8")
     with pytest.raises(ConfigError, match=r"plugin\.py: failed on import \(ZeroDivisionError: boom\)"):
         load_plugin(context(study_dir))
+
+
+def test_r12_the_import_failure_of_a_plugin_shows_its_text_with_every_secret_redacted(study_dir, monkeypatch):
+    """R12: the exception's text helps the author, but a client that failed to start can carry a credential in it."""
+    monkeypatch.setenv("TOYLAB_ACCESS_TOKEN", "amber-falcon-6620")
+    (study_dir / "plugin.py").write_text(
+        "import os\nraise RuntimeError('login refused for ' + os.environ['TOYLAB_ACCESS_TOKEN'])\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    assert "failed on import (RuntimeError: login refused for [redacted])" in str(caught.value)
+    assert "amber-falcon-6620" not in str(caught.value)
+
+
+def test_r12_the_import_failure_redacts_the_keys_models_toml_points_at_in_a_variable_or_a_file(study_dir, monkeypatch):
+    """R12: a model's key is redacted from a record whatever its variable is called, so from this message too: the
+    value of its `key_env` and the contents of its `key_file`."""
+    monkeypatch.setenv("TOYLAB_GAMMA", "gamma-secret-4471")  # a name no secret pattern matches: only the table knows
+    key_file = study_dir.parent / "delta.key"
+    key_file.write_text("delta-secret-9930\n", encoding="utf-8")
+    remote = (
+        '\n[models.gamma-remote]\nbackend = "openai_compat"\napi_id = "gamma-1"\n'
+        'base_url = "https://llm.example.invalid/v1"\nkey_env = "TOYLAB_GAMMA"\n'
+        '\n[models.delta-remote]\nbackend = "anthropic"\napi_id = "delta-1"\n'
+        f'base_url = "https://api.example.invalid"\nkey_file = "{key_file}"\n'
+    )
+    with (study_dir / "models.toml").open("a", encoding="utf-8") as handle:
+        handle.write(remote)
+    (study_dir / "plugin.py").write_text(
+        "import os, pathlib\n"
+        f"raise RuntimeError(os.environ['TOYLAB_GAMMA'] + ' ' + pathlib.Path({str(key_file)!r}).read_text().strip())\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    assert "failed on import (RuntimeError: [redacted] [redacted])" in str(caught.value)
+    log = (study_dir / "out" / "logs" / "harness-errors.log").read_text(encoding="utf-8")
+    for value in ("gamma-secret-4471", "delta-secret-9930"):
+        assert value not in str(caught.value)
+        assert value not in log
+
+
+def test_r12_a_short_secret_is_redacted_from_an_import_failure_where_it_stands_alone_and_nowhere_else(
+    study_dir, monkeypatch
+):
+    """R12: a secret too short to redact everywhere is still a secret: it is redacted where it stands as a token of its
+    own, in the message and in the log, while the same letters inside a longer name are left."""
+    monkeypatch.setenv("TEST_TOKEN", "lib")
+    (study_dir / "plugin.py").write_text("raise ValueError('lib')\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    assert "failed on import (ValueError: [redacted])" in str(caught.value)
+    log = (study_dir / "out" / "logs" / "harness-errors.log").read_text(encoding="utf-8")
+    assert "ValueError: [redacted]" in log
+    assert "'lib'" not in log
+    (study_dir / "plugin.py").write_text("import needed_library\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    assert "No module named 'needed_library'" in str(caught.value)  # inside a name, the letters are no secret
+
+
+def test_l08_an_import_failure_keeps_its_diagnostic_and_logs_its_traceback_whatever_short_value_is_set(
+    study_dir, monkeypatch
+):
+    """L08: a secret too short to redact everywhere is redacted only where it stands alone, so an unrelated one does
+    not wipe the message; the traceback is logged."""
+    monkeypatch.setenv("OTHER_TOKEN", "abc")
+    (study_dir / "plugin.py").write_text("import needed_library\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    log = study_dir / "out" / "logs" / "harness-errors.log"
+    assert "failed on import (ModuleNotFoundError: No module named 'needed_library')" in str(caught.value)
+    assert str(caught.value).endswith(f"; its traceback, redacted, is in {log}")
+    text = log.read_text(encoding="utf-8")
+    assert "importing plugin.py: ModuleNotFoundError" in text
+    assert "Traceback (most recent call last)" in text
 
 
 STUB_PLUGIN = """\

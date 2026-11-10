@@ -10,9 +10,10 @@ directory with `/` between its parts: `*` and `?` match within one part, `**` ma
 pattern that names a directory takes every file below it. A pattern that selects nothing is refused, because a list
 that names nothing would pass for any package (K01), and so is a pattern that is absolute or climbs out with `..`.
 
-Never selected, whatever the patterns say: version-control and cache directories, compiled Python, and the live
+Never selected, whatever the patterns say: version-control and cache directories, compiled Python, the live
 campaign under out/ (the store, its lock and its leases), since the package's analysis reads the snapshot of the store
-that the replay check keeps in the batch. A selected symbolic link is refused, since it could point out of the study.
+that the replay check keeps in the batch, and the campaign's local logs (`out/logs`, the harness defects' tracebacks),
+which stay on the author's machine. A selected symbolic link is refused, since it could point out of the study.
 The names the build writes at the package root (`GENERATED`) cannot be selected, nor can the other names GNU Make
 reads there (`GNUmakefile`, `makefile`), which would take the place of the generated Makefile; the generated
 instructions run `make -f Makefile check` as well. Nor can anything under `wheels/`, where the build puts the wheels
@@ -46,6 +47,7 @@ RESERVED = (*GENERATED, "GNUmakefile", "makefile")  # GNU Make reads GNUmakefile
 SKIPPED_PARTS = frozenset({".git", "__pycache__", ".venv", "venv", ".pytest_cache", ".ruff_cache", ".mypy_cache"})
 SKIPPED_SUFFIXES = frozenset({".pyc", ".pyo"})
 LIVE_CAMPAIGN = ("out/state.sqlite", "out/campaign.lock", "out/leases")
+LOCAL_ONLY = ("out/logs",)  # the campaign's local logs (`campaign.defect_log`): never committed, never packaged
 WHEELS_DIR = "wheels"  # the build fills it with the wheels of the environment (`package.wheels`)
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 
@@ -150,9 +152,12 @@ def pattern_regex(pattern: str) -> re.Pattern[str]:
 
 
 def never_selected(rel: str) -> bool:
-    """Tell whether a path is left out whatever the patterns say: caches, version control, the live campaign."""
+    """Tell whether a path is left out whatever the patterns say: caches, version control, the live campaign, the
+    local logs."""
     parts = rel.split("/")
     if SKIPPED_PARTS.intersection(parts) or os.path.splitext(rel)[1] in SKIPPED_SUFFIXES:
+        return True
+    if any(rel == local or rel.startswith(local + "/") for local in LOCAL_ONLY):
         return True
     return any(rel == live or rel.startswith(live + "-") or rel.startswith(live + "/") for live in LIVE_CAMPAIGN)
 

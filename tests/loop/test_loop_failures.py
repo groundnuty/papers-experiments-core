@@ -1,11 +1,15 @@
 """How failures end an attempt: infrastructure (B02, C02), slow requests (B03), defects (L08), own errors."""
 
+import asyncio
+
 import pytest
 from loop_support import FakeProvider, ScriptedBackend, call, turn
 
 from expcore import errors
 from expcore.errors import CORE_KINDS, ContextOverflow, InfraError, RequestAbandoned, register_infra_kind
+from expcore.loop.agent_loop import run_agent
 from expcore.loop.outcomes import harness_defect_of
+from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import StubAdapter
 from expcore.plugin import ToolOutput
 
@@ -185,3 +189,22 @@ def test_an_infrastructure_ending_after_a_tool_error_keeps_both_the_calls_and_th
     result = run(backend, [FakeProvider(ECHO)])
     assert result.outcome.infra_kind == "endpoint"
     assert [t.status for t in result.tool_calls] == ["ok"]
+
+
+def test_l08_a_defect_sink_that_raises_costs_neither_the_result_nor_the_defect(make_config, clock):
+    """L08: the loop guards its `on_defect` hook: what the hook raises is carried on the result, for the caller to
+    report once the record is kept, and the attempt still ends as the harness defect it was."""
+    seen = []
+
+    def sink(error, defect):
+        seen.append(defect)
+        raise OSError("the sink's disk is full")
+
+    config = make_config()
+    box = ToolBox([FakeProvider(ECHO)], cap_chars=config.limits.output_cap_chars)
+    result = asyncio.run(
+        run_agent(StubAdapter([LookupError("odd")]), box, "s", "t", config, clock=clock, on_defect=sink)
+    )
+    assert result.outcome.name == "harness_defect"
+    assert seen == [result.outcome.defect]
+    assert isinstance(result.sink_failure, OSError)

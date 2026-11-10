@@ -200,17 +200,26 @@ def _check(path: Path, params: StdioServerParameters, timeout_s: float) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the command line; return 0 on success, 1 on a mismatch, 2 on an error."""
-    parser = argparse.ArgumentParser(prog="python -m expcore.tools.manifest", description=__doc__)
+    """Run the command line; return 0 on success, 1 on a mismatch, 2 on an error.
+
+    Everything after the first `--` is the server's command, passed as it is; the options before it may come before or
+    after the action and the file, as the usage shows.
+    """
+    words = list(sys.argv[1:] if argv is None else argv)
+    ours, command = (words[: words.index("--")], words[words.index("--") + 1 :]) if "--" in words else (words, [])
+    parser = argparse.ArgumentParser(
+        prog="python -m expcore.tools.manifest",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage="%(prog)s {freeze,check} FILE [--pass-env NAME ...] [--timeout S] -- COMMAND [ARG ...]",
+    )
     parser.add_argument("action", choices=["freeze", "check"])
     parser.add_argument("file", type=Path)
     parser.add_argument(
         "--pass-env", action="append", default=[], metavar="NAME", help="copy this variable to the server"
     )
-    parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARG ...]")
-    args = parser.parse_args(argv)
-    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    parser.add_argument("--timeout", type=float, default=120.0, metavar="S", help="seconds to wait for the server")
+    args = parser.parse_args(ours)
     if not command:
         print("error: give the server command after --", file=sys.stderr)
         return 2

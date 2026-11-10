@@ -8,7 +8,8 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 - `run_study` opens or resumes the campaign and runs the scheduler. Its code identity is computed once, from the study
   directory and the scope study.toml names, and every record carries it. Its environment (the distributions the
   study's code imports, `provenance.environment`) goes into the campaign fingerprint, so a resume under another one
-  is refused (C06).
+  is refused (C06). Each hold is said on stderr once, as it begins, changes or ends, with when dispatch resumes, so a
+  run waiting out a pause is not silent.
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
@@ -71,6 +72,7 @@ from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
+    OUT_DIR,
     StudyConfig,
     StudyIdentity,
     find_study_root,
@@ -82,7 +84,6 @@ from expcore.study.factory_version import check_factory_version
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.verified import UNCOVERED, Unverified, load_verified
 
-OUT_DIR = "out"
 RUNS_DIR = "runs"
 MARKER_PATTERN = "*attempt-marker.json"
 HASHED_ONLY = (MARKER_PATTERN, SNAPSHOT_FILE)  # the campaign's own bookkeeping in a batch: hashed, never replayed
@@ -95,7 +96,7 @@ SNAPSHOT_KEY = "snapshot"  # the key of the check that says what its snapshot of
 
 
 class Refused(RuntimeError):
-    """A command refused to go on; the message says why and what to do."""
+    """A command refused to go on; the message says why and what to do, and the command line names the command."""
 
 
 @dataclass(frozen=True)
@@ -205,9 +206,15 @@ def _run_campaign(
         leases=leases,
         lease_group=plugin.lease_group,
         backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
+        on_hold=_say_hold,
         **options,
     ) as scheduler:
         return scheduler.run()
+
+
+def _say_hold(line: str) -> None:
+    """Say a hold of the campaign as it begins, changes or ends, on stderr."""
+    print(f"run: {line}", file=sys.stderr)
 
 
 def check_batch(
@@ -392,15 +399,12 @@ def _analyse_loaded(
         )
         verified = load_verified(batch, check, study.schema, partial=partial)
     except (BatchNotVerified, Unverified) as error:
-        raise Refused(f"refusing to analyse: {error}") from None
+        raise Refused(str(error)) from None
     rows = verified.snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
     changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])
     if changed:
         verified.snapshot.close()
-        raise Refused(
-            "refusing to analyse: the replay check ran under another environment than the campaign's:\n  "
-            + "\n  ".join(changed)
-        )
+        raise Refused("the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed))
     plugin = load_plugin(StudyContext(study, code))
     try:
         export = export_run_state(verified.snapshot, excluded=dict.fromkeys(verified.excluded, UNCOVERED))
@@ -410,7 +414,7 @@ def _analyse_loaded(
     for entry in export["analysed_attempts"]:
         record = verified.record_for(entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
         if record is None:  # load_verified guarantees one for every attempt it did not exclude
-            raise Refused(f"refusing to analyse: no verified record for {entry['run_key']}")
+            raise Refused(f"no verified record for {entry['run_key']}")
         scored = rescore(record, plugin.scorers)
         scores[entry["run_key"]] = scored.scores
         task = study.tasks[str(entry["factors"]["task"])]
@@ -418,7 +422,7 @@ def _analyse_loaded(
     try:
         result = analyse(rows, study.prereg, _absent_runs(export))
     except TreatmentOutcomesRefused as error:
-        raise Refused(f"refusing to analyse: {error}") from None
+        raise Refused(str(error)) from None
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)
 
