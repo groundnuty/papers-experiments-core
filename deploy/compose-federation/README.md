@@ -168,7 +168,8 @@ are not run against it here.
 measure (`<date>-federation-facts.md`): releases, live test results, the fault test, what listens on the host, the
 commands' timings and what is unknown. A new facts file starts from `day0/federation-facts.template.md`: its
 deployment table is what `describe` prints (the layout, the root's parent, each service's memory limit), and its
-memory table holds each service's peak as `memory` and down read it.
+memory table holds each service's peak as `memory` and down read it. A later run on the same date adds its own facts
+file, named by what it measured again (`<date>-federation-facts-<what>.md`), and leaves the earlier one as it was.
 
 Two scripts measure what the facts file records. `measure_partial_file.py` measures how a file at its final size with
 only a prefix written reads back through each provider. `measure_transfer_shapes.py` records, as field names and types
