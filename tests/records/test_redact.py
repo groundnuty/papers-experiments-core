@@ -259,6 +259,31 @@ def test_redact_text_replaces_the_secret_in_every_form():
     assert json.dumps(secret)[1:-1] not in text
 
 
+QUOTED = "quartz'pebble\"7781-amber"  # both quote kinds: Python's repr escapes one of them
+
+
+def test_R12_a_secret_in_python_repr_form_is_redacted_from_a_record(tmp_path):
+    """R12: an exception's text shows a secret as Python's repr does (`KeyError(secret)`), which escapes a quote when
+    the secret holds both kinds, so neither the raw form nor a JSON form matches it."""
+    shown = str(KeyError(QUOTED))
+    assert QUOTED not in shown  # the repr escaped a quote
+    base = hand_made()
+    record = hand_made(totals={**base.totals, "final_text": f"failed: {shown}"})
+    with pytest.warns(RuntimeWarning, match="redacted secrets"):
+        written = record.write(tmp_path, environ={"TOYLAB_TOKEN": QUOTED}).read_text(encoding="utf-8")
+    final = RunRecord.from_json(decode(written)).totals["final_text"]
+    assert final == "failed: '[redacted]'"
+    assert "pebble" not in written
+
+
+def test_R12_a_secret_in_the_repr_of_its_bytes_is_redacted_too():
+    """R12: `str(ValueError(secret.encode()))` shows the bytes' repr, which escapes the non-ASCII characters."""
+    secret = "café-quartz-7781"
+    text, count = redact_text(f"bad header {secret.encode()!r} and {secret!r}", {"TOYLAB_TOKEN": secret})
+    assert count == 1
+    assert "quartz" not in text
+
+
 def test_a_redactor_of_nothing_changes_nothing_even_a_key_that_names_a_secret():
     data = {"token": "kept", "text": KEY}
     assert Redactor.none().structure(data) == (data, [])

@@ -30,8 +30,10 @@ A value under 4 characters would match ordinary text, so it is refused instead, 
 variable and never shows the value. A number whose string form is a secret is replaced too.
 
 A secret is redacted in its raw form, in its JSON-escaped forms up to three levels of escaping (text inside a JSON
-string inside a JSON string), and percent-encoded, since a native message carries text in JSON strings and a URL
-carries it percent-encoded. A secret that was replaced is gone: neither the text nor a decoding of it holds the value.
+string inside a JSON string), percent-encoded, and as Python's repr shows it and the repr of its UTF-8 bytes, since a
+native message carries text in JSON strings, a URL carries it percent-encoded, and an exception's text often holds a
+repr (`KeyError(secret)` escapes a quote when the secret holds both kinds). A secret that was replaced is gone:
+neither the text nor a decoding of it holds the value.
 
 Redaction records the paths of what it changed, never values. It is a fixed point: redacting a redacted structure
 changes nothing. A number that is replaced becomes a string, so a record whose redaction would break a field that must
@@ -123,13 +125,15 @@ def secret_values(
 
 
 def forms_of(value: str) -> set[str]:
-    """Return the ways a secret can appear in text: raw, JSON-escaped up to three levels, and percent-encoded."""
+    """Return the ways a secret can appear in text: raw, JSON-escaped up to three levels, percent-encoded, and inside
+    Python's repr of it and of its UTF-8 bytes (the quotes around a repr are not part of the form)."""
     forms = {value}
     level = {value}
     for _ in range(ESCAPING_LEVELS):
         level = {json.dumps(v)[1:-1] for v in level} | {json.dumps(v, ensure_ascii=False)[1:-1] for v in level}
         forms |= level
-    return forms | {quote(value, safe=""), quote_plus(value)}
+    python = {repr(value)[1:-1], repr(value.encode("utf-8", "surrogatepass"))[2:-1]}
+    return forms | python | {quote(value, safe=""), quote_plus(value)}
 
 
 def is_secret_key(key: str) -> bool:

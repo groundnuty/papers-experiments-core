@@ -111,3 +111,18 @@ class _Plain:
 
     def text(self, value):
         return value
+
+
+def test_r12_a_secret_with_both_quote_kinds_is_redacted_from_the_log_in_its_repr_form(tmp_path, monkeypatch):
+    """R12: `KeyError(secret)` puts the secret's repr in the traceback, a quote escaped; the log redacts that too."""
+    quoted = "quartz'pebble\"7781-amber"
+    monkeypatch.setenv("TOYLAB_TOKEN", quoted)
+    crashed = key_of(SCHEMA, "mount-read")
+
+    async def lookup(request):
+        raise KeyError(quoted)
+
+    with build(tmp_path, executor=FakeExecutor({crashed: [lookup]}), plan=SMALL) as scheduler:
+        log = scheduler.run().harness_log.read_text(encoding="utf-8")
+    assert "KeyError: '[redacted]'" in log
+    assert "pebble" not in log
