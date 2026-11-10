@@ -286,7 +286,9 @@ assert counts == Counter()  # the example study runs without the platform
 
 ## 6. What a conclusion may say
 
-Every contrast ends in one of four words, `difference`, `trivial_difference`, `equivalent` or `not_detected`, and never in "no difference". Only `equivalent` may be read as no difference, and only a contrast with an `equivalence_margin` in the preregistration can reach it: the interval at 1 - 2 alpha lies inside plus or minus the margin and the test is not significant. `not_detected` is the absence of evidence, never evidence of absence; without a margin, it is the most a non-significant result can say.
+Every contrast ends in one of five words, `difference`, `trivial_difference`, `equivalent`, `not_detected` or `untestable`, and never in "no difference". Only `equivalent` may be read as no difference, and only a contrast with an `equivalence_margin` in the preregistration can reach it: the interval at 1 - 2 alpha lies inside plus or minus the margin and the test is not significant. `not_detected` is the absence of evidence, never evidence of absence; without a margin, it is the most a non-significant result can say.
+
+`untestable` means the contrast used no pair, whatever the cause: every partner run exhausted or unfinished, or scored `None` on an ordinary run. Nothing was tested, so it is not evidence of anything, least of all of no effect, and it has no estimate, p-value or minimum detectable effect. Its row in the report gives the causes of its missing pairs with their counts. In the Holm family it stays a member as p = 1, so the family keeps its size and the other members are adjusted as if it were there; it never rejects. An exploratory contrast can be untestable too.
 
 A contrast outside the preregistered Holm family is exploratory. It is judged by its raw p-value, nothing controls its multiplicity, and every table and report shows it apart, labelled exploratory, never as confirmatory. Only the Holm family carries the study's confirmatory claims.
 
@@ -295,10 +297,11 @@ A contrast that declares `treatment_outcomes = "excluded"` compares its arms wit
 ```python
 from expcore.stats.analysis import CONCLUSIONS, conclude
 
-assert CONCLUSIONS == ("difference", "trivial_difference", "equivalent", "not_detected")
+assert CONCLUSIONS == ("difference", "trivial_difference", "equivalent", "not_detected", "untestable")
 assert conclude(significant=False, equivalent=True) == "equivalent"  # needs a margin: without one, equivalent is False
 assert conclude(significant=False, equivalent=False) == "not_detected"
 assert conclude(significant=True, equivalent=True) == "trivial_difference"
+assert conclude(significant=False, equivalent=False, untestable=True) == "untestable"  # no pair: nothing was tested
 
 analysis = json.loads(Path("my-study/out/analysis.json").read_text())
 labels = {c["name"]: (c["exploratory"], c["equivalence_margin"]) for c in analysis["contrasts"]}

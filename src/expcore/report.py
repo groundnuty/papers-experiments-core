@@ -10,8 +10,10 @@ are the same text: no clock, no path and no random number enters it.
   Holm decisions is refused, so no table or summary line can show an exploratory contrast as confirmatory.
 - A conclusion is never shown without its significance. Each row carries the raw p-value and the Holm-adjusted one
   (or the word "exploratory") beside the conclusion, and the conclusion words already encode the decision:
-  `difference`, `trivial_difference`, `equivalent`, `not_detected`. Failing to detect a difference is not a finding of
-  none, and the report says so under the table.
+  `difference`, `trivial_difference`, `equivalent`, `not_detected`, `untestable`. Failing to detect a difference is
+  not a finding of none, and the report says so under the table. An `untestable` contrast used no pair: its row gives
+  the causes of its missing pairs with their counts in place of a number of pairs, and a result whose word disagrees
+  with its pairs is refused (S11).
 - Each contrast's row gives the pairs it used and how its treatment attempts entered it: declared "scored", declared
   "excluded" with the pairs that left out, or the pairs lost to a treatment attempt scored None. An excluded outage
   must not read as the absence of an outage effect (S10). A table of its own gives every contrast's missing pairs by
@@ -34,7 +36,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore.accounting import condition_accounting
-from expcore.stats.analysis import CONCLUSIONS, AnalysisResult, ContrastResult
+from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
 from expcore.stats.pairing import MISSING_CAUSES
 
 EXPLORATORY = "exploratory"
@@ -133,7 +135,7 @@ def _contrast_table(
             EXPLORATORY if exploratory else _p(adjusted[r.name]),
             conclusion,
             f"{r.n_clusters} (dropped {r.n_clusters_dropped})",
-            r.n_pairs,
+            _pairs_used(r),
             _treatment(r),
             ", ".join(r.tasks_dropped) or "none",
         ]
@@ -141,10 +143,32 @@ def _contrast_table(
     return _table(header, rows)
 
 
+def _pairs_used(result: ContrastResult) -> str:
+    """The pairs used; for an untestable contrast, why there are none, by cause with the pairs tables' counts."""
+    if result.conclusion != UNTESTABLE:
+        return str(result.n_pairs)
+    causes = [
+        f"{CAUSE_HEADINGS[cause][0].lower()}{CAUSE_HEADINGS[cause][1:]} {result.pairs_missing[cause]}"
+        for cause in MISSING_CAUSES
+        if result.pairs_missing[cause]
+    ]
+    return f"0 (missing: {', '.join(causes)})" if causes else "0 (no pair planned)"
+
+
+def _check_conclusion(result: ContrastResult) -> None:
+    """Refuse a word outside the vocabulary, or one that disagrees with the pairs: untestable exactly when none."""
+    if result.conclusion not in CONCLUSIONS:
+        raise ValueError(f"contrast {result.name!r} has conclusion {result.conclusion!r}, not one of {CONCLUSIONS}")
+    if (result.conclusion == UNTESTABLE) != (result.n_pairs == 0):
+        raise ValueError(
+            f"contrast {result.name!r}: conclusion {result.conclusion!r} with {result.n_pairs} pair(s) used; a "
+            "contrast is untestable exactly when it used no pair"
+        )
+
+
 def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
     for r in result.contrasts:
-        if r.conclusion not in CONCLUSIONS:
-            raise ValueError(f"contrast {r.name!r} has conclusion {r.conclusion!r}, not one of {CONCLUSIONS}")
+        _check_conclusion(r)
     adjusted = {d.name: d.p_holm for d in result.holm}
     family = [r for r in result.contrasts if not _exploratory(r, adjusted)]
     exploratory = [r for r in result.contrasts if _exploratory(r, adjusted)]
@@ -155,10 +179,13 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         "",
         "Conclusions: `difference` (significant), `trivial_difference` (significant, but inside the equivalence",
         "margin), `equivalent` (inside the margin, not significant), `not_detected` (anything else; failing to",
-        "detect a difference is not evidence that there is none).",
+        "detect a difference is not evidence that there is none), `untestable` (no usable pair, so nothing was",
+        "tested and the contrast is not evidence of anything, least of all of no effect; in the Holm family it",
+        "counts as p = 1).",
         "",
         "Pairs used: pairs with the outcome on both sides; each missing pair is counted by its cause in the pairs",
-        'table of its section ("Missing pairs by cause" says what each cause counts).',
+        'table of its section ("Missing pairs by cause" says what each cause counts). For an untestable contrast',
+        "the cell gives those causes with their counts.",
         "",
         "Treatment attempts: how the contrast's treatment attempts (runs that ended in an infrastructure failure their",
         "condition declares as its treatment) entered it. `scored`: the preregistration says the scorer returns values",
@@ -171,7 +198,8 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         lines += [
             "",
             "Min. detectable effect: the smallest effect this contrast's number of clusters could detect with the",
-            "preregistered power; n/a when it cannot be found (no spread between clusters, or too few clusters).",
+            "preregistered power; n/a when it cannot be found (no spread between clusters, or too few clusters);",
+            "`-` for an untestable contrast, which has none.",
         ]
     if family:
         lines += ["", *_pairs(family, "### Pairs of the family's contrasts")]
@@ -287,10 +315,12 @@ _COUNT_DEFINITIONS = [
 def summary_lines(result: AnalysisResult) -> list[str]:
     """One line per contrast for a terminal: the estimate, the raw p-value, the Holm-adjusted one (or the word
     exploratory) and the conclusion word, which is labelled exploratory too outside the family. A conclusion is never
-    printed without the basis it rests on."""
+    printed without the basis it rests on, and `untestable` is never printed for a contrast that used a pair, or
+    any other word for one that used none."""
     adjusted = {d.name: d.p_holm for d in result.holm}
     lines = []
     for r in result.contrasts:
+        _check_conclusion(r)
         member = not _exploratory(r, adjusted)
         holm = _p(adjusted[r.name]) if member else EXPLORATORY
         word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"

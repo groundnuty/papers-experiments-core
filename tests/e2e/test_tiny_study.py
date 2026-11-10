@@ -373,6 +373,45 @@ def test_c23_an_exhausted_run_is_counted_under_its_condition_and_as_the_cause_of
     ]
 
 
+EVERY_EXTENDED_RUN_FAILS = "".join(
+    f'    ("extended", "{task}"): "infrastructure",\n' for task in ("lake", "river", "hill")
+)
+
+
+def test_s11_a_contrast_whose_partners_are_all_exhausted_is_untestable_in_the_json_the_report_and_the_summary(
+    tmp_path, clean_environment, capsys
+):
+    """S11: through the command line: when every run of one arm exhausts its attempts, the confirmatory contrast and
+    the exploratory one that need it conclude untestable, never not_detected, with no p-value and no minimum
+    detectable effect; the other member's Holm adjustment counts it as p = 1."""
+    campaign = Campaign(make_copy(tmp_path, "study"))
+    edit_once(campaign.root / "plugin.py", "SPECIAL = {\n", "SPECIAL = {\n" + EVERY_EXTENDED_RUN_FAILS)
+    write_stamp(campaign.root, HEAD, load_study(campaign.root).scope)
+    campaign.codes["run"], _ = cli(clean_environment, "run", str(campaign.root))
+    finish(clean_environment, campaign)
+    assert campaign.codes == {"run": 0, "check": 0, "analyze": 0, "report": 0}
+    analysis = campaign.read("analysis.json")
+    contrasts = {c["name"]: c for c in analysis["contrasts"]}
+    for name in ("extended-vs-baseline", "tools-effect-on-rounds"):
+        empty = contrasts[name]
+        assert (empty["conclusion"], empty["n_pairs"], empty["significant"]) == ("untestable", 0, False)
+        assert (empty["p_value"], empty["minimum_detectable_effect"]) == (None, None)  # NaN is written as null
+        assert empty["pairs_missing"]["exhausted"] == 6
+    decisions = {d["name"]: d for d in analysis["holm"]}
+    assert (decisions["extended-vs-baseline"]["p_holm"], decisions["extended-vs-baseline"]["reject"]) == (None, False)
+    relay = contrasts["relay-vs-baseline"]["p_value"]
+    assert decisions["relay-vs-baseline"]["p_holm"] == pytest.approx(min(1.0, 2 * relay))  # m = 2, the other is p = 1
+    row = table(campaign.report, "## Preregistered contrasts")["extended-vs-baseline"]
+    assert (row[7], row[9]) == ("untestable", "0 (missing: exhausted run 6, unpaired or left out 2)")
+    exploratory = table(campaign.report, "## Exploratory contrasts")["tools-effect-on-rounds"]
+    assert exploratory[7] == "untestable (exploratory)"
+    capsys.readouterr()
+    assert main(["analyze", str(campaign.root)]) == 0
+    summary = {line.split(":")[0]: line for line in capsys.readouterr().out.splitlines() if "estimate" in line}
+    assert summary["extended-vs-baseline"].endswith(", Holm p n/a, untestable")
+    assert summary["tools-effect-on-rounds"].endswith(", untestable (exploratory)")
+
+
 def test_the_contrast_that_left_a_task_out_names_it(resumed):
     row = table(resumed.report, "## Preregistered contrasts")["extended-vs-baseline"]
     assert "dune" in row  # the subset condition did not run it

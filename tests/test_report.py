@@ -99,11 +99,66 @@ def table_of(report: str, heading: str) -> dict[str, list[str]]:
     return rows
 
 
-@pytest.mark.parametrize("conclusion", CONCLUSIONS)
+@pytest.mark.parametrize("conclusion", [word for word in CONCLUSIONS if word != "untestable"])  # S11 tests its own
 def test_each_conclusion_word_is_shown_in_the_row_of_its_contrast_beside_the_raw_and_the_holm_p_value(conclusion):
     report = render(analysis(contrast("primary", conclusion)))
     cells = row(report, "primary")
     assert cells[5:8] == ["0.0120", "0.0200", conclusion]  # p, Holm p, conclusion: never apart
+
+
+NO_PAIR = {
+    "treatment_outcome_none": 0,
+    "treatment_excluded": 0,
+    "exhausted": 2,
+    "unpaired_or_left_out": 1,
+    "outcome_none": 0,
+}
+
+
+def untestable(name: str, conclusion: str = "untestable", **changes) -> ContrastResult:
+    """A contrast with no usable pair as the kernel gives one: no estimate, no p-value, no minimum detectable effect."""
+    nothing = {"estimate": math.nan, "p_value": math.nan, "ci_low": math.nan, "ci_high": math.nan, "n_clusters": 0}
+    gone = {"n_clusters_dropped": 0, "n_pairs": 0, "n_pairs_missing": 0, "n_unpaired": 1, "pairs_missing": NO_PAIR}
+    return contrast(name, conclusion, **{**nothing, **gone, **changes})
+
+
+def untestable_analysis() -> AnalysisResult:
+    """A tested member, an untestable member (Holm leaves its adjusted p NaN) and an untestable exploratory contrast."""
+    results = (
+        contrast("tested", "difference", minimum_detectable_effect=0.31),
+        untestable("dry"),
+        untestable("dry-extra", in_family=False, exploratory=True),
+    )
+    holm = (HolmDecision("tested", 0.012, 0.024, 0.025, True), HolmDecision("dry", math.nan, math.nan, 0.05, False))
+    return AnalysisResult(results, holm, 0.05, dict(MANIFEST))
+
+
+def test_s11_an_untestable_contrast_shows_the_causes_of_its_missing_pairs_in_its_own_row():
+    """S11: the row says why nothing was tested, with the counts of the pairs table; p, Holm p and the minimum
+    detectable effect are not numbers, and the word is labelled exploratory outside the family."""
+    report = render(untestable_analysis())
+    cells = row(report, "dry")
+    assert cells[3] == "n/a"
+    assert cells[5:8] == ["n/a", "n/a", "untestable"]
+    assert cells[9] == "0 (missing: exhausted run 2, unpaired or left out 1)"
+    assert cells[12] == "-"  # no minimum detectable effect, though the column is shown for the tested contrast
+    extra = row(report, "dry-extra")
+    assert (extra[6], extra[7]) == ("exploratory", "untestable (exploratory)")
+    assert table_of(report, "### Pairs of the family's contrasts")["dry"][1:] == ["0", "0", "0", "2", "1", "0"]
+    assert "`untestable` (no usable pair" in report
+
+
+@pytest.mark.parametrize(
+    "result",
+    [contrast("tested-as-untestable", "untestable"), untestable("empty-as-tested", conclusion="not_detected")],
+    ids=["pairs-but-untestable", "no-pair-but-not-detected"],
+)
+def test_s11_a_result_whose_conclusion_disagrees_with_its_pairs_is_refused(result):
+    """S11: untestable exactly when no pair was used, so no table can show an empty contrast as tested."""
+    with pytest.raises(ValueError, match="untestable exactly when"):
+        render(analysis(result))
+    with pytest.raises(ValueError, match="untestable exactly when"):
+        summary_lines(analysis(result))
 
 
 def test_a_contrast_outside_the_family_is_exploratory_in_a_section_of_its_own_and_in_its_row():
