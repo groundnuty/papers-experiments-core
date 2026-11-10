@@ -16,7 +16,7 @@ The interfaces the plugin implements are described in [`docs/interfaces.md`](../
 
 ## Run it
 
-A study written by `uv run python -m expcore example my-study` and committed ([the study guide's section 1](../../docs/study-guide.md#1-start-a-study)) runs from the directory that holds `my-study`:
+A study written by `uv run python -m expcore example my-study` and committed, as [the study guide's section 1](../../docs/study-guide.md#1-start-a-study) sets it up, runs from the directory that holds `my-study`:
 
 ```
 uv run python -m expcore run my-study

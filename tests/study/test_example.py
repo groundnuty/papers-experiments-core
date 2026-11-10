@@ -56,6 +56,7 @@ def test_the_readme_written_out_points_at_the_installed_cores_docs_and_leads_wit
     # an editable install records no repository URL and no commit: the pages are named by path, at the version's tag
     assert f"`docs/interfaces.md` (in the core's repository, at tag v{version})" in readme
     assert f"section 8 (`docs/study-guide.md` in the core's repository, at tag v{version})" in readme
+    assert "))" not in readme  # no link sits inside parentheses, where its path would nest a second pair
     first_block = readme.split("```")[1]
     assert "uv run python -m expcore run my-study" in first_block
     assert "--allow-dirty" not in first_block
