@@ -316,3 +316,29 @@ def test_c02_a_kind_becomes_known_only_once_whether_it_is_treatable_is_already_w
     errors.register_infra_kind("ordering_probe_kind", "a kind registered by this test", treatable=False)
     assert seen == [True]
     assert errors.is_treatable("ordering_probe_kind") is False
+
+
+def test_c02_a_reader_waits_for_a_change_to_the_vocabulary_under_way_and_reads_it_whole():
+    """C02: the platforms' kinds, their treatability and the study kinds in scope are read together under the lock
+    that changes them, so a reader never mixes two moments: it waits while a change is under way."""
+    held, release = threading.Event(), threading.Event()
+    answers: list[tuple[str, ...]] = []
+
+    def change_under_way() -> None:
+        with errors._scope_lock:
+            held.set()
+            release.wait(5)
+
+    writer = threading.Thread(target=change_under_way)
+    writer.start()
+    held.wait(5)
+    reader = threading.Thread(target=lambda: answers.append(errors.infra_kinds()))
+    reader.start()
+    reader.join(0.2)
+    waiting = reader.is_alive()
+    release.set()
+    reader.join(5)
+    writer.join(5)
+    assert waiting  # the reader did not read while the change was under way
+    assert answers
+    assert set(errors.CORE_KINDS) <= set(answers[0])

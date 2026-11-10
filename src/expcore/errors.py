@@ -98,8 +98,8 @@ if hasattr(os, "register_at_fork"):  # every platform the core supports; absent 
     os.register_at_fork(
         before=_hold_lock_for_fork, after_in_parent=_release_lock_in_parent, after_in_child=_fresh_lock_in_child
     )
-_study_kinds: Mapping[str, _HeldKind] = {}  # the kinds in scope (`study_kinds`); replaced, never changed in place, so
-# a reader takes one consistent view without the lock
+_study_kinds: Mapping[str, _HeldKind] = {}  # the kinds in scope (`study_kinds`); replaced under the lock, never
+# changed in place; readers take every mapping together under the lock (`_view`)
 
 
 def _check_name(kind: str, description: str) -> None:
@@ -194,25 +194,49 @@ def register_infra_kind(kind: str, description: str, *, treatable: bool = True) 
             _platform_kinds[kind] = description
 
 
+class _View(NamedTuple):
+    """The vocabulary at one moment: the platforms' kinds, those of them that are untreatable, and the study kinds in
+    scope. Readers compute from one view, so they never mix two moments."""
+
+    platform: Mapping[str, str]
+    untreatable: Mapping[str, str]
+    study: Mapping[str, _HeldKind]
+
+    def kinds(self) -> tuple[str, ...]:
+        return (*CORE_KINDS, *self.platform, *self.study)
+
+    def untreatable_kinds(self) -> dict[str, str]:
+        return {
+            **CORE_UNTREATABLE,
+            **{k: why for k, why in self.untreatable.items() if k in self.platform},
+            **{k: held.kind.description for k, held in self.study.items() if not held.kind.treatable},
+        }
+
+
+def _view() -> _View:
+    """Take one view of the vocabulary under the lock: registration and scopes change it under the same lock."""
+    with _scope_lock:
+        return _View(dict(_platform_kinds), dict(_platform_untreatable), _study_kinds)
+
+
 def infra_kinds() -> tuple[str, ...]:
     """Return every kind in the vocabulary now: the core's, the registered ones in order, then the study's in scope."""
-    return (*CORE_KINDS, *_platform_kinds, *_study_kinds)
+    return _view().kinds()
 
 
 def untreatable_kinds() -> dict[str, str]:
     """Return every kind that cannot be a treatment now, with the reason each gives."""
-    return {
-        **CORE_UNTREATABLE,
-        **{k: why for k, why in _platform_untreatable.items() if k in _platform_kinds},
-        **{k: held.kind.description for k, held in _study_kinds.items() if not held.kind.treatable},
-    }
+    return _view().untreatable_kinds()
 
 
 def is_treatable(kind: str) -> bool:
-    """Tell whether a condition may declare the kind as its treatment; a kind outside the vocabulary is refused."""
-    if kind not in infra_kinds():
-        raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")
-    return kind not in untreatable_kinds()
+    """Tell whether a condition may declare the kind as its treatment; a kind outside the vocabulary is refused. Both
+    answers come from one view, so a kind cannot be known in one moment and its treatability read in another."""
+    view = _view()
+    known = view.kinds()
+    if kind not in known:
+        raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(known)}")
+    return kind not in view.untreatable_kinds()
 
 
 class RequestAbandoned(Exception):
@@ -241,9 +265,10 @@ class InfraError(RuntimeError):
     """An infrastructure failure of one of the registered kinds, with a short detail that never holds a secret."""
 
     def __init__(self, kind: str, detail: str):
-        if kind not in infra_kinds():
+        known = infra_kinds()  # one view, for the test and the message alike
+        if kind not in known:
             raise ValueError(
-                f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())} "
+                f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(known)} "
                 "(a platform adds its own with register_infra_kind)"
             )
         super().__init__(f"{kind}: {detail}")
