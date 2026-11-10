@@ -188,8 +188,15 @@ def test_l08_a_defect_the_loop_catches_reaches_the_log_with_the_records_stack_ha
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 @pytest.mark.parametrize(
     ("existing", "added"),
-    [("notes.txt\n", True), ("notes.txt", True), ("*.log\n", False), ("*\n!harness-errors.log\n", True)],
-    ids=["unrelated", "no-final-newline", "already-ignored", "negated"],
+    [
+        ("notes.txt\n", True),
+        ("notes.txt", True),
+        ("*.log\n", True),  # it would ignore the log, but nothing is read: the appended line settles it
+        ("!harness-errors.log\nnotes.txt\n", True),
+        (" harness-errors.log\n", True),  # a leading space is part of the pattern, which then names another file
+        ("notes.txt\n/harness-errors.log\n\n", False),  # the rule is already the last line
+    ],
+    ids=["unrelated", "no-final-newline", "star", "negated-earlier", "leading-space", "already-last"],
 )
 def test_l08_an_existing_gitignore_of_the_log_directory_is_kept_and_made_to_ignore_the_log(tmp_path, existing, added):
     """L08: the author's rules stay as they are; a rule for the log is appended only when they do not ignore it."""
