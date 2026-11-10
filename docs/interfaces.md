@@ -488,11 +488,61 @@ Implementer (the platform layer) guarantees:
 
 Not carried over from the earlier study: the gate's whole-file and merged-listing modes (that study's manipulated variables), the tracer and its checks, the capacity probes tied to two data layouts, and the replication branch of its fourth condition.
 
+## Estimator
+
+`expcore.stats.estimators`. A contrast names its estimator in `preregistration.toml` (`estimator = "..."`), with the estimator's parameters in `[estimators.<name>]`. The core registers one, `wilcoxon_cluster_bootstrap`.
+
+```python
+class Estimator(Protocol):
+    def __call__(self, paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult
+
+@dataclass(frozen=True)
+class PairedDifferences:
+    clusters: tuple[str, ...]  # the rows: the clusters with at least one paired cell, sorted
+    models: tuple[str, ...]    # the columns: the models with at least one paired cell, sorted
+    matrix: np.ndarray         # clusters x models, the mean difference A - B of each cell; NaN where it has no pair
+    cluster_differences: np.ndarray  # a property: per cluster, the equal-weight mean over its models with a cell
+
+@dataclass(frozen=True)
+class EstimatorSettings:
+    replicates: int            # [bootstrap] replicates
+    level: float               # the interval's level: [bootstrap] ci_level, or 1 - 2 alpha for the equivalence test
+    seed: tuple[int, ...]      # [bootstrap] seed and a digest of the contrast's name: the only entropy
+    params: Mapping[str, Any]  # [estimators.<name>] as preregistered
+
+@dataclass(frozen=True)
+class EstimatorResult:
+    estimate: float            # the effect A - B; NaN where it cannot be computed, as every float here
+    p_value: float             # two-sided
+    ci_low: float
+    ci_high: float
+    n_clusters: int
+    per_model: tuple[ModelEstimate, ...] = ()  # ModelEstimate(model, estimate, ci_low, ci_high, n_undefined_replicates)
+    counts: Mapping[str, int] = field(default_factory=dict)  # the estimator's own counts, such as zero_dropped
+
+def register(name: str, *, check_params=None, p_values=None)  # a decorator: @register("name") above the function
+```
+
+How pairs become the matrix's cells is in [the study guide's section 5](study-guide.md#how-pairs-become-a-contrasts-input).
+
+Core guarantees:
+- The matrix is read-only, and no row or column of it is all NaN; a contrast with no pair at all gets a `PairedDifferences` with no cluster.
+- `check_params(params)`, given at registration, is called when the preregistration is loaded, so a bad parameter is refused naming `[estimators.<name>]`; without one, any parameter is refused.
+- For a contrast with an `equivalence_margin` the analysis calls the estimator a second time with `level` at 1 - 2 alpha and the same seed. A NaN p-value counts as p = 1 in the Holm family.
+- `p_values`, given at registration, is used to simulate the minimum detectable effect with the contrast's own parameters (S06, S09). Without it the contrast's minimum detectable effect is NaN (`null` in `analysis.json`).
+
+Implementer must guarantee:
+- The estimator is a pure function of its arguments: called twice with equal settings, it returns equal results, whatever ran in between. NaN, never a guess, where it cannot compute a value.
+- `p_values(studies, params)` returns, for each row of a studies x clusters array of cluster differences, exactly the p-value the estimator reports for that row.
+- The name is lower-case letters, digits and underscores, registered once: a second registration of a name is refused.
+
+**Where a study's estimator is registered.** The preregistration is validated when the study is loaded, before its plugin is imported, so a name only the plugin registers is unknown at that point and the contrast is refused (`unknown estimator 'name'; registered: wilcoxon_cluster_bootstrap`). A study cannot register its estimator through its plugin. It registers it at the top level of a module that `[study] platforms` names, which the loader imports before it validates anything, as it does for a platform's infrastructure kinds. That module must be importable, so it is installed code, not a file of the study directory, which is not on the module search path: a distribution of the study's own, named in `[study] requires`, so it is part of the campaign's environment and the replication package vendors its wheel. Its version speaks for its code, so change the version when the estimator changes. Once registered, the estimator stays registered for the rest of the process.
+
 ## Other protocols the core defines
 
 | Protocol | Where | Signature |
 |---|---|---|
-| `Estimator` | `expcore.stats.estimators` | `__call__(self, paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult`; registered by name with `estimators.register`, named by a contrast in `preregistration.toml` |
+| `Estimator` | `expcore.stats.estimators` | `__call__(self, paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult`, [above](#estimator) |
 | `Recompute` | `expcore.replay.check` | `name: str`, `version: str`, `__call__(self, record: RunRecord) -> int`; recomputes a recorded decision offline and raises on a contradiction (R05) |
 
 ## Closed vocabularies
