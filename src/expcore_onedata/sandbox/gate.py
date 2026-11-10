@@ -602,6 +602,12 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
 
+    def send_response_only(self, code, message=None) -> None:
+        """A response's head begins, the final one after a `100 Continue` included: nothing is body until its headers
+        are all written (`end_headers`), so a head whose write fails is never counted as body bytes (O20)."""
+        self._w.mark = None
+        super().send_response_only(code, message)
+
     def send_header(self, keyword, value) -> None:
         super().send_header(keyword, value)
         if keyword.lower() == "content-length":

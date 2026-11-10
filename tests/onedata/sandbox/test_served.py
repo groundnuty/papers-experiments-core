@@ -327,3 +327,22 @@ def test_o20_a_request_line_after_the_teardown_mark_leaves_the_count_unknown():
     after = {"event": "request", "method": "GET", "body": "content", "body_bytes": 5, "conn": "1-2"}
     lines = log(*ANSWERS, after)  # ANSWERS ends with the teardown mark
     assert gatelog.served(lines, STOPPED)["unknown"] == [gatelog.GATE_TEARDOWN_UNCONFIRMED]
+
+
+def test_o20_a_final_head_after_a_100_continue_is_never_counted_as_body(monkeypatch):
+    """O20: a `100 Continue` ends its own head, which marks where a body would begin; the final response's head then
+    starts again from nothing, so a write of it that fails counts its header bytes as no body at all."""
+    from types import SimpleNamespace
+
+    from expcore_onedata.sandbox import gate
+
+    handler = object.__new__(gate.Handler)
+    handler._w = SimpleNamespace(mark=25, n=25, failed=0, total=None)  # the 100's head was written, 25 bytes
+    handler._conn, handler._last_logged = "1-1", 0
+    monkeypatch.setattr(gate.BaseHTTPRequestHandler, "send_response_only", lambda self, code, message=None: None)
+    handler.send_response_only(403)
+    handler._w.n, handler._w.failed = 37, 40  # 12 bytes of the 403's head went out, then the write failed
+    lines: list[dict] = []
+    monkeypatch.setattr(gate, "_log", lines.append)
+    handler._log({"event": "request", "conn_request": 1})
+    assert lines[0]["body_bytes"] == 0
