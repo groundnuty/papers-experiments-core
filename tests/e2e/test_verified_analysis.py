@@ -261,7 +261,8 @@ def test_r08_a_treatment_failure_left_out_is_counted_apart_and_not_as_scored(cop
     assert table_row(report, "### Infrastructure failures", "relay-down")[1:] == ["knowledge", "yes", "0", "1", "1"]
     (cell,) = [c for c in copy.read("export.json")["infrastructure_by_condition"] if c["kind"] == "knowledge"]
     assert (cell["treatment"], cell["excluded"]) == (1, 1)
-    assert table_row(report, "## Conditions", "relay-down")[1:3] == ["7", "1"]  # analysed, left out
+    planned, analysed, exhausted, unfinished, left_out = table_row(report, "## Conditions", "relay-down")[1:6]
+    assert (planned, analysed, exhausted, unfinished, left_out) == ("8", "7", "0", "0", "1")
 
 
 def test_r08_a_record_that_belongs_to_no_attempt_of_the_snapshot_is_refused(copy, clean_environment):

@@ -108,29 +108,39 @@ def script_for(condition: str, task: str, model: str, tools: str) -> list[Any]:
 
 
 class TinyScorer:
-    """A pure function of a record: two axes, a verdict and named numeric outcomes (a missing one is None)."""
+    """A pure function of a record: two axes, a verdict and named numeric outcomes (a missing one is None).
+
+    A treatment attempt (under `relay-down`, the tool server failed after the agent's first turn) is scored like any
+    other run: the failure is the condition's manipulation, so what the agent achieved under it is the measurement.
+    It gave no answer, so its accuracy is 0, and its rounds and lookups are what it did before the failure. None means
+    only that an outcome could not be measured: it would drop the run's pair from every contrast on that outcome, and a
+    confirmatory contrast is refused for that, even one that declares `treatment_outcomes = "scored"`, past the number
+    its preregistration allows in `max_unscored_treatment`.
+    """
 
     name = "tiny"
     version = "1"
 
     def score(self, record: RunRecord) -> dict[str, Any]:
         calls = record.tool_calls
-        outcome = record.outcome["name"]
+        outcome = record.outcome
         looked = [c for c in calls if c["name"] == "lookup"]
-        served = bool(looked) and all(c["status"] == "ok" for c in looked)
-        if outcome == "infrastructure":  # the platform failed under the run: nothing the agent did can be judged
+        if outcome["name"] == "infrastructure" and not outcome["treatment"]:
+            # A failure that is not the condition's treatment is set aside and run again, and the core never scores
+            # it; were it scored, nothing the agent did could be judged, so every outcome is unmeasured.
             return {
                 "axes": {"agent": "no_answer", "platform": "failed"},
                 "verdict": "not_determined",
                 "outcomes": {"accuracy": None, "rounds": None, "lookups": None},
             }
+        failed = outcome["name"] == "infrastructure" or not (looked and all(c["status"] == "ok" for c in looked))
         submitted = [c for c in calls if c["name"] == "submit" and c["status"] == "ok"]
         correct = bool(submitted) and submitted[-1]["arguments"].get("answer") == FACTS[record.factors["task"]]
         return {
-            "axes": {"agent": "answered" if submitted else "no_answer", "platform": "served" if served else "failed"},
+            "axes": {"agent": "answered" if submitted else "no_answer", "platform": "failed" if failed else "served"},
             "verdict": "fulfilled" if correct else "violated",
             "outcomes": {
-                "accuracy": 1.0 if correct else 0.0,
+                "accuracy": 1.0 if correct else 0.0,  # a treatment attempt gave no answer: 0, never None
                 "rounds": float(record.totals["rounds"]),
                 "lookups": float(len(looked)),
             },

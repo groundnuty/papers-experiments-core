@@ -183,9 +183,24 @@ uv run python -m expcore analyze my-study
 uv run python -m expcore report my-study
 ```
 
-`analyze` scores every record anew, from the record alone, with the scorers the plugin returns, and writes `export.json`, `scores.json` and `analysis.json` under `my-study/out/`. Nothing reads an earlier score back, so `analyze` is also how a study is re-scored after a scorer changes: the scorer is code, so run `check` again first. `report` writes `report.md`: every contrast with its estimate, interval, raw and Holm-adjusted p-value and conclusion, the infrastructure failures by condition, the preregistration hash, the code identity, the core version and each scorer's version.
+`analyze` scores every record anew, from the record alone, with the scorers the plugin returns, and writes `export.json`, `scores.json` and `analysis.json` under `my-study/out/`. Nothing reads an earlier score back, so `analyze` is also how a study is re-scored after a scorer changes: the scorer is code, so run `check` again first. `report` writes `report.md`: every contrast with its estimate, interval, raw and Holm-adjusted p-value and conclusion, the pairs it used and the pairs it is missing by cause, each condition's planned runs and how they ended, the infrastructure failures by condition (every condition, zeros included), the preregistration hash, the code identity, the core version and each scorer's version. `analysis.json` carries the same counts.
 
-The infrastructure failure the example declares as treatment comes after the model's first turn, so it is an analysed attempt, marked as treatment with its kind, and it is scored. A scorer is a pure function of the record: no model, no platform, no clock. It returns named numeric outcomes, and an outcome it could not compute is `None`, never 0; a `not_determined` verdict leaves every outcome that depends on the unobserved state `None`. Here is one applied to the treatment attempt:
+The infrastructure failure the example declares as treatment comes after the model's first turn, so it is an analysed attempt, marked as treatment with its kind, and it is scored as its condition's outcome. A scorer is a pure function of the record: no model, no platform, no clock. It returns named numeric outcomes, and an outcome it could not compute is `None`, never 0; a `not_determined` verdict leaves every outcome that depends on the unobserved state `None`.
+
+A treatment outcome is what the agent achieved under the manipulation, so a scorer returns values for a treatment attempt: the failure itself (the example's agent gave no answer, so its accuracy is 0) and what the agent did before it (its rounds and lookups). `None` stays reserved for what could not be measured, and it drops the run's pair from every contrast on that outcome: the attempt is scored as treatment and then leaves the comparison it was kept for. The analysis counts these drops per contrast. A confirmatory contrast (one in the Holm family) with any drop is refused, naming the contrast, the count and the fix, unless its preregistration says how treatment attempts enter it:
+
+- `treatment_outcomes = "scored"`: the scorer returns values for them. This is a claim the analysis checks: a confirmatory contrast that still loses a pair to a treatment attempt's `None` is refused. For a rare attempt that genuinely could not be measured, the contrast may preregister `max_unscored_treatment = N` (0 unless set; only on a contrast in the Holm family that declares `"scored"`; it cannot excuse every treatment attempt of the contrast), and the report shows how many pairs that cost;
+- `treatment_outcomes = "excluded"`: every pair with a treatment attempt is left out of that contrast, whatever the scorer returned, and the report names the contrast and how many pairs it left out beside its result. A confirmatory contrast this leaves with no pair is refused, since its conclusion would read as no effect detected.
+
+An exploratory contrast reports its drops and is not refused. The example's confirmatory contrast on the treatment condition declares its choice:
+
+```toml
+# my-study/preregistration.toml
+[contrasts.relay-vs-baseline]
+treatment_outcomes = "scored"
+```
+
+Here is a scorer applied to the treatment attempt:
 
 ```python
 from expcore.records.record import load_record, record_filename
@@ -199,13 +214,14 @@ record = load_record(Path("my-study/out/runs") / entry["run_dir"] / record_filen
 
 
 class LookupCount:
-    """How many lookups the agent made; not computable when the platform failed under the run."""
+    """How many lookups the agent made, under the declared treatment as well: the lookups before the failure count."""
 
     name = "lookups"
     version = "1"
 
     def score(self, record):
-        if record.outcome["name"] == "infrastructure":
+        if record.outcome["name"] == "infrastructure" and not record.outcome["treatment"]:
+            # set aside and run again: the core never scores it, and nothing the agent did can be judged
             return {"verdict": "not_determined", "outcomes": {"lookups": None}}
         looked = [call for call in record.tool_calls if call["name"] == "lookup"]
         return {"verdict": "fulfilled", "outcomes": {"lookups": float(len(looked))}}
@@ -214,8 +230,13 @@ class LookupCount:
 scored = rescore(record, [LookupCount()])
 assert scored.scores["lookups"] == {
     "version": "1",
-    "result": {"verdict": "not_determined", "outcomes": {"lookups": None}},
+    "result": {"verdict": "fulfilled", "outcomes": {"lookups": 1.0}},  # one lookup, then the tool server went down
 }
+
+analysis = json.loads(Path("my-study/out/analysis.json").read_text())
+relay = next(c for c in analysis["contrasts"] if c["name"] == "relay-vs-baseline")
+assert relay["treatment_outcomes"] == "scored" and relay["pairs_missing"]["treatment_outcome_none"] == 0
+assert relay["n_pairs"] == 8  # both treatment attempts stay in their own contrast
 ```
 
 ### Unknown platform estimates are data
@@ -268,6 +289,8 @@ assert counts == Counter()  # the example study runs without the platform
 Every contrast ends in one of four words, `difference`, `trivial_difference`, `equivalent` or `not_detected`, and never in "no difference". Only `equivalent` may be read as no difference, and only a contrast with an `equivalence_margin` in the preregistration can reach it: the interval at 1 - 2 alpha lies inside plus or minus the margin and the test is not significant. `not_detected` is the absence of evidence, never evidence of absence; without a margin, it is the most a non-significant result can say.
 
 A contrast outside the preregistered Holm family is exploratory. It is judged by its raw p-value, nothing controls its multiplicity, and every table and report shows it apart, labelled exploratory, never as confirmatory. Only the Holm family carries the study's confirmatory claims.
+
+A contrast that declares `treatment_outcomes = "excluded"` compares its arms without the runs the outage ended, so its conclusion says nothing about the outage itself, and `not_detected` there is not the absence of an outage effect. The report puts `excluded` and the pairs it left out in the contrast's own row, beside its conclusion.
 
 ```python
 from expcore.stats.analysis import CONCLUSIONS, conclude

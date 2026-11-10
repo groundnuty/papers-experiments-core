@@ -19,8 +19,10 @@ from study_crash import KILLED
 from study_support import HEAD, ROOT, Campaign, clean_environment, cli, copy_campaign, finish, make_copy, table
 
 from expcore.cli import main
+from expcore.provenance.codestamp import write_stamp
 from expcore.records.record import load_record, record_filename
 from expcore.stats.analysis import CONCLUSIONS
+from expcore.stats.pairing import MISSING_CAUSES
 from expcore.study.config import load_study
 from expcore.study.pipeline import OUTPUT_FILES, regenerate
 
@@ -122,8 +124,9 @@ def test_c01_the_treatment_failure_is_scored_and_never_run_again(resumed):
     ]
     for key in keys:
         result = resumed.read("scores.json")[key]["tiny"]["result"]
-        assert result["verdict"] == "not_determined"
-        assert result["outcomes"] == {"accuracy": None, "lookups": None, "rounds": None}  # missing, never zero
+        assert result["verdict"] == "violated"  # no answer under the outage: measured, not unknown
+        assert result["axes"] == {"agent": "no_answer", "platform": "failed"}
+        assert result["outcomes"] == {"accuracy": 0.0, "lookups": 1.0, "rounds": 1.0}  # what it did before the failure
 
 
 def test_the_scripts_end_as_a_finished_answer_a_malformed_call_a_turn_cap_and_an_infrastructure_failure(resumed):
@@ -240,9 +243,134 @@ def test_the_report_counts_the_treatment_failure_and_gives_each_condition_a_medi
     assert kinds[TREATMENT] == [TREATMENT, "knowledge", "yes", "0", "2", "0"]  # set aside, scored, left out
     conditions = table(resumed.report, "## Conditions")
     assert set(conditions) == {"baseline", SUBSET, TREATMENT}
-    assert {name: cells[1] for name, cells in conditions.items()} == {"baseline": "8", SUBSET: "6", TREATMENT: "8"}
-    assert {cells[2] for cells in conditions.values()} == {"0"}  # nothing is left out of a complete analysis
-    assert all(cells[3] != "n/a" for cells in conditions.values())
+    assert {name: cells[2] for name, cells in conditions.items()} == {"baseline": "8", SUBSET: "6", TREATMENT: "8"}
+    assert {cells[5] for cells in conditions.values()} == {"0"}  # nothing is left out of a complete analysis
+    assert all(cells[7] != "n/a" for cells in conditions.values())
+
+
+def test_c23_analysis_json_and_the_report_account_for_every_planned_run_and_every_pair(resumed):
+    """C23: per condition, the planned runs and how each ended; per contrast, the pairs used and the pairs missing by
+    cause, zeros included; every condition in the infrastructure table. The JSON and the report say the same."""
+    analysis = resumed.read("analysis.json")
+    ended = {
+        c["condition"]: (c["planned"], c["analysed"], c["exhausted"], c["unfinished"], c["left_out"], c["set_aside"])
+        for c in analysis["conditions"]
+    }
+    assert ended == {"baseline": (8, 8, 0, 0, 0, 0), SUBSET: (6, 6, 0, 0, 0, 0), TREATMENT: (8, 8, 0, 0, 0, 0)}
+    zero = dict.fromkeys(MISSING_CAUSES, 0)
+    pairs = {c["name"]: (c["n_pairs"], c["pairs_missing"]) for c in analysis["contrasts"]}
+    assert pairs == {
+        "extended-vs-baseline": (6, {**zero, "unpaired_or_left_out": 2}),  # the subset arm did not run dune
+        "relay-vs-baseline": (8, zero),  # the treatment attempts are scored, so their pairs are used
+        "tools-effect-on-rounds": (6, {**zero, "unpaired_or_left_out": 10}),  # no condition is relay with extended
+    }
+    shown = {
+        **table(resumed.report, "### Pairs of the family's contrasts"),
+        **table(resumed.report, "### Pairs of the exploratory contrasts"),
+    }
+    for name, (used, missing) in pairs.items():
+        assert shown[name][1:] == [str(used), *(str(missing[cause]) for cause in MISSING_CAUSES)]
+    kinds = table(resumed.report, "### Infrastructure failures")
+    assert kinds["baseline"] == ["baseline", "none", "no", "0", "0", "0"]
+    assert kinds[SUBSET] == [SUBSET, "none", "no", "0", "0", "0"]
+
+
+def test_s10_the_example_scores_its_treatment_attempts_and_declares_so_for_its_confirmatory_contrast(resumed):
+    """S10: the manipulated condition's treatment attempts stay in its own contrast, and the report says how."""
+    relay = next(c for c in resumed.read("analysis.json")["contrasts"] if c["name"] == "relay-vs-baseline")
+    assert (relay["in_family"], relay["treatment_outcomes"], relay["n_pairs_missing"]) == (True, "scored", 0)
+    assert table(resumed.report, "## Preregistered contrasts")["relay-vs-baseline"][10] == "scored"
+
+
+SCORED_TREATMENT = 'if outcome["name"] == "infrastructure" and not outcome["treatment"]:'
+NONE_FOR_TREATMENT = 'if outcome["name"] == "infrastructure":'  # the pattern that leaves a treatment attempt None
+DECLARED = 'treatment_outcomes = "scored"\n'
+
+
+def edit_once(path: Path, old: str, new: str) -> None:
+    """Replace one exact piece of a file, which must occur exactly once."""
+    text = path.read_text(encoding="utf-8")
+    assert text.count(old) == 1, f"{path.name}: {old!r} occurs {text.count(old)} times"
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+
+def test_s10_a_scorer_that_leaves_treatment_attempts_none_is_refused_until_the_contrast_declares_how_they_enter(
+    resumed, tmp_path, clean_environment
+):
+    """S10: through the command line: with the treatment attempts scored None and nothing declared, `analyze` refuses,
+    naming the confirmatory contrast, the count and the fix; declared scored, it still refuses, since the claim is
+    false; declared excluded, it goes on, and analysis.json and the report name the contrast that excludes them and
+    how many pairs that left out."""
+    copy = copy_campaign(resumed, tmp_path, "none-for-treatment")
+    edit_once(copy.root / "plugin.py", SCORED_TREATMENT, NONE_FOR_TREATMENT)
+    prereg = copy.root / "preregistration.toml"
+    edit_once(prereg, DECLARED, "")
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)  # the scorer and the preregistration are code
+    assert cli(clean_environment, "check", str(copy.runs))[0] == 0
+    code, errors = cli(clean_environment, "analyze", str(copy.root))
+    assert code == 1
+    assert "confirmatory contrast 'relay-vs-baseline' drops 2 pair(s)" in errors
+    assert 'treatment_outcomes = "scored"' in errors
+    assert 'treatment_outcomes = "excluded"' in errors
+    edit_once(prereg, "\n\n# Not in the family", '\ntreatment_outcomes = "scored"\n\n# Not in the family')
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    assert cli(clean_environment, "check", str(copy.runs))[0] == 0
+    code, errors = cli(clean_environment, "analyze", str(copy.root))
+    assert code == 1  # declaring them scored does not excuse a scorer that leaves them None
+    assert 'declares treatment_outcomes = "scored", but 2 pair(s)' in errors
+    edit_once(
+        prereg,
+        '\ntreatment_outcomes = "scored"\n\n# Not in the family',
+        '\ntreatment_outcomes = "excluded"\n\n# Not in the family',
+    )
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
+    assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)
+    relay = next(c for c in copy.read("analysis.json")["contrasts"] if c["name"] == "relay-vs-baseline")
+    assert (relay["treatment_outcomes"], relay["n_pairs"], relay["pairs_missing"]["treatment_excluded"]) == (
+        "excluded",
+        6,
+        2,
+    )
+    report = (copy.root / "out" / "report.md").read_text(encoding="utf-8")
+    assert table(report, "## Preregistered contrasts")["relay-vs-baseline"][10] == "excluded (2 pair(s) left out)"
+
+
+def test_c23_an_exhausted_run_is_counted_under_its_condition_and_as_the_cause_of_the_pairs_it_costs(
+    tmp_path, clean_environment
+):
+    """C23: through the command line: a run that fails on infrastructure at every attempt is seen under its own
+    condition, and each contrast that needed it counts the pair as missing because of the exhausted run."""
+    campaign = Campaign(make_copy(tmp_path, "study"))
+    edit_once(
+        campaign.root / "plugin.py", "SPECIAL = {\n", 'SPECIAL = {\n    ("baseline", "dune"): "infrastructure",\n'
+    )
+    write_stamp(campaign.root, HEAD, load_study(campaign.root).scope)
+    campaign.codes["run"], _ = cli(clean_environment, "run", str(campaign.root))
+    finish(clean_environment, campaign)
+    assert campaign.codes == {"run": 0, "check": 0, "analyze": 0, "report": 0}
+    analysis = campaign.read("analysis.json")
+    baseline = next(c for c in analysis["conditions"] if c["condition"] == "baseline")
+    assert baseline == {
+        "condition": "baseline",
+        "planned": 8,
+        "analysed": 6,
+        "exhausted": 2,  # the task under both models
+        "unfinished": 0,
+        "left_out": 0,
+        "set_aside": 6,  # three charged attempts each
+    }
+    zero = dict.fromkeys(MISSING_CAUSES, 0)
+    assert {c["name"]: (c["n_pairs"], c["pairs_missing"]) for c in analysis["contrasts"]} == {
+        "extended-vs-baseline": (6, {**zero, "exhausted": 2}),
+        "relay-vs-baseline": (6, {**zero, "exhausted": 2}),
+        "tools-effect-on-rounds": (6, {**zero, "exhausted": 2, "unpaired_or_left_out": 8}),
+    }
+    assert table(campaign.report, "## Conditions")["baseline"][1:7] == ["8", "6", "2", "0", "0", "6"]
+    assert table(campaign.report, "### Pairs of the family's contrasts")["relay-vs-baseline"][1:] == [
+        "6",
+        *(str({**zero, "exhausted": 2}[cause]) for cause in MISSING_CAUSES),
+    ]
 
 
 def test_the_contrast_that_left_a_task_out_names_it(resumed):

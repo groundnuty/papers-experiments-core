@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore.accounting import condition_accounting
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import build_fingerprint
@@ -48,8 +49,8 @@ from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore, scorer_name, scorer_version
 from expcore.replay.check import BatchNotVerified, require_current_check, verify_batch, write_check
 from expcore.report import render_report
-from expcore.stats.analysis import AnalysisResult, analyse
-from expcore.stats.rows import Row
+from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
+from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import StudyConfig, find_study_root, load_study
 from expcore.study.plugin import StudyContext, StudyPlugin, load_plugin
 from expcore.study.verified import UNCOVERED, Unverified, load_verified
@@ -224,6 +225,14 @@ def _outcomes_of(record: RunRecord) -> dict[str, float | None]:
     return merged
 
 
+ABSENT_LISTS = (("exhausted_runs", "exhausted"), ("unfinished_runs", "unfinished"), ("excluded_attempts", "excluded"))
+
+
+def _absent_runs(export: Mapping[str, Any]) -> list[AbsentRun]:
+    """The planned runs the export lists with no analysed attempt, each with the reason, for the pair accounting."""
+    return [AbsentRun.from_export(entry, reason) for part, reason in ABSENT_LISTS for entry in export.get(part, [])]
+
+
 def analyse_study(
     path: str | os.PathLike[str],
     *,
@@ -267,13 +276,18 @@ def analyse_study(
         scores[entry["run_key"]] = scored.scores
         task = study.tasks[str(entry["factors"]["task"])]
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))
-    result = analyse(rows, study.prereg)
+    try:
+        result = analyse(rows, study.prereg, _absent_runs(export))
+    except TreatmentOutcomesRefused as error:
+        raise Refused(f"refusing to analyse: {error}") from None
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)
 
 
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
-    """What `analysis.json` holds: the preregistration, the code, the core and each contrast with its Holm decision."""
+    """What `analysis.json` holds: the preregistration, the code, the core, each condition's planned runs and how they
+    ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
+    Holm decision."""
     return {
         "preregistration": dict(analysis.result.manifest),
         "alpha": analysis.result.alpha,
@@ -283,6 +297,7 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         "partial": analysis.export["partial"],
         "running_attempts": analysis.export["running_attempts"],
         "excluded_attempts": analysis.export["excluded_attempts"],
+        "conditions": condition_accounting(analysis.export),
         "contrasts": analysis.result.contrasts,
         "holm": analysis.result.holm,
     }
