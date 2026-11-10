@@ -10,6 +10,13 @@ resolves to the same entry. Nothing is read lazily: `load_models` validates ever
 entries share (P06), refuses settings that cannot work together (B16), and names the file and the key of every
 problem. The model's status gates study runs: only `frozen` settings may start one (B08).
 
+`backend` names one of the core's adapters (`BACKENDS`) or a backend of the study's own, a plain lower-case name. The
+core's rules for its own adapters apply only to them. The core cannot build a study's own backend: the study's plugin
+supplies a `backend_factory` that serves it, and a plugin without one is refused at load (`expcore.study.plugin`). An
+entry with such a backend and a problem of its own (a missing `api_id`, a rule it breaks) says first that the core does
+not build its backend, so a misspelt core backend is never reported as a missing key, and a name close to a core
+backend is named with it.
+
 Secrets never appear here. An entry points at an environment variable (`key_env`) or a file (`key_file`), and the
 key is read when a request is built, not when the table is loaded.
 """
@@ -23,16 +30,17 @@ from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-from expcore.config.loading import ConfigError, Section, load_toml
+from expcore.config.loading import ConfigError, Section, close_match, load_toml
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
 from expcore.config.prices import Price
 
-BACKENDS = ("openai_compat", "anthropic", "stub")
+BACKENDS = ("openai_compat", "anthropic", "stub")  # the backends the core builds; a plugin's factory serves others
 STATUSES = ("frozen", "draft")
 CACHE_TTLS = ("5m", "1h")
 
 _KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_BACKEND_RE = re.compile(r"[a-z][a-z0-9_]*")
 # Request fields each adapter sets itself; a model entry that names one would be overridden or would override it.
 _OWNED_FIELDS = {
     "openai_compat": frozenset(
@@ -95,7 +103,7 @@ class ModelSpec:
     """One model: how to reach it, what to send it, and whether its settings are frozen for study runs."""
 
     key: str
-    backend: str  # one of BACKENDS
+    backend: str  # one of BACKENDS, or a backend of the study's own that its plugin's factory serves
     api_id: str  # the id sent to the endpoint
     status: str  # "frozen" once the vendor settings are collected, else "draft"
     base_url: str | None = None
@@ -125,6 +133,11 @@ class ModelSpec:
     def priced(self) -> bool:
         """Tell whether the cost of its tokens is known: it has a price, or its entry says it is free (C12)."""
         return self.free or self.price is not None
+
+    @property
+    def core_backend(self) -> bool:
+        """Tell whether the core builds the entry's backend; a backend of the study's own is its plugin's to build."""
+        return self.backend in BACKENDS
 
     @property
     def seed_supported(self) -> bool:
@@ -163,8 +176,8 @@ def _rule_problems(spec: ModelSpec) -> list[str]:
     problems: list[str] = []
     if not _KEY_RE.fullmatch(spec.key):
         problems.append("key must be letters, digits, dot, dash and underscore, starting with a letter or digit")
-    if spec.backend not in BACKENDS:
-        return [*problems, f"backend must be one of {', '.join(BACKENDS)}, got {spec.backend!r}"]
+    if not spec.core_backend and not _BACKEND_RE.fullmatch(spec.backend):
+        return [_backend_problem(spec.backend), *problems]
     if spec.status not in STATUSES:
         problems.append(f"status must be one of {', '.join(STATUSES)}, got {spec.status!r}")
     if not spec.api_id.strip():
@@ -175,6 +188,25 @@ def _rule_problems(spec: ModelSpec) -> list[str]:
     return problems
 
 
+def _backend_problem(backend: str) -> str:
+    """The problem of a backend name that is neither the core's nor a plain lower-case name a plugin could serve."""
+    return (
+        f"backend must be one of {', '.join(BACKENDS)}, or the plain lower-case name of a backend the study's "
+        f"plugin serves, got {backend!r}{close_match(backend, BACKENDS)}"
+    )
+
+
+def not_built_by_core(backend: str) -> str:
+    """Say that the core does not build a backend, and what serves it instead: the plugin's `backend_factory`.
+
+    Said at load before any other problem of an entry that has one, and when a plugin without a factory is loaded.
+    """
+    return (
+        f"names {backend!r}{close_match(backend, BACKENDS)}, a backend the core does not build ({', '.join(BACKENDS)}); "
+        "the plugin must supply a backend_factory that serves it"
+    )
+
+
 def _endpoint_problems(spec: ModelSpec) -> list[str]:
     """Rules for the base URL and the place the key is read from."""
     problems = []
@@ -182,7 +214,8 @@ def _endpoint_problems(spec: ModelSpec) -> list[str]:
         if spec.base_url or spec.key_env or spec.key_file:
             problems.append("a stub model takes no base_url, key_env or key_file")
         return problems
-    problems += base_url_problems(spec.base_url)
+    if spec.core_backend or spec.base_url is not None:  # a study's own backend may need no URL; one it gives is checked
+        problems += base_url_problems(spec.base_url)
     if spec.key_env and spec.key_file:
         problems.append("give key_env or key_file, not both")
     if spec.backend == "anthropic" and not (spec.key_env or spec.key_file):
@@ -211,7 +244,7 @@ def _request_problems(spec: ModelSpec) -> list[str]:
         *sampling_problems(spec.sampling),
         *thinking_problems(spec.backend, spec.extra_body, spec.max_output_tokens),
     ]
-    owned = _OWNED_FIELDS[spec.backend]
+    owned = _OWNED_FIELDS.get(spec.backend, frozenset())  # a study's own backend: its factory knows what it sets
     for where, table in (("sampling", spec.sampling), ("extra_body", spec.extra_body)):
         problems += [f"{where} sets '{name}', which the adapter sets itself" for name in sorted(owned & table.keys())]
     if (spec.sampling.keys() | spec.extra_body.keys()) & {"stream"}:
@@ -277,8 +310,8 @@ class ModelTable:
         found = [spec for spec in self.models.values() if low in (n.lower() for n in spec.names)]
         if len(found) == 1:
             return found[0]
-        known = ", ".join(self.models)
-        raise ConfigError(f"{self.source}: unknown model {name!r}; the table holds: {known}")
+        known, hint = ", ".join(self.models), close_match(name, self.models)
+        raise ConfigError(f"{self.source}: unknown model {name!r}{hint}; the table holds: {known}")
 
     def require_frozen(self, names: Iterable[str]) -> None:
         """Refuse a study run unless every named model is frozen (B08)."""
@@ -357,11 +390,46 @@ def _price(section: Section) -> Price | None:
         raise section.fail("price", str(error)) from None
 
 
+def _backend_first(backend: str) -> list[str]:
+    """What an entry's problems begin with when its backend is not the core's: that the core does not build it and
+    the plugin's factory must (or that the name could not be a backend at all), so a missing key is never said first."""
+    if backend in BACKENDS:
+        return []
+    if not _BACKEND_RE.fullmatch(backend):
+        return [_backend_problem(backend)]
+    return [f"key 'backend' {not_built_by_core(backend)}"]
+
+
 def _entry(section: Section, key: str) -> ModelSpec:
-    """Build one ModelSpec from its table; every failure names the file and the key."""
-    section.reject_unknown(_ENTRY_KEYS)
+    """Build one ModelSpec from its table; every failure names the file and the key.
+
+    An entry whose backend the core does not build may still be valid (its plugin's factory serves it), so that is
+    said only when the entry has a problem, and then before the others.
+    """
     backend = section.string("backend")
-    spec_args: dict[str, Any] = {
+    first = _backend_first(backend)
+    try:
+        section.reject_unknown(_ENTRY_KEYS)
+        spec_args = _entry_args(section, key, backend)
+    except ConfigError as error:  # a key that cannot be read: the backend still comes first
+        if not first:
+            raise
+        own, file = f"{section.file}: {section.where}: ", f"{section.file}: "
+        text = str(error)
+        rest = text[len(own) :] if text.startswith(own) else text[len(file) :] if text.startswith(file) else text
+        raise ConfigError(own + "; ".join([*first, rest])) from None
+    if spec_args["api_id"] is None:
+        raise ConfigError(f"{section.file}: {section.where}: " + "; ".join([*first, "key 'api_id' is required"]))
+    try:
+        return ModelSpec(**spec_args)
+    except RuleViolation as error:
+        problems = [*first, *(problem for problem in error.problems if problem not in first)]
+        raise ConfigError(f"{section.file}: {section.where}: " + "; ".join(problems)) from None
+
+
+def _entry_args(section: Section, key: str, backend: str) -> dict[str, Any]:
+    """Read the keys of one entry into the arguments of its ModelSpec; a key of the wrong type raises ConfigError."""
+    return {
         "key": key,
         "backend": backend,
         "api_id": section.optional_string("api_id") or (key if backend == "stub" else None),
@@ -379,12 +447,6 @@ def _entry(section: Section, key: str) -> ModelSpec:
         "price": _price(section),
         "free": _flag(section, "free"),
     }
-    if spec_args["api_id"] is None:
-        raise section.fail("api_id", "is required")
-    try:
-        return ModelSpec(**spec_args)
-    except RuleViolation as error:
-        raise ConfigError(f"{section.file}: {section.where}: " + "; ".join(error.problems)) from None
 
 
 def load_models(path: str | os.PathLike[str]) -> ModelTable:

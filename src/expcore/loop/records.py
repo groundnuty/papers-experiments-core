@@ -99,6 +99,9 @@ class LoopResult:
     # seconds the attempt waited on infrastructure, by kind; a kind counts its own union, so the figures can add up to
     # more than infra_wait_s where two kinds overlapped (L04)
     infra_wait_by_kind: dict[str, float] = field(default_factory=dict)
+    # what the `on_defect` hook raised, if it did: never recorded, carried for the caller to report once the record is
+    # kept (`record_attempt`'s `on_sink_failure`)
+    sink_failure: Exception | None = None
 
     @property
     def malformed_rounds(self) -> int:

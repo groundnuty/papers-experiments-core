@@ -127,15 +127,22 @@ class RunRecord:
         validate(data, schemas)
         return cls(**data)
 
-    def dumps(self, schemas: tuple[SchemaVersion, ...] = SCHEMAS, environ: dict[str, str] | None = None) -> str:
-        """Return the text of the record: validated, secrets redacted, an unpaired surrogate as its \\u escape.
+    def dumps(
+        self,
+        schemas: tuple[SchemaVersion, ...] = SCHEMAS,
+        environ: dict[str, str] | None = None,
+        *,
+        redactor: Redactor | None = None,
+    ) -> str:
+        """Return the text of the record: validated, secrets redacted (by `redactor`, else from `environ`, the
+        process's by default), an unpaired surrogate as its \\u escape.
 
         A model's reply can carry an unpaired surrogate through JSON's \\u escapes. UTF-8 cannot encode one, so it is
         written as its escape, and reads back to the same value and the same text.
         """
         data = self.to_json(schemas)
         validate(data, schemas)
-        data, paths = Redactor.from_environment(environ).structure(data)
+        data, paths = (redactor or Redactor.from_environment(environ)).structure(data)
         if paths:
             if "redacted_paths" in data:
                 data["redacted_paths"] = sorted({*data["redacted_paths"], *paths})

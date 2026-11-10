@@ -9,12 +9,21 @@ import pytest
 from stats_support import both_arms, make_row
 
 from expcore.campaign.factors import FactorSchema
+from expcore.stats import contrasts as kernel
 from expcore.stats import estimators, power
-from expcore.stats.analysis import CONCLUSIONS, analyse, conclude, pilot_power, power_study, run_contrast
+from expcore.stats.analysis import (
+    CONCLUSIONS,
+    TreatmentOutcomesRefused,
+    analyse,
+    conclude,
+    pilot_power,
+    power_study,
+    run_contrast,
+)
 from expcore.stats.estimators import EstimatorResult
 from expcore.stats.pairing import ContrastSpec, pair_rows
 from expcore.stats.prereg import name_digest, parse
-from expcore.stats.rows import Row
+from expcore.stats.rows import AbsentRun, Row
 from expcore.stats.sim import OutcomeSpec, SimSpec, simulate
 
 TEXT = """\
@@ -520,7 +529,8 @@ def test_a_table_of_conclusions_alone_cannot_hide_a_detected_effect(concluded):
     _, result = concluded
     for contrast in result.contrasts:
         assert (contrast.conclusion in ("difference", "trivial_difference")) is contrast.significant, contrast.name
-    assert {c.conclusion for c in result.contrasts} == set(CONCLUSIONS)  # the fixture shows all four words
+    tested = set(CONCLUSIONS) - {"untestable"}  # every contrast of the fixture has pairs; S11 tests the fifth word
+    assert {c.conclusion for c in result.contrasts} == tested  # the fixture shows the four words of a tested contrast
 
 
 def test_a_contrast_outside_the_family_is_judged_by_its_raw_p_value(concluded):
@@ -549,11 +559,11 @@ def test_the_exploratory_label_is_a_field_of_the_result_not_something_a_report_m
     assert dataclasses.asdict(result.contrast("q-vs-r-margin"))["exploratory"] is True
 
 
-def test_every_conclusion_is_one_of_the_four_words(concluded):
+def test_every_conclusion_is_one_of_the_five_words(concluded):
     """The vocabulary is closed."""
     _, result = concluded
     assert {c.conclusion for c in result.contrasts} <= set(CONCLUSIONS)
-    assert set(CONCLUSIONS) == {"difference", "trivial_difference", "equivalent", "not_detected"}
+    assert set(CONCLUSIONS) == {"difference", "trivial_difference", "equivalent", "not_detected", "untestable"}
 
 
 def test_a_family_member_is_significant_by_holm_not_by_its_raw_p_value():
@@ -575,7 +585,7 @@ def test_a_family_member_is_significant_by_holm_not_by_its_raw_p_value():
     assert found.p_value == pytest.approx(0.03125)
     assert found.p_value < 0.05
     assert (found.significant, found.conclusion) == (False, "not_detected")
-    assert result.contrast("no-data").conclusion == "not_detected"  # no pair at all: NaN is never significant
+    assert result.contrast("no-data").conclusion == "untestable"  # no pair at all: nothing was tested (S11)
 
 
 def test_the_equivalence_interval_comes_from_the_estimator_at_the_level_it_is_asked_for(prereg, planted, monkeypatch):
@@ -745,3 +755,280 @@ def test_s09_an_estimator_without_a_p_values_function_has_no_minimum_detectable_
     result = analyse(rows, other)
     assert math.isnan(result.contrast("gate-effect").minimum_detectable_effect)
     assert result.contrast("open-vs-shut-at-x").minimum_detectable_effect > 0
+
+
+# --- treatment attempts in a contrast (S10) -----------------------------------------------------------------------
+
+TREATED_TEXT = """\
+alpha = 0.05
+holm_family = ["FAMILY"]
+
+[bootstrap]
+replicates = 50
+seed = 11
+
+[contrasts.a-vs-b]
+conditions = ["cond-a", "cond-b"]
+outcome = "score"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+DECLARATION
+[contrasts.x-vs-y]
+conditions = ["cond-x", "cond-y"]
+outcome = "score"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+"""
+
+
+def treated_prereg(family: str = "a-vs-b", declaration: str | None = None, tolerance: int | None = None):
+    """A preregistration over ARMS with a-vs-b and x-vs-y; `family` is the one Holm member, a-vs-b may declare."""
+    line = "" if declaration is None else f'treatment_outcomes = "{declaration}"\n'
+    line += "" if tolerance is None else f"max_unscored_treatment = {tolerance}\n"
+    text = TREATED_TEXT.replace("FAMILY", family).replace("DECLARATION\n", line)
+    return parse(tomllib.loads(text), "inline", "e" * 64, ARMS)
+
+
+def treated_rows() -> list[Row]:
+    """Six clusters of ordinary pairs, then two pairs whose cond-a run is a treatment attempt the scorer left None."""
+    rows = []
+    for i in range(6):
+        rows += both_arms(f"t{i}", "model-a", 1, 0.9 - 0.01 * i, 0.5, cluster=f"c{i}")
+    for i in range(2):
+        first, second = both_arms(f"outage-{i}", "model-a", 1, None, 0.5, cluster=f"c{i}")
+        rows += [dataclasses.replace(first, treatment=True), second]
+    return rows
+
+
+def test_s10_a_confirmatory_contrast_that_loses_a_pair_to_a_treatment_attempts_none_is_refused():
+    """S10: the condition's manipulation would silently leave its own contrast; the refusal names the contrast, the
+    count and both ways to fix it."""
+    with pytest.raises(TreatmentOutcomesRefused) as caught:
+        analyse(treated_rows(), treated_prereg())
+    message = str(caught.value)
+    assert "confirmatory contrast 'a-vs-b'" in message
+    assert "2 pair(s)" in message
+    assert "outcome 'score'" in message
+    assert 'treatment_outcomes = "scored"' in message
+    assert 'treatment_outcomes = "excluded"' in message
+    assert "[contrasts.a-vs-b]" in message
+
+
+def test_s10_declaring_scored_does_not_excuse_a_scorer_that_leaves_every_treatment_attempt_none():
+    """S10: "scored" is a claim the analysis checks. With every outage left None, the declaration is false and the
+    contrast is refused, naming the claim, the count and the ways out, or issue #39 would survive behind one line."""
+    with pytest.raises(TreatmentOutcomesRefused) as caught:
+        analyse(treated_rows(), treated_prereg(declaration="scored"))
+    message = str(caught.value)
+    assert "confirmatory contrast 'a-vs-b'" in message
+    assert 'declares treatment_outcomes = "scored"' in message
+    assert "2 pair(s)" in message
+    assert "max_unscored_treatment is 0" in message
+    assert "[contrasts.a-vs-b]" in message
+
+
+def measured_treatment_pair() -> list[Row]:
+    """One pair whose cond-a run is a treatment attempt the scorer did measure."""
+    first, second = both_arms("outage-measured", "model-a", 1, 0.2, 0.5, cluster="c0")
+    return [dataclasses.replace(first, treatment=True), second]
+
+
+def test_s10_a_preregistered_tolerance_allows_exactly_that_many_unscored_treatment_pairs():
+    """S10: for a rare genuine "could not be measured", a member may lose as many pairs as its preregistration set
+    beforehand, and the result says so; one more than that is refused."""
+    rows = treated_rows() + measured_treatment_pair()
+    result = analyse(rows, treated_prereg(declaration="scored", tolerance=2)).contrast("a-vs-b")
+    assert (result.in_family, result.treatment_outcomes, result.max_unscored_treatment) == (True, "scored", 2)
+    assert (result.n_pairs, result.pairs_missing["treatment_outcome_none"]) == (7, 2)
+    with pytest.raises(TreatmentOutcomesRefused, match="max_unscored_treatment is 1"):
+        analyse(rows, treated_prereg(declaration="scored", tolerance=1))
+
+
+@pytest.mark.parametrize("tolerance", [2, 100])
+def test_s10_no_tolerance_excuses_a_contrast_in_which_no_treatment_attempt_was_measured(tolerance):
+    """S10: a tolerance is for the rare attempt, so a large one cannot bring back the original bug of a scorer that
+    leaves every outage None."""
+    with pytest.raises(TreatmentOutcomesRefused, match="no treatment attempt of the contrast was measured"):
+        analyse(treated_rows(), treated_prereg(declaration="scored", tolerance=tolerance))
+
+
+def test_s10_a_treatment_attempt_left_none_beside_an_exhausted_partner_is_refused_too():
+    """S10: the partner's exhaustion must not hide that the scorer left the manipulation None."""
+    rows = treated_rows()[:12]
+    first, _ = both_arms("outage-0", "model-a", 1, None, 0.5, cluster="c0")
+    factors = {"task": "outage-0", "model": "model-a", "seed": 1}
+    partner = AbsentRun("task=outage-0|model=model-a|seed=1|condition=cond-b", "cond-b", factors, "exhausted")
+    with pytest.raises(TreatmentOutcomesRefused, match="1 pair"):
+        analyse([*rows, dataclasses.replace(first, treatment=True)], treated_prereg(declaration="scored"), [partner])
+
+
+def unfinished_partner(task: str) -> AbsentRun:
+    """The cond-b run of `task`, planned, with no analysed attempt."""
+    factors = {"task": task, "model": "model-a", "seed": 1}
+    return AbsentRun(f"task={task}|model=model-a|seed=1|condition=cond-b", "cond-b", factors, "unfinished")
+
+
+def test_s10_a_measured_treatment_attempt_whose_partner_is_unfinished_still_counts_as_measured():
+    """S10: the tolerance refuses a contrast that measured none of its treatment attempts, not one whose measured
+    attempt lost its partner to something else."""
+    first, _ = both_arms("outage-measured", "model-a", 1, 0.2, 0.5, cluster="c0")
+    rows = [*treated_rows(), dataclasses.replace(first, treatment=True)]
+    prereg = treated_prereg(declaration="scored", tolerance=2)
+    result = analyse(rows, prereg, [unfinished_partner("outage-measured")]).contrast("a-vs-b")
+    assert (result.n_pairs, result.pairs_missing["treatment_outcome_none"]) == (6, 2)
+
+
+def test_s10_a_treatment_attempt_on_a_task_one_arm_never_runs_does_not_refuse_the_contrast():
+    """S10: in a chain design the extra task is outside the contrast's pairs, so a None there costs it nothing."""
+    first, _ = both_arms("extra-task", "model-a", 1, None, 0.5, cluster="c0")
+    rows = [*treated_rows()[:12], dataclasses.replace(first, treatment=True)]
+    result = analyse(rows, treated_prereg()).contrast("a-vs-b")
+    assert (result.n_pairs, result.pairs_missing["treatment_outcome_none"]) == (6, 0)
+    assert result.pairs_missing["unpaired_or_left_out"] == 1
+
+
+def test_s10_excluded_is_refused_when_only_treatment_attempts_without_analysed_partners_remain():
+    """S10: an excluded attempt with an unfinished partner still counts as excluded, so the empty contrast is seen."""
+    first, _ = both_arms("outage-0", "model-a", 1, None, 0.5, cluster="c0")
+    rows = [dataclasses.replace(first, treatment=True)]
+    with pytest.raises(TreatmentOutcomesRefused, match="leaves it no pair: all 1 are treatment attempts"):
+        analyse(rows, treated_prereg(declaration="excluded"), [unfinished_partner("outage-0")])
+
+
+def test_s10_excluded_may_not_leave_a_confirmatory_contrast_with_no_pair():
+    """S10: with every pair a treatment attempt, "excluded" leaves nothing to estimate, and a conclusion of "not
+    detected" would read as no outage effect."""
+    with pytest.raises(TreatmentOutcomesRefused, match="leaves it no pair: all 2 are treatment attempts"):
+        analyse(treated_rows()[-4:], treated_prereg(declaration="excluded"))
+
+
+def test_s10_excluded_lets_the_confirmatory_contrast_through_and_counts_what_it_left_out():
+    """S10: "excluded" leaves out every pair with a treatment attempt, counted apart, and the result says so: the
+    design fixes the population, whatever the scorer returned."""
+    result = analyse(treated_rows(), treated_prereg(declaration="excluded")).contrast("a-vs-b")
+    assert (result.in_family, result.treatment_outcomes, result.max_unscored_treatment) == (True, "excluded", 0)
+    assert result.n_pairs == 6
+    assert (result.pairs_missing["treatment_outcome_none"], result.pairs_missing["treatment_excluded"]) == (0, 2)
+
+
+def test_s10_an_exploratory_contrast_reports_the_pairs_it_loses_to_a_treatment_attempts_none_and_is_not_refused():
+    """S10: outside the family nothing is claimed confirmatory, so the drop is reported and the analysis goes on."""
+    result = analyse(treated_rows(), treated_prereg(family="x-vs-y")).contrast("a-vs-b")
+    assert (result.exploratory, result.treatment_outcomes) == (True, None)
+    assert result.pairs_missing["treatment_outcome_none"] == 2
+    assert result.n_pairs == 6
+
+
+# --- a contrast with no usable pair (S11) -------------------------------------------------------------------------
+
+UNTESTABLE_TEXT = """\
+alpha = 0.05
+holm_family = FAMILY
+
+[bootstrap]
+replicates = 100
+seed = 9
+
+[power]
+seed = 4
+n_simulations = 30
+target_clusters = 20
+target_difference = 0.1
+sd_grid = [0.1]
+
+[contrasts.p-vs-q]
+conditions = ["cond-p", "cond-q"]
+outcome = "rate"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+
+[contrasts.q-vs-r]
+conditions = ["cond-q", "cond-r"]
+outcome = "rate"
+estimator = "ESTIMATOR"
+cluster = "group"
+"""
+
+
+def untestable_prereg(family=("p-vs-q", "q-vs-r"), estimator="wilcoxon_cluster_bootstrap"):
+    """p-vs-q has data; q-vs-r is the contrast whose partners are all missing. Power settings are present."""
+    text = UNTESTABLE_TEXT.replace("FAMILY", str(list(family)).replace("'", '"')).replace("ESTIMATOR", estimator)
+    return parse(tomllib.loads(text), "inline", "d" * 64, ARM_SCHEMA)
+
+
+def untestable_inputs(cause: str) -> tuple[list[Row], list[AbsentRun]]:
+    """Six clusters of p-vs-q pairs; every cond-r partner of q-vs-r is missing for `cause`."""
+    rows, absent = [], []
+    for i in range(6):
+        cluster = f"c{i}"
+        rows.append(
+            make_row(
+                f"t{i}", "model-a", 1, 0.9 - 0.01 * i, condition="cond-p", cluster=cluster, outcome="rate", arm="p"
+            )
+        )
+        rows.append(make_row(f"t{i}", "model-a", 1, 0.5, condition="cond-q", cluster=cluster, outcome="rate", arm="q"))
+        if cause == "outcome_none":  # an ordinary run the scorer could not measure
+            rows.append(
+                make_row(f"t{i}", "model-a", 1, None, condition="cond-r", cluster=cluster, outcome="rate", arm="r")
+            )
+        else:
+            factors = {"task": f"t{i}", "model": "model-a", "seed": 1, "arm": "r"}
+            absent.append(AbsentRun(f"task=t{i}|arm=r|model=model-a|seed=1", "cond-r", factors, cause))
+    return rows, absent
+
+
+CAUSE_OF = {"exhausted": "exhausted", "unfinished": "unpaired_or_left_out", "outcome_none": "outcome_none"}
+
+
+@pytest.mark.parametrize("cause", sorted(CAUSE_OF))
+def test_s11_a_contrast_with_no_usable_pair_is_untestable_whatever_the_cause(cause):
+    """S11: no evidence is never "not_detected": every partner exhausted, unfinished or scored None on an ordinary run
+    makes the contrast untestable, never significant, with no p-value, no estimate and no minimum detectable effect
+    although the preregistration has power settings."""
+    rows, absent = untestable_inputs(cause)
+    result = analyse(rows, untestable_prereg(), absent)
+    empty = result.contrast("q-vs-r")
+    assert (empty.n_pairs, empty.pairs_missing[CAUSE_OF[cause]]) == (0, 6)
+    assert (empty.conclusion, empty.significant, empty.equivalent) == ("untestable", False, False)
+    assert math.isnan(empty.p_value)
+    assert math.isnan(empty.estimate)
+    assert empty.minimum_detectable_effect is None
+    tested = result.contrast("p-vs-q")
+    assert tested.conclusion != "untestable"
+    assert tested.minimum_detectable_effect is not None
+
+
+def test_s11_an_untestable_member_stays_in_the_family_as_p_one_whatever_its_estimator_returned(monkeypatch):
+    """S11, S02: the family keeps its size, and the other member's adjusted p-value and level are what Holm gives with
+    p = 1 for the untestable one, which is also what it gives for a NaN. An estimator that returns a number for no
+    data is not believed: the contrast is still untestable and cannot reject."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    estimators.register("eager")(lambda paired, settings: EstimatorResult(0.3, 0.0001, 0.1, 0.5, len(paired.clusters)))
+    rows, absent = untestable_inputs("exhausted")
+    result = analyse(rows, untestable_prereg(estimator="eager"), absent)
+    empty = result.contrast("q-vs-r")
+    assert (empty.conclusion, empty.significant) == ("untestable", False)
+    assert math.isnan(empty.p_value)
+    decisions = {d.name: d for d in result.holm}
+    assert len(decisions) == 2
+    assert decisions["q-vs-r"].reject is False
+    assert math.isnan(decisions["q-vs-r"].p_holm)
+    p = result.contrast("p-vs-q").p_value
+    with_one, with_nan = kernel.holm([p, 1.0], 0.05), kernel.holm([p, math.nan], 0.05)
+    assert with_one.adjusted[0] == with_nan.adjusted[0] == decisions["p-vs-q"].p_holm
+    assert with_one.levels[0] == with_nan.levels[0] == decisions["p-vs-q"].level == 0.05 / 2
+
+
+def test_s11_an_exploratory_contrast_with_no_usable_pair_is_untestable_too():
+    """S11: outside the family the word is the same, and it is labelled exploratory wherever it is shown."""
+    rows, absent = untestable_inputs("unfinished")
+    empty = analyse(rows, untestable_prereg(family=("p-vs-q",)), absent).contrast("q-vs-r")
+    assert (empty.exploratory, empty.conclusion, empty.minimum_detectable_effect) == (True, "untestable", None)
+
+
+def test_s11_untestable_overrides_whatever_the_test_and_the_margin_say():
+    """S11: with no pair, neither a significant test nor an interval inside a margin can reach any other word."""
+    for significant in (True, False):
+        for equivalent in (True, False):
+            assert conclude(significant=significant, equivalent=equivalent, untestable=True) == "untestable"
+    assert conclude(significant=False, equivalent=False) == "not_detected"

@@ -1,9 +1,11 @@
-"""The plugin of the tiny study: the tools, the scorer, the executor, and a stub platform's health and resources.
+"""The plugin of the tiny study: the tools, the instrument, the scorer, the executor, and a stub platform's health and
+resources.
 
 The core calls `build(context)` once and expects a `StudyPlugin`. Everything here is the study's own code; the core
 imports nothing from this file by name. Copy the file, change the names and the behaviour, keep the shape.
 """
 
+import asyncio
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -12,9 +14,10 @@ from typing import Any
 from expcore.campaign.executor import RunRequest, record_run
 from expcore.campaign.healthgate import Health
 from expcore.errors import InfraError
-from expcore.models.adapters import ModelTurn, StubAdapter, ToolCall
+from expcore.models.adapters import ModelTurn, ToolCall
 from expcore.plugin import CallContext, ToolOutput, ToolSpec
 from expcore.prompt.templates import PromptTemplate
+from expcore.records.instruments import finish_instruments, start_instruments
 from expcore.records.record import RunRecord
 from expcore.study.plugin import StudyContext, StudyPlugin, tools_sha256
 from expcore.tools.function_provider import FunctionProvider
@@ -41,6 +44,23 @@ def lookup(arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> 
     return ToolOutput(f"The key fact about {topic} is: {FACTS[topic]}.", source_truncated=False)
 
 
+class Shelf:
+    """The stub platform's side of one run: it serves `lookup` and counts the facts it handed out.
+
+    A real platform keeps such state itself (a server's log, a block map); the stub keeps it here, one shelf per run.
+    """
+
+    def __init__(self) -> None:
+        self.served = 0
+
+    def lookup(self, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
+        """Serve one lookup, and count it when it handed out a fact."""
+        result = lookup(arguments, timeout_s=timeout_s, ctx=ctx)
+        if not result.is_error:
+            self.served += 1
+        return result
+
+
 def submit(arguments: dict[str, Any], *, timeout_s: float) -> str:
     """Take the answer. The spec marks this tool terminal, so a successful call ends the attempt."""
     return f"received: {arguments.get('answer')}"
@@ -62,10 +82,35 @@ def tool_specs(tools: str) -> list[ToolSpec]:
     ]
 
 
-def provider_for(tools: str) -> FunctionProvider:
+def provider_for(tools: str, shelf: Shelf) -> FunctionProvider:
     """A fresh tool provider for one run (a provider holds the state of its calls, so runs never share one)."""
     lookup_spec, submit_spec = tool_specs(tools)
-    return FunctionProvider([(lookup_spec, lookup), (submit_spec, submit)])
+    return FunctionProvider([(lookup_spec, shelf.lookup), (submit_spec, submit)])
+
+
+# --- the instrument -----------------------------------------------------------------------------------------------
+
+
+class FactsServed:
+    """An instrument: how many facts the platform handed out in one run, by the platform's own count.
+
+    The executor makes a fresh one per run, since it holds that run's reading between `start` and `finish`, and runs
+    can overlap. `start` takes the reading `finish` compares with; `identity` is the run's identity as a plain mapping
+    (`run_key`, `factors`, `attempt`), which this count does not need. `finish` returns the snapshot that goes into
+    `record.instruments["facts"]`, the only platform state a scorer reads. Both run outside the agent's time.
+    """
+
+    namespace = "facts"
+
+    def __init__(self, shelf: Shelf) -> None:
+        self.shelf = shelf
+        self.before = 0
+
+    def start(self, identity: Mapping[str, Any]) -> None:
+        self.before = self.shelf.served
+
+    def finish(self) -> dict[str, Any]:
+        return {"ok": True, "served": self.shelf.served - self.before}
 
 
 # --- the stub model's script --------------------------------------------------------------------------------------
@@ -108,31 +153,46 @@ def script_for(condition: str, task: str, model: str, tools: str) -> list[Any]:
 
 
 class TinyScorer:
-    """A pure function of a record: two axes, a verdict and named numeric outcomes (a missing one is None)."""
+    """A pure function of a record: two axes, a verdict and named numeric outcomes (a missing one is None).
+
+    A treatment attempt (under `relay-down`, the tool server failed after the agent's first turn) is scored like any
+    other run: the failure is the condition's manipulation, so what the agent achieved under it is the measurement.
+    It gave no answer, so its accuracy is 0, and its rounds and lookups are what it did before the failure. None means
+    only that an outcome could not be measured: it would drop the run's pair from every contrast on that outcome, and a
+    confirmatory contrast is refused for that, even one that declares `treatment_outcomes = "scored"`, past the number
+    its preregistration allows in `max_unscored_treatment`.
+
+    `served` is read from the instrument's snapshot, not from the tool calls: the platform's own count of the facts it
+    handed out. A snapshot that failed (`"ok": false`) or is missing gives None, never 0.
+    """
 
     name = "tiny"
     version = "1"
 
     def score(self, record: RunRecord) -> dict[str, Any]:
         calls = record.tool_calls
-        outcome = record.outcome["name"]
+        outcome = record.outcome
         looked = [c for c in calls if c["name"] == "lookup"]
-        served = bool(looked) and all(c["status"] == "ok" for c in looked)
-        if outcome == "infrastructure":  # the platform failed under the run: nothing the agent did can be judged
+        if outcome["name"] == "infrastructure" and not outcome["treatment"]:
+            # A failure that is not the condition's treatment is set aside and run again, and the core never scores
+            # it; were it scored, nothing the agent did could be judged, so every outcome is unmeasured.
             return {
                 "axes": {"agent": "no_answer", "platform": "failed"},
                 "verdict": "not_determined",
-                "outcomes": {"accuracy": None, "rounds": None, "lookups": None},
+                "outcomes": {"accuracy": None, "rounds": None, "lookups": None, "served": None},
             }
+        failed = outcome["name"] == "infrastructure" or not (looked and all(c["status"] == "ok" for c in looked))
         submitted = [c for c in calls if c["name"] == "submit" and c["status"] == "ok"]
         correct = bool(submitted) and submitted[-1]["arguments"].get("answer") == FACTS[record.factors["task"]]
+        facts = record.instruments.get(FactsServed.namespace, {})
         return {
-            "axes": {"agent": "answered" if submitted else "no_answer", "platform": "served" if served else "failed"},
+            "axes": {"agent": "answered" if submitted else "no_answer", "platform": "failed" if failed else "served"},
             "verdict": "fulfilled" if correct else "violated",
             "outcomes": {
-                "accuracy": 1.0 if correct else 0.0,
+                "accuracy": 1.0 if correct else 0.0,  # a treatment attempt gave no answer: 0, never None
                 "rounds": float(record.totals["rounds"]),
                 "lookups": float(len(looked)),
+                "served": float(facts["served"]) if facts.get("ok") is True else None,  # a failed reading: unmeasured
             },
         }
 
@@ -141,7 +201,8 @@ class TinyScorer:
 
 
 class TinyExecutor:
-    """Runs one attempt: script the stub, render the prompt, run the loop, write the record, return it."""
+    """Runs one attempt: script the stub, render the prompt, start the instrument, run the loop, finish the instrument,
+    write the record, return it."""
 
     def __init__(self, context: StudyContext) -> None:
         self.context = context
@@ -151,18 +212,25 @@ class TinyExecutor:
         study, factors = self.context.study, request.identity.factors
         condition = study.schema.condition_named(factors, request.run_key)
         backend = request.backend  # built by the scheduler from the admitted endpoint; never build one here
-        if not isinstance(backend, StubAdapter):
-            raise TypeError("the tiny study runs on stub models only")
+        if not callable(getattr(backend, "use", None)):  # the method this executor needs, whatever class serves it
+            raise TypeError("the tiny study needs a scripted backend, one with use(script), as the stub has")
         backend.use(script_for(condition, factors["task"], factors["model"], factors["tools"]))
         user = self.template.render({"TASK": factors["task"], "HINT": HINTS[factors["tools"]]}, study_run=True)
+        shelf = Shelf()
+        instruments = [FactsServed(shelf)]  # fresh for every run: an instrument holds one run's reading
+        identity = {"run_key": request.run_key, "factors": dict(factors), "attempt": request.identity.attempt}
+        await asyncio.to_thread(start_instruments, instruments, identity)  # blocking I/O stays off the event loop
         record = await record_run(
             request,
-            [provider_for(factors["tools"])],
+            [provider_for(factors["tools"], shelf)],
             "You are a careful assistant.",
             user,
             study.campaign.agent,
             code=dict(self.context.code),
         )
+        # The loop returns a record however the run ended, an infrastructure failure included, so the snapshot is
+        # taken for every attempt that has a record. finish_instruments returns a new record: write that one.
+        record = await asyncio.to_thread(finish_instruments, record, instruments)
         record.write(request.run_dir)  # the campaign checks, exports and analyses records that are on disk
         return record
 

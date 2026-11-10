@@ -31,6 +31,15 @@ def contrast(name: str, conclusion: str, **changes) -> ContrastResult:
         "n_pairs_missing": 2,
         "n_unpaired": 0,
         "tasks_dropped": (),
+        "treatment_outcomes": None,
+        "max_unscored_treatment": 0,
+        "pairs_missing": {
+            "treatment_outcome_none": 0,
+            "treatment_excluded": 0,
+            "exhausted": 0,
+            "unpaired_or_left_out": 0,
+            "outcome_none": 2,
+        },
         "counts": {},
         "per_model": (),
         "in_family": True,
@@ -76,11 +85,80 @@ def row(report: str, name: str) -> list[str]:
     return [cell.strip() for cell in line.strip("|").split(" | ")]
 
 
-@pytest.mark.parametrize("conclusion", CONCLUSIONS)
+def table_of(report: str, heading: str) -> dict[str, list[str]]:
+    """The first table after a heading, its header row included, keyed by the first cell of each row."""
+    lines = report.split(heading, 1)[1].splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("|"))
+    rows = {}
+    for line in lines[start:]:
+        if not line.startswith("|"):
+            break
+        if not line.startswith("|---"):
+            cells = [cell.strip() for cell in line.strip("|").split(" | ")]
+            rows[cells[0]] = cells
+    return rows
+
+
+@pytest.mark.parametrize("conclusion", [word for word in CONCLUSIONS if word != "untestable"])  # S11 tests its own
 def test_each_conclusion_word_is_shown_in_the_row_of_its_contrast_beside_the_raw_and_the_holm_p_value(conclusion):
     report = render(analysis(contrast("primary", conclusion)))
     cells = row(report, "primary")
-    assert cells[5:8] == ["0.0120", "0.0200", conclusion]  # p, Holm p, conclusion: never apart
+    assert cells[7:10] == ["0.0120", "0.0200", conclusion]  # p, Holm p, conclusion: never apart
+
+
+NO_PAIR = {
+    "treatment_outcome_none": 0,
+    "treatment_excluded": 0,
+    "exhausted": 2,
+    "unpaired_or_left_out": 1,
+    "outcome_none": 0,
+}
+
+
+def untestable(name: str, conclusion: str = "untestable", **changes) -> ContrastResult:
+    """A contrast with no usable pair as the kernel gives one: no estimate, no p-value, no minimum detectable effect."""
+    nothing = {"estimate": math.nan, "p_value": math.nan, "ci_low": math.nan, "ci_high": math.nan, "n_clusters": 0}
+    gone = {"n_clusters_dropped": 0, "n_pairs": 0, "n_pairs_missing": 0, "n_unpaired": 1, "pairs_missing": NO_PAIR}
+    return contrast(name, conclusion, **{**nothing, **gone, **changes})
+
+
+def untestable_analysis() -> AnalysisResult:
+    """A tested member, an untestable member (Holm leaves its adjusted p NaN) and an untestable exploratory contrast."""
+    results = (
+        contrast("tested", "difference", minimum_detectable_effect=0.31),
+        untestable("dry"),
+        untestable("dry-extra", in_family=False, exploratory=True),
+    )
+    holm = (HolmDecision("tested", 0.012, 0.024, 0.025, True), HolmDecision("dry", math.nan, math.nan, 0.05, False))
+    return AnalysisResult(results, holm, 0.05, dict(MANIFEST))
+
+
+def test_s11_an_untestable_contrast_shows_the_causes_of_its_missing_pairs_in_its_own_row():
+    """S11: the row says why nothing was tested, with the counts of the pairs table; p, Holm p and the minimum
+    detectable effect are not numbers, and the word is labelled exploratory outside the family."""
+    report = render(untestable_analysis())
+    cells = row(report, "dry")
+    assert cells[3] == "n/a"
+    assert cells[7:10] == ["n/a", "n/a", "untestable"]
+    assert cells[11] == "0 (missing: exhausted run 2, unpaired or left out 1)"
+    assert cells[14] == "-"  # no minimum detectable effect, though the column is shown for the tested contrast
+    extra = row(report, "dry-extra")
+    assert (extra[8], extra[9]) == ("exploratory", "untestable (exploratory)")
+    assert table_of(report, "### Pairs of the family's contrasts")["dry"][1:] == ["0", "0", "0", "2", "1", "0"]
+    assert "`untestable` (no usable pair" in report
+
+
+@pytest.mark.parametrize(
+    "result",
+    [contrast("tested-as-untestable", "untestable"), untestable("empty-as-tested", conclusion="not_detected")],
+    ids=["pairs-but-untestable", "no-pair-but-not-detected"],
+)
+def test_s11_a_result_whose_conclusion_disagrees_with_its_pairs_is_refused(result):
+    """S11: untestable exactly when no pair was used, so no table can show an empty contrast as tested."""
+    with pytest.raises(ValueError, match="untestable exactly when"):
+        render(analysis(result))
+    with pytest.raises(ValueError, match="untestable exactly when"):
+        summary_lines(analysis(result))
 
 
 def test_a_contrast_outside_the_family_is_exploratory_in_a_section_of_its_own_and_in_its_row():
@@ -93,7 +171,7 @@ def test_a_contrast_outside_the_family_is_exploratory_in_a_section_of_its_own_an
     assert "extra" in exploratory_part
     assert "in-family" not in exploratory_part
     cells = row(report, "extra")
-    assert (cells[6], cells[7]) == ("exploratory", "difference (exploratory)")  # never a bare conclusion
+    assert (cells[8], cells[9]) == ("exploratory", "difference (exploratory)")  # never a bare conclusion
 
 
 def test_the_kernels_flag_decides_and_a_result_whose_flags_disagree_with_the_holm_decisions_is_refused():
@@ -130,22 +208,22 @@ def test_a_factor_contrast_names_the_factor_and_its_levels():
 def test_tasks_dropped_and_clusters_are_shown():
     dropped = contrast("primary", "difference", tasks_dropped=("alpha-task", "beta-task"))
     cells = row(render(analysis(dropped)), "primary")
-    assert (cells[8], cells[9]) == ("12 (dropped 1)", "alpha-task, beta-task")
+    assert (cells[10], cells[13]) == ("12 (dropped 1)", "alpha-task, beta-task")
 
 
 def test_the_minimum_detectable_effect_is_shown_when_present_and_the_column_is_absent_otherwise():
     with_power = render(analysis(contrast("primary", "difference", minimum_detectable_effect=0.31)))
-    assert row(with_power, "primary")[10] == "0.31"
+    assert row(with_power, "primary")[14] == "0.31"
     assert "Min. detectable effect" not in render(analysis(contrast("primary", "difference")))
     unreachable = render(analysis(contrast("primary", "difference", minimum_detectable_effect=math.nan)))
-    assert row(unreachable, "primary")[10] == "n/a"
+    assert row(unreachable, "primary")[14] == "n/a"
     assert "Min. detectable effect: the smallest effect" in unreachable
 
 
 def test_a_value_that_could_not_be_estimated_reads_n_a_and_never_zero():
     cells = row(render(analysis(contrast("primary", "not_detected", estimate=math.nan, p_value=math.nan))), "primary")
     assert cells[3] == "n/a"
-    assert cells[5] == "n/a"
+    assert cells[7] == "n/a"
 
 
 def test_the_terminal_summary_gives_each_conclusion_with_its_basis_and_labels_the_exploratory_ones():
@@ -182,19 +260,20 @@ def test_the_header_names_the_preregistration_hash_with_its_override_mark_the_co
 def test_each_condition_has_its_runs_and_the_median_dispatch_position_of_its_attempts():
     report = render(analysis(contrast("primary", "difference")))
     conditions = report.split("## Conditions")[1]
-    assert "| cond-a | 2 | 0 | 2.5 |" in conditions
-    assert "| cond-b | 2 | 0 | 2.5 |" in conditions
+    assert "| cond-a | 2 | 2 | 0 | 0 | 0 | 0 | 2.5 |" in conditions
+    assert "| cond-b | 2 | 2 | 0 | 0 | 0 | 0 | 2.5 |" in conditions
     late = export(
+        planned_runs=5,
         analysed_attempts=[{"run_key": f"l{s}", "condition": "late", "dispatch_seq": s} for s in (7, 9, 30)]
         + [
             {"run_key": "early-run", "condition": "early", "dispatch_seq": 1},
             {"run_key": "g0", "condition": "legacy", "dispatch_seq": None},
-        ]
+        ],
     )
     conditions = render(analysis(contrast("primary", "difference")), late).split("## Conditions")[1]
-    assert "| late | 3 | 0 | 9 |" in conditions
-    assert "| early | 1 | 0 | 1 |" in conditions
-    assert "| legacy | 1 | 0 | n/a |" in conditions  # a position the database did not keep is unknown, not zero
+    assert "| late | 3 | 3 | 0 | 0 | 0 | 0 | 9 |" in conditions
+    assert "| early | 1 | 1 | 0 | 0 | 0 | 0 | 1 |" in conditions
+    assert "| legacy | 1 | 1 | 0 | 0 | 0 | 0 | n/a |" in conditions  # a position not kept is unknown, not zero
 
 
 def test_set_aside_and_treatment_counts_are_listed_per_condition_and_kind():
@@ -207,18 +286,153 @@ def test_set_aside_and_treatment_counts_are_listed_per_condition_and_kind():
     report = render(analysis(contrast("primary", "difference")), data)
     assert "| cond-a | endpoint | no | 3 | 0 | 0 |" in report
     assert "| cond-b | knowledge | yes | 1 | 2 | 0 |" in report
-    assert "No infrastructure failure." in render(analysis(contrast("primary", "difference")))
+    assert "| cond-a | none |" not in report  # a condition with a row of its own needs no row of zeros
+
+
+def test_c23_each_condition_shows_its_planned_runs_how_each_ended_and_its_attempts_set_aside():
+    """C23: planned is analysed + exhausted + unfinished + left out, per condition, so an exhausted run is seen under
+    its own condition and not only in the header; set-aside attempts are summed over the condition's kinds."""
+    data = export(
+        planned_runs=8,
+        exhausted_runs=[{"run_key": "k5", "condition": "cond-a"}],
+        unfinished_runs=[{"run_key": "k6", "condition": "cond-b"}, {"run_key": "k7", "condition": "cond-c"}],
+        partial=True,
+        running_attempts=0,
+        excluded_attempts=[{"run_key": "k8", "condition": "cond-c", "attempt": 2, "reason": "no record"}],
+        infrastructure_by_condition=[
+            {"condition": "cond-a", "kind": "endpoint", "declared_treatment": False, "set_aside": 3, "treatment": 0},
+            {"condition": "cond-a", "kind": "sandbox", "declared_treatment": False, "set_aside": 2, "treatment": 0},
+        ],
+    )
+    conditions = table_of(render(analysis(contrast("primary", "difference")), data), "## Conditions")
+    header = ["Planned", "Analysed", "Exhausted", "Unfinished", "Left out", "Attempts set aside"]
+    assert conditions["Condition"][1:7] == header
+    assert conditions["cond-a"][1:7] == ["3", "2", "1", "0", "0", "5"]
+    assert conditions["cond-b"][1:7] == ["3", "2", "0", "1", "0", "0"]
+    assert conditions["cond-c"][1:8] == ["2", "0", "0", "1", "1", "0", "n/a"]  # nothing analysed: no position
+
+
+def test_c23_every_condition_is_in_the_infrastructure_table_with_a_row_of_zeros_when_nothing_failed():
+    """C23: a condition that met no infrastructure failure has a row of zeros, so 0 is not mistaken for unreported;
+    that includes a condition known only from a run that was not analysed."""
+    data = export(planned_runs=5, exhausted_runs=[{"run_key": "k5", "condition": "cond-c"}])
+    kinds = render(analysis(contrast("primary", "difference")), data).split("### Infrastructure failures")[1]
+    for name in ("cond-a", "cond-b", "cond-c"):
+        assert f"| {name} | none | no | 0 | 0 | 0 |" in kinds
+    assert "No infrastructure failure." not in kinds
+
+
+def test_c23_an_export_whose_run_lists_do_not_add_up_to_the_planned_runs_is_refused():
+    """C23: the per-condition counts partition the plan; an export that loses a run is not reported as complete."""
+    with pytest.raises(ValueError, match="planned_runs is 5, but its run lists hold 4 runs"):
+        render(analysis(contrast("primary", "difference")), export(planned_runs=5))
+
+
+def test_c23_each_contrast_shows_the_pairs_it_used_and_the_pairs_it_is_missing_by_cause():
+    """C23: pairs used in the contrast's own row, and every cause of a missing pair in a table of its own, zeros
+    included, for every contrast, exploratory ones too."""
+    missing = {
+        "treatment_outcome_none": 1,
+        "treatment_excluded": 0,
+        "exhausted": 2,
+        "unpaired_or_left_out": 3,
+        "outcome_none": 4,
+    }
+    member = contrast("primary", "difference", n_pairs=14, pairs_missing=missing, treatment_outcomes="scored")
+    other = contrast("extra", "difference", in_family=False, exploratory=True)
+    report = render(analysis(member, other, family=["primary"]))
+    assert row(report, "primary")[11] == "14"
+    family = table_of(report, "### Pairs of the family's contrasts")
+    assert family["Contrast"] == [
+        "Contrast",
+        "Pairs used",
+        "Treatment outcome None",
+        "Treatment excluded",
+        "Exhausted run",
+        "Unpaired or left out",
+        "Outcome None (other)",
+    ]
+    assert set(family) == {"Contrast", "primary"}  # an exploratory contrast is never in a table of the family
+    assert family["primary"] == ["primary", "14", "1", "0", "2", "3", "4"]
+    assert table_of(report, "### Pairs of the exploratory contrasts")["extra"] == [
+        "extra",
+        "40",
+        "0",
+        "0",
+        "0",
+        "0",
+        "2",
+    ]
+    assert "- *Exhausted run*: the run of either arm used all its attempts" in report.split("## Missing pairs")[1]
+
+
+def test_s10_a_contrast_that_excludes_treatment_attempts_is_named_beside_its_result_with_how_many_it_left_out():
+    """S10: an excluded outage must not read as the absence of an outage effect, so the contrast's own row says that
+    it excludes treatment attempts and how many pairs that left out; the other declarations and an undeclared loss
+    are shown the same way."""
+    zero = dict.fromkeys(("treatment_outcome_none", "treatment_excluded", "exhausted", "unpaired_or_left_out"), 0)
+    excluded = contrast(
+        "outage-excluded",
+        "not_detected",
+        treatment_outcomes="excluded",
+        pairs_missing={**zero, "treatment_excluded": 2, "outcome_none": 0},
+    )
+    scored = contrast("outage-scored", "difference", treatment_outcomes="scored")
+    lost = contrast(
+        "outage-lost",
+        "not_detected",
+        in_family=False,
+        exploratory=True,
+        pairs_missing={**zero, "treatment_outcome_none": 3, "outcome_none": 0},
+    )
+    plain = contrast("no-outage", "difference")
+    report = render(analysis(excluded, scored, lost, plain, family=["outage-excluded", "outage-scored", "no-outage"]))
+    cells = row(report, "outage-excluded")
+    assert cells[9:13] == ["not_detected", "12 (dropped 1)", "40", "excluded (2 pair(s) left out)"]
+    assert row(report, "outage-scored")[12] == "scored"
+    assert row(report, "outage-lost")[12] == "not declared (3 pair(s) None)"
+    assert row(report, "no-outage")[12] == "-"
+    assert "Treatment attempts:" in report  # what the column says is stated beside the table
 
 
 def test_runs_that_were_not_analysed_are_counted_in_the_header():
     data = export(
-        exhausted_runs=[{"condition": "cond-a"}], unfinished_runs=[{"condition": "cond-b"}, {"condition": "cond-b"}]
+        planned_runs=7,
+        exhausted_runs=[{"condition": "cond-a"}],
+        unfinished_runs=[{"condition": "cond-b"}, {"condition": "cond-b"}],
     )
     expected = (
         "4 analysed, 1 exhausted (charged infrastructure attempts reached the limit; no scored attempt), "
         "2 unfinished, 0 left out"
     )
     assert expected in render(analysis(contrast("primary", "difference")), data)
+
+
+@pytest.mark.parametrize("member", [True, False], ids=["family", "exploratory"])
+def test_c23_each_contrast_table_shows_the_margin_and_the_equivalence_interval_its_conclusion_rests_on(member):
+    """C23: what analysis.json holds is in the report too: a reader can check `equivalent` against the preregistered
+    margin and the 1 - 2 alpha interval, in both tables, beside the interval at the reported level."""
+    flags = {} if member else {"in_family": False, "exploratory": True}
+    with_margin = contrast(
+        "near", "equivalent", equivalence_margin=0.25, equivalence_interval=(-0.1429, 0.1429), **flags
+    )
+    without = contrast("far", "difference", **flags)
+    report = render(analysis(with_margin, without, family=["near", "far"] if member else []), interval_level=0.95)
+    heading = "## Preregistered contrasts" if member else "## Exploratory contrasts"
+    table = table_of(report, heading)
+    assert table["Contrast"][4:7] == ["95% interval", "Margin", "90% equivalence interval"]
+    assert table["near"][4:7] == ["[0.1, 0.4]", "0.25", "[-0.1429, 0.1429]"]
+    assert table["far"][5:7] == ["-", "-"]  # no margin: it can never read equivalent, and the row says so
+    assert "Margin: the preregistered equivalence margin" in report
+
+
+def test_c23_the_equivalence_interval_is_named_by_its_level_and_an_untestable_contrast_has_none():
+    """C23: the level is 1 - 2 alpha, from the analysis's own alpha; with no pair the interval is n/a, never 0."""
+    dry = untestable("dry", equivalence_margin=0.2, equivalence_interval=(math.nan, math.nan))
+    result = dataclasses.replace(analysis(dry), alpha=0.025)
+    cells = table_of(render(result), "## Preregistered contrasts")
+    assert cells["Contrast"][6] == "95% equivalence interval"
+    assert cells["dry"][5:7] == ["0.2", "[n/a, n/a]"]
 
 
 def test_the_interval_level_is_named_when_given():
@@ -273,8 +487,8 @@ def test_a_partial_analysis_says_so_and_lists_each_attempt_it_leaves_out_with_th
 def test_every_count_comes_from_the_analysed_population_and_the_left_out_ones_have_a_column_of_their_own():
     report = render(analysis(contrast("primary", "difference")), partial_export())
     conditions = report.split("## Conditions")[1]
-    assert "| cond-a | 1 | 1 | 1 |" in conditions  # one run analysed, one left out, the median of the analysed one
-    assert "| cond-b | 2 | 0 | 2.5 |" in conditions
+    assert "| cond-a | 2 | 1 | 0 | 0 | 1 | 1 | 1 |" in conditions  # one analysed, one left out, the analysed median
+    assert "| cond-b | 2 | 2 | 0 | 0 | 0 | 0 | 2.5 |" in conditions
     assert "| cond-a | knowledge | yes | 1 | 0 | 2 |" in conditions  # the two excluded attempts are not "scored"
 
 
@@ -293,6 +507,7 @@ def test_c09_set_aside_counts_are_described_as_covering_every_run_not_only_the_a
     """C09: a pending run's set-aside attempt is counted, and the table says the count covers every run, finished
     or not, so it is not mistaken for part of the analysed population."""
     data = export(
+        planned_runs=5,
         unfinished_runs=[{"run_key": "k5", "condition": "cond-a"}],
         infrastructure_by_condition=[
             {
@@ -317,3 +532,36 @@ def test_r13_the_report_names_each_scorer_with_its_version_or_says_it_does_not_k
     given = render(analysis(contrast("primary", "difference")), scorers={"tiny": "2", "alpha": "sha256:ab"})
     assert "- Scorers: alpha `sha256:ab`, tiny `2`" in given
     assert "- Scorers: n/a" in render(analysis(contrast("primary", "difference")))
+
+
+def test_s10_a_scored_contrast_that_used_its_tolerance_shows_the_pairs_it_lost_and_the_number_it_was_allowed():
+    """S10: a preregistered tolerance is used in the open: the row gives what it cost and what was allowed."""
+    zero = dict.fromkeys(("treatment_excluded", "exhausted", "unpaired_or_left_out", "outcome_none"), 0)
+    tolerated = contrast(
+        "outage",
+        "difference",
+        treatment_outcomes="scored",
+        max_unscored_treatment=2,
+        pairs_missing={**zero, "treatment_outcome_none": 1},
+    )
+    report = render(analysis(tolerated, family=["outage"]))
+    assert row(report, "outage")[12] == "scored (1 pair(s) None, at most 2 preregistered)"
+
+
+@pytest.mark.parametrize(
+    ("alpha", "equivalence", "level", "interval"),
+    [
+        (0.05, "90%", 0.95, "95%"),
+        (0.0125, "97.5%", 0.975, "97.5%"),
+        (0.025, "95%", 0.999, "99.9%"),
+        (0.000005, "99.999%", 0.99999, "99.999%"),
+    ],
+)
+def test_c23_an_interval_level_is_named_with_its_fraction_never_rounded_to_another_level(
+    alpha, equivalence, level, interval
+):
+    """C23: alpha 0.0125 gives a 97.5% equivalence interval; calling it 98% would name an interval nobody computed."""
+    member = contrast("near", "equivalent", equivalence_margin=0.25, equivalence_interval=(-0.1, 0.1))
+    result = dataclasses.replace(analysis(member), alpha=alpha)
+    header = table_of(render(result, interval_level=level), "## Preregistered contrasts")["Contrast"]
+    assert header[4:7] == [f"{interval} interval", "Margin", f"{equivalence} equivalence interval"]

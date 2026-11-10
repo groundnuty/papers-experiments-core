@@ -1,11 +1,14 @@
 """The command line: usage, and the refusals that exit non-zero with a message saying why (the full run: e2e)."""
 
+import dataclasses
 import shutil
 from pathlib import Path
 
 import pytest
 from record_support import no_secrets_in_the_environment
 
+from expcore.campaign.holds import Hold
+from expcore.campaign.scheduler import RunSummary
 from expcore.cli import EXIT_PENDING, main
 from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
@@ -61,10 +64,40 @@ def test_analyze_and_report_refuse_a_study_that_was_never_run(study, capsys):
 def test_a_run_that_ends_with_runs_held_exits_with_the_pending_status_and_prints_the_hold(study, capsys):
     assert main(["run", str(study)]) == EXIT_PENDING
     captured = capsys.readouterr()
-    assert "dispatched 0 runs" in captured.out
+    assert "dispatched 0 attempts of 22 runs" in captured.out
     assert "hold on alpha-stub" in captured.out
     assert "over the ceiling" in captured.out
     assert "22 runs are still pending" in captured.err
+
+
+def test_c23_run_counts_what_it_dispatched_in_attempts_of_the_campaigns_runs(tmp_path, monkeypatch, capsys):
+    """C23: three runs were run again, so 65 attempts begun are 62 runs, none of them lost; the five workers that began
+    no attempt (a lease that timed out, a gate that closed while one waited) are not counted."""
+    summary = RunSummary(70, {}, {"done": 61, "infra_exhausted": 1}, attempts=65)
+    monkeypatch.setattr("expcore.cli.run_study", lambda *args, **kwargs: summary)
+    assert main(["run", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("dispatched 65 attempts of 62 runs; runs by status: {'done': 61, 'infra_exhausted': 1}\n")
+
+
+@pytest.mark.parametrize("command", ["analyze", "report"])
+def test_r04_a_refusal_names_the_command_that_refused_and_says_refused_once(study, command, capsys):
+    """R04: records with no replay check are refused by the command that was run, named, and "refused" is said once."""
+    (study / "out" / "runs").mkdir(parents=True)
+    assert main([command, str(study)]) == 1
+    err = capsys.readouterr().err.replace(str(study), "STUDY")
+    assert err.startswith(f"{command} refused: STUDY/out/runs: ")
+    assert err.count("refus") == 1
+    assert "python -m expcore check" in err  # what to do
+
+
+def test_c12_run_says_a_hold_on_stderr_as_it_begins_once_with_whether_it_ends_by_itself(study, capsys):
+    """C12: the budget holds every run of the model; the command says so as it happens, not only in its summary."""
+    assert main(["run", str(study)]) == EXIT_PENDING
+    said = [line for line in capsys.readouterr().err.splitlines() if line.startswith("run: hold on alpha-stub")]
+    assert len(said) == 1
+    assert said[0].startswith("run: hold on alpha-stub (budget): ")
+    assert said[0].endswith("; it does not end by itself: its runs stay pending until someone looks")
 
 
 def test_a_resume_under_a_changed_configuration_is_refused_by_the_command(study, capsys):
@@ -75,3 +108,16 @@ def test_a_resume_under_a_changed_configuration_is_refused_by_the_command(study,
     write_stamp(study, "a" * 40, load_study(study).scope)  # the stamp follows the edited files; the campaign does not
     assert main(["run", str(study)]) == 1
     assert "refused:" in capsys.readouterr().err
+
+
+def test_l08_a_run_stopped_on_harness_errors_prints_where_their_tracebacks_are(tmp_path, monkeypatch, capsys):
+    """L08: the attempt keeps a class and a stack hash; the command says which local file holds the tracebacks."""
+    log = tmp_path / "out" / "logs" / "harness-errors.log"
+    stop = Hold("harness_errors", "dispatch of every model is stopped by harness errors")
+    summary = RunSummary(3, {"all": stop}, {"harness_error": 3, "pending": 1}, log)
+    monkeypatch.setattr("expcore.cli.run_study", lambda *args, **kwargs: summary)
+    assert main(["run", str(tmp_path)]) == EXIT_PENDING
+    assert f"their tracebacks, redacted, are in {log}" in capsys.readouterr().out
+    monkeypatch.setattr("expcore.cli.run_study", lambda *args, **kwargs: dataclasses.replace(summary, holds={}))
+    assert main(["run", str(tmp_path)]) == EXIT_PENDING  # held by something else: no word of the log
+    assert "tracebacks" not in capsys.readouterr().out

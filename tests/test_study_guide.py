@@ -1,11 +1,14 @@
 """The study guide's code runs as written.
 
 Every fenced block of docs/study-guide.md is taken in order, in one new directory: an `sh` line runs (`uv run python`
-becomes this interpreter, and `python -m expcore` runs in this process), a `python` block is executed in one namespace
+becomes this interpreter, `python -m expcore` runs in this process, and `cd` moves every later block into the
+directory it names), a `python` block is executed in one namespace
 shared by all of them, and a `toml` block must agree with the file of the example it names on its first line, or, if
 it shows an `[[opaque]]` entry, load as one through the package's own inclusion-list loader. The two
 lines that make the project and add the core cannot run here, where the core is already installed: the `uv add` line
 must be exactly what depends on this version's tag, and scripts/fresh_repo.py runs both (tests/test_fresh_repo.py).
+The core is installed editable here, so the package vendors stand-in wheels and the package's `make check` runs with
+this interpreter (`check-installed`); scripts/fresh_repo.py runs the offline install for real.
 """
 
 import contextlib
@@ -19,9 +22,11 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from package_support import stand_in_vendor
 from study_support import clean_environment
 
 from expcore.cli import main
+from expcore.package import build as package_build
 from expcore.package.spec import load_spec
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +57,8 @@ def run_line(line: str) -> None:
         assert line == f"uv add git+https://github.com/groundnuty/papers-experiments-core@v{version()}", line
         return
     argv = shlex.split(line.replace("uv run python", shlex.quote(sys.executable)))
+    if argv[0] == "make":
+        argv = [*["check-installed" if a == "check" else a for a in argv], f"PYTHON={sys.executable}"]
     if argv[:3] == [sys.executable, "-m", "expcore"]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -65,6 +72,7 @@ def run_line(line: str) -> None:
 
 def test_every_block_of_the_study_guide_runs_in_order_in_a_new_directory(tmp_path, monkeypatch, clean_environment):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(package_build, "vendor_wheels", stand_in_vendor)
     for key, value in {
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -80,7 +88,12 @@ def test_every_block_of_the_study_guide_runs_in_order_in_a_new_directory(tmp_pat
     for number, (language, body) in enumerate(found, start=1):
         if language == "sh":
             for line in body.splitlines():
-                if line.strip() and not line.startswith("#"):
+                if line.startswith("cd "):
+                    [directory] = shlex.split(line)[1:]
+                    target = Path(directory).resolve()  # relative to where the guide's reader stands now
+                    assert target.is_relative_to(tmp_path.resolve()), f"block {number}: cd leaves the scratch dir"
+                    monkeypatch.chdir(target)
+                elif line.strip() and not line.startswith("#"):
                     run_line(line)
         elif language == "python":
             exec(compile(body, f"{GUIDE.name}, block {number}", "exec"), namespace)
@@ -93,7 +106,8 @@ def test_every_block_of_the_study_guide_runs_in_order_in_a_new_directory(tmp_pat
             named = NAMED_FILE.match(body)
             assert named, f"block {number}: a toml block names the file of the example it shows on its first line"
             shown = tomllib.loads(body)
-            assert contained(shown, tomllib.loads((tmp_path / named.group(1)).read_text(encoding="utf-8"))), number
+            assert contained(shown, tomllib.loads((Path.cwd() / named.group(1)).read_text(encoding="utf-8"))), number
         else:
             pytest.fail(f"block {number}: a block is sh, python or toml, so the test can run or check it")
-    assert (tmp_path / "dist" / "tiny-study-package" / "SHA256SUMS").is_file()  # the last step ran
+    assert Path.cwd() != tmp_path  # the guide made its project in a directory of its own, and worked in it
+    assert (Path.cwd() / "dist" / "tiny-study-package" / "SHA256SUMS").is_file()  # the last step ran

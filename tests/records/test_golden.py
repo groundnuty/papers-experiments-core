@@ -146,3 +146,35 @@ def test_C01_the_version_three_golden_is_a_targeted_treatment_and_replays_as_one
 def test_R03_the_version_three_golden_passes_the_replay_check_stages():
     """R03: it loads, writes back and replays through the loop."""
     assert check_record(GOLDEN_V3.read_bytes()) is None
+
+
+SECRET_SHAPED = {  # values a checking environment may hold: every form the redaction rules recognise, none in a golden
+    "TOYLAB_TOKEN": "amber-line-one\ncobalt-line-two",
+    "OTHER_API_KEY": "abcd/efgh-4471",
+    "THIRD_SECRET": "quartz'pebble\"7781-amber",
+}
+
+
+def test_R12_the_golden_records_check_and_replay_whatever_secrets_the_checking_environment_holds(monkeypatch):
+    """R12: a record written under earlier redaction rules checks and replays under the current ones: the write-back
+    redacts nothing and the replay redacts nothing, so only a secret the record really holds can stop it."""
+    for name, value in SECRET_SHAPED.items():
+        monkeypatch.setenv(name, value)
+    for golden in (GOLDEN, GOLDEN_V2):
+        assert check_record(golden.read_bytes()) is None
+
+
+def test_R12_a_secret_of_the_checking_environment_held_by_a_record_is_reported_as_a_leak_not_a_divergence(
+    monkeypatch,
+):
+    """R12: the golden record's user prompt stands in for a value a record should not hold. With it named as a secret
+    by the checking environment, the check stops at its own `secret` stage, naming where, never at the write-back;
+    without it the record checks clean, and its replay is the same either way."""
+    raw = GOLDEN_V2.read_bytes()
+    assert check_record(raw) is None
+    monkeypatch.setenv("TOYLAB_TOKEN", "do the task")
+    stage, error = check_record(raw)
+    assert stage == "secret"
+    assert "prompt" in error
+    assert "do the task" not in error
+    assert replay_record(load_record(GOLDEN_V2)).outcome == load_record(GOLDEN_V2).outcome

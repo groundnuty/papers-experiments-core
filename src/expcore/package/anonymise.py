@@ -10,8 +10,9 @@ very names the package hides (K03: a private list never enters the repository or
 
 - Only the files the list names are rewritten. Each must be prose or metadata (a suffix in `REWRITABLE_SUFFIXES`),
   outside the code the records were made with and outside out/. YAML (`.yml`, `.yaml`, `CITATION.cff`) is refused:
-  with no YAML parser its rewrite could not be checked, so the author leaves it out or ships an anonymised copy from
-  another path. JSON is rewritten lexically: each string token, key or value, is decoded, relabelled and re-encoded
+  with no YAML parser its rewrite could not be checked, so the author leaves it out or includes, instead of it, a
+  copy anonymised by hand under another name (`include` puts every file at its own path; it maps no file to another
+  path). JSON is rewritten lexically: each string token, key or value, is decoded, relabelled and re-encoded
   if it changed, so an escape such as `\\u0056` cannot hide a term from the rewrite, and every other byte, numbers
   with their exact spelling included, stays as it was; the result must still parse. TOML and plain text are
   rewritten as text, and a TOML file must still parse afterwards. Code, configuration, records and generated tables
@@ -39,13 +40,15 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from expcore.package.spec import PackageError
-from expcore.package.views import PARSED, hidden_name, streams, views
+from expcore.package.views import PARSED, streams, views
+from expcore.provenance.redact import Redactor
 from expcore.study.config import CONFIG_FILES
 
 REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".bib", ".json", ".toml"})
 YAML_SUFFIXES = frozenset({".yml", ".yaml", ".cff"})  # CITATION.cff is YAML
 _JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)  # in valid JSON, every quote outside a string starts one
 FINDING = "a term of the anonymisation list"
+LIST = "the anonymisation list"  # how a message names the list: never by its path, the author's
 REDACTED_PATH = "<path redacted>"
 
 
@@ -63,36 +66,50 @@ def _inside(path: Path, directory: Path) -> bool:
     return path == directory or directory in path.parents
 
 
-def load_anonymisation(path: Path, *, keep_out_of: Iterable[Path], model_names: Collection[str]) -> Anonymisation:
-    """Read and validate an anonymisation list; refuse one that lies inside any of `keep_out_of` (K03)."""
+def load_anonymisation(path: Path, *, keep_out_of: Iterable[Path], model_names: Collection[str] = ()) -> Anonymisation:
+    """Read and validate an anonymisation list; refuse one that lies inside any of `keep_out_of` (K03).
+
+    No message names the list's path or a place it lies in, which are the author's and may hold a term: it is the
+    anonymisation list. The model names (K04) may be checked here or, once the study is loaded, by `refuse_models`.
+    """
     path = Path(path)
     for directory in keep_out_of:
         if _inside(path, Path(directory)):
             raise PackageError(
-                f"the anonymisation list lies inside {directory}; keep it outside the repository, the study and the "
-                "output (K03)"
+                "the anonymisation list lies inside the study's repository, the study or the output; keep it outside "
+                "all three (K03)"
             )
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        raise PackageError(f"{path}: cannot be read as an anonymisation list ({type(error).__name__})") from None
+        raise PackageError(f"{LIST}: cannot be read ({type(error).__name__})") from None
     files, terms = raw.get("files"), raw.get("terms")
     if set(raw) - {"files", "terms"} or not isinstance(files, list) or not isinstance(terms, dict) or not terms:
-        raise PackageError(f"{path}: needs `files`, a list of paths, and a non-empty [terms] table, and nothing else")
+        raise PackageError(f"{LIST}: needs `files`, a list of paths, and a non-empty [terms] table, and nothing else")
     if not all(isinstance(f, str) and f for f in files) or len(set(files)) != len(files):
-        raise PackageError(f"{path}: `files` must name distinct paths")
-    models = {name.casefold() for name in model_names}
+        raise PackageError(f"{LIST}: `files` must name distinct paths")
     for number, (term, label) in enumerate(terms.items(), start=1):
-        where = f"{path}: term {number} of [terms]"  # a term is never shown, only its place in the list
+        where = f"{LIST}: term {number} of [terms]"  # a term is never shown, only its place in the list
         if not isinstance(label, str) or not label.strip():
             raise PackageError(f"{where} has no label to replace it with")
         if not term.strip() or not any(c.isalpha() for c in term):
             raise PackageError(f"{where} has no letter; numbers are never anonymised (K04)")
-        if term.casefold() in models:
-            raise PackageError(f"{where} names a model of the model table; model names are never anonymised (K04)")
         if any(_finder(other).search(label) for other in terms):
             raise PackageError(f"{where}: its label contains a term of the list")
-    return Anonymisation(path, tuple(files), dict(terms))
+    anonymisation = Anonymisation(path, tuple(files), dict(terms))
+    refuse_models(anonymisation, model_names)
+    return anonymisation
+
+
+def refuse_models(anonymisation: Anonymisation, model_names: Collection[str]) -> None:
+    """Refuse a term that is a key, API id or alias of the study's model table: model names are never anonymised."""
+    models = {name.casefold() for name in model_names}
+    for number, term in enumerate(anonymisation.terms, start=1):
+        if term.casefold() in models:
+            raise PackageError(
+                f"{LIST}: term {number} of [terms] names a model of the model table; model names are never "
+                "anonymised (K04)"
+            )
 
 
 def _body(term: str) -> str:
@@ -117,13 +134,14 @@ def rewrite(
     replacers = [(_replacer(term), label) for term, label in sorted(anonymisation.terms.items(), key=_longest_first)]
     result = dict(files)
     for name in anonymisation.files:
-        where = f"{anonymisation.source}: `files` names {name}"
+        where = f"{LIST}: `files` names {name}"
         if name not in files:
             raise PackageError(f"{where}, which the package does not include")
         if PurePosixPath(name).suffix.lower() in YAML_SUFFIXES:
             raise PackageError(
                 f"{where}, which is YAML: without a YAML parser its rewrite can be neither parsed nor read decoded, so "
-                "it is not rewritten. Leave it out of the package, or include an anonymised copy from another path"
+                "it is not rewritten. Leave it out of the package, or write an anonymised copy of it under another "
+                "name in the study, commit it, and include the copy instead of the original"
             )
         protected = name in code or name in CONFIG_FILES or name.startswith(out_prefix)
         if protected or PurePosixPath(name).suffix.lower() not in REWRITABLE_SUFFIXES:
@@ -199,30 +217,42 @@ def _lines(text: str, finders: Sequence[re.Pattern[str]]) -> set[int]:
     return {text.count("\n", 0, m.start()) + 1 for f in finders for m in f.finditer(text)}
 
 
+def term_lines(text: str, anonymisation: Anonymisation) -> set[int]:
+    """The lines of a text that hold a term of the list, read as it is."""
+    return _lines(text, [_finder(term) for term in anonymisation.terms])
+
+
 def holds_term(anonymisation: Anonymisation, text: str) -> bool:
     """Whether a text, a path for instance, holds a term of the list anywhere the residual check would find it."""
     return any(_finder(term).search(text) for term in anonymisation.terms)
 
 
 def find_terms(
-    files: Mapping[str, bytes], anonymisation: Anonymisation, *, opaque: Collection[str] = frozenset()
+    files: Mapping[str, bytes],
+    anonymisation: Anonymisation,
+    *,
+    opaque: Collection[str] = frozenset(),
+    redactor: Redactor | None = None,
 ) -> list[str]:
     """Return one finding per stream and line that holds a term, never the term; empty when the package is clean.
 
     Every stream of every file is read as the token check reads it (`views`): text as it is and decoded, a database's
     or archive's bytes under every encoding. A term found only in the parsed strings of a JSON or TOML stream has no
     line of its own and is reported for the stream. What the token check refuses is its finding, not one of these;
-    the files in `opaque` were attested by hash and are not read.
+    the files in `opaque` were attested by hash and are not read. A stream is named through `redactor`, the one every
+    check of the build shares, so a label that holds a term or a private name is shown the same hidden way here.
     """
     finders = [_finder(term) for term in anonymisation.terms]
+    if redactor is None:
+        redactor = Redactor(also=lambda text: holds_term(anonymisation, text))
     findings: list[str] = []
-    for position, name in enumerate(sorted(files), start=1):
+    for name in sorted(files):
         if name in opaque:
             continue
         for stream in streams(name, files[name])[0]:
             held = any(f.search(stream.label) for f in finders)
-            shown = hidden_name(position, stream.label) if held else stream.label
-            if shown != stream.label:
+            shown = redactor.name(stream.label, hide=held)
+            if held:
                 findings.append(f"{shown}: the path holds {FINDING}")
             lines, parsed = set(), False
             for view, text in views(stream):

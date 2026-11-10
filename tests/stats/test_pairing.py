@@ -1,5 +1,6 @@
 """Pairing: named-condition and factor contrasts, aggregation per cluster, and what is dropped and counted."""
 
+import dataclasses
 import math
 import random
 
@@ -8,7 +9,7 @@ import pytest
 from stats_support import both_arms, by_factor, make_row, named
 
 from expcore.stats.pairing import ContrastSpec, pair_rows
-from expcore.stats.rows import Row
+from expcore.stats.rows import AbsentRun, Row
 
 
 def bad_row(outcomes, attributes):
@@ -262,3 +263,155 @@ def test_a_spec_keeps_a_valid_margin_and_defaults_to_none():
         ContrastSpec("x", "score", "est", "group", conditions=("a", "b"), equivalence_margin=0.1).equivalence_margin
         == 0.1
     )
+
+
+# --- treatment attempts and the pairs a contrast is missing ---------------------------------------------------------
+
+
+def treated(task, model, seed, a, b, *, cluster="grp-a"):
+    """A pair whose cond-a run is a treatment attempt scored `a` and whose cond-b run is an ordinary one scored `b`."""
+    first, second = both_arms(task, model, seed, a, b, cluster=cluster)
+    return [dataclasses.replace(first, treatment=True), second]
+
+
+def absent(task, condition, reason, *, model="model-a", seed=1):
+    """A planned run of `condition` with no analysed attempt, as the export lists it, and why it has none."""
+    factors = {"task": task, "model": model, "seed": seed}
+    return AbsentRun(f"task={task}|model={model}|seed={seed}|condition={condition}", condition, factors, reason)
+
+
+@pytest.mark.parametrize("reason", ["exhausted", "unfinished"])
+def test_s10_a_treatment_attempt_left_none_is_counted_as_such_whatever_became_of_its_partner(reason):
+    """S10: the manipulation left its contrast because of the scorer, so the partner's fate must not hide it."""
+    first, _ = treated("task-a", "model-a", 1, None, 0.5)
+    pairing = pair_rows([first], named(), [absent("task-a", "cond-b", reason)])
+    assert pairing.missing["treatment_outcome_none"] == 1
+    assert (pairing.missing["exhausted"], pairing.missing["unpaired_or_left_out"]) == (0, 0)
+    assert (pairing.n_pairs, pairing.n_treatment_measured) == (0, 0)
+
+
+def test_s10_a_measured_treatment_attempt_or_an_ordinary_none_beside_an_exhausted_partner_stays_exhausted():
+    """S10: the scorer did nothing wrong there, so the pair is missing because of the exhausted run."""
+    measured, _ = treated("task-a", "model-a", 1, 0.2, 0.5)
+    ordinary, _ = both_arms("task-b", "model-a", 1, None, 0.5)
+    partners = [absent("task-a", "cond-b", "exhausted"), absent("task-b", "cond-b", "exhausted")]
+    pairing = pair_rows([measured, ordinary], named(), partners)
+    assert (pairing.missing["exhausted"], pairing.missing["treatment_outcome_none"]) == (2, 0)
+
+
+def test_s10_under_excluded_a_treatment_attempt_with_a_missing_partner_counts_as_excluded():
+    """S10: the preregistration leaves out every pair with a treatment attempt, whatever became of the other run."""
+    first, _ = treated("task-a", "model-a", 1, None, 0.5)
+    spec = dataclasses.replace(named(), treatment_outcomes="excluded")
+    pairing = pair_rows([first], spec, [absent("task-a", "cond-b", "unfinished")])
+    assert (pairing.missing["treatment_excluded"], pairing.missing["treatment_outcome_none"]) == (1, 0)
+    assert pairing.missing["unpaired_or_left_out"] == 0
+
+
+def test_s10_a_treatment_attempt_on_a_task_the_other_arm_never_planned_has_no_pair_to_leave():
+    """S10: a chain contrast's extra task is outside its pairs, so a None there costs the contrast nothing."""
+    first, _ = treated("task-a", "model-a", 1, None, 0.5)
+    pairing = pair_rows([first], named())
+    assert (pairing.missing["unpaired_or_left_out"], pairing.missing["treatment_outcome_none"]) == (1, 0)
+    assert pairing.n_treatment_measured == 0
+
+
+def test_s10_an_ordinary_run_on_a_task_only_one_arm_runs_may_lack_the_contrasts_outcome():
+    """S10: such a run stays unpaired, as it always was: only a treatment attempt of a planned pair is read."""
+    first, _ = both_arms("task-a", "model-a", 1, 0.5, 0.5)
+    pairing = pair_rows([dataclasses.replace(first, outcomes={})], named())
+    assert pairing.missing["unpaired_or_left_out"] == 1
+
+
+def test_s10_a_treatment_attempt_of_a_planned_pair_without_the_contrasts_outcome_is_refused():
+    """S10: a contrast on an outcome the scorer never gives is refused for a treatment attempt, partner or none."""
+    first, _ = treated("task-a", "model-a", 1, 0.5, 0.5)
+    with pytest.raises(ValueError, match="has no outcome 'score'"):
+        pair_rows([dataclasses.replace(first, outcomes={})], named(), [absent("task-a", "cond-b", "unfinished")])
+
+
+def test_s10_a_measured_treatment_attempt_counts_whatever_became_of_its_pair():
+    """S10: what tells a contrast that measured some treatment attempts from one that measured none: paired, beside
+    an ordinary None, or with an unfinished partner, but not on a task outside the contrast's pairs."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5) + treated("task-b", "model-a", 1, 0.0, 0.5)
+    rows += treated("task-c", "model-a", 1, 0.0, None)
+    rows += treated("task-d", "model-a", 1, 0.0, 0.5)[:1] + treated("task-e", "model-a", 1, 0.0, 0.5)[:1]
+    pairing = pair_rows(rows, named(), [absent("task-d", "cond-b", "unfinished")])
+    assert (pairing.n_pairs, pairing.n_treatment_measured) == (2, 3)
+
+
+def test_s10_a_pair_dropped_because_a_treatment_attempts_outcome_is_none_is_counted_apart():
+    """S10: a treatment attempt scored None takes its pair out of the contrast, and that drop is counted under its own
+    cause, apart from a None on an ordinary run; a scored treatment attempt is paired like any other run."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    rows += treated("task-b", "model-a", 1, None, 0.5)  # the treatment attempt's outcome is None
+    rows += both_arms("task-c", "model-a", 1, None, 0.5)  # an ordinary run's outcome is None
+    rows += treated("task-d", "model-a", 1, 0.0, None)  # the None is on the ordinary side
+    rows += treated("task-e", "model-a", 1, 0.0, 0.5)  # a treatment attempt the scorer measured
+    pairing = pair_rows(rows, named())
+    assert (pairing.n_pairs, pairing.n_pairs_missing) == (2, 3)
+    assert dict(pairing.missing) == {
+        "treatment_outcome_none": 1,
+        "treatment_excluded": 0,
+        "exhausted": 0,
+        "unpaired_or_left_out": 0,
+        "outcome_none": 2,
+    }
+
+
+def test_s10_a_contrast_that_excludes_treatment_attempts_leaves_out_every_pair_with_one_whatever_its_outcome():
+    """S10: under `treatment_outcomes = "excluded"` the preregistration, not the scorer, decides: each pair with a
+    treatment attempt is left out and counted as excluded, scored or not."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    rows += treated("task-b", "model-a", 1, None, 0.5)
+    rows += treated("task-c", "model-a", 1, 0.0, 0.5)
+    excluded = pair_rows(rows, dataclasses.replace(named(), treatment_outcomes="excluded"))
+    assert (excluded.n_pairs, excluded.n_pairs_missing) == (1, 0)
+    assert (excluded.missing["treatment_excluded"], excluded.missing["treatment_outcome_none"]) == (2, 0)
+    scored = pair_rows(rows, dataclasses.replace(named(), treatment_outcomes="scored"))
+    assert (scored.n_pairs, scored.missing["treatment_outcome_none"], scored.missing["treatment_excluded"]) == (2, 1, 0)
+
+
+@pytest.mark.parametrize("declared", ["", "kept", "Scored", True])
+def test_s10_a_spec_refuses_a_treatment_declaration_that_is_not_scored_or_excluded(declared):
+    """S10: the declaration says how treatment attempts enter the contrast, in one of two words."""
+    with pytest.raises(ValueError, match="treatment_outcomes must be 'scored' or 'excluded'"):
+        ContrastSpec("x", "score", "est", "group", conditions=("a", "b"), treatment_outcomes=declared)
+
+
+def test_c23_a_pair_missing_because_a_run_is_exhausted_is_counted_apart_from_one_unpaired_or_left_out():
+    """C23: a pair whose run in either arm exhausted its attempts is missing because of it, even when both runs are
+    absent; a pair whose other run is unfinished, left out of a partial analysis or never planned is unpaired or left
+    out. Every cause is reported, zeros included."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    rows.append(make_row("task-b", "model-a", 1, 0.8, condition="cond-a"))  # its cond-b run is exhausted
+    rows.append(make_row("task-d", "model-a", 1, 0.8, condition="cond-a"))  # its cond-b run is left out
+    rows.append(make_row("task-e", "model-a", 1, 0.8, condition="cond-a"))  # cond-b never planned it
+    gone = [
+        absent("task-b", "cond-b", "exhausted"),
+        absent("task-c", "cond-a", "exhausted"),  # neither run analysed: one exhausted, the other unfinished
+        absent("task-c", "cond-b", "unfinished"),
+        absent("task-d", "cond-b", "excluded"),
+        absent("task-f", "cond-a", "unfinished"),  # nothing of cond-b on task-f
+        absent("task-a", "cond-c", "exhausted"),  # another condition: not in this contrast
+    ]
+    pairing = pair_rows(rows, named(), absent=gone)
+    assert pairing.n_pairs == 1
+    assert pairing.n_unpaired == 3  # run keys analysed in one arm only, as before
+    assert dict(pairing.missing) == {
+        "treatment_outcome_none": 0,
+        "treatment_excluded": 0,
+        "exhausted": 2,
+        "unpaired_or_left_out": 3,
+        "outcome_none": 0,
+    }
+    assert pair_rows(rows, named()).missing["unpaired_or_left_out"] == 3  # without the absent runs: all unpaired
+
+
+def test_c23_an_absent_run_with_an_unknown_reason_or_a_run_key_an_analysed_row_holds_is_refused():
+    """C23: an absent run is exhausted, unfinished or excluded, and never also analysed."""
+    with pytest.raises(ValueError, match="reason must be one of 'exhausted', 'unfinished', 'excluded'"):
+        absent("task-a", "cond-a", "lost")
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    with pytest.raises(ValueError, match="two runs of 'cond-a' share one run key"):
+        pair_rows(rows, named(), absent=[absent("task-a", "cond-a", "exhausted")])

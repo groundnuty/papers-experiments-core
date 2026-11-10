@@ -1,5 +1,6 @@
 """The study-token hashing, candidate extraction, scanner and command line. Tokens here are all invented."""
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -274,8 +275,9 @@ def test_cli_hash_warns_by_line_number_about_tokens_that_can_only_match_a_whole_
     plain.write_text(f"{LONG_NAME}\n{CIDR}\n", encoding="utf-8")
     assert st.main(["hash", str(plain)]) == 0
     err = capsys.readouterr().err
-    assert "plain.txt:2" in err
-    assert "plain.txt:1" not in err
+    assert "line 2 of the plain list" in err
+    assert "line 1 of" not in err
+    assert "plain.txt" not in err  # the plain list's path is the maintainer's
     assert CIDR not in err
 
 
@@ -334,6 +336,38 @@ def test_check_exits_2_when_the_hash_file_is_absent_or_empty_unless_allowed(tmp_
     assert st.main(["check", "--hashes", str(tmp_path / "gone"), "--allow-missing-hashes"]) == 0
 
 
+@pytest.mark.parametrize("line", ["{digest}", "{digest}  -", "{digest}  names.txt"])
+def test_k01_a_file_of_plain_sha256_digests_is_refused_saying_how_to_generate_one(tmp_path, capsys, line):
+    """K01: a file of plain `sha256(token)` digests (bare, or as sha256sum prints them) would check nothing, since a
+    study-token hash is salted and normalised; it is refused with the command that makes a correct file."""
+    plain = tmp_path / "plain.sha256"
+    plain.write_text("\n".join([line.format(digest=hashlib.sha256(LONG_NAME.encode()).hexdigest())] * 2) + "\n")
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+    assert st.main(["check", "--hashes", str(plain), str(tmp_path / "m.py")]) == 2
+    err = capsys.readouterr().err
+    assert "the list given with --hashes:1: a bare SHA-256 digest" in err
+    assert "plain.sha256" not in err  # a path given with --hashes is the author's
+    assert "python -m expcore.provenance.study_tokens hash" in err
+
+
+def test_k01_a_malformed_hash_line_names_the_generating_command():
+    """K01: any line not in the hash format refuses the file, naming the line and the command that makes one."""
+    with pytest.raises(ValueError, match=r"names\.sha256:2: expected '<any\|whole> <code\|all> <sha256>'.*hash PLAIN"):
+        st.parse_hash_file(f"any all {'0' * 64}\nany secret-word\n", "names.sha256")
+
+
+def test_k01_the_check_says_how_many_hashes_it_loaded_and_which_list_never_its_path(tmp_path, hash_file, capsys):
+    """K01: the check prints how many hashes it read, so a file that loads but holds the wrong ones is noticed, and
+    whether it is the default list or one given in its place, never the path, which is the author's."""
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+    assert st.main(["check", "--hashes", str(hash_file), str(tmp_path / "m.py")]) == 0
+    count = len(st.load_hashes(hash_file).anywhere) + len(st.load_hashes(hash_file).whole)
+    assert count > 1
+    err = capsys.readouterr().err
+    assert f"study-token check: {count} hashes, from the list given with --hashes\n" in err
+    assert str(hash_file) not in err
+
+
 def test_cli_check_errors_on_missing_explicit_hash_file_or_path(tmp_path, hash_file, capsys):
     assert st.main(["check", "--hashes", str(tmp_path / "missing"), str(tmp_path)]) == 2
     assert st.main(["check", "--hashes", str(hash_file), str(tmp_path / "missing")]) == 2
@@ -350,3 +384,149 @@ def test_module_entry_point_runs_as_a_script(tmp_path, hash_file):
     )
     assert done.returncode == 1
     assert "m.py:1 comment" in done.stdout
+
+
+ORDINARY = "lantern"  # an invented ordinary word, long enough to be matched anywhere unless marked whole
+
+
+def test_a_whole_line_in_the_plain_list_marks_its_token_and_keeps_its_category():
+    """A `whole:` line names one token that matches only as an entire value, whatever its length."""
+    text = f"# category: providers\nwhole: {ORDINARY}\nopen-name\n"
+    entries = hf.parse_plain_entries(text)
+    assert [(e.token, e.scope, e.whole) for e in entries] == [(ORDINARY, "all", True), ("open-name", "all", False)]
+
+
+def test_a_whole_line_naming_no_token_is_refused_by_line_number():
+    with pytest.raises(ValueError, match=r"^line 2: 'whole:' names no token$"):
+        hf.parse_plain_entries("first-name\nwhole:   \n")
+
+
+def test_a_token_marked_whole_is_rendered_whole_with_its_scope_and_the_mark_wins_when_listed_both_ways():
+    marked = st.render_hash_file([(ORDINARY, "code", True)])
+    assert [line.split()[:2] for line in marked.splitlines() if not line.startswith("#")] == [["whole", "code"]]
+    both = st.render_hash_file([(ORDINARY, "all"), (ORDINARY, "all", True)])
+    assert [line.split()[0] for line in both.splitlines() if not line.startswith("#")] == ["whole"]
+    plain = st.render_hash_file([(ORDINARY, "all")])
+    assert [line.split()[0] for line in plain.splitlines() if not line.startswith("#")] == ["any"]
+
+
+def test_a_token_marked_whole_is_found_as_an_entire_name_but_not_inside_a_longer_one():
+    """The point of the mark: an ordinary word on the list stops matching inside unrelated identifiers."""
+    marked = st.parse_hash_file(st.render_hash_file([(ORDINARY, "all", True)]), "test")
+    assert st.scan_source("m.py", f"def light_{ORDINARY}_count():\n    return 1\n", marked) == []
+    assert st.scan_source("m.py", f'site = "{ORDINARY}"\n', marked)
+    unmarked = st.parse_hash_file(st.render_hash_file([ORDINARY]), "test")
+    assert st.scan_source("m.py", f"def light_{ORDINARY}_count():\n    return 1\n", unmarked)
+
+
+def test_the_hash_command_renders_a_marked_token_whole(tmp_path, capsys):
+    plain = tmp_path / "plain.txt"
+    plain.write_text(f"whole: {ORDINARY}\n", encoding="utf-8")
+    assert st.main(["hash", str(plain)]) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if not line.startswith("#")]
+    assert [line.split()[:2] for line in lines] == [["whole", "all"]]
+
+
+# --- the last guard: no message shows a listed name ----------------------------------------------------------------
+
+
+def test_p07_a_missing_list_or_plain_list_is_named_by_its_role_never_by_its_path(tmp_path, capsys):
+    """P07: before a list is loaded nothing can hide a name, so a hash file given with --hashes, or a plain list, that
+    cannot be read is named by its role; its path, which may hold a private name, is never printed."""
+    place = tmp_path / LONG_NAME
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+    assert st.main(["check", "--hashes", str(place / "list.sha256"), str(tmp_path / "m.py")]) == 2
+    assert st.main(["hash", str(place / "plain.txt")]) == 2
+    place.mkdir()
+    assert st.main(["check", "--hashes", str(place), str(tmp_path / "m.py")]) == 2  # a directory: cannot be read
+    err = capsys.readouterr().err
+    assert "the list given with --hashes is not there" in err
+    assert "the plain list cannot be read (FileNotFoundError)" in err
+    assert "the list given with --hashes cannot be read (IsADirectoryError)" in err
+    assert LONG_NAME not in err
+
+
+def test_p07_an_unreadable_file_and_a_git_error_are_shown_through_the_loaded_list(
+    tmp_path, hash_file, repo, monkeypatch, capsys
+):
+    """P07: once the list is loaded, every error goes through the redactor that knows it: a file whose name holds a
+    listed name and that cannot be read, and git's own message about a revision that holds one."""
+    locked = tmp_path / f"{LONG_NAME}.txt"
+    locked.write_text("x\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(path: Path) -> bytes:
+        if path.name == locked.name:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert st.main(["check", "--hashes", str(hash_file), str(locked)]) == 2
+    assert st.main(["check-commits", "--hashes", str(hash_file), "--repo", str(repo.path), f"{LONG_NAME}..HEAD"]) == 2
+    err = capsys.readouterr().err
+    assert err.count("error: ") == 2
+    assert "Permission denied" in err
+    assert LONG_NAME not in err
+
+
+def test_p07_an_exception_the_command_does_not_expect_is_caught_and_shown_through_the_list(
+    tmp_path, hash_file, monkeypatch, capsys
+):
+    """P07: the command catches every exception at the top, not only the ones it expects, so an unexpected one never
+    prints a traceback with a listed name in it; it is named by its kind and its text goes through the redactor."""
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError(f"cannot scan /data/{LONG_NAME}/m.py")
+
+    monkeypatch.setattr(st, "scan_paths", broken)
+    assert st.main(["check", "--hashes", str(hash_file), str(tmp_path / "m.py")]) == 2
+    err = capsys.readouterr().err
+    assert "error: RuntimeError: cannot scan" in err
+    assert LONG_NAME not in err
+
+
+def test_k05_a_finding_whose_path_holds_a_listed_name_of_several_words_hides_it(tmp_path, capsys):
+    """K05: the scanner hides a path that matches a listed name as a whole segment or by its components, but not one
+    whose segment holds a listed name of several words among other words; every findings line goes through the same
+    redactor as the command's other messages, which finds such a name as a phrase."""
+    phrase = "Ada Example"  # invented; a listed name of two words
+    listed = tmp_path / "list.sha256"
+    listed.write_text(st.render_hash_file([phrase, LONG_NAME]), encoding="utf-8")
+    noted = tmp_path / f"notes by {phrase}.txt"
+    noted.write_text(f"{LONG_NAME}\n", encoding="utf-8")
+    assert st.main(["check", "--hashes", str(listed), str(noted)]) == 1
+    out = capsys.readouterr().out
+    assert f":1 text {st.token_hash(LONG_NAME)[:12]}" in out
+    assert "example" not in out.casefold()
+
+
+def test_k05_an_interrupt_or_an_exit_from_inside_the_command_never_shows_a_listed_name(
+    tmp_path, hash_file, monkeypatch, capsys
+):
+    """K05: Ctrl-C and SystemExit are not exceptions `except Exception` catches, and Python reports them as they are: a
+    traceback naming installed paths, or the exit's own message. The command prints only `interrupted` for an
+    interrupt and exits 130; prints an exit's message through the redactor and exits 1; and passes an exit status, an
+    integer or None, on unchanged."""
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+    argv = ["check", "--hashes", str(hash_file), str(tmp_path / "m.py")]
+
+    def stopping(stop: BaseException):
+        def scan(*_args, **_kwargs):
+            raise stop
+
+        return scan
+
+    monkeypatch.setattr(st, "scan_paths", stopping(KeyboardInterrupt()))
+    assert st.main(argv) == 130
+    assert capsys.readouterr().err.endswith("\ninterrupted\n")
+    monkeypatch.setattr(st, "scan_paths", stopping(SystemExit(f"a plugin stopped at /data/{LONG_NAME}/m.py")))
+    assert st.main(argv) == 1
+    err = capsys.readouterr().err
+    assert "error: a plugin stopped at <hidden " in err
+    assert LONG_NAME not in err
+    for code in (3, 0, None):
+        monkeypatch.setattr(st, "scan_paths", stopping(SystemExit(code)))
+        with pytest.raises(SystemExit) as stopped:
+            st.main(argv)
+        assert stopped.value.code == code

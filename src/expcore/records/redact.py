@@ -29,9 +29,18 @@ the only place a fragment is looked for, and it becomes one marker.
 A value under 4 characters would match ordinary text, so it is refused instead, with a `ConfigError` that names the
 variable and never shows the value. A number whose string form is a secret is replaced too.
 
-A secret is redacted in its raw form, in its JSON-escaped forms up to three levels of escaping (text inside a JSON
-string inside a JSON string), and percent-encoded, since a native message carries text in JSON strings and a URL
-carries it percent-encoded. A secret that was replaced is gone: neither the text nor a decoding of it holds the value.
+A secret is redacted in three base forms, raw, as Python's repr shows it and as the repr of its UTF-8 bytes shows
+it, since an exception's text often holds a repr (`KeyError(secret)` escapes a quote when the secret holds both
+kinds), and in the forms derived from each of them: JSON-escaped up to three levels of escaping (text inside a JSON
+string inside a JSON string) and percent-encoded, since a native message carries text in JSON strings and a URL
+carries it percent-encoded. A secret that was replaced is gone: neither the text nor a decoding of it holds the
+value.
+
+In plain text that is never sealed (the harness-error log, a message printed to the author: `Redactor.with_lines`,
+`redact_text`), each line of a multi-line secret that is at least the minimum length is a secret of its own as well,
+since a formatter can put something between the lines (an exception group prefixes each with `| `). Never in a
+record: a record holds a multi-line secret whole or JSON-escaped, which the whole-secret forms match, and a line that
+is a common word would rename a key and break the record's seal.
 
 Redaction records the paths of what it changed, never values. It is a fixed point: redacting a redacted structure
 changes nothing. A number that is replaced becomes a string, so a record whose redaction would break a field that must
@@ -55,6 +64,10 @@ SECRET_NAME = re.compile(
 )
 SECRET_KEYS = ("token", "api_key", "apikey", "password", "secret", "authorization", "bearer")
 MIN_SECRET_LEN = 4
+# In a record, a line of a multi-line secret is replaced on its own only from this length: a short line (`true`,
+# `null`, `prompt`) is an ordinary word, and replacing it would corrupt the JSON a native message holds. Plain text
+# that is never sealed (a log, a printed message) replaces lines from MIN_SECRET_LEN.
+MIN_LINE_LEN = 8
 ESCAPING_LEVELS = 3
 REDACTED = "[redacted]"
 # The line the output cap puts after what it kept: the text before it is where a cut secret ends.
@@ -99,37 +112,64 @@ def secret_env_names(environ: Mapping[str, str] | None = None, declared: Iterabl
 
 
 def secret_values(
-    environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
+    environ: Mapping[str, str] | None = None,
+    extra: Iterable[str] = (),
+    declared: Iterable[str] = (),
+    *,
+    skip_short: bool = False,
 ) -> list[str]:
     """Return the distinct secret values (environment, registered and `extra`), longest first.
 
-    Raises ConfigError, naming the variable, for a value under the minimum length.
+    Raises ConfigError, naming the variable, for a value under the minimum length; with `skip_short` such a value is
+    left out of the list instead (`short_secret_values` gives them, for a redactor that replaces them as tokens).
     """
     env = os.environ if environ is None else environ
-    values: set[str] = set()
-    for name in secret_env_names(env, declared):
-        _refuse_short(env[name], f"environment variable {name}")
-        values.add(env[name])
+
+    def keep(value: str, what: str) -> bool:
+        if skip_short and len(value) < MIN_SECRET_LEN:
+            return False
+        _refuse_short(value, what)
+        return True
+
+    values = {env[name] for name in secret_env_names(env, declared) if keep(env[name], f"environment variable {name}")}
     with _lock:
-        registered = set(_registered)
-    for value in registered:
-        _refuse_short(value, "a registered secret")
-    for value in extra:
-        if value:
-            _refuse_short(value, "a secret given for this record")
-            values.add(value)
+        registered = {value for value in _registered if keep(value, "a registered secret")}
+    values |= {value for value in extra if value and keep(value, "a secret given for this record")}
     values |= registered
     return sorted((v for v in values if v not in REDACTED), key=len, reverse=True)
 
 
-def forms_of(value: str) -> set[str]:
-    """Return the ways a secret can appear in text: raw, JSON-escaped up to three levels, and percent-encoded."""
-    forms = {value}
-    level = {value}
+def _base_forms(value: str) -> set[str]:
+    """A secret as it is, and inside Python's repr of it and of its UTF-8 bytes (without the repr's quotes)."""
+    return {value, repr(value)[1:-1], repr(value.encode("utf-8", "surrogatepass"))[2:-1]}
+
+
+def short_secret_values(
+    environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
+) -> list[str]:
+    """Return the secret values `secret_values` refuses as too short (environment, registered and `extra`)."""
+    env = os.environ if environ is None else environ
+    with _lock:
+        registered = set(_registered)
+    named = {env[name] for name in secret_env_names(env, declared)}
+    short = {v for v in (*named, *registered, *extra) if v and len(v) < MIN_SECRET_LEN}
+    return sorted(short, key=len, reverse=True)
+
+
+def forms_of(value: str, *, lines: bool = False, line_min: int = MIN_SECRET_LEN) -> set[str]:
+    """Return the ways a secret can appear in text: each base form (raw, the repr of the string, the repr of its
+    bytes), and with `lines` of each of its lines of `line_min` characters or more too (for text and string values,
+    never for a mapping's keys), and each of those JSON-escaped up to three levels and percent-encoded."""
+    bases = _base_forms(value)
+    for line in value.splitlines() if lines else ():
+        if len(line) >= line_min:
+            bases |= _base_forms(line)
+    forms, level = set(bases), set(bases)
     for _ in range(ESCAPING_LEVELS):
         level = {json.dumps(v)[1:-1] for v in level} | {json.dumps(v, ensure_ascii=False)[1:-1] for v in level}
+        level |= {v.replace("/", "\\/") for v in level if "/" in v}  # JSON may escape a slash; Python never does
         forms |= level
-    return forms | {quote(value, safe=""), quote_plus(value)}
+    return forms | {quote(v, safe="") for v in bases} | {quote_plus(v) for v in bases}
 
 
 def is_secret_key(key: str) -> bool:
@@ -145,32 +185,73 @@ def _join(path: str, key: str) -> str:
 class Redactor:
     """Replaces a fixed set of secrets, and the values of keys that name one, in text and in JSON-like structures."""
 
-    def __init__(self, secrets: Iterable[str] = (), *, keys: bool = True):
+    def __init__(
+        self, secrets: Iterable[str] = (), *, keys: bool = True, short: Iterable[str] = (), lines: bool = False
+    ):
         values = [s for s in secrets if s and s not in REDACTED]
         for value in values:
             _refuse_short(value, "a secret")
-        self._inside: tuple[str, ...] = tuple(sorted({f for s in values for f in forms_of(s)}, key=len, reverse=True))
+        short = [s for s in short if s and s not in REDACTED]
+        self._values, self._short, self._keys, self._lines = tuple(values), tuple(short), keys, lines
+        # A secret too short to replace wherever it occurs is replaced only where it stands as a token of its own
+        # (no letter, digit or underscore on either side): for a diagnostic, never for a record, which refuses it.
+        tokens = sorted({f for s in short for f in forms_of(s, lines=lines)}, key=len, reverse=True)
+        self._tokens = tuple(re.compile(rf"(?<!\w){re.escape(form)}(?!\w)") for form in tokens)
+        # Text and string values are searched for each line of a multi-line secret too, since a secret can come back
+        # re-encoded line by line (CRLF line ends, or its lines as separate strings). A mapping's keys are searched for
+        # whole secrets only: replacing a common line there would rename a key and break the record.
+        line_min = MIN_SECRET_LEN if lines else MIN_LINE_LEN  # plain text replaces short lines too; a record does not
+        inside = {f for s in values for f in forms_of(s, lines=True, line_min=line_min)}
+        self._inside: tuple[str, ...] = tuple(sorted(inside, key=len, reverse=True))
+        whole = {f for s in values for f in forms_of(s)}
+        self._inside_keys: tuple[str, ...] = tuple(sorted(whole, key=len, reverse=True))
         self._numbers: frozenset[str] = frozenset(values)
-        self._keys = keys
+
+    def with_lines(self) -> "Redactor":
+        """The same redactor for plain text that is never sealed (a log, a printed message): each line of a
+        multi-line secret is replaced on its own too."""
+        return Redactor(self._values, keys=self._keys, short=self._short, lines=True)
 
     @classmethod
     def from_environment(
-        cls, environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
+        cls,
+        environ: Mapping[str, str] | None = None,
+        extra: Iterable[str] = (),
+        declared: Iterable[str] = (),
+        *,
+        short_tokens: bool = False,
+        lines: bool = False,
     ) -> "Redactor":
         """Build a redactor from the environment (the process's by default), the registered secrets, `extra` values and
-        the variables named in `declared`."""
-        return cls(secret_values(environ, extra, declared))
+        the variables named in `declared`. A secret under the minimum length is refused, or with `short_tokens`, for a
+        diagnostic on the author's terminal, replaced where it stands as a token of its own. `extra` is read once,
+        whatever iterable it is. `lines`: see `with_lines`."""
+        extra = tuple(extra)
+        long = secret_values(environ, extra, declared, skip_short=short_tokens)
+        short = short_secret_values(environ, extra, declared) if short_tokens else ()
+        return cls(long, short=short, lines=lines)
 
     @classmethod
     def none(cls) -> "Redactor":
         """A redactor that changes nothing, for data that was redacted already (a replay reads a stored record)."""
         return cls((), keys=False)
 
+    def _key(self, key: str) -> str:
+        """A mapping key with every whole secret replaced, never a single line of one, which could rename a key."""
+        for form in self._inside_keys:
+            if form in key:
+                key = key.replace(form, REDACTED)
+        for token in self._tokens:
+            key = token.sub(REDACTED, key)
+        return key
+
     def text(self, value: str) -> str:
         """Return the string with every secret replaced, and every fragment of one that a cut left at either end."""
         for form in self._inside:
             if form in value:
                 value = value.replace(form, REDACTED)
+        for token in self._tokens:
+            value = token.sub(REDACTED, value)
         return self._fragments(value) if self._inside else value
 
     def _fragments(self, value: str) -> str:
@@ -220,9 +301,10 @@ class Redactor:
 
         def walk(value: Any, path: str, schema: bool = False, property_names: bool = False) -> Any:
             if isinstance(value, str):
-                new = self.text(value)
-                if self._keys and not schema:
+                new = value
+                if self._keys and not schema:  # first, while the string is still the JSON it was
                     new = in_json_text(new, path)
+                new = self.text(new)
                 if new != value:
                     paths.append(path)
                 return new
@@ -234,7 +316,7 @@ class Redactor:
             if isinstance(value, dict):
                 out: dict = {}
                 for index, (k, v) in enumerate(value.items()):
-                    key = self.text(k) if isinstance(k, str) else k
+                    key = self._key(k) if isinstance(k, str) else k
                     here = _join(path, k if key == k else f"{{key {index}}}")
                     if key != k:
                         paths.append(here)
@@ -266,6 +348,7 @@ def redact_structure(
 def redact_text(
     text: str, environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
 ) -> tuple[str, int]:
-    """Redact plain text such as a log line or an error message; return the text and how many places changed."""
-    new = Redactor.from_environment(environ, extra, declared).text(text)
+    """Redact plain text such as a log line or an error message, each line of a multi-line secret too (`with_lines`);
+    return the text and how many places changed."""
+    new = Redactor.from_environment(environ, extra, declared, lines=True).text(text)
     return new, int(new != text)

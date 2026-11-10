@@ -259,6 +259,108 @@ def test_redact_text_replaces_the_secret_in_every_form():
     assert json.dumps(secret)[1:-1] not in text
 
 
+QUOTED = "quartz'pebble\"7781-amber"  # both quote kinds: Python's repr escapes one of them
+
+
+def test_R12_a_secret_in_python_repr_form_is_redacted_from_a_record(tmp_path):
+    """R12: an exception's text shows a secret as Python's repr does (`KeyError(secret)`), which escapes a quote when
+    the secret holds both kinds, so neither the raw form nor a JSON form matches it."""
+    shown = str(KeyError(QUOTED))
+    assert QUOTED not in shown  # the repr escaped a quote
+    base = hand_made()
+    record = hand_made(totals={**base.totals, "final_text": f"failed: {shown}"})
+    with pytest.warns(RuntimeWarning, match="redacted secrets"):
+        written = record.write(tmp_path, environ={"TOYLAB_TOKEN": QUOTED}).read_text(encoding="utf-8")
+    final = RunRecord.from_json(decode(written)).totals["final_text"]
+    assert final == "failed: '[redacted]'"
+    assert "pebble" not in written
+
+
+def test_R12_a_secret_in_the_repr_of_its_bytes_is_redacted_too():
+    """R12: `str(ValueError(secret.encode()))` shows the bytes' repr, which escapes the non-ASCII characters."""
+    secret = "café-quartz-7781"
+    text, count = redact_text(f"bad header {secret.encode()!r} and {secret!r}", {"TOYLAB_TOKEN": secret})
+    assert count == 1
+    assert "quartz" not in text
+
+
+@pytest.mark.parametrize("secret", ["café-quartz-7781", "quartz'pebble\"7781"])
+def test_R12_a_repr_of_a_secret_inside_json_or_a_url_is_redacted_in_that_form(secret):
+    """R12: every escaped form is derived from every base form, so the repr of a secret's bytes inside a JSON string
+    (an exception's text a record or a log keeps as JSON) and inside a URL is caught too."""
+    env = {"TOYLAB_TOKEN": secret}
+    for shown in (str(ValueError(secret.encode())), repr(secret)):
+        for text in (json.dumps({"e": shown}), json.dumps(json.dumps({"e": shown})), quote(shown, safe="")):
+            redacted, _ = redact_text(text, env)
+            assert "quartz" not in redacted, text
+
+
+def test_R12_a_multi_line_secret_leaves_a_records_keys_intact_and_is_redacted_whole(tmp_path):
+    """R12: a record holds a multi-line secret whole or JSON-escaped, which the whole-secret forms match, so its lines
+    are not secrets there: a line that is a common word (`prompt`) must not rename a key, or sealing fails."""
+    secret = "prompt\nquartz-7781"
+    base = hand_made()
+    record = hand_made(totals={**base.totals, "final_text": f"saw {secret} and {json.dumps(secret)}"})
+    with pytest.warns(RuntimeWarning, match="redacted secrets"):
+        written = record.write(tmp_path, environ={"TOYLAB_TOKEN": secret}).read_text(encoding="utf-8")
+    loaded = RunRecord.from_json(decode(written))
+    assert loaded.prompt == base.prompt  # the key and its content are as they were
+    assert loaded.totals["final_text"] == 'saw [redacted] and "[redacted]"'
+    assert "quartz-7781" not in written
+
+
+def test_R12_a_multi_line_secret_that_comes_back_line_by_line_is_redacted_in_a_records_values(tmp_path):
+    """R12: a multi-line secret (a private key, say) can come back re-encoded: CRLF line ends, or its lines as separate
+    strings. Each line is replaced in a record's string values, while its keys are searched for whole secrets only."""
+    secret = "amber-line-one\ncobalt-line-two"
+    base = hand_made()
+    record = hand_made(
+        totals={**base.totals, "final_text": "amber-line-one\r\ncobalt-line-two"},
+        instruments={"probe": {"lines": ["amber-line-one", "cobalt-line-two"]}},
+    )
+    with pytest.warns(RuntimeWarning, match="redacted secrets"):
+        written = record.write(tmp_path, environ={"TOYLAB_TOKEN": secret}).read_text(encoding="utf-8")
+    assert "amber-line-one" not in written
+    assert "cobalt-line-two" not in written
+    loaded = RunRecord.from_json(decode(written))
+    assert loaded.instruments["probe"]["lines"] == ["[redacted]", "[redacted]"]
+
+
+def test_R12_a_short_common_line_of_a_secret_leaves_native_json_intact_and_secret_keys_still_redacted():
+    """R12: a line under MIN_LINE_LEN (here `true`) is an ordinary word, not replaced on its own, so the JSON a native
+    message holds stays valid and its secret-named keys are still redacted."""
+    redactor = Redactor(["true\nquartz-7781"])
+    arguments = '{"enabled":true,"token":"unregistered-credential"}'
+    redacted, _ = redactor.structure({"arguments": arguments})
+    assert json.loads(redacted["arguments"]) == {"enabled": True, "token": "[redacted]"}
+
+
+def test_R12_a_secret_with_a_slash_is_redacted_in_jsons_escaped_slash_spelling():
+    """R12: JSON may write a slash as an escaped slash, which Python's encoder never does; another producer's JSON
+    holding the secret that way is still redacted, and decoding it recovers no part of the secret."""
+    redactor = Redactor(["abcd/efgh-4471"])
+    redacted, paths = redactor.structure({"arguments": '{"value":"abcd\\/efgh-4471"}'})
+    assert paths
+    assert "efgh-4471" not in json.loads(redacted["arguments"])["value"]
+
+
+def test_R12_extra_secrets_given_as_an_iterator_are_read_once_for_both_passes():
+    """R12: the long and the short secrets are picked from one reading of `extra`, so an iterator is not used up by
+    the first pass and a short value it holds is still replaced as a token."""
+    redactor = Redactor.from_environment({}, extra=iter(["xyz", "long-secret-4471"]), short_tokens=True)
+    assert redactor.text("xyz and long-secret-4471, not xyzzy") == "[redacted] and [redacted], not xyzzy"
+
+
+def test_R12_each_line_of_a_multi_line_secret_is_redacted_on_its_own():
+    """R12: in plain text, which is never sealed, a formatter that puts something between the lines of a secret (an
+    exception group's `| `) breaks the whole; each line of four or more characters is still caught."""
+    secret = "amber-line-one\ncobalt-line-two\nxy"
+    text, _ = redact_text("  | ValueError: amber-line-one\n    | cobalt-line-two\n    | xy", {"TOYLAB_TOKEN": secret})
+    assert "amber-line-one" not in text
+    assert "cobalt-line-two" not in text
+    assert text.endswith("| xy")  # a line under four characters would match ordinary text: it is left
+
+
 def test_a_redactor_of_nothing_changes_nothing_even_a_key_that_names_a_secret():
     data = {"token": "kept", "text": KEY}
     assert Redactor.none().structure(data) == (data, [])
@@ -428,3 +530,14 @@ def test_R12_the_registry_of_secrets_only_grows_nothing_in_the_module_removes_a_
     assert not hasattr(redact, "forget_secrets")
     register_secret("registered-for-good-81726354")
     assert redact_structure({"a": "registered-for-good-81726354"}, {})[0] == {"a": REDACTED}
+
+
+def test_R12_for_a_diagnostic_a_short_secret_is_replaced_only_where_it_stands_as_a_token():
+    """R12: a record refuses a secret under four characters; a diagnostic replaces it where no letter, digit or
+    underscore touches it, so the same letters inside a longer name stay readable."""
+    with pytest.raises(ConfigError, match="TEST_TOKEN"):
+        Redactor.from_environment({"TEST_TOKEN": "abc"})
+    redactor = Redactor.from_environment({"TEST_TOKEN": "abc"}, short_tokens=True)
+    text = redactor.text("ValueError('abc') at abcd, x_abc and abc.")
+    assert text == "ValueError('[redacted]') at abcd, x_abc and [redacted]."
+    assert redactor.text(text) == text  # still a fixed point

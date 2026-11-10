@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 from expcore.campaign.lease import Lease
 from expcore.campaign.markers import AttemptResult
-from expcore.config.models import Limits, ModelSpec
+from expcore.config.models import Limits, ModelSpec, ModelTable
 from expcore.errors import InfraError
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome, harness_defect_of
@@ -27,7 +27,7 @@ from expcore.models.adapters import ModelBackend
 from expcore.models.factory import build_backend
 from expcore.plugin import ToolProvider
 from expcore.prompt.templates import RenderedPrompt
-from expcore.records.build import PromptText, RunIdentity, record_attempt
+from expcore.records.build import DefectSink, PromptText, RunIdentity, record_attempt
 from expcore.records.injections import injected_targets
 from expcore.records.record import RunRecord
 from expcore.records.schema import first_turn_rule, outcome_from_entry, target_rule
@@ -86,6 +86,12 @@ class RunRequest:
     - `lease`: the lease the platform's resources require, held for the whole attempt; None without one.
     - `treatment_targets`: the target the condition declares for any of its treatment kinds (a position label such as
       `providers[1]`), which the run's fault injector takes down; the record must carry exactly these too.
+    - `models`: the study's whole model table. `record_run` records with it, so the key of every model is redacted
+      whatever the backend: the protocol does not require a backend to hold its model entry (R12).
+    - `defect_log`: where the attempt's harness defects leave their redacted traceback (`defect_log.DefectLog`); it
+      also keeps what an executor's own sink raised, which the attempt reports once the result is stored.
+      `record_run` passes it on, so a crash the loop catches is logged too, redacted with every secret the executor
+      hands `record_run`.
     """
 
     identity: RunIdentity
@@ -97,6 +103,8 @@ class RunRequest:
     treatment_kinds: tuple[str, ...]
     lease: Lease | None = None
     treatment_targets: Mapping[str, str] = field(default_factory=dict)
+    models: ModelTable | None = None
+    defect_log: DefectSink | None = None
 
     @property
     def run_key(self) -> str:
@@ -129,7 +137,8 @@ async def record_run(
     """Run the attempt through the loop with the request's backend, timer and treatment kinds, and return the record.
 
     The way an executor calls `record_attempt`: it cannot forget the treatment kinds and targets, which the store
-    checks, or build a backend of its own.
+    checks, or the model table the keys are redacted from, or the attempt's harness-defect log, or build a backend of
+    its own.
     """
     return await record_attempt(
         request.backend,
@@ -143,8 +152,14 @@ async def record_run(
         treatment_targets=request.treatment_targets,
         timer=request.timer,
         clock=request.clock,
-        **options,
+        **{"models": request.models, "defect_log": request.defect_log, **_sink_failure_to(request), **options},
     )
+
+
+def _sink_failure_to(request: RunRequest) -> dict[str, Any]:
+    """Where a failure of the attempt's defect sink goes (the request's own log, or an executor's sink passed in its
+    place): the request's log, which the attempt reports once the result is stored."""
+    return {} if request.defect_log is None else {"on_sink_failure": request.defect_log.keep}
 
 
 def _total(turns: Sequence[Mapping[str, Any]], name: str) -> int | None:

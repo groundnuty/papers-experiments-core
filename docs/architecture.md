@@ -138,7 +138,7 @@ TOML files in the study's repository, validated at load with messages that name 
 | `study.toml` | factors, conditions, task source, scorers, instruments | |
 | `models.toml` | **the single model table**: key, backend, API id, reported-name aliases, sampling, output limit, reasoning echo field, status | Each model is named once; caps and concurrency refer to these keys (P06). Status `frozen` gates study runs (B08). |
 | `campaign.toml` | caps per concurrency unit, attempt limits, budgets and prices, order seed | The campaign's endpoint and URL are the ones execution uses (C14). |
-| `platform.toml` | zone, providers, spaces, each agent site's local provider, the expected support set, tool-server settings | No platform name appears in code (O12); the agent is pinned to its local provider (O03); health checks the declared support set (O04). |
+| `platform.toml` | zone, providers, spaces, each agent site's local provider, the expected support set, tool-server settings, the one TLS setting all four clients of the federation take (`[tls]`) | No platform name appears in code (O12); the agent is pinned to its local provider (O03); health checks the declared support set (O04). The TLS mode, with a CA bundle's SHA-256, is in each run's record and the campaign fingerprint (C06). |
 | `preregistration.toml` | named contrasts with their outcome, estimator and cluster attribute; the Holm family; alpha, bootstrap replicates, power settings | Its hash goes into every analysis manifest (P04). |
 
 Secrets are referenced by environment variable or file path, never written in configuration, and checked at startup. Every configuration file's hash is recorded in the campaign manifest; resuming with a different hash is refused (C06).
@@ -208,7 +208,7 @@ Each token is normalised (Unicode NFKC, case-folded, surrounding whitespace remo
 2. Split each into maximal runs of letters, digits and `_ . -`; this separates URL schemes, paths, ports, queries and assignments.
 3. From each run, emit every contiguous sequence of its components (split at `_`, `.` and `-`), re-joined with the separators it had. A hostname inside a URL, a space name inside a path and a name inside a composed identifier all become candidates.
 
-The check hashes every candidate in every tracked file, and in each file's path, and fails on a match; findings print only a hash prefix, and a matching path is redacted. Tokens shorter than four characters match only as a whole string literal or identifier, to avoid false positives. Each hash carries a scope taken from the token's category:
+The check hashes every candidate in every tracked file, and in each file's path, and fails on a match; findings print only a hash prefix, and a matching path is redacted. Tokens shorter than four characters match only as a whole string literal or identifier, to avoid false positives. A longer token that is an ordinary word, which would otherwise be found inside unrelated names (in a vendored dependency, say), is marked the same way in the plain list with a `whole: <token>` line; it is normalised and hashed like any other and rendered as `whole <scope> <sha256>`, and where a token is listed both ways the mark wins. Each hash carries a scope taken from the token's category:
 - **code** (conditions, data states, tasks, datasets, models, repositories): names a study chose, which code must not hard-code but prose may mention;
 - **all** (hosts, addresses, spaces, providers, users, environment variables): private everywhere.
 

@@ -100,6 +100,35 @@ def test_the_command_line_freezes_a_server_and_checks_it_later(tmp_path, capsys)
     assert "missing from the server: add" in capsys.readouterr().err
 
 
+def test_l13_the_command_line_takes_its_options_after_the_file_as_its_usage_shows(tmp_path, capsys):
+    """L13: `freeze OUT --pass-env NAME -- COMMAND`, the documented form, freezes the server; the options are not
+    taken for the server's command."""
+    out = tmp_path / "tools.json"
+    server = [sys.executable, SERVER, "--tools", "echo,add"]
+    assert main(["freeze", str(out), "--pass-env", "TOYLAB_HOME", "--timeout", "60", "--", *server]) == 0
+    assert [t["name"] for t in FrozenManifest.load(out).tools] == ["add", "echo"]
+    assert main(["check", str(out), "--timeout", "60", "--pass-env", "TOYLAB_HOME", "--", *server]) == 0
+    assert main(["--pass-env", "TOYLAB_HOME", "check", str(out), "--", *server]) == 0  # before the action too
+    assert "No such file" not in capsys.readouterr().err
+
+
+def test_l13_the_variables_and_the_timeout_reach_the_server_and_the_rest_is_its_command(tmp_path, monkeypatch):
+    """L13: everything after the first `--` is the server's, a later `--` included; the options before it are ours."""
+    seen = {}
+
+    def freeze(path, params, timeout_s):
+        seen.update(path=path, params=params, timeout_s=timeout_s)
+        return 0
+
+    monkeypatch.setattr("expcore.tools.manifest._freeze", freeze)
+    monkeypatch.setenv("TOYLAB_HOME", "/srv/toylab")
+    argv = ["freeze", str(tmp_path / "t.json"), "--pass-env", "TOYLAB_HOME", "--timeout", "7", "--"]
+    assert main([*argv, "toy-server", "--flag", "--", "rest"]) == 0
+    assert (seen["params"].command, seen["params"].args) == ("toy-server", ["--flag", "--", "rest"])
+    assert seen["params"].env == {"TOYLAB_HOME": "/srv/toylab"}
+    assert seen["timeout_s"] == 7.0
+
+
 def test_the_command_line_needs_a_server_command(tmp_path, capsys):
     assert main(["check", str(tmp_path / "t.json")]) == 2
     assert "give the server command" in capsys.readouterr().err

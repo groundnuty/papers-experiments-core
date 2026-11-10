@@ -17,6 +17,7 @@ A divergence found while the loop runs stops it through `Halt`, not as an outcom
 import asyncio
 import copy
 import dataclasses
+import re
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from typing import Any
@@ -69,6 +70,16 @@ def holds_result(value: Any, call_id: str, text: str) -> bool:
     if isinstance(value, list):
         return any(holds_result(v, call_id, text) for v in value)
     return False
+
+
+_PARTS = {"tool_calls": "tool call", "text": "reply text", "reasoning": "reasoning"}  # of the reply as the loop read it
+
+
+def _part_named(where: str) -> str:
+    """The part of a recorded reply a difference is in, in plain words: `transcript[k].neutral.tool_calls[0]...` is a
+    tool call."""
+    found = re.match(r"transcript\[\d+\]\.neutral\.(\w+)", where)
+    return _PARTS.get(found.group(1), "reply") if found else "reply"
 
 
 class RecordedBackend:
@@ -146,7 +157,12 @@ class RecordedBackend:
             )
         where = first_difference(normalised(entry["neutral"]), derived, f"transcript[{k}].neutral")
         if where is not None:
-            stop(where, "the neutral turn does not follow from the native message of the same turn")
+            stop(
+                where,
+                f"the recorded {_part_named(where)} does not match the model's raw reply in that turn "
+                f"(transcript[{k}].native): the record was changed after it was written, or the backend now reads "
+                "that reply differently",
+            )
 
     async def step(self) -> ModelTurn:
         """Serve the next recorded turn; the request after the last turn is the recorded failure, if there is one."""

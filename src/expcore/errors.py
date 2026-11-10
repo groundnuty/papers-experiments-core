@@ -12,7 +12,10 @@ Never an InfraError: agent-code exceptions (non-zero exit codes), turn, time or 
 and a context that outgrew the model's window (`ContextOverflow`).
 
 The kinds form a closed vocabulary: the core's eight, plus whatever a platform registers once at import time with
-`register_infra_kind`. An unknown kind is a programming error and raises at once, so a typo never reaches a record.
+`register_infra_kind`, for the whole process, and while a study is loaded or run, what it declares in its study.toml
+(`[study.kinds]`, held by `study_kinds`). A study lists the platforms whose kinds it names (`[study] platforms`), and
+the study loader imports them before it validates the conditions. An unknown kind is a programming error and raises at
+once, so a typo never reaches a record.
 
 Each kind is treatable or not. A condition whose manipulation is a fault may declare the kind of that fault as its
 treatment, so an attempt that ends in it is scored instead of set aside (`FactorSchema`). A kind that reports a
@@ -28,7 +31,12 @@ failure of that target, while the run's fault injector held it down, is its trea
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import threading
+from collections.abc import Iterator, Mapping
+from typing import NamedTuple
 
 # endpoint: the model endpoint failed after the retries. key_rejected: HTTP 401 or 403 from the model API.
 # sandbox: the agent's sandbox failed. knowledge: a tool server failed. unattributed_kill: a process was killed
@@ -59,48 +67,200 @@ _KIND_RE = re.compile(r"[a-z][a-z0-9_]*")
 # What an infrastructure failure may name as its target: a table and a position in it, as the platform's
 # configuration orders its entries (`providers[1]`). A configured name never fits, so none can reach a record.
 TARGET_LABEL = re.compile(r"[a-z][a-z0-9_]*\[(0|[1-9][0-9]*)\]")
-_platform_kinds: dict[str, str] = {}
+_platform_kinds: dict[str, str] = {}  # process-wide: a platform registers its kinds once, when its module is imported
 _platform_untreatable: dict[str, str] = {}
 
 
-def register_infra_kind(kind: str, description: str, *, treatable: bool = True) -> None:
-    """Add a platform's infrastructure kind to the vocabulary; registering the same kind again is harmless.
+class StudyKind(NamedTuple):
+    """An infrastructure kind a study declares in its study.toml (`[study.kinds]`)."""
 
-    A kind registered with `treatable=False` can never be a condition's treatment: the factor schema refuses a
-    declaration of it. Registering a kind again with the other answer is refused, so it cannot be made treatable.
-    """
+    description: str
+    treatable: bool = True
+
+
+class _HeldKind(NamedTuple):
+    """A study's kind in scope, and how many scopes hold it."""
+
+    kind: StudyKind
+    scopes: int
+
+
+_scope_lock = threading.Lock()  # serialises every change to the study kinds in scope, and a platform's registration
+
+
+def _hold_lock_for_fork() -> None:
+    """Take the lock before a fork, so the child never copies a registration or a scope change half done. Nothing in
+    this module forks while it holds the lock, so the forking thread only waits for a change under way to finish."""
+    _scope_lock.acquire()
+
+
+def _release_lock_in_parent() -> None:
+    """Give the lock back in the parent once the fork is done."""
+    _scope_lock.release()
+
+
+def _fresh_lock_in_child() -> None:
+    """A forked child starts with a free lock of its own rather than the copy its forking thread holds. The kinds in
+    scope are kept, whole; the child's own scopes count from them."""
+    global _scope_lock
+    _scope_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # every platform the core supports; absent only where fork itself is
+    os.register_at_fork(
+        before=_hold_lock_for_fork, after_in_parent=_release_lock_in_parent, after_in_child=_fresh_lock_in_child
+    )
+_study_kinds: Mapping[str, _HeldKind] = {}  # the kinds in scope (`study_kinds`); replaced under the lock, never
+# changed in place; readers take every mapping together under the lock (`_view`)
+
+
+def _check_name(kind: str, description: str) -> None:
+    """Refuse a kind no one can add: a malformed name, a core kind or a blank description."""
     if not _KIND_RE.fullmatch(kind):
         raise ValueError(f"infrastructure kind {kind!r} must be lower-case letters, digits and underscores")
     if kind in CORE_KINDS:
         raise ValueError(f"infrastructure kind {kind!r} is one of the core's own kinds")
     if not description.strip():
         raise ValueError(f"infrastructure kind {kind!r} needs a description")
-    if kind in _platform_kinds and (kind in _platform_untreatable) == treatable:
-        held = "not treatable" if kind in _platform_untreatable else "treatable"
-        raise ValueError(f"infrastructure kind {kind!r} is already registered as {held}")
-    if kind not in _platform_kinds:
-        _platform_kinds[kind] = description
-        if treatable:
-            _platform_untreatable.pop(kind, None)
-        else:
-            _platform_untreatable[kind] = description
+
+
+def check_study_kind(kind: str, description: str) -> None:
+    """Refuse a kind a study cannot declare: one no one can add, or one a platform has registered."""
+    _check_name(kind, description)
+    if kind in _platform_kinds:
+        raise ValueError(f"infrastructure kind {kind!r} is a platform's kind; a study cannot declare it too")
+
+
+@contextlib.contextmanager
+def study_kinds(declared: Mapping[str, StudyKind]) -> Iterator[None]:
+    """Hold a study's own kinds in the vocabulary for the block, however the block ends.
+
+    A study's kinds are its own, so they last only while the study is loaded or run: the study loader and each step of
+    the pipeline enter this scope. Scopes may overlap, as when one thread runs a study while another loads one: entering
+    adds each kind with a count and leaving takes one off, so no scope can drop a kind another still holds, and nothing
+    remains once all have left. Overlapping scopes that give one name different meanings are refused, naming the kind.
+
+    While two studies overlap in one process each can see the other's kinds. That is accepted: it can only widen
+    validation for that overlap and never rejects a valid record. The vocabulary is held for the process and not in a
+    `ContextVar`, because a plain thread would not inherit one and a valid `InfraError` raised in it would be rejected.
+
+    The contract that keeps readers consistent: a kind leaves only when no scope holds it, and every step of the
+    pipeline validates a study's records inside that study's scope, so its kinds cannot leave mid-check; a platform's
+    kinds never leave. Each reader takes one view (`vocabulary` gives the kinds and their treatability together). A
+    caller that reads twice outside any scope while another study's scope changes can at worst refuse, or name the
+    kinds of a different moment in its message; it can never accept a kind it should refuse.
+    """
+    held = dict(declared)  # what was entered is what is left, whatever the caller does with its mapping
+    _enter_scope(held)
+    try:
+        yield
+    finally:
+        _leave_scope(held)
+
+
+def _enter_scope(declared: Mapping[str, StudyKind]) -> None:
+    """Count each kind in, or change nothing and raise ValueError when one cannot be held."""
+    global _study_kinds
+    with _scope_lock:
+        held = dict(_study_kinds)
+        for kind, entry in declared.items():
+            check_study_kind(kind, entry.description)  # a platform imported since the study was read may have taken it
+            current = held.get(kind)
+            if current is not None and current.kind != entry:
+                raise ValueError(f"infrastructure kind {kind!r} is declared differently by another study in scope")
+            held[kind] = _HeldKind(entry, 1 if current is None else current.scopes + 1)
+        _study_kinds = held
+
+
+def _leave_scope(declared: Mapping[str, StudyKind]) -> None:
+    """Count each kind out, removing the ones no scope holds any more."""
+    global _study_kinds
+    with _scope_lock:
+        held = dict(_study_kinds)
+        for kind in declared:
+            current = held[kind]
+            if current.scopes == 1:
+                del held[kind]
+            else:
+                held[kind] = current._replace(scopes=current.scopes - 1)
+        _study_kinds = held
+
+
+def register_infra_kind(kind: str, description: str, *, treatable: bool = True) -> None:
+    """Add a platform's infrastructure kind to the vocabulary, for the whole process; doing so again is harmless.
+
+    A platform calls it once, when its module is imported. A study that declares one of the kinds as a treatment lists
+    that module in study.toml (`[study] platforms`), so it is imported before the conditions are validated.
+
+    A kind registered with `treatable=False` can never be a condition's treatment: the factor schema refuses a
+    declaration of it. Registering a kind again with the other answer is refused, so it cannot be made treatable.
+    A kind of the study in scope (`study_kinds`) is refused: the two would be one kind with two owners.
+    """
+    _check_name(kind, description)
+    with _scope_lock:
+        if kind in _study_kinds:
+            raise ValueError(f"infrastructure kind {kind!r} is declared by the study in scope ([study.kinds])")
+        if kind in _platform_kinds and (kind in _platform_untreatable) == treatable:
+            held = "not treatable" if kind in _platform_untreatable else "treatable"
+            raise ValueError(f"infrastructure kind {kind!r} is already registered as {held}")
+        if kind not in _platform_kinds:
+            # whether it is treatable is written first, so a reader without the lock never sees the kind without it
+            if treatable:
+                _platform_untreatable.pop(kind, None)
+            else:
+                _platform_untreatable[kind] = description
+            _platform_kinds[kind] = description
+
+
+class _View(NamedTuple):
+    """The vocabulary at one moment: the platforms' kinds, those of them that are untreatable, and the study kinds in
+    scope. Readers compute from one view, so they never mix two moments."""
+
+    platform: Mapping[str, str]
+    untreatable: Mapping[str, str]
+    study: Mapping[str, _HeldKind]
+
+    def kinds(self) -> tuple[str, ...]:
+        return (*CORE_KINDS, *self.platform, *self.study)
+
+    def untreatable_kinds(self) -> dict[str, str]:
+        return {
+            **CORE_UNTREATABLE,
+            **{k: why for k, why in self.untreatable.items() if k in self.platform},
+            **{k: held.kind.description for k, held in self.study.items() if not held.kind.treatable},
+        }
+
+
+def _view() -> _View:
+    """Take one view of the vocabulary under the lock: registration and scopes change it under the same lock."""
+    with _scope_lock:
+        return _View(dict(_platform_kinds), dict(_platform_untreatable), _study_kinds)
 
 
 def infra_kinds() -> tuple[str, ...]:
-    """Return every kind in the vocabulary now: the core's kinds, then the registered ones in registration order."""
-    return (*CORE_KINDS, *_platform_kinds)
+    """Return every kind in the vocabulary now: the core's, the registered ones in order, then the study's in scope."""
+    return _view().kinds()
 
 
 def untreatable_kinds() -> dict[str, str]:
-    """Return every kind that cannot be a treatment now, with the reason each gives: the core's, then the registered."""
-    return {**CORE_UNTREATABLE, **{k: why for k, why in _platform_untreatable.items() if k in _platform_kinds}}
+    """Return every kind that cannot be a treatment now, with the reason each gives."""
+    return _view().untreatable_kinds()
+
+
+def vocabulary() -> tuple[tuple[str, ...], dict[str, str]]:
+    """Return every kind and the untreatable ones with their reasons, from one view, for a caller that needs both."""
+    view = _view()
+    return view.kinds(), view.untreatable_kinds()
 
 
 def is_treatable(kind: str) -> bool:
-    """Tell whether a condition may declare the kind as its treatment; a kind outside the vocabulary is refused."""
-    if kind not in infra_kinds():
-        raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")
-    return kind not in untreatable_kinds()
+    """Tell whether a condition may declare the kind as its treatment; a kind outside the vocabulary is refused. Both
+    answers come from one view, so a kind cannot be known in one moment and its treatability read in another."""
+    view = _view()
+    known = view.kinds()
+    if kind not in known:
+        raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(known)}")
+    return kind not in view.untreatable_kinds()
 
 
 class RequestAbandoned(Exception):
@@ -144,9 +304,10 @@ class InfraError(RuntimeError):
     """
 
     def __init__(self, kind: str, detail: str, *, target: str | None = None):
-        if kind not in infra_kinds():
+        known = infra_kinds()  # one view, for the test and the message alike
+        if kind not in known:
             raise ValueError(
-                f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())} "
+                f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(known)} "
                 "(a platform adds its own with register_infra_kind)"
             )
         check_target(target)

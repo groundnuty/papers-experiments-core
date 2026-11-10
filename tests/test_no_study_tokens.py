@@ -33,5 +33,5 @@ def test_committed_hash_file_matches_the_private_list():
     if not plain:
         pytest.skip("EXPCORE_STUDY_TOKENS is unset, so the private list is not available to compare with")
     entries = parse_plain_entries(Path(plain).read_text(encoding="utf-8"))
-    expected = render_hash_file((entry.token, entry.scope) for entry in entries)
+    expected = render_hash_file((entry.token, entry.scope, entry.whole) for entry in entries)
     assert HASH_FILE.read_text(encoding="utf-8") == expected, "tests/data/study_tokens.sha256 is stale; regenerate it"

@@ -2,9 +2,12 @@
 """TOML loading whose errors name the file and the key.
 
 Configuration is validated when it is loaded and never read lazily at first use. `Section` wraps one table with
-typed access, so a wrong type, a missing key or a misspelt key fails with a message that says where to look.
+typed access, so a wrong type, a missing key or a misspelt key fails with a message that says where to look. A name
+that is not one of a closed set of choices is refused with the choices, and `close_match` adds the one it was likely
+meant to be.
 """
 
+import difflib
 import os
 import tomllib
 from collections.abc import Iterable, Mapping
@@ -29,6 +32,16 @@ def load_toml(path: str | os.PathLike[str]) -> dict[str, Any]:
         return tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise ConfigError(f"{file}: not valid TOML: {error}") from None
+
+
+def close_match(name: object, choices: Iterable[str]) -> str:
+    """A hint to put right after a name that is none of `choices`: ` (did you mean 'x'?)` for the closest one,
+    ignoring case, or "" when none is close."""
+    if not isinstance(name, str):
+        return ""
+    by_lower = {choice.lower(): choice for choice in choices}
+    found = difflib.get_close_matches(name.lower(), list(by_lower), n=1)
+    return f" (did you mean {by_lower[found[0]]!r}?)" if found else ""
 
 
 class Section:

@@ -8,15 +8,17 @@ dropped, attached to the sandbox's internal network and to a bridge to reach
 the upstream. Configuration: JSON at the path in argv[1]:
 
   {"run_key": "...", "verify_ssl": true, "log": "/var/gate/requests.jsonl",
-   "tls_dir": "/etc/gate/tls",
+   "upstream_ca_file": "/etc/gate/federation-ca.pem", "tls_dir": "/etc/gate/tls",
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
                         "port": 443, "tls": true}},
    "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
 
 For each host name the sandbox resolves (via --add-host) to the gate, the gate
 terminates TLS with a certificate for that name (signed by the run's CA, which
-only the sandbox trusts), applies gatepolicy, and forwards to the real upstream
-(verifying its certificate against the system CAs). `tcp_forwards` are plain TCP
+only the sandbox trusts), applies gatepolicy, and forwards to the real upstream,
+checking its certificate as the platform's [tls] says: against the image's CAs
+by default, against `upstream_ca_file` alone (the platform's CA bundle, mounted
+read-only), or not at all when `verify_ssl` is false. `tcp_forwards` are plain TCP
 pass-through for the knowledge plane. Every request is logged as one JSON line.
 
 The gate holds the data-path token (from its environment, never from the configuration file or an argument) and adds it

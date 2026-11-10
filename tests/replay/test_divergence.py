@@ -85,7 +85,7 @@ def test_R03_a_native_message_that_the_neutral_turn_does_not_follow_from_diverge
     assert data["transcript"][2]["neutral"]["text"] == "done"
     data["transcript"][2]["native"]["content"] = "edited"
     error = diverges(data, "transcript[2].neutral.text")
-    assert "native message of the same turn" in str(error)
+    assert "the recorded reply text does not match the model's raw reply in that turn" in str(error)
 
 
 def test_R03_a_tool_call_changed_only_in_the_native_message_diverges():
@@ -93,6 +93,19 @@ def test_R03_a_tool_call_changed_only_in_the_native_message_diverges():
     data = record_of()
     data["transcript"][0]["native"]["tool_calls"][0]["function"]["arguments"] = '{"x": "other"}'
     diverges(data, "transcript[0].neutral.tool_calls[0].arguments.x")
+
+
+def test_R03_an_answer_edited_in_a_record_is_named_in_plain_words_with_what_to_conclude():
+    """R03: the message says what was compared and what it means, in words the guide uses, not the code's own terms."""
+    data = record_of()
+    data["transcript"][0]["neutral"]["tool_calls"][0]["arguments"]["x"] = "edited"
+    error = diverges(data, "transcript[0].neutral.tool_calls[0].arguments.x")
+    assert str(error).endswith(
+        "the recorded tool call does not match the model's raw reply in that turn (transcript[0].native): the record "
+        "was changed after it was written, or the backend now reads that reply differently"
+    )
+    assert "neutral turn" not in str(error)
+    assert "native message" not in str(error)
 
 
 def test_R03_a_malformed_call_follows_from_the_raw_arguments_in_its_native_message():

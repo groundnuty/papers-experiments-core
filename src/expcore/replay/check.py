@@ -9,13 +9,15 @@ offline through the real loop. The result is written beside the records as `repl
 
     {"schema": "replay-check/1", "record_schema", "checked_at", "code": {the code identity},
      "hashed_only_patterns", "n_records", "n_ok", "failures": [{"file", "stage", "error"}], "hashed_only": [paths],
-     "recompute": [{"name", "version", "records", "decisions", "failures"}], "inputs": {path: sha256}, "inputs_sha256"}
+     "recompute": [{"name", "version", "records", "decisions", "failures"}], "inputs": {path: sha256}, "inputs_sha256",
+     "environment": {the environment, when the caller gives one}}
 
 `replayed` lists the records that loaded, wrote back and replayed. A run record is never hashed only: a pattern
 that names one is refused when the check is made (`HashedOnlyRecord`), and `require_current_check` refuses a stored
 check that has one, so a check that replayed nothing cannot vouch for the records beside it.
 
-`stage` is `load`, `roundtrip`, `replay` or `decision` (a failure at `decision` also names the `hook`). Paths are relative to the batch, so a batch extracted from an
+`stage` is `load`, `roundtrip`, `secret` (the record holds a value of this environment's secrets), `replay` or
+`decision` (a failure at `decision` also names the `hook`). Paths are relative to the batch, so a batch extracted from an
 archive elsewhere has the same digest. An input is a record (a `.json` file anywhere under the batch, the check file
 excepted) or a file named by `hashed_only` patterns, which is hashed but not replayed, such as a manifest the analysis
 reads. A `.json` file that is not a record must therefore be named in `hashed_only`, or it fails the check at `load`.
@@ -23,7 +25,8 @@ reads. A `.json` file that is not a record must therefore be named in `hashed_on
 The code identity is the one `expcore.provenance.codestamp.version` returns for the code the check covers. The analysis
 accepts a batch only while `require_current_check` finds that its check passed, that no input was added, removed or
 changed, that the check was made under the code in use (the same commit and tree hash, neither unknown nor stale nor,
-unless allowed, dirty), and that it was made under the schemas in use. Otherwise the check runs again.
+unless allowed, dirty), that it was made under the schemas in use and, when the caller names the environment in use
+(`expcore.provenance.environment`), under that environment. Otherwise the check runs again.
 
 Decisions served during replay (R05): the core records none yet. A study that records a decision and serves it back
 from the record passes `recompute`, hooks that each have a `name` and a `version` and take the loaded record, return
@@ -47,15 +50,18 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from expcore.config.loading import ConfigError
+from expcore.errors import infra_kinds
 from expcore.provenance.codestamp import UNKNOWN, CodeScope, CodeVersionUnknown, require_known
 from expcore.provenance.codestamp import version as code_version
+from expcore.provenance.environment import differences
 from expcore.records.record import RunRecord, decode
-from expcore.records.redact import redact_text
+from expcore.records.redact import Redactor, redact_text
 from expcore.records.schema import SCHEMA_PREFIX, SCHEMAS, RecordError, SchemaVersion
 from expcore.replay.divergence import ReplayDivergence
+from expcore.replay.native import has_native_parser
 from expcore.replay.replay import replay_record
 
 CHECK_SCHEMA = "replay-check/1"
@@ -155,6 +161,48 @@ def input_files(batch: Path, hashed_only: Sequence[str] = ()) -> tuple[list[str]
     return sorted(records), sorted(hashed)
 
 
+class RecordNeeds(NamedTuple):
+    """What the records of a batch name that this process cannot read yet, each list sorted."""
+
+    backends: list[str]  # backends with no native parser registered
+    kinds: list[str]  # infrastructure kinds outside the vocabulary
+
+
+def _kinds_named(data: Mapping[str, Any]) -> set[str]:
+    """The infrastructure kinds a record names: what its condition declared, and what its outcome and request ended in."""
+    declared = data.get("treatment_kinds")
+    named = list(declared) if isinstance(declared, list) else []
+    for section in ("outcome", "failed_request"):
+        part = data.get(section)
+        if isinstance(part, Mapping):
+            named.append(part.get("infra_kind"))
+    return {kind for kind in named if isinstance(kind, str)}
+
+
+def what_records_need(batch: Path, hashed_only: Sequence[str] = ()) -> RecordNeeds:
+    """Return the backends and the infrastructure kinds the records of a batch name that this process cannot read.
+
+    Nothing here runs a record or a study's code, so a caller can decide what to import before anything is replayed. A
+    file that does not parse, or a field that is not what it should be, is left for the check to report.
+    """
+    backends: set[str] = set()
+    kinds: set[str] = set()
+    for rel in input_files(batch, hashed_only)[0]:
+        try:
+            data = json.loads((batch / rel).read_bytes())
+            route = data.get("route")
+        except (AttributeError, RecursionError, ValueError):  # not JSON, or not an object: the check says so
+            continue
+        backend = route.get("backend") if isinstance(route, Mapping) else None
+        if isinstance(backend, str):
+            backends.add(backend)
+        kinds |= _kinds_named(data)
+    return RecordNeeds(
+        sorted(backend for backend in backends if not has_native_parser(backend)),
+        sorted(kinds - set(infra_kinds())),
+    )
+
+
 def inputs_sha256(hashes: Mapping[str, str]) -> str:
     """Return the SHA-256 of the sorted list of [path, file hash] pairs, which names every input at once."""
     pairs = sorted([path, digest] for path, digest in hashes.items())
@@ -182,17 +230,30 @@ def _error(exc: BaseException) -> str:
 
 
 def check_record(raw: bytes, *, schemas: Sequence[SchemaVersion] = SCHEMAS) -> tuple[str, str] | None:
-    """Return None when the stored bytes load, write back to themselves and replay; else (stage, error)."""
+    """Return None when the stored bytes load, write back to themselves, hold no secret of this environment and
+    replay; else (stage, error).
+
+    The write-back redacts nothing: it checks the record's canonical form only, so a record written under an earlier
+    version of the redaction rules writes back to itself whatever the rules are now. Whether the record holds a value
+    of this environment's secrets, in any form the rules now recognise, is a stage of its own (`secret`): a leak to
+    report as one, never a format or replay divergence. The replay redacts nothing either (`Redactor.none`)."""
     try:
         record = RunRecord.from_json(decode(raw), tuple(schemas))
     except RecordError as exc:
         return "load", _redacted(str(exc))
     try:
-        written = record.dumps(tuple(schemas)).encode("utf-8")
+        written = record.dumps(tuple(schemas), redactor=Redactor.none()).encode("utf-8")
     except RecordError as exc:
         return "roundtrip", _error(exc)
     if written != raw:
         return "roundtrip", "writing the loaded record does not give back its stored bytes"
+    _, leaked = Redactor.from_environment().structure(decode(raw))
+    if leaked:
+        return "secret", (
+            f"a value of this environment's secrets appears in the record at {', '.join(leaked[:5])}: the record "
+            "holds a secret (written under another environment, or before the core recognised that form of it), so "
+            "it must not be published; rerun the attempt or remove the record"
+        )
     try:
         replay_record(record, schemas=schemas)
     except ReplayDivergence as exc:
@@ -209,10 +270,11 @@ def verify_batch(
     hashed_only: Sequence[str] = (),
     recompute: Sequence[Recompute] = (),
     schemas: Sequence[SchemaVersion] = SCHEMAS,
+    environment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Check every record of a batch and return the check, which `write_check` stores.
 
-    `code` is the identity of the code the check covers. The bytes hashed are the bytes checked. Each of the `recompute`
+    `code` is the identity of the code the check covers, and `environment`, if given, the environment it runs under. The bytes hashed are the bytes checked. Each of the `recompute`
     hooks runs on every record that loads, writes back and replays, and the check says which ran, on how many records,
     and how many decisions each recomputed.
     """
@@ -241,7 +303,7 @@ def verify_batch(
     _refuse_hashed_records(root, hashed)
     for rel in hashed:
         hashes[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
-    return {
+    check = {
         "schema": CHECK_SCHEMA,
         "record_schema": schemas[-1].name,
         "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -256,6 +318,9 @@ def verify_batch(
         "inputs": dict(sorted(hashes.items())),
         "inputs_sha256": inputs_sha256(hashes),
     }
+    if environment is not None:
+        check["environment"] = json.loads(json.dumps(environment, sort_keys=True))
+    return check
 
 
 def write_check(batch: str | os.PathLike[str], check: Mapping[str, Any]) -> Path:
@@ -341,6 +406,8 @@ def require_current_check(
     required_recompute: Sequence[str] = (),
     schemas: Sequence[SchemaVersion] = SCHEMAS,
     rerun_command: str | None = None,
+    environment: Mapping[str, Any] | None = None,
+    compare_sources: bool = True,
 ) -> dict[str, Any]:
     """Return the batch's stored check when it passed and is current; else raise BatchNotVerified saying why (R04).
 
@@ -351,7 +418,9 @@ def require_current_check(
     failures; inputs added, removed or changed since; a check made under another commit or tree hash than `code`, the
     identity of the code in use; code that is unknown, stale or, unless `allow_dirty`, dirty; and, for each name in
     `required_recompute`, a check that did not run that recompute hook, ran it on fewer records than the batch holds,
-    or whose hook disagreed with a record (R05).
+    or whose hook disagreed with a record (R05). With `environment`, the environment in use, a check made under
+    another one, or that records none, is refused too; `compare_sources` false compares only the Python version and
+    the distributions' versions, as a replication package installed from its own wheels does.
     """
     root = Path(batch)
     rerun = f"run `{rerun_command or f'python -m expcore.replay.check {root}'}` first"
@@ -396,6 +465,13 @@ def require_current_check(
         problem = f"the check was made under code tree {made['tree_sha256'][:12]}, the code in use has {code['tree_sha256'][:12]}"
     if problem:
         raise BatchNotVerified(f"{root}: {problem}; {rerun}")
+    if environment is not None:
+        changed = differences(check.get("environment"), environment, sources=compare_sources)
+        if changed:
+            raise BatchNotVerified(
+                f"{root}: the check was made under another environment than the one in use ({'; '.join(changed[:5])}"
+                f"{' and more' if len(changed) > 5 else ''}); {rerun}"
+            )
     return check
 
 

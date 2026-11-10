@@ -15,7 +15,7 @@ All of them are `typing.Protocol`s, so a test double needs no inheritance. Signa
 
 ## The study plugin
 
-A study directory holds `study.toml`, `models.toml`, `campaign.toml`, `preregistration.toml` and one Python file named by `[study] plugin`. `expcore.study.config.load_study(directory)` validates all of them against each other. `expcore.study.plugin.load_plugin` imports the file and calls
+A study directory holds `study.toml`, `models.toml`, `campaign.toml`, `preregistration.toml` and one Python file named by `[study] plugin`; `[study] requires` names the distributions beyond the core that the study's code imports. `expcore.study.config.load_study(directory)` validates all of them against each other. `expcore.study.plugin.load_plugin` imports the file and calls
 
 ```python
 def build(context: StudyContext) -> StudyPlugin: ...
@@ -39,11 +39,13 @@ class StudyPlugin:
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
     admission: RunAdmission | None = None  # (treatment_kinds, treatment_targets, cancel, exclusive) -> context manager
+    platform: Mapping[str, Any] = field(default_factory=dict)  # the platform's settings that make one experiment
+    backend_factory: BackendFactory | None = None  # None: the core's default_backend_factory
 ```
 
 `admission` is the platform's hold on a resource every run shares (`expcore.campaign.attempt.RunAdmission`). The core enters it after the lease and the second look at the gates, before the attempt's backend, timer and executor exist, so its wait is outside the agent's clock, and leaves it after the post-run check and the store's record; a refusal (`InfraError`) leaves the run unstarted, with no attempt used. Every health check runs in its caller's context, so the post-run check sees what the run's admission holds. `expcore_onedata.admission.run_admission(config)` is the one for a platform with `[faults]`. `exclusive` is whether the run's condition declares `exclusive = true` in study.toml (`FactorSchema.exclusive`): a condition with no fault whose runs the platform holds exclusively, as it does an outage run's, so a control can run under the outage's isolation; a campaign with such a condition and no run admission is refused at its start, naming the file and the key. The context manager yields what it holds, `shared` or `exclusive`; the core stores it in the attempt's row as it is admitted (`none` without an admission) and the export carries it as `admission` in every analysed and excluded entry and as `admissions`, one per charged attempt, in every exhausted run.
 
-The core guarantees: the code identity is computed once, from the study directory and the `[study] code` roots, and refused if it is unknown, stale or (without `--allow-dirty`) dirty; the plugin is rejected at load if a condition has no prompt or tool hash, or two scorers share a name; `prompts`, `tools`, the scorers' names and versions and the hash of each configuration file go into the campaign fingerprint, so a resume under any change is refused (C06).
+The core guarantees: the code identity is computed once, from the study directory and the `[study] code` roots, and refused if it is unknown, stale or (without `--allow-dirty`) dirty; the plugin is rejected at load if a condition has no prompt or tool hash, two scorers share a name, or `platform` is not a mapping; `prompts`, `tools`, the scorers' names and versions, the hash of each configuration file and, when not empty, `platform` go into the campaign fingerprint, so a resume under any change is refused (C06). A study on the Onedata layer passes `platform=config.fingerprint()`, the platform file's TLS mode with the CA bundle's SHA-256, so a resume under another mode or bundle is refused.
 
 The implementer must guarantee: `build` has no side effects beyond constructing objects; the hashes describe what the model sees under each condition; nothing is named by the core, so every name lives in the study.
 
@@ -53,7 +55,7 @@ What the analysis may use. `check` replays every record and also copies the camp
 
 ## ModelBackend
 
-`expcore.models.adapters.ModelBackend`; built by the core, never by the executor.
+`expcore.models.adapters.ModelBackend`; built by the core, never by the executor. The core builds three backends, named by `backend` in `models.toml`: `openai_compat`, `anthropic` and `stub` (`expcore.config.models.BACKENDS`). A study plugs in a backend of its own without editing the core: its model entries name it with a plain lower-case `backend` value, and the plugin supplies the `backend_factory` that builds it ([BackendFactory](#backendfactory)).
 
 ```python
 class ModelBackend(Protocol):
@@ -79,6 +81,23 @@ Implementer must guarantee:
 - `step` returns one reply per call. A token count the reply did not report is `None`, never 0 (R10).
 - A failure of the endpoint that outlasts the retries is raised as `InfraError("endpoint", ...)`; a refused key as `InfraError("key_rejected", ...)`. A reply cut at the output limit sets `stop_reason` to a limit stop.
 - `info()` and `transcript()` never contain a credential; the base URL has none (R12).
+- An executor that needs more than the protocol (the example's executor scripts the stub with `use`) checks for that method, never for a class, so a backend that wraps or replaces the stub serves it too.
+
+### Retries of a reply
+
+`ModelTurn.retries` holds the retries the reply took before it came, one object per retry, oldest first; `()` when it took none. The core's adapters fill it through `expcore.models.retry.Retrier`, and a backend of a study's own fills it the same way or leaves it empty. The keys of an entry are a closed set, `expcore.records.schema.RETRY_FIELDS`, and every one may be left out. Any other key makes the record invalid: writing it raises `RecordError`, and the attempt is recorded as a harness defect, which names the exception's class and not its message, so check the keys when you write the backend.
+
+| Key | Holds |
+|---|---|
+| `retry` | the retry's number within this reply, from 1 |
+| `kind` | the class of error that was retried (below) |
+| `error` | the class name of the error |
+| `status` | the HTTP status, or `null` for an error that has none (a timeout, a lost connection) |
+| `retry_after_s` | the wait the server asked for (`Retry-After`, `Retry-After-Ms`), or `null` |
+| `wait_s` | the wait before the retry, never less than `retry_after_s` |
+| `message` | the provider's message, cut to 300 characters; empty when the error has none |
+
+Only a transient error is retried, so `kind` is one of five: `rate_limit` (429), `timeout` (408, or a timeout while connecting or sending), `conflict` (409), `server` (5xx) and `connection` (the endpoint could not be reached). The retrier's other kinds never become an entry: `auth` (401 or 403) raises `InfraError("key_rejected", ...)`, `read_timeout` (the request went out and the reply is late) is never resent and abandons the request, `context_overflow` (a 400 or 413 whose code or message names the context) ends the run as the agent's outcome, and `not_found` and `bad_request` are raised unchanged. The record checks the keys and not the words, so a backend of its own uses these five for the same errors, and a reader can then count retries by kind across backends.
 
 ### BackendFactory
 
@@ -88,7 +107,11 @@ class BackendFactory(Protocol):
                  time_left: Callable[[], float | None] | None) -> ModelBackend
 ```
 
-The scheduler calls it for admission and for every run with the same `base_url`. The default builds the adapter the model entry names.
+The scheduler calls it for admission and for every run with the same `base_url`. The default, `expcore.campaign.executor.default_backend_factory`, builds the adapter the model entry names and refuses a backend the core does not build. A study replaces it with `StudyPlugin.backend_factory`, which `run_study` passes to the scheduler.
+
+The core guarantees: a model entry whose `backend` the core does not build is accepted by `models.toml` only as a plain lower-case name, and only the core's rules that are not about its own adapters apply to it (its `base_url`, if given, its key reference, its limits, its sampling); the plugin is refused at load, naming `models.toml` and the key, when such a model is in the table and the plugin supplies no factory. A plugin's factory is in the campaign fingerprint by its qualified name and its `version`, so a resume under another factory or another version is refused (C06); a study on the core's factory has no such section and keeps its fingerprint. A factory in the plugin file goes by its name alone, since a plugin's module name holds the study's path. The code identity covers a factory whose module's file is among the files `[study] code` lists, and its `version` is taken as declared. Otherwise the `version` speaks for its code, so it is held to the installed distribution that owns the module's file (the one whose `RECORD` lists it, or, for an editable install, the one whose top-level package holds it where it imports from, not a loose file below its project; never a namespace sibling that shares its top-level name): the campaign refuses to start or resume unless the two are equal as versions (`1.0+Build_1` is `1.0+build.1`), naming both. A factory whose file nothing owns and the identity does not cover is refused, naming its module.
+
+The implementer must guarantee: a factory a plugin supplies has a `version` attribute, a non-empty string changed whenever its behaviour changes (the plugin is refused at load without one); the factory decides which models it serves and passes every other model to `default_backend_factory`, so the core's backends keep their own rules (B08, B16); the backend it returns meets the `ModelBackend` contract above; a backend whose transcript is not in a core format registers its parser with `expcore.replay.native.register_native_parser`, under the name its `info()` gives, at the top level of the plugin module or of a module in `[study] platforms`, or the replay check cannot read its records. `check` imports both only when a record names a backend no parser is registered for, says so in one line, and does not call `build`, so it needs no model or key and a parser registered only inside `build` is not there. A record that names an infrastructure kind neither the core nor `[study.kinds]` holds makes it import the `[study] platforms` modules alone, and a batch that needs neither imports nothing from the study.
 
 ## ToolProvider and CallContext
 
@@ -117,6 +140,61 @@ Implementer must guarantee:
 - Blocking work does not run on the event loop (`asyncio.to_thread`, or `FunctionProvider`), and bounds itself with `timeout_s`: a thread cannot be killed (L15).
 - Every wait on infrastructure is wrapped in `ctx.infrastructure_wait`. What the agent's own call does (executing, reading data, a federation operation it triggers) is never a wait.
 
+### McpToolProvider
+
+A study or platform whose tools come from an MCP server speaks to it through `McpToolProvider`, one server session per run over stdio. The Onedata layer builds it for its tool server (`SandboxPlatform.tool_server`); any other platform builds it the same way.
+
+```python
+class McpToolProvider:  # expcore.tools.mcp_client
+    def __init__(self, command: str, args: Iterable[str] = (), *, frozen: FrozenManifest | Path,
+                 env: dict[str, str] | None = None, cwd: str | Path | None = None,
+                 allowed_tools: Iterable[str] = (), start_timeout_s: float = 120.0)
+    async def __aenter__(self) -> McpToolProvider  # start the server and check its tools
+    async def __aexit__(self, *exc) -> None        # end the session and stop the server
+    manifest_sha256: str | None                    # the frozen manifest's sha256, once the start succeeded
+```
+
+- `command` and `args` start the server as a child process, in `cwd`. `env` holds the variables the server gets beyond the few the MCP SDK passes on by default (`HOME`, `PATH`, `USER` and the like on POSIX); nothing else of the caller's environment reaches it, so a token the server needs goes in `env`.
+- `frozen` is the condition's frozen manifest, an object or the path of its file, read when the provider is made. The server's tools must equal it.
+- `allowed_tools` is the allow-list the caller gave the server's launcher; the server enforces it, and the client only checks that the server shows exactly those tools. Empty, there is no such check.
+- `start_timeout_s` bounds the whole start (spawn, initialize, list the tools); it must be positive (L14).
+
+Use it as an async context manager around `record_run`, started before the loop, so its start is outside the agent's time, and pass it in the providers. `tools()` returns the server's tools, none of them terminal. What fails where:
+- A server that cannot be spawned, does not start within the timeout or closes while starting raises `InfraError("knowledge", ...)` from `__aenter__`.
+- A server whose tools differ from the frozen manifest in any way (an extra or a missing tool, a changed description or schema), that lacks a tool of the allow-list or shows one outside it, raises `ManifestError` from `__aenter__`, listing every difference in `problems`. That is a fault of the study's set-up, not of the infrastructure, so the attempt is a harness defect (L13, C10).
+- During the run, a closed connection or an internal server error raises `InfraError("knowledge", ...)`; any other MCP error, and a result the server marks as an error, is a `ToolOutput` with `is_error` for the model to read (L12). The round trip to the server is the agent's time: the client marks no wait.
+
+### The frozen manifest
+
+`expcore.tools.manifest` reads a server's tools, freezes them into a file per condition and compares a server with that file.
+
+```python
+@dataclass(frozen=True)
+class FrozenManifest:
+    tools: list[dict]  # sorted by name: name, description, input_schema, output_schema, annotations
+    sha256: str        # SHA-256 of the canonical JSON of tools
+    server_name: str | None = None
+    server_version: str | None = None
+    protocol_version: str | None = None
+    @classmethod
+    def load(cls, path: Path) -> FrozenManifest  # ManifestError for a file that is not one, or was edited
+    def dump(self) -> str                        # the file's text: sorted keys, one trailing newline
+```
+
+Two manifests are equal when their names, descriptions, schemas and annotations are equal, byte for byte. `load` refuses a file whose stored `sha256` is not the hash of its tools, so a hand-edited manifest is refused rather than trusted. Freeze each condition's manifest from the server it will run, and check it again whenever the server is upgraded:
+
+```sh
+python -m expcore.tools.manifest freeze [--pass-env NAME ...] [--timeout SECONDS] OUT -- COMMAND [ARG ...]
+python -m expcore.tools.manifest check [--pass-env NAME ...] [--timeout SECONDS] FROZEN -- COMMAND [ARG ...]
+```
+
+Both start the server with `COMMAND [ARG ...]`, as the provider will, and read its tools within `--timeout` seconds (120 by default). `--pass-env NAME`, repeatable, copies that variable of your environment to the server by name, so no value is on the command line. `freeze` writes the frozen manifest to `OUT` and prints its tool count and hash; `check` compares the live server with `FROZEN`. Each exits 0 on success, 1 on a mismatch (listed on standard error) and 2 on an error. For example, with a server installed as `notes-server`:
+
+```sh
+python -m expcore.tools.manifest freeze --pass-env NOTES_TOKEN manifests/basic.json -- notes-server --read-only
+python -m expcore.tools.manifest check --pass-env NOTES_TOKEN manifests/basic.json -- notes-server --read-only
+```
+
 ## Scorer
 
 `expcore.records.rescore.Scorer`.
@@ -137,6 +215,7 @@ Implementer must guarantee:
 - The score is a pure function of the record: no model, no platform, no clock (R13). The platform axis comes from run-end snapshots in the record.
 - The result is JSON. By convention: `axes` (two named axes, what the agent did and what the platform's state shows), `verdict` (`fulfilled`, `violated` or `not_determined`; not enforced by the core) and `outcomes`, a mapping from a name to a finite number or `None`.
 - An outcome that could not be computed is `None`, never 0, and a `not_determined` verdict leaves every outcome that depends on the unobserved state `None` (R10, S05).
+- A treatment attempt (`record.outcome["treatment"]` is true) gets values: what the agent achieved under the manipulation (the failure itself, for example no answer and zero coverage) and what it did before it. `None` drops the run's pair from every contrast on that outcome; the analysis counts those drops per contrast, and refuses a contrast in the Holm family that has any, unless its preregistration declares `treatment_outcomes = "excluded"`; `"scored"` is a claim the analysis checks, so such a contrast is refused too, past its preregistered `max_unscored_treatment` (0 unless set) (S10).
 
 ## Instrument
 
@@ -155,6 +234,21 @@ The study's executor calls them; nothing in the loop does. `expcore.records.inst
 def start_instruments(instruments: Sequence[Instrument], identity: Mapping[str, Any]) -> None
 def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> RunRecord
 ```
+
+An executor runs them around `record_run`, as the example's does (`FactsServed` in `examples/tiny_study/plugin.py`):
+
+```python
+instruments = [FactsServed(shelf)]  # new objects for every run
+identity = {"run_key": request.run_key, "factors": dict(request.identity.factors), "attempt": request.identity.attempt}
+await asyncio.to_thread(start_instruments, instruments, identity)
+record = await record_run(request, providers, system, user, config, code=code)
+record = await asyncio.to_thread(finish_instruments, record, instruments)
+record.write(request.run_dir)  # the record finish_instruments returned, which holds the snapshots
+```
+
+- `identity` is the request's [`RunIdentity`](#runexecutor) as a plain mapping: `run_key`, `factors` and `attempt`. It is there for an instrument that labels its reading or looks something up by run; one that reads only the platform's state, such as the platform probes, ignores it.
+- One fresh instrument per run: an instrument holds one run's reading between `start` and `finish`, and the scheduler can run attempts at the same time, so an instrument shared between runs would mix their readings.
+- Which attempts get a snapshot: `record_run` returns a record however the loop ended, an infrastructure failure included (a tool's `InfraError`, an endpoint that outlasted its retries), so `finish` runs and the snapshot is kept: a treatment attempt's scorer reads it, and an attempt set aside keeps it for diagnosis. When the executor itself raises, before the loop or instead of returning, there is no record and so no snapshot. An exception from `start` is the executor's: an `InfraError` is recorded as infrastructure of its kind, anything else as a harness defect (C10).
 
 Core guarantees:
 - `check_instruments` runs first on both: a namespace that is not lower-case letters, digits and underscores, and two instruments with one namespace, raise before anything runs.
@@ -191,9 +285,25 @@ class RunRequest:
     treatment_kinds: tuple[str, ...]
     lease: Lease | None = None
     treatment_targets: Mapping[str, str] = {}  # kind -> the target the condition declares for it
+    models: ModelTable | None = None
+    defect_log: DefectSink | None = None
+
+    @property
+    def run_key(self) -> str  # identity.run_key
+
+@dataclass(frozen=True)
+class RunIdentity:  # expcore.records.build
+    run_key: str
+    factors: Mapping[str, Any]
+    attempt: int
 ```
 
-`record_run(request, providers, system, user, config, *, code, **options)` runs the loop with the request's backend, timer and treatment kinds and returns the record.
+`RunIdentity` says which attempt of which run the request is, and goes into the record as it is:
+- `run_key` is the run's key text, the factor values joined in the order of `[identity] order` (`task=lake|access=direct|tools=basic|model=alpha-stub|seed=1`). It is the same for every attempt of the run, and `RunRequest.run_key` returns it.
+- `factors` maps every factor of the run key to the run's level: the study's declared factors and the built-in `task`, `model` and `seed` (an integer). The condition is not among them; `study.schema.condition_named(factors, run_key)` names it.
+- `attempt` is 1 for a run's first attempt and one more for each attempt of the run that was charged before it, an infrastructure failure set aside for instance, so a stub that should fail on the first try and succeed on the next tests `attempt`. An attempt that was interrupted (a killed process) is not charged, and its run is tried again under the same number. The record's file is named by `run_key` and `attempt` (`record_filename`), in `request.run_dir`, the directory of this try (`try<N>`, where N counts every try of the run, interrupted ones included, so it can be larger than `attempt`).
+
+`record_run(request, providers, system, user, config, *, code, **options)` runs the loop with the request's backend, timer and treatment kinds and returns the record. It records with the request's model table, which the scheduler fills in for every run, so the key of each model in `models.toml` is redacted whatever the backend (R12). It also hands on the request's `defect_log`, so the traceback of a crash the loop catches goes to the local harness-error log, redacted with every secret the executor gave `record_run` (L08). A sink should not raise; if one does (the log cannot be written, or an executor passed a `defect_log` of its own), the record is still built and written, and the attempt stops dispatch once its result is stored, naming the failure (C17).
 
 Core guarantees:
 - The gates (health, harness stop, budget, unit pause) were passed, the lease the platform declared for the run is held for the whole attempt, and the timer is not started: the loop starts it. The attempt has a row (`running`) before the executor is called, so a kill leaves a run that the next start settles (C04).
@@ -280,6 +390,7 @@ Core guarantees: `ctx.infrastructure_wait` is given a kind of `WAIT_KINDS`; the 
 Implementer (the platform layer) guarantees:
 - `launch` opens `ctx.infrastructure_wait("sandbox_lifecycle")` around the start (the token mint, the image checks, the containers) and around the stop, and nowhere else. Executing the agent's code and its reads of data are never waits.
 - Every image is started by the id it is pinned to in `platform.toml`; a tag that now resolves elsewhere raises `StartRefused` before anything exists (O13). Each sandbox gets its own small network from the configured pool, whose ranges are strict networks checked at load (O14).
+- The data gate's upstream connection and oneclient check the federation's certificate as the platform's one `[tls]` says, as the REST client and the tool server do (`expcore_onedata.tls`): against their default CAs, against the run's own read-only copy of the `ca_file` bundle's verified bytes (written once, after their hash is checked against the one loaded, and mounted read-only; a bundle that changed since the load refuses the start), or not at all with `insecure_tls`. The agent trusts the run's own CA alone. `metadata()["tls"]` records the mode, with the bundle's SHA-256 under `ca_file`, never its path or contents (O05, O12).
 - Teardown runs on every path that ends a sandbox, in the order readers, unmount, sidecar, agent, and verifies that each step took effect; a sandbox that is not verifiably gone makes `stop` raise `SandboxError` and `launch` raise `InfraError("sandbox")`, and the probe keeps the lease key quarantined (O15, C19).
 - `SandboxProbe.resource_gone(key, note)` answers exactly `True` only when docker lists no container and no network labelled with the key and the mount table shows no mount in a directory of the key; any failed read is `False`.
 - The gate passes only reads, answers a refusal as 4xx and never as an error, and marks a transfer it cut (`cut`, `unread_bytes`) so it is told from an error of the gate (`error_origin: gate`) or of the platform (`upstream`) (O16).
@@ -304,13 +415,25 @@ An unknown value raises where it is built, so a typo never reaches a record.
 | Vocabulary | Values | Defined in |
 |---|---|---|
 | Outcomes | `finished`, `turn_cap`, `time_cap`, `token_cap`, `output_cap`, `malformed_end`, `leaked_tool_call`, `harness_defect`, `error`, `infrastructure` | `expcore.loop.outcomes.OUTCOMES` |
-| Infrastructure kinds | `endpoint`, `key_rejected`, `sandbox`, `knowledge`, `unattributed_kill`, `ceiling`, `tool_plane_integrity`, `post_check_unverified`, plus kinds a platform adds once with `expcore.errors.register_infra_kind` (pass `treatable=False` for one that must never be a treatment) | `expcore.errors.CORE_KINDS`, `infra_kinds()`, `untreatable_kinds()` |
+| Infrastructure kinds | `endpoint`, `key_rejected`, `sandbox`, `knowledge`, `unattributed_kill`, `ceiling`, `tool_plane_integrity`, `post_check_unverified`, plus kinds a platform registers ([below](#infrastructure-kinds-of-a-platform-or-a-study)) and kinds a study declares in `[study.kinds]` | `expcore.errors.CORE_KINDS`, `infra_kinds()`, `untreatable_kinds()` |
 | Wait kinds | `model_retry`, `lease_queue`, `sandbox_lifecycle`, `toolserver_lifecycle` | `expcore.plugin.WAIT_KINDS` |
-| Conclusion words | `difference`, `trivial_difference`, `equivalent`, `not_detected` | `expcore.stats.analysis.CONCLUSIONS` |
+| Conclusion words | `difference`, `trivial_difference`, `equivalent`, `not_detected`, `untestable` | `expcore.stats.analysis.CONCLUSIONS` |
 | Tool call statuses | `ok`, `error`, `malformed`, `skipped`, `cut`, `failed` | `expcore.loop.records.TOOL_STATUSES` |
 | Attempt states | `running`, `done`, `infra_fail`, `outage_discarded`, `interrupted`, `harness_error` | `expcore.campaign.attempts.STATES` |
 | Run statuses | `pending`, `done`, `infra_exhausted`, `harness_error` | `expcore.campaign.attempts.RUN_STATUSES` |
 | Lease outcomes of an attempt | `granted`, `none` (a refused lease starts no attempt, so it is in the lease wait log and the event log) | `expcore.campaign.attempts.LEASE_OUTCOMES` |
 | Malformed-call policies | `report`, `end` | `expcore.loop.config.MALFORMED_POLICIES` |
 
-The conclusion words encode significance: `difference` and `trivial_difference` are significant, the other two are not; a contrast outside the Holm family is judged by its raw p-value and labelled exploratory wherever it is shown. Failing to detect a difference is not evidence of none.
+The conclusion words encode significance: `difference` and `trivial_difference` are significant, the other three are not; a contrast outside the Holm family is judged by its raw p-value and labelled exploratory wherever it is shown. Failing to detect a difference is not evidence of none. `untestable` is the word of a contrast that used no pair, and of no other: nothing was tested, and in the Holm family it counts as p = 1.
+
+### Infrastructure kinds of a platform or a study
+
+```python
+def register_infra_kind(kind: str, description: str, *, treatable: bool = True) -> None
+```
+
+A platform adds a kind with `expcore.errors.register_infra_kind`, once, at the top level of a module of its own, so the kind exists as soon as that module is imported. `kind` is lower-case letters, digits and underscores and not a core kind; `description` is not blank and is the reason given when the kind is refused as a treatment; `treatable=False` marks a kind that can never be a condition's treatment, such as a failed integrity check of the harness. Registering a kind again with the same answer is harmless, and with the other answer is refused.
+
+A study's `study.toml` is validated when it is loaded, before its plugin is imported, so a kind registered by the plugin, or by a platform only the plugin imports, is unknown to the conditions. A study that declares a platform's kind as a treatment lists the module that registers it in `[study] platforms`; the loader imports each listed module before it validates anything, and refuses one that cannot be imported, naming the file, the key, the module and the type of the exception, never its text. For the Onedata layer, that module is `expcore_onedata.sandbox.kinds`. A study without a platform declares its own kinds in `[study.kinds]`, as `name = { description = "...", treatable = true }`. They are held in the vocabulary only while the study is loaded and while the pipeline works on it (`expcore.errors.study_kinds`), so they do not outlast it, and a failed load leaves none behind; a platform's kinds stay for the whole process. The scopes are counted: two studies that overlap in one process each keep their kinds and can see the other's for the overlap, which can only widen validation, and declaring one name differently while they overlap is refused, naming the kind. A study's kind that is a core kind or a platform's is refused; so is a platform registering a kind of the study in scope. Neither key is part of the factor schema (study.toml's hash is in the campaign fingerprint, as before), so a study that uses neither keeps its fingerprint and schema digest. [`study-guide.md`](study-guide.md#treatment-kinds) shows both keys.
+
+A condition that names a kind outside the vocabulary is refused as unknown, with the treatable kinds as the choices; a known kind that is not treatable is refused as one that can never be a treatment, with the reason its registration gave.

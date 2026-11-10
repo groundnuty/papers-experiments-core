@@ -6,20 +6,34 @@ an estimator: a contrast names one, the registry supplies it, and the result typ
 reports. A contrast that cannot be estimated keeps its place with NaN values, and a NaN p-value stays in the Holm
 family as p = 1 (S02).
 
-Each contrast ends in one of four conclusions, and never in "no difference". Two facts decide it: whether the test is
-significant (a member of the Holm family by Holm's decision, any other contrast by its raw p-value at alpha, since
-nothing adjusts for it), and whether the preregistration declares an `equivalence_margin` for the contrast and the
-cluster-bootstrap interval at 1 - 2 alpha lies inside plus or minus that margin (the interval form of two one-sided
-tests at alpha).
+Each contrast ends in one of five conclusions, and never in "no difference". A contrast that used no pair, whatever
+the cause, is "untestable": nothing was tested, so no other word applies (S11). It has no estimate, interval, p-value
+or minimum detectable effect, whatever its estimator returned for no data; in the Holm family it stays a member as
+p = 1, the kernel's reading of a NaN p-value, so the family keeps its size and it never rejects. For every other
+contrast two facts decide: whether the test is significant (a member of the Holm family by Holm's decision, any other
+contrast by its raw p-value at alpha, since nothing adjusts for it), and whether the preregistration declares an
+`equivalence_margin` for the contrast and the cluster-bootstrap interval at 1 - 2 alpha lies inside plus or minus that
+margin (the interval form of two one-sided tests at alpha).
 - "difference": significant, and not inside the margin (or no margin is declared);
 - "trivial_difference": significant, and inside the margin. The effect is detected and smaller than the margin the
   study called negligible; it has its own word so that a table of conclusions cannot hide a detected effect;
 - "equivalent": inside the margin, and not significant;
 - "not_detected": everything else, including a non-significant result without a margin and a margin whose interval is
-  too wide. Failing to detect a difference is not evidence of none.
+  too wide. Failing to detect a difference is not evidence of none;
+- "untestable": no pair was used. It is not evidence of anything, least of all of no effect.
 
 A contrast outside the preregistered Holm family is `exploratory`: nothing controls its multiplicity, it is judged by
 its raw p-value at alpha, and every table or report that shows its conclusion shows that label with it.
+
+A treatment attempt (a run that ended in an infrastructure failure its condition declares as its treatment) is scored
+as its condition's outcome, so a scorer that returns None for it takes its pair out of every contrast on that outcome,
+and the manipulation silently leaves the comparison it was kept for (S10). Each result counts those pairs, with every
+other cause of a missing pair (`pairing.MISSING_CAUSES`). A member of the Holm family that loses any is refused
+(`TreatmentOutcomesRefused`) unless its preregistration declares `treatment_outcomes` = "excluded" (every pair with a
+treatment attempt is left out of the contrast and reported as such). "scored" says the scorer returns values for
+treatment attempts, and that claim is checked: a member that still loses a pair this way is refused too, past the
+contrast's preregistered `max_unscored_treatment` (0 unless set). An exploratory contrast reports the count and is not
+refused.
 
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
 """
@@ -35,12 +49,18 @@ import numpy as np
 from expcore.stats import contrasts as kernel
 from expcore.stats import estimators, power
 from expcore.stats.estimators import ModelEstimate, PairedDifferences
-from expcore.stats.pairing import ContrastSpec, pair_rows
+from expcore.stats.pairing import ContrastSpec, Pairing, pair_rows
 from expcore.stats.prereg import Preregistration, name_digest
 from expcore.stats.rejection import rejects
-from expcore.stats.rows import Row
+from expcore.stats.rows import AbsentRun, Row
 
-CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected")
+UNTESTABLE = "untestable"  # the conclusion of a contrast that used no pair
+CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected", UNTESTABLE)
+
+
+class TreatmentOutcomesRefused(ValueError):
+    """A confirmatory contrast lost pairs to treatment attempts scored None, and its preregistration either does not
+    say how treatment attempts are scored for it or claims they are scored and allows fewer such pairs."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,9 +80,12 @@ class ContrastResult:
     n_clusters: int
     n_clusters_dropped: int
     n_pairs: int
-    n_pairs_missing: int
-    n_unpaired: int
+    n_pairs_missing: int  # pairs whose outcome is None on either side: pairs_missing's two None causes together
+    n_unpaired: int  # run keys analysed in one arm only
     tasks_dropped: tuple[str, ...]  # tasks one of the two arms did not run, left out of this contrast only
+    treatment_outcomes: str | None  # as preregistered: "scored", "excluded", or None when undeclared
+    max_unscored_treatment: int  # as preregistered: the pairs a "scored" member may lose to a treatment None
+    pairs_missing: Mapping[str, int]  # every cause of pairing.MISSING_CAUSES with its count, zeros included
     counts: Mapping[str, int]
     per_model: tuple[ModelEstimate, ...]
     in_family: bool  # a member of the Holm family; any other contrast has no multiplicity control
@@ -110,8 +133,13 @@ class AnalysisResult:
         raise KeyError(f"no contrast named {name!r}; declared: {', '.join(r.name for r in self.contrasts)}")
 
 
-def conclude(significant: bool, equivalent: bool) -> str:
-    """The conclusion from the test and the margin: a significant effect inside the margin is a trivial difference."""
+def conclude(significant: bool, equivalent: bool, untestable: bool = False) -> str:
+    """The conclusion from the test and the margin: a significant effect inside the margin is a trivial difference.
+
+    `untestable` (the contrast used no pair) overrides both: with no evidence, no other word applies (S11).
+    """
+    if untestable:
+        return UNTESTABLE
     if equivalent:
         return "trivial_difference" if significant else "equivalent"
     return "difference" if significant else "not_detected"
@@ -163,20 +191,77 @@ def _minimum_detectable_effect(
     return power.minimum_detectable_effect(sd, len(differences.clusters), level, prereg.power, rng, p_values)
 
 
+def _refuse_lost_treatment_pairs(spec: ContrastSpec, prereg: Preregistration, pairing: Pairing) -> None:
+    """Refuse a member of the Holm family whose treatment attempts left it unseen (S10). "scored" is a claim checked
+    here, not a switch that turns the check off, and a tolerance cannot cover every treatment attempt. "excluded" loses
+    no pair this way, but may not leave the contrast with no pair, whose conclusion would read as no effect detected."""
+    if spec.name not in prereg.holm_family:
+        return
+    if spec.treatment_outcomes == "excluded":
+        removed = pairing.missing["treatment_excluded"]
+        if removed and not pairing.n_pairs:
+            raise TreatmentOutcomesRefused(
+                f'{prereg.source}: confirmatory contrast {spec.name!r} declares treatment_outcomes = "excluded", which '
+                f"leaves it no pair: all {removed} are treatment attempts, so nothing is estimated and its conclusion "
+                'would read as no effect detected. Declare treatment_outcomes = "scored" and score them, or take the '
+                "contrast out of holm_family"
+            )
+        return
+    lost = pairing.missing["treatment_outcome_none"]
+    if not lost:
+        return
+    if spec.treatment_outcomes == "scored":
+        within = lost <= spec.max_unscored_treatment
+        if within and pairing.n_treatment_measured:
+            return
+        unmeasured = "; no treatment attempt of the contrast was measured, which no tolerance excuses" if within else ""
+        raise TreatmentOutcomesRefused(
+            f'{prereg.source}: confirmatory contrast {spec.name!r} declares treatment_outcomes = "scored", but {lost} '
+            f"pair(s) have a treatment attempt whose outcome {spec.outcome!r} is None "
+            f"(max_unscored_treatment is {spec.max_unscored_treatment}{unmeasured}). Make the scorer return values for "
+            f"treatment attempts; preregister max_unscored_treatment in [contrasts.{spec.name}] only for attempts "
+            'that genuinely could not be measured; or declare treatment_outcomes = "excluded" to leave every pair '
+            "with a treatment attempt out of this contrast, reported as such"
+        )
+    raise TreatmentOutcomesRefused(
+        f"{prereg.source}: confirmatory contrast {spec.name!r} drops {lost} pair(s) because a treatment attempt's "
+        f"outcome {spec.outcome!r} is None, so the condition's manipulation silently leaves its own contrast. Make the "
+        "scorer return values for treatment attempts (None only for what could not be measured) and declare "
+        f'treatment_outcomes = "scored" in [contrasts.{spec.name}], or declare treatment_outcomes = "excluded" there '
+        "to leave every pair with a treatment attempt out of this contrast, reported as such"
+    )
+
+
 def run_contrast(
-    rows: Iterable[Row], spec: ContrastSpec, prereg: Preregistration, significant: bool | None = None
+    rows: Iterable[Row],
+    spec: ContrastSpec,
+    prereg: Preregistration,
+    significant: bool | None = None,
+    absent: Iterable[AbsentRun] = (),
 ) -> ContrastResult:
     """Pair the rows for one contrast and run its registered estimator under the preregistration's settings.
 
     `significant` is the decision of the test. `analyse` passes Holm's decision for a member of the family; left out,
-    it is the raw p-value at alpha, with nothing adjusting for the family.
+    it is the raw p-value at alpha, with nothing adjusting for the family. `absent` are the planned runs with no
+    analysed attempt, which say why a pair is missing. A member of the family that loses a pair to a treatment
+    attempt scored None is refused (`TreatmentOutcomesRefused`), unless it declares `treatment_outcomes = "excluded"`
+    or the loss is within a "scored" contrast's preregistered `max_unscored_treatment`.
     """
-    pairing = pair_rows(rows, spec)
+    pairing = pair_rows(rows, spec, absent)
+    _refuse_lost_treatment_pairs(spec, prereg, pairing)
     estimate = estimators.get(spec.estimator)(pairing.differences, prereg.estimator_settings(spec))
     in_family = spec.name in prereg.holm_family
+    untestable = pairing.n_pairs == 0
+    if untestable:  # no data: whatever the estimator returned is not evidence, and NaN enters Holm as p = 1 (S11)
+        estimate = dataclasses.replace(estimate, estimate=math.nan, p_value=math.nan, ci_low=math.nan, ci_high=math.nan)
+        significant = False
     if significant is None:
         significant = bool(rejects(estimate.p_value, prereg.alpha))  # False for a NaN p-value
-    interval, equivalent = _equivalence(spec, prereg, pairing.differences)
+    if untestable:
+        interval, equivalent = (None if spec.equivalence_margin is None else (math.nan, math.nan)), False
+    else:
+        interval, equivalent = _equivalence(spec, prereg, pairing.differences)
+    mde = None if untestable else _minimum_detectable_effect(spec, prereg, pairing.differences, in_family)
     return ContrastResult(
         name=spec.name,
         outcome=spec.outcome,
@@ -194,6 +279,9 @@ def run_contrast(
         n_pairs_missing=pairing.n_pairs_missing,
         n_unpaired=pairing.n_unpaired,
         tasks_dropped=pairing.tasks_dropped,
+        treatment_outcomes=spec.treatment_outcomes,
+        max_unscored_treatment=spec.max_unscored_treatment,
+        pairs_missing=dict(pairing.missing),
         counts=dict(estimate.counts),
         per_model=estimate.per_model,
         in_family=in_family,
@@ -202,15 +290,18 @@ def run_contrast(
         equivalence_margin=spec.equivalence_margin,
         equivalence_interval=interval,
         equivalent=equivalent,
-        conclusion=conclude(significant, equivalent),
-        minimum_detectable_effect=_minimum_detectable_effect(spec, prereg, pairing.differences, in_family),
+        conclusion=conclude(significant, equivalent, untestable),
+        minimum_detectable_effect=mde,
     )
 
 
-def analyse(rows: Iterable[Row], prereg: Preregistration) -> AnalysisResult:
-    """Run every declared contrast, then Holm over the declared family at the preregistered alpha."""
-    rows = list(rows)
-    results = tuple(run_contrast(rows, spec, prereg) for spec in prereg.contrasts.values())
+def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[AbsentRun] = ()) -> AnalysisResult:
+    """Run every declared contrast, then Holm over the declared family at the preregistered alpha.
+
+    `absent` are the planned runs with no analysed attempt (exhausted, unfinished, left out), from the export.
+    """
+    rows, absent = list(rows), list(absent)
+    results = tuple(run_contrast(rows, spec, prereg, absent=absent) for spec in prereg.contrasts.values())
     by_name = {result.name: result for result in results}
     p_values = [by_name[name].p_value for name in prereg.holm_family]
     outcome = kernel.holm(p_values, prereg.alpha)
@@ -220,9 +311,13 @@ def analyse(rows: Iterable[Row], prereg: Preregistration) -> AnalysisResult:
             prereg.holm_family, p_values, outcome.adjusted, outcome.levels, outcome.reject, strict=True
         )
     )
-    rejected = {d.name: d.reject for d in decisions}
+    rejected = {d.name: d.reject for d in decisions}  # an untestable member's NaN p never rejects
     decided = tuple(
-        dataclasses.replace(r, significant=rejected[r.name], conclusion=conclude(rejected[r.name], r.equivalent))
+        dataclasses.replace(
+            r,
+            significant=rejected[r.name],
+            conclusion=conclude(rejected[r.name], r.equivalent, untestable=r.n_pairs == 0),
+        )
         if r.name in rejected
         else r
         for r in results

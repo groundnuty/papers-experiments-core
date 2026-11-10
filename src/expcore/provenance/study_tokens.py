@@ -45,6 +45,7 @@ from expcore.provenance.hashfile import (
     parse_plain_list,
     render_hash_file,
 )
+from expcore.provenance.redact import QuietParser, Redactor, failure, stopped
 from expcore.provenance.scanner import Finding, scan_message, scan_source
 
 __all__ = [
@@ -79,7 +80,12 @@ EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
 
 
 class MissingHashesError(ValueError):
-    """The hash file is absent or empty, so the check cannot say anything."""
+    """The hash file is absent or empty, so the check cannot say anything. Its message names no path."""
+
+
+class ListError(ValueError):
+    """A list the command needs cannot be used. The message names the list by its role and a line by its number,
+    never a path or a value, so it is shown even before any list is loaded."""
 
 
 def load_hashes(path: Path) -> Hashes:
@@ -162,40 +168,67 @@ def _missing(reason: str, allow: bool) -> None:
 
 
 def _load_for_cli(explicit: Path | None, allow_missing: bool) -> Hashes | None:
-    """Load the named or default hash file; None only when it is absent or empty and that is allowed."""
-    path = explicit or DEFAULT_HASHES
+    """Load the named or default hash file; None only when it is absent or empty and that is allowed.
+
+    No message names a path given with --hashes, which is the author's and may hold a private name: it is named by its
+    role. The default's path is the repository's own.
+    """
+    origin = "the default list" if explicit is None else "the list given with --hashes"
+    label = DEFAULT_HASHES.as_posix() if explicit is None else origin
     try:
-        hashes = load_hashes(path)
+        hashes = parse_hash_file((explicit or DEFAULT_HASHES).read_text(encoding="utf-8"), label)
     except FileNotFoundError:
-        _missing(f"{path} not found", allow_missing)
+        _missing(f"{label} not found" if explicit is None else f"{label} is not there", allow_missing)
         return None
+    except (OSError, UnicodeDecodeError) as error:
+        raise ListError(f"{label} cannot be read ({type(error).__name__})") from None
+    except ValueError as error:  # it names the line by `label`, never its text
+        raise ListError(str(error)) from None
     if not hashes:
-        _missing(f"{path} holds no hashes", allow_missing)
+        _missing(f"{label} holds no hashes", allow_missing)
         return None
+    print(f"study-token check: {count_hashes(hashes)}, from {origin}", file=sys.stderr)  # never the path
     return hashes
 
 
-def _report(lines: Sequence[str]) -> int:
-    """Print findings to stdout and return the exit code."""
+def count_hashes(hashes: Hashes) -> str:
+    """How many hashes a loaded file holds, of either match: `1 hash`, `12 hashes`."""
+    count = len(hashes.anywhere) + len(hashes.whole)
+    return f"{count} hash" if count == 1 else f"{count} hashes"
+
+
+def _report(lines: Sequence[str], redactor: Redactor) -> int:
+    """Print findings to stdout, each through the redactor of the loaded list, and return the exit code.
+
+    The scanner hides a path that matches a listed name as a whole or by its components; one that holds a listed name
+    of several words among other words of a segment is hidden here, as any message of the command is."""
     for line in lines:
-        print(line)
+        print(redactor.scrub(line))
     if lines:
         print(f"{len(lines)} study-token finding(s); the matched text is deliberately not shown", file=sys.stderr)
     return EXIT_FINDINGS if lines else EXIT_OK
 
 
 def _cmd_hash(args: argparse.Namespace) -> int:
-    """Print the hash file for a plain list; warn (by line number) about tokens that can never match."""
-    text = args.plain_list.read_text(encoding="utf-8")
-    entries = parse_plain_entries(text)
+    """Print the hash file for a plain list; warn (by line number) about tokens that can never match. No message names
+    the plain list's path, the maintainer's."""
+    try:
+        text = args.plain_list.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ListError(f"the plain list cannot be read ({type(error).__name__})") from None
+    try:
+        entries = parse_plain_entries(text)
+    except ValueError as error:  # it names the line, never the token
+        raise ListError(f"the plain list: {error}") from None
+    args.redactor = Redactor(hashes_from_tokens(entry.token for entry in entries))
     for entry in entries:
         if not is_matchable(entry.token):
             print(
-                f"warning: {args.plain_list}:{entry.line}: token has characters outside letters, digits and _ . - "
-                "or edge separators; it can match only as an entire literal or line",
+                f"warning: line {entry.line} of the plain list: token has characters outside letters, digits and "
+                "_ . - or edge separators; it can match only as an entire literal or line",
                 file=sys.stderr,
             )
-    sys.stdout.write(render_hash_file((entry.token, entry.scope) for entry in entries))
+    sys.stdout.write(render_hash_file((entry.token, entry.scope, entry.whole) for entry in entries))
     return EXIT_OK
 
 
@@ -204,8 +237,9 @@ def _cmd_check(args: argparse.Namespace) -> int:
     hashes = _load_for_cli(args.hashes, args.allow_missing_hashes)
     if hashes is None:
         return EXIT_OK
+    args.redactor = Redactor(hashes)
     findings = scan_paths([Path(p) for p in args.paths], hashes) if args.paths else _scan_repository(hashes)
-    return _report([str(f) for f in findings])
+    return _report([str(f) for f in findings], args.redactor)
 
 
 def _scan_repository(hashes: Hashes) -> list[Finding]:
@@ -218,19 +252,20 @@ def _cmd_check_commits(args: argparse.Namespace) -> int:
     hashes = _load_for_cli(args.hashes, args.allow_missing_hashes)
     if hashes is None:
         return EXIT_OK
+    args.redactor = Redactor(hashes)
     results = check_commits(args.repo, args.revs, hashes, history=args.history)
     source = args.acknowledged or DEFAULT_ACKNOWLEDGED
     entries = load_acknowledgements(source, required=args.acknowledged is not None)
     refuse_current_commit(entries, args.repo, str(source))
     remaining, acknowledged = split_acknowledged(results, entries)
     if acknowledged:
-        print(f"{len(acknowledged)} finding(s) acknowledged in {source}", file=sys.stderr)
-    return _report([f"{sha[:12]} {finding}" for sha, finding in remaining])
+        print(args.redactor.scrub(f"{len(acknowledged)} finding(s) acknowledged in {source}"), file=sys.stderr)
+    return _report([f"{sha[:12]} {finding}" for sha, finding in remaining], args.redactor)
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command line parser."""
-    parser = argparse.ArgumentParser(prog="python -m expcore.provenance.study_tokens", description=__doc__)
+    parser = QuietParser(prog="python -m expcore.provenance.study_tokens", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     hash_cmd = sub.add_parser("hash", help="print the hash file for a plain token list")
     hash_cmd.add_argument("plain_list", type=Path)
@@ -260,12 +295,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the command line; return 0 when clean, 1 on findings, 2 on an error."""
+    """Run the command line; return 0 when clean, 1 on findings, 2 on an error.
+
+    Every exception ends here, the last guard, and is shown through the redactor of the list the command loaded
+    (`provenance.redact.failure`), so a path, a revision or git's own message that holds a listed name is never
+    printed. Before a list is loaded, only the command's own errors, built from fixed words, are shown as they are,
+    and anything else by its kind.
+    """
     args = build_parser().parse_args(argv)
+    args.redactor = None  # the command sets it once its list is loaded
     try:
         return args.run(args)
-    except (OSError, ValueError, GitError) as error:
-        print(f"error: {error}", file=sys.stderr)
+    except (KeyboardInterrupt, SystemExit) as stop:
+        return stopped(stop, args.redactor)
+    except Exception as error:
+        shown = failure(
+            error, args.redactor, expected=(OSError, ValueError, GitError), fixed=(MissingHashesError, ListError)
+        )
+        print(f"error: {shown}", file=sys.stderr)
         return EXIT_ERROR
 
 

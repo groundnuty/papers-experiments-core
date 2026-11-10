@@ -11,7 +11,10 @@ so a refused start leaves the store as it found it.
 """
 
 import json
+import sqlite3
 from pathlib import Path
+from typing import Any
+from urllib.parse import quote
 
 from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.factors import FactorSchema
@@ -36,6 +39,28 @@ class FingerprintMismatch(ResumeRefused):
             f"experiment (start a new store for a new one){hint}:\n  {lines}"
         )
         self.differences = differences
+
+
+def recorded_fingerprint(rows: list[Any]) -> dict | None:
+    """The fingerprint a store's meta table holds, from the rows of a query for it; None when it holds none."""
+    if not rows:
+        return None
+    try:
+        value = json.loads(rows[0][0])
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def read_fingerprint(path: Path) -> dict | None:
+    """The fingerprint the store at `path` records, read over a read-only connection; None when it records none."""
+    connection = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=30.0)
+    try:
+        return recorded_fingerprint(
+            connection.execute("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,)).fetchall()
+        )
+    finally:
+        connection.close()
 
 
 def open_campaign(

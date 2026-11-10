@@ -6,7 +6,10 @@ or `whole` (only an entire identifier, literal or line equals it, used for token
 scope is `all` (checked in every file) or `code` (checked everywhere except under docs/, where such a name is
 ordinary prose). A line without a scope is an older two-field line and reads as scope `all`.
 
-The plain list may carry `# category: <name>` header lines; a token takes the category above it.
+The plain list may carry `# category: <name>` header lines; a token takes the category above it. A line
+`whole: <token>` marks one token as matching only as an entire identifier, literal or line, whatever its length: for
+an ordinary word that would otherwise be found inside unrelated names. It is normalised and hashed like any other
+token, and rendered as `whole <scope> <sha256>`; where a token is listed both ways, the override wins.
 """
 
 import re
@@ -24,7 +27,12 @@ SCOPES = (SCOPE_CODE, SCOPE_ALL)
 CODE_CATEGORIES = frozenset({"conditions", "data-states", "tasks", "datasets", "models", "repositories"})
 
 _CATEGORY_RE = re.compile(r"^#\s*category\s*:\s*(.+?)\s*$", re.IGNORECASE)
+WHOLE_PREFIX = "whole:"  # a plain-list line that marks its token as matching only as an entire value
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+GENERATE = (
+    "Generate the file from the plain list (one token per line): "
+    "python -m expcore.provenance.study_tokens hash PLAIN > FILE"
+)
 
 
 @dataclass(frozen=True)
@@ -47,12 +55,14 @@ class Hashes:
 
 
 class PlainEntry(NamedTuple):
-    """One token of the private plain list, with its line number, category and resulting scope."""
+    """One token of the private plain list, with its line number, category, resulting scope and whether its line
+    marks it as matching only as an entire value."""
 
     line: int
     token: str
     category: str | None
     scope: str
+    whole: bool = False
 
 
 def scope_for_category(category: str | None) -> str:
@@ -61,7 +71,9 @@ def scope_for_category(category: str | None) -> str:
 
 
 def parse_plain_entries(text: str) -> list[PlainEntry]:
-    """Read a plain list: one token per line, blank and ordinary '#' lines ignored, '# category:' headers tracked."""
+    """Read a plain list: one token per line, blank and ordinary '#' lines ignored, '# category:' headers tracked, and
+    a `whole:` line marking its token whole-only. Raise ValueError, naming the line but never its token, for a `whole:`
+    line that names no token."""
     entries: list[PlainEntry] = []
     category: str | None = None
     for number, raw in enumerate(text.splitlines(), start=1):
@@ -70,7 +82,11 @@ def parse_plain_entries(text: str) -> list[PlainEntry]:
         if header:
             category = header.group(1)
         elif line and not line.startswith("#"):
-            entries.append(PlainEntry(number, line, category, scope_for_category(category)))
+            whole = line.startswith(WHOLE_PREFIX)
+            token = line[len(WHOLE_PREFIX) :].strip() if whole else line
+            if not token:
+                raise ValueError(f"line {number}: '{WHOLE_PREFIX}' names no token")
+            entries.append(PlainEntry(number, token, category, scope_for_category(category), whole))
     return entries
 
 
@@ -79,18 +95,22 @@ def parse_plain_list(text: str) -> list[str]:
     return [entry.token for entry in parse_plain_entries(text)]
 
 
-def render_hash_file(entries: Iterable[str | tuple[str, str]]) -> str:
-    """Render the hash file: sorted, de-duplicated lines; a bare token has scope `all`, a pair is (token, scope)."""
-    best: dict[tuple[str, str], str] = {}
+def render_hash_file(entries: Iterable[str | tuple[str, str] | tuple[str, str, bool]]) -> str:
+    """Render the hash file: sorted, de-duplicated lines. A bare token has scope `all`; a pair is (token, scope); a
+    triple is (token, scope, whole), where `whole` marks the token as matching only as an entire value."""
+    scopes: dict[str, str] = {}  # digest -> scope, `all` winning for a token listed under two categories
+    whole: dict[str, bool] = {}  # digest -> matched only whole: short, or marked so on any of its lines
     for entry in entries:
-        token, scope = (entry, SCOPE_ALL) if isinstance(entry, str) else entry
+        token, scope, marked = (entry, SCOPE_ALL, False) if isinstance(entry, str) else (*entry, False)[:3]
         if scope not in SCOPES:
             raise ValueError(f"unknown scope {scope!r}; expected one of {SCOPES}")
         normalised = normalise(token)
         if normalised:
-            key = ("whole" if len(normalised) < WHOLE_ONLY_BELOW else "any", token_hash(token))
-            if best.get(key) != SCOPE_ALL:  # a token listed under two categories is checked everywhere
-                best[key] = scope
+            digest = token_hash(token)
+            if scopes.get(digest) != SCOPE_ALL:  # a token listed under two categories is checked everywhere
+                scopes[digest] = scope
+            whole[digest] = whole.get(digest, False) or bool(marked) or len(normalised) < WHOLE_ONLY_BELOW
+    best = {("whole" if whole[digest] else "any", digest): scope for digest, scope in scopes.items()}
     header = [
         "# expcore study-token hashes, format 2: '<any|whole> <code|all> <sha256>' (two-field lines read as 'all').",
         f"# Hash input: '{HASH_PREFIX}' + NFKC, case-folded, stripped token. Regenerate; do not edit.",
@@ -98,8 +118,24 @@ def render_hash_file(entries: Iterable[str | tuple[str, str]]) -> str:
     return "\n".join([*header, *sorted(f"{match} {scope} {digest}" for (match, digest), scope in best.items())]) + "\n"
 
 
+def _malformed(source: str, number: int, fields: list[str]) -> ValueError:
+    """The error for a line not in the hash format: a line that starts with a digest is a plain `sha256(token)`, the
+    likeliest mistake, and is named as one; either way the message gives the command that makes a correct file."""
+    if _DIGEST_RE.fullmatch(fields[0]):
+        return ValueError(
+            f"{source}:{number}: a bare SHA-256 digest, without the '<any|whole> <code|all>' fields; a study-token "
+            f"hash is salted with '{HASH_PREFIX}' and normalised, so a plain digest of a name matches nothing. "
+            f"{GENERATE}"
+        )
+    return ValueError(f"{source}:{number}: expected '<any|whole> <code|all> <sha256>'. {GENERATE}")
+
+
 def parse_hash_file(text: str, source: str) -> Hashes:
-    """Parse hash-file text; raise ValueError naming the source and line on a malformed line."""
+    """Parse hash-file text; raise ValueError naming the source and line on a malformed line.
+
+    A file of lines in the right format whose digests were made some other way cannot be told from a correct one:
+    a digest shows nothing of its input. Only the shape of each line is checked.
+    """
     tables: dict[str, dict[str, str]] = {"any": {}, "whole": {}}
     for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -110,7 +146,7 @@ def parse_hash_file(text: str, source: str) -> Hashes:
             fields.insert(1, SCOPE_ALL)
         ok = len(fields) == 3 and fields[0] in tables and fields[1] in SCOPES and _DIGEST_RE.fullmatch(fields[2])
         if not ok:
-            raise ValueError(f"{source}:{number}: expected '<any|whole> <code|all> <sha256>'")
+            raise _malformed(source, number, line.split())
         match, scope, digest = fields
         if tables[match].get(digest) != SCOPE_ALL:
             tables[match][digest] = scope

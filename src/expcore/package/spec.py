@@ -10,12 +10,14 @@ directory with `/` between its parts: `*` and `?` match within one part, `**` ma
 pattern that names a directory takes every file below it. A pattern that selects nothing is refused, because a list
 that names nothing would pass for any package (K01), and so is a pattern that is absolute or climbs out with `..`.
 
-Never selected, whatever the patterns say: version-control and cache directories, compiled Python, and the live
+Never selected, whatever the patterns say: version-control and cache directories, compiled Python, the live
 campaign under out/ (the store, its lock and its leases), since the package's analysis reads the snapshot of the store
-that the replay check keeps in the batch. A selected symbolic link is refused, since it could point out of the study.
+that the replay check keeps in the batch, and the campaign's local logs (`out/logs`, the harness defects' tracebacks),
+which stay on the author's machine. A selected symbolic link is refused, since it could point out of the study.
 The names the build writes at the package root (`GENERATED`) cannot be selected, nor can the other names GNU Make
 reads there (`GNUmakefile`, `makefile`), which would take the place of the generated Makefile; the generated
-instructions run `make -f Makefile check` as well.
+instructions run `make -f Makefile check` as well. Nor can anything under `wheels/`, where the build puts the wheels
+the package's check installs (`package.wheels`).
 
 The package's checks read only what they can read in full (text, SQLite databases and archives of them; see `views`)
 and refuse everything else. A file they cannot read, a PDF figure for instance, goes in only when the author attests
@@ -27,7 +29,8 @@ it, having inspected it by hand:
     reason = "a figure drawn by hand; read page by page, no name in it"
 
 The build then includes that exact file unscanned, refuses it if its bytes no longer have that hash, and lists the
-attestation in PACKAGE.json.
+attestation in PACKAGE.json. A path under `wheels/` names a member of a vendored wheel instead,
+`wheels/<wheel file>/<member>`, which the build checks once the wheels are made (`wheelscan`).
 """
 
 import os
@@ -44,11 +47,22 @@ RESERVED = (*GENERATED, "GNUmakefile", "makefile")  # GNU Make reads GNUmakefile
 SKIPPED_PARTS = frozenset({".git", "__pycache__", ".venv", "venv", ".pytest_cache", ".ruff_cache", ".mypy_cache"})
 SKIPPED_SUFFIXES = frozenset({".pyc", ".pyo"})
 LIVE_CAMPAIGN = ("out/state.sqlite", "out/campaign.lock", "out/leases")
+LOCAL_ONLY = ("out/logs",)  # the campaign's local logs (`campaign.defect_log`): never committed, never packaged
+WHEELS_DIR = "wheels"  # the build fills it with the wheels of the environment (`package.wheels`)
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 
 
 class PackageError(RuntimeError):
-    """A package cannot be built or verified; the message says why and never shows a value it must not."""
+    """A package cannot be built or verified; the message says why and never shows a value it must not.
+
+    A path that must not be shown is named by its place in the package and the start of its hash (`views.hidden_name`).
+    `private` maps each such name the message gives to the path it stands for, relative to the study: the command line
+    shows it to the author on a terminal, never in a log or a file.
+    """
+
+    def __init__(self, message: str, *, private: Mapping[str, str] | None = None) -> None:
+        super().__init__(message)
+        self.private = dict(private or {})
 
 
 @dataclass(frozen=True)
@@ -147,9 +161,12 @@ def pattern_regex(pattern: str) -> re.Pattern[str]:
 
 
 def never_selected(rel: str) -> bool:
-    """Tell whether a path is left out whatever the patterns say: caches, version control, the live campaign."""
+    """Tell whether a path is left out whatever the patterns say: caches, version control, the live campaign, the
+    local logs."""
     parts = rel.split("/")
     if SKIPPED_PARTS.intersection(parts) or os.path.splitext(rel)[1] in SKIPPED_SUFFIXES:
+        return True
+    if any(rel == local or rel.startswith(local + "/") for local in LOCAL_ONLY):
         return True
     return any(rel == live or rel.startswith(live + "-") or rel.startswith(live + "/") for live in LIVE_CAMPAIGN)
 
@@ -176,7 +193,7 @@ def select(root: Path, spec: PackageSpec) -> list[str]:
             continue
         if path.is_symlink():
             raise PackageError(f"{spec.source}: {rel} is a symbolic link; a package holds regular files only")
-        if rel in RESERVED:
+        if rel in RESERVED or rel.startswith(f"{WHEELS_DIR}/"):
             raise PackageError(
                 f"{spec.source}: {rel} is a name the build generates or make reads at the package root; leave it out"
             )
@@ -186,7 +203,7 @@ def select(root: Path, spec: PackageSpec) -> list[str]:
     empty = [pattern for pattern, count in hits.items() if not count]
     if empty:
         raise PackageError(f"{spec.source}: [package] include {empty[0]!r} selects no file")
-    stray = sorted(set(spec.opaque) - set(chosen))
+    stray = sorted(path for path in set(spec.opaque) - set(chosen) if not path.startswith(f"{WHEELS_DIR}/"))
     if stray:
         raise PackageError(f"{spec.source}: [[opaque]] attests {stray[0]}, which the package does not include")
     return chosen
