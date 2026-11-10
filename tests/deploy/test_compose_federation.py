@@ -130,3 +130,34 @@ def test_the_baseline_has_a_directory_of_more_than_1000_entries_and_repeatable_c
     first = files[1]
     assert first.content() == first.content()
     assert len(first.content()) == first.size
+
+
+@needs_openssl
+def test_the_committed_template_renders_into_a_platform_file_the_layer_loads(fed, tmp_path):
+    """The template, filled from facts as up fills it, is a platform.toml the platform layer accepts: its CA bundle
+    verified (ca_file, never insecure), its support set the three providers, the agent pinned to the data provider."""
+    from fedboot import Bootstrap, Ids
+
+    from expcore_onedata.config import load_platform
+
+    layout = fed.layout
+    boot = Bootstrap.__new__(Bootstrap)
+    boot.ids = Ids(
+        users={user: f"u{i}" for i, user in enumerate(layout.PRINCIPALS)},
+        providers={p.name: f"p{i}" for i, p in enumerate(layout.PROVIDERS)},
+        spaces={name: f"s{i}" for i, name in enumerate(layout.SPACES)},
+    )
+    platform = tmp_path / "platform.toml"
+    template = layout.TEMPLATE.read_text(encoding="utf-8")
+    platform.write_text(fed.cli.render(template, fed.cli.placeholders(fed.cli.facts_of(boot))), encoding="utf-8")
+    (tmp_path / "ca").mkdir()
+    fed.pki.make_ca(tmp_path / "ca" / "federation-ca.pem", tmp_path / "ca.key", "test CA")
+    config = load_platform(platform, require_secrets=False)
+    assert config.tls.record()["mode"] == "ca_file"
+    assert config.support.providers == tuple(p.name for p in layout.PROVIDERS)
+    assert config.support.local == layout.HOLDER
+    assert config.space.name == layout.STUDY_SPACE
+    assert config.space.id == boot.ids.spaces[layout.STUDY_SPACE]
+    assert {name: p.url for name, p in config.providers.items()} == {p.name: p.url for p in layout.PROVIDERS}
+    body = "\n".join(line for line in platform.read_text(encoding="utf-8").splitlines() if not line.startswith("#"))
+    assert fed.cli.PLACEHOLDER.search(body) is None  # every placeholder filled
