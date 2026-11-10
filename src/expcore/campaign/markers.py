@@ -12,7 +12,8 @@ attempt is not mistaken for this one's.
 Schema 2 added the model turns the attempt completed and the treatment rule of its record's version. Schema 1 markers
 are still read, since a campaign killed between its marker and the store must resume after an upgrade: they have no
 turn count, so they are read under the version-1 rule (treatment by the declared kind alone) and marked
-`legacy_marker`, which recovery records as an event.
+`legacy_marker`, which recovery records as an event. A schema-2 marker written before a field was added reads without
+it: `first_turn_rule` as the version-2 rule, `turn_usage` as unknown.
 """
 
 import json
@@ -40,9 +41,12 @@ _RESULT_FIELDS = (
     "model_turns",
     "recorded_treatment",
     "first_turn_rule",
+    "turn_usage",
 )
 # What a schema-1 marker holds of a result; the rest take their defaults under the version-1 rule.
 _LEGACY_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("model_turns")]
+# Fields added to schema 2 after its first markers were written: a marker without one reads with its default.
+_ADDED_FIELDS = ("first_turn_rule", "turn_usage")
 
 
 class MarkerError(RuntimeError):
@@ -73,6 +77,9 @@ class AttemptResult:
     - `legacy_marker`: True for a result read from a schema-1 marker, which has no model-turn count. It is never
       written; recovery applies the version-1 rule to such a result (first_turn_rule False, the declared kind alone
       decides) and records a `legacy_marker` event.
+    - `turn_usage`: each model turn's counts as its record reported them, in order: input tokens (the whole prompt),
+      output tokens, cache writes and cache reads, each `None` when not reported; `None` when unknown (no record). A
+      tiered price is applied to each request from these (C24).
     """
 
     outcome: Outcome
@@ -89,11 +96,15 @@ class AttemptResult:
     recorded_treatment: bool | None = None
     first_turn_rule: bool = True
     legacy_marker: bool = False
+    turn_usage: tuple[tuple[int | None, int | None, int | None, int | None], ...] | None = None
 
     def __post_init__(self) -> None:
-        """Refuse a kind outside the closed vocabulary, so a typo never reaches the store; keep the kinds sorted."""
+        """Refuse a kind outside the closed vocabulary, so a typo never reaches the store; keep the kinds sorted; refuse
+        per-turn usage that is not four counts per turn."""
         if isinstance(self.model_turns, bool) or not isinstance(self.model_turns, int) or self.model_turns < 0:
             raise ValueError("model_turns must be a count of completed turns, zero or more")
+        if self.turn_usage is not None:
+            object.__setattr__(self, "turn_usage", _turn_usage(self.turn_usage))
         if self.recorded_treatment is not None and not isinstance(self.recorded_treatment, bool):
             raise ValueError("recorded_treatment must be True, False or None")
         if not isinstance(self.first_turn_rule, bool) or not isinstance(self.legacy_marker, bool):
@@ -102,6 +113,21 @@ class AttemptResult:
             if kind not in infra_kinds():
                 raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")
         object.__setattr__(self, "treatment_kinds", tuple(sorted(set(self.treatment_kinds))))
+
+
+def _turn_usage(value: Any) -> tuple[tuple[int | None, int | None, int | None, int | None], ...]:
+    """Return per-turn usage as tuples, or raise ValueError: each turn four counts, each a non-negative int or None."""
+    if not isinstance(value, list | tuple):
+        raise ValueError("turn_usage must be a list of turns")
+    turns = []
+    for turn in value:
+        if not isinstance(turn, list | tuple) or len(turn) != 4:
+            raise ValueError("each turn of turn_usage holds four counts: input, output, cache writes, cache reads")
+        for count in turn:
+            if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 0):
+                raise ValueError("a count of turn_usage is a non-negative integer or None")
+        turns.append(tuple(turn))
+    return tuple(turns)
 
 
 def _outcome_json(outcome: Outcome) -> dict[str, Any]:
@@ -180,8 +206,9 @@ def read_marker(run_dir: Path, run_key: str, attempt_id: int) -> AttemptResult |
         extra = set(data) - {"outcome", *fields}
         if extra:
             raise MarkerError(f"{path}: unknown result fields: {', '.join(sorted(extra))}")
-        # A schema-2 marker written before `first_turn_rule` was added holds a version-2 record: read it as such.
-        kept = {f: data[f] for f in fields if f != "first_turn_rule" or f in data}
+        # A schema-2 marker written before `first_turn_rule` was added holds a version-2 record: read it as such; one
+        # written before `turn_usage` was added has none, which leaves a tiered attempt's cost to its bound.
+        kept = {f: data[f] for f in fields if f not in _ADDED_FIELDS or f in data}
         if schema == MARKER_SCHEMA:
             kept.setdefault("first_turn_rule", True)
         if schema == LEGACY_MARKER_SCHEMA:  # no turn count to hold it to: the rule of the time, and a mark for recovery

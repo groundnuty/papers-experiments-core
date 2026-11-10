@@ -77,6 +77,7 @@ _ADDED_COLUMNS = (
     ("attempts", "dispatch_seq", "INTEGER"),  # place in the campaign's dispatch sequence; grows with every attempt
     ("attempts", "lease_wait_s", "REAL"),  # seconds waited for the lease the attempt ran under; NULL: none or unknown
     ("attempts", "lease_outcome", "TEXT"),  # how the lease was obtained (attempts.LEASE_OUTCOMES); NULL: unknown
+    ("attempts", "turn_usage", "TEXT"),  # JSON: each turn's [input, output, cache writes, cache reads]; NULL: unknown
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -490,7 +491,7 @@ class Store:
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"
                 " detail=?, termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?,"
-                " cache_read_tokens=?, usage_complete=? WHERE id=?",
+                " cache_read_tokens=?, usage_complete=?, turn_usage=? WHERE id=?",
                 (
                     state,
                     int(charged),
@@ -506,6 +507,7 @@ class Store:
                     result.cache_creation_tokens,
                     result.cache_read_tokens,
                     int(result.usage_complete),
+                    None if result.turn_usage is None else json.dumps(result.turn_usage),
                     attempt_id,
                 ),
             )

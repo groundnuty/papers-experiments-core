@@ -19,6 +19,9 @@ backend is named with it.
 
 Secrets never appear here. An entry points at an environment variable (`key_env`) or a file (`key_file`), and the
 key is read when a request is built, not when the table is loaded.
+
+A price is `[models.<key>.price]`, in dollars per million tokens, flat or in tiers by the prompt's length, a request
+priced, its reply included, at the tier its prompt fell in (`expcore.config.price_table`, C24).
 """
 
 from __future__ import annotations
@@ -32,7 +35,8 @@ from typing import Any
 
 from expcore.config.loading import ConfigError, Section, close_match, load_toml
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
-from expcore.config.prices import Price
+from expcore.config.price_table import read_price
+from expcore.config.prices import Price, TieredPrice
 
 BACKENDS = ("openai_compat", "anthropic", "stub")  # the backends the core builds; a plugin's factory serves others
 STATUSES = ("frozen", "draft")
@@ -116,7 +120,8 @@ class ModelSpec:
     echo_reasoning_field: str | None = None  # openai_compat: assistant-message field the reasoning is sent back in
     extra_body: dict[str, Any] = dataclasses.field(default_factory=dict)  # vendor extras sent verbatim (B14)
     prompt_cache_ttl: str | None = None  # anthropic: cache lifetime ("5m" or "1h"); None sends no cache marker
-    price: Price | None = None  # dollars per million tokens; None with free=False is an unknown cost (C12)
+    price: Price | TieredPrice | None = None  # dollars per million tokens, flat or by prompt tier (C24); None with
+    # free=False is an unknown cost (C12)
     free: bool = False  # a model that costs nothing per token (hosted by the study): priced without a price
 
     def __post_init__(self) -> None:
@@ -356,7 +361,6 @@ _ENTRY_KEYS = (
     "price",
     "free",
 )
-_PRICE_KEYS = ("input_per_mtok", "output_per_mtok", "cache_write_per_mtok", "cache_read_per_mtok")
 
 
 def _flag(section: Section, key: str) -> bool:
@@ -365,29 +369,6 @@ def _flag(section: Section, key: str) -> bool:
     if not isinstance(value, bool):
         raise section.fail(key, f"must be true or false, got {type(value).__name__}")
     return value
-
-
-def _price(section: Section) -> Price | None:
-    """Read the optional `price` table; its input and output prices are required, and a failure names the key."""
-    table = section.table("price")
-    if not table:
-        return None
-    where = section.section("price")
-    where.reject_unknown(_PRICE_KEYS)
-    values: dict[str, float] = {}
-    for name in _PRICE_KEYS:
-        if name in table:
-            value = table[name]
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                raise where.fail(name, f"must be a number of dollars per million tokens, got {type(value).__name__}")
-            values[name] = float(value)
-    for name in ("input_per_mtok", "output_per_mtok"):
-        if name not in values:
-            raise where.fail(name, "is required in a price table")
-    try:
-        return Price(**values)
-    except ValueError as error:
-        raise section.fail("price", str(error)) from None
 
 
 def _backend_first(backend: str) -> list[str]:
@@ -444,7 +425,7 @@ def _entry_args(section: Section, key: str, backend: str) -> dict[str, Any]:
         "echo_reasoning_field": section.optional_string("echo_reasoning_field"),
         "extra_body": section.table("extra_body"),
         "prompt_cache_ttl": section.optional_string("prompt_cache_ttl"),
-        "price": _price(section),
+        "price": read_price(section),
         "free": _flag(section, "free"),
     }
 

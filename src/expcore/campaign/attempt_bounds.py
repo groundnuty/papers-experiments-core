@@ -13,13 +13,20 @@ attempts out**, so a kill does not make a model look dear to the projection, and
 The bound is for the budget the attempt ran under, which the caller names (`token_budget`, normally the campaign's
 `Limits.token_budget`). A model whose cost is unknown (no price, not free) has no cost at all: `None`, never 0, and the
 budget gate holds it (C12).
+
+A measured attempt of a model with a flat price costs its totals at that price. One of a model with a tiered price
+costs each of its requests at the tier its prompt fell in, from the per-turn usage the store keeps (C24); an attempt
+whose per-turn usage is unknown is charged its bound, since its totals cannot say which tier each token fell in.
 """
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from expcore.campaign.store import Store, column_for
 from expcore.config.models import ModelSpec
+from expcore.config.prices import TieredPrice
 
 # Attempts that spent tokens: every state but `running`, whose cost is not known yet.
 BILLED_STATES = ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded")
@@ -48,13 +55,19 @@ def bound_usd(spec: ModelSpec, token_budget: int) -> float | None:
     return token_budget * spec.price.dearest_per_token()
 
 
-def measured_usd(spec: ModelSpec, row: Mapping[str, int | None]) -> float | None:
+def measured_usd(spec: ModelSpec, row: Mapping[str, Any]) -> float | None:
     """Return the cost of an attempt from its counts, or None if the model's price is unknown or a count is missing.
 
-    A count the endpoint did not report is unknown, never zero, so the caller bounds the attempt instead.
+    A count the endpoint did not report is unknown, never zero, so the caller bounds the attempt instead. A flat price
+    is applied to the attempt's totals. A tiered price is applied to each request at the tier its prompt fell in, from
+    the per-turn usage the store keeps (C24); without it, or with a turn that did not report its prompt or its reply,
+    the cost is unknown, since totals cannot say which tier each token fell in.
     """
     if spec.free:
         return 0.0
+    if isinstance(spec.price, TieredPrice):
+        requests = _requests(row["turn_usage"])
+        return None if requests is None else spec.price.requests_usd(requests)
     if spec.price is None or row["input_tokens"] is None or row["output_tokens"] is None:
         return None
     return spec.price.usd(
@@ -65,6 +78,23 @@ def measured_usd(spec: ModelSpec, row: Mapping[str, int | None]) -> float | None
     )
 
 
+def _requests(stored: str | None) -> list[tuple[int, int, int, int]] | None:
+    """Return the requests of an attempt from its stored per-turn usage; None when unknown or a turn's prompt or reply
+    count is missing (a cache count left out is none)."""
+    if stored is None:
+        return None
+    try:
+        turns = json.loads(stored)
+    except ValueError:
+        return None
+    requests = []
+    for prompt, reply, written, read in turns:
+        if prompt is None or reply is None:
+            return None
+        requests.append((prompt, reply, written or 0, read or 0))
+    return requests
+
+
 def attempt_costs(store: Store, models: Mapping[str, ModelSpec], token_budget: int) -> list[AttemptCost]:
     """Return the cost of every attempt that spent tokens, in attempt order, each charged as the module docstring says.
 
@@ -73,7 +103,7 @@ def attempt_costs(store: Store, models: Mapping[str, ModelSpec], token_budget: i
     marks = ",".join("?" * len(BILLED_STATES))
     rows = store.q(
         "SELECT a.id, a.run_key, a.state, r." + column_for("model") + " AS model, a.input_tokens, a.output_tokens, "
-        "a.cache_creation_tokens, a.cache_read_tokens, COALESCE(a.usage_complete,1) AS complete "
+        "a.cache_creation_tokens, a.cache_read_tokens, a.turn_usage, COALESCE(a.usage_complete,1) AS complete "
         f"FROM attempts a JOIN runs r USING(run_key) WHERE a.state IN ({marks}) ORDER BY a.id",
         BILLED_STATES,
     )
