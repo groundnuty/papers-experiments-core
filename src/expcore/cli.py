@@ -32,10 +32,11 @@ from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.factors import PlanError
 from expcore.campaign.scheduler import CampaignLocked
 from expcore.config.loading import ConfigError
-from expcore.package.build import build_package, verify_package
+from expcore.package.build import build_package, default_hashes, private_hashes, verify_package
 from expcore.package.spec import PackageError
 from expcore.provenance.codestamp import CodeVersionUnknown
-from expcore.provenance.redact import QuietParser
+from expcore.provenance.redact import QuietParser, Redactor
+from expcore.provenance.redact import failure as shown_failure
 from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified
 from expcore.report import summary_lines
 from expcore.study.example import ExampleError, write_example
@@ -61,6 +62,7 @@ _REFUSALS = (
     PackageError,
     ExampleError,
 )
+_GUARDED = frozenset({"package", "package-check"})  # commands whose every message goes through the redactor
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -181,8 +183,15 @@ def _package(args: argparse.Namespace) -> int:
 
 
 def _package_check(args: argparse.Namespace) -> int:
+    """Verify an unpacked package. Every problem, and any exception, goes through a redactor of the core's public
+    study-token list, the only list a reader has; without it the command refuses before reading anything."""
     sys.dont_write_bytecode = True  # importing the study's plugin must not add files to the package
-    problems = verify_package(args.package)
+    redactor = Redactor(private_hashes(default_hashes(), given=False))
+    try:
+        problems = verify_package(args.package, redactor=redactor)
+    except Exception as error:
+        print(f"refused: {shown_failure(error, redactor, expected=_REFUSALS)}", file=sys.stderr)
+        return EXIT_REFUSED
     for problem in problems:
         print(f"FAIL {problem}")
     if problems:
@@ -222,6 +231,13 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
         print(f"{args.command} refused: {error}", file=sys.stderr)
         if getattr(args, "show_private_paths", False):
             _show_private_paths(getattr(error, "private", {}))
+        return EXIT_REFUSED
+    except Exception as error:  # the package commands' last guard
+        if args.command not in _GUARDED:
+            raise
+        # The build and the check turn everything after their lists load into a refusal that went through the
+        # redactor; what reaches here came before, when nothing could hide a name in its message.
+        print(f"refused: {shown_failure(error, None)}", file=sys.stderr)
         return EXIT_REFUSED
 
 

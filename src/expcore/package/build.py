@@ -36,12 +36,13 @@ path of the build machine is added. The campaign snapshot keeps the attempt dire
 replay check hashed them; the token check reads it like any file.
 """
 
+import contextlib
 import dataclasses
 import hashlib
 import json
 import sys
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -76,7 +77,7 @@ from expcore.package.tracking import Tracking, note_tracking
 from expcore.package.wheels import REQUIREMENTS, Vendor, Wheel, makefile, requirements, vendor_wheels
 from expcore.package.wheelscan import scan_wheels
 from expcore.package.withhold import withhold_headers
-from expcore.provenance.codestamp import STAMP, covered_files, is_sha
+from expcore.provenance.codestamp import STAMP, CodeVersionUnknown, covered_files, is_sha
 from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_environment
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.hashfile import Hashes
@@ -89,6 +90,9 @@ from expcore.study.pipeline import ANALYSIS_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DI
 
 PACKAGE_FILE = "PACKAGE.json"
 PACKAGE_FORMAT = "expcore-package/1"
+# The refusals a build's steps raise, whose message is shown as it is (after the redactor); any other exception is
+# shown after its kind.
+_REFUSALS = (PackageError, ConfigError, Refused, BatchNotVerified, EnvironmentUnknown, CodeVersionUnknown)
 
 
 def _stderr(line: str) -> None:
@@ -248,29 +252,48 @@ def collect(
     no commit holds. `hashes` names a study-token hash file to use in place of the core's public one: it replaces that
     list, it does not add to it.
 
-    The hashes load first, so that every message after them, warnings and refusals alike, goes through one redactor
-    (`provenance.redact`): nothing that holds a private name or a term of the anonymisation list is ever shown, and a
-    hidden path is named by the start of its SHA-256. `hidden`, when given, is filled with each hidden name and the
-    path it stands for, on purpose: the command line shows them only when the author asks (`--show-private-paths`).
+    The hashes load first, then the anonymisation list, so that every message after them, warnings and refusals
+    alike, goes through one redactor (`provenance.redact`): nothing that holds a private name or a term of the
+    anonymisation list is ever shown, and a hidden path is named by the start of its SHA-256. Every exception after
+    the hashes, whatever raised it, leaves as a PackageError whose message went through it (`_guarded`). `hidden`, when
+    given, is filled with each hidden name and the path it stands for, on purpose: the command line shows them only
+    when the author asks (`--show-private-paths`).
     """
+    study_root = Path(study_root)
+    tokens, redactor = _token_list(hashes, note)
+    with _guarded(redactor, hidden):
+        terms = _terms(anonymise, study_root, out_dir, redactor)
+        say = _scrubbing(redactor, warn or _warning)
+        return _collect(study_root, tokens, terms, redactor, out_dir, vendor, wheels, allow_uncommitted, say)
+
+
+def _token_list(hashes: Path | None, note: Callable[[str], None] | None) -> tuple[Hashes, Redactor]:
+    """The hashes of names private everywhere, and the redactor every later message goes through; says how many."""
     tokens = private_hashes(default_hashes() if hashes is None else Path(hashes), given=hashes is not None)
     origin = "the core's public list" if hashes is None else "the list given with --hashes, which replaces the core's"
     (note or _stderr)(f"study-token check: {count_hashes(tokens)} of names private everywhere, from {origin}")
-    redactor = Redactor(tokens)
+    return tokens, Redactor(tokens)
+
+
+def _terms(anonymise: Path | None, study_root: Path, out_dir: Path | None, redactor: Redactor) -> Anonymisation | None:
+    """The anonymisation list, if one is given; from then on the redactor hides its terms as well as the tokens."""
+    if anonymise is None:
+        return None
+    terms = load_anonymisation(Path(anonymise), keep_out_of=private_list_guard(study_root, out_dir))
+    redactor.also = partial(holds_term, terms)
+    return terms
+
+
+@contextlib.contextmanager
+def _guarded(redactor: Redactor, hidden: dict[str, str] | None) -> Iterator[None]:
+    """Every exception that leaves becomes a PackageError whose message went through the redactor: a refusal's as it
+    is, any other's (a file that cannot be read, a wheel that cannot be opened, a directory that cannot be made) after
+    its kind. So no message shows a path or a value that holds a private name or a term, whatever raised it."""
     try:
-        return _collect(
-            Path(study_root),
-            tokens,
-            redactor,
-            anonymise,
-            out_dir,
-            vendor,
-            wheels,
-            allow_uncommitted,
-            _scrubbing(redactor, warn or _warning),
-        )
-    except PackageError as error:
-        raise PackageError(redactor.scrub(str(error)), private=redactor.hidden) from None
+        yield
+    except Exception as error:
+        text = str(error) if isinstance(error, _REFUSALS) else f"{type(error).__name__}: {error}"
+        raise PackageError(redactor.scrub(text), private=redactor.hidden) from None
     finally:
         if hidden is not None:
             hidden.update(redactor.hidden)
@@ -288,18 +311,14 @@ def _warning(line: str) -> None:
 def _collect(
     study_root: Path,
     tokens: Hashes,
+    terms: Anonymisation | None,
     redactor: Redactor,
-    anonymise: Path | None,
     out_dir: Path | None,
     vendor: Vendor | None,
     wheels: Path | None,
     allow_uncommitted: bool,
     warn: Callable[[str], None],
 ) -> tuple[PackageSpec, dict[str, bytes]]:
-    terms: Anonymisation | None = None
-    if anonymise is not None:  # first, so every message after it hides the terms as well as the tokens
-        terms = load_anonymisation(Path(anonymise), keep_out_of=private_list_guard(study_root, out_dir))
-        redactor.also = partial(holds_term, terms)
     study, spec, files, check = _selection(study_root)
     if terms is not None:
         refuse_models(terms, _model_names(study))
@@ -415,11 +434,16 @@ def _model_names(study: StudyConfig) -> set[str]:
     return names
 
 
-def verify_package(root: Path) -> list[str]:
+def verify_package(root: Path, *, redactor: Redactor | None = None) -> list[str]:
     """The package's own check: the core version, every file against SHA256SUMS, the environment against the one the
     check ran under (names and versions: the package is installed from its own wheels), then the outputs byte for
-    byte."""
-    root = Path(root)
+    byte. With `redactor`, each problem comes back through it (the build's own, or one of the core's public list for
+    `package-check`), so none shows a path or a value it must not."""
+    problems = _verify(Path(root))
+    return problems if redactor is None else [redactor.scrub(problem) for problem in problems]
+
+
+def _verify(root: Path) -> list[str]:
     try:
         package = json.loads((root / PACKAGE_FILE).read_text(encoding="utf-8"))
         expected, recorded = package["core_version"], package["environment"]
@@ -458,31 +482,24 @@ def build_package(
 ) -> Path:
     """Build the package of a study into `out_dir/<name>.tar.gz` and return the archive's path (see `collect`)."""
     out_dir, study_root = Path(out_dir), Path(study_root)
-    batch = (study_root / OUT_DIR).resolve()
-    if out_dir.resolve() == batch or batch in out_dir.resolve().parents:
-        raise PackageError(
-            f"the output directory lies inside the study's {OUT_DIR}/, whose files the package is checked against"
-        )
-    out_dir.mkdir(parents=True, exist_ok=True)
-    spec, files = collect(
-        study_root,
-        hashes=hashes,
-        anonymise=anonymise,
-        out_dir=out_dir,
-        vendor=vendor,
-        wheels=wheels,
-        allow_uncommitted=allow_uncommitted,
-        warn=warn,
-        note=note,
-        hidden=hidden,
-    )
-    with tempfile.TemporaryDirectory(prefix=".staging-", dir=out_dir) as scratch:
-        stage = Path(scratch) / spec.name
-        lay_out(stage, files)
-        problems = verify_package(stage)
-    if problems:
-        raise PackageError("the package fails its own check:\n  " + "\n  ".join(problems))
-    return write_archive(out_dir / f"{spec.name}.tar.gz", spec.name, files)
+    tokens, redactor = _token_list(hashes, note)
+    with _guarded(redactor, hidden):  # the output directory, the staging and the archive included
+        terms = _terms(anonymise, study_root, out_dir, redactor)
+        batch = (study_root / OUT_DIR).resolve()
+        if out_dir.resolve() == batch or batch in out_dir.resolve().parents:
+            raise PackageError(
+                f"the output directory lies inside the study's {OUT_DIR}/, whose files the package is checked against"
+            )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        say = _scrubbing(redactor, warn or _warning)
+        spec, files = _collect(study_root, tokens, terms, redactor, out_dir, vendor, wheels, allow_uncommitted, say)
+        with tempfile.TemporaryDirectory(prefix=".staging-", dir=out_dir) as scratch:
+            stage = Path(scratch) / spec.name
+            lay_out(stage, files)
+            problems = verify_package(stage, redactor=redactor)
+        if problems:
+            raise PackageError("the package fails its own check:\n  " + "\n  ".join(problems))
+        return write_archive(out_dir / f"{spec.name}.tar.gz", spec.name, files)
 
 
 __all__ = [

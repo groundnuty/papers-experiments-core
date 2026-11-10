@@ -29,6 +29,7 @@ refused: that file names a URL and a commit.
 import hashlib
 import io
 import zipfile
+import zlib
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -52,13 +53,22 @@ class WheelScan:
     binaries: Mapping[str, list[dict[str, str]]] = field(default_factory=dict)
 
 
-def members(wheel: Wheel) -> list[tuple[str, bytes]]:
-    """The files of a wheel, in the order the archive holds them."""
+_UNREADABLE = (zipfile.BadZipFile, OSError, EOFError, RuntimeError, NotImplementedError, ValueError, zlib.error)
+
+
+def members(wheel: Wheel, redactor: Redactor | None = None) -> list[tuple[str, bytes]]:
+    """The files of a wheel, in the order the archive holds them.
+
+    A wheel that cannot be opened, or a member that cannot be read (encrypted, compressed in a way the reader does not
+    know, damaged), refuses the build naming the wheel through `redactor` and the kind of failure only: the reader's
+    own message names the member, whose path can hold a private name or a term.
+    """
     try:
         with zipfile.ZipFile(io.BytesIO(wheel.data)) as archive:
             return [(info.filename, archive.read(info)) for info in archive.infolist() if not info.is_dir()]
-    except (zipfile.BadZipFile, OSError, EOFError) as error:
-        raise PackageError(f"{wheel.path}: cannot be read as a wheel ({type(error).__name__})") from None
+    except _UNREADABLE as error:
+        shown = wheel.path if redactor is None else redactor.name(wheel.path)
+        raise PackageError(f"{shown}: cannot be read as a wheel, in full ({type(error).__name__})") from None
 
 
 def as_text(data: bytes) -> str | None:
@@ -122,7 +132,7 @@ def scan_wheels(
     seen: set[str] = set()
     for wheel in wheels:
         binaries[wheel.path] = []
-        for member, data in members(wheel):
+        for member, data in members(wheel, redactor):
             label = f"{wheel.path}/{member}"
             seen.add(label)
             digest = hashlib.sha256(data).hexdigest()

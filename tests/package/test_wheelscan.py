@@ -2,10 +2,11 @@
 
 from pathlib import Path
 
+import pytest
 from package_support import wheel_of
 
 from expcore.package.anonymise import Anonymisation
-from expcore.package.spec import Opaque
+from expcore.package.spec import Opaque, PackageError
 from expcore.package.wheels import Wheel
 from expcore.package.wheelscan import scan_wheels
 from expcore.provenance.hashfile import hashes_from_tokens
@@ -53,3 +54,26 @@ def test_k05_an_attestation_mismatch_a_direct_url_and_a_stray_attestation_hide_t
     direct = f"{tools.path}/pkg-1.0.dist-info/direct_url.json"
     assert any(line.startswith(f"{hidden_name(direct)}: names where the distribution came from") for line in found)
     assert f"{hidden_name(stray)}: [[opaque]] attests a member no vendored wheel holds" in found
+
+
+def marked_encrypted(data: bytes) -> bytes:
+    """The zip with every member marked encrypted: bit 0 of the flags of each central directory entry, which is the
+    one the reader consults before it asks for a password."""
+    marked = bytearray(data)
+    at = marked.find(b"PK\x01\x02")
+    while at != -1:
+        marked[at + 8] |= 0x01
+        at = marked.find(b"PK\x01\x02", at + 4)
+    return bytes(marked)
+
+
+def test_k05_an_encrypted_member_refuses_the_build_naming_neither_the_member_nor_a_private_wheel():
+    """K05: the zip reader's own error for an encrypted member names the member, whose path can hold a private name;
+    the refusal names the wheel through the redactor and the kind of failure, never the member."""
+    for name in ("tools", f"{PRIVATE}-tools"):
+        plain = wheel(name, {f"tools/{PRIVATE}/secret.py": b"x = 1\n"})
+        locked = Wheel(plain.name, plain.version, plain.filename, marked_encrypted(plain.data), from_index=False)
+        with pytest.raises(PackageError) as refused:
+            messages([locked], attested={})
+        assert "cannot be read as a wheel, in full (RuntimeError)" in str(refused.value)
+        assert PRIVATE not in str(refused.value)

@@ -249,7 +249,7 @@ def test_k03_an_anonymisation_list_in_the_studys_repository_refuses_the_build(
     listed = anonymisation(repo.path / "anon.toml", {AUTHOR: "Author A"})
     with pytest.raises(PackageError, match="K03"):
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=listed)
-    assert list((tmp_path / "dist").iterdir()) == []
+    assert not (tmp_path / "dist").exists()  # the list loads before the output directory is made
     assert private_list_guard(root, None) == [repo.path, root]
     assert private_list_guard(tmp_path, tmp_path / "dist") == [tmp_path, tmp_path / "dist"]
 
@@ -325,6 +325,61 @@ def test_k05_a_refusal_before_the_checks_hides_a_path_that_holds_a_term(campaign
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=listed)
     assert str(refused.value).startswith(f"{hidden_name('notes/varek/data.txt')}: its SHA-256 is not the one")
     assert "varek" not in str(refused.value).casefold()
+
+
+def test_k05_a_file_that_cannot_be_read_is_refused_without_showing_a_private_name_in_its_path(
+    campaign, hashes, tmp_path, monkeypatch, capsys
+):
+    """K05: an exception no step expects (a file the build may not read, whose path holds a private name) is refused
+    like any other, its message through the redactor, by the library and the command line alike; a --hashes path that
+    is not there is named by its role, since no list is loaded yet to hide a name in it."""
+    root = with_notes(campaign, tmp_path / "study", PRIVATE)
+    real = Path.read_bytes
+
+    def refuse(path: Path) -> bytes:
+        if PRIVATE in path.parts:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    with pytest.raises(PackageError) as refused:
+        build_package(root, tmp_path / "dist", hashes=hashes)
+    assert str(refused.value).startswith("PermissionError: [Errno 13] Permission denied: ")
+    assert PRIVATE not in str(refused.value)
+    assert main(["package", str(root), "--out", str(tmp_path / "dist"), "--hashes", str(hashes)]) == 1
+    missing = tmp_path / PRIVATE / "list.sha256"
+    assert main(["package", str(root), "--out", str(tmp_path / "dist"), "--hashes", str(missing)]) == 1
+    err = capsys.readouterr().err
+    assert "refused: PermissionError: [Errno 13] Permission denied: " in err
+    assert "refused: the study-token list given with --hashes is not there" in err
+    assert PRIVATE not in err
+
+
+def test_k05_package_check_shows_its_problems_and_any_exception_through_the_cores_list(
+    built, hashes, tmp_path, monkeypatch, capsys
+):
+    """K05: package-check prints every problem, and any exception it meets, through a redactor of the core's public
+    study-token list, the one list a reader has (here the test's list stands in for it): a file the manifest does not
+    list, and a file that cannot be read, whose paths hold a private name."""
+    monkeypatch.setattr("expcore.cli.default_hashes", lambda: hashes)
+    root = unpack(built, tmp_path)
+    stray = root / f"{PRIVATE}.txt"
+    stray.write_text("stray\n", encoding="utf-8")
+    assert main(["package-check", str(root)]) == 1
+    assert f"FAIL {hidden_name(stray.name)}: not listed in {SUMS_FILE}" in capsys.readouterr().out
+    stray.unlink()
+    real = Path.read_bytes
+
+    def refuse(path: Path) -> bytes:
+        if path.name == "README.md":
+            raise PermissionError(13, "Permission denied", str(root / PRIVATE / "README.md"))
+        return real(path)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert main(["package-check", str(root)]) == 1
+    err = capsys.readouterr().err
+    assert "refused: PermissionError: [Errno 13] Permission denied: " in err
+    assert PRIVATE not in err
 
 
 FIGURE = b"%PDF-1.4\n<< /Filter /FlateDecode >>\nstream\n" + zlib.compress(b"a drawn figure") + b"\nendstream\n"
