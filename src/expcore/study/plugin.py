@@ -16,7 +16,6 @@ import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from importlib import metadata
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -67,7 +66,7 @@ class StudyPlugin:
       `default_backend_factory`. It must have a `version` attribute, a non-empty string: the factory's name and version
       go into the campaign fingerprint, so a resume under another factory or version is refused (C06). Code in the
       study directory is covered by the code identity as well; the version speaks for a factory in an installed package,
-      and must then be that package's installed version (`check_factory_version`).
+      and must then be that package's installed version (`factory_version.check_factory_version`).
     """
 
     executor: RunExecutor
@@ -95,42 +94,15 @@ class StudyPlugin:
         factory = self.backend_factory
         if factory is None:
             return None
-        module, qualname = _factory_name(factory)
+        module, qualname = factory_name(factory)
         name = qualname if module.startswith(PLUGIN_MODULE_PREFIX) else f"{module}.{qualname}"
         return {"name": name, "version": factory.version}
 
 
-def _factory_name(factory: Any) -> tuple[str, str]:
+def factory_name(factory: Any) -> tuple[str, str]:
     """The module and qualified name of a factory, or of its class when it is a callable instance."""
     named = factory if hasattr(factory, "__qualname__") else type(factory)
     return str(named.__module__), str(named.__qualname__)
-
-
-def check_factory_version(plugin: StudyPlugin, where: Any) -> None:
-    """Refuse a backend factory from an installed distribution that declares another version than that one's (C06).
-
-    The declared version is all the campaign fingerprint knows of a factory outside the study's code, so when the
-    factory's module belongs to an installed distribution (`importlib.metadata.packages_distributions`, for its
-    top-level package), the declared version must equal that distribution's: changed backend code under an unchanged
-    declared version cannot then resume silently. A top-level package that several distributions share (a namespace)
-    is accepted when the version equals one of theirs. A factory defined in the study's own code, the plugin file
-    included, belongs to no distribution: the code identity covers its code, and its version is left as declared.
-    """
-    factory = plugin.backend_factory
-    if factory is None:
-        return
-    module, qualname = _factory_name(factory)
-    if module.startswith(PLUGIN_MODULE_PREFIX):
-        return
-    owners = sorted(set(metadata.packages_distributions().get(module.split(".", 1)[0], [])))
-    installed = {name: metadata.version(name) for name in owners}
-    if installed and factory.version not in installed.values():
-        found = ", ".join(f"{name} {version}" for name, version in installed.items())
-        raise ConfigError(
-            f"{where}: the plugin's backend_factory {module}.{qualname} declares version {factory.version!r}, but its "
-            f"module belongs to {found}: declare the installed version, so a change to the backend's code is a change "
-            "to the campaign fingerprint"
-        )
 
 
 def tools_sha256(specs: Sequence[ToolSpec]) -> str:

@@ -78,7 +78,8 @@ from expcore.study.config import (
     load_study,
     read_study_identity,
 )
-from expcore.study.plugin import StudyContext, StudyPlugin, check_factory_version, import_plugin_module, load_plugin
+from expcore.study.factory_version import check_factory_version
+from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.verified import UNCOVERED, Unverified, load_verified
 
 OUT_DIR = "out"
@@ -138,9 +139,9 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
 
     A plugin's `backend_factory` enters as its name and its `version`. Code that lives in the study directory is
     already covered by the code identity every record carries; the version is what speaks for a factory that lives
-    in an installed package, and it is refused unless it is that package's installed version.
+    in an installed package, and it is refused unless it is that package's installed version (`factory_version`).
     """
-    check_factory_version(plugin, study.plugin_file)
+    check_factory_version(plugin, study)
     return build_fingerprint(
         study.schema,
         tasks={task.id: _digest(dict(task.attributes)) for task in study.tasks.values()},
