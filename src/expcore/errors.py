@@ -229,6 +229,12 @@ def untreatable_kinds() -> dict[str, str]:
     return _view().untreatable_kinds()
 
 
+def vocabulary() -> tuple[tuple[str, ...], dict[str, str]]:
+    """Return every kind and the untreatable ones with their reasons, from one view, for a caller that needs both."""
+    view = _view()
+    return view.kinds(), view.untreatable_kinds()
+
+
 def is_treatable(kind: str) -> bool:
     """Tell whether a condition may declare the kind as its treatment; a kind outside the vocabulary is refused. Both
     answers come from one view, so a kind cannot be known in one moment and its treatability read in another."""

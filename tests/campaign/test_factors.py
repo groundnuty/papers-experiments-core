@@ -441,3 +441,15 @@ def test_o05_a_schema_built_in_code_refuses_an_untreatable_kind_too(registry):
     """O05: the check is the schema's, not the loader's."""
     with pytest.raises(ConfigError, match="can never be a treatment"):
         treatment_schema(("tool_plane_integrity",))
+
+
+def test_c02_a_conditions_treatment_kinds_are_checked_against_one_view_of_the_vocabulary(
+    tmp_path, registry, monkeypatch
+):
+    """C02: the kinds and their treatability are read together, once for the whole schema, so a study scope leaving
+    between two reads cannot let an untreatable kind through as a treatment."""
+    views = []
+    real = errors._view
+    monkeypatch.setattr(errors, "_view", lambda: views.append(1) or real())
+    load_factor_schema(write_study(tmp_path, TREATMENT_TOML))
+    assert len(views) == 1

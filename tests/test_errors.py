@@ -342,3 +342,14 @@ def test_c02_a_reader_waits_for_a_change_to_the_vocabulary_under_way_and_reads_i
     assert waiting  # the reader did not read while the change was under way
     assert answers
     assert set(errors.CORE_KINDS) <= set(answers[0])
+
+
+def test_c02_the_vocabulary_and_its_untreatable_kinds_come_from_one_view(monkeypatch):
+    """C02: a caller that needs both the kinds and their treatability gets them from one moment, so a study's
+    untreatable kind cannot be known in one read and missing from the other."""
+    views = []
+    real = errors._view
+    monkeypatch.setattr(errors, "_view", lambda: views.append(1) or real())
+    known, untreatable = errors.vocabulary()
+    assert len(views) == 1
+    assert set(untreatable) <= set(known)
