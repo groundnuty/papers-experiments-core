@@ -65,7 +65,8 @@ class StudyPlugin:
       (`config.models.BACKENDS`) needs one, and the factory decides which models it serves: it hands the others to
       `default_backend_factory`. It must have a `version` attribute, a non-empty string: the factory's name and version
       go into the campaign fingerprint, so a resume under another factory or version is refused (C06). Code in the
-      study directory is covered by the code identity as well; the version speaks for a factory in an installed package.
+      study directory is covered by the code identity as well; the version speaks for a factory in an installed package,
+      and must then be that package's installed version (`factory_version.check_factory_version`).
     """
 
     executor: RunExecutor
@@ -93,10 +94,15 @@ class StudyPlugin:
         factory = self.backend_factory
         if factory is None:
             return None
-        named = factory if hasattr(factory, "__qualname__") else type(factory)
-        module = str(named.__module__)
-        name = named.__qualname__ if module.startswith(PLUGIN_MODULE_PREFIX) else f"{module}.{named.__qualname__}"
+        module, qualname = factory_name(factory)
+        name = qualname if module.startswith(PLUGIN_MODULE_PREFIX) else f"{module}.{qualname}"
         return {"name": name, "version": factory.version}
+
+
+def factory_name(factory: Any) -> tuple[str, str]:
+    """The module and qualified name of a factory, or of its class when it is a callable instance."""
+    named = factory if hasattr(factory, "__qualname__") else type(factory)
+    return str(named.__module__), str(named.__qualname__)
 
 
 def tools_sha256(specs: Sequence[ToolSpec]) -> str:

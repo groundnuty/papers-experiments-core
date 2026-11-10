@@ -199,6 +199,11 @@ def _lines(text: str, finders: Sequence[re.Pattern[str]]) -> set[int]:
     return {text.count("\n", 0, m.start()) + 1 for f in finders for m in f.finditer(text)}
 
 
+def term_lines(text: str, anonymisation: Anonymisation) -> set[int]:
+    """The lines of a text that hold a term of the list, read as it is."""
+    return _lines(text, [_finder(term) for term in anonymisation.terms])
+
+
 def holds_term(anonymisation: Anonymisation, text: str) -> bool:
     """Whether a text, a path for instance, holds a term of the list anywhere the residual check would find it."""
     return any(_finder(term).search(text) for term in anonymisation.terms)

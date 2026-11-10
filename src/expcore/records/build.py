@@ -32,6 +32,7 @@ from expcore.models.adapters import ModelBackend
 from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
 from expcore.prompt.templates import RenderedPrompt, sha256_of
+from expcore.provenance.environment import CORE_DISTRIBUTION
 from expcore.records.digest import digest, plain
 from expcore.records.record import RunRecord
 from expcore.records.recording import Captured, RecordingBackend
@@ -39,7 +40,6 @@ from expcore.records.redact import Redactor
 from expcore.records.schema import CURRENT, RecordError, first_turn_rule
 from expcore.records.seal import mark_unverified, seal
 
-CORE_DISTRIBUTION = "papers-experiments-core"
 CONTEXT_OVERFLOW = "ContextOverflow"
 INFRA_PREFIX = "infrastructure: "
 

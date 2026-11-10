@@ -15,7 +15,8 @@ campaign under out/ (the store, its lock and its leases), since the package's an
 that the replay check keeps in the batch. A selected symbolic link is refused, since it could point out of the study.
 The names the build writes at the package root (`GENERATED`) cannot be selected, nor can the other names GNU Make
 reads there (`GNUmakefile`, `makefile`), which would take the place of the generated Makefile; the generated
-instructions run `make -f Makefile check` as well.
+instructions run `make -f Makefile check` as well. Nor can anything under `wheels/`, where the build puts the wheels
+the package's check installs (`package.wheels`).
 
 The package's checks read only what they can read in full (text, SQLite databases and archives of them; see `views`)
 and refuse everything else. A file they cannot read, a PDF figure for instance, goes in only when the author attests
@@ -27,7 +28,8 @@ it, having inspected it by hand:
     reason = "a figure drawn by hand; read page by page, no name in it"
 
 The build then includes that exact file unscanned, refuses it if its bytes no longer have that hash, and lists the
-attestation in PACKAGE.json.
+attestation in PACKAGE.json. A path under `wheels/` names a member of a vendored wheel instead,
+`wheels/<wheel file>/<member>`, which the build checks once the wheels are made (`wheelscan`).
 """
 
 import os
@@ -44,6 +46,7 @@ RESERVED = (*GENERATED, "GNUmakefile", "makefile")  # GNU Make reads GNUmakefile
 SKIPPED_PARTS = frozenset({".git", "__pycache__", ".venv", "venv", ".pytest_cache", ".ruff_cache", ".mypy_cache"})
 SKIPPED_SUFFIXES = frozenset({".pyc", ".pyo"})
 LIVE_CAMPAIGN = ("out/state.sqlite", "out/campaign.lock", "out/leases")
+WHEELS_DIR = "wheels"  # the build fills it with the wheels of the environment (`package.wheels`)
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 
 
@@ -176,7 +179,7 @@ def select(root: Path, spec: PackageSpec) -> list[str]:
             continue
         if path.is_symlink():
             raise PackageError(f"{spec.source}: {rel} is a symbolic link; a package holds regular files only")
-        if rel in RESERVED:
+        if rel in RESERVED or rel.startswith(f"{WHEELS_DIR}/"):
             raise PackageError(
                 f"{spec.source}: {rel} is a name the build generates or make reads at the package root; leave it out"
             )
@@ -186,7 +189,7 @@ def select(root: Path, spec: PackageSpec) -> list[str]:
     empty = [pattern for pattern, count in hits.items() if not count]
     if empty:
         raise PackageError(f"{spec.source}: [package] include {empty[0]!r} selects no file")
-    stray = sorted(set(spec.opaque) - set(chosen))
+    stray = sorted(path for path in set(spec.opaque) - set(chosen) if not path.startswith(f"{WHEELS_DIR}/"))
     if stray:
         raise PackageError(f"{spec.source}: [[opaque]] attests {stray[0]}, which the package does not include")
     return chosen

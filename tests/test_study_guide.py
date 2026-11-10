@@ -6,6 +6,8 @@ shared by all of them, and a `toml` block must agree with the file of the exampl
 it shows an `[[opaque]]` entry, load as one through the package's own inclusion-list loader. The two
 lines that make the project and add the core cannot run here, where the core is already installed: the `uv add` line
 must be exactly what depends on this version's tag, and scripts/fresh_repo.py runs both (tests/test_fresh_repo.py).
+The core is installed editable here, so the package vendors stand-in wheels and the package's `make check` runs with
+this interpreter (`check-installed`); scripts/fresh_repo.py runs the offline install for real.
 """
 
 import contextlib
@@ -19,9 +21,11 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from package_support import stand_in_vendor
 from study_support import clean_environment
 
 from expcore.cli import main
+from expcore.package import build as package_build
 from expcore.package.spec import load_spec
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +56,8 @@ def run_line(line: str) -> None:
         assert line == f"uv add git+https://github.com/groundnuty/papers-experiments-core@v{version()}", line
         return
     argv = shlex.split(line.replace("uv run python", shlex.quote(sys.executable)))
+    if argv[0] == "make":
+        argv = [*["check-installed" if a == "check" else a for a in argv], f"PYTHON={sys.executable}"]
     if argv[:3] == [sys.executable, "-m", "expcore"]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -65,6 +71,7 @@ def run_line(line: str) -> None:
 
 def test_every_block_of_the_study_guide_runs_in_order_in_a_new_directory(tmp_path, monkeypatch, clean_environment):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(package_build, "vendor_wheels", stand_in_vendor)
     for key, value in {
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",

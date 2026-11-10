@@ -1,10 +1,13 @@
 """A model backend of the study's own: named in models.toml, built by the plugin's factory, with no edit to the core."""
 
+import importlib.machinery
 import json
 import shutil
+import sys
 import uuid
 
 import pytest
+from package_support import installed_distribution
 from study_support import EXAMPLE, HEAD, clean_environment, cli
 
 from expcore.campaign.resume import FingerprintMismatch
@@ -161,6 +164,209 @@ def test_c06_a_backend_factory_without_a_version_is_refused_when_the_plugin_is_l
     plugin.write_text(text.replace('relay_factory.version = "1"', replacement), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"plugin\.py: the plugin's backend_factory needs a 'version' attribute"):
         load_plugin(StudyContext(load_study(copy), {"commit": HEAD}))
+
+
+KIT = "toy_relay_kit"  # an installed package that holds a backend factory, outside the study directory
+KIT_CODE = '''"""A backend kit installed beside the study: the factory a plugin imports instead of defining its own."""
+
+from expcore.campaign.executor import default_backend_factory
+
+
+def relay_factory(spec, *, seed, limits, base_url, time_left):
+    return default_backend_factory(spec, seed=seed, limits=limits, base_url=base_url, time_left=time_left)
+
+
+relay_factory.version = "1.3.0"
+'''
+USE_KIT = f"""
+
+import dataclasses as _dataclasses
+
+from {KIT} import relay_factory as _kit_factory
+
+_build_without_kit = build
+
+
+def build(context):
+    return _dataclasses.replace(_build_without_kit(context), backend_factory=_kit_factory)
+"""
+
+
+@pytest.fixture
+def installed_kit(tmp_path, monkeypatch):
+    """The kit installed as distribution toy-relay-kit 1.4.0, importable for one test."""
+    site = tmp_path / "site"
+    installed_distribution(site, "toy-relay-kit", "1.4.0", {f"{KIT}/__init__.py": KIT_CODE.encode()})
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.delitem(sys.modules, KIT, raising=False)
+    yield
+    sys.modules.pop(KIT, None)
+
+
+def test_c06_a_factory_from_an_installed_package_must_declare_the_version_installed(
+    tmp_path, installed_kit, clean_environment
+):
+    """C06: the declared version is all the fingerprint knows of a factory outside the study's code, so a factory whose
+    module belongs to an installed distribution must declare that distribution's version: otherwise new backend code
+    under an old declared version would resume silently. The refusal names both versions, before anything runs."""
+    copy = study_copy(tmp_path, factory=False)
+    shutil.copy(EXAMPLE / "models.toml", copy / "models.toml")
+    (copy / "plugin.py").write_text((copy / "plugin.py").read_text(encoding="utf-8") + USE_KIT, encoding="utf-8")
+    write_stamp(copy, HEAD, load_study(copy).scope)
+    study = load_study(copy)
+    plugin = load_plugin(StudyContext(study, {"commit": HEAD}))
+    refusal = r"declares version '1\.3\.0', but its module belongs to toy-relay-kit 1\.4\.0"
+    with pytest.raises(ConfigError, match=rf"plugin\.py: the plugin's backend_factory {KIT}\.relay_factory {refusal}"):
+        fingerprint_of(study, plugin)
+    with pytest.raises(ConfigError, match=refusal):
+        run_study(copy)
+    assert not (copy / "out" / "state.sqlite").exists()
+    plugin.backend_factory.version = "1.4.0"  # what the kit's next release would declare
+    assert fingerprint_of(study, plugin)["backend_factory"] == {"name": f"{KIT}.relay_factory", "version": "1.4.0"}
+
+
+def test_c06_a_factory_in_the_study_s_own_code_may_declare_any_version(tmp_path, clean_environment):
+    """C06: a factory defined in the plugin file belongs to no installed distribution; the code identity covers its
+    code, so its declared version is only checked to be there (the resume test above runs a campaign under one)."""
+    copy = study_copy(tmp_path, factory=True)
+    edit_plugin(copy, 'relay_factory.version = "1"', 'relay_factory.version = "study-made"')
+    study = load_study(copy)
+    plugin = load_plugin(StudyContext(study, {"commit": HEAD}))
+    assert fingerprint_of(study, plugin)["backend_factory"] == {"name": "relay_factory", "version": "study-made"}
+
+
+@pytest.fixture
+def importable(tmp_path, monkeypatch):
+    """Put a directory on the path for one test, and forget the modules imported from it afterwards."""
+    names: list[str] = []
+
+    def add(where, *modules: str):
+        monkeypatch.syspath_prepend(str(where))
+        for name in modules:
+            monkeypatch.delitem(sys.modules, name, raising=False)
+        names.extend(modules)
+
+    yield add
+    for name in names:
+        sys.modules.pop(name, None)
+
+
+def study_using(tmp_path, module: str):
+    """The example, its plugin taking its backend factory from `module`; the study and its loaded plugin."""
+    copy = study_copy(tmp_path, factory=False)
+    shutil.copy(EXAMPLE / "models.toml", copy / "models.toml")
+    use = USE_KIT.replace(f"from {KIT} import", f"from {module} import")
+    (copy / "plugin.py").write_text((copy / "plugin.py").read_text(encoding="utf-8") + use, encoding="utf-8")
+    study = load_study(copy)
+    return study, load_plugin(StudyContext(study, {"commit": HEAD}))
+
+
+def test_c06_the_distribution_that_owns_the_factory_s_file_decides_not_a_namespace_sibling(
+    tmp_path, importable, clean_environment
+):
+    """C06: two distributions share the namespace package of the factory's module; the one whose installed files hold
+    the module's file is the factory's, so the sibling's version does not vouch for it."""
+    site = tmp_path / "site"
+    code = KIT_CODE.replace('version = "1.3.0"', 'version = "2.0"').encode()
+    installed_distribution(site, "toykit-relay", "1.0", {"toykit/relay.py": code})
+    installed_distribution(site, "toykit-extra", "2.0", {"toykit/extra.py": b"EXTRA = 1\n"})
+    importable(site, "toykit", "toykit.relay")
+    study, plugin = study_using(tmp_path, "toykit.relay")
+    with pytest.raises(ConfigError, match=r"declares version '2\.0', but its module belongs to toykit-relay 1\.0:"):
+        fingerprint_of(study, plugin)
+
+
+def test_c06_versions_are_compared_as_versions_local_labels_included(tmp_path, importable, clean_environment):
+    """C06: the declared and installed versions are compared normalised, so `1.0+Build_1` is `1.0+build.1`; the
+    fingerprint keeps the version as declared."""
+    site = tmp_path / "site"
+    code = KIT_CODE.replace('version = "1.3.0"', 'version = "1.0+Build_1"').encode()
+    installed_distribution(site, "toy-relay-kit", "1.0+build.1", {f"{KIT}/__init__.py": code})
+    importable(site, KIT)
+    study, plugin = study_using(tmp_path, KIT)
+    assert fingerprint_of(study, plugin)["backend_factory"] == {
+        "name": f"{KIT}.relay_factory",
+        "version": "1.0+Build_1",
+    }
+    plugin.backend_factory.version = "1.0+build.2"
+    with pytest.raises(ConfigError, match=r"declares version '1\.0\+build\.2', but its module belongs to toy-relay"):
+        fingerprint_of(study, plugin)
+
+
+def test_c06_a_factory_no_distribution_owns_must_lie_in_the_study_s_code(tmp_path, importable, clean_environment):
+    """C06: a factory from a module on the path that no installed distribution owns, outside the files the code
+    identity covers, has nothing behind its version: it is refused, naming the module."""
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    (loose / "loose_relay.py").write_text(KIT_CODE, encoding="utf-8")
+    importable(loose, "loose_relay")
+    study, plugin = study_using(tmp_path, "loose_relay")
+    with pytest.raises(ConfigError, match=r"backend_factory loose_relay\.relay_factory comes from module loose_relay"):
+        fingerprint_of(study, plugin)
+
+
+class _KitHook:
+    """An editable install's import hook: loads toy_kit from the project's src directory."""
+
+    def __init__(self, src) -> None:
+        self.src = src
+
+    def find_spec(self, name, path=None, target=None):
+        return importlib.machinery.PathFinder.find_spec(name, [str(self.src)]) if name == "toy_kit" else None
+
+
+def test_c06_a_loose_module_in_an_editable_project_is_not_that_distribution_s_code(
+    tmp_path, importable, monkeypatch, clean_environment
+):
+    """C06: an editable distribution owns the modules of its importable top-level packages, found where they import
+    from, not every file below its project: a loose module of the project on a path added by hand is refused, while
+    a factory in the package the hook loads is held to the distribution's version."""
+    project = tmp_path / "project"
+    (project / "src" / "toy_kit").mkdir(parents=True)
+    (project / "build").mkdir()
+    code = KIT_CODE.replace('version = "1.3.0"', 'version = "1.0.0"')
+    (project / "src" / "toy_kit" / "__init__.py").write_text(code, encoding="utf-8")
+    (project / "build" / "loose_relay.py").write_text(code, encoding="utf-8")
+    site = tmp_path / "site"
+    editable = json.dumps({"url": project.as_uri(), "dir_info": {"editable": True}})
+    hook = {"__editable__.toy_kit-1.0.0.pth": b"import _toy_kit_finder; _toy_kit_finder.install()\n"}
+    installed_distribution(site, "toy-kit", "1.0.0", hook, direct_url=editable)
+    monkeypatch.setattr(sys, "meta_path", [_KitHook(project / "src"), *sys.meta_path])
+    importable(site)
+    importable(project / "build", "loose_relay", "toy_kit")
+    study, plugin = study_using(tmp_path / "loose", "loose_relay")
+    with pytest.raises(ConfigError, match=r"comes from module loose_relay, which no installed distribution owns"):
+        fingerprint_of(study, plugin)
+    study, plugin = study_using(tmp_path / "packaged", "toy_kit")
+    assert fingerprint_of(study, plugin)["backend_factory"] == {"name": "toy_kit.relay_factory", "version": "1.0.0"}
+    plugin.backend_factory.version = "1.1.0"
+    with pytest.raises(ConfigError, match=r"declares version '1\.1\.0', but its module belongs to toy-kit 1\.0\.0"):
+        fingerprint_of(study, plugin)
+
+
+def test_c06_a_single_module_an_import_hook_loads_is_its_editable_distribution_s_code(
+    tmp_path, importable, monkeypatch, clean_environment
+):
+    """C06: an editable distribution may ship one top-level module rather than a package; the module the hook loads is
+    its code, so a factory there is held to the distribution's version rather than refused as unowned."""
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    code = KIT_CODE.replace('version = "1.3.0"', 'version = "1.0.0"')
+    (project / "src" / "toy_kit.py").write_text(code, encoding="utf-8")
+    site = tmp_path / "site"
+    editable = json.dumps({"url": project.as_uri(), "dir_info": {"editable": True}})
+    hook = {
+        "__editable__.toy_kit-1.0.0.pth": b"import _toy_kit_finder; _toy_kit_finder.install()\n",
+        "toy_kit-1.0.0.dist-info/top_level.txt": b"toy_kit\n",  # setuptools names its top-level module
+    }
+    installed_distribution(site, "toy-kit", "1.0.0", hook, direct_url=editable)
+    monkeypatch.setattr(sys, "meta_path", [_KitHook(project / "src"), *sys.meta_path])
+    importable(site, "toy_kit")
+    study, plugin = study_using(tmp_path / "single", "toy_kit")
+    assert fingerprint_of(study, plugin)["backend_factory"] == {"name": "toy_kit.relay_factory", "version": "1.0.0"}
+    plugin.backend_factory.version = "1.1.0"
+    with pytest.raises(ConfigError, match=r"declares version '1\.1\.0', but its module belongs to toy-kit 1\.0\.0"):
+        fingerprint_of(study, plugin)
 
 
 CREDENTIAL_VARIABLE = "TOY_RELAY_CREDENTIAL"  # not a name the environment's own redaction matches

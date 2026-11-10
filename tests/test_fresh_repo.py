@@ -97,10 +97,12 @@ def test_the_study_steps_run_the_example_end_to_end_in_a_new_repository_and_its_
     tmp_path, clean_environment
 ):
     """Everything but the install, against this interpreter: the example comes from the core through `example`, the
-    commit makes the code identity clean, and the package passes its own make check."""
+    commit makes the code identity clean, and the package passes its own make check with this interpreter. The core
+    is installed editable here, so the commands run through a runner that vendors stand-in wheels."""
     workdir = tmp_path / "fresh"
     workdir.mkdir()
-    args = fresh.build_parser().parse_args(["--skip-install", "--runner", sys.executable, "--workdir", str(workdir)])
+    runner = f"{sys.executable} {ROOT / 'tests' / 'support' / 'stand_in_runner.py'}"
+    args = fresh.build_parser().parse_args(["--skip-install", "--runner", runner, "--workdir", str(workdir)])
     assert fresh.run(fresh.plan(args, workdir), workdir, fresh.clean_environment(clean_environment)) == 0
     log = subprocess.run(["git", "log", "--format=%s"], cwd=workdir, capture_output=True, text=True, check=True)
     assert log.stdout.splitlines() == ["the example study"]

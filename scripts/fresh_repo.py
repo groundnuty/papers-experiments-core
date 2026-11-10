@@ -6,14 +6,17 @@
 It makes an empty git repository and a bare project, adds the core by commit with
 `uv add git+https://github.com/groundnuty/papers-experiments-core@<sha>`, writes the example study the installed core
 carries (`python -m expcore example study`), commits it, and runs it end to end: `run`, `check`, `analyze`, `report`,
-then builds the replication package and runs the package's own `make -f Makefile check`. No file is copied from a
-checkout of the core: everything the study runs comes from the installed package. A step that fails ends the check
-with its exit status, after printing what it ran.
+then builds the replication package and runs the package's own `make -f Makefile check`, which installs the wheels
+the package vendors into a fresh environment, offline. No file is copied from a checkout of the core: everything the
+study runs comes from the installed package. A step that fails ends the check with its exit status, after printing
+what it ran.
 
 `--source` names another place to depend on (a local path or a file URL; with `--sha`, a commit of a local
-repository); `--runner` and `--skip-install` run the study steps with an interpreter that already has the core; and
-`--dry-run` prints the steps without running them. Those exist for the script's own tests, which cannot depend on an
-unpushed commit. Standard library only, because it runs before any environment exists.
+repository); `--runner` and `--skip-install` run the study steps with an interpreter that already has the core, whose
+package is then checked with that interpreter (`make -f Makefile check-installed`); `--wheels` names a directory of
+wheels for the package build to vendor first; and `--dry-run` prints the steps without running them. Those exist for
+the script's own tests, which cannot depend on an unpushed commit. Standard library only, because it runs before any
+environment exists.
 """
 
 import argparse
@@ -79,9 +82,17 @@ def install_steps(requirement: str, python: str) -> list[Step]:
     ]
 
 
-def study_steps(runner: Sequence[str], python_for_make: str, project: Sequence[str] = ()) -> list[Step]:
+def study_steps(
+    runner: Sequence[str],
+    python_for_make: str,
+    project: Sequence[str] = (),
+    *,
+    make_target: str = "check",
+    wheels: str | None = None,
+) -> list[Step]:
     """Write the example from the installed core, commit it, run it end to end, package it, check the package."""
     core = (*runner, "-m", "expcore")
+    package = (*core, "package", STUDY, "--out", "dist", *(("--wheels", wheels) if wheels else ()))
     commit = ("git", *_IDENTITY, *_NO_SIGNING_OR_HOOKS, "commit", "--quiet", "-m", "the example study")
     return [
         Step("write the example study from the installed core", (*core, "example", STUDY)),
@@ -91,11 +102,11 @@ def study_steps(runner: Sequence[str], python_for_make: str, project: Sequence[s
         Step("check the records", (*core, "check", f"{STUDY}/out/runs")),
         Step("analyse", (*core, "analyze", STUDY)),
         Step("report", (*core, "report", STUDY)),
-        Step("build the replication package", (*core, "package", STUDY, "--out", "dist")),
+        Step("build the replication package", package),
         Step("unpack it", (*runner, "-c", _UNPACK, f"dist/{PACKAGE}.tar.gz", "unpacked")),
         Step(
             "run the package's make check",
-            ("make", "-C", f"unpacked/{PACKAGE}", "-f", "Makefile", "check", f"PYTHON={python_for_make}"),
+            ("make", "-C", f"unpacked/{PACKAGE}", "-f", "Makefile", make_target, f"PYTHON={python_for_make}"),
         ),
     ]
 
@@ -129,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workdir", type=Path, help="an empty directory to work in (default: a new temporary one)")
     parser.add_argument("--runner", help="run the study steps with this command instead of `uv run python`")
     parser.add_argument("--skip-install", action="store_true", help="make the git repository only; add no project")
+    parser.add_argument("--wheels", help="a directory of wheels the package build vendors first")
     parser.add_argument("--dry-run", action="store_true", help="print the steps and run nothing")
     return parser
 
@@ -137,10 +149,14 @@ def plan(args: argparse.Namespace, workdir: Path) -> list[Step]:
     """The steps the arguments ask for, in order."""
     runner = shlex.split(args.runner) if args.runner else ["uv", "run", "python"]
     python_for_make = runner[0] if args.runner else str(workdir / ".venv" / "bin" / "python")
+    options = {"make_target": "check-installed" if args.runner else "check", "wheels": args.wheels}
     if args.skip_install:
-        return [Step("make an empty git repository", ("git", "init", "--quiet")), *study_steps(runner, python_for_make)]
+        return [
+            Step("make an empty git repository", ("git", "init", "--quiet")),
+            *study_steps(runner, python_for_make, **options),
+        ]
     requirement = dependency(args.sha, args.source)
-    return install_steps(requirement, args.python) + study_steps(runner, python_for_make, PROJECT_FILES)
+    return install_steps(requirement, args.python) + study_steps(runner, python_for_make, PROJECT_FILES, **options)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

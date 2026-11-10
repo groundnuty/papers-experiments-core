@@ -6,7 +6,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 `scores.json`, `analysis.json`).
 
 - `run_study` opens or resumes the campaign and runs the scheduler. Its code identity is computed once, from the study
-  directory and the scope study.toml names, and every record carries it.
+  directory and the scope study.toml names, and every record carries it. Its environment (the distributions the
+  study's code imports, `provenance.environment`) goes into the campaign fingerprint, so a resume under another one
+  is refused (C06).
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
@@ -14,7 +16,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   table and imports nothing, unless a record needs it, and says so first: a kind still unknown imports the modules
   `[study] platforms` names, and a backend no native parser is registered for also imports the plugin module, so
   what is registered there is known in a new process. `build` is not called, so no model or key is needed.
-- `analyse_study` refuses unless the batch has a current passing check (R04, R05), and writes nothing. It then uses
+  It refuses to run under another environment than the campaign's, and records the one it ran under.
+- `analyse_study` refuses unless the batch has a current passing check (R04, R05), made under the environment in use
+  and the campaign's (the snapshot's fingerprint), and writes nothing. It then uses
   only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once and compared
   with the check's hash, cross-validated against each other. It exports from the snapshot, scores the records in
   memory (a record is never written after its check, since that would change its hash) and runs the preregistered
@@ -44,12 +48,14 @@ from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import build_fingerprint
+from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
 from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
+from expcore.provenance.environment import EnvironmentUnknown, differences, environment
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore, scorer_name, scorer_version
@@ -72,6 +78,7 @@ from expcore.study.config import (
     load_study,
     read_study_identity,
 )
+from expcore.study.factory_version import check_factory_version
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.verified import UNCOVERED, Unverified, load_verified
 
@@ -114,13 +121,27 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
 
+def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:
+    """The environment of the study's code: the core and what `[study] requires` names, with their requirements."""
+    try:
+        return environment(study.requires)
+    except EnvironmentUnknown as error:
+        raise Refused(f"{study.root}: {error}") from None
+
+
+def campaign_environment(fingerprint: Mapping[str, Any] | None) -> Any:
+    """The environment a campaign's fingerprint records; None when it records none."""
+    return None if fingerprint is None else fingerprint.get("environment")
+
+
 def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
     """The campaign fingerprint: what makes two starts one experiment (C06), from the study and its plugin.
 
     A plugin's `backend_factory` enters as its name and its `version`. Code that lives in the study directory is
     already covered by the code identity every record carries; the version is what speaks for a factory that lives
-    in an installed package, and it changes when the factory's behaviour does.
+    in an installed package, and it is refused unless it is that package's installed version (`factory_version`).
     """
+    check_factory_version(plugin, study)
     return build_fingerprint(
         study.schema,
         tasks={task.id: _digest(dict(task.attributes)) for task in study.tasks.values()},
@@ -133,6 +154,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
         configs=study.config_sha256,
         platform=plugin.platform,
         backend_factory=plugin.backend_factory_identity(),
+        environment=study_environment(study),
     )
 
 
@@ -220,12 +242,21 @@ def _check_batch_of(
     directory = Path(batch)
     if not directory.is_dir():
         raise Refused(f"{directory}: no batch of records here; run the study first")
+    env = study_environment(study)
+    store = out_dir(study) / STATE_FILE
+    if store.is_file():  # without a store, take_snapshot refuses below
+        changed = differences(campaign_environment(read_fingerprint(store)), env)
+        if changed:
+            raise Refused(
+                f"{store}: the campaign ran under another environment than this check would; check under the "
+                "campaign's environment:\n  " + "\n  ".join(changed)
+            )
     _import_what_the_records_need(study, directory)
     try:
-        running = take_snapshot(out_dir(study) / STATE_FILE, directory / SNAPSHOT_FILE, allow_running=partial)
+        running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
         raise Refused(str(error)) from None
-    check = verify_batch(directory, code=code, hashed_only=list(HASHED_ONLY))
+    check = verify_batch(directory, code=code, hashed_only=list(HASHED_ONLY), environment=env)
     check[SNAPSHOT_KEY] = {"file": SNAPSHOT_FILE, "attempts_running": running, "partial": partial}
     write_check(directory, check)
     return check
@@ -349,13 +380,27 @@ def _analyse_loaded(
     if not batch.is_dir():
         raise Refused(f"{out}: no campaign here; run the study first")
     code = code_version(code_root or study.root, study.scope, use_git=not stamped)
+    env = study_environment(study)
     try:
         check = require_current_check(
-            batch, code=code, allow_dirty=allow_dirty, rerun_command=f"python -m expcore check {batch}"
+            batch,
+            code=code,
+            allow_dirty=allow_dirty,
+            rerun_command=f"python -m expcore check {batch}",
+            environment=env,
+            compare_sources=not stamped,
         )
         verified = load_verified(batch, check, study.schema, partial=partial)
     except (BatchNotVerified, Unverified) as error:
         raise Refused(f"refusing to analyse: {error}") from None
+    rows = verified.snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
+    changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])
+    if changed:
+        verified.snapshot.close()
+        raise Refused(
+            "refusing to analyse: the replay check ran under another environment than the campaign's:\n  "
+            + "\n  ".join(changed)
+        )
     plugin = load_plugin(StudyContext(study, code))
     try:
         export = export_run_state(verified.snapshot, excluded=dict.fromkeys(verified.excluded, UNCOVERED))
