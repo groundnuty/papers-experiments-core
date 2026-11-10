@@ -28,7 +28,7 @@ from expcore.provenance.headers import (
     strip_header,
 )
 from expcore.provenance.redact import Redactor
-from expcore.provenance.sanitise_map import Entry, MapError, category_of, load_map, matches_on_components
+from expcore.provenance.sanitise_map import Entry, MapError, load_map, matches_on_components
 from expcore.provenance.scanner import (
     FSTRING_END_TYPES,
     FSTRING_MIDDLE_TYPES,
@@ -99,16 +99,16 @@ class _Replacer:
 def _name(replacer: _Replacer, name: str) -> str:
     """Return the sanitised form of an identifier; it must stay an identifier.
 
-    A refusal names the map entry by its number, its category and its replacement, never its token or the identifier.
+    A refusal names the map entry by its number alone, never its token, its replacement or the identifier.
     """
     entry = replacer.whole(name)
     new, used = (entry.replacement, [entry]) if entry else replacer.within(name, escapes=False)
     if used and not new.isidentifier():
         bad = next((e for e in used if not e.replacement.isidentifier()), used[0])
         raise SanitiseError(
-            f"map entry #{bad.number} ({category_of(bad)}): its replacement {bad.replacement!r} is used inside "
-            "an identifier here, so it must itself be an identifier (letters, digits and underscores, not starting "
-            "with a digit); give the spelling with underscores an entry of its own"
+            f"map entry #{bad.number}: its 'replacement' is used inside an identifier here, so it must itself be an "
+            "identifier (letters, digits and underscores, not starting with a digit); give the spelling with "
+            "underscores an entry of its own"
         )
     return new
 

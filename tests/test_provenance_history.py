@@ -212,7 +212,8 @@ def test_a_source_blob_git_cannot_read_is_reported_without_the_source_repository
 def test_an_import_made_with_another_map_is_reported(world, tmp_path):
     core, origin, *_ = world
     other = tmp_path / "other_map.toml"
-    other.write_text(MAP_TEXT + '\n[[entry]]\ntoken = "unrelated-name"\nreplacement = "other-name"\ncategory = "x"\n')
+    extra = '\n[[entry]]\ntoken = "unrelated-name"\nreplacement = "other-name"\ncategory = "hosts"\n'
+    other.write_text(MAP_TEXT + extra)
     problems = hist.verify_history(core.path, {"origin-repo": origin.path}, load_map(other))
     assert len(problems) == 1
     assert "different sanitising map" in problems[0]

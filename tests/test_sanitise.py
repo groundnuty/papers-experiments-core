@@ -36,12 +36,12 @@ category = "space"
 [[entry]]
 token = "zq"
 replacement = "xx"
-category = "option"
+category = "conditions"
 
 [[entry]]
 token = "10.99.0.0/16"
 replacement = "192.0.2.0/24"
-category = "network"
+category = "addresses"
 """
 
 SOURCE = '''#!/usr/bin/env python3
@@ -162,38 +162,59 @@ def test_result_compiles_and_the_checker_finds_no_listed_token(token_map):
 
 
 def test_replacement_that_is_not_an_identifier_is_refused_with_file_and_line(token_map):
-    with pytest.raises(sn.SanitiseError, match=r"mod\.py:2: map entry #1 .*must itself be an identifier"):
+    with pytest.raises(sn.SanitiseError, match=r"mod\.py:2: map entry #1: .*must itself be an identifier"):
         sn.sanitise_python("x = 1\nsecret_space = 1\n", _entries("secret_space", "space-a"), filename="mod.py")
 
 
-def test_an_identifier_error_names_the_entry_by_number_and_replacement_never_the_token():
-    """P07: the map is private, so a refusal names the entry by its number and its replacement, never its token."""
+def test_an_identifier_error_names_the_entry_by_number_never_its_token_or_replacement():
+    """P07: the map is private, so a refusal names the entry by its number alone, never its token or replacement."""
     entries = parse_map(_map_with(("brindle-gate", "gate-a"), ("brindle_gate", "gate-b"), ("other_gate", "gate-c")))
     with pytest.raises(sn.SanitiseError) as refused:
         sn.sanitise_python("x = 1\nother_gate = 1\n", entries.entries, filename="mod.py")
     message = str(refused.value)
-    assert message.startswith("mod.py:2: map entry #3 (category 'hosts'): its replacement 'gate-c' is used inside")
+    assert message.startswith("mod.py:2: map entry #3: its 'replacement' is used inside an identifier")
     assert "must itself be an identifier" in message
     assert "other_gate" not in message
+    assert "gate-c" not in message
 
 
 @pytest.mark.parametrize(
     ("entries", "shown"),
     [
-        ([("brindle-gate", "gate-a"), ("BRINDLE-GATE", "gate-b")], "entry #2 (category 'hosts', replacement 'gate-b')"),
-        ([("brindle-gate", 'gate"a')], "entry #1 (category 'hosts', replacement 'gate\"a')"),
-        ([("brindle-gate", "gate-a"), ("gate-b", "x-brindle-gate")], "entry #2 (category 'hosts')"),
-        ([("brindle-gate", "BRINDLE-GATE")], "entry #1 (category 'hosts')"),
+        ([("brindle-gate", "gate-a"), ("BRINDLE-GATE", "gate-b")], "entry #2: 'token' repeats entry #1"),
+        ([("brindle-gate", 'gate"a')], "entry #1: 'replacement' has quotes"),
+        ([("brindle-gate", "gate-a"), ("gate-b", "x-brindle-gate")], "entry #2: 'replacement' contains a mapped"),
+        ([("brindle-gate", "BRINDLE-GATE")], "entry #1: 'replacement' equals a mapped token"),
     ],
 )
-def test_a_map_error_names_the_entry_by_number_and_replacement_never_the_token(entries, shown):
-    """P07: a map refusal names the entry by number and its replacement, which is public, and leaves out a replacement
-    that holds a mapped token; the token never appears."""
+def test_a_map_error_names_the_entry_by_number_and_the_field_by_name_never_a_value(entries, shown):
+    """P07: a map refusal names the entry by its number and the field by its name; no token, replacement or category
+    appears."""
     with pytest.raises(MapError) as refused:
         parse_map(_map_with(*entries), "map.toml")
     message = str(refused.value)
-    assert f"map.toml: {shown}: " in message
+    assert f"map.toml: {shown}" in message
     assert "brindle" not in message.casefold()
+    assert "gate-" not in message
+    assert "hosts" not in message
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [("brindle", " brindlex")],  # inside a longer word, which no check of the map reads as the token
+        [("Ada Example", "Author A"), ("ada example", "Ada Example 2")],  # a name of two words
+    ],
+)
+def test_a_map_error_never_shows_a_replacement_that_holds_its_own_token(entries):
+    """P07: a replacement can hold its own token in ways the checks of the map do not catch (inside a longer word, as
+    a name of several words); whatever the error, the message shows neither."""
+    with pytest.raises(MapError) as refused:
+        parse_map(_map_with(*entries), "map.toml")
+    message = str(refused.value).casefold()
+    assert "map.toml: entry #" in message
+    assert "brindle" not in message
+    assert "example" not in message
 
 
 def test_a_replacement_that_breaks_the_syntax_is_reported_with_the_file_name():
@@ -223,13 +244,13 @@ def _map_with(*entries: tuple[str, str]) -> bytes:
 @pytest.mark.parametrize(
     ("entries", "message"),
     [
-        ([("alpha-one", "beta-one"), ("ALPHA-ONE", "beta-two")], r"entry #2 .*token repeats entry #1"),
-        ([("alpha-one", "beta-one"), ("alpha-two", "Beta-One")], r"entry #2 .*replacement repeats entry #1"),
-        ([("alpha-one", "alpha-one")], r"entry #1 .*replacement equals a mapped token"),
-        ([("alpha-one", "ALPHA-ONE")], r"entry #1 .*replacement equals a mapped token"),
-        ([("alpha-one", "beta-one"), ("beta-one", "gamma-one")], r"entry #1 .*replacement equals a mapped token"),
-        ([("alpha", "x-alpha-y")], r"entry #1 .*contains a mapped token on a component boundary"),
-        ([("alpha-one", 'bad"quote')], r"entry #1 .*quotes, backslashes"),
+        ([("alpha-one", "beta-one"), ("ALPHA-ONE", "beta-two")], r"entry #2: 'token' repeats entry #1"),
+        ([("alpha-one", "beta-one"), ("alpha-two", "Beta-One")], r"entry #2: 'replacement' repeats entry #1"),
+        ([("alpha-one", "alpha-one")], r"entry #1: 'replacement' equals a mapped token"),
+        ([("alpha-one", "ALPHA-ONE")], r"entry #1: 'replacement' equals a mapped token"),
+        ([("alpha-one", "beta-one"), ("beta-one", "gamma-one")], r"entry #1: 'replacement' equals a mapped token"),
+        ([("alpha", "x-alpha-y")], r"entry #1: 'replacement' contains a mapped token on a component boundary"),
+        ([("alpha-one", 'bad"quote')], r"entry #1: 'replacement' has quotes, backslashes"),
     ],
 )
 def test_invalid_maps_name_the_entry(entries, message):
@@ -259,19 +280,31 @@ def test_malformed_maps_are_refused(text, message):
         parse_map(text.encode(), "map.toml")
 
 
-def test_an_undocumented_category_is_never_shown_and_the_entry_still_loads():
-    """P07: a category is free text; one that is none of the documented words is never shown in an error, the entry
-    still loads (the category plays no part in sanitising), and a documented one is read in any of its spellings."""
-    text = "version = 1\n[[entry]]\ntoken = 'brindle-gate'\nreplacement = 'gate-a'\ncategory = 'orchard-hosts'\n"
-    (entry,) = parse_map(text.encode(), "map.toml").entries
+def test_a_category_outside_the_documented_ones_is_refused_naming_only_the_entry():
+    """P07: a category is free text, which could be a token typed in the wrong field: one that is none of the
+    documented words refuses the map when it loads, naming the entry by its number and never the category."""
+    text = "version = 1\n[[entry]]\ntoken = 'brindle-gate'\nreplacement = 'gate-a'\ncategory = 'hosts'\n"
+    odd = "[[entry]]\ntoken = 'other-gate'\nreplacement = 'gate-b'\ncategory = 'orchard-hosts'\n"
     with pytest.raises(MapError) as refused:
-        parse_map((text + "[[entry]]\ntoken = 'BRINDLE-GATE'\nreplacement = 'gate-b'\ncategory = 'x'\n").encode())
+        parse_map((text + odd).encode(), "map.toml")
+    assert str(refused.value).startswith("map.toml: entry #2: 'category' is none of the documented ones: conditions,")
     assert "orchard" not in str(refused.value)
-    assert "entry #2 (an undocumented category, replacement 'gate-b'): token repeats entry #1" in str(refused.value)
-    assert parse_map(text.replace("orchard-hosts", "Environment_Variable").encode()).entries[0].category == (
-        "environment-variables"
-    )
-    assert entry.replacement == "gate-a"
+
+
+@pytest.mark.parametrize(
+    ("written", "read"),
+    [
+        ("env-vars", "env-vars"),
+        ("Env_Var", "env-vars"),
+        ("environment variable", "environment-variables"),
+        ("Hosts", "hosts"),
+    ],
+)
+def test_env_vars_is_a_documented_category_and_each_is_read_in_any_of_its_spellings(written, read):
+    """P07: environment names are a category of the token list under `env-vars` too, the name the maintainers' own
+    map uses; a singular, capitals, `_` or a space are read as the same word."""
+    text = f"version = 1\n[[entry]]\ntoken = 'BRINDLE_HOME'\nreplacement = 'STUDY_HOME'\ncategory = '{written}'\n"
+    assert parse_map(text.encode(), "map.toml").entries[0].category == read
 
 
 @pytest.mark.parametrize(
@@ -405,7 +438,7 @@ def test_verify_fails_when_the_map_or_the_source_changed_since_the_import(map_fi
     dest = tmp_path / "mod.py"
     assert run_import(map_file, src, dest) == 0
     other_map = tmp_path / "other.toml"
-    extra = '\n[[entry]]\ntoken = "unrelated-name"\nreplacement = "other-name"\ncategory = "x"\n'
+    extra = '\n[[entry]]\ntoken = "unrelated-name"\nreplacement = "other-name"\ncategory = "hosts"\n'
     other_map.write_text(MAP_TEXT + extra)
     assert verify(other_map, src, dest) == 1
     assert "map hash does not match" in capsys.readouterr().out

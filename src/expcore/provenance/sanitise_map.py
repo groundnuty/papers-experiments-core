@@ -3,12 +3,10 @@
 
 Format: TOML with `version = 1` and `[[entry]]` tables holding `token`, `replacement` and `category`, one of
 `MAP_CATEGORIES` (the token list's categories; a singular, capitals, `_` or a space in place of `-` are read as the
-same). The map is private, so no error shows a value it holds beyond what is known to be public: an entry is named by
-its number, its category when it is one of the documented words, and its replacement, never its token, and a
-replacement that holds a mapped token is left out too. Any other category is free text and is never shown: such an
-entry still sanitises, since the category plays no part in it, but errors call it undocumented. An unknown key is
-counted, never shown, and a file that is not TOML is named by the line and column alone. `load_map` names no path
-either: the map's path is the maintainer's.
+same). The map is private, so no error shows a value it holds, whatever the error: an entry is named by its number and
+a field by its name, never a token, a replacement or a category. A category outside `MAP_CATEGORIES` is refused when
+the map loads, since a misspelt one would be free text. An unknown key is counted, never shown, and a file that is not
+TOML is named by the line and column alone. `load_map` names no path either: the map's path is the maintainer's.
 """
 
 import hashlib
@@ -21,7 +19,8 @@ from expcore.provenance.study_tokens import WHOLE_ONLY_BELOW, candidates, normal
 
 MAP_VERSION = 1
 _ENTRY_KEYS = frozenset({"token", "replacement", "category"})
-# The token list's categories (docs/architecture.md, "The study-token list"), each with its singular.
+# The token list's categories (docs/architecture.md, "The study-token list"), each with its singular. Environment
+# names are private everywhere under either name; `env-vars` is the one the maintainers' own lists use.
 MAP_CATEGORIES = {
     "conditions": "condition",
     "data-states": "data-state",
@@ -35,11 +34,11 @@ MAP_CATEGORIES = {
     "providers": "provider",
     "users": "user",
     "environment-variables": "environment-variable",
+    "env-vars": "env-var",
 }
 _ACCEPTED = {form: plural for plural, singular in MAP_CATEGORIES.items() for form in (plural, singular)}
 _TOML_PLACE = re.compile(r"\(at line (\d+), column (\d+)\)")
 MAP_SOURCE = "the sanitising map"
-UNDOCUMENTED = ""  # the category of an entry whose category is none of MAP_CATEGORIES, which is never shown
 _FORBIDDEN_IN_REPLACEMENT = frozenset("\"'\\{}\r\n\0")
 
 
@@ -71,56 +70,46 @@ def matches_on_components(token: str) -> bool:
     return len(key) >= WHOLE_ONLY_BELOW and key in {normalise(c) for c in candidates(token)}
 
 
-def holds_mapped_token(value: str, keys: set[str]) -> bool:
-    """Tell whether a value equals a mapped token or holds one as a component, so showing it would show the token."""
-    return normalise(value) in keys or any(normalise(c) in keys for c in candidates(value))
-
-
-def category_of(entry: Entry) -> str:
-    """How an error names an entry's category: the documented word, or that it is undocumented, never free text."""
-    return f"category {entry.category!r}" if entry.category in MAP_CATEGORIES else "an undocumented category"
-
-
-def _describe(index: int, entry: Entry, keys: set[str]) -> str:
-    """Name an entry the way every error message does: its number, its category and its replacement, never its token.
-
-    The replacement is public, unless it holds a mapped token, and then it is left out as well.
-    """
-    if holds_mapped_token(entry.replacement, keys):
-        return f"entry #{index} ({category_of(entry)})"
-    return f"entry #{index} ({category_of(entry)}, replacement {entry.replacement!r})"
+def _place(source: str, index: int) -> str:
+    """How every error names an entry: by its number alone, never by a value it holds (a replacement can hold its own
+    token, in a way no check of the map catches: inside a longer word, or as a name of several words)."""
+    return f"{source}: entry #{index}"
 
 
 def _read_entry(index: int, raw: object, source: str) -> Entry:
-    """Turn one TOML table into an Entry, checking its keys and value types."""
+    """Turn one TOML table into an Entry, checking its keys, its value types and its category."""
     if not isinstance(raw, dict):
-        raise MapError(f"{source}: entry #{index} is not a table")
+        raise MapError(f"{_place(source, index)} is not a table")
     unknown = set(raw) - _ENTRY_KEYS
     missing = _ENTRY_KEYS - set(raw)
     if unknown:  # a key is free text, a token typed in the wrong place for instance: counted, never shown
         raise MapError(
-            f"{source}: entry #{index}: {len(unknown)} unknown key(s); an entry holds exactly 'category', "
+            f"{_place(source, index)}: {len(unknown)} unknown key(s); an entry holds exactly 'category', "
             "'replacement' and 'token'"
         )
     if missing:
-        raise MapError(f"{source}: entry #{index}: missing keys {sorted(missing)}")
+        raise MapError(f"{_place(source, index)}: missing keys {sorted(missing)}")
     for key in sorted(_ENTRY_KEYS):
         if not isinstance(raw[key], str) or not raw[key].strip():
-            raise MapError(f"{source}: entry #{index}: {key!r} must be a non-empty string")
-    category = _ACCEPTED.get(re.sub(r"[\s_]+", "-", raw["category"].strip().casefold()), UNDOCUMENTED)
+            raise MapError(f"{_place(source, index)}: {key!r} must be a non-empty string")
+    category = _ACCEPTED.get(re.sub(r"[\s_]+", "-", raw["category"].strip().casefold()))
+    if category is None:  # free text, a token typed in the wrong field for instance: refused, never shown
+        documented = ", ".join(MAP_CATEGORIES)
+        raise MapError(f"{_place(source, index)}: 'category' is none of the documented ones: {documented}")
     return Entry(raw["token"], raw["replacement"], category, index)
 
 
 def _check_replacement(source: str, index: int, entry: Entry, keys: set[str]) -> None:
     """Reject a replacement that could break a literal or that would itself contain a mapped token."""
-    where = f"{source}: {_describe(index, entry, keys)}"
     if _FORBIDDEN_IN_REPLACEMENT.intersection(entry.replacement) or entry.replacement != entry.replacement.strip():
-        raise MapError(f"{where}: replacement has quotes, backslashes, braces, line breaks or edge whitespace")
+        raise MapError(
+            f"{_place(source, index)}: 'replacement' has quotes, backslashes, braces, line breaks or edge whitespace"
+        )
     if normalise(entry.replacement) in keys:
-        raise MapError(f"{where}: replacement equals a mapped token")
+        raise MapError(f"{_place(source, index)}: 'replacement' equals a mapped token")
     normalised = (normalise(c) for c in candidates(entry.replacement))
     if any(len(c) >= WHOLE_ONLY_BELOW and c in keys for c in normalised):
-        raise MapError(f"{where}: replacement contains a mapped token on a component boundary")
+        raise MapError(f"{_place(source, index)}: 'replacement' contains a mapped token on a component boundary")
 
 
 def parse_map(data: bytes, source: str = "<map>") -> TokenMap:
@@ -151,7 +140,7 @@ def parse_map(data: bytes, source: str = "<map>") -> TokenMap:
         ):
             key = normalise(value)
             if key in seen:
-                raise MapError(f"{source}: {_describe(index, entry, keys)}: {label} repeats entry #{seen[key]}")
+                raise MapError(f"{_place(source, index)}: {label!r} repeats entry #{seen[key]}")
             seen[key] = index
     for index, entry in enumerate(entries, start=1):
         _check_replacement(source, index, entry, keys)
