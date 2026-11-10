@@ -2,9 +2,11 @@
 
 import json
 import shutil
+import sys
 import uuid
 
 import pytest
+from package_support import installed_distribution
 from study_support import EXAMPLE, HEAD, clean_environment, cli
 
 from expcore.campaign.resume import FingerprintMismatch
@@ -161,6 +163,75 @@ def test_c06_a_backend_factory_without_a_version_is_refused_when_the_plugin_is_l
     plugin.write_text(text.replace('relay_factory.version = "1"', replacement), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"plugin\.py: the plugin's backend_factory needs a 'version' attribute"):
         load_plugin(StudyContext(load_study(copy), {"commit": HEAD}))
+
+
+KIT = "toy_relay_kit"  # an installed package that holds a backend factory, outside the study directory
+KIT_CODE = '''"""A backend kit installed beside the study: the factory a plugin imports instead of defining its own."""
+
+from expcore.campaign.executor import default_backend_factory
+
+
+def relay_factory(spec, *, seed, limits, base_url, time_left):
+    return default_backend_factory(spec, seed=seed, limits=limits, base_url=base_url, time_left=time_left)
+
+
+relay_factory.version = "1.3.0"
+'''
+USE_KIT = f"""
+
+import dataclasses as _dataclasses
+
+from {KIT} import relay_factory as _kit_factory
+
+_build_without_kit = build
+
+
+def build(context):
+    return _dataclasses.replace(_build_without_kit(context), backend_factory=_kit_factory)
+"""
+
+
+@pytest.fixture
+def installed_kit(tmp_path, monkeypatch):
+    """The kit installed as distribution toy-relay-kit 1.4.0, importable for one test."""
+    site = tmp_path / "site"
+    installed_distribution(site, "toy-relay-kit", "1.4.0", {f"{KIT}/__init__.py": KIT_CODE.encode()})
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.delitem(sys.modules, KIT, raising=False)
+    yield
+    sys.modules.pop(KIT, None)
+
+
+def test_c06_a_factory_from_an_installed_package_must_declare_the_version_installed(
+    tmp_path, installed_kit, clean_environment
+):
+    """C06: the declared version is all the fingerprint knows of a factory outside the study's code, so a factory whose
+    module belongs to an installed distribution must declare that distribution's version: otherwise new backend code
+    under an old declared version would resume silently. The refusal names both versions, before anything runs."""
+    copy = study_copy(tmp_path, factory=False)
+    shutil.copy(EXAMPLE / "models.toml", copy / "models.toml")
+    (copy / "plugin.py").write_text((copy / "plugin.py").read_text(encoding="utf-8") + USE_KIT, encoding="utf-8")
+    write_stamp(copy, HEAD, load_study(copy).scope)
+    study = load_study(copy)
+    plugin = load_plugin(StudyContext(study, {"commit": HEAD}))
+    refusal = r"declares version '1\.3\.0', but its module belongs to toy-relay-kit 1\.4\.0"
+    with pytest.raises(ConfigError, match=rf"plugin\.py: the plugin's backend_factory {KIT}\.relay_factory {refusal}"):
+        fingerprint_of(study, plugin)
+    with pytest.raises(ConfigError, match=refusal):
+        run_study(copy)
+    assert not (copy / "out" / "state.sqlite").exists()
+    plugin.backend_factory.version = "1.4.0"  # what the kit's next release would declare
+    assert fingerprint_of(study, plugin)["backend_factory"] == {"name": f"{KIT}.relay_factory", "version": "1.4.0"}
+
+
+def test_c06_a_factory_in_the_study_s_own_code_may_declare_any_version(tmp_path, clean_environment):
+    """C06: a factory defined in the plugin file belongs to no installed distribution; the code identity covers its
+    code, so its declared version is only checked to be there (the resume test above runs a campaign under one)."""
+    copy = study_copy(tmp_path, factory=True)
+    edit_plugin(copy, 'relay_factory.version = "1"', 'relay_factory.version = "study-made"')
+    study = load_study(copy)
+    plugin = load_plugin(StudyContext(study, {"commit": HEAD}))
+    assert fingerprint_of(study, plugin)["backend_factory"] == {"name": "relay_factory", "version": "study-made"}
 
 
 CREDENTIAL_VARIABLE = "TOY_RELAY_CREDENTIAL"  # not a name the environment's own redaction matches
