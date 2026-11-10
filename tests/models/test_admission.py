@@ -3,11 +3,12 @@
 import asyncio
 from types import SimpleNamespace
 
+import anthropic
 import pytest
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.models.adapters import AnthropicAdapter, OpenAICompatAdapter, ProbeReply, StubAdapter
-from expcore.models.admission import admit
+from expcore.models.admission import admit, reply_cap_unshown
 from expcore.records.recording import RecordingBackend
 
 
@@ -159,3 +160,47 @@ def test_b07_a_backend_whose_probe_returns_nothing_to_read_cannot_show_its_usage
         "the backend's probe returned no reply to read, so it cannot show that the endpoint reports usage"
     )
     assert admitted(RecordingBackend(StubAdapter([]))) is None
+
+
+def cap_probe(backend):
+    return asyncio.run(reply_cap_unshown(backend))
+
+
+@pytest.mark.parametrize(
+    ("reply", "why"),
+    [
+        ({"usage": (20, 16), "finish": "length"}, None),
+        ({"usage": (20, 300), "finish": "length"}, "reported 300 output tokens for a max_tokens of 16"),
+        ({"usage": (20, 9), "finish": "stop"}, "stopped by itself (stop) after 9 tokens"),
+        ({"usage": (20, None), "finish": "length"}, "reported no output token count"),
+    ],
+)
+def test_c27_the_probe_of_the_reply_maximum_shows_it_held_only_by_a_reply_cut_at_a_small_max_tokens(
+    make_spec, limits, fake_client, completion, reply, why
+):
+    """C27: a request for a long reply under max_tokens 16, the vendor extras with it, must come back stopped at the
+    limit with an output count within it; a longer reply, one that stopped by itself, or one without the count do not
+    show it."""
+    spec = make_spec(extra_body={"provider": {"order": ["alpha"]}})
+    client = fake_client(completion("1\n2\n3", usage=reply["usage"], finish=reply["finish"]))
+    result = cap_probe(OpenAICompatAdapter(spec, 1, limits, client=client, sleep=_no_sleep))
+    assert result is None if why is None else why in result
+    (request,) = client.requests
+    assert request["max_tokens"] == 16
+    assert request["extra_body"]["provider"] == {"order": ["alpha"]}
+    assert "Count from 1 to 500" in request["messages"][0]["content"]
+
+
+def test_c27_the_anthropic_probe_of_the_reply_maximum_reads_its_stop_reason_and_a_refusal_is_a_reason(
+    make_spec, limits, fake_client, message, make_error
+):
+    """C27: the Messages API says `max_tokens` when it cut the reply; an endpoint that refuses the probe shows nothing,
+    and says why, while the model is still admitted on its one-token completion."""
+    spec = make_spec(backend="anthropic")
+    cut = fake_client(message(stop="max_tokens", usage={"input_tokens": 20, "output_tokens": 16}), api="anthropic")
+    assert cap_probe(AnthropicAdapter(spec, 1, limits, client=cut, api_key="test-key", sleep=_no_sleep)) is None
+    assert cut.requests[0]["max_tokens"] == 16
+    assert "extra_body" not in cut.requests[0]
+    refused = fake_client(make_error(400, message="max_tokens too small", sdk=anthropic), api="anthropic")
+    reason = cap_probe(AnthropicAdapter(spec, 1, limits, client=refused, api_key="test-key", sleep=_no_sleep))
+    assert reason.startswith("the endpoint refused the probe of the reply maximum: BadRequestError HTTP 400")

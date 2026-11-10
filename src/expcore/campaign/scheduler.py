@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign import reply_cap
 from expcore.campaign.attempt import AttemptRunner, Parts
 from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
@@ -58,7 +59,7 @@ from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
 from expcore.config.models import ModelTable
 from expcore.loop.config import AgentConfig
-from expcore.models.admission import admit
+from expcore.models.admission import admit, reply_cap_unshown
 
 __all__ = ["CampaignLocked", "RunSummary", "Scheduler", "iso", "utc_now"]
 
@@ -188,10 +189,11 @@ class Scheduler:
         self.stops = HarnessStops(store, cfg.harness_stop)
         self.reconcile_accounting()
         self.identities = ServedIdentities(store, self.stamp)
+        held = self._admit_models()  # before the gate: which models are held to the reply maximum (C27)
         self.budget, self.ledger = None, None
         if cfg.budget is not None:
             specs = {m: self.models.resolve(m) for m in self.plan_models}
-            self.budget = BudgetGate(store, specs, cfg.budget, self.agent_config.limits)
+            self.budget = BudgetGate(store, specs, cfg.budget, self.agent_config.limits, reply_capped=held)
             # a top-up is decided under the dispatcher's locks, in its order, against the runs in flight (C26)
             self.ledger = Ledger(
                 self.budget,
@@ -208,7 +210,6 @@ class Scheduler:
                 store, self.health_check, self.stamp, recheck_s=cfg.recheck_s, timeout_s=cfg.health_timeout_s
             )
             self.gate.load()
-        self._admit_models()
         self._sweep_leases()
         self.runner = AttemptRunner(
             Parts(
@@ -252,29 +253,38 @@ class Scheduler:
             )
         )
 
-    def _admit_models(self) -> None:
-        """Admit each model's endpoint once (C14). The endpoint checked here is the one every run of the model uses."""
-        assert self.store
-        for model in self.plan_models:
-            endpoint = self.endpoints[model]
-            backend = self.backend_factory(
-                self.models.resolve(model),
-                seed=0,
-                limits=self.agent_config.limits,
-                base_url=endpoint.base_url,
-                time_left=None,
-            )
+    def _admit_models(self) -> frozenset[str]:
+        """Admit each model's endpoint once (C14). The endpoint checked here is the one every run of the model uses.
 
-            async def check(backend: Any = backend) -> str | None:
+        With a budget, a model of the core's own factory is also probed for the reply maximum; return the models the
+        probe showed held to it, and mark in the store those it did not (C27).
+        """
+        assert self.store
+        held = set()
+        for model in self.plan_models:
+            endpoint, spec = self.endpoints[model], self.models.resolve(model)
+            backend = self.backend_factory(
+                spec, seed=0, limits=self.agent_config.limits, base_url=endpoint.base_url, time_left=None
+            )
+            probed = reply_cap.probed(spec, self.backend_factory, self.settings.budget is not None)
+
+            async def check(backend: Any = backend, probed: bool = probed) -> tuple[str | None, str | None]:
                 try:
-                    return await admit(backend)
+                    reason = await admit(backend)
+                    return reason, await reply_cap_unshown(backend) if reason is None and probed else None
                 finally:
                     await backend.aclose()
 
-            reason = asyncio.run(check())
+            reason, unshown = asyncio.run(check())
             if reason is not None:
                 self.not_admitted[model] = reason
                 self.store.event(self.stamp(), "model_not_admitted", model, f"{model}: {reason}")
+            elif probed and unshown is None:
+                held.add(model)
+            elif probed:
+                detail = f"{model}: {unshown}; its runs are reserved by its context window"
+                reply_cap.mark_unheld(self.store, model, self.stamp(), "reply_cap_not_shown", detail)
+        return frozenset(held)
 
     def _sweep_leases(self) -> None:
         """Look for what dead lease holders left (C19); the keys still held back are said to the event log."""

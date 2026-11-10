@@ -65,13 +65,14 @@ class ModelBackend(Protocol):
     async def step(self) -> ModelTurn
     def add_tool_results(self, results: list[ToolResult]) -> None
     def transcript(self) -> list[dict]
-    async def probe(self) -> None
+    async def probe(self) -> ProbeReply | None
     async def aclose(self) -> None
 ```
 
 Core guarantees:
-- The scheduler builds the backend of a run from the endpoint the campaign admitted (`probe` succeeded once, B07), through a `BackendFactory` (below); a run never resolves a URL of its own (C14). A model that is not frozen (B08), whose settings cannot be sent together (B16) or, with a budget, has no price (C12) or no `context_tokens` (C25) is refused before a run starts.
-- With a budget, each run is reserved the most its caps let it cost (C25). For `openai_compat` and `anthropic`, whose requests carry the reply maximum as `max_tokens`, that counts at most the rounds times the reply maximum as output; for the stub and a backend of the study's own, which the core cannot hold to it, the whole token cap and, for the request a run can make past it, the whole context window at the dearest rate. A backend of the study's own whose request outgrows the window is outside that bound.
+- The scheduler builds the backend of a run from the endpoint the campaign admitted (`probe` succeeded once, B07), through a `BackendFactory` (below); a run never resolves a URL of its own (C14). `probe` returns what its one-token reply reported (`ProbeReply`: the `max_tokens` it carried, the input and output counts, the stop reason); a reply without both counts, or a probe that returns `None`, is not admitted, because the token budget is held from the counts each reply reports (B07). A backend that wraps another passes the inner probe's reply on. A model that is not frozen (B08), whose settings cannot be sent together (B16) or, with a budget, has no price (C12) or no `context_tokens` (C25) is refused before a run starts.
+- With a budget, each run is reserved the most its caps let it cost (C25). For a model held to its reply maximum that counts at most the rounds times the reply maximum as output; for any other, the whole token cap and, for the request a run can make past it, the whole context window at the dearest rate. A model is held to it only when the core's own factory builds an `openai_compat` or `anthropic` adapter for it, which sends the maximum as `max_tokens`, and admission's probe showed the endpoint cuts a long reply at a small `max_tokens`; never a model a plugin's factory builds, whatever its `backend`, and no longer once one of its replies reports more than the maximum (C27). A backend of the study's own whose request outgrows the window is outside that bound.
+- With a budget, a send the token cap cannot account for reserves its own bound before it goes out (C26): a resend after a connection error or a 5xx from the core's retrier, and every request after a reply that left a count out. The guard reaches the core's adapters through a context variable the attempt runner installs (`expcore.models.spend`), so a core adapter a plugin's backend wraps is covered; a backend of the study's own that resends on its own is not. A top-up that does not fit ends the attempt as infrastructure of kind `budget_hold`.
 - The backend is closed (`aclose`) after the executor returns, whatever happens.
 - Retries of transient errors, the served-model check and usage totals are the adapters' (B01 to B16); the stub adapter takes a script (`StubAdapter.use(script)`, items: text, a list of `(tool, arguments)`, `{"text", "stop"}`, a ready-made `ModelTurn`, or an exception it raises).
 
@@ -407,7 +408,7 @@ An unknown value raises where it is built, so a typo never reaches a record.
 | Vocabulary | Values | Defined in |
 |---|---|---|
 | Outcomes | `finished`, `turn_cap`, `time_cap`, `token_cap`, `output_cap`, `malformed_end`, `leaked_tool_call`, `harness_defect`, `error`, `infrastructure` | `expcore.loop.outcomes.OUTCOMES` |
-| Infrastructure kinds | `endpoint`, `key_rejected`, `sandbox`, `knowledge`, `unattributed_kill`, `ceiling`, `tool_plane_integrity`, plus kinds a platform registers ([below](#infrastructure-kinds-of-a-platform-or-a-study)) and kinds a study declares in `[study.kinds]` | `expcore.errors.CORE_KINDS`, `infra_kinds()`, `untreatable_kinds()` |
+| Infrastructure kinds | `endpoint`, `key_rejected`, `sandbox`, `knowledge`, `unattributed_kill`, `ceiling`, `tool_plane_integrity`, `budget_hold`, plus kinds a platform registers ([below](#infrastructure-kinds-of-a-platform-or-a-study)) and kinds a study declares in `[study.kinds]` | `expcore.errors.CORE_KINDS`, `infra_kinds()`, `untreatable_kinds()` |
 | Wait kinds | `model_retry`, `lease_queue`, `sandbox_lifecycle`, `toolserver_lifecycle` | `expcore.plugin.WAIT_KINDS` |
 | Conclusion words | `difference`, `trivial_difference`, `equivalent`, `not_detected`, `untestable` | `expcore.stats.analysis.CONCLUSIONS` |
 | Tool call statuses | `ok`, `error`, `malformed`, `skipped`, `cut`, `failed` | `expcore.loop.records.TOOL_STATUSES` |

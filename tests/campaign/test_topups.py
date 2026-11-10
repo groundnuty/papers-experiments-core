@@ -10,7 +10,7 @@ from loop_support import FakeProvider
 from record_support import CODE
 from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, models_for, settings_for
 
-from expcore.campaign.attempt_bounds import attempt_costs, bound_usd
+from expcore.campaign.attempt_bounds import attempt_costs, bound_usd, request_bound_usd
 from expcore.campaign.executor import record_run
 from expcore.campaign.export import export_run_state
 from expcore.campaign.gate import Budget, BudgetGate
@@ -61,7 +61,7 @@ def charged(store, attempt_id):
 def test_c26_the_bounds_of_this_file_are_the_stubs_cap_and_window_at_the_dearest_rate():
     """C26: the figures the tests below rest on."""
     assert bound_usd(SPEC, LIMITS) == pytest.approx(BOUND)
-    assert ledger_for(None, 10.0).bound(MODEL) == pytest.approx(TOPUP)
+    assert request_bound_usd(SPEC, LIMITS) == pytest.approx(TOPUP)
 
 
 def test_c26_a_top_up_that_fits_is_charged_at_once_counted_while_the_attempt_runs_and_never_refunded(tmp_path):

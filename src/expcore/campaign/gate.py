@@ -7,10 +7,10 @@
 Before a run starts, the gate asks whether the campaign can afford one more of its model. The answer is the dollars
 spent so far (attempts counted by their counts, an interrupted one by its bound, C05), plus what the runs in flight can
 cost, plus what this run can cost, against a ceiling. **What a run can cost is always its bound**, the most one attempt's
-caps let it cost, the request it can make past its token cap included (`attempt_bounds.bound_usd`, C25), never the
-mean of the runs that finished: a reservation for a pending or running
-attempt is the worst case, because an attempt that overruns its mean is still inside the ceiling only if the bound was
-set aside for it. A run starts only when the remaining budget covers the bound. The historical mean is an estimate for
+caps let it cost, the request it can make past its token cap included (`attempt_bounds.bound_usd`, C25), by the reply
+maximum only for a model the campaign holds to it (C27), never the mean of the runs that finished: a reservation for a
+pending or running attempt is the worst case, because an attempt that overruns its mean is still inside the ceiling
+only if the bound was set aside for it. A run starts only when the remaining budget covers the bound. The historical mean is an estimate for
 the status and the reports (`BudgetState.estimate_usd`) and decides nothing.
 
 A send of a run in flight that its token cap cannot account for asks for a top-up first (`refusal`, C26; the ledger
@@ -31,12 +31,12 @@ not to the whole second the store's timestamps carry, because a release must be 
 """
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from expcore.campaign import release
-from expcore.campaign.attempt_bounds import attempt_costs, bound_usd, mean_run_usd, spent_usd
+from expcore.campaign import release, reply_cap
+from expcore.campaign.attempt_bounds import attempt_costs, bound_usd, mean_run_usd, request_bound_usd, spent_usd
 from expcore.campaign.store import Store
 from expcore.config.models import Limits, ModelSpec
 
@@ -106,9 +106,20 @@ class BudgetState:
 class BudgetGate:
     """Assess the budget before each dispatch; read the store afresh every time, keep nothing between assessments."""
 
-    def __init__(self, store: Store, models: Mapping[str, ModelSpec], budget: Budget, limits: Limits):
+    def __init__(
+        self,
+        store: Store,
+        models: Mapping[str, ModelSpec],
+        budget: Budget,
+        limits: Limits,
+        reply_capped: Collection[str] = (),
+    ):
         """Take the store, the plan's models, the ceilings and the caps every attempt runs under; refuse a priced model
-        with no context window, whose request past the token cap nothing bounds (C25)."""
+        with no context window, whose request past the token cap nothing bounds (C25).
+
+        `reply_capped` are the models this start of the campaign showed held to the reply maximum (C27); the store's
+        marks take a model off it for the rest of the campaign (`expcore.campaign.reply_cap`).
+        """
         windowless = [key for key, spec in models.items() if spec.price is not None and spec.context_tokens is None]
         if windowless:
             raise ValueError(
@@ -116,6 +127,7 @@ class BudgetGate:
                 "request a run makes past its token cap"
             )
         self.store, self.models, self.budget, self.limits = store, models, budget, limits
+        self.shown_capped = frozenset(reply_capped)
 
     # --- the ceilings and what has been released -------------------------------------------------------------------
 
@@ -172,10 +184,11 @@ class BudgetGate:
         `now` at full precision (fractional seconds), with which a stop that begins is dated.
         """
         holds, released = self._apply_releases(self._json(HOLDS_KEY), self._json(RELEASED_KEY), now)
-        costs = attempt_costs(self.store, self.models, self.limits)
+        capped = self.capped()
+        costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped)
         spent = spent_usd(costs)
-        reserve = {m: self._reserve(m) for m in self.models}
-        estimate = {m: self._estimate(m, costs) for m in self.models}
+        reserve = {m: self._reserve(m, capped) for m in self.models}
+        estimate = {m: self._estimate(m, costs, capped) for m in self.models}
         flying = {m: sum(1 for x in in_flight if x == m) for m in self.models}
         found: dict[str, list[Hold]] = {}
         over: dict[str, str] = {}
@@ -189,7 +202,7 @@ class BudgetGate:
             {m: tuple(v) for m, v in found.items()}, spent, reserve, self.ceiling(ALL, released) or 0.0, estimate
         )
 
-    def refusal(self, model: str, in_flight: Sequence[str], extra_usd: float) -> str | None:
+    def refusal(self, model: str, in_flight: Sequence[str], extra_usd: float, label: str = "this top-up") -> str | None:
         """Tell why `extra_usd` more for a run of `model` already in flight would not fit, or None when it would (C26).
 
         The figure is the assessment's (what was spent, top-ups included, and the reservations of the runs in flight,
@@ -198,25 +211,35 @@ class BudgetGate:
         either. A total that is unknown refuses too.
         """
         released = self._json(RELEASED_KEY)
-        costs = attempt_costs(self.store, self.models, self.limits)
+        capped = self.capped()
+        costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped)
         spent = spent_usd(costs)
-        reserve = {m: self._reserve(m) for m in self.models}
+        reserve = {m: self._reserve(m, capped) for m in self.models}
         flying = {m: sum(1 for x in in_flight if x == m) for m in self.models}
-        holds = self._holds_of(model, self.models[model], costs, spent, reserve, flying, released, extra_usd)
+        holds = self._holds_of(model, self.models[model], costs, spent, reserve, flying, released, extra_usd, label)
         return "; ".join(h.reason for h in holds) if holds else None
 
-    def _reserve(self, model: str) -> float | None:
+    def capped(self) -> frozenset[str]:
+        """The models whose runs are reserved by the reply maximum now: shown at this start and not taken off since."""
+        marks = reply_cap.unheld(self.store)
+        return frozenset(m for m in self.shown_capped if not reply_cap.is_unheld(marks, m))
+
+    def request_bound(self, model: str) -> float | None:
+        """What one request of the model can cost now: the bound of a top-up (C26); None when unpriced."""
+        return request_bound_usd(self.models[model], self.limits, reply_capped=model in self.capped())
+
+    def _reserve(self, model: str, capped: Collection[str]) -> float | None:
         """Return what one pending or running run of the model is reserved: its bound, always; None if unpriced."""
         spec = self.models[model]
-        return bound_usd(spec, self.limits) if spec.priced else None
+        return bound_usd(spec, self.limits, reply_capped=model in capped) if spec.priced else None
 
-    def _estimate(self, model: str, costs: list) -> float | None:
+    def _estimate(self, model: str, costs: list, capped: Collection[str]) -> float | None:
         """Return what one more run of the model is expected to cost, for reports: its mean, else its bound."""
         spec = self.models[model]
         if not spec.priced:
             return None
         mean = mean_run_usd(self.store, costs, model)
-        return mean if mean is not None else bound_usd(spec, self.limits)
+        return mean if mean is not None else bound_usd(spec, self.limits, reply_capped=model in capped)
 
     def _holds_of(
         self,
@@ -228,6 +251,7 @@ class BudgetGate:
         flying: Mapping[str, int],
         released: Mapping[str, float],
         topup: float | None = None,
+        label: str = "this top-up",
     ) -> list[Hold]:
         """Return the holds on one model: the unknown ones first, then each ceiling its next run would pass, or, with
         `topup`, each ceiling that top-up of a run in flight would pass."""
@@ -239,7 +263,7 @@ class BudgetGate:
         if any(reserve[m] is None for m, n in flying.items() if n):
             return [Hold(ALL, "a run in flight is of a model without a price: the total is unknown", False)]
         mine = reserve[model] if topup is None else topup
-        what = "this run" if topup is None else "this top-up"
+        what = "this run" if topup is None else label
         out = []
         cap = self.ceiling(model, released)
         if cap is not None:

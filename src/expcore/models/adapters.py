@@ -38,6 +38,9 @@ from expcore.models.served import Served, requested_from_sent
 from expcore.models.usage import UsageTally, token_count
 
 PROBE_PROMPT = "ping"
+# The probe of the reply maximum (C27): a request that asks for a reply far longer than the max_tokens it carries.
+REPLY_CAP_PROBE_TOKENS = 16
+REPLY_CAP_PROMPT = "Count from 1 to 500, one number per line, and write nothing else."
 # Stop reasons that mean the reply was cut at the output limit: OpenAI-compatible "length", Anthropic "max_tokens".
 OUTPUT_LIMIT_STOPS = frozenset({"length", "max_tokens"})
 
@@ -64,12 +67,13 @@ class ToolResult:
 
 @dataclasses.dataclass(frozen=True)
 class ProbeReply:
-    """What the reply to an admission probe reported: the max_tokens the request carried and the reply's usage, a
-    count the reply left out being None (B07)."""
+    """What the reply to an admission probe reported: the max_tokens the request carried, the reply's usage, a count
+    the reply left out being None (B07), and the provider's stop reason, when read (C27)."""
 
     max_tokens: int
     input_tokens: int | None
     output_tokens: int | None
+    stop_reason: str | None = None
 
 
 @dataclasses.dataclass
@@ -377,6 +381,23 @@ class OpenAICompatAdapter(_SdkBackend):
         usage = getattr(resp, "usage", None)  # reported, never tallied: the probe is no part of a run
         return ProbeReply(1, token_count(usage, "prompt_tokens"), token_count(usage, "completion_tokens"))
 
+    async def probe_reply_cap(self) -> ProbeReply:
+        """Ask for a long reply under a small max_tokens, with the vendor extras, and return what came back (C27)."""
+        kw: dict[str, Any] = {
+            "model": self.spec.api_id,
+            "messages": [{"role": "user", "content": REPLY_CAP_PROMPT}],
+            "max_tokens": REPLY_CAP_PROBE_TOKENS,
+        }
+        if extra := self._extra_body():
+            kw["extra_body"] = extra
+        resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
+        choices = getattr(resp, "choices", None)
+        if not choices:
+            raise InfraError("endpoint", "the probe of the reply maximum carried no choices")
+        usage = getattr(resp, "usage", None)
+        counts = token_count(usage, "prompt_tokens"), token_count(usage, "completion_tokens")
+        return ProbeReply(REPLY_CAP_PROBE_TOKENS, *counts, getattr(choices[0], "finish_reason", None))
+
     def _wire_messages(self) -> list[dict]:
         """The conversation as sent: the internal copy of the reasoning is stripped."""
         return [{k: v for k, v in m.items() if k != "_reasoning"} for m in self._messages]
@@ -541,6 +562,20 @@ class AnthropicAdapter(_SdkBackend):
         if not isinstance(getattr(resp, "content", None), (list, tuple)):
             raise InfraError("endpoint", "the one-token completion carried no content blocks")
         return ProbeReply(1, *_anthropic_counts(getattr(resp, "usage", None)))
+
+    async def probe_reply_cap(self) -> ProbeReply:
+        """Ask for a long reply under a small max_tokens, without the vendor extras as the probe above, and return what
+        came back (C27)."""
+        kw = {
+            "model": self.spec.api_id,
+            "messages": [{"role": "user", "content": REPLY_CAP_PROMPT}],
+            "max_tokens": REPLY_CAP_PROBE_TOKENS,
+        }
+        resp, _ = await self.retrier.call(lambda: self._client.messages.create(**kw))
+        if not isinstance(getattr(resp, "content", None), (list, tuple)):
+            raise InfraError("endpoint", "the probe of the reply maximum carried no content blocks")
+        counts = _anthropic_counts(getattr(resp, "usage", None))
+        return ProbeReply(REPLY_CAP_PROBE_TOKENS, *counts, getattr(resp, "stop_reason", None))
 
     def transcript(self) -> list[dict]:
         """Return the conversation with the system prompt first; on the wire it travels as a separate parameter."""
