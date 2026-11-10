@@ -179,6 +179,19 @@ def tools_sha256(specs: Sequence[ToolSpec]) -> str  # expcore.study.plugin
 
 `tools_sha256` is the SHA-256 of a tool set: each tool's name, description, `input_schema` and `terminal` flag, in name order. A study gives one per condition as `StudyPlugin.tools`, over the specs its executor passes to `record_run` under that condition, and it goes into the campaign fingerprint: a changed description or schema, an added tool or a changed `terminal` flag refuses a resume (C06). It does not see a name clash, which shows at the first run as above. It is not the hash a record carries. `RunRecord.prompt["tools_sha256"]` is the tool box's, taken over the descriptions as the model saw them, each with the output-cap sentence appended, so it also changes with `output_cap_chars` (L06). The core compares neither with the other, nor the declared hash with the tools the executor then passes: the plugin guarantees that the hash describes what the model sees under the condition.
 
+### Two tool hashes
+
+Two hashes describe a run's tools, over different text, so they differ even for the same tools, by design:
+
+| Hash | What it covers | Where it goes |
+|---|---|---|
+| `expcore.study.plugin.tools_sha256(specs)` | the tools as the study declares them: each `ToolSpec`'s name, description, input schema and terminal flag, in name order | the plugin's `StudyPlugin.tools`, one per condition, which the campaign fingerprint holds (C06) |
+| `ToolBox.manifest_sha256` (`expcore.loop.toolbox`) | the definitions the model is sent: each tool's name, input schema and description with the output-cap sentence the tool box appends (`describe_cap`, which states `output_cap_chars`), plus each tool's terminal flag, which the model is not told | the record, as `prompt.tools_sha256` despite its name; the replay check rebuilds the tool box from the record's `tools` and the cap and refuses a record whose hash differs (R03) |
+
+The record also keeps `tools`, each tool as its provider gave it, before the cap sentence: exactly what `tools_sha256` hashes. The cap itself is in the fingerprint through the loop's caps, so neither hash leaves it unguarded.
+
+To check that conditions differ only in which tools they expose, compare `tools_sha256` values: the plugin's per condition before the runs (conditions meant to differ only in tools have equal `prompts` hashes and different `tools` hashes), and, after them, the hash recomputed from each record's `tools` (`tools_sha256([ToolSpec(**t) for t in record.tools])`) against the plugin's hash for the run's condition, which shows that the executor exposed what the plugin declared. That value does not depend on the output cap, so it compares across campaigns too. The records' `prompt.tools_sha256` values may be compared with each other within one campaign, where every run has the same cap, but never with a `tools_sha256`. An MCP server's frozen manifest has a third hash, `FrozenManifest.sha256` ([below](#the-frozen-manifest)), over the server's own tool listing.
+
 ### McpToolProvider
 
 A study or platform whose tools come from an MCP server speaks to it through `McpToolProvider`, one server session per run over stdio. The Onedata layer builds it for its tool server (`SandboxPlatform.tool_server`); any other platform builds it the same way.

@@ -332,6 +332,20 @@ assert relay["treatment_outcomes"] == "scored" and relay["pairs_missing"]["treat
 assert relay["n_pairs"] == 8  # both treatment attempts stay in their own contrast
 ```
 
+### Which tool hash to compare
+
+Two hashes describe a run's tools. `tools_sha256`, which the plugin computes for each condition from the tools it declares (their names, descriptions, schemas and terminal flags), is what the campaign fingerprint holds. The record's `prompt.tools_sha256` holds the other, `ToolBox.manifest_sha256`: the definitions the model was sent, whose descriptions end with the sentence that states the output cap, and the terminal flags. They differ for the same tools, by design. To check that conditions differ only in which tools they expose, compare `tools_sha256` values: the plugin's for each condition, and the one recomputed from a record's `tools`, which the record keeps as declared, before the cap sentence ([two tool hashes](interfaces.md#two-tool-hashes)).
+
+```python
+from expcore.plugin import ToolSpec
+from expcore.study.plugin import StudyContext, load_plugin, tools_sha256
+
+plugin = load_plugin(StudyContext(study, {}))
+exposed = tools_sha256([ToolSpec(**tool) for tool in record.tools])  # the treated run's tools, as declared
+assert exposed == plugin.tools["relay-down"] == plugin.tools["baseline"] != plugin.tools["extended"]
+assert record.prompt["tools_sha256"] != exposed  # what the model was sent: the cap sentence in each description
+```
+
 ### How pairs become a contrast's input
 
 What a contrast estimates is decided by how its pairs are combined, in stages of plain means:
