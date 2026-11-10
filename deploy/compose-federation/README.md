@@ -86,3 +86,8 @@ uv run python -m expcore_onedata.day0 /mnt/volume2/expcore-federation/platform.t
 
 The sandbox tests (`EXPCORE_LIVE_DOCKER`) start containers and networks of their own, outside this project, so they
 are not run against it here.
+
+`day0/` holds the dated reports: the day-0 checks' own (`day0-<UTC>.md` and `.json`) and the facts they do not
+measure (`<date>-federation-facts.md`): releases, live test results, the fault test, what listens on the host, the
+commands' timings and what is unknown. `measure_partial_file.py` measures how a file at its final size with only a
+prefix written reads back through each provider; its commands and results are in the facts file.
