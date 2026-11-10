@@ -13,9 +13,12 @@ author who asks to see them on their own terminal (`python -m expcore package --
 ever prints that mapping.
 """
 
+import argparse
 import hashlib
 import re
+import sys
 from collections.abc import Callable, Iterable
+from typing import NoReturn
 
 from expcore.provenance.candidates import MAX_CANDIDATE_CHARS, token_hash
 from expcore.provenance.hashfile import Hashes
@@ -37,6 +40,26 @@ def _standing_alone(label: str) -> re.Pattern[str]:
     before = r"(?<![\w.\-])" if _RUN.fullmatch(label[0]) else ""
     after = r"(?![\w\-])(?!\.\w)" if _RUN.fullmatch(label[-1]) else ""
     return re.compile(before + re.escape(label) + after)
+
+
+class QuietParser(argparse.ArgumentParser):
+    """A command-line parser whose errors never repeat what was typed.
+
+    argparse names an unrecognised argument, or a value it refuses, in its error, and it parses before any list is
+    loaded that could hide it: a private name typed in the wrong place, a path or a map entry pasted as an argument,
+    would be printed as it is. This parser prints its usage line and one fixed sentence instead, and exits with 2 as
+    argparse does. Its subcommands are parsers of the same kind.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        """Print the usage and a fixed sentence; `message`, which may quote the command line, is never shown."""
+        del message
+        self.print_usage(sys.stderr)
+        self.exit(
+            2,
+            f"{self.prog}: error: the command line is not one this command takes (an unknown argument, a missing or "
+            "an extra one, or a value it does not accept); what was typed is not repeated, see --help\n",
+        )
 
 
 def hidden_name(label: str) -> str:

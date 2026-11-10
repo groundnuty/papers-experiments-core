@@ -35,6 +35,7 @@ from expcore.config.loading import ConfigError
 from expcore.package.build import build_package, verify_package
 from expcore.package.spec import PackageError
 from expcore.provenance.codestamp import CodeVersionUnknown
+from expcore.provenance.redact import QuietParser
 from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified
 from expcore.report import summary_lines
 from expcore.study.example import ExampleError, write_example
@@ -64,7 +65,7 @@ _REFUSALS = (
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command line parser."""
-    parser = argparse.ArgumentParser(prog="python -m expcore", description=__doc__.split("\n\n")[0])
+    parser = QuietParser(prog="python -m expcore", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
     for name, target, text in (
         ("run", "study", "a study directory"),

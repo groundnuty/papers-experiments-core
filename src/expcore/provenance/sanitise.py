@@ -27,7 +27,7 @@ from expcore.provenance.headers import (
     split_lines,
     strip_header,
 )
-from expcore.provenance.redact import Redactor
+from expcore.provenance.redact import QuietParser, Redactor
 from expcore.provenance.sanitise_map import Entry, MapError, load_map, matches_on_components
 from expcore.provenance.scanner import (
     FSTRING_END_TYPES,
@@ -326,7 +326,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command line parser."""
-    parser = argparse.ArgumentParser(prog="python -m expcore.provenance.sanitise", description=__doc__)
+    parser = QuietParser(prog="python -m expcore.provenance.sanitise", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     imp = sub.add_parser("import", help="sanitise SRC into DEST with a provenance header")
     imp.add_argument("--map", type=Path, required=True)

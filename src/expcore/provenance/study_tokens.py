@@ -45,6 +45,7 @@ from expcore.provenance.hashfile import (
     parse_plain_list,
     render_hash_file,
 )
+from expcore.provenance.redact import QuietParser
 from expcore.provenance.scanner import Finding, scan_message, scan_source
 
 __all__ = [
@@ -238,7 +239,7 @@ def _cmd_check_commits(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command line parser."""
-    parser = argparse.ArgumentParser(prog="python -m expcore.provenance.study_tokens", description=__doc__)
+    parser = QuietParser(prog="python -m expcore.provenance.study_tokens", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     hash_cmd = sub.add_parser("hash", help="print the hash file for a plain token list")
     hash_cmd.add_argument("plain_list", type=Path)

@@ -21,7 +21,7 @@ from pathlib import Path
 from expcore.provenance.gitobjects import GitError, read_blob, run_git
 from expcore.provenance.hashfile import hashes_from_tokens
 from expcore.provenance.headers import HeaderError, read_header, strip_header
-from expcore.provenance.redact import Redactor
+from expcore.provenance.redact import QuietParser, Redactor
 from expcore.provenance.sanitise import SanitiseError, sanitise_checked
 from expcore.provenance.sanitise_map import TokenMap, load_map
 from expcore.provenance.study_tokens import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK
@@ -179,7 +179,7 @@ def verify_history(core: Path, sources: Mapping[str, Path], token_map: TokenMap,
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command line parser."""
-    parser = argparse.ArgumentParser(prog="python -m expcore.provenance.history", description=__doc__.split("\n\n")[0])
+    parser = QuietParser(prog="python -m expcore.provenance.history", description=__doc__.split("\n\n")[0])
     parser.add_argument("--map", type=Path, required=True, help="the private sanitising map the imports were made with")
     parser.add_argument(
         "--source-repos",

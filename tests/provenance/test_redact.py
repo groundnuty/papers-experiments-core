@@ -3,6 +3,10 @@ term is shown, a hidden label keeps one name everywhere, and the mapping is only
 
 import hashlib
 
+import pytest
+
+from expcore import cli
+from expcore.provenance import history, sanitise, study_tokens
 from expcore.provenance.hashfile import hashes_from_tokens
 from expcore.provenance.redact import WITHHELD, Redactor, hidden_name
 
@@ -73,3 +77,43 @@ def test_k05_a_name_already_handed_out_is_replaced_wherever_a_message_repeats_it
     path = f"{PRIVATE}-home/study/x.txt"
     shown = seen.name(path)
     assert seen.scrub(f"the file '{path}' (untracked)") == f"the file '{shown}' (untracked)"
+
+
+@pytest.mark.parametrize(
+    ("main", "argv"),
+    [
+        (history.main, ["--map", "map.toml", f"--{PRIVATE}-home"]),
+        (history.main, ["--map", "map.toml", f"/data/{PRIVATE}/extra"]),
+        (sanitise.main, [PRIVATE]),
+        (sanitise.main, ["verify", "--map", "m", "--source", "s", "--module", "d", f"--{PRIVATE}=1"]),
+        (study_tokens.main, [f"{PRIVATE}-check"]),
+        (study_tokens.main, ["check-commits", "HEAD", f"--{PRIVATE}"]),
+    ],
+)
+def test_p07_a_command_line_a_provenance_command_does_not_take_is_refused_without_repeating_it(main, argv, capsys):
+    """P07: argparse parses before any list is loaded and names an unrecognised argument or a refused value in its
+    error; the provenance commands print their usage and a fixed sentence instead, and exit with 2."""
+    with pytest.raises(SystemExit) as stopped:
+        main(argv)
+    assert stopped.value.code == 2
+    err = capsys.readouterr().err
+    assert "usage:" in err
+    assert "what was typed is not repeated" in err
+    assert PRIVATE not in err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["package", "study", "--out", "dist", f"--{PRIVATE}"],
+        ["package-check", "package", f"{PRIVATE}/notes.txt"],
+        [PRIVATE],
+    ],
+)
+def test_k05_a_command_line_the_package_commands_do_not_take_is_refused_without_repeating_it(argv, capsys):
+    """K05: the package commands' parser never repeats an argument it refuses, which could be a private name typed in
+    the wrong place; it prints the usage and a fixed sentence, and the command exits with the usage status."""
+    assert cli.main(argv) == 2
+    err = capsys.readouterr().err
+    assert "usage:" in err
+    assert PRIVATE not in err
