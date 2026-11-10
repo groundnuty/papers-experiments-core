@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 from expcore.campaign.lease import Lease
 from expcore.campaign.markers import AttemptResult
-from expcore.config.models import Limits, ModelSpec
+from expcore.config.models import Limits, ModelSpec, ModelTable
 from expcore.errors import InfraError
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome, harness_defect_of
@@ -83,6 +83,8 @@ class RunRequest:
     - `treatment_kinds`: the infrastructure kinds the run's condition declares as its treatment. The record must carry
       exactly these, or the store refuses the result.
     - `lease`: the lease the platform's resources require, held for the whole attempt; None without one.
+    - `models`: the study's whole model table. `record_run` records with it, so the key of every model is redacted
+      whatever the backend: the protocol does not require a backend to hold its model entry (R12).
     """
 
     identity: RunIdentity
@@ -93,6 +95,7 @@ class RunRequest:
     clock: Callable[[], float]
     treatment_kinds: tuple[str, ...]
     lease: Lease | None = None
+    models: ModelTable | None = None
 
     @property
     def run_key(self) -> str:
@@ -124,8 +127,8 @@ async def record_run(
 ) -> RunRecord:
     """Run the attempt through the loop with the request's backend, timer and treatment kinds, and return the record.
 
-    The way an executor calls `record_attempt`: it cannot forget the treatment kinds, which the store checks, or build
-    a backend of its own.
+    The way an executor calls `record_attempt`: it cannot forget the treatment kinds, which the store checks, or the
+    model table the keys are redacted from, or build a backend of its own.
     """
     return await record_attempt(
         request.backend,
@@ -138,7 +141,7 @@ async def record_run(
         treatment_kinds=request.treatment_kinds,
         timer=request.timer,
         clock=request.clock,
-        **options,
+        **{"models": request.models, **options},
     )
 
 

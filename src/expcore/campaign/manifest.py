@@ -141,6 +141,7 @@ def build_fingerprint(
     scorer_digest: str,
     configs: Mapping[str, str],
     platform: Mapping[str, Any] | None = None,
+    backend_factory: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return the fingerprint of an experiment.
 
@@ -156,6 +157,8 @@ def build_fingerprint(
     - `platform`: the settings the platform says make two starts one experiment, as plain data without a secret (the
       Onedata layer's is its TLS mode and CA bundle hash, `PlatformConfig.fingerprint`). It is a section only when
       given and not empty, so a study without a platform keeps the fingerprint it had; no change to it is growth.
+    - `backend_factory`: the name and version of the factory a study's plugin builds its backends with. It is a section
+      only when given, so a study on the core's factory keeps the fingerprint it had; no change to it is growth.
     """
     if not isinstance(scorer_digest, str) or not _HEX64.fullmatch(scorer_digest):
         raise PlanError("fingerprint scorer_digest must be a 64-character lower-case hex digest")
@@ -179,6 +182,8 @@ def build_fingerprint(
     }
     if platform:
         fingerprint["platform"] = _plain("platform", platform)
+    if backend_factory:
+        fingerprint["backend_factory"] = _plain("backend_factory", backend_factory)
     return json.loads(json.dumps(fingerprint, sort_keys=True, allow_nan=False))
 
 

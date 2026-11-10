@@ -16,17 +16,21 @@ import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
-from expcore.campaign.executor import RunExecutor
+from expcore.campaign.executor import BackendFactory, RunExecutor
 from expcore.campaign.healthgate import HealthCheck
 from expcore.campaign.lease import ResourceProbe
-from expcore.config.loading import ConfigError
+from expcore.config.loading import ConfigError, Section
+from expcore.config.models import BACKENDS
 from expcore.plugin import ToolSpec
 from expcore.records.rescore import Scorer, scorer_name, scorer_version
 from expcore.study.config import StudyConfig
 
 BUILD = "build"
+PLUGIN_MODULE_PREFIX = "expcore_study_plugin_"  # the rest of a plugin's module name is a hash of its path
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,12 @@ class StudyPlugin:
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
       Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash). They go into the campaign
       fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
+    - `backend_factory`: builds the backend of every model, for admission and for each run, in place of the core's
+      `default_backend_factory`; None keeps the core's. A model whose backend the core does not build
+      (`config.models.BACKENDS`) needs one, and the factory decides which models it serves: it hands the others to
+      `default_backend_factory`. It must have a `version` attribute, a non-empty string: the factory's name and version
+      go into the campaign fingerprint, so a resume under another factory or version is refused (C06). Code in the
+      study directory is covered by the code identity as well; the version speaks for a factory in an installed package.
     """
 
     executor: RunExecutor
@@ -67,11 +77,26 @@ class StudyPlugin:
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
     platform: Mapping[str, Any] = field(default_factory=dict)
+    backend_factory: BackendFactory | None = None
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
         entries = sorted([scorer_name(s), scorer_version(s)] for s in self.scorers)
         return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def backend_factory_identity(self) -> dict[str, str] | None:
+        """The factory's name and version for the campaign fingerprint; None when the plugin supplies no factory.
+
+        The name is qualified by its module, except that a factory in the plugin file goes by its name alone: a
+        plugin's module name holds the path of the study directory, and moving a study is not another experiment.
+        """
+        factory = self.backend_factory
+        if factory is None:
+            return None
+        named = factory if hasattr(factory, "__qualname__") else type(factory)
+        module = str(named.__module__)
+        name = named.__qualname__ if module.startswith(PLUGIN_MODULE_PREFIX) else f"{module}.{named.__qualname__}"
+        return {"name": name, "version": factory.version}
 
 
 def tools_sha256(specs: Sequence[ToolSpec]) -> str:
@@ -84,10 +109,15 @@ def tools_sha256(specs: Sequence[ToolSpec]) -> str:
     return hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def load_plugin(context: StudyContext) -> StudyPlugin:
-    """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve."""
-    file = context.study.plugin_file
-    module_name = f"expcore_study_plugin_{hashlib.sha256(str(file).encode()).hexdigest()[:12]}"
+def import_plugin_module(file: Path, *, error_text: bool = True) -> ModuleType:
+    """Import the study's plugin module from its file, running its top level, and return it; ConfigError if it cannot.
+
+    `build` is not called, so no model or key is read. What the module registers when imported, the native parser of a
+    backend of the study's own, is then there for a step that needs nothing else of the plugin: the replay check. That
+    step passes `error_text=False`, so a refusal names the file and the exception's type and never its text, which can
+    hold a credential.
+    """
+    module_name = f"{PLUGIN_MODULE_PREFIX}{hashlib.sha256(str(file).encode()).hexdigest()[:12]}"
     spec = importlib.util.spec_from_file_location(module_name, file)
     if spec is None or spec.loader is None:
         raise ConfigError(f"{file}: cannot be loaded as a Python module")
@@ -97,7 +127,16 @@ def load_plugin(context: StudyContext) -> StudyPlugin:
         spec.loader.exec_module(module)
     except Exception as error:
         del sys.modules[module_name]
+        if not error_text:
+            raise ConfigError(f"{file}: failed on import ({type(error).__name__})") from None
         raise ConfigError(f"{file}: failed on import ({type(error).__name__}: {error})") from error
+    return module
+
+
+def load_plugin(context: StudyContext) -> StudyPlugin:
+    """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve."""
+    file = context.study.plugin_file
+    module = import_plugin_module(file)
     build = getattr(module, BUILD, None)
     if not callable(build):
         raise ConfigError(f"{file}: must define a function {BUILD}(context) that returns a StudyPlugin")
@@ -109,7 +148,8 @@ def load_plugin(context: StudyContext) -> StudyPlugin:
 
 
 def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
-    """Refuse a plugin that does not cover the study: a scorer twice, a condition without a prompt or tool hash."""
+    """Refuse a plugin that does not cover the study: a scorer twice, a condition without a prompt or tool hash, a
+    model whose backend nothing can build."""
     names = [scorer_name(s) for s in plugin.scorers]
     if not names or len(set(names)) != len(names):
         raise ConfigError(f"{file}: the plugin needs at least one scorer, and their names must differ: {names}")
@@ -120,3 +160,24 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
     if not isinstance(plugin.platform, Mapping):
         kind = type(plugin.platform).__name__
         raise ConfigError(f"{file}: the plugin's platform must be a mapping of plain data, not a {kind}")
+    if plugin.backend_factory is None:
+        _check_backends(study)
+    else:
+        version = getattr(plugin.backend_factory, "version", None)
+        if not isinstance(version, str) or not version.strip():
+            raise ConfigError(
+                f"{file}: the plugin's backend_factory needs a 'version' attribute, a non-empty string, for the "
+                "campaign fingerprint; change it whenever the factory's behaviour changes"
+            )
+
+
+def _check_backends(study: StudyConfig) -> None:
+    """Without a factory of the plugin's, every model of the table must name a backend the core builds."""
+    for key in study.models:
+        spec = study.models.resolve(key)
+        if not spec.core_backend:
+            raise Section({}, study.models.source, f"[models.{key}]").fail(
+                "backend",
+                f"names {spec.backend!r}, a backend the core does not build ({', '.join(BACKENDS)}); the plugin "
+                "must supply a backend_factory that serves it",
+            )

@@ -47,15 +47,17 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from expcore.config.loading import ConfigError
+from expcore.errors import infra_kinds
 from expcore.provenance.codestamp import UNKNOWN, CodeScope, CodeVersionUnknown, require_known
 from expcore.provenance.codestamp import version as code_version
 from expcore.records.record import RunRecord, decode
 from expcore.records.redact import redact_text
 from expcore.records.schema import SCHEMA_PREFIX, SCHEMAS, RecordError, SchemaVersion
 from expcore.replay.divergence import ReplayDivergence
+from expcore.replay.native import has_native_parser
 from expcore.replay.replay import replay_record
 
 CHECK_SCHEMA = "replay-check/1"
@@ -153,6 +155,48 @@ def input_files(batch: Path, hashed_only: Sequence[str] = ()) -> tuple[list[str]
         elif path.suffix == ".json":
             records.append(rel)
     return sorted(records), sorted(hashed)
+
+
+class RecordNeeds(NamedTuple):
+    """What the records of a batch name that this process cannot read yet, each list sorted."""
+
+    backends: list[str]  # backends with no native parser registered
+    kinds: list[str]  # infrastructure kinds outside the vocabulary
+
+
+def _kinds_named(data: Mapping[str, Any]) -> set[str]:
+    """The infrastructure kinds a record names: what its condition declared, and what its outcome and request ended in."""
+    declared = data.get("treatment_kinds")
+    named = list(declared) if isinstance(declared, list) else []
+    for section in ("outcome", "failed_request"):
+        part = data.get(section)
+        if isinstance(part, Mapping):
+            named.append(part.get("infra_kind"))
+    return {kind for kind in named if isinstance(kind, str)}
+
+
+def what_records_need(batch: Path, hashed_only: Sequence[str] = ()) -> RecordNeeds:
+    """Return the backends and the infrastructure kinds the records of a batch name that this process cannot read.
+
+    Nothing here runs a record or a study's code, so a caller can decide what to import before anything is replayed. A
+    file that does not parse, or a field that is not what it should be, is left for the check to report.
+    """
+    backends: set[str] = set()
+    kinds: set[str] = set()
+    for rel in input_files(batch, hashed_only)[0]:
+        try:
+            data = json.loads((batch / rel).read_bytes())
+            route = data.get("route")
+        except (AttributeError, RecursionError, ValueError):  # not JSON, or not an object: the check says so
+            continue
+        backend = route.get("backend") if isinstance(route, Mapping) else None
+        if isinstance(backend, str):
+            backends.add(backend)
+        kinds |= _kinds_named(data)
+    return RecordNeeds(
+        sorted(backend for backend in backends if not has_native_parser(backend)),
+        sorted(kinds - set(infra_kinds())),
+    )
 
 
 def inputs_sha256(hashes: Mapping[str, str]) -> str:

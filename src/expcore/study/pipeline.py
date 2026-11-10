@@ -10,7 +10,10 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
-  store with attempts still running unless `partial`, which the check records.
+  store with attempts still running unless `partial`, which the check records. It reads only the study's `[study]`
+  table and imports nothing, unless a record needs it, and says so first: a kind still unknown imports the modules
+  `[study] platforms` names, and a backend no native parser is registered for also imports the plugin module, so
+  what is registered there is known in a new process. `build` is not called, so no model or key is needed.
 - `analyse_study` refuses unless the batch has a current passing check (R04, R05), and writes nothing. It then uses
   only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once and compared
   with the check's hash, cross-validated against each other. It exports from the snapshot, scores the records in
@@ -29,6 +32,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -36,28 +40,45 @@ from pathlib import Path
 from typing import Any
 
 from expcore.accounting import condition_accounting
+from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import build_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore, scorer_name, scorer_version
-from expcore.replay.check import BatchNotVerified, require_current_check, verify_batch, write_check
+from expcore.replay.check import (
+    BatchNotVerified,
+    require_current_check,
+    verify_batch,
+    what_records_need,
+    write_check,
+)
+from expcore.replay.native import has_native_parser
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
-from expcore.study.config import StudyConfig, find_study_root, load_study
-from expcore.study.plugin import StudyContext, StudyPlugin, load_plugin
+from expcore.study.config import (
+    StudyConfig,
+    StudyIdentity,
+    find_study_root,
+    import_platforms,
+    load_study,
+    read_study_identity,
+)
+from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.verified import UNCOVERED, Unverified, load_verified
 
 OUT_DIR = "out"
 RUNS_DIR = "runs"
 MARKER_PATTERN = "*attempt-marker.json"
+HASHED_ONLY = (MARKER_PATTERN, SNAPSHOT_FILE)  # the campaign's own bookkeeping in a batch: hashed, never replayed
 EXPORT_FILE = "export.json"
 SCORES_FILE = "scores.json"
 ANALYSIS_FILE = "analysis.json"
@@ -84,7 +105,7 @@ class StudyAnalysis:
     scorers: Mapping[str, str]  # the version of each scorer that scored the records, by name
 
 
-def out_dir(study: StudyConfig) -> Path:
+def out_dir(study: StudyConfig | StudyIdentity) -> Path:
     """The directory a study writes to."""
     return study.root / OUT_DIR
 
@@ -94,7 +115,12 @@ def _digest(value: Any) -> str:
 
 
 def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
-    """The campaign fingerprint: what makes two starts one experiment (C06), from the study and its plugin."""
+    """The campaign fingerprint: what makes two starts one experiment (C06), from the study and its plugin.
+
+    A plugin's `backend_factory` enters as its name and its `version`. Code that lives in the study directory is
+    already covered by the code identity every record carries; the version is what speaks for a factory that lives
+    in an installed package, and it changes when the factory's behaviour does.
+    """
     return build_fingerprint(
         study.schema,
         tasks={task.id: _digest(dict(task.attributes)) for task in study.tasks.values()},
@@ -106,6 +132,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
         scorer_digest=plugin.scorer_digest(),
         configs=study.config_sha256,
         platform=plugin.platform,
+        backend_factory=plugin.backend_factory_identity(),
     )
 
 
@@ -120,10 +147,22 @@ def run_study(
 
     Refuses code that cannot be vouched for (unknown, stale, or dirty unless `allow_dirty`). The scheduler returns when
     no run is in flight and every pending run is held by something that will not end by itself (a budget, a stop):
-    a command line has no one to release it. `crash_hook` is the scheduler's own test seam for killing the process at
-    a chosen point of an attempt.
+    a command line has no one to release it. Every backend is built by the plugin's `backend_factory`, or the core's
+    when it supplies none. `crash_hook` is the scheduler's own test seam for killing the process at a chosen point of
+    an attempt.
     """
     study = load_study(path)
+    with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
+        return _run_campaign(study, allow_dirty, code_root, crash_hook)
+
+
+def _run_campaign(
+    study: StudyConfig,
+    allow_dirty: bool,
+    code_root: str | os.PathLike[str] | None,
+    crash_hook: Callable[[str, str], None] | None,
+) -> RunSummary:
+    """Run the campaign of a loaded study, with its own infrastructure kinds in scope."""
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
     plugin = load_plugin(StudyContext(study, code))
     out = out_dir(study)
@@ -143,6 +182,7 @@ def run_study(
         health=plugin.health,
         leases=leases,
         lease_group=plugin.lease_group,
+        backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
         **options,
     ) as scheduler:
         return scheduler.run()
@@ -163,19 +203,61 @@ def check_batch(
     it instead of the live store. A store with attempts still running is refused unless `partial`; the check records
     how many were running and that a partial snapshot was asked for.
     """
-    study = load_study(find_study_root(study_root if study_root is not None else batch))
+    study = read_study_identity(find_study_root(study_root if study_root is not None else batch))
+    with study_kinds(study.kinds):  # a replayed record may end in one of the study's own kinds
+        return _check_batch_of(study, batch, allow_dirty, code_root, partial)
+
+
+def _check_batch_of(
+    study: StudyIdentity,
+    batch: str | os.PathLike[str],
+    allow_dirty: bool,
+    code_root: str | os.PathLike[str] | None,
+    partial: bool,
+) -> dict[str, Any]:
+    """Snapshot the store and replay the batch of a study, with its own infrastructure kinds in scope."""
     code = require_known("replay check", code_root or study.root, study.scope, allow_dirty=allow_dirty)
     directory = Path(batch)
     if not directory.is_dir():
         raise Refused(f"{directory}: no batch of records here; run the study first")
+    _import_what_the_records_need(study, directory)
     try:
         running = take_snapshot(out_dir(study) / STATE_FILE, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
         raise Refused(str(error)) from None
-    check = verify_batch(directory, code=code, hashed_only=[MARKER_PATTERN, SNAPSHOT_FILE])
+    check = verify_batch(directory, code=code, hashed_only=list(HASHED_ONLY))
     check[SNAPSHOT_KEY] = {"file": SNAPSHOT_FILE, "attempts_running": running, "partial": partial}
     write_check(directory, check)
     return check
+
+
+def _import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
+    """Import only what a record of the batch cannot be read without, and say so first.
+
+    The study's own kinds are in scope already, read as data. A record that names a kind still unknown imports the
+    modules `[study] platforms` names, installed code the study declares, and not the plugin; a kind still unknown after
+    that fails its record. A record that names a backend no parser is registered for also imports the plugin, whose
+    code is the study's own. A batch that needs neither imports nothing.
+    """
+    needs = what_records_need(batch, HASHED_ONLY)
+    if needs.kinds and study.platforms:
+        print(
+            f"check: importing the study's platforms ({', '.join(study.platforms)}) to read the records of "
+            f"infrastructure kind {', '.join(map(repr, needs.kinds))}; this runs those modules",
+            file=sys.stderr,
+        )
+        import_platforms(study.study_file, study.platforms)
+    unread = [backend for backend in needs.backends if not has_native_parser(backend)]  # a platform may have added it
+    if not unread:
+        return
+    names = ", ".join(map(repr, unread))
+    print(
+        f"check: importing the study's platforms and plugin ({study.plugin_file.name}) to read the records of backend "
+        f"{names}; this runs the study's code",
+        file=sys.stderr,
+    )
+    import_platforms(study.study_file, study.platforms)
+    import_plugin_module(study.plugin_file, error_text=False)
 
 
 def _json_text(data: Any) -> str:
@@ -250,6 +332,18 @@ def analyse_study(
     the study and never from a repository around it, as in a replication package.
     """
     study = load_study(path)
+    with study_kinds(study.kinds):  # the snapshot's attempts and the records may end in one of the study's own kinds
+        return _analyse_loaded(study, allow_dirty, code_root, partial, stamped)
+
+
+def _analyse_loaded(
+    study: StudyConfig,
+    allow_dirty: bool,
+    code_root: str | os.PathLike[str] | None,
+    partial: bool,
+    stamped: bool,
+) -> StudyAnalysis:
+    """Analyse the records of a loaded study, with its own infrastructure kinds in scope."""
     out = out_dir(study)
     batch = out / RUNS_DIR
     if not batch.is_dir():

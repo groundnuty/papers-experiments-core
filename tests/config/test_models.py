@@ -179,7 +179,10 @@ def test_b08_status_other_than_frozen_or_draft_is_refused_at_load(tmp_path):
         ({"base_url": "https://user:pw@llm.example.invalid/v1"}, "must not carry credentials"),
         ({"backend": "stub", "base_url": "https://llm.example.invalid"}, "a stub model takes no base_url"),
         ({"backend": "stub", "base_url": None, "sampling": {"temperature": 0}}, "stub model takes no sampling"),
-        ({"backend": "gateway"}, "backend must be one of openai_compat, anthropic, stub"),
+        ({"backend": "Gate way"}, "backend must be one of openai_compat, anthropic, stub, or the plain lower-case"),
+        ({"backend": "toy_relay", "base_url": "ftp://x.invalid"}, "base_url must be an http or https URL"),
+        ({"backend": "toy_relay", "key_env": "A", "key_file": "/f"}, "key_env or key_file, not both"),
+        ({"backend": "toy_relay", "echo_reasoning_field": "x"}, "echo_reasoning_field applies to openai_compat"),
         ({"key": "bad key"}, "key must be letters, digits"),
         ({"api_id": " "}, "api_id must not be empty"),
     ],
@@ -188,6 +191,16 @@ def test_b16_an_incompatible_combination_is_refused_at_configuration(overrides, 
     """B16: each incompatible per-model rule raises when the entry is built, before any request can exist."""
     with pytest.raises(RuleViolation, match=message):
         spec(**overrides)
+
+
+def test_b16_a_backend_of_the_study_s_own_is_an_entry_the_core_does_not_build_and_needs_no_url():
+    """B16: a plain lower-case backend name the core does not know is accepted at the entry, without a URL, so the
+    study's plugin can serve it; the core's rules for its own adapters do not apply, and the plugin is refused at load
+    without a factory (tests/study/test_backend_factory.py)."""
+    own = spec(backend="toy_relay", base_url=None, sampling={"temperature": 0})
+    assert (own.backend, own.core_backend, own.seed_supported) == ("toy_relay", False, False)
+    assert spec().core_backend
+    assert spec(backend="stub", base_url=None).core_backend
 
 
 def test_b16_all_broken_rules_of_an_entry_are_reported_together():

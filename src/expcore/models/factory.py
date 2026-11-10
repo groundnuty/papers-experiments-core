@@ -50,8 +50,14 @@ def build_backend(
     before anything is built, let alone sent (B08). A pilot passes False. `base_url` overrides the entry's, for a
     campaign whose admitted endpoint is the one a run must use (C14). `script` is the stub's list of turns.
     An Anthropic thinking budget that is not below the effective output limit, the lower of the study's cap and
-    the entry's own, raises before anything is built (B16).
+    the entry's own, raises before anything is built (B16). A backend of the study's own is refused: only the
+    plugin's factory can build it, and it is never sent as if it were one of the core's.
     """
+    if not spec.core_backend:
+        raise ConfigError(
+            f"model {spec.key!r}: the core builds no backend {spec.backend!r}; the study's plugin must supply a "
+            "backend_factory that serves it"
+        )
     if require_frozen:
         assert_frozen(spec)
     refuse_unsendable_thinking(spec, limits)

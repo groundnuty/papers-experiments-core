@@ -29,7 +29,7 @@ agent. When a condition's manipulation is the fault itself (a provider that is d
 looks healthy would remove the effect being measured. Under such a condition an attempt that ends as infrastructure
 of a listed kind is a scored final attempt: the store marks it as treatment, never runs it again and does not charge
 it against the infrastructure limit. Other kinds under the same condition are set aside and run again as usual. The
-kinds are checked against the registry in `expcore.errors` (the core's kinds and any a platform registered), and
+kinds are checked against the registry in `expcore.errors` (the core's, a platform's, a study's own), and
 the declaration is part of the schema, so changing it between a start and a resume is refused (C06). A kind the
 registry marks as not treatable (`tool_plane_integrity` and any a platform registered so) is refused when the
 schema is loaded, naming the file and the key: a run that failed an integrity check of the harness says nothing about
@@ -60,7 +60,7 @@ from typing import Any
 from urllib.parse import quote
 
 from expcore.config.loading import Section, load_toml
-from expcore.errors import infra_kinds, is_treatable, untreatable_kinds
+from expcore.errors import vocabulary
 
 BUILTIN_FACTORS = ("task", "model", "seed")
 TREATMENT_KEY = "infrastructure_is_treatment"
@@ -206,6 +206,7 @@ class FactorSchema:
     def _check_treatment(self, declared: Mapping[str, Sequence[str]]) -> dict[str, tuple[str, ...]]:
         """Check each declared treatment against the registry of kinds; return every condition's sorted kinds."""
         out: dict[str, tuple[str, ...]] = dict.fromkeys(self.conditions, ())
+        known, untreatable = vocabulary()  # one view for the whole schema: a scope leaving cannot split two reads
         for name, kinds in declared.items():
             if name not in self.conditions:
                 raise Section({}, self.file, "[conditions]").fail(name, f"declares {TREATMENT_KEY} but is no condition")
@@ -214,16 +215,18 @@ class FactorSchema:
             if not all(isinstance(k, str) and k for k in kinds):
                 raise where.fail(TREATMENT_KEY, "must be an array of infrastructure kinds")
             for kind in kinds:
-                if kind not in infra_kinds():
+                if kind not in known:
+                    treatable = [k for k in known if k not in untreatable]
                     raise where.fail(
                         TREATMENT_KEY,
-                        f"names unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}",
+                        f"names unknown infrastructure kind {kind!r}; treatable kinds: {', '.join(treatable)}; "
+                        "a platform's kinds are known once study.toml lists its module in [study] platforms, and a "
+                        "study declares its own in [study.kinds]",
                     )
-                if not is_treatable(kind):
+                if kind in untreatable:
                     raise where.fail(
                         TREATMENT_KEY,
-                        f"names infrastructure kind {kind!r}, which can never be a treatment: "
-                        f"{untreatable_kinds()[kind]}",
+                        f"names infrastructure kind {kind!r}, which can never be a treatment: {untreatable[kind]}",
                     )
             repeated = sorted({k for k in kinds if kinds.count(k) > 1})
             if repeated:

@@ -28,6 +28,7 @@ The study directory holds four configuration files and one Python file, the plug
 | `prompts`, `tools` | per condition, the SHA-256 of its prompt template and of its tool manifest; both go into the campaign fingerprint | from `PromptTemplate` and `tools_sha256` |
 | tools | `ToolProvider`s the executor passes to `record_run`: plain functions through `FunctionProvider`, or an MCP server through `McpToolProvider` | `lookup` and `submit` |
 | `health`, `probe`, `lease_group`, `lease_keys` | the platform's health check, resource probe and leases; the Onedata layer supplies real ones | stubs that always succeed |
+| `backend_factory` | optional: a `BackendFactory` that builds the backend of every model, for a study with a model backend of its own. Its model entries name that backend in `models.toml` with a plain lower-case `backend` value; the factory serves those and hands every other model to the core's `default_backend_factory`. It carries a `version` attribute that goes into the campaign fingerprint with its name. Without a factory, such a model is refused when the plugin is loaded | none: the core's factory builds the stub |
 
 The plugin names everything; the core names nothing. What each interface guarantees, and what you must guarantee in return (an executor never builds a backend, a scorer never reads the platform), is in [`interfaces.md`](interfaces.md).
 
@@ -37,7 +38,7 @@ All configuration is TOML in the study directory, validated when the study is lo
 
 | File | Holds |
 |---|---|
-| `study.toml` | the study's name, its plugin, the code identity's scope, the factors, the conditions and the tasks |
+| `study.toml` | the study's name, its plugin, the code identity's scope, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the factors, the conditions and the tasks |
 | `models.toml` | the single model table: each model once, with backend, API id, sampling, limits, price and status |
 | `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the budget |
 | `preregistration.toml` | the named contrasts, the Holm family, alpha, the estimators, the bootstrap and the power settings |
@@ -155,6 +156,22 @@ except ConfigError as error:
 shutil.rmtree(tampered)
 ```
 
+A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run. A kind named nowhere is refused as unknown, and the error lists the treatable kinds.
+
+```python
+from expcore.errors import infra_kinds
+
+own = Path("own-kind-study")
+shutil.copytree("my-study", own)
+toml = own / "study.toml"
+declared = '"prompt.txt"]\n\n[study.kinds]\nrelay_restart = { description = "the relay restarted", treatable = true }\n'
+text = toml.read_text().replace('"prompt.txt"]\n', declared, 1)
+toml.write_text(text.replace('["knowledge"]', '["relay_restart"]'))
+assert load_study(own).schema.treatment_kinds["relay-down"] == ("relay_restart",)
+assert "relay_restart" not in infra_kinds()  # the kind lasts only while its study is loaded or run
+shutil.rmtree(own)
+```
+
 ## 4. Run, record and check
 
 ```sh
@@ -165,6 +182,8 @@ uv run python -m expcore check my-study/out/runs
 `run` opens the campaign or resumes it: a killed run is settled and the plan finishes, and it exits 3 if runs are left pending, held by the budget or a stop. Every attempt writes one record under `my-study/out/runs/<digest>/try<N>/`: the route and the settings actually sent, the prompt and the tool manifest, the agent configuration as resolved, every model turn and tool call with what the model saw and what was raw, every clock reading, the outcome from a closed vocabulary, and the code identity. Secrets are redacted before writing.
 
 `check` is the replay check. It loads every record, writes it back, and replays it: the real loop runs again with every model turn, tool result and clock reading served from the record, and must re-derive the transcript, the tool-call log and the outcome byte for byte, with no model and no platform. It copies the campaign store beside the records and hashes the copy with them. Analysis refuses a batch without a current passing check, so a record edited, added or removed after the check, or code changed since, makes `analyze` and `report` refuse until the check is run again. A campaign with attempts still running is refused unless `--partial`, and every output then says that it is partial and lists what was left out.
+
+`check` reads only the `[study]` table of `study.toml`. A batch recorded entirely with the core's backends, whose infrastructure kinds are the core's or declared in `[study.kinds]`, imports nothing from the study, so checking it runs none of the study's code. Checking a batch can import the platforms it names: a record that names a kind still unknown makes `check` print one line and import the modules in `[study] platforms`, which are installed code the study declares, and not the plugin; a kind still unknown after that fails its record. A record of a backend the core has no parser for needs the parser the study registers, so `check` prints one line saying so and also imports the plugin module: checking such a batch runs the plugin's code, so check it only if you trust the study. It does not call `build`, so it needs no model and no key. A module that cannot be imported is refused, naming the module and the exception's type.
 
 The check is stored beside the records, with the code identity it was made under and the hash of every input:
 

@@ -214,7 +214,15 @@ class AttemptRunner:
         )
         begun, run_dir = self._begin(row, lease)
         request = RunRequest(
-            RunIdentity(key, factors, begun.number), run_dir, endpoint, backend, timer, p.monotonic, kinds, lease
+            RunIdentity(key, factors, begun.number),
+            run_dir,
+            endpoint,
+            backend,
+            timer,
+            p.monotonic,
+            kinds,
+            lease,
+            p.models,
         )
 
         async def go() -> Any:

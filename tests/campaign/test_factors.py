@@ -253,7 +253,21 @@ def test_c02_an_unknown_infrastructure_kind_is_refused_naming_file_and_key(tmp_p
     message = str(caught.value)
     assert message.startswith(f"{path}: [conditions.api-none]: key 'infrastructure_is_treatment'")
     assert "unknown infrastructure kind 'wifi'" in message
-    assert "known kinds: endpoint" in message
+    assert "treatable kinds: endpoint" in message
+
+
+def test_c02_the_kinds_an_unknown_kind_error_offers_are_the_treatable_ones(tmp_path, registry):
+    """C02: the choices listed are the kinds a condition may declare; a kind that can never be a treatment, the core's
+    or a platform's, is not offered, and the error says how a platform's or a study's own kind becomes known."""
+    errors.register_infra_kind("provider_tampered", "a provider whose state was changed", treatable=False)
+    errors.register_infra_kind("provider_down", "a provider that is down")
+    path = write_study(tmp_path, TREATMENT_TOML.replace('"sandbox", "endpoint"', '"wifi"'))
+    with pytest.raises(ConfigError) as caught:
+        load_factor_schema(path)
+    offered = str(caught.value).split("treatable kinds: ", 1)[1].split(";", 1)[0].split(", ")
+    assert offered == [k for k in errors.infra_kinds() if k not in ("tool_plane_integrity", "provider_tampered")]
+    assert "[study] platforms" in str(caught.value)
+    assert "[study.kinds]" in str(caught.value)
 
 
 def test_c02_a_kind_a_platform_registered_is_accepted_and_refused_before_it_is(tmp_path, registry):
@@ -427,3 +441,15 @@ def test_o05_a_schema_built_in_code_refuses_an_untreatable_kind_too(registry):
     """O05: the check is the schema's, not the loader's."""
     with pytest.raises(ConfigError, match="can never be a treatment"):
         treatment_schema(("tool_plane_integrity",))
+
+
+def test_c02_a_conditions_treatment_kinds_are_checked_against_one_view_of_the_vocabulary(
+    tmp_path, registry, monkeypatch
+):
+    """C02: the kinds and their treatability are read together, once for the whole schema, so a study scope leaving
+    between two reads cannot let an untreatable kind through as a treatment."""
+    views = []
+    real = errors._view
+    monkeypatch.setattr(errors, "_view", lambda: views.append(1) or real())
+    load_factor_schema(write_study(tmp_path, TREATMENT_TOML))
+    assert len(views) == 1

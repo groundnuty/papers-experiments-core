@@ -12,7 +12,7 @@ from typing import Any
 from expcore.campaign.executor import RunRequest, record_run
 from expcore.campaign.healthgate import Health
 from expcore.errors import InfraError
-from expcore.models.adapters import ModelTurn, StubAdapter, ToolCall
+from expcore.models.adapters import ModelTurn, ToolCall
 from expcore.plugin import CallContext, ToolOutput, ToolSpec
 from expcore.prompt.templates import PromptTemplate
 from expcore.records.record import RunRecord
@@ -161,8 +161,8 @@ class TinyExecutor:
         study, factors = self.context.study, request.identity.factors
         condition = study.schema.condition_named(factors, request.run_key)
         backend = request.backend  # built by the scheduler from the admitted endpoint; never build one here
-        if not isinstance(backend, StubAdapter):
-            raise TypeError("the tiny study runs on stub models only")
+        if not callable(getattr(backend, "use", None)):  # the method this executor needs, whatever class serves it
+            raise TypeError("the tiny study needs a scripted backend, one with use(script), as the stub has")
         backend.use(script_for(condition, factors["task"], factors["model"], factors["tools"]))
         user = self.template.render({"TASK": factors["task"], "HINT": HINTS[factors["tools"]]}, study_run=True)
         record = await record_run(

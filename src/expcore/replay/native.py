@@ -115,6 +115,11 @@ def register_native_parser(backend: str, parser: NativeParser) -> None:
     _PARSERS[backend] = parser
 
 
+def has_native_parser(backend: str) -> bool:
+    """Tell whether a parser for the native messages of the named backend is registered in this process."""
+    return backend in _PARSERS
+
+
 def neutral_of(backend: object, native: dict[str, Any], malformed: Sequence[bool] = ()) -> dict[str, Any] | None:
     """Return the neutral turn a native message of the named backend stands for, or None if no parser is registered.
 
