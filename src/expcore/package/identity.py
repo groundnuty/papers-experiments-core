@@ -274,7 +274,7 @@ def hidden_identity(
     return frozenset(commit[:PREFIX_DIGITS] for commit in commits), forms
 
 
-def _commit_lines(text: str, prefixes: frozenset[str]) -> set[int]:
+def commit_lines(text: str, prefixes: frozenset[str]) -> set[int]:
     lines = set()
     for run in _HEX_RUN.finditer(text):
         digits = run.group(0).lower()
@@ -283,7 +283,7 @@ def _commit_lines(text: str, prefixes: frozenset[str]) -> set[int]:
     return lines
 
 
-def _url_lines(text: str, forms: frozenset[str]) -> set[int]:
+def url_lines(text: str, forms: frozenset[str]) -> set[int]:
     lowered = text.lower()
     return {lowered.count("\n", 0, m.start()) + 1 for form in forms for m in re.finditer(re.escape(form), lowered)}
 
@@ -297,11 +297,11 @@ def find_identity(
         if name in opaque:
             continue
         for stream in streams(name, files[name])[0]:
-            held = _commit_lines(stream.label, prefixes) or _url_lines(stream.label, forms)
+            held = commit_lines(stream.label, prefixes) or url_lines(stream.label, forms)
             shown = hidden_name(position, stream.label) if held else stream.label
             if held:
                 findings.add(f"{shown}: the path holds {FOUND_COMMIT} or URL")
             for _, text in views(stream):
-                findings |= {f"{shown}:{line}: {FOUND_COMMIT}" for line in _commit_lines(text, prefixes)}
-                findings |= {f"{shown}:{line}: {FOUND_URL}" for line in _url_lines(text, forms)}
+                findings |= {f"{shown}:{line}: {FOUND_COMMIT}" for line in commit_lines(text, prefixes)}
+                findings |= {f"{shown}:{line}: {FOUND_URL}" for line in url_lines(text, forms)}
     return sorted(findings)

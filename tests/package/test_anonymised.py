@@ -4,15 +4,17 @@ The campaign runs once per module with the core's source reported as a version-c
 reach every place an environment is recorded; a real one in these tests is editable and has neither.
 """
 
+import io
 import json
 import sqlite3
 import subprocess
 import sys
 import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
-from package_support import stand_in_vendor
+from package_support import stand_in_vendor, wheel_of
 from study_support import HEAD, Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
 from expcore.package import build as package_build
@@ -226,13 +228,55 @@ def test_k11_the_core_wheel_is_searched_for_the_identity_too(campaign, hashes, a
     def naming_the_url(distributions, supplied=None):
         out = []
         for wheel in stand_in_vendor(distributions):
-            data = wheel.data.replace(b"Metadata-Version", f"Home: {CORE_URL}\nMetadata-Version".encode(), 1)
-            out.append(Wheel(wheel.name, wheel.version, wheel.filename, data, wheel.scanned))
+            if wheel.name == CORE_DISTRIBUTION:
+                filename, data = wheel_of(
+                    wheel.name, wheel.version, {"expcore/home.py": f"HOME = '{CORE_URL}'\n".encode()}
+                )
+                wheel = Wheel(wheel.name, wheel.version, filename, data, wheel.from_index)
+            out.append(wheel)
         return out
 
     root = copy_campaign(campaign, tmp_path, "copy").root
     with pytest.raises(PackageError, match=r"papers_experiments_core-.*whl.*a source URL"):
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation, vendor=naming_the_url)
+
+
+def test_k11_a_core_installed_from_an_index_with_a_listed_authors_name_is_refused(
+    campaign, hashes, anonymisation, tmp_path
+):
+    """K11: a wheel is read whatever it was installed from, so a core from an index (or a private one) that names a
+    listed author in its metadata refuses the anonymised build; a wheel that carries a direct_url.json, which names a
+    URL and a commit, is refused too."""
+
+    def index_core(distributions, supplied=None):
+        out = []
+        for wheel in stand_in_vendor(distributions):
+            if wheel.name == CORE_DISTRIBUTION:
+                notice = {"expcore/__init__.py": f'"""The core, by {AUTHOR}."""\n'.encode()}
+                filename, data = wheel_of(wheel.name, wheel.version, notice)
+                wheel = Wheel(wheel.name, wheel.version, filename, data, from_index=True)
+            out.append(wheel)
+        return out
+
+    def with_direct_url(distributions, supplied=None):
+        out = []
+        for wheel in stand_in_vendor(distributions):
+            if wheel.name == "numpy":
+                buffer = io.BytesIO(wheel.data)
+                with zipfile.ZipFile(buffer, "a") as archive:
+                    archive.writestr(f"numpy-{wheel.version}.dist-info/direct_url.json", '{"url": "https://x.example"}')
+                wheel = Wheel(wheel.name, wheel.version, wheel.filename, buffer.getvalue(), from_index=True)
+            out.append(wheel)
+        return out
+
+    root = copy_campaign(campaign, tmp_path, "copy").root
+    with pytest.raises(
+        PackageError, match=r"papers_experiments_core-[^/]+\.whl/expcore/__init__\.py:1: a term"
+    ) as refused:
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation, vendor=index_core)
+    assert AUTHOR not in str(refused.value)
+    with pytest.raises(PackageError, match=r"direct_url\.json: names where the distribution came from"):
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation, vendor=with_direct_url)
 
 
 def test_the_core_itself_names_no_repository_url_in_what_it_ships():

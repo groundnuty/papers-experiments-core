@@ -21,9 +21,8 @@
    everywhere (hosts, addresses, users, spaces, providers: the `all` scope): a study's own condition, dataset or model
    names belong in its own package. Both checks fail closed: a file goes in only if they can read all of it (text,
    SQLite databases and archives of them, `views`); anything else is refused, unless package.toml attests that exact
-   file by its SHA-256 with a reason (`[[opaque]]`), and then it goes in unread. A wheel of a distribution installed
-   from an index is a public release, attested by name, version and hash, and goes in unread; the core's wheel and
-   every other one are read like any file;
+   file by its SHA-256 with a reason (`[[opaque]]`), and then it goes in unread. Every text member of every wheel is
+   read too, and every member that is not text is attested by its hash and listed in PACKAGE.json (`wheelscan`);
 7. lay the package out in a scratch directory and run its check there, with this interpreter: every file against
    `SHA256SUMS`, the environment against the check's, then the four outputs derived anew from the records and
    compared byte for byte (K07);
@@ -57,9 +56,10 @@ from expcore.package.identity import (
     verify_inputs,
 )
 from expcore.package.leaks import default_hashes, findings_in, private_hashes, scan_tokens
-from expcore.package.spec import PackageError, PackageSpec, load_spec, select
+from expcore.package.spec import WHEELS_DIR, PackageError, PackageSpec, load_spec, select
 from expcore.package.tracking import Tracking, note_tracking
 from expcore.package.wheels import REQUIREMENTS, Vendor, Wheel, makefile, requirements, vendor_wheels
+from expcore.package.wheelscan import scan_wheels
 from expcore.provenance.codestamp import STAMP, covered_files, is_sha
 from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_environment
 from expcore.provenance.gitobjects import GitError, run_git
@@ -150,6 +150,7 @@ def _package_json(
     state: Tracking,
     *,
     rewritten_identity: bool,
+    binaries: Mapping[str, list[dict[str, str]]],
 ) -> bytes:
     data = {
         "format": PACKAGE_FORMAT,
@@ -165,7 +166,8 @@ def _package_json(
         "checked_at": check.get("checked_at"),
         "environment": env,
         "wheels": [
-            {"file": w.path, "name": w.name, "version": w.version, "sha256": w.sha256, "scanned": w.scanned}
+            {"file": w.path, "name": w.name, "version": w.version, "sha256": w.sha256}
+            | {"read": "as it is" if w.from_index else "every view", "binaries": binaries[w.path]}
             | ({"uncompared": list(w.uncompared)} if w.uncompared else {})
             for w in sorted(wheels, key=lambda w: w.name)
         ],
@@ -186,12 +188,14 @@ def _package_json(
 def _attested(spec: PackageSpec, files: Mapping[str, bytes]) -> frozenset[str]:
     """The files package.toml attests by hash, each checked to be exactly the attested bytes."""
     for path, entry in sorted(spec.opaque.items()):
+        if path.startswith(f"{WHEELS_DIR}/"):
+            continue  # a member of a vendored wheel, checked when the wheels are read (`wheelscan`)
         if hashlib.sha256(files[path]).hexdigest() != entry.sha256:
             raise PackageError(
                 f"{path}: its SHA-256 is not the one [[opaque]] attests in {spec.source}; inspect the file again and "
                 "attest its new hash, or leave it out"
             )
-    return frozenset(spec.opaque)
+    return frozenset(path for path in spec.opaque if not path.startswith(f"{WHEELS_DIR}/"))
 
 
 def collect(
@@ -241,10 +245,22 @@ def collect(
     vendored = _wheels(env, vendor, wheels)
     files.update({wheel.path: wheel.data for wheel in vendored})
     files[REQUIREMENTS] = requirements(vendored)
-    opaque |= {wheel.path for wheel in vendored if not wheel.scanned}  # public releases, attested by name and hash
+    opaque |= {wheel.path for wheel in vendored}  # read member by member below
+    tokens = private_hashes(default_hashes() if hashes is None else Path(hashes))
+    attested = {path: entry for path, entry in spec.opaque.items() if path.startswith(f"{WHEELS_DIR}/")}
+    read = scan_wheels(vendored, tokens, terms=terms, hidden=(hidden_commits, hidden_urls), attested=attested)
     files["Makefile"] = makefile(env)
     files[PACKAGE_FILE] = _package_json(
-        spec, study, code, check, rewritten, env, vendored, state, rewritten_identity=terms is not None
+        spec,
+        study,
+        code,
+        check,
+        rewritten,
+        env,
+        vendored,
+        state,
+        rewritten_identity=terms is not None,
+        binaries=read.binaries,
     )
     files[STAMP] = stamp_bytes(
         files, study.root, study.scope, str(code["commit"]), str(check.get("checked_at")), out_dir
@@ -252,8 +268,7 @@ def collect(
     if json.loads(files[STAMP])["tree_sha256"] != code["tree_sha256"]:
         raise PackageError(f"{where}: the package's code is not the code the records were checked under")
     files[SUMS_FILE] = render_sums(files)
-    tokens = private_hashes(default_hashes() if hashes is None else Path(hashes))
-    findings = findings_in(files, tokens, terms, hidden_commits, hidden_urls, opaque)
+    findings = read.findings + findings_in(files, tokens, terms, hidden_commits, hidden_urls, opaque)
     if findings:
         raise PackageError("refusing to build the package:\n  " + "\n  ".join(findings))
     return spec, files

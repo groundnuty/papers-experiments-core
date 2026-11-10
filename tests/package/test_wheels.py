@@ -107,7 +107,7 @@ def test_k10_an_editable_install_is_refused_unless_the_author_supplies_its_wheel
     name, data = wheel_of("toy-platform", "2.0.0", CODE)
     (supplied / name).write_bytes(data)
     [wheel] = vendor_wheels({"toy-platform": "2.0.0"}, supplied)
-    assert (wheel.filename, wheel.data, wheel.scanned) == (name, data, True)
+    assert (wheel.filename, wheel.data, wheel.from_index) == (name, data, False)
     (supplied / name).write_bytes(stand_in("toy-platform", "9.9.9")[1])
     with pytest.raises(PackageError, match=r"does not name toy-platform 2\.0\.0"):
         supplied_wheel(supplied, "toy-platform", "2.0.0")
@@ -191,14 +191,15 @@ def test_k10_the_cores_own_wheel_built_from_this_checkout_matches_its_editable_i
     assert all(member.startswith("expcore/examples/tiny_study/") for member in uncompared)
 
 
-def test_k10_a_distribution_from_an_index_is_attested_and_one_from_a_direct_url_is_scanned(site, monkeypatch):
-    """K10: a public release (no direct_url.json) goes in unread, attested by hash; anything else is read."""
+def test_k10_a_wheel_says_whether_it_came_from_an_index_which_decides_how_deep_it_is_read(site, monkeypatch):
+    """K10: a wheel packed from an index install (no direct_url.json) is a release, read as it is; anything else is
+    the author's own code, read with every view the checks have."""
     public = installed_distribution(site, "numlib", "1.4.2", {"numlib.py": b"X = 1\n"})
     vcs = json.dumps({"url": "https://code.example.org/toy", "vcs_info": {"vcs": "git", "commit_id": "c" * 40}})
     own = installed_distribution(site, "toy-platform", "2.0.0", CODE, direct_url=vcs)
     monkeypatch.setattr(wheels_module, "installed", lambda: {"numlib": public, "toy-platform": own})
-    found = {w.name: w.scanned for w in vendor_wheels({"numlib": "1.4.2", "toy-platform": "2.0.0"})}
-    assert found == {"numlib": False, "toy-platform": True}
+    found = {w.name: w.from_index for w in vendor_wheels({"numlib": "1.4.2", "toy-platform": "2.0.0"})}
+    assert found == {"numlib": True, "toy-platform": False}
     with pytest.raises(PackageError, match="not installed here"):
         vendor_wheels({"numlib": "1.5.0"})
 
@@ -208,7 +209,7 @@ def test_k10_the_make_environment_target_installs_exactly_the_vendored_wheels_of
     (no index, hashes required), each wheel requirements.txt pins; an index the reader's pip is configured with is
     never asked."""
     name, data = repack(installed_distribution(site, "toy-platform", "2.0.0", CODE))
-    wheel = Wheel("toy-platform", "2.0.0", name, data, scanned=True)
+    wheel = Wheel("toy-platform", "2.0.0", name, data, from_index=False)
     package = tmp_path / "pkg"
     (package / "wheels").mkdir(parents=True)
     (package / wheel.path).write_bytes(wheel.data)
@@ -252,7 +253,7 @@ def test_k10_the_install_ignores_the_readers_pip_environment_and_configuration(s
     despite --no-index; the install runs isolated from both, so a requirement slipped in through either has no
     effect."""
     name, data = repack(installed_distribution(site, "toy-platform", "2.0.0", CODE))
-    wheel = Wheel("toy-platform", "2.0.0", name, data, scanned=True)
+    wheel = Wheel("toy-platform", "2.0.0", name, data, from_index=False)
     package = tmp_path / "pkg"
     (package / "wheels").mkdir(parents=True)
     (package / wheel.path).write_bytes(wheel.data)

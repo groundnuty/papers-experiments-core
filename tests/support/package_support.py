@@ -49,7 +49,7 @@ def wheel_of(name: str, version: str, files: Mapping[str, bytes]) -> tuple[str, 
 def stand_in_vendor(distributions: Mapping[str, str], supplied: Path | None = None) -> list[Wheel]:
     """Vendor a stand-in per distribution: the core's is read by the scans, as a direct-URL install's is."""
     return [
-        Wheel(name, version, *stand_in(name, version), scanned=name == CORE_DISTRIBUTION)
+        Wheel(name, version, *stand_in(name, version), from_index=name != CORE_DISTRIBUTION)
         for name, version in sorted(distributions.items())
     ]
 

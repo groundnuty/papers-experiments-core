@@ -28,7 +28,8 @@ it, having inspected it by hand:
     reason = "a figure drawn by hand; read page by page, no name in it"
 
 The build then includes that exact file unscanned, refuses it if its bytes no longer have that hash, and lists the
-attestation in PACKAGE.json.
+attestation in PACKAGE.json. A path under `wheels/` names a member of a vendored wheel instead,
+`wheels/<wheel file>/<member>`, which the build checks once the wheels are made (`wheelscan`).
 """
 
 import os
@@ -188,7 +189,7 @@ def select(root: Path, spec: PackageSpec) -> list[str]:
     empty = [pattern for pattern, count in hits.items() if not count]
     if empty:
         raise PackageError(f"{spec.source}: [package] include {empty[0]!r} selects no file")
-    stray = sorted(set(spec.opaque) - set(chosen))
+    stray = sorted(path for path in set(spec.opaque) - set(chosen) if not path.startswith(f"{WHEELS_DIR}/"))
     if stray:
         raise PackageError(f"{spec.source}: [[opaque]] attests {stray[0]}, which the package does not include")
     return chosen

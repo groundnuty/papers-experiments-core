@@ -7,16 +7,18 @@ vendors stand-in wheels (`package_support`); the make target that installs real 
 """
 
 import hashlib
+import io
 import json
 import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 import zlib
 from pathlib import Path
 
 import pytest
-from package_support import stand_in, stand_in_vendor
+from package_support import stand_in_vendor
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
 from expcore.cli import main
@@ -312,7 +314,8 @@ def test_k10_the_package_records_the_checks_environment_and_vendors_one_pinned_w
         assert hashlib.sha256(data).hexdigest() == wheel["sha256"]
         assert f"{name}=={wheel['version']} --hash=sha256:{wheel['sha256']}\n" in pins
         assert f"{wheel['sha256']}  {wheel['file']}\n" in sums
-        assert wheel["scanned"] == (name == CORE_DISTRIBUTION)
+        assert wheel["read"] == ("every view" if name == CORE_DISTRIBUTION else "as it is")
+        assert wheel["binaries"] == []  # a stand-in holds text only
     makefile = (root / "Makefile").read_text(encoding="utf-8")
     assert "--no-index" in makefile
     assert f"Python {package['environment']['python']}" in makefile
@@ -331,31 +334,55 @@ def test_k10_the_package_check_refuses_an_environment_other_than_the_one_it_name
     assert "`make -f Makefile check` installs it from wheels/" in problem
 
 
-def test_k10_the_cores_wheel_is_read_by_the_token_check_and_a_public_release_goes_in_attested(
+def with_member(wheel: Wheel, member: str, data: bytes) -> Wheel:
+    """The wheel with one more member."""
+    buffer = io.BytesIO(wheel.data)
+    with zipfile.ZipFile(buffer, "a") as archive:
+        archive.writestr(zipfile.ZipInfo(member, date_time=(1980, 1, 1, 0, 0, 0)), data)
+    return Wheel(wheel.name, wheel.version, wheel.filename, buffer.getvalue(), wheel.from_index)
+
+
+def test_k10_every_wheel_is_read_and_a_member_holding_a_private_name_is_refused_unless_attested(
     campaign, hashes, tmp_path
 ):
-    """K10: a wheel from a direct-URL install, the core's, is read like any file, so a private name in it refuses the
-    build; a public release's wheel goes in unread, listed as not scanned with its hash."""
+    """K10: the text of every wheel is read, a public release's included, so a private name in a library's module
+    refuses the build, naming the member and printing the attestation that would let it in once read by hand; a
+    member that is not text goes in attested by its hash, named in PACKAGE.json."""
+    note = f"# tuned on {PRIVATE}\n".encode()
 
-    def leaky(distributions, supplied=None):
-        wheels = stand_in_vendor(distributions)
-        core = next(w for w in wheels if w.name == CORE_DISTRIBUTION)
-        name, data = stand_in(core.name, core.version)
-        with_name = data.replace(b"Version: ", f"Summary: built on {PRIVATE}\nVersion: ".encode(), 1)
-        return [w if w is not core else Wheel(w.name, w.version, name, with_name, scanned=True) for w in wheels]
-
-    def public_leak(distributions, supplied=None):
+    def vendor(distributions, supplied=None):
         return [
-            Wheel(w.name, w.version, w.filename, w.data + PRIVATE.encode(), scanned=False) if w.name == "numpy" else w
+            with_member(with_member(w, "numpy/_tuning.py", note), "numpy/_core.so", b"\x7fELF\0binary")
+            if w.name == "numpy"
+            else w
             for w in stand_in_vendor(distributions)
         ]
 
-    with pytest.raises(PackageError, match=r"wheels/papers_experiments_core-.*\.whl") as refused:
-        build_package(a_copy(campaign, tmp_path / "a"), tmp_path / "dist-a", hashes=hashes, vendor=leaky)
+    with pytest.raises(PackageError, match=r"wheels/numpy-[^/]+\.whl/numpy/_tuning\.py:1 text") as refused:
+        build_package(a_copy(campaign, tmp_path / "a"), tmp_path / "dist-a", hashes=hashes, vendor=vendor)
     assert PRIVATE not in str(refused.value)
-    archive = build_package(a_copy(campaign, tmp_path / "b"), tmp_path / "dist-b", hashes=hashes, vendor=public_leak)
+    hint = next(line for line in str(refused.value).splitlines() if "[[opaque]] path" in line)
+    path, digest = hint.split('path = "')[1].split('"')[0], hint.split('sha256 = "')[1].split('"')[0]
+    assert digest == hashlib.sha256(note).hexdigest()
+    root = a_copy(campaign, tmp_path / "b")
+    attestation = f'\n[[opaque]]\npath = "{path}"\nsha256 = "{digest}"\nreason = "read by hand"\n'
+    (root / "package.toml").write_text((root / "package.toml").read_text(encoding="utf-8") + attestation, "utf-8")
+    archive = build_package(root, tmp_path / "dist-b", hashes=hashes, vendor=vendor)
     package = json.loads((unpack(archive, tmp_path / "unpacked") / PACKAGE_FILE).read_text(encoding="utf-8"))
-    assert {w["name"]: w["scanned"] for w in package["wheels"]}["numpy"] is False
+    numpy = next(w for w in package["wheels"] if w["name"] == "numpy")
+    assert numpy["binaries"] == [{"path": "numpy/_core.so", "sha256": hashlib.sha256(b"\x7fELF\0binary").hexdigest()}]
+    assert {"path": path, "sha256": digest, "reason": "read by hand"} in package["opaque"]
+
+
+def test_k10_an_attestation_of_a_wheel_member_that_no_wheel_holds_is_refused(campaign, hashes, tmp_path):
+    """K10: an attestation that names a member no vendored wheel holds would vouch for nothing, so it is refused."""
+    root = a_copy(campaign, tmp_path)
+    stray = (
+        f'\n[[opaque]]\npath = "wheels/absent-1.0-py3-none-any.whl/absent.py"\nsha256 = "{"0" * 64}"\nreason = "x"\n'
+    )
+    (root / "package.toml").write_text((root / "package.toml").read_text(encoding="utf-8") + stray, "utf-8")
+    with pytest.raises(PackageError, match=r"absent\.py: \[\[opaque\]\] attests a member no vendored wheel holds"):
+        build_package(root, tmp_path / "dist", hashes=hashes)
 
 
 def test_k10_a_build_under_another_environment_than_the_checks_is_refused(campaign, hashes, tmp_path, monkeypatch):

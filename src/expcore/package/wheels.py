@@ -26,10 +26,10 @@ Where a wheel comes from, for each distribution:
 - a distribution installed editable is refused: its installed files are a pointer to a checkout, not its code.
 
 A wheel is built for the platform and the Python of the build, as installed; the package says which, and a reader
-needs the same. A distribution installed from an index (no `direct_url.json`) is a public release: its wheel is
-attested by name, version and hash and goes in unscanned, like an `[[opaque]]` file, since a compiled extension is
-binary the scan refuses. Every other wheel, the core's and a study's own packages, can hold the author's names, so
-the package's checks read it like any other file.
+needs the same. Every text member of every wheel is read by the package's checks, and every other member (a
+compiled extension) is attested by its hash (`wheelscan`); `from_index` says whether the wheel was packed from an
+index install, a release whose text is read as it is, rather than the author's own code, which is read with every
+view the checks have.
 """
 
 import base64
@@ -87,13 +87,13 @@ _INSTALLER_RECORD = re.compile(r"(uv|pip)_[A-Za-z0-9_]*\.json")
 
 @dataclass(frozen=True)
 class Wheel:
-    """One vendored wheel: its distribution, its file name and bytes, and whether the package's checks read it."""
+    """One vendored wheel: its distribution, its file name and bytes, and whether it came from an index install."""
 
     name: str
     version: str
     filename: str
     data: bytes
-    scanned: bool
+    from_index: bool
     uncompared: tuple[str, ...] = ()  # members of a supplied wheel with no installed counterpart to compare
 
     @property
@@ -309,7 +309,8 @@ def vendor_wheels(distributions: Mapping[str, str], supplied: Path | None = None
         editable = bool(source and source.get("editable"))
         uncompared = compare_supplied(dist, editable, *given) if given is not None else ()
         filename, data = given or repack(dist)
-        wheels.append(Wheel(name, version, filename, data, scanned=source is not None, uncompared=uncompared))
+        from_index = source is None and given is None
+        wheels.append(Wheel(name, version, filename, data, from_index=from_index, uncompared=uncompared))
     return wheels
 
 
