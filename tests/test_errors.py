@@ -3,6 +3,7 @@
 import os
 import sys
 import threading
+import time
 import warnings
 
 import pytest
@@ -274,29 +275,27 @@ def test_o05_the_core_s_untreatable_kind_cannot_be_registered_again_as_treatable
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="the platform cannot fork")
-def test_c02_a_child_forked_while_another_thread_holds_the_kind_lock_can_still_enter_a_scope():
-    """C02: the thread holding the lock does not exist in a forked child, so the child must not inherit a lock no one
-    will release; it enters and leaves a scope and exits, rather than hanging."""
-    held, release = threading.Event(), threading.Event()
+def test_c02_a_fork_waits_for_a_change_to_the_kinds_under_way_and_the_child_starts_with_the_lock_free():
+    """C02: a fork never copies a half-made registration or scope change into the child: it waits for the change under
+    way to finish, and the child has a free lock of its own, so it cannot hang on one no thread will release."""
+    held = threading.Event()
 
-    def hold() -> None:
+    def change_under_way() -> None:
         with errors._scope_lock:
             held.set()
-            release.wait(5)
+            time.sleep(0.3)
 
-    holder = threading.Thread(target=hold)
+    holder = threading.Thread(target=change_under_way)
     holder.start()
     held.wait(5)
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)  # forking a threaded process: the point of the test
-            pid = os.fork()
-        if pid == 0:  # the child: entering a scope must not block; os._exit keeps pytest out of the child
-            done = threading.Event()
-            threading.Thread(target=lambda: (errors.study_kinds({}).__enter__(), done.set()), daemon=True).start()
-            os._exit(0 if done.wait(5) else 1)
-        _, status = os.waitpid(pid, 0)
-        assert os.waitstatus_to_exitcode(status) == 0
-    finally:
-        release.set()
-        holder.join(5)
+    started = time.monotonic()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)  # forking a threaded process: the point of the test
+        pid = os.fork()
+    if pid == 0:  # the child: its lock must be free; os._exit keeps pytest out of the child
+        os._exit(0 if errors._scope_lock.acquire(blocking=False) else 1)
+    waited = time.monotonic() - started
+    _, status = os.waitpid(pid, 0)
+    holder.join(5)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert waited >= 0.25  # the fork waited for the change to finish

@@ -76,15 +76,28 @@ class _HeldKind(NamedTuple):
 _scope_lock = threading.Lock()  # serialises every change to the study kinds in scope, and a platform's registration
 
 
+def _hold_lock_for_fork() -> None:
+    """Take the lock before a fork, so the child never copies a registration or a scope change half done. Nothing in
+    this module forks while it holds the lock, so the forking thread only waits for a change under way to finish."""
+    _scope_lock.acquire()
+
+
+def _release_lock_in_parent() -> None:
+    """Give the lock back in the parent once the fork is done."""
+    _scope_lock.release()
+
+
 def _fresh_lock_in_child() -> None:
-    """A forked child starts with the lock free: a thread that held it in the parent does not exist in the child, so the
-    lock it took would never be released. The kinds in scope are kept; the child's own scopes count from them."""
+    """A forked child starts with a free lock of its own rather than the copy its forking thread holds. The kinds in
+    scope are kept, whole; the child's own scopes count from them."""
     global _scope_lock
     _scope_lock = threading.Lock()
 
 
 if hasattr(os, "register_at_fork"):  # every platform the core supports; absent only where fork itself is
-    os.register_at_fork(after_in_child=_fresh_lock_in_child)
+    os.register_at_fork(
+        before=_hold_lock_for_fork, after_in_parent=_release_lock_in_parent, after_in_child=_fresh_lock_in_child
+    )
 _study_kinds: Mapping[str, _HeldKind] = {}  # the kinds in scope (`study_kinds`); replaced, never changed in place, so
 # a reader takes one consistent view without the lock
 
