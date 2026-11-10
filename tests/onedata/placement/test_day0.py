@@ -2,7 +2,9 @@
 
 import json
 
+import httpx
 import pytest
+from fake_federation import ZONE
 from placement_support import BETA_ID, with_placement
 from platform_support import write_platform
 
@@ -160,8 +162,53 @@ def test_read_only_enforcement_fails_when_a_write_is_accepted_and_the_write_is_r
     assert [n.name for n in fake.nodes.values() if n.name.startswith("day0-")] == []
 
 
+def refusing_the_gates_name_read(fake):
+    """A transport on which Onezone answers the gate's read of the space's name with 400 `badValueNotAllowed`, the
+    answer the gate's own lookup got on Onedata 25.0 when it asked for a path; everything else is the fake's."""
+
+    def handler(request):
+        if request.method == "GET" and request.url.path == f"{ZONE}/spaces/{fake.SPACE_ID}":
+            return httpx.Response(400, json={"error": {"id": "badValueNotAllowed", "details": {}}})
+        return fake.respond(request)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize("cause", ["the gate's lookup", "the space root"])
+def test_o08_a_write_that_was_never_sent_makes_read_only_unknown_because_the_probe_could_not_run(
+    context, platform, fake, cause
+):
+    """O08, O05: when the gate's own read of the target's space fails, or the space root cannot be read, no write is
+    sent, so nothing was refused or accepted. The check is unknown and says the probe could not run and no write was
+    sent, never that a write was not refused with a 401 or 403."""
+    options = {"allow_mutation": True}
+    if cause == "the gate's lookup":
+        options["client"] = OnezoneClient(load_config(platform), http=refusing_the_gates_name_read(fake))
+    else:
+        fake.statuses = [[f"/spaces/{fake.SPACE_ID}", 99, 503]]
+    entry = by_name(run_checks(context(**options), ["read_only"]))["read_only"]
+    assert entry.ok is None
+    assert "could not run" in entry.summary
+    assert "no write was sent" in entry.summary
+    assert "not refused" not in entry.summary
+    assert {row["sent"] for row in entry.facts["providers"].values()} == {False}
+    assert mutating_calls(fake) == []
+
+
+def test_o08_a_write_answered_neither_way_is_unknown_and_says_it_was_sent(context, fake):
+    """O08: a write that was sent and answered with neither an acceptance nor a 401 or 403 (here a 500) is unknown,
+    and the summary says the write was sent and how it was answered."""
+    fake.statuses = [["/children", 99, 500]]
+    entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
+    assert entry.ok is None
+    assert "was sent" in entry.summary
+    assert "(500 internalServerError)" in entry.summary
+    rows = entry.facts["providers"].values()
+    assert {(row["sent"], row["status"], row["code"]) for row in rows} == {(True, 500, "internalServerError")}
+
+
 def attribute_reads(fake):
-    """The reads of the scratch directory itself: a GET of its entry that is not the gate's read of its path."""
+    """The reads of the scratch directory itself: a GET of its entry that is not one of the gate's reads."""
     return [r for r in fake.requests if r.method == "GET" and "/fid-" in r.path and not r.query]
 
 

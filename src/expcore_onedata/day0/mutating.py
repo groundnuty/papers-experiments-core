@@ -17,11 +17,12 @@ import secrets
 from typing import Any
 
 from expcore_onedata import consistency
-from expcore_onedata.client import PlatformError
+from expcore_onedata.client import NotSent, PlatformError
 from expcore_onedata.day0.registry import Context, Result, failed, passed, register, unknown
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.rangemap import RangeRow
 from expcore_onedata.ranges import place_ranges
+from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import data_path_spec
 
 SCRATCH_BYTES = 8192
@@ -69,44 +70,82 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
     return {"cleaned": False, "cleanup_reason": reason}
 
 
+def _attempt_write(ctx: Context, name: str, token: str) -> dict[str, Any]:
+    """Send one write as the data-path token to a provider and say what became of it.
+
+    `sent` is False when nothing reached the provider: the space root could not be read, or the client's gate refused
+    the write or could not check it (`NotSent`), so the probe did not run there. A write that was sent is accepted
+    (`enforced` False, and removed again), refused with a 401 or 403 (`enforced` True), or neither (`enforced` None:
+    no answer, or another status, kept with Onedata's error id as `code`)."""
+    created: str | None = None
+    try:
+        root = consistency.space_root(ctx.client, name, ctx.config.space.id, tries=3, wait_s=1.0, sleep=ctx.sleep)
+    except PlatformError as error:
+        return {"enforced": None, "sent": False, "error": "the space root could not be read", "status": error.status}
+    try:
+        answer = ctx.client.mutate(
+            "POST",
+            f"/data/{root}/children",
+            provider=name,
+            params={"name": _scratch_name(), "type": "DIR"},
+            token=token,
+        )
+        created = answer.get("fileId") if isinstance(answer, dict) else None
+        row: dict[str, Any] = {"enforced": False, "sent": True, "status": "accepted"}
+    except NotSent as error:  # the gate's own refusal or failed lookup: no write reached the provider
+        row = {"enforced": None, "sent": False, "error": str(error)[:200]}
+    except PlatformError as error:
+        if error.transport or error.status is None:
+            row = {"enforced": None, "sent": True, "error": "no answer"}
+        else:
+            enforced = True if error.status in REFUSALS else None
+            row = {"enforced": enforced, "sent": True, "status": error.status, "code": error.code}
+    finally:
+        if created:  # the write was accepted: remove what it made, as the admin, and show that it is gone
+            row.update(_remove_and_verify(ctx, name, created))
+    return row
+
+
+def _answered(row: dict[str, Any]) -> str:
+    """How a sent write was answered, for a summary: its status and Onedata's error id, or that none came."""
+    if "status" not in row:
+        return str(row.get("error"))
+    return f"{row['status']} {row['code']}" if row.get("code") else str(row["status"])
+
+
 @register("read_only", "Read-only enforcement on each data path", mutates=True)
 def read_only(ctx: Context) -> Result:
-    """Send a write as the data-path token to each supporting provider; every one must refuse it."""
+    """Send a write as the data-path token to each supporting provider; every one must refuse it.
+
+    It passes only when every provider refused a write it was sent. A write that was never sent measured nothing, so
+    the probe could not run there and the check is unknown with that reason, never a refusal it could not read (O08)."""
     if not ctx.allow_mutation:
         return unknown(f"the write attempt {NEEDS_CONSENT}")
     if ctx.config.principals.data_path is None:
         return unknown("no fixed [principals] data-path user is declared, so no token can be minted")
-    space = ctx.config.space
-    token = ctx.issuer.mint(data_path_spec(space.id), ctx.config.principals.data_path, ceiling_s=ctx.ceiling_s)
-    rows: dict[str, Any] = {}
-    for name in ctx.config.support.providers:
-        created: str | None = None
-        try:
-            root = consistency.space_root(ctx.client, name, space.id, tries=3, wait_s=1.0, sleep=ctx.sleep)
-            try:
-                answer = ctx.client.mutate(
-                    "POST",
-                    f"/data/{root}/children",
-                    provider=name,
-                    params={"name": _scratch_name(), "type": "DIR"},
-                    token=token.reveal(),
-                )
-                created = answer.get("fileId") if isinstance(answer, dict) else None
-                rows[name] = {"enforced": False, "status": "accepted"}
-            except PlatformError as error:
-                if error.transport or error.status is None:
-                    rows[name] = {"enforced": None, "error": "no answer"}
-                else:
-                    rows[name] = {"enforced": True if error.status in REFUSALS else None, "status": error.status}
-        except PlatformError as error:
-            rows[name] = {"enforced": None, "error": "the space root could not be read", "status": error.status}
-        finally:
-            if created:  # the write was accepted: remove what it made, as the admin, and show that it is gone
-                rows[name].update(_remove_and_verify(ctx, name, created))
+    try:
+        token = ctx.issuer.mint(
+            data_path_spec(ctx.config.space.id), ctx.config.principals.data_path, ceiling_s=ctx.ceiling_s
+        )
+    except (TokenRefused, PlatformError) as error:
+        return unknown(f"the probe could not run: no data-path token was minted, so no write was sent ({error})"[:300])
+    rows = {name: _attempt_write(ctx, name, token.reveal()) for name in ctx.config.support.providers}
     if any(row["enforced"] is False for row in rows.values()):
         return failed("a write made with the read-only data-path token was ACCEPTED", providers=rows)
-    if any(row["enforced"] is None for row in rows.values()):
-        return unknown("a write was not refused with a 401 or 403, and its refusal could not be read", providers=rows)
+    unsent = [name for name, row in rows.items() if row["sent"] is False]
+    unanswered = [name for name, row in rows.items() if row["sent"] is True and row["enforced"] is None]
+    reasons = []
+    if unsent:
+        first = rows[unsent[0]]["error"]
+        reasons.append(f"the probe could not run on {', '.join(unsent)}: no write was sent ({first})")
+    if unanswered:
+        answers = sorted({_answered(rows[name]) for name in unanswered})
+        reasons.append(
+            f"a write was sent to {', '.join(unanswered)} and answered neither by acceptance nor by a 401 or 403 "
+            f"({', '.join(answers)})"
+        )
+    if reasons:
+        return unknown("; ".join(reasons), providers=rows)
     return passed(f"the write was refused on all {len(rows)} supporting provider(s)", providers=rows)
 
 
