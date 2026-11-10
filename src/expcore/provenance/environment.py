@@ -98,8 +98,8 @@ def _sanitised_url(url: str) -> str | None:
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
-def editable_roots(dist: metadata.Distribution, url: str = "") -> list[Path]:
-    """The directories an editable install imports from: what its `.pth` files put on the path, else its project."""
+def pth_directories(dist: metadata.Distribution) -> list[Path]:
+    """The directories a distribution's `.pth` files put on the path, as an editable install's do."""
     roots: list[Path] = []
     for item in dist.files or []:
         if item.suffix != ".pth":
@@ -110,10 +110,20 @@ def editable_roots(dist: metadata.Distribution, url: str = "") -> list[Path]:
             continue
         entries = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith(("#", "import"))]
         roots += [Path(entry) for entry in entries if Path(entry).is_dir()]
-    if not roots and urlsplit(url).scheme == "file":
-        project = Path(url2pathname(urlsplit(url).path))
-        roots = [project] if project.is_dir() else []
     return roots
+
+
+def editable_roots(dist: metadata.Distribution) -> list[Path]:
+    """The directories an editable install imports from: what its `.pth` files put on the path, else its project."""
+    roots = pth_directories(dist)
+    if roots:
+        return roots
+    try:
+        url = str(json.loads(dist.read_text("direct_url.json") or "{}").get("url", ""))
+    except (ValueError, AttributeError):
+        return []
+    project = Path(url2pathname(urlsplit(url).path)) if urlsplit(url).scheme == "file" else None
+    return [project] if project is not None and project.is_dir() else []
 
 
 def python_files(root: Path) -> list[Path]:
@@ -156,7 +166,7 @@ def source_of(dist: metadata.Distribution) -> dict[str, Any] | None:
     editable = isinstance(data.get("dir_info"), dict) and data["dir_info"].get("editable") is True
     if not editable:
         return {"kind": "directory", "editable": False}
-    roots = editable_roots(dist, str(data.get("url", "")))
+    roots = editable_roots(dist)
     if not roots:
         name = dist.metadata["Name"] if dist.metadata is not None else "a distribution"
         raise EnvironmentUnknown(f"{name} is installed editable, but the checkout it imports from cannot be found")

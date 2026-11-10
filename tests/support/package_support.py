@@ -32,6 +32,20 @@ def stand_in(name: str, version: str) -> tuple[str, bytes]:
     return f"{escaped}-{version}-py3-none-any.whl", buffer.getvalue()
 
 
+def wheel_of(name: str, version: str, files: Mapping[str, bytes]) -> tuple[str, bytes]:
+    """A minimal wheel holding the files given, with the metadata that names it."""
+    escaped = name.replace("-", "_")
+    info = f"{escaped}-{version}.dist-info"
+    entries = dict(files)
+    entries[f"{info}/METADATA"] = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n".encode()
+    entries[f"{info}/WHEEL"] = b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for entry, data in entries.items():
+            archive.writestr(zipfile.ZipInfo(entry, date_time=(1980, 1, 1, 0, 0, 0)), data)
+    return f"{escaped}-{version}-py3-none-any.whl", buffer.getvalue()
+
+
 def stand_in_vendor(distributions: Mapping[str, str], supplied: Path | None = None) -> list[Wheel]:
     """Vendor a stand-in per distribution: the core's is read by the scans, as a direct-URL install's is."""
     return [

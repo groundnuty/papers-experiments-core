@@ -7,9 +7,10 @@ import subprocess
 import sys
 import zipfile
 from importlib import metadata
+from pathlib import Path
 
 import pytest
-from package_support import installed_distribution, stand_in
+from package_support import installed_distribution, stand_in, wheel_of
 
 from expcore.package import wheels as wheels_module
 from expcore.package.spec import PackageError
@@ -17,6 +18,7 @@ from expcore.package.wheels import (
     MAKEFILE,
     REQUIREMENTS,
     Wheel,
+    compare_supplied,
     makefile,
     repack,
     requirements,
@@ -102,13 +104,91 @@ def test_k10_an_editable_install_is_refused_unless_the_author_supplies_its_wheel
         vendor_wheels({"toy-platform": "2.0.0"})
     supplied = tmp_path / "supplied"
     supplied.mkdir()
-    name, data = stand_in("toy-platform", "2.0.0")
+    name, data = wheel_of("toy-platform", "2.0.0", CODE)
     (supplied / name).write_bytes(data)
     [wheel] = vendor_wheels({"toy-platform": "2.0.0"}, supplied)
     assert (wheel.filename, wheel.data, wheel.scanned) == (name, data, True)
     (supplied / name).write_bytes(stand_in("toy-platform", "9.9.9")[1])
     with pytest.raises(PackageError, match=r"does not name toy-platform 2\.0\.0"):
         supplied_wheel(supplied, "toy-platform", "2.0.0")
+
+
+def test_k10_a_supplied_wheel_of_older_code_under_the_same_version_is_refused_naming_the_member(
+    site, tmp_path, monkeypatch
+):
+    """K10: a supplied wheel is held to what is installed, member by member against the RECORD hashes, so a wheel of
+    older code that carries the same version is refused, naming the member that differs; so is one that lacks a file
+    or holds one that is not installed. The wheel of exactly what is installed is taken byte for byte."""
+    dist = installed_distribution(site, "toy-platform", "2.0.0", CODE)
+    monkeypatch.setattr(wheels_module, "installed", lambda: {"toy-platform": dist})
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    cases = [
+        (
+            {**CODE, "toy_platform/__init__.py": b"WIRE = 'grey'\n"},
+            r"toy_platform/__init__\.py differs from the installed",
+        ),
+        ({"toy_platform/__init__.py": CODE["toy_platform/__init__.py"]}, r"lacks toy_platform/data/table\.txt"),
+        ({**CODE, "toy_platform/extra.py": b"X = 1\n"}, r"toy_platform/extra\.py is in the wheel but not installed"),
+    ]
+    for files, refusal in cases:
+        name, data = wheel_of("toy-platform", "2.0.0", files)
+        (supplied / name).write_bytes(data)
+        with pytest.raises(PackageError, match=refusal):
+            vendor_wheels({"toy-platform": "2.0.0"}, supplied)
+    name, data = wheel_of("toy-platform", "2.0.0", CODE)
+    (supplied / name).write_bytes(data)
+    [wheel] = vendor_wheels({"toy-platform": "2.0.0"}, supplied)
+    assert (wheel.data, wheel.uncompared) == (data, ())
+
+
+def test_k10_a_supplied_wheel_for_an_editable_install_is_held_to_its_checkout(site, tmp_path, monkeypatch):
+    """K10: for an editable install each member is compared with the checkout's file, a Python file of the checkout
+    the wheel lacks refuses it, and a member with nothing to compare against (data the build maps in) goes in,
+    listed."""
+    checkout = tmp_path / "checkout"
+    for rel, data in CODE.items():
+        (checkout / rel).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / rel).write_bytes(data)
+    editable = json.dumps({"url": "file:///somewhere/toy", "dir_info": {"editable": True}})
+    dist = installed_distribution(site, "toy-platform", "2.0.0", {}, direct_url=editable, checkout=checkout)
+    monkeypatch.setattr(wheels_module, "installed", lambda: {"toy-platform": dist})
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    older = {**CODE, "toy_platform/__init__.py": b"WIRE = 'grey'\n"}
+    for files, refusal in (
+        (older, r"toy_platform/__init__\.py differs"),
+        ({"toy_platform/data/table.txt": CODE["toy_platform/data/table.txt"]}, r"lacks toy_platform/__init__\.py"),
+    ):
+        name, data = wheel_of("toy-platform", "2.0.0", files)
+        (supplied / name).write_bytes(data)
+        with pytest.raises(PackageError, match=refusal):
+            vendor_wheels({"toy-platform": "2.0.0"}, supplied)
+    name, data = wheel_of("toy-platform", "2.0.0", {**CODE, "toy_platform/examples/notes.txt": b"mapped in\n"})
+    (supplied / name).write_bytes(data)
+    [wheel] = vendor_wheels({"toy-platform": "2.0.0"}, supplied)
+    assert wheel.uncompared == ("toy_platform/examples/notes.txt",)
+
+
+def test_k10_the_cores_own_wheel_built_from_this_checkout_matches_its_editable_install():
+    """K10: a wheel laid out as the core's build lays it out (its packages, the example mapped in, the public hash
+    file) passes the comparison with this editable install; the example's files are the ones listed as uncompared."""
+    root = Path(__file__).resolve().parents[2]
+    files = {}
+    for package in ("expcore", "expcore_onedata"):
+        for path in sorted((root / "src" / package).rglob("*")):
+            if path.is_file() and "__pycache__" not in path.parts:
+                files[path.relative_to(root / "src").as_posix()] = path.read_bytes()
+    for path in sorted((root / "examples" / "tiny_study").rglob("*")):
+        if path.is_file() and "__pycache__" not in path.parts and "out" not in path.relative_to(root).parts:
+            files[f"expcore/examples/tiny_study/{path.relative_to(root / 'examples' / 'tiny_study').as_posix()}"] = (
+                path.read_bytes()
+            )
+    files["expcore/provenance/study_tokens.sha256"] = (root / "tests" / "data" / "study_tokens.sha256").read_bytes()
+    name, data = wheel_of("papers-experiments-core", "0.1.0", files)
+    uncompared = compare_supplied(metadata.distribution("papers-experiments-core"), True, name, data)
+    assert uncompared
+    assert all(member.startswith("expcore/examples/tiny_study/") for member in uncompared)
 
 
 def test_k10_a_distribution_from_an_index_is_attested_and_one_from_a_direct_url_is_scanned(site, monkeypatch):

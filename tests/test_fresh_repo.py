@@ -13,10 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from package_support import stand_in
 from study_support import clean_environment
-
-from expcore.provenance.environment import environment
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "fresh_repo.py"
@@ -101,17 +98,11 @@ def test_the_study_steps_run_the_example_end_to_end_in_a_new_repository_and_its_
 ):
     """Everything but the install, against this interpreter: the example comes from the core through `example`, the
     commit makes the code identity clean, and the package passes its own make check with this interpreter. The core
-    is installed editable here, so the build is given stand-in wheels to vendor."""
+    is installed editable here, so the commands run through a runner that vendors stand-in wheels."""
     workdir = tmp_path / "fresh"
     workdir.mkdir()
-    wheels = tmp_path / "wheels"
-    wheels.mkdir()
-    for name, version in environment()["distributions"].items():
-        filename, data = stand_in(name, version)
-        (wheels / filename).write_bytes(data)
-    args = fresh.build_parser().parse_args(
-        ["--skip-install", "--runner", sys.executable, "--workdir", str(workdir), "--wheels", str(wheels)]
-    )
+    runner = f"{sys.executable} {ROOT / 'tests' / 'support' / 'stand_in_runner.py'}"
+    args = fresh.build_parser().parse_args(["--skip-install", "--runner", runner, "--workdir", str(workdir)])
     assert fresh.run(fresh.plan(args, workdir), workdir, fresh.clean_environment(clean_environment)) == 0
     log = subprocess.run(["git", "log", "--format=%s"], cwd=workdir, capture_output=True, text=True, check=True)
     assert log.stdout.splitlines() == ["the example study"]

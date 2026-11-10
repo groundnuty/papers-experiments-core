@@ -11,8 +11,13 @@ fetch.
 
 Where a wheel comes from, for each distribution:
 - a wheel the author supplies (`--wheels DIR`), named `<name>-<version>-<tags>.whl` with that name and version in
-  its metadata, is taken byte for byte: the way to ship a public release's own wheel, or the wheel of a distribution
-  installed editable;
+  its metadata, is taken byte for byte, once its code is shown to be what is installed: the way to ship a public
+  release's own wheel, or the wheel of a distribution installed editable. Each member outside its `.dist-info` must
+  match the installed file its RECORD lists (by hash), and every installed file must be in it; for an editable install,
+  each member must match the file of the checkout it imports from, found below a directory its `.pth` puts on the
+  path (or through its RECORD), and every Python file of the checkout under a package the wheel holds must be in it.
+  A member with no counterpart there (an example data file the build maps in) cannot be compared: it goes in and is
+  listed in `PACKAGE.json`. A wheel whose code differs is refused, naming the member;
 - otherwise the installed files are packed again into a wheel: every file the distribution's RECORD lists inside
   the site directory, each checked against its RECORD hash, without bytecode and without what the installer added
   (INSTALLER, REQUESTED, RECORD, direct_url.json and the installer's own records); RECORD is written anew. The wheel
@@ -41,7 +46,15 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from expcore.package.spec import WHEELS_DIR, PackageError
-from expcore.provenance.environment import EnvironmentUnknown, canonical, installed, source_of
+from expcore.provenance.environment import (
+    EnvironmentUnknown,
+    canonical,
+    editable_roots,
+    installed,
+    pth_directories,
+    python_files,
+    source_of,
+)
 
 REQUIREMENTS = f"{WHEELS_DIR}/requirements.txt"
 ZIP_DATE = (1980, 1, 1, 0, 0, 0)
@@ -81,6 +94,7 @@ class Wheel:
     filename: str
     data: bytes
     scanned: bool
+    uncompared: tuple[str, ...] = ()  # members of a supplied wheel with no installed counterpart to compare
 
     @property
     def path(self) -> str:
@@ -195,6 +209,82 @@ def supplied_wheel(directory: Path, name: str, version: str) -> tuple[str, bytes
     return matches[0].name, data
 
 
+_DATA_IN_SITE = re.compile(r"[^/]+\.data/(?:purelib|platlib)/(.+)")
+
+
+def code_members(data: bytes) -> dict[str, bytes]:
+    """A wheel's files as they install into the site directory, outside its `.dist-info`."""
+    found = {}
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        for name in archive.namelist():
+            first = name.split("/", 1)[0]
+            if name.endswith("/") or first.endswith(".dist-info"):
+                continue
+            if first.endswith(".data"):
+                inside = _DATA_IN_SITE.fullmatch(name)
+                if inside is None:
+                    continue  # scripts, headers and data install outside the site directory
+                found[inside.group(1)] = archive.read(name)
+            else:
+                found[name] = archive.read(name)
+    return found
+
+
+def _installed_files(dist: metadata.Distribution) -> dict[str, Any]:
+    """The installed files of a distribution inside the site directory, by path, without bytecode or its metadata."""
+    files = {}
+    for item in dist.files or []:
+        path = PurePosixPath(item.as_posix())
+        if path.parts and not path.parts[0].endswith(".dist-info") and _kept(path, ""):
+            files[path.as_posix()] = item
+    return files
+
+
+def _same_as_record(dist: metadata.Distribution, item: Any, data: bytes) -> bool:
+    if item.hash is not None:
+        return _record_hash(data) == f"{item.hash.mode}={item.hash.value}"
+    located = Path(str(dist.locate_file(item)))
+    return located.is_file() and located.read_bytes() == data
+
+
+def compare_supplied(dist: metadata.Distribution, editable: bool, filename: str, data: bytes) -> tuple[str, ...]:
+    """Refuse a supplied wheel whose code is not what is installed; return its members with nothing to compare."""
+    members = code_members(data)
+    record = _installed_files(dist)
+    roots = editable_roots(dist) if editable else []
+    uncompared = []
+    for member, content in sorted(members.items()):
+        local = next((root / member for root in roots if (root / member).is_file()), None)
+        if local is not None:
+            same = local.read_bytes() == content
+        elif member in record and not member.endswith(".pth"):
+            same = _same_as_record(dist, record[member], content)
+        elif editable:
+            uncompared.append(member)
+            continue
+        else:
+            raise PackageError(f"{filename}: {member} is in the wheel but not installed; supply the installed wheel")
+        if not same:
+            raise PackageError(
+                f"{filename}: {member} differs from the installed one; supply the wheel of what is installed"
+            )
+    for path in _expected(dist, editable, roots, members, record):
+        if path not in members:
+            raise PackageError(f"{filename}: lacks {path}, which is installed; supply the wheel of what is installed")
+    return tuple(uncompared)
+
+
+def _expected(dist: metadata.Distribution, editable: bool, roots: list[Path], members, record) -> list[str]:
+    """What a supplied wheel must hold: every installed file, or for an editable install every Python file of the
+    directories its `.pth` puts on the path; below a project directory, only those under a package the wheel holds."""
+    if not editable:
+        return [path for path in record if not path.endswith(".pth")]
+    whole = bool(pth_directories(dist))
+    tops = {member.split("/", 1)[0] for member in members if "/" in member}
+    found = [p.relative_to(root).as_posix() for root in roots for p in python_files(root)]
+    return [path for path in found if whole or path.split("/", 1)[0] in tops]
+
+
 def vendor_wheels(distributions: Mapping[str, str], supplied: Path | None = None) -> list[Wheel]:
     """One wheel per distribution of the environment, from `supplied` or the installed files, as described above."""
     found = installed()
@@ -216,8 +306,10 @@ def vendor_wheels(distributions: Mapping[str, str], supplied: Path | None = None
                 f"{name} is installed editable, so its installed files are not its code; build its wheel (for example "
                 "`uv build --wheel --out-dir DIR` in its project) and pass `--wheels DIR`"
             )
+        editable = bool(source and source.get("editable"))
+        uncompared = compare_supplied(dist, editable, *given) if given is not None else ()
         filename, data = given or repack(dist)
-        wheels.append(Wheel(name, version, filename, data, scanned=source is not None))
+        wheels.append(Wheel(name, version, filename, data, scanned=source is not None, uncompared=uncompared))
     return wheels
 
 

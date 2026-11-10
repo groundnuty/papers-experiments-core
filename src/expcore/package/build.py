@@ -166,6 +166,7 @@ def _package_json(
         "environment": env,
         "wheels": [
             {"file": w.path, "name": w.name, "version": w.version, "sha256": w.sha256, "scanned": w.scanned}
+            | ({"uncompared": list(w.uncompared)} if w.uncompared else {})
             for w in sorted(wheels, key=lambda w: w.name)
         ],
         "include": list(spec.include),
