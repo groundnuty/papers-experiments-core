@@ -195,6 +195,30 @@ def test_k11_a_commit_or_source_url_left_in_a_file_refuses_the_build_without_sho
     assert not (tmp_path / "dist").exists() or not list((tmp_path / "dist").glob("*.tar.gz"))
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Clone git@forge.example:someauthor/thestudy.git to start.",
+        "See https://forge.example/someauthor/thestudy for the data.",
+        "See someauthor/thestudy on the forge.",
+    ],
+)
+def test_k11_a_remote_of_the_studys_repository_is_found_in_every_form_it_can_be_written(
+    campaign, hashes, anonymisation, repo, tmp_path, monkeypatch, line
+):
+    """K11: the study's own repository is an identifying URL too: its remote is searched for in scp form, as a URL and
+    as owner/name, and the commit the repository is at has to go with it."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    root = copy_campaign(campaign, repo.path, "study").root
+    repo.git("remote", "add", "origin", "git@forge.example:someauthor/thestudy.git")
+    with (root / "README.md").open("a", encoding="utf-8") as readme:
+        readme.write(f"\n{line}\n")
+    repo.commit("the study")
+    with pytest.raises(PackageError, match=r"README\.md:\d+: a source URL") as refused:
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
+    assert "someauthor" not in str(refused.value)
+
+
 def test_k11_the_core_wheel_is_searched_for_the_identity_too(campaign, hashes, anonymisation, tmp_path):
     """K11: a wheel read by the checks is searched like any file, so a core whose sources name its URL refuses the
     build; the example the core ships must therefore never name it."""
