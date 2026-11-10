@@ -1,7 +1,9 @@
 # Provenance: new
 """Load and validate the private study-token map that sanitising imports apply.
 
-Format: TOML with `version = 1` and `[[entry]]` tables holding `token`, `replacement` and `category`.
+Format: TOML with `version = 1` and `[[entry]]` tables holding `token`, `replacement` and `category`. The map is
+private, so an error names an entry by its number, its category and its replacement, and never its token; a
+replacement that holds a mapped token is left out too.
 """
 
 import hashlib
@@ -27,6 +29,7 @@ class Entry:
     token: str
     replacement: str
     category: str
+    number: int = 0  # its place in the map, from 1, which errors name instead of the token
 
 
 @dataclass(frozen=True)
@@ -43,9 +46,19 @@ def matches_on_components(token: str) -> bool:
     return len(key) >= WHOLE_ONLY_BELOW and key in {normalise(c) for c in candidates(token)}
 
 
-def _describe(index: int, entry: Entry) -> str:
-    """Name an entry the way every error message does."""
-    return f"entry #{index} (category {entry.category!r}, token {entry.token!r})"
+def holds_mapped_token(value: str, keys: set[str]) -> bool:
+    """Tell whether a value equals a mapped token or holds one as a component, so showing it would show the token."""
+    return normalise(value) in keys or any(normalise(c) in keys for c in candidates(value))
+
+
+def _describe(index: int, entry: Entry, keys: set[str]) -> str:
+    """Name an entry the way every error message does: its number, its category and its replacement, never its token.
+
+    The replacement is public, unless it holds a mapped token, and then it is left out as well.
+    """
+    if holds_mapped_token(entry.replacement, keys):
+        return f"entry #{index} (category {entry.category!r})"
+    return f"entry #{index} (category {entry.category!r}, replacement {entry.replacement!r})"
 
 
 def _read_entry(index: int, raw: object, source: str) -> Entry:
@@ -60,12 +73,12 @@ def _read_entry(index: int, raw: object, source: str) -> Entry:
     for key in sorted(_ENTRY_KEYS):
         if not isinstance(raw[key], str) or not raw[key].strip():
             raise MapError(f"{source}: entry #{index}: {key!r} must be a non-empty string")
-    return Entry(raw["token"], raw["replacement"], raw["category"])
+    return Entry(raw["token"], raw["replacement"], raw["category"], index)
 
 
 def _check_replacement(source: str, index: int, entry: Entry, keys: set[str]) -> None:
     """Reject a replacement that could break a literal or that would itself contain a mapped token."""
-    where = f"{source}: {_describe(index, entry)}"
+    where = f"{source}: {_describe(index, entry, keys)}"
     if _FORBIDDEN_IN_REPLACEMENT.intersection(entry.replacement) or entry.replacement != entry.replacement.strip():
         raise MapError(f"{where}: replacement has quotes, backslashes, braces, line breaks or edge whitespace")
     if normalise(entry.replacement) in keys:
@@ -87,6 +100,7 @@ def parse_map(data: bytes, source: str = "<map>") -> TokenMap:
     if not isinstance(raw_entries, list):
         raise MapError(f"{source}: 'entry' must be an array of tables ([[entry]])")
     entries = tuple(_read_entry(i, raw, source) for i, raw in enumerate(raw_entries, start=1))
+    keys = {normalise(entry.token) for entry in entries}
     seen_tokens: dict[str, int] = {}
     seen_replacements: dict[str, int] = {}
     for index, entry in enumerate(entries, start=1):
@@ -96,9 +110,8 @@ def parse_map(data: bytes, source: str = "<map>") -> TokenMap:
         ):
             key = normalise(value)
             if key in seen:
-                raise MapError(f"{source}: {_describe(index, entry)}: {label} repeats entry #{seen[key]}")
+                raise MapError(f"{source}: {_describe(index, entry, keys)}: {label} repeats entry #{seen[key]}")
             seen[key] = index
-    keys = set(seen_tokens)
     for index, entry in enumerate(entries, start=1):
         _check_replacement(source, index, entry, keys)
     return TokenMap(entries, hashlib.sha256(data).hexdigest())

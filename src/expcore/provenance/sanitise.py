@@ -95,11 +95,19 @@ class _Replacer:
 
 
 def _name(replacer: _Replacer, name: str) -> str:
-    """Return the sanitised form of an identifier; it must stay an identifier."""
+    """Return the sanitised form of an identifier; it must stay an identifier.
+
+    A refusal names the map entry by its number, its category and its replacement, never its token or the identifier.
+    """
     entry = replacer.whole(name)
     new, used = (entry.replacement, [entry]) if entry else replacer.within(name, escapes=False)
     if used and not new.isidentifier():
-        raise SanitiseError(f"replacement for token of category {used[0].category!r} is not a valid identifier")
+        bad = next((e for e in used if not e.replacement.isidentifier()), used[0])
+        raise SanitiseError(
+            f"map entry #{bad.number} (category {bad.category!r}): its replacement {bad.replacement!r} is used inside "
+            "an identifier here, so it must itself be an identifier (letters, digits and underscores, not starting "
+            "with a digit); give the spelling with underscores an entry of its own"
+        )
     return new
 
 

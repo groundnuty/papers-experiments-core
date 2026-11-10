@@ -162,8 +162,38 @@ def test_result_compiles_and_the_checker_finds_no_listed_token(token_map):
 
 
 def test_replacement_that_is_not_an_identifier_is_refused_with_file_and_line(token_map):
-    with pytest.raises(sn.SanitiseError, match=r"mod\.py:2: .*not a valid identifier"):
+    with pytest.raises(sn.SanitiseError, match=r"mod\.py:2: map entry #1 .*must itself be an identifier"):
         sn.sanitise_python("x = 1\nsecret_space = 1\n", _entries("secret_space", "space-a"), filename="mod.py")
+
+
+def test_an_identifier_error_names_the_entry_by_number_and_replacement_never_the_token():
+    """P07: the map is private, so a refusal names the entry by its number and its replacement, never its token."""
+    entries = parse_map(_map_with(("brindle-gate", "gate-a"), ("brindle_gate", "gate-b"), ("other_gate", "gate-c")))
+    with pytest.raises(sn.SanitiseError) as refused:
+        sn.sanitise_python("x = 1\nother_gate = 1\n", entries.entries, filename="mod.py")
+    message = str(refused.value)
+    assert message.startswith("mod.py:2: map entry #3 (category 'c'): its replacement 'gate-c' is used inside")
+    assert "must itself be an identifier" in message
+    assert "other_gate" not in message
+
+
+@pytest.mark.parametrize(
+    ("entries", "shown"),
+    [
+        ([("brindle-gate", "gate-a"), ("BRINDLE-GATE", "gate-b")], "entry #2 (category 'c', replacement 'gate-b')"),
+        ([("brindle-gate", 'gate"a')], "entry #1 (category 'c', replacement 'gate\"a')"),
+        ([("brindle-gate", "gate-a"), ("gate-b", "x-brindle-gate")], "entry #2 (category 'c')"),
+        ([("brindle-gate", "BRINDLE-GATE")], "entry #1 (category 'c')"),
+    ],
+)
+def test_a_map_error_names_the_entry_by_number_and_replacement_never_the_token(entries, shown):
+    """P07: a map refusal names the entry by number and its replacement, which is public, and leaves out a replacement
+    that holds a mapped token; the token never appears."""
+    with pytest.raises(MapError) as refused:
+        parse_map(_map_with(*entries), "map.toml")
+    message = str(refused.value)
+    assert f"map.toml: {shown}: " in message
+    assert "brindle" not in message.casefold()
 
 
 def test_a_replacement_that_breaks_the_syntax_is_reported_with_the_file_name():
