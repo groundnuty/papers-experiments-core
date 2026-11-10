@@ -25,6 +25,7 @@ from expcore.stats.analysis import CONCLUSIONS
 from expcore.stats.pairing import MISSING_CAUSES
 from expcore.study.config import load_study
 from expcore.study.pipeline import OUTPUT_FILES, regenerate
+from expcore.study.plugin import import_plugin_module
 
 CRASH = ROOT / "tests" / "support" / "study_crash.py"
 TREATMENT, SUBSET = "relay-down", "extended"
@@ -126,7 +127,8 @@ def test_c01_the_treatment_failure_is_scored_and_never_run_again(resumed):
         result = resumed.read("scores.json")[key]["tiny"]["result"]
         assert result["verdict"] == "violated"  # no answer under the outage: measured, not unknown
         assert result["axes"] == {"agent": "no_answer", "platform": "failed"}
-        assert result["outcomes"] == {"accuracy": 0.0, "lookups": 1.0, "rounds": 1.0}  # what it did before the failure
+        # what it did before the failure, and the one fact the platform served, from the instrument's snapshot
+        assert result["outcomes"] == {"accuracy": 0.0, "lookups": 1.0, "rounds": 1.0, "served": 1.0}
 
 
 def test_the_scripts_end_as_a_finished_answer_a_malformed_call_a_turn_cap_and_an_infrastructure_failure(resumed):
@@ -140,6 +142,24 @@ def test_the_subset_condition_only_ran_on_its_tasks(resumed):
     assert ran == {"lake", "river", "hill"}
     everywhere = {task for _, condition, task, _ in resumed.planned() if condition == "baseline"}
     assert everywhere == {"lake", "river", "hill", "dune"}
+
+
+def test_every_record_holds_the_instruments_snapshot_and_the_scorer_reads_its_count(resumed):
+    """The example's instrument runs around every attempt, the treatment failure's included, and counts what the
+    platform served: a malformed lookup was never executed, so it served nothing."""
+    scores = resumed.read("scores.json")
+    for entry in resumed.read("export.json")["analysed_attempts"]:
+        record = record_of(resumed, entry)
+        served = len([c for c in record.tool_calls if c["name"] == "lookup" and c["status"] == "ok"])
+        assert record.instruments == {"facts": {"ok": True, "served": served}}
+        assert scores[entry["run_key"]]["tiny"]["result"]["outcomes"]["served"] == float(served)
+
+
+def test_the_example_scorer_takes_a_failed_snapshot_as_unmeasured_never_as_zero(resumed):
+    entry = resumed.read("export.json")["analysed_attempts"][0]
+    record = record_of(resumed, entry).with_instrument("facts", {"ok": False, "error": "TimeoutError"})
+    plugin = import_plugin_module(resumed.root / "plugin.py")
+    assert plugin.TinyScorer().score(record)["outcomes"]["served"] is None
 
 
 # --- the replay check ------------------------------------------------------------------------------------------------
