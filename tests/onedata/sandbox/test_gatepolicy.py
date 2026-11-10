@@ -258,11 +258,20 @@ def test_o19_every_page_goes_with_the_agents_options_but_the_ones_the_gate_sets(
 
 def test_o19_a_page_gives_its_entries_and_the_next_token_or_ends_the_listing():
     """O19: a page that is not the last gives the token of the next, whatever its length; the last gives none."""
-    seen = set()
-    page = b'{"children": [], "isLast": false, "nextPageToken": "next-a"}'
-    assert policy.listing_page(page, seen) == ([], "next-a")
-    entries, after = policy.listing_page(b'{"children": [{"name": "a"}], "isLast": true, "nextPageToken": null}', seen)
-    assert (entries, after, seen) == ([{"name": "a"}], None, {"next-a"})
+    walk = policy.ListingWalk()
+    assert walk.page(b'{"children": [], "isLast": false, "nextPageToken": "next-a"}') == ([], "next-a")
+    entries, after = walk.page(b'{"children": [{"name": "a"}], "isLast": true, "nextPageToken": null}')
+    assert (entries, after, walk.token_bytes) == ([{"name": "a"}], None, len("next-a"))
+
+
+def seeded() -> policy.ListingWalk:
+    """A listing that has read one page: an entry named `seen-entry`, an entry with the file id `id-seen`, and the
+    token `next-z`."""
+    walk = policy.ListingWalk()
+    walk.page(
+        b'{"children": [{"name": "seen-entry"}, {"fileId": "id-seen"}], "isLast": false, "nextPageToken": "next-z"}'
+    )
+    return walk
 
 
 @pytest.mark.parametrize(
@@ -276,10 +285,51 @@ def test_o19_a_page_gives_its_entries_and_the_next_token_or_ends_the_listing():
         b'{"children": [], "isLast": false, "nextPageToken": ""}',
         b'{"children": [], "isLast": false, "nextPageToken": "next-z"}',
         b'{"children": [NaN], "isLast": true}',
+        b'{"children": [], "isLast": false, "nextPageToken": "next-y", "isLast": true}',
+        b'{"children": [{"name": "b", "name": "c"}], "isLast": true}',
+        b'{"children": [{"name": "seen-entry"}], "isLast": true}',
+        b'{"children": [{"fileId": "id-seen", "name": "renamed"}], "isLast": true}',
+        b'{"children": [{"name": "twice"}, {"name": "twice"}], "isLast": true}',
+    ],
+    ids=[
+        "not-json",
+        "not-an-object",
+        "no-children",
+        "is-last-number",
+        "no-token",
+        "empty-token",
+        "token-again",
+        "nan",
+        "is-last-twice",
+        "entry-key-twice",
+        "entry-again-by-name",
+        "entry-again-by-id",
+        "entry-twice-in-a-page",
     ],
 )
 def test_o19_a_page_the_listing_cannot_go_on_from_is_refused(data):
-    """O19: no end and no continuation, a token the listing gave before, a page that is not one, or a value JSON
-    does not have: the listing cannot be completed from it, so it is never taken for its end."""
+    """O19: no end and no continuation, a token or an entry the listing gave before, a page that is not one, a key
+    given twice (which of the two a reader takes is not known) or a value JSON does not have: the listing cannot be
+    completed from it, so it is never taken for its end."""
     with pytest.raises(ValueError, match="listing page"):
-        policy.listing_page(data, {"next-z"})
+        seeded().page(data)
+
+
+def test_o19_a_walk_keeps_a_fixed_size_digest_of_each_token_and_counts_the_tokens_bytes():
+    """O19: a listing of empty pages with long, distinct tokens keeps 16 bytes of each token, not the token, and counts
+    every token's bytes towards the bound of the merged answer, so such pages cannot exhaust the gate's memory before
+    the bound refuses the listing."""
+    walk = policy.ListingWalk()
+    for n in range(20):
+        token = f"next-{n:04d}-" + "k" * 100_000
+        assert walk.page(json.dumps({"children": [], "isLast": False, "nextPageToken": token}).encode())[1] == token
+    assert walk.token_bytes == 20 * (len("next-0000-") + 100_000)
+    assert all(len(digest) == 16 for digest in walk._tokens)
+    assert len(walk._tokens) == 20
+
+
+def test_o19_entries_that_carry_neither_a_file_id_nor_a_name_are_not_told_apart():
+    """O19: two entries are the same entry by their file id, else by their name; entries with neither (a listing that
+    asks for no such attribute) can be alike without being one, so they are not refused: the check's known limit."""
+    walk = policy.ListingWalk()
+    assert walk.page(b'{"children": [{"size": 1}, {"size": 1}], "isLast": true}')[0] == [{"size": 1}, {"size": 1}]

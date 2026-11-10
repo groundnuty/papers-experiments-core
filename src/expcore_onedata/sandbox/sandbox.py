@@ -703,9 +703,13 @@ class DockerSandbox:
                     break
                 self._sleep(0.1)
             logs = self.host.docker("logs", self.names.gate, check=False, timeout=30)
-            said = logs.stderr + logs.stdout
-            note["log_write_failed"] = "GATE LOG FAILED" in said
-            note["teardown_incomplete"] = any(m in said for m in TEARDOWN_TROUBLE)  # a close line may be missing (O20)
+            note["output_read"] = logs.returncode == 0
+            if note["output_read"]:  # only output that was read can show that nothing went wrong (O20)
+                said = logs.stderr + logs.stdout
+                note["log_write_failed"] = "GATE LOG FAILED" in said
+                note["teardown_incomplete"] = any(m in said for m in TEARDOWN_TROUBLE)  # a close line may be missing
+            else:  # unknown, never "no failure": the count of the bytes served is then unknown too
+                note["log_write_failed"] = note["teardown_incomplete"] = None
         except Exception as e:
             note["error"] = describe_error(e)
 

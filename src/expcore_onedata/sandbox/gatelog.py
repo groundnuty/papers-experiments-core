@@ -28,11 +28,14 @@ accepted (`body_bytes`), never fewer than the agent received, and what that body
 It counts body bytes, never headers or TLS framing, never what the gate read upstream, and never the plain TCP
 forwards of the knowledge plane. It is a count of what was served, so it can exceed what the agent's code consumed by
 what sat unread in its socket when the agent stopped reading (a cut transfer's line and its connection's close line
-show that). Every count is None, with its reasons in `unknown`, when any line may be missing or cannot be read: the
-gate was not shown stopped (`gate_not_stopped`), its log could not be read or written whole (`gate_log_unreadable`,
-`gate_log_malformed`, `gate_log_write_failed`), it could not write the close line of every connection
-(`gate_teardown_incomplete`), or a request was still being answered when it stopped (`request_in_flight_at_stop`).
-Unknown is never zero.
+show that). A log is whole only with a positive mark: the `teardown_complete` line the gate writes last, once every
+connection's close line is written; an exit code alone proves nothing, since a gate killed by its memory limit exits
+too. Every count is None, with its reasons in `unknown`, when any line may be missing or cannot be read: the gate was
+not shown stopped (`gate_not_stopped`), its log holds no `teardown_complete` (`gate_teardown_unconfirmed`), its log
+could not be read or written whole (`gate_log_unreadable`, `gate_log_malformed`, `gate_log_write_failed`), its own
+output could not be read to show neither went wrong (`gate_output_unreadable`), it could not write the close line of
+every connection (`gate_teardown_incomplete`), or a request was still being answered when it stopped
+(`request_in_flight_at_stop`). Unknown is never zero.
 """
 
 import json
@@ -149,7 +152,10 @@ GATE_NOT_STOPPED = "gate_not_stopped"
 GATE_LOG_MALFORMED = "gate_log_malformed"
 GATE_LOG_WRITE_FAILED = "gate_log_write_failed"
 GATE_TEARDOWN_INCOMPLETE = "gate_teardown_incomplete"
+GATE_TEARDOWN_UNCONFIRMED = "gate_teardown_unconfirmed"
+GATE_OUTPUT_UNREADABLE = "gate_output_unreadable"
 REQUEST_IN_FLIGHT = "request_in_flight_at_stop"
+TEARDOWN_COMPLETE = "teardown_complete"  # the event the gate logs last, once every close line is written (gate.py)
 SERVED_FIELDS = ("served_bytes", "content_bytes", "listing_bytes", "other_bytes", "gate_answer_bytes")
 _BODY_FIELD = {
     "content": "content_bytes",
@@ -167,17 +173,21 @@ def served_unknown(*reasons: str) -> dict[str, Any]:
 def served(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str, Any]:
     """The bytes the gate served the agent in a run, from its log once it was stopped (O20; the module docstring says
     what each count holds). `lines` are the log's lines, None when it could not be read; `stop` is what the stop of the
-    gate found (`gate_stop` of the sandbox's metadata): it must have been signalled and shown exited, with no failed
-    write of its log and every connection's close line written."""
+    gate found (`gate_stop` of the sandbox's metadata): it must have been signalled and shown exited, with its own
+    output read and showing no failed write of its log and no close line it could not write. The log must hold the
+    gate's `teardown_complete` line, whatever its exit code."""
     reasons = set() if lines is not None else {UNREADABLE}
     if not isinstance(stop, Mapping) or stop.get("signalled") is not True or "exit_code" not in stop:
         reasons.add(GATE_NOT_STOPPED)
+    elif stop.get("output_read") is not True:  # the gate's output not read: whether a write failed is not known
+        reasons.add(GATE_OUTPUT_UNREADABLE)
     else:
         if stop.get("log_write_failed") is not False:
             reasons.add(GATE_LOG_WRITE_FAILED)
         if stop.get("teardown_incomplete") is not False:
             reasons.add(GATE_TEARDOWN_INCOMPLETE)
     counts = dict.fromkeys(_BODY_FIELD.values(), 0)
+    confirmed = False
     for text in lines or ():
         if not text.strip():
             continue
@@ -191,6 +201,7 @@ def served(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str,
             continue
         if record.get("event") == "conn_close" and record.get("in_request") is True:
             reasons.add(REQUEST_IN_FLIGHT)  # its answer may have begun, and has no line
+        confirmed = confirmed or record.get("event") == TEARDOWN_COMPLETE
         if "body_bytes" not in record:
             if "method" in record:  # a request's line always has its answer's body bytes
                 reasons.add(GATE_LOG_MALFORMED)
@@ -200,6 +211,8 @@ def served(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str,
             reasons.add(GATE_LOG_MALFORMED)  # a line that does not say what it served is no count
             continue
         counts[field] += size
+    if lines is not None and not confirmed:  # an exit is no proof: a gate killed by its memory limit exits as well
+        reasons.add(GATE_TEARDOWN_UNCONFIRMED)
     if reasons:
         return served_unknown(*reasons)
     total = counts["content_bytes"] + counts["listing_bytes"] + counts["other_bytes"]

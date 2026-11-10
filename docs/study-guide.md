@@ -119,6 +119,8 @@ A study selects each condition's data path through its `data_path` factor: the c
 - `level = "rest"`, or `listing = "paged"`: a listing is the server's page, as it comes. The official client's `ls` reads one page, so a directory of more than 1000 entries shows its first 1000.
 - `level = { kind = "rest", listing = "complete" }`: the gate answers every listing with all of the directory's entries, as one last page. A listing it cannot serve whole (past 64 MiB or 10,000 pages) ends the run as `data_gate_integrity`, so the run is set aside and never scored on a part of the directory; a listing that names where to start (`token`, `index`, `offset`) gets a 400 the agent reads.
 
+A complete listing is complete only for a directory that does not change while the gate reads it, since Onedata gives a listing no snapshot. Keep the study's data fixed while runs read it, as a study's data should be anyway. An entry another client adds during the read makes one entry come twice, and the gate refuses that listing with a 502. An entry removed during the read can make another one drop out of the answer unseen, and nothing shows that it happened.
+
 Two conditions that differ only in the listing mode are two levels of the factor, so they can run side by side in one campaign. The run's metadata records the mode, and `config.fingerprint()` holds every level's kind and mode, so changing a level's data path or its listing between starts is refused like any other change of the experiment. `listing` on a mount or `none` level is refused at load. What else each data path guarantees is in [`interfaces.md`](interfaces.md#the-platform-layers-sandbox).
 
 ## 3. Declare the design

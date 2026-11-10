@@ -138,15 +138,15 @@ def get(world, target, body=None):
         return status, data
 
 
-def line(world, seconds=10.0) -> dict:
-    """The log line of the one listing request."""
+def line(world, nth=1, seconds=10.0) -> dict:
+    """The log line of the `nth` request (the gate may log it just after the client has its answer)."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         found = [json.loads(x) for x in world.log.read_text().splitlines() if x.strip() and '"method"' in x]
-        if found:
-            return found[-1]
+        if len(found) >= nth:
+            return found[nth - 1]
         time.sleep(0.05)
-    raise AssertionError("no request line was logged")
+    raise AssertionError(f"request line {nth} was not logged")
 
 
 def test_o19_a_complete_listing_merges_every_page_in_the_servers_order_and_a_paged_one_does_not(served):
@@ -173,7 +173,7 @@ def test_o19_a_complete_listing_merges_every_page_in_the_servers_order_and_a_pag
     assert status == 200
     assert len(answer["children"]) == 1000
     assert (answer["isLast"], answer["nextPageToken"]) == (False, "1000")
-    assert "complete_listing" not in line(paged)
+    assert "complete_listing" not in line(paged, nth=2)  # the two gates share the test's log
 
 
 def test_o19_a_short_page_that_is_not_the_last_is_followed(served):
@@ -199,8 +199,19 @@ def test_o19_a_short_page_that_is_not_the_last_is_followed(served):
         (200, b"not json"),
         (404, {"error": {"id": "posix", "details": "enoent"}}),  # a page after the first that is not a 200
         (503, b""),
+        (200, b'{"children": [{"name": "z"}], "isLast": false, "nextPageToken": "next-b", "isLast": true}'),
     ],
-    ids=["no-is-last", "is-last-text", "no-token", "token-again", "children-object", "not-json", "404", "503"],
+    ids=[
+        "no-is-last",
+        "is-last-text",
+        "no-token",
+        "token-again",
+        "children-object",
+        "not-json",
+        "404",
+        "503",
+        "key-twice",
+    ],
 )
 def test_o19_a_page_the_listing_cannot_go_on_from_is_the_platforms_502_and_no_entry_is_passed(served, second):
     """O19: after a first page that is not the last, a second page that does not end the listing or continue it, or
@@ -245,6 +256,34 @@ def test_o19_a_listing_past_its_bound_is_refused_for_the_gates_integrity_and_its
     error = kinds.gate_error(gatelog.refusals(world.log.read_text().splitlines()))
     assert error is not None
     assert error.kind == kinds.DATA_GATE_INTEGRITY
+
+
+def test_o19_empty_pages_with_long_tokens_count_towards_the_bound_and_are_refused(served, monkeypatch):
+    """O19: the tokens a listing gives count towards the bound of the merged answer, so a platform that answers empty
+    pages, each with a long token of its own, reaches `listing_too_large` long before it could exhaust the gate's
+    memory, rather than being followed for free up to the page bound."""
+    monkeypatch.setattr(gate.gatepolicy, "COMPLETE_LISTING_BYTES", 3000)
+    pages = [page([], False, f"next-{k}-" + "t" * 1000) for k in range(5)] + [page(["end"], True)]
+    upstream = WrittenPages(pages)
+    world = served(upstream)
+    status, _ = get(world, PAGES)
+    assert status == 502
+    logged = line(world)
+    assert (logged["gate_refusal"], logged["listing_bound"], logged["pages"]) == ("listing_too_large", "bytes", 3)
+    assert len(upstream.seen) == 3  # it stopped following the tokens at the bound
+
+
+def test_o19_an_entry_shifted_into_the_next_page_by_an_insertion_refuses_the_listing(served):
+    """O19: a directory changed while it is read (another client adds an entry before `b`, shifting `b` into the next
+    page) gives `b` twice; the gate refuses that listing as the platform's 502 and passes none of it, since a listing
+    with an entry twice is no directory's listing."""
+    world = served(WrittenPages([page(["a", "b"], False, "next-a"), page(["b", "c"], True)]))
+    status, answer = get(world, PAGES)
+    assert status == 502
+    assert b'"a"' not in json.dumps(answer).encode()
+    logged = line(world)
+    assert (logged["error_origin"], logged["client_saw"], logged["pages"]) == ("upstream", "5xx", 1)
+    assert "gave before" in logged["error"]
 
 
 @pytest.mark.parametrize(
@@ -337,7 +376,16 @@ def test_o20_the_bytes_served_are_what_the_client_received_in_either_listing_mod
         time.sleep(0.05)
     answered = [json.loads(x) for x in lines if '"method"' in x]
     assert sorted(r["body"] for r in answered) == sorted(kind for kind, *_ in calls)  # lines may land in either order
-    stopped = {"signalled": True, "exit_code": 0, "log_write_failed": False, "teardown_incomplete": False}
+    stopped = {
+        "signalled": True,
+        "exit_code": 0,
+        "output_read": True,
+        "log_write_failed": False,
+        "teardown_incomplete": False,
+    }
+    assert gatelog.served(lines, stopped)["unknown"] == ["gate_teardown_unconfirmed"]  # still serving: no mark yet
+    gate.teardown()  # the gate's own stop writes its close lines and the mark
+    lines = world.log.read_text().splitlines()
     got = gatelog.served(lines, stopped)
     assert got == {
         "served_bytes": received["content"] + received["listing"] + received["other"],

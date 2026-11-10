@@ -66,15 +66,23 @@ same mode (the first `merged:` line); this one bounds it and checks every page:
     directory's complete listing, so it is refused with a 400 the agent reads, as any policy refusal is. The options are
     the ones the API's own description of the call lists (the second `merged:` line above);
   * it continues while a page says `isLast` false and gives a token, whatever the page's length: the API says a page can
-    be short and still not the last, and that `isLast` is the only sign of the end. A page that is not an object with a
-    list of children, an `isLast` that is not a boolean, `isLast` false without a token, or a token the listing gave
-    before (it would never end) is the platform's malformed answer: a 502 of origin `upstream`, never a part of the
-    listing taken for the whole (`listing_page`);
-  * the merged answer is at most `COMPLETE_LISTING_BYTES` (64 MiB) and `COMPLETE_LISTING_PAGES` (10,000) pages; past
-    either, the listing cannot be served whole and the gate refuses it for its own integrity (`listing_too_large`, so
-    the run is set aside), never passing a part of it on. 64 MiB is about 220,000 entries of 300 bytes, the size of an
-    entry with a file id of 180 characters and the attributes the official client asks for; the gate's memory for it is
-    worked out in `gate.py` (`BUFFER_SLOTS`).
+    be short and still not the last, and that `isLast` is the only sign of the end. A page that is not JSON with each
+    key once, not an object with a list of children, an `isLast` that is not a boolean, `isLast` false without a
+    token, a token the listing gave before (it would never end) or an entry it gave before (the directory changed) is
+    the platform's malformed answer: a 502 of origin `upstream`, never a part of the listing taken for the whole
+    (`ListingWalk`);
+  * the merged answer, with every continuation token the listing gave, is at most `COMPLETE_LISTING_BYTES` (64 MiB),
+    and the listing at most `COMPLETE_LISTING_PAGES` (10,000) pages; past either, the listing cannot be served whole
+    and the gate refuses it for its own integrity (`listing_too_large`, so the run is set aside), never passing a part
+    of it on. Of the tokens and the entries only a 16-byte digest each is kept to find a repeat. 64 MiB is about 220,000
+    entries of 300 bytes, the size of an entry with a file id of 180 characters and the attributes the official client
+    asks for; the gate's memory for it is worked out in `gate.py` (`BUFFER_SLOTS`).
+
+**A known limit.** Onedata gives a listing no snapshot, so a complete listing is complete only for a directory that
+does not change while the gate reads it, as a study's data should not. An entry added meanwhile shifts the ones after
+it, one of them then comes twice, and the listing is refused; an entry removed meanwhile can shift another out of the
+pages unseen, and the answer then lacks it with nothing to show. An entry that carries neither a file id nor a name
+(a listing that asks for neither attribute) cannot be told from another, so no repeat of it is found.
 
 The earlier study's gate had a whole-file mode too, a download stored before it is released; it is not carried over.
 """
@@ -82,6 +90,7 @@ The earlier study's gate had a whole-file mode too, a download stored before it 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import re
 from urllib.parse import parse_qs, parse_qsl, urlencode
@@ -259,26 +268,65 @@ def _no_constant(name: str) -> None:
     raise ValueError(f"{name} is not a JSON value")
 
 
-def listing_page(data: bytes, seen: set[str]) -> tuple[list, str | None]:
-    """One page of a complete listing as (its entries, the token of the next page, None after the last); `seen` holds
-    the tokens the listing gave before and gains this page's. ValueError for a page the listing cannot go on from: not
-    an object with a list of children, an `isLast` that is not a boolean, `isLast` false without a token, or a token
-    given before (the listing would never end). A short page with `isLast` false is not the end (O19). A value JSON does
-    not have (NaN, Infinity), which the merged answer could not carry, makes the page not JSON."""
-    try:
-        page = json.loads(data, parse_constant=_no_constant)
-    except ValueError:
-        raise ValueError("a listing page is not JSON") from None
-    if not isinstance(page, dict) or not isinstance(page.get("children"), list):
-        raise ValueError("a listing page is not an object with a list of children")
-    last, token = page.get("isLast"), page.get("nextPageToken")
-    if last is True:
-        return page["children"], None
-    if last is not False:
-        raise ValueError("a listing page's isLast is not a boolean")
-    if not isinstance(token, str) or not token:
-        raise ValueError("a listing page that is not the last gives no token for the next")
-    if token in seen:
-        raise ValueError("a listing page gave a token the listing gave before: it would never end")
-    seen.add(token)
-    return page["children"], token
+def _digest(kind: str, value: object) -> bytes:
+    """A fixed-size digest of a token or an entry's identity: what a listing keeps of each, whatever its length."""
+    return hashlib.blake2b(f"{kind}\0{value}".encode("utf-8", "surrogatepass"), digest_size=16).digest()
+
+
+def _identity(entry: object) -> tuple[str, object] | None:
+    """What tells an entry of a directory from the others: its file id, else its name (one per directory); None for an
+    entry that carries neither, which nothing then tells from another."""
+    if isinstance(entry, dict):
+        for key in ("fileId", "name"):
+            if isinstance(entry.get(key), str):
+                return key, entry[key]
+    return None
+
+
+class ListingWalk:
+    """What a complete listing has read so far, page by page (O19): a fixed-size digest of every token it gave and of
+    every entry's identity, and the bytes of its tokens, which count towards `COMPLETE_LISTING_BYTES` with its entries.
+
+    Onedata gives a listing no snapshot, so a directory another client changes while it is read can be listed wrong: an
+    entry added shifts the ones after it into the next page, which then shows one of them twice, and that is refused
+    here; an entry removed shifts one out of the pages unseen, and nothing shows it. A complete listing is complete only
+    for a directory that does not change while it is read, as a study's data should not."""
+
+    def __init__(self) -> None:
+        self._tokens: set[bytes] = set()
+        self._entries: set[bytes] = set()
+        self.token_bytes = 0  # the bytes of the tokens the listing gave, held while it is read
+
+    def page(self, data: bytes) -> tuple[list, str | None]:
+        """One page as (its entries, the token of the next page, None after the last). ValueError for a page the
+        listing cannot go on from: not JSON with each key once (a value JSON does not have, NaN or Infinity, included),
+        not an object with a list of children, an `isLast` that is not a boolean, `isLast` false without a token, a
+        token given before (the listing would never end), or an entry given before (the directory changed while it was
+        read). A short page with `isLast` false is not the end."""
+        try:
+            page = json.loads(data, parse_constant=_no_constant, object_pairs_hook=_unique_keys)
+        except ValueError:
+            raise ValueError("a listing page is not JSON with each key once") from None
+        if not isinstance(page, dict) or not isinstance(page.get("children"), list):
+            raise ValueError("a listing page is not an object with a list of children")
+        last, token = page.get("isLast"), page.get("nextPageToken")
+        if last is not True and last is not False:
+            raise ValueError("a listing page's isLast is not a boolean")
+        if last is False and (not isinstance(token, str) or not token):
+            raise ValueError("a listing page that is not the last gives no token for the next")
+        for entry in page["children"]:
+            identity = _identity(entry)
+            if identity is None:
+                continue
+            digest = _digest(*identity)
+            if digest in self._entries:
+                raise ValueError("a listing page gave an entry the listing gave before: the directory changed")
+            self._entries.add(digest)
+        if last is True:
+            return page["children"], None
+        digest = _digest("token", token)
+        if digest in self._tokens:
+            raise ValueError("a listing page gave a token the listing gave before: it would never end")
+        self._tokens.add(digest)
+        self.token_bytes += len(token.encode("utf-8", "surrogatepass"))
+        return page["children"], token

@@ -15,7 +15,13 @@ from expcore_onedata.sandbox import gatelog
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 from expcore_onedata.sandbox.served import NAMESPACE, ServedBytes
 
-STOPPED = {"signalled": True, "exit_code": 0, "log_write_failed": False, "teardown_incomplete": False}
+STOPPED = {
+    "signalled": True,
+    "exit_code": 0,
+    "output_read": True,
+    "log_write_failed": False,
+    "teardown_incomplete": False,
+}
 ANSWERS = [  # a run's answers, as the gate logs them
     {"method": "GET", "tag": "content", "status": 200, "body": "content", "body_bytes": 1000},
     {"method": "GET", "tag": "content", "status": 206, "body": "content", "body_bytes": 24},
@@ -29,7 +35,9 @@ ANSWERS = [  # a run's answers, as the gate logs them
     {"event": "conn_close", "conn": "1-1", "after_request": 3, "ended": "eof"},
     {"event": "conn_close", "conn": "1-2", "after_request": 4, "ended": "teardown", "in_request": False},
     {"event": "connection_error", "error_origin": "client"},
+    {"event": "teardown_complete", "connections": 1},  # the gate's last line: every close line was written
 ]
+UNMARKED = ANSWERS[:-1]  # the same answers from a gate that never wrote its teardown mark
 
 
 def log(*records) -> list[str]:
@@ -69,6 +77,10 @@ def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
         (log(*ANSWERS, {"method": "GET", "status": 200, "body_bytes": 5}), STOPPED, "gate_log_malformed"),
         (log(*ANSWERS, {"method": "GET", "body": "content", "body_bytes": -1}), STOPPED, "gate_log_malformed"),
         (log(*ANSWERS, ["not", "an", "object"]), STOPPED, "gate_log_malformed"),
+        (log(*UNMARKED), {**STOPPED, "exit_code": 137}, "gate_teardown_unconfirmed"),
+        (log(*UNMARKED), STOPPED, "gate_teardown_unconfirmed"),
+        (log(*ANSWERS), {**STOPPED, "output_read": False}, "gate_output_unreadable"),
+        (log(*ANSWERS), {k: v for k, v in STOPPED.items() if k != "output_read"}, "gate_output_unreadable"),
     ],
     ids=[
         "unreadable",
@@ -83,6 +95,10 @@ def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
         "no-body-kind",
         "negative",
         "not-an-object",
+        "killed-no-mark",
+        "exited-no-mark",
+        "output-not-read",
+        "output-unknown",
     ],
 )
 def test_o20_a_count_that_may_be_missing_a_line_is_unknown_never_zero(lines, stop, reason):
@@ -196,6 +212,68 @@ def test_o20_a_gate_log_that_is_not_json_is_unknown_and_the_metadata_still_writt
     (sbx.dir / "gatelog" / "requests.jsonl").write_text('{"method": "GET", "body_by\n', encoding="utf-8")
     sbx.collect(tmp_path / "evidence")
     meta = json.loads((tmp_path / "evidence" / "metadata.json").read_text())
-    assert meta["served_bytes"]["unknown"] == ["gate_log_malformed"]
+    assert meta["served_bytes"]["unknown"] == ["gate_log_malformed", "gate_teardown_unconfirmed"]
     assert meta["gate"]["unavailable"] == "the gate log could not be parsed"
     sbx.stop()
+
+
+def test_o20_a_gate_that_exited_without_its_teardown_mark_is_unknown_whatever_its_exit_code(world, tmp_path):
+    """O20: a gate killed by its memory limit exits too, before it can log an answer still owed or its close lines; an
+    exit code shows nothing about that, even a clean one. Only the gate's `teardown_complete` line does, so a log
+    without it is unknown."""
+    sbx = start(world, "via-gate")
+    write_log(sbx, *UNMARKED)
+    sbx.collect(tmp_path / "evidence")
+    assert sbx.metadata()["gate_stop"]["exit_code"] == 0  # shown exited, and still not shown whole
+    assert sbx.served_bytes()["unknown"] == ["gate_teardown_unconfirmed"]
+    assert sbx.served_bytes()["served_bytes"] is None
+    sbx.stop()
+
+
+def test_o20_a_gate_output_that_cannot_be_read_leaves_its_log_and_teardown_unknown(world, tmp_path):
+    """O20: the gate reports a failed write of its log and a close line it could not write on its own output; a read of
+    that output that fails shows neither, so whether the log is whole is unknown, never taken for "no failure"."""
+    from expcore_onedata.sandbox.hostops import CmdResult
+
+    sbx = start(world, "via-gate")
+    write_log(sbx, *ANSWERS)
+    docker = world.host.docker
+
+    def failing_logs(*args, **kwargs):
+        return CmdResult(1, "", "Error response from daemon") if args[:1] == ("logs",) else docker(*args, **kwargs)
+
+    world.host.docker = failing_logs
+    sbx.collect(tmp_path / "evidence")
+    world.host.docker = docker
+    stop = sbx.metadata()["gate_stop"]
+    assert (stop["output_read"], stop["log_write_failed"], stop["teardown_incomplete"]) == (False, None, None)
+    assert sbx.served_bytes()["unknown"] == ["gate_output_unreadable"]
+    sbx.stop()
+
+
+def test_o20_the_gate_marks_a_complete_teardown_and_only_a_complete_one(tmp_path, monkeypatch):
+    """O20: the gate's stop writes the close line of every connection still open and then `teardown_complete`; when a
+    close line cannot be written, it writes no mark, so the count of the bytes it served is unknown."""
+    from expcore_onedata.sandbox import gate
+
+    class Open:
+        """A connection still open when the gate stops; `broken` makes its close line fail."""
+
+        def __init__(self, broken):
+            self.broken = broken
+
+        def _teardown_line(self):
+            if self.broken:
+                raise OSError("the close line could not be built")
+            gate._log({"event": "conn_close", "conn": "1-1", "ended": "teardown", "in_request": False})
+
+    log_file = tmp_path / "requests.jsonl"
+    monkeypatch.setattr(gate, "CFG", {"log": str(log_file)})
+    for broken, marked in ((False, True), (True, False)):
+        log_file.write_text("", encoding="utf-8")
+        monkeypatch.setattr(gate, "_LIVE", {"1-1": Open(broken)})
+        gate.teardown()
+        events = [json.loads(x).get("event") for x in log_file.read_text().splitlines()]
+        assert ("teardown_complete" in events) is marked
+        if marked:
+            assert events == ["conn_close", "teardown_complete"]  # the mark comes after every close line

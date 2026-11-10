@@ -20,7 +20,9 @@ the upstream. Configuration: JSON at the path in argv[1]:
 start. In `complete` the gate answers a listing with all of the directory's entries as one page, which it merges from
 the pages it reads upstream (`Handler._complete_listing`): each page passes the response boundary as any answer that is
 no file's content does, the merged answer is checked once more before any byte of it goes, and a listing it cannot
-complete within its bounds is refused, never passed on in part.
+complete within its bounds, or that gives an entry twice, is refused rather than passed on in part. The answer is the
+directory's whole listing only if no other client changed the directory while it was read: an entry removed meanwhile
+can be missing unseen (gatepolicy, "A known limit").
 
 For each host name the sandbox resolves (via --add-host) to the gate, the gate
 terminates TLS with a certificate for that name (signed by the run's CA, which
@@ -57,7 +59,8 @@ gate serves that host in (`onezone`, `oneprovider`), or `not_configured`, never 
 request following, one `conn_close` event line says how (see `Handler._peer_gone`), with the kernel's counters of that connection at that moment: a response's
 `body_bytes` counts what the gate's socket accepted, which says nothing of what the client read, and the close is what shows it. When the gate itself is stopped
 (SIGTERM or SIGINT: `serve`; or the server closed: `GateServer.server_close`), every connection still open gets that line with `ended` "teardown", before the process
-exits (`teardown`); a gate that is killed (SIGKILL, `docker rm -f`) cannot write one, and a connection with no close line at all says so.
+exits (`teardown`), and then one `teardown_complete` line once every such line is written; a gate that is killed (SIGKILL, `docker rm -f`) cannot write
+either, and a log without `teardown_complete` says so.
 
 Errors and retries, identical on every path: an upstream attempt that fails before any byte of
 an answer arrives (connect, handshake, send, or the peer closing first) is retried once, on a new connection, before
@@ -127,10 +130,11 @@ UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split bet
 # gateboundary.BUFFER_CAP (4 MiB), and checked before it goes. At most 16 such buffers are held, 64 MiB, and a check
 # holds about four times its buffer at its peak (the raw bytes, a decoded layer, the next, a projection): 256 MiB. A
 # complete listing (O19) reads each page in one of these slots, and one listing at a time is merged (_LISTING_SLOT),
-# into at most gatepolicy.COMPLETE_LISTING_BYTES (64 MiB): its pieces, the merged answer and the check of it, about
-# 6 x 64 = 384 MiB at the peak. Together 640 MiB, under the gate's memory limit (sandbox.limits.gate_memory_bytes, 1 GiB
-# by default). An answer that must be buffered, or a listing to merge, waits for a slot: the wait is the agent's own
-# concurrency, on the agent's time.
+# into at most gatepolicy.COMPLETE_LISTING_BYTES (64 MiB) of entries and tokens: its pieces, the merged answer and the
+# check of it, about 6 x 64 = 384 MiB at the peak, and a 16-byte digest of each entry and token in a set, about 100
+# bytes each with the set's own, 22 MB for the 220,000 entries 64 MiB holds. Together about 660 MiB, under the gate's
+# memory limit (sandbox.limits.gate_memory_bytes, 1 GiB by default). An answer that must be buffered, or a listing to
+# merge, waits for a slot: the wait is the agent's own concurrency, on the agent's time.
 BUFFER_SLOTS = 16
 _BUFFER_SLOTS = threading.BoundedSemaphore(BUFFER_SLOTS)
 _LISTING_SLOT = threading.BoundedSemaphore(1)
@@ -965,16 +969,18 @@ class Handler(BaseHTTPRequestHandler):
         answered as one page, or nothing of it.
 
         The gate asks for pages of `gatepolicy.MAX_LIST_LIMIT` with the agent's other options (`complete_listing_request`)
-        and goes on while a page says it is not the last (`listing_page`). The first page's answer that is not a 200 (the
-        directory does not exist, say) is passed on as the paged mode passes it. After that, a page that is not a 200 or
-        that the listing cannot go on from is the platform's failure (a 502 of origin `upstream`), and a listing past
-        `COMPLETE_LISTING_BYTES` or `COMPLETE_LISTING_PAGES` is refused for the gate's integrity (`listing_too_large`):
-        never a part of the listing passed on as if it were the whole. Each page passes the boundary as any answer that
-        is no file's content does, read whole in a buffer slot and checked, and the merged answer is checked once more."""
+        and goes on while a page says it is not the last (`gatepolicy.ListingWalk`). The first page's answer that is not
+        a 200 (the directory does not exist, say) is passed on as the paged mode passes it. After that, a page that is
+        not a 200 or that the listing cannot go on from (an entry it gave before among them) is the platform's failure
+        (a 502 of origin `upstream`), and a listing whose entries and tokens pass `COMPLETE_LISTING_BYTES`, or that
+        passes `COMPLETE_LISTING_PAGES`, is refused for the gate's integrity (`listing_too_large`). Each page passes the
+        boundary as any answer that is no file's content does, read whole in a buffer slot and checked, and the merged
+        answer is checked once more. The answer is the directory's whole listing when the directory did not change while
+        it was read; an entry removed meanwhile can be missing from it unseen (`gatepolicy`, "A known limit")."""
         pairs, body = gatepolicy.complete_listing_request(url.query, body)
         fwd, token = self._fwd_headers(headers), CFG.get("token")
         pieces: list[bytes] = []
-        size, entries, seen, after = len(_MERGED_HEAD) + len(_MERGED_TAIL), 0, set(), None
+        size, entries, walk, after = len(_MERGED_HEAD) + len(_MERGED_TAIL), 0, gatepolicy.ListingWalk(), None
         rec.update(complete_listing=True, pages=0)
         waited = time.monotonic()
         with _LISTING_SLOT:
@@ -996,7 +1002,7 @@ class Handler(BaseHTTPRequestHandler):
                         return  # refused: answered and logged
                     self._settle(hcfg, resp)
                     try:
-                        children, after = gatepolicy.listing_page(data, seen)
+                        children, after = walk.page(data)
                     except ValueError as e:
                         raise _Upstream(_Framing(str(e))) from e
                     piece = json.dumps(children).encode()[1:-1]  # the entries without the brackets: ASCII JSON
@@ -1005,7 +1011,8 @@ class Handler(BaseHTTPRequestHandler):
                 if piece:
                     size += len(piece) + (len(_MERGED_JOIN) if pieces else 0)
                     pieces.append(piece)
-                bound = "bytes" if size > gatepolicy.COMPLETE_LISTING_BYTES else None
+                held = size + walk.token_bytes  # the tokens count too: empty pages with long tokens are not free
+                bound = "bytes" if held > gatepolicy.COMPLETE_LISTING_BYTES else None
                 if bound is None and after is not None and rec["pages"] >= gatepolicy.COMPLETE_LISTING_PAGES:
                     bound = "pages"
                 if bound is not None:
@@ -1159,19 +1166,28 @@ class Handler(BaseHTTPRequestHandler):
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _handle
 
 
+TEARDOWN_COMPLETE = "teardown_complete"  # the log's last word on a gate that stopped with every close line written
+
+
 def _teardown_lines() -> None:
     with _LIVE_LOCK:
         live = list(_LIVE.values())
+    failed = 0
     for h in live:
         try:
             h._teardown_line()
         except Exception as e:
+            failed += 1
             print("GATE TEARDOWN LINE FAILED", repr(e)[:200], file=sys.stderr, flush=True)
+    if not failed:  # the positive mark the count of the bytes served needs (O20): without it, a line may be missing
+        _log({"event": TEARDOWN_COMPLETE, "connections": len(live)})
 
 
 def teardown() -> None:
-    """The gate is stopping: a `conn_close` line (`ended` "teardown") for every client connection still open, before the process exits. Never raises, and never waits
-    more than TEARDOWN_BUDGET_S: the lines are written by a thread this waits for that long, so a log that is stuck cannot hold the gate up."""
+    """The gate is stopping: a `conn_close` line (`ended` "teardown") for every client connection still open, before the process exits, and then one
+    `teardown_complete` line, written only when every close line was. Never raises, and never waits more than TEARDOWN_BUDGET_S: the lines are written by a
+    thread this waits for that long, so a log that is stuck cannot hold the gate up. A gate killed before it gets here (SIGKILL, its memory limit) leaves no
+    `teardown_complete` line, and the count of the bytes it served is then unknown (gatelog, O20)."""
     try:
         t = threading.Thread(target=_teardown_lines, daemon=True)
         t.start()
