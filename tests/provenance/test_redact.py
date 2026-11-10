@@ -42,6 +42,31 @@ def test_k05_scrub_names_every_word_that_must_not_be_shown_and_withholds_a_line_
     assert two_words.scrub("written by Quillon Varek\nplain") == f"{WITHHELD}\nplain"
 
 
+def test_k05_a_listed_name_of_several_words_is_hidden_as_a_phrase_among_other_words():
+    """K05: the scanner reads one run of letters, digits and `_ . -` at a time, so a listed name with a space in it
+    matched only an entire line; the redactor finds it among other words, whatever white space it is written with,
+    in a message and in a label."""
+    phrase = "Ada Example"  # invented; a listed name of two words
+    seen = Redactor(hashes_from_tokens([phrase, PRIVATE]))
+    scrubbed = seen.scrub(f"written by {phrase}, and by ada  example too\nplain line")
+    assert "example" not in scrubbed.casefold()
+    assert scrubbed.splitlines()[1] == "plain line"
+    assert f"written by {hidden_name(phrase)}, and by" in scrubbed
+    label = f"notes/by {phrase}.txt"
+    assert seen.name(label) == hidden_name(label)
+
+
+def test_k05_a_short_name_matched_only_whole_is_never_replaced_inside_a_longer_word():
+    """K05: a name shorter than four characters is matched only as an entire value; once it has been named, a later
+    message replaces it where it stands on its own, never inside a longer word, exactly as the scanner matches it."""
+    short = "vyk"  # invented; a listed name too short to be matched inside other names
+    seen = Redactor(hashes_from_tokens([short]))
+    assert seen.name(short) == hidden_name(short)
+    scrubbed = seen.scrub(f"the canvyk file, {short}-extra and {short} itself, then data/{short}:3 and {short}.")
+    shown = hidden_name(short)
+    assert scrubbed == f"the canvyk file, {short}-extra and {shown} itself, then data/{shown}:3 and {shown}."
+
+
 def test_k05_a_name_already_handed_out_is_replaced_wherever_a_message_repeats_its_label():
     """K05: once a label is named, every later message that spells it, whatever surrounds it, shows the name."""
     seen = redactor()
