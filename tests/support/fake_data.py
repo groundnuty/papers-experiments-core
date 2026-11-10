@@ -3,7 +3,7 @@
 `FakeData` adds to `FakeFederation` the calls of `/api/v3/oneprovider`, chosen by the request's host:
 
   GET    /spaces/{space}                        the root directory of the space (ENOENT for `root_enoent_polls` calls)
-  GET    /data/{id}                             attributes
+  GET    /data/{id}                             attributes, `parent_id` among them; asked for a path, 400 as in 25.0
   GET    /data/{id}/children                    paged by `limit` and `token`
   POST   /data/{id}/children?name&type          create a file or a directory
   PUT    /data/{id}/content?offset              write bytes; the writing provider holds them
@@ -321,6 +321,8 @@ class FakeData(FakeFederation):
                 return self._error(404, "notFound")
             part = found.group(2) or ""
             if part == "" and method == "GET":
+                if "path" in query.get_list("attribute"):  # Onedata 25.0 has no path attribute ([L1] in client.py)
+                    return self._error(400, "badValueNotAllowed")
                 return httpx.Response(200, json=self._attributes(node))
             if part == "" and method == "DELETE":
                 if self.fail_deletes:
@@ -356,22 +358,25 @@ class FakeData(FakeFederation):
             return httpx.Response(404, json={"error": {"id": "posix", "details": {"errno": "enoent"}}})
         return httpx.Response(200, json={"fileId": ROOT_ID, "name": self.space_name})
 
-    def _path_of(self, node: Node) -> str:
-        parts = []
-        while node.parent is not None:
-            parts.append(node.name)
-            node = self.nodes[node.parent]
-        return "/" + "/".join([self.space_name, *reversed(parts)])
-
     def _attributes(self, node: Node) -> dict:
+        """A file's attributes as Onedata 25.0 names them; `parent_id` is its parent's id, null for a space's root."""
         return {
             "fileId": node.file_id,
             "file_id": node.file_id,
             "name": node.name,
             "type": node.kind,
             "size": len(node.content),
-            "path": self._path_of(node),
+            "parent_id": node.parent,
         }
+
+    def add_tree(self, root_id: str, path: str) -> str:
+        """Make a tree that is no part of the study space: a root of its own, with no parent, and a path below it;
+        return the id of the path's last entry. It stands for a file of a space this configuration does not know."""
+        self.nodes[root_id] = Node(root_id, "", "DIR", None)
+        parent = root_id
+        for part in path.strip("/").split("/"):
+            parent = self._child(parent, part) or self._create(parent, part, "DIR")
+        return parent
 
     def _list(self, node: Node, query: httpx.QueryParams) -> httpx.Response:
         if node.kind != "DIR":

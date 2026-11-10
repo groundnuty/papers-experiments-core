@@ -25,37 +25,24 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
     assert "2 skipped" in done.stdout
 
 
-def test_every_unverified_endpoint_has_a_live_contract_test():
-    """Each (method, path) no source confirms is named by a `covers:` line of a live test, so none goes unchecked."""
-    from expcore_onedata.client import UNVERIFIED_ENDPOINTS
+def test_o09_no_call_is_left_unconfirmed_and_the_refuted_path_read_is_gone():
+    """O09: the live contract tests against Onedata 25.0 confirmed every call the layer makes that no source did, the
+    gate's walk by `parent_id` among them, and refuted the file's `path` attribute the gate read before, which no
+    release at hand answers. The gate no longer asks for it, so nothing is left unconfirmed; the client's docstring
+    records what refuted it."""
+    from expcore_onedata import client
 
-    live = (ROOT / "tests" / "live" / "test_contract.py").read_text(encoding="utf-8")
-    assert UNVERIFIED_ENDPOINTS, "the list is empty: remove this test along with the last unconfirmed endpoint"
-    missing = [f"{m} {p}" for m, p, _ in UNVERIFIED_ENDPOINTS if f"# covers: {m} {p}\n" not in live]
-    assert not missing, f"no live test covers: {missing}"
-
-
-def test_the_unconfirmed_calls_are_exactly_the_path_read_the_live_federation_refuted():
-    """O05, O09: the live contract tests against Onedata 25.0 confirmed a space's details, the subject of an
-    examination, the providers' name and online fields, the content type of a file's content, the waiting state and
-    Date header of the transfer listing, and a transfer record's type, provider ids and times. Those left the list,
-    and their live tests stay. What is left is the file's path attribute the mutation gate reads, which that release
-    does not have: the entry says so, and what it costs."""
-    from expcore_onedata.client import UNVERIFIED_ENDPOINTS
-
-    assert {(m, p) for m, p, _ in UNVERIFIED_ENDPOINTS} == {("GET", "/data/{id}")}
-    what = " ".join(w for _, _, w in UNVERIFIED_ENDPOINTS)
-    assert "mock" in what  # the only source that ever answered it
-    assert "refuted" in what
-    assert "badValueNotAllowed" in what
-    assert "fail closed" in what  # a mutation by file id is refused, never sent unchecked
+    assert client.UNVERIFIED_ENDPOINTS == ()
+    assert "badValueNotAllowed" in client.__doc__
+    assert '"attribute": "path"' not in Path(client.__file__).read_text(encoding="utf-8")
 
 
 def test_every_endpoint_the_live_federation_confirmed_keeps_its_live_test():
-    """O05, O08: an entry that left the list on a live run keeps the test that confirmed it, so a release that answers
-    otherwise fails it."""
+    """O05, O08, O09: an entry that left the list on a live run keeps the test that confirmed it, so a release that
+    answers otherwise fails it."""
     live = (ROOT / "tests" / "live" / "test_contract.py").read_text(encoding="utf-8")
     for method, path in (
+        ("GET", "/data/{id}"),
         ("GET", "/spaces/{space}"),
         ("POST", "/tokens/examine"),
         ("POST", "/tokens/infer_access_token_scope"),

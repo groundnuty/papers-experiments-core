@@ -90,11 +90,41 @@ def test_the_study_space_resolves_to_its_declared_name(config, client):
     assert client.space_name(config.space.id) == config.space.name  # the name the mutation gate checks the prefixes of
 
 
-def test_a_file_resolves_to_its_space_through_its_path_attribute(config, client):
+def nested_file(client, provider, root):
+    """The first regular file two levels below the space root, found by listing: its id, its names from the root and
+    the ids of the directories above it. Skips when the space holds none."""
+    params = {"limit": 100, "attribute": ["name", "file_id", "type"]}
+    for entry in client.get(f"/data/{root}/children", provider=provider, params=params)["children"]:
+        if entry["type"] != "DIR":
+            continue
+        inner = client.get(f"/data/{entry['file_id']}/children", provider=provider, params=params)["children"]
+        found = next((child for child in inner if child["type"] == "REG"), None)
+        if found is not None:
+            return found["file_id"], [entry["name"], found["name"]], [root, entry["file_id"]]
+    pytest.skip("the space holds no regular file two levels below its root")
+
+
+def test_a_nested_file_resolves_to_its_space_by_its_parent_links(config, client):
+    """O09: Onedata 25.0 has no path attribute, so the gate walks a file's `parent_id` links up to the root of the
+    configured space: the root's is null, each other's names the directory above it, the root is the same file on
+    every supporting provider, and a file two levels down resolves to the configured space and its name on each."""
     # covers: GET /data/{id}
+    roots = {p: client.get(f"/spaces/{config.space.id}", provider=p)["fileId"] for p in config.support.providers}
+    assert len(set(roots.values())) == 1
     provider = config.support.providers[0]
-    root = client.get(f"/spaces/{config.space.id}", provider=provider)["fileId"]
-    assert client.file_space_name(root, provider) == config.space.name  # the name a mutation by file id is gated on
+    root = roots[provider]
+    file_id, _, above = nested_file(client, provider, root)
+    link = {"attribute": "parent_id"}
+    assert client.get(f"/data/{root}", provider=provider, params=link) == {"parent_id": None}
+    assert client.get(f"/data/{file_id}", provider=provider, params=link) == {"parent_id": above[-1]}
+    assert client.get(f"/data/{above[-1]}", provider=provider, params=link) == {"parent_id": root}
+    for each in config.support.providers:
+        fresh = OnezoneClient(config)  # nothing kept from another provider's walk
+        try:
+            assert fresh.file_space_id(file_id, each) == config.space.id
+            assert fresh.file_space_name(file_id, each) == config.space.name  # the name a mutation is gated on
+        finally:
+            fresh.close()
 
 
 def test_discovery_finds_the_space_and_the_declared_local_provider(config, issuer, client):

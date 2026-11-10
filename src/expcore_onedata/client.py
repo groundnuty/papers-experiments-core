@@ -24,16 +24,37 @@ Reads and mutations are separate calls:
   client reads that space's name from Onezone (`space_name`) right before sending and refuses unless the name starts
   with one of the configured prefixes (`[space] prefixes`). The name is read afresh for every mutation and never
   cached, because a space can be renamed out of the study's scope after an earlier read; a cache would go on
-  authorising it. A file addressed by id (`/data/{id}`, a transfer job's `fileId`, a range read) is resolved the same
-  way: its space is read from the file's `path` attribute through the provider right before every request, never kept
-  (`file_space_name`), and a path that is not canonical resolves to no space. Anything else, a path of a provider
-  among it, resolves to no space and is refused, so a mistaken or hostile target cannot reach a space outside the
-  study's. What remains is the interval between that read and the platform acting on the request, which a client
-  cannot close;
+  authorising it. A file addressed by id (`/data/{id}`, a transfer job's `fileId`, a range read) is first resolved to
+  the id of the space it lies in, by walking its parent links up to the root of a space the configuration knows
+  (`file_space_id`, below), and that space's name is then read and checked the same way, afresh every time. Anything
+  else, a path of a provider among it, resolves to no space and is refused, so a mistaken or hostile target cannot
+  reach a space outside the study's. What remains is the interval between the name's read and the platform acting on
+  the request, which a client cannot close;
 - `mint_own_token` is the one operation on credentials: a platform user mints its own temporary token with its own
   password (HTTP Basic), as the earlier code did. It acts on no space, so it has a call of its own; the password is
   registered as a secret when it is read and the minted value before the call returns (R12), and so is the admin token
   the client itself uses, when the client is built. Tokens are not revoked: they end with their lifetime.
+
+**The space of a file.** Onedata 25.0 gives a file no path and no space attribute, so the gate walks the file's
+parent links: `GET /data/{id}?attribute=parent_id` through the provider the request is for, from the file up, until it
+meets the root of a space the configuration knows (`[space] id`, whose root is the `fileId` of the provider's
+`GET /spaces/{id}`). The root itself needs no parent read. A walk that reaches the top of a tree (a null parent) without
+meeting a known root, or that has followed `MAX_SPACE_DEPTH` links without meeting one (a cycle among them), resolves to
+no space (`OutOfScope`). The space is never decoded from the file's id: that encoding is undocumented and may change
+between releases. A file's space does not change, so what a walk read is kept for the client's life, a run's or a
+campaign's: each provider's root of the space, kept once a provider answered it, and each parent link, which names
+files by their ids on every provider, kept only once its walk reached a known root; a walk that failed or was refused
+keeps no link, so a later request walks again. A file moved within the space keeps its space, so a link it left behind
+still leads to the right root. A file resolved before costs no request to a provider, a new file beside resolved ones
+costs one, and a cold walk costs one root read and one parent read per level. The name is then one read on Onezone,
+every time.
+
+Every read the gate makes, the walk's and the name's, is the client's own: with the admin credential, through its own
+connection pool with the platform's `[tls]`, from the core's process. None passes the data gate, so none is in the
+gate's log or counted in what the agent was served, and a write sent as a data-path token (`mutate(..., token=)`) is
+still resolved as the admin. When one of those reads fails, the request is refused unsent with `ScopeUnread`, which
+keeps the read's status, error id and transport flag; a 404 of the target or of a directory above it is `OutOfScope`.
+Both are `NotSent`, so a caller can tell a request the platform never saw from one it answered.
 
 The other halves of O09 (refuse to evict the data provider's own copy, tear down only logged ids, a teardown that finds
 files left revokes nothing) belong to provisioning and the sandbox (step 4b); they call `mutate`.
@@ -63,18 +84,20 @@ record was read directly, since no live test ran one).
   `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
 - Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
 - Step 4b2 sends to a provider (all confirmed by [S8], whose code sends them and reads the answers as the layer does):
-  `GET /spaces/{space}` (the key `fileId` is the space's root), `GET /data/{id}/children` (query `limit`, `attribute`,
-  `token`; answer `children`, `isLast`, `nextPageToken`), `POST /data/{parent}/children` (query `name`, `type`; answer
+  `GET /spaces/{space}` (the key `fileId` is the space's root; [L1] shows it the same on every provider),
+  `GET /data/{id}/children` (query `limit`, `attribute`, `token`; answer `children`, `isLast`, `nextPageToken`),
+  `POST /data/{parent}/children` (query `name`, `type`; answer
   `fileId`), `PUT /data/{id}/content` (query `offset`, an octet-stream body), `GET /data/{id}`, `DELETE /data/{id}`,
   `GET /data/{id}/distribution`, `POST /transfers` (body `type`, `dataSourceType`, `fileId`, `replicatingProviderId`
   or `evictingProviderId`) and `GET /transfers/{id}`. `read_range` is `GET /data/{id}/content` with a `Range` header,
   answered with a 206 and a `Content-Range`. `content_answer` is the same call whole or with `Range: bytes=0-0`, of
   which only the status and the `Content-Type` are read: the type it measures (`precampaign.py`),
   `application/octet-stream` for both, is confirmed by [L1].
-- `file_space_name`: `GET /data/{id}` with the query `attribute=path`, the answer key `path`, whose first segment is
-  the name of the space the file lies in. [S9] is the earlier study's mock of what the official client calls, and it
-  answers `path` as `/{space name}/...`. **Refuted by [L1]**: Onedata 25.0 has no `path` attribute, so on that release
-  every mutation and range read by file id is refused before it is sent; see `UNVERIFIED_ENDPOINTS`.
+- `file_space_id`: `GET /data/{id}` with the query `attribute=parent_id`, answered `{"parent_id": <id>}`, and
+  `{"parent_id": null}` for a space's root. Confirmed by [L1] (a file two levels down, its directory and the root, on
+  each of the three providers), which also refuted the `path` attribute the gate read before: [S9], the earlier
+  study's mock of what the official client calls, answered it as `/{space name}/...`, and Onedata 25.0 answers
+  `attribute=path` with 400 `badValueNotAllowed`. No release at hand answers it, so the gate no longer asks for it.
 - The probes' transfer log (`transferlog.py`) reads `GET /spaces/{space}/transfers` on a provider (query `state`,
   `limit`, `page_token`; answer `transfers`, a list of ids, and `nextPageToken`, followed until empty), confirmed by
   [S10] for the states `ongoing` and `ended`, and each id's `GET /transfers/{id}`, whose `fileId` [S10] and state and
@@ -86,13 +109,14 @@ record was read directly, since no live test ran one).
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
 which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
-[L1] confirms, and what [L1] refuted; each entry has a live contract test (`tests/live/test_contract.py`) that fails if
-the deployment answers otherwise.
+[L1] confirms; it is empty, since [L1] confirmed every such call the layer still makes. A call [L1] confirmed keeps its
+live contract test (`tests/live/test_contract.py`), which fails if a deployment answers otherwise.
 """
 
 import base64
 import re
 import socket
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -114,18 +138,12 @@ READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_acc
 
 # What no source and no live run confirms, or a live run refuted: (method, path, what). Each has a test in
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
-# The six entries [L1] confirmed left the list; their live tests stay, so a later release that answers otherwise fails.
-UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
-    (
-        "GET",
-        "/data/{id}",
-        "the `path` attribute, which the gate of a mutation by file id reads the space's name from (its first "
-        "segment): the earlier study's mock [S9] answers it as /{space name}/..., and [L1] refuted it: Onedata 25.0 "
-        "answers attribute=path with 400 badValueNotAllowed (its attributes are file_id, parent_id, name and the "
-        "like, with no path), so on that release the gate refuses every mutation and range read by file id, fail "
-        "closed, until it reads a file's space another way",
-    ),
-)
+# The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
+# their live tests stay, so a later release that answers otherwise fails.
+UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = ()
+# The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that
+# loop, resolve to no space: the walk is bounded in requests, and a study's tree is far shallower.
+MAX_SPACE_DEPTH = 64
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 _FILE_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a file's object id: one plain path segment
@@ -145,12 +163,22 @@ class PlatformError(RuntimeError):
         self.transport = transport  # True only when no answer came back: a reset, a refusal or a timeout (O08)
 
 
-class MintNotSent(PlatformError):
+class NotSent(PlatformError):
+    """A request the client refused, or could not check, before sending it: the platform never saw it."""
+
+
+class MintNotSent(NotSent):
     """A token request failed before it was sent (no credential for the user), so no token can exist."""
 
 
-class OutOfScope(PlatformError):
+class OutOfScope(NotSent):
     """A mutation's target is no study space, or a path leaves the API; the mutation was not sent."""
+
+
+class ScopeUnread(NotSent):
+    """A read the gate makes to find a request's target space failed, so the request was not sent (fail closed).
+
+    It keeps that read's status, error id and transport flag, so a caller can tell an outage from an answer."""
 
 
 def _error_code(response: httpx.Response) -> str | None:
@@ -190,19 +218,19 @@ def _plain(path: str) -> list[str]:
     return path.split("/")
 
 
-def _space_of_path(path: Any) -> str:
-    """Return the first segment of a file's path as a provider answered it, which is its space's name.
+def _parent_link(answer: Any) -> str | None:
+    """Return the parent link of a provider's answer to `attribute=parent_id`: a plain file id, or None at the top.
 
-    The path must be canonical: absolute, with no `.` or `..` segment, no empty segment (`//`, or a trailing `/`), no
-    percent-escape and no backslash. A path that is not would let a prefix check pass on its first segment while the
-    path leads into another space (`/{study space}/../{other space}/f`), so it resolves to no space (O09).
-    """
-    if not isinstance(path, str) or not path.startswith("/"):
-        raise OutOfScope("the provider's answer for the target file holds no path, so it resolves to no space")
-    segments = path.split("/")[1:]
-    if "%" in path or "\\" in path or any(part in ("", ".", "..") for part in segments):
-        raise OutOfScope("the provider's path for the target file is not canonical, so it resolves to no space")
-    return segments[0]
+    Anything else (no `parent_id` key, an empty or non-plain id, another type) is unreadable, a PlatformError, so the
+    gate refuses the request unsent rather than guess where the file lies (O09)."""
+    if not isinstance(answer, dict) or "parent_id" not in answer:
+        raise PlatformError("the provider's answer for a parent link holds no parent_id")
+    parent = answer["parent_id"]
+    if parent is None:
+        return None
+    if not isinstance(parent, str) or not _FILE_ID.fullmatch(parent):
+        raise PlatformError("the provider's parent link is not a plain file id")
+    return parent
 
 
 def _file_target(method: str, path: str, body: Any) -> str | None:
@@ -245,6 +273,11 @@ class OnezoneClient:
         credential = admin_token if admin_token is not None else config.admin.read(environ)
         register_secret(credential)
         self._admin = {AUTH_HEADER: credential}
+        # What the gate's walks read and keep (`file_space_id`): a file's space does not change. Guarded by the lock,
+        # since one client may serve several threads; only a walk that reached a known root adds to them.
+        self._parents: dict[str, str] = {}  # file id -> its parent's id
+        self._roots: dict[tuple[str, str], str] = {}  # (provider, space id) -> the space's root file id
+        self._walk_lock = threading.Lock()
 
     def close(self) -> None:
         """Close the connection pool when the client built it."""
@@ -394,36 +427,122 @@ class OnezoneClient:
             raise OutOfScope("Onezone's answer for the target space holds no name, so it resolves to no space")
         return name
 
-    def file_space_name(self, file_id: str, provider: str) -> str:
-        """Return the name of the space a file lies in, read now from its `path` attribute through a provider.
+    def _space_roots(self, provider: str) -> dict[str, str]:
+        """Return root file id -> space id for the spaces the configuration knows, their roots as `provider` gives them.
 
-        Every call reads: nothing is kept, so a file moved or a space renamed since the last call changes the answer
-        (O09). The path must be canonical (`_space_of_path`) and its first segment is its space's name. A file the
-        provider does not know, or an answer without a canonical path, raises OutOfScope; any other failure of the
-        read raises PlatformError. Neither message holds the id or a name. Onedata 25.0 has no `path` attribute and
-        answers 400, so there every caller fails closed with PlatformError (`UNVERIFIED_ENDPOINTS`).
-        """
-        if not isinstance(file_id, str) or not _FILE_ID.fullmatch(file_id):
-            raise OutOfScope("the target file id is not a plain id, so it resolves to no space")
+        A root is the `fileId` of the provider's `GET /spaces/{id}`, read once per provider and kept once it was
+        answered. A 404 is a space the provider does not hold, which resolves to no space (OutOfScope); any other
+        failure, or an answer without a plain id, raises PlatformError and keeps nothing."""
+        space_id = self._config.space.id
+        with self._walk_lock:
+            root = self._roots.get((provider, space_id))
+        if root is None:
+            try:
+                answer = self._send("GET", f"/spaces/{space_id}", provider=provider, headers=self._admin)
+            except PlatformError as error:
+                if error.status == 404:
+                    raise OutOfScope(
+                        "the configured space is unknown to that provider, so the target resolves to no space"
+                    ) from None
+                raise
+            root = answer.get("fileId") if isinstance(answer, dict) else None
+            if not isinstance(root, str) or not _FILE_ID.fullmatch(root):
+                raise PlatformError(f"{self.provider_label(provider)}: the space's answer holds no plain root file id")
+            with self._walk_lock:
+                self._roots[(provider, space_id)] = root
+        return {root: space_id}
+
+    def _parent_of(self, node: str, provider: str, read: dict[str, str]) -> str | None:
+        """Return a file's parent id, from what earlier walks kept, what this walk read, or a read now; None at the top.
+
+        The read is `GET /data/{id}?attribute=parent_id` with the admin credential. A 404 is a file or directory the
+        provider does not know, which resolves to no space (OutOfScope); any other failure, or an answer that is no
+        plain id and no null, raises PlatformError. A link read now goes into `read`, which the caller keeps only once
+        its walk has reached a known root."""
+        with self._walk_lock:
+            kept = self._parents.get(node)
+        if kept is not None:
+            return kept
+        if node in read:
+            return read[node]
         try:
             answer = self._send(
-                "GET", f"/data/{file_id}", provider=provider, headers=self._admin, params={"attribute": "path"}
+                "GET", f"/data/{node}", provider=provider, headers=self._admin, params={"attribute": "parent_id"}
             )
         except PlatformError as error:
             if error.status == 404:
-                raise OutOfScope("the target file is unknown to its provider, so it resolves to no space") from None
+                raise OutOfScope(
+                    "the target file, or a directory above it, is unknown to its provider, so it resolves to no space"
+                ) from None
             raise
-        return _space_of_path(answer.get("path") if isinstance(answer, dict) else None)
+        try:
+            parent = _parent_link(answer)
+        except PlatformError as error:
+            raise PlatformError(f"{self.provider_label(provider)}: {error}") from None
+        if parent is not None:
+            read[node] = parent
+        return parent
+
+    def file_space_id(self, file_id: str, provider: str) -> str:
+        """Return the id of the configured space a file lies in, found by walking its parent links up to its root.
+
+        See "The space of a file" in this module's docstring. A file id that is not plain, a file or directory on the
+        way that the provider does not know, a walk that ends above every known root, and one longer than
+        `MAX_SPACE_DEPTH` raise OutOfScope; a read that fails or is answered with something unreadable raises
+        PlatformError. No message holds an id, a path or a name.
+        """
+        if not isinstance(file_id, str) or not _FILE_ID.fullmatch(file_id):
+            raise OutOfScope("the target file id is not a plain id, so it resolves to no space")
+        roots = self._space_roots(provider)
+        read: dict[str, str] = {}  # the links this walk read: kept only once it reaches a known root
+        node = file_id
+        for depth in range(MAX_SPACE_DEPTH + 1):
+            if node in roots:
+                with self._walk_lock:
+                    self._parents.update(read)
+                return roots[node]
+            if depth == MAX_SPACE_DEPTH:
+                break
+            parent = self._parent_of(node, provider, read)
+            if parent is None:
+                raise OutOfScope(
+                    "the target file lies in no space this configuration knows, so it resolves to no space"
+                )
+            node = parent
+        raise OutOfScope(
+            f"the target file lies more than {MAX_SPACE_DEPTH} directories below a known space's root, or its "
+            "parent links loop, so it resolves to no space"
+        )
+
+    def file_space_name(self, file_id: str, provider: str) -> str:
+        """Return the name Onezone gives, now, the space a file lies in: its space's id (`file_space_id`), then that
+        space's name, read afresh (`space_name`), so a space renamed since an earlier call changes the answer (O09)."""
+        return self.space_name(self.file_space_id(file_id, provider))
 
     def _target_name(self, method: str, path: str, provider: str | None, body: Any) -> str:
-        """Return the name of the space a request acts on: the space in its path, or the space of the file it names."""
+        """Return the name of the space a request acts on: the space in its path, or the space of the file it names.
+
+        A read made for it that fails is refused as not sent (ScopeUnread), keeping that read's status, error id and
+        transport flag; a target that resolves to no space stays OutOfScope."""
         parts = _plain(path)
-        if len(parts) >= 3 and parts[1] == "spaces":
-            return self.space_name(_target_space_id(path))
-        file_id = _file_target(method, path, body)
-        if file_id is None or provider is None:
-            raise OutOfScope("the mutation names no space and no file, so it resolves to no space; nothing was sent")
-        return self.file_space_name(file_id, provider)
+        try:
+            if len(parts) >= 3 and parts[1] == "spaces":
+                return self.space_name(_target_space_id(path))
+            file_id = _file_target(method, path, body)
+            if file_id is None or provider is None:
+                raise OutOfScope(
+                    "the mutation names no space and no file, so it resolves to no space; nothing was sent"
+                )
+            return self.file_space_name(file_id, provider)
+        except NotSent:
+            raise
+        except PlatformError as error:
+            raise ScopeUnread(
+                f"the gate could not read the target's space ({error}); nothing was sent",
+                status=error.status,
+                code=error.code,
+                transport=error.transport,
+            ) from None
 
     def _require_in_scope(self, name: str) -> None:
         if not name.startswith(self._config.space.prefixes):
