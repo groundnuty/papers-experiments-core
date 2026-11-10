@@ -21,7 +21,7 @@ from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.models import spend
-from expcore.models.adapters import ModelBackend, ModelTurn, ToolResult
+from expcore.models.adapters import ModelBackend, ModelTurn, ProbeReply, ToolResult
 from expcore.records.digest import digest, plain
 from expcore.records.schema import RecordError
 
@@ -139,9 +139,9 @@ class RecordingBackend:
         """Return the inner backend's conversation."""
         return self.inner.transcript()
 
-    async def probe(self) -> None:
-        """Probe through the inner backend."""
-        await self.inner.probe()
+    async def probe(self) -> ProbeReply | None:
+        """Probe through the inner backend, and return what its reply reported."""
+        return await self.inner.probe()
 
     async def aclose(self) -> None:
         """Close the inner backend."""

@@ -6,8 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
-from expcore.models.adapters import OpenAICompatAdapter, StubAdapter
+from expcore.models.adapters import AnthropicAdapter, OpenAICompatAdapter, ProbeReply, StubAdapter
 from expcore.models.admission import admit
+from expcore.records.recording import RecordingBackend
 
 
 async def _no_sleep(seconds):
@@ -112,3 +113,49 @@ def test_b11_a_backend_with_unknown_limits_is_not_refused_for_them():
     """B11: A backend with unknown limits is not refused for them."""
     assert admitted(StubAdapter([])) is None
     assert admitted(StubAdapter([], output_limit=10, context_tokens=10)) is not None
+
+
+@pytest.mark.parametrize(
+    ("usage", "missing"),
+    [(None, "no input and no output"), ((None, 1), "no input"), ((3, None), "no output")],
+)
+def test_b07_an_endpoint_whose_one_token_completion_omits_usage_is_not_admitted(
+    make_spec, limits, fake_client, completion, usage, missing
+):
+    """B07: the token budget is held from the counts each reply reports, so a model whose endpoint leaves them out
+    would be the one model the cap does not bind; its one-token completion says so, and it is not admitted."""
+    backend = OpenAICompatAdapter(make_spec(), 1, limits, client=fake_client(completion("x", usage=usage)))
+    reason = admitted(backend)
+    assert reason is not None
+    assert reason.startswith(f"the one-token completion reported {missing} token count")
+    assert backend.info()["usage_seen"]["responses"] == 0  # read, never tallied: the probe is no part of a run
+
+
+def test_b07_an_anthropic_completion_counts_its_prompt_with_its_cached_parts_and_must_report_both_counts(
+    make_spec, limits, fake_client, message
+):
+    """B07: the Messages API's input_tokens is only the uncached remainder; the whole prompt is what the probe reads,
+    and a reply without its output count is not admitted."""
+    spec = make_spec(backend="anthropic")
+    usage = {"input_tokens": 2, "cache_read_input_tokens": 5, "cache_creation_input_tokens": 0, "output_tokens": 1}
+    client = fake_client(message(usage=usage), api="anthropic")
+    backend = AnthropicAdapter(spec, 1, limits, client=client, api_key="test-key", sleep=_no_sleep)
+    assert asyncio.run(backend.probe()) == ProbeReply(1, 7, 1)
+    silent = fake_client(message(usage={"input_tokens": 2, "output_tokens": 1}), api="anthropic")
+    silent.outcomes[0].usage.output_tokens = None
+    backend = AnthropicAdapter(spec, 1, limits, client=silent, api_key="test-key", sleep=_no_sleep)
+    assert admitted(backend).startswith("the one-token completion reported no output token count")
+
+
+def test_b07_a_backend_whose_probe_returns_nothing_to_read_cannot_show_its_usage_and_is_not_admitted():
+    """B07: a backend of a study's own whose probe returns None says nothing of the usage its endpoint reports, so it
+    is refused as one that omits it; a backend that wraps a core one and passes its probe's reply on is admitted."""
+
+    class Silent(StubAdapter):
+        async def probe(self):
+            await super().probe()
+
+    assert admitted(Silent([])) == (
+        "the backend's probe returned no reply to read, so it cannot show that the endpoint reports usage"
+    )
+    assert admitted(RecordingBackend(StubAdapter([]))) is None

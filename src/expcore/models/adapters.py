@@ -62,6 +62,16 @@ class ToolResult:
     is_error: bool = False
 
 
+@dataclasses.dataclass(frozen=True)
+class ProbeReply:
+    """What the reply to an admission probe reported: the max_tokens the request carried and the reply's usage, a
+    count the reply left out being None (B07)."""
+
+    max_tokens: int
+    input_tokens: int | None
+    output_tokens: int | None
+
+
 @dataclasses.dataclass
 class ModelTurn:
     """One reply of the model with its usage; a count the reply did not carry is None, never 0 (B10)."""
@@ -121,8 +131,10 @@ class ModelBackend(Protocol):
         """Return a copy of the conversation as sent, system prompt first."""
         ...
 
-    async def probe(self) -> None:
-        """Send a one-token completion; raise when the model cannot serve one (B07)."""
+    async def probe(self) -> ProbeReply | None:
+        """Send a one-token completion and return what its reply reported; raise when the model cannot serve one (B07).
+
+        None says nothing of the usage, so admission refuses it as usage it cannot show is reported."""
         ...
 
     async def aclose(self) -> None:
@@ -350,7 +362,7 @@ class OpenAICompatAdapter(_SdkBackend):
         for r in results:
             self._messages.append({"role": "tool", "tool_call_id": r.call.id, "content": r.text})
 
-    async def probe(self) -> None:
+    async def probe(self) -> ProbeReply:
         """Send a one-token completion with the model's id and its vendor extras (a provider pin applies to it too)."""
         kw: dict[str, Any] = {
             "model": self.spec.api_id,
@@ -362,6 +374,8 @@ class OpenAICompatAdapter(_SdkBackend):
         resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
         if not getattr(resp, "choices", None):
             raise InfraError("endpoint", "the one-token completion carried no choices")
+        usage = getattr(resp, "usage", None)  # reported, never tallied: the probe is no part of a run
+        return ProbeReply(1, token_count(usage, "prompt_tokens"), token_count(usage, "completion_tokens"))
 
     def _wire_messages(self) -> list[dict]:
         """The conversation as sent: the internal copy of the reasoning is stripped."""
@@ -461,8 +475,7 @@ class AnthropicAdapter(_SdkBackend):
         fresh = token_count(ua, "input_tokens")  # the API's input_tokens is only the uncached remainder
         created = token_count(ua, "cache_creation_input_tokens")
         read = token_count(ua, "cache_read_input_tokens")
-        out_tok = token_count(ua, "output_tokens")
-        in_tok = None if fresh is None else fresh + (created or 0) + (read or 0)  # the prompt size the budget counts
+        in_tok, out_tok = _anthropic_counts(ua)  # the prompt size the budget counts, cached parts included
         self.served.note(resp)
         self._count(in_tok, out_tok)
         if not isinstance(getattr(resp, "content", None), (list, tuple)):
@@ -521,12 +534,13 @@ class AnthropicAdapter(_SdkBackend):
             }
         )
 
-    async def probe(self) -> None:
+    async def probe(self) -> ProbeReply:
         """Send a one-token completion. The vendor extras are left out: extended thinking needs a larger budget."""
         kw = {"model": self.spec.api_id, "messages": [{"role": "user", "content": PROBE_PROMPT}], "max_tokens": 1}
         resp, _ = await self.retrier.call(lambda: self._client.messages.create(**kw))
         if not isinstance(getattr(resp, "content", None), (list, tuple)):
             raise InfraError("endpoint", "the one-token completion carried no content blocks")
+        return ProbeReply(1, *_anthropic_counts(getattr(resp, "usage", None)))
 
     def transcript(self) -> list[dict]:
         """Return the conversation with the system prompt first; on the wire it travels as a separate parameter."""
@@ -536,6 +550,15 @@ class AnthropicAdapter(_SdkBackend):
     async def aclose(self) -> None:
         """Close the client."""
         await self._client.close()
+
+
+def _anthropic_counts(usage: Any) -> tuple[int | None, int | None]:
+    """The whole prompt (the uncached remainder the API calls input_tokens, plus both cache parts) and the output of a
+    Messages API usage object; a count it left out is None."""
+    fresh = token_count(usage, "input_tokens")
+    created, read = token_count(usage, "cache_creation_input_tokens"), token_count(usage, "cache_read_input_tokens")
+    whole = None if fresh is None else fresh + (created or 0) + (read or 0)
+    return whole, token_count(usage, "output_tokens")
 
 
 class StubAdapter:
@@ -653,10 +676,11 @@ class StubAdapter:
         """Return a copy of the conversation."""
         return json.loads(json.dumps(self._messages, default=str))
 
-    async def probe(self) -> None:
-        """Succeed, or raise the error the stub was given."""
+    async def probe(self) -> ProbeReply:
+        """Succeed with a synthetic one-token reply, as the stub's counts are synthetic, or raise the error it was given."""
         if self._probe_error is not None:
             raise self._probe_error
+        return ProbeReply(1, 1, 1)
 
     async def aclose(self) -> None:
         """Nothing to release."""

@@ -82,7 +82,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | B04 | Echo the reasoning field when the model needs it | `tests/models/test_adapters_openai.py` |
 | B05 | Anthropic thinking blocks go back verbatim | `tests/models/test_adapters_anthropic.py` |
 | B06 | Served-model check | `tests/models/test_adapters_openai.py`, `tests/models/test_served.py` |
-| B07 | A listed model is not a servable model | `tests/models/test_adapters_anthropic.py`, `tests/models/test_adapters_openai.py`, `tests/models/test_admission.py` |
+| B07 | A listed model is not a servable model | `tests/campaign/test_scheduler.py`, `tests/models/test_adapters_anthropic.py`, `tests/models/test_adapters_openai.py`, `tests/models/test_admission.py` |
 | B08 | Unfrozen settings refuse a study run | `tests/config/test_models.py`, `tests/models/test_factory.py` |
 | B09 | A rejected key is not retried and not recorded | `tests/models/test_adapters_anthropic.py`, `tests/models/test_adapters_openai.py`, `tests/models/test_retry.py` |
 | B10 | Usage is counted on arrival and never invented | `tests/loop/test_agent_loop.py`, `tests/models/test_adapters_anthropic.py`, `tests/models/test_adapters_openai.py`, `tests/models/test_usage.py` |
