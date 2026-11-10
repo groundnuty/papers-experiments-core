@@ -8,9 +8,15 @@ here changes every report, and a replication package's regeneration with it.
 NO_KIND = "none"  # the kind column of a condition's row of zeros
 
 
+def percent(level: float) -> str:
+    """A level as a percentage with at most two decimals and no trailing zeros: 0.9 is 90%, 0.975 is 97.5%, never
+    rounded to another level's name."""
+    return f"{level * 100:.2f}".rstrip("0").rstrip(".") + "%"
+
+
 def equivalence_header(alpha: float) -> str:
     """The heading of the equivalence interval's column: its level, 1 - 2 alpha."""
-    return f"{1 - 2 * alpha:.0%} equivalence interval"
+    return f"{percent(1 - 2 * alpha)} equivalence interval"
 
 
 def contrast_notes(alpha: float) -> list[str]:

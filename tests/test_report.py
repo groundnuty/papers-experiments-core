@@ -546,3 +546,17 @@ def test_s10_a_scored_contrast_that_used_its_tolerance_shows_the_pairs_it_lost_a
     )
     report = render(analysis(tolerated, family=["outage"]))
     assert row(report, "outage")[12] == "scored (1 pair(s) None, at most 2 preregistered)"
+
+
+@pytest.mark.parametrize(
+    ("alpha", "equivalence", "level", "interval"),
+    [(0.05, "90%", 0.95, "95%"), (0.0125, "97.5%", 0.975, "97.5%"), (0.025, "95%", 0.999, "99.9%")],
+)
+def test_c23_an_interval_level_is_named_with_its_fraction_never_rounded_to_another_level(
+    alpha, equivalence, level, interval
+):
+    """C23: alpha 0.0125 gives a 97.5% equivalence interval; calling it 98% would name an interval nobody computed."""
+    member = contrast("near", "equivalent", equivalence_margin=0.25, equivalence_interval=(-0.1, 0.1))
+    result = dataclasses.replace(analysis(member), alpha=alpha)
+    header = table_of(render(result, interval_level=level), "## Preregistered contrasts")["Contrast"]
+    assert header[4:7] == [f"{interval} interval", "Margin", f"{equivalence} equivalence interval"]

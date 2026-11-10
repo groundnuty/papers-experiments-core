@@ -46,6 +46,7 @@ from expcore.report_notes import (
     NO_KIND,
     contrast_notes,
     equivalence_header,
+    percent,
 )
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
 from expcore.stats.pairing import MISSING_CAUSES
@@ -146,7 +147,7 @@ def _contrast_table(
     *,
     with_mde: bool,
 ) -> list[str]:
-    interval = "Interval" if level is None else f"{level:.0%} interval"
+    interval = "Interval" if level is None else f"{percent(level)} interval"
     header = ["Contrast", "Arms (A vs B, A - B)", "Outcome", "Estimate", interval, "Margin", equivalence_header(alpha)]
     header += ["p", "Holm p", "Conclusion"]
     header += ["Clusters", "Pairs used", "Treatment attempts", "Tasks dropped"]
