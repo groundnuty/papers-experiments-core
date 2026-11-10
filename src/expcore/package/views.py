@@ -39,7 +39,6 @@ import binascii
 import bz2
 import contextlib
 import gzip
-import hashlib
 import html
 import io
 import json
@@ -333,10 +332,14 @@ def _runs(text: str) -> Iterator[tuple[int, str]]:
         yield from flush(parts)
 
 
-def payloads(text: str) -> Iterator[tuple[str, bytes, bool]]:
-    """Every base64 run and every hex run of `MIN_RUN` characters or more, decoded, once each: (what it was, the
-    bytes, whether the run was long). Linear in the text."""
-    seen: dict[bytes, bool] = {}
+def payloads(text: str, seen: dict[bytes, int] | None = None) -> Iterator[tuple[str, bytes, bool]]:
+    """Every base64 run and every hex run of `MIN_RUN` characters or more, decoded: (what it was, the bytes, whether
+    the run was long). Linear in the text. Runs are told apart by what they decode to and where they stand, so the
+    same bytes decoded from two places of the text are both given. `seen` counts, for each decoded value, how many
+    runs earlier calls gave for other forms of the same text (decoded, parsed): a call gives a value only past that
+    count, so a run every form shows is given once. It is shared across calls, and updated, on purpose."""
+    seen = {} if seen is None else seen
+    here: dict[bytes, int] = {}  # this form's runs of each value so far
     for start, run in _runs(text):
         found = []
         if len(run) >= MIN_RUN:
@@ -347,8 +350,11 @@ def payloads(text: str) -> Iterator[tuple[str, bytes, bool]]:
                 (f"hex@{start + match.start()}", bytes.fromhex(digits[: len(digits) // 2 * 2]), len(digits) >= LONG_RUN)
             )
         for where, decoded, long in found:
-            if decoded and decoded not in seen:
-                seen[decoded] = long
+            if not decoded:
+                continue
+            here[decoded] = here.get(decoded, 0) + 1
+            if here[decoded] > seen.get(decoded, 0):
+                seen[decoded] = here[decoded]
                 yield where, decoded, long
 
 
@@ -361,9 +367,12 @@ def _texts_of(text: str) -> list[str]:
 
 
 def _walk_text(label: str, data: bytes, text: str, depth: int, budget: _Budget) -> Iterator[Stream]:
+    """The text, then what each encoded run in it decodes to, once per run however many forms of the text show it;
+    a run is named by its offset in the first form that shows it (the text as it is, if it does)."""
     yield Stream(label, data, TEXT, text)
+    seen: dict[bytes, int] = {}
     for form in _texts_of(text):
-        for where, decoded, long in payloads(form):
+        for where, decoded, long in payloads(form, seen):
             _spend(budget, label, len(decoded))
             yield from _walk_decoded(f"{label}!({where})", decoded, depth + 1, budget, strict=long)
 
@@ -529,12 +538,6 @@ def streams(path: str, data: bytes) -> tuple[list[Stream], list[tuple[str, str]]
     return found, budget.problems
 
 
-def hidden_name(position: int, label: str) -> str:
-    """How a finding names a stream whose label must not be shown: the file's place in the package and the start of
-    the label's SHA-256, so that two such findings are never folded into one and the author can find each."""
-    return f"file {position} (path sha256 {hashlib.sha256(label.encode('utf-8')).hexdigest()[:12]})"
-
-
 def _byte_views(data: bytes) -> list[tuple[str, str]]:
     views = [
         ("utf-8", data.decode("utf-8", errors="replace")),
@@ -585,6 +588,7 @@ def _decoded(text: str) -> str:
 
 
 PARSED = ("json", "toml")  # views without the file's own lines
+JOINED = ("normalised", "decoded")  # views whose continuations are joined, which shifts the lines after them
 
 
 def _text_views(label: str, text: str) -> list[tuple[str, str]]:

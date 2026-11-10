@@ -15,6 +15,7 @@ from expcore.package.build import PACKAGE_FILE, build_package, verify_package
 from expcore.package.spec import PackageError
 from expcore.package.tracking import tracking
 from expcore.provenance.hashfile import render_hash_file
+from expcore.provenance.redact import hidden_name
 
 NAME = "tiny-study-package"
 
@@ -138,6 +139,34 @@ def test_k12_a_path_that_holds_a_listed_term_is_shown_only_by_its_place(committe
     with pytest.raises(PackageError, match=r"\(untracked\)") as refused:
         build_package(committed, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
     assert "quillon" not in str(refused.value).lower()
+
+
+def test_k05_the_refusal_carries_each_hidden_path_for_the_author_to_ask_for(committed, hashes, anonymisation, tmp_path):
+    """K05: a file no commit holds whose path holds a term is named by its hash in the refusal, which carries the path
+    itself only for the command line to show when the author asks."""
+    name = "quillon varek notes.txt"
+    (committed / name).write_text("a note\n", encoding="utf-8")
+    include(committed, name)
+    with pytest.raises(PackageError) as refused:
+        build_package(committed, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
+    assert refused.value.private == {hidden_name(name): name}
+    assert hidden_name(name) in str(refused.value)
+
+
+def test_k12_the_warning_about_an_uncommitted_file_hides_a_path_that_holds_a_private_name(committed, hashes, tmp_path):
+    """K12: the hashes load before the tracking check, so its warning names a path that holds a private name by its
+    hash, like every later message, and never shows the name."""
+    name = "zarnothwick-notes.txt"  # holds the invented private name the hash file lists
+    (committed / name).write_text("a note\n", encoding="utf-8")
+    include(committed, name)
+    warned: list[str] = []
+    with pytest.raises(PackageError) as refused:  # the path's own finding refuses the build afterwards
+        build_package(committed, tmp_path / "dist", hashes=hashes, warn=warned.append)
+    assert [line for line in warned if "no commit holds" in line] == [
+        "included but no commit holds them, listed in PACKAGE.json: "
+        f"package.toml (modified), {hidden_name(name)} (untracked)"
+    ]
+    assert "zarnothwick" not in "".join(warned) + str(refused.value)
 
 
 def test_k12_a_study_outside_any_repository_says_it_cannot_tell_and_is_not_refused(

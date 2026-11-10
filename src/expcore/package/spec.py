@@ -53,7 +53,16 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 
 
 class PackageError(RuntimeError):
-    """A package cannot be built or verified; the message says why and never shows a value it must not."""
+    """A package cannot be built or verified; the message says why and never shows a value it must not.
+
+    A path that must not be shown is named by its place in the package and the start of its hash (`views.hidden_name`).
+    `private` maps each such name the message gives to the path it stands for, relative to the study: the command line
+    shows it to the author on a terminal, never in a log or a file.
+    """
+
+    def __init__(self, message: str, *, private: Mapping[str, str] | None = None) -> None:
+        super().__init__(message)
+        self.private = dict(private or {})
 
 
 @dataclass(frozen=True)

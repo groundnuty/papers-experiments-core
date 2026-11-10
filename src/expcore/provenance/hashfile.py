@@ -29,6 +29,10 @@ CODE_CATEGORIES = frozenset({"conditions", "data-states", "tasks", "datasets", "
 _CATEGORY_RE = re.compile(r"^#\s*category\s*:\s*(.+?)\s*$", re.IGNORECASE)
 WHOLE_PREFIX = "whole:"  # a plain-list line that marks its token as matching only as an entire value
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+GENERATE = (
+    "Generate the file from the plain list (one token per line): "
+    "python -m expcore.provenance.study_tokens hash PLAIN > FILE"
+)
 
 
 @dataclass(frozen=True)
@@ -114,8 +118,24 @@ def render_hash_file(entries: Iterable[str | tuple[str, str] | tuple[str, str, b
     return "\n".join([*header, *sorted(f"{match} {scope} {digest}" for (match, digest), scope in best.items())]) + "\n"
 
 
+def _malformed(source: str, number: int, fields: list[str]) -> ValueError:
+    """The error for a line not in the hash format: a line that starts with a digest is a plain `sha256(token)`, the
+    likeliest mistake, and is named as one; either way the message gives the command that makes a correct file."""
+    if _DIGEST_RE.fullmatch(fields[0]):
+        return ValueError(
+            f"{source}:{number}: a bare SHA-256 digest, without the '<any|whole> <code|all>' fields; a study-token "
+            f"hash is salted with '{HASH_PREFIX}' and normalised, so a plain digest of a name matches nothing. "
+            f"{GENERATE}"
+        )
+    return ValueError(f"{source}:{number}: expected '<any|whole> <code|all> <sha256>'. {GENERATE}")
+
+
 def parse_hash_file(text: str, source: str) -> Hashes:
-    """Parse hash-file text; raise ValueError naming the source and line on a malformed line."""
+    """Parse hash-file text; raise ValueError naming the source and line on a malformed line.
+
+    A file of lines in the right format whose digests were made some other way cannot be told from a correct one:
+    a digest shows nothing of its input. Only the shape of each line is checked.
+    """
     tables: dict[str, dict[str, str]] = {"any": {}, "whole": {}}
     for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -126,7 +146,7 @@ def parse_hash_file(text: str, source: str) -> Hashes:
             fields.insert(1, SCOPE_ALL)
         ok = len(fields) == 3 and fields[0] in tables and fields[1] in SCOPES and _DIGEST_RE.fullmatch(fields[2])
         if not ok:
-            raise ValueError(f"{source}:{number}: expected '<any|whole> <code|all> <sha256>'")
+            raise _malformed(source, number, line.split())
         match, scope, digest = fields
         if tables[match].get(digest) != SCOPE_ALL:
             tables[match][digest] = scope

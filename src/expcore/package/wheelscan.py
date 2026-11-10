@@ -29,15 +29,17 @@ refused: that file names a URL and a commit.
 import hashlib
 import io
 import zipfile
+import zlib
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term, term_lines
 from expcore.package.identity import FOUND_COMMIT, FOUND_URL, commit_lines, find_identity, url_lines
-from expcore.package.leaks import scan_tokens
+from expcore.package.leaks import describe_hit, scan_tokens
 from expcore.package.spec import Opaque, PackageError
 from expcore.package.wheels import Wheel
 from expcore.provenance.hashfile import Hashes
+from expcore.provenance.redact import Redactor
 from expcore.provenance.scanner import scan_source
 
 DIRECT_URL = "direct_url.json"
@@ -51,13 +53,22 @@ class WheelScan:
     binaries: Mapping[str, list[dict[str, str]]] = field(default_factory=dict)
 
 
-def members(wheel: Wheel) -> list[tuple[str, bytes]]:
-    """The files of a wheel, in the order the archive holds them."""
+_UNREADABLE = (zipfile.BadZipFile, OSError, EOFError, RuntimeError, NotImplementedError, ValueError, zlib.error)
+
+
+def members(wheel: Wheel, redactor: Redactor | None = None) -> list[tuple[str, bytes]]:
+    """The files of a wheel, in the order the archive holds them.
+
+    A wheel that cannot be opened, or a member that cannot be read (encrypted, compressed in a way the reader does not
+    know, damaged), refuses the build naming the wheel through `redactor` and the kind of failure only: the reader's
+    own message names the member, whose path can hold a private name or a term.
+    """
     try:
         with zipfile.ZipFile(io.BytesIO(wheel.data)) as archive:
             return [(info.filename, archive.read(info)) for info in archive.infolist() if not info.is_dir()]
-    except (zipfile.BadZipFile, OSError, EOFError) as error:
-        raise PackageError(f"{wheel.path}: cannot be read as a wheel ({type(error).__name__})") from None
+    except _UNREADABLE as error:
+        shown = wheel.path if redactor is None else redactor.name(wheel.path)
+        raise PackageError(f"{shown}: cannot be read as a wheel, in full ({type(error).__name__})") from None
 
 
 def as_text(data: bytes) -> str | None:
@@ -70,27 +81,30 @@ def as_text(data: bytes) -> str | None:
         return None
 
 
-def _plain(label: str, text: str, tokens: Hashes | None, terms: Anonymisation | None, hidden) -> list[str]:
+def _plain(
+    label: str, text: str, tokens: Hashes | None, terms: Anonymisation | None, hidden, redactor: Redactor
+) -> list[str]:
     """Read a member of a release as it is: the token list line by line (unless the release is exempt from it), and
-    the terms and identity if anonymised."""
-    found = (
-        [] if tokens is None else [str(h) for h in scan_source(label, text, tokens, exempt_header=False, python=False)]
-    )
+    the terms and identity if anonymised. The member is named through `redactor`, like every path of the build."""
+    shown = redactor.name(label)
+    hits = [] if tokens is None else scan_source(label, text, tokens, exempt_header=False, python=False)
+    found = [describe_hit(shown, hit) for hit in hits]
     if terms is not None:
         commits, urls = hidden
-        found += [f"{label}:{line}: a term of the anonymisation list" for line in sorted(term_lines(text, terms))]
-        found += [f"{label}:{line}: {FOUND_COMMIT}" for line in sorted(commit_lines(text, commits))]
-        found += [f"{label}:{line}: {FOUND_URL}" for line in sorted(url_lines(text, urls))]
+        found += [f"{shown}:{line}: a term of the anonymisation list" for line in sorted(term_lines(text, terms))]
+        found += [f"{shown}:{line}: {FOUND_COMMIT}" for line in sorted(commit_lines(text, commits))]
+        found += [f"{shown}:{line}: {FOUND_URL}" for line in sorted(url_lines(text, urls))]
     return found
 
 
-def _deep(label: str, data: bytes, tokens: Hashes, terms: Anonymisation | None, hidden) -> list[str]:
+def _deep(
+    label: str, data: bytes, tokens: Hashes, terms: Anonymisation | None, hidden, redactor: Redactor
+) -> list[str]:
     """Read a member of the author's own code with every view the checks use for a file."""
     one = {label: data}
-    marked = (lambda name: holds_term(terms, name)) if terms is not None else (lambda name: False)
-    found = scan_tokens(one, tokens, hidden=marked)
+    found = scan_tokens(one, tokens, redactor=redactor)
     if terms is not None:
-        found += find_terms(one, terms) + find_identity(one, *hidden, opaque=())
+        found += find_terms(one, terms, redactor=redactor) + find_identity(one, *hidden, opaque=(), redactor=redactor)
     return found
 
 
@@ -102,48 +116,63 @@ def scan_wheels(
     hidden: tuple[frozenset[str], frozenset[str]],
     attested: Mapping[str, Opaque],
     exempt: Collection[str] = frozenset(),
+    redactor: Redactor | None = None,
 ) -> WheelScan:
     """Read every text member of every wheel; list the members that are not text; refuse nothing on its own.
 
     A wheel in `exempt` (`lockfile.token_exempt`: a pypi.org release whose bytes the study's lock records) is read as
-    a release, without the study-token list; the terms and identity of an anonymised package still apply to it.
+    a release, without the study-token list; the terms and identity of an anonymised package still apply to it. Every
+    message names a member through `redactor` (by default one that knows the tokens and the terms), so a member path
+    that holds a private name or a term is never shown, in a finding, an attestation hint or a refusal.
     """
+    if redactor is None:
+        redactor = Redactor(tokens, (lambda text: holds_term(terms, text)) if terms is not None else None)
     findings: list[str] = []
     binaries: dict[str, list[dict[str, str]]] = {}
     seen: set[str] = set()
     for wheel in wheels:
         binaries[wheel.path] = []
-        for member, data in members(wheel):
+        for member, data in members(wheel, redactor):
             label = f"{wheel.path}/{member}"
             seen.add(label)
             digest = hashlib.sha256(data).hexdigest()
             if label in attested:
                 if attested[label].sha256 != digest:
-                    findings.append(f"{label}: its SHA-256 is not the one [[opaque]] attests; read it again")
+                    findings.append(
+                        f"{redactor.name(label)}: its SHA-256 is not the one [[opaque]] attests; read it again"
+                    )
                 continue
             if terms is not None and member.endswith(f".dist-info/{DIRECT_URL}"):
-                findings.append(f"{label}: names where the distribution came from; an anonymised package refuses it")
+                findings.append(
+                    f"{redactor.name(label)}: names where the distribution came from; an anonymised package refuses it"
+                )
                 continue
             text = as_text(data)
             if text is None:
                 binaries[wheel.path].append({"path": member, "sha256": digest})
                 continue
             if wheel.path in exempt:
-                found = _plain(label, text, None, terms, hidden)
+                found = _plain(label, text, None, terms, hidden, redactor)
             elif wheel.from_index:
-                found = _plain(label, text, tokens, terms, hidden)
+                found = _plain(label, text, tokens, terms, hidden, redactor)
             else:
-                found = _deep(label, data, tokens, terms, hidden)
+                found = _deep(label, data, tokens, terms, hidden, redactor)
             if found:
                 findings += found
-                findings.append(_attest_hint(label, digest, terms))
-    findings += [f"{path}: [[opaque]] attests a member no vendored wheel holds" for path in _stray(attested, seen)]
+                findings.append(_attest_hint(label, digest, redactor))
+    findings += [
+        f"{redactor.name(path)}: [[opaque]] attests a member no vendored wheel holds" for path in _stray(attested, seen)
+    ]
     return WheelScan(findings, binaries)
 
 
-def _attest_hint(label: str, digest: str, terms: Anonymisation | None) -> str:
-    if terms is not None and holds_term(terms, label):
-        return "a wheel member above can be attested in package.toml once read by hand, by its path and SHA-256"
+def _attest_hint(label: str, digest: str, redactor: Redactor) -> str:
+    shown = redactor.name(label)
+    if shown != label:
+        return (
+            f"to attest {shown} once read by hand: [[opaque]] with its path (which --show-private-paths prints), "
+            f'sha256 = "{digest}", reason = "..."'
+        )
     return f'to attest it once read by hand: [[opaque]] path = "{label}", sha256 = "{digest}", reason = "..."'
 
 

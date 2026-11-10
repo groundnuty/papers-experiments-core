@@ -6,6 +6,7 @@ import bz2
 import gzip
 import hashlib
 import io
+import json
 import lzma
 import random
 import sqlite3
@@ -18,8 +19,10 @@ import zlib
 import pytest
 
 from expcore.package.build import scan_tokens
-from expcore.package.views import hidden_name
+from expcore.package.leaks import findings_in, without_paths
+from expcore.provenance.candidates import token_hash
 from expcore.provenance.hashfile import hashes_from_tokens
+from expcore.provenance.redact import hidden_name
 
 PRIVATE = "zarnothwick"  # invented; private everywhere in these tests
 HASHES = hashes_from_tokens([PRIVATE])
@@ -116,7 +119,7 @@ def test_k03_a_zip_member_and_a_member_name_are_found_and_the_name_is_redacted()
     """K03: zip members are opened; a member whose own name holds the private name is shown redacted."""
     assert found({"bundle.zip": zipped({"inner/notes.txt": TEXT})})
     named = found({"bundle.zip": zipped({f"{PRIVATE}/notes.txt": b"plain\n"})})
-    member = hidden_name(1, f"bundle.zip!{PRIVATE}/notes.txt")  # the member, named by place and hash, besides the zip
+    member = hidden_name(f"bundle.zip!{PRIVATE}/notes.txt")  # the member, named by its hash, besides the zip
     assert any(finding.startswith(member) for finding in named)
 
 
@@ -325,16 +328,16 @@ def test_k03_a_member_that_fails_to_decompress_refuses_the_file_at_once():
     assert [s.label for s in streams] == ["cut.gz"]
 
 
-def test_k03_refused_files_under_a_redacted_directory_are_each_named_by_position_and_path_hash():
+def test_k03_refused_files_under_a_redacted_directory_are_each_named_by_their_path_hash():
     """K03: a refusal whose path holds a private name is never shown, and never folded into another: each names the
-    file's position in the package and the start of its path's SHA-256."""
+    start of its path's SHA-256."""
     first, second = f"{PRIVATE}/a.pdf", f"{PRIVATE}/b.pdf"
     findings = found({"README.md": b"plain\n", first: b"%PDF-1.4\n", second: b"%PDF-1.4\n"})
-    named = [finding.split(": refused", 1)[0] for finding in findings if "refused" in finding]
-    assert named == [
-        f"file 2 (path sha256 {hashlib.sha256(first.encode()).hexdigest()[:12]})",
-        f"file 3 (path sha256 {hashlib.sha256(second.encode()).hexdigest()[:12]})",
-    ]
+    named = {finding.split(": refused", 1)[0] for finding in findings if "refused" in finding}
+    assert named == {
+        f"<hidden {hashlib.sha256(first.encode()).hexdigest()[:12]}>",
+        f"<hidden {hashlib.sha256(second.encode()).hexdigest()[:12]}>",
+    }
 
 
 def test_k03_a_long_base64_run_that_looks_compressed_but_fails_to_decompress_refuses_the_file():
@@ -411,3 +414,124 @@ def test_k03_a_digest_that_looks_like_a_tiny_deflate_stream_is_never_refused():
 def test_k03_several_caption_lines_above_an_encoded_block_do_not_hide_it():
     """K03: a joined run is also decoded from each line whose width differs from the one before it."""
     assert found({"attachment.txt": b"Experiment\nResults\nPayload\n" + base64.b64encode(zlib.compress(TEXT))})
+
+
+# --- how a finding reads ----------------------------------------------------------------------------------------------
+
+NAMED = f"a private name (study token {token_hash(PRIVATE)[:12]})"
+
+
+def test_k05_a_finding_says_it_is_a_private_name_and_gives_the_line_once():
+    """K05: a finding reads like the term check's, naming the study token by a hash prefix, once per line, whatever
+    views found it."""
+    assert found({"notes.txt": b"first line\n" + TEXT}) == [f"notes.txt:2: {NAMED}"]
+    assert found({"tool.py": f'HOST = "{PRIVATE}"  # {PRIVATE}\n'.encode()}) == [f"tool.py:1: {NAMED}"]
+
+
+def test_k05_a_one_line_json_file_is_reported_at_its_one_line_and_never_again_for_its_parsed_strings():
+    """K05: the parsed strings of a JSON or TOML file have no lines of their own; a name the text shows is reported at
+    its line alone."""
+    mirror = json.dumps({"a": 1, "b": "x", "host": f"{PRIVATE}.example"}).encode()
+    assert found({"extra/mirror.json": mirror}) == [f"extra/mirror.json:1: {NAMED}"]
+    assert found({"conf.toml": f'name = "{PRIVATE}"\n'.encode()}) == [f"conf.toml:1: {NAMED}"]
+
+
+def test_k05_a_name_seen_only_once_decoded_says_so():
+    """K05: a name only a decoded view shows is reported at its line of the decoded text, marked as such."""
+    hidden = PRIVATE[:4] + "%" + PRIVATE[4].encode().hex() + PRIVATE[5:]
+    assert found({"notes.txt": f"plain\nran on {hidden}\n".encode()}) == [f"notes.txt:2: {NAMED}, once decoded"]
+
+
+def test_k05_a_base64_run_is_reported_once_whichever_forms_of_the_text_show_it():
+    """K05: a run the text shows as it is and again in its parsed strings is decoded and reported once, at its offset
+    in the text."""
+    record = b'{"k": "' + b64(TEXT) + b'"}'
+    assert found({"record.json": record}) == [f"record.json!(base64@7):1: {NAMED}"]
+
+
+def test_k05_raw_bytes_have_no_lines_and_a_path_is_reported_once_for_its_file():
+    """K05: a name in an archive's raw bytes is reported without a line; a name in a directory is reported once, for
+    the file, not again for each stream inside it."""
+    stored = io.BytesIO()
+    with zipfile.ZipFile(stored, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("notes.txt", TEXT)
+    assert found({"bundle.zip": stored.getvalue()}) == [
+        f"bundle.zip!notes.txt:1: {NAMED}",
+        f"bundle.zip: {NAMED}, in its raw bytes",
+    ]
+    path = f"{PRIVATE}/bundle.zip"
+    findings = found({path: zipped({"notes.txt": b"plain\n"})})
+    assert findings == [f"{hidden_name(path)}: the path holds {NAMED}"]
+
+
+def test_k05_a_plain_and_an_encoded_occurrence_on_different_lines_are_both_reported():
+    """K05: findings are de-duplicated per occurrence, not per name: the same name plain on one line and
+    percent-encoded on another is reported at both lines."""
+    hidden = PRIVATE[:4] + "%" + PRIVATE[4].encode().hex() + PRIVATE[5:]
+    text = f"ran on {PRIVATE}\nplain\nand on {hidden}\n".encode()
+    assert found({"notes.txt": text}) == [f"notes.txt:1: {NAMED}", f"notes.txt:3: {NAMED}, once decoded"]
+
+
+def test_k05_a_name_after_a_continuation_is_reported_once_at_its_own_line():
+    """K05: joining continuations shifts the lines after them; a name there is reported at its line of the file, once,
+    and one a continuation splits is reported at the line it starts on."""
+    split = PRIVATE[:5] + "\\\n    " + PRIVATE[5:]
+    text = f"first \\\n  second\nthird {PRIVATE}\nsplit {split}\n".encode()
+    assert found({"run.sh": text}) == [f"run.sh:3: {NAMED}", f"run.sh:4: {NAMED}, once decoded"]
+
+
+def test_k05_a_generated_file_is_masked_only_where_it_names_a_reported_path_exactly():
+    """K05: a manifest line or a JSON string that is exactly a reported path is masked; a longer string that merely
+    holds it, and with it another private name, is still read."""
+    other = f"{PRIVATE}-extra"  # invented; a second private name that holds the first
+    hashes = hashes_from_tokens([PRIVATE, other])
+    files = {
+        f"notes/{PRIVATE}": b"plain\n",
+        "SHA256SUMS": f"{'0' * 64}  notes/{PRIVATE}\n".encode(),
+        "PACKAGE.json": json.dumps({"uncommitted": [f"notes/{PRIVATE}"], "include": [f"notes/{other}*"]}).encode(),
+    }
+    findings = findings_in(
+        files, hashes, None, frozenset(), frozenset(), frozenset(), generated={"SHA256SUMS", "PACKAGE.json"}
+    )
+    assert not any(finding.startswith("SHA256SUMS") for finding in findings)
+    assert f"PACKAGE.json:1: a private name (study token {token_hash(other)[:12]})" in findings
+    assert (
+        without_paths(b'["notes/a", "notes/a-b"]\nabc  notes/a\nabc  notes/a/c\n', {"notes/a"})
+        == b'["<*>", "notes/a-b"]\nabc  <*>\nabc  notes/a/c\n'
+    )
+
+
+def test_k05_a_reported_path_inside_a_longer_string_of_a_generated_file_is_never_masked():
+    """K05: a generated file is masked only where a reported path is an entire JSON string or an entire manifest path
+    field; a note that names the path among other words is a longer string, read like the rest, so the name it holds is
+    still found there."""
+    path = f"{PRIVATE}.txt"
+    files = {
+        path: b"plain\n",
+        "PACKAGE.json": json.dumps({"note": f"copied {path} yesterday", "uncommitted": [path]}).encode(),
+        "SHA256SUMS": f"{'0' * 64}  {path}\n".encode(),
+    }
+    findings = findings_in(
+        files, HASHES, None, frozenset(), frozenset(), frozenset(), generated={"SHA256SUMS", "PACKAGE.json"}
+    )
+    assert f"PACKAGE.json:1: {NAMED}" in findings
+    assert not any(finding.startswith("SHA256SUMS") for finding in findings)
+    note = json.dumps([f"copied {path} yesterday", path, f"{path} again"]).encode()
+    assert without_paths(note, {path}) == json.dumps([f"copied {path} yesterday", "<*>", f"{path} again"]).encode()
+    assert without_paths(f"{'0' * 64}  {path} copy\n".encode(), {path}) == f"{'0' * 64}  {path} copy\n".encode()
+
+
+def test_k05_the_same_payload_encoded_on_two_lines_is_reported_at_both():
+    """K05: decoded runs are told apart by what they decode to and where they stand, so the same payload encoded twice,
+    on two lines, is reported for each run; a run the parsed strings show again is still reported once."""
+    run = b64(TEXT).decode()
+    text = f"first {run}\n\nagain {run}\n".encode()
+    second = len(f"first {run}\n\nagain ")
+    assert set(found({"notes.txt": text})) == {
+        f"notes.txt!(base64@6):1: {NAMED}",
+        f"notes.txt!(base64@{second}):1: {NAMED}",
+    }
+    record = json.dumps({"a": run, "b": run}).encode()
+    at = len('{"a": "'), len(f'{{"a": "{run}", "b": "')
+    decoded = {finding for finding in found({"record.json": record}) if finding.endswith(f":1: {NAMED}")}
+    assert decoded == {f"record.json!(base64@{offset}):1: {NAMED}" for offset in at}

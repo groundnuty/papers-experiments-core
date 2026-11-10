@@ -24,12 +24,12 @@ category = "space"
 [[entry]]
 token = "latin"
 replacement = "greek"
-category = "word"
+category = "tasks"
 
 [[entry]]
 token = "zq"
 replacement = "xx"
-category = "option"
+category = "conditions"
 """
 
 
@@ -246,7 +246,7 @@ HEX_MAP = b"""version = 1
 [[entry]]
 token = "abcd"
 replacement = "ef12"
-category = "word"
+category = "tasks"
 """
 
 

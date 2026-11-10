@@ -36,6 +36,7 @@ from expcore.package.spec import PackageError
 from expcore.package.wheels import REQUIREMENTS, Wheel
 from expcore.provenance.environment import CORE_DISTRIBUTION
 from expcore.provenance.hashfile import render_hash_file
+from expcore.provenance.redact import hidden_name
 from expcore.study import pipeline
 
 PRIVATE = "zarnothwick"  # invented; the test hash file treats it as a name private everywhere
@@ -143,7 +144,7 @@ def test_k05_a_private_name_in_an_included_file_refuses_the_build_showing_only_a
     root = a_copy(campaign, tmp_path)
     with (root / "README.md").open("a", encoding="utf-8") as readme:
         readme.write(f"\nRun on the {PRIVATE} cluster.\n")
-    with pytest.raises(PackageError, match=r"README\.md:\d+ text [0-9a-f]{12}") as refused:
+    with pytest.raises(PackageError, match=r"README\.md:\d+: a private name \(study token [0-9a-f]{12}\)") as refused:
         build_package(root, tmp_path / "dist", hashes=hashes)
     assert PRIVATE not in str(refused.value)
     assert not (tmp_path / "dist").exists() or not any((tmp_path / "dist").iterdir())
@@ -157,6 +158,24 @@ def test_k01_a_hash_file_that_is_missing_or_names_nothing_private_refuses_the_bu
     code_only.write_text(render_hash_file([("a-condition-name", "code")]), encoding="utf-8")
     with pytest.raises(PackageError, match="K01"):
         private_hashes(code_only)
+
+
+def test_k01_a_hash_file_of_plain_digests_refuses_the_build_naming_the_command_that_makes_one(tmp_path):
+    """K01: a file of plain sha256 digests would check nothing; the build refuses it and says how to make a real one."""
+    plain = tmp_path / f"{PRIVATE}.sha256"  # a path of the author's, which no message shows
+    plain.write_text(f"{hashlib.sha256(PRIVATE.encode()).hexdigest()}\n", encoding="utf-8")
+    with pytest.raises(PackageError, match=r"given with --hashes:1: a bare SHA-256 digest.*hash PLAIN") as refused:
+        private_hashes(plain)
+    assert PRIVATE not in str(refused.value)
+
+
+def test_k01_the_build_says_how_many_hashes_it_loaded_and_that_its_list_replaces_the_cores(campaign, hashes, tmp_path):
+    """K01: the build prints how many hashes of names private everywhere it checks with, and whether they are the
+    core's or a list given in their place, never the list's path, which is the author's."""
+    said: list[str] = []
+    package_build.collect(a_copy(campaign, tmp_path), hashes=hashes, note=said.append)
+    origin = "the list given with --hashes, which replaces the core's"
+    assert said == [f"study-token check: 1 hash of names private everywhere, from {origin}"]
 
 
 def test_the_default_hash_file_is_the_cores_public_one_with_names_private_everywhere():
@@ -230,7 +249,7 @@ def test_k03_an_anonymisation_list_in_the_studys_repository_refuses_the_build(
     listed = anonymisation(repo.path / "anon.toml", {AUTHOR: "Author A"})
     with pytest.raises(PackageError, match="K03"):
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=listed)
-    assert list((tmp_path / "dist").iterdir()) == []
+    assert not (tmp_path / "dist").exists()  # the list loads before the output directory is made
     assert private_list_guard(root, None) == [repo.path, root]
     assert private_list_guard(tmp_path, tmp_path / "dist") == [tmp_path, tmp_path / "dist"]
 
@@ -247,6 +266,120 @@ def test_a_listed_term_in_a_code_file_fails_the_build_naming_file_and_line_and_i
         )
     assert "lookup" not in str(refused.value)
     assert (root / "plugin.py").read_bytes() == before
+
+
+def with_notes(campaign: Campaign, tmp_path: Path, directory: str) -> Path:
+    """A copy of the study that includes a clean file below `notes/<directory>/`."""
+    root = a_copy(campaign, tmp_path)
+    (root / "notes" / directory).mkdir(parents=True)
+    (root / "notes" / directory / "data.txt").write_text("nothing private here\n", encoding="utf-8")
+    spec = root / "package.toml"
+    spec.write_text(spec.read_text(encoding="utf-8").replace('    "README.md",\n', '    "README.md",\n    "notes",\n'))
+    return root
+
+
+def test_k05_a_private_name_in_a_path_is_reported_once_for_the_file_never_through_a_generated_file(
+    campaign, hashes, tmp_path
+):
+    """K05: a path that holds a private name is reported once, by its hash, not again for the line of SHA256SUMS or
+    PACKAGE.json the build generated from it; the refusal carries the path for the author to ask for."""
+    with pytest.raises(PackageError) as refused:
+        build_package(with_notes(campaign, tmp_path, PRIVATE), tmp_path / "dist", hashes=hashes)
+    findings = [line.strip() for line in str(refused.value).splitlines()[1:]]
+    prefix = hashlib.sha256(f"expcore-study-token-v1:{PRIVATE}".encode()).hexdigest()[:12]
+    path = f"notes/{PRIVATE}/data.txt"
+    assert findings == [f"{hidden_name(path)}: the path holds a private name (study token {prefix})"]
+    assert PRIVATE not in str(refused.value)
+    assert refused.value.private == {hidden_name(path): path}
+
+
+def test_k05_a_term_in_a_path_is_named_by_its_path_only_when_the_author_asks(
+    campaign, hashes, tmp_path, capsys, monkeypatch
+):
+    """K05: in an anonymised build, a path that holds a term is reported once, never through SHA256SUMS, and hidden
+    even on a terminal, which says nothing about who reads it; --show-private-paths alone names it."""
+    root = with_notes(campaign, tmp_path, "varek")
+    argv = ["package", str(root), "--hashes", str(hashes), "--anonymise", str(tmp_path / "anon.toml")]
+    anonymisation(tmp_path / "anon.toml", {AUTHOR: "Author A", "Varek": "Author B"})
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    assert main([*argv, "--out", str(tmp_path / "dist-log")]) == 1
+    logged = capsys.readouterr().err
+    assert f"{hidden_name('notes/varek/data.txt')}: the path holds a term of the anonymisation list" in logged
+    assert "SHA256SUMS" not in logged
+    assert "varek" not in logged.casefold()
+    assert main([*argv, "--out", str(tmp_path / "dist-asked"), "--show-private-paths"]) == 1
+    shown = capsys.readouterr().err
+    assert f"  {hidden_name('notes/varek/data.txt')} is notes/varek/data.txt\n" in shown
+
+
+def test_k05_a_refusal_before_the_checks_hides_a_path_that_holds_a_term(campaign, hashes, tmp_path):
+    """K05: the anonymisation list loads before the study's files are selected, so even the earliest refusal, an
+    attestation whose file changed, names a path that holds a term by its hash and never shows the term; nor does
+    any message name the list's own path, which is the author's."""
+    root = with_notes(campaign, tmp_path / "study", "varek")
+    stale = '\n[[opaque]]\npath = "notes/varek/data.txt"\nsha256 = "' + "0" * 64 + '"\nreason = "read"\n'
+    (root / "package.toml").write_text((root / "package.toml").read_text(encoding="utf-8") + stale, "utf-8")
+    (tmp_path / "varek-lists").mkdir()
+    listed = anonymisation(tmp_path / "varek-lists" / "anon.toml", {AUTHOR: "Author A", "Varek": "Author B"})
+    with pytest.raises(PackageError) as refused:
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=listed)
+    assert str(refused.value).startswith(f"{hidden_name('notes/varek/data.txt')}: its SHA-256 is not the one")
+    assert "varek" not in str(refused.value).casefold()
+
+
+def test_k05_a_file_that_cannot_be_read_is_refused_without_showing_a_private_name_in_its_path(
+    campaign, hashes, tmp_path, monkeypatch, capsys
+):
+    """K05: an exception no step expects (a file the build may not read, whose path holds a private name) is refused
+    like any other, its message through the redactor, by the library and the command line alike; a --hashes path that
+    is not there is named by its role, since no list is loaded yet to hide a name in it."""
+    root = with_notes(campaign, tmp_path / "study", PRIVATE)
+    real = Path.read_bytes
+
+    def refuse(path: Path) -> bytes:
+        if PRIVATE in path.parts:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    with pytest.raises(PackageError) as refused:
+        build_package(root, tmp_path / "dist", hashes=hashes)
+    assert str(refused.value).startswith("PermissionError: [Errno 13] Permission denied: ")
+    assert PRIVATE not in str(refused.value)
+    assert main(["package", str(root), "--out", str(tmp_path / "dist"), "--hashes", str(hashes)]) == 1
+    missing = tmp_path / PRIVATE / "list.sha256"
+    assert main(["package", str(root), "--out", str(tmp_path / "dist"), "--hashes", str(missing)]) == 1
+    err = capsys.readouterr().err
+    assert "refused: PermissionError: [Errno 13] Permission denied: " in err
+    assert "refused: the study-token list given with --hashes is not there" in err
+    assert PRIVATE not in err
+
+
+def test_k05_package_check_shows_its_problems_and_any_exception_through_the_cores_list(
+    built, hashes, tmp_path, monkeypatch, capsys
+):
+    """K05: package-check prints every problem, and any exception it meets, through a redactor of the core's public
+    study-token list, the one list a reader has (here the test's list stands in for it): a file the manifest does not
+    list, and a file that cannot be read, whose paths hold a private name."""
+    monkeypatch.setattr("expcore.cli.default_hashes", lambda: hashes)
+    root = unpack(built, tmp_path)
+    stray = root / f"{PRIVATE}.txt"
+    stray.write_text("stray\n", encoding="utf-8")
+    assert main(["package-check", str(root)]) == 1
+    assert f"FAIL {hidden_name(stray.name)}: not listed in {SUMS_FILE}" in capsys.readouterr().out
+    stray.unlink()
+    real = Path.read_bytes
+
+    def refuse(path: Path) -> bytes:
+        if path.name == "README.md":
+            raise PermissionError(13, "Permission denied", str(root / PRIVATE / "README.md"))
+        return real(path)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert main(["package-check", str(root)]) == 1
+    err = capsys.readouterr().err
+    assert "refused: PermissionError: [Errno 13] Permission denied: " in err
+    assert PRIVATE not in err
 
 
 FIGURE = b"%PDF-1.4\n<< /Filter /FlateDecode >>\nstream\n" + zlib.compress(b"a drawn figure") + b"\nendstream\n"
@@ -358,7 +491,7 @@ def test_k10_every_wheel_is_read_and_a_member_holding_a_private_name_is_refused_
             for w in stand_in_vendor(distributions)
         ]
 
-    with pytest.raises(PackageError, match=r"wheels/numpy-[^/]+\.whl/numpy/_tuning\.py:1 text") as refused:
+    with pytest.raises(PackageError, match=r"wheels/numpy-[^/]+\.whl/numpy/_tuning\.py:1: a private name") as refused:
         build_package(a_copy(campaign, tmp_path / "a"), tmp_path / "dist-a", hashes=hashes, vendor=vendor)
     assert PRIVATE not in str(refused.value)
     hint = next(line for line in str(refused.value).splitlines() if "[[opaque]] path" in line)
