@@ -55,6 +55,12 @@ def _editable(dist: metadata.Distribution) -> bool:
     return isinstance(info, dict) and info.get("editable") is True
 
 
+def _top_level_names(dist: metadata.Distribution) -> set[str]:
+    """The top-level names a distribution declares in `top_level.txt`, which setuptools writes for an editable install
+    too; none when it declares none."""
+    return set((dist.read_text("top_level.txt") or "").split())
+
+
 def _owns(dist: metadata.Distribution, file: Path, top: str) -> bool:
     """Whether an installed distribution's code holds the file of a module under top-level name `top`: listed in its
     RECORD, or, for an editable install, inside one of its top-level packages where it imports from (directly below a
@@ -67,7 +73,12 @@ def _owns(dist: metadata.Distribution, file: Path, top: str) -> bool:
             return any(h.resolve() in file.parents for h in homes) or any(
                 (d / f"{top}.py").resolve() == file for d in pth
             )
-        return any(d.resolve() in file.parents for d in top_level_location(top, editable_roots(dist))[0])
+        directories, module = top_level_location(top, editable_roots(dist))
+        if any(d.resolve() in file.parents for d in directories):
+            return True
+        # A single top-level module counts only when the distribution names it among its top-level names, so a loose
+        # module of the project on a path added by hand is not taken for the distribution's code.
+        return module is not None and module.resolve() == file and top in _top_level_names(dist)
     site = Path(str(dist.locate_file(""))).resolve()
     try:
         relative = PurePosixPath(file.relative_to(site).as_posix())

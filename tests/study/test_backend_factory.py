@@ -344,6 +344,31 @@ def test_c06_a_loose_module_in_an_editable_project_is_not_that_distribution_s_co
         fingerprint_of(study, plugin)
 
 
+def test_c06_a_single_module_an_import_hook_loads_is_its_editable_distribution_s_code(
+    tmp_path, importable, monkeypatch, clean_environment
+):
+    """C06: an editable distribution may ship one top-level module rather than a package; the module the hook loads is
+    its code, so a factory there is held to the distribution's version rather than refused as unowned."""
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    code = KIT_CODE.replace('version = "1.3.0"', 'version = "1.0.0"')
+    (project / "src" / "toy_kit.py").write_text(code, encoding="utf-8")
+    site = tmp_path / "site"
+    editable = json.dumps({"url": project.as_uri(), "dir_info": {"editable": True}})
+    hook = {
+        "__editable__.toy_kit-1.0.0.pth": b"import _toy_kit_finder; _toy_kit_finder.install()\n",
+        "toy_kit-1.0.0.dist-info/top_level.txt": b"toy_kit\n",  # setuptools names its top-level module
+    }
+    installed_distribution(site, "toy-kit", "1.0.0", hook, direct_url=editable)
+    monkeypatch.setattr(sys, "meta_path", [_KitHook(project / "src"), *sys.meta_path])
+    importable(site, "toy_kit")
+    study, plugin = study_using(tmp_path / "single", "toy_kit")
+    assert fingerprint_of(study, plugin)["backend_factory"] == {"name": "toy_kit.relay_factory", "version": "1.0.0"}
+    plugin.backend_factory.version = "1.1.0"
+    with pytest.raises(ConfigError, match=r"declares version '1\.1\.0', but its module belongs to toy-kit 1\.0\.0"):
+        fingerprint_of(study, plugin)
+
+
 CREDENTIAL_VARIABLE = "TOY_RELAY_CREDENTIAL"  # not a name the environment's own redaction matches
 CREDENTIAL = "toy-relay-credential-value-0123456789"
 LEAKING_TOOL = '''
