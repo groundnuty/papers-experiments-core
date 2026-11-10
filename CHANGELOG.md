@@ -170,7 +170,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | K01 | A check with no input fails | `tests/package/test_archive.py`, `tests/package/test_build.py`, `tests/package/test_spec.py`, `tests/test_study_tokens.py` |
 | K03 | The private name list never enters the repository or the output | `tests/package/test_anonymise.py`, `tests/package/test_build.py`, `tests/package/test_scan.py`, `tests/package/test_spec.py` |
 | K04 | Anonymisation must not change numbers, model names or parseability | `tests/package/test_anonymise.py` |
-| K05 | Findings never carry the matched value | `tests/package/test_anonymise.py`, `tests/package/test_build.py`, `tests/package/test_scan.py`, `tests/package/test_tracking.py`, `tests/package/test_wheelscan.py`, `tests/provenance/test_redact.py` |
+| K05 | Findings never carry the matched value | `tests/package/test_anonymise.py`, `tests/package/test_build.py`, `tests/package/test_scan.py`, `tests/package/test_tracking.py`, `tests/package/test_wheelscan.py`, `tests/provenance/test_redact.py`, `tests/test_study_tokens.py` |
 | K06 | Archives are deterministic | `tests/package/test_anonymised.py`, `tests/package/test_archive.py`, `tests/package/test_build.py`, `tests/package/test_wheels.py` |
 | K07 | `make check` regenerates every table from records and compares byte for byte | `tests/campaign/test_export.py`, `tests/e2e/test_tiny_study.py`, `tests/package/test_build.py`, `tests/package/test_spec.py`, `tests/test_fresh_repo.py` |
 | K08 | Shipped code parses on the oldest supported Python | `tests/test_oldest_python.py` |

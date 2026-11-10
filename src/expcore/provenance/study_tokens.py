@@ -197,10 +197,13 @@ def count_hashes(hashes: Hashes) -> str:
     return f"{count} hash" if count == 1 else f"{count} hashes"
 
 
-def _report(lines: Sequence[str]) -> int:
-    """Print findings to stdout and return the exit code."""
+def _report(lines: Sequence[str], redactor: Redactor) -> int:
+    """Print findings to stdout, each through the redactor of the loaded list, and return the exit code.
+
+    The scanner hides a path that matches a listed name as a whole or by its components; one that holds a listed name
+    of several words among other words of a segment is hidden here, as any message of the command is."""
     for line in lines:
-        print(line)
+        print(redactor.scrub(line))
     if lines:
         print(f"{len(lines)} study-token finding(s); the matched text is deliberately not shown", file=sys.stderr)
     return EXIT_FINDINGS if lines else EXIT_OK
@@ -236,7 +239,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
         return EXIT_OK
     args.redactor = Redactor(hashes)
     findings = scan_paths([Path(p) for p in args.paths], hashes) if args.paths else _scan_repository(hashes)
-    return _report([str(f) for f in findings])
+    return _report([str(f) for f in findings], args.redactor)
 
 
 def _scan_repository(hashes: Hashes) -> list[Finding]:
@@ -257,7 +260,7 @@ def _cmd_check_commits(args: argparse.Namespace) -> int:
     remaining, acknowledged = split_acknowledged(results, entries)
     if acknowledged:
         print(args.redactor.scrub(f"{len(acknowledged)} finding(s) acknowledged in {source}"), file=sys.stderr)
-    return _report([f"{sha[:12]} {finding}" for sha, finding in remaining])
+    return _report([f"{sha[:12]} {finding}" for sha, finding in remaining], args.redactor)
 
 
 def build_parser() -> argparse.ArgumentParser:

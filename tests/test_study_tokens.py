@@ -484,3 +484,18 @@ def test_p07_an_exception_the_command_does_not_expect_is_caught_and_shown_throug
     err = capsys.readouterr().err
     assert "error: RuntimeError: cannot scan" in err
     assert LONG_NAME not in err
+
+
+def test_k05_a_finding_whose_path_holds_a_listed_name_of_several_words_hides_it(tmp_path, capsys):
+    """K05: the scanner hides a path that matches a listed name as a whole segment or by its components, but not one
+    whose segment holds a listed name of several words among other words; every findings line goes through the same
+    redactor as the command's other messages, which finds such a name as a phrase."""
+    phrase = "Ada Example"  # invented; a listed name of two words
+    listed = tmp_path / "list.sha256"
+    listed.write_text(st.render_hash_file([phrase, LONG_NAME]), encoding="utf-8")
+    noted = tmp_path / f"notes by {phrase}.txt"
+    noted.write_text(f"{LONG_NAME}\n", encoding="utf-8")
+    assert st.main(["check", "--hashes", str(listed), str(noted)]) == 1
+    out = capsys.readouterr().out
+    assert f":1 text {st.token_hash(LONG_NAME)[:12]}" in out
+    assert "example" not in out.casefold()
