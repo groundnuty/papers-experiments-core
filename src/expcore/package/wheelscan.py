@@ -1,19 +1,21 @@
 # Provenance: new
-"""The leak checks over the wheels a package vendors: every text member of every wheel is read, always.
+"""The leak checks over the wheels a package vendors: every member of every wheel is opened, always.
 
 A wheel is opened member by member. A member that is UTF-8 text without NUL bytes (Python source, METADATA, RECORD,
 entry points, licences) is read; any other member is a compiled binary or data that is not text (an extension module,
 a scientific wheel's test data), which no check can read: it goes in attested by its SHA-256, listed per wheel in
 `PACKAGE.json` (`binaries`). Text is read with the study-token list, and in an anonymised package with the terms of
-the anonymisation list and the identity it must not hold (`identity.find_identity`'s commits and URLs).
+the anonymisation list and the identity it must not hold (`identity.find_identity`'s commits and URLs). The one
+exception is the study-token list for a wheel proven to be a pypi.org release, whose bytes the study's `uv.lock`
+records (`lockfile`): the anonymisation list and the identity still apply to it.
 
 How deep a member is read depends on where its wheel came from. A wheel of a distribution installed from a direct
 URL, or supplied by the author, can be the author's own code, so its text members get every view the package's
 checks use for any file (`views`: escapes, entities, base64 and hex runs decoded). A wheel packed from an index
-install is read as it is, line by line: it is a release whose text is tens of megabytes, and the decoded views would
-take an hour where the plain read takes a minute or two. Either way a finding refuses the build. A member the author
-has read and found clean (a public release's code that merely contains a word the token list also holds) can be
-attested in `package.toml` like any file, by its path inside the package and its SHA-256:
+install, or one the lock proves a release, is read as it is, line by line: its text runs to tens of megabytes, and
+the decoded views would take an hour where the plain read takes a minute or two. Either way a finding refuses the
+build. A member the author has read and found clean (a public release's code that merely contains a word the token
+list also holds) can be attested in `package.toml` like any file, by its path inside the package and its SHA-256:
 
     [[opaque]]
     path = "wheels/<wheel file>/<member>"
@@ -27,7 +29,7 @@ refused: that file names a URL and a commit.
 import hashlib
 import io
 import zipfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term, term_lines
@@ -68,9 +70,12 @@ def as_text(data: bytes) -> str | None:
         return None
 
 
-def _plain(label: str, text: str, tokens: Hashes, terms: Anonymisation | None, hidden) -> list[str]:
-    """Read a member of a release as it is: the token list line by line, and the terms and identity if anonymised."""
-    found = [str(hit) for hit in scan_source(label, text, tokens, exempt_header=False, python=False)]
+def _plain(label: str, text: str, tokens: Hashes | None, terms: Anonymisation | None, hidden) -> list[str]:
+    """Read a member of a release as it is: the token list line by line (unless the release is exempt from it), and
+    the terms and identity if anonymised."""
+    found = (
+        [] if tokens is None else [str(h) for h in scan_source(label, text, tokens, exempt_header=False, python=False)]
+    )
     if terms is not None:
         commits, urls = hidden
         found += [f"{label}:{line}: a term of the anonymisation list" for line in sorted(term_lines(text, terms))]
@@ -96,8 +101,13 @@ def scan_wheels(
     terms: Anonymisation | None,
     hidden: tuple[frozenset[str], frozenset[str]],
     attested: Mapping[str, Opaque],
+    exempt: Collection[str] = frozenset(),
 ) -> WheelScan:
-    """Read every text member of every wheel; list the members that are not text; refuse nothing on its own."""
+    """Read every text member of every wheel; list the members that are not text; refuse nothing on its own.
+
+    A wheel in `exempt` (`lockfile.token_exempt`: a pypi.org release whose bytes the study's lock records) is read as
+    a release, without the study-token list; the terms and identity of an anonymised package still apply to it.
+    """
     findings: list[str] = []
     binaries: dict[str, list[dict[str, str]]] = {}
     seen: set[str] = set()
@@ -118,7 +128,9 @@ def scan_wheels(
             if text is None:
                 binaries[wheel.path].append({"path": member, "sha256": digest})
                 continue
-            if wheel.from_index:
+            if wheel.path in exempt:
+                found = _plain(label, text, None, terms, hidden)
+            elif wheel.from_index:
                 found = _plain(label, text, tokens, terms, hidden)
             else:
                 found = _deep(label, data, tokens, terms, hidden)

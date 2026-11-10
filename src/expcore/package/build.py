@@ -23,7 +23,9 @@
    names belong in its own package. Both checks fail closed: a file goes in only if they can read all of it (text,
    SQLite databases and archives of them, `views`); anything else is refused, unless package.toml attests that exact
    file by its SHA-256 with a reason (`[[opaque]]`), and then it goes in unread. Every text member of every wheel is
-   read too, and every member that is not text is attested by its hash and listed in PACKAGE.json (`wheelscan`);
+   read too, and every member that is not text is attested by its hash and listed in PACKAGE.json (`wheelscan`); a
+   wheel whose bytes the study's `uv.lock` records from pypi.org skips the token list alone (`lockfile`), and
+   PACKAGE.json lists it with the lock's hash;
 7. lay the package out in a scratch directory and run its check there, with this interpreter: every file against
    `SHA256SUMS`, the environment against the check's, then the four outputs derived anew from the records and
    compared byte for byte (K07);
@@ -58,6 +60,7 @@ from expcore.package.identity import (
     verify_inputs,
 )
 from expcore.package.leaks import default_hashes, findings_in, private_hashes, scan_tokens
+from expcore.package.lockfile import PYPI, lock_hashes, token_exempt
 from expcore.package.spec import WHEELS_DIR, PackageError, PackageSpec, load_spec, select
 from expcore.package.tracking import Tracking, note_tracking
 from expcore.package.wheels import REQUIREMENTS, Vendor, Wheel, makefile, requirements, vendor_wheels
@@ -154,6 +157,7 @@ def _package_json(
     *,
     rewritten_identity: bool,
     binaries: Mapping[str, list[dict[str, str]]],
+    exempt: Mapping[str, str],
 ) -> bytes:
     data = {
         "format": PACKAGE_FORMAT,
@@ -170,9 +174,14 @@ def _package_json(
         "environment": env,
         "wheels": [
             {"file": w.path, "name": w.name, "version": w.version, "sha256": w.sha256}
-            | {"read": "as it is" if w.from_index else "every view", "binaries": binaries[w.path]}
+            | {"read": "as it is" if w.from_index or w.path in exempt else "every view", "binaries": binaries[w.path]}
             | ({"uncompared": list(w.uncompared)} if w.uncompared else {})
             for w in sorted(wheels, key=lambda w: w.name)
+        ],
+        "study_tokens_exempt": [
+            {"file": w.path, "name": w.name, "version": w.version, "lock_sha256": exempt[w.path], "lock_source": PYPI}
+            for w in sorted(wheels, key=lambda w: w.name)
+            if w.path in exempt
         ],
         "include": list(spec.include),
         "outputs": [f"{OUT_DIR}/{name}" for name in OUTPUT_FILES],
@@ -255,7 +264,10 @@ def collect(
     opaque |= {wheel.path for wheel in vendored}  # read member by member below
     tokens = private_hashes(default_hashes() if hashes is None else Path(hashes))
     attested = {path: entry for path, entry in spec.opaque.items() if path.startswith(f"{WHEELS_DIR}/")}
-    read = scan_wheels(vendored, tokens, terms=terms, hidden=(hidden_commits, hidden_urls), attested=attested)
+    exempt = token_exempt(vendored, lock_hashes(study.root))  # the bytes vendored, after any header was withheld
+    read = scan_wheels(
+        vendored, tokens, terms=terms, hidden=(hidden_commits, hidden_urls), attested=attested, exempt=exempt
+    )
     files["Makefile"] = makefile(env)
     files[PACKAGE_FILE] = _package_json(
         spec,
@@ -268,6 +280,7 @@ def collect(
         state,
         rewritten_identity=terms is not None,
         binaries=read.binaries,
+        exempt=exempt,
     )
     files[STAMP] = stamp_bytes(
         files, study.root, study.scope, str(code["commit"]), str(check.get("checked_at")), out_dir

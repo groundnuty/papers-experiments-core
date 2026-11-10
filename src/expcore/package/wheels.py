@@ -29,7 +29,9 @@ A wheel is built for the platform and the Python of the build, as installed; the
 needs the same. Every text member of every wheel is read by the package's checks, and every other member (a
 compiled extension) is attested by its hash (`wheelscan`); `from_index` says whether the wheel was packed from an
 index install, a release whose text is read as it is, rather than the author's own code, which is read with every
-view the checks have.
+view the checks have. `direct` says whether the distribution was installed from a URL, a repository or a directory,
+whichever way its wheel was made: such a wheel always gets the study-token list (`lockfile`). A wheel packed again is
+never the published artifact's bytes, so only a supplied wheel can be the release a lock records.
 """
 
 import base64
@@ -87,7 +89,8 @@ _INSTALLER_RECORD = re.compile(r"(uv|pip)_[A-Za-z0-9_]*\.json")
 
 @dataclass(frozen=True)
 class Wheel:
-    """One vendored wheel: its distribution, its file name and bytes, and whether it came from an index install."""
+    """One vendored wheel: its distribution, its file name and bytes, whether it was packed from an index install, and
+    whether its distribution was installed from a URL, a repository or a directory (`direct`), supplied or not."""
 
     name: str
     version: str
@@ -95,6 +98,7 @@ class Wheel:
     data: bytes
     from_index: bool
     uncompared: tuple[str, ...] = ()  # members of a supplied wheel with no installed counterpart to compare
+    direct: bool = False
 
     @property
     def path(self) -> str:
@@ -310,7 +314,11 @@ def vendor_wheels(distributions: Mapping[str, str], supplied: Path | None = None
         uncompared = compare_supplied(dist, editable, *given) if given is not None else ()
         filename, data = given or repack(dist)
         from_index = source is None and given is None
-        wheels.append(Wheel(name, version, filename, data, from_index=from_index, uncompared=uncompared))
+        wheels.append(
+            Wheel(
+                name, version, filename, data, from_index=from_index, uncompared=uncompared, direct=source is not None
+            )
+        )
     return wheels
 
 
