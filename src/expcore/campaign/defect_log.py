@@ -14,10 +14,13 @@ either.
   redact) withholds the traceback: the entry says why, naming the variable, never a value.
 - **Never shared.** The directory holds a `.gitignore` that ignores everything in it, so a study whose own
   `.gitignore` misses `out/` still does not commit it, and a replication package never selects it, whatever its
-  patterns (`package.spec.LOCAL_ONLY`). It is outside `out/runs`, so the replay check neither hashes nor replays it.
+  patterns (`package.spec.LOCAL_ONLY`). A `.gitignore` the author put there is kept as it is; when its rules do not
+  ignore the log, a rule for the log is appended. It is outside `out/runs`, so the replay check neither hashes nor
+  replays it.
 - Entries are appended under a lock, since the campaign's workers are threads.
 """
 
+import fnmatch
 import threading
 import traceback
 from collections.abc import Callable
@@ -28,7 +31,8 @@ from expcore.loop.outcomes import HarnessDefect
 from expcore.records.redact import Redactor
 
 LOG_DIR = "logs"
-HARNESS_LOG = f"{LOG_DIR}/harness-errors.log"
+LOG_NAME = "harness-errors.log"
+HARNESS_LOG = f"{LOG_DIR}/{LOG_NAME}"
 IGNORE_ALL = "# written by expcore: local logs, never committed or packaged\n*\n"
 
 _lock = threading.Lock()
@@ -70,12 +74,37 @@ def write_failure(
     path = log_path(root)
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)
-        ignore = path.parent / ".gitignore"
-        if not ignore.exists():
-            ignore.write_text(IGNORE_ALL, encoding="utf-8")
+        _ensure_ignored(path.parent / ".gitignore")
         with path.open("a", encoding="utf-8") as handle:
             handle.write(head + text + ("" if text.endswith("\n") else "\n"))
     return path
+
+
+def _ensure_ignored(ignore: Path) -> None:
+    """Make the log's directory ignore the log: write an ignore file that ignores everything, or append a rule for the
+    log to one whose rules do not ignore it, leaving the author's rules as they are."""
+    if not ignore.exists():
+        ignore.write_text(IGNORE_ALL, encoding="utf-8")
+        return
+    text = ignore.read_text(encoding="utf-8")
+    if not ignores_log(text):
+        with ignore.open("a", encoding="utf-8") as handle:
+            handle.write(("\n" if text and not text.endswith("\n") else "") + f"/{LOG_NAME}\n")
+
+
+def ignores_log(text: str) -> bool:
+    """Tell whether an ignore file in the log's directory ignores the log: by the last of its rules that matches the
+    log's name (a pattern of one part, `*` and `?` as they are read there), a `!` rule un-ignoring it."""
+    ignored = False
+    for line in text.splitlines():
+        rule = line.strip()
+        if not rule or rule.startswith("#"):
+            continue
+        negated = rule.startswith("!")
+        pattern = (rule[1:] if negated else rule).lstrip("/")
+        if "/" not in pattern and fnmatch.fnmatchcase(LOG_NAME, pattern):
+            ignored = not negated
+    return ignored
 
 
 class DefectLog:

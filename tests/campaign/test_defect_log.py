@@ -183,3 +183,25 @@ def test_l08_a_defect_the_loop_catches_reaches_the_log_with_the_records_stack_ha
     assert f"{crashed} attempt 1: LookupError, stack {defect['stack_sha256']}" in log
     assert "LookupError: no route for key [redacted]" in log
     assert SECRET not in log
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+@pytest.mark.parametrize(
+    ("existing", "added"),
+    [("notes.txt\n", True), ("notes.txt", True), ("*.log\n", False), ("*\n!harness-errors.log\n", True)],
+    ids=["unrelated", "no-final-newline", "already-ignored", "negated"],
+)
+def test_l08_an_existing_gitignore_of_the_log_directory_is_kept_and_made_to_ignore_the_log(tmp_path, existing, added):
+    """L08: the author's rules stay as they are; a rule for the log is appended only when they do not ignore it."""
+    ignore = tmp_path / "out" / "logs" / ".gitignore"
+    ignore.parent.mkdir(parents=True)
+    ignore.write_text(existing, encoding="utf-8")
+    error, defect = defect_of("boom")
+    path = write_defect(tmp_path / "out", error, defect, stamp="T", run_key="k", attempt=1, redactor=_Plain)
+    text = ignore.read_text(encoding="utf-8")
+    assert text.startswith(existing)
+    assert (text != existing) is added
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    assert subprocess.run(["git", "-C", str(tmp_path), "check-ignore", "-q", str(path)], check=False).returncode == 0
+    write_defect(tmp_path / "out", error, defect, stamp="T", run_key="k", attempt=2, redactor=_Plain)
+    assert ignore.read_text(encoding="utf-8") == text  # appended once
