@@ -261,6 +261,12 @@ assert check["n_ok"] == check["n_records"] == len(check["replayed"]) and not che
 assert check["code"]["dirty"] is False and "campaign-snapshot.sqlite" in check["inputs"]
 ```
 
+### Files an agent writes
+
+A file the agent writes during a run (a report, a mask, a table) has no place in the batch today. The check takes every `.json` file under `out/runs` as a record, so a `.json` file beside a record fails the check at `load` (`unsupported record schema None`); a file of any other kind is not among the check's inputs, so nothing vouches for it; and `analyze` reads the records alone. The scorer is a pure function of the record, so what it needs of such a file must be in the record.
+
+The supported way is an instrument, as the example's `FactsServed` is. The executor makes it with access to where the agent's files land; its `finish` reads them after the loop and returns what the scorer needs as its snapshot, a JSON object: the fields or counts the scorer reads, `None` with the failure beside it for a file that is missing or cannot be parsed, and the file's SHA-256 if a reader should be able to match the snapshot to the original bytes. The snapshot is in `record.instruments[namespace]`, so it is replayed and hashed with the record and travels into the package with it. The original bytes do not: keep the files outside `out/runs`, and out of the package unless `package.toml` attests each one (the package's checks refuse a file they cannot read, binary for one).
+
 ## 5. Score and analyse
 
 ```sh
@@ -437,6 +443,28 @@ from expcore.provenance.codestamp import version
 assert version("my-study", study.scope)["dirty"] is False  # the committed study: a clean identity
 assert analysis["preregistration"]["preregistration_sha256"] == study.prereg.sha256
 assert analysis["code"]["dirty"] is False
+```
+
+### A rehearsal on stubs
+
+A dress rehearsal runs the whole plan on stub models before the real campaign: the executor, the tools, the scorers, the check, the analysis and the package, at no cost. The core's stub takes no backend's settings: `base_url`, `key_env`, `key_file`, `sampling`, `extra_body`, `prompt_cache_ttl` and `echo_reasoning_field` are refused on a `stub` entry when `models.toml` is loaded. So a rehearsal cannot run on the frozen model table with only the backend swapped; it runs on a `models.toml` of its own, whose hash is in the campaign fingerprint, and its fingerprint differs from the real campaign's. That is by design: a rehearsal's records can never be resumed into the real campaign or taken for its records.
+
+Rehearse in a copy of the study directory (a branch, or a directory of its own), so the rehearsal's `out/` stays apart: in the same `out/`, the real campaign would be refused as a resume under a changed configuration. In the copy, change `models.toml` alone. Keep every model key, so `campaign.toml`'s plan is unchanged, and `status = "frozen"`; set `backend = "stub"` and drop the settings a stub refuses; keep each model's price, `max_output_tokens` and `context_tokens`, which a stub takes, so the budget gate reserves the bound it will reserve for the real model and holds where it will hold. Keep identical what decides a result: the plan, the prompts, the tools, the scorers and the preregistration. The plugin's prompt and tool hashes and the scorers' versions are then the same in both fingerprints, and only the model table's hash differs. An executor that scripts the stub checks for `use(script)` on its backend, as the example's does, so one plugin serves both; a stub with no script replies `done` to every turn.
+
+```python
+rehearsal = Path("rehearsal-study")
+shutil.copytree("my-study", rehearsal, ignore=shutil.ignore_patterns("out"))
+models = rehearsal / "models.toml"
+entry = '[models.alpha-stub]\nbackend = "stub"\nstatus = "frozen"\n'
+models.write_text(models.read_text().replace(entry, entry + "max_output_tokens = 256\ncontext_tokens = 200000\n"))
+assert load_study(rehearsal).config_sha256["models.toml"] != study.config_sha256["models.toml"]  # another campaign
+models.write_text(models.read_text().replace(entry, entry + 'prompt_cache_ttl = "5m"\n'))
+try:
+    load_study(rehearsal)
+    raise AssertionError("a stub took a setting of another backend")
+except ConfigError as error:
+    assert "prompt_cache_ttl applies to anthropic models only" in str(error)
+shutil.rmtree(rehearsal)
 ```
 
 ## 8. Ship a replication package
