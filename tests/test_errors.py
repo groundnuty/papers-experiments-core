@@ -1,5 +1,8 @@
 """The closed infrastructure-kind vocabulary, its registry, and the two errors that are not infrastructure."""
 
+import sys
+import threading
+
 import pytest
 
 from expcore import errors
@@ -123,8 +126,8 @@ def test_o05_a_registered_kind_cannot_be_made_treatable_or_untreatable_by_regist
 
 
 def test_c02_a_study_s_own_kinds_hold_only_for_its_scope_however_the_scope_ends():
-    """C02: a study's kinds join the vocabulary for the block that enters them, one scope at a time, and the vocabulary
-    is what it was afterwards, whether the block returned or raised; a platform cannot register a kind in scope."""
+    """C02: a study's kinds join the vocabulary for the block that enters them, and the vocabulary is what it was
+    afterwards, whether the block returned or raised; a platform cannot register a kind in scope."""
     kinds = {"relay_flap": errors.StudyKind("the relay restarted", treatable=False)}
     with errors.study_kinds(kinds):
         assert "relay_flap" in infra_kinds()
@@ -132,15 +135,115 @@ def test_c02_a_study_s_own_kinds_hold_only_for_its_scope_however_the_scope_ends(
         assert untreatable_kinds()["relay_flap"] == "the relay restarted"
         with pytest.raises(ValueError, match=r"declared by the study in scope \(\[study.kinds\]\)"):
             register_infra_kind("relay_flap", "the relay restarted", treatable=False)
-        with errors.study_kinds({}):
-            assert "relay_flap" not in infra_kinds()
-        assert "relay_flap" in infra_kinds()
     assert infra_kinds() == CORE_KINDS
     with pytest.raises(RuntimeError, match="boom"), errors.study_kinds(kinds):
         raise RuntimeError("boom")
     assert infra_kinds() == CORE_KINDS
     register_infra_kind("relay_flap", "now a platform's, once no study holds the name")
     assert "relay_flap" in infra_kinds()
+
+
+FLAP = errors.StudyKind("the relay restarted")
+GONE = errors.StudyKind("the relay went away")
+SHARED = errors.StudyKind("a fault two studies describe alike")
+
+
+def in_a_plain_thread(action) -> list[BaseException]:
+    """Run an action in a new thread, which inherits no context, and return what it raised."""
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            action()
+        except BaseException as error:  # handed to the test, which asserts on it
+            raised.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    return raised
+
+
+def test_c02_a_study_keeps_its_kinds_while_another_enters_and_leaves():
+    """C02: a scope adds to the vocabulary and never replaces it: while another study is loaded the first study's kinds
+    still validate, in a plain thread of its run as well, and after it left they are all that remain."""
+    with errors.study_kinds({"relay_flap": FLAP}):
+        with errors.study_kinds({"relay_gone": GONE}):
+            assert {"relay_flap", "relay_gone"} <= set(infra_kinds())  # the overlap may see both: accepted
+            assert (
+                in_a_plain_thread(lambda: InfraError("relay_flap", "raised by a run while another study loads")) == []
+            )
+        assert "relay_flap" in infra_kinds()
+        assert "relay_gone" not in infra_kinds()
+    assert infra_kinds() == CORE_KINDS
+
+
+@pytest.mark.parametrize("first_out", [0, 1], ids=["first-in-first-out", "last-in-first-out"])
+def test_c02_overlapping_scopes_leave_nothing_behind_in_either_exit_order(first_out):
+    """C02: a kind stays until the last scope that declares it has left, and no scope takes another's kind with it."""
+    declared = [{"relay_flap": FLAP, "relay_shared": SHARED}, {"relay_gone": GONE, "relay_shared": SHARED}]
+    scopes = [errors.study_kinds(kinds) for kinds in declared]
+    for scope in scopes:
+        scope.__enter__()
+    assert {*declared[0], *declared[1]} <= set(infra_kinds())
+    scopes[first_out].__exit__(None, None, None)
+    staying, leaving = declared[1 - first_out], declared[first_out]
+    assert set(staying) <= set(infra_kinds())
+    assert not (set(leaving) - set(staying)) & set(infra_kinds())
+    scopes[1 - first_out].__exit__(None, None, None)
+    assert infra_kinds() == CORE_KINDS
+
+
+@pytest.mark.parametrize(
+    "other", [errors.StudyKind("another reading of the fault"), errors.StudyKind(FLAP.description, treatable=False)]
+)
+def test_c02_an_overlapping_scope_that_declares_a_name_differently_is_refused_naming_it(other):
+    """C02: while two scopes overlap a name has one meaning, so the second is refused, and being refused it adds nothing
+    and takes nothing from the scope already held."""
+    with errors.study_kinds({"relay_flap": FLAP}):
+        with (
+            pytest.raises(ValueError, match="'relay_flap'"),
+            errors.study_kinds({"relay_gone": GONE, "relay_flap": other}),
+        ):
+            pass
+        assert "relay_gone" not in infra_kinds()
+        assert is_treatable("relay_flap") is True
+    assert infra_kinds() == CORE_KINDS
+
+
+def test_c02_scopes_entered_and_left_concurrently_leave_the_registry_as_it_began(monkeypatch):
+    """C02: threads that each hold their own kind and one they share, all at once, always see their own kinds and leave
+    nothing behind."""
+    workers, rounds = 8, 150
+    barrier = threading.Barrier(workers)
+    raised: list[BaseException] = []
+
+    def work(number: int) -> None:
+        own = f"relay_{number}"
+        declared = {own: errors.StudyKind(f"relay number {number}"), "relay_shared": SHARED}
+        try:
+            barrier.wait()
+            for _ in range(rounds):
+                with errors.study_kinds(declared):
+                    assert own in infra_kinds()
+                    assert is_treatable("relay_shared") is True
+                    InfraError(own, "raised while its study is in scope")
+        except BaseException as error:  # handed to the test, which asserts on it
+            raised.append(error)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-5)  # so the threads interleave inside the scopes
+    try:
+        threads = [threading.Thread(target=work, args=(number,)) for number in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert raised == []
+    assert infra_kinds() == CORE_KINDS
+    assert untreatable_kinds() == errors.CORE_UNTREATABLE
 
 
 @pytest.mark.parametrize(

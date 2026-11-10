@@ -23,7 +23,7 @@ Two optional keys of `[study]` widen the infrastructure kinds a condition may de
 
 A module that cannot be imported is refused, as is a study kind that is a core kind or a platform's. A platform's kinds
 are the process's once imported. A study's own last only while it is loaded and while the pipeline works on it
-(`errors.study_kinds(study.kinds)`), so one study's kinds never reach another. Neither key is part of the factor schema;
+(`errors.study_kinds(study.kinds)`), so a study's kinds do not outlast it. Neither key is part of the factor schema;
 study.toml's hash is in the campaign fingerprint, as it always is.
 
 Everything is validated when it is loaded, with messages that name the file and the key: the models of the plan are in

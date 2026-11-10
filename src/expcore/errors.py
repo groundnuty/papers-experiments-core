@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+import threading
 from collections.abc import Iterator, Mapping
 from typing import NamedTuple
 
@@ -64,7 +65,16 @@ class StudyKind(NamedTuple):
     treatable: bool = True
 
 
-_study_kinds: Mapping[str, StudyKind] = {}  # the kinds of the study in scope (`study_kinds`), for as long as it is
+class _HeldKind(NamedTuple):
+    """A study's kind in scope, and how many scopes hold it."""
+
+    kind: StudyKind
+    scopes: int
+
+
+_scope_lock = threading.Lock()  # serialises every change to the study kinds in scope, and a platform's registration
+_study_kinds: Mapping[str, _HeldKind] = {}  # the kinds in scope (`study_kinds`); replaced, never changed in place, so
+# a reader takes one consistent view without the lock
 
 
 def _check_name(kind: str, description: str) -> None:
@@ -86,22 +96,51 @@ def check_study_kind(kind: str, description: str) -> None:
 
 @contextlib.contextmanager
 def study_kinds(declared: Mapping[str, StudyKind]) -> Iterator[None]:
-    """Hold a study's own kinds in the vocabulary for the block, and restore the vocabulary however the block ends.
+    """Hold a study's own kinds in the vocabulary for the block, however the block ends.
 
     A study's kinds are its own, so they last only while the study is loaded or run: the study loader and each step of
-    the pipeline enter this scope. Worker threads see it, since a run's attempts need it. One study is in scope at a
-    time: a nested scope replaces the kinds of the one around it, which come back when it ends.
+    the pipeline enter this scope. Scopes may overlap, as when one thread runs a study while another loads one: entering
+    adds each kind with a count and leaving takes one off, so no scope can drop a kind another still holds, and nothing
+    remains once all have left. Overlapping scopes that give one name different meanings are refused, naming the kind.
+
+    While two studies overlap in one process each can see the other's kinds. That is accepted: it can only widen
+    validation for that overlap and never rejects a valid record. The vocabulary is held for the process and not in a
+    `ContextVar`, because a plain thread would not inherit one and a valid `InfraError` raised in it would be rejected.
     """
-    global _study_kinds
-    for kind, entry in declared.items():
-        check_study_kind(
-            kind, entry.description
-        )  # a platform imported since the study was read may have taken the name
-    previous, _study_kinds = _study_kinds, dict(declared)
+    held = dict(declared)  # what was entered is what is left, whatever the caller does with its mapping
+    _enter_scope(held)
     try:
         yield
     finally:
-        _study_kinds = previous
+        _leave_scope(held)
+
+
+def _enter_scope(declared: Mapping[str, StudyKind]) -> None:
+    """Count each kind in, or change nothing and raise ValueError when one cannot be held."""
+    global _study_kinds
+    with _scope_lock:
+        held = dict(_study_kinds)
+        for kind, entry in declared.items():
+            check_study_kind(kind, entry.description)  # a platform imported since the study was read may have taken it
+            current = held.get(kind)
+            if current is not None and current.kind != entry:
+                raise ValueError(f"infrastructure kind {kind!r} is declared differently by another study in scope")
+            held[kind] = _HeldKind(entry, 1 if current is None else current.scopes + 1)
+        _study_kinds = held
+
+
+def _leave_scope(declared: Mapping[str, StudyKind]) -> None:
+    """Count each kind out, removing the ones no scope holds any more."""
+    global _study_kinds
+    with _scope_lock:
+        held = dict(_study_kinds)
+        for kind in declared:
+            current = held[kind]
+            if current.scopes == 1:
+                del held[kind]
+            else:
+                held[kind] = current._replace(scopes=current.scopes - 1)
+        _study_kinds = held
 
 
 def register_infra_kind(kind: str, description: str, *, treatable: bool = True) -> None:
@@ -115,17 +154,18 @@ def register_infra_kind(kind: str, description: str, *, treatable: bool = True) 
     A kind of the study in scope (`study_kinds`) is refused: the two would be one kind with two owners.
     """
     _check_name(kind, description)
-    if kind in _study_kinds:
-        raise ValueError(f"infrastructure kind {kind!r} is declared by the study in scope ([study.kinds])")
-    if kind in _platform_kinds and (kind in _platform_untreatable) == treatable:
-        held = "not treatable" if kind in _platform_untreatable else "treatable"
-        raise ValueError(f"infrastructure kind {kind!r} is already registered as {held}")
-    if kind not in _platform_kinds:
-        _platform_kinds[kind] = description
-        if treatable:
-            _platform_untreatable.pop(kind, None)
-        else:
-            _platform_untreatable[kind] = description
+    with _scope_lock:
+        if kind in _study_kinds:
+            raise ValueError(f"infrastructure kind {kind!r} is declared by the study in scope ([study.kinds])")
+        if kind in _platform_kinds and (kind in _platform_untreatable) == treatable:
+            held = "not treatable" if kind in _platform_untreatable else "treatable"
+            raise ValueError(f"infrastructure kind {kind!r} is already registered as {held}")
+        if kind not in _platform_kinds:
+            _platform_kinds[kind] = description
+            if treatable:
+                _platform_untreatable.pop(kind, None)
+            else:
+                _platform_untreatable[kind] = description
 
 
 def infra_kinds() -> tuple[str, ...]:
@@ -138,7 +178,7 @@ def untreatable_kinds() -> dict[str, str]:
     return {
         **CORE_UNTREATABLE,
         **{k: why for k, why in _platform_untreatable.items() if k in _platform_kinds},
-        **{k: entry.description for k, entry in _study_kinds.items() if not entry.treatable},
+        **{k: held.kind.description for k, held in _study_kinds.items() if not held.kind.treatable},
     }
 
 
