@@ -9,6 +9,7 @@ import pytest
 from stats_support import both_arms, make_row
 
 from expcore.campaign.factors import FactorSchema
+from expcore.stats import contrasts as kernel
 from expcore.stats import estimators, power
 from expcore.stats.analysis import (
     CONCLUSIONS,
@@ -528,7 +529,8 @@ def test_a_table_of_conclusions_alone_cannot_hide_a_detected_effect(concluded):
     _, result = concluded
     for contrast in result.contrasts:
         assert (contrast.conclusion in ("difference", "trivial_difference")) is contrast.significant, contrast.name
-    assert {c.conclusion for c in result.contrasts} == set(CONCLUSIONS)  # the fixture shows all four words
+    tested = set(CONCLUSIONS) - {"untestable"}  # every contrast of the fixture has pairs; S11 tests the fifth word
+    assert {c.conclusion for c in result.contrasts} == tested  # the fixture shows the four words of a tested contrast
 
 
 def test_a_contrast_outside_the_family_is_judged_by_its_raw_p_value(concluded):
@@ -557,11 +559,11 @@ def test_the_exploratory_label_is_a_field_of_the_result_not_something_a_report_m
     assert dataclasses.asdict(result.contrast("q-vs-r-margin"))["exploratory"] is True
 
 
-def test_every_conclusion_is_one_of_the_four_words(concluded):
+def test_every_conclusion_is_one_of_the_five_words(concluded):
     """The vocabulary is closed."""
     _, result = concluded
     assert {c.conclusion for c in result.contrasts} <= set(CONCLUSIONS)
-    assert set(CONCLUSIONS) == {"difference", "trivial_difference", "equivalent", "not_detected"}
+    assert set(CONCLUSIONS) == {"difference", "trivial_difference", "equivalent", "not_detected", "untestable"}
 
 
 def test_a_family_member_is_significant_by_holm_not_by_its_raw_p_value():
@@ -583,7 +585,7 @@ def test_a_family_member_is_significant_by_holm_not_by_its_raw_p_value():
     assert found.p_value == pytest.approx(0.03125)
     assert found.p_value < 0.05
     assert (found.significant, found.conclusion) == (False, "not_detected")
-    assert result.contrast("no-data").conclusion == "not_detected"  # no pair at all: NaN is never significant
+    assert result.contrast("no-data").conclusion == "untestable"  # no pair at all: nothing was tested (S11)
 
 
 def test_the_equivalence_interval_comes_from_the_estimator_at_the_level_it_is_asked_for(prereg, planted, monkeypatch):
@@ -915,3 +917,118 @@ def test_s10_an_exploratory_contrast_reports_the_pairs_it_loses_to_a_treatment_a
     assert (result.exploratory, result.treatment_outcomes) == (True, None)
     assert result.pairs_missing["treatment_outcome_none"] == 2
     assert result.n_pairs == 6
+
+
+# --- a contrast with no usable pair (S11) -------------------------------------------------------------------------
+
+UNTESTABLE_TEXT = """\
+alpha = 0.05
+holm_family = FAMILY
+
+[bootstrap]
+replicates = 100
+seed = 9
+
+[power]
+seed = 4
+n_simulations = 30
+target_clusters = 20
+target_difference = 0.1
+sd_grid = [0.1]
+
+[contrasts.p-vs-q]
+conditions = ["cond-p", "cond-q"]
+outcome = "rate"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+
+[contrasts.q-vs-r]
+conditions = ["cond-q", "cond-r"]
+outcome = "rate"
+estimator = "ESTIMATOR"
+cluster = "group"
+"""
+
+
+def untestable_prereg(family=("p-vs-q", "q-vs-r"), estimator="wilcoxon_cluster_bootstrap"):
+    """p-vs-q has data; q-vs-r is the contrast whose partners are all missing. Power settings are present."""
+    text = UNTESTABLE_TEXT.replace("FAMILY", str(list(family)).replace("'", '"')).replace("ESTIMATOR", estimator)
+    return parse(tomllib.loads(text), "inline", "d" * 64, ARM_SCHEMA)
+
+
+def untestable_inputs(cause: str) -> tuple[list[Row], list[AbsentRun]]:
+    """Six clusters of p-vs-q pairs; every cond-r partner of q-vs-r is missing for `cause`."""
+    rows, absent = [], []
+    for i in range(6):
+        cluster = f"c{i}"
+        rows.append(
+            make_row(
+                f"t{i}", "model-a", 1, 0.9 - 0.01 * i, condition="cond-p", cluster=cluster, outcome="rate", arm="p"
+            )
+        )
+        rows.append(make_row(f"t{i}", "model-a", 1, 0.5, condition="cond-q", cluster=cluster, outcome="rate", arm="q"))
+        if cause == "outcome_none":  # an ordinary run the scorer could not measure
+            rows.append(
+                make_row(f"t{i}", "model-a", 1, None, condition="cond-r", cluster=cluster, outcome="rate", arm="r")
+            )
+        else:
+            factors = {"task": f"t{i}", "model": "model-a", "seed": 1, "arm": "r"}
+            absent.append(AbsentRun(f"task=t{i}|arm=r|model=model-a|seed=1", "cond-r", factors, cause))
+    return rows, absent
+
+
+CAUSE_OF = {"exhausted": "exhausted", "unfinished": "unpaired_or_left_out", "outcome_none": "outcome_none"}
+
+
+@pytest.mark.parametrize("cause", sorted(CAUSE_OF))
+def test_s11_a_contrast_with_no_usable_pair_is_untestable_whatever_the_cause(cause):
+    """S11: no evidence is never "not_detected": every partner exhausted, unfinished or scored None on an ordinary run
+    makes the contrast untestable, never significant, with no p-value, no estimate and no minimum detectable effect
+    although the preregistration has power settings."""
+    rows, absent = untestable_inputs(cause)
+    result = analyse(rows, untestable_prereg(), absent)
+    empty = result.contrast("q-vs-r")
+    assert (empty.n_pairs, empty.pairs_missing[CAUSE_OF[cause]]) == (0, 6)
+    assert (empty.conclusion, empty.significant, empty.equivalent) == ("untestable", False, False)
+    assert math.isnan(empty.p_value)
+    assert math.isnan(empty.estimate)
+    assert empty.minimum_detectable_effect is None
+    tested = result.contrast("p-vs-q")
+    assert tested.conclusion != "untestable"
+    assert tested.minimum_detectable_effect is not None
+
+
+def test_s11_an_untestable_member_stays_in_the_family_as_p_one_whatever_its_estimator_returned(monkeypatch):
+    """S11, S02: the family keeps its size, and the other member's adjusted p-value and level are what Holm gives with
+    p = 1 for the untestable one, which is also what it gives for a NaN. An estimator that returns a number for no
+    data is not believed: the contrast is still untestable and cannot reject."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    estimators.register("eager")(lambda paired, settings: EstimatorResult(0.3, 0.0001, 0.1, 0.5, len(paired.clusters)))
+    rows, absent = untestable_inputs("exhausted")
+    result = analyse(rows, untestable_prereg(estimator="eager"), absent)
+    empty = result.contrast("q-vs-r")
+    assert (empty.conclusion, empty.significant) == ("untestable", False)
+    assert math.isnan(empty.p_value)
+    decisions = {d.name: d for d in result.holm}
+    assert len(decisions) == 2
+    assert decisions["q-vs-r"].reject is False
+    assert math.isnan(decisions["q-vs-r"].p_holm)
+    p = result.contrast("p-vs-q").p_value
+    with_one, with_nan = kernel.holm([p, 1.0], 0.05), kernel.holm([p, math.nan], 0.05)
+    assert with_one.adjusted[0] == with_nan.adjusted[0] == decisions["p-vs-q"].p_holm
+    assert with_one.levels[0] == with_nan.levels[0] == decisions["p-vs-q"].level == 0.05 / 2
+
+
+def test_s11_an_exploratory_contrast_with_no_usable_pair_is_untestable_too():
+    """S11: outside the family the word is the same, and it is labelled exploratory wherever it is shown."""
+    rows, absent = untestable_inputs("unfinished")
+    empty = analyse(rows, untestable_prereg(family=("p-vs-q",)), absent).contrast("q-vs-r")
+    assert (empty.exploratory, empty.conclusion, empty.minimum_detectable_effect) == (True, "untestable", None)
+
+
+def test_s11_untestable_overrides_whatever_the_test_and_the_margin_say():
+    """S11: with no pair, neither a significant test nor an interval inside a margin can reach any other word."""
+    for significant in (True, False):
+        for equivalent in (True, False):
+            assert conclude(significant=significant, equivalent=equivalent, untestable=True) == "untestable"
+    assert conclude(significant=False, equivalent=False) == "not_detected"

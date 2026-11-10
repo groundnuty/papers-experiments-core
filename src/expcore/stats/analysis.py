@@ -6,17 +6,21 @@ an estimator: a contrast names one, the registry supplies it, and the result typ
 reports. A contrast that cannot be estimated keeps its place with NaN values, and a NaN p-value stays in the Holm
 family as p = 1 (S02).
 
-Each contrast ends in one of four conclusions, and never in "no difference". Two facts decide it: whether the test is
-significant (a member of the Holm family by Holm's decision, any other contrast by its raw p-value at alpha, since
-nothing adjusts for it), and whether the preregistration declares an `equivalence_margin` for the contrast and the
-cluster-bootstrap interval at 1 - 2 alpha lies inside plus or minus that margin (the interval form of two one-sided
-tests at alpha).
+Each contrast ends in one of five conclusions, and never in "no difference". A contrast that used no pair, whatever
+the cause, is "untestable": nothing was tested, so no other word applies (S11). It has no estimate, interval, p-value
+or minimum detectable effect, whatever its estimator returned for no data; in the Holm family it stays a member as
+p = 1, the kernel's reading of a NaN p-value, so the family keeps its size and it never rejects. For every other
+contrast two facts decide: whether the test is significant (a member of the Holm family by Holm's decision, any other
+contrast by its raw p-value at alpha, since nothing adjusts for it), and whether the preregistration declares an
+`equivalence_margin` for the contrast and the cluster-bootstrap interval at 1 - 2 alpha lies inside plus or minus that
+margin (the interval form of two one-sided tests at alpha).
 - "difference": significant, and not inside the margin (or no margin is declared);
 - "trivial_difference": significant, and inside the margin. The effect is detected and smaller than the margin the
   study called negligible; it has its own word so that a table of conclusions cannot hide a detected effect;
 - "equivalent": inside the margin, and not significant;
 - "not_detected": everything else, including a non-significant result without a margin and a margin whose interval is
-  too wide. Failing to detect a difference is not evidence of none.
+  too wide. Failing to detect a difference is not evidence of none;
+- "untestable": no pair was used. It is not evidence of anything, least of all of no effect.
 
 A contrast outside the preregistered Holm family is `exploratory`: nothing controls its multiplicity, it is judged by
 its raw p-value at alpha, and every table or report that shows its conclusion shows that label with it.
@@ -50,7 +54,8 @@ from expcore.stats.prereg import Preregistration, name_digest
 from expcore.stats.rejection import rejects
 from expcore.stats.rows import AbsentRun, Row
 
-CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected")
+UNTESTABLE = "untestable"  # the conclusion of a contrast that used no pair
+CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected", UNTESTABLE)
 
 
 class TreatmentOutcomesRefused(ValueError):
@@ -128,8 +133,13 @@ class AnalysisResult:
         raise KeyError(f"no contrast named {name!r}; declared: {', '.join(r.name for r in self.contrasts)}")
 
 
-def conclude(significant: bool, equivalent: bool) -> str:
-    """The conclusion from the test and the margin: a significant effect inside the margin is a trivial difference."""
+def conclude(significant: bool, equivalent: bool, untestable: bool = False) -> str:
+    """The conclusion from the test and the margin: a significant effect inside the margin is a trivial difference.
+
+    `untestable` (the contrast used no pair) overrides both: with no evidence, no other word applies (S11).
+    """
+    if untestable:
+        return UNTESTABLE
     if equivalent:
         return "trivial_difference" if significant else "equivalent"
     return "difference" if significant else "not_detected"
@@ -241,9 +251,17 @@ def run_contrast(
     _refuse_lost_treatment_pairs(spec, prereg, pairing)
     estimate = estimators.get(spec.estimator)(pairing.differences, prereg.estimator_settings(spec))
     in_family = spec.name in prereg.holm_family
+    untestable = pairing.n_pairs == 0
+    if untestable:  # no data: whatever the estimator returned is not evidence, and NaN enters Holm as p = 1 (S11)
+        estimate = dataclasses.replace(estimate, estimate=math.nan, p_value=math.nan, ci_low=math.nan, ci_high=math.nan)
+        significant = False
     if significant is None:
         significant = bool(rejects(estimate.p_value, prereg.alpha))  # False for a NaN p-value
-    interval, equivalent = _equivalence(spec, prereg, pairing.differences)
+    if untestable:
+        interval, equivalent = (None if spec.equivalence_margin is None else (math.nan, math.nan)), False
+    else:
+        interval, equivalent = _equivalence(spec, prereg, pairing.differences)
+    mde = None if untestable else _minimum_detectable_effect(spec, prereg, pairing.differences, in_family)
     return ContrastResult(
         name=spec.name,
         outcome=spec.outcome,
@@ -272,8 +290,8 @@ def run_contrast(
         equivalence_margin=spec.equivalence_margin,
         equivalence_interval=interval,
         equivalent=equivalent,
-        conclusion=conclude(significant, equivalent),
-        minimum_detectable_effect=_minimum_detectable_effect(spec, prereg, pairing.differences, in_family),
+        conclusion=conclude(significant, equivalent, untestable),
+        minimum_detectable_effect=mde,
     )
 
 
@@ -293,9 +311,13 @@ def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[Absen
             prereg.holm_family, p_values, outcome.adjusted, outcome.levels, outcome.reject, strict=True
         )
     )
-    rejected = {d.name: d.reject for d in decisions}
+    rejected = {d.name: d.reject for d in decisions}  # an untestable member's NaN p never rejects
     decided = tuple(
-        dataclasses.replace(r, significant=rejected[r.name], conclusion=conclude(rejected[r.name], r.equivalent))
+        dataclasses.replace(
+            r,
+            significant=rejected[r.name],
+            conclusion=conclude(rejected[r.name], r.equivalent, untestable=r.n_pairs == 0),
+        )
         if r.name in rejected
         else r
         for r in results
