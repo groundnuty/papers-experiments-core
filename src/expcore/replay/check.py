@@ -16,7 +16,8 @@ offline through the real loop. The result is written beside the records as `repl
 that names one is refused when the check is made (`HashedOnlyRecord`), and `require_current_check` refuses a stored
 check that has one, so a check that replayed nothing cannot vouch for the records beside it.
 
-`stage` is `load`, `roundtrip`, `replay` or `decision` (a failure at `decision` also names the `hook`). Paths are relative to the batch, so a batch extracted from an
+`stage` is `load`, `roundtrip`, `secret` (the record holds a value of this environment's secrets), `replay` or
+`decision` (a failure at `decision` also names the `hook`). Paths are relative to the batch, so a batch extracted from an
 archive elsewhere has the same digest. An input is a record (a `.json` file anywhere under the batch, the check file
 excepted) or a file named by `hashed_only` patterns, which is hashed but not replayed, such as a manifest the analysis
 reads. A `.json` file that is not a record must therefore be named in `hashed_only`, or it fails the check at `load`.
@@ -57,7 +58,7 @@ from expcore.provenance.codestamp import UNKNOWN, CodeScope, CodeVersionUnknown,
 from expcore.provenance.codestamp import version as code_version
 from expcore.provenance.environment import differences
 from expcore.records.record import RunRecord, decode
-from expcore.records.redact import redact_text
+from expcore.records.redact import Redactor, redact_text
 from expcore.records.schema import SCHEMA_PREFIX, SCHEMAS, RecordError, SchemaVersion
 from expcore.replay.divergence import ReplayDivergence
 from expcore.replay.native import has_native_parser
@@ -229,17 +230,30 @@ def _error(exc: BaseException) -> str:
 
 
 def check_record(raw: bytes, *, schemas: Sequence[SchemaVersion] = SCHEMAS) -> tuple[str, str] | None:
-    """Return None when the stored bytes load, write back to themselves and replay; else (stage, error)."""
+    """Return None when the stored bytes load, write back to themselves, hold no secret of this environment and
+    replay; else (stage, error).
+
+    The write-back redacts nothing: it checks the record's canonical form only, so a record written under an earlier
+    version of the redaction rules writes back to itself whatever the rules are now. Whether the record holds a value
+    of this environment's secrets, in any form the rules now recognise, is a stage of its own (`secret`): a leak to
+    report as one, never a format or replay divergence. The replay redacts nothing either (`Redactor.none`)."""
     try:
         record = RunRecord.from_json(decode(raw), tuple(schemas))
     except RecordError as exc:
         return "load", _redacted(str(exc))
     try:
-        written = record.dumps(tuple(schemas)).encode("utf-8")
+        written = record.dumps(tuple(schemas), redactor=Redactor.none()).encode("utf-8")
     except RecordError as exc:
         return "roundtrip", _error(exc)
     if written != raw:
         return "roundtrip", "writing the loaded record does not give back its stored bytes"
+    _, leaked = Redactor.from_environment().structure(decode(raw))
+    if leaked:
+        return "secret", (
+            f"a value of this environment's secrets appears in the record at {', '.join(leaked[:5])}: the record "
+            "holds a secret (written under another environment, or before the core recognised that form of it), so "
+            "it must not be published; rerun the attempt or remove the record"
+        )
     try:
         replay_record(record, schemas=schemas)
     except ReplayDivergence as exc:
