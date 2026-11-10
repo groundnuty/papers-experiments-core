@@ -189,7 +189,7 @@ The infrastructure failure the example declares as treatment comes after the mod
 
 A treatment outcome is what the agent achieved under the manipulation, so a scorer returns values for a treatment attempt: the failure itself (the example's agent gave no answer, so its accuracy is 0) and what the agent did before it (its rounds and lookups). `None` stays reserved for what could not be measured, and it drops the run's pair from every contrast on that outcome: the attempt is scored as treatment and then leaves the comparison it was kept for. The analysis counts these drops per contrast. A confirmatory contrast (one in the Holm family) with any drop is refused, naming the contrast, the count and the fix, unless its preregistration says how treatment attempts enter it:
 
-- `treatment_outcomes = "scored"`: the scorer returns values for them; a `None` left is counted and reported;
+- `treatment_outcomes = "scored"`: the scorer returns values for them. This is a claim the analysis checks: a confirmatory contrast that still loses a pair to a treatment attempt's `None` is refused. For a rare attempt that genuinely could not be measured, the contrast may preregister `max_unscored_treatment = N` (0 unless set; only on a contrast in the Holm family that declares `"scored"`), and the report shows how many pairs that cost;
 - `treatment_outcomes = "excluded"`: every pair with a treatment attempt is left out of that contrast, whatever the scorer returned, and the report names the contrast and how many pairs it left out beside its result.
 
 An exploratory contrast reports its drops and is not refused. The example's confirmatory contrast on the treatment condition declares its choice:

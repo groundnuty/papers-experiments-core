@@ -107,7 +107,8 @@ def _treatment(result: ContrastResult) -> str:
     if result.treatment_outcomes == "excluded":
         return f"excluded ({excluded} pair(s) left out)"
     if result.treatment_outcomes == "scored":
-        return f"scored ({lost} pair(s) None)" if lost else "scored"
+        allowed = f", at most {result.max_unscored_treatment} preregistered" if result.max_unscored_treatment else ""
+        return f"scored ({lost} pair(s) None{allowed})" if lost else "scored"
     return f"not declared ({lost} pair(s) None)" if lost else "-"
 
 

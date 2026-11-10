@@ -421,6 +421,44 @@ def test_s10_a_contrast_may_declare_how_its_treatment_attempts_are_scored_and_th
     assert prereg.contrasts["gate-effect"].treatment_outcomes is None
 
 
+def tolerating(value: str, word: str = '"scored"') -> str:
+    """The base text with a-vs-b declaring `word` for its treatment attempts and the tolerance `value` (TOML)."""
+    return declaring(f"{word}\nmax_unscored_treatment = {value}")
+
+
+def test_s10_a_scored_member_of_the_family_may_preregister_a_tolerance_that_is_otherwise_zero(tmp_path):
+    """S10: the tolerance for attempts that could not be measured is set beforehand, and is 0 when it is not."""
+    assert load(write(tmp_path, tolerating("2"))).contrasts["a-vs-b"].max_unscored_treatment == 2
+    assert load(write(tmp_path, declaring('"scored"'))).contrasts["a-vs-b"].max_unscored_treatment == 0
+
+
+@pytest.mark.parametrize("value", ["-1", "1.5", "true", '"1"'])
+def test_s10_a_tolerance_that_is_not_a_non_negative_integer_is_refused_with_the_file_and_the_key(tmp_path, value):
+    """S10: anything else is refused when the file is loaded, naming the file and the key."""
+    path = write(tmp_path, tolerating(value))
+    with pytest.raises(ConfigError) as caught:
+        load(path)
+    assert str(caught.value).startswith(f"{path}: [contrasts.a-vs-b]: key 'max_unscored_treatment' ")
+
+
+def test_s10_a_tolerance_is_only_for_a_contrast_that_claims_its_treatment_attempts_are_scored(tmp_path):
+    """S10: with "excluded" no pair can be lost to a treatment None, so a tolerance there would mean nothing."""
+    path = write(tmp_path, tolerating("1", '"excluded"'))
+    with pytest.raises(ConfigError) as caught:
+        load(path)
+    assert "key 'max_unscored_treatment' is only for a contrast with" in str(caught.value)
+
+
+def test_s10_a_tolerance_on_a_contrast_outside_the_family_is_refused_because_it_would_do_nothing(tmp_path):
+    """S10: only a member of the Holm family is refused for a treatment None; elsewhere a tolerance does nothing."""
+    text = tolerating("1").replace('holm_family = ["a-vs-b", "gate-effect"]', 'holm_family = ["gate-effect"]')
+    path = write(tmp_path, text)
+    with pytest.raises(ConfigError) as caught:
+        load(path)
+    assert "'a-vs-b'" in str(caught.value)
+    assert "max_unscored_treatment would do nothing" in str(caught.value)
+
+
 @pytest.mark.parametrize("value", ['"dropped"', '""', "true", "1"])
 def test_s10_a_treatment_declaration_other_than_scored_or_excluded_is_refused_with_the_file_and_the_key(
     tmp_path, value

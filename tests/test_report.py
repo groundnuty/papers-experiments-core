@@ -32,6 +32,7 @@ def contrast(name: str, conclusion: str, **changes) -> ContrastResult:
         "n_unpaired": 0,
         "tasks_dropped": (),
         "treatment_outcomes": None,
+        "max_unscored_treatment": 0,
         "pairs_missing": {
             "treatment_outcome_none": 0,
             "treatment_excluded": 0,
@@ -449,3 +450,17 @@ def test_r13_the_report_names_each_scorer_with_its_version_or_says_it_does_not_k
     given = render(analysis(contrast("primary", "difference")), scorers={"tiny": "2", "alpha": "sha256:ab"})
     assert "- Scorers: alpha `sha256:ab`, tiny `2`" in given
     assert "- Scorers: n/a" in render(analysis(contrast("primary", "difference")))
+
+
+def test_s10_a_scored_contrast_that_used_its_tolerance_shows_the_pairs_it_lost_and_the_number_it_was_allowed():
+    """S10: a preregistered tolerance is used in the open: the row gives what it cost and what was allowed."""
+    zero = dict.fromkeys(("treatment_excluded", "exhausted", "unpaired_or_left_out", "outcome_none"), 0)
+    tolerated = contrast(
+        "outage",
+        "difference",
+        treatment_outcomes="scored",
+        max_unscored_treatment=2,
+        pairs_missing={**zero, "treatment_outcome_none": 1},
+    )
+    report = render(analysis(tolerated, family=["outage"]))
+    assert row(report, "outage")[10] == "scored (1 pair(s) None, at most 2 preregistered)"

@@ -298,8 +298,9 @@ def test_s10_a_scorer_that_leaves_treatment_attempts_none_is_refused_until_the_c
     resumed, tmp_path, clean_environment
 ):
     """S10: through the command line: with the treatment attempts scored None and nothing declared, `analyze` refuses,
-    naming the confirmatory contrast, the count and the fix; declared excluded, it goes on, and analysis.json and the
-    report name the contrast that excludes them and how many pairs that left out."""
+    naming the confirmatory contrast, the count and the fix; declared scored, it still refuses, since the claim is
+    false; declared excluded, it goes on, and analysis.json and the report name the contrast that excludes them and
+    how many pairs that left out."""
     copy = copy_campaign(resumed, tmp_path, "none-for-treatment")
     edit_once(copy.root / "plugin.py", SCORED_TREATMENT, NONE_FOR_TREATMENT)
     prereg = copy.root / "preregistration.toml"
@@ -311,7 +312,17 @@ def test_s10_a_scorer_that_leaves_treatment_attempts_none_is_refused_until_the_c
     assert "confirmatory contrast 'relay-vs-baseline' drops 2 pair(s)" in errors
     assert 'treatment_outcomes = "scored"' in errors
     assert 'treatment_outcomes = "excluded"' in errors
-    edit_once(prereg, "\n\n# Not in the family", '\ntreatment_outcomes = "excluded"\n\n# Not in the family')
+    edit_once(prereg, "\n\n# Not in the family", '\ntreatment_outcomes = "scored"\n\n# Not in the family')
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    assert cli(clean_environment, "check", str(copy.runs))[0] == 0
+    code, errors = cli(clean_environment, "analyze", str(copy.root))
+    assert code == 1  # declaring them scored does not excuse a scorer that leaves them None
+    assert 'declares treatment_outcomes = "scored", but 2 pair(s)' in errors
+    edit_once(
+        prereg,
+        '\ntreatment_outcomes = "scored"\n\n# Not in the family',
+        '\ntreatment_outcomes = "excluded"\n\n# Not in the family',
+    )
     write_stamp(copy.root, HEAD, load_study(copy.root).scope)
     steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
     assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)

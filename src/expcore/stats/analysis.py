@@ -25,9 +25,11 @@ A treatment attempt (a run that ended in an infrastructure failure its condition
 as its condition's outcome, so a scorer that returns None for it takes its pair out of every contrast on that outcome,
 and the manipulation silently leaves the comparison it was kept for (S10). Each result counts those pairs, with every
 other cause of a missing pair (`pairing.MISSING_CAUSES`). A member of the Holm family that loses any is refused
-(`TreatmentOutcomesUndeclared`) unless its preregistration declares `treatment_outcomes`: "scored" (the scorer returns
-values for treatment attempts, and a None left is reported) or "excluded" (every pair with a treatment attempt is left
-out of the contrast and reported as such). An exploratory contrast reports the count and is not refused.
+(`TreatmentOutcomesRefused`) unless its preregistration declares `treatment_outcomes` = "excluded" (every pair with a
+treatment attempt is left out of the contrast and reported as such). "scored" says the scorer returns values for
+treatment attempts, and that claim is checked: a member that still loses a pair this way is refused too, past the
+contrast's preregistered `max_unscored_treatment` (0 unless set). An exploratory contrast reports the count and is not
+refused.
 
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
 """
@@ -51,9 +53,9 @@ from expcore.stats.rows import AbsentRun, Row
 CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected")
 
 
-class TreatmentOutcomesUndeclared(ValueError):
-    """A confirmatory contrast lost pairs to treatment attempts scored None, and its preregistration does not say how
-    treatment attempts are scored for it."""
+class TreatmentOutcomesRefused(ValueError):
+    """A confirmatory contrast lost pairs to treatment attempts scored None, and its preregistration either does not
+    say how treatment attempts are scored for it or claims they are scored and allows fewer such pairs."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,6 +79,7 @@ class ContrastResult:
     n_unpaired: int  # run keys analysed in one arm only
     tasks_dropped: tuple[str, ...]  # tasks one of the two arms did not run, left out of this contrast only
     treatment_outcomes: str | None  # as preregistered: "scored", "excluded", or None when undeclared
+    max_unscored_treatment: int  # as preregistered: the pairs a "scored" member may lose to a treatment None
     pairs_missing: Mapping[str, int]  # every cause of pairing.MISSING_CAUSES with its count, zeros included
     counts: Mapping[str, int]
     per_model: tuple[ModelEstimate, ...]
@@ -178,12 +181,22 @@ def _minimum_detectable_effect(
     return power.minimum_detectable_effect(sd, len(differences.clusters), level, prereg.power, rng, p_values)
 
 
-def _refuse_undeclared_treatment_drops(spec: ContrastSpec, prereg: Preregistration, pairing: Pairing) -> None:
-    """Refuse a member of the Holm family that lost a pair to a treatment attempt scored None, unless declared (S10)."""
+def _refuse_lost_treatment_pairs(spec: ContrastSpec, prereg: Preregistration, pairing: Pairing) -> None:
+    """Refuse a member of the Holm family that lost a pair to a treatment attempt scored None (S10): "excluded" loses
+    none this way, and "scored" is a claim checked here, not a switch that turns the check off."""
     lost = pairing.missing["treatment_outcome_none"]
-    if not lost or spec.name not in prereg.holm_family or spec.treatment_outcomes is not None:
+    if not lost or spec.name not in prereg.holm_family or lost <= spec.max_unscored_treatment:
         return
-    raise TreatmentOutcomesUndeclared(
+    if spec.treatment_outcomes == "scored":
+        raise TreatmentOutcomesRefused(
+            f'{prereg.source}: confirmatory contrast {spec.name!r} declares treatment_outcomes = "scored", but {lost} '
+            f"pair(s) have a treatment attempt whose outcome {spec.outcome!r} is None "
+            f"(max_unscored_treatment is {spec.max_unscored_treatment}). Make the scorer return values for treatment "
+            f"attempts; preregister max_unscored_treatment in [contrasts.{spec.name}] only for attempts that genuinely "
+            'could not be measured; or declare treatment_outcomes = "excluded" to leave every pair with a treatment '
+            "attempt out of this contrast, reported as such"
+        )
+    raise TreatmentOutcomesRefused(
         f"{prereg.source}: confirmatory contrast {spec.name!r} drops {lost} pair(s) because a treatment attempt's "
         f"outcome {spec.outcome!r} is None, so the condition's manipulation silently leaves its own contrast. Make the "
         "scorer return values for treatment attempts (None only for what could not be measured) and declare "
@@ -204,10 +217,11 @@ def run_contrast(
     `significant` is the decision of the test. `analyse` passes Holm's decision for a member of the family; left out,
     it is the raw p-value at alpha, with nothing adjusting for the family. `absent` are the planned runs with no
     analysed attempt, which say why a pair is missing. A member of the family that loses a pair to a treatment
-    attempt scored None without a `treatment_outcomes` declaration is refused (`TreatmentOutcomesUndeclared`).
+    attempt scored None is refused (`TreatmentOutcomesRefused`), unless it declares `treatment_outcomes = "excluded"`
+    or the loss is within a "scored" contrast's preregistered `max_unscored_treatment`.
     """
     pairing = pair_rows(rows, spec, absent)
-    _refuse_undeclared_treatment_drops(spec, prereg, pairing)
+    _refuse_lost_treatment_pairs(spec, prereg, pairing)
     estimate = estimators.get(spec.estimator)(pairing.differences, prereg.estimator_settings(spec))
     in_family = spec.name in prereg.holm_family
     if significant is None:
@@ -231,6 +245,7 @@ def run_contrast(
         n_unpaired=pairing.n_unpaired,
         tasks_dropped=pairing.tasks_dropped,
         treatment_outcomes=spec.treatment_outcomes,
+        max_unscored_treatment=spec.max_unscored_treatment,
         pairs_missing=dict(pairing.missing),
         counts=dict(estimate.counts),
         per_model=estimate.per_model,

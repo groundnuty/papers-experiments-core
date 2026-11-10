@@ -114,7 +114,8 @@ class TinyScorer:
     other run: the failure is the condition's manipulation, so what the agent achieved under it is the measurement.
     It gave no answer, so its accuracy is 0, and its rounds and lookups are what it did before the failure. None means
     only that an outcome could not be measured: it would drop the run's pair from every contrast on that outcome, and a
-    confirmatory contrast refuses that unless its preregistration declares `treatment_outcomes`.
+    confirmatory contrast is refused for that, even one that declares `treatment_outcomes = "scored"`, past the number
+    its preregistration allows in `max_unscored_treatment`.
     """
 
     name = "tiny"

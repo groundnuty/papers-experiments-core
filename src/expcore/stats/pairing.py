@@ -52,6 +52,8 @@ class ContrastSpec:
     `equivalence_margin`, in the outcome's units, is declared only for a contrast whose preregistration allows the
     conclusion that the two arms are equivalent. `treatment_outcomes` says how treatment attempts enter the contrast:
     "scored" (the scorer returns values for them), "excluded" (every pair with one is left out) or None (undeclared).
+    `max_unscored_treatment` is how many pairs a "scored" member of the Holm family may still lose to a treatment
+    attempt's None: 0 unless preregistered, for a rare genuine "could not be measured".
     """
 
     name: str
@@ -63,6 +65,7 @@ class ContrastSpec:
     levels: tuple[str, str] | None = None
     equivalence_margin: float | None = None
     treatment_outcomes: str | None = None
+    max_unscored_treatment: int = 0
 
     def __post_init__(self) -> None:
         """Require exactly one form, with two different arms, a positive finite margin and a known treatment word."""
@@ -75,6 +78,11 @@ class ContrastSpec:
                 f"contrast {self.name!r}: treatment_outcomes must be 'scored' or 'excluded', "
                 f"got {self.treatment_outcomes!r}"
             )
+        tolerance = self.max_unscored_treatment
+        if isinstance(tolerance, bool) or not isinstance(tolerance, int) or tolerance < 0:
+            raise ValueError(f"contrast {self.name!r}: max_unscored_treatment must be a non-negative integer")
+        if tolerance and self.treatment_outcomes != "scored":
+            raise ValueError(f'contrast {self.name!r}: max_unscored_treatment needs treatment_outcomes = "scored"')
         if self.conditions is not None and (self.factor is not None or self.levels is not None):
             raise ValueError(f"contrast {self.name!r}: give conditions, or a factor with its levels, not both")
         if self.conditions is None and (self.factor is None or self.levels is None):

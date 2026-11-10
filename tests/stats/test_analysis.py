@@ -12,7 +12,7 @@ from expcore.campaign.factors import FactorSchema
 from expcore.stats import estimators, power
 from expcore.stats.analysis import (
     CONCLUSIONS,
-    TreatmentOutcomesUndeclared,
+    TreatmentOutcomesRefused,
     analyse,
     conclude,
     pilot_power,
@@ -779,9 +779,10 @@ cluster = "group"
 """
 
 
-def treated_prereg(family: str = "a-vs-b", declaration: str | None = None):
+def treated_prereg(family: str = "a-vs-b", declaration: str | None = None, tolerance: int | None = None):
     """A preregistration over ARMS with a-vs-b and x-vs-y; `family` is the one Holm member, a-vs-b may declare."""
     line = "" if declaration is None else f'treatment_outcomes = "{declaration}"\n'
+    line += "" if tolerance is None else f"max_unscored_treatment = {tolerance}\n"
     text = TREATED_TEXT.replace("FAMILY", family).replace("DECLARATION\n", line)
     return parse(tomllib.loads(text), "inline", "e" * 64, ARMS)
 
@@ -800,7 +801,7 @@ def treated_rows() -> list[Row]:
 def test_s10_a_confirmatory_contrast_that_loses_a_pair_to_a_treatment_attempts_none_is_refused():
     """S10: the condition's manipulation would silently leave its own contrast; the refusal names the contrast, the
     count and both ways to fix it."""
-    with pytest.raises(TreatmentOutcomesUndeclared) as caught:
+    with pytest.raises(TreatmentOutcomesRefused) as caught:
         analyse(treated_rows(), treated_prereg())
     message = str(caught.value)
     assert "confirmatory contrast 'a-vs-b'" in message
@@ -811,17 +812,36 @@ def test_s10_a_confirmatory_contrast_that_loses_a_pair_to_a_treatment_attempts_n
     assert "[contrasts.a-vs-b]" in message
 
 
-@pytest.mark.parametrize(("declaration", "used", "none", "excluded"), [("scored", 6, 2, 0), ("excluded", 6, 0, 2)])
-def test_s10_either_declaration_lets_the_confirmatory_contrast_through_and_its_drops_are_counted(
-    declaration, used, none, excluded
-):
-    """S10: "scored" keeps the pairs the scorer measured and counts its Nones; "excluded" leaves out every pair with a
-    treatment attempt and counts it. Either way the result says which was declared."""
-    result = analyse(treated_rows(), treated_prereg(declaration=declaration)).contrast("a-vs-b")
-    assert (result.in_family, result.treatment_outcomes) == (True, declaration)
-    assert result.n_pairs == used
-    missing = result.pairs_missing
-    assert (missing["treatment_outcome_none"], missing["treatment_excluded"]) == (none, excluded)
+def test_s10_declaring_scored_does_not_excuse_a_scorer_that_leaves_every_treatment_attempt_none():
+    """S10: "scored" is a claim the analysis checks. With every outage left None, the declaration is false and the
+    contrast is refused, naming the claim, the count and the ways out, or issue #39 would survive behind one line."""
+    with pytest.raises(TreatmentOutcomesRefused) as caught:
+        analyse(treated_rows(), treated_prereg(declaration="scored"))
+    message = str(caught.value)
+    assert "confirmatory contrast 'a-vs-b'" in message
+    assert 'declares treatment_outcomes = "scored"' in message
+    assert "2 pair(s)" in message
+    assert "max_unscored_treatment is 0" in message
+    assert "[contrasts.a-vs-b]" in message
+
+
+def test_s10_a_preregistered_tolerance_allows_exactly_that_many_unscored_treatment_pairs():
+    """S10: for a rare genuine "could not be measured", a member may lose as many pairs as its preregistration set
+    beforehand, and the result says so; one more than that is refused."""
+    result = analyse(treated_rows(), treated_prereg(declaration="scored", tolerance=2)).contrast("a-vs-b")
+    assert (result.in_family, result.treatment_outcomes, result.max_unscored_treatment) == (True, "scored", 2)
+    assert (result.n_pairs, result.pairs_missing["treatment_outcome_none"]) == (6, 2)
+    with pytest.raises(TreatmentOutcomesRefused, match="max_unscored_treatment is 1"):
+        analyse(treated_rows(), treated_prereg(declaration="scored", tolerance=1))
+
+
+def test_s10_excluded_lets_the_confirmatory_contrast_through_and_counts_what_it_left_out():
+    """S10: "excluded" leaves out every pair with a treatment attempt, counted apart, and the result says so: the
+    design fixes the population, whatever the scorer returned."""
+    result = analyse(treated_rows(), treated_prereg(declaration="excluded")).contrast("a-vs-b")
+    assert (result.in_family, result.treatment_outcomes, result.max_unscored_treatment) == (True, "excluded", 0)
+    assert result.n_pairs == 6
+    assert (result.pairs_missing["treatment_outcome_none"], result.pairs_missing["treatment_excluded"]) == (0, 2)
 
 
 def test_s10_an_exploratory_contrast_reports_the_pairs_it_loses_to_a_treatment_attempts_none_and_is_not_refused():

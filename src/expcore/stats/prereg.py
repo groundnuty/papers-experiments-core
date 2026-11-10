@@ -37,7 +37,9 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     equivalence_margin = 0.05  # optional: only with a margin can the result be called "equivalent"
     treatment_outcomes = "scored"  # optional: how treatment attempts enter: "scored" or "excluded" (every pair
                                    # with one is left out); a member of the Holm family that loses a pair to a
-                                   # treatment attempt scored None is refused without it
+                                   # treatment attempt scored None is refused without it, and with "scored" too
+    max_unscored_treatment = 1 # optional, with "scored" in the Holm family only: the pairs it may still lose to a
+                               # treatment attempt that genuinely could not be measured (default 0)
 
     [contrasts.gate-effect]    # factor form: a declared factor of the schema and two of its levels
     factor = "gate"
@@ -78,6 +80,7 @@ _CONTRAST_KEYS = (
     "cluster",
     "equivalence_margin",
     "treatment_outcomes",
+    "max_unscored_treatment",
 )
 
 
@@ -327,6 +330,18 @@ def _treatment_outcomes(section: Section) -> str | None:
     return value
 
 
+def _max_unscored(section: Section, treatment: str | None) -> int:
+    """Read the optional tolerance of a "scored" contrast for treatment attempts that could not be measured."""
+    if "max_unscored_treatment" not in section.data:
+        return 0
+    value = section.data["max_unscored_treatment"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise section.fail("max_unscored_treatment", f"must be a non-negative integer, got {value!r}")
+    if value and treatment != "scored":
+        raise section.fail("max_unscored_treatment", 'is only for a contrast with treatment_outcomes = "scored"')
+    return value
+
+
 def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, alpha: float) -> ContrastSpec:
     """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
@@ -336,7 +351,12 @@ def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSc
         estimators.get(estimator)
     except UnknownEstimator as error:
         raise section.fail("estimator", str(error)) from None
-    declared = {"equivalence_margin": _margin(section, alpha), "treatment_outcomes": _treatment_outcomes(section)}
+    treatment = _treatment_outcomes(section)
+    declared = {
+        "equivalence_margin": _margin(section, alpha),
+        "treatment_outcomes": treatment,
+        "max_unscored_treatment": _max_unscored(section, treatment),
+    }
     if "conditions" in table:
         for extra in ("factor", "levels"):
             if extra in table:
@@ -395,4 +415,11 @@ def _family(root: Section, contrasts: Mapping[str, ContrastSpec]) -> tuple[str, 
             )
     if len(set(family)) != len(family):
         raise root.fail("holm_family", "names a contrast twice")
+    for name, spec in contrasts.items():
+        if spec.max_unscored_treatment and name not in family:
+            raise root.fail(
+                "holm_family",
+                f"does not name {name!r}, whose max_unscored_treatment would do nothing: only a member of the family "
+                "is refused for a treatment attempt left None",
+            )
     return family
