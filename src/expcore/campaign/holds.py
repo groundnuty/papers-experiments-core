@@ -23,11 +23,14 @@ ALL = "all"
 
 @dataclass(frozen=True)
 class Hold:
-    """A reason a subject's runs do not start: its kind (a short word), the sentence, and whether it ends by itself."""
+    """A reason a subject's runs do not start: its kind (a short word), the sentence, whether it ends by itself, and
+    when, if that is known (a unit's pause). The end is part of the hold, so a pause extended while it holds is a
+    change, written and reported once."""
 
     kind: str
     reason: str
     temporary: bool = False
+    until: str | None = None  # when the hold ends by itself, as the store writes a time; None when not known
 
 
 class HoldRegistry:
@@ -57,7 +60,8 @@ class HoldRegistry:
         if hold is None and before is not None:
             self.store.event(self._stamp(), "hold_lifted", model, f"{subject}: {before.kind} hold ended")
         elif hold is not None:
-            self.store.event(self._stamp(), "hold", model, f"{subject}: {hold.kind}: {hold.reason}")
+            until = "" if hold.until is None else f" (until {hold.until})"
+            self.store.event(self._stamp(), "hold", model, f"{subject}: {hold.kind}: {hold.reason}{until}")
         if self._on_change is not None:
             self._on_change(subject, before, hold)
 

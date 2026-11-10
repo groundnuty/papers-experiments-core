@@ -1,5 +1,6 @@
 """The gates around an attempt, through the scheduler: harness stops, health, budgets, units, identity, leases."""
 
+import datetime as dt
 import json
 import os
 import re
@@ -234,6 +235,27 @@ def test_c15_a_unit_pause_is_said_once_with_when_dispatch_resumes_and_once_when_
     assert "is paused after repeated failures; only a success clears it" in paused
     assert re.search(r"; dispatch on it resumes at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ, when one run may probe it$", paused)
     assert lines.count("hold on unit:unit-m1 ended (unit_paused); dispatch of its runs resumes") == 1
+
+
+def test_c15_a_pause_extended_while_it_holds_is_said_again_once_with_its_new_end(tmp_path):
+    """C15: a unit already down that fails again is paused again from that moment; the time said first is stale, so
+    the extension is a change of the hold, said once, and the dispatcher's later passes add nothing."""
+    now = [dt.datetime(2026, 11, 10, 12, 0, tzinfo=dt.UTC)]
+    lines = []
+    settings = settings_for(unit_pause_s=60)
+    with build(tmp_path, settings=settings, plan=SMALL, on_hold=lines.append, clock=lambda: now[0]) as scheduler:
+        scheduler.units.failure("unit-m1", immediate=True)
+        scheduler.next_dispatch()
+        scheduler.next_dispatch()
+        now[0] += dt.timedelta(seconds=30)
+        scheduler.units.failure("unit-m1", immediate=True)  # down already: paused again, from now
+        scheduler.next_dispatch()
+        scheduler.next_dispatch()
+    said = [line.split("resumes at ")[1] for line in lines if line.startswith("hold on unit:unit-m1 (unit_paused)")]
+    assert said == [
+        "2026-11-10T12:01:00Z, when one run may probe it",
+        "2026-11-10T12:01:30Z, when one run may probe it",
+    ]
 
 
 def test_c15_a_paused_unit_holds_its_runs_and_leaves_other_units_alone(tmp_path):

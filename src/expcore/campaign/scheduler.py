@@ -395,9 +395,9 @@ class Scheduler:
         """The hold on a unit: its pause (C15)."""
         if self.units.ok(unit):
             return None
-        return Hold(
-            "unit_paused", f"{unit} is paused after repeated failures; only a success clears it", temporary=True
-        )
+        until = iso(dt.datetime.fromtimestamp(self.units.paused_until(unit), dt.UTC))
+        reason = f"{unit} is paused after repeated failures; only a success clears it"
+        return Hold("unit_paused", reason, temporary=True, until=until)
 
     def next_dispatch(self) -> tuple[Any | None, bool]:
         """Return the first pending run, in manifest order, that can start now, and whether any run is only waiting.
@@ -525,9 +525,8 @@ class Scheduler:
 
     def _resumes(self, subject: str, hold: Hold) -> str:
         """When dispatch held by `hold` resumes, as far as the scheduler knows."""
-        if hold.kind == "unit_paused" and subject.startswith("unit:"):
-            until = dt.datetime.fromtimestamp(self.units.paused_until(subject.split(":", 1)[1]), dt.UTC)
-            return f"dispatch on it resumes at {iso(until)}, when one run may probe it"
+        if hold.kind == "unit_paused" and hold.until is not None:
+            return f"dispatch on it resumes at {hold.until}, when one run may probe it"
         if hold.kind == "health_gate":
             return f"dispatch resumes when a health check passes (checked every {self.settings.recheck_s:g} s)"
         if hold.temporary:
