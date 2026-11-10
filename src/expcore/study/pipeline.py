@@ -64,9 +64,6 @@ from expcore.replay.native import has_native_parser
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
-from expcore.study.config import StudyConfig, find_study_root, load_study
-from expcore.stats.analysis import AnalysisResult, analyse
-from expcore.stats.rows import Row
 from expcore.study.config import (
     StudyConfig,
     StudyIdentity,
