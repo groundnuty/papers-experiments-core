@@ -5,6 +5,7 @@ The core imports the plugin as a package whose path is the plugin's directory, n
 it imports from there must be one `[study] code` lists, or the plugin is refused when it is loaded.
 """
 
+import os
 import shutil
 import sys
 import tarfile
@@ -98,6 +99,80 @@ def test_p02_an_absolute_import_of_a_module_beside_the_plugin_says_how_to_import
         import_plugin_module(read_study_identity(study_dir), error_text=False)
     assert str(caught.value).endswith("and list its file in [study] code")
     assert "No module named" not in str(caught.value)  # the exception's own text stays out of the check's refusal
+
+
+BY_PATH = """\
+import importlib.util as _found
+import sys as _sys
+from pathlib import Path as _Path
+
+_spec = _found.spec_from_file_location("facts", _Path(__file__).resolve().parent / "facts.py")
+_facts = _found.module_from_spec(_spec)
+_REGISTER
+_spec.loader.exec_module(_facts)
+FACTS = _facts.FACTS
+"""
+
+
+@pytest.mark.parametrize(
+    ("listed", "register", "needle"),
+    [
+        (False, False, "[study]: key 'code' does not list 'facts.py'"),
+        (True, False, "[study]: 'facts.py' runs from the study directory outside the plugin's package"),
+        (True, True, "[study]: 'facts.py' runs from the study directory outside the plugin's package (as 'facts')"),
+    ],
+)
+def test_p02_a_file_of_the_study_loaded_by_path_is_refused_listed_or_not(tmp_path, listed, register, needle):
+    """P02: adds that the check goes by where code comes from, not by its module name: a file of the study directory
+    the plugin runs by path (registered as a module or not) is refused when `[study] code` leaves it out, and refused
+    when listed too, since only a module of the plugin's package is loaded from its source and kept from others."""
+    statement = BY_PATH.replace("_REGISTER", '_sys.modules["facts"] = _facts' if register else "pass")
+    study_dir = split_copy(tmp_path, "study", listed=listed, statement=statement)
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    assert str(caught.value).startswith(f"{study_dir / 'study.toml'}: {needle}")
+    assert "facts" not in sys.modules  # a refused load leaves none of its modules behind
+
+
+def test_p02_a_module_found_through_the_search_path_is_refused_and_forgotten(tmp_path, monkeypatch):
+    """P02: adds that `import facts` with the study directory on the module search path is refused even though
+    `[study] code` lists the file: the module would be cached under a name any other study could be served, so the
+    refusal drops it and says to import it relatively."""
+    study_dir = split_copy(tmp_path, "study", statement="from facts import FACTS")
+    monkeypatch.syspath_prepend(str(study_dir))
+    with pytest.raises(ConfigError, match=r"'facts.py' runs from the study directory outside the plugin's package"):
+        load_plugin(context(study_dir))
+    assert "facts" not in sys.modules
+
+
+def test_p02_no_module_of_one_study_is_served_to_the_next(tmp_path):
+    """P02: adds that a study refused for a module it registered under a plain name leaves it nowhere, so the next
+    study's `import facts` finds no other study's answer key and is refused with the fix."""
+    registered = BY_PATH.replace("_REGISTER", '_sys.modules["facts"] = _facts')
+    first = split_copy(tmp_path, "first", statement=registered)
+    second = split_copy(tmp_path, "second", statement="from facts import FACTS")
+    with pytest.raises(ConfigError, match="outside the plugin's package"):
+        load_plugin(context(first))
+    with pytest.raises(ConfigError, match=r"'facts' is a module beside the plugin: import it relatively"):
+        load_plugin(context(second))
+
+
+def test_p02_a_reload_runs_the_edited_source_even_at_the_same_size_and_modification_time(tmp_path, monkeypatch):
+    """P02: adds that the plugin and the modules beside it are compiled from their files' bytes on every load, never
+    from cached bytecode, which a same-size edit within the same second would leave looking current: what runs is what
+    the code identity hashed, and no bytecode is written into the study."""
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    study_dir = split_copy(tmp_path, "study")
+    load_plugin(context(study_dir))
+    for name, old, new in (("facts.py", '"green"', '"grass"'), ("plugin.py", '"Be brief."', '"Be terse."')):
+        path = study_dir / name
+        before = path.stat()
+        edit(path, old, new)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert path.stat().st_size == before.st_size
+    module = sys.modules[type(load_plugin(context(study_dir)).executor).__module__]
+    assert (module.FACTS["hill"], module.HINTS["basic"]) == ("grass", "Be terse.")
+    assert not list(study_dir.rglob("__pycache__"))
 
 
 def test_p02_two_studies_with_a_module_of_one_name_each_import_their_own_and_a_reload_reads_it_anew(tmp_path):
