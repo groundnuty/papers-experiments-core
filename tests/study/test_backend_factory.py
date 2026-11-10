@@ -11,7 +11,7 @@ from expcore.campaign.resume import FingerprintMismatch
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
 from expcore.records.redact import REDACTED
-from expcore.replay.check import CHECK_FILE, backends_without_parser
+from expcore.replay.check import CHECK_FILE, what_records_need
 from expcore.study.config import load_study
 from expcore.study.pipeline import HASHED_ONLY, fingerprint_of, run_study
 from expcore.study.plugin import StudyContext, load_plugin
@@ -288,9 +288,10 @@ def test_r03_a_batch_of_core_backend_records_checks_clean_without_importing_anyt
     assert check["n_ok"] == check["n_records"] > 0
 
 
-def test_r03_only_a_backend_with_no_registered_parser_asks_for_the_study_s_code(tmp_path):
-    """R03: the scan reads the backend each replayable record names and nothing else, so a file the check will report
-    as broken, a record that names no backend, a core backend or a marker that is only hashed imports nothing."""
+def test_r03_only_what_this_process_cannot_read_asks_for_the_study_s_code(tmp_path):
+    """R03: the scan reads the backend and the infrastructure kinds each replayable record names and nothing else, so a
+    file the check will report as broken, a field of the wrong type, a core name or a marker that is only hashed asks
+    for nothing; a kind may be named by the condition's treatment, the outcome or the failed request."""
     batch = tmp_path / "batch"
     batch.mkdir()
     files = {
@@ -299,13 +300,17 @@ def test_r03_only_a_backend_with_no_registered_parser_asks_for_the_study_s_code(
         "no-route.json": '{"route": 3}',
         "no-backend.json": '{"route": {}}',
         "odd-backend.json": '{"route": {"backend": 3}}',
-        "core.json": '{"route": {"backend": "stub"}}',
+        "core.json": '{"route": {"backend": "stub"}, "treatment_kinds": ["knowledge"], "outcome": {}}',
+        "unhashable.json": '{"route": {"backend": []}, "treatment_kinds": [[]], "outcome": {"infra_kind": {}}}',
         "own.json": '{"route": {"backend": "toy_unread"}}',
-        "x-attempt-marker.json": '{"route": {"backend": "toy_marker"}}',
+        "treated.json": '{"treatment_kinds": ["toy_treated", 3]}',
+        "ended.json": '{"outcome": {"infra_kind": "toy_ended"}, "failed_request": {"infra_kind": "toy_failed"}}',
+        "odd-kinds.json": '{"treatment_kinds": "toy_not_a_list", "outcome": 3}',
+        "x-attempt-marker.json": '{"route": {"backend": "toy_marker"}, "treatment_kinds": ["toy_marker"]}',
     }
     for name, body in files.items():
         (batch / name).write_text(body, encoding="utf-8")
-    assert backends_without_parser(batch, HASHED_ONLY) == ["toy_unread"]
+    assert what_records_need(batch, HASHED_ONLY) == (["toy_unread"], ["toy_ended", "toy_failed", "toy_treated"])
 
 
 @pytest.mark.parametrize("gated", ["plugin", "platform"])

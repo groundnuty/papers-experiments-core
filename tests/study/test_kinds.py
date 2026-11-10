@@ -4,6 +4,7 @@ Both are known before study.toml's conditions are validated: `[study] platforms`
 `register_infra_kind` calls have run, and `[study.kinds]` declares the study's own.
 """
 
+import json
 import shutil
 import uuid
 from pathlib import Path
@@ -14,6 +15,7 @@ from study_support import HEAD, clean_environment, cli
 from expcore import errors
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
+from expcore.replay.check import CHECK_FILE
 from expcore.study.config import load_study
 from expcore.study.pipeline import analyse_study, run_study
 
@@ -255,3 +257,102 @@ def test_c06_a_study_that_lists_platforms_and_kinds_but_declares_none_keeps_its_
     list_platforms(study_dir, "json")
     add_kinds(study_dir, 'relay_flap = { description = "the relay restarted" }')
     assert load_study(study_dir).schema.digest == before
+
+
+GATE_VARIABLE = "TOY_REFUSE_IMPORT"
+GATE_CREDENTIAL = "toy-gate-credential-0123456789"
+RAISE_WHEN_GATED = (
+    "import os",
+    f'if os.environ.get("{GATE_VARIABLE}"):',
+    f'    raise RuntimeError("login refused for {GATE_CREDENTIAL}")',
+)
+REGISTER_FLAP = 'register_infra_kind("relay_flap", "the relay restarted")'
+PLATFORMS_NOTE = "importing the study's platforms ("
+
+
+def ran_ending_in(study: Path, kind: str) -> None:
+    """Make the relay-down condition's failure the kind, gate the plugin's import, and run the study to its end."""
+    plugin = study / "plugin.py"
+    text = plugin.read_text(encoding="utf-8")
+    assert 'InfraError("knowledge"' in text
+    gate = "\n".join(RAISE_WHEN_GATED)
+    swapped = text.replace('InfraError("knowledge"', f'InfraError("{kind}"')
+    plugin.write_text(f"{swapped}\n{gate}\n", encoding="utf-8")
+    declare(study, kind)
+    write_stamp(study, HEAD, load_study(study).scope)
+    summary = run_study(study)
+    assert summary.statuses == {"done": len(load_study(study).manifest.rows)}, summary.statuses
+
+
+def gated_check(study: Path, tmp_path: Path, environment: dict[str, str]) -> tuple[int, str, dict]:
+    """Run `check` as a fresh process in which a gated module raises at import; return its status, stderr and check."""
+    gated = {**environment, GATE_VARIABLE: "1", "PYTHONPATH": str(tmp_path / "site")}
+    code, stderr = cli(gated, "check", str(study / "out" / "runs"), process=True)
+    written = study / "out" / "runs" / CHECK_FILE
+    return code, stderr, json.loads(written.read_text(encoding="utf-8")) if written.is_file() else {}
+
+
+def test_r03_a_platform_s_kind_on_core_backends_passes_a_check_that_imports_the_platform_and_never_the_plugin(
+    study_dir, tmp_path, monkeypatch, registry, clean_environment
+):
+    """R03: a record names a kind only a platform registers, so a fresh `check` imports the modules study.toml names and
+    says so in one line; it does not import the plugin, which raises here, because no backend needs it."""
+    module = toy_platform(tmp_path, monkeypatch, REGISTER_FLAP)
+    list_platforms(study_dir, module)
+    ran_ending_in(study_dir, "relay_flap")
+    code, stderr, check = gated_check(study_dir, tmp_path, clean_environment)
+    assert code == 0, stderr
+    assert check["failures"] == []
+    assert check["n_ok"] == check["n_records"] > 0
+    notes = [line for line in stderr.splitlines() if PLATFORMS_NOTE in line]
+    assert len(notes) == 1, stderr
+    assert module in notes[0]
+    assert "'relay_flap'" in notes[0]
+
+
+def test_r03_a_kind_the_study_declares_passes_a_check_that_imports_nothing(
+    study_dir, tmp_path, monkeypatch, registry, clean_environment
+):
+    """R03: `[study.kinds]` is read as data, so a batch whose kinds are declared there imports neither the listed
+    platform nor the plugin, both of which raise here."""
+    module = toy_platform(tmp_path, monkeypatch, *RAISE_WHEN_GATED)
+    list_platforms(study_dir, module)
+    add_kinds(study_dir, 'relay_flap = { description = "the relay restarted", treatable = true }')
+    ran_ending_in(study_dir, "relay_flap")
+    code, stderr, check = gated_check(study_dir, tmp_path, clean_environment)
+    assert code == 0, stderr
+    assert check["failures"] == []
+    assert PLATFORMS_NOTE not in stderr
+
+
+def test_r03_a_platform_needed_for_a_kind_that_cannot_be_imported_is_refused_by_module_and_exception_type_only(
+    study_dir, tmp_path, monkeypatch, registry, clean_environment
+):
+    """R03: the records need the platform and it will not import, so `check` refuses them; the text of the exception
+    can hold a credential, so the refusal names only the module and the exception's type."""
+    module = toy_platform(tmp_path, monkeypatch, *RAISE_WHEN_GATED, REGISTER_FLAP)
+    list_platforms(study_dir, module)
+    ran_ending_in(study_dir, "relay_flap")
+    code, stderr, _ = gated_check(study_dir, tmp_path, clean_environment)
+    assert code != 0
+    assert PLATFORMS_NOTE in stderr
+    assert f"key 'platforms' names module {module!r}, which cannot be imported (RuntimeError)" in stderr
+    assert GATE_CREDENTIAL not in stderr
+    assert "Traceback" not in stderr
+
+
+def test_r03_a_kind_still_unknown_after_the_platforms_are_imported_fails_its_records(
+    study_dir, tmp_path, monkeypatch, registry, clean_environment
+):
+    """R03: importing the listed platforms is all `check` does for a kind; one none of them registers fails the records
+    that name it, in the check's own list of failures."""
+    module = toy_platform(
+        tmp_path, monkeypatch, "import os", f'if not os.environ.get("{GATE_VARIABLE}"):', f"    {REGISTER_FLAP}"
+    )
+    list_platforms(study_dir, module)
+    ran_ending_in(study_dir, "relay_flap")
+    code, stderr, check = gated_check(study_dir, tmp_path, clean_environment)
+    assert code != 0
+    assert PLATFORMS_NOTE in stderr
+    assert check["failures"]
+    assert all("unknown infrastructure kind 'relay_flap'" in failure["error"] for failure in check["failures"])

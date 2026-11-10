@@ -11,9 +11,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
   store with attempts still running unless `partial`, which the check records. It reads only the study's `[study]`
-  table and imports none of the study's code, unless a record names a backend no native parser is registered for; then
-  it says so and imports the study's platforms and plugin module, so the parser registered there is known in a new
-  process. `build` is not called, so no model or key is needed.
+  table and imports nothing, unless a record needs it, and says so first: a kind still unknown imports the modules
+  `[study] platforms` names, and a backend no native parser is registered for also imports the plugin module, so
+  what is registered there is known in a new process. `build` is not called, so no model or key is needed.
 - `analyse_study` refuses unless the batch has a current passing check (R04, R05), and writes nothing. It then uses
   only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once and compared
   with the check's hash, cross-validated against each other. It exports from the snapshot, scores the records in
@@ -55,11 +55,12 @@ from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore, scorer_name, scorer_version
 from expcore.replay.check import (
     BatchNotVerified,
-    backends_without_parser,
     require_current_check,
     verify_batch,
+    what_records_need,
     write_check,
 )
+from expcore.replay.native import has_native_parser
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
@@ -222,7 +223,7 @@ def _check_batch_of(
     directory = Path(batch)
     if not directory.is_dir():
         raise Refused(f"{directory}: no batch of records here; run the study first")
-    _import_for_unread_backends(study, directory)
+    _import_what_the_records_need(study, directory)
     try:
         running = take_snapshot(out_dir(study) / STATE_FILE, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
@@ -233,13 +234,23 @@ def _check_batch_of(
     return check
 
 
-def _import_for_unread_backends(study: StudyIdentity, batch: Path) -> None:
-    """Import the study's platforms and plugin module only if a record names a backend no parser is registered for.
+def _import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
+    """Import only what a record of the batch cannot be read without, and say so first.
 
-    A parser for a backend of the study's own is registered when its plugin or a platform is imported. A batch recorded
-    entirely with the core's backends needs neither, so checking it runs none of the study's code.
+    The study's own kinds are in scope already, read as data. A record that names a kind still unknown imports the
+    modules `[study] platforms` names, installed code the study declares, and not the plugin; a kind still unknown after
+    that fails its record. A record that names a backend no parser is registered for also imports the plugin, whose
+    code is the study's own. A batch that needs neither imports nothing.
     """
-    unread = backends_without_parser(batch, HASHED_ONLY)
+    needs = what_records_need(batch, HASHED_ONLY)
+    if needs.kinds and study.platforms:
+        print(
+            f"check: importing the study's platforms ({', '.join(study.platforms)}) to read the records of "
+            f"infrastructure kind {', '.join(map(repr, needs.kinds))}; this runs those modules",
+            file=sys.stderr,
+        )
+        import_platforms(study.study_file, study.platforms)
+    unread = [backend for backend in needs.backends if not has_native_parser(backend)]  # a platform may have added it
     if not unread:
         return
     names = ", ".join(map(repr, unread))
