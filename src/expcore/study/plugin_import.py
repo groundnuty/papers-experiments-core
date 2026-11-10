@@ -40,7 +40,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from expcore.provenance.environment import installed, is_editable, owns_file, pth_directories, top_level_names
+from expcore.provenance.environment import editable_roots, installed, is_editable, owns_file
 
 PLUGIN_MODULE_PREFIX = "expcore_study_plugin_"  # the rest of a plugin's module name is a hash of its path
 CORE_PACKAGES = ("expcore", "expcore_onedata")  # the core's own packages: the environment's code, never the study's
@@ -144,32 +144,39 @@ def _environment() -> tuple[str, ...]:
 
 
 class _Installed:
-    """Whether a file of the study directory is an installed distribution's code, editable or not (`owns_file`, as
-    the environment record finds an install's code); the distributions are read once, when first asked."""
+    """Whether a file of the study directory is an installed distribution's code, editable or not, so that the recorded
+    environment covers it rather than `[study] code`; the distributions are read once, when first asked.
 
-    def __init__(self) -> None:
-        self._dists: list[tuple[metadata.Distribution, bool, str]] | None = None
+    A distribution installed normally owns exactly the files its RECORD lists. An editable one owns the files below one
+    of its import roots (the directories its `.pth` puts on the path, else its project) only when that root lies
+    strictly inside the study directory, as a dependency vendored in the study does. A root that is the study directory,
+    or holds it, is the study installed as a project of its own: its files are the study's code, never an install's,
+    whatever names or paths would suggest otherwise."""
 
-    def _all(self) -> list[tuple[metadata.Distribution, bool, str]]:
+    def __init__(self, root: str) -> None:
+        self.root = root
+        self._dists: list[tuple[metadata.Distribution, list[str]]] | None = None
+
+    def _all(self) -> list[tuple[metadata.Distribution, list[str]]]:
         if self._dists is None:
-            self._dists = [
-                (dist, is_editable(dist), os.path.realpath(str(dist.locate_file("")))) for dist in installed().values()
-            ]
+            self._dists = []
+            for dist in installed().values():
+                if not is_editable(dist):
+                    self._dists.append((dist, []))
+                    continue
+                roots = [os.path.realpath(r) for r in editable_roots(dist)]
+                vendored = [r for r in roots if _inside(r, self.root) and r != self.root]
+                self._dists.append((dist, vendored))
         return self._dists
 
-    def owns(self, path: str, name: str | None) -> bool:
+    def owns(self, path: str) -> bool:
         file = Path(path)
-        for dist, editable, site in self._all():
-            if not editable:
+        for dist, vendored in self._all():
+            if not is_editable(dist):
+                site = os.path.realpath(str(dist.locate_file("")))
                 if _inside(path, site) and owns_file(dist, file, ""):
                     return True
-                continue
-            tops = top_level_names(dist) | ({name.split(".", 1)[0]} if name else set())
-            for directory in pth_directories(dist):
-                home = os.path.realpath(directory)
-                if _inside(path, home) and path != home:
-                    tops.add(Path(os.path.relpath(path, home)).parts[0].removesuffix(".py"))
-            if any(owns_file(dist, file, top) for top in tops if top.isidentifier()):
+            elif any(_inside(path, root) and path != root for root in vendored):
                 return True
         return False
 
@@ -187,7 +194,7 @@ class Locator:
     core, below no directory the code identity skips, and not an installed distribution's."""
 
     def __init__(self, root: str, skip_dirs: frozenset[str]) -> None:
-        self.root, self.skip_dirs, self._installed = root, skip_dirs, _Installed()
+        self.root, self.skip_dirs, self._installed = root, skip_dirs, _Installed(root)
 
     def locate(self, file: str, name: str | None = None, *, own: bool = False) -> StudyCode | None:
         """The study code a file is, or None. `own`: a module of the plugin's package, the study's by definition."""
@@ -199,7 +206,7 @@ class Locator:
         relative = os.path.relpath(path, self.root).replace(os.sep, "/")
         if set(relative.split("/")) & self.skip_dirs:
             return None
-        if not own and self._installed.owns(path, name):
+        if not own and self._installed.owns(path):
             return None
         return StudyCode(path, relative)
 

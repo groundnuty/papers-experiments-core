@@ -6,6 +6,7 @@ inside the study) neither refuses them nor drops them from the process.
 """
 
 import importlib
+import importlib.machinery
 import json
 import shutil
 import sys
@@ -84,6 +85,62 @@ def test_p02_an_editable_dependency_inside_the_study_is_the_environment_s_code(t
         assert sys.modules["toykit"].ANSWER == "deep"
     finally:
         sys.modules.pop("toykit", None)
+
+
+def test_p02_a_study_installed_editable_as_its_own_project_still_holds_its_files_to_the_code_identity(
+    tmp_path, monkeypatch
+):
+    """P02: adds that a study installed as a project of its own, its directory on the path through the install's
+    `.pth`, gains no exemption: an unlisted helper it imports is still refused as uncovered study code."""
+    study_dir = example_copy(tmp_path)
+    (study_dir / "helper.py").write_text('ANSWER = "deep"\n', encoding="utf-8")
+    url = json.dumps({"url": study_dir.as_uri(), "dir_info": {"editable": True}})
+    installed_distribution(tmp_path / "site", "tiny-study", "1.0", {}, direct_url=url, checkout=study_dir)
+    monkeypatch.syspath_prepend(str(tmp_path / "site"))
+    monkeypatch.syspath_prepend(str(study_dir))  # what the install's .pth does at start-up
+    monkeypatch.delitem(sys.modules, "helper", raising=False)
+    edit(study_dir / "plugin.py", '"""The plugin of the tiny study', 'import helper\n\n"""The plugin of the tiny study')
+    try:
+        with pytest.raises(ConfigError, match=r"helper\.py"):
+            load_plugin(context(study_dir))
+    finally:
+        sys.modules.pop("helper", None)
+
+
+class _VendorHook:
+    """An editable install's import hook: loads `hookkit` from a directory inside the study, with no `.pth` entry."""
+
+    def __init__(self, home: Path) -> None:
+        self.home = home
+
+    def find_spec(self, name, path=None, target=None):
+        if name != "hookkit":
+            return None
+        return importlib.machinery.PathFinder.find_spec(name, [str(self.home)])
+
+
+def test_p02_a_vendored_editable_dependency_behind_an_import_hook_is_the_environment_s_code(tmp_path, monkeypatch):
+    """P02: adds that a dependency installed editable from inside the study through an import hook, with no `.pth`
+    entry and no declared top-level names, is recognised by its project's place alone, the same way whether its
+    module or the code it runs is looked at: the plugin that imports it loads."""
+    study_dir = example_copy(tmp_path)
+    vendor = study_dir / "vendor" / "hookkit-src"
+    (vendor / "hookkit").mkdir(parents=True)
+    (vendor / "hookkit" / "__init__.py").write_text('ANSWER = "deep"\n', encoding="utf-8")
+    url = json.dumps({"url": vendor.as_uri(), "dir_info": {"editable": True}})
+    hook = {"__editable__.hookkit-1.0.pth": b"import _hookkit_finder; _hookkit_finder.install()\n"}
+    installed_distribution(tmp_path / "site", "hookkit", "1.0", hook, direct_url=url)
+    monkeypatch.syspath_prepend(str(tmp_path / "site"))
+    monkeypatch.setattr(sys, "meta_path", [_VendorHook(vendor), *sys.meta_path])
+    monkeypatch.delitem(sys.modules, "hookkit", raising=False)
+    edit(
+        study_dir / "plugin.py", '"""The plugin of the tiny study', 'import hookkit\n\n"""The plugin of the tiny study'
+    )
+    try:
+        load_plugin(context(study_dir))
+        assert sys.modules["hookkit"].ANSWER == "deep"
+    finally:
+        sys.modules.pop("hookkit", None)
 
 
 def test_p02_one_audit_hook_is_installed_in_a_process_however_many_studies_load(tmp_path, monkeypatch):
