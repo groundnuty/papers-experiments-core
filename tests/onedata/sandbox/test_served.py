@@ -277,3 +277,21 @@ def test_o20_the_gate_marks_a_complete_teardown_and_only_a_complete_one(tmp_path
         assert ("teardown_complete" in events) is marked
         if marked:
             assert events == ["conn_close", "teardown_complete"]  # the mark comes after every close line
+
+
+def test_o20_a_request_counts_as_logged_only_once_its_line_is_written(monkeypatch):
+    """O20: a teardown that reads a connection between a response and its log line must see that request outstanding
+    (`in_request`), or it writes `teardown_complete` over a line that may never be written, and the count reads as a
+    known zero. So the connection's last logged request moves only after the line is written."""
+    from types import SimpleNamespace
+
+    from expcore_onedata.sandbox import gate
+
+    handler = object.__new__(gate.Handler)
+    handler._w = SimpleNamespace(mark=0, n=123, failed=0, total=123)
+    handler._conn, handler._last_logged = "1-1", 4
+    seen: list[int] = []
+    monkeypatch.setattr(gate, "_log", lambda rec: seen.append(handler._last_logged))
+    handler._log({"event": "request", "conn_request": 5})
+    assert seen == [4]  # at the moment the line was written, request 5 was still outstanding
+    assert handler._last_logged == 5

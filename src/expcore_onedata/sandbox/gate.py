@@ -624,8 +624,6 @@ class Handler(BaseHTTPRequestHandler):
         headers is the body not sent at all."""
         w = self._w
         rec.setdefault("conn", self._conn)
-        if "conn_request" in rec:
-            self._last_logged = rec["conn_request"]
         body = 0 if w.mark is None else w.n - w.mark
         rec["body_bytes"] = body
         if w.failed:
@@ -633,6 +631,10 @@ class Handler(BaseHTTPRequestHandler):
             total = w.total if w.total is not None else body + in_body
             rec["body_bytes_unconfirmed"] = max(total - body, in_body)
         _log(rec)
+        # Only now, with the line written: a teardown that reads this connection between the response and its line
+        # sees the request still outstanding (`in_request`), so the count is unknown rather than a zero (O20).
+        if "conn_request" in rec:
+            self._last_logged = rec["conn_request"]
 
     def send_error(self, code, message=None, explain=None) -> None:
         """Errors the request parser answers before `_handle` runs (a malformed request line or version, an unknown
