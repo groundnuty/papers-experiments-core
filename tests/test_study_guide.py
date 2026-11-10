@@ -1,7 +1,8 @@
 """The study guide's code runs as written.
 
 Every fenced block of docs/study-guide.md is taken in order, in one new directory: an `sh` line runs (`uv run python`
-becomes this interpreter, and `python -m expcore` runs in this process), a `python` block is executed in one namespace
+becomes this interpreter, `python -m expcore` runs in this process, and `cd` moves every later block into the
+directory it names), a `python` block is executed in one namespace
 shared by all of them, and a `toml` block must agree with the file of the example it names on its first line, or, if
 it shows an `[[opaque]]` entry, load as one through the package's own inclusion-list loader. The two
 lines that make the project and add the core cannot run here, where the core is already installed: the `uv add` line
@@ -87,7 +88,12 @@ def test_every_block_of_the_study_guide_runs_in_order_in_a_new_directory(tmp_pat
     for number, (language, body) in enumerate(found, start=1):
         if language == "sh":
             for line in body.splitlines():
-                if line.strip() and not line.startswith("#"):
+                if line.startswith("cd "):
+                    [directory] = shlex.split(line)[1:]
+                    target = Path(directory).resolve()  # relative to where the guide's reader stands now
+                    assert target.is_relative_to(tmp_path.resolve()), f"block {number}: cd leaves the scratch dir"
+                    monkeypatch.chdir(target)
+                elif line.strip() and not line.startswith("#"):
                     run_line(line)
         elif language == "python":
             exec(compile(body, f"{GUIDE.name}, block {number}", "exec"), namespace)
@@ -100,7 +106,8 @@ def test_every_block_of_the_study_guide_runs_in_order_in_a_new_directory(tmp_pat
             named = NAMED_FILE.match(body)
             assert named, f"block {number}: a toml block names the file of the example it shows on its first line"
             shown = tomllib.loads(body)
-            assert contained(shown, tomllib.loads((tmp_path / named.group(1)).read_text(encoding="utf-8"))), number
+            assert contained(shown, tomllib.loads((Path.cwd() / named.group(1)).read_text(encoding="utf-8"))), number
         else:
             pytest.fail(f"block {number}: a block is sh, python or toml, so the test can run or check it")
-    assert (tmp_path / "dist" / "tiny-study-package" / "SHA256SUMS").is_file()  # the last step ran
+    assert Path.cwd() != tmp_path  # the guide made its project in a directory of its own, and worked in it
+    assert (Path.cwd() / "dist" / "tiny-study-package" / "SHA256SUMS").is_file()  # the last step ran

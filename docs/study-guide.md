@@ -4,10 +4,11 @@ How to build a study on the core: start it, configure it, declare its design, ru
 
 ## 1. Start a study
 
-A study is its own git repository that depends on the core by tag and copies nothing from it. Start from the example: write it out of the installed core, commit it, and change the names and the behaviour while keeping the shape.
+A study is its own git repository that depends on the core by tag and copies nothing from it. Start from the example: make a new repository, add the core, write the example out of the installed core into a directory of its own (`my-study` below; every later command runs from the repository's root), commit it, and change the names and the behaviour while keeping the shape.
 
 ```sh
-git init --quiet
+git init --quiet my-project
+cd my-project
 uv init --bare
 uv add git+https://github.com/groundnuty/papers-experiments-core@v0.1.0
 uv run python -m expcore example my-study
@@ -29,6 +30,7 @@ The study directory holds four configuration files and one Python file, the plug
 | `scorers` | `Scorer`s: a pure function of a record, returning named numeric outcomes | `TinyScorer` |
 | `prompts`, `tools` | per condition, the SHA-256 of its prompt template and of its tool manifest; both go into the campaign fingerprint | from `PromptTemplate` and `tools_sha256` |
 | tools | `ToolProvider`s the executor passes to `record_run`: plain functions through `FunctionProvider`, or an MCP server through `McpToolProvider` | `lookup` and `submit` |
+| instruments | `Instrument`s the executor runs around the loop, fresh for every run, since each holds one run's reading and runs can overlap: `start_instruments(instruments, identity)` before `record_run`, `record = finish_instruments(record, instruments)` after, both through `asyncio.to_thread`, then write the record `finish_instruments` returned. `identity` is the request's `RunIdentity` as a plain mapping: `{"run_key": ..., "factors": {...}, "attempt": ...}`. The loop returns a record however the run ended, an infrastructure failure included, so every attempt with a record gets its snapshots. A scorer reads a snapshot at `record.instruments[namespace]`, the only platform state it may read | `FactsServed`, the stub platform's own count of the facts it served, which `TinyScorer` reads as its `served` outcome |
 | `health`, `probe`, `lease_group`, `lease_keys` | the platform's health check, resource probe and leases; the Onedata layer supplies real ones | stubs that always succeed |
 | `backend_factory` | optional: a `BackendFactory` that builds the backend of every model, for a study with a model backend of its own. Its model entries name that backend in `models.toml` with a plain lower-case `backend` value; the factory serves those and hands every other model to the core's `default_backend_factory`. It carries a `version` attribute that goes into the campaign fingerprint with its name; a factory imported from an installed package must declare the installed version of the distribution that owns its module's file, one defined in a file `[study] code` lists, which the code identity covers, may declare any, and one from anywhere else is refused. Without a factory, such a model is refused when the plugin is loaded | none: the core's factory builds the stub |
 
@@ -221,7 +223,7 @@ An exploratory contrast reports its drops and is not refused. The example's conf
 treatment_outcomes = "scored"
 ```
 
-Here is a scorer applied to the treatment attempt:
+Here is a scorer applied to the treatment attempt. Its record also holds the snapshot of the example's instrument, taken when the loop returned after the outage, as it is after every run that returns a record:
 
 ```python
 from expcore.records.record import load_record, record_filename
@@ -232,6 +234,7 @@ treated = [e for e in export["analysed_attempts"] if e["treatment"]]
 assert {(e["condition"], e["infra_kind"]) for e in treated} == {("relay-down", "knowledge")}
 entry = treated[0]
 record = load_record(Path("my-study/out/runs") / entry["run_dir"] / record_filename(entry["run_key"], entry["attempt"]))
+assert record.instruments["facts"] == {"ok": True, "served": 1}  # the platform served one fact before the outage
 
 
 class LookupCount:
@@ -389,6 +392,15 @@ A public library's code can hold a word that the study-token list also holds, so
 The same option gives the package a code identity by tree hash alone, because a commit id against a public repository is a lookup key to its authors, and so is a source URL. Every commit of the study (in the records, the replay check, the code stamp, `analysis.json`, the report and `PACKAGE.json`) becomes the first 40 hexadecimal digits of the tree hash of the same code, which a reader can recompute; `code_identity` in `PACKAGE.json` says so. The environment keeps names and versions and loses every source, so the core's commit and URL go too, and so does an editable checkout's digest; a distribution with a local version label (`1.2+g1a2b3c`) is refused, since a label can spell a commit, and so is a wheel that holds a `direct_url.json`. The provenance header at the top of each vendored module, which names the earlier repository the code was extracted from with its commit, is replaced by one neutral comment line, and the build checks that each rewritten module has the same syntax tree as before. No seal covers a record's code block, so the seals stay valid; the build makes the replay check again over the rewritten records, and the tables must be exactly yours with the commit replaced, so `make check` regenerates them byte for byte. The build holds every record to the bytes the original check hashed before it rewrites anything. The real commits stay in your local campaign. Then every file of the assembled package, the wheels included, is searched for each commit of the study's repository, the records, the environment and the withheld headers, for each source URL and repository remote, and for each repository name the headers held, and a hit fails the build naming the file and the line, never the value.
 
 An anonymised package still shows the distribution name `papers-experiments-core` and the module name `expcore`, in its wheel, its environment and the command its Makefile runs, and the core's code, which the reviewer has to run. If the core is public under your name, those are lookup keys no build removes: check what your venue allows.
+
+### Which build goes where
+
+A paper needs both builds, from one batch:
+
+- **The submission** gets the anonymised package (`--anonymise LIST`), behind an anonymous link that reviewers can open without learning who you are: an anonymous file share, or the venue's own upload of supplementary material.
+- **The camera-ready and the archived copy** get the plain build, without `--anonymise`. It keeps the study's commits and the provenance headers of the vendored code, which name the repository and the commit each module was extracted from. The paper's AI-use disclosure and its attribution of reused code rest on those, so the copy that stays with the paper must carry them.
+
+Build both from the same batch and the same replay check: run `check` once, then build the two packages from its result, without running the campaign or the check again in between. The anonymised build holds every record to the bytes that check hashed, so the two packages carry the same results, and the anonymised one differs only where anonymising changes it: tree hashes in place of the commits, an environment without sources, the files its list rewrites and the neutral headers. What the reviewers checked is then what you archive.
 
 
 ### What the checks read
