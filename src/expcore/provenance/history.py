@@ -19,21 +19,27 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from expcore.provenance.gitobjects import GitError, read_blob, run_git
+from expcore.provenance.hashfile import hashes_from_tokens
 from expcore.provenance.headers import HeaderError, read_header, strip_header
+from expcore.provenance.redact import Redactor
 from expcore.provenance.sanitise import SanitiseError, sanitise_checked
 from expcore.provenance.sanitise_map import TokenMap, load_map
 from expcore.provenance.study_tokens import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK
 
 SOURCE_REPOS_VARIABLE = "EXPCORE_SOURCE_REPOS"
+_MERGES = ("--diff-merges=first-parent",)  # a merge's changes, as against its first parent
 
 
 def parse_source_repos(spec: str) -> dict[str, Path]:
-    """Parse `name=path` pairs separated by semicolons; raise ValueError on a malformed pair."""
+    """Parse `name=path` pairs separated by semicolons; raise ValueError on a malformed pair.
+
+    The names are the earlier studies' repositories, which are private, so an error names a pair by its position only.
+    """
     repos: dict[str, Path] = {}
-    for pair in filter(None, (part.strip() for part in spec.split(";"))):
+    for number, pair in enumerate(filter(None, (part.strip() for part in spec.split(";"))), start=1):
         name, separator, path = pair.partition("=")
         if not separator or not name.strip() or not path.strip():
-            raise ValueError(f"expected name=path in {pair!r}")
+            raise ValueError(f"source repository {number} (counted from 1, between ';'): expected NAME=PATH")
         repos[name.strip()] = Path(path.strip())
     return repos
 
@@ -48,9 +54,9 @@ def _renamed_from(core: Path, commit: str, path: str) -> str | None:
     """Return the path a commit renamed to `path`: one it deleted in the same commit, never a file it kept.
 
     Rename detection only (`-M`, no `-C`), over the whole tree, so a new file that resembles one that stays is a new
-    file, whatever git's copy detection would say.
+    file, whatever git's copy detection would say. A merge is compared with its first parent, as the log reads it.
     """
-    out = run_git(core, "diff-tree", "-r", "-M", "--root", "--no-commit-id", "--name-status", "-z", commit)
+    out = run_git(core, "diff-tree", *_MERGES, "-r", "-M", "--root", "--no-commit-id", "--name-status", "-z", commit)
     fields = out.decode("utf-8").split("\0")
     index = 0
     while index < len(fields) and fields[index]:
@@ -70,11 +76,15 @@ def _import_commit(core: Path, path: str) -> tuple[str, str] | None:
 
     That is the latest commit that added the path, or, when that commit renamed it from a path it deleted, the commit
     that started the earlier path's history, and so on. Git's copy detection (`--follow`) is not used: it would trace
-    a hand-edited copy of an imported module to the clean import it resembles (#55).
+    a hand-edited copy of an imported module to the clean import it resembles (#55). A merge counts as a commit like
+    any other, compared with its first parent: a file a merge adds, or adds back edited after it was deleted, starts
+    its history there.
     """
     rev, current = "HEAD", path
     while True:  # each round starts from an older commit, so the walk ends
-        log = run_git(core, "log", "--topo-order", "--no-renames", "--diff-filter=A", "--format=%H", rev, "--", current)
+        log = run_git(
+            core, "log", "--topo-order", "--no-renames", *_MERGES, "--diff-filter=A", "--format=%H", rev, "--", current
+        )
         commits = log.decode("ascii").split()
         if not commits:
             return None
@@ -104,8 +114,8 @@ def _check_module(core: Path, path: str, sources: Mapping[str, Path], token_map:
     if header.new:
         return []
     repo = sources.get(header.source_repo or "")
-    if repo is None:
-        return [f"{path}: source repository {header.source_repo!r} is not among the repositories provided"]
+    if repo is None:  # the name is the earlier study's, private: the module's own path says which header to read
+        return [f"{path}: the source repository its header names is not among the ones provided"]
     if _source_blob(repo, header.commit or "", header.path or "") != header.blob:
         return [f"{path}: header blob is not the blob of the named source commit and path"]
     added = _import_commit(core, path)
@@ -121,7 +131,10 @@ def _check_module(core: Path, path: str, sources: Mapping[str, Path], token_map:
         return [f"{path}: import commit {commit[:12]} does not carry the source header that is current now"]
     if at_import.map_sha256 != token_map.sha256:
         return [f"{path}: import commit {commit[:12]} names a different sanitising map than the one provided"]
-    source = run_git(repo, "cat-file", "blob", header.blob or "").decode("utf-8")
+    try:
+        source = run_git(repo, "cat-file", "blob", header.blob or "").decode("utf-8")
+    except GitError:  # its message names the source repository's path
+        return [f"{path}: the source blob cannot be read from the source repository its header names"]
     try:
         expected = sanitise_checked(source, token_map.entries, filename=path)
     except SanitiseError as error:
@@ -154,7 +167,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the check; return 0 when every module holds, 1 when one does not, 2 on an error."""
+    """Run the check; return 0 when every module holds, 1 when one does not, 2 on an error or when there is no module.
+
+    Every line goes through one redactor that knows the map's tokens (`provenance.redact`), so no message shows a name
+    the map hides, whatever a header or an error holds; a source repository is never named, only the module.
+    """
     args = build_parser().parse_args(argv)
     spec = args.source_repos if args.source_repos is not None else os.environ.get(SOURCE_REPOS_VARIABLE, "")
     try:
@@ -162,16 +179,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not sources:
             raise ValueError(f"name the source repositories with --source-repos or {SOURCE_REPOS_VARIABLE}")
         token_map = load_map(args.map)
-        modules = _modules(args.repo, args.root)
-        problems = verify_history(args.repo, sources, token_map, root=args.root)
-    except (OSError, ValueError, GitError) as error:  # MapError and decoding errors are ValueErrors
+    except (OSError, ValueError) as error:  # MapError is a ValueError; neither message holds a value of the map
         print(f"error: {error}", file=sys.stderr)
         return EXIT_ERROR
+    redactor = Redactor(hashes_from_tokens(entry.token for entry in token_map.entries))
+    try:
+        modules = _modules(args.repo, args.root)
+        problems = verify_history(args.repo, sources, token_map, root=args.root)
+    except GitError:  # its message names a repository's path
+        print("error: the repository checked cannot be read; is --repo a repository with a commit?", file=sys.stderr)
+        return EXIT_ERROR
+    if not modules:
+        print(
+            redactor.scrub(f"error: no Python module under {args.root} at HEAD, so nothing was checked"),
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
     for problem in problems:
-        print(f"FAIL {problem}")
+        print(redactor.scrub(f"FAIL {problem}"))
     if not problems:
-        print(f"ok: every module under {args.root} holds ({len(modules)} modules)")
+        imported = len(modules) - len(_new_modules(args.repo, modules))
+        print(redactor.scrub(f"ok: every module under {args.root} holds ({len(modules)} modules, {imported} imported)"))
     return EXIT_FINDINGS if problems else EXIT_OK
+
+
+def _new_modules(core: Path, modules: Sequence[str]) -> list[str]:
+    """The modules whose header says they were written fresh (`# Provenance: new`)."""
+    new = []
+    for path in modules:
+        try:
+            header = read_header(read_blob(core, "HEAD", path).decode("utf-8"))
+        except (HeaderError, UnicodeDecodeError):
+            continue
+        if header is not None and header.new:
+            new.append(path)
+    return new
 
 
 if __name__ == "__main__":

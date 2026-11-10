@@ -172,7 +172,7 @@ def test_an_identifier_error_names_the_entry_by_number_and_replacement_never_the
     with pytest.raises(sn.SanitiseError) as refused:
         sn.sanitise_python("x = 1\nother_gate = 1\n", entries.entries, filename="mod.py")
     message = str(refused.value)
-    assert message.startswith("mod.py:2: map entry #3 (category 'c'): its replacement 'gate-c' is used inside")
+    assert message.startswith("mod.py:2: map entry #3 (category 'hosts'): its replacement 'gate-c' is used inside")
     assert "must itself be an identifier" in message
     assert "other_gate" not in message
 
@@ -180,10 +180,10 @@ def test_an_identifier_error_names_the_entry_by_number_and_replacement_never_the
 @pytest.mark.parametrize(
     ("entries", "shown"),
     [
-        ([("brindle-gate", "gate-a"), ("BRINDLE-GATE", "gate-b")], "entry #2 (category 'c', replacement 'gate-b')"),
-        ([("brindle-gate", 'gate"a')], "entry #1 (category 'c', replacement 'gate\"a')"),
-        ([("brindle-gate", "gate-a"), ("gate-b", "x-brindle-gate")], "entry #2 (category 'c')"),
-        ([("brindle-gate", "BRINDLE-GATE")], "entry #1 (category 'c')"),
+        ([("brindle-gate", "gate-a"), ("BRINDLE-GATE", "gate-b")], "entry #2 (category 'hosts', replacement 'gate-b')"),
+        ([("brindle-gate", 'gate"a')], "entry #1 (category 'hosts', replacement 'gate\"a')"),
+        ([("brindle-gate", "gate-a"), ("gate-b", "x-brindle-gate")], "entry #2 (category 'hosts')"),
+        ([("brindle-gate", "BRINDLE-GATE")], "entry #1 (category 'hosts')"),
     ],
 )
 def test_a_map_error_names_the_entry_by_number_and_replacement_never_the_token(entries, shown):
@@ -208,7 +208,7 @@ def test_source_that_does_not_compile_is_reported_with_the_file_name(token_map):
 
 def _entries(token: str, replacement: str):
     return parse_map(
-        f'version = 1\n[[entry]]\ntoken = "{token}"\nreplacement = "{replacement}"\ncategory = "c"\n'.encode()
+        f'version = 1\n[[entry]]\ntoken = "{token}"\nreplacement = "{replacement}"\ncategory = "hosts"\n'.encode()
     ).entries
 
 
@@ -216,7 +216,7 @@ def _entries(token: str, replacement: str):
 
 
 def _map_with(*entries: tuple[str, str]) -> bytes:
-    body = "".join(f"[[entry]]\ntoken = '{t}'\nreplacement = '{r}'\ncategory = 'c'\n\n" for t, r in entries)
+    body = "".join(f"[[entry]]\ntoken = '{t}'\nreplacement = '{r}'\ncategory = 'hosts'\n\n" for t, r in entries)
     return ("version = 1\n\n" + body).encode()
 
 
@@ -246,7 +246,10 @@ def test_invalid_maps_name_the_entry(entries, message):
             "version = 1\n[[entry]]\ntoken = 'alpha-one'\nreplacement = 'beta-one'\n",
             r"entry #1: missing keys \['category'\]",
         ),
-        ("version = 1\n[[entry]]\ntoken='a'\nreplacement='b'\ncategory='c'\nextra=1\n", r"entry #1: unknown keys"),
+        (
+            "version = 1\n[[entry]]\ntoken='a'\nreplacement='b'\ncategory='c'\nextra=1\n",
+            r"entry #1: 1 unknown key\(s\)",
+        ),
         ("version = 1\n[[entry]]\ntoken=''\nreplacement='b'\ncategory='c'\n", r"entry #1: 'token' must be"),
         ("version = [", r"not valid TOML"),
     ],
@@ -254,6 +257,55 @@ def test_invalid_maps_name_the_entry(entries, message):
 def test_malformed_maps_are_refused(text, message):
     with pytest.raises(MapError, match=message):
         parse_map(text.encode(), "map.toml")
+
+
+def test_an_undocumented_category_is_never_shown_and_the_entry_still_loads():
+    """P07: a category is free text; one that is none of the documented words is never shown in an error, the entry
+    still loads (the category plays no part in sanitising), and a documented one is read in any of its spellings."""
+    text = "version = 1\n[[entry]]\ntoken = 'brindle-gate'\nreplacement = 'gate-a'\ncategory = 'orchard-hosts'\n"
+    (entry,) = parse_map(text.encode(), "map.toml").entries
+    with pytest.raises(MapError) as refused:
+        parse_map((text + "[[entry]]\ntoken = 'BRINDLE-GATE'\nreplacement = 'gate-b'\ncategory = 'x'\n").encode())
+    assert "orchard" not in str(refused.value)
+    assert "entry #2 (an undocumented category, replacement 'gate-b'): token repeats entry #1" in str(refused.value)
+    assert parse_map(text.replace("orchard-hosts", "Environment_Variable").encode()).entries[0].category == (
+        "environment-variables"
+    )
+    assert entry.replacement == "gate-a"
+
+
+@pytest.mark.parametrize(
+    ("text", "shown", "hidden"),
+    [
+        (
+            "version = 1\n[[entry]]\ntoken='a-b'\nreplacement='c-d'\ncategory='hosts'\nbrindle-gate=1\n",
+            "1 unknown key",
+            "brindle",
+        ),
+        ("version = 1\nbrindle-gate = = 'x'\n", "not valid TOML (at line 2, column", "brindle"),
+        ("version = 1\n'brindle-gate\n", "not valid TOML (at the end of the file)", "brindle"),
+    ],
+)
+def test_a_map_error_shows_no_key_and_no_toml_text_of_the_map(text, shown, hidden):
+    """P07: an unknown key is counted, never shown, and a file that is not TOML is named by its line and column alone,
+    since the parser's own message can quote the map."""
+    with pytest.raises(MapError) as refused:
+        parse_map(text.encode(), "map.toml")
+    assert shown in str(refused.value)
+    assert hidden not in str(refused.value)
+
+
+def test_an_invalid_source_field_is_named_never_echoed(map_file, tmp_path, capsys):
+    """P07: the source repository and path are the earlier study's; a refusal names the field and never its value."""
+    blob = tmp_path / "blob.py"
+    blob.write_text("x = 1\n", encoding="utf-8")
+    argv = ["import", "--map", str(map_file), "--commit", "0123abc", str(blob), str(tmp_path / "out.py")]
+    assert sn.main([*argv[:3], "--source-repo", "https://orchardrepo.example/x", "--path", "a.py", *argv[3:]]) == 2
+    assert sn.main([*argv[:3], "--source-repo", "old", "--path", "/orchardrepo/a.py", *argv[3:]]) == 2
+    err = capsys.readouterr().err
+    assert "the source repository must be a name" in err
+    assert "the source path must be a relative path" in err
+    assert "orchardrepo" not in err
 
 
 def test_the_map_hash_is_the_sha256_of_the_file(map_file, token_map):
