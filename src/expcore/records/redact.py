@@ -64,6 +64,10 @@ SECRET_NAME = re.compile(
 )
 SECRET_KEYS = ("token", "api_key", "apikey", "password", "secret", "authorization", "bearer")
 MIN_SECRET_LEN = 4
+# In a record, a line of a multi-line secret is replaced on its own only from this length: a short line (`true`,
+# `null`, `prompt`) is an ordinary word, and replacing it would corrupt the JSON a native message holds. Plain text
+# that is never sealed (a log, a printed message) replaces lines from MIN_SECRET_LEN.
+MIN_LINE_LEN = 8
 ESCAPING_LEVELS = 3
 REDACTED = "[redacted]"
 # The line the output cap puts after what it kept: the text before it is where a cut secret ends.
@@ -152,13 +156,13 @@ def short_secret_values(
     return sorted(short, key=len, reverse=True)
 
 
-def forms_of(value: str, *, lines: bool = False) -> set[str]:
+def forms_of(value: str, *, lines: bool = False, line_min: int = MIN_SECRET_LEN) -> set[str]:
     """Return the ways a secret can appear in text: each base form (raw, the repr of the string, the repr of its
-    bytes), and with `lines` of each of its lines of the minimum length or more too (for text and string values, never
-    for a mapping's keys), and each of those JSON-escaped up to three levels and percent-encoded."""
+    bytes), and with `lines` of each of its lines of `line_min` characters or more too (for text and string values,
+    never for a mapping's keys), and each of those JSON-escaped up to three levels and percent-encoded."""
     bases = _base_forms(value)
     for line in value.splitlines() if lines else ():
-        if len(line) >= MIN_SECRET_LEN:
+        if len(line) >= line_min:
             bases |= _base_forms(line)
     forms, level = set(bases), set(bases)
     for _ in range(ESCAPING_LEVELS):
@@ -195,9 +199,10 @@ class Redactor:
         # Text and string values are searched for each line of a multi-line secret too, since a secret can come back
         # re-encoded line by line (CRLF line ends, or its lines as separate strings). A mapping's keys are searched for
         # whole secrets only: replacing a common line there would rename a key and break the record.
-        inside = {f for s in values for f in forms_of(s, lines=True)}
+        line_min = MIN_SECRET_LEN if lines else MIN_LINE_LEN  # plain text replaces short lines too; a record does not
+        inside = {f for s in values for f in forms_of(s, lines=True, line_min=line_min)}
         self._inside: tuple[str, ...] = tuple(sorted(inside, key=len, reverse=True))
-        whole = {f for s in values for f in forms_of(s, lines=lines)}
+        whole = {f for s in values for f in forms_of(s)}
         self._inside_keys: tuple[str, ...] = tuple(sorted(whole, key=len, reverse=True))
         self._numbers: frozenset[str] = frozenset(values)
 
@@ -295,9 +300,10 @@ class Redactor:
 
         def walk(value: Any, path: str, schema: bool = False, property_names: bool = False) -> Any:
             if isinstance(value, str):
-                new = self.text(value)
-                if self._keys and not schema:
+                new = value
+                if self._keys and not schema:  # first, while the string is still the JSON it was
                     new = in_json_text(new, path)
+                new = self.text(new)
                 if new != value:
                     paths.append(path)
                 return new

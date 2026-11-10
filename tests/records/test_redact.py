@@ -326,6 +326,15 @@ def test_R12_a_multi_line_secret_that_comes_back_line_by_line_is_redacted_in_a_r
     assert loaded.instruments["probe"]["lines"] == ["[redacted]", "[redacted]"]
 
 
+def test_R12_a_short_common_line_of_a_secret_leaves_native_json_intact_and_secret_keys_still_redacted():
+    """R12: a line under MIN_LINE_LEN (here `true`) is an ordinary word, not replaced on its own, so the JSON a native
+    message holds stays valid and its secret-named keys are still redacted."""
+    redactor = Redactor(["true\nquartz-7781"])
+    arguments = '{"enabled":true,"token":"unregistered-credential"}'
+    redacted, _ = redactor.structure({"arguments": arguments})
+    assert json.loads(redacted["arguments"]) == {"enabled": True, "token": "[redacted]"}
+
+
 def test_R12_extra_secrets_given_as_an_iterator_are_read_once_for_both_passes():
     """R12: the long and the short secrets are picked from one reading of `extra`, so an iterator is not used up by
     the first pass and a short value it holds is still replaced as a token."""
