@@ -4,7 +4,7 @@
 #   merged: icsa-2027-experiments @ 6fc798cf, day0/REPORT.md:345-358 (the listing's default and largest page, measured)
 #   merged: icsa-2027-experiments @ 6fc798cf, day0/evidence/docs_research.md:47-54,155-176 (the server's and client's code)
 #   merged: icsa-2027-experiments @ 6fc798cf, day0/evidence/changes.jsonl (the file ids of a real federation)
-#   merged: icsa-2027-experiments @ 6fc798cf, icsa/sandbox/gatepolicy.py:13-14,72-73 (a merged listing as a mode)
+#   merged: icsa-2027-experiments @ 6fc798cf, icsa/sandbox/gatepolicy.py:14,51,74-75 (a merged listing as a mode)
 #   merged: icsa-2027-experiments @ 6fc798cf, day0/evidence/docs_research.md:24-47 (the listing's paging options)
 #   changes: see the history of this file from its import commit
 """Request policy of the sandbox gate: which Onedata REST calls pass (O05, O16), and how a listing is paged (O19).

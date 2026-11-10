@@ -13,6 +13,11 @@ The TLS checks need a platform file whose `[tls]` is not the default, because it
 CA no default trusts (a self-signed one): with each of the three modes in turn, oneclient must fail to mount by default
 and mount with `ca_file` or `insecure_tls`, and the gate's upstream must refuse the zone by default and reach it with
 either. With `insecure_tls` in the file, the `ca_file` cases skip.
+
+The listing and byte-count checks (O19, O20) need a level of `[sandbox.data_paths]` whose listing is complete, and
+`EXPCORE_LIVE_LISTING_PATH` naming a provisioned directory of more than 1000 entries by its path in the space: through
+the gate the agent's one listing of it must come back whole as the last page, and the collection's count must equal the
+bytes the agent's code received. A mount level's count must be unknown after its collection.
 """
 
 import dataclasses
@@ -96,6 +101,7 @@ def spec_for(config, level, run_key, lease_key=None):
         zone=Endpoint.from_url(config.zone.url),
         provider=Endpoint.from_url(config.local_provider.url),
         lease_key=lease_key,
+        listing=config.sandbox.listing_of(level) or "paged",
     )
 
 
@@ -257,3 +263,67 @@ def test_o05_the_gates_upstream_reaches_the_zone_as_the_tls_setting_says(config,
         assert status == 502
     else:
         assert status < 500
+
+
+LISTING_PATH = os.environ.get("EXPCORE_LIVE_LISTING_PATH")  # a provisioned directory of more than 1000 entries
+# The agent's own read of a directory through the gate, as the official client lists: one request for a page of 1000.
+LISTING_CALL = """
+import json, urllib.request
+base = "https://" + {provider!r} + "/api/v3/oneprovider"
+lookup = urllib.request.Request(base + "/lookup-file-id/" + {space!r} + "/" + {path!r}, data=b"", method="POST")
+found = urllib.request.urlopen(lookup, timeout=120).read()
+listing = urllib.request.urlopen(base + "/data/" + json.loads(found)["fileId"] + "/children?limit=1000", timeout=600)
+body = listing.read()
+page = json.loads(body)
+names = [entry.get("name") for entry in page["children"]]
+print(json.dumps({{"lookup": len(found), "listing": len(body), "entries": len(names), "unique": len(set(names)),
+                  "last": page["isLast"], "next": page["nextPageToken"]}}))
+"""
+
+
+@needs_platform
+def test_o19_o20_a_complete_level_serves_a_large_directory_whole_and_counts_the_bytes_it_served(config, host, tmp_path):
+    """O19, O20: through the gate of a level whose listing is complete, one listing of a directory of more than 1000
+    entries comes back whole as the last page, with each name once; after the collection stopped the gate, its count
+    is known and equals the bytes the agent's code received: the listing and the lookup, and no file content."""
+    import json
+
+    if not LISTING_PATH:
+        pytest.skip("EXPCORE_LIVE_LISTING_PATH is not set; it names a directory of more than 1000 entries in the space")
+    found = [level for level in levels(config) if config.sandbox.listing_of(level) == "complete"]
+    if not found:
+        pytest.skip("[sandbox.data_paths] gives no level a complete listing")
+    spec = spec_for(config, found[0], f"live-listing-{int(time.time())}")
+    sandbox = DockerSandbox.start(host, config.sandbox, spec)
+    try:
+        code = LISTING_CALL.format(provider=spec.provider.host, space=config.space.name, path=LISTING_PATH.strip("/"))
+        said = json.loads(sandbox.exec(code, 900).stdout.strip())
+        sandbox.collect(tmp_path / "evidence")
+        counted = sandbox.served_bytes()
+    finally:
+        sandbox.stop()
+    assert said["entries"] > 1000
+    assert said["unique"] == said["entries"]
+    assert (said["last"], said["next"]) == (True, None)
+    assert counted["unknown"] == []
+    assert (counted["listing"], counted["listing_bytes"], counted["other_bytes"]) == (
+        "complete",
+        said["listing"],
+        said["lookup"],
+    )
+    assert counted["content_bytes"] == 0
+
+
+@needs_platform
+def test_o20_a_mount_levels_count_is_unknown_after_its_collection(config, host, tmp_path):
+    """O20: a mount's reads go through oneclient, which no gate sees: its count is unknown, never zero."""
+    level = level_of(config, DataPathMode.MOUNT)
+    sandbox = DockerSandbox.start(host, config.sandbox, spec_for(config, level, f"live-mount-count-{int(time.time())}"))
+    try:
+        sandbox.exec(f"import os\nprint(len(os.listdir({config.sandbox.mount.path!r})))", 120)
+        sandbox.collect(tmp_path / "evidence")
+        counted = sandbox.served_bytes()
+    finally:
+        sandbox.stop()
+    assert counted["unknown"] == ["mount_not_through_gate"]
+    assert counted["served_bytes"] is None
