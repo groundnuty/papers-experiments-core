@@ -79,7 +79,8 @@ def iso(moment: dt.datetime) -> str:
 class RunSummary:
     """How a call to `run` ended: the workers it started (`dispatched`, what `max_dispatch` bounds), the holds still
     in force, the runs by status, the local log of harness defects' tracebacks when there is one (`defect_log`), and
-    the attempts it began: a worker that got no lease, or found a gate closed once it had one, began none."""
+    the attempts it began: a worker that got no lease, was not admitted by the platform (`Parts.admission`), or found a
+    gate closed once it had either, began none."""
 
     dispatched: int
     holds: Mapping[str, Hold] = field(default_factory=dict)
@@ -551,8 +552,13 @@ class Scheduler:
         """When dispatch held by `hold` resumes, as far as the scheduler knows."""
         if hold.kind == "unit_paused" and hold.until is not None:
             return f"dispatch on it resumes at {hold.until}, when one run may probe it"
-        if hold.kind == "health_gate":
+        if hold.kind == "health_gate" and hold.temporary:
             return f"dispatch resumes when a health check passes (checked every {self.settings.recheck_s:g} s)"
+        if hold.kind == "health_gate":  # blocking: a deferral past its bound, whose holder may never let go
+            return (
+                "it may not end by itself: dispatch resumes only when a health check passes (checked every "
+                f"{self.settings.recheck_s:g} s), so someone should look at what holds the platform"
+            )
         if hold.temporary:
             return "dispatch resumes when it ends by itself"
         return "it does not end by itself: its runs stay pending until someone looks"

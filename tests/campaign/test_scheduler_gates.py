@@ -21,6 +21,7 @@ from expcore.campaign.healthgate import Health, parse
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.store import Store
 from expcore.config.loading import ConfigError
+from expcore.errors import InfraError
 
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 SCHEMA = make_schema()
@@ -216,12 +217,47 @@ def test_c10_a_run_that_waited_for_admission_does_not_start_once_a_harness_stop_
     executor = FakeExecutor(default=defect_once_the_other_waits)
     settings = settings_for(workers=2, harness_stop=HarnessStopConfig(stop_after=1, models_stop=1))
     with build(tmp_path, executor=executor, settings=settings, plan=SMALL, admission=admission) as scheduler:
-        scheduler.run()
+        summary = scheduler.run()
         kinds = event_kinds(scheduler.store)
         attempts = scheduler.store.q("SELECT state FROM attempts")
     assert len(executor.requests) == 1  # B never started
     assert [r["state"] for r in attempts] == ["harness_error"]
     assert "run_unstarted" in kinds
+    assert (summary.dispatched, summary.attempts) == (2, 1)  # B's worker began no attempt, so none is counted
+    log = summary.harness_log.read_text(encoding="utf-8")  # A's traceback, written while it held the admission
+    assert log.count("=== ") == 1
+    assert "ValueError" in log
+
+
+class RefuseFirst:
+    """A run admission that refuses the first run it is asked for, as a platform that cannot hold its resource, and
+    admits every run after it."""
+
+    def __init__(self):
+        self.refused = False
+
+    @contextlib.contextmanager
+    def __call__(self, treatment_kinds, treatment_targets, cancel, exclusive):
+        if not self.refused:
+            self.refused = True
+            raise InfraError("sandbox", "the shared resource could not be held")
+        yield "shared"
+
+
+def test_c11_a_run_the_platform_does_not_admit_begins_no_attempt_and_is_not_counted_as_one(tmp_path):
+    """C11, C19: a refused admission leaves the run unstarted, with no attempt row; it starts later under an admission
+    that holds, and the summary counts the attempts begun, not the workers started."""
+    executor = FakeExecutor()
+    settings = settings_for(workers=1)
+    with build(tmp_path, executor=executor, settings=settings, plan=SMALL, admission=RefuseFirst()) as scheduler:
+        summary = scheduler.run()
+        rows = scheduler.store.q("SELECT admission FROM attempts")
+        unstarted = [e["detail"] for e in scheduler.store.q("SELECT detail FROM events WHERE kind='run_unstarted'")]
+    assert summary.statuses == {"done": 3}
+    assert (summary.dispatched, summary.attempts) == (4, 3)
+    assert [r["admission"] for r in rows] == ["shared"] * 3
+    assert len(unstarted) == 1
+    assert "not admitted by the platform, no attempt used" in unstarted[0]
 
 
 # --- C12 and C13: the budget ------------------------------------------------------------------------------------------

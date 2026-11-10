@@ -218,6 +218,30 @@ def test_c11_a_campaign_whose_check_stays_deferred_past_the_bound_stops_dispatch
         assert "providers[1]" in outage["first_detail"]
 
 
+def test_c11_a_blocking_gate_is_said_once_as_a_hold_that_may_not_end_by_itself(tmp_path):
+    """C11: the line `run` says for a gate closed past max_defer_s tells it from a gate that reopens by itself: what
+    would end it, and that someone should look, never only the recheck interval."""
+    moments = iter(dt.datetime(2026, 1, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=40 * n) for n in range(10_000))
+    settings = settings_for(recheck_s=0.01, health_timeout_s=5, max_defer_s=100, workers=1)
+    lines = []
+    with build(
+        tmp_path,
+        executor=FakeExecutor(),
+        settings=settings,
+        health=lambda: WEDGED,
+        plan=SMALL,
+        clock=lambda: next(moments),
+        on_hold=lines.append,
+    ) as scheduler:
+        scheduler.run()
+    said = [line for line in lines if line.startswith("hold on all (health_gate)")]
+    assert said == [
+        "hold on all (health_gate): the health gate is closed: the platform's check stayed deferred past max_defer_s; "
+        "it may not end by itself: dispatch resumes only when a health check passes (checked every 0.01 s), so "
+        "someone should look at what holds the platform"
+    ]
+
+
 def test_c11_a_closed_gate_whose_own_checks_stay_deferred_past_the_bound_becomes_blocking(tmp_path):
     """C11: a gate closed by an ordinary failure is re-checked by the dispatcher alone; when those checks stay
     deferred past max_defer_s, because a holder wedged the platform meanwhile, the outage becomes blocking too, so the
