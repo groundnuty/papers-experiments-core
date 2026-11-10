@@ -8,11 +8,11 @@ A complete minimal study for the core. Copy this directory, change the names and
 | `models.toml` | the model table: two priced stub models |
 | `campaign.toml` | the plan (models, seeds, run order seed), the loop's caps, the scheduler's caps and a budget |
 | `preregistration.toml` | two contrasts in the Holm family (one with an equivalence margin, one declaring that its treatment attempts are scored), one exploratory contrast outside it, the estimator, power settings |
-| `plugin.py` | the tools (a lookup that waits on tool-server start-up and that the stub platform answers, and a terminal submit), an instrument (the platform's own count of the facts it served in a run), the scorer (which reads that count and returns values for a treatment attempt), the executor, the health check and the resource probe |
+| `plugin.py` | the tools (two functions, one waits on tool-server start-up), the stub platform's shelf, which serves the lookups and counts the facts it handed out, an instrument (that count, as a snapshot at the run's end), the scorer (which reads the count and returns values for a treatment attempt), the executor, the health check and the resource probe |
 | `prompt.txt` | the prompt template with its named slots |
 | `package.toml` | the inclusion list of the study's replication package |
 
-The interfaces the plugin implements are described in [`docs/interfaces.md`](../../docs/interfaces.md), and how to build a study on them in [`docs/study-guide.md`](../../docs/study-guide.md). In a copy that `python -m expcore example` wrote, these links point at the documentation of the core version that wrote it. They name the core's repository: before a double-blind submission, drop or rewrite them (an anonymised build refuses them when the core was installed from that repository).
+The interfaces the plugin implements are described in [`docs/interfaces.md`](../../docs/interfaces.md), and how to build a study on them in [`docs/study-guide.md`](../../docs/study-guide.md). In a copy that `python -m expcore example` writes, they point at the documentation of the core that wrote it: links on GitHub at the commit the core was installed from, when it came from a GitHub repository, and otherwise each page's path in the core's repository with the tag or commit to read it at. A link to the core's repository can lead to its authors, so drop or rewrite such links before a double-blind submission; an anonymised build refuses them when the core was installed from that repository.
 
 ## Run it
 
