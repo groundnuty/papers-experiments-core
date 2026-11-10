@@ -176,9 +176,9 @@ def test_k11_a_plain_package_says_where_the_core_came_from(campaign, hashes, tmp
     [
         (f"Built at {HEAD}.", "a commit id of the study's repository"),
         (f"The core was {CORE_COMMIT[:12]}.", "a commit id of the study's repository"),
-        ("Source: https://code.example.org/qvarek/tiny-core.git", "a source URL of the study's repository"),
-        ("Fork of git@code.example.org:qvarek/tiny-core.git today", "a source URL of the study's repository"),
-        ("See code.example.org/qvarek/tiny-core for the tool", "a source URL of the study's repository"),
+        ("Source: https://code.example.org/qvarek/tiny-core.git", "a source URL or repository name"),
+        ("Fork of git@code.example.org:qvarek/tiny-core.git today", "a source URL or repository name"),
+        ("See code.example.org/qvarek/tiny-core for the tool", "a source URL or repository name"),
     ],
 )
 def test_k11_a_commit_or_source_url_left_in_a_file_refuses_the_build_without_showing_it(
@@ -277,6 +277,71 @@ def test_k11_a_core_installed_from_an_index_with_a_listed_authors_name_is_refuse
     assert AUTHOR not in str(refused.value)
     with pytest.raises(PackageError, match=r"direct_url\.json: names where the distribution came from"):
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation, vendor=with_direct_url)
+
+
+HEADED = (
+    "# Provenance:\n"
+    f"#   source: quillon-old-study @ {'ab12' * 10}, old/tool.py, blob {'cd34' * 10}\n"
+    f"#   import: sanitised with study-token map {'ef56' * 16}\n"
+    "#   merged: varek-pilot @ 1a2b3c4, pilot/run.py:10-20\n"
+    '"""A tool."""\n\nVALUE = 1\n'
+)
+
+
+def headed_core(distributions, supplied=None):
+    """Stand-ins, with the core's wheel holding a module whose provenance header names earlier repositories."""
+    out = []
+    for wheel in stand_in_vendor(distributions):
+        if wheel.name == CORE_DISTRIBUTION:
+            filename, data = wheel_of(wheel.name, wheel.version, {"expcore/tool.py": HEADED.encode()})
+            wheel = Wheel(wheel.name, wheel.version, filename, data, from_index=False)
+        out.append(wheel)
+    return out
+
+
+def test_k11_the_vendored_codes_provenance_headers_are_withheld_and_none_of_what_they_named_survives(
+    campaign, hashes, anonymisation, tmp_path
+):
+    """K11: an anonymised package's wheels carry no provenance header: no earlier repository's name and no commit or
+    blob id it held is anywhere in the package; a package that is not anonymised keeps the header."""
+    archive = build_package(
+        copy_campaign(campaign, tmp_path, "a").root,
+        tmp_path / "dist",
+        hashes=hashes,
+        anonymise=anonymisation,
+        vendor=headed_core,
+    )
+    root = unpack(archive, tmp_path / "unpacked")
+    [core] = list((root / "wheels").glob("papers_experiments_core-*.whl"))
+    with zipfile.ZipFile(core) as wheel:
+        assert wheel.read("expcore/tool.py").decode().startswith("# (provenance withheld")
+    contents = b"".join(path.read_bytes() for path in root.rglob("*") if path.is_file())
+    with zipfile.ZipFile(core) as wheel:
+        contents += b"".join(wheel.read(name) for name in wheel.namelist())
+    for hidden in ("quillon-old-study", "varek-pilot", "ab12" * 10, "cd34" * 10, "1a2b3c4"):
+        assert hidden.encode() not in contents, hidden
+    plain = build_package(
+        copy_campaign(campaign, tmp_path, "b").root, tmp_path / "plain", hashes=hashes, vendor=headed_core
+    )
+    with tarfile.open(plain) as members:
+        name = next(n for n in members.getnames() if n.endswith(".whl") and "papers_experiments_core" in n)
+        with zipfile.ZipFile(io.BytesIO(members.extractfile(name).read())) as wheel:
+            assert wheel.read("expcore/tool.py").decode() == HEADED
+
+
+def test_k11_a_name_or_id_a_withheld_header_held_refuses_the_build_wherever_else_it_appears(
+    campaign, hashes, anonymisation, tmp_path
+):
+    """K11: the final check over the assembled package: a repository name or a short commit from a withheld header,
+    left in another file, refuses the build without showing it."""
+    for line in ("Ported from quillon-old-study.", "See commit 1a2b3c4 of the pilot."):
+        root = copy_campaign(campaign, tmp_path, f"copy-{len(line)}").root
+        with (root / "README.md").open("a", encoding="utf-8") as readme:
+            readme.write(f"\n{line}\n")
+        with pytest.raises(PackageError, match=r"README\.md:\d+: a ") as refused:
+            build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation, vendor=headed_core)
+        assert "quillon-old-study" not in str(refused.value)
+        assert "1a2b3c4" not in str(refused.value)
 
 
 def test_the_core_itself_names_no_repository_url_in_what_it_ships():

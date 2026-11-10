@@ -163,5 +163,5 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | K07 | `make check` regenerates every table from records and compares byte for byte | `tests/campaign/test_export.py`, `tests/e2e/test_tiny_study.py`, `tests/package/test_build.py`, `tests/package/test_spec.py`, `tests/test_fresh_repo.py` |
 | K08 | Shipped code parses on the oldest supported Python | `tests/test_oldest_python.py` |
 | K10 | A package installs the environment it was checked under, offline | `tests/package/test_build.py`, `tests/package/test_spec.py`, `tests/package/test_wheels.py` |
-| K11 | An anonymised package holds no commit id and no source URL, and passes its own check | `tests/package/test_anonymised.py` |
+| K11 | An anonymised package holds no commit id and no source URL, and passes its own check | `tests/package/test_anonymised.py`, `tests/package/test_withhold.py` |
 | K12 | A package lists every included file no commit holds | `tests/package/test_tracking.py` |

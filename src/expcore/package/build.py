@@ -9,8 +9,9 @@
 3. refuse a check made under code that is not a clean commit, outputs made by another core version, and a check that
    records no environment or another one than the build's (`provenance.environment`); warn about every other included
    file no commit holds and list it, and refuse one in an anonymised build unless the author allows it (`tracking`);
-4. with an anonymisation list (`anonymise`), rewrite the prose and metadata files it names, and give the package a
-   code identity by tree hash alone: no commit id and no source URL anywhere (`identity`);
+4. with an anonymisation list (`anonymise`), rewrite the prose and metadata files it names, give the package a code
+   identity by tree hash alone: no commit id and no source URL anywhere (`identity`), and withhold the provenance
+   headers of the vendored code (`withhold`);
 5. add the generated files: `.code-stamp.json` (the commit and tree hash the check names, dated by the check), one
    wheel per distribution of the check's environment under `wheels/` with `wheels/requirements.txt` pinning each by
    hash (`wheels`), a `Makefile` whose `check` target installs those wheels into a fresh environment, offline, and
@@ -47,6 +48,7 @@ from expcore.models.route import sdk_version
 from expcore.package.anonymise import Anonymisation, load_anonymisation, rewrite
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
 from expcore.package.identity import (
+    PREFIX_DIGITS,
     anonymise_identity,
     hidden_identity,
     lay_out,
@@ -60,6 +62,7 @@ from expcore.package.spec import WHEELS_DIR, PackageError, PackageSpec, load_spe
 from expcore.package.tracking import Tracking, note_tracking
 from expcore.package.wheels import REQUIREMENTS, Vendor, Wheel, makefile, requirements, vendor_wheels
 from expcore.package.wheelscan import scan_wheels
+from expcore.package.withhold import withhold_headers
 from expcore.provenance.codestamp import STAMP, covered_files, is_sha
 from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_environment
 from expcore.provenance.gitobjects import GitError, run_git
@@ -243,6 +246,10 @@ def collect(
             files, root=study.root, scope=study.scope, check=check, env=env, parent=out_dir
         )
     vendored = _wheels(env, vendor, wheels)
+    if terms is not None:  # an anonymised package withholds the vendored code's provenance headers
+        vendored, withheld = withhold_headers(vendored)
+        hidden_commits |= {found[:PREFIX_DIGITS] for found in withheld.ids}
+        hidden_urls |= {name.lower() for name in withheld.repositories}
     files.update({wheel.path: wheel.data for wheel in vendored})
     files[REQUIREMENTS] = requirements(vendored)
     opaque |= {wheel.path for wheel in vendored}  # read member by member below

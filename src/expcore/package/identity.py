@@ -28,9 +28,10 @@ wheel is searched for the terms of the list and for the identifying URLs like ev
 sources name no author.
 
 `find_identity` is the safety net behind the rewriting: every stream of every file the checks read is searched for each
-commit of the study's repository, of the records and of the environment (by its first 12 digits, which also finds
-longer prefixes) and for each source URL of the environment and each remote of the study's repository, ignoring case
-and the scheme. A finding names the file and line, never the value (K05).
+commit of the study's repository, of the records, of the environment and of the provenance headers withheld from the
+vendored code (`withhold`; by its first 12 digits, which also finds longer prefixes, or exactly for an id written
+shorter), for each source URL of the environment and each remote of the study's repository, ignoring case and the
+scheme, and for each repository name those headers held. A finding names the file and line, never the value (K05).
 """
 
 import dataclasses
@@ -57,9 +58,10 @@ from expcore.replay.check import CHECK_FILE, inputs_sha256, verify_batch, write_
 from expcore.study.pipeline import OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
 
 PREFIX_DIGITS = 12
-_HEX_RUN = re.compile(rf"[0-9a-fA-F]{{{PREFIX_DIGITS},}}")
+SHORTEST_ID = 7  # a commit written short, as provenance headers write the ones they merge from
+_HEX_RUN = re.compile(rf"[0-9a-fA-F]{{{SHORTEST_ID},}}")
 FOUND_COMMIT = "a commit id of the study's repository or its environment"
-FOUND_URL = "a source URL of the study's repository or its environment"
+FOUND_URL = "a source URL or repository name of the study, its environment or the vendored code"
 BATCH = f"{OUT_DIR}/{RUNS_DIR}"
 
 
@@ -275,10 +277,14 @@ def hidden_identity(
 
 
 def commit_lines(text: str, prefixes: frozenset[str]) -> set[int]:
+    """The lines that hold a hidden id: a run of hex digits holding one's first 12 digits, or, for an id written
+    shorter than that, a run of hex digits that is exactly the id (inside a longer run it would match digests)."""
+    short = {prefix for prefix in prefixes if len(prefix) < PREFIX_DIGITS}
     lines = set()
     for run in _HEX_RUN.finditer(text):
         digits = run.group(0).lower()
-        if any(digits[i : i + PREFIX_DIGITS] in prefixes for i in range(len(digits) - PREFIX_DIGITS + 1)):
+        windows = (digits[i : i + PREFIX_DIGITS] for i in range(len(digits) - PREFIX_DIGITS + 1))
+        if digits in short or any(window in prefixes for window in windows):
             lines.add(text.count("\n", 0, run.start()) + 1)
     return lines
 

@@ -134,7 +134,7 @@ def _kept(path: PurePosixPath, info_dir: str) -> bool:
     return True
 
 
-def _zip(entries: Sequence[tuple[str, bytes, bool]]) -> bytes:
+def zip_entries(entries: Sequence[tuple[str, bytes, bool]]) -> bytes:
     """A deterministic zip of (name, bytes, executable) entries, in the order given."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
@@ -176,7 +176,7 @@ def repack(dist: metadata.Distribution) -> tuple[str, bytes]:
     record = "".join(f"{n},{_record_hash(d)},{len(d)}\n" for n, d, _ in ordered) + f"{info_dir}/RECORD,,\n"
     ordered.append((f"{info_dir}/RECORD", record.encode("utf-8"), False))
     tag = _wheel_tag(wheel_file.decode("utf-8"), name)
-    return f"{_escaped(name)}-{version.replace('-', '_')}-{tag}.whl", _zip(ordered)
+    return f"{_escaped(name)}-{version.replace('-', '_')}-{tag}.whl", zip_entries(ordered)
 
 
 def _metadata_of(data: bytes) -> tuple[str, str] | None:
