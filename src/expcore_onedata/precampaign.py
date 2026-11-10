@@ -14,6 +14,8 @@ both typed as the gate requires. Only the heads are read (`OnezoneClient.content
 path over REST the gate streams nothing, so nothing is read and the campaign is admitted. A type that differs, or one
 that cannot be measured (the file is missing, the provider fails), refuses the campaign: unknown is not a pass. The
 detail names the problem, the provider by its position and the type measured, never a configured value.
+`measure_content_type` says besides whether a type was measured at all, so the day-0 check can report a check that
+measured nothing as unknown, never as passed, while the campaign is still admitted when nothing streams.
 
 Where it runs. The core has no hook at a campaign's start, and a study's `build` must have no side effects, so the
 check runs at the first call of the health gate, which the core makes before any attempt starts. The platform's
@@ -35,6 +37,7 @@ answers every call after it.
 import re
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from expcore.campaign.healthgate import Health, HealthCheck, read_health
@@ -48,6 +51,10 @@ from expcore_onedata.sandbox.gateboundary import DATA_CONTENT_TYPE, streams
 
 CHECK_KEY = "[sandbox] content_check_file"
 REFUSED = "the campaign is refused before any run starts"
+NOTHING_STREAMS = (
+    "no data path is REST (no [sandbox], or none of its levels is rest), so nothing was measured: the data gate "
+    "streams nothing, so there is no content type to check"
+)
 _SHOWN_TYPE = re.compile(r"[^A-Za-z0-9/.+;=_ -]")
 
 
@@ -74,13 +81,33 @@ def _child(client: OnezoneClient, provider: str, directory: str, name: str) -> s
         params = {**params, "token": page["nextPageToken"]}
 
 
-def content_type_check(config: PlatformConfig, client: OnezoneClient) -> Health:
+@dataclass(frozen=True)
+class ContentTypeVerdict:
+    """What the content-type check found: whether it measured a type at all, whether a campaign may start, and why.
+
+    `measured` is False when nothing was read (no REST data path, no check file) or the reads failed; `ok` is True
+    only when a type was measured and is the one the gate streams on, or when there is nothing for the gate to stream.
+    """
+
+    measured: bool
+    ok: bool
+    detail: str
+
+    @property
+    def health(self) -> Health:
+        """The verdict as the health gate reads it."""
+        return Health(self.ok, self.detail)
+
+
+def measure_content_type(config: PlatformConfig, client: OnezoneClient) -> ContentTypeVerdict:
     """Measure the content type of a file's content, whole and by range, on the local provider; never raise."""
     sandbox = config.sandbox
     if sandbox is None or DataPathMode.REST not in sandbox.data_paths.values():
-        return Health(True, "no data path is REST: the data gate streams nothing, so there is no content type to check")
+        return ContentTypeVerdict(False, True, NOTHING_STREAMS)
     if sandbox.content_check_file is None:
-        return Health(False, f"{REFUSED}: {CHECK_KEY} is not set, so the content type the gate streams on is unknown")
+        return ContentTypeVerdict(
+            False, False, f"{REFUSED}: {CHECK_KEY} is not set, so the content type the gate streams on is unknown"
+        )
     local = config.support.local
     label = client.provider_label(local)
     try:
@@ -90,21 +117,33 @@ def content_type_check(config: PlatformConfig, client: OnezoneClient) -> Health:
         whole = client.content_answer(f"/data/{node}/content", provider=local, first_byte=False)
         part = client.content_answer(f"/data/{node}/content", provider=local, first_byte=True)
     except (PlatformError, LookupError, ValueError) as error:  # their messages hold labels and positions, no value
-        return Health(False, f"{REFUSED}: the content type of {CHECK_KEY} on {label} could not be measured ({error})")
+        return ContentTypeVerdict(
+            False, False, f"{REFUSED}: the content type of {CHECK_KEY} on {label} could not be measured ({error})"
+        )
     except Exception as error:
-        return Health(False, f"{REFUSED}: measuring the content type on {label} raised {type(error).__name__}")
+        return ContentTypeVerdict(
+            False, False, f"{REFUSED}: measuring the content type on {label} raised {type(error).__name__}"
+        )
     problems = [
         f"a {what} was answered {status} typed {_shown(content_type)}"
         for what, expected, (status, content_type) in (("whole read", 200, whole), ("read by range", 206, part))
         if status != expected or not streams(status, "content", content_type)
     ]
     if problems:
-        return Health(
+        return ContentTypeVerdict(
+            True,
             False,
             f"{REFUSED}: on {label}, {'; '.join(problems)}, not {DATA_CONTENT_TYPE} with 200 and 206, the only "
             "answer the data gate streams, so every REST read over 4 MiB would be refused mid-campaign",
         )
-    return Health(True, f"a file's content on {label} is {DATA_CONTENT_TYPE}, whole (200) and by range (206)")
+    return ContentTypeVerdict(
+        True, True, f"a file's content on {label} is {DATA_CONTENT_TYPE}, whole (200) and by range (206)"
+    )
+
+
+def content_type_check(config: PlatformConfig, client: OnezoneClient) -> Health:
+    """The pre-campaign check as the health gate reads it (`measure_content_type`); never raise."""
+    return measure_content_type(config, client).health
 
 
 class PreCampaignHealth:
@@ -136,4 +175,4 @@ class PreCampaignHealth:
         return self._health()
 
 
-__all__ = ["CHECK_KEY", "PreCampaignHealth", "content_type_check"]
+__all__ = ["CHECK_KEY", "ContentTypeVerdict", "PreCampaignHealth", "content_type_check", "measure_content_type"]

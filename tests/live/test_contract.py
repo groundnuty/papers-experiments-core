@@ -127,6 +127,32 @@ def test_a_nested_file_resolves_to_its_space_by_its_parent_links(config, client)
             fresh.close()
 
 
+def test_the_pre_campaign_content_check_measures_a_nested_file_and_passes(config, tmp_path):
+    """O05, O09: the check a campaign with a REST data path runs before its first run, on a file two levels down, read
+    through the gate's walk on a client that has walked nothing yet: it measures a type, and it is the one the data
+    gate streams on. The federation's platform.toml has no [sandbox], so the test adds one with a REST level."""
+    import dataclasses
+
+    from sandbox_support import sandbox_data
+
+    from expcore.config.loading import Section
+    from expcore_onedata.precampaign import measure_content_type
+    from expcore_onedata.sandbox.settings import load_sandbox
+
+    fresh = OnezoneClient(config)
+    try:
+        local = config.support.local
+        root = fresh.get(f"/spaces/{config.space.id}", provider=local)["fileId"]
+        _, names, _ = nested_file(fresh, local, root)
+        table = {**sandbox_data(), "data_paths": {"via-rest": "rest"}, "content_check_file": "/".join(names)}
+        sandbox = load_sandbox(Section(table, tmp_path / "platform.toml", "[sandbox]"), tmp_path, tls=config.tls)
+        verdict = measure_content_type(dataclasses.replace(config, sandbox=sandbox), fresh)
+    finally:
+        fresh.close()
+    assert verdict.measured, verdict.detail
+    assert verdict.ok, verdict.detail
+
+
 def test_discovery_finds_the_space_and_the_declared_local_provider(config, issuer, client):
     # covers: POST /tokens/infer_access_token_scope
     user = service_user(config)
