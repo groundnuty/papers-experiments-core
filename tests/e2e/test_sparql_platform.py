@@ -259,6 +259,13 @@ def test_a_query_that_mints_blank_nodes_is_refused_because_its_labels_differ_on_
         assert tools.query({"query": minted}, timeout_s=5).error_class == "BlankNodeResult", minted
 
 
+@pytest.mark.parametrize("call", ["RAND()", "UUID()", "STRUUID()", "NOW()", "now ()"])
+def test_a_function_whose_value_differs_on_every_call_is_refused(graph, call):
+    """The tool's output must be the same each time a query runs, so random and clock functions are refused."""
+    query = f"SELECT ({call} AS ?v) WHERE {{}}"
+    assert tools_over(graph).query({"query": query}, timeout_s=5).error_class == "UnstableFunction"
+
+
 def test_a_result_that_takes_longer_than_the_time_left_is_the_models_tool_error_not_the_stores_failure(graph):
     """Reading results past the deadline is a slow query, not a broken store: a tool error, never InfraError."""
     tools = tools_over(graph)

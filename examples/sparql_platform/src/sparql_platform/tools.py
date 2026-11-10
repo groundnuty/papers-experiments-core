@@ -35,6 +35,8 @@ _OPAQUE = re.compile(
 # a query reach the network. A query that only mentions the word in a literal is refused too, by design.
 _SERVICE = re.compile(r"service", re.IGNORECASE)
 _CODEPOINT = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+# Functions whose value differs on every call: the tool's output must be the same each time a query runs.
+_UNSTABLE = re.compile(r"\b(RAND|UUID|STRUUID|NOW)\s*\(", re.IGNORECASE)
 _UPDATE = re.compile(r"\b(INSERT|DELETE|LOAD|CLEAR|CREATE|DROP|COPY|MOVE|ADD|WITH)\b", re.IGNORECASE)
 
 
@@ -96,6 +98,10 @@ class SparqlTools:
             return self._refuse(
                 "SERVICE is refused, and so is the word anywhere in a query: this tool queries only the local graph",
                 "ServiceRefused",
+            )
+        if _UNSTABLE.search(_decoded(text)):
+            return self._refuse(
+                "RAND, UUID, STRUUID and NOW are refused: their values differ on every run", "UnstableFunction"
             )
         return self._run(text, time.monotonic() + timeout_s)
 
