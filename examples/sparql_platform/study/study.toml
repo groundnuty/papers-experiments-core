@@ -1,0 +1,39 @@
+# A small study on the SPARQL platform. Every name here belongs to this example; the core and the platform know none.
+
+[study]
+name = "orchard-study"
+plugin = "plugin.py"
+# What the code identity covers: the configuration, the plugin, the prompt and the graph the platform loads.
+code = ["study.toml", "models.toml", "campaign.toml", "preregistration.toml", "plugin.py", "prompt.txt", "orchard.ttl"]
+# The distribution the plugin imports beyond the core; the campaign's environment records it with what it requires.
+requires = ["sparql-platform"]
+# Imported before anything is validated, so the platform's infrastructure kind is known.
+platforms = ["sparql_platform.kinds"]
+
+# One declared factor: which tools the agent is shown. `task`, `model` and `seed` are built in.
+[factors.exposure]
+levels = ["query_only", "query_and_schema"]
+
+[identity]
+order = ["task", "exposure", "model", "seed"]
+
+# The query tool alone.
+[conditions.bare]
+exposure = "query_only"
+
+# The query tool and the schema tool, which lists the predicates the graph uses.
+[conditions.guided]
+exposure = "query_and_schema"
+
+# Four questions. `shape` is a text attribute; the preregistration clusters by it.
+[tasks.marrowby-crew]
+shape = "lookup"
+
+[tasks.oldest-fruit]
+shape = "lookup"
+
+[tasks.quillfen-count]
+shape = "aggregate"
+
+[tasks.thistledown-fruits]
+shape = "aggregate"

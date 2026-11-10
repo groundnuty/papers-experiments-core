@@ -1,0 +1,30 @@
+# The plan and the limits of the campaign.
+
+order_seed = 20261110
+seeds = [1]
+models = ["alpha-stub", "beta-stub"]
+
+# The loop's caps for every run. The output cap is above what a capped result can hold, so the cut a model meets is
+# the platform's row cap, recorded as source_truncated, and never the core's character cap.
+[agent]
+max_tool_rounds = 6
+time_cap_s = 30
+token_budget = 20000
+output_cap_chars = 4000
+max_output_tokens = 256
+
+[scheduler]
+max_attempts = 3
+workers = 1
+retry_delay_s = 0
+poll_interval_s = 0.05
+recheck_s = 1
+health_timeout_s = 5
+lease_timeout_s = 30
+
+[scheduler.unit_caps]
+alpha-stub = 1
+beta-stub = 1
+
+[budget]
+max_usd = 5.0

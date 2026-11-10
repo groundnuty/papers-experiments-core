@@ -1,0 +1,26 @@
+# The replication package: `python -m expcore package . --out DIR` writes DIR/orchard-study-package.tar.gz.
+# Only the files these patterns select go in. The platform is not a file of the study: its wheel is vendored with the
+# rest of the environment.
+
+[package]
+name = "orchard-study-package"
+include = [
+    "README.md",
+    "package.toml",
+    # everything [study] code names: the configuration, the plugin, the prompt and the graph, which `make check`
+    # loads again when it scores the records anew
+    "study.toml",
+    "models.toml",
+    "campaign.toml",
+    "preregistration.toml",
+    "plugin.py",
+    "prompt.txt",
+    "orchard.ttl",
+    # the records, their outcome markers, the snapshot of the campaign store and the replay check
+    "out/runs",
+    # the tables and the report that the package's `make check` regenerates from the records, byte for byte
+    "out/export.json",
+    "out/scores.json",
+    "out/analysis.json",
+    "out/report.md",
+]
