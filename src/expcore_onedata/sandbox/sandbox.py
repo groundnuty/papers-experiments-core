@@ -665,7 +665,8 @@ class DockerSandbox:
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
         if self.spec.mode is DataPathMode.REST:
             self._stop_gate()
-            self._meta["served_bytes"] = gatelog.served(self._gate_log_lines(), self._meta["gate_stop"])  # final (O20)
+            if "served_bytes" not in self._meta:  # counted once (O20): a second collection finds the gate already gone
+                self._meta["served_bytes"] = gatelog.served(self._gate_log_lines(), self._meta["gate_stop"])
             log_file = self.dir / "gatelog" / "requests.jsonl"
             self._copy_out(log_file, dest / "gate-requests.jsonl")
             result["gate_log"] = "gate-requests.jsonl"

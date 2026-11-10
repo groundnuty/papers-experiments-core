@@ -126,6 +126,20 @@ def test_o20_a_rest_runs_count_is_taken_once_by_the_collection_and_the_instrumen
     assert NAMESPACE == "served_bytes"
 
 
+def test_o20_a_second_collection_keeps_the_count_the_first_took(world, tmp_path):
+    """O20: the count is taken once. A second collection stops a gate that is already gone (on a real host its stop
+    then fails), so counting again could only lose what the first collection counted; it keeps that count."""
+    sbx = start(world, "via-gate")
+    write_log(sbx, *ANSWERS)
+    sbx.collect(tmp_path / "first")
+    counted = sbx.served_bytes()
+    write_log(sbx)  # a recount of this log would give zero
+    sbx.collect(tmp_path / "second")
+    assert sbx.served_bytes() == counted
+    assert counted["served_bytes"] == 1504
+    sbx.stop()
+
+
 def test_o20_the_instrument_puts_the_count_in_the_record_where_a_scorer_reads_it(world, tmp_path):
     """O20: through the core's instrument hooks the count lands in the record under its namespace, as a plain JSON
     object, so a scorer and replay read the recorded value and nothing measures it again."""
