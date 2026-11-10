@@ -105,7 +105,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | C03 | Attempts are charged by cause | `tests/campaign/test_scheduler.py`, `tests/campaign/test_store.py` |
 | C04 | A kill at any point resumes cleanly | `tests/campaign/test_dispatch_position.py`, `tests/campaign/test_legacy_markers.py`, `tests/campaign/test_recovery.py`, `tests/campaign/test_resume.py`, `tests/campaign/test_scheduler.py`, `tests/campaign/test_scheduler_accounting.py`, `tests/campaign/test_store.py`, `tests/e2e/test_tiny_study.py` |
 | C05 | An interrupted attempt costs its bound, never 0 | `tests/campaign/test_attempt_bounds.py`, `tests/campaign/test_executor.py` |
-| C06 | A campaign never resumes into a different experiment | `tests/campaign/test_factors.py`, `tests/campaign/test_manifest.py`, `tests/campaign/test_resume.py`, `tests/onedata/test_tls.py`, `tests/study/test_backend_factory.py`, `tests/study/test_kinds.py`, `tests/study/test_study.py` |
+| C06 | A campaign never resumes into a different experiment | `tests/campaign/test_factors.py`, `tests/campaign/test_manifest.py`, `tests/campaign/test_resume.py`, `tests/e2e/test_verified_analysis.py`, `tests/onedata/test_tls.py`, `tests/provenance/test_environment.py`, `tests/study/test_backend_factory.py`, `tests/study/test_kinds.py`, `tests/study/test_study.py` |
 | C07 | One dispatcher per store | `tests/campaign/test_lock.py`, `tests/campaign/test_scheduler.py`, `tests/campaign/test_scheduler_close.py` |
 | C08 | Run order is seeded and stable when the plan grows | `tests/campaign/test_manifest.py`, `tests/campaign/test_resume.py` |
 | C09 | Exhausted runs reach the analysis | `tests/campaign/test_export.py`, `tests/test_report.py` |
@@ -159,7 +159,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | K03 | The private name list never enters the repository or the output | `tests/package/test_anonymise.py`, `tests/package/test_build.py`, `tests/package/test_scan.py`, `tests/package/test_spec.py` |
 | K04 | Anonymisation must not change numbers, model names or parseability | `tests/package/test_anonymise.py` |
 | K05 | Findings never carry the matched value | `tests/package/test_anonymise.py`, `tests/package/test_build.py` |
-| K06 | Archives are deterministic | `tests/package/test_archive.py`, `tests/package/test_build.py` |
+| K06 | Archives are deterministic | `tests/package/test_anonymised.py`, `tests/package/test_archive.py`, `tests/package/test_build.py`, `tests/package/test_wheels.py` |
 | K07 | `make check` regenerates every table from records and compares byte for byte | `tests/campaign/test_export.py`, `tests/e2e/test_tiny_study.py`, `tests/package/test_build.py`, `tests/package/test_spec.py`, `tests/test_fresh_repo.py` |
 | K08 | Shipped code parses on the oldest supported Python | `tests/test_oldest_python.py` |
 | K10 | A package installs the environment it was checked under, offline | `tests/package/test_build.py`, `tests/package/test_spec.py`, `tests/package/test_wheels.py` |
