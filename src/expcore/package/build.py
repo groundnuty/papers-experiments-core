@@ -264,7 +264,7 @@ def collect(
     opaque |= {wheel.path for wheel in vendored}  # read member by member below
     tokens = private_hashes(default_hashes() if hashes is None else Path(hashes))
     attested = {path: entry for path, entry in spec.opaque.items() if path.startswith(f"{WHEELS_DIR}/")}
-    exempt = token_exempt(vendored, lock_hashes(study.root))  # the bytes vendored, after any header was withheld
+    exempt = token_exempt(vendored, lock_hashes(study.root, warn))  # the bytes vendored, after headers withheld
     read = scan_wheels(
         vendored, tokens, terms=terms, hidden=(hidden_commits, hidden_urls), attested=attested, exempt=exempt
     )

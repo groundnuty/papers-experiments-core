@@ -244,6 +244,22 @@ def test_k11_the_lock_is_the_studys_own_or_its_repositorys_and_only_pypi_org_ent
     outside = tmp_path / "snapshot"
     outside.mkdir()
     assert find_lock(outside) is None
-    (outside / LOCK_FILE).write_text("version = [\n", encoding="utf-8")
-    with pytest.raises(PackageError, match=r"uv\.lock: cannot be read"):
-        pypi_hashes(outside / LOCK_FILE)
+
+
+def test_k11_a_lock_that_cannot_be_read_exempts_nothing_and_refuses_nothing_on_its_own(
+    campaign, versions, hashes, tmp_path
+):
+    """K11: a uv.lock that cannot be parsed (an unrelated or broken one) does not refuse a build that needs no
+    exemption: one warning names the file and every wheel gets both lists, so a private name still refuses."""
+    root = copy_campaign(campaign, tmp_path, "copy").root
+    (root / LOCK_FILE).write_text("version = [\n", encoding="utf-8")
+    said: list[str] = []
+    _, files = collect(root, hashes=hashes, vendor=stand_in_vendor, warn=said.append)
+    assert json.loads(files[PACKAGE_FILE])["study_tokens_exempt"] == []
+    [warning] = [line for line in said if LOCK_FILE in line]
+    assert warning.endswith(
+        f"{LOCK_FILE}: cannot be read (TOMLDecodeError), so no wheel is exempt from the study-token list"
+    )
+    filename, data = release(versions[RELEASE], f"tuned on {PRIVATE}\n")
+    with pytest.raises(PackageError, match=rf"wheels/{re.escape(filename)}/{NOTES}:1 "):
+        collect(root, hashes=hashes, vendor=replacing({RELEASE: (filename, data)}), warn=said.append)

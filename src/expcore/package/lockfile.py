@@ -14,7 +14,8 @@ the bytes must be the published artifact's.
   be what is installed, and those bytes are what the lock records.
 - The core's own wheel, and the wheel of any distribution installed from a URL, a repository or a directory
   (editable or not), always gets the list, whatever the lock says.
-- With no lock, or a package the lock does not hold, every wheel gets the list.
+- With no lock, a lock that cannot be read (one warning names it), or a package the lock does not hold, every wheel
+  gets the list. A broken or unrelated lock thus refuses nothing on its own: the scan fails closed.
 - The anonymisation list and the identity an anonymised package must not hold apply to every wheel, always.
 
 The lock is the nearest `uv.lock` from the study directory up to the top of its repository, and no further; a study
@@ -22,12 +23,12 @@ outside any repository has only the one in its own directory. `PACKAGE.json` lis
 hash (`study_tokens_exempt`), which a reader can check against the index.
 """
 
+import sys
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from expcore.package.spec import PackageError
 from expcore.package.wheels import Wheel
 from expcore.provenance.environment import CORE_DISTRIBUTION, canonical
 from expcore.provenance.gitobjects import GitError, run_git
@@ -67,12 +68,17 @@ def _from_pypi(source: object) -> bool:
     return (url.scheme, url.netloc, url.path.rstrip("/"), url.query) == ("https", "pypi.org", "/simple", "")
 
 
-def pypi_hashes(lock: Path) -> dict[tuple[str, str], frozenset[str]]:
-    """The SHA-256 of every wheel the lock records from the pypi.org registry, by (canonical name, version)."""
+def pypi_hashes(lock: Path, warn: Callable[[str], None] | None = None) -> dict[tuple[str, str], frozenset[str]]:
+    """The SHA-256 of every wheel the lock records from the pypi.org registry, by (canonical name, version).
+
+    A lock that cannot be read holds none: `warn` (standard error by default) gets one line naming it.
+    """
     try:
         data = tomllib.loads(Path(lock).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        raise PackageError(f"{lock}: cannot be read ({type(error).__name__}); fix it or move it away") from None
+        say = warn or (lambda line: print(f"warning: {line}", file=sys.stderr))
+        say(f"{lock}: cannot be read ({type(error).__name__}), so no wheel is exempt from the study-token list")
+        return {}
     found: dict[tuple[str, str], set[str]] = {}
     packages = data.get("package")
     for entry in packages if isinstance(packages, list) else []:
@@ -90,10 +96,10 @@ def pypi_hashes(lock: Path) -> dict[tuple[str, str], frozenset[str]]:
     return {key: frozenset(value) for key, value in found.items()}
 
 
-def lock_hashes(study_root: Path) -> LockHashes:
-    """The pypi.org wheel hashes of the study's lock; empty when it has none."""
+def lock_hashes(study_root: Path, warn: Callable[[str], None] | None = None) -> LockHashes:
+    """The pypi.org wheel hashes of the study's lock; empty when it has none or it cannot be read."""
     lock = find_lock(study_root)
-    return {} if lock is None else pypi_hashes(lock)
+    return {} if lock is None else pypi_hashes(lock, warn)
 
 
 def token_exempt(wheels: Sequence[Wheel], hashes: LockHashes) -> dict[str, str]:
