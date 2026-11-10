@@ -10,8 +10,9 @@ very names the package hides (K03: a private list never enters the repository or
 
 - Only the files the list names are rewritten. Each must be prose or metadata (a suffix in `REWRITABLE_SUFFIXES`),
   outside the code the records were made with and outside out/. YAML (`.yml`, `.yaml`, `CITATION.cff`) is refused:
-  with no YAML parser its rewrite could not be checked, so the author leaves it out or ships an anonymised copy from
-  another path. JSON is rewritten lexically: each string token, key or value, is decoded, relabelled and re-encoded
+  with no YAML parser its rewrite could not be checked, so the author leaves it out or includes, instead of it, a
+  copy anonymised by hand under another name (`include` puts every file at its own path; it maps no file to another
+  path). JSON is rewritten lexically: each string token, key or value, is decoded, relabelled and re-encoded
   if it changed, so an escape such as `\\u0056` cannot hide a term from the rewrite, and every other byte, numbers
   with their exact spelling included, stays as it was; the result must still parse. TOML and plain text are
   rewritten as text, and a TOML file must still parse afterwards. Code, configuration, records and generated tables
@@ -123,7 +124,8 @@ def rewrite(
         if PurePosixPath(name).suffix.lower() in YAML_SUFFIXES:
             raise PackageError(
                 f"{where}, which is YAML: without a YAML parser its rewrite can be neither parsed nor read decoded, so "
-                "it is not rewritten. Leave it out of the package, or include an anonymised copy from another path"
+                "it is not rewritten. Leave it out of the package, or write an anonymised copy of it under another "
+                "name in the study, commit it, and include the copy instead of the original"
             )
         protected = name in code or name in CONFIG_FILES or name.startswith(out_prefix)
         if protected or PurePosixPath(name).suffix.lower() not in REWRITABLE_SUFFIXES:
