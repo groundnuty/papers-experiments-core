@@ -7,8 +7,10 @@ the file of the factory's module (the module of its class, for a callable instan
 - a file among the files the code identity covers (`[study] code`, the plugin file when it is listed there) is the
   study's own code: the identity covers it, and the version is taken as declared;
 - otherwise the installed distribution that owns the file decides: the one whose RECORD lists it, or, for an editable
-  install, the one whose checkout holds it (below a directory its `.pth` puts on the path, else its project). Not any
-  distribution that shares the module's top-level name: a namespace package can have several. The declared version
+  install, the one one of whose top-level packages holds it where it imports from (directly below a directory its
+  `.pth` puts on the path, else where its import hook loads it inside the project); a loose file below the project
+  that something else put on the path is not its code. Not any distribution that shares the module's top-level name
+  either: a namespace package can have several. The declared version
   must equal the owner's as a version (`packaging`: `1.0+Build_1` is `1.0+build.1`); a version that does not parse
   must equal it as written. The refusal names both;
 - a file nothing owns and the identity does not cover (a module found on the path, a module without a file) has
@@ -24,7 +26,7 @@ from packaging.version import InvalidVersion, Version
 
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import covered_files
-from expcore.provenance.environment import editable_roots, installed
+from expcore.provenance.environment import editable_roots, installed, pth_directories, top_level_location
 from expcore.study.config import StudyConfig
 from expcore.study.plugin import StudyPlugin, factory_name
 
@@ -53,10 +55,19 @@ def _editable(dist: metadata.Distribution) -> bool:
     return isinstance(info, dict) and info.get("editable") is True
 
 
-def _owns(dist: metadata.Distribution, file: Path) -> bool:
-    """Whether an installed distribution's code holds the file: listed in its RECORD, or in its editable checkout."""
+def _owns(dist: metadata.Distribution, file: Path, top: str) -> bool:
+    """Whether an installed distribution's code holds the file of a module under top-level name `top`: listed in its
+    RECORD, or, for an editable install, inside one of its top-level packages where it imports from (directly below a
+    directory its `.pth` puts on the path, else where an import hook loads it inside the project), never merely
+    somewhere below the project."""
     if _editable(dist):
-        return any(root.resolve() in file.parents for root in editable_roots(dist))
+        pth = pth_directories(dist)
+        if pth:
+            homes = [d / top for d in pth if (d / top).is_dir()]
+            return any(h.resolve() in file.parents for h in homes) or any(
+                (d / f"{top}.py").resolve() == file for d in pth
+            )
+        return any(d.resolve() in file.parents for d in top_level_location(top, editable_roots(dist))[0])
     site = Path(str(dist.locate_file(""))).resolve()
     try:
         relative = PurePosixPath(file.relative_to(site).as_posix())
@@ -82,7 +93,8 @@ def check_factory_version(plugin: StudyPlugin, study: StudyConfig) -> None:
     file = _module_file(module)
     if file is not None and _covered(study, file):
         return  # the study's own code: the code identity covers it
-    owners = [dist for dist in installed().values() if _owns(dist, file)] if file is not None else []
+    top = module.split(".", 1)[0]
+    owners = [dist for dist in installed().values() if _owns(dist, file, top)] if file is not None else []
     if not owners:
         raise ConfigError(
             f"{where} comes from module {module}, which no installed distribution owns and the study's code identity "

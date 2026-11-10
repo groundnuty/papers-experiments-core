@@ -1,5 +1,6 @@
 """A model backend of the study's own: named in models.toml, built by the plugin's factory, with no edit to the core."""
 
+import importlib.machinery
 import json
 import shutil
 import sys
@@ -301,6 +302,45 @@ def test_c06_a_factory_no_distribution_owns_must_lie_in_the_study_s_code(tmp_pat
     importable(loose, "loose_relay")
     study, plugin = study_using(tmp_path, "loose_relay")
     with pytest.raises(ConfigError, match=r"backend_factory loose_relay\.relay_factory comes from module loose_relay"):
+        fingerprint_of(study, plugin)
+
+
+class _KitHook:
+    """An editable install's import hook: loads toy_kit from the project's src directory."""
+
+    def __init__(self, src) -> None:
+        self.src = src
+
+    def find_spec(self, name, path=None, target=None):
+        return importlib.machinery.PathFinder.find_spec(name, [str(self.src)]) if name == "toy_kit" else None
+
+
+def test_c06_a_loose_module_in_an_editable_project_is_not_that_distribution_s_code(
+    tmp_path, importable, monkeypatch, clean_environment
+):
+    """C06: an editable distribution owns the modules of its importable top-level packages, found where they import
+    from, not every file below its project: a loose module of the project on a path added by hand is refused, while
+    a factory in the package the hook loads is held to the distribution's version."""
+    project = tmp_path / "project"
+    (project / "src" / "toy_kit").mkdir(parents=True)
+    (project / "build").mkdir()
+    code = KIT_CODE.replace('version = "1.3.0"', 'version = "1.0.0"')
+    (project / "src" / "toy_kit" / "__init__.py").write_text(code, encoding="utf-8")
+    (project / "build" / "loose_relay.py").write_text(code, encoding="utf-8")
+    site = tmp_path / "site"
+    editable = json.dumps({"url": project.as_uri(), "dir_info": {"editable": True}})
+    hook = {"__editable__.toy_kit-1.0.0.pth": b"import _toy_kit_finder; _toy_kit_finder.install()\n"}
+    installed_distribution(site, "toy-kit", "1.0.0", hook, direct_url=editable)
+    monkeypatch.setattr(sys, "meta_path", [_KitHook(project / "src"), *sys.meta_path])
+    importable(site)
+    importable(project / "build", "loose_relay", "toy_kit")
+    study, plugin = study_using(tmp_path / "loose", "loose_relay")
+    with pytest.raises(ConfigError, match=r"comes from module loose_relay, which no installed distribution owns"):
+        fingerprint_of(study, plugin)
+    study, plugin = study_using(tmp_path / "packaged", "toy_kit")
+    assert fingerprint_of(study, plugin)["backend_factory"] == {"name": "toy_kit.relay_factory", "version": "1.0.0"}
+    plugin.backend_factory.version = "1.1.0"
+    with pytest.raises(ConfigError, match=r"declares version '1\.1\.0', but its module belongs to toy-kit 1\.0\.0"):
         fingerprint_of(study, plugin)
 
 
