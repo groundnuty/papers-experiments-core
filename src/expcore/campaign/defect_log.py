@@ -100,6 +100,10 @@ class DefectLog:
     The redactor starts as the one the attempt runner can build (the backend's model and the model table);
     `record_attempt` replaces it with the attempt's whole redaction context (`redact_with`), so an entry written after
     that, for a crash the loop caught or one that escaped the executor, is redacted with every secret the record is.
+
+    Writing an entry never raises, since it happens inside the loop and before the result is stored: a log that cannot
+    be written must not cost the record or the marker. The first failure is kept, and the attempt raises it with
+    `raise_failure` once the result is stored, which stops dispatch loudly (C17).
     """
 
     def __init__(
@@ -107,19 +111,39 @@ class DefectLog:
     ):
         self.root, self.run_key, self.attempt, self._stamp = Path(root), run_key, attempt, stamp
         self._redactor = redactor
+        self.failure: Exception | None = None  # the first entry that could not be written, if any
 
     def redact_with(self, redactor: Callable[[], Redactor]) -> None:
         """Use this redactor for the attempt's entries from now on."""
         self._redactor = redactor
 
-    def __call__(self, error: BaseException, defect: HarnessDefect) -> Path:
-        """Write the redacted traceback of a harness defect of this attempt; return the log's path."""
-        return write_defect(
-            self.root,
-            error,
-            defect,
-            stamp=self._stamp(),
-            run_key=self.run_key,
-            attempt=self.attempt,
-            redactor=self._redactor,
-        )
+    def __call__(self, error: BaseException, defect: HarnessDefect) -> Path | None:
+        """Write the redacted traceback of a harness defect of this attempt; return the log's path, or None when the
+        entry could not be written (the failure is kept for `raise_failure`)."""
+        try:
+            return write_defect(
+                self.root,
+                error,
+                defect,
+                stamp=self._stamp(),
+                run_key=self.run_key,
+                attempt=self.attempt,
+                redactor=self._redactor,
+            )
+        except Exception as failure:  # kept, and raised by the attempt once its result is stored
+            if self.failure is None:
+                self.failure = failure
+            return None
+
+    def raise_failure(self) -> None:
+        """Raise LogUnwritable, naming the log and why, when an entry of this attempt could not be written."""
+        if self.failure is not None:
+            why = f"{type(self.failure).__name__}: {self.failure}"
+            raise LogUnwritable(
+                f"the harness-error log {log_path(self.root)} could not be written ({why}); the attempt's result is "
+                "stored, and dispatch stops until the log can be written"
+            ) from self.failure
+
+
+class LogUnwritable(RuntimeError):
+    """The harness-error log could not be written; raised once the attempt's result is stored."""

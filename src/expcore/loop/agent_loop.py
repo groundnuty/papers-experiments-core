@@ -70,7 +70,8 @@ async def run_agent(
     cleanup took (`cleanup_s`) and whether it was given up on (`cleanup_timed_out`).
 
     `on_defect` is called with every crash in our own code the loop turns into a harness defect, and the defect the
-    outcome carries, so the caller can keep the traceback the outcome leaves out (the campaign's `defect_log`).
+    outcome carries, so the caller can keep the traceback the outcome leaves out (the campaign's `defect_log`). It must
+    not raise: the result, and the record built from it, come after it.
     """
     if toolbox.cap_chars != config.limits.output_cap_chars:
         raise ValueError(

@@ -9,7 +9,7 @@ import pytest
 from campaign_support import make_schema
 from loop_support import FakeProvider
 from record_support import CODE
-from scheduler_support import FakeExecutor, build, key_of
+from scheduler_support import FakeExecutor, attempts_of, build, key_of
 
 from expcore.campaign.defect_log import HARNESS_LOG, log_path, write_defect
 from expcore.campaign.executor import record_run
@@ -228,3 +228,27 @@ def test_r12_a_two_line_secret_in_an_exception_group_is_redacted_from_the_log(tm
     assert "| ValueError: refused [redacted]" in log
     assert "amber-line-one" not in log
     assert "cobalt-line-two" not in log
+
+
+def test_c17_an_unwritable_log_never_costs_the_record_and_stops_dispatch_naming_it(tmp_path):
+    """C17: the log cannot be written (its directory's place is taken by a file); the attempt still ends as a harness
+    defect with its record and marker kept and stored, and only then does dispatch stop loudly, naming the log."""
+    (tmp_path / "logs").write_text("a file where the log's directory goes\n", encoding="utf-8")
+    crashed = key_of(SCHEMA, "mount-read")
+    executor = FakeExecutor()
+
+    async def lookup(request):
+        request.backend.use([LookupError("no route")])
+        record = await record_run(request, [FakeProvider({})], "be brief", "do it", executor.config, code=dict(CODE))
+        executor.records.append(record)
+        return record
+
+    executor.behaviours[crashed] = collections.deque([lookup])
+    with build(tmp_path, executor=executor, plan=SMALL) as scheduler:
+        with pytest.raises(RuntimeError, match=r"the harness-error log .*harness-errors\.log could not be written"):
+            scheduler.run()
+        assert attempts_of(scheduler.store, crashed) == [("harness_error", 0, 1)]
+    [record] = [r for r in executor.records if r.run_key == crashed]
+    assert record.outcome["defect"]["exception"] == "LookupError"
+    markers = [json.loads(p.read_text(encoding="utf-8")) for p in (tmp_path / "runs").rglob("*marker.json")]
+    assert [m["result"]["outcome"]["name"] for m in markers if m["run_key"] == crashed] == ["harness_defect"]

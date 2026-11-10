@@ -251,6 +251,7 @@ class AttemptRunner:
             self._bookkeeping(model, endpoint, key, result, kinds, moved)
 
         status = self._finish(begun, run_dir, key, result, bookkeeping)
+        defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
         return p.settings.retry_delay_s if status == "pending" else 0.0
 
     def _judge(self, result: AttemptResult, record: Any, model: str, key: str) -> tuple[AttemptResult, bool]:

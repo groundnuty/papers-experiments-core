@@ -385,7 +385,9 @@ def build_record(result: LoopResult, recording: RecordingBackend, **options: Any
 
 class DefectSink(Protocol):
     """Where the traceback of a harness defect goes (the campaign's `defect_log.DefectLog`). `record_attempt` hands it
-    the attempt's whole redaction context first, and calls it with each crash the loop turns into a defect."""
+    the attempt's whole redaction context first, and calls it with each crash the loop turns into a defect. Calling it
+    must not raise, since the loop calls it before the record exists: a sink keeps its own failure and reports it
+    once the result is stored."""
 
     def redact_with(self, redactor: Callable[[], Redactor]) -> None:
         """Use this redactor, built when an entry is written, for the attempt's entries from now on."""
