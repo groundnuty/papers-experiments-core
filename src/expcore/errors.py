@@ -186,11 +186,12 @@ def register_infra_kind(kind: str, description: str, *, treatable: bool = True) 
             held = "not treatable" if kind in _platform_untreatable else "treatable"
             raise ValueError(f"infrastructure kind {kind!r} is already registered as {held}")
         if kind not in _platform_kinds:
-            _platform_kinds[kind] = description
+            # whether it is treatable is written first, so a reader without the lock never sees the kind without it
             if treatable:
                 _platform_untreatable.pop(kind, None)
             else:
                 _platform_untreatable[kind] = description
+            _platform_kinds[kind] = description
 
 
 def infra_kinds() -> tuple[str, ...]:

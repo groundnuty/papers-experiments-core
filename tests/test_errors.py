@@ -299,3 +299,20 @@ def test_c02_a_fork_waits_for_a_change_to_the_kinds_under_way_and_the_child_star
     holder.join(5)
     assert os.waitstatus_to_exitcode(status) == 0
     assert waited >= 0.25  # the fork waited for the change to finish
+
+
+def test_c02_a_kind_becomes_known_only_once_whether_it_is_treatable_is_already_written(monkeypatch):
+    """C02: readers take no lock, so a platform's kind must never be visible before its treatability: an untreatable
+    kind seen half-registered would read as treatable and could be scored as a treatment."""
+    seen: list[bool] = []
+
+    class Watched(dict):
+        def __setitem__(self, kind, description):
+            seen.append(kind in errors._platform_untreatable)
+            super().__setitem__(kind, description)
+
+    monkeypatch.setattr(errors, "_platform_kinds", Watched(errors._platform_kinds))
+    monkeypatch.setattr(errors, "_platform_untreatable", dict(errors._platform_untreatable))
+    errors.register_infra_kind("ordering_probe_kind", "a kind registered by this test", treatable=False)
+    assert seen == [True]
+    assert errors.is_treatable("ordering_probe_kind") is False
