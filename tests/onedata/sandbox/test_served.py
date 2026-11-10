@@ -73,9 +73,13 @@ def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
             "request_in_flight_at_stop",
         ),
         ([*log(*ANSWERS), '{"method": "GET", "tag": "content", "body_by'], STOPPED, "gate_log_malformed"),
-        (log(*ANSWERS, {"method": "GET", "tag": "attrs", "status": 200}), STOPPED, "gate_log_malformed"),
-        (log(*ANSWERS, {"method": "GET", "status": 200, "body_bytes": 5}), STOPPED, "gate_log_malformed"),
-        (log(*ANSWERS, {"method": "GET", "body": "content", "body_bytes": -1}), STOPPED, "gate_log_malformed"),
+        (log(*UNMARKED, {"method": "GET", "tag": "attrs", "status": 200}, ANSWERS[-1]), STOPPED, "gate_log_malformed"),
+        (log(*UNMARKED, {"method": "GET", "status": 200, "body_bytes": 5}, ANSWERS[-1]), STOPPED, "gate_log_malformed"),
+        (
+            log(*UNMARKED, {"method": "GET", "body": "content", "body_bytes": -1}, ANSWERS[-1]),
+            STOPPED,
+            "gate_log_malformed",
+        ),
         (log(*ANSWERS, ["not", "an", "object"]), STOPPED, "gate_log_malformed"),
         (log(*UNMARKED), {**STOPPED, "exit_code": 137}, "gate_teardown_unconfirmed"),
         (log(*UNMARKED), STOPPED, "gate_teardown_unconfirmed"),
@@ -295,3 +299,31 @@ def test_o20_a_request_counts_as_logged_only_once_its_line_is_written(monkeypatc
     handler._log({"event": "request", "conn_request": 5})
     assert seen == [4]  # at the moment the line was written, request 5 was still outstanding
     assert handler._last_logged == 5
+
+
+def test_o20_a_request_that_starts_once_the_stop_began_answers_nothing(monkeypatch):
+    """O20: a request read before the stop but counted after the teardown read its connection would be answered and
+    logged after `teardown_complete`; once the stop has begun, a request that starts is closed unanswered instead."""
+    from types import SimpleNamespace
+
+    from expcore_onedata.sandbox import gate
+
+    stopping = gate.threading.Event()
+    handler = object.__new__(gate.Handler)
+    handler.connection = SimpleNamespace(settimeout=lambda s: None)
+    handler.server = SimpleNamespace(stopping=stopping)
+    handler._served, handler.close_connection = 0, False
+    stopping.set()
+    handler._handle()  # with the stop begun, it returns before reading the request's host or writing anything
+    assert handler.close_connection is True
+    sent: list[int] = []
+    monkeypatch.setattr(gate.BaseHTTPRequestHandler, "send_error", lambda self, code, *a: sent.append(code))
+    handler.send_error(501)  # the parser's own answer is held to the same rule
+    assert sent == []
+
+
+def test_o20_a_request_line_after_the_teardown_mark_leaves_the_count_unknown():
+    """O20: a line the mark did not cover means the mark proves nothing, so the count is unknown, never a total."""
+    after = {"event": "request", "method": "GET", "body": "content", "body_bytes": 5, "conn": "1-2"}
+    lines = log(*ANSWERS, after)  # ANSWERS ends with the teardown mark
+    assert gatelog.served(lines, STOPPED)["unknown"] == [gatelog.GATE_TEARDOWN_UNCONFIRMED]

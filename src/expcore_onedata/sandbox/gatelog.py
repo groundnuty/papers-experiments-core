@@ -201,6 +201,8 @@ def served(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str,
             continue
         if record.get("event") == "conn_close" and record.get("in_request") is True:
             reasons.add(REQUEST_IN_FLIGHT)  # its answer may have begun, and has no line
+        if confirmed and "method" in record:  # a request's line after the mark: the mark did not cover it
+            reasons.add(GATE_TEARDOWN_UNCONFIRMED)
         confirmed = confirmed or record.get("event") == TEARDOWN_COMPLETE
         if "body_bytes" not in record:
             if "method" in record:  # a request's line always has its answer's body bytes

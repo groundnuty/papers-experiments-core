@@ -636,10 +636,26 @@ class Handler(BaseHTTPRequestHandler):
         if "conn_request" in rec:
             self._last_logged = rec["conn_request"]
 
+    def _begin_request(self) -> bool:
+        """Count a request this connection is about to answer, before anything is written; False, with the connection
+        to close unanswered, once the server's stop has begun. The stop sets its flag before it reads the connections,
+        so a request is either counted in time for the teardown to see it outstanding, or answered with nothing at all:
+        no answer can go out unseen between the teardown's reading and its `teardown_complete` line (O20)."""
+        self._served += 1
+        stopping = getattr(self.server, "stopping", None)
+        if stopping is not None and stopping.is_set():
+            self.close_connection = True
+            return False
+        return True
+
     def send_error(self, code, message=None, explain=None) -> None:
         """Errors the request parser answers before `_handle` runs (a malformed request line or version, an unknown
-        method, an oversized line): logged like every other request, as the client's own. `_handle` never calls this."""
+        method, an oversized line): logged like every other request, as the client's own. `_handle` never calls this.
+        Counted as a request like any other, so a stop that comes while it is answered sees it outstanding."""
+        if not self._begin_request():
+            return
         rec = {
+            "conn_request": self._served,
             "event": "request_error",
             "status": code,
             "reason": message or "",
@@ -756,7 +772,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         self.connection.settimeout(BODY_TIMEOUT_S)  # the head has arrived; the body gets a bounded time
-        self._served += 1
+        if not self._begin_request():
+            return
         self._response_started = False
         host = (self.headers.get("Host") or "").split(":")[0].lower()
         hcfg = CFG["hosts"].get(host)
@@ -1207,7 +1224,13 @@ class GateServer(ThreadingHTTPServer):
     request_queue_size = 256
     daemon_threads = True
 
+    def __init__(self, *args, **kwargs) -> None:
+        # Set when this server's stop begins, before its teardown reads the connections (`Handler._begin_request`).
+        self.stopping = threading.Event()
+        super().__init__(*args, **kwargs)
+
     def server_close(self) -> None:
+        self.stopping.set()  # first: a request counted after this is closed unanswered, one counted before is seen
         try:
             teardown()
         finally:
