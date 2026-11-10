@@ -216,7 +216,7 @@ tools = "basic"
 infrastructure_is_treatment = ["knowledge"]
 ```
 
-Two rules bound this. A failure before the model's first turn is never treatment, whatever the condition declares: nothing the agent did can have met the manipulation, so the attempt is set aside and run again. And a kind may be non-treatable: `tool_plane_integrity` (the tool server's rights or token could not be verified) can never be a treatment, nor can a kind a platform registers with `treatable=False`, and loading a study whose condition declares one is refused, naming the file and the key. The scheduler also refuses a campaign in which a condition declares the kind its health check or its endpoint-identity check reports.
+Two rules bound this. A failure before the model's first turn is never treatment, whatever the condition declares: nothing the agent did can have met the manipulation, so the attempt is set aside and run again. And a kind may be non-treatable: `tool_plane_integrity` (the tool server's rights or token could not be verified) and `budget_hold` (the budget stopped the run, [section 2](#prices-and-the-budget)) can never be a treatment, nor can a kind a platform registers with `treatable=False`, and loading a study whose condition declares one is refused, naming the file and the key. The scheduler also refuses a campaign in which a condition declares the kind its health check or its endpoint-identity check reports.
 
 ```python
 import shutil
