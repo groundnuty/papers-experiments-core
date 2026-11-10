@@ -129,6 +129,18 @@ def test_a_module_that_fails_on_import_is_refused_naming_the_file_and_the_error(
         load_plugin(context(study_dir))
 
 
+def test_r12_the_import_failure_of_a_plugin_shows_its_text_with_every_secret_redacted(study_dir, monkeypatch):
+    """R12: the exception's text helps the author, but a client that failed to start can carry a credential in it."""
+    monkeypatch.setenv("TOYLAB_ACCESS_TOKEN", "amber-falcon-6620")
+    (study_dir / "plugin.py").write_text(
+        "import os\nraise RuntimeError('login refused for ' + os.environ['TOYLAB_ACCESS_TOKEN'])\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    assert "failed on import (RuntimeError: login refused for [redacted])" in str(caught.value)
+    assert "amber-falcon-6620" not in str(caught.value)
+
+
 STUB_PLUGIN = """\
 from expcore.study.plugin import StudyPlugin
 

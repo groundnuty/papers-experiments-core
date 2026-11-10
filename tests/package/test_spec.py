@@ -2,6 +2,8 @@
 
 import pytest
 
+from expcore.campaign.defect_log import write_defect
+from expcore.loop.outcomes import harness_defect_of
 from expcore.package.spec import PackageError, load_spec, pattern_regex, select
 
 
@@ -55,6 +57,29 @@ def test_a_directory_takes_every_file_below_it_but_never_caches_or_the_live_camp
         "out/runs/aa/try1/aa.1.json",
         "out/runs/replay-check.json",
     ]
+
+
+def test_l08_the_harness_defect_log_is_never_selected_whatever_the_patterns_say(tree):
+    """L08: the redacted tracebacks stay on the author's machine: "out", "out/logs" or "**/*.log" never take them."""
+    try:
+        raise ValueError("a crash")
+    except ValueError as error:
+        defect = harness_defect_of(error)
+        log = write_defect(tree / "out", error, defect, stamp="T", run_key="k", attempt=1, redactor=Plain)
+    assert log.is_file()
+    assert (log.parent / ".gitignore").is_file()
+    for pattern in ("out", "out/**"):
+        assert not [path for path in select(tree, spec_with(tree, [pattern])) if path.startswith("out/logs")]
+    for pattern in ("out/logs", "**/*.log", "out/logs/.gitignore"):  # a pattern that names only the logs names nothing
+        with pytest.raises(PackageError, match="selects no file"):
+            select(tree, spec_with(tree, ["study.toml", pattern]))
+
+
+class Plain:
+    """A redactor that changes nothing."""
+
+    def text(self, value):
+        return value
 
 
 @pytest.mark.parametrize(

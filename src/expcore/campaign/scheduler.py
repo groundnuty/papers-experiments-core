@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.attempt import AttemptRunner, Parts
+from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.gate import BudgetGate
@@ -74,11 +75,13 @@ def iso(moment: dt.datetime) -> str:
 
 @dataclass(frozen=True)
 class RunSummary:
-    """How a call to `run` ended: runs dispatched, the holds still in force, and the runs by status."""
+    """How a call to `run` ended: attempts dispatched, the holds still in force, the runs by status, and the local log
+    of harness defects' tracebacks when there is one (`defect_log`)."""
 
     dispatched: int
     holds: Mapping[str, Hold] = field(default_factory=dict)
     statuses: Mapping[str, int] = field(default_factory=dict)
+    harness_log: Path | None = None
 
 
 class Scheduler:
@@ -505,7 +508,8 @@ class Scheduler:
         if self._fatal is not None:
             raise RuntimeError(f"campaign stopped by an unexpected error: {self._fatal!r}") from self._fatal
         statuses = {r["status"]: r["n"] for r in store.q("SELECT status, COUNT(*) AS n FROM runs GROUP BY status")}
-        return RunSummary(dispatched, self.holds.current(), statuses)
+        log = log_path(self.root)
+        return RunSummary(dispatched, self.holds.current(), statuses, log if log.is_file() else None)
 
     def _wake(self) -> None:
         with self._cv:

@@ -106,6 +106,9 @@ def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None
     pending = summary.statuses.get("pending", 0)
     for subject, hold in sorted(summary.holds.items()):
         print(f"hold on {subject}: {hold.reason}")
+    stopped = any(hold.kind == "harness_errors" for hold in summary.holds.values())
+    if stopped and summary.harness_log is not None:
+        print(f"dispatch stopped on harness errors; their tracebacks, redacted, are in {summary.harness_log}")
     if pending:
         print(f"{pending} runs are still pending; see the holds above", file=sys.stderr)
         return EXIT_PENDING

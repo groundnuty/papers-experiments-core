@@ -1,0 +1,113 @@
+"""The local log of harness defects: the redacted traceback that no record, marker or store holds (L08)."""
+
+import json
+import shutil
+import subprocess
+
+import pytest
+from campaign_support import make_schema
+from scheduler_support import FakeExecutor, build, key_of
+
+from expcore.campaign.defect_log import HARNESS_LOG, log_path, write_defect
+from expcore.config.loading import ConfigError
+from expcore.loop.outcomes import harness_defect_of
+
+SCHEMA = make_schema()
+SMALL = {"tasks": ("task-a",), "seeds": (1,)}
+SECRET = "pebble-quartz-7781-secret"
+
+
+def crashing_with(text):
+    async def crash(request):
+        raise TypeError(text)
+
+    return crash
+
+
+def test_l08_a_harness_defect_leaves_its_redacted_traceback_in_the_local_log_and_nowhere_else(tmp_path, monkeypatch):
+    """L08: the attempt keeps the class and the stack hash; the traceback, with its message redacted, is in the log."""
+    monkeypatch.setenv("TOYLAB_API_KEY", SECRET)
+    crashed = key_of(SCHEMA, "mount-read")
+    executor = FakeExecutor({crashed: [crashing_with(f"the parser choked on key {SECRET}")]})
+    with build(tmp_path / "out", executor=executor, plan=SMALL) as scheduler:
+        summary = scheduler.run()
+    assert summary.statuses == {"done": 2, "harness_error": 1}
+    assert summary.harness_log == tmp_path / "out" / HARNESS_LOG
+    log = summary.harness_log.read_text(encoding="utf-8")
+    markers = [json.loads(p.read_text(encoding="utf-8")) for p in (tmp_path / "out" / "runs").rglob("*marker.json")]
+    [defect] = [m["result"]["outcome"]["defect"] for m in markers if m["result"]["outcome"].get("defect")]
+    assert f"{crashed} attempt 1: TypeError, stack {defect['stack_sha256']}" in log  # found from the marker
+    assert "Traceback (most recent call last)" in log
+    assert "the parser choked on key [redacted]" in log
+    assert "crash" in log  # the frame that raised, which the stack hash names without its line
+    for path in tmp_path.rglob("*"):  # neither the log, nor a record, a marker or the store holds the secret
+        assert not path.is_file() or SECRET.encode() not in path.read_bytes(), path
+    store = (tmp_path / "out" / "state.sqlite").read_bytes()
+    assert b"the parser choked" not in store
+    assert not list((tmp_path / "out" / "runs").rglob("*.log"))
+
+
+def test_l08_a_campaign_with_no_harness_defect_has_no_log(tmp_path):
+    """L08: the log is written only when there is something to diagnose, so its path is printed only then."""
+    with build(tmp_path, plan=SMALL) as scheduler:
+        summary = scheduler.run()
+    assert summary.harness_log is None
+    assert not log_path(tmp_path).exists()
+
+
+def defect_of(text):
+    try:
+        raise ValueError(text)
+    except ValueError as error:
+        return error, harness_defect_of(error)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_l08_the_log_is_ignored_by_git_whatever_the_studys_own_gitignore_says(tmp_path):
+    """L08: the log's directory ignores everything in it, so a study that does not ignore out/ never commits it."""
+    error, defect = defect_of("boom")
+    path = write_defect(tmp_path / "out", error, defect, stamp="T", run_key="k", attempt=1, redactor=_Plain)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    ignored = subprocess.run(["git", "-C", str(tmp_path), "check-ignore", "-q", str(path)], check=False)
+    assert ignored.returncode == 0
+    status = subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--porcelain", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+
+def test_l08_a_traceback_that_cannot_be_redacted_is_withheld_with_the_reason(tmp_path):
+    """L08: a secret too short to redact refuses the redactor; the entry then says why and holds no traceback."""
+
+    def refused():
+        raise ConfigError("environment variable SHORT_TOKEN holds a secret of fewer than 4 characters")
+
+    error, defect = defect_of("carries abc")
+    write_defect(tmp_path, error, defect, stamp="T", run_key="k", attempt=2, redactor=refused)
+    log = log_path(tmp_path).read_text(encoding="utf-8")
+    assert "k attempt 2: ValueError" in log
+    assert "withheld" in log
+    assert "SHORT_TOKEN" in log
+    assert "carries abc" not in log
+    assert "Traceback" not in log
+
+
+def test_l08_entries_are_appended_one_per_defect(tmp_path):
+    """L08: a second defect adds an entry and keeps the first."""
+    for attempt in (1, 2):
+        error, defect = defect_of(f"crash {attempt}")
+        write_defect(tmp_path, error, defect, stamp="T", run_key="k", attempt=attempt, redactor=_Plain)
+    log = log_path(tmp_path).read_text(encoding="utf-8")
+    assert log.count("=== T k attempt") == 2
+    assert "crash 1" in log
+    assert "crash 2" in log
+
+
+class _Plain:
+    """A redactor that changes nothing."""
+
+    def text(self, value):
+        return value

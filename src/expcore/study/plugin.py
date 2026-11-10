@@ -26,6 +26,7 @@ from expcore.campaign.lease import ResourceProbe
 from expcore.config.loading import ConfigError, Section
 from expcore.config.models import BACKENDS
 from expcore.plugin import ToolSpec
+from expcore.records.redact import Redactor
 from expcore.records.rescore import Scorer, scorer_name, scorer_version
 from expcore.study.config import StudyConfig
 
@@ -121,7 +122,8 @@ def import_plugin_module(file: Path, *, error_text: bool = True) -> ModuleType:
     `build` is not called, so no model or key is read. What the module registers when imported, the native parser of a
     backend of the study's own, is then there for a step that needs nothing else of the plugin: the replay check. That
     step passes `error_text=False`, so a refusal names the file and the exception's type and never its text, which can
-    hold a credential.
+    hold a credential. Otherwise the text is shown redacted as a record is, by the secrets of the environment and the
+    registered ones, and withheld when they cannot be redacted.
     """
     module_name = f"{PLUGIN_MODULE_PREFIX}{hashlib.sha256(str(file).encode()).hexdigest()[:12]}"
     spec = importlib.util.spec_from_file_location(module_name, file)
@@ -135,8 +137,16 @@ def import_plugin_module(file: Path, *, error_text: bool = True) -> ModuleType:
         del sys.modules[module_name]
         if not error_text:
             raise ConfigError(f"{file}: failed on import ({type(error).__name__})") from None
-        raise ConfigError(f"{file}: failed on import ({type(error).__name__}: {error})") from error
+        raise ConfigError(f"{file}: failed on import ({type(error).__name__}: {_redacted(error)})") from error
     return module
+
+
+def _redacted(error: BaseException) -> str:
+    """The text of an exception with every secret redacted; a note in its place when the secrets cannot be."""
+    try:
+        return Redactor.from_environment().text(str(error))
+    except ConfigError:
+        return "its text is withheld, since a secret in the environment is too short to redact"
 
 
 def load_plugin(context: StudyContext) -> StudyPlugin:

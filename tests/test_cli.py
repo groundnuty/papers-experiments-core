@@ -1,11 +1,14 @@
 """The command line: usage, and the refusals that exit non-zero with a message saying why (the full run: e2e)."""
 
+import dataclasses
 import shutil
 from pathlib import Path
 
 import pytest
 from record_support import no_secrets_in_the_environment
 
+from expcore.campaign.holds import Hold
+from expcore.campaign.scheduler import RunSummary
 from expcore.cli import EXIT_PENDING, main
 from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
@@ -75,3 +78,16 @@ def test_a_resume_under_a_changed_configuration_is_refused_by_the_command(study,
     write_stamp(study, "a" * 40, load_study(study).scope)  # the stamp follows the edited files; the campaign does not
     assert main(["run", str(study)]) == 1
     assert "refused:" in capsys.readouterr().err
+
+
+def test_l08_a_run_stopped_on_harness_errors_prints_where_their_tracebacks_are(tmp_path, monkeypatch, capsys):
+    """L08: the attempt keeps a class and a stack hash; the command says which local file holds the tracebacks."""
+    log = tmp_path / "out" / "logs" / "harness-errors.log"
+    stop = Hold("harness_errors", "dispatch of every model is stopped by harness errors")
+    summary = RunSummary(3, {"all": stop}, {"harness_error": 3, "pending": 1}, log)
+    monkeypatch.setattr("expcore.cli.run_study", lambda *args, **kwargs: summary)
+    assert main(["run", str(tmp_path)]) == EXIT_PENDING
+    assert f"their tracebacks, redacted, are in {log}" in capsys.readouterr().out
+    monkeypatch.setattr("expcore.cli.run_study", lambda *args, **kwargs: dataclasses.replace(summary, holds={}))
+    assert main(["run", str(tmp_path)]) == EXIT_PENDING  # held by something else: no word of the log
+    assert "tracebacks" not in capsys.readouterr().out
