@@ -405,6 +405,26 @@ def test_s12_an_exploratory_only_preregistration_runs_through_analyze_and_report
     assert all(line.endswith("(exploratory)") for line in summary)
 
 
+def test_c25_a_budgeted_study_without_context_windows_still_analyses_reports_and_regenerates_but_does_not_run(
+    resumed, tmp_path, clean_environment
+):
+    """C25: the context window bounds what a run is reserved, so only starting or resuming a run needs it: a finished
+    study whose models declare none (one made before the rule) is checked, analysed, reported and regenerated as a
+    replication package's check does, and `run` refuses it, naming models.toml and the models."""
+    copy = copy_campaign(resumed, tmp_path, "no-windows")
+    models = copy.root / "models.toml"
+    models.write_text(models.read_text(encoding="utf-8").replace("context_tokens = 8192\n", ""), encoding="utf-8")
+    assert "context_tokens" not in models.read_text(encoding="utf-8")
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
+    assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)
+    assert regenerate(copy.root, stamped=True) == []
+    code, errors = cli(clean_environment, "run", str(copy.root))
+    assert code != 0
+    assert "models.toml" in errors
+    assert "no context window for model(s) 'alpha-stub', 'beta-stub'" in errors
+
+
 def test_c23_an_exhausted_run_is_counted_under_its_condition_and_as_the_cause_of_the_pairs_it_costs(
     tmp_path, clean_environment
 ):

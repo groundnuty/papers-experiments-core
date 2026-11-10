@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+import sqlite3
 
 import pytest
 from campaign_support import finished, planned_store, run_one
@@ -11,6 +12,7 @@ from record_support import make_config, no_secrets_in_the_environment, record_ru
 from expcore.campaign.attempt_bounds import attempt_costs, bound_usd
 from expcore.campaign.executor import result_from_record
 from expcore.campaign.markers import MARKER_NAME, read_marker, write_marker
+from expcore.campaign.snapshot import StoreSnapshot
 from expcore.config.models import ModelSpec
 from expcore.config.prices import Price, PriceTier, TieredPrice
 from expcore.models.adapters import ModelTurn, ToolCall
@@ -98,6 +100,25 @@ def test_c24_a_tiered_attempt_with_a_turn_whose_usage_is_unknown_is_charged_its_
     result = dataclasses.replace(result, turn_usage=((150_000, 2_000, None, None), (None, 3_000, 0, 0)))
     cost = charged(tmp_path, result, TIERED)
     assert (cost.usd, cost.bounded) == (bound_usd(spec(TIERED), LIMITS), True)
+
+
+def test_c24_a_snapshot_of_a_store_older_than_the_per_turn_usage_still_gives_flat_costs(tmp_path):
+    """C24 and C21: a read-only snapshot of a store made before `turn_usage` existed cannot be migrated, so the cost
+    measure reads it without that column: a flat price is charged its totals, and a tiered one its bound."""
+    store, schema, manifest = planned_store(tmp_path)
+    run_one(store, manifest.rows[0].key.text, finished(input_tokens=400_000, output_tokens=5_000))
+    store.close()
+    old = sqlite3.connect(tmp_path / "campaign.db")
+    old.execute("ALTER TABLE attempts DROP COLUMN turn_usage")
+    old.commit()
+    old.execute("PRAGMA journal_mode = DELETE")  # a snapshot's bytes are a plain database, as `snapshot` writes one
+    snapshot = StoreSnapshot(old.serialize(), schema)
+    old.close()
+    assert "turn_usage" not in [row["name"] for row in snapshot.q("PRAGMA table_info(attempts)")]
+    [flat] = attempt_costs(snapshot, {"m1": spec(FLAT)}, LIMITS)
+    assert (flat.usd, flat.bounded) == (FLAT.usd(400_000, 5_000), False)
+    [tiered] = attempt_costs(snapshot, {"m1": spec(TIERED)}, LIMITS)
+    assert (tiered.usd, tiered.bounded) == (bound_usd(spec(TIERED), LIMITS), True)
 
 
 def test_c24_the_marker_keeps_the_per_turn_usage_and_an_older_marker_without_it_still_reads(tmp_path):

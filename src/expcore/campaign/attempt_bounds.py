@@ -26,12 +26,15 @@ starts or has in flight.
   dearest rate.
 - The stub's counts ignore R and a study's own backend may not send it, so for those the requests within the cap are
   bounded by the whole cap at the dearest rate, as before C25.
-- The request past the cap adds at most `W x p_in + R x p_out`, which needs the model's `context_tokens`: a campaign
-  with a budget refuses a priced model without one (`ModelTable.require_context_window`).
+- The request past the cap adds at most `W x p_in + R x p_out` for the two backends that send R, and `W x max(p_in,
+  p_out)` for any other, whose prompt and reply together only the window holds. Both need the model's
+  `context_tokens`: a run with a budget does not start or resume with a priced model without one
+  (`ModelTable.require_context_window`).
 
-The bound holds while the endpoint honours the `max_tokens` it is sent and refuses a prompt beyond its window; the core
-does not check a reply's count against R. A free model's bound is 0. A model whose cost is unknown (no price, not
-free) has no cost at all: `None`, never 0, and the budget gate holds it (C12).
+The bound holds while the endpoint honours the `max_tokens` it is sent and refuses a request beyond its window; the
+core does not check a reply's count against R. A stub's scripted usage beyond the model's context window, or a backend
+of the study's own whose request outgrows it, is outside that guarantee. A free model's bound is 0. A model whose cost
+is unknown (no price, not free) has no cost at all: `None`, never 0, and the budget gate holds it (C12).
 
 A measured attempt of a model with a flat price costs its totals at that price. One of a model with a tiered price
 costs each of its requests at the tier its prompt fell in, from the per-turn usage the store keeps (C24); an attempt
@@ -43,6 +46,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from expcore.campaign.export import RunState
 from expcore.campaign.store import Store, column_for
 from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import TOKENS_PER_PRICE_UNIT, TieredPrice
@@ -104,13 +108,16 @@ def _within_cap(spec: ModelSpec, limits: Limits) -> float:
 
 def _past_cap(spec: ModelSpec, limits: Limits) -> float:
     """The most the request a run sends below its cap and ends past it can cost, in tokens times dollars per million:
-    a prompt within the context window and a reply within its maximum."""
+    for a backend that sends the reply maximum, a prompt within the context window and a reply within that maximum;
+    for any other, prompt and reply together within the window, at the dearer rate."""
     input_rate, output_rate = _rates(spec, limits)
     if spec.context_tokens is None:
         raise ValueError(
             f"model {spec.key!r} has no context_tokens, so nothing bounds the request a run can make past its token "
             "cap; give it the endpoint's context window in models.toml"
         )
+    if spec.backend not in REPLY_CAPPED_BACKENDS:  # nothing caps the reply: only the window holds the request
+        return spec.context_tokens * max(input_rate, output_rate)
     return spec.context_tokens * input_rate + spec.output_tokens(limits.max_output_tokens) * output_rate
 
 
@@ -175,16 +182,19 @@ def _requests(stored: str | None) -> list[tuple[int, int, int, int]] | None:
     return requests
 
 
-def attempt_costs(store: Store, models: Mapping[str, ModelSpec], limits: Limits) -> list[AttemptCost]:
+def attempt_costs(store: RunState, models: Mapping[str, ModelSpec], limits: Limits) -> list[AttemptCost]:
     """Return the cost of every attempt that spent tokens, in attempt order, each charged as the module docstring says.
 
     `models` maps a run's model key to its table entry; a key it lacks is an unknown cost. `limits` are the caps the
     attempts ran under, which bound one whose usage is unknown.
     """
     marks = ",".join("?" * len(BILLED_STATES))
+    # A read-only snapshot of a store made before `turn_usage` existed cannot be migrated: read it without the column.
+    columns = {row["name"] for row in store.q("PRAGMA table_info(attempts)")}
+    turn_usage = "a.turn_usage" if "turn_usage" in columns else "NULL AS turn_usage"
     rows = store.q(
         "SELECT a.id, a.run_key, a.state, r." + column_for("model") + " AS model, a.input_tokens, a.output_tokens, "
-        "a.cache_creation_tokens, a.cache_read_tokens, a.turn_usage, COALESCE(a.usage_complete,1) AS complete "
+        f"a.cache_creation_tokens, a.cache_read_tokens, {turn_usage}, COALESCE(a.usage_complete,1) AS complete "
         f"FROM attempts a JOIN runs r USING(run_key) WHERE a.state IN ({marks}) ORDER BY a.id",
         BILLED_STATES,
     )

@@ -10,10 +10,10 @@ from expcore.campaign.recovery import recover
 from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import Price
 
-# One attempt's bound is 30 USD: a 1.96M-token cap at the stub's dearest 15 USD per million, and the request past the
-# cap, a 100,000-token window at 3 USD and a 20,000-token reply at 15 (C25).
+# One attempt's bound is 30 USD: a 1.9M-token cap at the stub's dearest 15 USD per million, and the request past the
+# cap, its 100,000-token window at 15 too, since nothing caps a stub's reply (C25).
 BUDGET = Limits(
-    max_tool_rounds=10, time_cap_s=60.0, token_budget=1_960_000, output_cap_chars=100, max_output_tokens=20_000
+    max_tool_rounds=10, time_cap_s=60.0, token_budget=1_900_000, output_cap_chars=100, max_output_tokens=20_000
 )
 SPEC = ModelSpec(key="m1", backend="stub", api_id="m1", status="frozen", price=Price(3.0, 15.0), context_tokens=100_000)
 TOKENS = {"input_tokens": 1_000_000, "output_tokens": 100_000}

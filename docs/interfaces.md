@@ -71,7 +71,7 @@ class ModelBackend(Protocol):
 
 Core guarantees:
 - The scheduler builds the backend of a run from the endpoint the campaign admitted (`probe` succeeded once, B07), through a `BackendFactory` (below); a run never resolves a URL of its own (C14). A model that is not frozen (B08), whose settings cannot be sent together (B16) or, with a budget, has no price (C12) or no `context_tokens` (C25) is refused before a run starts.
-- With a budget, each run is reserved the most its caps let it cost (C25). For `openai_compat` and `anthropic`, whose requests carry the reply maximum as `max_tokens`, that counts at most the rounds times the reply maximum as output; for the stub and a backend of the study's own, which the core cannot hold to it, the whole token cap at the dearest rate.
+- With a budget, each run is reserved the most its caps let it cost (C25). For `openai_compat` and `anthropic`, whose requests carry the reply maximum as `max_tokens`, that counts at most the rounds times the reply maximum as output; for the stub and a backend of the study's own, which the core cannot hold to it, the whole token cap and, for the request a run can make past it, the whole context window at the dearest rate. A backend of the study's own whose request outgrows the window is outside that bound.
 - The backend is closed (`aclose`) after the executor returns, whatever happens.
 - Retries of transient errors, the served-model check and usage totals are the adapters' (B01 to B16); the stub adapter takes a script (`StubAdapter.use(script)`, items: text, a list of `(tool, arguments)`, `{"text", "stop"}`, a ready-made `ModelTurn`, or an exception it raises).
 

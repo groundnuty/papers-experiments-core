@@ -5,11 +5,17 @@ import random
 
 import pytest
 from campaign_support import NOW, planned_store
+from loop_support import ScriptedBackend
+from record_support import no_secrets_in_the_environment, record_run
 
-from expcore.campaign.attempt_bounds import bound_usd, cap_bound_usd, overshoot_usd
+from expcore.campaign.attempt_bounds import REPLY_CAPPED_BACKENDS, bound_usd, cap_bound_usd, overshoot_usd
 from expcore.campaign.gate import Budget, BudgetGate
 from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import Price, PriceTier, TieredPrice
+from expcore.models.adapters import ModelTurn
+
+pytestmark = pytest.mark.usefixtures("no_secrets_in_the_environment")
+__all__ = ["no_secrets_in_the_environment"]
 
 LIMITS = Limits(
     max_tool_rounds=30, time_cap_s=600.0, token_budget=10_000_000, output_cap_chars=8000, max_output_tokens=8000
@@ -80,10 +86,28 @@ def test_c25_output_dearer_than_input_and_more_output_allowed_than_the_cap_is_th
 @pytest.mark.parametrize("backend", ["stub", "plugin_backend"])
 def test_c25_a_backend_whose_reply_maximum_the_core_does_not_send_keeps_the_whole_cap_at_the_dearest_rate(backend):
     """C25: the stub's synthetic counts ignore the output limit and a study's own backend may not send one, so the cap
-    is bounded as before, at the dearest rate, with the request past it added."""
+    is bounded as before, at the dearest rate, and the request past it by its context window alone, prompt and reply
+    together, at the dearest rate too."""
     spec = model(backend)
     assert cap_bound_usd(spec, LIMITS) == pytest.approx(old_bound(spec, LIMITS))
+    assert overshoot_usd(spec, LIMITS) == pytest.approx(200_000 * 2.5e-6)  # the window at the upper tier's output rate
     assert bound_usd(spec, LIMITS) == pytest.approx(old_bound(spec, LIMITS) + overshoot_usd(spec, LIMITS))
+
+
+def test_c25_a_stub_reply_longer_than_its_reply_maximum_is_within_the_reservation():
+    """C25: a stub's scripted reply is not held to the reply maximum, so a cap of 100 tokens, a 10-token maximum and a
+    1,000-token window still let one reply of 1,000 tokens through, at $10 per million: $0.01, more than the cap and
+    one capped reply could cost. The request past the cap is bounded by the window alone, which covers it."""
+    spec = model("stub", price=Price(1.0, 10.0), context=1000)
+    limits = dataclasses.replace(LIMITS, token_budget=100, max_output_tokens=10)
+    script = [ModelTurn("all at once", [], 0, 1000, "stop", 0.1)]
+    record = record_run([], {}, backend=ScriptedBackend(script), token_budget=100, max_output_tokens=10)
+    assert record.outcome["name"] == "token_cap"
+    [turn] = record.transcript
+    cost = spec.price.request_usd(turn["usage"]["input_tokens"], turn["usage"]["output_tokens"])
+    assert cost == pytest.approx(0.01)
+    assert cost > (100 * 10.0 + 1000 * 1.0 + 10 * 10.0) / 1e6  # the cap, the window as input, one capped reply
+    assert cost <= bound_usd(spec, limits)
 
 
 def test_c25_a_free_model_costs_nothing_an_unpriced_one_is_unknown_and_one_without_a_window_cannot_be_bounded():
@@ -130,9 +154,11 @@ def random_limits(rng: random.Random) -> Limits:
 
 def reachable_cost(spec: ModelSpec, limits: Limits, rng: random.Random) -> float:
     """The cost of one run the loop allows: a request is sent while the tokens used are below the cap, at most one
-    more than the tool rounds, each prompt within the context window and each reply within the maximum it carries.
-    Counts are drawn toward their extremes, where the worst case lies; the last request may pass the cap."""
+    more than the tool rounds, and each prompt within the context window. A backend that sends the reply maximum
+    keeps each reply within it; for any other, a reply is held only by the window, prompt and reply together. Counts
+    are drawn toward their extremes, where the worst case lies; the last request may pass the cap."""
     reply_max, window = spec.output_tokens(limits.max_output_tokens), spec.context_tokens
+    capped = spec.backend in REPLY_CAPPED_BACKENDS
 
     def draw(top: int) -> int:
         return rng.choice([0, top, top, rng.randint(0, top)])
@@ -141,7 +167,8 @@ def reachable_cost(spec: ModelSpec, limits: Limits, rng: random.Random) -> float
     for _ in range(limits.max_tool_rounds + 1):
         if used >= limits.token_budget:
             break
-        prompt, reply = draw(window), draw(reply_max)
+        prompt = draw(window)
+        reply = draw(reply_max if capped else window - prompt)
         written = rng.randint(0, prompt)
         read = rng.randint(0, prompt - written)
         cost += spec.price.request_usd(prompt, reply, written, read)

@@ -130,7 +130,7 @@ PRICE = Price(3.0, 15.0)
 
 
 def models_for(
-    *keys: str, price: Price | None = PRICE, free: bool = False, context_tokens: int | None = 32_000
+    *keys: str, price: Price | None = PRICE, free: bool = False, context_tokens: int | None = 16_000
 ) -> ModelTable:
     """A model table of stub models, all with one price (or free, or none) and a context window (or none)."""
     return ModelTable(
