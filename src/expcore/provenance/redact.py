@@ -62,6 +62,31 @@ class QuietParser(argparse.ArgumentParser):
         )
 
 
+NOT_SHOWN = "its message is not shown: no list is loaded yet to check it against"
+
+
+def failure(
+    error: BaseException,
+    redactor: "Redactor | None",
+    *,
+    expected: tuple[type[BaseException], ...] = (),
+    fixed: tuple[type[BaseException], ...] = (),
+) -> str:
+    """How a command shows the exception that ended it: the last guard at its entry point, which catches every one.
+
+    The text of one of the command's own errors (`expected`) is shown as it is, and any other's after its kind; either
+    way through `redactor`, which knows the lists the command loaded. Before they are loaded there is nothing to check
+    a message against, so only an error the command builds from fixed words (`fixed`: no path, no value) is shown, and
+    any other by its kind alone.
+    """
+    text = str(error) if isinstance(error, expected) else f"{type(error).__name__}: {error}"
+    if redactor is not None:
+        return redactor.scrub(text)
+    if isinstance(error, fixed):
+        return text
+    return f"{type(error).__name__} ({NOT_SHOWN})"
+
+
 def hidden_name(label: str) -> str:
     """How a message names a label it must not show: the start of the label's SHA-256."""
     return f"<hidden {hashlib.sha256(label.encode('utf-8')).hexdigest()[:HIDDEN_PREFIX_CHARS]}>"

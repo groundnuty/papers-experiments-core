@@ -341,6 +341,29 @@ def test_an_invalid_source_field_is_named_never_echoed(map_file, tmp_path, capsy
     assert "orchardrepo" not in err
 
 
+def test_p07_an_exception_the_import_does_not_expect_is_caught_and_never_shows_a_mapped_name(
+    map_file, tmp_path, capsys, monkeypatch
+):
+    """P07: the command catches every exception at the top, not only the ones it expects. With the map loaded an
+    unexpected one is shown by its kind with its text through the redactor of the map's tokens; when the map cannot
+    be loaded, by its kind alone."""
+    blob = tmp_path / "blob.py"
+    blob.write_text("x = 1\n", encoding="utf-8")
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("cannot read /data/secret-space/blob.py")
+
+    monkeypatch.setattr(sn, "import_module", broken)
+    assert run_import(map_file, blob, tmp_path / "out.py") == 2
+    err = capsys.readouterr().err
+    assert "error: RuntimeError: cannot read <hidden " in err
+    assert "secret-space" not in err
+    monkeypatch.setattr(sn, "load_map", broken)
+    assert sn.main(["verify", "--map", str(map_file), "--source", str(blob), "--module", str(blob)]) == 2
+    err = capsys.readouterr().err
+    assert err == "error: RuntimeError (its message is not shown: no list is loaded yet to check it against)\n"
+
+
 def test_the_map_hash_is_the_sha256_of_the_file(map_file, token_map):
     assert token_map.sha256 == hashlib.sha256(map_file.read_bytes()).hexdigest()
 

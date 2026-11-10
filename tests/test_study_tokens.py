@@ -275,8 +275,9 @@ def test_cli_hash_warns_by_line_number_about_tokens_that_can_only_match_a_whole_
     plain.write_text(f"{LONG_NAME}\n{CIDR}\n", encoding="utf-8")
     assert st.main(["hash", str(plain)]) == 0
     err = capsys.readouterr().err
-    assert "plain.txt:2" in err
-    assert "plain.txt:1" not in err
+    assert "line 2 of the plain list" in err
+    assert "line 1 of" not in err
+    assert "plain.txt" not in err  # the plain list's path is the maintainer's
     assert CIDR not in err
 
 
@@ -344,7 +345,8 @@ def test_k01_a_file_of_plain_sha256_digests_is_refused_saying_how_to_generate_on
     (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
     assert st.main(["check", "--hashes", str(plain), str(tmp_path / "m.py")]) == 2
     err = capsys.readouterr().err
-    assert "plain.sha256:1: a bare SHA-256 digest" in err
+    assert "the list given with --hashes:1: a bare SHA-256 digest" in err
+    assert "plain.sha256" not in err  # a path given with --hashes is the author's
     assert "python -m expcore.provenance.study_tokens hash" in err
 
 
@@ -423,3 +425,62 @@ def test_the_hash_command_renders_a_marked_token_whole(tmp_path, capsys):
     assert st.main(["hash", str(plain)]) == 0
     lines = [line for line in capsys.readouterr().out.splitlines() if not line.startswith("#")]
     assert [line.split()[:2] for line in lines] == [["whole", "all"]]
+
+
+# --- the last guard: no message shows a listed name ----------------------------------------------------------------
+
+
+def test_p07_a_missing_list_or_plain_list_is_named_by_its_role_never_by_its_path(tmp_path, capsys):
+    """P07: before a list is loaded nothing can hide a name, so a hash file given with --hashes, or a plain list, that
+    cannot be read is named by its role; its path, which may hold a private name, is never printed."""
+    place = tmp_path / LONG_NAME
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+    assert st.main(["check", "--hashes", str(place / "list.sha256"), str(tmp_path / "m.py")]) == 2
+    assert st.main(["hash", str(place / "plain.txt")]) == 2
+    place.mkdir()
+    assert st.main(["check", "--hashes", str(place), str(tmp_path / "m.py")]) == 2  # a directory: cannot be read
+    err = capsys.readouterr().err
+    assert "the list given with --hashes is not there" in err
+    assert "the plain list cannot be read (FileNotFoundError)" in err
+    assert "the list given with --hashes cannot be read (IsADirectoryError)" in err
+    assert LONG_NAME not in err
+
+
+def test_p07_an_unreadable_file_and_a_git_error_are_shown_through_the_loaded_list(
+    tmp_path, hash_file, repo, monkeypatch, capsys
+):
+    """P07: once the list is loaded, every error goes through the redactor that knows it: a file whose name holds a
+    listed name and that cannot be read, and git's own message about a revision that holds one."""
+    locked = tmp_path / f"{LONG_NAME}.txt"
+    locked.write_text("x\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(path: Path) -> bytes:
+        if path.name == locked.name:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert st.main(["check", "--hashes", str(hash_file), str(locked)]) == 2
+    assert st.main(["check-commits", "--hashes", str(hash_file), "--repo", str(repo.path), f"{LONG_NAME}..HEAD"]) == 2
+    err = capsys.readouterr().err
+    assert err.count("error: ") == 2
+    assert "Permission denied" in err
+    assert LONG_NAME not in err
+
+
+def test_p07_an_exception_the_command_does_not_expect_is_caught_and_shown_through_the_list(
+    tmp_path, hash_file, monkeypatch, capsys
+):
+    """P07: the command catches every exception at the top, not only the ones it expects, so an unexpected one never
+    prints a traceback with a listed name in it; it is named by its kind and its text goes through the redactor."""
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError(f"cannot scan /data/{LONG_NAME}/m.py")
+
+    monkeypatch.setattr(st, "scan_paths", broken)
+    assert st.main(["check", "--hashes", str(hash_file), str(tmp_path / "m.py")]) == 2
+    err = capsys.readouterr().err
+    assert "error: RuntimeError: cannot scan" in err
+    assert LONG_NAME not in err

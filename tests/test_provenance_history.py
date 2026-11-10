@@ -299,6 +299,27 @@ def test_the_command_line_never_prints_a_name_the_map_hides(world, map_file, cap
     assert "secret-space" not in out
 
 
+def test_p07_an_exception_the_check_does_not_expect_is_caught_and_never_shows_a_mapped_name(
+    world, map_file, capsys, monkeypatch
+):
+    """P07: the command catches every exception at the top. Once the map is loaded an unexpected one is shown by its
+    kind with its text through the redactor of the map's tokens; before, by its kind alone, since nothing could hide
+    a name in it."""
+    core, origin, *_ = world
+    argv = ["--map", str(map_file), "--source-repos", f"origin-repo={origin.path}", "--repo", str(core.path)]
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("cannot read /data/secret-space/tools.py")
+
+    monkeypatch.setattr(hist, "verify_history", broken)
+    assert hist.main(argv) == 2
+    assert "error: RuntimeError: cannot read <hidden " in capsys.readouterr().err
+    monkeypatch.setattr(hist, "load_map", broken)
+    assert hist.main(argv) == 2
+    err = capsys.readouterr().err
+    assert err == "error: RuntimeError (its message is not shown: no list is loaded yet to check it against)\n"
+
+
 # --- merges -----------------------------------------------------------------------------------------------------------
 
 

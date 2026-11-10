@@ -21,7 +21,7 @@ from pathlib import Path
 from expcore.provenance.gitobjects import GitError, read_blob, run_git
 from expcore.provenance.hashfile import hashes_from_tokens
 from expcore.provenance.headers import HeaderError, read_header, strip_header
-from expcore.provenance.redact import QuietParser, Redactor
+from expcore.provenance.redact import QuietParser, Redactor, failure
 from expcore.provenance.sanitise import SanitiseError, sanitise_checked
 from expcore.provenance.sanitise_map import TokenMap, load_map
 from expcore.provenance.study_tokens import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK
@@ -195,7 +195,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the check; return 0 when every module holds, 1 when one does not, 2 on an error or when there is no module.
 
     Every line goes through one redactor that knows the map's tokens (`provenance.redact`), so no message shows a name
-    the map hides, whatever a header or an error holds; a source repository is never named, only the module.
+    the map hides, whatever a header or an error holds; a source repository is never named, only the module. Every
+    exception ends here, the last guard: before the map is loaded only the command's own errors, which name a position
+    or a setting and never a value, are shown, and anything else by its kind; after, through the redactor.
     """
     args = build_parser().parse_args(argv)
     spec = args.source_repos if args.source_repos is not None else os.environ.get(SOURCE_REPOS_VARIABLE, "")
@@ -204,16 +206,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not sources:
             raise ValueError(f"name the source repositories with --source-repos or {SOURCE_REPOS_VARIABLE}")
         token_map = load_map(args.map)
-    except (OSError, ValueError) as error:  # MapError is a ValueError; neither message holds a value of the map
-        print(f"error: {error}", file=sys.stderr)
+    except Exception as error:  # MapError is a ValueError; neither kind of message holds a value of the map
+        print(f"error: {failure(error, None, expected=(ValueError,), fixed=(ValueError,))}", file=sys.stderr)
         return EXIT_ERROR
     redactor = Redactor(hashes_from_tokens(entry.token for entry in token_map.entries))
     try:
-        modules = _modules(args.repo, args.root)
-        problems = verify_history(args.repo, sources, token_map, root=args.root)
+        return _report(args, sources, token_map, redactor)
     except GitError:  # its message names a repository's path
         print("error: the repository checked cannot be read; is --repo a repository with a commit?", file=sys.stderr)
-        return EXIT_ERROR
+    except Exception as error:
+        print(f"error: {failure(error, redactor)}", file=sys.stderr)
+    return EXIT_ERROR
+
+
+def _report(args: argparse.Namespace, sources: Mapping[str, Path], token_map: TokenMap, redactor: Redactor) -> int:
+    """Check the repository and print what was found, every line through the redactor; return the exit status."""
+    modules = _modules(args.repo, args.root)
+    problems = verify_history(args.repo, sources, token_map, root=args.root)
     if not modules:
         print(
             redactor.scrub(f"error: no Python module under {args.root} at HEAD, so nothing was checked"),

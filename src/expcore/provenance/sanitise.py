@@ -27,7 +27,7 @@ from expcore.provenance.headers import (
     split_lines,
     strip_header,
 )
-from expcore.provenance.redact import QuietParser, Redactor
+from expcore.provenance.redact import QuietParser, Redactor, failure
 from expcore.provenance.sanitise_map import Entry, MapError, load_map, matches_on_components
 from expcore.provenance.scanner import (
     FSTRING_END_TYPES,
@@ -344,12 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _redactor(map_path: Path) -> Redactor:
-    """The redactor every line of the command goes through: it knows the map's tokens, when the map loads."""
+def _redactor(map_path: Path) -> Redactor | None:
+    """The redactor every line of the command goes through: it knows the map's tokens; None when the map does not
+    load (the load fails again in the command, with a message that holds no value of the map)."""
     try:
         entries = load_map(map_path).entries
-    except MapError:
-        return Redactor()  # the load fails again in the command, with a message that holds no value of the map
+    except Exception:  # whatever it is, the command meets it again and the last guard shows it
+        return None
     return Redactor(hashes_from_tokens(entry.token for entry in entries))
 
 
@@ -357,7 +358,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the command line; return 0 on success, 1 when verify fails, 2 on an error.
 
     Every line it prints goes through one redactor that knows the map's tokens (`provenance.redact`): a file name, a
-    path or an error that holds a name the map hides is never shown.
+    path or an error that holds a name the map hides is never shown. Every exception ends here, the last guard; when
+    the map did not load, only a map error, which names an entry by its number and nothing it holds, is shown, and any
+    other exception by its kind.
     """
     args = build_parser().parse_args(argv)
     redactor = _redactor(args.map)
@@ -365,11 +368,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with contextlib.redirect_stdout(out):
             status = args.run(args)
-    except (OSError, SanitiseError, MapError) as error:
+    except Exception as error:
         status = EXIT_ERROR
-        print(redactor.scrub(f"error: {error}"), file=sys.stderr)
+        shown = failure(error, redactor, expected=(OSError, SanitiseError, MapError), fixed=(MapError,))
+        print(f"error: {shown}", file=sys.stderr)
     if out.getvalue():
-        print(redactor.scrub(out.getvalue().rstrip("\n")))
+        print((redactor or Redactor()).scrub(out.getvalue().rstrip("\n")))
     return status
 
 
