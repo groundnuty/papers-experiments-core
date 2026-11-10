@@ -40,7 +40,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from expcore.package.spec import PackageError
-from expcore.package.views import PARSED, hidden_name, streams, views
+from expcore.package.views import PARSED, streams, views
+from expcore.provenance.redact import Redactor
 from expcore.study.config import CONFIG_FILES
 
 REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".bib", ".json", ".toml"})
@@ -212,24 +213,31 @@ def holds_term(anonymisation: Anonymisation, text: str) -> bool:
 
 
 def find_terms(
-    files: Mapping[str, bytes], anonymisation: Anonymisation, *, opaque: Collection[str] = frozenset()
+    files: Mapping[str, bytes],
+    anonymisation: Anonymisation,
+    *,
+    opaque: Collection[str] = frozenset(),
+    redactor: Redactor | None = None,
 ) -> list[str]:
     """Return one finding per stream and line that holds a term, never the term; empty when the package is clean.
 
     Every stream of every file is read as the token check reads it (`views`): text as it is and decoded, a database's
     or archive's bytes under every encoding. A term found only in the parsed strings of a JSON or TOML stream has no
     line of its own and is reported for the stream. What the token check refuses is its finding, not one of these;
-    the files in `opaque` were attested by hash and are not read.
+    the files in `opaque` were attested by hash and are not read. A stream is named through `redactor`, the one every
+    check of the build shares, so a label that holds a term or a private name is shown the same hidden way here.
     """
     finders = [_finder(term) for term in anonymisation.terms]
+    if redactor is None:
+        redactor = Redactor(also=lambda text: holds_term(anonymisation, text))
     findings: list[str] = []
-    for position, name in enumerate(sorted(files), start=1):
+    for name in sorted(files):
         if name in opaque:
             continue
         for stream in streams(name, files[name])[0]:
             held = any(f.search(stream.label) for f in finders)
-            shown = hidden_name(position, stream.label) if held else stream.label
-            if shown != stream.label:
+            shown = redactor.name(stream.label, hide=held)
+            if held:
                 findings.append(f"{shown}: the path holds {FINDING}")
             lines, parsed = set(), False
             for view, text in views(stream):

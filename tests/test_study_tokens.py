@@ -354,13 +354,16 @@ def test_k01_a_malformed_hash_line_names_the_generating_command():
         st.parse_hash_file(f"any all {'0' * 64}\nany secret-word\n", "names.sha256")
 
 
-def test_k01_the_check_says_how_many_hashes_it_loaded_and_from_where(tmp_path, hash_file, capsys):
-    """K01: the check prints how many hashes it read, so a file that loads but holds the wrong ones is noticed."""
+def test_k01_the_check_says_how_many_hashes_it_loaded_and_which_list_never_its_path(tmp_path, hash_file, capsys):
+    """K01: the check prints how many hashes it read, so a file that loads but holds the wrong ones is noticed, and
+    whether it is the default list or one given in its place, never the path, which is the author's."""
     (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
     assert st.main(["check", "--hashes", str(hash_file), str(tmp_path / "m.py")]) == 0
     count = len(st.load_hashes(hash_file).anywhere) + len(st.load_hashes(hash_file).whole)
     assert count > 1
-    assert f"study-token check: {count} hashes from {hash_file}" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert f"study-token check: {count} hashes, from the list given with --hashes\n" in err
+    assert str(hash_file) not in err
 
 
 def test_cli_check_errors_on_missing_explicit_hash_file_or_path(tmp_path, hash_file, capsys):

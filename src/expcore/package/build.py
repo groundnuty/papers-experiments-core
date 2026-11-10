@@ -42,13 +42,14 @@ import json
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.config.loading import ConfigError
 from expcore.models.route import sdk_version
-from expcore.package.anonymise import Anonymisation, load_anonymisation, rewrite
+from expcore.package.anonymise import Anonymisation, holds_term, load_anonymisation, rewrite
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
 from expcore.package.identity import (
     PREFIX_DIGITS,
@@ -60,9 +61,17 @@ from expcore.package.identity import (
     stamp_bytes,
     verify_inputs,
 )
-from expcore.package.leaks import default_hashes, findings_in, hidden_paths, private_hashes, scan_tokens
+from expcore.package.leaks import default_hashes, findings_in, private_hashes, scan_tokens
 from expcore.package.lockfile import PYPI, lock_hashes, token_exempt
-from expcore.package.spec import GENERATED, WHEELS_DIR, PackageError, PackageSpec, load_spec, select
+from expcore.package.spec import (
+    GENERATED,
+    SPEC_FILE,
+    WHEELS_DIR,
+    PackageError,
+    PackageSpec,
+    load_spec,
+    select,
+)
 from expcore.package.tracking import Tracking, note_tracking
 from expcore.package.wheels import REQUIREMENTS, Vendor, Wheel, makefile, requirements, vendor_wheels
 from expcore.package.wheelscan import scan_wheels
@@ -70,6 +79,8 @@ from expcore.package.withhold import withhold_headers
 from expcore.provenance.codestamp import STAMP, covered_files, is_sha
 from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_environment
 from expcore.provenance.gitobjects import GitError, run_git
+from expcore.provenance.hashfile import Hashes
+from expcore.provenance.redact import Redactor
 from expcore.provenance.study_tokens import count_hashes
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.replay.check import CHECK_FILE, BatchNotVerified
@@ -203,15 +214,15 @@ def _package_json(
     return (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _attested(spec: PackageSpec, files: Mapping[str, bytes]) -> frozenset[str]:
+def _attested(spec: PackageSpec, files: Mapping[str, bytes], redactor: Redactor) -> frozenset[str]:
     """The files package.toml attests by hash, each checked to be exactly the attested bytes."""
     for path, entry in sorted(spec.opaque.items()):
         if path.startswith(f"{WHEELS_DIR}/"):
             continue  # a member of a vendored wheel, checked when the wheels are read (`wheelscan`)
         if hashlib.sha256(files[path]).hexdigest() != entry.sha256:
             raise PackageError(
-                f"{path}: its SHA-256 is not the one [[opaque]] attests in {spec.source}; inspect the file again and "
-                "attest its new hash, or leave it out"
+                f"{redactor.name(path)}: its SHA-256 is not the one [[opaque]] attests in {SPEC_FILE}; inspect the "
+                "file again and attest its new hash, or leave it out"
             )
     return frozenset(path for path in spec.opaque if not path.startswith(f"{WHEELS_DIR}/"))
 
@@ -227,6 +238,7 @@ def collect(
     allow_uncommitted: bool = False,
     warn: Callable[[str], None] | None = None,
     note: Callable[[str], None] | None = None,
+    hidden: dict[str, str] | None = None,
 ) -> tuple[PackageSpec, dict[str, bytes]]:
     """Select, check and complete the files of a package, without writing anything; return the spec and the files.
 
@@ -235,10 +247,58 @@ def collect(
     hashes were loaded (both standard error by default); `allow_uncommitted` lets an anonymised package include files
     no commit holds. `hashes` names a study-token hash file to use in place of the core's public one: it replaces that
     list, it does not add to it.
+
+    The hashes load first, so that every message after them, warnings and refusals alike, goes through one redactor
+    (`provenance.redact`): nothing that holds a private name or a term of the anonymisation list is ever shown, and a
+    hidden path is named by the start of its SHA-256. `hidden`, when given, is filled with each hidden name and the
+    path it stands for, on purpose: the command line shows them only when the author asks (`--show-private-paths`).
     """
-    study, spec, files, check = _selection(Path(study_root))
+    tokens = private_hashes(default_hashes() if hashes is None else Path(hashes), given=hashes is not None)
+    origin = "the core's public list" if hashes is None else "the list given with --hashes, which replaces the core's"
+    (note or _stderr)(f"study-token check: {count_hashes(tokens)} of names private everywhere, from {origin}")
+    redactor = Redactor(tokens)
+    try:
+        return _collect(
+            Path(study_root),
+            tokens,
+            redactor,
+            anonymise,
+            out_dir,
+            vendor,
+            wheels,
+            allow_uncommitted,
+            _scrubbing(redactor, warn or _warning),
+        )
+    except PackageError as error:
+        raise PackageError(redactor.scrub(str(error)), private=redactor.hidden) from None
+    finally:
+        if hidden is not None:
+            hidden.update(redactor.hidden)
+
+
+def _scrubbing(redactor: Redactor, say: Callable[[str], None]) -> Callable[[str], None]:
+    """A warning callback that scrubs each line before it is said."""
+    return lambda line: say(redactor.scrub(line))
+
+
+def _warning(line: str) -> None:
+    print(f"warning: {line}", file=sys.stderr)
+
+
+def _collect(
+    study_root: Path,
+    tokens: Hashes,
+    redactor: Redactor,
+    anonymise: Path | None,
+    out_dir: Path | None,
+    vendor: Vendor | None,
+    wheels: Path | None,
+    allow_uncommitted: bool,
+    warn: Callable[[str], None],
+) -> tuple[PackageSpec, dict[str, bytes]]:
+    study, spec, files, check = _selection(study_root)
     where = f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}"
-    opaque = _attested(spec, files)
+    opaque = _attested(spec, files, redactor)
     code = _clean_code(check, where)
     env = _environment(study, check, where)
     _require_this_core(files)
@@ -248,9 +308,10 @@ def collect(
         terms = load_anonymisation(
             Path(anonymise), keep_out_of=private_list_guard(study.root, out_dir), model_names=_model_names(study)
         )
+        redactor.also = partial(holds_term, terms)
     covered = set(covered_files(study.root, study.scope))
     others = [p for p in files if not p.startswith(f"{OUT_DIR}/") and p not in covered]  # the identity and check vouch
-    state = note_tracking(study.root, others, sorted(files), terms, allow_uncommitted, warn)
+    state = note_tracking(study.root, others, redactor, terms is not None, allow_uncommitted, warn)
     hidden_commits, hidden_urls = frozenset(), frozenset()
     if terms is not None:
         rewritten = list(terms.files)
@@ -271,13 +332,16 @@ def collect(
     files.update({wheel.path: wheel.data for wheel in vendored})
     files[REQUIREMENTS] = requirements(vendored)
     opaque |= {wheel.path for wheel in vendored}  # read member by member below
-    tokens = private_hashes(default_hashes() if hashes is None else Path(hashes))
-    origin = "the core's public list" if hashes is None else f"{hashes}, which replaces the core's list"
-    (note or _stderr)(f"study-token check: {count_hashes(tokens)} of names private everywhere, from {origin}")
     attested = {path: entry for path, entry in spec.opaque.items() if path.startswith(f"{WHEELS_DIR}/")}
     exempt = token_exempt(vendored, lock_hashes(study.root, warn))  # the bytes vendored, after headers withheld
     read = scan_wheels(
-        vendored, tokens, terms=terms, hidden=(hidden_commits, hidden_urls), attested=attested, exempt=exempt
+        vendored,
+        tokens,
+        terms=terms,
+        hidden=(hidden_commits, hidden_urls),
+        attested=attested,
+        exempt=exempt,
+        redactor=redactor,
     )
     files["Makefile"] = makefile(env)
     files[PACKAGE_FILE] = _package_json(
@@ -301,12 +365,10 @@ def collect(
     files[SUMS_FILE] = render_sums(files)
     generated = {*GENERATED, REQUIREMENTS}
     findings = read.findings + findings_in(
-        files, tokens, terms, hidden_commits, hidden_urls, opaque, generated=generated
+        files, tokens, terms, hidden_commits, hidden_urls, opaque, generated=generated, redactor=redactor
     )
     if findings:
-        raise PackageError(
-            "refusing to build the package:\n  " + "\n  ".join(findings), private=hidden_paths(findings, files)
-        )
+        raise PackageError("refusing to build the package:" + "".join(f"\n  {finding}" for finding in findings))
     return spec, files
 
 
@@ -392,12 +454,15 @@ def build_package(
     allow_uncommitted: bool = False,
     warn: Callable[[str], None] | None = None,
     note: Callable[[str], None] | None = None,
+    hidden: dict[str, str] | None = None,
 ) -> Path:
     """Build the package of a study into `out_dir/<name>.tar.gz` and return the archive's path (see `collect`)."""
     out_dir, study_root = Path(out_dir), Path(study_root)
     batch = (study_root / OUT_DIR).resolve()
     if out_dir.resolve() == batch or batch in out_dir.resolve().parents:
-        raise PackageError(f"{out_dir}: lies inside the study's {OUT_DIR}/, whose files the package is checked against")
+        raise PackageError(
+            f"the output directory lies inside the study's {OUT_DIR}/, whose files the package is checked against"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     spec, files = collect(
         study_root,
@@ -409,6 +474,7 @@ def build_package(
         allow_uncommitted=allow_uncommitted,
         warn=warn,
         note=note,
+        hidden=hidden,
     )
     with tempfile.TemporaryDirectory(prefix=".staging-", dir=out_dir) as scratch:
         stage = Path(scratch) / spec.name

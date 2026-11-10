@@ -100,6 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
     package.add_argument(
         "--allow-uncommitted", action="store_true", help="let an anonymised package include files no commit holds"
     )
+    package.add_argument(
+        "--show-private-paths",
+        action="store_true",
+        help="after the build, print the path each hidden name stands for; for your own terminal only, never a log",
+    )
     verify = commands.add_parser("package-check", help="package-check PACKAGE: verify an unpacked package")
     verify.add_argument("package", type=Path, help="the directory of an unpacked package")
     example = commands.add_parser("example", help="example DEST: write the example study into a new directory")
@@ -158,6 +163,7 @@ def _report(args: argparse.Namespace) -> int:
 
 
 def _package(args: argparse.Namespace) -> int:
+    hidden: dict[str, str] = {}
     archive = build_package(
         args.study,
         args.out,
@@ -165,8 +171,11 @@ def _package(args: argparse.Namespace) -> int:
         anonymise=args.anonymise,
         wheels=args.wheels,
         allow_uncommitted=args.allow_uncommitted,
+        hidden=hidden,
     )
-    print(f"wrote {archive} (sha256 {hashlib.sha256(archive.read_bytes()).hexdigest()})")
+    print(f"wrote {archive.name} (sha256 {hashlib.sha256(archive.read_bytes()).hexdigest()}) in the --out directory")
+    if args.show_private_paths:
+        _show_private_paths(hidden)
     return EXIT_OK
 
 
@@ -210,14 +219,16 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
         return commands[args.command](args)
     except _REFUSALS as error:
         print(f"{args.command} refused: {error}", file=sys.stderr)
-        _name_hidden_paths(getattr(error, "private", {}))
+        if getattr(args, "show_private_paths", False):
+            _show_private_paths(getattr(error, "private", {}))
         return EXIT_REFUSED
 
 
-def _name_hidden_paths(private: Mapping[str, str]) -> None:
-    """Show the author which path each hidden name stands for, only on a terminal: a log may be public."""
-    if not private or not getattr(sys.stderr, "isatty", lambda: False)():
+def _show_private_paths(private: Mapping[str, str]) -> None:
+    """Print the path each hidden name stands for. Only `--show-private-paths` asks for it: whether standard error is
+    a terminal says nothing about who reads it (a recorded session reports a terminal), so the author decides."""
+    if not private:
         return
-    print("on this terminal only, never in a log or a file, the paths named above by place and hash:", file=sys.stderr)
+    print("the paths the hidden names above stand for; for your own terminal only, never a log:", file=sys.stderr)
     for name, path in private.items():
         print(f"  {name} is {path}", file=sys.stderr)

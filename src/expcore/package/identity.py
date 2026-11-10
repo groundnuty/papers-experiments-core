@@ -49,10 +49,11 @@ from urllib.parse import urlsplit
 from expcore.campaign.resume import FINGERPRINT_KEY
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.package.spec import PackageError
-from expcore.package.views import hidden_name, streams, views
+from expcore.package.views import streams, views
 from expcore.provenance.codestamp import STAMP, CodeScope, covered_files, is_sha, write_stamp
 from expcore.provenance.environment import without_sources
 from expcore.provenance.gitobjects import GitError, run_git
+from expcore.provenance.redact import Redactor
 from expcore.records.record import RunRecord, decode
 from expcore.replay.check import CHECK_FILE, inputs_sha256, verify_batch, write_check
 from expcore.study.pipeline import OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
@@ -295,16 +296,23 @@ def url_lines(text: str, forms: frozenset[str]) -> set[int]:
 
 
 def find_identity(
-    files: Mapping[str, bytes], prefixes: frozenset[str], forms: frozenset[str], *, opaque: Collection[str]
+    files: Mapping[str, bytes],
+    prefixes: frozenset[str],
+    forms: frozenset[str],
+    *,
+    opaque: Collection[str],
+    redactor: Redactor | None = None,
 ) -> list[str]:
-    """One finding per stream and line that holds a hidden commit or URL, never the value; empty when clean."""
+    """One finding per stream and line that holds a hidden commit or URL, never the value; empty when clean. A stream
+    is named through `redactor`, the one every check of the build shares."""
+    redactor = Redactor() if redactor is None else redactor
     findings: set[str] = set()
-    for position, name in enumerate(sorted(files), start=1):
+    for name in sorted(files):
         if name in opaque:
             continue
         for stream in streams(name, files[name])[0]:
             held = commit_lines(stream.label, prefixes) or url_lines(stream.label, forms)
-            shown = hidden_name(position, stream.label) if held else stream.label
+            shown = redactor.name(stream.label, hide=bool(held))
             if held:
                 findings.add(f"{shown}: the path holds {FOUND_COMMIT} or URL")
             for _, text in views(stream):

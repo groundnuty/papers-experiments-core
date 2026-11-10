@@ -36,6 +36,7 @@ from expcore.package.spec import PackageError
 from expcore.package.wheels import REQUIREMENTS, Wheel
 from expcore.provenance.environment import CORE_DISTRIBUTION
 from expcore.provenance.hashfile import render_hash_file
+from expcore.provenance.redact import hidden_name
 from expcore.study import pipeline
 
 PRIVATE = "zarnothwick"  # invented; the test hash file treats it as a name private everywhere
@@ -161,17 +162,19 @@ def test_k01_a_hash_file_that_is_missing_or_names_nothing_private_refuses_the_bu
 
 def test_k01_a_hash_file_of_plain_digests_refuses_the_build_naming_the_command_that_makes_one(tmp_path):
     """K01: a file of plain sha256 digests would check nothing; the build refuses it and says how to make a real one."""
-    plain = tmp_path / "plain.sha256"
+    plain = tmp_path / f"{PRIVATE}.sha256"  # a path of the author's, which no message shows
     plain.write_text(f"{hashlib.sha256(PRIVATE.encode()).hexdigest()}\n", encoding="utf-8")
-    with pytest.raises(PackageError, match=r"plain\.sha256:1: a bare SHA-256 digest.*study_tokens hash PLAIN"):
+    with pytest.raises(PackageError, match=r"given with --hashes:1: a bare SHA-256 digest.*hash PLAIN") as refused:
         private_hashes(plain)
+    assert PRIVATE not in str(refused.value)
 
 
 def test_k01_the_build_says_how_many_hashes_it_loaded_and_that_its_list_replaces_the_cores(campaign, hashes, tmp_path):
-    """K01: the build prints how many hashes of names private everywhere it checks with, and from which list."""
+    """K01: the build prints how many hashes of names private everywhere it checks with, and whether they are the
+    core's or a list given in their place, never the list's path, which is the author's."""
     said: list[str] = []
     package_build.collect(a_copy(campaign, tmp_path), hashes=hashes, note=said.append)
-    origin = f"{hashes}, which replaces the core's list"
+    origin = "the list given with --hashes, which replaces the core's"
     assert said == [f"study-token check: 1 hash of names private everywhere, from {origin}"]
 
 
@@ -278,36 +281,35 @@ def with_notes(campaign: Campaign, tmp_path: Path, directory: str) -> Path:
 def test_k05_a_private_name_in_a_path_is_reported_once_for_the_file_never_through_a_generated_file(
     campaign, hashes, tmp_path
 ):
-    """K05: a path that holds a private name is reported once, by its place and hash, not again for the line of
-    SHA256SUMS or PACKAGE.json the build generated from it; the refusal carries the path for the author's terminal."""
+    """K05: a path that holds a private name is reported once, by its hash, not again for the line of SHA256SUMS or
+    PACKAGE.json the build generated from it; the refusal carries the path for the author to ask for."""
     with pytest.raises(PackageError) as refused:
         build_package(with_notes(campaign, tmp_path, PRIVATE), tmp_path / "dist", hashes=hashes)
     findings = [line.strip() for line in str(refused.value).splitlines()[1:]]
     prefix = hashlib.sha256(f"expcore-study-token-v1:{PRIVATE}".encode()).hexdigest()[:12]
-    assert len(findings) == 1
-    assert findings[0].endswith(f": the path holds a private name (study token {prefix})")
+    path = f"notes/{PRIVATE}/data.txt"
+    assert findings == [f"{hidden_name(path)}: the path holds a private name (study token {prefix})"]
     assert PRIVATE not in str(refused.value)
-    assert refused.value.private == {findings[0].split(":")[0]: f"notes/{PRIVATE}/data.txt"}
+    assert refused.value.private == {hidden_name(path): path}
 
 
-def test_k05_a_term_in_a_path_is_named_by_its_path_on_the_authors_terminal_and_nowhere_else(
+def test_k05_a_term_in_a_path_is_named_by_its_path_only_when_the_author_asks(
     campaign, hashes, tmp_path, capsys, monkeypatch
 ):
-    """K05: in an anonymised build, a path that holds a term is reported once, never through SHA256SUMS; the command
-    line names the path, relative to the study, only when standard error is a terminal, never in a log."""
+    """K05: in an anonymised build, a path that holds a term is reported once, never through SHA256SUMS, and hidden
+    even on a terminal, which says nothing about who reads it; --show-private-paths alone names it."""
     root = with_notes(campaign, tmp_path, "varek")
     argv = ["package", str(root), "--hashes", str(hashes), "--anonymise", str(tmp_path / "anon.toml")]
     anonymisation(tmp_path / "anon.toml", {AUTHOR: "Author A", "Varek": "Author B"})
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
     assert main([*argv, "--out", str(tmp_path / "dist-log")]) == 1
     logged = capsys.readouterr().err
-    assert "the path holds a term of the anonymisation list" in logged
+    assert f"{hidden_name('notes/varek/data.txt')}: the path holds a term of the anonymisation list" in logged
     assert "SHA256SUMS" not in logged
     assert "varek" not in logged.casefold()
-    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
-    assert main([*argv, "--out", str(tmp_path / "dist-terminal")]) == 1
+    assert main([*argv, "--out", str(tmp_path / "dist-asked"), "--show-private-paths"]) == 1
     shown = capsys.readouterr().err
-    hidden = next(line.strip().split(":")[0] for line in shown.splitlines() if "the path holds a term" in line)
-    assert f"  {hidden} is notes/varek/data.txt\n" in shown
+    assert f"  {hidden_name('notes/varek/data.txt')} is notes/varek/data.txt\n" in shown
 
 
 FIGURE = b"%PDF-1.4\n<< /Filter /FlateDecode >>\nstream\n" + zlib.compress(b"a drawn figure") + b"\nendstream\n"

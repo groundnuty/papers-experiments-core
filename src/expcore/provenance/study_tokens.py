@@ -172,7 +172,8 @@ def _load_for_cli(explicit: Path | None, allow_missing: bool) -> Hashes | None:
     if not hashes:
         _missing(f"{path} holds no hashes", allow_missing)
         return None
-    print(f"study-token check: {count_hashes(hashes)} from {path}", file=sys.stderr)
+    origin = "the default list" if explicit is None else "the list given with --hashes"
+    print(f"study-token check: {count_hashes(hashes)}, from {origin}", file=sys.stderr)  # never the path
     return hashes
 
 

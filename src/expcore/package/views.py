@@ -39,7 +39,6 @@ import binascii
 import bz2
 import contextlib
 import gzip
-import hashlib
 import html
 import io
 import json
@@ -533,12 +532,6 @@ def streams(path: str, data: bytes) -> tuple[list[Stream], list[tuple[str, str]]
     return found, budget.problems
 
 
-def hidden_name(position: int, label: str) -> str:
-    """How a finding names a stream whose label must not be shown: the file's place in the package and the start of
-    the label's SHA-256, so that two such findings are never folded into one and the author can find each."""
-    return f"file {position} (path sha256 {hashlib.sha256(label.encode('utf-8')).hexdigest()[:12]})"
-
-
 def _byte_views(data: bytes) -> list[tuple[str, str]]:
     views = [
         ("utf-8", data.decode("utf-8", errors="replace")),
@@ -589,6 +582,7 @@ def _decoded(text: str) -> str:
 
 
 PARSED = ("json", "toml")  # views without the file's own lines
+JOINED = ("normalised", "decoded")  # views whose continuations are joined, which shifts the lines after them
 
 
 def _text_views(label: str, text: str) -> list[tuple[str, str]]:

@@ -13,14 +13,13 @@ cannot tell, and nothing is refused, because no file is known to be uncommitted.
 """
 
 import sys
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
 
-from expcore.package.anonymise import Anonymisation, holds_term
 from expcore.package.spec import PackageError
-from expcore.package.views import hidden_name
 from expcore.provenance.gitobjects import GitError, run_git
+from expcore.provenance.redact import Redactor
 
 GIT, NO_VCS = "git", "none"
 UNTRACKED, MODIFIED = "untracked", "modified"
@@ -61,31 +60,28 @@ def tracking(root: Path, paths: Collection[str]) -> Tracking:
 def note_tracking(
     root: Path,
     paths: Collection[str],
-    places: Sequence[str],
-    terms: Anonymisation | None,
+    redactor: Redactor,
+    anonymised: bool,
     allow_uncommitted: bool,
     warn: Callable[[str], None] | None,
 ) -> Tracking:
     """Warn about the files of `paths` no commit holds, or refuse them in an anonymised package; return the state.
 
-    `places` is the package's sorted file list: a path that holds a term of the list is shown only by its place in it.
+    Each path is named through `redactor`, the one the build's checks share, so one that holds a private name or a
+    term of the anonymisation list is shown only by its hidden name, in the warning and in the refusal alike.
     """
     say = warn or (lambda line: print(f"warning: {line}", file=sys.stderr))
     state = tracking(root, paths)
     if state.vcs == NO_VCS:
-        say(f"{root} is not in a repository, so whether its included files are committed cannot be told")
+        say("the study is not in a repository, so whether its included files are committed cannot be told")
     if not state.uncommitted:
         return state
-    names = {
-        path: hidden_name(places.index(path) + 1, path) if terms and holds_term(terms, path) else path
-        for path, _ in state.uncommitted
-    }
-    shown = ", ".join(f"{names[path]} ({kind})" for path, kind in state.uncommitted)
-    if terms is not None and not allow_uncommitted:
+    shown = ", ".join(f"{redactor.name(path)} ({kind})" for path, kind in state.uncommitted)
+    if anonymised and not allow_uncommitted:
         raise PackageError(
             f"an anonymised package names no commit, so it cannot include files no commit holds: {shown}; commit them, "
             "leave them out, or pass --allow-uncommitted",
-            private={name: path for path, name in names.items() if name != path},
+            private=redactor.hidden,
         )
     say(f"included but no commit holds them, listed in PACKAGE.json: {shown}")
     return state
