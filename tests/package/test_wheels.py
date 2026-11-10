@@ -1,7 +1,9 @@
 """The wheels a package vendors: installed files packed again, exactly and deterministically, or the author's own."""
 
+import importlib.machinery
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -186,9 +188,9 @@ def test_k10_a_supplied_wheel_for_an_editable_install_is_held_to_its_checkout(si
     assert wheel.uncompared == ("toy_platform/examples/notes.txt",)
 
 
-def test_k10_the_cores_own_wheel_built_from_this_checkout_matches_its_editable_install():
-    """K10: a wheel laid out as the core's build lays it out (its packages, the example mapped in, the public hash
-    file) passes the comparison with this editable install; the example's files are the ones listed as uncompared."""
+def core_wheel_files() -> dict[str, bytes]:
+    """The members of a wheel laid out as the core's build lays it out: its packages, the example mapped in, the
+    public hash file."""
     root = Path(__file__).resolve().parents[2]
     files = {}
     for package in ("expcore", "expcore_onedata"):
@@ -201,10 +203,83 @@ def test_k10_the_cores_own_wheel_built_from_this_checkout_matches_its_editable_i
                 path.read_bytes()
             )
     files["expcore/provenance/study_tokens.sha256"] = (root / "tests" / "data" / "study_tokens.sha256").read_bytes()
+    return files
+
+
+def test_k10_the_cores_own_wheel_built_from_this_checkout_matches_its_editable_install():
+    """K10: the core's own wheel passes the comparison with this editable install, and every member is compared: the
+    packages with what they import from, the example and the hash file through the mapping pyproject.toml declares."""
+    name, data = wheel_of("papers-experiments-core", "0.1.0", core_wheel_files())
+    assert compare_supplied(metadata.distribution("papers-experiments-core"), True, name, data) == ()
+
+
+@pytest.mark.parametrize("member", ["expcore/examples/tiny_study/plugin.py", "expcore/examples/tiny_study/prompt.txt"])
+def test_k10_an_edited_example_file_in_the_cores_wheel_is_refused(member):
+    """K10: the example the core's wheel maps in from the checkout is compared with the checkout's file, Python or
+    not, so a wheel whose example plugin or prompt differs is refused, naming the member."""
+    files = core_wheel_files()
+    files[member] += b"\n# edited\n"
     name, data = wheel_of("papers-experiments-core", "0.1.0", files)
-    uncompared = compare_supplied(metadata.distribution("papers-experiments-core"), True, name, data)
-    assert uncompared
-    assert all(member.startswith("expcore/examples/tiny_study/") for member in uncompared)
+    with pytest.raises(PackageError, match=rf"{re.escape(member)} differs from the installed one"):
+        compare_supplied(metadata.distribution("papers-experiments-core"), True, name, data)
+
+
+BACKEND = {
+    "toy_backend/__init__.py": b"WIRE = 'blue'\n",
+    "toy_backend/core.py": b"X = 1\n",
+    "toy_backend/data/table.txt": b"one\ntwo\n",
+}
+
+
+class _HookFinder:
+    """An editable install's import hook: finds toy_backend in the project's src directory, as a .pth hook does."""
+
+    def __init__(self, src: Path) -> None:
+        self.src = src
+
+    def find_spec(self, name, path=None, target=None):
+        if name != "toy_backend":
+            return None
+        return importlib.machinery.PathFinder.find_spec(name, [str(self.src)])
+
+
+def test_k10_a_src_layout_editable_behind_an_import_hook_is_compared_with_the_package_it_imports(
+    site, tmp_path, monkeypatch
+):
+    """K10: an editable install whose .pth runs an import hook puts no directory on the path; its package is found
+    where it imports from (project/src/toy_backend against members toy_backend/), so an older wheel of the same
+    version is refused, as are one that lacks a module and one with a Python module the checkout does not have. With
+    no mapping declared, a member found nowhere else is compared with the project's file below its top-level package
+    stripped (a file the build maps in); a data member with nothing to compare goes in, listed."""
+    project = tmp_path / "project"
+    for rel, data in BACKEND.items():
+        (project / "src" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (project / "src" / rel).write_bytes(data)
+    (project / "notes").mkdir()
+    (project / "notes" / "readme.txt").write_bytes(b"mapped from the project\n")
+    editable = json.dumps({"url": project.as_uri(), "dir_info": {"editable": True}})
+    hook = {"__editable__.toy_backend-2.0.0.pth": b"import _toy_backend_finder; _toy_backend_finder.install()\n"}
+    dist = installed_distribution(site, "toy-backend", "2.0.0", hook, direct_url=editable)
+    monkeypatch.setattr(wheels_module, "installed", lambda: {"toy-backend": dist})
+    monkeypatch.setattr(sys, "meta_path", [_HookFinder(project / "src"), *sys.meta_path])
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    cases = [
+        ({**BACKEND, "toy_backend/__init__.py": b"WIRE = 'grey'\n"}, r"toy_backend/__init__\.py differs"),
+        ({k: v for k, v in BACKEND.items() if k != "toy_backend/core.py"}, r"lacks toy_backend/core\.py"),
+        ({**BACKEND, "toy_backend/stale.py": b"Y = 2\n"}, r"toy_backend/stale\.py is Python code with nothing"),
+        ({**BACKEND, "toy_backend/notes/readme.txt": b"older\n"}, r"toy_backend/notes/readme\.txt differs"),
+    ]
+    for files, refusal in cases:
+        name, data = wheel_of("toy-backend", "2.0.0", files)
+        (supplied / name).write_bytes(data)
+        with pytest.raises(PackageError, match=refusal):
+            vendor_wheels({"toy-backend": "2.0.0"}, supplied)
+    mapped = {"toy_backend/notes/readme.txt": b"mapped from the project\n", "toy_backend/data/notes.txt": b"new\n"}
+    name, data = wheel_of("toy-backend", "2.0.0", {**BACKEND, **mapped})
+    (supplied / name).write_bytes(data)
+    [wheel] = vendor_wheels({"toy-backend": "2.0.0"}, supplied)
+    assert (wheel.data, wheel.uncompared) == (data, ("toy_backend/data/notes.txt",))
 
 
 def test_k10_a_wheel_says_whether_it_came_from_an_index_which_decides_how_deep_it_is_read(site, monkeypatch):

@@ -14,11 +14,11 @@ Where a wheel comes from, for each distribution:
   its metadata, is taken byte for byte, once its code is shown to be what is installed: the way to ship a public
   release's own wheel, or the wheel of a distribution installed editable. Each member outside its `.dist-info` must
   match the bytes of the installed file its RECORD lists (RECORD names the file; its hash is not trusted, since an
-  installed file can be edited after the install), and every installed file must be in it; for an editable install,
-  each member must match the file of the checkout it imports from, found below a directory its `.pth` puts on the
-  path (or through its RECORD), and every Python file of the checkout under a package the wheel holds must be in it.
-  A member with no counterpart there (an example data file the build maps in) cannot be compared: it goes in and is
-  listed in `PACKAGE.json`. A wheel whose code differs is refused, naming the member;
+  installed file can be edited after the install), and every installed file must be in it. For an editable install
+  each member must match the checkout's file it was built from, found where the install imports from or through the
+  wheel mapping the project declares, and every Python file the install imports must be in it (`editable`); a Python
+  member found nowhere is refused, and a data member found nowhere goes in, listed in `PACKAGE.json`. A wheel whose
+  code differs is refused, naming the member;
 - otherwise the installed files are packed again into a wheel: every file the distribution's RECORD lists inside
   the site directory, each checked against its RECORD hash, without bytecode and without what the installer added
   (INSTALLER, REQUESTED, RECORD, direct_url.json and the installer's own records); RECORD is written anew. The wheel
@@ -48,16 +48,9 @@ from importlib import metadata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from expcore.package.editable import checkout_of
 from expcore.package.spec import WHEELS_DIR, PackageError
-from expcore.provenance.environment import (
-    EnvironmentUnknown,
-    canonical,
-    editable_roots,
-    installed,
-    pth_directories,
-    python_files,
-    source_of,
-)
+from expcore.provenance.environment import EnvironmentUnknown, canonical, installed, source_of
 
 REQUIREMENTS = f"{WHEELS_DIR}/requirements.txt"
 ZIP_DATE = (1980, 1, 1, 0, 0, 0)
@@ -256,14 +249,19 @@ def compare_supplied(dist: metadata.Distribution, editable: bool, filename: str,
     """Refuse a supplied wheel whose code is not what is installed; return its members with nothing to compare."""
     members = code_members(data)
     record = _installed_files(dist)
-    roots = editable_roots(dist) if editable else []
+    checkout = checkout_of(dist) if editable else None  # where an editable install's code lives (`editable`)
     uncompared = []
     for member, content in sorted(members.items()):
-        local = next((root / member for root in roots if (root / member).is_file()), None)
+        local = checkout.counterpart(member) if checkout is not None else None
         if local is not None:
             same = local.read_bytes() == content
         elif member in record and not member.endswith(".pth"):
             same = _same_as_installed(dist, record[member], content)
+        elif editable and member.endswith(".py"):
+            raise PackageError(
+                f"{filename}: {member} is Python code with nothing installed to compare it with; supply the wheel of "
+                "what is installed"
+            )
         elif editable:
             uncompared.append(member)
             continue
@@ -273,21 +271,14 @@ def compare_supplied(dist: metadata.Distribution, editable: bool, filename: str,
             raise PackageError(
                 f"{filename}: {member} differs from the installed one; supply the wheel of what is installed"
             )
-    for path in _expected(dist, editable, roots, members, record):
+    if checkout is not None:
+        expected = checkout.expected(sorted(members))
+    else:
+        expected = [path for path in record if not path.endswith(".pth")]
+    for path in expected:
         if path not in members:
             raise PackageError(f"{filename}: lacks {path}, which is installed; supply the wheel of what is installed")
     return tuple(uncompared)
-
-
-def _expected(dist: metadata.Distribution, editable: bool, roots: list[Path], members, record) -> list[str]:
-    """What a supplied wheel must hold: every installed file, or for an editable install every Python file of the
-    directories its `.pth` puts on the path; below a project directory, only those under a package the wheel holds."""
-    if not editable:
-        return [path for path in record if not path.endswith(".pth")]
-    whole = bool(pth_directories(dist))
-    tops = {member.split("/", 1)[0] for member in members if "/" in member}
-    found = [p.relative_to(root).as_posix() for root in roots for p in python_files(root)]
-    return [path for path in found if whole or path.split("/", 1)[0] in tops]
 
 
 def vendor_wheels(distributions: Mapping[str, str], supplied: Path | None = None) -> list[Wheel]:
