@@ -22,7 +22,7 @@ The identity covers the study's directory and nothing else. Platform and backend
 
 ### What you implement
 
-The study directory holds four configuration files and one Python file, the plugin, named by `[study] plugin`. The core imports the plugin and calls `build(context)`, which returns a `StudyPlugin`:
+The study directory holds four configuration files and the plugin, the Python file `[study] plugin` names. The core imports the plugin and calls `build(context)`, which returns a `StudyPlugin`:
 
 | Part | What it is | In the example |
 |---|---|---|
@@ -35,6 +35,8 @@ The study directory holds four configuration files and one Python file, the plug
 | `backend_factory` | optional: a `BackendFactory` that builds the backend of every model, for a study with a model backend of its own. Its model entries name that backend in `models.toml` with a plain lower-case `backend` value; the factory serves those and hands every other model to the core's `default_backend_factory`. It carries a `version` attribute that goes into the campaign fingerprint with its name; a factory imported from an installed package must declare the installed version of the distribution that owns its module's file, one defined in a file `[study] code` lists, which the code identity covers, may declare any, and one from anywhere else is refused. Without a factory, such a model is refused when the plugin is loaded | none: the core's factory builds the stub |
 
 The plugin names everything; the core names nothing. What each interface guarantees, and what you must guarantee in return (an executor never builds a backend, a scorer never reads the platform), is in [`interfaces.md`](interfaces.md).
+
+A plugin that outgrows one file imports the modules beside it relatively: `from .scoring import Scorer` in `plugin.py` finds `scoring.py` in the same directory. The core imports the plugin as a package of its own directory, under a name made from the plugin's path, so two studies' modules of one name never meet, and `import scoring` finds nothing (the error says to import it relatively). List every such file in `[study] code` beside `plugin.py`, and in `package.toml`: the core refuses to load a plugin that imports, at its top level or in `build`, a file the list leaves out, because the code identity would not cover code that runs.
 
 ## 2. Where configuration lives
 

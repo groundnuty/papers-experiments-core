@@ -158,7 +158,7 @@ def test_every_record_holds_the_instruments_snapshot_and_the_scorer_reads_its_co
 def test_the_example_scorer_takes_a_failed_snapshot_as_unmeasured_never_as_zero(resumed):
     entry = resumed.read("export.json")["analysed_attempts"][0]
     record = record_of(resumed, entry).with_instrument("facts", {"ok": False, "error": "TimeoutError"})
-    plugin = import_plugin_module(resumed.root / "plugin.py")
+    plugin = import_plugin_module(load_study(resumed.root))
     assert plugin.TinyScorer().score(record)["outcomes"]["served"] is None
 
 

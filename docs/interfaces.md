@@ -15,7 +15,7 @@ All of them are `typing.Protocol`s, so a test double needs no inheritance. Signa
 
 ## The study plugin
 
-A study directory holds `study.toml`, `models.toml`, `campaign.toml`, `preregistration.toml` and one Python file named by `[study] plugin`; `[study] requires` names the distributions beyond the core that the study's code imports. `expcore.study.config.load_study(directory)` validates all of them against each other. `expcore.study.plugin.load_plugin` imports the file and calls
+A study directory holds `study.toml`, `models.toml`, `campaign.toml`, `preregistration.toml` and the plugin, the Python file `[study] plugin` names, with any modules it imports from beside it; `[study] requires` names the distributions beyond the core that the study's code imports. `expcore.study.config.load_study(directory)` validates all of them against each other. `expcore.study.plugin.load_plugin` imports the file and calls
 
 ```python
 def build(context: StudyContext) -> StudyPlugin: ...
@@ -45,6 +45,8 @@ class StudyPlugin:
 The core guarantees: the code identity is computed once, from the study directory and the `[study] code` roots, and refused if it is unknown, stale or (without `--allow-dirty`) dirty; the plugin is rejected at load if a condition has no prompt or tool hash, two scorers share a name, or `platform` is not a mapping; `prompts`, `tools`, the scorers' names and versions, the hash of each configuration file and, when not empty, `platform` go into the campaign fingerprint, so a resume under any change is refused (C06). A study on the Onedata layer passes `platform=config.fingerprint()`, the platform file's TLS mode with the CA bundle's SHA-256, so a resume under another mode or bundle is refused.
 
 The implementer must guarantee: `build` has no side effects beyond constructing objects; the hashes describe what the model sees under each condition; nothing is named by the core, so every name lives in the study.
+
+**A plugin over several files.** `import_plugin_module` imports the plugin as a package whose path is the plugin's own directory, named `expcore_study_plugin_` plus a hash of the plugin's path. A module beside it is imported relatively (`from .scoring import Scorer`, or `from . import scoring`) and is named below that package, so two studies' `scoring.py` never meet in one process, and loading a study again reads its files anew. `import scoring` finds nothing, since the study directory is not on the module search path; the refusal names the fix. The core guarantees that every module the plugin imports from its directory, at its top level or in `build`, is a file of the code identity: after the import and again after `build` it refuses one that `[study] code` does not list, naming `study.toml`, the key and the file, and the replay check's import refuses it too. The implementer must guarantee that every such file is in `[study] code` (and so in `package.toml`, whose build requires every file the identity covers), and imports it at the plugin's top level or in `build`: a module first imported while a run is under way escapes that check. A backend factory in such a module enters the fingerprint as `scoring.Factory`, without the hashed name.
 
 The command line is `python -m expcore run|check|analyze|report|package|package-check|example` ([`cli.py`](../src/expcore/cli.py)). Output goes under `<study>/out/`; `package` writes a replication package where `--out` says, and `example` writes the example study into a new directory. How to use them is in [`study-guide.md`](study-guide.md).
 
