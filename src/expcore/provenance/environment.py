@@ -7,10 +7,13 @@
 
 The distributions are the core's and those the study names in `[study] requires` (a platform package, a backend),
 with everything they require, transitively: the closure of their `Requires-Dist` over what is installed, which is
-what the study's code can import through its dependencies. A requirement behind an extra counts only when that extra
-was asked for; any other marker is not evaluated, and a requirement that is not installed is left out, since the
-installer decided it did not apply. Tools installed beside the study and not required by it (a test runner, a
-linter, the installer itself) are not part of it, so a reader's fresh environment holds exactly these.
+what the study's code can import through its dependencies. Each requirement's marker is evaluated for this
+interpreter and platform (`packaging.markers`), once with no extra and once for each extra asked of the distribution
+that requires it, so a requirement counts when any of those makes its marker true: `extra == "x" or python_version
+>= "3.0"` counts with or without the extra, and a tool whose marker is false is left out even when it is installed. A
+requirement whose marker holds but that is not installed is left out too, since nothing can import it. Tools
+installed beside the study and not required by it (a test runner, a linter, the installer itself) are not part of
+it, so a reader's fresh environment holds exactly these.
 
 `sources` names, for each distribution installed from a direct URL rather than an index (PEP 610 `direct_url.json`),
 where it came from: a version-control URL and commit, an archive URL and hash, or a local directory. A local path is
@@ -31,10 +34,10 @@ from importlib import metadata
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from packaging.requirements import InvalidRequirement, Requirement
+
 CORE_DISTRIBUTION = "papers-experiments-core"
-_REQUIREMENT = re.compile(r"\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?:\[([^\]]*)\])?")
 _ROOT = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?:\[[A-Za-z0-9._,\s-]*\])?")
-_EXTRA = re.compile(r"""\bextra\s*==\s*['"]([^'"]+)['"]""")
 
 
 class EnvironmentUnknown(RuntimeError):
@@ -51,14 +54,19 @@ def is_requirement_name(text: object) -> bool:
     return isinstance(text, str) and _ROOT.fullmatch(text) is not None
 
 
-def _parse(requirement: str) -> tuple[str, frozenset[str], frozenset[str]] | None:
-    """A requirement's name, the extras it asks for, and the extras its marker is conditional on; None if unreadable."""
-    head, _, marker = requirement.partition(";")
-    found = _REQUIREMENT.match(head)
-    if found is None:
-        return None
-    asked = frozenset(canonical(e) for e in (found.group(2) or "").split(",") if e.strip())
-    return canonical(found.group(1)), asked, frozenset(canonical(e) for e in _EXTRA.findall(marker))
+def _parse(requirement: str, where: str) -> Requirement:
+    """A requirement as `packaging` reads it; one that cannot be read leaves the environment unknown."""
+    try:
+        return Requirement(requirement)
+    except InvalidRequirement:
+        raise EnvironmentUnknown(f"{where}: the requirement {requirement!r} cannot be read") from None
+
+
+def applies(requirement: Requirement, extras: Iterable[str]) -> bool:
+    """Whether a requirement's marker holds here, with no extra or with any of the extras asked of its requirer."""
+    if requirement.marker is None:
+        return True
+    return any(requirement.marker.evaluate({"extra": extra}) for extra in ("", *sorted(extras)))
 
 
 def installed() -> dict[str, metadata.Distribution]:
@@ -113,25 +121,23 @@ def environment(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Di
     dists = installed() if found is None else found
     queue: list[tuple[str, frozenset[str]]] = []
     for root in (CORE_DISTRIBUTION, *requires):
-        parsed = _parse(root)
-        if parsed is None or parsed[0] not in dists:
+        parsed = _parse(root, "[study] requires")
+        if canonical(parsed.name) not in dists:
             raise EnvironmentUnknown(
                 f"{root!r} is not installed, so the environment it belongs to cannot be recorded; install it"
             )
-        queue.append((parsed[0], parsed[1]))
+        queue.append((canonical(parsed.name), frozenset(canonical(e) for e in parsed.extras)))
     asked: dict[str, set[str]] = {}
     while queue:
         name, extras = queue.pop()
         if name in asked and extras <= asked[name]:
             continue
         asked.setdefault(name, set()).update(extras)
-        for requirement in dists[name].requires or []:
-            parsed = _parse(requirement)
-            if parsed is None or parsed[0] not in dists:
-                continue  # not installed: the installer judged that its marker did not apply
-            if parsed[2] and not parsed[2] & asked[name]:
-                continue  # behind an extra nobody asked for
-            queue.append((parsed[0], parsed[1]))
+        for text in dists[name].requires or []:
+            parsed = _parse(text, name)
+            if not applies(parsed, asked[name]) or canonical(parsed.name) not in dists:
+                continue  # its marker is false here, or nothing installed answers it
+            queue.append((canonical(parsed.name), frozenset(canonical(e) for e in parsed.extras)))
     versions = {name: str(dists[name].version) for name in sorted(asked)}
     sources = {name: source for name in sorted(asked) if (source := source_of(dists[name])) is not None}
     python = f"{sys.version_info.major}.{sys.version_info.minor}"

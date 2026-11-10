@@ -618,6 +618,7 @@ dependencies = [
     { name = "mcp" },
     { name = "numpy" },
     { name = "openai" },
+    { name = "packaging" },
     { name = "scipy" },
 ]
 
@@ -640,6 +641,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.3.0" },
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "openai", specifier = ">=3.46.0" },
+    { name = "packaging", specifier = ">=24.0" },
     { name = "scipy", specifier = ">=1.18.1" },
 ]
 provides-extras = ["onedata"]

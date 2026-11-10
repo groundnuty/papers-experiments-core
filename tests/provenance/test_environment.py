@@ -59,6 +59,26 @@ def test_c06_the_environment_is_the_closure_of_the_core_and_the_study_requiremen
     assert "test-runner" not in with_extra["distributions"]
 
 
+def test_c06_markers_are_evaluated_so_a_false_one_leaves_a_tool_out_and_a_true_one_keeps_a_library_in(tmp_path):
+    """C06: a tool whose marker is false here stays out even though it is installed, and a requirement whose marker
+    holds without its extra (`extra == "x" or python_version >= "3.0"`) is in."""
+    where = tmp_path / "site"
+    found = {
+        CORE_DISTRIBUTION: install(
+            where,
+            CORE_DISTRIBUTION,
+            "0.1.0",
+            [
+                "faraway-tool ; sys_platform == 'no-such-platform'",
+                "eitherlib ; extra == 'x' or python_version >= '3.0'",
+            ],
+        ),
+        "faraway-tool": install(where, "faraway-tool", "1.0"),
+        "eitherlib": install(where, "eitherlib", "2.0"),
+    }
+    assert environment(found=found)["distributions"] == {CORE_DISTRIBUTION: "0.1.0", "eitherlib": "2.0"}
+
+
 def test_c06_a_required_distribution_that_is_not_installed_cannot_be_recorded(site):
     """C06: an environment that names a distribution it cannot find is refused rather than recorded without it."""
     with pytest.raises(EnvironmentUnknown, match="'absent-platform' is not installed"):
