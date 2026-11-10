@@ -90,7 +90,9 @@ def test_every_block_of_the_study_guide_runs_in_order_in_a_new_directory(tmp_pat
             for line in body.splitlines():
                 if line.startswith("cd "):
                     [directory] = shlex.split(line)[1:]
-                    monkeypatch.chdir(directory)
+                    target = Path(directory).resolve()  # relative to where the guide's reader stands now
+                    assert target.is_relative_to(tmp_path.resolve()), f"block {number}: cd leaves the scratch dir"
+                    monkeypatch.chdir(target)
                 elif line.strip() and not line.startswith("#"):
                     run_line(line)
         elif language == "python":
