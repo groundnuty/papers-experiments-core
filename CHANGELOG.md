@@ -139,7 +139,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | P04 | Every output manifest carries the hash of its configuration and preregistration | `tests/stats/test_analysis.py`, `tests/stats/test_prereg.py` |
 | P05 | Scoring and inference code are frozen by digest and a known-answer test | `tests/stats/test_kat.py` |
 | P06 | One model table | `tests/config/test_models.py`, `tests/study/test_study.py` |
-| P07 | A replication package is not a code source | `tests/test_provenance_history.py` |
+| P07 | A replication package is not a code source | `tests/provenance/test_redact.py`, `tests/test_provenance_history.py`, `tests/test_sanitise.py`, `tests/test_study_tokens.py` |
 | S01 | Float noise is snapped before rank tests | `tests/stats/test_contrasts.py` |
 | S02 | Holm keeps the declared family | `tests/stats/test_analysis.py`, `tests/stats/test_contrasts.py` |
 | S03 | Degenerate contrasts are defined | `tests/stats/test_analysis.py`, `tests/stats/test_contrasts.py`, `tests/stats/test_estimators.py`, `tests/stats/test_pairing.py` |
