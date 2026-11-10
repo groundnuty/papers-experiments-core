@@ -24,7 +24,8 @@ are the same text: no clock, no path and no random number enters it.
 - Per condition it shows the planned runs and how each ended (analysed, exhausted, unfinished, left out), the attempts
   set aside and a median dispatch position, so a reader can see whether one condition's runs came late; and per
   condition and infrastructure kind the infrastructure failures, with a row of zeros for a condition that had none, so
-  0 is never mistaken for "not reported" (C23).
+  0 is never mistaken for "not reported" (C23); and per condition and model the attempts a budget hold set aside, a row
+  of zeros for each pair the plan runs, so a reader sees whether the budget stopped one model more than another (C26).
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
@@ -35,12 +36,14 @@ are the same text: no clock, no path and no random number enters it.
 
 import math
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore.accounting import condition_accounting
+from expcore.errors import BUDGET_HOLD
 from expcore.report_notes import (
+    BUDGET_HOLD_NOTES,
     CONDITION_NOTES,
     COUNT_DEFINITIONS,
     MDE_NOTES,
@@ -290,7 +293,13 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
         *_table([*header, "Median dispatch position"], rows),
         "",
     ]
-    return [*lines, *_infrastructure(export, [cell["condition"] for cell in accounting]), ""]
+    return [
+        *lines,
+        *_infrastructure(export, [cell["condition"] for cell in accounting]),
+        "",
+        *_budget_holds(export),
+        "",
+    ]
 
 
 def _infrastructure(export: Mapping[str, Any], conditions: Sequence[str]) -> list[str]:
@@ -318,6 +327,30 @@ def _infrastructure(export: Mapping[str, Any], conditions: Sequence[str]) -> lis
         return [*lines, "No condition has a planned run."]
     header = ["Condition", "Kind", "Declared treatment", "Set aside (all runs)", "Scored as treatment", "Left out"]
     return [*lines, *_table(header, rows), "", *COUNT_DEFINITIONS]
+
+
+def _budget_holds(export: Mapping[str, Any]) -> list[str]:
+    """The attempts a budget hold set aside, per condition and model, with a row of zeros for each pair the plan runs,
+    so a reader sees whether the budget stopped one model's runs more than another's (C26)."""
+    counts: Counter[tuple[str, str]] = Counter()
+    for row in export["retries_by_kind"]:
+        if row["kind"] == BUDGET_HOLD:
+            counts[(row["condition"], row["model"])] += row["attempts"]
+    planned = {
+        (entry["condition"], entry["factors"]["model"])
+        for part in ("analysed_attempts", "exhausted_runs", "unfinished_runs", "excluded_attempts")
+        for entry in export.get(part, [])
+    }
+    rows = [[condition, model, counts[(condition, model)]] for condition, model in sorted(planned | set(counts))]
+    lines = ["### Budget holds by condition and model", ""]
+    if not rows:
+        return [*lines, "No condition has a planned run."]
+    return [
+        *lines,
+        *_table(["Condition", "Model", "Attempts set aside by a budget hold"], rows),
+        "",
+        *BUDGET_HOLD_NOTES,
+    ]
 
 
 def summary_lines(result: AnalysisResult) -> list[str]:

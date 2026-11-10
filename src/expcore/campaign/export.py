@@ -16,7 +16,7 @@ attempt is discarded, and so are all the attempts of an exhausted run. Interrupt
 attempts are reported in their own rows of `discarded_usage`, never folded into one another.
 
 Infrastructure retries are grouped by the kind from the closed vocabulary in `expcore.errors`, each under its own name
-(C02). `infrastructure_by_condition` adds, per condition and kind, how many attempts were set aside and run again and
+(C02), per condition and model; an attempt a budget hold set aside is one of kind `budget_hold` (C26). `infrastructure_by_condition` adds, per condition and kind, how many attempts were set aside and run again and
 how many were scored as treatment, with the kinds each condition declares, so a reader sees whether a condition's
 fault was measured or re-run away. Field names are generic: a run is named by its key, its condition, its model and its
 factor values. The file is written to a temporary file in its directory and moved into place, so a reader sees the old

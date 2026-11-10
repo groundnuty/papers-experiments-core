@@ -101,4 +101,14 @@ COUNT_DEFINITIONS = [
     "treatment, after the model's first turn; each is its run's final, scored attempt. Runs a partial analysis leaves "
     "out are not included.",
     "- *Left out*: the set-aside and treatment attempts of runs a partial analysis leaves out, and only those.",
+    "- *Kind* `budget_hold`: no failure of the infrastructure, but the campaign's budget: a request was not sent "
+    "because the top-up it needed would have passed the ceiling. Set aside like a failure, and never a treatment.",
+]
+
+BUDGET_HOLD_NOTES = [
+    "Attempts set aside by a budget hold: attempts that ended because a request the token cap could not account for",
+    "(a resend after a failure that may have been billed, or a request after a reply without usage) needed a top-up",
+    "the campaign's budget could not cover, so it was not sent. They are among the attempts set aside above, and are",
+    "counted over every run of the campaign, a run a partial analysis leaves out included. A model with more of them",
+    "had its runs stopped by the budget more often than the others.",
 ]

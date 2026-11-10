@@ -60,6 +60,9 @@ def analysis(*results: ContrastResult, family=None) -> AnalysisResult:
     return AnalysisResult(tuple(results), holm, 0.05, dict(MANIFEST))
 
 
+RUN_PARTS = ("analysed_attempts", "exhausted_runs", "unfinished_runs", "excluded_attempts")
+
+
 def export(**changes):
     base = {
         "planned_runs": 4,
@@ -72,8 +75,13 @@ def export(**changes):
             {"run_key": "k3", "condition": "cond-b", "dispatch_seq": 3},
         ],
         "infrastructure_by_condition": [],
+        "retries_by_kind": [],
     }
-    return {**base, **changes}
+    data = {**base, **changes}
+    for part in RUN_PARTS:  # an export names each run's model among its factors; these runs are of one model
+        if part in data:
+            data[part] = [{"factors": {"model": "model-a"}, **entry} for entry in data[part]]
+    return data
 
 
 def render(result, data=None, **options):
@@ -626,3 +634,52 @@ def test_s12_an_exploratory_only_result_with_a_confirmatory_contrast_is_refused(
         render(bad)
     with pytest.raises(ValueError, match="exploratory_only"):
         summary_lines(bad)
+
+
+def budget_hold(condition: str, model: str, attempts: int) -> dict:
+    return {
+        "condition": condition,
+        "model": model,
+        "kind": "budget_hold",
+        "state": "infra_fail",
+        "charged": False,
+        "attempts": attempts,
+    }
+
+
+def test_c26_budget_holds_are_counted_per_condition_and_model_so_a_reader_sees_where_they_cluster():
+    """C26: the attempts a budget hold set aside, by condition and model, from the export; another kind's attempts
+    are not counted, and a model that met the ceiling more often stands out."""
+    analysed = [
+        {"run_key": "k1", "condition": "cond-a", "factors": {"model": "model-a"}},
+        {"run_key": "k2", "condition": "cond-a", "factors": {"model": "model-b"}},
+        {"run_key": "k3", "condition": "cond-b", "factors": {"model": "model-a"}},
+        {"run_key": "k4", "condition": "cond-b", "factors": {"model": "model-b"}},
+    ]
+    retries = [
+        budget_hold("cond-a", "model-b", 3),
+        budget_hold("cond-b", "model-b", 2),
+        {**budget_hold("cond-a", "model-a", 5), "kind": "endpoint", "charged": True},
+    ]
+    report = render(
+        analysis(contrast("primary", "difference")), export(analysed_attempts=analysed, retries_by_kind=retries)
+    )
+    holds = report.split("### Budget holds by condition and model", 1)[1]
+    assert "| Condition | Model | Attempts set aside by a budget hold |" in holds
+    rows = [line for line in holds.splitlines() if line.startswith("| cond-")]
+    assert rows == [
+        "| cond-a | model-a | 0 |",
+        "| cond-a | model-b | 3 |",
+        "| cond-b | model-a | 0 |",
+        "| cond-b | model-b | 2 |",
+    ]
+    assert "top-up" in holds
+
+
+def test_c26_a_campaign_without_a_budget_hold_has_a_row_of_zeros_for_every_condition_and_model_it_ran():
+    """C26: 0 is never mistaken for "not reported": each pair the plan runs has its row, a run left unfinished or
+    exhausted included."""
+    data = export(planned_runs=5, exhausted_runs=[{"run_key": "k5", "condition": "cond-c"}])
+    holds = render(analysis(contrast("primary", "difference")), data).split("### Budget holds by condition", 1)[1]
+    for name in ("cond-a", "cond-b", "cond-c"):
+        assert f"| {name} | model-a | 0 |" in holds

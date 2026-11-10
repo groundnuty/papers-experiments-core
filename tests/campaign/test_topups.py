@@ -22,6 +22,8 @@ from expcore.config.prices import Price
 from expcore.errors import BudgetHold
 from expcore.models.adapters import ModelTurn, ToolCall
 from expcore.replay.replay import replay_record
+from expcore.report import render_report
+from expcore.stats.analysis import AnalysisResult
 
 MODEL = "quince"
 TABLE = models_for(MODEL, price=Price(3.0, 15.0), context_tokens=16_000)
@@ -32,6 +34,8 @@ LIMITS = Limits(
 # A stub's run is reserved its whole cap and its whole window at 15 USD per million, 1.50 + 0.24; nothing holds a
 # stub's reply to the reply maximum, so one request's bound, a top-up, is the window at that rate: 0.24.
 BOUND, TOPUP = 1.74, 0.24
+NO_CONTRASTS = AnalysisResult((), (), 0.05, {"preregistration_sha256": "e" * 64})
+STAMP = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
 
 
 def ledger_for(store, max_usd: float, in_flight=(MODEL,)) -> Ledger:
@@ -224,6 +228,14 @@ def test_c26_a_request_the_budget_cannot_top_up_is_not_sent_and_its_attempt_is_a
         assert {(r["model"], r["kind"], r["state"], r["charged"]) for r in export["retries_by_kind"]} == {
             (MODEL, "budget_hold", "infra_fail", False)
         }
+        [held] = [r for r in export["infrastructure_by_condition"] if r["kind"] == "budget_hold"]
+        assert (held["set_aside"], held["treatment"], held["declared_treatment"]) == (1, 0, False)
+        report = render_report(NO_CONTRASTS, export, study="topup-study", code=STAMP, core_version="0.1.0")
+        rows = [
+            line for line in report.split("### Budget holds by condition and model")[1].splitlines() if MODEL in line
+        ]
+        assert f"| {held['condition']} | {MODEL} | 1 |" in rows
+        assert sorted(row.rsplit("|", 2)[1].strip() for row in rows) == ["0", "0", "1"]  # the other conditions' zeros
         [record] = scheduler.executor.records
         assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "budget_hold")
         assert record.set_aside
