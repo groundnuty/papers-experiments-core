@@ -1,14 +1,18 @@
 """The local log of harness defects: the redacted traceback that no record, marker or store holds (L08)."""
 
+import collections
 import json
 import shutil
 import subprocess
 
 import pytest
 from campaign_support import make_schema
+from loop_support import FakeProvider
+from record_support import CODE
 from scheduler_support import FakeExecutor, build, key_of
 
 from expcore.campaign.defect_log import HARNESS_LOG, log_path, write_defect
+from expcore.campaign.executor import record_run
 from expcore.config.loading import ConfigError
 from expcore.loop.outcomes import harness_defect_of
 
@@ -126,3 +130,56 @@ def test_r12_a_secret_with_both_quote_kinds_is_redacted_from_the_log_in_its_repr
         log = scheduler.run().harness_log.read_text(encoding="utf-8")
     assert "KeyError: '[redacted]'" in log
     assert "pebble" not in log
+
+
+PASSED = "willow-cobalt-5523-passed"  # a secret only the executor knows: given to record_run, in no environment
+
+
+class ToolsFail:
+    """A tool provider whose tool list cannot be built: a crash before the loop starts."""
+
+    def tools(self):
+        raise ValueError(f"the catalogue refused credential {PASSED}")
+
+
+def test_r12_a_crash_inside_record_run_is_redacted_with_the_secrets_the_executor_passed_it(tmp_path):
+    """R12: the log uses the attempt's whole redaction context, the `secrets` given to record_run included, not only
+    the model table."""
+    crashed = key_of(SCHEMA, "mount-read")
+    executor = FakeExecutor()
+
+    async def broken(request):
+        return await record_run(
+            request, [ToolsFail()], "be brief", "do it", executor.config, code=dict(CODE), secrets=[PASSED]
+        )
+
+    executor.behaviours[crashed] = collections.deque([broken])
+    with build(tmp_path, executor=executor, plan=SMALL) as scheduler:
+        log = scheduler.run().harness_log.read_text(encoding="utf-8")
+    assert "ValueError: the catalogue refused credential [redacted]" in log
+    assert PASSED not in log
+
+
+def test_l08_a_defect_the_loop_catches_reaches_the_log_with_the_records_stack_hash(tmp_path, monkeypatch):
+    """L08: a backend that raises inside the loop ends the attempt as a harness defect in its record, with only the
+    class and the stack hash; the traceback goes to the same log, redacted, matched by that hash."""
+    monkeypatch.setenv("TOYLAB_API_KEY", SECRET)
+    crashed = key_of(SCHEMA, "mount-read")
+    executor = FakeExecutor()
+
+    async def lookup(request):
+        request.backend.use([LookupError(f"no route for key {SECRET}")])
+        record = await record_run(request, [FakeProvider({})], "be brief", "do it", executor.config, code=dict(CODE))
+        executor.records.append(record)
+        return record
+
+    executor.behaviours[crashed] = collections.deque([lookup])
+    with build(tmp_path, executor=executor, plan=SMALL) as scheduler:
+        summary = scheduler.run()
+    [record] = [r for r in executor.records if r.outcome["name"] == "harness_defect"]
+    defect = record.outcome["defect"]
+    assert defect["exception"] == "LookupError"
+    log = summary.harness_log.read_text(encoding="utf-8")
+    assert f"{crashed} attempt 1: LookupError, stack {defect['stack_sha256']}" in log
+    assert "LookupError: no route for key [redacted]" in log
+    assert SECRET not in log

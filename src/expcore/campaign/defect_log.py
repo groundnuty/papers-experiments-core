@@ -67,3 +67,34 @@ def write_defect(
         with path.open("a", encoding="utf-8") as handle:
             handle.write(head + text + ("" if text.endswith("\n") else "\n"))
     return path
+
+
+class DefectLog:
+    """The harness-defect log of one attempt: each entry carries its run key and attempt number.
+
+    The redactor starts as the one the attempt runner can build (the backend's model and the model table);
+    `record_attempt` replaces it with the attempt's whole redaction context (`redact_with`), so an entry written after
+    that, for a crash the loop caught or one that escaped the executor, is redacted with every secret the record is.
+    """
+
+    def __init__(
+        self, root: Path, run_key: str, attempt: int, stamp: Callable[[], str], redactor: Callable[[], Redactor]
+    ):
+        self.root, self.run_key, self.attempt, self._stamp = Path(root), run_key, attempt, stamp
+        self._redactor = redactor
+
+    def redact_with(self, redactor: Callable[[], Redactor]) -> None:
+        """Use this redactor for the attempt's entries from now on."""
+        self._redactor = redactor
+
+    def __call__(self, error: BaseException, defect: HarnessDefect) -> Path:
+        """Write the redacted traceback of a harness defect of this attempt; return the log's path."""
+        return write_defect(
+            self.root,
+            error,
+            defect,
+            stamp=self._stamp(),
+            run_key=self.run_key,
+            attempt=self.attempt,
+            redactor=self._redactor,
+        )

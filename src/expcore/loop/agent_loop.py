@@ -28,7 +28,7 @@ from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.loop.config import AgentConfig, config_sha256_of
 from expcore.loop.endings import cannot_start, cut_ending, time_ending
 from expcore.loop.leaks import leaked_tool
-from expcore.loop.outcomes import Outcome, harness_defect_of
+from expcore.loop.outcomes import HarnessDefect, Outcome, harness_defect_of
 from expcore.loop.records import LoopResult, ToolCallRecord, TurnRecord
 from expcore.loop.timer import AgentTimer, Tick, WaitContext, waited_since
 from expcore.loop.toolbox import ToolBox, ToolRun
@@ -57,6 +57,7 @@ async def run_agent(
     timer: AgentTimer | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    on_defect: Callable[[BaseException, HarnessDefect], object] | None = None,
 ) -> LoopResult:
     """Run one attempt and return how it went.
 
@@ -67,6 +68,9 @@ async def run_agent(
     Cancelling the run from outside cancels the call in flight, waits for it up to `config.cleanup_deadline_s`, and
     raises `CancelledError`. No result is returned then; a caller that passed its own `timer` finds there how long the
     cleanup took (`cleanup_s`) and whether it was given up on (`cleanup_timed_out`).
+
+    `on_defect` is called with every crash in our own code the loop turns into a harness defect, and the defect the
+    outcome carries, so the caller can keep the traceback the outcome leaves out (the campaign's `defect_log`).
     """
     if toolbox.cap_chars != config.limits.output_cap_chars:
         raise ValueError(
@@ -79,7 +83,7 @@ async def run_agent(
         raise ValueError("the timer's caps differ from the run configuration")
     elif timer.started:
         raise ValueError("the timer has already started; the loop starts it")
-    return await _Run(backend, toolbox, system, user, config, timer, sleep).execute()
+    return await _Run(backend, toolbox, system, user, config, timer, sleep, on_defect).execute()
 
 
 class _Run:
@@ -94,8 +98,10 @@ class _Run:
         config: AgentConfig,
         timer: AgentTimer,
         sleep: Callable[[float], Awaitable[None]],
+        on_defect: Callable[[BaseException, HarnessDefect], object] | None = None,
     ):
         self.backend, self.toolbox, self.system, self.user = backend, toolbox, system, user
+        self.on_defect = on_defect
         self.config, self.timer = config, timer
         self.watcher = Watcher(timer, sleep, cleanup_deadline_s=config.cleanup_deadline_s)
         self.turns: list[TurnRecord] = []
@@ -390,6 +396,8 @@ class _Run:
     def _defect(self, where: str, exc: BaseException) -> Outcome:
         """Record a crash in our own code: the exception class and a stack hash without line numbers (L08)."""
         defect = harness_defect_of(exc)
+        if self.on_defect is not None:  # the traceback, which the outcome leaves out
+            self.on_defect(exc, defect)
         detail = f"{where} failed inside the harness ({defect.exception}, stack {defect.stack_sha256[:12]}): {exc}"
         return Outcome("harness_defect", detail, defect=defect)
 

@@ -278,6 +278,7 @@ class RunRequest:
     treatment_kinds: tuple[str, ...]
     lease: Lease | None = None
     models: ModelTable | None = None
+    defect_log: DefectSink | None = None
 
     @property
     def run_key(self) -> str  # identity.run_key
@@ -294,7 +295,7 @@ class RunIdentity:  # expcore.records.build
 - `factors` maps every factor of the run key to the run's level: the study's declared factors and the built-in `task`, `model` and `seed` (an integer). The condition is not among them; `study.schema.condition_named(factors, run_key)` names it.
 - `attempt` is 1 for a run's first attempt and one more for each attempt of the run that was charged before it, an infrastructure failure set aside for instance, so a stub that should fail on the first try and succeed on the next tests `attempt`. An attempt that was interrupted (a killed process) is not charged, and its run is tried again under the same number. The record's file is named by `run_key` and `attempt` (`record_filename`), in `request.run_dir`, the directory of this try (`try<N>`, where N counts every try of the run, interrupted ones included, so it can be larger than `attempt`).
 
-`record_run(request, providers, system, user, config, *, code, **options)` runs the loop with the request's backend, timer and treatment kinds and returns the record. It records with the request's model table, which the scheduler fills in for every run, so the key of each model in `models.toml` is redacted whatever the backend (R12).
+`record_run(request, providers, system, user, config, *, code, **options)` runs the loop with the request's backend, timer and treatment kinds and returns the record. It records with the request's model table, which the scheduler fills in for every run, so the key of each model in `models.toml` is redacted whatever the backend (R12). It also hands on the request's `defect_log`, so the traceback of a crash the loop catches goes to the local harness-error log, redacted with every secret the executor gave `record_run` (L08).
 
 Core guarantees:
 - The gates (health, harness stop, budget, unit pause) were passed, the lease the platform declared for the run is held for the whole attempt, and the timer is not started: the loop starts it. The attempt has a row (`running`) before the executor is called, so a kill leaves a run that the next start settles (C04).
