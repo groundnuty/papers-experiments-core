@@ -350,6 +350,30 @@ Implementer must guarantee:
 - Pass `request.treatment_kinds` unchanged (`record_run` does) and the code identity from `StudyContext.code`.
 - Close nothing the core owns (backend, timer, lease).
 
+### What an executor reads
+
+An executor keeps the `StudyContext` that `build` received (the example's keeps it as `self.context`) and reads the loaded configuration from `context.study`, an `expcore.study.config.StudyConfig`, beside what the request carries. All of it is read-only, and every field comes from the study's configuration files, whose hashes are in the campaign fingerprint, so nothing an executor reads there can change under a resumed campaign (C06).
+
+| To get | Read | What it is |
+|---|---|---|
+| the run's levels | `request.identity.factors` | every factor of the run key: the declared ones and the built-in `task`, `model` and `seed` |
+| the run's condition | `study.schema.condition_named(factors, request.run_key)` | the condition's name |
+| a task's attributes | `study.tasks[task_id].attributes` | the text keys of `[tasks.<id>]` in `study.toml`; `study.tasks[task_id].id` is the id |
+| the loop's caps | `study.campaign.agent.limits` | `max_tool_rounds`, `time_cap_s`, `token_budget`, `output_cap_chars` and `max_output_tokens` (`expcore.config.models.Limits`); `study.campaign.agent`, the whole loop configuration, goes to `record_run` |
+| the plan | `study.campaign.models`, `.seeds`, `.order_seed`; `study.manifest` | the models and seeds of the plan, its order seed, and every run in the seeded order |
+| a model's entry | `study.models.resolve(key)`, or `request.models` | a `ModelSpec`: backend, API id, limits, price, status; the run's backend itself is `request.backend` |
+| a condition's settings | `study.schema.conditions[name]`, `.condition_tasks[name]`, `.treatment_kinds[name]` | its levels, its task list (`None`: every task) and its treatment kinds; the run's own kinds are `request.treatment_kinds`, passed on unchanged |
+| the study's name, its own kinds, its distributions | `study.name`, `study.kinds`, `study.requires` | |
+| the code identity | `context.code` | passed to `record_run` unchanged |
+
+The rest has no place in a run: `study.prereg` is the analysis plan, and `study.root`, `study.plugin_file` and `study.scope` hold paths of the machine, which must reach neither a prompt nor a record (the plugin finds its own files from `__file__`, as the example's `HERE` does). A prompt filled per task takes its values from these fields, as the example's does with the task's `region` (a value that is not text is rendered with `str`):
+
+```python
+task, limits = study.tasks[factors["task"]], study.campaign.agent.limits
+slots = {"TASK": task.id, "REGION": task.attributes["region"], "ROUNDS": limits.max_tool_rounds}
+user = template.render(slots, study_run=True)  # for a template with a {ROUNDS} slot, which the example's has not
+```
+
 ## HealthCheck
 
 `expcore.campaign.healthgate.HealthCheck`; `Health` is a named tuple `(ok: bool, detail: str)`.

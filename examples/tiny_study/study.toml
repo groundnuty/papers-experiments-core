@@ -34,7 +34,7 @@ access = "relay"
 tools = "basic"
 infrastructure_is_treatment = ["knowledge"]
 
-# Four tasks. Every key of a task is a text attribute; the preregistration clusters by `region`.
+# Four tasks. Every key of a task is a text attribute; the preregistration clusters by `region`, and the prompt names it.
 [tasks.lake]
 region = "north"
 

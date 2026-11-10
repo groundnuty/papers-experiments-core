@@ -7,6 +7,7 @@ key, and the platform is a stub whose health, probe and leases always succeed.
 The campaigns are built once per module (the module-scoped fixtures) and each test asserts one thing about them.
 """
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -153,6 +154,21 @@ def test_every_record_holds_the_instruments_snapshot_and_the_scorer_reads_its_co
         served = len([c for c in record.tool_calls if c["name"] == "lookup" and c["status"] == "ok"])
         assert record.instruments == {"facts": {"ok": True, "served": served}}
         assert scores[entry["run_key"]]["tiny"]["result"]["outcomes"]["served"] == float(served)
+
+
+def test_b15_each_record_holds_the_prompt_filled_from_its_tasks_own_attributes(resumed):
+    """B15: adds that the user prompt a record keeps is the one the model was sent, filled per task: the example's
+    executor reads the task's `region` from `study.tasks`, and the record holds the slot values and the template's
+    hash beside the text."""
+    study = load_study(resumed.root)
+    template = (resumed.root / "prompt.txt").read_text(encoding="utf-8")
+    for entry in resumed.read("export.json")["analysed_attempts"]:
+        record = record_of(resumed, entry)
+        user, task = record.prompt["user"], study.tasks[record.factors["task"]]
+        region = task.attributes["region"]
+        assert (user["slots"]["TASK"], user["slots"]["REGION"]) == (task.id, region)
+        assert user["text"].startswith(f"You are answering a question about one place: {task.id}, in the {region}.")
+        assert user["template_sha256"] == hashlib.sha256(template.encode("utf-8")).hexdigest()
 
 
 def test_the_example_scorer_takes_a_failed_snapshot_as_unmeasured_never_as_zero(resumed):

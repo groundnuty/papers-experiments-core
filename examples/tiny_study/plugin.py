@@ -215,7 +215,9 @@ class TinyExecutor:
         if not callable(getattr(backend, "use", None)):  # the method this executor needs, whatever class serves it
             raise TypeError("the tiny study needs a scripted backend, one with use(script), as the stub has")
         backend.use(script_for(condition, factors["task"], factors["model"], factors["tools"]))
-        user = self.template.render({"TASK": factors["task"], "HINT": HINTS[factors["tools"]]}, study_run=True)
+        task = study.tasks[factors["task"]]  # the task's table of study.toml: its id and its text attributes
+        slots = {"TASK": task.id, "REGION": task.attributes["region"], "HINT": HINTS[factors["tools"]]}
+        user = self.template.render(slots, study_run=True)  # study_run: no draft marker reaches the model
         shelf = Shelf()
         instruments = [FactsServed(shelf)]  # fresh for every run: an instrument holds one run's reading
         identity = {"run_key": request.run_key, "factors": dict(factors), "attempt": request.identity.attempt}
@@ -263,12 +265,13 @@ def build(context: StudyContext) -> StudyPlugin:
     study = context.study
     template = PromptTemplate.from_file(HERE / "prompt.txt")
     levels = {name: condition["tools"] for name, condition in study.schema.conditions.items()}
+    # A condition's prompt hash: the template with what the condition decides (the hint) and stand-ins for what each
+    # task fills in. The tasks' attributes are in study.toml, whose own hash is in the fingerprint already.
+    stand_ins = {"TASK": "task", "REGION": "region"}
     return StudyPlugin(
         executor=TinyExecutor(context),
         scorers=[TinyScorer()],
-        prompts={
-            c: template.render({"TASK": "task", "HINT": HINTS[level]}).rendered_sha256 for c, level in levels.items()
-        },
+        prompts={c: template.render({**stand_ins, "HINT": HINTS[lvl]}).rendered_sha256 for c, lvl in levels.items()},
         tools={c: tools_sha256(tool_specs(level)) for c, level in levels.items()},
         health=healthy,
         probe=StubProbe(),
