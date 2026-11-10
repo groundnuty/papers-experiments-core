@@ -65,7 +65,8 @@ class StudyPlugin:
     - `admission`: the platform's hold on a resource every run shares (`campaign.attempt.RunAdmission`): entered before
       an attempt starts and left after its post-run check, so the check sees what the run left; None when it has none.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
-      Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash). They go into the campaign
+      Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, and with `[faults]` the fault
+      injector's sanction and targets). They go into the campaign
       fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
     - `backend_factory`: builds the backend of every model, for admission and for each run, in place of the core's
       `default_backend_factory`; None keeps the core's. A model whose backend the core does not build

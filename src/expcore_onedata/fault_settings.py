@@ -22,12 +22,14 @@ service entry, its position, never by a provider's or a service's name. The serv
     <provider name> = "<service>"    # each provider that may be taken down, by its name in [providers]
 """
 
+import hashlib
 import math
 import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from expcore.config.loading import Section, load_toml
 from expcore_onedata.compose import CommandRunner, ComposeDriver, run_command
@@ -120,6 +122,24 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         health_wait_s=_number(table, "health_wait_s", 30.0, 0),
         config_sha256=config.sha256,
     )
+
+
+def faults_fingerprint(config: PlatformConfig) -> dict[str, Any] | None:
+    """`[faults]`'s half of the platform's fingerprint (`PlatformConfig.fingerprint`); None when the file has none.
+
+    What a resume must not change about the fault injector: that it is configured at all (every run is then admitted
+    to the federation, an outage run exclusively), whether it is sanctioned, and which service each target takes down,
+    by the target's label and the SHA-256 of the service's name, never a name or a path (O12). The bounds of its waits
+    and where its journal lies are how it runs, not what the runs measure, so they are left out.
+    """
+    if "faults" not in load_toml(config.file):
+        return None
+    settings = load_faults(config.file, config)
+    targets = {
+        config.provider_label(name): hashlib.sha256(service.encode("utf-8")).hexdigest()
+        for name, service in settings.services.items()
+    }
+    return {"sanctioned": settings.sanctioned, "targets": dict(sorted(targets.items()))}
 
 
 def compose_driver(settings: FaultSettings, runner: CommandRunner = run_command) -> ComposeDriver:

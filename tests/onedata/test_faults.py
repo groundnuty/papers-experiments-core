@@ -3,10 +3,12 @@
 Every test runs against `FakeServices`; nothing here contacts Docker or a deployment.
 """
 
+import hashlib
 import json
 import multiprocessing
 
 import pytest
+from campaign_support import make_fingerprint, make_manifest, make_schema
 from fault_support import (
     LOCAL_TARGET,
     OUTAGE_TARGET,
@@ -17,8 +19,9 @@ from fault_support import (
     injector_for,
     write_faults,
 )
-from platform_support import configured_values
+from platform_support import NOW, configured_values, write_platform
 
+from expcore.campaign.resume import FingerprintMismatch, open_campaign
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError, is_treatable
 from expcore.records.injections import FAULT_NAMESPACE
@@ -324,3 +327,53 @@ def test_o11_a_start_command_that_keeps_failing_is_recorded_as_such_and_left_ope
     cleared = next(step for step in snapshot["steps"] if step["step"] == "cleared")
     assert (cleared["ok"], cleared["how"], snapshot["ok"]) == (False, "start_failed", False)
     assert len(open_injections(tmp_path)) == 1
+
+
+def folder(tmp_path, name):
+    """A new directory for one platform.toml and what it names."""
+    path = tmp_path / name
+    path.mkdir()
+    return path
+
+
+def test_c06_the_platform_fingerprint_holds_the_faults_sanction_and_targets_by_label_and_digest_never_a_name(tmp_path):
+    """C06, O12: with `[faults]` the platform's half of the campaign fingerprint gains the sanction and the service of
+    each target, by its label and the SHA-256 of the service's name; no name, path or service appears in it, and a
+    platform.toml without `[faults]` keeps the fingerprint it had."""
+    platform = write_faults(folder(tmp_path, "faults"))
+    fingerprint = load_platform(platform, require_secrets=False).fingerprint()
+    services = {LOCAL_TARGET: SERVICES["alpha"], OUTAGE_TARGET: SERVICES["beta"]}
+    digests = {label: hashlib.sha256(service.encode()).hexdigest() for label, service in services.items()}
+    assert fingerprint == {"tls": {"mode": "verify"}, "faults": {"sanctioned": True, "targets": digests}}
+    text = json.dumps(fingerprint)
+    assert [value for value in [*configured_values(tmp_path / "faults"), *SERVICES.values()] if value in text] == []
+    plain = load_platform(write_platform(folder(tmp_path, "plain")), require_secrets=False).fingerprint()
+    assert plain == {"tls": {"mode": "verify"}}
+
+
+def test_c06_a_campaign_does_not_resume_under_another_target_service_or_sanction_and_does_under_other_waits(tmp_path):
+    """C06: a resume that takes another service down for a target, changes the sanction, or adds or drops `[faults]`,
+    is refused naming the platform's faults; one that changes only how long the injector waits resumes."""
+    schema, manifest = make_schema(), make_manifest(make_schema())
+    configs = {
+        "started": write_faults(folder(tmp_path, "a")),
+        "other waits": write_faults(folder(tmp_path, "b"), settle_timeout_s=60, admission_timeout_s=10, poll_s=3),
+        "other service": write_faults(folder(tmp_path, "c"), services={**SERVICES, "beta": "store-three"}),
+        "unsanctioned": write_faults(folder(tmp_path, "d"), sanctioned=False),
+        "no faults": write_platform(folder(tmp_path, "e")),
+    }
+
+    def resume(label):
+        config = load_platform(configs[label], require_secrets=False)
+        fingerprint = make_fingerprint(schema, platform=config.fingerprint())
+        store, _ = open_campaign(tmp_path / "campaign.db", schema, manifest, fingerprint, now=NOW, max_attempts=3)
+        store.close()
+
+    resume("started")
+    resume("other waits")
+    for label in ("other service", "unsanctioned", "no faults"):
+        with pytest.raises(FingerprintMismatch) as caught:
+            resume(label)
+        assert all(line.startswith("platform.faults") for line in caught.value.differences), label
+        assert "store-three" not in str(caught.value)
+    resume("started")

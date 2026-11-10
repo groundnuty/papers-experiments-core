@@ -216,8 +216,13 @@ class PlatformConfig:
     def fingerprint(self) -> dict[str, Any]:
         """The platform's half of the campaign fingerprint (`StudyPlugin.platform`): what a resume must not change.
 
-        It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12)."""
-        return {"tls": self.tls.record()}
+        It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, and, when the file has `[faults]`,
+        the fault injector's sanction and targets (`fault_settings.faults_fingerprint`), never a path, a name or a value
+        (O12). A file without `[faults]` keeps the fingerprint it had before the fault injector existed."""
+        from expcore_onedata.fault_settings import faults_fingerprint  # it reads this module's config: import when used
+
+        faults = faults_fingerprint(self)
+        return {"tls": self.tls.record()} if faults is None else {"tls": self.tls.record(), "faults": faults}
 
     def condition_label(self, name: str) -> str:
         """Name a declared condition for a message by its position in the file, `conditions[i]`, never by its name."""
