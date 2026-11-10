@@ -135,8 +135,8 @@ def test_k10_the_make_environment_target_installs_exactly_the_vendored_wheels_of
     (package / REQUIREMENTS).write_bytes(requirements([wheel]))
     python = f"{sys.version_info.major}.{sys.version_info.minor}"
     (package / "Makefile").write_bytes(makefile({"python": python, "distributions": {}}))
-    assert "--no-index" in MAKEFILE
-    assert "--require-hashes" in MAKEFILE
+    for option in ("--no-index", "--no-deps", "--require-hashes", "--isolated", "PIP_CONFIG_FILE=/dev/null"):
+        assert option in MAKEFILE
     venv = tmp_path / "fresh"
     environ = {"PATH": "/usr/bin:/bin", "PIP_INDEX_URL": "http://127.0.0.1:9/simple", "HOME": str(tmp_path)}
     done = subprocess.run(
@@ -163,4 +163,41 @@ def test_k10_the_make_environment_target_installs_exactly_the_vendored_wheels_of
     )
     assert tampered.returncode != 0
     assert "hash" in (tampered.stdout + tampered.stderr).lower()
+    shutil.rmtree(venv, ignore_errors=True)
+
+
+@pytest.mark.parametrize("channel", ["PIP_REQUIREMENT", "user configuration", "PIP_CONFIG_FILE"])
+def test_k10_the_install_ignores_the_readers_pip_environment_and_configuration(site, tmp_path, channel):
+    """K10: pip reads requirements from its environment and its configuration files, which could add a URL to fetch
+    despite --no-index; the install runs isolated from both, so a requirement slipped in through either has no
+    effect."""
+    name, data = repack(installed_distribution(site, "toy-platform", "2.0.0", CODE))
+    wheel = Wheel("toy-platform", "2.0.0", name, data, scanned=True)
+    package = tmp_path / "pkg"
+    (package / "wheels").mkdir(parents=True)
+    (package / wheel.path).write_bytes(wheel.data)
+    (package / REQUIREMENTS).write_bytes(requirements([wheel]))
+    python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    (package / "Makefile").write_bytes(makefile({"python": python, "distributions": {}}))
+    slipped = tmp_path / "slipped.txt"
+    slipped.write_text("absent-distribution @ http://127.0.0.1:9/absent-1.0-py3-none-any.whl\n", encoding="utf-8")
+    config = f"[global]\nrequirement = {slipped}\n[install]\nrequirement = {slipped}\n"
+    environ = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")}
+    if channel == "PIP_REQUIREMENT":
+        environ["PIP_REQUIREMENT"] = str(slipped)
+    elif channel == "user configuration":
+        (tmp_path / "home" / ".config" / "pip").mkdir(parents=True)
+        (tmp_path / "home" / ".config" / "pip" / "pip.conf").write_text(config, encoding="utf-8")
+    else:
+        (tmp_path / "pip.conf").write_text(config, encoding="utf-8")
+        environ["PIP_CONFIG_FILE"] = str(tmp_path / "pip.conf")
+    venv = tmp_path / "fresh"
+    done = subprocess.run(
+        ["make", "-C", str(package), "-f", "Makefile", "environment", f"PYTHON={sys.executable}", f"VENV={venv}"],
+        capture_output=True,
+        text=True,
+        env=environ,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "absent" not in done.stdout + done.stderr
     shutil.rmtree(venv, ignore_errors=True)

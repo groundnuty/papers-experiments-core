@@ -4,7 +4,10 @@
 A package holds one wheel per distribution of the environment its replay check ran under (`provenance.environment`):
 the core, the study's platform and backend packages, and everything they require. `make check` installs them into a
 fresh environment with `pip install --no-index --no-deps --require-hashes`, from `wheels/requirements.txt`, which
-pins each wheel by name, version and SHA-256, so the reader needs neither the network nor an index.
+pins each wheel by name, version and SHA-256, so the reader needs neither the network nor an index. pip runs isolated
+(`--isolated`, which ignores its environment variables and the user's configuration, and `PIP_CONFIG_FILE=/dev/null`,
+which skips every configuration file): a `PIP_REQUIREMENT` or a configured requirement could otherwise add a URL to
+fetch.
 
 Where a wheel comes from, for each distribution:
 - a wheel the author supplies (`--wheels DIR`), named `<name>-<version>-<tags>.whl` with that name and version in
@@ -59,8 +62,8 @@ check: environment
 environment:
 \t$(PYTHON) -c 'import sys; sys.exit(sys.version_info[:2] != ({major}, {minor}) and "this needs Python {python}")'
 \t$(PYTHON) -m venv --clear "$(VENV)"
-\t"$(VENV)/bin/python" -m pip install --quiet --disable-pip-version-check --no-index --no-deps --require-hashes \\
-\t\t--find-links wheels -r {requirements}
+\tPIP_CONFIG_FILE=/dev/null "$(VENV)/bin/python" -m pip install --isolated --quiet --disable-pip-version-check \\
+\t\t--no-index --no-deps --require-hashes --find-links wheels -r {requirements}
 
 check-installed:
 \t$(PYTHON) -m expcore package-check .
