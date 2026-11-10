@@ -192,7 +192,7 @@ def _package_check(args: argparse.Namespace) -> int:
     except (KeyboardInterrupt, SystemExit) as stop:  # a study's plugin, run during the regeneration, can raise either
         return stopped(stop, redactor, prefix=f"{args.command} refused: ")
     except Exception as error:
-        print(f"refused: {shown_failure(error, redactor, expected=_REFUSALS)}", file=sys.stderr)
+        print(f"{args.command} refused: {shown_failure(error, redactor, expected=_REFUSALS)}", file=sys.stderr)
         return EXIT_REFUSED
     for problem in problems:
         print(f"FAIL {problem}")
@@ -243,7 +243,7 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
             raise
         # The build and the check turn everything after their lists load into a refusal that went through the
         # redactor; what reaches here came before, when nothing could hide a name in its message.
-        print(f"refused: {shown_failure(error, None)}", file=sys.stderr)
+        print(f"{args.command} refused: {shown_failure(error, None)}", file=sys.stderr)
         return EXIT_REFUSED
 
 
