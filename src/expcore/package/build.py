@@ -49,7 +49,7 @@ from typing import Any
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.config.loading import ConfigError
 from expcore.models.route import sdk_version
-from expcore.package.anonymise import Anonymisation, holds_term, load_anonymisation, rewrite
+from expcore.package.anonymise import Anonymisation, holds_term, load_anonymisation, refuse_models, rewrite
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
 from expcore.package.identity import (
     PREFIX_DIGITS,
@@ -296,19 +296,19 @@ def _collect(
     allow_uncommitted: bool,
     warn: Callable[[str], None],
 ) -> tuple[PackageSpec, dict[str, bytes]]:
+    terms: Anonymisation | None = None
+    if anonymise is not None:  # first, so every message after it hides the terms as well as the tokens
+        terms = load_anonymisation(Path(anonymise), keep_out_of=private_list_guard(study_root, out_dir))
+        redactor.also = partial(holds_term, terms)
     study, spec, files, check = _selection(study_root)
+    if terms is not None:
+        refuse_models(terms, _model_names(study))
     where = f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}"
     opaque = _attested(spec, files, redactor)
     code = _clean_code(check, where)
     env = _environment(study, check, where)
     _require_this_core(files)
     rewritten: list[str] = []
-    terms: Anonymisation | None = None
-    if anonymise is not None:
-        terms = load_anonymisation(
-            Path(anonymise), keep_out_of=private_list_guard(study.root, out_dir), model_names=_model_names(study)
-        )
-        redactor.also = partial(holds_term, terms)
     covered = set(covered_files(study.root, study.scope))
     others = [p for p in files if not p.startswith(f"{OUT_DIR}/") and p not in covered]  # the identity and check vouch
     state = note_tracking(study.root, others, redactor, terms is not None, allow_uncommitted, warn)
@@ -384,7 +384,7 @@ def _selection(study_root: Path) -> tuple[StudyConfig, PackageSpec, dict[str, by
     missing = [path for path in _required(study, check) if path not in files]
     if missing:
         more = f" and {len(missing) - 1} more" if len(missing) > 1 else ""
-        raise PackageError(f"{spec.source}: the package's check needs {missing[0]}{more}; add it to [package] include")
+        raise PackageError(f"{SPEC_FILE}: the package's check needs {missing[0]}{more}; add it to [package] include")
     return study, spec, files, check
 
 

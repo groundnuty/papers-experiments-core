@@ -312,6 +312,21 @@ def test_k05_a_term_in_a_path_is_named_by_its_path_only_when_the_author_asks(
     assert f"  {hidden_name('notes/varek/data.txt')} is notes/varek/data.txt\n" in shown
 
 
+def test_k05_a_refusal_before_the_checks_hides_a_path_that_holds_a_term(campaign, hashes, tmp_path):
+    """K05: the anonymisation list loads before the study's files are selected, so even the earliest refusal, an
+    attestation whose file changed, names a path that holds a term by its hash and never shows the term; nor does
+    any message name the list's own path, which is the author's."""
+    root = with_notes(campaign, tmp_path / "study", "varek")
+    stale = '\n[[opaque]]\npath = "notes/varek/data.txt"\nsha256 = "' + "0" * 64 + '"\nreason = "read"\n'
+    (root / "package.toml").write_text((root / "package.toml").read_text(encoding="utf-8") + stale, "utf-8")
+    (tmp_path / "varek-lists").mkdir()
+    listed = anonymisation(tmp_path / "varek-lists" / "anon.toml", {AUTHOR: "Author A", "Varek": "Author B"})
+    with pytest.raises(PackageError) as refused:
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=listed)
+    assert str(refused.value).startswith(f"{hidden_name('notes/varek/data.txt')}: its SHA-256 is not the one")
+    assert "varek" not in str(refused.value).casefold()
+
+
 FIGURE = b"%PDF-1.4\n<< /Filter /FlateDecode >>\nstream\n" + zlib.compress(b"a drawn figure") + b"\nendstream\n"
 
 

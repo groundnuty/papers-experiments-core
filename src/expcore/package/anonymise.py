@@ -48,6 +48,7 @@ REWRITABLE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".bib", ".j
 YAML_SUFFIXES = frozenset({".yml", ".yaml", ".cff"})  # CITATION.cff is YAML
 _JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)  # in valid JSON, every quote outside a string starts one
 FINDING = "a term of the anonymisation list"
+LIST = "the anonymisation list"  # how a message names the list: never by its path, the author's
 REDACTED_PATH = "<path redacted>"
 
 
@@ -65,36 +66,50 @@ def _inside(path: Path, directory: Path) -> bool:
     return path == directory or directory in path.parents
 
 
-def load_anonymisation(path: Path, *, keep_out_of: Iterable[Path], model_names: Collection[str]) -> Anonymisation:
-    """Read and validate an anonymisation list; refuse one that lies inside any of `keep_out_of` (K03)."""
+def load_anonymisation(path: Path, *, keep_out_of: Iterable[Path], model_names: Collection[str] = ()) -> Anonymisation:
+    """Read and validate an anonymisation list; refuse one that lies inside any of `keep_out_of` (K03).
+
+    No message names the list's path or a place it lies in, which are the author's and may hold a term: it is the
+    anonymisation list. The model names (K04) may be checked here or, once the study is loaded, by `refuse_models`.
+    """
     path = Path(path)
     for directory in keep_out_of:
         if _inside(path, Path(directory)):
             raise PackageError(
-                f"the anonymisation list lies inside {directory}; keep it outside the repository, the study and the "
-                "output (K03)"
+                "the anonymisation list lies inside the study's repository, the study or the output; keep it outside "
+                "all three (K03)"
             )
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        raise PackageError(f"{path}: cannot be read as an anonymisation list ({type(error).__name__})") from None
+        raise PackageError(f"{LIST}: cannot be read ({type(error).__name__})") from None
     files, terms = raw.get("files"), raw.get("terms")
     if set(raw) - {"files", "terms"} or not isinstance(files, list) or not isinstance(terms, dict) or not terms:
-        raise PackageError(f"{path}: needs `files`, a list of paths, and a non-empty [terms] table, and nothing else")
+        raise PackageError(f"{LIST}: needs `files`, a list of paths, and a non-empty [terms] table, and nothing else")
     if not all(isinstance(f, str) and f for f in files) or len(set(files)) != len(files):
-        raise PackageError(f"{path}: `files` must name distinct paths")
-    models = {name.casefold() for name in model_names}
+        raise PackageError(f"{LIST}: `files` must name distinct paths")
     for number, (term, label) in enumerate(terms.items(), start=1):
-        where = f"{path}: term {number} of [terms]"  # a term is never shown, only its place in the list
+        where = f"{LIST}: term {number} of [terms]"  # a term is never shown, only its place in the list
         if not isinstance(label, str) or not label.strip():
             raise PackageError(f"{where} has no label to replace it with")
         if not term.strip() or not any(c.isalpha() for c in term):
             raise PackageError(f"{where} has no letter; numbers are never anonymised (K04)")
-        if term.casefold() in models:
-            raise PackageError(f"{where} names a model of the model table; model names are never anonymised (K04)")
         if any(_finder(other).search(label) for other in terms):
             raise PackageError(f"{where}: its label contains a term of the list")
-    return Anonymisation(path, tuple(files), dict(terms))
+    anonymisation = Anonymisation(path, tuple(files), dict(terms))
+    refuse_models(anonymisation, model_names)
+    return anonymisation
+
+
+def refuse_models(anonymisation: Anonymisation, model_names: Collection[str]) -> None:
+    """Refuse a term that is a key, API id or alias of the study's model table: model names are never anonymised."""
+    models = {name.casefold() for name in model_names}
+    for number, term in enumerate(anonymisation.terms, start=1):
+        if term.casefold() in models:
+            raise PackageError(
+                f"{LIST}: term {number} of [terms] names a model of the model table; model names are never "
+                "anonymised (K04)"
+            )
 
 
 def _body(term: str) -> str:
@@ -119,7 +134,7 @@ def rewrite(
     replacers = [(_replacer(term), label) for term, label in sorted(anonymisation.terms.items(), key=_longest_first)]
     result = dict(files)
     for name in anonymisation.files:
-        where = f"{anonymisation.source}: `files` names {name}"
+        where = f"{LIST}: `files` names {name}"
         if name not in files:
             raise PackageError(f"{where}, which the package does not include")
         if PurePosixPath(name).suffix.lower() in YAML_SUFFIXES:
