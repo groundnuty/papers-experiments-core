@@ -1,5 +1,6 @@
 """The study-token hashing, candidate extraction, scanner and command line. Tokens here are all invented."""
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -332,6 +333,34 @@ def test_check_exits_2_when_the_hash_file_is_absent_or_empty_unless_allowed(tmp_
     assert "holds no hashes" in capsys.readouterr().err
     assert st.main(["check", "--hashes", str(empty), "--allow-missing-hashes"]) == 0
     assert st.main(["check", "--hashes", str(tmp_path / "gone"), "--allow-missing-hashes"]) == 0
+
+
+@pytest.mark.parametrize("line", ["{digest}", "{digest}  -", "{digest}  names.txt"])
+def test_k01_a_file_of_plain_sha256_digests_is_refused_saying_how_to_generate_one(tmp_path, capsys, line):
+    """K01: a file of plain `sha256(token)` digests (bare, or as sha256sum prints them) would check nothing, since a
+    study-token hash is salted and normalised; it is refused with the command that makes a correct file."""
+    plain = tmp_path / "plain.sha256"
+    plain.write_text("\n".join([line.format(digest=hashlib.sha256(LONG_NAME.encode()).hexdigest())] * 2) + "\n")
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+    assert st.main(["check", "--hashes", str(plain), str(tmp_path / "m.py")]) == 2
+    err = capsys.readouterr().err
+    assert "plain.sha256:1: a bare SHA-256 digest" in err
+    assert "python -m expcore.provenance.study_tokens hash" in err
+
+
+def test_k01_a_malformed_hash_line_names_the_generating_command():
+    """K01: any line not in the hash format refuses the file, naming the line and the command that makes one."""
+    with pytest.raises(ValueError, match=r"names\.sha256:2: expected '<any\|whole> <code\|all> <sha256>'.*hash PLAIN"):
+        st.parse_hash_file(f"any all {'0' * 64}\nany secret-word\n", "names.sha256")
+
+
+def test_k01_the_check_says_how_many_hashes_it_loaded_and_from_where(tmp_path, hash_file, capsys):
+    """K01: the check prints how many hashes it read, so a file that loads but holds the wrong ones is noticed."""
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+    assert st.main(["check", "--hashes", str(hash_file), str(tmp_path / "m.py")]) == 0
+    count = len(st.load_hashes(hash_file).anywhere) + len(st.load_hashes(hash_file).whole)
+    assert count > 1
+    assert f"study-token check: {count} hashes from {hash_file}" in capsys.readouterr().err
 
 
 def test_cli_check_errors_on_missing_explicit_hash_file_or_path(tmp_path, hash_file, capsys):

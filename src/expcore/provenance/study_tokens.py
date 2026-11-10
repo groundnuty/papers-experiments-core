@@ -172,7 +172,14 @@ def _load_for_cli(explicit: Path | None, allow_missing: bool) -> Hashes | None:
     if not hashes:
         _missing(f"{path} holds no hashes", allow_missing)
         return None
+    print(f"study-token check: {count_hashes(hashes)} from {path}", file=sys.stderr)
     return hashes
+
+
+def count_hashes(hashes: Hashes) -> str:
+    """How many hashes a loaded file holds, of either match: `1 hash`, `12 hashes`."""
+    count = len(hashes.anywhere) + len(hashes.whole)
+    return f"{count} hash" if count == 1 else f"{count} hashes"
 
 
 def _report(lines: Sequence[str]) -> int:

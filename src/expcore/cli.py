@@ -87,7 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     package = commands.add_parser("package", help="package STUDY: build the replication package package.toml lists")
     package.add_argument("study", type=Path, help="a study directory with a package.toml")
     package.add_argument("--out", type=Path, required=True, help="where the archive is written")
-    package.add_argument("--hashes", type=Path, help="study-token hash file (default: the core's public one)")
+    package.add_argument(
+        "--hashes",
+        type=Path,
+        help="a study-token hash file to use in place of the core's public one: it replaces that list, it does not add "
+        "to it (make one with: python -m expcore.provenance.study_tokens hash PLAIN)",
+    )
     package.add_argument("--anonymise", type=Path, help="anonymisation list, kept outside the study and the output")
     package.add_argument(
         "--wheels", type=Path, help="a directory of wheels to vendor instead of packing installed ones"

@@ -159,6 +159,22 @@ def test_k01_a_hash_file_that_is_missing_or_names_nothing_private_refuses_the_bu
         private_hashes(code_only)
 
 
+def test_k01_a_hash_file_of_plain_digests_refuses_the_build_naming_the_command_that_makes_one(tmp_path):
+    """K01: a file of plain sha256 digests would check nothing; the build refuses it and says how to make a real one."""
+    plain = tmp_path / "plain.sha256"
+    plain.write_text(f"{hashlib.sha256(PRIVATE.encode()).hexdigest()}\n", encoding="utf-8")
+    with pytest.raises(PackageError, match=r"plain\.sha256:1: a bare SHA-256 digest.*study_tokens hash PLAIN"):
+        private_hashes(plain)
+
+
+def test_k01_the_build_says_how_many_hashes_it_loaded_and_that_its_list_replaces_the_cores(campaign, hashes, tmp_path):
+    """K01: the build prints how many hashes of names private everywhere it checks with, and from which list."""
+    said: list[str] = []
+    package_build.collect(a_copy(campaign, tmp_path), hashes=hashes, note=said.append)
+    origin = f"{hashes}, which replaces the core's list"
+    assert said == [f"study-token check: 1 hash of names private everywhere, from {origin}"]
+
+
 def test_the_default_hash_file_is_the_cores_public_one_with_names_private_everywhere():
     assert default_hashes().is_file()
     assert private_hashes(default_hashes())

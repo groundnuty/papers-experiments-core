@@ -39,6 +39,7 @@ replay check hashed them; the token check reads it like any file.
 import dataclasses
 import hashlib
 import json
+import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -69,6 +70,7 @@ from expcore.package.withhold import withhold_headers
 from expcore.provenance.codestamp import STAMP, covered_files, is_sha
 from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_environment
 from expcore.provenance.gitobjects import GitError, run_git
+from expcore.provenance.study_tokens import count_hashes
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.replay.check import CHECK_FILE, BatchNotVerified
 from expcore.study.config import CONFIG_FILES, StudyConfig, load_study
@@ -76,6 +78,10 @@ from expcore.study.pipeline import ANALYSIS_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DI
 
 PACKAGE_FILE = "PACKAGE.json"
 PACKAGE_FORMAT = "expcore-package/1"
+
+
+def _stderr(line: str) -> None:
+    print(line, file=sys.stderr)
 
 
 def _read_json(files: Mapping[str, bytes], path: str, what: str) -> dict:
@@ -220,12 +226,15 @@ def collect(
     wheels: Path | None = None,
     allow_uncommitted: bool = False,
     warn: Callable[[str], None] | None = None,
+    note: Callable[[str], None] | None = None,
 ) -> tuple[PackageSpec, dict[str, bytes]]:
     """Select, check and complete the files of a package, without writing anything; return the spec and the files.
 
     `vendor` makes the wheels (`wheels.vendor_wheels` by default, which takes the author's own from the directory
-    `wheels` first). `warn` receives each warning (standard error by default); `allow_uncommitted` lets an anonymised
-    package include files no commit holds.
+    `wheels` first). `warn` receives each warning and `note` each line of information, such as how many study-token
+    hashes were loaded (both standard error by default); `allow_uncommitted` lets an anonymised package include files
+    no commit holds. `hashes` names a study-token hash file to use in place of the core's public one: it replaces that
+    list, it does not add to it.
     """
     study, spec, files, check = _selection(Path(study_root))
     where = f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}"
@@ -263,6 +272,8 @@ def collect(
     files[REQUIREMENTS] = requirements(vendored)
     opaque |= {wheel.path for wheel in vendored}  # read member by member below
     tokens = private_hashes(default_hashes() if hashes is None else Path(hashes))
+    origin = "the core's public list" if hashes is None else f"{hashes}, which replaces the core's list"
+    (note or _stderr)(f"study-token check: {count_hashes(tokens)} of names private everywhere, from {origin}")
     attested = {path: entry for path, entry in spec.opaque.items() if path.startswith(f"{WHEELS_DIR}/")}
     exempt = token_exempt(vendored, lock_hashes(study.root, warn))  # the bytes vendored, after headers withheld
     read = scan_wheels(
@@ -375,8 +386,9 @@ def build_package(
     wheels: Path | None = None,
     allow_uncommitted: bool = False,
     warn: Callable[[str], None] | None = None,
+    note: Callable[[str], None] | None = None,
 ) -> Path:
-    """Build the package of a study into `out_dir/<name>.tar.gz` and return the archive's path."""
+    """Build the package of a study into `out_dir/<name>.tar.gz` and return the archive's path (see `collect`)."""
     out_dir, study_root = Path(out_dir), Path(study_root)
     batch = (study_root / OUT_DIR).resolve()
     if out_dir.resolve() == batch or batch in out_dir.resolve().parents:
@@ -391,6 +403,7 @@ def build_package(
         wheels=wheels,
         allow_uncommitted=allow_uncommitted,
         warn=warn,
+        note=note,
     )
     with tempfile.TemporaryDirectory(prefix=".staging-", dir=out_dir) as scratch:
         stage = Path(scratch) / spec.name
