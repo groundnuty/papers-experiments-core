@@ -80,6 +80,22 @@ Implementer must guarantee:
 - `info()` and `transcript()` never contain a credential; the base URL has none (R12).
 - An executor that needs more than the protocol (the example's executor scripts the stub with `use`) checks for that method, never for a class, so a backend that wraps or replaces the stub serves it too.
 
+### Retries of a reply
+
+`ModelTurn.retries` holds the retries the reply took before it came, one object per retry, oldest first; `()` when it took none. The core's adapters fill it through `expcore.models.retry.Retrier`, and a backend of a study's own fills it the same way or leaves it empty. The keys of an entry are a closed set, `expcore.records.schema.RETRY_FIELDS`, and every one may be left out. Any other key makes the record invalid: writing it raises `RecordError`, and the attempt is recorded as a harness defect, which names the exception's class and not its message, so check the keys when you write the backend.
+
+| Key | Holds |
+|---|---|
+| `retry` | the retry's number within this reply, from 1 |
+| `kind` | the class of error that was retried (below) |
+| `error` | the class name of the error |
+| `status` | the HTTP status, or `null` for an error that has none (a timeout, a lost connection) |
+| `retry_after_s` | the wait the server asked for (`Retry-After`, `Retry-After-Ms`), or `null` |
+| `wait_s` | the wait before the retry, never less than `retry_after_s` |
+| `message` | the provider's message, cut to 300 characters; empty when the error has none |
+
+Only a transient error is retried, so `kind` is one of five: `rate_limit` (429), `timeout` (408, or a timeout while connecting or sending), `conflict` (409), `server` (5xx) and `connection` (the endpoint could not be reached). The retrier's other kinds never become an entry: `auth` (401 or 403) raises `InfraError("key_rejected", ...)`, `read_timeout` (the request went out and the reply is late) is never resent and abandons the request, `context_overflow` (a 400 or 413 whose code or message names the context) ends the run as the agent's outcome, and `not_found` and `bad_request` are raised unchanged. The record checks the keys and not the words, so a backend of its own uses these five for the same errors, and a reader can then count retries by kind across backends.
+
 ### BackendFactory
 
 ```python
@@ -121,6 +137,61 @@ Implementer must guarantee:
 - Blocking work does not run on the event loop (`asyncio.to_thread`, or `FunctionProvider`), and bounds itself with `timeout_s`: a thread cannot be killed (L15).
 - Every wait on infrastructure is wrapped in `ctx.infrastructure_wait`. What the agent's own call does (executing, reading data, a federation operation it triggers) is never a wait.
 
+### McpToolProvider
+
+A study or platform whose tools come from an MCP server speaks to it through `McpToolProvider`, one server session per run over stdio. The Onedata layer builds it for its tool server (`SandboxPlatform.tool_server`); any other platform builds it the same way.
+
+```python
+class McpToolProvider:  # expcore.tools.mcp_client
+    def __init__(self, command: str, args: Iterable[str] = (), *, frozen: FrozenManifest | Path,
+                 env: dict[str, str] | None = None, cwd: str | Path | None = None,
+                 allowed_tools: Iterable[str] = (), start_timeout_s: float = 120.0)
+    async def __aenter__(self) -> McpToolProvider  # start the server and check its tools
+    async def __aexit__(self, *exc) -> None        # end the session and stop the server
+    manifest_sha256: str | None                    # the frozen manifest's sha256, once the start succeeded
+```
+
+- `command` and `args` start the server as a child process, in `cwd`. `env` holds the variables the server gets beyond the few the MCP SDK passes on by default (`HOME`, `PATH`, `USER` and the like on POSIX); nothing else of the caller's environment reaches it, so a token the server needs goes in `env`.
+- `frozen` is the condition's frozen manifest, an object or the path of its file, read when the provider is made. The server's tools must equal it.
+- `allowed_tools` is the allow-list the caller gave the server's launcher; the server enforces it, and the client only checks that the server shows exactly those tools. Empty, there is no such check.
+- `start_timeout_s` bounds the whole start (spawn, initialize, list the tools); it must be positive (L14).
+
+Use it as an async context manager around `record_run`, started before the loop, so its start is outside the agent's time, and pass it in the providers. `tools()` returns the server's tools, none of them terminal. What fails where:
+- A server that cannot be spawned, does not start within the timeout or closes while starting raises `InfraError("knowledge", ...)` from `__aenter__`.
+- A server whose tools differ from the frozen manifest in any way (an extra or a missing tool, a changed description or schema), that lacks a tool of the allow-list or shows one outside it, raises `ManifestError` from `__aenter__`, listing every difference in `problems`. That is a fault of the study's set-up, not of the infrastructure, so the attempt is a harness defect (L13, C10).
+- During the run, a closed connection or an internal server error raises `InfraError("knowledge", ...)`; any other MCP error, and a result the server marks as an error, is a `ToolOutput` with `is_error` for the model to read (L12). The round trip to the server is the agent's time: the client marks no wait.
+
+### The frozen manifest
+
+`expcore.tools.manifest` reads a server's tools, freezes them into a file per condition and compares a server with that file.
+
+```python
+@dataclass(frozen=True)
+class FrozenManifest:
+    tools: list[dict]  # sorted by name: name, description, input_schema, output_schema, annotations
+    sha256: str        # SHA-256 of the canonical JSON of tools
+    server_name: str | None = None
+    server_version: str | None = None
+    protocol_version: str | None = None
+    @classmethod
+    def load(cls, path: Path) -> FrozenManifest  # ManifestError for a file that is not one, or was edited
+    def dump(self) -> str                        # the file's text: sorted keys, one trailing newline
+```
+
+Two manifests are equal when their names, descriptions, schemas and annotations are equal, byte for byte. `load` refuses a file whose stored `sha256` is not the hash of its tools, so a hand-edited manifest is refused rather than trusted. Freeze each condition's manifest from the server it will run, and check it again whenever the server is upgraded:
+
+```sh
+python -m expcore.tools.manifest freeze [--pass-env NAME ...] [--timeout SECONDS] OUT -- COMMAND [ARG ...]
+python -m expcore.tools.manifest check [--pass-env NAME ...] [--timeout SECONDS] FROZEN -- COMMAND [ARG ...]
+```
+
+Both start the server with `COMMAND [ARG ...]`, as the provider will, and read its tools within `--timeout` seconds (120 by default). `--pass-env NAME`, repeatable, copies that variable of your environment to the server by name, so no value is on the command line. `freeze` writes the frozen manifest to `OUT` and prints its tool count and hash; `check` compares the live server with `FROZEN`. Each exits 0 on success, 1 on a mismatch (listed on standard error) and 2 on an error. For example, with a server installed as `notes-server`:
+
+```sh
+python -m expcore.tools.manifest freeze --pass-env NOTES_TOKEN manifests/basic.json -- notes-server --read-only
+python -m expcore.tools.manifest check --pass-env NOTES_TOKEN manifests/basic.json -- notes-server --read-only
+```
+
 ## Scorer
 
 `expcore.records.rescore.Scorer`.
@@ -161,6 +232,21 @@ def start_instruments(instruments: Sequence[Instrument], identity: Mapping[str, 
 def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> RunRecord
 ```
 
+An executor runs them around `record_run`, as the example's does (`FactsServed` in `examples/tiny_study/plugin.py`):
+
+```python
+instruments = [FactsServed(shelf)]  # new objects for every run
+identity = {"run_key": request.run_key, "factors": dict(request.identity.factors), "attempt": request.identity.attempt}
+await asyncio.to_thread(start_instruments, instruments, identity)
+record = await record_run(request, providers, system, user, config, code=code)
+record = await asyncio.to_thread(finish_instruments, record, instruments)
+record.write(request.run_dir)  # the record finish_instruments returned, which holds the snapshots
+```
+
+- `identity` is the request's [`RunIdentity`](#runexecutor) as a plain mapping: `run_key`, `factors` and `attempt`. It is there for an instrument that labels its reading or looks something up by run; one that reads only the platform's state, such as the platform probes, ignores it.
+- One fresh instrument per run: an instrument holds one run's reading between `start` and `finish`, and the scheduler can run attempts at the same time, so an instrument shared between runs would mix their readings.
+- Which attempts get a snapshot: `record_run` returns a record however the loop ended, an infrastructure failure included (a tool's `InfraError`, an endpoint that outlasted its retries), so `finish` runs and the snapshot is kept: a treatment attempt's scorer reads it, and an attempt set aside keeps it for diagnosis. When the executor itself raises, before the loop or instead of returning, there is no record and so no snapshot. An exception from `start` is the executor's: an `InfraError` is recorded as infrastructure of its kind, anything else as a harness defect (C10).
+
 Core guarantees:
 - `check_instruments` runs first on both: a namespace that is not lower-case letters, digits and underscores, and two instruments with one namespace, raise before anything runs.
 - `finish_instruments` returns a new record with each snapshot in `RunRecord.instruments[namespace]`, a JSON object (NaN and values JSON cannot hold are refused). An instrument whose `finish` raises, or returns anything but a JSON object, is recorded as `{"ok": false, "error": <class name>}`: the attempt keeps its record and a scorer that needs the snapshot sees that it failed (O08).
@@ -192,7 +278,21 @@ class RunRequest:
     treatment_kinds: tuple[str, ...]
     lease: Lease | None = None
     models: ModelTable | None = None
+
+    @property
+    def run_key(self) -> str  # identity.run_key
+
+@dataclass(frozen=True)
+class RunIdentity:  # expcore.records.build
+    run_key: str
+    factors: Mapping[str, Any]
+    attempt: int
 ```
+
+`RunIdentity` says which attempt of which run the request is, and goes into the record as it is:
+- `run_key` is the run's key text, the factor values joined in the order of `[identity] order` (`task=lake|access=direct|tools=basic|model=alpha-stub|seed=1`). It is the same for every attempt of the run, and `RunRequest.run_key` returns it.
+- `factors` maps every factor of the run key to the run's level: the study's declared factors and the built-in `task`, `model` and `seed` (an integer). The condition is not among them; `study.schema.condition_named(factors, run_key)` names it.
+- `attempt` is 1 for a run's first attempt and one more for each attempt of the run that was charged before it, an infrastructure failure set aside for instance, so a stub that should fail on the first try and succeed on the next tests `attempt`. An attempt that was interrupted (a killed process) is not charged, and its run is tried again under the same number. The record's file is named by `run_key` and `attempt` (`record_filename`), in `request.run_dir`, the directory of this try (`try<N>`, where N counts every try of the run, interrupted ones included, so it can be larger than `attempt`).
 
 `record_run(request, providers, system, user, config, *, code, **options)` runs the loop with the request's backend, timer and treatment kinds and returns the record. It records with the request's model table, which the scheduler fills in for every run, so the key of each model in `models.toml` is redacted whatever the backend (R12).
 
