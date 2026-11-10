@@ -27,6 +27,9 @@ onedata = [
 dev = [
     "pytest>=8",
     "ruff>=0.8",
+    # The example platform beside the Onedata layer (examples/sparql_platform), with its store, pyoxigraph: a
+    # development dependency only, so tests/e2e/test_sparql_platform.py always runs. The core never imports it.
+    "sparql-platform",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -118,3 +121,6 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
 "src/expcore_onedata/probes.py" = ["E501"]
 "src/expcore_onedata/users.py" = ["E501"]
 "tests/support/fake_onedata.py" = ["E501"]
+
+[tool.uv.sources]
+sparql-platform = { path = "examples/sparql_platform", editable = true }

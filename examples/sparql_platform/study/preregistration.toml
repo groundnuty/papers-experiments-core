@@ -1,0 +1,42 @@
+# Written and frozen before the runs. Its hash goes into every analysis and into the report.
+
+alpha = 0.05
+holm_family = ["accuracy-guided-vs-bare", "queries-guided-vs-bare"]
+
+[bootstrap]
+replicates = 200
+seed = 20261110
+ci_level = 0.95
+
+[power]
+seed = 1
+n_simulations = 50
+target_clusters = 10
+target_difference = 0.2
+sd_grid = [0.1, 0.2]
+
+[estimators.wilcoxon_cluster_bootstrap]
+method = "auto"
+
+# Does showing the schema tool change whether the agent answers right? Only this one can be called "equivalent".
+[contrasts.accuracy-guided-vs-bare]
+conditions = ["guided", "bare"]
+outcome = "accuracy"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "shape"
+equivalence_margin = 0.2
+
+# Does it change how many queries the agent runs?
+[contrasts.queries-guided-vs-bare]
+conditions = ["guided", "bare"]
+outcome = "queries"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "shape"
+
+# Outside the family: exploratory. A factor contrast: it varies `exposure` and pairs on every other factor.
+[contrasts.exposure-effect-on-rows]
+factor = "exposure"
+levels = ["query_and_schema", "query_only"]
+outcome = "rows_served"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "shape"
