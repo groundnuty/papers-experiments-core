@@ -18,7 +18,11 @@ it, so a reader's fresh environment holds exactly these.
 `sources` names, for each distribution installed from a direct URL rather than an index (PEP 610 `direct_url.json`),
 where it came from: a version-control URL and commit, an archive URL and hash, or a local directory. A local path is
 never kept (it names the machine), nor are credentials, a query or a fragment of a URL. A distribution installed from
-an index has no entry. An anonymised replication package drops `sources` altogether.
+an index has no entry. An editable install's version does not change when its checkout does, so its entry also holds
+`python_sha256`, a digest of the Python source it imports from: every `*.py` below the directories its `.pth` files
+put on the path (or below its project directory when it has none), by path relative to that directory and content,
+never by where the checkout lies. Editing the checkout or swapping it for another changes the environment. An
+anonymised replication package drops `sources` altogether.
 
 The campaign fingerprint holds the environment, so a resume under another one is refused (C06). The replay check
 records the environment it ran under, refused unless it is the campaign's, and the analysis refuses a check made
@@ -26,18 +30,24 @@ under another environment than the one in use (R04). A replication package compa
 installed from the wheels it ships, which have no direct-URL source.
 """
 
+import hashlib
 import json
 import re
 import sys
 from collections.abc import Iterable, Mapping
 from importlib import metadata
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+from urllib.request import url2pathname
 
 from packaging.requirements import InvalidRequirement, Requirement
 
 CORE_DISTRIBUTION = "papers-experiments-core"
 _ROOT = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?:\[[A-Za-z0-9._,\s-]*\])?")
+
+
+SKIPPED_DIRS = frozenset({"__pycache__", ".git", ".venv", "venv", ".tox", "build", "dist", "node_modules"})
 
 
 class EnvironmentUnknown(RuntimeError):
@@ -88,6 +98,40 @@ def _sanitised_url(url: str) -> str | None:
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
+def editable_roots(dist: metadata.Distribution, url: str = "") -> list[Path]:
+    """The directories an editable install imports from: what its `.pth` files put on the path, else its project."""
+    roots: list[Path] = []
+    for item in dist.files or []:
+        if item.suffix != ".pth":
+            continue
+        try:
+            lines = Path(str(dist.locate_file(item))).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        entries = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith(("#", "import"))]
+        roots += [Path(entry) for entry in entries if Path(entry).is_dir()]
+    if not roots and urlsplit(url).scheme == "file":
+        project = Path(url2pathname(urlsplit(url).path))
+        roots = [project] if project.is_dir() else []
+    return roots
+
+
+def python_files(root: Path) -> list[Path]:
+    """The Python source below a directory, in path order, without caches, environments or version control."""
+    found = [p for p in root.rglob("*.py") if p.is_file() and not SKIPPED_DIRS & set(p.relative_to(root).parts)]
+    return sorted(found, key=lambda p: p.relative_to(root).as_posix())
+
+
+def python_digest(roots: list[Path]) -> str:
+    """A digest of the Python source below the directories, by relative path and content; no path of the machine."""
+    digest = hashlib.sha256()
+    for number, root in enumerate(roots):
+        for path in python_files(root):
+            name = f"{number}/{path.relative_to(root).as_posix()}".encode()
+            digest.update(name + b"\0" + hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
 def source_of(dist: metadata.Distribution) -> dict[str, Any] | None:
     """Where a distribution was installed from, from its `direct_url.json`; None when it came from an index."""
     text = dist.read_text("direct_url.json")
@@ -110,7 +154,13 @@ def source_of(dist: metadata.Distribution) -> dict[str, Any] | None:
         digest = hashes.get("sha256") or (str(archive.get("hash", "")).partition("=")[2] or None)
         return {"kind": "archive", **shown, **({"sha256": digest} if digest else {})}
     editable = isinstance(data.get("dir_info"), dict) and data["dir_info"].get("editable") is True
-    return {"kind": "directory", "editable": editable}
+    if not editable:
+        return {"kind": "directory", "editable": False}
+    roots = editable_roots(dist, str(data.get("url", "")))
+    if not roots:
+        name = dist.metadata["Name"] if dist.metadata is not None else "a distribution"
+        raise EnvironmentUnknown(f"{name} is installed editable, but the checkout it imports from cannot be found")
+    return {"kind": "directory", "editable": True, "python_sha256": python_digest(roots)}
 
 
 def environment(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Distribution] | None = None) -> dict:

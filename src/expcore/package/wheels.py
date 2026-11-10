@@ -38,7 +38,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from expcore.package.spec import WHEELS_DIR, PackageError
-from expcore.provenance.environment import canonical, installed, source_of
+from expcore.provenance.environment import EnvironmentUnknown, canonical, installed, source_of
 
 REQUIREMENTS = f"{WHEELS_DIR}/requirements.txt"
 ZIP_DATE = (1980, 1, 1, 0, 0, 0)
@@ -203,7 +203,10 @@ def vendor_wheels(distributions: Mapping[str, str], supplied: Path | None = None
                 f"{name} {version} is in the environment the check ran under but not installed here; build the "
                 "package in the campaign's environment"
             )
-        source = source_of(dist)
+        try:
+            source = source_of(dist)
+        except EnvironmentUnknown as error:
+            raise PackageError(str(error)) from None
         given = supplied_wheel(supplied, name, version) if supplied is not None else None
         if given is None and source is not None and source.get("editable"):
             raise PackageError(

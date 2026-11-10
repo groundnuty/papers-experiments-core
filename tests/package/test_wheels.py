@@ -92,7 +92,11 @@ def test_k10_an_editable_install_is_refused_unless_the_author_supplies_its_wheel
     """K10: an editable install's files are a pointer to a checkout, so its wheel must come from `--wheels`; the
     supplied wheel is taken byte for byte, and one whose metadata names another version is refused."""
     editable = json.dumps({"url": "file:///somewhere/toy", "dir_info": {"editable": True}})
-    dist = installed_distribution(site, "toy-platform", "2.0.0", CODE, direct_url=editable)
+    checkout = tmp_path / "checkout"
+    for rel, data in CODE.items():
+        (checkout / rel).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / rel).write_bytes(data)
+    dist = installed_distribution(site, "toy-platform", "2.0.0", {}, direct_url=editable, checkout=checkout)
     monkeypatch.setattr(wheels_module, "installed", lambda: {"toy-platform": dist})
     with pytest.raises(PackageError, match=r"installed editable.*--wheels DIR"):
         vendor_wheels({"toy-platform": "2.0.0"})

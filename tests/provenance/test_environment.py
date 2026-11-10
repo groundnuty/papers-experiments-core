@@ -17,7 +17,9 @@ from expcore.provenance.environment import (
 )
 
 
-def install(site: Path, name: str, version: str, requires=(), direct_url: dict | None = None) -> metadata.Distribution:
+def install(
+    site: Path, name: str, version: str, requires=(), direct_url: dict | None = None, checkout: Path | None = None
+) -> metadata.Distribution:
     """A fake installed distribution: a dist-info directory with its metadata and, if given, its direct_url.json."""
     info = site / f"{name.replace('-', '_')}-{version}.dist-info"
     info.mkdir(parents=True)
@@ -26,6 +28,10 @@ def install(site: Path, name: str, version: str, requires=(), direct_url: dict |
     (info / "METADATA").write_text("\n".join(lines) + "\n", encoding="utf-8")
     if direct_url is not None:
         (info / "direct_url.json").write_text(json.dumps(direct_url), encoding="utf-8")
+    if checkout is not None:  # an editable install: a .pth file in the site directory points at the checkout
+        pth = f"_{name.replace('-', '_')}.pth"
+        (site / pth).write_text(f"{checkout}\n", encoding="utf-8")
+        (info / "RECORD").write_text(f"{pth},,\n{info.name}/RECORD,,\n", encoding="utf-8")
     return metadata.Distribution.at(info)
 
 
@@ -103,6 +109,7 @@ def test_c06_a_direct_url_source_keeps_its_commit_and_drops_credentials_and_loca
             "toy-platform",
             "2.0.0",
             direct_url={"url": "file:///home/someone/plat", "dir_info": {"editable": True}},
+            checkout=checkout(tmp_path / "someone-plat", "WIRE = 'blue'\n"),
         ),
         "archivelib": install(
             where,
@@ -118,10 +125,42 @@ def test_c06_a_direct_url_source_keeps_its_commit_and_drops_credentials_and_loca
         "url": "https://code.example.org/lab/core",
         "commit": "c" * 40,
     }
-    assert sources["toy-platform"] == {"kind": "directory", "editable": True}
+    assert sources["toy-platform"]["kind"] == "directory"
+    assert sources["toy-platform"]["editable"] is True
     assert sources["archivelib"] == {"kind": "archive", "sha256": "d" * 64}
     assert "someone" not in json.dumps(sources)
     assert "token" not in json.dumps(sources)
+
+
+def checkout(where: Path, code: str) -> Path:
+    """A checkout of a platform package: its importable source under src/, with a cache beside it."""
+    (where / "src" / "toy_platform" / "__pycache__").mkdir(parents=True)
+    (where / "src" / "toy_platform" / "__init__.py").write_text(code, encoding="utf-8")
+    (where / "src" / "toy_platform" / "__pycache__" / "x.pyc").write_bytes(b"compiled")
+    return where / "src"
+
+
+def test_c06_an_editable_checkout_is_identified_by_its_python_source_and_not_by_where_it_lies(tmp_path):
+    """C06: two editable checkouts at one version compare unequal when their source differs, and one checkout, or an
+    identical copy of it anywhere, compares equal; the entry holds no path."""
+    editable = {"url": "file:///somewhere/toy", "dir_info": {"editable": True}}
+
+    def source(name: str, code: str) -> dict:
+        site = tmp_path / name / "site"
+        core = install(site, CORE_DISTRIBUTION, "0.1.0", ["toy-platform"])
+        toy = install(site, "toy-platform", "2.0.0", direct_url=editable, checkout=checkout(tmp_path / name, code))
+        return environment(found={CORE_DISTRIBUTION: core, "toy-platform": toy})
+
+    first = source("first", "WIRE = 'blue'\n")
+    assert first == source("first-copy", "WIRE = 'blue'\n")
+    edited = source("edited", "WIRE = 'red'\n")
+    assert differences(first, edited) == ["toy-platform installed from another source than the one recorded"]
+    assert differences(first, edited, sources=False) == []  # a package keeps only names and versions
+    assert str(tmp_path) not in json.dumps(first)
+    gone = install(tmp_path / "gone" / "site", "toy-platform", "2.0.0", direct_url=editable)
+    core = install(tmp_path / "gone" / "site", CORE_DISTRIBUTION, "0.1.0", ["toy-platform"])
+    with pytest.raises(EnvironmentUnknown, match="installed editable, but the checkout"):
+        environment(found={CORE_DISTRIBUTION: core, "toy-platform": gone})
 
 
 def test_c06_differences_name_every_change_and_never_a_url_or_commit(site):

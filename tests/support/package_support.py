@@ -41,7 +41,13 @@ def stand_in_vendor(distributions: Mapping[str, str], supplied: Path | None = No
 
 
 def installed_distribution(
-    site: Path, name: str, version: str, files: Mapping[str, bytes], *, direct_url: str | None = None
+    site: Path,
+    name: str,
+    version: str,
+    files: Mapping[str, bytes],
+    *,
+    direct_url: str | None = None,
+    checkout: Path | None = None,
 ) -> metadata.Distribution:
     """Install a fake pure distribution into `site` the way an installer does: its files, a dist-info with RECORD."""
     escaped = name.replace("-", "_")
@@ -53,6 +59,8 @@ def installed_distribution(
     written[f"{info}/uv_cache.json"] = b'{"timestamp": 1}'
     if direct_url is not None:
         written[f"{info}/direct_url.json"] = direct_url.encode()
+    if checkout is not None:  # an editable install: a .pth file puts the checkout on the path
+        written[f"_{escaped}.pth"] = f"{checkout}\n".encode()
     lines = []
     for rel, data in written.items():
         target = site / rel
