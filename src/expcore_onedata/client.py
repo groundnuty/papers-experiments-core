@@ -45,8 +45,10 @@ or a record through it.
 Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S11]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
 client test in a source sends it and reads the answer as this layer does. `[L1]` is the live contract tests
-(`tests/live/test_contract.py`) run against Onedata 25.0, the release the deployments of record run, on the Compose
-federation of `deploy/compose-federation` on 10 Nov 2026 (its day-0 report is beside it).
+(`tests/live/test_contract.py`) and the direct reads recorded beside them, run against Onedata 25.0, the release the
+deployments of record run, on the Compose federation of `deploy/compose-federation` on 10 Nov 2026: its day-0 report
+and `day0/2026-11-10-federation-facts.md`, which says which fact a test showed and which a direct read (an eviction's
+record was read directly, since no live test ran one).
 
 - Authentication: the header `X-Auth-Token` with an access token. Confirmed by [S2].
 - `get`: `GET /spaces/{space}/users/{user}/privileges` and `GET /spaces/{space}/effective_users/{user}/privileges`; the
