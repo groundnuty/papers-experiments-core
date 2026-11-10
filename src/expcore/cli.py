@@ -25,7 +25,7 @@ no lease began none.
 import argparse
 import hashlib
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from expcore.campaign.attempts import ResumeRefused
@@ -210,4 +210,14 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
         return commands[args.command](args)
     except _REFUSALS as error:
         print(f"{args.command} refused: {error}", file=sys.stderr)
+        _name_hidden_paths(getattr(error, "private", {}))
         return EXIT_REFUSED
+
+
+def _name_hidden_paths(private: Mapping[str, str]) -> None:
+    """Show the author which path each hidden name stands for, only on a terminal: a log may be public."""
+    if not private or not getattr(sys.stderr, "isatty", lambda: False)():
+        return
+    print("on this terminal only, never in a log or a file, the paths named above by place and hash:", file=sys.stderr)
+    for name, path in private.items():
+        print(f"  {name} is {path}", file=sys.stderr)

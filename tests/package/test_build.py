@@ -265,6 +265,51 @@ def test_a_listed_term_in_a_code_file_fails_the_build_naming_file_and_line_and_i
     assert (root / "plugin.py").read_bytes() == before
 
 
+def with_notes(campaign: Campaign, tmp_path: Path, directory: str) -> Path:
+    """A copy of the study that includes a clean file below `notes/<directory>/`."""
+    root = a_copy(campaign, tmp_path)
+    (root / "notes" / directory).mkdir(parents=True)
+    (root / "notes" / directory / "data.txt").write_text("nothing private here\n", encoding="utf-8")
+    spec = root / "package.toml"
+    spec.write_text(spec.read_text(encoding="utf-8").replace('    "README.md",\n', '    "README.md",\n    "notes",\n'))
+    return root
+
+
+def test_k05_a_private_name_in_a_path_is_reported_once_for_the_file_never_through_a_generated_file(
+    campaign, hashes, tmp_path
+):
+    """K05: a path that holds a private name is reported once, by its place and hash, not again for the line of
+    SHA256SUMS or PACKAGE.json the build generated from it; the refusal carries the path for the author's terminal."""
+    with pytest.raises(PackageError) as refused:
+        build_package(with_notes(campaign, tmp_path, PRIVATE), tmp_path / "dist", hashes=hashes)
+    findings = [line.strip() for line in str(refused.value).splitlines()[1:]]
+    prefix = hashlib.sha256(f"expcore-study-token-v1:{PRIVATE}".encode()).hexdigest()[:12]
+    assert len(findings) == 1
+    assert findings[0].endswith(f": the path holds a private name (study token {prefix})")
+    assert PRIVATE not in str(refused.value)
+    assert refused.value.private == {findings[0].split(":")[0]: f"notes/{PRIVATE}/data.txt"}
+
+
+def test_k05_a_term_in_a_path_is_named_by_its_path_on_the_authors_terminal_and_nowhere_else(
+    campaign, hashes, tmp_path, capsys, monkeypatch
+):
+    """K05: in an anonymised build, a path that holds a term is reported once, never through SHA256SUMS; the command
+    line names the path, relative to the study, only when standard error is a terminal, never in a log."""
+    root = with_notes(campaign, tmp_path, "varek")
+    argv = ["package", str(root), "--hashes", str(hashes), "--anonymise", str(tmp_path / "anon.toml")]
+    anonymisation(tmp_path / "anon.toml", {AUTHOR: "Author A", "Varek": "Author B"})
+    assert main([*argv, "--out", str(tmp_path / "dist-log")]) == 1
+    logged = capsys.readouterr().err
+    assert "the path holds a term of the anonymisation list" in logged
+    assert "SHA256SUMS" not in logged
+    assert "varek" not in logged.casefold()
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    assert main([*argv, "--out", str(tmp_path / "dist-terminal")]) == 1
+    shown = capsys.readouterr().err
+    hidden = next(line.strip().split(":")[0] for line in shown.splitlines() if "the path holds a term" in line)
+    assert f"  {hidden} is notes/varek/data.txt\n" in shown
+
+
 FIGURE = b"%PDF-1.4\n<< /Filter /FlateDecode >>\nstream\n" + zlib.compress(b"a drawn figure") + b"\nendstream\n"
 
 

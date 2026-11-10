@@ -60,9 +60,9 @@ from expcore.package.identity import (
     stamp_bytes,
     verify_inputs,
 )
-from expcore.package.leaks import default_hashes, findings_in, private_hashes, scan_tokens
+from expcore.package.leaks import default_hashes, findings_in, hidden_paths, private_hashes, scan_tokens
 from expcore.package.lockfile import PYPI, lock_hashes, token_exempt
-from expcore.package.spec import WHEELS_DIR, PackageError, PackageSpec, load_spec, select
+from expcore.package.spec import GENERATED, WHEELS_DIR, PackageError, PackageSpec, load_spec, select
 from expcore.package.tracking import Tracking, note_tracking
 from expcore.package.wheels import REQUIREMENTS, Vendor, Wheel, makefile, requirements, vendor_wheels
 from expcore.package.wheelscan import scan_wheels
@@ -299,9 +299,14 @@ def collect(
     if json.loads(files[STAMP])["tree_sha256"] != code["tree_sha256"]:
         raise PackageError(f"{where}: the package's code is not the code the records were checked under")
     files[SUMS_FILE] = render_sums(files)
-    findings = read.findings + findings_in(files, tokens, terms, hidden_commits, hidden_urls, opaque)
+    generated = {*GENERATED, REQUIREMENTS}
+    findings = read.findings + findings_in(
+        files, tokens, terms, hidden_commits, hidden_urls, opaque, generated=generated
+    )
     if findings:
-        raise PackageError("refusing to build the package:\n  " + "\n  ".join(findings))
+        raise PackageError(
+            "refusing to build the package:\n  " + "\n  ".join(findings), private=hidden_paths(findings, files)
+        )
     return spec, files
 
 

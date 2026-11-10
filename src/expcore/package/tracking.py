@@ -76,14 +76,16 @@ def note_tracking(
         say(f"{root} is not in a repository, so whether its included files are committed cannot be told")
     if not state.uncommitted:
         return state
-    shown = ", ".join(
-        f"{hidden_name(places.index(path) + 1, path) if terms and holds_term(terms, path) else path} ({kind})"
-        for path, kind in state.uncommitted
-    )
+    names = {
+        path: hidden_name(places.index(path) + 1, path) if terms and holds_term(terms, path) else path
+        for path, _ in state.uncommitted
+    }
+    shown = ", ".join(f"{names[path]} ({kind})" for path, kind in state.uncommitted)
     if terms is not None and not allow_uncommitted:
         raise PackageError(
             f"an anonymised package names no commit, so it cannot include files no commit holds: {shown}; commit them, "
-            "leave them out, or pass --allow-uncommitted"
+            "leave them out, or pass --allow-uncommitted",
+            private={name: path for path, name in names.items() if name != path},
         )
     say(f"included but no commit holds them, listed in PACKAGE.json: {shown}")
     return state

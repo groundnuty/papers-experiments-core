@@ -140,6 +140,20 @@ def test_k12_a_path_that_holds_a_listed_term_is_shown_only_by_its_place(committe
     assert "quillon" not in str(refused.value).lower()
 
 
+def test_k05_the_refusal_carries_each_hidden_path_for_the_authors_terminal(committed, hashes, anonymisation, tmp_path):
+    """K05: a file no commit holds whose path holds a term is named by place and hash in the refusal, which carries
+    the path itself only for the command line to show on a terminal."""
+    name = "quillon varek notes.txt"
+    (committed / name).write_text("a note\n", encoding="utf-8")
+    include(committed, name)
+    with pytest.raises(PackageError) as refused:
+        build_package(committed, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
+    ((hidden, path),) = refused.value.private.items()
+    assert path == name
+    assert hidden.startswith("file ")
+    assert hidden in str(refused.value)
+
+
 def test_k12_a_study_outside_any_repository_says_it_cannot_tell_and_is_not_refused(
     campaign, hashes, anonymisation, tmp_path, monkeypatch
 ):

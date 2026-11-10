@@ -6,7 +6,9 @@ hashes of the names private everywhere. `findings_in` adds what an anonymised pa
 """
 
 import importlib.resources
-from collections.abc import Callable, Collection, Mapping
+import json
+import re
+from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
 
 import expcore
@@ -21,6 +23,7 @@ from expcore.provenance.study_tokens import load_hashes
 HASHES_NAME = "study_tokens.sha256"
 PRIVATE_NAME = "a private name"
 PLAIN_VIEWS = frozenset({"text"})  # the views whose line numbers are the stream's own lines
+_HIDDEN = re.compile(r"file (\d+) \(path sha256 [0-9a-f]{12}\)")  # how `views.hidden_name` names a path
 
 
 def default_hashes() -> Path:
@@ -134,11 +137,60 @@ def findings_in(
     commits: frozenset[str],
     urls: frozenset[str],
     opaque: Collection[str],
+    *,
+    generated: Collection[str] = frozenset(),
 ) -> list[str]:
-    """Every leak the checks find: study tokens, and for an anonymised package its terms and its identity."""
+    """Every leak the checks find: study tokens, and for an anonymised package its terms and its identity.
+
+    The files in `generated` are the build's own (SHA256SUMS, PACKAGE.json, ...), which list the package's paths. A
+    path whose own finding reports it is not reported again through them: they are read with it masked.
+    """
+    reported = reported_paths(files, tokens, terms, opaque)
+    files = {path: without_paths(data, reported) if path in generated else data for path, data in files.items()}
     hidden = (lambda label: holds_term(terms, label)) if terms is not None else (lambda label: False)
     findings = scan_tokens(files, tokens, opaque=opaque, hidden=hidden)
     if terms is not None:
         findings += find_terms(files, terms, opaque=opaque)
         findings += find_identity(files, commits, urls, opaque=opaque)
     return findings
+
+
+def reported_paths(
+    files: Mapping[str, bytes], tokens: Hashes, terms: Anonymisation | None, opaque: Collection[str]
+) -> set[str]:
+    """The paths the checks report as paths: those that hold a private name or a term, of files they read."""
+    return {
+        path
+        for path in files
+        if path not in opaque and (_path_prefixes(path, tokens) or (terms is not None and holds_term(terms, path)))
+    }
+
+
+MASK = b"<*>"  # no letter or digit, so it can be neither a term nor a part of a name
+
+
+def without_paths(data: bytes, paths: Collection[str]) -> bytes:
+    """A generated file with each of `paths` masked, as written in a manifest and as a JSON string writes it."""
+    for path in sorted(paths, key=len, reverse=True):  # a longer path first, so a shorter one inside it stays whole
+        for form in dict.fromkeys((path, json.dumps(path)[1:-1])):
+            data = data.replace(form.encode("utf-8"), MASK)
+    return data
+
+
+def hidden_paths(findings: Iterable[str], files: Mapping[str, bytes]) -> dict[str, str]:
+    """For each name of a hidden path in `findings` (`views.hidden_name`), the path or stream label it stands for,
+    in the order the findings give them; a name the files cannot resolve (a wheel member's, say) is left out."""
+    ordered = sorted(files)
+    resolved: dict[str, str] = {}
+    for finding in findings:
+        for match in _HIDDEN.finditer(finding):
+            name, position = match.group(0), int(match.group(1))
+            if name in resolved or not 1 <= position <= len(ordered):
+                continue
+            path = ordered[position - 1]
+            found, problems = streams(path, files[path])
+            labels = [path, *(stream.label for stream in found), *(label for label, _ in problems)]
+            label = next((label for label in labels if hidden_name(position, label) == name), None)
+            if label is not None:
+                resolved[name] = label
+    return resolved
