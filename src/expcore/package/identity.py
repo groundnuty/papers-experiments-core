@@ -5,6 +5,9 @@ A commit id in a double-blind package is a lookup key to its authors, in any pub
 a source URL. An anonymised build therefore replaces every commit id with the first 40 hexadecimal digits of the tree
 hash of the same code, which a reader can recompute, and drops every source:
 
+- first, every file of the batch must be exactly the bytes the original replay check hashed, and no other input may
+  have appeared: a record changed after the check would otherwise be given a pseudo-commit and pass under the
+  original check's time;
 - each record's `code.commit`, and the head of the commit in `code.why`, become that record's pseudo-commit. The
   field is free text under the format and no seal covers it (`records.seal` pins prompts, configuration, tools and
   settings), so no record format changes, and every digest a record holds stays valid;
@@ -31,6 +34,8 @@ and the scheme. A finding names the file and line, never the value (K05).
 """
 
 import dataclasses
+import fnmatch
+import hashlib
 import json
 import re
 import sqlite3
@@ -48,7 +53,7 @@ from expcore.provenance.codestamp import STAMP, CodeScope, covered_files, is_sha
 from expcore.provenance.environment import without_sources
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.records.record import RunRecord, decode
-from expcore.replay.check import CHECK_FILE, verify_batch, write_check
+from expcore.replay.check import CHECK_FILE, inputs_sha256, verify_batch, write_check
 from expcore.study.pipeline import OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
 
 PREFIX_DIGITS = 12
@@ -79,6 +84,31 @@ def stamp_bytes(
         lay_out(Path(scratch), {p: d for p, d in files.items() if p in covered_files(root, scope)})
         write_stamp(scratch, head, scope, created_utc=created_utc)
         return (Path(scratch) / STAMP).read_bytes()
+
+
+def verify_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -> None:
+    """Refuse a batch whose files are not exactly the inputs the replay check hashed, naming the first that differs.
+
+    An input is what the check counts as one: a `.json` file other than the check, or a file its hashed-only patterns
+    name, never a name starting with a dot.
+    """
+    recorded = check.get("inputs")
+    if not isinstance(recorded, dict) or check.get("inputs_sha256") != inputs_sha256(recorded):
+        raise PackageError(f"{BATCH}/{CHECK_FILE}: its list of inputs was altered; run `python -m expcore check` again")
+    patterns = check.get("hashed_only_patterns") or ()
+    current = {}
+    for path, data in files.items():
+        rel = path[len(BATCH) + 1 :] if path.startswith(f"{BATCH}/") else None
+        if rel is None or rel == CHECK_FILE or Path(rel).name.startswith("."):
+            continue
+        if rel.endswith(".json") or any(fnmatch.fnmatchcase(rel, pattern) for pattern in patterns):
+            current[rel] = hashlib.sha256(data).hexdigest()
+    for rel in sorted(set(current) | set(recorded)):
+        if current.get(rel) != recorded.get(rel):
+            state = "is not" if rel not in recorded else "is missing" if rel not in current else "differs from"
+            raise PackageError(
+                f"{BATCH}/{rel} {state} what the replay check hashed; run `python -m expcore check` again"
+            )
 
 
 def replayed_records(check: Mapping[str, Any]) -> list[str]:
@@ -186,6 +216,7 @@ def anonymise_identity(
 ) -> tuple[dict[str, bytes], dict[str, Any], Mapping[str, Any]]:
     """Return the files with a tree-hash identity and no source, the new code identity and the environment kept."""
     refuse_labelled_versions(env)
+    verify_inputs(files, check)
     original = dict(check["code"])
     code = {**original, "commit": pseudo_commit(original["tree_sha256"])}
     kept = without_sources(env)

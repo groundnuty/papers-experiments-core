@@ -54,6 +54,7 @@ from expcore.package.identity import (
     record_commits,
     replayed_records,
     stamp_bytes,
+    verify_inputs,
 )
 from expcore.package.leaks import default_hashes, findings_in, private_hashes, scan_tokens
 from expcore.package.spec import PackageError, PackageSpec, load_spec, select
@@ -227,6 +228,7 @@ def collect(
     hidden_commits, hidden_urls = frozenset(), frozenset()
     if terms is not None:
         rewritten = list(terms.files)
+        verify_inputs(files, check)  # before a record is read: the bytes must be the ones the check hashed
         hidden_commits, hidden_urls = hidden_identity(
             study.root, code, env, record_commits(files, replayed_records(check))
         )

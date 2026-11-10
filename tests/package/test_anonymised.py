@@ -258,6 +258,25 @@ def test_k11_a_local_version_label_refuses_an_anonymised_build(campaign, hashes,
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
 
 
+def test_k11_a_record_changed_after_the_check_refuses_the_anonymised_build_naming_it(
+    campaign, hashes, anonymisation, tmp_path
+):
+    """K11: anonymising makes the check again, so it first holds every record to the bytes the original check hashed;
+    a record swapped in afterwards would otherwise get a pseudo-commit and pass under the original check's time."""
+    root = copy_campaign(campaign, tmp_path, "copy").root
+    record = sorted(record_files(root))[0]
+    data = json.loads(record.read_text(encoding="utf-8"))
+    data["code"]["commit"] = "c" * 40
+    record.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    rel = record.relative_to(root).as_posix()
+    with pytest.raises(PackageError, match=rf"{rel} differs from what the replay check hashed"):
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
+    record.write_bytes((campaign.root / rel).read_bytes())
+    (record.parent / "extra.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(PackageError, match=r"extra\.json is not what the replay check hashed"):
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
+
+
 def test_k11_a_table_the_records_do_not_give_is_refused_in_an_anonymised_build(
     campaign, hashes, anonymisation, tmp_path
 ):
