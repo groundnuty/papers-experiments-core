@@ -68,7 +68,7 @@ def write_failure(
     """Append the redacted traceback of any failure of the harness to the campaign's log, headed by the time and
     `title`; return the log's path. A study's plugin that fails on import is one (`study.plugin`)."""
     try:
-        text = redactor().text("".join(traceback.format_exception(error)))
+        text = redactor().with_lines().text("".join(traceback.format_exception(error)))  # plain text, never sealed
     except ConfigError as refusal:
         text = f"the traceback is withheld, since it cannot be redacted: {refusal}\n"
     head = f"=== {stamp} {title}\n"

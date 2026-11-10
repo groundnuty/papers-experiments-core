@@ -81,6 +81,9 @@ class Plain:
     def text(self, value):
         return value
 
+    def with_lines(self):
+        return self
+
 
 @pytest.mark.parametrize(
     ("pattern", "path", "matches"),

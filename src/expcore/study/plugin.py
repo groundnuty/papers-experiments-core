@@ -146,7 +146,7 @@ def import_plugin_module(
         if not error_text:
             raise ConfigError(f"{file}: failed on import ({type(error).__name__})") from None
         redactor = partial(redactor_for, None, models=models, short_tokens=True)
-        message = f"{file}: failed on import ({type(error).__name__}: {redactor().text(str(error))})"
+        message = f"{file}: failed on import ({type(error).__name__}: {redactor().with_lines().text(str(error))})"
         if log_root is not None:
             stamp = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
             title = f"importing {file.name}: {type(error).__name__}"

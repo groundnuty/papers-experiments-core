@@ -33,9 +33,14 @@ A secret is redacted in three base forms, raw, as Python's repr shows it and as 
 it, since an exception's text often holds a repr (`KeyError(secret)` escapes a quote when the secret holds both
 kinds), and in the forms derived from each of them: JSON-escaped up to three levels of escaping (text inside a JSON
 string inside a JSON string) and percent-encoded, since a native message carries text in JSON strings and a URL
-carries it percent-encoded. Each line of a multi-line secret that is at least the minimum length is a secret of its
-own as well, since a formatter can put something between the lines (an exception group prefixes each with `| `). A
-secret that was replaced is gone: neither the text nor a decoding of it holds the value.
+carries it percent-encoded. A secret that was replaced is gone: neither the text nor a decoding of it holds the
+value.
+
+In plain text that is never sealed (the harness-error log, a message printed to the author: `Redactor.with_lines`,
+`redact_text`), each line of a multi-line secret that is at least the minimum length is a secret of its own as well,
+since a formatter can put something between the lines (an exception group prefixes each with `| `). Never in a
+record: a record holds a multi-line secret whole or JSON-escaped, which the whole-secret forms match, and a line that
+is a common word would rename a key and break the record's seal.
 
 Redaction records the paths of what it changed, never values. It is a fixed point: redacting a redacted structure
 changes nothing. A number that is replaced becomes a string, so a record whose redaction would break a field that must
@@ -147,12 +152,12 @@ def short_secret_values(
     return sorted(short, key=len, reverse=True)
 
 
-def forms_of(value: str) -> set[str]:
+def forms_of(value: str, *, lines: bool = False) -> set[str]:
     """Return the ways a secret can appear in text: each base form (raw, the repr of the string, the repr of its
-    bytes), of the secret and of each of its lines of the minimum length or more, and each of those JSON-escaped up to
-    three levels and percent-encoded."""
+    bytes), and with `lines` (plain text only, never a record) of each of its lines of the minimum length or more too,
+    and each of those JSON-escaped up to three levels and percent-encoded."""
     bases = _base_forms(value)
-    for line in value.splitlines():
+    for line in value.splitlines() if lines else ():
         if len(line) >= MIN_SECRET_LEN:
             bases |= _base_forms(line)
     forms, level = set(bases), set(bases)
@@ -175,17 +180,26 @@ def _join(path: str, key: str) -> str:
 class Redactor:
     """Replaces a fixed set of secrets, and the values of keys that name one, in text and in JSON-like structures."""
 
-    def __init__(self, secrets: Iterable[str] = (), *, keys: bool = True, short: Iterable[str] = ()):
+    def __init__(
+        self, secrets: Iterable[str] = (), *, keys: bool = True, short: Iterable[str] = (), lines: bool = False
+    ):
         values = [s for s in secrets if s and s not in REDACTED]
         for value in values:
             _refuse_short(value, "a secret")
+        short = [s for s in short if s and s not in REDACTED]
+        self._values, self._short, self._keys, self._lines = tuple(values), tuple(short), keys, lines
         # A secret too short to replace wherever it occurs is replaced only where it stands as a token of its own
         # (no letter, digit or underscore on either side): for a diagnostic, never for a record, which refuses it.
-        tokens = sorted({f for s in short if s and s not in REDACTED for f in forms_of(s)}, key=len, reverse=True)
+        tokens = sorted({f for s in short for f in forms_of(s, lines=lines)}, key=len, reverse=True)
         self._tokens = tuple(re.compile(rf"(?<!\w){re.escape(form)}(?!\w)") for form in tokens)
-        self._inside: tuple[str, ...] = tuple(sorted({f for s in values for f in forms_of(s)}, key=len, reverse=True))
+        inside = {f for s in values for f in forms_of(s, lines=lines)}
+        self._inside: tuple[str, ...] = tuple(sorted(inside, key=len, reverse=True))
         self._numbers: frozenset[str] = frozenset(values)
-        self._keys = keys
+
+    def with_lines(self) -> "Redactor":
+        """The same redactor for plain text that is never sealed (a log, a printed message): each line of a
+        multi-line secret is replaced on its own too."""
+        return Redactor(self._values, keys=self._keys, short=self._short, lines=True)
 
     @classmethod
     def from_environment(
@@ -195,13 +209,16 @@ class Redactor:
         declared: Iterable[str] = (),
         *,
         short_tokens: bool = False,
+        lines: bool = False,
     ) -> "Redactor":
         """Build a redactor from the environment (the process's by default), the registered secrets, `extra` values and
         the variables named in `declared`. A secret under the minimum length is refused, or with `short_tokens`, for a
-        diagnostic on the author's terminal, replaced where it stands as a token of its own."""
+        diagnostic on the author's terminal, replaced where it stands as a token of its own. `extra` is read once,
+        whatever iterable it is. `lines`: see `with_lines`."""
+        extra = tuple(extra)
         long = secret_values(environ, extra, declared, skip_short=short_tokens)
         short = short_secret_values(environ, extra, declared) if short_tokens else ()
-        return cls(long, short=short)
+        return cls(long, short=short, lines=lines)
 
     @classmethod
     def none(cls) -> "Redactor":
@@ -310,6 +327,7 @@ def redact_structure(
 def redact_text(
     text: str, environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
 ) -> tuple[str, int]:
-    """Redact plain text such as a log line or an error message; return the text and how many places changed."""
-    new = Redactor.from_environment(environ, extra, declared).text(text)
+    """Redact plain text such as a log line or an error message, each line of a multi-line secret too (`with_lines`);
+    return the text and how many places changed."""
+    new = Redactor.from_environment(environ, extra, declared, lines=True).text(text)
     return new, int(new != text)

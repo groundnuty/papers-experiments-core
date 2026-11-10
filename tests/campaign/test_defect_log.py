@@ -117,6 +117,9 @@ class _Plain:
     def text(self, value):
         return value
 
+    def with_lines(self):
+        return self
+
 
 def test_r12_a_secret_with_both_quote_kinds_is_redacted_from_the_log_in_its_repr_form(tmp_path, monkeypatch):
     """R12: `KeyError(secret)` puts the secret's repr in the traceback, a quote escaped; the log redacts that too."""
@@ -213,6 +216,29 @@ def test_l08_an_existing_gitignore_of_the_log_directory_is_kept_and_made_to_igno
     assert subprocess.run(["git", "-C", str(tmp_path), "check-ignore", "-q", str(path)], check=False).returncode == 0
     write_defect(tmp_path / "out", error, defect, stamp="T", run_key="k", attempt=2, redactor=_Plain)
     assert ignore.read_text(encoding="utf-8") == text  # appended once
+
+
+def test_r12_a_secret_whose_line_is_a_common_word_keeps_the_record_and_is_redacted_from_the_log(tmp_path, monkeypatch):
+    """R12: a secret whose first line is `prompt` would rename the record's `prompt` key if its lines were secrets in a
+    record; they are only in the log, where the exception group's `| ` splits the secret and over-redacting harms
+    nothing."""
+    secret = "prompt\nquartz-7781"
+    monkeypatch.setenv("TOYLAB_TOKEN", secret)
+    crashed = key_of(SCHEMA, "mount-read")
+    executor = FakeExecutor()
+
+    async def grouped(request):
+        record = await record_run(request, [FakeProvider({})], "be brief", "do it", executor.config, code=dict(CODE))
+        executor.records.append(record)
+        raise ExceptionGroup("the batch failed", [ValueError(f"refused {secret}")])
+
+    executor.behaviours[crashed] = collections.deque([grouped])
+    with build(tmp_path, executor=executor, plan=SMALL) as scheduler:
+        log = scheduler.run().harness_log.read_text(encoding="utf-8")
+    [record] = [r for r in executor.records if r.run_key == crashed]
+    assert "prompt" in record.to_json()  # the record was built and sealed, its keys intact
+    assert "| ValueError: refused [redacted]" in log
+    assert "quartz-7781" not in log
 
 
 def test_r12_a_two_line_secret_in_an_exception_group_is_redacted_from_the_log(tmp_path):

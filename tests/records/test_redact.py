@@ -295,9 +295,30 @@ def test_R12_a_repr_of_a_secret_inside_json_or_a_url_is_redacted_in_that_form(se
             assert "quartz" not in redacted, text
 
 
+def test_R12_a_multi_line_secret_leaves_a_records_keys_intact_and_is_redacted_whole(tmp_path):
+    """R12: a record holds a multi-line secret whole or JSON-escaped, which the whole-secret forms match, so its lines
+    are not secrets there: a line that is a common word (`prompt`) must not rename a key, or sealing fails."""
+    secret = "prompt\nquartz-7781"
+    base = hand_made()
+    record = hand_made(totals={**base.totals, "final_text": f"saw {secret} and {json.dumps(secret)}"})
+    with pytest.warns(RuntimeWarning, match="redacted secrets"):
+        written = record.write(tmp_path, environ={"TOYLAB_TOKEN": secret}).read_text(encoding="utf-8")
+    loaded = RunRecord.from_json(decode(written))
+    assert loaded.prompt == base.prompt  # the key and its content are as they were
+    assert loaded.totals["final_text"] == 'saw [redacted] and "[redacted]"'
+    assert "quartz-7781" not in written
+
+
+def test_R12_extra_secrets_given_as_an_iterator_are_read_once_for_both_passes():
+    """R12: the long and the short secrets are picked from one reading of `extra`, so an iterator is not used up by
+    the first pass and a short value it holds is still replaced as a token."""
+    redactor = Redactor.from_environment({}, extra=iter(["xyz", "long-secret-4471"]), short_tokens=True)
+    assert redactor.text("xyz and long-secret-4471, not xyzzy") == "[redacted] and [redacted], not xyzzy"
+
+
 def test_R12_each_line_of_a_multi_line_secret_is_redacted_on_its_own():
-    """R12: a formatter that puts something between the lines of a secret (an exception group's `| `) breaks the
-    whole; each line of four or more characters is still caught."""
+    """R12: in plain text, which is never sealed, a formatter that puts something between the lines of a secret (an
+    exception group's `| `) breaks the whole; each line of four or more characters is still caught."""
     secret = "amber-line-one\ncobalt-line-two\nxy"
     text, _ = redact_text("  | ValueError: amber-line-one\n    | cobalt-line-two\n    | xy", {"TOYLAB_TOKEN": secret})
     assert "amber-line-one" not in text
