@@ -151,6 +151,51 @@ def test_r12_the_import_failure_of_a_plugin_shows_its_text_with_every_secret_red
     assert "amber-falcon-6620" not in str(caught.value)
 
 
+def test_r12_the_import_failure_redacts_the_keys_models_toml_points_at_in_a_variable_or_a_file(study_dir, monkeypatch):
+    """R12: a model's key is redacted from a record whatever its variable is called, so from this message too: the
+    value of its `key_env` and the contents of its `key_file`."""
+    monkeypatch.setenv("TOYLAB_GAMMA", "gamma-secret-4471")  # a name no secret pattern matches: only the table knows
+    key_file = study_dir.parent / "delta.key"
+    key_file.write_text("delta-secret-9930\n", encoding="utf-8")
+    remote = (
+        '\n[models.gamma-remote]\nbackend = "openai_compat"\napi_id = "gamma-1"\n'
+        'base_url = "https://llm.example.invalid/v1"\nkey_env = "TOYLAB_GAMMA"\n'
+        '\n[models.delta-remote]\nbackend = "anthropic"\napi_id = "delta-1"\n'
+        f'base_url = "https://api.example.invalid"\nkey_file = "{key_file}"\n'
+    )
+    with (study_dir / "models.toml").open("a", encoding="utf-8") as handle:
+        handle.write(remote)
+    (study_dir / "plugin.py").write_text(
+        "import os, pathlib\n"
+        f"raise RuntimeError(os.environ['TOYLAB_GAMMA'] + ' ' + pathlib.Path({str(key_file)!r}).read_text().strip())\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    assert "failed on import (RuntimeError: [redacted] [redacted])" in str(caught.value)
+    log = (study_dir / "out" / "logs" / "harness-errors.log").read_text(encoding="utf-8")
+    for value in ("gamma-secret-4471", "delta-secret-9930"):
+        assert value not in str(caught.value)
+        assert value not in log
+
+
+def test_l08_an_import_failure_keeps_its_diagnostic_and_logs_its_traceback_whatever_short_value_is_set(
+    study_dir, monkeypatch
+):
+    """L08: a secret too short to redact is left out as the record redactor's rules leave it out of what can be
+    redacted (a run refuses it anyway), so an unrelated one does not wipe the message; the traceback is logged."""
+    monkeypatch.setenv("OTHER_TOKEN", "abc")
+    (study_dir / "plugin.py").write_text("import needed_library\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    log = study_dir / "out" / "logs" / "harness-errors.log"
+    assert "failed on import (ModuleNotFoundError: No module named 'needed_library')" in str(caught.value)
+    assert str(caught.value).endswith(f"; its traceback, redacted, is in {log}")
+    text = log.read_text(encoding="utf-8")
+    assert "importing plugin.py: ModuleNotFoundError" in text
+    assert "Traceback (most recent call last)" in text
+
+
 STUB_PLUGIN = """\
 from expcore.study.plugin import StudyPlugin
 

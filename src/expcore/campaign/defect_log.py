@@ -53,11 +53,20 @@ def write_defect(
 
     `redactor` builds the redactor when it is needed; a ConfigError from it withholds the traceback, with its reason.
     """
+    title = f"{run_key} attempt {attempt}: {defect.exception}, stack {defect.stack_sha256}"
+    return write_failure(root, error, title=title, stamp=stamp, redactor=redactor)
+
+
+def write_failure(
+    root: Path, error: BaseException, *, title: str, stamp: str, redactor: Callable[[], Redactor]
+) -> Path:
+    """Append the redacted traceback of any failure of the harness to the campaign's log, headed by the time and
+    `title`; return the log's path. A study's plugin that fails on import is one (`study.plugin`)."""
     try:
         text = redactor().text("".join(traceback.format_exception(error)))
     except ConfigError as refusal:
         text = f"the traceback is withheld, since it cannot be redacted: {refusal}\n"
-    head = f"=== {stamp} {run_key} attempt {attempt}: {defect.exception}, stack {defect.stack_sha256}\n"
+    head = f"=== {stamp} {title}\n"
     path = log_path(root)
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)

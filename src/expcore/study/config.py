@@ -53,6 +53,7 @@ STUDY_FILE = "study.toml"
 MODELS_FILE = "models.toml"
 CAMPAIGN_FILE = "campaign.toml"
 PREREG_FILE = "preregistration.toml"
+OUT_DIR = "out"  # everything a study produces goes below it (`study.pipeline`)
 CONFIG_FILES = (STUDY_FILE, MODELS_FILE, CAMPAIGN_FILE, PREREG_FILE)
 PLATFORMS_KEY, KINDS_KEY = "platforms", "kinds"
 KIND_KEYS = ("description", "treatable")

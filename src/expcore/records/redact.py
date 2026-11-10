@@ -101,25 +101,30 @@ def secret_env_names(environ: Mapping[str, str] | None = None, declared: Iterabl
 
 
 def secret_values(
-    environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
+    environ: Mapping[str, str] | None = None,
+    extra: Iterable[str] = (),
+    declared: Iterable[str] = (),
+    *,
+    skip_short: bool = False,
 ) -> list[str]:
     """Return the distinct secret values (environment, registered and `extra`), longest first.
 
-    Raises ConfigError, naming the variable, for a value under the minimum length.
+    Raises ConfigError, naming the variable, for a value under the minimum length; with `skip_short` such a value is
+    left out instead, for a diagnostic shown on the author's own terminal: a value that short cannot be redacted
+    without damaging the text, and a run refuses it before any record is written.
     """
     env = os.environ if environ is None else environ
-    values: set[str] = set()
-    for name in secret_env_names(env, declared):
-        _refuse_short(env[name], f"environment variable {name}")
-        values.add(env[name])
+
+    def keep(value: str, what: str) -> bool:
+        if skip_short and len(value) < MIN_SECRET_LEN:
+            return False
+        _refuse_short(value, what)
+        return True
+
+    values = {env[name] for name in secret_env_names(env, declared) if keep(env[name], f"environment variable {name}")}
     with _lock:
-        registered = set(_registered)
-    for value in registered:
-        _refuse_short(value, "a registered secret")
-    for value in extra:
-        if value:
-            _refuse_short(value, "a secret given for this record")
-            values.add(value)
+        registered = {value for value in _registered if keep(value, "a registered secret")}
+    values |= {value for value in extra if value and keep(value, "a secret given for this record")}
     values |= registered
     return sorted((v for v in values if v not in REDACTED), key=len, reverse=True)
 
@@ -159,11 +164,16 @@ class Redactor:
 
     @classmethod
     def from_environment(
-        cls, environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
+        cls,
+        environ: Mapping[str, str] | None = None,
+        extra: Iterable[str] = (),
+        declared: Iterable[str] = (),
+        *,
+        skip_short: bool = False,
     ) -> "Redactor":
         """Build a redactor from the environment (the process's by default), the registered secrets, `extra` values and
-        the variables named in `declared`."""
-        return cls(secret_values(environ, extra, declared))
+        the variables named in `declared` (`skip_short`: see `secret_values`)."""
+        return cls(secret_values(environ, extra, declared, skip_short=skip_short))
 
     @classmethod
     def none(cls) -> "Redactor":

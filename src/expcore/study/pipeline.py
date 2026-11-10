@@ -72,6 +72,7 @@ from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
+    OUT_DIR,
     StudyConfig,
     StudyIdentity,
     find_study_root,
@@ -83,7 +84,6 @@ from expcore.study.factory_version import check_factory_version
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.verified import UNCOVERED, Unverified, load_verified
 
-OUT_DIR = "out"
 RUNS_DIR = "runs"
 MARKER_PATTERN = "*attempt-marker.json"
 HASHED_ONLY = (MARKER_PATTERN, SNAPSHOT_FILE)  # the campaign's own bookkeeping in a batch: hashed, never replayed
