@@ -1,0 +1,318 @@
+# A throwaway Onedata federation: one Onezone and three Oneproviders, for the live contract tests (#29).
+#
+# Bring it up, reset it and take it down with federation.py (see README.md), never with docker compose alone: up
+# generates the CA, the certificates and the secrets these services read, and bootstraps the federation once they run.
+#
+# - Project name: expcore-fed. Every container and the one network carry it; nothing else on the daemon is touched.
+# - Images: exactly the two pinned tags, never pulled (pull_policy: never), never rebuilt.
+# - Ports: each service publishes its 443 on the host's loopback only. Nothing else is published, so the providers'
+#   transfer port and the panels stay on the project's network.
+# - Data: every bind source is below EXPCORE_FED_ROOT (default /mnt/volume2/expcore-federation), made by up and removed
+#   by down. A missing source is an error, never created by the daemon.
+# - Certificates: the federation's own CA signs every service's web certificate (up seeds them into the persistence
+#   directories). start.sh adds the CA to each container's system store before it becomes the stock start script.
+name: expcore-fed
+
+x-zone-image: &zone-image docker.onedata.org/onezone:ID-ba7a778696
+x-provider-image: &provider-image docker.onedata.org/oneprovider:ID-765309c84f
+
+x-service: &service
+  pull_policy: never
+  restart: "no"
+  entrypoint: ["/bin/bash", "/expcore/start.sh"]
+  stop_grace_period: 120s
+  mem_limit: 6g
+  healthcheck:
+    test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 900s
+
+x-ca-mount: &ca-mount
+  type: bind
+  source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/ca/federation-ca.pem
+  target: /expcore/federation-ca.pem
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-start-mount: &start-mount
+  type: bind
+  source: ./start.sh
+  target: /expcore/start.sh
+  read_only: true
+  bind:
+    create_host_path: false
+
+services:
+  zone:
+    <<: *service
+    image: *zone-image
+    command: ["/root/onezone.sh"]
+    hostname: node1
+    domainname: zone.expcore-fed.test
+    env_file:
+      - path: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/zone.env
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEZONE_CONFIG: |
+        cluster:
+          domainName: "zone.expcore-fed.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+        onezone:
+          name: "expcore-fed-zone"
+          domainName: "zone.expcore-fed.test"
+          letsEncryptEnabled: false
+    volumes:
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/zone/persistence
+        target: /volumes/persistence
+        bind:
+          create_host_path: false
+      - *ca-mount
+      - *start-mount
+    ports:
+      - "127.0.0.1:29443:443"
+    networks:
+      fed:
+        aliases: [zone.expcore-fed.test]
+
+  pine:
+    <<: *service
+    image: *provider-image
+    command: ["/root/oneprovider.sh"]
+    hostname: node1
+    domainname: pine.expcore-fed.test
+    env_file:
+      - path: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/pine.env
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "pine.expcore-fed.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "pine"
+          adminEmail: "admin@pine.expcore-fed.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "pine.expcore-fed.test"
+        onezone:
+          domainName: "zone.expcore-fed.test"
+    volumes:
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/pine/persistence
+        target: /volumes/persistence
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/pine/storage
+        target: /volumes/storage
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/pine.regtoken
+        target: /expcore/registration-token
+        read_only: true
+        bind:
+          create_host_path: false
+      - *ca-mount
+      - *start-mount
+    ports:
+      - "127.0.0.1:29444:443"
+    networks:
+      fed:
+        aliases: [pine.expcore-fed.test]
+
+  birch:
+    <<: *service
+    image: *provider-image
+    command: ["/root/oneprovider.sh"]
+    hostname: node1
+    domainname: birch.expcore-fed.test
+    env_file:
+      - path: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/birch.env
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "birch.expcore-fed.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "birch"
+          adminEmail: "admin@birch.expcore-fed.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "birch.expcore-fed.test"
+        onezone:
+          domainName: "zone.expcore-fed.test"
+    volumes:
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/birch/persistence
+        target: /volumes/persistence
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/birch/storage
+        target: /volumes/storage
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/birch.regtoken
+        target: /expcore/registration-token
+        read_only: true
+        bind:
+          create_host_path: false
+      - *ca-mount
+      - *start-mount
+    ports:
+      - "127.0.0.1:29445:443"
+    networks:
+      fed:
+        aliases: [birch.expcore-fed.test]
+
+  cedar:
+    <<: *service
+    image: *provider-image
+    command: ["/root/oneprovider.sh"]
+    hostname: node1
+    domainname: cedar.expcore-fed.test
+    env_file:
+      - path: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/cedar.env
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "cedar.expcore-fed.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "cedar"
+          adminEmail: "admin@cedar.expcore-fed.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "cedar.expcore-fed.test"
+        onezone:
+          domainName: "zone.expcore-fed.test"
+    volumes:
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/cedar/persistence
+        target: /volumes/persistence
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/cedar/storage
+        target: /volumes/storage
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/cedar.regtoken
+        target: /expcore/registration-token
+        read_only: true
+        bind:
+          create_host_path: false
+      - *ca-mount
+      - *start-mount
+    ports:
+      - "127.0.0.1:29446:443"
+    networks:
+      fed:
+        aliases: [cedar.expcore-fed.test]
+
+  # Down's helper: removes what the services wrote as root under EXPCORE_FED_ROOT. No network, no published port; it
+  # runs only when down asks for it (profile "janitor") and is removed when it exits.
+  janitor:
+    image: *provider-image
+    pull_policy: never
+    profiles: ["janitor"]
+    network_mode: none
+    entrypoint: ["find", "/fed", "-mindepth", "1", "-delete"]
+    volumes:
+      - type: bind
+        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}
+        target: /fed
+        bind:
+          create_host_path: false
+
+networks:
+  fed:
+    driver: bridge
