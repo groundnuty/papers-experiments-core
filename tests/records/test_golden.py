@@ -160,7 +160,7 @@ def test_R12_the_golden_records_check_and_replay_whatever_secrets_the_checking_e
     redacts nothing and the replay redacts nothing, so only a secret the record really holds can stop it."""
     for name, value in SECRET_SHAPED.items():
         monkeypatch.setenv(name, value)
-    for golden in (GOLDEN, GOLDEN_V2):
+    for golden in (GOLDEN, GOLDEN_V2, GOLDEN_V3):
         assert check_record(golden.read_bytes()) is None
 
 
