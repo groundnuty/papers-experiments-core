@@ -2,7 +2,8 @@
 """Settling injections: bring a target back with a changed identity, and recover what a run left open (O11).
 
 `Recovery` holds what the fault injector and the platform's health check share and neither needs a target for: the
-infrastructure kinds of a fault, the driver protocol, and the steps that leave one journalled injection settled. A
+injector's own failure (its kind, like `provider_outage`, is registered by `expcore_onedata.sandbox.kinds`, the module
+a study lists in `[study] platforms`), the driver protocol, and the steps that leave one journalled injection settled. A
 restore counts only when the service runs with an identity other than the one journalled before the injection;
 readiness alone is not one, and a service back with the same identity is a failed restore. A service that cannot be
 read is started all the same (starting a running service changes nothing), and its restore is then
@@ -17,15 +18,11 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
-from expcore.errors import InfraError, register_infra_kind
+from expcore.errors import InfraError
 from expcore_onedata.compose import DriverError, Observation
 from expcore_onedata.fault_journal import InjectionJournal, holder_alive
 from expcore_onedata.fault_settings import FaultSettings
-
-PROVIDER_OUTAGE = "provider_outage"
-INJECTOR_FAILURE = "injector_failure"
-register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable")
-register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
+from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE  # the platform layer's one module of kinds registers it
 
 
 class FaultDriver(Protocol):

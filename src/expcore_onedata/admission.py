@@ -52,8 +52,9 @@ from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.errors import InfraError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, make_directories
-from expcore_onedata.fault_recovery import INJECTOR_FAILURE, PROVIDER_OUTAGE, failure
+from expcore_onedata.fault_recovery import failure
 from expcore_onedata.fault_settings import FaultSettings, load_faults
+from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 
 FEDERATION_LOCK = "federation.lock"
 FEDERATION_INTENT = "federation.intent"  # the turnstile every admission passes before the main lock

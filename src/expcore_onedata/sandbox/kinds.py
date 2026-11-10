@@ -16,6 +16,13 @@ the agent (a redirect, an encoded body, its token in a header, its token in a bo
 (`gate_error`). Such a run is neither the agent's
 doing nor a condition's manipulation, so the kind is not treatable: the run is set aside and counted per condition, and
 the factor schema refuses a condition that declares the kind (O05, O16, C01).
+
+This is the one module of the platform layer that registers kinds, so a study names it alone in `[study] platforms` to
+make every kind the layer raises known before its conditions are validated, and `check` imports it alone for a record
+that names one. The fault injector's two kinds are registered here too (`expcore_onedata.faults`):
+`provider_outage`, a provider of the federation that was unavailable, which a condition may declare with the target
+it takes down; and `injector_failure`, the injector's own failure to inject, clear or verify, which is not treatable,
+so a run whose fault was never verified is set aside and never scored as the outage (O10, O11, C01).
 """
 
 from collections.abc import Iterable, Mapping
@@ -32,6 +39,10 @@ register_infra_kind(
     "manipulation",
     treatable=False,
 )
+PROVIDER_OUTAGE = "provider_outage"
+INJECTOR_FAILURE = "injector_failure"
+register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable")
+register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
 
 KIND_OF_CATEGORY: Mapping[str, str | None] = {
     "agent": None,
@@ -90,4 +101,13 @@ def gate_error(refusals: Iterable[str]) -> InfraError | None:
     )
 
 
-__all__ = ["DATA_GATE_INTEGRITY", "KIND_OF_CATEGORY", "death_error", "gate_error", "kill_error", "kind_of"]
+__all__ = [
+    "DATA_GATE_INTEGRITY",
+    "INJECTOR_FAILURE",
+    "KIND_OF_CATEGORY",
+    "PROVIDER_OUTAGE",
+    "death_error",
+    "gate_error",
+    "kill_error",
+    "kind_of",
+]

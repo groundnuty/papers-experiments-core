@@ -13,7 +13,9 @@ and brings it back in `finish`, after the loop ends; neither happens in the agen
 kind. Its snapshot (namespace `fault_injector`, `expcore.records.injections`) records the injection, and the core scores
 the attempt as treatment only if the failure that ended it names the same label (`provider_outage` builds such a
 failure) and the snapshot shows that label injected in this attempt. Another provider's failure, the agent's own
-included, is set aside.
+included, is set aside. Both kinds of this module are registered by `expcore_onedata.sandbox.kinds`, which the study
+lists in `[study] platforms` (`platforms = ["expcore_onedata.sandbox.kinds"]`), so `provider_outage` is known when its
+conditions are validated and `check` knows both kinds when a record names one.
 
 **Sanction (O10).** Taking a provider down is destructive, so nothing here acts on two halves of a sanction short of
 both: `sanctioned = true` in `[faults]` of platform.toml, and `sanctioned=True` passed by the code that builds the
@@ -98,8 +100,9 @@ from expcore_onedata.admission import (
 from expcore_onedata.compose import DriverError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
-from expcore_onedata.fault_recovery import INJECTOR_FAILURE, PROVIDER_OUTAGE, FaultDriver, Recovery, digest
+from expcore_onedata.fault_recovery import FaultDriver, Recovery, digest
 from expcore_onedata.fault_settings import FaultSettings, compose_driver, load_faults
+from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 
 __all__ = [
     "INJECTOR_FAILURE",
