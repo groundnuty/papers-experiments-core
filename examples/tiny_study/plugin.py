@@ -34,8 +34,18 @@ HINTS = {  # a prompt slot may not be blank, so the basic level says something s
 # --- the tools ---------------------------------------------------------------------------------------------------
 
 
+def lookup(arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
+    """Look a topic up. A plain function runs in a worker thread, so it takes `timeout_s` and may take `ctx`."""
+    with ctx.infrastructure_wait("toolserver_lifecycle"):  # the tool server's start-up is not the agent's time
+        time.sleep(0)  # a real tool starts its server here
+    topic = arguments.get("topic")
+    if topic not in FACTS:
+        return ToolOutput(f"no such topic: {topic!r}", is_error=True, error_class="UnknownTopic")
+    return ToolOutput(f"The key fact about {topic} is: {FACTS[topic]}.", source_truncated=False)
+
+
 class Shelf:
-    """The stub platform's side of one run: it answers lookups and counts the facts it handed out.
+    """The stub platform's side of one run: it serves `lookup` and counts the facts it handed out.
 
     A real platform keeps such state itself (a server's log, a block map); the stub keeps it here, one shelf per run.
     """
@@ -44,14 +54,11 @@ class Shelf:
         self.served = 0
 
     def lookup(self, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
-        """Look a topic up. A plain function runs in a worker thread, so it takes `timeout_s` and may take `ctx`."""
-        with ctx.infrastructure_wait("toolserver_lifecycle"):  # the tool server's start-up is not the agent's time
-            time.sleep(0)  # a real tool starts its server here
-        topic = arguments.get("topic")
-        if topic not in FACTS:
-            return ToolOutput(f"no such topic: {topic!r}", is_error=True, error_class="UnknownTopic")
-        self.served += 1
-        return ToolOutput(f"The key fact about {topic} is: {FACTS[topic]}.", source_truncated=False)
+        """Serve one lookup, and count it when it handed out a fact."""
+        result = lookup(arguments, timeout_s=timeout_s, ctx=ctx)
+        if not result.is_error:
+            self.served += 1
+        return result
 
 
 def submit(arguments: dict[str, Any], *, timeout_s: float) -> str:
