@@ -9,16 +9,20 @@ path (`study.plugin`), so a module beside it is imported relatively and named be
   runs is what the code identity hashed, and no bytecode is written into the study.
 - **By location.** What counts is where code comes from, not its module name. While the plugin is imported and while
   its `build` runs, `watching` records every file whose code is executed (the interpreter's `exec` audit event), and
-  `study_files` finds every module in `sys.modules` whose file lies in the study directory. Each such file must be one
+  `Locator.modules` finds every module in `sys.modules` whose file is the study's own code. Each such file must be one
   the code identity covers, and must be a module of the plugin's package: one imported through the module search path
   or loaded by path would be cached under a name any other study could be served, or run from stale bytecode.
-- **Nothing left behind.** `forget` drops every module whose file lies in the study directory, whatever its name, and
-  every module of the package, before an import and after a refused one.
+- **Nothing left behind.** `forget` drops every module of the study's own code, whatever its name, and every module of
+  the package, before an import and after a refused one.
 
-Code that lives in the running environment (below `sys.prefix`, a virtual environment inside the study directory for
-one) or below a directory the code identity skips is the environment's, not the study's. Only code is seen: a data
-file the plugin reads by path is not, and is covered only if `[study] code` lists it. A module first imported while a
-run is under way, after `build` returned, escapes the check.
+The study's own code is a file inside the study directory that the recorded environment does not cover: not the core's
+own packages, not the running environment (below `sys.prefix`, a virtual environment inside the study directory for
+one), not an installed distribution's code, editable or not (`environment.owns_file`, as the environment record finds
+it), and not below a directory the code identity skips. So a study at the root of a repository that holds the core, or
+one that vendors an editable dependency, neither refuses that code nor drops it, and this module, whose audit hook
+cannot be removed, is never dropped and never installs a second one. Only code is seen: a data file the plugin reads by
+path is not, and is covered only if `[study] code` lists it. A module first imported while a run is under way, after
+`build` returned, escapes the check.
 """
 
 import importlib.abc
@@ -29,11 +33,17 @@ import sys
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
+from importlib import metadata
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from expcore.provenance.environment import installed, is_editable, owns_file, pth_directories, top_level_names
+
 PLUGIN_MODULE_PREFIX = "expcore_study_plugin_"  # the rest of a plugin's module name is a hash of its path
+CORE_PACKAGES = ("expcore", "expcore_onedata")  # the core's own packages: the environment's code, never the study's
 
 
 class SourceOnlyLoader(importlib.machinery.SourceFileLoader):
@@ -61,7 +71,7 @@ class _PackageFinder(importlib.abc.MetaPathFinder):
 
 
 _LOCK = threading.RLock()  # re-entrant: the audit hook may fire while it is held
-_RUN: list[set[str]] = []  # the files whose code ran, one set per watch in progress
+_RUN: dict[object, set[str]] = {}  # the files whose code ran, by a token of each watch in progress
 _installed: list[bool] = []
 
 
@@ -72,12 +82,16 @@ def _audit(event: str, args: tuple[Any, ...]) -> None:
     name = getattr(args[0], "co_filename", None) if args else None
     if isinstance(name, str) and os.path.isabs(name):
         with _LOCK:
-            for files in _RUN:
+            for files in _RUN.values():
                 files.add(name)
 
 
 def install() -> None:
-    """Install the package finder and the audit hook, once for the process; neither acts outside a plugin's load."""
+    """Install the package finder and the audit hook, once for the process; neither acts outside a plugin's load.
+
+    An audit hook cannot be removed, so this module is never dropped from the process (`forget` keeps the core's
+    modules), and a second hook is never added.
+    """
     with _LOCK:
         if _installed:
             return
@@ -88,16 +102,16 @@ def install() -> None:
 
 @contextmanager
 def watching() -> Iterator[set[str]]:
-    """Collect the files whose code is executed in the block."""
+    """Collect the files whose code is executed in the block; watches may overlap, each keeps its own record."""
     install()
-    files: set[str] = set()
+    token, files = object(), set()
     with _LOCK:
-        _RUN.append(files)
+        _RUN[token] = files
     try:
         yield files
     finally:
         with _LOCK:
-            _RUN.remove(files)
+            del _RUN[token]
 
 
 @lru_cache(maxsize=4096)
@@ -105,39 +119,112 @@ def _real_dir(directory: str) -> str:
     return os.path.realpath(directory)
 
 
+def resolved(file: str) -> str:
+    """A file's path with its directory's links resolved."""
+    absolute = os.path.abspath(file)
+    return os.path.join(_real_dir(os.path.dirname(absolute)), os.path.basename(absolute))
+
+
+def _inside(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(directory + os.sep)
+
+
 @lru_cache(maxsize=1)
 def _environment() -> tuple[str, ...]:
-    return tuple({os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)})
+    """The running environment's directories and the core's own packages: code the environment record covers."""
+    found = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)}
+    for name in CORE_PACKAGES:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            continue
+        if spec is not None:
+            found |= {os.path.realpath(d) for d in spec.submodule_search_locations or []}
+    return tuple(sorted(found))
 
 
-def relative_in(file: str, root: str, skip_dirs: frozenset[str]) -> str | None:
-    """The path of `file` relative to the study directory `root`, or None when the file is not the study's code: it
-    lies outside, in the running environment, or below a directory the code identity skips."""
-    absolute = os.path.abspath(file)
-    resolved = os.path.join(_real_dir(os.path.dirname(absolute)), os.path.basename(absolute))
-    if not resolved.startswith(root + os.sep):
-        return None
-    if any(resolved.startswith(prefix + os.sep) for prefix in _environment()):
-        return None
-    relative = os.path.relpath(resolved, root).replace(os.sep, "/")
-    return None if set(relative.split("/")) & skip_dirs else relative
+class _Installed:
+    """Whether a file of the study directory is an installed distribution's code, editable or not (`owns_file`, as
+    the environment record finds an install's code); the distributions are read once, when first asked."""
+
+    def __init__(self) -> None:
+        self._dists: list[tuple[metadata.Distribution, bool, str]] | None = None
+
+    def _all(self) -> list[tuple[metadata.Distribution, bool, str]]:
+        if self._dists is None:
+            self._dists = [
+                (dist, is_editable(dist), os.path.realpath(str(dist.locate_file("")))) for dist in installed().values()
+            ]
+        return self._dists
+
+    def owns(self, path: str, name: str | None) -> bool:
+        file = Path(path)
+        for dist, editable, site in self._all():
+            if not editable:
+                if _inside(path, site) and owns_file(dist, file, ""):
+                    return True
+                continue
+            tops = top_level_names(dist) | ({name.split(".", 1)[0]} if name else set())
+            for directory in pth_directories(dist):
+                home = os.path.realpath(directory)
+                if _inside(path, home) and path != home:
+                    tops.add(Path(os.path.relpath(path, home)).parts[0].removesuffix(".py"))
+            if any(owns_file(dist, file, top) for top in tops if top.isidentifier()):
+                return True
+        return False
 
 
-def study_files(root: str, skip_dirs: frozenset[str]) -> dict[str, str]:
-    """Every module in `sys.modules` whose file is the study's code, by name, with that file relative to `root`."""
-    found = {}
-    for name, module in list(sys.modules.items()):
-        file = getattr(module, "__file__", None)
-        if isinstance(file, str):
-            relative = relative_in(file, root, skip_dirs)
-            if relative is not None:
-                found[name] = relative
-    return found
+@dataclass(frozen=True)
+class StudyCode:
+    """Code of the study directory: its resolved path, and that path relative to the study directory."""
+
+    path: str
+    relative: str
+
+
+class Locator:
+    """Which files are the study's own code: inside the study directory, outside the running environment and the
+    core, below no directory the code identity skips, and not an installed distribution's."""
+
+    def __init__(self, root: str, skip_dirs: frozenset[str]) -> None:
+        self.root, self.skip_dirs, self._installed = root, skip_dirs, _Installed()
+
+    def locate(self, file: str, name: str | None = None, *, own: bool = False) -> StudyCode | None:
+        """The study code a file is, or None. `own`: a module of the plugin's package, the study's by definition."""
+        path = resolved(file)
+        if not _inside(path, self.root) or path == self.root:
+            return None
+        if any(_inside(path, place) for place in _environment()):
+            return None
+        relative = os.path.relpath(path, self.root).replace(os.sep, "/")
+        if set(relative.split("/")) & self.skip_dirs:
+            return None
+        if not own and self._installed.owns(path, name):
+            return None
+        return StudyCode(path, relative)
+
+    def modules(self, package: str) -> dict[str, StudyCode]:
+        """Every module in `sys.modules` whose file is the study's code, by name. The core's modules never are."""
+        found = {}
+        for name, module in list(sys.modules.items()):
+            file = getattr(module, "__file__", None)
+            if not isinstance(file, str) or name.split(".", 1)[0] in CORE_PACKAGES:
+                continue
+            code = self.locate(file, name, own=in_package(name, package))
+            if code is not None:
+                found[name] = code
+        return found
+
+
+def in_package(name: str, package: str) -> bool:
+    """Whether a module name is the plugin's package or below it."""
+    return name == package or name.startswith(f"{package}.")
 
 
 def forget(package: str, root: str, skip_dirs: frozenset[str]) -> None:
-    """Drop the package's modules and every module whose file is the study's code, whatever it is called."""
-    doomed = set(study_files(root, skip_dirs))
-    doomed |= {name for name in list(sys.modules) if name == package or name.startswith(f"{package}.")}
+    """Drop the package's modules and every module whose file is the study's code, whatever it is called; never a
+    module of the core or of an installed distribution."""
+    doomed = set(Locator(root, skip_dirs).modules(package))
+    doomed |= {name for name in list(sys.modules) if in_package(name, package)}
     for name in doomed:
         sys.modules.pop(name, None)

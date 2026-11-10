@@ -38,7 +38,7 @@ import re
 import sys
 from collections.abc import Iterable, Mapping
 from importlib import metadata
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import url2pathname
@@ -171,6 +171,48 @@ def top_level_location(top: str, places: Iterable[Path]) -> tuple[list[Path], Pa
         return [Path(d) for d in spec.submodule_search_locations if _inside(Path(d), places)], None
     origin = Path(spec.origin) if spec.has_location and spec.origin else None
     return [], origin if origin is not None and origin.is_file() and _inside(origin, places) else None
+
+
+def is_editable(dist: metadata.Distribution) -> bool:
+    """Whether a distribution is an editable install, by its `direct_url.json` (PEP 660)."""
+    try:
+        data = json.loads(dist.read_text("direct_url.json") or "{}")
+    except ValueError:
+        return False
+    info = data.get("dir_info") if isinstance(data, dict) else None
+    return isinstance(info, dict) and info.get("editable") is True
+
+
+def top_level_names(dist: metadata.Distribution) -> set[str]:
+    """The top-level names a distribution declares in `top_level.txt`, which setuptools writes for an editable install
+    too; none when it declares none."""
+    return set((dist.read_text("top_level.txt") or "").split())
+
+
+def owns_file(dist: metadata.Distribution, file: Path, top: str) -> bool:
+    """Whether an installed distribution's code holds the file of a module under top-level name `top`: listed in its
+    RECORD, or, for an editable install, inside one of its top-level packages where it imports from (directly below a
+    directory its `.pth` puts on the path, else where an import hook loads it inside the project), never merely
+    somewhere below the project."""
+    if is_editable(dist):
+        pth = pth_directories(dist)
+        if pth:
+            homes = [d / top for d in pth if (d / top).is_dir()]
+            return any(h.resolve() in file.parents for h in homes) or any(
+                (d / f"{top}.py").resolve() == file for d in pth
+            )
+        directories, module = top_level_location(top, editable_roots(dist))
+        if any(d.resolve() in file.parents for d in directories):
+            return True
+        # A single top-level module counts only when the distribution names it among its top-level names, so a loose
+        # module of the project on a path added by hand is not taken for the distribution's code.
+        return module is not None and module.resolve() == file and top in top_level_names(dist)
+    site = Path(str(dist.locate_file(""))).resolve()
+    try:
+        relative = PurePosixPath(file.relative_to(site).as_posix())
+    except ValueError:
+        return False
+    return any(PurePosixPath(item.as_posix()) == relative for item in dist.files or [])
 
 
 def python_digest(roots: list[Path]) -> str:

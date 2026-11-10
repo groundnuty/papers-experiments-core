@@ -37,10 +37,11 @@ from expcore.records.rescore import Scorer, scorer_name, scorer_version
 from expcore.study.config import OUT_DIR, STUDY_FILE, StudyConfig, StudyIdentity
 from expcore.study.plugin_import import (
     PLUGIN_MODULE_PREFIX,
+    Locator,
     SourceOnlyLoader,
     forget,
-    relative_in,
-    study_files,
+    in_package,
+    resolved,
     watching,
 )
 
@@ -227,32 +228,45 @@ def check_plugin_modules(study: StudyConfig | StudyIdentity, module: ModuleType,
     """
     root, skip_dirs = _where(study)
     package = module.__name__
-    modules = study_files(root, skip_dirs)
-    own = {relative for name, relative in modules.items() if name == package or name.startswith(f"{package}.")}
-    elsewhere = {relative: name for name, relative in sorted(modules.items()) if relative not in own}
-    ran_here = {relative for file in ran if (relative := relative_in(file, root, skip_dirs)) is not None}
-    found = sorted(set(modules.values()) | ran_here)
-    covered = set(covered_files(root, study.scope))
+    locator = Locator(root, skip_dirs)
+    modules = locator.modules(package)
+    own = {code.path for name, code in modules.items() if in_package(name, package)}
+    elsewhere = {code.path: name for name, code in sorted(modules.items()) if not in_package(name, package)}
+    found = {code.path: code for code in modules.values()}
+    for file in ran:
+        if resolved(file) not in found and (code := locator.locate(file)) is not None:
+            found[code.path] = code
+    listed = [os.path.join(root, name) for name in covered_files(root, study.scope)]
+    covered = {resolved(file) for file in listed} | {os.path.realpath(file) for file in listed}  # links either side
     section = Section({}, Path(root) / STUDY_FILE, "[study]")
-    for relative in found:
-        if relative not in covered:
+    ordered = sorted(found.values(), key=lambda code: code.relative)
+    for code in ordered:
+        if code.path not in covered and os.path.realpath(code.path) not in covered:
             _forget(study, package)
             raise section.fail(
                 "code",
-                f"does not list {relative!r}, whose code runs when the plugin is loaded; list every file of the study "
-                "directory the plugin runs in [study] code, so the code identity covers the code that runs",
+                f"does not list {code.relative!r}, whose code runs when the plugin is loaded; list every file of the "
+                "study directory the plugin runs in [study] code, so the code identity covers the code that runs",
             )
-    for relative in found:
-        if relative not in own:
+    for code in ordered:
+        if code.path not in own:
             _forget(study, package)
-            shown = f" (as {elsewhere[relative]!r})" if relative in elsewhere else ""
-            stem = Path(relative).with_suffix("").as_posix().replace("/", ".")
+            shown = f" (as {elsewhere[code.path]!r})" if code.path in elsewhere else ""
             raise section.fail(
                 None,
-                f"{relative!r} runs from the study directory outside the plugin's package{shown}; import it "
-                f"relatively from the plugin (from .{stem} import ...), so it is compiled from the source the code "
-                "identity hashed and no other study can be served it",
+                f"{code.relative!r} runs from the study directory outside the plugin's package{shown}; "
+                f"{_relative_import(study, code.path)}, so it is compiled from the source the code identity hashed and "
+                "no other study can be served it",
             )
+
+
+def _relative_import(study: StudyConfig | StudyIdentity, path: str) -> str:
+    """How the plugin imports a file relatively, by the file's path from the plugin's own directory."""
+    home = os.path.realpath(study.plugin_file.parent)
+    if not path.startswith(home + os.sep):
+        return "move it into the plugin's directory and import it relatively from the plugin"
+    stem = Path(os.path.relpath(path, home)).with_suffix("").as_posix().replace("/", ".").removesuffix(".__init__")
+    return f"import it relatively from the plugin (from .{stem} import ...)"
 
 
 def load_plugin(context: StudyContext) -> StudyPlugin:
