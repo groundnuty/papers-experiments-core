@@ -69,6 +69,16 @@ def test_a_model_of_the_plan_that_the_model_table_lacks_is_refused_naming_it(stu
     refused(study_dir, "campaign.toml", "'models'", "gamma-stub", "models.toml")
 
 
+def test_p06_a_model_of_the_plan_the_table_lacks_is_refused_listing_the_table_with_the_closest_name(study_dir):
+    """P06: the plan names a model by its key in the one table; a misspelt key is refused with the keys it could be."""
+    edit(study_dir, "campaign.toml", '"beta-stub"]', '"beta-stbu"]')
+    text = refused(study_dir, "campaign.toml")
+    assert text.endswith(
+        "key 'models' names 'beta-stbu' (did you mean 'beta-stub'?), which models.toml does not define; it defines: "
+        "alpha-stub, beta-stub"
+    )
+
+
 def test_a_cluster_that_a_task_lacks_is_refused_naming_the_contrast_and_the_task(study_dir):
     edit(study_dir, "study.toml", '[tasks.dune]\nregion = "south"', '[tasks.dune]\nzone = "south"')
     refused(study_dir, "preregistration.toml", "extended-vs-baseline", "'region'", "'dune'")

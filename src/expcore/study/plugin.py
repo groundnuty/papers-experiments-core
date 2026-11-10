@@ -24,7 +24,7 @@ from expcore.campaign.executor import BackendFactory, RunExecutor
 from expcore.campaign.healthgate import HealthCheck
 from expcore.campaign.lease import ResourceProbe
 from expcore.config.loading import ConfigError, Section
-from expcore.config.models import BACKENDS
+from expcore.config.models import not_built_by_core
 from expcore.plugin import ToolSpec
 from expcore.records.redact import Redactor
 from expcore.records.rescore import Scorer, scorer_name, scorer_version
@@ -192,8 +192,4 @@ def _check_backends(study: StudyConfig) -> None:
     for key in study.models:
         spec = study.models.resolve(key)
         if not spec.core_backend:
-            raise Section({}, study.models.source, f"[models.{key}]").fail(
-                "backend",
-                f"names {spec.backend!r}, a backend the core does not build ({', '.join(BACKENDS)}); the plugin "
-                "must supply a backend_factory that serves it",
-            )
+            raise Section({}, study.models.source, f"[models.{key}]").fail("backend", not_built_by_core(spec.backend))

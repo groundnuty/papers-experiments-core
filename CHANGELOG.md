@@ -45,6 +45,7 @@ For readers of the commits before this release:
 - The README that `python -m expcore example` writes no longer links `../../docs/`, which leads nowhere outside the core's checkout, and leads with the study's own commands without `--allow-dirty`, saying where that option belongs. The command's hint says to commit the study before running it.
 - `run` reports what it dispatched as attempts of the campaign's runs (`dispatched 65 attempts of 62 runs`), not as runs. A refusal on the command line names the command (`report refused: ...`), and the analysis's refusals no longer begin with "refusing to analyse".
 - A replay that finds a recorded reply the model's raw reply does not give names the part in plain words: `the recorded tool call does not match the model's raw reply in that turn (transcript[k].native): the record was changed after it was written, or the backend now reads that reply differently`, in place of a sentence about the "neutral turn" and the "native message". The study guide says what replay compares.
+- An entry of `models.toml` whose backend the core does not build, and that has a problem of its own, says first that the core does not build that backend and that the plugin must supply a `backend_factory`, so `backend = "toy"` with no `api_id` no longer reads as only a missing `api_id`. A refusal that names a backend close to one of the core's, a model of `campaign.toml` that `models.toml` does not define, or a model name the table cannot resolve adds the closest name (`did you mean ...?`), and the campaign's error lists the models `models.toml` defines. A condition that leaves a factor out is refused with that factor's levels.
 
 ### Known limits
 
@@ -132,7 +133,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | P03 | Tree hashes ignore modification times and caches | `tests/provenance/test_codestamp.py` |
 | P04 | Every output manifest carries the hash of its configuration and preregistration | `tests/stats/test_analysis.py`, `tests/stats/test_prereg.py` |
 | P05 | Scoring and inference code are frozen by digest and a known-answer test | `tests/stats/test_kat.py` |
-| P06 | One model table | `tests/config/test_models.py` |
+| P06 | One model table | `tests/config/test_models.py`, `tests/study/test_study.py` |
 | P07 | A replication package is not a code source | `tests/test_provenance_history.py` |
 | S01 | Float noise is snapped before rank tests | `tests/stats/test_contrasts.py` |
 | S02 | Holm keeps the declared family | `tests/stats/test_analysis.py`, `tests/stats/test_contrasts.py` |

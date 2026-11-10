@@ -197,7 +197,10 @@ class FactorSchema:
                     )
             for factor in self.declared:
                 if factor not in assignment:
-                    raise where.fail(factor, "is missing; a condition assigns every declared factor")
+                    levels = ", ".join(self.declared[factor])
+                    raise where.fail(
+                        factor, f"is missing; a condition assigns every declared factor; levels of {factor!r}: {levels}"
+                    )
             levels = tuple(assignment[f] for f in self.declared)
             if levels in seen:
                 raise where.fail(None, f"duplicates condition {seen[levels]!r}: both assign the same levels")
