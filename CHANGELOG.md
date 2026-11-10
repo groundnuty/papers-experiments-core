@@ -43,6 +43,7 @@ For readers of the commits before this release:
 - A condition that names an unknown infrastructure kind is refused with the treatable kinds as its choices, instead of every known kind, and the error says how a platform's or a study's kind becomes known. A known kind that is not treatable is refused as one that can never be a treatment, whether the core, a listed platform or the study declared it.
 - The example measures with an instrument. Its executor makes a fresh `FactsServed` for every run, starts it before `record_run`, finishes it after, and writes the record `finish_instruments` returns; the scorer reads the instrument's count as a fourth outcome, `served`, which is `None` when the snapshot failed. Every record of the example holds `instruments.facts`, and `scores.json` gains the outcome; the contrasts and the report's tables are unchanged.
 - The README that `python -m expcore example` writes no longer links `../../docs/`, which leads nowhere outside the core's checkout, and leads with the study's own commands without `--allow-dirty`, saying where that option belongs. The command's hint says to commit the study before running it.
+- `run` reports what it dispatched as attempts of the campaign's runs (`dispatched 65 attempts of 62 runs`), not as runs. A refusal on the command line names the command (`report refused: ...`), and the analysis's refusals no longer begin with "refusing to analyse".
 
 ### Known limits
 
@@ -94,7 +95,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | R01 | Records are written atomically and read back byte for byte | `tests/records/test_golden.py`, `tests/records/test_record.py`, `tests/replay/test_divergence.py` |
 | R02 | Unknown schema versions and fields are refused | `tests/records/test_build.py`, `tests/records/test_golden.py`, `tests/records/test_record.py`, `tests/records/test_schema.py` |
 | R03 | Replay re-derives every derived field without a model call | `tests/records/test_golden.py`, `tests/replay/test_divergence.py`, `tests/replay/test_native.py`, `tests/replay/test_raw_chars.py`, `tests/replay/test_redaction.py`, `tests/replay/test_replay.py`, `tests/replay/test_waits.py`, `tests/study/test_backend_factory.py`, `tests/study/test_kinds.py` |
-| R04 | Analysis refuses records without a current replay check | `tests/e2e/test_verified_analysis.py`, `tests/replay/test_check.py` |
+| R04 | Analysis refuses records without a current replay check | `tests/e2e/test_verified_analysis.py`, `tests/replay/test_check.py`, `tests/test_cli.py` |
 | R05 | Decisions served during replay are recomputed offline | `tests/replay/test_check.py` |
 | R06 | The echoed request is pinned by a digest | `tests/records/test_build.py`, `tests/replay/test_divergence.py` |
 | R07 | Records hold no interpreter-specific text | `tests/records/test_build.py` |
@@ -124,7 +125,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | C18 | Two conditions never share attempt keys | `tests/campaign/test_factors.py` |
 | C19 | Leases on shared mutable resources fail safe | `tests/campaign/test_lease.py`, `tests/campaign/test_reservation.py`, `tests/campaign/test_scheduler_gates.py`, `tests/live/test_sandbox.py`, `tests/onedata/placement/test_users.py`, `tests/onedata/sandbox/test_mountrecords.py`, `tests/onedata/sandbox/test_provider.py`, `tests/onedata/sandbox/test_sandbox.py`, `tests/onedata/sandbox/test_settings.py`, `tests/onedata/test_tokens.py`, `tests/onedata/test_toolserver.py` |
 | C20 | Store schema changes are crash-safe | `tests/campaign/test_dispatch_position.py`, `tests/campaign/test_store.py`, `tests/campaign/test_store_concurrent_open.py` |
-| C23 | The report accounts for every planned run and every pair | `tests/e2e/test_tiny_study.py`, `tests/stats/test_pairing.py`, `tests/test_report.py` |
+| C23 | The report accounts for every planned run and every pair | `tests/e2e/test_tiny_study.py`, `tests/stats/test_pairing.py`, `tests/test_cli.py`, `tests/test_report.py` |
 | P01 | Unknown code is dirty code, and dirty code does not start a study run | `tests/provenance/test_codestamp.py` |
 | P02 | Code identity includes the data files the code reads, and is re-verified | `tests/provenance/test_codestamp.py` |
 | P03 | Tree hashes ignore modification times and caches | `tests/provenance/test_codestamp.py` |

@@ -96,7 +96,7 @@ SNAPSHOT_KEY = "snapshot"  # the key of the check that says what its snapshot of
 
 
 class Refused(RuntimeError):
-    """A command refused to go on; the message says why and what to do."""
+    """A command refused to go on; the message says why and what to do, and the command line names the command."""
 
 
 @dataclass(frozen=True)
@@ -399,13 +399,13 @@ def _analyse_loaded(
         )
         verified = load_verified(batch, check, study.schema, partial=partial)
     except (BatchNotVerified, Unverified) as error:
-        raise Refused(f"refusing to analyse: {error}") from None
+        raise Refused(str(error)) from None
     rows = verified.snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
     changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])
     if changed:
         verified.snapshot.close()
         raise Refused(
-            "refusing to analyse: the replay check ran under another environment than the campaign's:\n  "
+            "the replay check ran under another environment than the campaign's:\n  "
             + "\n  ".join(changed)
         )
     plugin = load_plugin(StudyContext(study, code))
@@ -417,7 +417,7 @@ def _analyse_loaded(
     for entry in export["analysed_attempts"]:
         record = verified.record_for(entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
         if record is None:  # load_verified guarantees one for every attempt it did not exclude
-            raise Refused(f"refusing to analyse: no verified record for {entry['run_key']}")
+            raise Refused(f"no verified record for {entry['run_key']}")
         scored = rescore(record, plugin.scorers)
         scores[entry["run_key"]] = scored.scores
         task = study.tasks[str(entry["factors"]["task"])]
@@ -425,7 +425,7 @@ def _analyse_loaded(
     try:
         result = analyse(rows, study.prereg, _absent_runs(export))
     except TreatmentOutcomesRefused as error:
-        raise Refused(f"refusing to analyse: {error}") from None
+        raise Refused(str(error)) from None
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)
 

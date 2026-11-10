@@ -16,8 +16,9 @@ A thin shell; the logic is in the packages.
                     from the records and compared byte for byte
     example DEST    write the example study the core carries into DEST, a new directory, to run it from there
 
-Exit status: 0 done, 1 refused (the message on stderr says why and what to do), 2 usage, 3 `run` ended with runs still
-pending (held by a budget or a stop; the holds are printed).
+Exit status: 0 done, 1 refused (the message on stderr names the command, says why and what to do), 2 usage, 3 `run`
+ended with runs still pending (held by a budget or a stop; the holds are printed). `run` counts what it dispatched in
+attempts, of the campaign's runs: a run set aside and run again is one run of two attempts.
 """
 
 import argparse
@@ -102,7 +103,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None) -> int:
     summary = run_study(args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, crash_hook=crash_hook)
-    print(f"dispatched {summary.dispatched} runs; runs by status: {dict(sorted(summary.statuses.items()))}")
+    runs = sum(summary.statuses.values())
+    statuses = dict(sorted(summary.statuses.items()))
+    print(f"dispatched {summary.dispatched} attempts of {runs} runs; runs by status: {statuses}")
     pending = summary.statuses.get("pending", 0)
     for subject, hold in sorted(summary.holds.items()):
         print(f"hold on {subject}: {hold.reason}")
@@ -200,5 +203,5 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
         }
         return commands[args.command](args)
     except _REFUSALS as error:
-        print(f"refused: {error}", file=sys.stderr)
+        print(f"{args.command} refused: {error}", file=sys.stderr)
         return EXIT_REFUSED
