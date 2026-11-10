@@ -11,7 +11,7 @@ code. The campaign decides whether to re-run the attempt.
 Never an InfraError: agent-code exceptions (non-zero exit codes), turn, time or token caps, report outcomes, slowness,
 and a context that outgrew the model's window (`ContextOverflow`).
 
-The kinds form a closed vocabulary: the core's seven, plus whatever a platform registers once at import time with
+The kinds form a closed vocabulary: the core's eight, plus whatever a platform registers once at import time with
 `register_infra_kind`, for the whole process, and while a study is loaded or run, what it declares in its study.toml
 (`[study.kinds]`, held by `study_kinds`). A study lists the platforms whose kinds it names (`[study] platforms`), and
 the study loader imports them before it validates the conditions. An unknown kind is a programming error and raises at
@@ -23,6 +23,10 @@ failure of the harness's own integrity checks must never be scored that way, bec
 nothing about the manipulation: `tool_plane_integrity` is not treatable, and a platform registers further kinds
 that are not with `register_infra_kind(kind, description, treatable=False)`. The factor schema refuses to load a
 condition that declares one, and the scheduler refuses a campaign whose health or identity kind a condition declares.
+
+`budget_hold` is no failure of anything outside the agent either, but the campaign's own decision: a request the token
+cap cannot account for would have taken the campaign past its budget, so it was not sent (`BudgetHold`, C26). It is
+set aside like infrastructure, never treatable, and costs the run no attempt.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from typing import NamedTuple
 # and no cause was recorded. ceiling: a call was still running when the whole-time ceiling passed, with the agent's
 # own time under its cap, so something other than the agent held it up (L04). tool_plane_integrity: the tool plane
 # failed the checks that it is what the condition declared (its token, its principal's privileges); not treatable.
+# budget_hold: a request was not sent because its top-up would have passed the campaign's budget (C26); not treatable.
 CORE_KINDS = (
     "endpoint",
     "key_rejected",
@@ -47,11 +52,14 @@ CORE_KINDS = (
     "unattributed_kill",
     "ceiling",
     "tool_plane_integrity",
+    "budget_hold",
 )
 TOOL_PLANE_INTEGRITY = "tool_plane_integrity"
+BUDGET_HOLD = "budget_hold"
 # The core's kinds that no condition may declare as its treatment, and why.
 CORE_UNTREATABLE: dict[str, str] = {
     TOOL_PLANE_INTEGRITY: "a run whose tool plane failed its integrity checks says nothing about the manipulation",
+    BUDGET_HOLD: "a run the budget stopped says nothing about the manipulation, only about what the campaign could pay",
 }
 
 _KIND_RE = re.compile(r"[a-z][a-z0-9_]*")
@@ -286,3 +294,14 @@ class InfraError(RuntimeError):
         super().__init__(f"{kind}: {detail}")
         self.kind = kind
         self.detail = detail
+
+
+class BudgetHold(InfraError):
+    """A request was not sent: the top-up it needed would have taken the campaign past its budget (C26).
+
+    An infrastructure failure of kind `budget_hold`, so the attempt ends set aside and is never scored; the run is
+    not charged an attempt for it (`expcore.campaign.attempts.UNCHARGED_KINDS`).
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(BUDGET_HOLD, detail)

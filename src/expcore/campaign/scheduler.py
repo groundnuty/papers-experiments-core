@@ -54,6 +54,7 @@ from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.store import Store, column_for
+from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
 from expcore.config.models import ModelTable
 from expcore.loop.config import AgentConfig
@@ -187,10 +188,18 @@ class Scheduler:
         self.stops = HarnessStops(store, cfg.harness_stop)
         self.reconcile_accounting()
         self.identities = ServedIdentities(store, self.stamp)
-        self.budget = None
+        self.budget, self.ledger = None, None
         if cfg.budget is not None:
             specs = {m: self.models.resolve(m) for m in self.plan_models}
             self.budget = BudgetGate(store, specs, cfg.budget, self.agent_config.limits)
+            # a top-up is decided under the dispatcher's locks, in its order, against the runs in flight (C26)
+            self.ledger = Ledger(
+                self.budget,
+                store,
+                self.stamp,
+                (self._cv, self._assess),
+                lambda: [m for m, _ in self._inflight.values()],
+            )
         else:
             store.event(self.stamp(), "budget_gate_off", None, "no budget in this campaign: runs are not held for cost")
         self.gate = None
@@ -225,6 +234,7 @@ class Scheduler:
                 leases=self.leases,
                 lease_group=self.lease_group,
                 crash_hook=self.crash_hook,
+                ledger=self.ledger,
             )
         )
 

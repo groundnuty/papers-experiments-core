@@ -279,11 +279,12 @@ def test_c03_the_limit_is_a_parameter_and_exhaustion_is_set_in_the_finishing_tra
 
 
 @pytest.mark.parametrize("kind", CORE_KINDS)
-def test_c03_only_a_key_rejection_among_the_core_kinds_is_uncharged(tmp_path, kind):
-    """C03: the infrastructure kinds other than key_rejected all count against the limit."""
+def test_c03_only_a_key_rejection_and_a_budget_hold_among_the_core_kinds_are_uncharged(tmp_path, kind):
+    """C03: the infrastructure kinds other than key_rejected and budget_hold all count against the limit; a budget hold
+    is the campaign's own decision not to pay for a request (C26)."""
     store, _, manifest = planned_store(tmp_path)
     run_one(store, manifest.rows[0].key.text, infra(kind))
-    assert store.charged_attempts(manifest.rows[0].key.text) == (0 if kind == "key_rejected" else 1)
+    assert store.charged_attempts(manifest.rows[0].key.text) == (0 if kind in ("key_rejected", "budget_hold") else 1)
 
 
 def test_usage_is_stored_as_reported_and_unreported_stays_null(tmp_path):

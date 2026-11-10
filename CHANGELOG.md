@@ -143,6 +143,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | C23 | The report accounts for every planned run and every pair | `tests/e2e/test_tiny_study.py`, `tests/stats/test_pairing.py`, `tests/test_cli.py`, `tests/test_report.py` |
 | C24 | A tiered price is applied request by request | `tests/campaign/test_tiered_cost.py`, `tests/config/test_price_tiers.py` |
 | C25 | A run's reservation is the most its caps let it cost, the request past its token cap included | `tests/campaign/test_scheduler_gates.py`, `tests/campaign/test_worst_case.py`, `tests/study/test_study.py` |
+| C26 | A send the token cap cannot account for reserves its own bound before it is sent | `tests/campaign/test_topup_bound.py`, `tests/campaign/test_topups.py`, `tests/models/test_spend.py` |
 | P01 | Unknown code is dirty code, and dirty code does not start a study run | `tests/provenance/test_codestamp.py` |
 | P02 | Code identity includes the data files the code reads, and is re-verified | `tests/provenance/test_codestamp.py` |
 | P03 | Tree hashes ignore modification times and caches | `tests/provenance/test_codestamp.py` |

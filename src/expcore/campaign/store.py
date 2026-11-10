@@ -78,6 +78,8 @@ _ADDED_COLUMNS = (
     ("attempts", "lease_wait_s", "REAL"),  # seconds waited for the lease the attempt ran under; NULL: none or unknown
     ("attempts", "lease_outcome", "TEXT"),  # how the lease was obtained (attempts.LEASE_OUTCOMES); NULL: unknown
     ("attempts", "turn_usage", "TEXT"),  # JSON: each turn's [input, output, cache writes, cache reads]; NULL: unknown
+    ("attempts", "topups", "INTEGER NOT NULL DEFAULT 0"),  # sends the token cap could not account for (C26)
+    ("attempts", "topup_usd", "REAL NOT NULL DEFAULT 0"),  # what they were charged, each its bound, never refunded
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -438,6 +440,26 @@ class Store:
             return BegunAttempt(int(cursor.lastrowid), number, int(sequence))
 
         return self.transact(go)
+
+    def add_topup(self, attempt_id: int, usd: float, now: str, event: tuple[str, str | None, str]) -> None:
+        """Charge a running attempt one top-up of `usd` dollars and append its event, in one transaction (C26).
+
+        A top-up is charged when it is reserved and never refunded, so it is part of what was spent from that moment,
+        whatever comes of the attempt; `finish_attempt` leaves it as it is. An attempt that is not running is refused.
+        """
+        if isinstance(usd, bool) or not isinstance(usd, int | float) or not usd >= 0 or usd == float("inf"):
+            raise ValueError(f"a top-up is a finite number of dollars, not below zero, not {usd!r}")
+
+        def go() -> None:
+            cursor = self.db.execute(
+                "UPDATE attempts SET topups = topups + 1, topup_usd = topup_usd + ? WHERE id=? AND state='running'",
+                (float(usd), attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise AttemptRefused(f"attempt {attempt_id} is not running, so it takes no top-up")
+            self.db.execute("INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)", (now, *event))
+
+        self.transact(go)
 
     def running_attempts(self) -> list[sqlite3.Row]:
         """Return the attempts now marked running."""

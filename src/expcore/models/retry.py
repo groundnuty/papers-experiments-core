@@ -15,6 +15,10 @@ same shape is treated like the SDK's own. What each class of error means for a r
 - anything else with a status (a plain 400 or 413, a 404): not retried, and passed on unchanged.
 
 The SDKs' own retries are switched off by the adapters, so every retry is counted and recorded here.
+
+A connection error or a 5xx may come after the request reached the model and was billed. The attempt's spend guard,
+when the campaign installed one, is told of each such send: it charges it, and clears the send that follows, before
+the wait, or ends the attempt as a budget hold (`expcore.models.spend`, C26).
 """
 
 import asyncio
@@ -29,6 +33,7 @@ from typing import Any, Protocol
 
 from expcore.config.models import ClientSettings
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
+from expcore.models import spend
 
 MESSAGE_LIMIT = 300
 _TRANSIENT_STATUSES = frozenset({408, 409, 429})
@@ -272,7 +277,12 @@ class Retrier:
                     raise
                 self._refuse_final(exc, info)
                 wait = self.policy.delay(len(made), info.retry_after_s, self.rng)
-                self._refuse_exhausted(exc, info, wait, len(made))
+                try:
+                    self._refuse_exhausted(exc, info, wait, len(made))
+                except InfraError:
+                    await spend.after_failed_send(info.kind, resend=False)  # the last send may have been billed too
+                    raise
+                await spend.after_failed_send(info.kind, resend=True)  # a budget hold here: nothing is sent again
                 made.append(self._record(info, wait, len(made)))
                 await self.sleep(wait)
 

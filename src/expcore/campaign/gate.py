@@ -13,6 +13,10 @@ attempt is the worst case, because an attempt that overruns its mean is still in
 set aside for it. A run starts only when the remaining budget covers the bound. The historical mean is an estimate for
 the status and the reports (`BudgetState.estimate_usd`) and decides nothing.
 
+A send of a run in flight that its token cap cannot account for asks for a top-up first (`refusal`, C26; the ledger
+is `expcore.campaign.topup`): the same figure, with the top-up in place of a new run's bound. What was spent includes
+every top-up, of finished attempts and of running ones, from the moment it was reserved.
+
 Cost that cannot be known holds like cost that is over: a model whose price is unknown (no price, not free) is held,
 and so is every model once an attempt of an unpriced model has been charged, because the total spent is then unknown.
 These holds end only when the table is fixed; a release file does not price a model.
@@ -185,6 +189,22 @@ class BudgetGate:
             {m: tuple(v) for m, v in found.items()}, spent, reserve, self.ceiling(ALL, released) or 0.0, estimate
         )
 
+    def refusal(self, model: str, in_flight: Sequence[str], extra_usd: float) -> str | None:
+        """Tell why `extra_usd` more for a run of `model` already in flight would not fit, or None when it would (C26).
+
+        The figure is the assessment's (what was spent, top-ups included, and the reservations of the runs in flight,
+        this one among them), with `extra_usd` in place of a new run's reservation, against both ceilings as released so
+        far. Nothing is recorded: a stop begins at the next assessment, which a request this refused would not pass
+        either. A total that is unknown refuses too.
+        """
+        released = self._json(RELEASED_KEY)
+        costs = attempt_costs(self.store, self.models, self.limits)
+        spent = spent_usd(costs)
+        reserve = {m: self._reserve(m) for m in self.models}
+        flying = {m: sum(1 for x in in_flight if x == m) for m in self.models}
+        holds = self._holds_of(model, self.models[model], costs, spent, reserve, flying, released, extra_usd)
+        return "; ".join(h.reason for h in holds) if holds else None
+
     def _reserve(self, model: str) -> float | None:
         """Return what one pending or running run of the model is reserved: its bound, always; None if unpriced."""
         spec = self.models[model]
@@ -207,8 +227,10 @@ class BudgetGate:
         reserve: Mapping[str, float | None],
         flying: Mapping[str, int],
         released: Mapping[str, float],
+        topup: float | None = None,
     ) -> list[Hold]:
-        """Return the holds on one model: the unknown ones first, then each ceiling its next run would pass."""
+        """Return the holds on one model: the unknown ones first, then each ceiling its next run would pass, or, with
+        `topup`, each ceiling that top-up of a run in flight would pass."""
         if not spec.priced:
             return [Hold(model, f"model {model} has no price and is not marked free: its cost is unknown", False)]
         if spent is None:
@@ -216,18 +238,22 @@ class BudgetGate:
         later = {m: n * reserve[m] for m, n in flying.items() if n and reserve[m] is not None}
         if any(reserve[m] is None for m, n in flying.items() if n):
             return [Hold(ALL, "a run in flight is of a model without a price: the total is unknown", False)]
-        mine = reserve[model]
+        mine = reserve[model] if topup is None else topup
+        what = "this run" if topup is None else "this top-up"
         out = []
         cap = self.ceiling(model, released)
         if cap is not None:
             used = spent_usd(costs, model) or 0.0
             figure = used + later.get(model, 0.0) + (mine or 0.0)
             if figure > cap:
-                out.append(Hold(model, _over(f"model {model}", figure, used, later.get(model, 0.0), mine, cap), True))
+                text = _over(f"model {model}", figure, used, later.get(model, 0.0), mine, cap, what)
+                out.append(Hold(model, text, True))
         total_cap = self.ceiling(ALL, released) or 0.0
         figure = spent + sum(later.values()) + (mine or 0.0)
         if figure > total_cap:
-            out.append(Hold(ALL, _over("the campaign", figure, spent, sum(later.values()), mine, total_cap), True))
+            out.append(
+                Hold(ALL, _over("the campaign", figure, spent, sum(later.values()), mine, total_cap, what), True)
+            )
         return out
 
     def _record_stops(self, holds: dict, over: dict[str, str], now: str, exact: str) -> None:
@@ -252,9 +278,11 @@ def _stop_epoch(hold: Mapping) -> float:
     return release.epoch_of(hold.get("since_utc"))
 
 
-def _over(what: str, figure: float, spent: float, flying: float, mine: float | None, cap: float) -> str:
+def _over(
+    what: str, figure: float, spent: float, flying: float, mine: float | None, cap: float, mine_is: str = "this run"
+) -> str:
     """Return the sentence that says what is over: the figure, how it is made up, and the ceiling."""
     return (
-        f"{what}: {figure:.2f} USD (spent {spent:.2f} + in flight {flying:.2f} + this run {mine or 0.0:.2f}) "
+        f"{what}: {figure:.2f} USD (spent {spent:.2f} + in flight {flying:.2f} + {mine_is} {mine or 0.0:.2f}) "
         f"is over the ceiling of {cap:.2f} USD"
     )

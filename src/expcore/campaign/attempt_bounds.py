@@ -39,6 +39,12 @@ is unknown (no price, not free) has no cost at all: `None`, never 0, and the bud
 A measured attempt of a model with a flat price costs its totals at that price. One of a model with a tiered price
 costs each of its requests at the tier its prompt fell in, from the per-turn usage the store keeps (C24); an attempt
 whose per-turn usage is unknown is charged its bound, since its totals cannot say which tier each token fell in.
+
+**A send the token cap cannot account for is charged a top-up** (C26): a send that failed after it may have been
+billed, and every request after a reply that left a count out. Each top-up is the bound of one request, the same as
+the request past the cap (`request_bound_usd`), charged when it is reserved and never refunded, since what that send
+cost is unknown. An attempt costs what is said above plus its top-ups, so a run's true cost is never more than its
+reservation and its top-ups together.
 """
 
 import json
@@ -131,6 +137,17 @@ def overshoot_usd(spec: ModelSpec, limits: Limits) -> float:
     return _past_cap(spec, limits) / TOKENS_PER_PRICE_UNIT
 
 
+def request_bound_usd(spec: ModelSpec, limits: Limits) -> float | None:
+    """Return what one request of the model can cost, in dollars: the bound of a top-up (C26), which is the request
+    past the token cap's; 0 for a free model, None when the price is unknown."""
+    _check_limits(limits)
+    if spec.free:
+        return 0.0
+    if spec.price is None:
+        return None
+    return overshoot_usd(spec, limits)
+
+
 def bound_usd(spec: ModelSpec, limits: Limits) -> float | None:
     """Return the bound of one attempt: the requests within its token cap and the one past it at their worst (C25);
     0 for a free model, None when the price is unknown. A priced model with no context window is refused."""
@@ -186,35 +203,49 @@ def attempt_costs(store: RunState, models: Mapping[str, ModelSpec], limits: Limi
     """Return the cost of every attempt that spent tokens, in attempt order, each charged as the module docstring says.
 
     `models` maps a run's model key to its table entry; a key it lacks is an unknown cost. `limits` are the caps the
-    attempts ran under, which bound one whose usage is unknown.
+    attempts ran under, which bound one whose usage is unknown. Each attempt's top-ups are added to its cost (C26),
+    and a running attempt with top-ups is listed with them alone, since they were charged when they were reserved; an
+    attempt with a top-up is `bounded`, its cost being in part a ceiling.
     """
-    marks = ",".join("?" * len(BILLED_STATES))
-    # A read-only snapshot of a store made before `turn_usage` existed cannot be migrated: read it without the column.
+    states = (*BILLED_STATES, "running")
+    marks = ",".join("?" * len(states))
+    # A read-only snapshot of a store made before a column existed cannot be migrated: read it without the column.
     columns = {row["name"] for row in store.q("PRAGMA table_info(attempts)")}
     turn_usage = "a.turn_usage" if "turn_usage" in columns else "NULL AS turn_usage"
+    topup_usd = "a.topup_usd" if "topup_usd" in columns else "0 AS topup_usd"
     rows = store.q(
         "SELECT a.id, a.run_key, a.state, r." + column_for("model") + " AS model, a.input_tokens, a.output_tokens, "
-        f"a.cache_creation_tokens, a.cache_read_tokens, {turn_usage}, COALESCE(a.usage_complete,1) AS complete "
-        f"FROM attempts a JOIN runs r USING(run_key) WHERE a.state IN ({marks}) ORDER BY a.id",
-        BILLED_STATES,
+        f"a.cache_creation_tokens, a.cache_read_tokens, {turn_usage}, COALESCE(a.usage_complete,1) AS complete, "
+        f"{topup_usd} FROM attempts a JOIN runs r USING(run_key) WHERE a.state IN ({marks}) ORDER BY a.id",
+        states,
     )
     costs = []
     for row in rows:
-        spec = models.get(row["model"])
-        if spec is None:
-            costs.append(AttemptCost(row["id"], row["run_key"], row["model"], row["state"], None, False))
+        spec, topped = models.get(row["model"]), float(row["topup_usd"] or 0.0)
+        if row["state"] == "running":
+            if topped:
+                costs.append(AttemptCost(row["id"], row["run_key"], row["model"], "running", topped, True))
             continue
-        measured = measured_usd(spec, row) if row["complete"] else None
-        if measured is not None:
-            costs.append(AttemptCost(row["id"], row["run_key"], row["model"], row["state"], measured, False))
-            continue
-        bound = bound_usd(spec, limits)
+        usd, bounded = _base_cost(spec, row, limits)
         costs.append(
             AttemptCost(
-                row["id"], row["run_key"], row["model"], row["state"], bound, bound is not None and not spec.free
+                row["id"], row["run_key"], row["model"], row["state"],
+                None if usd is None else usd + topped, bounded or topped > 0,
             )
-        )
+        )  # fmt: skip
     return costs
+
+
+def _base_cost(spec: ModelSpec | None, row: Mapping[str, Any], limits: Limits) -> tuple[float | None, bool]:
+    """An attempt's cost without its top-ups, and whether it is its bound: measured when its counts are known and
+    complete, else its bound; None for a model the table lacks or whose price is unknown."""
+    if spec is None:
+        return None, False
+    measured = measured_usd(spec, row) if row["complete"] else None
+    if measured is not None:
+        return measured, False
+    bound = bound_usd(spec, limits)
+    return bound, bound is not None and not spec.free
 
 
 def spent_usd(costs: list[AttemptCost], model: str | None = None) -> float | None:
