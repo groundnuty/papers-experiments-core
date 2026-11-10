@@ -103,6 +103,22 @@ except ConfigError as error:
     assert "campaign.toml" in message and "key 'health_kind'" in message
     assert "did you mean 'sandbox'" in message
 shutil.rmtree(misspelt)
+
+### What the budget reserves
+
+`[budget] max_usd` in `campaign.toml` is a ceiling the campaign never passes, not an estimate. Before a run starts, the scheduler adds what has been spent, what the runs in flight can still cost and what this run can cost, and holds the run while that sum is over the ceiling. What a run can cost is its bound, the worst case: the loop's `token_budget` (in `[agent]`, the most tokens one attempt may use) at the model's dearest rate, the highest of its input, output and cache prices. Each run in flight is reserved its bound too, and an attempt that was killed, or whose usage was not reported, is charged its bound as spent. The mean cost of the runs so far decides nothing, because a run that overran it would pass the ceiling. `per_model_usd` caps single models the same way, and a model with neither a price nor `free = true` is held outright, since its cost is unknown.
+
+The example's bound is small: 20,000 tokens at alpha-stub's dearest rate, 2 USD per million output tokens, is 0.04 USD a run, against a ceiling of 5 USD. A real model's is not. With `token_budget = 2000000` and a model priced at 15 USD per million input tokens and 75 per million output tokens, every run reserves 2,000,000 tokens at 75 USD per million, 150 USD, however little a typical run spends. A ceiling of 50 USD then holds the campaign before its first run (0 spent, 0 in flight, 150 for this run: over 50), `run` exits 3, and the hold it prints gives those three figures. With two workers, the second run needs 300 USD of room. To run, raise `max_usd` above the bound times the runs that may be in flight, plus what has been spent, or lower `token_budget`, which is also the cap that ends a run as `token_cap`.
+
+```python
+from expcore.campaign.attempt_bounds import bound_usd
+from expcore.config.prices import Price
+
+limits = study.campaign.agent.limits
+assert (limits.token_budget, study.campaign.scheduler.budget.max_usd) == (20000, 5.0)
+assert bound_usd(study.models.resolve("alpha-stub"), limits.token_budget) == 0.04  # what each run reserves
+dear = Price(input_per_mtok=15.0, output_per_mtok=75.0)  # US dollars per million tokens
+assert dear.dearest_per_token() * 2_000_000 == 150.0  # its bound under token_budget = 2000000
 ```
 
 ### The federation's certificate
@@ -308,6 +324,27 @@ analysis = json.loads(Path("my-study/out/analysis.json").read_text())
 relay = next(c for c in analysis["contrasts"] if c["name"] == "relay-vs-baseline")
 assert relay["treatment_outcomes"] == "scored" and relay["pairs_missing"]["treatment_outcome_none"] == 0
 assert relay["n_pairs"] == 8  # both treatment attempts stay in their own contrast
+```
+
+### How pairs become a contrast's input
+
+What a contrast estimates is decided by how its pairs are combined, in stages of plain means:
+
+1. **Pairs.** A pair is one run of each arm with the same pairing key: task, model and seed for a contrast between two named conditions, and every other factor of the run key as well for a factor contrast. Its difference is A - B on the contrast's outcome. A pair whose outcome is missing on either side is left out and counted by its cause.
+2. **Per task and model.** The pairs of one task and one model (its seeds, and a factor contrast's levels of the other factors) are averaged into one value.
+3. **Per cluster and model.** The task values of one cluster (the tasks with one value of the contrast's `cluster` attribute) and one model are averaged, each task with equal weight whatever its number of pairs. These are the cells of the estimator's input, `PairedDifferences.matrix`: a row per cluster, a column per model, NaN where a model has no pair in a cluster.
+4. **Per cluster.** A cluster's difference is the mean over the models that have a cell in it, each model with equal weight (`cluster_differences`).
+
+`wilcoxon_cluster_bootstrap` tests those cluster differences with a signed-rank test (after snapping float noise and dropping zero differences, which it counts), its estimate is their mean, and its interval resamples whole clusters, one draw for every model. The cluster is the unit of inference: a task with more seeds, or a cluster with more tasks, weighs no more than another, and each model counts the same however many runs it has. The example has two regions, so each of its contrasts has two clusters.
+
+```python
+import numpy as np
+
+from expcore.stats.estimators import PairedDifferences
+
+cells = PairedDifferences(("north", "south"), ("alpha-stub", "beta-stub"), np.array([[1.0, 0.0], [0.5, np.nan]]))
+assert list(cells.cluster_differences) == [0.5, 0.5]  # south: beta-stub has no pair there, so alpha-stub's alone
+assert relay["n_clusters"] == len({task.attributes["region"] for task in study.tasks.values()}) == 2
 ```
 
 ### Unknown platform estimates are data
