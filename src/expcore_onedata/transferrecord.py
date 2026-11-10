@@ -7,9 +7,9 @@
 What is confirmed. The listing's answer, `transfers` (ids) and `nextPageToken`, is what running code of the sources in
 the header read; so are a record's state and counters (`transferStatus`, `replicationStatus`, `evictionStatus`,
 `bytesReplicated`, `filesReplicated`, `filesEvicted`, `filesFailed`) and its `fileId`. A record's `type`,
-`replicatingProviderId`, `evictingProviderId`, `scheduleTime`, `startTime` and `finishTime` are not: only the
-provider's API description and a mocked client test name them. They are in `client.UNVERIFIED_ENDPOINTS`, with a live
-contract test.
+`replicatingProviderId`, `evictingProviderId`, `scheduleTime`, `startTime` and `finishTime` were named only by the
+provider's API description and a mocked client test; the live contract test confirmed them against Onedata 25.0, for
+a replication and an eviction, with the times in epoch seconds (`[L1]` in `client.py`), and stays to pin them.
 
 **Fail closed.** A page not in that shape, and a record without a readable `scheduleTime`, a `type` of replication,
 eviction or migration, or (for a job that replicates) its `replicatingProviderId` and `bytesReplicated`, raise

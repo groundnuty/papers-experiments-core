@@ -35,30 +35,35 @@ def test_every_unverified_endpoint_has_a_live_contract_test():
     assert not missing, f"no live test covers: {missing}"
 
 
-def test_the_unconfirmed_calls_and_details_are_exactly_the_gate_reads_the_answer_details_and_the_transfer_log():
-    """O05, O08: the list holds the two reads the mutation gate relies on (a space's details, a file's path attribute),
-    the three answer details no source confirms (the subject of an examination, the providers' name and online fields,
-    and the content type of a file's content, which the data gate streams on), and the two details of the probes'
-    transfer log (the waiting state of the listing, a record's type, provider ids and times); nothing else."""
+def test_the_unconfirmed_calls_are_exactly_the_path_read_the_live_federation_refuted():
+    """O05, O09: the live contract tests against Onedata 25.0 confirmed a space's details, the subject of an
+    examination, the providers' name and online fields, the content type of a file's content, the waiting state and
+    Date header of the transfer listing, and a transfer record's type, provider ids and times. Those left the list,
+    and their live tests stay. What is left is the file's path attribute the mutation gate reads, which that release
+    does not have: the entry says so, and what it costs."""
     from expcore_onedata.client import UNVERIFIED_ENDPOINTS
 
-    assert {(m, p) for m, p, _ in UNVERIFIED_ENDPOINTS} == {
+    assert {(m, p) for m, p, _ in UNVERIFIED_ENDPOINTS} == {("GET", "/data/{id}")}
+    what = " ".join(w for _, _, w in UNVERIFIED_ENDPOINTS)
+    assert "mock" in what  # the only source that ever answered it
+    assert "refuted" in what
+    assert "badValueNotAllowed" in what
+    assert "fail closed" in what  # a mutation by file id is refused, never sent unchecked
+
+
+def test_every_endpoint_the_live_federation_confirmed_keeps_its_live_test():
+    """O05, O08: an entry that left the list on a live run keeps the test that confirmed it, so a release that answers
+    otherwise fails it."""
+    live = (ROOT / "tests" / "live" / "test_contract.py").read_text(encoding="utf-8")
+    for method, path in (
         ("GET", "/spaces/{space}"),
-        ("GET", "/data/{id}"),
         ("POST", "/tokens/examine"),
         ("POST", "/tokens/infer_access_token_scope"),
         ("GET", "/data/{file}/content"),
         ("GET", "/spaces/{space}/transfers"),
         ("GET", "/transfers/{id}"),
-    }
-    what = " ".join(w for _, _, w in UNVERIFIED_ENDPOINTS)
-    assert "subject" in what
-    assert "name and online" in what
-    assert "name field" in what
-    assert "application/octet-stream" in what
-    assert "mock" in what  # the only basis there is
-    assert "waiting" in what
-    assert all(field in what for field in ("type", "replicatingProviderId", "scheduleTime", "finishTime"))
+    ):
+        assert f"# covers: {method} {path}\n" in live
 
 
 def test_the_slow_live_expiry_test_needs_its_own_switch():
