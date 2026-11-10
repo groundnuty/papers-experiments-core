@@ -4,8 +4,10 @@
 #   merged: icsa-2027-experiments @ 6fc798cf, day0/REPORT.md:345-358 (the listing's default and largest page, measured)
 #   merged: icsa-2027-experiments @ 6fc798cf, day0/evidence/docs_research.md:47-54,155-176 (the server's and client's code)
 #   merged: icsa-2027-experiments @ 6fc798cf, day0/evidence/changes.jsonl (the file ids of a real federation)
+#   merged: icsa-2027-experiments @ 6fc798cf, icsa/sandbox/gatepolicy.py:13-14,72-73 (a merged listing as a mode)
+#   merged: icsa-2027-experiments @ 6fc798cf, day0/evidence/docs_research.md:24-47 (the listing's paging options)
 #   changes: see the history of this file from its import commit
-"""Request policy of the sandbox gate: which Onedata REST calls pass (O05, O16).
+"""Request policy of the sandbox gate: which Onedata REST calls pass (O05, O16), and how a listing is paged (O19).
 
 Pure functions, no I/O, so the policy is unit-testable. `gate.py` (which runs in the gate container, with the standard
 library only) applies it to every request the sandbox makes.
@@ -51,9 +53,30 @@ more for any further attribute a request names, a path among them. The fake plat
 is about 3.7 MB, and the gate serves it (`tests/onedata/sandbox/test_gate.py`). An answer that still outgrows the cap,
 a listing that names attributes as large as a file's extended attributes, is refused loudly as before, never passed.
 
-The earlier study's gate had two further modes (a whole-file download that is stored before it is released, and a
-listing merged into one page). They were that study's manipulated variables and are not carried over: this gate is the
-plain read-only path.
+**Two listing modes (O19).** A REST data path is `paged` (the default) or `complete`, as `[sandbox.data_paths]` says
+for the level (`settings.py`), and the gate is told which in its configuration. `paged` is everything above: a listing
+is the server's page, passed on as it came. `complete` answers every listing with all of the directory's entries, in
+the server's order, as one page (`isLast` true, `nextPageToken` null): the gate follows the pages upstream itself, so a
+client that reads one page (the official one's `ls` does) sees the whole directory. The earlier study's gate had the
+same mode (the first `merged:` line); this one bounds it and checks every page:
+
+  * the gate drives the paging: it asks for pages of `MAX_LIST_LIMIT` and drops the agent's `limit` and
+    `tuneForLargeContinuousListing` (`DROPPED_OPTIONS`; the second cannot go with the token the gate sends from the second
+    page on). A listing that names where to start, `token`, `index` or `offset` (`START_OPTIONS`), could not be the
+    directory's complete listing, so it is refused with a 400 the agent reads, as any policy refusal is. The options are
+    the ones the API's own description of the call lists (the second `merged:` line above);
+  * it continues while a page says `isLast` false and gives a token, whatever the page's length: the API says a page can
+    be short and still not the last, and that `isLast` is the only sign of the end. A page that is not an object with a
+    list of children, an `isLast` that is not a boolean, `isLast` false without a token, or a token the listing gave
+    before (it would never end) is the platform's malformed answer: a 502 of origin `upstream`, never a part of the
+    listing taken for the whole (`listing_page`);
+  * the merged answer is at most `COMPLETE_LISTING_BYTES` (64 MiB) and `COMPLETE_LISTING_PAGES` (10,000) pages; past
+    either, the listing cannot be served whole and the gate refuses it for its own integrity (`listing_too_large`, so
+    the run is set aside), never passing a part of it on. 64 MiB is about 220,000 entries of 300 bytes, the size of an
+    entry with a file id of 180 characters and the attributes the official client asks for; the gate's memory for it is
+    worked out in `gate.py` (`BUFFER_SLOTS`).
+
+The earlier study's gate had a whole-file mode too, a download stored before it is released; it is not carried over.
 """
 
 from __future__ import annotations
@@ -61,9 +84,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, parse_qsl, urlencode
 
 ONEZONE, ONEPROVIDER = "onezone", "oneprovider"
+PAGED, COMPLETE = "paged", "complete"  # the listing modes of a REST data path (O19)
+LISTINGS = (PAGED, COMPLETE)
 
 _P = "/api/v3/"
 _RULES = (
@@ -86,6 +111,14 @@ MAX_BODY_DEPTH = 32  # the deepest a listing's JSON body may nest; the official 
 _STRUCTURE = re.compile(
     r'["\\\[\]{}]'
 )  # the characters that open or close a string, an array or an object, and escapes
+START_OPTIONS = ("token", "index", "offset")  # where a listing starts: refused in a complete listing
+DROPPED_OPTIONS = ("limit", "tuneForLargeContinuousListing")  # the gate's to set when it pages a complete listing
+COMPLETE_LISTING_BYTES = 64 * 1024 * 1024  # the largest merged answer of a complete listing
+COMPLETE_LISTING_PAGES = 10_000  # the most pages a complete listing follows
+START_REFUSED = (
+    "this data path answers every listing with all of the directory's entries, from its first: a listing may not name "
+    "token, index or offset"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,20 +127,27 @@ class Decision:
     reason: str
     tag: str = ""
     status: int = 403  # HTTP status of a refusal
+    merge_pages: bool = False  # a complete listing: the gate follows the pages upstream and answers with one (O19)
 
 
-def decide(role: str, method: str, path: str, query: str = "", body: bytes | None = None) -> Decision:
+def decide(
+    role: str, method: str, path: str, query: str = "", body: bytes | None = None, *, listing: str = PAGED
+) -> Decision:
     """`path` is the request path without the query string; `query` is the query string, and `body` the request's body,
-    which a listing's limit is read from as well."""
+    which a listing's options are read from as well. `listing` is the data path's listing mode; one this module does
+    not know raises, since the gate refuses to start with it."""
+    if listing not in LISTINGS:
+        raise ValueError("the listing mode is not one the gate knows")
     low = path.lower()
     if {".", ".."} & set(path.split("/")) or "%2e" in low or "%2f" in low or "%5c" in low or "\\" in path:
         return Decision(False, "dot segments and encoded separators are not allowed")
     for r_role, r_method, rx, tag in _RULES:
         if r_role == role and r_method == method and rx.match(path):
-            refused = _listing_refusal(query, body) if tag == "children" else None
+            merge = tag == "children" and listing == COMPLETE
+            refused = _listing_refusal(query, body, complete=merge) if tag == "children" else None
             if refused is not None:
                 return Decision(False, refused, tag, status=400)
-            return Decision(True, "allowed", tag)
+            return Decision(True, "listing merged into one page" if merge else "allowed", tag, merge_pages=merge)
     return Decision(False, "not an allowed read call")  # the line has the method and the path, as the agent sent them
 
 
@@ -145,27 +185,45 @@ def _nested_deeper(text: str, bound: int) -> bool:
     return False
 
 
-def _listing_refusal(query: str, body: bytes | None) -> str | None:
-    """Why a listing is refused for the size of the page it asks for, or None when it may pass.
+BODY_REFUSED = "a listing's body must be one JSON object with each key once"
 
-    Every limit is read, from the query (each time the parameter is given) and from a JSON body, since which one the
-    server reads is not known; a listing with none passes, and the server answers its default page."""
-    limits: list[object] = list(parse_qs(query, keep_blank_values=True).get("limit", []))
-    if body:
-        try:  # decoded as the parser decodes bytes (UTF-8, -16 or -32, found from the first bytes)
-            text = body.decode(json.detect_encoding(body), "surrogatepass")
-        except (UnicodeDecodeError, LookupError):
-            return "a listing's body must be one JSON object with each key once"
-        if _nested_deeper(text, MAX_BODY_DEPTH):  # refused before the parser, which recurses once per level
-            return f"a listing's body may nest at most {MAX_BODY_DEPTH} levels of arrays and objects"
-        try:
-            options = json.loads(text, object_pairs_hook=_unique_keys)
-        except Exception:  # any failure of the parser, RecursionError included, is the agent's malformed request
-            options = None
-        if not isinstance(options, dict):
-            return "a listing's body must be one JSON object with each key once"
-        if "limit" in options:
-            limits.append(options["limit"])
+
+def _body_options(body: bytes | None) -> dict | str | None:
+    """A listing's JSON body as its options, None for no body, or why it is refused: it is decoded as the parser decodes
+    bytes (UTF-8, -16 or -32, found from the first bytes), its nesting is bounded before the parser runs (which
+    recurses once per level), and it must be one JSON object with each key once."""
+    if not body:
+        return None
+    try:
+        text = body.decode(json.detect_encoding(body), "surrogatepass")
+    except (UnicodeDecodeError, LookupError):
+        return BODY_REFUSED
+    if _nested_deeper(text, MAX_BODY_DEPTH):
+        return f"a listing's body may nest at most {MAX_BODY_DEPTH} levels of arrays and objects"
+    try:
+        options = json.loads(text, object_pairs_hook=_unique_keys)
+    except Exception:  # any failure of the parser, RecursionError included, is the agent's malformed request
+        options = None
+    return options if isinstance(options, dict) else BODY_REFUSED
+
+
+def _listing_refusal(query: str, body: bytes | None, *, complete: bool = False) -> str | None:
+    """Why a listing is refused, or None when it may pass.
+
+    Paged: for the size of the page it asks for. Every limit is read, from the query (each time the parameter is given)
+    and from a JSON body, since which one the server reads is not known; a listing with none passes, and the server
+    answers its default page. Complete: for naming where it starts (`START_OPTIONS`, in either place); its limit is
+    the gate's, and is not read."""
+    options = _body_options(body)
+    if isinstance(options, str):
+        return options
+    given = parse_qs(query, keep_blank_values=True)
+    if complete:
+        named = set(given) | set(options or {})
+        return START_REFUSED if named & set(START_OPTIONS) else None
+    limits: list[object] = list(given.get("limit", []))
+    if options and "limit" in options:
+        limits.append(options["limit"])
     for limit in limits:
         if isinstance(limit, str) and _WHOLE_NUMBER.fullmatch(limit):
             limit = int(limit)
@@ -177,3 +235,50 @@ def _listing_refusal(query: str, body: bytes | None) -> str | None:
                 "passing each answer's nextPageToken as the next request's token"
             )
     return None
+
+
+def complete_listing_request(query: str, body: bytes | None) -> tuple[list[tuple[str, str]], bytes | None]:
+    """The query options and the body every page of a complete listing is asked for with: the agent's, without the
+    options the gate sets (`DROPPED_OPTIONS`), in either place. A body that names none of them goes as it came. Call it
+    only on a listing `decide` allowed, whose body is then one JSON object or empty."""
+    pairs = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True) if k not in DROPPED_OPTIONS]
+    options = _body_options(body)
+    if isinstance(options, dict) and set(options) & set(DROPPED_OPTIONS):
+        body = json.dumps({k: v for k, v in options.items() if k not in DROPPED_OPTIONS}).encode()
+    return pairs, body
+
+
+def page_target(path: str, pairs: list[tuple[str, str]], token: str | None) -> str:
+    """The target of one page of a complete listing: the agent's options, the gate's page size and, from the second page
+    on, the token the page before gave."""
+    paging = [("limit", str(MAX_LIST_LIMIT))] + ([("token", token)] if token is not None else [])
+    return f"{path}?{urlencode(pairs + paging)}"
+
+
+def _no_constant(name: str) -> None:
+    raise ValueError(f"{name} is not a JSON value")
+
+
+def listing_page(data: bytes, seen: set[str]) -> tuple[list, str | None]:
+    """One page of a complete listing as (its entries, the token of the next page, None after the last); `seen` holds
+    the tokens the listing gave before and gains this page's. ValueError for a page the listing cannot go on from: not
+    an object with a list of children, an `isLast` that is not a boolean, `isLast` false without a token, or a token
+    given before (the listing would never end). A short page with `isLast` false is not the end (O19). A value JSON does
+    not have (NaN, Infinity), which the merged answer could not carry, makes the page not JSON."""
+    try:
+        page = json.loads(data, parse_constant=_no_constant)
+    except ValueError:
+        raise ValueError("a listing page is not JSON") from None
+    if not isinstance(page, dict) or not isinstance(page.get("children"), list):
+        raise ValueError("a listing page is not an object with a list of children")
+    last, token = page.get("isLast"), page.get("nextPageToken")
+    if last is True:
+        return page["children"], None
+    if last is not False:
+        raise ValueError("a listing page's isLast is not a boolean")
+    if not isinstance(token, str) or not token:
+        raise ValueError("a listing page that is not the last gives no token for the next")
+    if token in seen:
+        raise ValueError("a listing page gave a token the listing gave before: it would never end")
+    seen.add(token)
+    return page["children"], token

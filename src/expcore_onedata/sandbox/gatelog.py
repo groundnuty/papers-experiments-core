@@ -7,9 +7,10 @@ One JSON line per request or event. The summary separates three things that must
 refusal (4xx, the enforcement working), an error the gate made itself (origin `gate`) and an error the platform made
 (origin `upstream`). A transfer the gate cut, because the client went away or an upstream failed mid-body, carries
 `cut` and `unread_bytes`; one it cut because the body held its token carries `cut_reason` too. An answer the gate
-refused for its own integrity (a redirect, an encoded body, its token in a header or a body) carries `gate_refusal`,
-its reason (`refusals`): the gate cut the condition's read, the agent did not read less. A log that cannot be read is
-unknown, never zero errors, and never no refusal (`UNREADABLE`).
+refused for its own integrity (a redirect, an encoded body, its token in a header or a body, an answer or a complete
+listing too large to check or serve whole) carries `gate_refusal`, its reason (`refusals`): the gate cut the
+condition's read, the agent did not read less. A log that cannot be read is unknown, never zero errors, and never no
+refusal (`UNREADABLE`).
 """
 
 import json

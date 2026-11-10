@@ -47,6 +47,7 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.sandbox import gatelog, kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec
+from expcore_onedata.sandbox.gatepolicy import PAGED
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, mount_identity, parse_mountinfo
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
@@ -285,7 +286,8 @@ class SandboxPlatform:
             raise ValueError("a run with a data path needs a leased slot, or [principals.data_path] for a fixed user")
         return fixed
 
-    def _spec(self, run_key: str, mode: DataPathMode, token: MintedToken | None, lease: Lease | None) -> SandboxSpec:
+    def _spec(self, run_key: str, level: str, token: MintedToken | None, lease: Lease | None) -> SandboxSpec:
+        mode = self._s.mode_of(level)
         if mode is DataPathMode.NONE:
             return SandboxSpec(run_key=run_key, mode=mode, lease_key=lease.key if lease else None)
         return SandboxSpec(
@@ -295,6 +297,7 @@ class SandboxPlatform:
             zone=Endpoint.from_url(self._config.zone.url),
             provider=Endpoint.from_url(self._config.local_provider.url),  # the agent is pinned to its local provider
             lease_key=lease.key if lease else None,
+            listing=self._s.listing_of(level) or PAGED,  # the level's listing mode (O19)
         )
 
     def _mint(
@@ -329,7 +332,7 @@ class SandboxPlatform:
             ended()
 
     def _prepare(
-        self, run_key: str, mode: DataPathMode, lease: Lease | None, tokens: RunTokens | None, condition: str | None
+        self, run_key: str, level: str, lease: Lease | None, tokens: RunTokens | None, condition: str | None
     ) -> DockerSandbox:
         """The sandbox of a run, built and not started: it has no effect on the host, so a launch holds it, and can stop
         it, from before the first resource exists."""
@@ -337,7 +340,7 @@ class SandboxPlatform:
         sandbox = DockerSandbox(
             self._host,
             self._s,
-            self._spec(run_key, mode, data, lease),
+            self._spec(run_key, level, data, lease),
             registry=self._registry,
             config_sha256=self._config.sha256,
             **self._options,
@@ -401,7 +404,7 @@ class SandboxPlatform:
                 )
                 minting.add_done_callback(lambda _: minted())  # a task that never got to run has no thread to end
                 tokens = await asyncio.shield(minting)
-                sandbox = self._prepare(run_key, mode, lease, tokens, condition)
+                sandbox = self._prepare(run_key, level, lease, tokens, condition)
                 ended = self._threads.began(lease.key if lease is not None else None)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end

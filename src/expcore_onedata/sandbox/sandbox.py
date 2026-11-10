@@ -41,7 +41,7 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import gatelog, hostops, netpool
+from expcore_onedata.sandbox import gatelog, gatepolicy, hostops, netpool
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
@@ -114,6 +114,7 @@ class DockerSandbox:
         self._meta: dict[str, Any] = {
             "run_key": spec.run_key,
             "data_path": spec.mode.value,
+            "listing": spec.listing if spec.mode is DataPathMode.REST else None,  # the gate's listing mode (O19)
             "images": {},
             "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
         }
@@ -190,6 +191,10 @@ class DockerSandbox:
             raise StartRefused("a REST data path needs the zone")
         if sp.mode is DataPathMode.MOUNT and (s.mount is None or s.oneclient is None):
             raise StartRefused("a mount data path needs [sandbox.mount] and the oneclient image")
+        if sp.listing not in gatepolicy.LISTINGS or (
+            sp.mode is not DataPathMode.REST and sp.listing != gatepolicy.PAGED
+        ):
+            raise StartRefused("the listing mode must be paged or complete, and complete is for a REST data path only")
         if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
             try:  # the bytes the record names by their hash, read once: the containers get these and never the path
                 self._ca_bytes = s.tls.bundle()
@@ -285,6 +290,7 @@ class DockerSandbox:
             "log": "/var/gate/requests.jsonl",
             "tls_dir": "/etc/gate/tls",
             "hosts": hosts,
+            "listing": self.spec.listing,  # paged, or every listing answered complete (O19)
         }
         if self._ca_copy is not None:
             config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only

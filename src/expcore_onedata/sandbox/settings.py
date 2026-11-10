@@ -46,8 +46,15 @@ io_mode = "direct"              # optional: "direct" or "proxy"
 extra_args = []                 # further oneclient arguments, never one that changes the TLS mode
 
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
-<level> = "rest"
+<level> = "rest"                # the kind alone; a rest level then pages its listings as the server does
+<level> = { kind = "rest", listing = "complete" }  # or a table: a rest level's listing, "paged" or "complete"
 ```
+
+`listing` is a REST data path's option (O19): `paged`, the default, passes the server's page of a listing as it comes,
+and `complete` has the data gate answer every listing with all of the directory's entries (`gatepolicy`). It is refused
+on a mount or no data path, where no gate serves a listing. A study selects it per condition through the level the
+condition gives its `data_path` factor. The run's metadata records it (`listing`), and so does the campaign fingerprint
+(`config.PlatformConfig.fingerprint`, from `data_path_record`), so two modes are never one experiment.
 
 The certificate check of the data gate's upstream and of oneclient is not declared here either: it is the platform's one
 `[tls]` setting (`tls.py`), which `load_platform` hands to `load_sandbox` and which every client of the federation
@@ -68,6 +75,7 @@ from types import MappingProxyType
 
 from expcore.config.loading import ConfigError, Section
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.sandbox.gatepolicy import LISTINGS, PAGED
 from expcore_onedata.sandbox.hostops import strict_networks
 from expcore_onedata.tls import TlsSettings, moved
 
@@ -141,12 +149,27 @@ class SandboxSettings:
     trust_paths: tuple[str, ...] = ()
     content_check_file: str | None = None  # the file the pre-campaign check reads (`precampaign.py`)
     tls: TlsSettings = field(default_factory=TlsSettings)  # the platform's [tls]: the gate's upstream and oneclient
+    listings: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))  # rest level -> its listing
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
         if level not in self.data_paths:
             raise ValueError("[sandbox.data_paths] does not map the level of this run's data_path factor")
         return self.data_paths[level]
+
+    def listing_of(self, level: str) -> str | None:
+        """The listing mode of a level (O19): `paged` or `complete` for a REST data path, None for any other."""
+        if self.mode_of(level) is not DataPathMode.REST:
+            return None
+        return self.listings.get(level, PAGED)
+
+    def data_path_record(self) -> dict[str, dict[str, str]]:
+        """Every level's data path as the campaign fingerprint holds it: its kind and, for REST, its listing mode."""
+        out: dict[str, dict[str, str]] = {}
+        for level, mode in self.data_paths.items():
+            listing = self.listing_of(level)
+            out[level] = {"kind": mode.value} | ({"listing": listing} if listing is not None else {})
+        return out
 
     def label(self, name: str) -> str:
         """A docker label key in this deployment's namespace."""
@@ -246,20 +269,47 @@ def _entry_string(section: Section, key: str, position: int) -> str:
     return value
 
 
-def _data_paths(section: Section) -> Mapping[str, DataPathMode]:
-    """Read [sandbox.data_paths]: level of the study's factor -> mount, rest or none."""
-    out = {}
-    for position, level in enumerate(section.data):  # a level is the study's word: it is named by position, not echoed
-        value = _entry_string(section, level, position)
-        try:
-            out[level] = DataPathMode(value)
-        except ValueError:
+def _data_path(section: Section, level: str, position: int) -> tuple[DataPathMode, str | None]:
+    """One level's data path: its kind, and the listing mode a REST level's table names (None when it names none). The
+    entry is a kind, or a table of `kind` and `listing`; it is named by its position, never by the level (O12)."""
+    value = section.data[level]
+    if isinstance(value, Mapping):
+        unknown = sorted(set(value) - {"kind", "listing"})
+        if unknown:
             raise section.fail(
-                None, f"entry {position}: must be one of: {', '.join(m.value for m in DataPathMode)}"
-            ) from None
-    if not out:
+                None, f"entry {position}: key {unknown[0]!r} is not a known key; known keys: kind, listing"
+            )
+        if "kind" not in value:
+            raise section.fail(None, f"entry {position}: key 'kind' is required")
+        kind, listing = value["kind"], value.get("listing")
+    else:
+        kind, listing = _entry_string(section, level, position), None
+    try:
+        mode = DataPathMode(kind) if isinstance(kind, str) else None
+    except ValueError:
+        mode = None
+    if mode is None:
+        raise section.fail(None, f"entry {position}: must be one of: {', '.join(m.value for m in DataPathMode)}")
+    if listing is not None and listing not in LISTINGS:
+        raise section.fail(None, f"entry {position}: key 'listing' must be one of: {', '.join(LISTINGS)}")
+    if listing is not None and mode is not DataPathMode.REST:
+        raise section.fail(
+            None, f"entry {position}: key 'listing' applies to a rest data path only: no gate lists here"
+        )
+    return mode, listing
+
+
+def _data_paths(section: Section) -> tuple[Mapping[str, DataPathMode], Mapping[str, str]]:
+    """Read [sandbox.data_paths]: level of the study's factor -> mount, rest or none, and each REST level's listing mode
+    (O19), `paged` unless its entry names `complete`."""
+    modes, listings = {}, {}
+    for position, level in enumerate(section.data):  # a level is the study's word: it is named by position, not echoed
+        modes[level], listing = _data_path(section, level, position)
+        if modes[level] is DataPathMode.REST:
+            listings[level] = listing or PAGED
+    if not modes:
         raise section.fail(None, "must map at least one level of the data_path factor")
-    return MappingProxyType(out)
+    return MappingProxyType(modes), MappingProxyType(listings)
 
 
 def _space_path(section: Section, key: str) -> str | None:
@@ -311,7 +361,7 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
     if not NAMESPACE_RE.fullmatch(namespace):
         raise section.fail("label_namespace", "must be lower-case letters, digits, '.' and '-'")
     agent, gate, oneclient = _images(section.section("images"))
-    data_paths = _data_paths(section.section("data_paths"))
+    data_paths, listings = _data_paths(section.section("data_paths"))
     mount = _mount(section.section("mount")) if "mount" in section.data else None
     if DataPathMode.MOUNT in data_paths.values() and (mount is None or oneclient is None):
         raise section.fail("mount", "and [sandbox.images.oneclient] are required when a data path is a mount")
@@ -343,6 +393,7 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
         trust_paths=_words(section, "trust_paths", ()),
         content_check_file=check_file,
         tls=tls if tls is not None else TlsSettings(),
+        listings=listings,
     )
 
 

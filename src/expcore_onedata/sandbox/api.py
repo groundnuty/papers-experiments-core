@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
+from expcore_onedata.sandbox.gatepolicy import PAGED
+
 
 class SandboxError(RuntimeError):
     """The sandbox failed: something did not come up, did not go away, or was not as declared."""
@@ -69,7 +71,8 @@ class SandboxSpec:
 
     The agent is pinned to its local provider (O03): `provider` is that one, and no other host is reachable. A run with
     no data path has no token and no endpoint. `lease_key` names the leased resource the sandbox's containers, network
-    and directories are labelled with, so a probe can prove them gone (C19).
+    and directories are labelled with, so a probe can prove them gone (C19). `listing` is a REST data path's listing
+    mode, `paged` or `complete` (`gatepolicy`, O19); a start refuses another, and any but `paged` on another data path.
     """
 
     run_key: str
@@ -78,6 +81,7 @@ class SandboxSpec:
     zone: Endpoint | None = None
     provider: Endpoint | None = None
     lease_key: str | None = None
+    listing: str = PAGED
 
 
 RAN = "ran"  # the cell was started: its exit code, timeout and kill say how it ended

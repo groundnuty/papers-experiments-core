@@ -1,6 +1,8 @@
 # Provenance:
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/sandbox/gate.py, blob 81e0330d90ea3d9a21ed27a9a9a09e9a78cafab0
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
+#   merged: icsa-2027-experiments @ 6fc798cf, icsa/sandbox/gate.py:846-888 (a listing merged from its pages upstream)
+#   changes: see the history of this file from its import commit
 """Policy gate: the only network peer the sandbox has (the sandbox network is internal).
 
 Runs in its own container, as root with all capabilities but NET_BIND_SERVICE
@@ -9,9 +11,16 @@ the upstream. Configuration: JSON at the path in argv[1]:
 
   {"run_key": "...", "verify_ssl": true, "log": "/var/gate/requests.jsonl",
    "upstream_ca_file": "/etc/gate/federation-ca.pem", "tls_dir": "/etc/gate/tls",
+   "listing": "paged|complete",
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
                         "port": 443, "tls": true}},
    "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
+
+`listing` is the data path's listing mode (gatepolicy, O19), `paged` when absent; a gate given another refuses to
+start. In `complete` the gate answers a listing with all of the directory's entries as one page, which it merges from
+the pages it reads upstream (`Handler._complete_listing`): each page passes the response boundary as any answer that is
+no file's content does, the merged answer is checked once more before any byte of it goes, and a listing it cannot
+complete within its bounds is refused, never passed on in part.
 
 For each host name the sandbox resolves (via --add-host) to the gate, the gate
 terminates TLS with a certificate for that name (signed by the run's CA, which
@@ -41,7 +50,9 @@ connection is served by its own thread and owns its upstream connections: nothin
 TLS context and the log.
 
 Every line the handler of a client connection logs carries that connection's `conn` (unique in this process), and a request's line carries
-`req_headers`: the few request headers that say what client it was (REQ_HEADERS_LOGGED), never any other. A request's `host` is the role the
+`req_headers`: the few request headers that say what client it was (REQ_HEADERS_LOGGED), never any other. A response's line says what its body was
+(`body`): `content` (the platform's 200 or 206 to a read of a file's content), `listing` (its 200 to a listing, or the merged answer), `other` (any other
+answer of the platform's, passed on) or `gate` (the gate's own answer: a refusal, an error); the per-run count of the bytes served reads it (gatelog, O20). A request's `host` is the role the
 gate serves that host in (`onezone`, `oneprovider`), or `not_configured`, never the host's configured name (O12). When a connection ends after a response without a
 request following, one `conn_close` event line says how (see `Handler._peer_gone`), with the kernel's counters of that connection at that moment: a response's
 `body_bytes` counts what the gate's socket accepted, which says nothing of what the client read, and the close is what shows it. When the gate itself is stopped
@@ -114,11 +125,15 @@ CLIENT_CREDENTIALS = {AUTH_HEADER.lower(), "authorization", "cookie"}  # whateve
 UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split between two reads is still found
 # How many answers the gate buffers at once (O05): an answer that is no file content is read whole, up to
 # gateboundary.BUFFER_CAP (4 MiB), and checked before it goes. At most 16 such buffers are held, 64 MiB, and a check
-# holds about four times its buffer at its peak (the raw bytes, a decoded layer, the next, a projection), so the whole
-# stays well under the gate's memory limit (sandbox.limits.gate_memory_bytes, 1 GiB by default). An answer that must be
-# buffered waits for a slot: the wait is the agent's own concurrency, on the agent's time.
+# holds about four times its buffer at its peak (the raw bytes, a decoded layer, the next, a projection): 256 MiB. A
+# complete listing (O19) reads each page in one of these slots, and one listing at a time is merged (_LISTING_SLOT),
+# into at most gatepolicy.COMPLETE_LISTING_BYTES (64 MiB): its pieces, the merged answer and the check of it, about
+# 6 x 64 = 384 MiB at the peak. Together 640 MiB, under the gate's memory limit (sandbox.limits.gate_memory_bytes, 1 GiB
+# by default). An answer that must be buffered, or a listing to merge, waits for a slot: the wait is the agent's own
+# concurrency, on the agent's time.
 BUFFER_SLOTS = 16
 _BUFFER_SLOTS = threading.BoundedSemaphore(BUFFER_SLOTS)
+_LISTING_SLOT = threading.BoundedSemaphore(1)
 # A buffered answer is written to the agent within this, or its connection is closed (the agent stopped reading): a
 # client that holds its socket open without reading cannot keep a buffer slot, so it cannot stall the others.
 CLIENT_WRITE_TIMEOUT_S = 60
@@ -375,6 +390,19 @@ def _checked(resp: http.client.HTTPResponse, seen: dict) -> http.client.HTTPResp
 
 
 TLS_RECORD = 16384  # the most plaintext one TLS record carries: a client reads a record whole or not at all
+# a complete listing's answer (O19): the pages' entries in one list, which is the last page and points to none
+_MERGED_HEAD, _MERGED_JOIN, _MERGED_TAIL = b'{"children": [', b", ", b'], "isLast": true, "nextPageToken": null}'
+_MERGED_HEADERS = [("Content-Type", "application/json")]
+
+
+def _body_kind(tag: str | None, status: int) -> str:
+    """What a body of the platform's that the gate passes on is, for its line (`body`) and the count of the bytes served
+    (gatelog, O20): a file's content, a listing, or anything else."""
+    if tag == "content" and status in (200, 206):
+        return "content"
+    if tag == "children" and status == 200:
+        return "listing"
+    return "other"
 
 
 class _CountingWriter:
@@ -612,6 +640,7 @@ class Handler(BaseHTTPRequestHandler):
             "error_origin": "client",
             "client_saw": "5xx" if code >= 500 else "4xx",
             "request_line": (getattr(self, "raw_requestline", b"") or b"")[:200].decode("latin-1", "replace").strip(),
+            "body": "gate",
         }
         try:
             super().send_error(code, message, explain)
@@ -620,6 +649,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _answer(self, rec: dict, code: int, obj: dict) -> None:
         """The gate's own answer, and then its line, so the line has the answer's body bytes; logged whatever the client did meanwhile."""
+        rec["body"] = "gate"
         try:
             self._send_json(code, obj)
         finally:
@@ -759,7 +789,8 @@ class Handler(BaseHTTPRequestHandler):
             rec.update(decision="deny", reason="host not allowed", status=403)
             self._answer(rec, 403, {"error": {"id": "forbidden", "details": "host not allowed"}})
             return
-        dec = gatepolicy.decide(hcfg["role"], self.command, url.path, url.query, body)  # a listing's limit: O05
+        listing = CFG.get("listing", gatepolicy.PAGED)  # a listing's limit: O05; its mode: O19
+        dec = gatepolicy.decide(hcfg["role"], self.command, url.path, url.query, body, listing=listing)
         rec.update(decision="allow" if dec.allow else "deny", reason=dec.reason, tag=dec.tag)
         if not dec.allow:
             rec["status"] = dec.status
@@ -776,7 +807,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._answer(rec, 400, {"error": {"id": "badRequest", "details": rec["reason"]}})
                 return
         try:
-            self._forward(hcfg, url, headers, body, rec)
+            if dec.merge_pages:
+                self._complete_listing(hcfg, url, headers, body, rec)
+            else:
+                self._forward(hcfg, url, headers, body, rec)
         except (ConnectionError, ssl.SSLError) as e:
             # unwrapped connection and TLS errors come only from the client's socket (upstream ones arrive as
             # _Upstream): the client went away, for instance while the headers were written; its own doing, not an error
@@ -841,15 +875,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def _forward(self, hcfg, url, headers, body, rec) -> None:
         target = url.path + ("?" + url.query if url.query else "")
-        resp = self._upstream(hcfg, self.command, target, body, self._fwd_headers(headers), rec)
+        self._pass_on(hcfg, self._upstream(hcfg, self.command, target, body, self._fwd_headers(headers), rec), rec)
+
+    def _screen(self, hcfg, resp, rec) -> list[tuple[str, str]] | None:
+        """The boundary's checks of an answer's status and headers (O05): the headers that may go to the agent, or None
+        when the answer was refused (answered with a 502 and logged). A redirect and an encoded body are refused, and so
+        is a header that holds the token; a credential header without it is withheld."""
         if gateboundary.is_redirect(resp.status):  # its Location or its body may hold the token: never followed
             error, details = "the upstream answered with a redirect", gateboundary.REDIRECT_DETAILS
             self._refuse_answer(hcfg, resp, rec, error=error, details=details, refusal=gateboundary.REDIRECT_REFUSED)
-            return
+            return None
         if not gateboundary.readable_encoding(resp.getheader("Content-Encoding"), resp.getheader("Transfer-Encoding")):
             error, details = "the upstream answered with an encoded body", gateboundary.ENCODED_DETAILS
             self._refuse_answer(hcfg, resp, rec, error=error, details=details, refusal=gateboundary.ENCODED_RESPONSE)
-            return
+            return None
         token = CFG.get("token")
         passed, withheld = [], []
         for k, v in resp.getheaders():
@@ -863,38 +902,132 @@ class Handler(BaseHTTPRequestHandler):
                 self._refuse_answer(
                     hcfg, resp, rec, error=error, details=details, refusal=gateboundary.CREDENTIAL_IN_HEADER
                 )
-                return
+                return None
             if k.lower() in gateboundary.CREDENTIAL_HEADERS:
                 withheld.append(k.lower())  # a credential of the upstream's, never the agent's
             else:
                 passed.append((k, v))
         if withheld:
             rec["withheld_headers"] = sorted(set(withheld))  # their names only
+        return passed
+
+    def _pass_on(self, hcfg, resp, rec) -> None:
+        """The platform's answer, through the boundary, to the agent as it came: a file's content streamed, anything else
+        read whole and checked first."""
+        passed = self._screen(hcfg, resp, rec)
+        if passed is None:
+            return
+        token, kind = CFG.get("token"), _body_kind(rec.get("tag"), resp.status)
         # the length http.client frames the body by (None: chunked, or until EOF), never the raw header; the boundary
         # never rewrites a body, so it stays true
         declared = None if resp.chunked else resp.length
         if gateboundary.streams(resp.status, rec.get("tag"), resp.getheader("Content-Type")):
+            rec["body"] = kind
             declared = self._send_head(resp, passed, declared)
             sent, failure, failure_origin = self._stream(resp, rec, token)
         else:  # no file's content: whole, and checked before any byte goes, in one of the shared buffer slots
-            waited = time.monotonic()
-            with _BUFFER_SLOTS:
-                if (wait := time.monotonic() - waited) > 0.001:
-                    rec["buffer_wait_s"] = round(wait, 3)  # the agent's own concurrency: other answers held the slots
+            with self._buffer_slot(rec):
                 body = self._buffered(hcfg, resp, rec, declared, token)
                 if body is None:
                     return  # refused: answered and logged
-                self.connection.settimeout(CLIENT_WRITE_TIMEOUT_S)  # a client that stops reading frees its slot
-                try:
-                    declared = self._send_head(resp, passed, len(body))
-                    sent, failure, failure_origin = self._write_whole(body, rec)
-                except TimeoutError:  # the head did not go: the agent stopped reading
-                    rec["client_stalled"] = rec["client_aborted"] = True
-                    self.close_connection = True
-                    declared, sent, failure, failure_origin = len(body), 0, None, "upstream"
-                finally:
-                    self.connection.settimeout(None)
+                declared, sent, failure, failure_origin = self._send_whole(resp, passed, body, rec, kind)
                 del body  # the slot is free once its buffer is gone
+        self._finish(hcfg, resp, rec, sent, declared, failure, failure_origin)
+
+    @contextlib.contextmanager
+    def _buffer_slot(self, rec):
+        """One of the shared buffer slots, held for the block; a wait for it is recorded (`buffer_wait_s`), summed over
+        the pages of a complete listing."""
+        waited = time.monotonic()
+        with _BUFFER_SLOTS:
+            if (wait := time.monotonic() - waited) > 0.001:  # the agent's own concurrency: other answers held the slots
+                rec["buffer_wait_s"] = round(rec.get("buffer_wait_s", 0) + wait, 3)
+            yield
+
+    def _send_whole(self, resp, passed, body: bytes, rec, kind: str) -> tuple[int | None, int, str | None, str]:
+        """A checked body and its head, written within CLIENT_WRITE_TIMEOUT_S: (length framed, bytes sent, failure, its
+        origin). A client that stops reading frees its slot: its connection is closed (`client_stalled`)."""
+        self.connection.settimeout(CLIENT_WRITE_TIMEOUT_S)
+        rec["body"] = kind
+        try:
+            declared = self._send_head(resp, passed, len(body))
+            sent, failure, failure_origin = self._write_whole(body, rec)
+        except TimeoutError:  # the head did not go: the agent stopped reading
+            rec["client_stalled"] = rec["client_aborted"] = True
+            self.close_connection = True
+            declared, sent, failure, failure_origin = len(body), 0, None, "upstream"
+        finally:
+            self.connection.settimeout(None)
+        return declared, sent, failure, failure_origin
+
+    def _complete_listing(self, hcfg, url, headers, body, rec) -> None:
+        """A listing in the complete mode (O19): every page of the directory, read upstream in the server's order and
+        answered as one page, or nothing of it.
+
+        The gate asks for pages of `gatepolicy.MAX_LIST_LIMIT` with the agent's other options (`complete_listing_request`)
+        and goes on while a page says it is not the last (`listing_page`). The first page's answer that is not a 200 (the
+        directory does not exist, say) is passed on as the paged mode passes it. After that, a page that is not a 200 or
+        that the listing cannot go on from is the platform's failure (a 502 of origin `upstream`), and a listing past
+        `COMPLETE_LISTING_BYTES` or `COMPLETE_LISTING_PAGES` is refused for the gate's integrity (`listing_too_large`):
+        never a part of the listing passed on as if it were the whole. Each page passes the boundary as any answer that
+        is no file's content does, read whole in a buffer slot and checked, and the merged answer is checked once more."""
+        pairs, body = gatepolicy.complete_listing_request(url.query, body)
+        fwd, token = self._fwd_headers(headers), CFG.get("token")
+        pieces: list[bytes] = []
+        size, entries, seen, after = len(_MERGED_HEAD) + len(_MERGED_TAIL), 0, set(), None
+        rec.update(complete_listing=True, pages=0)
+        waited = time.monotonic()
+        with _LISTING_SLOT:
+            if (wait := time.monotonic() - waited) > 0.001:  # another complete listing was being merged
+                rec["listing_wait_s"] = round(wait, 3)
+            while True:
+                target = gatepolicy.page_target(url.path, pairs, after)
+                resp = self._upstream(hcfg, self.command, target, body, fwd, rec)
+                if resp.status != 200 and not rec["pages"]:
+                    self._pass_on(hcfg, resp, rec)  # the platform's answer to the agent's own listing
+                    return
+                if resp.status != 200:
+                    raise _Upstream(_Framing(f"page {rec['pages'] + 1} of a complete listing answered {resp.status}"))
+                if self._screen(hcfg, resp, rec) is None:
+                    return
+                with self._buffer_slot(rec):
+                    data = self._buffered(hcfg, resp, rec, None if resp.chunked else resp.length, token)
+                    if data is None:
+                        return  # refused: answered and logged
+                    self._settle(hcfg, resp)
+                    try:
+                        children, after = gatepolicy.listing_page(data, seen)
+                    except ValueError as e:
+                        raise _Upstream(_Framing(str(e))) from e
+                    piece = json.dumps(children).encode()[1:-1]  # the entries without the brackets: ASCII JSON
+                rec["pages"] += 1
+                entries += len(children)
+                if piece:
+                    size += len(piece) + (len(_MERGED_JOIN) if pieces else 0)
+                    pieces.append(piece)
+                bound = "bytes" if size > gatepolicy.COMPLETE_LISTING_BYTES else None
+                if bound is None and after is not None and rec["pages"] >= gatepolicy.COMPLETE_LISTING_PAGES:
+                    bound = "pages"
+                if bound is not None:
+                    rec["listing_bound"] = bound
+                    error, details = "a complete listing is past the gate's bound", gateboundary.LISTING_DETAILS
+                    self._refuse_answer(
+                        hcfg, resp, rec, error=error, details=details, refusal=gateboundary.LISTING_TOO_LARGE
+                    )
+                    return
+                if after is None:
+                    break
+            merged = _MERGED_HEAD + _MERGED_JOIN.join(pieces) + _MERGED_TAIL
+            del pieces
+            rec["entries"] = entries
+            if gateboundary.holds_token(merged, token):  # the pages were checked; their joins are checked here
+                error, details = "the merged listing held the gate's credential", gateboundary.CREDENTIAL_DETAILS
+                self._refuse_answer(
+                    hcfg, resp, rec, error=error, details=details, refusal=gateboundary.CREDENTIAL_IN_RESPONSE
+                )
+                return
+            declared, sent, failure, failure_origin = self._send_whole(resp, _MERGED_HEADERS, merged, rec, "listing")
+            del merged
         self._finish(hcfg, resp, rec, sent, declared, failure, failure_origin)
 
     def _buffered(self, hcfg, resp, rec, declared, token) -> bytes | None:
@@ -1207,6 +1340,8 @@ def main() -> None:
     CFG["token"] = os.environ.pop(TOKEN_ENV, "")  # out of the environment as soon as it is read
     if not CFG["token"]:
         raise SystemExit("the gate has no token to add to the requests it forwards")
+    if CFG.get("listing", gatepolicy.PAGED) not in gatepolicy.LISTINGS:  # O19: never a mode it would guess at
+        raise SystemExit("the gate's listing mode is not one it knows")
     for f in CFG.get("tcp_forwards", []):
         _tcp_forward(f["listen"], f["host"], f["port"])
     GateServer.request_queue_size = int(CFG.get("listen_backlog", GateServer.request_queue_size))

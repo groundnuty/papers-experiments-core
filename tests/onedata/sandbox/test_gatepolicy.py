@@ -215,3 +215,71 @@ def test_o05_the_nesting_bound_reads_the_body_as_the_parser_decodes_it(encoding)
     assert policy.decide("oneprovider", "GET", CHILDREN, "", body).allow
     deep = ('{"a": ' + "[" * 40 + "]" * 40 + "}").encode(encoding)
     assert policy.decide("oneprovider", "GET", CHILDREN, "", deep).status == 400
+
+
+def test_o19_a_listing_in_the_complete_mode_is_merged_and_one_in_the_paged_mode_is_not():
+    """O19: the data path's listing mode decides whether the gate follows a listing's pages; only a listing is merged,
+    and a mode the policy does not know raises rather than being taken for either."""
+    complete = policy.decide("oneprovider", "GET", CHILDREN, "limit=1000", listing=policy.COMPLETE)
+    assert (complete.allow, complete.merge_pages, complete.tag) == (True, True, "children")
+    assert not policy.decide("oneprovider", "GET", CHILDREN, "limit=1000").merge_pages
+    assert not policy.decide("oneprovider", "GET", BASE + "oneprovider/data/f1", listing=policy.COMPLETE).merge_pages
+    with pytest.raises(ValueError, match="listing mode"):
+        policy.decide("oneprovider", "GET", CHILDREN, listing="everything")
+
+
+@pytest.mark.parametrize(
+    ("query", "body"),
+    [("token=t", None), ("index=a", None), ("offset=2", None), ("", b'{"token": "t"}'), ("", b'{"index": "a"}')],
+)
+def test_o19_a_complete_listing_naming_where_it_starts_is_refused_and_its_limit_is_not_read(query, body):
+    """O19: where a complete listing starts is not the agent's to say, in the query or the body; its limit is the
+    gate's, so a limit the paged mode refuses passes, while a malformed body is still refused."""
+    refused = policy.decide("oneprovider", "GET", CHILDREN, query, body, listing=policy.COMPLETE)
+    assert (refused.allow, refused.status, refused.reason) == (False, 400, policy.START_REFUSED)
+    assert policy.decide("oneprovider", "GET", CHILDREN, "limit=5000", listing=policy.COMPLETE).allow
+    assert policy.decide("oneprovider", "GET", CHILDREN, "", b'{"limit": "x"}', listing=policy.COMPLETE).allow
+    assert policy.decide("oneprovider", "GET", CHILDREN, "", b"[1]", listing=policy.COMPLETE).status == 400
+
+
+def test_o19_every_page_goes_with_the_agents_options_but_the_ones_the_gate_sets():
+    """O19: the gate drops the agent's limit and the large-listing hint from the query and the body, keeps the rest,
+    leaves a body without them as it came, and adds its page size and the token of the page before."""
+    pairs, body = policy.complete_listing_request(
+        "limit=7&attribute=name&tuneForLargeContinuousListing=true", b'{"limit": 9, "attributes": ["size"]}'
+    )
+    assert pairs == [("attribute", "name")]
+    assert json.loads(body) == {"attributes": ["size"]}
+    untouched = b'{ "attributes" : ["size"] }'
+    assert policy.complete_listing_request("", untouched) == ([], untouched)
+    assert policy.page_target("/p", pairs, None) == f"/p?attribute=name&limit={policy.MAX_LIST_LIMIT}"
+    assert policy.page_target("/p", [], "a b") == f"/p?limit={policy.MAX_LIST_LIMIT}&token=a+b"
+
+
+def test_o19_a_page_gives_its_entries_and_the_next_token_or_ends_the_listing():
+    """O19: a page that is not the last gives the token of the next, whatever its length; the last gives none."""
+    seen = set()
+    page = b'{"children": [], "isLast": false, "nextPageToken": "next-a"}'
+    assert policy.listing_page(page, seen) == ([], "next-a")
+    entries, after = policy.listing_page(b'{"children": [{"name": "a"}], "isLast": true, "nextPageToken": null}', seen)
+    assert (entries, after, seen) == ([{"name": "a"}], None, {"next-a"})
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"not json",
+        b"[]",
+        b'{"isLast": true}',
+        b'{"children": [], "isLast": 1}',
+        b'{"children": [], "isLast": false}',
+        b'{"children": [], "isLast": false, "nextPageToken": ""}',
+        b'{"children": [], "isLast": false, "nextPageToken": "next-z"}',
+        b'{"children": [NaN], "isLast": true}',
+    ],
+)
+def test_o19_a_page_the_listing_cannot_go_on_from_is_refused(data):
+    """O19: no end and no continuation, a token the listing gave before, a page that is not one, or a value JSON
+    does not have: the listing cannot be completed from it, so it is never taken for its end."""
+    with pytest.raises(ValueError, match="listing page"):
+        policy.listing_page(data, {"next-z"})

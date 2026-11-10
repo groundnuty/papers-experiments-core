@@ -2,7 +2,7 @@
 
 import pytest
 from platform_support import write_platform
-from sandbox_support import AGENT_IMAGE_ID, GATE_IMAGE_ID, LEVELS, POOL, add_sandbox
+from sandbox_support import AGENT_IMAGE_ID, COMPLETE_LEVEL, GATE_IMAGE_ID, LEVELS, POOL, add_sandbox
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
@@ -200,3 +200,93 @@ def test_o12_a_level_with_a_bad_value_is_named_by_position_and_never_by_itself(t
     with pytest.raises(ConfigError, match=r"entry \d+: must be a non-empty string, got int") as caught:
         load(tmp_path, edit)
     assert key not in str(caught.value)
+
+
+def test_o19_a_rest_level_selects_its_listing_mode_and_one_without_it_pages(tmp_path):
+    """O19: a level's entry is its kind, or a table of its kind and a REST level's listing mode; a REST level that names
+    none pages its listings as the server does, and a level of another kind has no listing mode."""
+
+    def edit(data):
+        data["sandbox"]["data_paths"]["via-gate-full"] = {"kind": "rest", "listing": "complete"}
+        data["sandbox"]["data_paths"]["via-gate-pages"] = {"kind": "rest", "listing": "paged"}
+        data["sandbox"]["data_paths"]["mounted-too"] = {"kind": "mount"}
+
+    sandbox = load(tmp_path, edit)
+    assert sandbox.mode_of("via-gate-full") is DataPathMode.REST
+    listings = {level: sandbox.listing_of(level) for level in sandbox.data_paths}
+    assert listings == {
+        "mounted": None,
+        "via-gate": "paged",
+        "isolated": None,
+        COMPLETE_LEVEL: "complete",
+        "via-gate-full": "complete",
+        "via-gate-pages": "paged",
+        "mounted-too": None,
+    }
+    assert sandbox.data_path_record()["via-gate-full"] == {"kind": "rest", "listing": "complete"}
+    assert sandbox.data_path_record()["mounted-too"] == {"kind": "mount"}
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [
+        ({"kind": "mount", "listing": "complete"}, "applies to a rest data path only"),
+        ({"kind": "none", "listing": "paged"}, "applies to a rest data path only"),
+        ({"kind": "rest", "listing": "everything"}, "key 'listing' must be one of: paged, complete"),
+        ({"kind": "rest", "listing": 1}, "key 'listing' must be one of"),
+        ({"listing": "complete"}, "key 'kind' is required"),
+        ({"kind": "rest", "pages": "all"}, "key 'pages' is not a known key"),
+        ({"kind": "elsewhere"}, "must be one of: mount, rest, none"),
+    ],
+)
+def test_o19_o12_a_listing_mode_where_it_cannot_apply_is_refused_naming_the_level_by_position(tmp_path, entry, message):
+    """O19, O12: a listing mode on a mount or no data path, one the gate does not know, or a table without a kind is
+    refused at load; the level is named by its position, never by itself."""
+
+    def edit(data):
+        data["sandbox"]["data_paths"]["via-gate"] = entry
+
+    with pytest.raises(ConfigError, match=rf"entry \d: .*{message}") as caught:
+        load(tmp_path, edit)
+    assert "via-gate" not in str(caught.value)
+
+
+def test_o19_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(tmp_path):
+    """O19, C06: the platform's half of the fingerprint holds each level's kind and a REST level's listing mode, so a
+    campaign started with one listing mode for a level is refused a resume with the other; the same mode resumes."""
+    from campaign_support import make_fingerprint, make_manifest, make_schema
+    from platform_support import NOW
+
+    from expcore.campaign.resume import FingerprintMismatch, open_campaign
+
+    def platform(listing):
+        def edit(data):
+            add_sandbox(data)
+            data["sandbox"]["data_paths"]["via-gate"] = {"kind": "rest", "listing": listing}
+
+        (tmp_path / listing).mkdir()
+        return load_platform(write_platform(tmp_path / listing, edit), require_secrets=False).fingerprint()
+
+    paged, complete = platform("paged"), platform("complete")
+    assert paged["data_paths"] == {
+        "mounted": {"kind": "mount"},
+        "via-gate": {"kind": "rest", "listing": "paged"},
+        "isolated": {"kind": "none"},
+        COMPLETE_LEVEL: {"kind": "rest", "listing": "complete"},
+    }
+    assert complete["data_paths"]["via-gate"] == {"kind": "rest", "listing": "complete"}
+    schema, manifest = make_schema(), make_manifest(make_schema())
+
+    def resume(fingerprint):
+        store, _ = open_campaign(
+            tmp_path / "campaign.db", schema, manifest, make_fingerprint(schema, platform=fingerprint), now=NOW,
+            max_attempts=3,
+        )  # fmt: skip
+        store.close()
+
+    resume(paged)
+    with pytest.raises(FingerprintMismatch) as caught:
+        resume(complete)
+    assert caught.value.differences
+    assert all(line.startswith("platform.data_paths") for line in caught.value.differences)
+    resume(paged)
