@@ -192,10 +192,14 @@ MASK = b"<*>"  # no letter or digit, so it can be neither a term nor a part of a
 
 
 def without_paths(data: bytes, paths: Collection[str]) -> bytes:
-    """A generated file with each exact mention of `paths` masked: a whole field of a manifest line (`<sha256>  <path>`)
-    or a whole JSON string. A longer string that merely starts with a path, or holds one, is left as it is, so a name
-    it holds besides is still found."""
+    """A generated file with each exact mention of `paths` masked: an entire JSON string, everything between its
+    quotes, as the generated JSON writes a path; or an entire path field of a manifest line (`<sha256>  <path>`, to the
+    end of the line). Nothing inside a longer string or field is masked, a note that names a path among other words
+    say, so a name it holds is still found there."""
     for path in paths:
-        for form in {path.encode("utf-8"), json.dumps(path)[1:-1].encode("utf-8")}:
-            data = re.sub(rb'(?<![^\s"])' + re.escape(form) + rb'(?![^\s"])', MASK, data)
+        quoted = {json.dumps(path, ensure_ascii=escaped)[1:-1].encode("utf-8") for escaped in (True, False)}
+        for form in quoted:
+            data = re.sub(rb'(?<!\\)"' + re.escape(form) + rb'"', b'"' + MASK + b'"', data)
+        field = re.escape(path.encode("utf-8"))
+        data = re.sub(rb"(?m)^(\S+  )" + field + rb"(\r?)$", rb"\g<1>" + MASK + rb"\g<2>", data)
     return data

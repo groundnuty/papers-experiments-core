@@ -499,3 +499,39 @@ def test_k05_a_generated_file_is_masked_only_where_it_names_a_reported_path_exac
         without_paths(b'["notes/a", "notes/a-b"]\nabc  notes/a\nabc  notes/a/c\n', {"notes/a"})
         == b'["<*>", "notes/a-b"]\nabc  <*>\nabc  notes/a/c\n'
     )
+
+
+def test_k05_a_reported_path_inside_a_longer_string_of_a_generated_file_is_never_masked():
+    """K05: a generated file is masked only where a reported path is an entire JSON string or an entire manifest path
+    field; a note that names the path among other words is a longer string, read like the rest, so the name it holds is
+    still found there."""
+    path = f"{PRIVATE}.txt"
+    files = {
+        path: b"plain\n",
+        "PACKAGE.json": json.dumps({"note": f"copied {path} yesterday", "uncommitted": [path]}).encode(),
+        "SHA256SUMS": f"{'0' * 64}  {path}\n".encode(),
+    }
+    findings = findings_in(
+        files, HASHES, None, frozenset(), frozenset(), frozenset(), generated={"SHA256SUMS", "PACKAGE.json"}
+    )
+    assert f"PACKAGE.json:1: {NAMED}" in findings
+    assert not any(finding.startswith("SHA256SUMS") for finding in findings)
+    note = json.dumps([f"copied {path} yesterday", path, f"{path} again"]).encode()
+    assert without_paths(note, {path}) == json.dumps([f"copied {path} yesterday", "<*>", f"{path} again"]).encode()
+    assert without_paths(f"{'0' * 64}  {path} copy\n".encode(), {path}) == f"{'0' * 64}  {path} copy\n".encode()
+
+
+def test_k05_the_same_payload_encoded_on_two_lines_is_reported_at_both():
+    """K05: decoded runs are told apart by what they decode to and where they stand, so the same payload encoded twice,
+    on two lines, is reported for each run; a run the parsed strings show again is still reported once."""
+    run = b64(TEXT).decode()
+    text = f"first {run}\n\nagain {run}\n".encode()
+    second = len(f"first {run}\n\nagain ")
+    assert set(found({"notes.txt": text})) == {
+        f"notes.txt!(base64@6):1: {NAMED}",
+        f"notes.txt!(base64@{second}):1: {NAMED}",
+    }
+    record = json.dumps({"a": run, "b": run}).encode()
+    at = len('{"a": "'), len(f'{{"a": "{run}", "b": "')
+    decoded = {finding for finding in found({"record.json": record}) if finding.endswith(f":1: {NAMED}")}
+    assert decoded == {f"record.json!(base64@{offset}):1: {NAMED}" for offset in at}
