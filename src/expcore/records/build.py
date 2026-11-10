@@ -386,8 +386,8 @@ def build_record(result: LoopResult, recording: RecordingBackend, **options: Any
 class DefectSink(Protocol):
     """Where the traceback of a harness defect goes (the campaign's `defect_log.DefectLog`). `record_attempt` hands it
     the attempt's whole redaction context first, and calls it with each crash the loop turns into a defect. Calling it
-    must not raise, since the loop calls it before the record exists: a sink keeps its own failure and reports it
-    once the result is stored."""
+    should not raise, since the loop calls it before the record exists; if it does, the loop carries the exception
+    forward and `record_attempt` hands it to `on_sink_failure` once the record is built."""
 
     def redact_with(self, redactor: Callable[[], Redactor]) -> None:
         """Use this redactor, built when an entry is written, for the attempt's entries from now on."""
@@ -418,6 +418,7 @@ async def _record_attempt(
     models: ModelTable | None = None,
     environ: Mapping[str, str] | None = None,
     defect_log: DefectSink | None = None,
+    on_sink_failure: Callable[[Exception], object] | None = None,
 ) -> RunRecord:
     """Run one attempt through the loop, recording it as `schema_version`, and return its record.
 
@@ -438,6 +439,8 @@ async def _record_attempt(
 
     `defect_log` (the campaign passes one through `record_run`) gets the same redaction context before anything can
     crash, so a traceback in it is redacted with these secrets too, and each crash the loop turns into a harness defect.
+    What the sink raises is handed to `on_sink_failure` once the record is built (`record_run` passes the attempt's
+    log, which reports it once the result is stored), or, with no one to hand it to, warned of.
     """
     secrets, secret_env = tuple(secrets), tuple(secret_env)  # read once: the early check would use up an iterator
 
@@ -462,7 +465,7 @@ async def _record_attempt(
         sleep=sleep,
         on_defect=defect_log,
     )
-    return _build_record(
+    record = _build_record(
         result,
         recording,
         identity=identity,
@@ -478,6 +481,12 @@ async def _record_attempt(
         models=models,
         environ=environ,
     )
+    if result.sink_failure is not None:  # the record exists: now the sink's failure can be reported
+        if on_sink_failure is None:
+            warnings.warn(f"the defect sink failed: {type(result.sink_failure).__name__}", RuntimeWarning, stacklevel=2)
+        else:
+            on_sink_failure(result.sink_failure)
+    return record
 
 
 async def record_attempt(
@@ -493,8 +502,8 @@ async def record_attempt(
 
     A live run cannot choose an older record version: that would apply an older treatment rule to a new run.
     The keyword options are those of the private `_record_attempt` (`code`, `core_version`, `treatment_kinds`,
-    `timer`, `clock`, `sleep`, `secrets`, `secret_env`, `models`, `environ`, `defect_log`); `schema_version`
-    is refused.
+    `timer`, `clock`, `sleep`, `secrets`, `secret_env`, `models`, `environ`, `defect_log`, `on_sink_failure`);
+    `schema_version` is refused.
     """
     if "schema_version" in options:
         raise TypeError("record_attempt writes the current record version; a live run cannot choose another")

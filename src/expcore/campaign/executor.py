@@ -85,7 +85,8 @@ class RunRequest:
     - `lease`: the lease the platform's resources require, held for the whole attempt; None without one.
     - `models`: the study's whole model table. `record_run` records with it, so the key of every model is redacted
       whatever the backend: the protocol does not require a backend to hold its model entry (R12).
-    - `defect_log`: where the attempt's harness defects leave their redacted traceback (`defect_log.DefectLog`).
+    - `defect_log`: where the attempt's harness defects leave their redacted traceback (`defect_log.DefectLog`); it
+      also keeps what an executor's own sink raised, which the attempt reports once the result is stored.
       `record_run` passes it on, so a crash the loop catches is logged too, redacted with every secret the executor
       hands `record_run`.
     """
@@ -145,8 +146,14 @@ async def record_run(
         treatment_kinds=request.treatment_kinds,
         timer=request.timer,
         clock=request.clock,
-        **{"models": request.models, "defect_log": request.defect_log, **options},
+        **{"models": request.models, "defect_log": request.defect_log, **_sink_failure_to(request), **options},
     )
+
+
+def _sink_failure_to(request: RunRequest) -> dict[str, Any]:
+    """Where a failure of the attempt's defect sink goes (the request's own log, or an executor's sink passed in its
+    place): the request's log, which the attempt reports once the result is stored."""
+    return {} if request.defect_log is None else {"on_sink_failure": request.defect_log.keep}
 
 
 def _total(turns: Sequence[Mapping[str, Any]], name: str) -> int | None:

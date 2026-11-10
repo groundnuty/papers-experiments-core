@@ -278,3 +278,38 @@ def test_c17_an_unwritable_log_never_costs_the_record_and_stops_dispatch_naming_
     assert record.outcome["defect"]["exception"] == "LookupError"
     markers = [json.loads(p.read_text(encoding="utf-8")) for p in (tmp_path / "runs").rglob("*marker.json")]
     assert [m["result"]["outcome"]["name"] for m in markers if m["run_key"] == crashed] == ["harness_defect"]
+
+
+class RaisingSink:
+    """An executor's own defect sink that fails, against the advice that a sink should not raise."""
+
+    def redact_with(self, redactor):
+        pass
+
+    def __call__(self, error, defect):
+        raise RuntimeError("the sink's disk is full")
+
+
+def test_c17_a_custom_sink_that_raises_never_costs_the_record_and_stops_dispatch_naming_its_failure(tmp_path):
+    """C17: the loop guards its sink: the attempt still ends as a harness defect with its record, marker and store row,
+    and only then does dispatch stop loudly, naming what the sink raised."""
+    crashed = key_of(SCHEMA, "mount-read")
+    executor = FakeExecutor()
+
+    async def lookup(request):
+        request.backend.use([LookupError("no route")])
+        record = await record_run(
+            request, [FakeProvider({})], "be brief", "do it", executor.config, code=dict(CODE), defect_log=RaisingSink()
+        )
+        executor.records.append(record)
+        return record
+
+    executor.behaviours[crashed] = collections.deque([lookup])
+    with build(tmp_path, executor=executor, plan=SMALL) as scheduler:
+        with pytest.raises(RuntimeError, match=r"the executor's defect sink .*RuntimeError: the sink's disk is full"):
+            scheduler.run()
+        assert attempts_of(scheduler.store, crashed) == [("harness_error", 0, 1)]
+    [record] = [r for r in executor.records if r.run_key == crashed]
+    assert record.outcome["defect"]["exception"] == "LookupError"
+    markers = [json.loads(p.read_text(encoding="utf-8")) for p in (tmp_path / "runs").rglob("*marker.json")]
+    assert [m["result"]["outcome"]["name"] for m in markers if m["run_key"] == crashed] == ["harness_defect"]

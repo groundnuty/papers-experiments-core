@@ -112,6 +112,7 @@ class DefectLog:
         self.root, self.run_key, self.attempt, self._stamp = Path(root), run_key, attempt, stamp
         self._redactor = redactor
         self.failure: Exception | None = None  # the first entry that could not be written, if any
+        self._where = f"the harness-error log {log_path(self.root)}"
 
     def redact_with(self, redactor: Callable[[], Redactor]) -> None:
         """Use this redactor for the attempt's entries from now on."""
@@ -135,13 +136,19 @@ class DefectLog:
                 self.failure = failure
             return None
 
+    def keep(self, failure: Exception) -> None:
+        """Keep what an executor's own defect sink raised, to be raised by `raise_failure` once the result is stored."""
+        if self.failure is None:
+            self.failure, self._where = failure, "the executor's defect sink"
+
     def raise_failure(self) -> None:
-        """Raise LogUnwritable, naming the log and why, when an entry of this attempt could not be written."""
+        """Raise LogUnwritable, naming the log or the executor's sink and why, when an entry of this attempt could not
+        be written."""
         if self.failure is not None:
             why = f"{type(self.failure).__name__}: {self.failure}"
             raise LogUnwritable(
-                f"the harness-error log {log_path(self.root)} could not be written ({why}); the attempt's result is "
-                "stored, and dispatch stops until the log can be written"
+                f"{self._where} could not be written ({why}); the attempt's result is stored, and dispatch stops until "
+                "it can be written"
             ) from self.failure
 
 

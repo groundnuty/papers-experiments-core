@@ -70,8 +70,9 @@ async def run_agent(
     cleanup took (`cleanup_s`) and whether it was given up on (`cleanup_timed_out`).
 
     `on_defect` is called with every crash in our own code the loop turns into a harness defect, and the defect the
-    outcome carries, so the caller can keep the traceback the outcome leaves out (the campaign's `defect_log`). It must
-    not raise: the result, and the record built from it, come after it.
+    outcome carries, so the caller can keep the traceback the outcome leaves out (the campaign's `defect_log`). It
+    should not raise; if it does, the loop keeps the result and the defect and carries the hook's exception on the
+    result (`sink_failure`), so the record built from it is not lost.
     """
     if toolbox.cap_chars != config.limits.output_cap_chars:
         raise ValueError(
@@ -103,6 +104,7 @@ class _Run:
     ):
         self.backend, self.toolbox, self.system, self.user = backend, toolbox, system, user
         self.on_defect = on_defect
+        self.sink_failure: Exception | None = None  # the first exception the on_defect hook raised
         self.config, self.timer = config, timer
         self.watcher = Watcher(timer, sleep, cleanup_deadline_s=config.cleanup_deadline_s)
         self.turns: list[TurnRecord] = []
@@ -398,7 +400,10 @@ class _Run:
         """Record a crash in our own code: the exception class and a stack hash without line numbers (L08)."""
         defect = harness_defect_of(exc)
         if self.on_defect is not None:  # the traceback, which the outcome leaves out
-            self.on_defect(exc, defect)
+            try:
+                self.on_defect(exc, defect)
+            except Exception as failure:  # the hook's own failure must cost neither the result nor the record
+                self.sink_failure = self.sink_failure or failure
         detail = f"{where} failed inside the harness ({defect.exception}, stack {defect.stack_sha256[:12]}): {exc}"
         return Outcome("harness_defect", detail, defect=defect)
 
@@ -435,4 +440,5 @@ class _Run:
             tool_manifest_sha256=self.toolbox.manifest_sha256,
             config_sha256=config_sha256_of(record),
             config=record,
+            sink_failure=self.sink_failure,
         )
