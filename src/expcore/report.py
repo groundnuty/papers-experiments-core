@@ -9,7 +9,8 @@ are the same text: no clock, no path and no random number enters it.
   flag (`ContrastResult.exploratory`), never from a guess here, and a result whose flag disagrees with its place in the
   Holm decisions is refused, so no table or summary line can show an exploratory contrast as confirmatory.
 - A conclusion is never shown without its significance. Each row carries the raw p-value and the Holm-adjusted one
-  (or the word "exploratory") beside the conclusion, and the conclusion words already encode the decision:
+  (or the word "exploratory") beside the conclusion, and the preregistered equivalence margin with the interval at
+  1 - 2 alpha that `equivalent` and `trivial_difference` rest on, and the conclusion words already encode the decision:
   `difference`, `trivial_difference`, `equivalent`, `not_detected`, `untestable`. Failing to detect a difference is
   not a finding of none, and the report says so under the table. An `untestable` contrast used no pair: its row gives
   the causes of its missing pairs with their counts in place of a number of pairs, and a result whose word disagrees
@@ -25,6 +26,7 @@ are the same text: no clock, no path and no random number enters it.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
+- The fixed prose beside the tables is in `expcore.report_notes`.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
   the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13).
 """
@@ -36,12 +38,21 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore.accounting import condition_accounting
+from expcore.report_notes import (
+    CONDITION_NOTES,
+    COUNT_DEFINITIONS,
+    MDE_NOTES,
+    MISSING_PAIRS,
+    NO_KIND,
+    contrast_notes,
+    equivalence_header,
+)
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
 from expcore.stats.pairing import MISSING_CAUSES
 
 EXPLORATORY = "exploratory"
 UNKNOWN = "n/a"
-NO_KIND = "none"  # the kind column of a condition's row of zeros
+NO_MARGIN = "-"  # the margin and the equivalence interval of a contrast that preregistered no margin
 CAUSE_HEADINGS = {
     "treatment_outcome_none": "Treatment outcome None",
     "treatment_excluded": "Treatment excluded",
@@ -96,6 +107,19 @@ def _arms(result: ContrastResult) -> str:
     return f"{first} vs {second}"
 
 
+def _margin(result: ContrastResult) -> str:
+    """The preregistered equivalence margin, or `-` without one."""
+    return NO_MARGIN if result.equivalence_margin is None else _num(result.equivalence_margin)
+
+
+def _equivalence_interval(result: ContrastResult) -> str:
+    """The interval at 1 - 2 alpha that is compared with the margin, or `-` without a margin."""
+    if result.equivalence_interval is None:
+        return NO_MARGIN
+    low, high = result.equivalence_interval
+    return f"[{_num(low)}, {_num(high)}]"
+
+
 def _mde(result: ContrastResult) -> str:
     if result.minimum_detectable_effect is None:
         return "-"
@@ -115,10 +139,16 @@ def _treatment(result: ContrastResult) -> str:
 
 
 def _contrast_table(
-    results: Sequence[ContrastResult], adjusted: Mapping[str, float], level: float | None, *, with_mde: bool
+    results: Sequence[ContrastResult],
+    adjusted: Mapping[str, float],
+    level: float | None,
+    alpha: float,
+    *,
+    with_mde: bool,
 ) -> list[str]:
     interval = "Interval" if level is None else f"{level:.0%} interval"
-    header = ["Contrast", "Arms (A vs B, A - B)", "Outcome", "Estimate", interval, "p", "Holm p", "Conclusion"]
+    header = ["Contrast", "Arms (A vs B, A - B)", "Outcome", "Estimate", interval, "Margin", equivalence_header(alpha)]
+    header += ["p", "Holm p", "Conclusion"]
     header += ["Clusters", "Pairs used", "Treatment attempts", "Tasks dropped"]
     header += ["Min. detectable effect"] if with_mde else []
     rows = []
@@ -131,6 +161,8 @@ def _contrast_table(
             r.outcome,
             _num(r.estimate),
             f"[{_num(r.ci_low)}, {_num(r.ci_high)}]",
+            _margin(r),
+            _equivalence_interval(r),
             _p(r.p_value),
             EXPLORATORY if exploratory else _p(adjusted[r.name]),
             conclusion,
@@ -174,33 +206,12 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
     exploratory = [r for r in result.contrasts if _exploratory(r, adjusted)]
     with_mde = any(r.minimum_detectable_effect is not None for r in result.contrasts)
     lines = [f"## Preregistered contrasts (Holm family of {len(family)}, alpha = {result.alpha:g})", ""]
-    lines += _contrast_table(family, adjusted, level, with_mde=with_mde) if family else ["No contrast in the family."]
-    lines += [
-        "",
-        "Conclusions: `difference` (significant), `trivial_difference` (significant, but inside the equivalence",
-        "margin), `equivalent` (inside the margin, not significant), `not_detected` (anything else; failing to",
-        "detect a difference is not evidence that there is none), `untestable` (no usable pair, so nothing was",
-        "tested and the contrast is not evidence of anything, least of all of no effect; in the Holm family it",
-        "counts as p = 1).",
-        "",
-        "Pairs used: pairs with the outcome on both sides; each missing pair is counted by its cause in the pairs",
-        'table of its section ("Missing pairs by cause" says what each cause counts). For an untestable contrast',
-        "the cell gives those causes with their counts.",
-        "",
-        "Treatment attempts: how the contrast's treatment attempts (runs that ended in an infrastructure failure their",
-        "condition declares as its treatment) entered it. `scored`: the preregistration says the scorer returns values",
-        "for them. `excluded`: the preregistration leaves every pair with one out of the contrast, and the count says",
-        "how many; the contrast then says nothing about the outage itself. `not declared`: pairs were lost because a",
-        "treatment attempt's outcome is None, which only an exploratory contrast may do. `-`: nothing declared,",
-        "nothing lost.",
-    ]
+    alpha = result.alpha
+    table = _contrast_table(family, adjusted, level, alpha, with_mde=with_mde) if family else []
+    lines += table or ["No contrast in the family."]
+    lines += ["", *contrast_notes(alpha)]
     if with_mde:
-        lines += [
-            "",
-            "Min. detectable effect: the smallest effect this contrast's number of clusters could detect with the",
-            "preregistered power; n/a when it cannot be found (no spread between clusters, or too few clusters);",
-            "`-` for an untestable contrast, which has none.",
-        ]
+        lines += ["", *MDE_NOTES]
     if family:
         lines += ["", *_pairs(family, "### Pairs of the family's contrasts")]
     lines += [
@@ -209,12 +220,12 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         "",
     ]
     if exploratory:
-        lines += _contrast_table(exploratory, adjusted, level, with_mde=with_mde)
+        lines += _contrast_table(exploratory, adjusted, level, alpha, with_mde=with_mde)
         lines += ["", "Nothing adjusts these for multiplicity; each is judged by its raw p-value at alpha."]
         lines += ["", *_pairs(exploratory, "### Pairs of the exploratory contrasts")]
     else:
         lines += ["None declared."]
-    return [*lines, "", *_MISSING_PAIRS, ""]
+    return [*lines, "", *MISSING_PAIRS, ""]
 
 
 def _pairs(results: Sequence[ContrastResult], heading: str) -> list[str]:
@@ -222,22 +233,6 @@ def _pairs(results: Sequence[ContrastResult], heading: str) -> list[str]:
     rows = [[r.name, r.n_pairs, *(r.pairs_missing[cause] for cause in MISSING_CAUSES)] for r in results]
     header = ["Contrast", "Pairs used", *(CAUSE_HEADINGS[cause] for cause in MISSING_CAUSES)]
     return [heading, "", *_table(header, rows)]
-
-
-_MISSING_PAIRS = [
-    "## Missing pairs by cause",
-    "",
-    "A pair is two runs that differ only in the contrast's arm. Each pair is used or is missing for one cause, counted",
-    "in the pairs tables above:",
-    "",
-    "- *Treatment outcome None*: the outcome is None on a treatment attempt, whatever became of the other planned run.",
-    "- *Treatment excluded*: a run is a treatment attempt and the preregistration declares "
-    '`treatment_outcomes = "excluded"` for the contrast; left out whatever its outcome.',
-    "- *Exhausted run*: the run of either arm used all its attempts on infrastructure failures.",
-    "- *Unpaired or left out*: the other run is unfinished, left out of a partial analysis, or not in the plan (a "
-    "task one arm does not run).",
-    "- *Outcome None (other)*: both runs analysed, and the outcome is None on an ordinary run only.",
-]
 
 
 def _conditions(export: Mapping[str, Any]) -> list[str]:
@@ -259,11 +254,7 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
     lines = [
         "## Conditions",
         "",
-        "Planned runs are analysed, exhausted (charged infrastructure attempts reached the limit; no scored attempt),",
-        "unfinished, or left out of a partial analysis. Attempts set aside are the condition's set-aside",
-        "infrastructure attempts, as in the table below. Median dispatch position is the median place, in the",
-        "campaign's dispatch sequence, of each analysed run's scored attempt, where it has one (a database older than",
-        "the dispatch column has none); a condition whose runs came late has a higher one.",
+        *CONDITION_NOTES,
         "",
         *_table([*header, "Median dispatch position"], rows),
         "",
@@ -295,21 +286,7 @@ def _infrastructure(export: Mapping[str, Any], conditions: Sequence[str]) -> lis
     if not rows:
         return [*lines, "No condition has a planned run."]
     header = ["Condition", "Kind", "Declared treatment", "Set aside (all runs)", "Scored as treatment", "Left out"]
-    return [*lines, *_table(header, rows), "", *_COUNT_DEFINITIONS]
-
-
-_COUNT_DEFINITIONS = [
-    f"- *Kind* `{NO_KIND}`: the condition met no infrastructure failure and declares no treatment kind; every count is "
-    "0.",
-    "- *Set aside*: attempts that ended as an infrastructure failure of a kind the condition does not declare as "
-    "treatment, or before the model's first turn, or that were discarded for an outage. Counted over every run of "
-    "the campaign whatever its status (an exhausted run's last attempt included), except runs a partial analysis "
-    "leaves out.",
-    "- *Scored as treatment*: attempts that ended as an infrastructure failure of a kind the condition declares as "
-    "treatment, after the model's first turn; each is its run's final, scored attempt. Runs a partial analysis leaves "
-    "out are not included.",
-    "- *Left out*: the set-aside and treatment attempts of runs a partial analysis leaves out, and only those.",
-]
+    return [*lines, *_table(header, rows), "", *COUNT_DEFINITIONS]
 
 
 def summary_lines(result: AnalysisResult) -> list[str]:

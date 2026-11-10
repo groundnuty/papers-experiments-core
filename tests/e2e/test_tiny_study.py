@@ -242,12 +242,22 @@ def test_the_report_shows_each_contrast_with_an_allowed_conclusion_beside_its_si
     assert set(family) == {n for n, flag in CONTRASTS.items() if not flag}
     assert set(exploratory) == {n for n, flag in CONTRASTS.items() if flag}
     for cells in family.values():
-        assert cells[7] in CONCLUSIONS  # the conclusion column, beside the raw and the Holm p-values at 5 and 6
-        assert cells[6] != "exploratory"
+        assert cells[9] in CONCLUSIONS  # the conclusion column, beside the raw and the Holm p-values at 7 and 8
+        assert cells[8] != "exploratory"
     for cells in exploratory.values():
-        assert cells[7].split(" (")[0] in CONCLUSIONS
-        assert cells[6] == "exploratory"
-        assert cells[7].endswith("(exploratory)")
+        assert cells[9].split(" (")[0] in CONCLUSIONS
+        assert cells[8] == "exploratory"
+        assert cells[9].endswith("(exploratory)")
+    analysis = json.loads((resumed.root / "out" / "analysis.json").read_text(encoding="utf-8"))
+    for contrast in analysis["contrasts"]:  # the margin and the 1 - 2 alpha interval behind the word, as analysis.json
+        cells = (exploratory if contrast["exploratory"] else family)[contrast["name"]]
+        margin, interval = contrast["equivalence_margin"], contrast["equivalence_interval"]
+        assert cells[5] == ("-" if margin is None else f"{margin:.4g}")
+        if interval is None:
+            assert cells[6] == "-"
+        else:
+            assert cells[6].startswith("[")
+    assert resumed.report.count("| 95% interval | Margin | 90% equivalence interval | p | Holm p | Conclusion |") == 2
 
 
 def test_the_report_names_the_preregistration_the_code_and_the_core(resumed):
@@ -299,7 +309,7 @@ def test_s10_the_example_scores_its_treatment_attempts_and_declares_so_for_its_c
     """S10: the manipulated condition's treatment attempts stay in its own contrast, and the report says how."""
     relay = next(c for c in resumed.read("analysis.json")["contrasts"] if c["name"] == "relay-vs-baseline")
     assert (relay["in_family"], relay["treatment_outcomes"], relay["n_pairs_missing"]) == (True, "scored", 0)
-    assert table(resumed.report, "## Preregistered contrasts")["relay-vs-baseline"][10] == "scored"
+    assert table(resumed.report, "## Preregistered contrasts")["relay-vs-baseline"][12] == "scored"
 
 
 SCORED_TREATMENT = 'if outcome["name"] == "infrastructure" and not outcome["treatment"]:'
@@ -353,7 +363,7 @@ def test_s10_a_scorer_that_leaves_treatment_attempts_none_is_refused_until_the_c
         2,
     )
     report = (copy.root / "out" / "report.md").read_text(encoding="utf-8")
-    assert table(report, "## Preregistered contrasts")["relay-vs-baseline"][10] == "excluded (2 pair(s) left out)"
+    assert table(report, "## Preregistered contrasts")["relay-vs-baseline"][12] == "excluded (2 pair(s) left out)"
 
 
 def test_c23_an_exhausted_run_is_counted_under_its_condition_and_as_the_cause_of_the_pairs_it_costs(
@@ -422,9 +432,9 @@ def test_s11_a_contrast_whose_partners_are_all_exhausted_is_untestable_in_the_js
     relay = contrasts["relay-vs-baseline"]["p_value"]
     assert decisions["relay-vs-baseline"]["p_holm"] == pytest.approx(min(1.0, 2 * relay))  # m = 2, the other is p = 1
     row = table(campaign.report, "## Preregistered contrasts")["extended-vs-baseline"]
-    assert (row[7], row[9]) == ("untestable", "0 (missing: exhausted run 6, unpaired or left out 2)")
+    assert (row[9], row[11]) == ("untestable", "0 (missing: exhausted run 6, unpaired or left out 2)")
     exploratory = table(campaign.report, "## Exploratory contrasts")["tools-effect-on-rounds"]
-    assert exploratory[7] == "untestable (exploratory)"
+    assert exploratory[9] == "untestable (exploratory)"
     capsys.readouterr()
     assert main(["analyze", str(campaign.root)]) == 0
     summary = {line.split(":")[0]: line for line in capsys.readouterr().out.splitlines() if "estimate" in line}

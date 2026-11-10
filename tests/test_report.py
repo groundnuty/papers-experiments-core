@@ -103,7 +103,7 @@ def table_of(report: str, heading: str) -> dict[str, list[str]]:
 def test_each_conclusion_word_is_shown_in_the_row_of_its_contrast_beside_the_raw_and_the_holm_p_value(conclusion):
     report = render(analysis(contrast("primary", conclusion)))
     cells = row(report, "primary")
-    assert cells[5:8] == ["0.0120", "0.0200", conclusion]  # p, Holm p, conclusion: never apart
+    assert cells[7:10] == ["0.0120", "0.0200", conclusion]  # p, Holm p, conclusion: never apart
 
 
 NO_PAIR = {
@@ -139,11 +139,11 @@ def test_s11_an_untestable_contrast_shows_the_causes_of_its_missing_pairs_in_its
     report = render(untestable_analysis())
     cells = row(report, "dry")
     assert cells[3] == "n/a"
-    assert cells[5:8] == ["n/a", "n/a", "untestable"]
-    assert cells[9] == "0 (missing: exhausted run 2, unpaired or left out 1)"
-    assert cells[12] == "-"  # no minimum detectable effect, though the column is shown for the tested contrast
+    assert cells[7:10] == ["n/a", "n/a", "untestable"]
+    assert cells[11] == "0 (missing: exhausted run 2, unpaired or left out 1)"
+    assert cells[14] == "-"  # no minimum detectable effect, though the column is shown for the tested contrast
     extra = row(report, "dry-extra")
-    assert (extra[6], extra[7]) == ("exploratory", "untestable (exploratory)")
+    assert (extra[8], extra[9]) == ("exploratory", "untestable (exploratory)")
     assert table_of(report, "### Pairs of the family's contrasts")["dry"][1:] == ["0", "0", "0", "2", "1", "0"]
     assert "`untestable` (no usable pair" in report
 
@@ -171,7 +171,7 @@ def test_a_contrast_outside_the_family_is_exploratory_in_a_section_of_its_own_an
     assert "extra" in exploratory_part
     assert "in-family" not in exploratory_part
     cells = row(report, "extra")
-    assert (cells[6], cells[7]) == ("exploratory", "difference (exploratory)")  # never a bare conclusion
+    assert (cells[8], cells[9]) == ("exploratory", "difference (exploratory)")  # never a bare conclusion
 
 
 def test_the_kernels_flag_decides_and_a_result_whose_flags_disagree_with_the_holm_decisions_is_refused():
@@ -208,22 +208,22 @@ def test_a_factor_contrast_names_the_factor_and_its_levels():
 def test_tasks_dropped_and_clusters_are_shown():
     dropped = contrast("primary", "difference", tasks_dropped=("alpha-task", "beta-task"))
     cells = row(render(analysis(dropped)), "primary")
-    assert (cells[8], cells[11]) == ("12 (dropped 1)", "alpha-task, beta-task")
+    assert (cells[10], cells[13]) == ("12 (dropped 1)", "alpha-task, beta-task")
 
 
 def test_the_minimum_detectable_effect_is_shown_when_present_and_the_column_is_absent_otherwise():
     with_power = render(analysis(contrast("primary", "difference", minimum_detectable_effect=0.31)))
-    assert row(with_power, "primary")[12] == "0.31"
+    assert row(with_power, "primary")[14] == "0.31"
     assert "Min. detectable effect" not in render(analysis(contrast("primary", "difference")))
     unreachable = render(analysis(contrast("primary", "difference", minimum_detectable_effect=math.nan)))
-    assert row(unreachable, "primary")[12] == "n/a"
+    assert row(unreachable, "primary")[14] == "n/a"
     assert "Min. detectable effect: the smallest effect" in unreachable
 
 
 def test_a_value_that_could_not_be_estimated_reads_n_a_and_never_zero():
     cells = row(render(analysis(contrast("primary", "not_detected", estimate=math.nan, p_value=math.nan))), "primary")
     assert cells[3] == "n/a"
-    assert cells[5] == "n/a"
+    assert cells[7] == "n/a"
 
 
 def test_the_terminal_summary_gives_each_conclusion_with_its_basis_and_labels_the_exploratory_ones():
@@ -341,7 +341,7 @@ def test_c23_each_contrast_shows_the_pairs_it_used_and_the_pairs_it_is_missing_b
     member = contrast("primary", "difference", n_pairs=14, pairs_missing=missing, treatment_outcomes="scored")
     other = contrast("extra", "difference", in_family=False, exploratory=True)
     report = render(analysis(member, other, family=["primary"]))
-    assert row(report, "primary")[9] == "14"
+    assert row(report, "primary")[11] == "14"
     family = table_of(report, "### Pairs of the family's contrasts")
     assert family["Contrast"] == [
         "Contrast",
@@ -388,10 +388,10 @@ def test_s10_a_contrast_that_excludes_treatment_attempts_is_named_beside_its_res
     plain = contrast("no-outage", "difference")
     report = render(analysis(excluded, scored, lost, plain, family=["outage-excluded", "outage-scored", "no-outage"]))
     cells = row(report, "outage-excluded")
-    assert cells[7:11] == ["not_detected", "12 (dropped 1)", "40", "excluded (2 pair(s) left out)"]
-    assert row(report, "outage-scored")[10] == "scored"
-    assert row(report, "outage-lost")[10] == "not declared (3 pair(s) None)"
-    assert row(report, "no-outage")[10] == "-"
+    assert cells[9:13] == ["not_detected", "12 (dropped 1)", "40", "excluded (2 pair(s) left out)"]
+    assert row(report, "outage-scored")[12] == "scored"
+    assert row(report, "outage-lost")[12] == "not declared (3 pair(s) None)"
+    assert row(report, "no-outage")[12] == "-"
     assert "Treatment attempts:" in report  # what the column says is stated beside the table
 
 
@@ -406,6 +406,33 @@ def test_runs_that_were_not_analysed_are_counted_in_the_header():
         "2 unfinished, 0 left out"
     )
     assert expected in render(analysis(contrast("primary", "difference")), data)
+
+
+@pytest.mark.parametrize("member", [True, False], ids=["family", "exploratory"])
+def test_c23_each_contrast_table_shows_the_margin_and_the_equivalence_interval_its_conclusion_rests_on(member):
+    """C23: what analysis.json holds is in the report too: a reader can check `equivalent` against the preregistered
+    margin and the 1 - 2 alpha interval, in both tables, beside the interval at the reported level."""
+    flags = {} if member else {"in_family": False, "exploratory": True}
+    with_margin = contrast(
+        "near", "equivalent", equivalence_margin=0.25, equivalence_interval=(-0.1429, 0.1429), **flags
+    )
+    without = contrast("far", "difference", **flags)
+    report = render(analysis(with_margin, without, family=["near", "far"] if member else []), interval_level=0.95)
+    heading = "## Preregistered contrasts" if member else "## Exploratory contrasts"
+    table = table_of(report, heading)
+    assert table["Contrast"][4:7] == ["95% interval", "Margin", "90% equivalence interval"]
+    assert table["near"][4:7] == ["[0.1, 0.4]", "0.25", "[-0.1429, 0.1429]"]
+    assert table["far"][5:7] == ["-", "-"]  # no margin: it can never read equivalent, and the row says so
+    assert "Margin: the preregistered equivalence margin" in report
+
+
+def test_c23_the_equivalence_interval_is_named_by_its_level_and_an_untestable_contrast_has_none():
+    """C23: the level is 1 - 2 alpha, from the analysis's own alpha; with no pair the interval is n/a, never 0."""
+    dry = untestable("dry", equivalence_margin=0.2, equivalence_interval=(math.nan, math.nan))
+    result = dataclasses.replace(analysis(dry), alpha=0.025)
+    cells = table_of(render(result), "## Preregistered contrasts")
+    assert cells["Contrast"][6] == "95% equivalence interval"
+    assert cells["dry"][5:7] == ["0.2", "[n/a, n/a]"]
 
 
 def test_the_interval_level_is_named_when_given():
@@ -518,4 +545,4 @@ def test_s10_a_scored_contrast_that_used_its_tolerance_shows_the_pairs_it_lost_a
         pairs_missing={**zero, "treatment_outcome_none": 1},
     )
     report = render(analysis(tolerated, family=["outage"]))
-    assert row(report, "outage")[10] == "scored (1 pair(s) None, at most 2 preregistered)"
+    assert row(report, "outage")[12] == "scored (1 pair(s) None, at most 2 preregistered)"
