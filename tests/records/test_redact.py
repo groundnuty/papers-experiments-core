@@ -474,3 +474,14 @@ def test_R12_the_registry_of_secrets_only_grows_nothing_in_the_module_removes_a_
     assert not hasattr(redact, "forget_secrets")
     register_secret("registered-for-good-81726354")
     assert redact_structure({"a": "registered-for-good-81726354"}, {})[0] == {"a": REDACTED}
+
+
+def test_R12_for_a_diagnostic_a_short_secret_is_replaced_only_where_it_stands_as_a_token():
+    """R12: a record refuses a secret under four characters; a diagnostic replaces it where no letter, digit or
+    underscore touches it, so the same letters inside a longer name stay readable."""
+    with pytest.raises(ConfigError, match="TEST_TOKEN"):
+        Redactor.from_environment({"TEST_TOKEN": "abc"})
+    redactor = Redactor.from_environment({"TEST_TOKEN": "abc"}, short_tokens=True)
+    text = redactor.text("ValueError('abc') at abcd, x_abc and abc.")
+    assert text == "ValueError('[redacted]') at abcd, x_abc and [redacted]."
+    assert redactor.text(text) == text  # still a fixed point

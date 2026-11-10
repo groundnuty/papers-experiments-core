@@ -112,8 +112,7 @@ def secret_values(
     """Return the distinct secret values (environment, registered and `extra`), longest first.
 
     Raises ConfigError, naming the variable, for a value under the minimum length; with `skip_short` such a value is
-    left out instead, for a diagnostic shown on the author's own terminal: a value that short cannot be redacted
-    without damaging the text, and a run refuses it before any record is written.
+    left out of the list instead (`short_secret_values` gives them, for a redactor that replaces them as tokens).
     """
     env = os.environ if environ is None else environ
 
@@ -134,6 +133,18 @@ def secret_values(
 def _base_forms(value: str) -> set[str]:
     """A secret as it is, and inside Python's repr of it and of its UTF-8 bytes (without the repr's quotes)."""
     return {value, repr(value)[1:-1], repr(value.encode("utf-8", "surrogatepass"))[2:-1]}
+
+
+def short_secret_values(
+    environ: Mapping[str, str] | None = None, extra: Iterable[str] = (), declared: Iterable[str] = ()
+) -> list[str]:
+    """Return the secret values `secret_values` refuses as too short (environment, registered and `extra`)."""
+    env = os.environ if environ is None else environ
+    with _lock:
+        registered = set(_registered)
+    named = {env[name] for name in secret_env_names(env, declared)}
+    short = {v for v in (*named, *registered, *extra) if v and len(v) < MIN_SECRET_LEN}
+    return sorted(short, key=len, reverse=True)
 
 
 def forms_of(value: str) -> set[str]:
@@ -164,10 +175,14 @@ def _join(path: str, key: str) -> str:
 class Redactor:
     """Replaces a fixed set of secrets, and the values of keys that name one, in text and in JSON-like structures."""
 
-    def __init__(self, secrets: Iterable[str] = (), *, keys: bool = True):
+    def __init__(self, secrets: Iterable[str] = (), *, keys: bool = True, short: Iterable[str] = ()):
         values = [s for s in secrets if s and s not in REDACTED]
         for value in values:
             _refuse_short(value, "a secret")
+        # A secret too short to replace wherever it occurs is replaced only where it stands as a token of its own
+        # (no letter, digit or underscore on either side): for a diagnostic, never for a record, which refuses it.
+        tokens = sorted({f for s in short if s and s not in REDACTED for f in forms_of(s)}, key=len, reverse=True)
+        self._tokens = tuple(re.compile(rf"(?<!\w){re.escape(form)}(?!\w)") for form in tokens)
         self._inside: tuple[str, ...] = tuple(sorted({f for s in values for f in forms_of(s)}, key=len, reverse=True))
         self._numbers: frozenset[str] = frozenset(values)
         self._keys = keys
@@ -179,11 +194,14 @@ class Redactor:
         extra: Iterable[str] = (),
         declared: Iterable[str] = (),
         *,
-        skip_short: bool = False,
+        short_tokens: bool = False,
     ) -> "Redactor":
         """Build a redactor from the environment (the process's by default), the registered secrets, `extra` values and
-        the variables named in `declared` (`skip_short`: see `secret_values`)."""
-        return cls(secret_values(environ, extra, declared, skip_short=skip_short))
+        the variables named in `declared`. A secret under the minimum length is refused, or with `short_tokens`, for a
+        diagnostic on the author's terminal, replaced where it stands as a token of its own."""
+        long = secret_values(environ, extra, declared, skip_short=short_tokens)
+        short = short_secret_values(environ, extra, declared) if short_tokens else ()
+        return cls(long, short=short)
 
     @classmethod
     def none(cls) -> "Redactor":
@@ -195,6 +213,8 @@ class Redactor:
         for form in self._inside:
             if form in value:
                 value = value.replace(form, REDACTED)
+        for token in self._tokens:
+            value = token.sub(REDACTED, value)
         return self._fragments(value) if self._inside else value
 
     def _fragments(self, value: str) -> str:

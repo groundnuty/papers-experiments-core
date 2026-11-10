@@ -128,8 +128,9 @@ def import_plugin_module(
     backend of the study's own, is then there for a step that needs nothing else of the plugin: the replay check. That
     step passes `error_text=False`, so a refusal names the file and the exception's type and never its text, which can
     hold a credential. Otherwise the text is shown redacted as a record is, with the secrets of the environment, the
-    registered ones and the keys of `models` (the value of each `key_env`, the contents of each `key_file`), leaving
-    out a value too short to redact, as a run refuses it anyway; and with `log_root` (a study's `out/`) the redacted
+    registered ones and the keys of `models` (the value of each `key_env`, the contents of each `key_file`); a value
+    too short to redact everywhere is redacted where it stands as a token of its own, so it cannot wipe the rest of
+    the diagnostic; and with `log_root` (a study's `out/`) the redacted
     traceback goes to the harness-error log there, which the message names.
     """
     module_name = f"{PLUGIN_MODULE_PREFIX}{hashlib.sha256(str(file).encode()).hexdigest()[:12]}"
@@ -144,7 +145,7 @@ def import_plugin_module(
         del sys.modules[module_name]
         if not error_text:
             raise ConfigError(f"{file}: failed on import ({type(error).__name__})") from None
-        redactor = partial(redactor_for, None, models=models, skip_short=True)
+        redactor = partial(redactor_for, None, models=models, short_tokens=True)
         message = f"{file}: failed on import ({type(error).__name__}: {redactor().text(str(error))})"
         if log_root is not None:
             stamp = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")

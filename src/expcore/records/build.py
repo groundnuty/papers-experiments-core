@@ -232,17 +232,18 @@ def redactor_for(
     secrets: Iterable[str] = (),
     secret_env: Iterable[str] = (),
     models: ModelTable | None = None,
-    skip_short: bool = False,
+    short_tokens: bool = False,
 ) -> Redactor:
     """Build the redactor of a record: the environment's secrets, the variables named in `secret_env`, the key
     variables of the models in use (added automatically), the registered secrets and `secrets`.
 
     Raises ConfigError, naming the variable, when a secret is too short to redact (see `expcore.records.redact`);
-    `skip_short` leaves such a secret out instead, for a diagnostic on the author's terminal (`secret_values`).
+    `short_tokens` replaces such a secret where it stands as a token of its own instead, for a diagnostic on the
+    author's terminal (`Redactor.from_environment`).
     """
     secrets, secret_env = tuple(secrets), tuple(secret_env)  # whatever iterable the caller gave is read once
     names, keys = model_secrets(backend, models, environ)
-    return Redactor.from_environment(environ, [*secrets, *keys], [*secret_env, *names], skip_short=skip_short)
+    return Redactor.from_environment(environ, [*secrets, *keys], [*secret_env, *names], short_tokens=short_tokens)
 
 
 def expected_conversation(system: str, user: str, captured: Sequence[Captured]) -> list[dict[str, Any]]:

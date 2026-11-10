@@ -179,11 +179,30 @@ def test_r12_the_import_failure_redacts_the_keys_models_toml_points_at_in_a_vari
         assert value not in log
 
 
+def test_r12_a_short_secret_is_redacted_from_an_import_failure_where_it_stands_alone_and_nowhere_else(
+    study_dir, monkeypatch
+):
+    """R12: a secret too short to redact everywhere is still a secret: it is redacted where it stands as a token of its
+    own, in the message and in the log, while the same letters inside a longer name are left."""
+    monkeypatch.setenv("TEST_TOKEN", "lib")
+    (study_dir / "plugin.py").write_text("raise ValueError('lib')\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    assert "failed on import (ValueError: [redacted])" in str(caught.value)
+    log = (study_dir / "out" / "logs" / "harness-errors.log").read_text(encoding="utf-8")
+    assert "ValueError: [redacted]" in log
+    assert "'lib'" not in log
+    (study_dir / "plugin.py").write_text("import needed_library\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_plugin(context(study_dir))
+    assert "No module named 'needed_library'" in str(caught.value)  # inside a name, the letters are no secret
+
+
 def test_l08_an_import_failure_keeps_its_diagnostic_and_logs_its_traceback_whatever_short_value_is_set(
     study_dir, monkeypatch
 ):
-    """L08: a secret too short to redact is left out as the record redactor's rules leave it out of what can be
-    redacted (a run refuses it anyway), so an unrelated one does not wipe the message; the traceback is logged."""
+    """L08: a secret too short to redact everywhere is redacted only where it stands alone, so an unrelated one does
+    not wipe the message; the traceback is logged."""
     monkeypatch.setenv("OTHER_TOKEN", "abc")
     (study_dir / "plugin.py").write_text("import needed_library\n", encoding="utf-8")
     with pytest.raises(ConfigError) as caught:
