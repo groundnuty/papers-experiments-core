@@ -7,7 +7,9 @@ are the same text: no clock, no path and no random number enters it.
 - Contrasts in the Holm family are in one table, contrasts outside it in a table of their own under the heading
   "Exploratory contrasts": nothing controls their multiplicity. Which is which comes from the statistics kernel's own
   flag (`ContrastResult.exploratory`), never from a guess here, and a result whose flag disagrees with its place in the
-  Holm decisions is refused, so no table or summary line can show an exploratory contrast as confirmatory.
+  Holm decisions is refused, so no table or summary line can show an exploratory contrast as confirmatory. A
+  preregistration with `exploratory_only = true` has no family: its report has no family table, shows every contrast
+  in the exploratory one, and says in its summary and on the terminal that it makes no confirmatory claim (S12).
 - A conclusion is never shown without its significance. Each row carries the raw p-value and the Holm-adjusted one
   (or the word "exploratory") beside the conclusion, and the preregistered equivalence margin with the interval at
   1 - 2 alpha that `equivalent` and `trivial_difference` rest on, and the conclusion words already encode the decision:
@@ -43,6 +45,7 @@ from expcore.report_notes import (
     COUNT_DEFINITIONS,
     MDE_NOTES,
     MISSING_PAIRS,
+    NO_CLAIM,
     NO_KIND,
     contrast_notes,
     equivalence_header,
@@ -199,9 +202,36 @@ def _check_conclusion(result: ContrastResult) -> None:
         )
 
 
+def _check_no_claim(result: AnalysisResult) -> None:
+    """Refuse a result that says it makes no confirmatory claim and still holds a member of a family (S12)."""
+    if result.exploratory_only and (result.holm or any(not r.exploratory for r in result.contrasts)):
+        raise ValueError(
+            "the analysis says the preregistration is exploratory_only, yet it holds a Holm decision or a contrast "
+            "that is not exploratory; the flags must agree"
+        )
+
+
+def _exploratory_only(result: AnalysisResult, level: float | None) -> list[str]:
+    """The contrasts of a preregistration with no Holm family (S12): one exploratory table, and no family table."""
+    contrasts = list(result.contrasts)
+    with_mde = any(r.minimum_detectable_effect is not None for r in contrasts)
+    lines = ["## Exploratory contrasts (every contrast: the preregistration makes no confirmatory claim)", ""]
+    lines += _contrast_table(contrasts, {}, level, result.alpha, with_mde=with_mde) if contrasts else ["None declared."]
+    lines += ["", "Nothing adjusts these for multiplicity; each is judged by its raw p-value at alpha."]
+    lines += ["", *contrast_notes(result.alpha, family=False)]
+    if with_mde:
+        lines += ["", *MDE_NOTES]
+    if contrasts:
+        lines += ["", *_pairs(contrasts, "### Pairs of the exploratory contrasts")]
+    return [*lines, "", *MISSING_PAIRS, ""]
+
+
 def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
     for r in result.contrasts:
         _check_conclusion(r)
+    _check_no_claim(result)
+    if result.exploratory_only:
+        return _exploratory_only(result, level)
     adjusted = {d.name: d.p_holm for d in result.holm}
     family = [r for r in result.contrasts if not _exploratory(r, adjusted)]
     exploratory = [r for r in result.contrasts if _exploratory(r, adjusted)]
@@ -295,8 +325,9 @@ def summary_lines(result: AnalysisResult) -> list[str]:
     exploratory) and the conclusion word, which is labelled exploratory too outside the family. A conclusion is never
     printed without the basis it rests on, and `untestable` is never printed for a contrast that used a pair, or
     any other word for one that used none."""
+    _check_no_claim(result)
     adjusted = {d.name: d.p_holm for d in result.holm}
-    lines = []
+    lines = [f"No confirmatory claim: {NO_CLAIM}."] if result.exploratory_only else []
     for r in result.contrasts:
         _check_conclusion(r)
         member = not _exploratory(r, adjusted)
@@ -370,6 +401,8 @@ def render_report(
         "attempt), "
         f"{len(export['unfinished_runs'])} unfinished, {len(left_out)} left out of the analysis",
         _partial_line(export),
-        "",
     ]
+    if result.exploratory_only:
+        lines.append(f"- **Confirmatory claims**: none; {NO_CLAIM}")
+    lines.append("")
     return "\n".join(lines + _contrasts(result, interval_level) + _conditions(export) + _left_out(left_out))

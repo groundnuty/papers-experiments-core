@@ -45,7 +45,7 @@ All configuration is TOML in the study directory, validated when the study is lo
 | `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the factors, the conditions and the tasks |
 | `models.toml` | the single model table: each model once, with backend, API id, sampling, limits, price and status |
 | `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the budget |
-| `preregistration.toml` | the named contrasts, the Holm family, alpha, the estimators, the bootstrap and the power settings |
+| `preregistration.toml` | the named contrasts, the Holm family (or `exploratory_only = true`, [section 6](#6-what-a-conclusion-may-say)), alpha, the estimators, the bootstrap and the power settings |
 | `package.toml` | the inclusion list of the replication package ([section 7](#7-ship-a-replication-package)) |
 | `platform.toml` | a platform's own settings, read by the platform layer (`expcore_onedata`), not by the core |
 
@@ -317,6 +317,8 @@ Every contrast ends in one of five words, `difference`, `trivial_difference`, `e
 `untestable` means the contrast used no pair, whatever the cause: every partner run exhausted or unfinished, or scored `None` on an ordinary run. Nothing was tested, so it is not evidence of anything, least of all of no effect, and it has no estimate, p-value or minimum detectable effect. Its row in the report gives the causes of its missing pairs with their counts. In the Holm family it stays a member as p = 1, so the family keeps its size and the other members are adjusted as if it were there; it never rejects. An exploratory contrast can be untestable too.
 
 A contrast outside the preregistered Holm family is exploratory. It is judged by its raw p-value, nothing controls its multiplicity, and every table and report shows it apart, labelled exploratory, never as confirmatory. Only the Holm family carries the study's confirmatory claims.
+
+A preregistration that makes no confirmatory claim, such as a pilot's, says so with `exploratory_only = true` in place of `holm_family`. Every contrast is then exploratory: `analysis.json` has `"exploratory_only": true` and no Holm decision, the report has one table, of exploratory contrasts, and its summary and `analyze`'s terminal output say that no confirmatory claim is made. An empty `holm_family = []` is refused, because it is more likely a family never filled in than a choice; the flag is the way to make that choice. The flag is in the file, so in the preregistration's hash, and a pilot's runs analysed under it never enter a confirmatory test.
 
 A contrast that declares `treatment_outcomes = "excluded"` compares its arms without the runs the outage ended, so its conclusion says nothing about the outage itself, and `not_detected` there is not the absence of an outage effect. The report puts `excluded` and the pairs it left out in the contrast's own row, beside its conclusion.
 

@@ -565,3 +565,64 @@ def test_c23_an_interval_level_is_named_with_its_fraction_never_rounded_to_anoth
     result = dataclasses.replace(analysis(member), alpha=alpha)
     header = table_of(render(result, interval_level=level), "## Preregistered contrasts")["Contrast"]
     assert header[4:7] == [f"{interval} interval", "Margin", f"{equivalence} equivalence interval"]
+
+
+# --- a preregistration that makes no confirmatory claim (S12) ------------------------------------------------------
+
+NO_CLAIM = "makes no confirmatory claim"
+
+
+def exploratory_only(*names: str) -> AnalysisResult:
+    """An analysis of an exploratory-only preregistration: every contrast exploratory, no Holm decision."""
+    results = [contrast(name, "difference", in_family=False, exploratory=True) for name in names]
+    return dataclasses.replace(analysis(*results, family=[]), exploratory_only=True)
+
+
+def test_s12_the_summary_says_plainly_that_no_confirmatory_claim_is_made():
+    """S12: the report's provenance summary says, before any table, that the preregistration makes no confirmatory
+    claim; a report of a preregistration with a family says nothing of the kind."""
+    report = render(exploratory_only("pilot-a", "pilot-b"))
+    summary = report.split("## Provenance", 1)[1].split("\n## ", 1)[0]
+    assert NO_CLAIM in summary
+    assert "exploratory_only = true" in summary
+    assert NO_CLAIM not in render(analysis(contrast("member", "difference")))
+
+
+def test_s12_every_contrast_is_in_the_exploratory_table_and_there_is_no_family_table():
+    """S12: no empty family table and no family pairs table: every contrast is shown once, labelled exploratory."""
+    report = render(exploratory_only("pilot-a", "pilot-b"))
+    assert "## Preregistered contrasts" not in report
+    assert "Holm family of" not in report
+    assert "No contrast in the family." not in report
+    assert "### Pairs of the family's contrasts" not in report
+    shown = table_of(report, "## Exploratory contrasts")
+    assert set(shown) - {"Contrast"} == {"pilot-a", "pilot-b"}
+    for name in ("pilot-a", "pilot-b"):
+        assert row(report, name)[8:10] == ["exploratory", "difference (exploratory)"]
+    assert set(table_of(report, "### Pairs of the exploratory contrasts")) - {"Contrast"} == {"pilot-a", "pilot-b"}
+
+
+def test_s12_the_notes_say_nothing_of_a_holm_family_there_is_not():
+    """S12: the notes beside the table explain the conclusion words without the family's p = 1 rule."""
+    report = render(exploratory_only("pilot-a"))
+    assert "Holm family" not in report
+    assert "Conclusions: `difference`" in report
+
+
+def test_s12_the_terminal_summary_says_no_confirmatory_claim_is_made_before_the_contrasts():
+    """S12: the first line printed says so; every contrast after it is labelled exploratory."""
+    lines = summary_lines(exploratory_only("pilot-a", "pilot-b"))
+    assert NO_CLAIM in lines[0]
+    assert [line.split(":")[0] for line in lines[1:]] == ["pilot-a", "pilot-b"]
+    assert all(line.endswith("Holm p exploratory, difference (exploratory)") for line in lines[1:])
+    assert not any(NO_CLAIM in line for line in summary_lines(analysis(contrast("member", "difference"))))
+
+
+def test_s12_an_exploratory_only_result_with_a_confirmatory_contrast_is_refused():
+    """S12: a result that says it makes no confirmatory claim and holds a member of a family cannot be shown either
+    way without mislabelling it."""
+    bad = dataclasses.replace(analysis(contrast("member", "difference")), exploratory_only=True)
+    with pytest.raises(ValueError, match="exploratory_only"):
+        render(bad)
+    with pytest.raises(ValueError, match="exploratory_only"):
+        summary_lines(bad)

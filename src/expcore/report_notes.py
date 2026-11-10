@@ -19,14 +19,22 @@ def equivalence_header(alpha: float) -> str:
     return f"{percent(1 - 2 * alpha)} equivalence interval"
 
 
-def contrast_notes(alpha: float) -> list[str]:
-    """What the conclusion words, the margin, the equivalence interval, the pairs used and the treatment column mean."""
+def contrast_notes(alpha: float, family: bool = True) -> list[str]:
+    """What the conclusion words, the margin, the equivalence interval, the pairs used and the treatment column mean.
+
+    `family` is False for a preregistration with no Holm family (S12), whose notes then say nothing of one.
+    """
+    untestable = [
+        "tested and the contrast is not evidence of anything, least of all of no effect; in the Holm family it",
+        "counts as p = 1).",
+    ]
+    if not family:
+        untestable = ["tested and the contrast is not evidence of anything, least of all of no effect)."]
     return [
         "Conclusions: `difference` (significant), `trivial_difference` (significant, but inside the equivalence",
         "margin), `equivalent` (inside the margin, not significant), `not_detected` (anything else; failing to",
         "detect a difference is not evidence that there is none), `untestable` (no usable pair, so nothing was",
-        "tested and the contrast is not evidence of anything, least of all of no effect; in the Holm family it",
-        "counts as p = 1).",
+        *untestable,
         "",
         "Margin: the preregistered equivalence margin, plus or minus; `-` when the contrast has none, and then it",
         "can never conclude `equivalent` or `trivial_difference`.",
@@ -46,6 +54,12 @@ def contrast_notes(alpha: float) -> list[str]:
         "nothing lost.",
     ]
 
+
+NO_CLAIM = (  # the summary line of a preregistration with no Holm family (S12)
+    "the preregistration declares `exploratory_only = true`, so it makes no confirmatory claim: every contrast is "
+    "exploratory, judged by its raw p-value at alpha with nothing adjusting for multiplicity, and none may be read as "
+    "a confirmatory test"
+)
 
 MDE_NOTES = [
     "Min. detectable effect: the smallest effect this contrast's number of clusters could detect with the",
