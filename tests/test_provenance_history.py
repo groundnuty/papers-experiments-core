@@ -331,6 +331,20 @@ def test_an_import_first_added_in_a_merge_commit_is_traced_to_that_merge(make_re
     assert hist.verify_history(core.path, {"origin-repo": origin.path}, load_map(map_file)) == []
 
 
+def test_a_branch_brought_up_to_date_by_merging_main_still_traces_a_module_to_its_import(world):
+    """P07: merging main into a branch that never held the module gives the merge main's adapted file, exactly as main
+    holds it; the module's history is main's, so it is still checked at its import commit, not at the merge."""
+    core, _, _, import_commit, _ = world
+    main = core.git("rev-parse", "--abbrev-ref", "HEAD")
+    core.write(MODULE, (core.path / MODULE).read_text(encoding="utf-8") + "\n\nEXTRA = 1\n")
+    core.commit("adapt after the import")
+    core.git("checkout", "-q", "-b", "feature", f"{import_commit}^")
+    core.write("feature.txt", "feature\n")
+    core.commit("feature")
+    core.git("merge", "-q", "--no-ff", "--no-edit", main)
+    assert verify(world) == []
+
+
 def test_a_module_deleted_and_added_back_edited_in_a_merge_is_checked_at_the_merge(world):
     """P07: a merge that adds back, edited, a module deleted on its first parent starts the module's history there; the
     old clean import is no evidence for it."""

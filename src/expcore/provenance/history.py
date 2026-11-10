@@ -27,7 +27,6 @@ from expcore.provenance.sanitise_map import TokenMap, load_map
 from expcore.provenance.study_tokens import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK
 
 SOURCE_REPOS_VARIABLE = "EXPCORE_SOURCE_REPOS"
-_MERGES = ("--diff-merges=first-parent",)  # a merge's changes, as against its first parent
 
 
 def parse_source_repos(spec: str) -> dict[str, Path]:
@@ -50,13 +49,14 @@ def _modules(core: Path, root: str) -> list[str]:
     return sorted(name for name in listing.decode("utf-8").split("\0") if name.endswith(".py"))
 
 
-def _renamed_from(core: Path, commit: str, path: str) -> str | None:
+def _renamed_from(core: Path, commit: str, path: str, *, merge: bool) -> str | None:
     """Return the path a commit renamed to `path`: one it deleted in the same commit, never a file it kept.
 
     Rename detection only (`-M`, no `-C`), over the whole tree, so a new file that resembles one that stays is a new
-    file, whatever git's copy detection would say. A merge is compared with its first parent, as the log reads it.
+    file, whatever git's copy detection would say. A merge is compared with its first parent.
     """
-    out = run_git(core, "diff-tree", *_MERGES, "-r", "-M", "--root", "--no-commit-id", "--name-status", "-z", commit)
+    against = (f"{commit}^1", commit) if merge else ("--root", commit)
+    out = run_git(core, "diff-tree", "-r", "-M", "--no-commit-id", "--name-status", "-z", *against)
     fields = out.decode("utf-8").split("\0")
     index = 0
     while index < len(fields) and fields[index]:
@@ -71,28 +71,53 @@ def _renamed_from(core: Path, commit: str, path: str) -> str | None:
     return None
 
 
+def _holds(core: Path, rev: str, path: str) -> bool:
+    """Whether a commit's tree holds the path."""
+    try:
+        run_git(core, "cat-file", "-e", "--end-of-options", f"{rev}:{path}")
+    except GitError:
+        return False
+    return True
+
+
+def _latest_add(core: Path, rev: str, path: str) -> tuple[str, bool] | None:
+    """The latest commit in the path's history from `rev` that added it, and whether it is a merge.
+
+    The history is git's default one for the path: a merge whose file is exactly one parent's (a branch brought up to
+    date with main, say) is not part of it, since the file came from that parent. A merge that is part of it, holding
+    the file as no parent does, added it when its first parent did not hold it: a module a merge adds, or adds back
+    edited after it was deleted, starts its history there.
+    """
+    added = set(
+        run_git(core, "log", "--no-renames", "--diff-filter=A", "--format=%H", rev, "--", path).decode().split()
+    )
+    for line in run_git(core, "log", "--topo-order", "--format=%H %P", rev, "--", path).decode().splitlines():
+        commit, *parents = line.split()
+        if len(parents) < 2 and commit in added:
+            return commit, False
+        if len(parents) >= 2 and not _holds(core, f"{commit}^1", path) and _holds(core, commit, path):
+            return commit, True
+    return None
+
+
 def _import_commit(core: Path, path: str) -> tuple[str, str] | None:
     """Return (commit, path at that commit) of the commit that started the file's history at HEAD.
 
-    That is the latest commit that added the path, or, when that commit renamed it from a path it deleted, the commit
-    that started the earlier path's history, and so on. Git's copy detection (`--follow`) is not used: it would trace
-    a hand-edited copy of an imported module to the clean import it resembles (#55). A merge counts as a commit like
-    any other, compared with its first parent: a file a merge adds, or adds back edited after it was deleted, starts
-    its history there.
+    That is the latest commit that added the path (`_latest_add`, merges included), or, when that commit renamed it
+    from a path it deleted, the commit that started the earlier path's history, and so on. Git's copy detection
+    (`--follow`) is not used: it would trace a hand-edited copy of an imported module to the clean import it
+    resembles (#55).
     """
     rev, current = "HEAD", path
     while True:  # each round starts from an older commit, so the walk ends
-        log = run_git(
-            core, "log", "--topo-order", "--no-renames", *_MERGES, "--diff-filter=A", "--format=%H", rev, "--", current
-        )
-        commits = log.decode("ascii").split()
-        if not commits:
+        found = _latest_add(core, rev, current)
+        if found is None:
             return None
-        commit = commits[0]
-        earlier = _renamed_from(core, commit, current)
+        commit, merge = found
+        earlier = _renamed_from(core, commit, current, merge=merge)
         if earlier is None:
             return commit, current
-        rev, current = f"{commit}^", earlier
+        rev, current = f"{commit}^1", earlier
 
 
 def _source_blob(repo: Path, commit: str, path: str) -> str | None:
