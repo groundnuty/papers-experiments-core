@@ -309,6 +309,23 @@ def test_R12_a_multi_line_secret_leaves_a_records_keys_intact_and_is_redacted_wh
     assert "quartz-7781" not in written
 
 
+def test_R12_a_multi_line_secret_that_comes_back_line_by_line_is_redacted_in_a_records_values(tmp_path):
+    """R12: a multi-line secret (a private key, say) can come back re-encoded: CRLF line ends, or its lines as separate
+    strings. Each line is replaced in a record's string values, while its keys are searched for whole secrets only."""
+    secret = "amber-line-one\ncobalt-line-two"
+    base = hand_made()
+    record = hand_made(
+        totals={**base.totals, "final_text": "amber-line-one\r\ncobalt-line-two"},
+        instruments={"probe": {"lines": ["amber-line-one", "cobalt-line-two"]}},
+    )
+    with pytest.warns(RuntimeWarning, match="redacted secrets"):
+        written = record.write(tmp_path, environ={"TOYLAB_TOKEN": secret}).read_text(encoding="utf-8")
+    assert "amber-line-one" not in written
+    assert "cobalt-line-two" not in written
+    loaded = RunRecord.from_json(decode(written))
+    assert loaded.instruments["probe"]["lines"] == ["[redacted]", "[redacted]"]
+
+
 def test_R12_extra_secrets_given_as_an_iterator_are_read_once_for_both_passes():
     """R12: the long and the short secrets are picked from one reading of `extra`, so an iterator is not used up by
     the first pass and a short value it holds is still replaced as a token."""

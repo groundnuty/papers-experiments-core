@@ -154,8 +154,8 @@ def short_secret_values(
 
 def forms_of(value: str, *, lines: bool = False) -> set[str]:
     """Return the ways a secret can appear in text: each base form (raw, the repr of the string, the repr of its
-    bytes), and with `lines` (plain text only, never a record) of each of its lines of the minimum length or more too,
-    and each of those JSON-escaped up to three levels and percent-encoded."""
+    bytes), and with `lines` of each of its lines of the minimum length or more too (for text and string values, never
+    for a mapping's keys), and each of those JSON-escaped up to three levels and percent-encoded."""
     bases = _base_forms(value)
     for line in value.splitlines() if lines else ():
         if len(line) >= MIN_SECRET_LEN:
@@ -192,8 +192,13 @@ class Redactor:
         # (no letter, digit or underscore on either side): for a diagnostic, never for a record, which refuses it.
         tokens = sorted({f for s in short for f in forms_of(s, lines=lines)}, key=len, reverse=True)
         self._tokens = tuple(re.compile(rf"(?<!\w){re.escape(form)}(?!\w)") for form in tokens)
-        inside = {f for s in values for f in forms_of(s, lines=lines)}
+        # Text and string values are searched for each line of a multi-line secret too, since a secret can come back
+        # re-encoded line by line (CRLF line ends, or its lines as separate strings). A mapping's keys are searched for
+        # whole secrets only: replacing a common line there would rename a key and break the record.
+        inside = {f for s in values for f in forms_of(s, lines=True)}
         self._inside: tuple[str, ...] = tuple(sorted(inside, key=len, reverse=True))
+        whole = {f for s in values for f in forms_of(s, lines=lines)}
+        self._inside_keys: tuple[str, ...] = tuple(sorted(whole, key=len, reverse=True))
         self._numbers: frozenset[str] = frozenset(values)
 
     def with_lines(self) -> "Redactor":
@@ -224,6 +229,15 @@ class Redactor:
     def none(cls) -> "Redactor":
         """A redactor that changes nothing, for data that was redacted already (a replay reads a stored record)."""
         return cls((), keys=False)
+
+    def _key(self, key: str) -> str:
+        """A mapping key with every whole secret replaced, never a single line of one, which could rename a key."""
+        for form in self._inside_keys:
+            if form in key:
+                key = key.replace(form, REDACTED)
+        for token in self._tokens:
+            key = token.sub(REDACTED, key)
+        return key
 
     def text(self, value: str) -> str:
         """Return the string with every secret replaced, and every fragment of one that a cut left at either end."""
@@ -295,7 +309,7 @@ class Redactor:
             if isinstance(value, dict):
                 out: dict = {}
                 for index, (k, v) in enumerate(value.items()):
-                    key = self.text(k) if isinstance(k, str) else k
+                    key = self._key(k) if isinstance(k, str) else k
                     here = _join(path, k if key == k else f"{{key {index}}}")
                     if key != k:
                         paths.append(here)
