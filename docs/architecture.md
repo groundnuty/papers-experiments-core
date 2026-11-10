@@ -203,7 +203,7 @@ Each token is normalised (Unicode NFKC, case-folded, surrounding whitespace remo
 2. Split each into maximal runs of letters, digits and `_ . -`; this separates URL schemes, paths, ports, queries and assignments.
 3. From each run, emit every contiguous sequence of its components (split at `_`, `.` and `-`), re-joined with the separators it had. A hostname inside a URL, a space name inside a path and a name inside a composed identifier all become candidates.
 
-The check hashes every candidate in every tracked file, and in each file's path, and fails on a match; findings print only a hash prefix, and a matching path is redacted. Tokens shorter than four characters match only as a whole string literal or identifier, to avoid false positives. Each hash carries a scope taken from the token's category:
+The check hashes every candidate in every tracked file, and in each file's path, and fails on a match; findings print only a hash prefix, and a matching path is redacted. Tokens shorter than four characters match only as a whole string literal or identifier, to avoid false positives. A longer token that is an ordinary word, which would otherwise be found inside unrelated names (in a vendored dependency, say), is marked the same way in the plain list with a `whole: <token>` line; it is normalised and hashed like any other and rendered as `whole <scope> <sha256>`, and where a token is listed both ways the mark wins. Each hash carries a scope taken from the token's category:
 - **code** (conditions, data states, tasks, datasets, models, repositories): names a study chose, which code must not hard-code but prose may mention;
 - **all** (hosts, addresses, spaces, providers, users, environment variables): private everywhere.
 
