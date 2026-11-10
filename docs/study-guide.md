@@ -106,7 +106,7 @@ shutil.rmtree(misspelt)
 
 ### What the budget reserves
 
-`[budget] max_usd` in `campaign.toml` is a ceiling the campaign never passes, not an estimate. Before a run starts, the scheduler adds what has been spent, what the runs in flight can still cost and what this run can cost, and holds the run while that sum is over the ceiling. What a run can cost is its bound, the worst case: the loop's `token_budget` (in `[agent]`, the most tokens one attempt may use) at the model's dearest rate, the highest of its input, output and cache prices. Each run in flight is reserved its bound too, and an attempt that was killed, or whose usage was not reported, is charged its bound as spent. The mean cost of the runs so far decides nothing, because a run that overran it would pass the ceiling. `per_model_usd` caps single models the same way, and a model with neither a price nor `free = true` is held outright, since its cost is unknown.
+`[budget] max_usd` in `campaign.toml` is a ceiling that is enforced, not estimated. Before a run starts, the scheduler adds what has been spent, what the runs in flight can still cost and what this run can cost, and holds the run while that sum is over the ceiling. What a run can cost is its bound: the loop's `token_budget` (in `[agent]`) at the model's dearest rate, the highest of its input, output and cache prices. The token budget is checked after each response, so a run can exceed it by at most one request (a prompt within the model's context window, plus the reply maximum), and it then ends as `token_cap`. Each run in flight is reserved its bound too, and an attempt that was killed, or whose usage was not reported, is charged its bound as spent. The mean cost of the runs so far decides nothing, because a run that overran it would pass the ceiling. `per_model_usd` caps single models the same way, and a model with neither a price nor `free = true` is held outright, since its cost is unknown.
 
 The example's bound is small: 20,000 tokens at alpha-stub's dearest rate, 2 USD per million output tokens, is 0.04 USD a run, against a ceiling of 5 USD. A real model's is not. With `token_budget = 2000000` and a model priced at 15 USD per million input tokens and 75 per million output tokens, every run reserves 2,000,000 tokens at 75 USD per million, 150 USD, however little a typical run spends. A ceiling of 50 USD then holds the campaign before its first run (0 spent, 0 in flight, 150 for this run: over 50), `run` exits 3, and the hold it prints gives those three figures. With two workers, the second run needs 300 USD of room. To run, raise `max_usd` above the bound times the runs that may be in flight, plus what has been spent, or lower `token_budget`, which is also the cap that ends a run as `token_cap`.
 
@@ -463,7 +463,7 @@ assert analysis["code"]["dirty"] is False
 
 A dress rehearsal runs the whole plan on stub models before the real campaign: the executor, the tools, the scorers, the check, the analysis and the package, at no cost. The core's stub takes no backend's settings: `base_url`, `key_env`, `key_file`, `sampling`, `extra_body`, `prompt_cache_ttl` and `echo_reasoning_field` are refused on a `stub` entry when `models.toml` is loaded. So a rehearsal cannot run on the frozen model table with only the backend swapped; it runs on a `models.toml` of its own, whose hash is in the campaign fingerprint, and its fingerprint differs from the real campaign's. That is by design: a rehearsal's records can never be resumed into the real campaign or taken for its records.
 
-Rehearse in a copy of the study directory (a branch, or a directory of its own), so the rehearsal's `out/` stays apart: in the same `out/`, the real campaign would be refused as a resume under a changed configuration. In the copy, change `models.toml` alone. Keep every model key, so `campaign.toml`'s plan is unchanged, and `status = "frozen"`; set `backend = "stub"` and drop the settings a stub refuses; keep each model's price, `max_output_tokens` and `context_tokens`, which a stub takes, so the budget gate reserves the bound it will reserve for the real model and holds where it will hold. Keep identical what decides a result: the plan, the prompts, the tools, the scorers and the preregistration. The plugin's prompt and tool hashes and the scorers' versions are then the same in both fingerprints, and what differs comes from the model table alone: its hash and each model's entry. An executor that scripts the stub checks for `use(script)` on its backend, as the example's does, so one plugin serves both; a stub with no script replies `done` to every turn.
+Rehearse in a copy of the study directory (a branch, or a directory of its own), so the rehearsal's `out/` stays apart: in the same `out/`, the real campaign would be refused as a resume under a changed configuration. In the copy, change `models.toml` alone. Keep every model key, so `campaign.toml`'s plan is unchanged, and `status = "frozen"`; set `backend = "stub"` and drop the settings a stub refuses; keep each model's price, `max_output_tokens` and `context_tokens`, which a stub takes, so the budget gate reserves the bound it will reserve for the real model and holds where it will hold. Keep identical what decides a result: the plan, the prompts, the tools, the scorers and the preregistration. The plugin's prompt and tool hashes and the scorers' versions are then the same in both fingerprints, and what differs comes from the model table alone: its hash and each model's entry.
 
 ```python
 rehearsal = Path("rehearsal-study")
@@ -479,6 +479,23 @@ try:
 except ConfigError as error:
     assert "prompt_cache_ttl applies to anthropic models only" in str(error)
 shutil.rmtree(rehearsal)
+```
+
+The example's executor runs on stubs only: it requires its backend to have `use(script)` and raises without it. A plugin meant for both the rehearsal and the real campaign scripts its backend only when the backend has `use`, and otherwise leaves the model to answer; the plugin is then the same file in both, so its code identity is the same. A stub given no script replies `done` to every turn.
+
+```python
+from expcore.models.adapters import StubAdapter
+
+
+def script_if_stub(backend, script):
+    """Script a backend that takes a script, the rehearsal's stub; a real model's backend has no `use`."""
+    use = getattr(backend, "use", None)
+    if callable(use):
+        use(script)
+
+
+script_if_stub(StubAdapter([]), ["deep"])  # the rehearsal: the stub plays the script
+script_if_stub(object(), ["deep"])  # the real campaign: a backend without `use` is left to answer
 ```
 
 ## 8. Ship a replication package
