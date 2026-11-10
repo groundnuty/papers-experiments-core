@@ -255,7 +255,7 @@ def compare_supplied(dist: metadata.Distribution, editable: bool, filename: str,
         local = checkout.counterpart(member) if checkout is not None else None
         if local is not None:
             same = local.read_bytes() == content
-        elif member in record and not member.endswith(".pth"):
+        elif member in record and (checkout is None or not member.endswith(".pth")):  # an editable's .pth is a pointer
             same = _same_as_installed(dist, record[member], content)
         elif editable and member.endswith(".py"):
             raise PackageError(
@@ -271,10 +271,7 @@ def compare_supplied(dist: metadata.Distribution, editable: bool, filename: str,
             raise PackageError(
                 f"{filename}: {member} differs from the installed one; supply the wheel of what is installed"
             )
-    if checkout is not None:
-        expected = checkout.expected(sorted(members))
-    else:
-        expected = [path for path in record if not path.endswith(".pth")]
+    expected = checkout.expected(sorted(members)) if checkout is not None else list(record)
     for path in expected:
         if path not in members:
             raise PackageError(f"{filename}: lacks {path}, which is installed; supply the wheel of what is installed")

@@ -282,6 +282,73 @@ def test_k10_a_src_layout_editable_behind_an_import_hook_is_compared_with_the_pa
     assert (wheel.data, wheel.uncompared) == (data, ("toy_backend/data/notes.txt",))
 
 
+def hooked_backend(site, tmp_path, monkeypatch, files: dict[str, bytes]) -> Path:
+    """toy-backend 2.0.0 installed editable behind an import hook that loads project/src; the project's directory."""
+    project = tmp_path / "project"
+    for rel, data in files.items():
+        (project / rel).parent.mkdir(parents=True, exist_ok=True)
+        (project / rel).write_bytes(data)
+    editable = json.dumps({"url": project.as_uri(), "dir_info": {"editable": True}})
+    hook = {"__editable__.toy_backend-2.0.0.pth": b"import _toy_backend_finder; _toy_backend_finder.install()\n"}
+    dist = installed_distribution(site, "toy-backend", "2.0.0", hook, direct_url=editable)
+    monkeypatch.setattr(wheels_module, "installed", lambda: {"toy-backend": dist})
+    monkeypatch.setattr(sys, "meta_path", [_HookFinder(project / "src"), *sys.meta_path])
+    return project
+
+
+def test_k10_a_stale_copy_at_the_project_root_never_stands_in_for_the_package_the_hook_imports(
+    site, tmp_path, monkeypatch
+):
+    """K10: where the install imports from comes first: a stale project/toy_backend/ beside the project/src/toy_backend/
+    the hook loads does not vouch for a wheel built from the stale copy, and the wheel of what is imported passes."""
+    stale = {f"{k}": (b"WIRE = 'grey'\n" if k.endswith("__init__.py") else v) for k, v in BACKEND.items()}
+    hooked_backend(site, tmp_path, monkeypatch, {**{f"src/{k}": v for k, v in BACKEND.items()}, **stale})
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    name, data = wheel_of("toy-backend", "2.0.0", stale)
+    (supplied / name).write_bytes(data)
+    with pytest.raises(PackageError, match=r"toy_backend/__init__\.py differs"):
+        vendor_wheels({"toy-backend": "2.0.0"}, supplied)
+    name, data = wheel_of("toy-backend", "2.0.0", BACKEND)
+    (supplied / name).write_bytes(data)
+    assert vendor_wheels({"toy-backend": "2.0.0"}, supplied)[0].data == data
+
+
+def test_k10_a_symlinked_subpackage_the_wheel_leaves_out_is_refused(site, tmp_path, monkeypatch):
+    """K10: the Python files an editable install imports are found with directory links followed, so a subpackage
+    linked into the package is one the wheel must hold."""
+    project = hooked_backend(site, tmp_path, monkeypatch, {f"src/{k}": v for k, v in BACKEND.items()})
+    (tmp_path / "shared" / "plugins").mkdir(parents=True)
+    (tmp_path / "shared" / "plugins" / "relay.py").write_bytes(b"RELAY = 1\n")
+    (project / "src" / "toy_backend" / "plugins").symlink_to(tmp_path / "shared" / "plugins", target_is_directory=True)
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    name, data = wheel_of("toy-backend", "2.0.0", BACKEND)
+    (supplied / name).write_bytes(data)
+    with pytest.raises(PackageError, match=r"lacks toy_backend/plugins/relay\.py"):
+        vendor_wheels({"toy-backend": "2.0.0"}, supplied)
+    name, data = wheel_of("toy-backend", "2.0.0", {**BACKEND, "toy_backend/plugins/relay.py": b"RELAY = 1\n"})
+    (supplied / name).write_bytes(data)
+    assert vendor_wheels({"toy-backend": "2.0.0"}, supplied)[0].data == data
+
+
+def test_k10_a_pth_file_of_an_installed_distribution_is_compared_like_any_member(site, tmp_path, monkeypatch):
+    """K10: a distribution installed from an index can ship a .pth file of its own (a precedence shim); the wheel it
+    was installed from passes, its .pth compared with the installed file, and a wheel whose .pth differs is refused."""
+    files = {"toolshim/__init__.py": b"SHIM = 1\n", "toolshim-precedence.pth": b"import toolshim\n"}
+    dist = installed_distribution(site, "toolshim", "1.0", files)
+    monkeypatch.setattr(wheels_module, "installed", lambda: {"toolshim": dist})
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    name, data = wheel_of("toolshim", "1.0", files)
+    (supplied / name).write_bytes(data)
+    assert vendor_wheels({"toolshim": "1.0"}, supplied)[0].data == data
+    name, data = wheel_of("toolshim", "1.0", {**files, "toolshim-precedence.pth": b"import toolshim, sys\n"})
+    (supplied / name).write_bytes(data)
+    with pytest.raises(PackageError, match=r"toolshim-precedence\.pth differs from the installed one"):
+        vendor_wheels({"toolshim": "1.0"}, supplied)
+
+
 def test_k10_a_wheel_says_whether_it_came_from_an_index_which_decides_how_deep_it_is_read(site, monkeypatch):
     """K10: a wheel packed from an index install (no direct_url.json) is a release, read as it is; anything else is
     the author's own code, read with every view the checks have."""

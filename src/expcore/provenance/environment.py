@@ -31,7 +31,9 @@ installed from the wheels it ships, which have no direct-URL source.
 """
 
 import hashlib
+import importlib.util
 import json
+import os
 import re
 import sys
 from collections.abc import Iterable, Mapping
@@ -127,9 +129,48 @@ def editable_roots(dist: metadata.Distribution) -> list[Path]:
 
 
 def python_files(root: Path) -> list[Path]:
-    """The Python source below a directory, in path order, without caches, environments or version control."""
-    found = [p for p in root.rglob("*.py") if p.is_file() and not SKIPPED_DIRS & set(p.relative_to(root).parts)]
+    """The Python source below a directory, in path order, without caches, environments or version control.
+
+    Directory links are followed, since a package linked into another imports like one inside it; a directory
+    reached again (a link back up the tree) is walked once, by its resolved path.
+    """
+    found: list[Path] = []
+    walked: set[Path] = set()
+    for here, dirs, files in os.walk(root, followlinks=True):
+        real = Path(here).resolve()
+        if real in walked:
+            dirs[:] = []
+            continue
+        walked.add(real)
+        dirs[:] = [name for name in dirs if name not in SKIPPED_DIRS]
+        found += [Path(here) / name for name in files if name.endswith(".py") and (Path(here) / name).is_file()]
     return sorted(found, key=lambda p: p.relative_to(root).as_posix())
+
+
+def _inside(path: Path, places: Iterable[Path]) -> bool:
+    resolved = path.resolve()
+    return any(resolved == place.resolve() or place.resolve() in resolved.parents for place in places)
+
+
+def top_level_location(top: str, places: Iterable[Path]) -> tuple[list[Path], Path | None]:
+    """Where a top-level package imports from (its directories) or a module (its file), if inside `places`.
+
+    Found with `importlib.util.find_spec`, which does not import it, so a package behind an import hook is found where
+    the hook loads it from. A name that is not importable here, or found outside `places`, has no location.
+    """
+    places = list(places)
+    if not top.isidentifier():
+        return [], None
+    try:
+        spec = importlib.util.find_spec(top)
+    except (ImportError, ValueError):
+        return [], None  # not importable here, so nothing of it is imported
+    if spec is None:
+        return [], None
+    if spec.submodule_search_locations is not None:
+        return [Path(d) for d in spec.submodule_search_locations if _inside(Path(d), places)], None
+    origin = Path(spec.origin) if spec.has_location and spec.origin else None
+    return [], origin if origin is not None and origin.is_file() and _inside(origin, places) else None
 
 
 def python_digest(roots: list[Path]) -> str:
