@@ -406,10 +406,30 @@ def _entry(section: Section, key: str) -> ModelSpec:
     An entry whose backend the core does not build may still be valid (its plugin's factory serves it), so that is
     said only when the entry has a problem, and then before the others.
     """
-    section.reject_unknown(_ENTRY_KEYS)
     backend = section.string("backend")
     first = _backend_first(backend)
-    spec_args: dict[str, Any] = {
+    try:
+        section.reject_unknown(_ENTRY_KEYS)
+        spec_args = _entry_args(section, key, backend)
+    except ConfigError as error:  # a key that cannot be read: the backend still comes first
+        if not first:
+            raise
+        own, file = f"{section.file}: {section.where}: ", f"{section.file}: "
+        text = str(error)
+        rest = text[len(own) :] if text.startswith(own) else text[len(file) :] if text.startswith(file) else text
+        raise ConfigError(own + "; ".join([*first, rest])) from None
+    if spec_args["api_id"] is None:
+        raise ConfigError(f"{section.file}: {section.where}: " + "; ".join([*first, "key 'api_id' is required"]))
+    try:
+        return ModelSpec(**spec_args)
+    except RuleViolation as error:
+        problems = [*first, *(problem for problem in error.problems if problem not in first)]
+        raise ConfigError(f"{section.file}: {section.where}: " + "; ".join(problems)) from None
+
+
+def _entry_args(section: Section, key: str, backend: str) -> dict[str, Any]:
+    """Read the keys of one entry into the arguments of its ModelSpec; a key of the wrong type raises ConfigError."""
+    return {
         "key": key,
         "backend": backend,
         "api_id": section.optional_string("api_id") or (key if backend == "stub" else None),
@@ -427,13 +447,6 @@ def _entry(section: Section, key: str) -> ModelSpec:
         "price": _price(section),
         "free": _flag(section, "free"),
     }
-    if spec_args["api_id"] is None:
-        raise ConfigError(f"{section.file}: {section.where}: " + "; ".join([*first, "key 'api_id' is required"]))
-    try:
-        return ModelSpec(**spec_args)
-    except RuleViolation as error:
-        problems = [*first, *(problem for problem in error.problems if problem not in first)]
-        raise ConfigError(f"{section.file}: {section.where}: " + "; ".join(problems)) from None
 
 
 def load_models(path: str | os.PathLike[str]) -> ModelTable:

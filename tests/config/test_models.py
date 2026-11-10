@@ -241,6 +241,28 @@ def test_b16_a_backend_name_close_to_a_cores_is_said_first_with_the_name_it_was_
     assert problems[-1].startswith(last)
 
 
+@pytest.mark.parametrize(
+    ("entry", "then"),
+    [
+        ("api_id = 5", "key 'api_id' must be"),
+        ('api_id = "x"\nmax_output_tokens = "many"', "key 'max_output_tokens' must be"),
+        ('api_id = "x"\ncolour = "blue"', "key 'colour' is not a known key"),
+        ('api_id = "x"\n[models.m.price]\ninput_per_mtok = "cheap"', "key 'input_per_mtok' must be a number"),
+    ],
+    ids=["type", "integer", "unknown-key", "price"],
+)
+def test_b16_the_backend_and_its_suggestion_come_first_whatever_key_fails_to_read(tmp_path, entry, then):
+    """B16: a key that cannot even be read (a wrong type, an unknown key, a bad price) does not hide that the core does
+    not build the backend, or the core backend it was likely meant to be."""
+    path = write(tmp_path, f'[models.m]\nbackend = "openai_compta"\n{entry}\n')
+    with pytest.raises(ConfigError) as caught:
+        load_models(path)
+    message = str(caught.value)
+    first = f"{path}: [models.m]: key 'backend' names 'openai_compta' (did you mean 'openai_compat'?), a backend"
+    assert message.startswith(first)
+    assert then in message.split("backend_factory that serves it; ", 1)[1]
+
+
 def test_b16_a_backend_of_the_study_s_own_is_an_entry_the_core_does_not_build_and_needs_no_url():
     """B16: a plain lower-case backend name the core does not know is accepted at the entry, without a URL, so the
     study's plugin can serve it; the core's rules for its own adapters do not apply, and the plugin is refused at load
