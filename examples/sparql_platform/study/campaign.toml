@@ -21,6 +21,9 @@ poll_interval_s = 0.05
 recheck_s = 1
 health_timeout_s = 5
 lease_timeout_s = 30
+# The kind a failed health check is recorded as. The core's default is its sandbox kind; this platform's own kind
+# says what failed, and `[study] platforms` makes it known before the campaign starts.
+health_kind = "rdf_store"
 
 [scheduler.unit_caps]
 alpha-stub = 1

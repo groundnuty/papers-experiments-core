@@ -8,7 +8,7 @@ A second platform for the core, beside the Onedata layer: an in-process RDF stor
 | `GraphStore` | a Turtle or N-Triples file loaded into an in-memory store; its snapshot is the triple count and the SHA-256 of the sorted N-Quads dump |
 | `SparqlPlatform.session()` | one run's view: a `FunctionProvider` with `sparql_query` (and `list_predicates` when `schema=True`), each capped at `max_rows` rows and marking a cut result `source_truncated`, and the run's instrument |
 | `StoreSnapshot` | the instrument, namespace `rdf_store`: the store's state at the run's start and end, whether it changed, and what the platform served (queries, rows, cut results, refusals), with the platform's and the store's versions |
-| `StoreHealth` | the health check: the store answers and holds as many triples as when it was loaded |
+| `StoreHealth` | the health check: the store answers and holds as many triples as when it was loaded; a study records its failure as `rdf_store` with `health_kind = "rdf_store"` under `[scheduler]` in `campaign.toml` (the core's default kind is `sandbox`) |
 | `SparqlPlatform.fingerprint()` | the row cap and the graph's snapshot, for `StudyPlugin.platform`, so a resume under another is refused |
 
 Read-only: nothing here calls the store's update API, and `Store.query` parses queries only, so an update is refused as a syntax error; the tool says it was refused for being an update. `SERVICE`, which would send part of a query to another endpoint over HTTP, is refused before the query runs, wherever the keyword appears outside a string, an IRI or a comment.
