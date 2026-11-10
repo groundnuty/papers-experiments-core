@@ -142,6 +142,22 @@ def test_k10_a_supplied_wheel_of_older_code_under_the_same_version_is_refused_na
     assert (wheel.data, wheel.uncompared) == (data, ())
 
 
+def test_k10_an_installed_file_edited_after_install_refuses_the_original_wheel_though_record_still_matches(
+    site, tmp_path, monkeypatch
+):
+    """K10: RECORD only says which installed files to compare; the bytes compared are the installed file's, so a file
+    edited by hand after the install, its RECORD line left as it was, makes the wheel it was installed from refused."""
+    dist = installed_distribution(site, "toy-platform", "2.0.0", CODE)
+    (site / "toy_platform" / "__init__.py").write_bytes(b"WIRE = 'patched by hand'\n")
+    monkeypatch.setattr(wheels_module, "installed", lambda: {"toy-platform": dist})
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    name, data = wheel_of("toy-platform", "2.0.0", CODE)
+    (supplied / name).write_bytes(data)
+    with pytest.raises(PackageError, match=r"toy_platform/__init__\.py differs from the installed one"):
+        vendor_wheels({"toy-platform": "2.0.0"}, supplied)
+
+
 def test_k10_a_supplied_wheel_for_an_editable_install_is_held_to_its_checkout(site, tmp_path, monkeypatch):
     """K10: for an editable install each member is compared with the checkout's file, a Python file of the checkout
     the wheel lacks refuses it, and a member with nothing to compare against (data the build maps in) goes in,

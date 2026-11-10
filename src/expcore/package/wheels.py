@@ -13,7 +13,8 @@ Where a wheel comes from, for each distribution:
 - a wheel the author supplies (`--wheels DIR`), named `<name>-<version>-<tags>.whl` with that name and version in
   its metadata, is taken byte for byte, once its code is shown to be what is installed: the way to ship a public
   release's own wheel, or the wheel of a distribution installed editable. Each member outside its `.dist-info` must
-  match the installed file its RECORD lists (by hash), and every installed file must be in it; for an editable install,
+  match the bytes of the installed file its RECORD lists (RECORD names the file; its hash is not trusted, since an
+  installed file can be edited after the install), and every installed file must be in it; for an editable install,
   each member must match the file of the checkout it imports from, found below a directory its `.pth` puts on the
   path (or through its RECORD), and every Python file of the checkout under a package the wheel holds must be in it.
   A member with no counterpart there (an example data file the build maps in) cannot be compared: it goes in and is
@@ -244,9 +245,9 @@ def _installed_files(dist: metadata.Distribution) -> dict[str, Any]:
     return files
 
 
-def _same_as_record(dist: metadata.Distribution, item: Any, data: bytes) -> bool:
-    if item.hash is not None:
-        return _record_hash(data) == f"{item.hash.mode}={item.hash.value}"
+def _same_as_installed(dist: metadata.Distribution, item: Any, data: bytes) -> bool:
+    """Whether the installed file a RECORD line names holds these bytes: RECORD says which file, never what it holds,
+    since an installed file can be edited after the install with its RECORD line left as it was."""
     located = Path(str(dist.locate_file(item)))
     return located.is_file() and located.read_bytes() == data
 
@@ -262,7 +263,7 @@ def compare_supplied(dist: metadata.Distribution, editable: bool, filename: str,
         if local is not None:
             same = local.read_bytes() == content
         elif member in record and not member.endswith(".pth"):
-            same = _same_as_record(dist, record[member], content)
+            same = _same_as_installed(dist, record[member], content)
         elif editable:
             uncompared.append(member)
             continue
