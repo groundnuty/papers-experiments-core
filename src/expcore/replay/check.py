@@ -56,6 +56,7 @@ from expcore.records.record import RunRecord, decode
 from expcore.records.redact import redact_text
 from expcore.records.schema import SCHEMA_PREFIX, SCHEMAS, RecordError, SchemaVersion
 from expcore.replay.divergence import ReplayDivergence
+from expcore.replay.native import has_native_parser
 from expcore.replay.replay import replay_record
 
 CHECK_SCHEMA = "replay-check/1"
@@ -153,6 +154,24 @@ def input_files(batch: Path, hashed_only: Sequence[str] = ()) -> tuple[list[str]
         elif path.suffix == ".json":
             records.append(rel)
     return sorted(records), sorted(hashed)
+
+
+def backends_without_parser(batch: Path, hashed_only: Sequence[str] = ()) -> list[str]:
+    """Return, sorted, the backends the records of a batch name that have no native parser registered in this process.
+
+    Nothing here runs a record or a study's code, so a caller can decide what to import before anything is replayed. A
+    file that does not parse, or a record that names no backend, is left for the check to report.
+    """
+    named: set[str] = set()
+    for rel in input_files(batch, hashed_only)[0]:
+        try:
+            route = json.loads((batch / rel).read_bytes()).get("route")
+        except (AttributeError, RecursionError, ValueError):  # not JSON, or not an object: the check says so
+            continue
+        backend = route.get("backend") if isinstance(route, Mapping) else None
+        if isinstance(backend, str):
+            named.add(backend)
+    return sorted(name for name in named if not has_native_parser(name))
 
 
 def inputs_sha256(hashes: Mapping[str, str]) -> str:

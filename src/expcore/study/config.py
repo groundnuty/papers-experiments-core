@@ -33,7 +33,7 @@ the model table, and the cluster each preregistered contrast names is an attribu
 import hashlib
 import importlib
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -87,6 +87,18 @@ class StudyConfig:
         return build_manifest(keys, self.campaign.order_seed)
 
 
+@dataclass(frozen=True)
+class StudyIdentity:
+    """What study.toml says the study is: enough to check its records, with none of its code imported."""
+
+    root: Path
+    study_file: Path
+    plugin_file: Path
+    scope: CodeScope
+    platforms: tuple[str, ...]
+    kinds: Mapping[str, StudyKind]
+
+
 def find_study_root(start: str | os.PathLike[str]) -> Path:
     """Return the nearest directory at or above `start` that holds a study.toml; raise ConfigError when none does."""
     first = Path(start).resolve()
@@ -128,10 +140,14 @@ def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope]:
     return name, plugin_file, scope
 
 
-def _import_platforms(top: Section) -> None:
+def _platforms(top: Section) -> tuple[str, ...]:
+    return Section(top.section("study").data, top.file, "[study]").strings(PLATFORMS_KEY)
+
+
+def import_platforms(study_file: Path, modules: Sequence[str]) -> None:
     """Import the modules `[study] platforms` names, so the kinds they register are known for the whole process."""
-    section = Section(top.section("study").data, top.file, "[study]")
-    for module in section.strings(PLATFORMS_KEY):
+    section = Section({}, study_file, "[study]")
+    for module in modules:
         try:
             importlib.import_module(module)
         except Exception as error:  # an import may fail in any way; each is a platform the study cannot use
@@ -172,13 +188,27 @@ def _check_clusters(study: str, tasks: Mapping[str, Task], loaded: Preregistrati
             )
 
 
+def read_study_identity(path: str | os.PathLike[str]) -> StudyIdentity:
+    """Read the `[study]` table of a study directory, importing nothing and reading no other configuration file.
+
+    A condition may name a kind that only a platform registers, so the rest of the study cannot be validated without
+    importing the platform. The replay check needs only this, and imports the study's code only for a record that
+    cannot be read without it.
+    """
+    root = Path(path).resolve()
+    study_file = root / STUDY_FILE
+    top = Section(load_toml(study_file), study_file, "top level")
+    _, plugin_file, scope = _study_table(top, root)
+    return StudyIdentity(root, study_file, plugin_file, scope, _platforms(top), _declared_kinds(top))
+
+
 def load_study(path: str | os.PathLike[str]) -> StudyConfig:
     """Load and cross-check the configuration of a study directory; raise ConfigError naming the file and the key."""
     root = Path(path).resolve()
     study_file = root / STUDY_FILE
     top = Section(load_toml(study_file), study_file, "top level")
     name, plugin_file, scope = _study_table(top, root)
-    _import_platforms(top)  # before anything names a kind: the conditions here, the campaign's kinds below
+    import_platforms(study_file, _platforms(top))  # before anything names a kind: the conditions, the campaign's kinds
     kinds = _declared_kinds(top)
     with study_kinds(kinds):  # held for this load only: a failed load, or the next study, finds none of them
         schema = load_factor_schema(study_file)

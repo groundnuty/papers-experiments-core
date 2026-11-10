@@ -183,6 +183,8 @@ uv run python -m expcore check my-study/out/runs
 
 `check` is the replay check. It loads every record, writes it back, and replays it: the real loop runs again with every model turn, tool result and clock reading served from the record, and must re-derive the transcript, the tool-call log and the outcome byte for byte, with no model and no platform. It copies the campaign store beside the records and hashes the copy with them. Analysis refuses a batch without a current passing check, so a record edited, added or removed after the check, or code changed since, makes `analyze` and `report` refuse until the check is run again. A campaign with attempts still running is refused unless `--partial`, and every output then says that it is partial and lists what was left out.
 
+`check` reads only the `[study]` table of `study.toml`. A batch recorded entirely with the core's backends imports nothing from the study, so checking it runs none of the study's code. A record of a backend the core has no parser for needs the parser the study registers, so `check` then prints one line saying so and imports the study's `[study] platforms` and plugin module: checking such a batch runs the plugin's code, so check it only if you trust the study. It does not call `build`, so it needs no model and no key. A module that cannot be imported is refused, naming the module and the exception's type.
+
 The check is stored beside the records, with the code identity it was made under and the hash of every input:
 
 ```python

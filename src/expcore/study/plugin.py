@@ -109,11 +109,13 @@ def tools_sha256(specs: Sequence[ToolSpec]) -> str:
     return hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def import_plugin_module(file: Path) -> ModuleType:
+def import_plugin_module(file: Path, *, error_text: bool = True) -> ModuleType:
     """Import the study's plugin module from its file, running its top level, and return it; ConfigError if it cannot.
 
     `build` is not called, so no model or key is read. What the module registers when imported, the native parser of a
-    backend of the study's own, is then there for a step that needs nothing else of the plugin: the replay check.
+    backend of the study's own, is then there for a step that needs nothing else of the plugin: the replay check. That
+    step passes `error_text=False`, so a refusal names the file and the exception's type and never its text, which can
+    hold a credential.
     """
     module_name = f"{PLUGIN_MODULE_PREFIX}{hashlib.sha256(str(file).encode()).hexdigest()[:12]}"
     spec = importlib.util.spec_from_file_location(module_name, file)
@@ -125,6 +127,8 @@ def import_plugin_module(file: Path) -> ModuleType:
         spec.loader.exec_module(module)
     except Exception as error:
         del sys.modules[module_name]
+        if not error_text:
+            raise ConfigError(f"{file}: failed on import ({type(error).__name__})") from None
         raise ConfigError(f"{file}: failed on import ({type(error).__name__}: {error})") from error
     return module
 

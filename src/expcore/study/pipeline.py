@@ -10,9 +10,10 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
-  store with attempts still running unless `partial`, which the check records. Before it replays anything it imports
-  the plugin module (and the study's platforms, as every load does), so a native parser a backend of the study's own
-  registers there is known in a new process; `build` is not called, so no model or key is needed.
+  store with attempts still running unless `partial`, which the check records. It reads only the study's `[study]`
+  table and imports none of the study's code, unless a record names a backend no native parser is registered for; then
+  it says so and imports the study's platforms and plugin module, so the parser registered there is known in a new
+  process. `build` is not called, so no model or key is needed.
 - `analyse_study` refuses unless the batch has a current passing check (R04, R05), and writes nothing. It then uses
   only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once and compared
   with the check's hash, cross-validated against each other. It exports from the snapshot, scores the records in
@@ -31,6 +32,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -51,17 +53,34 @@ from expcore.provenance.codestamp import version as code_version
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore, scorer_name, scorer_version
-from expcore.replay.check import BatchNotVerified, require_current_check, verify_batch, write_check
+from expcore.replay.check import (
+    BatchNotVerified,
+    backends_without_parser,
+    require_current_check,
+    verify_batch,
+    write_check,
+)
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import StudyConfig, find_study_root, load_study
+from expcore.stats.analysis import AnalysisResult, analyse
+from expcore.stats.rows import Row
+from expcore.study.config import (
+    StudyConfig,
+    StudyIdentity,
+    find_study_root,
+    import_platforms,
+    load_study,
+    read_study_identity,
+)
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.verified import UNCOVERED, Unverified, load_verified
 
 OUT_DIR = "out"
 RUNS_DIR = "runs"
 MARKER_PATTERN = "*attempt-marker.json"
+HASHED_ONLY = (MARKER_PATTERN, SNAPSHOT_FILE)  # the campaign's own bookkeeping in a batch: hashed, never replayed
 EXPORT_FILE = "export.json"
 SCORES_FILE = "scores.json"
 ANALYSIS_FILE = "analysis.json"
@@ -88,7 +107,7 @@ class StudyAnalysis:
     scorers: Mapping[str, str]  # the version of each scorer that scored the records, by name
 
 
-def out_dir(study: StudyConfig) -> Path:
+def out_dir(study: StudyConfig | StudyIdentity) -> Path:
     """The directory a study writes to."""
     return study.root / OUT_DIR
 
@@ -186,32 +205,51 @@ def check_batch(
     it instead of the live store. A store with attempts still running is refused unless `partial`; the check records
     how many were running and that a partial snapshot was asked for.
     """
-    study = load_study(find_study_root(study_root if study_root is not None else batch))
+    study = read_study_identity(find_study_root(study_root if study_root is not None else batch))
     with study_kinds(study.kinds):  # a replayed record may end in one of the study's own kinds
-        return _check_loaded(study, batch, allow_dirty, code_root, partial)
+        return _check_batch_of(study, batch, allow_dirty, code_root, partial)
 
 
-def _check_loaded(
-    study: StudyConfig,
+def _check_batch_of(
+    study: StudyIdentity,
     batch: str | os.PathLike[str],
     allow_dirty: bool,
     code_root: str | os.PathLike[str] | None,
     partial: bool,
 ) -> dict[str, Any]:
-    """Snapshot the store and replay the batch of a loaded study, with its own infrastructure kinds in scope."""
+    """Snapshot the store and replay the batch of a study, with its own infrastructure kinds in scope."""
     code = require_known("replay check", code_root or study.root, study.scope, allow_dirty=allow_dirty)
     directory = Path(batch)
     if not directory.is_dir():
         raise Refused(f"{directory}: no batch of records here; run the study first")
-    import_plugin_module(study.plugin_file)  # what it registers at import, a backend's parser, the replay needs
+    _import_for_unread_backends(study, directory)
     try:
         running = take_snapshot(out_dir(study) / STATE_FILE, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
         raise Refused(str(error)) from None
-    check = verify_batch(directory, code=code, hashed_only=[MARKER_PATTERN, SNAPSHOT_FILE])
+    check = verify_batch(directory, code=code, hashed_only=list(HASHED_ONLY))
     check[SNAPSHOT_KEY] = {"file": SNAPSHOT_FILE, "attempts_running": running, "partial": partial}
     write_check(directory, check)
     return check
+
+
+def _import_for_unread_backends(study: StudyIdentity, batch: Path) -> None:
+    """Import the study's platforms and plugin module only if a record names a backend no parser is registered for.
+
+    A parser for a backend of the study's own is registered when its plugin or a platform is imported. A batch recorded
+    entirely with the core's backends needs neither, so checking it runs none of the study's code.
+    """
+    unread = backends_without_parser(batch, HASHED_ONLY)
+    if not unread:
+        return
+    names = ", ".join(map(repr, unread))
+    print(
+        f"check: importing the study's platforms and plugin ({study.plugin_file.name}) to read the records of backend "
+        f"{names}; this runs the study's code",
+        file=sys.stderr,
+    )
+    import_platforms(study.study_file, study.platforms)
+    import_plugin_module(study.plugin_file, error_text=False)
 
 
 def _json_text(data: Any) -> str:
