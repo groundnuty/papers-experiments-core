@@ -9,9 +9,9 @@ NO_KIND = "none"  # the kind column of a condition's row of zeros
 
 
 def percent(level: float) -> str:
-    """A level as a percentage with at most two decimals and no trailing zeros: 0.9 is 90%, 0.975 is 97.5%, never
-    rounded to another level's name."""
-    return f"{level * 100:.2f}".rstrip("0").rstrip(".") + "%"
+    """A level as a percentage in as many digits as it has, up to ten significant ones: 0.9 is 90%, 0.975 is 97.5%,
+    0.99999 is 99.999%, never rounded to another level's name (only float noise past the tenth digit goes)."""
+    return f"{level * 100:.10g}%"
 
 
 def equivalence_header(alpha: float) -> str:

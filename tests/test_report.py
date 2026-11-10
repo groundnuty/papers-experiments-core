@@ -550,7 +550,12 @@ def test_s10_a_scored_contrast_that_used_its_tolerance_shows_the_pairs_it_lost_a
 
 @pytest.mark.parametrize(
     ("alpha", "equivalence", "level", "interval"),
-    [(0.05, "90%", 0.95, "95%"), (0.0125, "97.5%", 0.975, "97.5%"), (0.025, "95%", 0.999, "99.9%")],
+    [
+        (0.05, "90%", 0.95, "95%"),
+        (0.0125, "97.5%", 0.975, "97.5%"),
+        (0.025, "95%", 0.999, "99.9%"),
+        (0.000005, "99.999%", 0.99999, "99.999%"),
+    ],
 )
 def test_c23_an_interval_level_is_named_with_its_fraction_never_rounded_to_another_level(
     alpha, equivalence, level, interval
