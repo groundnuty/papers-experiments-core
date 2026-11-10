@@ -195,7 +195,7 @@ def _cmd_hash(args: argparse.Namespace) -> int:
                 "or edge separators; it can match only as an entire literal or line",
                 file=sys.stderr,
             )
-    sys.stdout.write(render_hash_file((entry.token, entry.scope) for entry in entries))
+    sys.stdout.write(render_hash_file((entry.token, entry.scope, entry.whole) for entry in entries))
     return EXIT_OK
 
 

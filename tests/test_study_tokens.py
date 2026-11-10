@@ -350,3 +350,44 @@ def test_module_entry_point_runs_as_a_script(tmp_path, hash_file):
     )
     assert done.returncode == 1
     assert "m.py:1 comment" in done.stdout
+
+
+ORDINARY = "lantern"  # an invented ordinary word, long enough to be matched anywhere unless marked whole
+
+
+def test_a_whole_line_in_the_plain_list_marks_its_token_and_keeps_its_category():
+    """A `whole:` line names one token that matches only as an entire value, whatever its length."""
+    text = f"# category: providers\nwhole: {ORDINARY}\nopen-name\n"
+    entries = hf.parse_plain_entries(text)
+    assert [(e.token, e.scope, e.whole) for e in entries] == [(ORDINARY, "all", True), ("open-name", "all", False)]
+
+
+def test_a_whole_line_naming_no_token_is_refused_by_line_number():
+    with pytest.raises(ValueError, match=r"^line 2: 'whole:' names no token$"):
+        hf.parse_plain_entries("first-name\nwhole:   \n")
+
+
+def test_a_token_marked_whole_is_rendered_whole_with_its_scope_and_the_mark_wins_when_listed_both_ways():
+    marked = st.render_hash_file([(ORDINARY, "code", True)])
+    assert [line.split()[:2] for line in marked.splitlines() if not line.startswith("#")] == [["whole", "code"]]
+    both = st.render_hash_file([(ORDINARY, "all"), (ORDINARY, "all", True)])
+    assert [line.split()[0] for line in both.splitlines() if not line.startswith("#")] == ["whole"]
+    plain = st.render_hash_file([(ORDINARY, "all")])
+    assert [line.split()[0] for line in plain.splitlines() if not line.startswith("#")] == ["any"]
+
+
+def test_a_token_marked_whole_is_found_as_an_entire_name_but_not_inside_a_longer_one():
+    """The point of the mark: an ordinary word on the list stops matching inside unrelated identifiers."""
+    marked = st.parse_hash_file(st.render_hash_file([(ORDINARY, "all", True)]), "test")
+    assert st.scan_source("m.py", f"def light_{ORDINARY}_count():\n    return 1\n", marked) == []
+    assert st.scan_source("m.py", f'site = "{ORDINARY}"\n', marked)
+    unmarked = st.parse_hash_file(st.render_hash_file([ORDINARY]), "test")
+    assert st.scan_source("m.py", f"def light_{ORDINARY}_count():\n    return 1\n", unmarked)
+
+
+def test_the_hash_command_renders_a_marked_token_whole(tmp_path, capsys):
+    plain = tmp_path / "plain.txt"
+    plain.write_text(f"whole: {ORDINARY}\n", encoding="utf-8")
+    assert st.main(["hash", str(plain)]) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if not line.startswith("#")]
+    assert [line.split()[:2] for line in lines] == [["whole", "all"]]
