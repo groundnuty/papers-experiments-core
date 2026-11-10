@@ -222,6 +222,47 @@ def load_map_sha(world) -> str:
     return world[4].sha256
 
 
+# --- the command line -----------------------------------------------------------------------------------------------
+
+
+def test_the_command_line_checks_every_module_and_exits_0_when_all_hold(world, map_file, capsys, monkeypatch):
+    """P07: `python -m expcore.provenance.history` runs the check on a repository and says it holds."""
+    core, origin, *_ = world
+    monkeypatch.delenv("EXPCORE_SOURCE_REPOS", raising=False)
+    argv = ["--map", str(map_file), "--source-repos", f"origin-repo={origin.path}", "--repo", str(core.path)]
+    assert hist.main(argv) == 0
+    assert capsys.readouterr().out == "ok: every module under src holds (2 modules)\n"
+
+
+def test_the_command_line_lists_each_problem_and_exits_1(world, map_file, capsys, monkeypatch):
+    """P07: the command prints every problem and exits 1; the source repositories may come from the environment."""
+    core, origin, *_ = world
+    core.write("src/expcore/bare.py", "x = 1\n")
+    core.commit("bare")
+    monkeypatch.setenv("EXPCORE_SOURCE_REPOS", f"origin-repo={origin.path}")
+    monkeypatch.chdir(core.path)
+    assert hist.main(["--map", str(map_file)]) == 1
+    assert capsys.readouterr().out == "FAIL src/expcore/bare.py: has no provenance header\n"
+
+
+@pytest.mark.parametrize("repos", [None, "origin-repo"])
+def test_the_command_line_refuses_missing_or_malformed_source_repositories(world, map_file, capsys, monkeypatch, repos):
+    core, *_ = world
+    monkeypatch.delenv("EXPCORE_SOURCE_REPOS", raising=False)
+    argv = ["--map", str(map_file), "--repo", str(core.path)] + ([] if repos is None else ["--source-repos", repos])
+    assert hist.main(argv) == 2
+    assert "error:" in capsys.readouterr().err
+
+
+def test_the_command_line_refuses_a_map_that_does_not_load(world, tmp_path, capsys):
+    core, origin, *_ = world
+    bad = tmp_path / "bad.toml"
+    bad.write_text("version = 2\n", encoding="utf-8")
+    argv = ["--map", str(bad), "--source-repos", f"origin-repo={origin.path}", "--repo", str(core.path)]
+    assert hist.main(argv) == 2
+    assert "expected 'version = 1'" in capsys.readouterr().err
+
+
 # --- the real check, where the source repositories and the private map are present ----------------------------------
 
 

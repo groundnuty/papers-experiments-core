@@ -1,6 +1,6 @@
 # Study guide
 
-How to build a study on the core: start it, configure it, declare its design, run and record it, check, score and analyse it, freeze its protocol and ship its replication package. The exact interfaces are in [`interfaces.md`](interfaces.md), and the reasons behind them in [`architecture.md`](architecture.md); this guide is the order to use them in. It follows the example study (`examples/tiny_study/`), which the core carries, so every step below runs as written. `tests/test_study_guide.py` runs every `sh` and `python` block of this file in order, in a new directory, and checks every `toml` block against the example's files. The two lines that make the project and add the core are the exception: the test runs with the core already installed, and `scripts/fresh_repo.py`, which the fresh-repo workflow runs after every push to `main`, runs those two from a pushed commit.
+How to build a study on the core: start it, configure it, declare its design, run and record it, check, score and analyse it, freeze its protocol and ship its replication package, and bring in code from an earlier study. The exact interfaces are in [`interfaces.md`](interfaces.md), and the reasons behind them in [`architecture.md`](architecture.md); this guide is the order to use them in. It follows the example study (`examples/tiny_study/`), which the core carries, so every step below runs as written. `tests/test_study_guide.py` runs every `sh` and `python` block of this file in order, in a new directory, and checks every `toml` block against the example's files. The two lines that make the project and add the core are the exception: the test runs with the core already installed, and `scripts/fresh_repo.py`, which the fresh-repo workflow runs after every push to `main`, runs those two from a pushed commit.
 
 ## 1. Start a study
 
@@ -424,3 +424,42 @@ The build checks the hash, refuses the file if its bytes changed, and lists ever
 ### Warnings
 
 The code identity vouches for the code, and the replay check and the regeneration for what is under `out/`. Any other file the package includes (a README, `package.toml`, a figure) has only the commit it came from behind it, so the build warns about each included file no commit holds and lists it in `PACKAGE.json` under `uncommitted`: `untracked` if git does not track it, ignored or not, and `modified` if it differs from HEAD. An anonymised package names no commit, so the build refuses such a file unless you pass `--allow-uncommitted`, and then it is listed like any other. A study outside any repository (a stamped snapshot) has no commit to compare with: the build says so, `vcs` in `PACKAGE.json` is `none`, and nothing is refused.
+
+## 9. Importing code from an earlier study
+
+Code an earlier study wrote can start a module of yours, but its files hold that study's private names, and whatever a commit of a public repository holds stays visible. So code from an earlier study enters only through the sanitising import, which replaces every private name with a neutral stand-in before anything is committed and records where the code came from. Never copy its text by hand.
+
+The replacements are a map, kept with the plain token list outside the repository. It is TOML: `version = 1`, then one `[[entry]]` table per name, with its `token`, its `replacement` and a `category` (`hosts`, `spaces`, `users`, as in the token list; a label that errors name). A token is replaced wherever it is a whole identifier or string literal, and a token of four characters or more also as a component of a longer name, between `_`, `.` and `-`, never inside another word. Each spelling is its own entry: `pebble-ridge` does not cover `pebble_ridge`. A replacement holds no quotes, backslashes, braces, line breaks or edge whitespace and no token of the map, and a replacement whose token appears inside an identifier lands there, so it must itself be an identifier: letters, digits and underscores. An error names the entry by its number, its category and its replacement, never its token. With invented names:
+
+```python
+from expcore.provenance.sanitise import sanitise_checked
+from expcore.provenance.sanitise_map import parse_map
+
+token_map = parse_map(b"""
+version = 1
+
+[[entry]]
+token = "pebble-ridge"
+replacement = "cluster-a"
+category = "hosts"
+
+[[entry]]
+token = "pebble_ridge"
+replacement = "cluster_a"
+category = "hosts"
+""")
+source = 'HOST = "pebble-ridge.example.org"\n\n\ndef pebble_ridge_slots():\n    return 4\n'
+assert sanitise_checked(source, token_map.entries) == (
+    'HOST = "cluster-a.example.org"\n\n\ndef cluster_a_slots():\n    return 4\n'
+)
+```
+
+The import reads the file as the earlier study's repository holds it at a commit, never from its working tree, which may be on another branch: `git -C OLD show COMMIT:PATH > BLOB`, then check that `git hash-object BLOB` prints what `git -C OLD rev-parse COMMIT:PATH` does. Then `uv run python -m expcore.provenance.sanitise import --map MAP --source-repo NAME --commit COMMIT --path PATH BLOB DEST` writes the sanitised module to `DEST` with a provenance header and prints the map's SHA-256. It never overwrites a file, and it refuses the import if the token check still finds a mapped name in the result (behind an escape, in a full-width form, glued to other letters): fix the map then, never the module. Commit `DEST` on its own: that is the import commit. Every adaptation, a stand-in turned into a configuration lookup for instance, is a later commit, so the module's history from its import is the whole public transformation. The header names the source repository by name, never by URL, the commit, the path and the git blob id of the file there, and the map by its SHA-256:
+
+```python
+# Provenance:
+#   source: old-study @ 4b1e2f3a9c0d, harness/slots.py, blob 8e0c2d41b7a95f63e18d0b2c4a6f7e9d1c3b5a70
+#   import: sanitised with study-token map 2f6a9c1e8b3d5f70a4c2e9b1d6f8a3c5e7b9d1f2a4c6e8b0d2f4a6c8e0b2d4f6
+```
+
+`uv run python -m expcore.provenance.sanitise verify --map MAP --source BLOB --module DEST` sanitises the blob again and says whether `DEST` is still exactly the import; it is, until the first adaptation. After that, anyone who holds the map and the source repositories checks the whole history (P07 in the regression list) with `uv run python -m expcore.provenance.history --map MAP --source-repos "NAME=PATH;NAME=PATH"`, which reads `EXPCORE_SOURCE_REPOS` when `--source-repos` is not given. For each module under `src/` (`--root` names another directory) that carries a source header, it checks that the header's blob is the one the source repository holds at the commit and path the header names, and that the module as its import commit holds it, minus the header, is exactly the sanitisation of that blob under the map. The import commit is the commit that started the module's history: the latest commit that added its path, followed back through a rename only when that commit deleted the earlier path. A copy of an imported module, edited or not, is therefore checked at its own adding commit, never at the import it resembles. The command prints each module that fails and exits 1, or says every module holds and exits 0.

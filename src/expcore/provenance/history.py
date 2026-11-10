@@ -2,18 +2,29 @@
 """The maintainer's P07 check: every imported module reproduces from the source blob its header names.
 
 For each module under src/ with a `source:` header, in the committed tree: the header's blob must be the blob
-the source repository holds at the named commit and path, and the module's import commit (the first commit that
-added the file), minus the header, must equal the sanitisation of that blob under the private map. Runs only
-where the source repositories and the map are present.
+the source repository holds at the named commit and path, and the module's import commit (the commit that started
+its history: see `_import_commit`), minus the header, must equal the sanitisation of that blob under the private map.
+Runs only where the source repositories and the map are present:
+
+    python -m expcore.provenance.history --map MAP --source-repos "NAME=PATH;NAME=PATH" [--repo DIR] [--root src]
+
+`--source-repos` defaults to `EXPCORE_SOURCE_REPOS`. The command prints each problem and exits 1, or exits 0 when
+every module holds; 2 is an error (an unreadable map, an unknown repository setting, a git failure).
 """
 
-from collections.abc import Mapping
+import argparse
+import os
+import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from expcore.provenance.gitobjects import GitError, read_blob, run_git
 from expcore.provenance.headers import HeaderError, read_header, strip_header
 from expcore.provenance.sanitise import SanitiseError, sanitise_checked
-from expcore.provenance.sanitise_map import TokenMap
+from expcore.provenance.sanitise_map import TokenMap, load_map
+from expcore.provenance.study_tokens import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK
+
+SOURCE_REPOS_VARIABLE = "EXPCORE_SOURCE_REPOS"
 
 
 def parse_source_repos(spec: str) -> dict[str, Path]:
@@ -126,3 +137,42 @@ def verify_history(core: Path, sources: Mapping[str, Path], token_map: TokenMap,
     for path in _modules(core, root):
         problems.extend(_check_module(core, path, sources, token_map))
     return problems
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command line parser."""
+    parser = argparse.ArgumentParser(prog="python -m expcore.provenance.history", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--map", type=Path, required=True, help="the private sanitising map the imports were made with")
+    parser.add_argument(
+        "--source-repos",
+        default=None,
+        help=f"NAME=PATH pairs separated by ';', one per source repository (default: ${SOURCE_REPOS_VARIABLE})",
+    )
+    parser.add_argument("--repo", type=Path, default=Path(), help="the repository to check (default: here)")
+    parser.add_argument("--root", default="src", help="the directory whose modules are checked (default: src)")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the check; return 0 when every module holds, 1 when one does not, 2 on an error."""
+    args = build_parser().parse_args(argv)
+    spec = args.source_repos if args.source_repos is not None else os.environ.get(SOURCE_REPOS_VARIABLE, "")
+    try:
+        sources = parse_source_repos(spec)
+        if not sources:
+            raise ValueError(f"name the source repositories with --source-repos or {SOURCE_REPOS_VARIABLE}")
+        token_map = load_map(args.map)
+        modules = _modules(args.repo, args.root)
+        problems = verify_history(args.repo, sources, token_map, root=args.root)
+    except (OSError, ValueError, GitError) as error:  # MapError and decoding errors are ValueErrors
+        print(f"error: {error}", file=sys.stderr)
+        return EXIT_ERROR
+    for problem in problems:
+        print(f"FAIL {problem}")
+    if not problems:
+        print(f"ok: every module under {args.root} holds ({len(modules)} modules)")
+    return EXIT_FINDINGS if problems else EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
