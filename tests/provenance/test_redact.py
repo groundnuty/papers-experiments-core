@@ -7,7 +7,7 @@ import pytest
 
 from expcore import cli
 from expcore.provenance import history, sanitise, study_tokens
-from expcore.provenance.hashfile import hashes_from_tokens
+from expcore.provenance.hashfile import hashes_from_tokens, render_hash_file
 from expcore.provenance.redact import WITHHELD, Redactor, hidden_name
 
 PRIVATE = "zarnothwick"  # invented; a private name in these tests
@@ -117,3 +117,56 @@ def test_k05_a_command_line_the_package_commands_do_not_take_is_refused_without_
     err = capsys.readouterr().err
     assert "usage:" in err
     assert PRIVATE not in err
+
+
+def raising(stop: BaseException):
+    def raise_it(*_args, **_kwargs):
+        raise stop
+
+    return raise_it
+
+
+def stop_history(monkeypatch, stop, where, hashes, mapped) -> int:
+    monkeypatch.setattr(history, "_modules", raising(stop))
+    return history.main(["--map", str(mapped), "--source-repos", "origin=/nowhere", "--repo", str(where)])
+
+
+def stop_sanitise(monkeypatch, stop, where, hashes, mapped) -> int:
+    monkeypatch.setattr(sanitise, "import_module", raising(stop))
+    blob = where / "blob.py"
+    blob.write_text("x = 1\n", encoding="utf-8")
+    argv = ["import", "--map", str(mapped), "--source-repo", "origin", "--commit", "0123abcd", "--path", "p.py"]
+    return sanitise.main([*argv, str(blob), str(where / "out.py")])
+
+
+def stop_package_check(monkeypatch, stop, where, hashes, mapped) -> int:
+    monkeypatch.setattr("expcore.cli.default_hashes", lambda: hashes)  # stands in for the core's public list
+    monkeypatch.setattr("expcore.cli.verify_package", raising(stop))
+    return cli.main(["package-check", str(where)])
+
+
+def stop_package(monkeypatch, stop, where, hashes, mapped) -> int:
+    monkeypatch.setattr("expcore.package.build.load_study", raising(stop))  # as a study's plugin would, loading
+    return cli.main(["package", str(where), "--out", str(where / "dist"), "--hashes", str(hashes)])
+
+
+@pytest.mark.parametrize("command", [stop_history, stop_sanitise, stop_package_check, stop_package])
+def test_k05_every_guarded_command_ends_an_interrupt_or_an_exit_with_a_message_the_same_way(
+    command, tmp_path, monkeypatch, capsys
+):
+    """K05: the P07 command, the import and both package commands share the study-token command's handling of
+    Ctrl-C and of a SystemExit that carries a message (`provenance.redact.stopped`): `interrupted` and 130, or the
+    message through the redactor and 1; never a traceback or the raw text."""
+    hashes = tmp_path / "list.sha256"
+    hashes.write_text(render_hash_file([PRIVATE]), encoding="utf-8")
+    mapped = tmp_path / "map.toml"
+    entry = f"[[entry]]\ntoken = '{PRIVATE}'\nreplacement = 'place-a'\ncategory = 'hosts'\n"
+    mapped.write_text(f"version = 1\n{entry}", encoding="utf-8")
+    assert command(monkeypatch, KeyboardInterrupt(), tmp_path, hashes, mapped) == 130
+    assert capsys.readouterr().err.endswith("interrupted\n")
+    plugin_exit = SystemExit(f"a plugin stopped at /data/{PRIVATE}/run.py")
+    assert command(monkeypatch, plugin_exit, tmp_path, hashes, mapped) == 1
+    err = capsys.readouterr().err
+    assert "a plugin stopped at <hidden " in err
+    assert PRIVATE not in err
+    assert "Traceback" not in err

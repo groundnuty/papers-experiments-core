@@ -87,6 +87,38 @@ def failure(
     return f"{type(error).__name__} ({NOT_SHOWN})"
 
 
+INTERRUPTED = "interrupted"
+EXIT_INTERRUPTED = 130  # what a shell reports for a command Ctrl-C stopped
+EXIT_STOPPED = 1
+
+
+def stop_message(stop: SystemExit) -> str | None:
+    """The message a SystemExit carries (a study plugin's `SystemExit("...")`, say); None when it carries an exit
+    status, an integer or None, which a command passes on unchanged."""
+    code = stop.code
+    return None if code is None or isinstance(code, int) else str(code)
+
+
+def stopped(stop: BaseException, redactor: "Redactor | None", *, prefix: str = "error: ") -> int:
+    """How a command ends when something it runs stops it, the last guard beside `failure`: Ctrl-C, or a SystemExit,
+    which `except Exception` does not catch and Python reports as they are (a traceback whose frames name installed
+    paths, or the exit's own message).
+
+    An interrupt prints only `interrupted` and gives 130. An exit with a message prints it after `prefix`, through
+    `redactor` (by its kind alone before a list is loaded), and gives 1. An exit with a status is raised again
+    unchanged, so the command exits with that status.
+    """
+    if isinstance(stop, KeyboardInterrupt):
+        print(INTERRUPTED, file=sys.stderr)
+        return EXIT_INTERRUPTED
+    message = stop_message(stop) if isinstance(stop, SystemExit) else None
+    if message is None:
+        raise stop
+    shown = redactor.scrub(message) if redactor is not None else f"SystemExit ({NOT_SHOWN})"
+    print(f"{prefix}{shown}", file=sys.stderr)
+    return EXIT_STOPPED
+
+
 def hidden_name(label: str) -> str:
     """How a message names a label it must not show: the start of the label's SHA-256."""
     return f"<hidden {hashlib.sha256(label.encode('utf-8')).hexdigest()[:HIDDEN_PREFIX_CHARS]}>"

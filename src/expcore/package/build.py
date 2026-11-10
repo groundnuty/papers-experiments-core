@@ -81,7 +81,7 @@ from expcore.provenance.codestamp import STAMP, CodeVersionUnknown, covered_file
 from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_environment
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.hashfile import Hashes
-from expcore.provenance.redact import Redactor
+from expcore.provenance.redact import Redactor, stop_message
 from expcore.provenance.study_tokens import count_hashes
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.replay.check import CHECK_FILE, BatchNotVerified
@@ -291,6 +291,11 @@ def _guarded(redactor: Redactor, hidden: dict[str, str] | None) -> Iterator[None
     its kind. So no message shows a path or a value that holds a private name or a term, whatever raised it."""
     try:
         yield
+    except SystemExit as stop:  # a study's plugin, run during the build's own check, may exit with a message
+        message = stop_message(stop)
+        if message is None:
+            raise  # an exit status goes on unchanged
+        raise PackageError(redactor.scrub(message), private=redactor.hidden) from None
     except Exception as error:
         text = str(error) if isinstance(error, _REFUSALS) else f"{type(error).__name__}: {error}"
         raise PackageError(redactor.scrub(text), private=redactor.hidden) from None

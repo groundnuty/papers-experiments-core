@@ -35,7 +35,7 @@ from expcore.config.loading import ConfigError
 from expcore.package.build import build_package, default_hashes, private_hashes, verify_package
 from expcore.package.spec import PackageError
 from expcore.provenance.codestamp import CodeVersionUnknown
-from expcore.provenance.redact import QuietParser, Redactor
+from expcore.provenance.redact import QuietParser, Redactor, stopped
 from expcore.provenance.redact import failure as shown_failure
 from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified
 from expcore.report import summary_lines
@@ -189,6 +189,8 @@ def _package_check(args: argparse.Namespace) -> int:
     redactor = Redactor(private_hashes(default_hashes(), given=False))
     try:
         problems = verify_package(args.package, redactor=redactor)
+    except (KeyboardInterrupt, SystemExit) as stop:  # a study's plugin, run during the regeneration, can raise either
+        return stopped(stop, redactor, prefix=f"{args.command} refused: ")
     except Exception as error:
         print(f"refused: {shown_failure(error, redactor, expected=_REFUSALS)}", file=sys.stderr)
         return EXIT_REFUSED
@@ -232,6 +234,10 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
         if getattr(args, "show_private_paths", False):
             _show_private_paths(getattr(error, "private", {}))
         return EXIT_REFUSED
+    except (KeyboardInterrupt, SystemExit) as stop:  # the build turns an exit with a message into a refusal
+        if args.command not in _GUARDED:
+            raise
+        return stopped(stop, None, prefix=f"{args.command} refused: ")
     except Exception as error:  # the package commands' last guard
         if args.command not in _GUARDED:
             raise

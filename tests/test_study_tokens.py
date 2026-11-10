@@ -499,3 +499,34 @@ def test_k05_a_finding_whose_path_holds_a_listed_name_of_several_words_hides_it(
     out = capsys.readouterr().out
     assert f":1 text {st.token_hash(LONG_NAME)[:12]}" in out
     assert "example" not in out.casefold()
+
+
+def test_k05_an_interrupt_or_an_exit_from_inside_the_command_never_shows_a_listed_name(
+    tmp_path, hash_file, monkeypatch, capsys
+):
+    """K05: Ctrl-C and SystemExit are not exceptions `except Exception` catches, and Python reports them as they are: a
+    traceback naming installed paths, or the exit's own message. The command prints only `interrupted` for an
+    interrupt and exits 130; prints an exit's message through the redactor and exits 1; and passes an exit status, an
+    integer or None, on unchanged."""
+    (tmp_path / "m.py").write_text("x = 1\n", encoding="utf-8")
+    argv = ["check", "--hashes", str(hash_file), str(tmp_path / "m.py")]
+
+    def stopping(stop: BaseException):
+        def scan(*_args, **_kwargs):
+            raise stop
+
+        return scan
+
+    monkeypatch.setattr(st, "scan_paths", stopping(KeyboardInterrupt()))
+    assert st.main(argv) == 130
+    assert capsys.readouterr().err.endswith("\ninterrupted\n")
+    monkeypatch.setattr(st, "scan_paths", stopping(SystemExit(f"a plugin stopped at /data/{LONG_NAME}/m.py")))
+    assert st.main(argv) == 1
+    err = capsys.readouterr().err
+    assert "error: a plugin stopped at <hidden " in err
+    assert LONG_NAME not in err
+    for code in (3, 0, None):
+        monkeypatch.setattr(st, "scan_paths", stopping(SystemExit(code)))
+        with pytest.raises(SystemExit) as stopped:
+            st.main(argv)
+        assert stopped.value.code == code

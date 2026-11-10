@@ -21,7 +21,7 @@ from pathlib import Path
 from expcore.provenance.gitobjects import GitError, read_blob, run_git
 from expcore.provenance.hashfile import hashes_from_tokens
 from expcore.provenance.headers import HeaderError, read_header, strip_header
-from expcore.provenance.redact import QuietParser, Redactor, failure
+from expcore.provenance.redact import QuietParser, Redactor, failure, stopped
 from expcore.provenance.sanitise import SanitiseError, sanitise_checked
 from expcore.provenance.sanitise_map import TokenMap, load_map
 from expcore.provenance.study_tokens import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK
@@ -218,12 +218,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not sources:
             raise ValueError(f"name the source repositories with --source-repos or {SOURCE_REPOS_VARIABLE}")
         token_map = load_map(args.map)
+    except (KeyboardInterrupt, SystemExit) as stop:
+        return stopped(stop, None)
     except Exception as error:  # MapError is a ValueError; neither kind of message holds a value of the map
         print(f"error: {failure(error, None, expected=(ValueError,), fixed=(ValueError,))}", file=sys.stderr)
         return EXIT_ERROR
     redactor = Redactor(hashes_from_tokens(entry.token for entry in token_map.entries))
     try:
         return _report(args, sources, token_map, redactor)
+    except (KeyboardInterrupt, SystemExit) as stop:
+        return stopped(stop, redactor)
     except GitError:  # its message names a repository's path
         print("error: the repository checked cannot be read; is --repo a repository with a commit?", file=sys.stderr)
     except Exception as error:

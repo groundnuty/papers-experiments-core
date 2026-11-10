@@ -45,7 +45,7 @@ from expcore.provenance.hashfile import (
     parse_plain_list,
     render_hash_file,
 )
-from expcore.provenance.redact import QuietParser, Redactor, failure
+from expcore.provenance.redact import QuietParser, Redactor, failure, stopped
 from expcore.provenance.scanner import Finding, scan_message, scan_source
 
 __all__ = [
@@ -306,6 +306,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.redactor = None  # the command sets it once its list is loaded
     try:
         return args.run(args)
+    except (KeyboardInterrupt, SystemExit) as stop:
+        return stopped(stop, args.redactor)
     except Exception as error:
         shown = failure(
             error, args.redactor, expected=(OSError, ValueError, GitError), fixed=(MissingHashesError, ListError)

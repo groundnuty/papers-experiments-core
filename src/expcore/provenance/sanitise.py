@@ -27,7 +27,7 @@ from expcore.provenance.headers import (
     split_lines,
     strip_header,
 )
-from expcore.provenance.redact import QuietParser, Redactor, failure
+from expcore.provenance.redact import QuietParser, Redactor, failure, stopped
 from expcore.provenance.sanitise_map import Entry, MapError, load_map, matches_on_components
 from expcore.provenance.scanner import (
     FSTRING_END_TYPES,
@@ -366,14 +366,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     redactor = _redactor(args.map)
     out = io.StringIO()
     try:
-        with contextlib.redirect_stdout(out):
-            status = args.run(args)
-    except Exception as error:
-        status = EXIT_ERROR
-        shown = failure(error, redactor, expected=(OSError, SanitiseError, MapError), fixed=(MapError,))
-        print(f"error: {shown}", file=sys.stderr)
-    if out.getvalue():
-        print((redactor or Redactor()).scrub(out.getvalue().rstrip("\n")))
+        try:
+            with contextlib.redirect_stdout(out):
+                status = args.run(args)
+        except (KeyboardInterrupt, SystemExit) as stop:
+            status = stopped(stop, redactor)
+        except Exception as error:
+            status = EXIT_ERROR
+            shown = failure(error, redactor, expected=(OSError, SanitiseError, MapError), fixed=(MapError,))
+            print(f"error: {shown}", file=sys.stderr)
+    finally:  # what the command printed before it ended, an exit passed on included
+        if out.getvalue():
+            print((redactor or Redactor()).scrub(out.getvalue().rstrip("\n")))
     return status
 
 
