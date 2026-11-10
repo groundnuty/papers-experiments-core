@@ -28,6 +28,7 @@ condition that declares one, and the scheduler refuses a campaign whose health o
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import threading
 from collections.abc import Iterator, Mapping
@@ -73,6 +74,17 @@ class _HeldKind(NamedTuple):
 
 
 _scope_lock = threading.Lock()  # serialises every change to the study kinds in scope, and a platform's registration
+
+
+def _fresh_lock_in_child() -> None:
+    """A forked child starts with the lock free: a thread that held it in the parent does not exist in the child, so the
+    lock it took would never be released. The kinds in scope are kept; the child's own scopes count from them."""
+    global _scope_lock
+    _scope_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # every platform the core supports; absent only where fork itself is
+    os.register_at_fork(after_in_child=_fresh_lock_in_child)
 _study_kinds: Mapping[str, _HeldKind] = {}  # the kinds in scope (`study_kinds`); replaced, never changed in place, so
 # a reader takes one consistent view without the lock
 

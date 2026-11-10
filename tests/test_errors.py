@@ -1,7 +1,9 @@
 """The closed infrastructure-kind vocabulary, its registry, and the two errors that are not infrastructure."""
 
+import os
 import sys
 import threading
+import warnings
 
 import pytest
 
@@ -269,3 +271,32 @@ def test_o05_the_core_s_untreatable_kind_cannot_be_registered_again_as_treatable
     with pytest.raises(ValueError, match="core's own kinds"):
         register_infra_kind("tool_plane_integrity", "described", treatable=True)
     assert is_treatable("endpoint") is True
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="the platform cannot fork")
+def test_c02_a_child_forked_while_another_thread_holds_the_kind_lock_can_still_enter_a_scope():
+    """C02: the thread holding the lock does not exist in a forked child, so the child must not inherit a lock no one
+    will release; it enters and leaves a scope and exits, rather than hanging."""
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with errors._scope_lock:
+            held.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait(5)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # forking a threaded process: the point of the test
+            pid = os.fork()
+        if pid == 0:  # the child: entering a scope must not block; os._exit keeps pytest out of the child
+            done = threading.Event()
+            threading.Thread(target=lambda: (errors.study_kinds({}).__enter__(), done.set()), daemon=True).start()
+            os._exit(0 if done.wait(5) else 1)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+    finally:
+        release.set()
+        holder.join(5)
