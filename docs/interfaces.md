@@ -374,6 +374,36 @@ slots = {"TASK": task.id, "REGION": task.attributes["region"], "ROUNDS": limits.
 user = template.render(slots, study_run=True)  # for a template with a {ROUNDS} slot, which the example's has not
 ```
 
+## PromptTemplate
+
+`expcore.prompt.templates`. A template is text with named slots. The executor renders it for each run and passes the result to `record_run`, which records the text with the template's hash and the values of its slots.
+
+```python
+@dataclass(frozen=True)
+class PromptTemplate:
+    text: str
+    slot_names: tuple[str, ...]  # a property: the template's slots, sorted, each once
+    sha256: str                  # a property: the SHA-256 of the template's text
+    @classmethod
+    def from_file(cls, path: Path, *, expected_sha256: str | None = None) -> PromptTemplate
+    def render(self, values: Mapping[str, Any], *, study_run: bool = False) -> RenderedPrompt
+
+@dataclass(frozen=True)
+class RenderedPrompt:
+    text: str
+    template_sha256: str
+    rendered_sha256: str
+    slots: dict[str, str]  # the values inserted, as text
+```
+
+- **Slots.** A slot is `{NAME}`: an opening brace, a capital letter, any capital letters, digits and underscores, and a closing brace. Every other brace is text and is sent as it is, so a JSON example in a prompt (`{"answer": "...", "sources": [{"id": 1}]}`), `{}` or `{lower}` needs no escape. The slot form itself has no escape: to show `{NAME}` to the model, give it as the value of a slot.
+- **Values.** `render` needs a value for every slot, and refuses a value for a name the template does not have, or for a name that cannot be a slot. A value is made text with `str`, and one that is `None` or blank (empty, or only whitespace) is refused, so a condition with nothing to add in a slot still says something short (the example's `HINTS`). A value is inserted as it is and never searched for slots again.
+- **`study_run=True`** refuses the draft marker `PLACEHOLDER`, in any case, in the template or in any value, so a draft prompt never reaches a model of a study run; it changes nothing else. The example's executor passes it. A pilot or a test that renders a draft leaves it off.
+- **`from_file(path, expected_sha256=...)`** reads a template as UTF-8 and, given `expected_sha256`, refuses a file whose text has another hash, to pin the template to the hash a protocol froze.
+- **Refusals** raise `PromptError`, a `ValueError` that names the slot. Raised in an executor, it makes the attempt a harness defect (C10).
+- **The record.** Pass the `RenderedPrompt` itself to `record_run` as `system` or `user`: the record keeps its `text`, the text's `sha256`, `template_sha256` and `slots`. A plain string is recorded with neither a template hash nor slots. The hash a plugin gives for a condition (`StudyPlugin.prompts`) is the template rendered with what the condition decides and stand-ins for what each task fills in, as the example's `build` does; the tasks' values come from `study.toml`, whose hash the fingerprint holds.
+- **Nesting.** To compose templates, render the inner one first and pass its `text` as the value of a slot of the outer one, as in `outer.render({"RULES": inner.render(rules).text, ...})`. A value is never searched again, so the inner text's braces stay as they are. **Known limit:** the record then holds the outer template's hash and the inner text as that slot's value, and neither the inner template's hash nor its slot values. A study that needs them pins the inner template with `expected_sha256`, or records its hash and slots itself, in an instrument's snapshot for instance.
+
 ## HealthCheck
 
 `expcore.campaign.healthgate.HealthCheck`; `Health` is a named tuple `(ok: bool, detail: str)`.
