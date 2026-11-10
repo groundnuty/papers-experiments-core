@@ -1,15 +1,21 @@
 """An interrupted attempt costs its bound, never 0, and is left out of the mean cost of a run (C05)."""
 
+import dataclasses
+
 import pytest
 from campaign_support import LATER, finished, planned_store, run_one
 
 from expcore.campaign.attempt_bounds import attempt_costs, bound_usd, mean_run_usd, spent_usd
 from expcore.campaign.recovery import recover
-from expcore.config.models import ModelSpec
+from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import Price
 
-BUDGET = 2_000_000
-SPEC = ModelSpec(key="m1", backend="stub", api_id="m1", status="frozen", price=Price(3.0, 15.0))
+# One attempt's bound is 30 USD: a 1.96M-token cap at the stub's dearest 15 USD per million, and the request past the
+# cap, a 100,000-token window at 3 USD and a 20,000-token reply at 15 (C25).
+BUDGET = Limits(
+    max_tool_rounds=10, time_cap_s=60.0, token_budget=1_960_000, output_cap_chars=100, max_output_tokens=20_000
+)
+SPEC = ModelSpec(key="m1", backend="stub", api_id="m1", status="frozen", price=Price(3.0, 15.0), context_tokens=100_000)
 TOKENS = {"input_tokens": 1_000_000, "output_tokens": 100_000}
 
 
@@ -24,14 +30,14 @@ def keys_of(manifest):
 
 
 def test_c05_an_interrupted_attempt_is_charged_its_bound_and_not_zero(tmp_path):
-    """C05: an interrupted attempt with no record is charged one attempt's token budget at the dearest rate."""
+    """C05: an interrupted attempt with no record is charged the most its caps let one attempt cost."""
     store, _, manifest = planned_store(tmp_path)
     key = keys_of(manifest)[0]
     interrupted(store, key)
     [cost] = attempt_costs(store, {"m1": SPEC}, BUDGET)
     assert cost.state == "interrupted"
     assert cost.bounded
-    assert cost.usd == pytest.approx(BUDGET * 15.0 / 1_000_000)
+    assert cost.usd == pytest.approx(30.0)
     assert cost.usd == bound_usd(SPEC, BUDGET)
     assert cost.usd > 0
 
@@ -97,7 +103,8 @@ def test_c05_a_free_model_costs_nothing_and_an_unpriced_model_has_no_cost(tmp_pa
 
 
 def test_c05_the_budget_of_an_attempt_is_a_positive_whole_number():
-    """C05: a bound from a missing or silly budget is refused rather than computed."""
-    for bad in (0, -5, 1.5, True):
-        with pytest.raises(ValueError, match="positive integer"):
-            bound_usd(SPEC, bad)
+    """C05: a bound from a missing or silly budget, reply maximum or round count is refused rather than computed."""
+    for name, bad in (("token_budget", 0), ("token_budget", -5), ("token_budget", 1.5), ("token_budget", True),
+                      ("max_output_tokens", 0), ("max_tool_rounds", -1)):  # fmt: skip
+        with pytest.raises(ValueError, match=f"the {name} of an attempt is an integer of at least"):
+            bound_usd(SPEC, dataclasses.replace(BUDGET, **{name: bad}))

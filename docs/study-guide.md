@@ -43,7 +43,7 @@ All configuration is TOML in the study directory, validated when the study is lo
 | File | Holds |
 |---|---|
 | `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the factors, the conditions and the tasks |
-| `models.toml` | the single model table: each model once, with backend, API id, sampling, limits, price and status |
+| `models.toml` | the single model table: each model once, with backend, API id, sampling, limits and context window, price (flat or in tiers, [below](#prices-and-the-budget)) and status |
 | `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the budget |
 | `preregistration.toml` | the named contrasts, the Holm family (or `exploratory_only = true`, [section 6](#6-what-a-conclusion-may-say)), alpha, the estimators, the bootstrap and the power settings |
 | `package.toml` | the inclusion list of the replication package ([section 7](#7-ship-a-replication-package)) |
@@ -59,6 +59,77 @@ assert study.name == "tiny-study"
 assert sorted(study.config_sha256) == ["campaign.toml", "models.toml", "preregistration.toml", "study.toml"]
 statuses = {key: study.models.resolve(key).status for key in study.models}
 assert statuses == {"alpha-stub": "frozen", "beta-stub": "frozen"}  # only frozen settings may start a study run
+```
+
+### Prices and the budget
+
+A model's price is `[models.<key>.price]` in `models.toml`, in US dollars per million tokens: `input_per_mtok` and `output_per_mtok`, and optionally `cache_write_per_mtok` and `cache_read_per_mtok`, which are the input price when left out. A model the study hosts itself says `free = true` instead. With a budget, every planned model that is not free also declares its endpoint's context window, `context_tokens`, for the reason given below; loading the study refuses one without, naming `models.toml` and the model's key.
+
+```toml
+# my-study/models.toml
+[models.alpha-stub]
+context_tokens = 8192
+
+[models.alpha-stub.price]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+```
+
+A price that depends on the prompt's length is two or more `[[models.<key>.price.tiers]]` tables in place of the flat keys, each with those four prices. Every tier but the last has `up_to_prompt_tokens`, the longest prompt it takes, increasing from tier to tier; the last takes every longer prompt. A request, its reply included, takes the prices of the tier its whole prompt, cached part included, fell in. A run's cost is the sum over its requests, from the usage each turn of its record reports, so the cost the campaign charged is the cost its records give again. A model without tiers is priced from a run's totals.
+
+```python
+import tomllib
+
+from expcore.config.models import parse_models
+
+LONG_CONTEXT = """
+[models.long-context]
+backend = "openai_compat"
+api_id = "vendor/long-context-1"
+base_url = "https://llm.example.invalid/v1"
+key_env = "LONG_CONTEXT_KEY"
+status = "frozen"
+context_tokens = 200000
+
+[[models.long-context.price.tiers]]
+up_to_prompt_tokens = 128000
+input_per_mtok = 0.25
+output_per_mtok = 1.25
+cache_write_per_mtok = 0.3125
+
+[[models.long-context.price.tiers]]
+input_per_mtok = 0.5
+output_per_mtok = 2.5
+cache_write_per_mtok = 0.625
+"""
+model = parse_models(tomllib.loads(LONG_CONTEXT), "models.toml").resolve("long-context")
+assert model.price.for_prompt(128_000).input_per_mtok == 0.25  # at the boundary: the lower tier
+assert model.price.request_usd(150_000, 2_000) == (150_000 * 0.5 + 2_000 * 2.5) / 1e6  # past it, reply included
+```
+
+`[budget]` of `campaign.toml` sets the ceiling, `max_usd`. Before a run starts, the budget gate reserves the most the run can cost, and the run starts only when what was spent, the reservations of the runs in flight and its own fit under the ceiling. What a run can cost follows from its caps in `[agent]`:
+
+- The token cap, `token_budget` (C below), counts each reply's input and output tokens, the whole prompt with its cached part, summed over the run's requests. The budget is checked after each response and before each request, so a run can exceed it by at most one request: the last request goes out while the run is under its cap, and its prompt and reply then count. That request's prompt is within the context window (W, `context_tokens`) and its reply within the reply maximum (R, `max_output_tokens`, or the model's own when lower), and the run then ends as `token_cap`.
+- A run makes at most one request more than its tool rounds, so the requests before the last carry at most O = `max_tool_rounds` x R output tokens.
+- Let p_out be the dearest output price of any tier and p_in the dearest input price of any tier, the input or a cache price, whichever is higher.
+
+The reservation of one run is then the most its requests within the cap can cost, plus the request past it, W x p_in + R x p_out. Within the cap it is O x p_out + (C - O) x p_in when p_out is at least p_in and O is at most C, and C x max(p_in, p_out) otherwise, which is never more than the whole cap at the dearest rate. That bound relies on the reply maximum, which the OpenAI-compatible and Anthropic backends send as `max_tokens` in every request. The stub ignores it and a backend of the study's own may not send it, so for those the requests within the cap are reserved the whole cap at the dearest rate. The reservation is a hard upper bound as long as the endpoint applies the `max_tokens` it is sent to each reply and refuses a prompt longer than its window; the core does not check a reply's count against R. An attempt killed before its usage was recorded, or whose usage is unknown, is charged the same amount.
+
+For the tiered model above, with a 10M-token cap, 30 rounds and replies of at most 8,000 tokens, the upper tier's prices apply. The replies before the last carry at most 240,000 output tokens at $2.50 per million, $0.60, and the rest of the cap is input at its dearest rate, the cache write's $0.625, $6.10. The request past the cap adds a 200,000-token prompt at $0.625 and an 8,000-token reply at $2.50, $0.145. The reservation, $6.845, is far below the $25 of the whole cap at the dearest rate. The example's stubs reserve their whole cap at the dearest rate plus the request past it:
+
+```python
+from expcore.campaign.attempt_bounds import bound_usd, cap_bound_usd, overshoot_usd
+from expcore.config.models import Limits
+
+limits = Limits(
+    max_tool_rounds=30, time_cap_s=600.0, token_budget=10_000_000, output_cap_chars=8000, max_output_tokens=8000
+)
+assert round(cap_bound_usd(model, limits), 6) == 6.70  # 240,000 x 2.50 + 9,760,000 x 0.625, per million
+assert round(overshoot_usd(model, limits), 6) == 0.145  # 200,000 x 0.625 + 8,000 x 2.50, per million
+assert round(bound_usd(model, limits), 6) == 6.845
+
+alpha = study.models.resolve("alpha-stub")
+assert round(bound_usd(alpha, study.campaign.agent.limits), 6) == 0.048704  # 20,000 x 2 + 8,192 x 1 + 256 x 2
 ```
 
 ### The federation's certificate

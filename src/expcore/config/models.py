@@ -332,6 +332,22 @@ class ModelTable:
                 "or mark it free = true if it costs nothing per token; a study run needs a known cost to enforce its budget"
             )
 
+    def require_context_window(self, names: Iterable[str]) -> None:
+        """Refuse a campaign with a budget whose models, other than free ones, do not all declare `context_tokens`.
+
+        The budget reserves for each run the request it can make past its token cap, and only the context window
+        bounds that request's prompt (C25).
+        """
+        missing = [spec.key for spec in map(self.resolve, names) if not spec.free and spec.context_tokens is None]
+        if missing:
+            raise ConfigError(
+                f"{self.source}: no context window for model(s) {', '.join(map(repr, missing))}: with a budget "
+                "(max_usd), each run "
+                "is reserved what it can cost, including the one request it can send just under its token cap and end "
+                "past it, whose prompt only the context window bounds; give each model context_tokens = <the "
+                "endpoint's context window in tokens>, or mark it free = true if it costs nothing per token"
+            )
+
     def require_keys(self, names: Iterable[str], env: Mapping[str, str] | None = None) -> None:
         """Check at startup that the key of every named model can be read; the values are discarded."""
         for name in names:
@@ -432,7 +448,11 @@ def _entry_args(section: Section, key: str, backend: str) -> dict[str, Any]:
 
 def load_models(path: str | os.PathLike[str]) -> ModelTable:
     """Load and validate `models.toml`; fail at once, naming the file and the key, on the first bad entry."""
-    data = load_toml(path)
+    return parse_models(load_toml(path), path)
+
+
+def parse_models(data: Mapping[str, Any], path: str | os.PathLike[str]) -> ModelTable:
+    """Validate the parsed TOML of a model table, whose messages name `path` as its file."""
     root = Section(data, path, "(file)")
     root.reject_unknown(["models"])
     table = root.table("models")

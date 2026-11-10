@@ -5,7 +5,7 @@ A complete minimal study for the core. Copy this directory, change the names and
 | File | Holds |
 |---|---|
 | `study.toml` | two factors (`access`, `tools`), three named conditions, four tasks with a `region` attribute. `extended` runs on three of the tasks only. `relay-down` declares the tool server's failure (`knowledge`) as its treatment |
-| `models.toml` | the model table: two priced stub models |
+| `models.toml` | the model table: two priced stub models, each with the context window the budget needs |
 | `campaign.toml` | the plan (models, seeds, run order seed), the loop's caps, the scheduler's caps and a budget |
 | `preregistration.toml` | two contrasts in the Holm family (one with an equivalence margin, one declaring that its treatment attempts are scored), one exploratory contrast outside it, the estimator, power settings |
 | `plugin.py` | the tools (two functions, one waits on tool-server start-up), the stub platform's shelf, which serves the lookups and counts the facts it handed out, an instrument (that count, as a snapshot at the run's end), the scorer (which reads the count and returns values for a treatment attempt), the executor, the health check and the resource probe |

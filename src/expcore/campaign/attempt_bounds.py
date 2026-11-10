@@ -2,17 +2,36 @@
 #   source: icsa-2027-experiments @ 6fc798cf6ef196700854d6ff3ec0d353da030e85, icsa/campaign/attempt_bounds.py, blob aa745b2e86b2bd41637333a5a7ec1a9256542c1f
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
 #   changes: see git history of this file from its import commit
-"""What an attempt cost, and the bound charged for one that left no count (C05).
+"""What an attempt cost, and the bound charged for one that left no count (C05, C25).
 
 An attempt killed before its outcome was recorded is `interrupted`: no counts, no transcript. It may have spent anything
-up to its token budget, so it is **charged its bound, one attempt's token budget at the model's dearest rate**, never 0.
-The same goes for an attempt whose usage is known to be short (an abandoned request) or was never reported. A bounded
-attempt is part of what has been spent, and no part of what a run costs: **the mean cost of a run leaves bounded
-attempts out**, so a kill does not make a model look dear to the projection, and its bound does not make it look cheap.
+up to what its caps allow, so it is **charged its bound**, never 0. The same goes for an attempt whose usage is known to
+be short (an abandoned request) or was never reported. A bounded attempt is part of what has been spent, and no part of
+what a run costs: **the mean cost of a run leaves bounded attempts out**, so a kill does not make a model look dear to
+the projection, and its bound does not make it look cheap. The budget gate reserves the same bound for every run it
+starts or has in flight.
 
-The bound is for the budget the attempt ran under, which the caller names (`token_budget`, normally the campaign's
-`Limits.token_budget`). A model whose cost is unknown (no price, not free) has no cost at all: `None`, never 0, and the
-budget gate holds it (C12).
+**The bound is the most the caps let one attempt cost** (C25), from the limits it ran under (`Limits`, the campaign's):
+- The token cap counts each reply's input and output tokens, the whole prompt with its cached part, summed over the
+  attempt's requests. The loop checks it before each request and after each reply, so a request goes out whenever the
+  tokens used are below the cap, and its prompt and reply then count: a run can pass its cap by one request. The
+  requests before that one used less than the cap, and that one's prompt is within the model's context window W and
+  its reply within the reply maximum R (the study's `max_output_tokens`, or the model's own when lower).
+- The loop makes at most one request more than its tool rounds: each reply with tool calls is a round, and the reply
+  after the last round ends the run. So the requests before the last carry at most O = rounds x R output tokens.
+- The OpenAI-compatible and Anthropic adapters send R as `max_tokens` in every request, so the endpoint caps each
+  reply. The requests within the cap then cost at most the worst of `input + output <= cap`, `output <= O` at the
+  dearest rates of any tier (input at the dearest of the input and cache prices): `O x p_out + (cap - O) x p_in` when
+  output is the dearer and `O <= cap`, `cap x max(p_in, p_out)` otherwise. That is never above the whole cap at the
+  dearest rate.
+- The stub's counts ignore R and a study's own backend may not send it, so for those the requests within the cap are
+  bounded by the whole cap at the dearest rate, as before C25.
+- The request past the cap adds at most `W x p_in + R x p_out`, which needs the model's `context_tokens`: a campaign
+  with a budget refuses a priced model without one (`ModelTable.require_context_window`).
+
+The bound holds while the endpoint honours the `max_tokens` it is sent and refuses a prompt beyond its window; the core
+does not check a reply's count against R. A free model's bound is 0. A model whose cost is unknown (no price, not
+free) has no cost at all: `None`, never 0, and the budget gate holds it (C12).
 
 A measured attempt of a model with a flat price costs its totals at that price. One of a model with a tiered price
 costs each of its requests at the tier its prompt fell in, from the per-turn usage the store keeps (C24); an attempt
@@ -25,11 +44,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from expcore.campaign.store import Store, column_for
-from expcore.config.models import ModelSpec
-from expcore.config.prices import TieredPrice
+from expcore.config.models import Limits, ModelSpec
+from expcore.config.prices import TOKENS_PER_PRICE_UNIT, TieredPrice
 
 # Attempts that spent tokens: every state but `running`, whose cost is not known yet.
 BILLED_STATES = ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded")
+# Backends whose every request carries the reply maximum as `max_tokens`, which the endpoint applies to the reply.
+REPLY_CAPPED_BACKENDS = ("openai_compat", "anthropic")
 
 
 @dataclass(frozen=True)
@@ -44,15 +65,74 @@ class AttemptCost:
     bounded: bool
 
 
-def bound_usd(spec: ModelSpec, token_budget: int) -> float | None:
-    """Return the bound of one attempt: its token budget at the model's dearest rate; 0 for a free model, None unknown."""
-    if isinstance(token_budget, bool) or not isinstance(token_budget, int) or token_budget <= 0:
-        raise ValueError(f"the token budget of an attempt is a positive integer, not {token_budget!r}")
+def _check_limits(limits: Limits) -> None:
+    """Refuse limits that bound nothing: the cap and the reply maximum positive, the rounds a count."""
+    for name in ("token_budget", "max_output_tokens", "max_tool_rounds"):
+        value = getattr(limits, name)
+        least = 0 if name == "max_tool_rounds" else 1
+        if isinstance(value, bool) or not isinstance(value, int) or value < least:
+            raise ValueError(f"the {name} of an attempt is an integer of at least {least}, not {value!r}")
+
+
+def _worst_within(cap: int, most_output: int, input_rate: float, output_rate: float) -> float:
+    """The most `input + output <= cap` tokens with `output <= most_output` cost, in tokens times dollars per million.
+
+    The cost is linear in the two counts, so its maximum over that region is at a corner: all of the cap as input, or
+    as much of it as output as the replies allow and the rest as input (all output when they allow the whole cap).
+    """
+    output = min(most_output, cap)
+    return max(cap * input_rate, (cap - output) * input_rate + output * output_rate)
+
+
+def _rates(spec: ModelSpec, limits: Limits) -> tuple[float, float]:
+    """The dearest input and output rates of a priced model in any tier, in dollars per million tokens."""
+    _check_limits(limits)
+    if spec.price is None:
+        raise ValueError(f"model {spec.key!r} has no price, so nothing bounds its cost")
+    return spec.price.input_ceiling_per_mtok(), spec.price.output_ceiling_per_mtok()
+
+
+def _within_cap(spec: ModelSpec, limits: Limits) -> float:
+    """The most the requests within the token cap can cost, in tokens times dollars per million."""
+    input_rate, output_rate = _rates(spec, limits)
+    cap = limits.token_budget
+    if spec.backend not in REPLY_CAPPED_BACKENDS:  # nothing caps a reply: the whole cap at the dearest rate
+        return cap * max(input_rate, output_rate)
+    most_output = limits.max_tool_rounds * spec.output_tokens(limits.max_output_tokens)
+    return _worst_within(cap, most_output, input_rate, output_rate)
+
+
+def _past_cap(spec: ModelSpec, limits: Limits) -> float:
+    """The most the request a run sends below its cap and ends past it can cost, in tokens times dollars per million:
+    a prompt within the context window and a reply within its maximum."""
+    input_rate, output_rate = _rates(spec, limits)
+    if spec.context_tokens is None:
+        raise ValueError(
+            f"model {spec.key!r} has no context_tokens, so nothing bounds the request a run can make past its token "
+            "cap; give it the endpoint's context window in models.toml"
+        )
+    return spec.context_tokens * input_rate + spec.output_tokens(limits.max_output_tokens) * output_rate
+
+
+def cap_bound_usd(spec: ModelSpec, limits: Limits) -> float:
+    """The most a priced model's requests within the token cap can cost, in dollars (the module docstring says how)."""
+    return _within_cap(spec, limits) / TOKENS_PER_PRICE_UNIT
+
+
+def overshoot_usd(spec: ModelSpec, limits: Limits) -> float:
+    """The most the one request past the token cap can cost, in dollars, at the dearest rates of any tier."""
+    return _past_cap(spec, limits) / TOKENS_PER_PRICE_UNIT
+
+
+def bound_usd(spec: ModelSpec, limits: Limits) -> float | None:
+    """Return the bound of one attempt: the requests within its token cap and the one past it at their worst (C25);
+    0 for a free model, None when the price is unknown. A priced model with no context window is refused."""
+    _check_limits(limits)
     if spec.free:
         return 0.0
     if spec.price is None:
         return None
-    return token_budget * spec.price.dearest_per_token()
+    return (_within_cap(spec, limits) + _past_cap(spec, limits)) / TOKENS_PER_PRICE_UNIT
 
 
 def measured_usd(spec: ModelSpec, row: Mapping[str, Any]) -> float | None:
@@ -95,10 +175,11 @@ def _requests(stored: str | None) -> list[tuple[int, int, int, int]] | None:
     return requests
 
 
-def attempt_costs(store: Store, models: Mapping[str, ModelSpec], token_budget: int) -> list[AttemptCost]:
+def attempt_costs(store: Store, models: Mapping[str, ModelSpec], limits: Limits) -> list[AttemptCost]:
     """Return the cost of every attempt that spent tokens, in attempt order, each charged as the module docstring says.
 
-    `models` maps a run's model key to its table entry; a key it lacks is an unknown cost.
+    `models` maps a run's model key to its table entry; a key it lacks is an unknown cost. `limits` are the caps the
+    attempts ran under, which bound one whose usage is unknown.
     """
     marks = ",".join("?" * len(BILLED_STATES))
     rows = store.q(
@@ -117,7 +198,7 @@ def attempt_costs(store: Store, models: Mapping[str, ModelSpec], token_budget: i
         if measured is not None:
             costs.append(AttemptCost(row["id"], row["run_key"], row["model"], row["state"], measured, False))
             continue
-        bound = bound_usd(spec, token_budget)
+        bound = bound_usd(spec, limits)
         costs.append(
             AttemptCost(
                 row["id"], row["run_key"], row["model"], row["state"], bound, bound is not None and not spec.free

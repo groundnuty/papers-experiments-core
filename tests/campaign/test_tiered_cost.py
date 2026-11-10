@@ -6,7 +6,7 @@ import json
 import pytest
 from campaign_support import finished, planned_store, run_one
 from loop_support import ScriptedBackend
-from record_support import no_secrets_in_the_environment, record_run
+from record_support import make_config, no_secrets_in_the_environment, record_run
 
 from expcore.campaign.attempt_bounds import attempt_costs, bound_usd
 from expcore.campaign.executor import result_from_record
@@ -23,6 +23,7 @@ LOW, HIGH = Price(1.25, 10.0, None, 0.125), Price(2.5, 15.0, None, 0.25)
 TIERED = TieredPrice((PriceTier(200_000, LOW), PriceTier(None, HIGH)))
 FLAT = Price(3.0, 15.0, 3.75, 0.3)
 CAP = 2_000_000
+LIMITS = make_config(token_budget=CAP).limits
 ENDED = "2026-01-01T00:10:00Z"
 EXACT = LOW.usd(150_000, 2_000) + HIGH.usd(250_000, 3_000, 0, 100_000)
 
@@ -45,7 +46,7 @@ def charged(tmp_path, result, price):
     """The cost the store's measure gives an attempt with this result, of a model with this price."""
     store, _, manifest = planned_store(tmp_path)
     run_one(store, manifest.rows[0].key.text, result)
-    [cost] = attempt_costs(store, {"m1": spec(price)}, CAP)
+    [cost] = attempt_costs(store, {"m1": spec(price)}, LIMITS)
     return cost
 
 
@@ -88,7 +89,7 @@ def test_c24_a_tiered_attempt_without_per_turn_usage_is_charged_its_bound_never_
     """C24 and C05: totals alone cannot say which tier each token fell in (a database older than the per-turn usage),
     so the attempt is charged its bound, as one whose usage is unknown."""
     cost = charged(tmp_path, finished(input_tokens=400_000, output_tokens=5_000), TIERED)
-    assert (cost.usd, cost.bounded) == (bound_usd(spec(TIERED), CAP), True)
+    assert (cost.usd, cost.bounded) == (bound_usd(spec(TIERED), LIMITS), True)
 
 
 def test_c24_a_tiered_attempt_with_a_turn_whose_usage_is_unknown_is_charged_its_bound(tmp_path):
@@ -96,7 +97,7 @@ def test_c24_a_tiered_attempt_with_a_turn_whose_usage_is_unknown_is_charged_its_
     result = result_from_record(two_requests(), ended_utc=ENDED)
     result = dataclasses.replace(result, turn_usage=((150_000, 2_000, None, None), (None, 3_000, 0, 0)))
     cost = charged(tmp_path, result, TIERED)
-    assert (cost.usd, cost.bounded) == (bound_usd(spec(TIERED), CAP), True)
+    assert (cost.usd, cost.bounded) == (bound_usd(spec(TIERED), LIMITS), True)
 
 
 def test_c24_the_marker_keeps_the_per_turn_usage_and_an_older_marker_without_it_still_reads(tmp_path):

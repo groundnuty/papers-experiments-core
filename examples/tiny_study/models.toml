@@ -1,9 +1,12 @@
 # The single model table. Both models are stubs that play a script, so the example needs no network and no key.
-# `status = "frozen"` is what lets a study run start; a price lets the campaign's budget be enforced.
+# `status = "frozen"` is what lets a study run start; a price lets the campaign's budget be enforced. The context
+# window bounds the one request a run can make past its token cap, so a campaign with a budget needs one for every
+# model that is not free.
 
 [models.alpha-stub]
 backend = "stub"
 status = "frozen"
+context_tokens = 8192
 
 [models.alpha-stub.price]
 input_per_mtok = 1.0
@@ -12,6 +15,7 @@ output_per_mtok = 2.0
 [models.beta-stub]
 backend = "stub"
 status = "frozen"
+context_tokens = 8192
 
 [models.beta-stub.price]
 input_per_mtok = 0.5

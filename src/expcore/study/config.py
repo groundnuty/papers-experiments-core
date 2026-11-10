@@ -230,6 +230,8 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
                 f"{campaign.source}: key 'models' names {unknown[0]!r}{close_match(unknown[0], models)}, which "
                 f"{MODELS_FILE} does not define; it defines: {', '.join(models)}"
             )
+        if campaign.scheduler.budget is not None:  # the reservation bounds the request past the cap by the window
+            models.require_context_window(campaign.models)
         loaded = prereg.load(root / PREREG_FILE, schema)
         _check_clusters(name, tasks, loaded)
     hashes = {file: hashlib.sha256((root / file).read_bytes()).hexdigest() for file in CONFIG_FILES}

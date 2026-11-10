@@ -6,8 +6,9 @@
 
 Before a run starts, the gate asks whether the campaign can afford one more of its model. The answer is the dollars
 spent so far (attempts counted by their counts, an interrupted one by its bound, C05), plus what the runs in flight can
-cost, plus what this run can cost, against a ceiling. **What a run can cost is always its bound**, one attempt's token
-budget at the model's dearest rate, never the mean of the runs that finished: a reservation for a pending or running
+cost, plus what this run can cost, against a ceiling. **What a run can cost is always its bound**, the most one attempt's
+caps let it cost, the request it can make past its token cap included (`attempt_bounds.bound_usd`, C25), never the
+mean of the runs that finished: a reservation for a pending or running
 attempt is the worst case, because an attempt that overruns its mean is still inside the ceiling only if the bound was
 set aside for it. A run starts only when the remaining budget covers the bound. The historical mean is an estimate for
 the status and the reports (`BudgetState.estimate_usd`) and decides nothing.
@@ -33,7 +34,7 @@ from pathlib import Path
 from expcore.campaign import release
 from expcore.campaign.attempt_bounds import attempt_costs, bound_usd, mean_run_usd, spent_usd
 from expcore.campaign.store import Store
-from expcore.config.models import ModelSpec
+from expcore.config.models import Limits, ModelSpec
 
 HOLDS_KEY = "budget_holds"  # scope -> {"since_utc", "reason"}: the stops in force
 RELEASED_KEY = "budget_released"  # scope -> dollars released so far
@@ -101,8 +102,16 @@ class BudgetState:
 class BudgetGate:
     """Assess the budget before each dispatch; read the store afresh every time, keep nothing between assessments."""
 
-    def __init__(self, store: Store, models: Mapping[str, ModelSpec], budget: Budget, token_budget: int):
-        self.store, self.models, self.budget, self.token_budget = store, models, budget, token_budget
+    def __init__(self, store: Store, models: Mapping[str, ModelSpec], budget: Budget, limits: Limits):
+        """Take the store, the plan's models, the ceilings and the caps every attempt runs under; refuse a priced model
+        with no context window, whose request past the token cap nothing bounds (C25)."""
+        windowless = [key for key, spec in models.items() if spec.price is not None and spec.context_tokens is None]
+        if windowless:
+            raise ValueError(
+                f"model(s) {', '.join(windowless)} have a price and no context_tokens: the budget gate cannot bound the "
+                "request a run makes past its token cap"
+            )
+        self.store, self.models, self.budget, self.limits = store, models, budget, limits
 
     # --- the ceilings and what has been released -------------------------------------------------------------------
 
@@ -159,7 +168,7 @@ class BudgetGate:
         `now` at full precision (fractional seconds), with which a stop that begins is dated.
         """
         holds, released = self._apply_releases(self._json(HOLDS_KEY), self._json(RELEASED_KEY), now)
-        costs = attempt_costs(self.store, self.models, self.token_budget)
+        costs = attempt_costs(self.store, self.models, self.limits)
         spent = spent_usd(costs)
         reserve = {m: self._reserve(m) for m in self.models}
         estimate = {m: self._estimate(m, costs) for m in self.models}
@@ -179,7 +188,7 @@ class BudgetGate:
     def _reserve(self, model: str) -> float | None:
         """Return what one pending or running run of the model is reserved: its bound, always; None if unpriced."""
         spec = self.models[model]
-        return bound_usd(spec, self.token_budget) if spec.priced else None
+        return bound_usd(spec, self.limits) if spec.priced else None
 
     def _estimate(self, model: str, costs: list) -> float | None:
         """Return what one more run of the model is expected to cost, for reports: its mean, else its bound."""
@@ -187,7 +196,7 @@ class BudgetGate:
         if not spec.priced:
             return None
         mean = mean_run_usd(self.store, costs, model)
-        return mean if mean is not None else bound_usd(spec, self.token_budget)
+        return mean if mean is not None else bound_usd(spec, self.limits)
 
     def _holds_of(
         self,

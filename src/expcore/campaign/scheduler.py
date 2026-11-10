@@ -164,6 +164,8 @@ class Scheduler:
         cfg = self.settings
         if cfg.budget is not None and cfg.refuse_unpriced:
             self.models.require_priced(self.plan_models)
+        if cfg.budget is not None:  # the reservation bounds the request past the token cap by the window (C25)
+            self.models.require_context_window(self.plan_models)
         self.store, self.recovery = open_campaign(
             self.root / STATE_FILE,
             self.schema,
@@ -188,7 +190,7 @@ class Scheduler:
         self.budget = None
         if cfg.budget is not None:
             specs = {m: self.models.resolve(m) for m in self.plan_models}
-            self.budget = BudgetGate(store, specs, cfg.budget, self.agent_config.limits.token_budget)
+            self.budget = BudgetGate(store, specs, cfg.budget, self.agent_config.limits)
         else:
             store.event(self.stamp(), "budget_gate_off", None, "no budget in this campaign: runs are not held for cost")
         self.gate = None
