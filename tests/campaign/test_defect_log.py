@@ -15,6 +15,7 @@ from expcore.campaign.defect_log import HARNESS_LOG, log_path, write_defect
 from expcore.campaign.executor import record_run
 from expcore.config.loading import ConfigError
 from expcore.loop.outcomes import harness_defect_of
+from expcore.records.redact import Redactor
 
 SCHEMA = make_schema()
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
@@ -212,3 +213,18 @@ def test_l08_an_existing_gitignore_of_the_log_directory_is_kept_and_made_to_igno
     assert subprocess.run(["git", "-C", str(tmp_path), "check-ignore", "-q", str(path)], check=False).returncode == 0
     write_defect(tmp_path / "out", error, defect, stamp="T", run_key="k", attempt=2, redactor=_Plain)
     assert ignore.read_text(encoding="utf-8") == text  # appended once
+
+
+def test_r12_a_two_line_secret_in_an_exception_group_is_redacted_from_the_log(tmp_path):
+    """R12: an exception group's traceback puts `| ` before every line of its members' messages, so a two-line
+    secret never appears whole; each of its lines is redacted on its own."""
+    secret = "amber-line-one\ncobalt-line-two"
+    try:
+        raise ExceptionGroup("the batch failed", [ValueError(f"refused {secret}")])
+    except ExceptionGroup as error:
+        defect = harness_defect_of(error)
+        write_defect(tmp_path, error, defect, stamp="T", run_key="k", attempt=1, redactor=lambda: Redactor([secret]))
+    log = log_path(tmp_path).read_text(encoding="utf-8")
+    assert "| ValueError: refused [redacted]" in log
+    assert "amber-line-one" not in log
+    assert "cobalt-line-two" not in log

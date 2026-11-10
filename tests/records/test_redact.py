@@ -284,6 +284,27 @@ def test_R12_a_secret_in_the_repr_of_its_bytes_is_redacted_too():
     assert "quartz" not in text
 
 
+@pytest.mark.parametrize("secret", ["café-quartz-7781", "quartz'pebble\"7781"])
+def test_R12_a_repr_of_a_secret_inside_json_or_a_url_is_redacted_in_that_form(secret):
+    """R12: every escaped form is derived from every base form, so the repr of a secret's bytes inside a JSON string
+    (an exception's text a record or a log keeps as JSON) and inside a URL is caught too."""
+    env = {"TOYLAB_TOKEN": secret}
+    for shown in (str(ValueError(secret.encode())), repr(secret)):
+        for text in (json.dumps({"e": shown}), json.dumps(json.dumps({"e": shown})), quote(shown, safe="")):
+            redacted, _ = redact_text(text, env)
+            assert "quartz" not in redacted, text
+
+
+def test_R12_each_line_of_a_multi_line_secret_is_redacted_on_its_own():
+    """R12: a formatter that puts something between the lines of a secret (an exception group's `| `) breaks the
+    whole; each line of four or more characters is still caught."""
+    secret = "amber-line-one\ncobalt-line-two\nxy"
+    text, _ = redact_text("  | ValueError: amber-line-one\n    | cobalt-line-two\n    | xy", {"TOYLAB_TOKEN": secret})
+    assert "amber-line-one" not in text
+    assert "cobalt-line-two" not in text
+    assert text.endswith("| xy")  # a line under four characters would match ordinary text: it is left
+
+
 def test_a_redactor_of_nothing_changes_nothing_even_a_key_that_names_a_secret():
     data = {"token": "kept", "text": KEY}
     assert Redactor.none().structure(data) == (data, [])

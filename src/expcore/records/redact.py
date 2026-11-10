@@ -29,11 +29,13 @@ the only place a fragment is looked for, and it becomes one marker.
 A value under 4 characters would match ordinary text, so it is refused instead, with a `ConfigError` that names the
 variable and never shows the value. A number whose string form is a secret is replaced too.
 
-A secret is redacted in its raw form, in its JSON-escaped forms up to three levels of escaping (text inside a JSON
-string inside a JSON string), percent-encoded, and as Python's repr shows it and the repr of its UTF-8 bytes, since a
-native message carries text in JSON strings, a URL carries it percent-encoded, and an exception's text often holds a
-repr (`KeyError(secret)` escapes a quote when the secret holds both kinds). A secret that was replaced is gone:
-neither the text nor a decoding of it holds the value.
+A secret is redacted in three base forms, raw, as Python's repr shows it and as the repr of its UTF-8 bytes shows
+it, since an exception's text often holds a repr (`KeyError(secret)` escapes a quote when the secret holds both
+kinds), and in the forms derived from each of them: JSON-escaped up to three levels of escaping (text inside a JSON
+string inside a JSON string) and percent-encoded, since a native message carries text in JSON strings and a URL
+carries it percent-encoded. Each line of a multi-line secret that is at least the minimum length is a secret of its
+own as well, since a formatter can put something between the lines (an exception group prefixes each with `| `). A
+secret that was replaced is gone: neither the text nor a decoding of it holds the value.
 
 Redaction records the paths of what it changed, never values. It is a fixed point: redacting a redacted structure
 changes nothing. A number that is replaced becomes a string, so a record whose redaction would break a field that must
@@ -129,16 +131,24 @@ def secret_values(
     return sorted((v for v in values if v not in REDACTED), key=len, reverse=True)
 
 
+def _base_forms(value: str) -> set[str]:
+    """A secret as it is, and inside Python's repr of it and of its UTF-8 bytes (without the repr's quotes)."""
+    return {value, repr(value)[1:-1], repr(value.encode("utf-8", "surrogatepass"))[2:-1]}
+
+
 def forms_of(value: str) -> set[str]:
-    """Return the ways a secret can appear in text: raw, JSON-escaped up to three levels, percent-encoded, and inside
-    Python's repr of it and of its UTF-8 bytes (the quotes around a repr are not part of the form)."""
-    forms = {value}
-    level = {value}
+    """Return the ways a secret can appear in text: each base form (raw, the repr of the string, the repr of its
+    bytes), of the secret and of each of its lines of the minimum length or more, and each of those JSON-escaped up to
+    three levels and percent-encoded."""
+    bases = _base_forms(value)
+    for line in value.splitlines():
+        if len(line) >= MIN_SECRET_LEN:
+            bases |= _base_forms(line)
+    forms, level = set(bases), set(bases)
     for _ in range(ESCAPING_LEVELS):
         level = {json.dumps(v)[1:-1] for v in level} | {json.dumps(v, ensure_ascii=False)[1:-1] for v in level}
         forms |= level
-    python = {repr(value)[1:-1], repr(value.encode("utf-8", "surrogatepass"))[2:-1]}
-    return forms | python | {quote(value, safe=""), quote_plus(value)}
+    return forms | {quote(v, safe="") for v in bases} | {quote_plus(v) for v in bases}
 
 
 def is_secret_key(key: str) -> bool:
