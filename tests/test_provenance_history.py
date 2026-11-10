@@ -380,6 +380,72 @@ def test_a_module_deleted_and_added_back_edited_in_a_merge_is_checked_at_the_mer
     assert "differs from the sanitised source blob" in problems[0]
 
 
+OLD_MODULE = "src/expcore/old_tools.py"
+
+
+def core_with_origin(make_repo):
+    """A source repository holding the module's source, and a core repository holding a skeleton only."""
+    origin = make_repo("origin")
+    origin.write(SOURCE_PATH, SOURCE)
+    source_commit = origin.commit("source")
+    core = make_repo("core")
+    core.write("src/expcore/__init__.py", "# Provenance: new\n")
+    core.commit("skeleton")
+    return origin, source_commit, core
+
+
+def side_with_adapted_import(core, map_file, source_commit, tmp_path, branch: str) -> None:
+    """On a new branch: import the module under its old name, adapt it in a later commit, then return."""
+    core.git("checkout", "-q", "-b", branch)
+    staged = tmp_path / f"{branch}.py"
+    staged.write_text(SOURCE, encoding="utf-8")
+    sn.import_module(map_file, "origin-repo", source_commit, SOURCE_PATH, staged, core.path / OLD_MODULE)
+    core.commit("import on the side")
+    core.write(OLD_MODULE, (core.path / OLD_MODULE).read_text(encoding="utf-8") + "\n\nEXTRA = 1\n")
+    core.commit("adapt on the side")
+    core.git("checkout", "-q", "-")
+
+
+def test_p07_a_module_a_merge_renames_from_its_side_branch_is_traced_to_the_side_branchs_import(
+    make_repo, map_file, tmp_path
+):
+    """P07: a side branch imports a module and adapts it, and the merge into main, which holds neither name, renames
+    it. The merge adds the file only relative to its first parent; relative to the side branch it renames it, so the
+    module's history goes on there, to its import, and the adaptation is a later change."""
+    origin, source_commit, core = core_with_origin(make_repo)
+    side_with_adapted_import(core, map_file, source_commit, tmp_path, "side")
+    core.write("main.txt", "main\n")
+    core.commit("main")
+    core.git("merge", "-q", "--no-ff", "--no-commit", "side")
+    core.git("mv", OLD_MODULE, MODULE)
+    core.commit("merge side, renaming the module")
+    assert hist.verify_history(core.path, {"origin-repo": origin.path}, load_map(map_file)) == []
+
+
+def test_p07_an_octopus_merge_that_renames_a_module_from_its_last_parent_is_traced_to_that_parents_import(
+    make_repo, map_file, tmp_path
+):
+    """P07: every parent of a merge is looked at for a rename source, not only the first: an octopus merge that takes
+    the module from its third parent and renames it is traced to that parent's import."""
+    origin, source_commit, core = core_with_origin(make_repo)
+    side_with_adapted_import(core, map_file, source_commit, tmp_path, "side-b")
+    core.git("checkout", "-q", "-b", "side-a")
+    core.write("a.txt", "a\n")
+    core.commit("side a")
+    core.git("checkout", "-q", "-")
+    core.write("main.txt", "main\n")
+    core.commit("main")
+    core.git("checkout", "side-a", "--", "a.txt")
+    core.git("checkout", "side-b", "--", OLD_MODULE)
+    core.git("mv", OLD_MODULE, MODULE)
+    parents = [core.git("rev-parse", ref) for ref in ("HEAD", "side-a", "side-b")]
+    tree = core.git("write-tree")
+    merge = core.git("commit-tree", tree, "-p", parents[0], "-p", parents[1], "-p", parents[2], "-m", "octopus")
+    core.git("reset", "-q", "--hard", merge)
+    assert core.git("rev-list", "--parents", "-n", "1", "HEAD").split()[1:] == parents
+    assert hist.verify_history(core.path, {"origin-repo": origin.path}, load_map(map_file)) == []
+
+
 # --- the real check, where the source repositories and the private map are present ----------------------------------
 
 

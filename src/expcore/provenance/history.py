@@ -49,14 +49,25 @@ def _modules(core: Path, root: str) -> list[str]:
     return sorted(name for name in listing.decode("utf-8").split("\0") if name.endswith(".py"))
 
 
-def _renamed_from(core: Path, commit: str, path: str, *, merge: bool) -> str | None:
-    """Return the path a commit renamed to `path`: one it deleted in the same commit, never a file it kept.
+def _renamed_from(core: Path, commit: str, path: str, parents: Sequence[str]) -> tuple[str, str] | None:
+    """Return (the parent, the path it held) when the commit renamed that path to `path`: one it deleted in the same
+    commit relative to that parent, never a file it kept.
 
     Rename detection only (`-M`, no `-C`), over the whole tree, so a new file that resembles one that stays is a new
-    file, whatever git's copy detection would say. A merge is compared with its first parent.
+    file, whatever git's copy detection would say. A merge is compared with each of its parents in turn, the first
+    first: a side branch can hold the path a merge renames while main holds neither, and the module's history then
+    goes on along that side branch.
     """
-    against = (f"{commit}^1", commit) if merge else ("--root", commit)
-    out = run_git(core, "diff-tree", "-r", "-M", "--no-commit-id", "--name-status", "-z", *against)
+    for parent in parents[:1] if len(parents) < 2 else parents:
+        old = _rename_source(core, path, parent, commit)
+        if old is not None:
+            return parent, old
+    return None
+
+
+def _rename_source(core: Path, path: str, parent: str, commit: str) -> str | None:
+    """The path `parent` held that `commit` holds renamed as `path`; None when there is no such rename."""
+    out = run_git(core, "diff-tree", "-r", "-M", "--no-commit-id", "--name-status", "-z", parent, commit)
     fields = out.decode("utf-8").split("\0")
     index = 0
     while index < len(fields) and fields[index]:
@@ -80,8 +91,8 @@ def _holds(core: Path, rev: str, path: str) -> bool:
     return True
 
 
-def _latest_add(core: Path, rev: str, path: str) -> tuple[str, bool] | None:
-    """The latest commit in the path's history from `rev` that added it, and whether it is a merge.
+def _latest_add(core: Path, rev: str, path: str) -> tuple[str, list[str]] | None:
+    """The latest commit in the path's history from `rev` that added it, and its parents.
 
     The history is git's default one for the path: a merge whose file is exactly one parent's (a branch brought up to
     date with main, say) is not part of it, since the file came from that parent. A merge that is part of it, holding
@@ -94,9 +105,9 @@ def _latest_add(core: Path, rev: str, path: str) -> tuple[str, bool] | None:
     for line in run_git(core, "log", "--topo-order", "--format=%H %P", rev, "--", path).decode().splitlines():
         commit, *parents = line.split()
         if len(parents) < 2 and commit in added:
-            return commit, False
+            return commit, parents
         if len(parents) >= 2 and not _holds(core, f"{commit}^1", path) and _holds(core, commit, path):
-            return commit, True
+            return commit, parents
     return None
 
 
@@ -104,7 +115,8 @@ def _import_commit(core: Path, path: str) -> tuple[str, str] | None:
     """Return (commit, path at that commit) of the commit that started the file's history at HEAD.
 
     That is the latest commit that added the path (`_latest_add`, merges included), or, when that commit renamed it
-    from a path it deleted, the commit that started the earlier path's history, and so on. Git's copy detection
+    from a path it deleted relative to one of its parents (`_renamed_from`), the commit that started the earlier
+    path's history from that parent, and so on. Git's copy detection
     (`--follow`) is not used: it would trace a hand-edited copy of an imported module to the clean import it
     resembles (#55).
     """
@@ -113,11 +125,11 @@ def _import_commit(core: Path, path: str) -> tuple[str, str] | None:
         found = _latest_add(core, rev, current)
         if found is None:
             return None
-        commit, merge = found
-        earlier = _renamed_from(core, commit, current, merge=merge)
+        commit, parents = found
+        earlier = _renamed_from(core, commit, current, parents)
         if earlier is None:
             return commit, current
-        rev, current = f"{commit}^1", earlier
+        rev, current = earlier
 
 
 def _source_blob(repo: Path, commit: str, path: str) -> str | None:
