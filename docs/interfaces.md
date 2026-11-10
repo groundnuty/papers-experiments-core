@@ -15,7 +15,7 @@ All of them are `typing.Protocol`s, so a test double needs no inheritance. Signa
 
 ## The study plugin
 
-A study directory holds `study.toml`, `models.toml`, `campaign.toml`, `preregistration.toml` and one Python file named by `[study] plugin`. `expcore.study.config.load_study(directory)` validates all of them against each other. `expcore.study.plugin.load_plugin` imports the file and calls
+A study directory holds `study.toml`, `models.toml`, `campaign.toml`, `preregistration.toml` and one Python file named by `[study] plugin`; `[study] requires` names the distributions beyond the core that the study's code imports. `expcore.study.config.load_study(directory)` validates all of them against each other. `expcore.study.plugin.load_plugin` imports the file and calls
 
 ```python
 def build(context: StudyContext) -> StudyPlugin: ...

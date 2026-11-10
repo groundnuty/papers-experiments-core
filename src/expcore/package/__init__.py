@@ -4,6 +4,10 @@
 - `spec`: the inclusion list in the study's `package.toml`; anything it does not list is left out.
 - `anonymise`: anonymisation lists for double-blind submissions, applied only to the prose and metadata files named.
 - `archive`: the SHA-256 checksum manifest and the deterministic archive.
+- `wheels`: the wheels of the environment a package vendors and its `make check` installs offline.
+- `identity`: an anonymised package's code identity, by tree hash alone, with no commit id or source URL.
+- `tracking`: which included files no commit holds.
+- `leaks`: the token, term and identity checks over a package's files.
 - `build`: `python -m expcore package` builds a package, and `python -m expcore package-check`, which the package's own
   `make check` runs, verifies one.
 - `views`: what the package's checks read in a file, and which files they refuse.
