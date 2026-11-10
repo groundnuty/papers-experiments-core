@@ -9,8 +9,8 @@ import threading
 import time
 
 from campaign_support import keys_under, planned_store
-from fault_support import LOCAL_TARGET, FakeServices, injector_for, write_faults
-from platform_support import NOW
+from fault_support import LOCAL_TARGET, FakeServices, faults_table, injector_for, write_faults
+from platform_support import NOW, write_platform
 
 from expcore.campaign.healthgate import FOUND, GO, HealthGate
 from expcore_onedata.admission import FederationLock
@@ -18,6 +18,7 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import load_faults
 from expcore_onedata.health import PlatformHealth
+from expcore_onedata.tls import WARNING
 from expcore_onedata.tokens import TokenIssuer
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
@@ -82,8 +83,6 @@ def test_o11_a_failed_recovery_closes_the_standard_gate_naming_the_target(tmp_pa
 
 def test_o11_without_a_faults_table_the_standard_check_reads_no_journal(tmp_path, fake):
     """O11: a platform that declares no fault injector has nothing to settle; its check is as before."""
-    from platform_support import write_platform
-
     assert standard_health(write_platform(tmp_path), fake)().ok is True
 
 
@@ -105,6 +104,30 @@ def test_o11_a_baseline_check_whose_wait_runs_out_during_an_outage_is_deferred_a
     assert verdict.verdict == "defer", verdict.detail
     assert gate.closed is False
     assert store.q("SELECT COUNT(*) FROM attempts")[0][0] == 0
+
+
+def test_o11_a_deferred_reading_stays_deferred_with_the_insecure_tls_warning_appended(tmp_path, fake):
+    """O11, O05: with `insecure_tls` every reading ends with its warning, and a reading deferred because an outage run
+    holds the federation keeps its deferral: the warning changes the detail, never the verdict, so the run is still
+    held without a charge rather than counted as an outage."""
+
+    def edit(data):
+        data["faults"] = faults_table(health_wait_s=0.2)
+        data["tls"] = {"insecure_tls": True}
+
+    platform = write_platform(tmp_path, edit)
+    health = standard_health(platform, fake)
+    injector = injector_for(platform, FakeServices())
+    injector.start(RUN)
+    try:
+        reading = health()
+    finally:
+        assert injector.finish()["ok"] is True
+    assert (reading.ok, reading.deferred) == (False, True), reading.detail
+    assert reading.detail.endswith(f"; {WARNING}")
+    after = health()
+    assert (after.ok, after.deferred) == (True, False), after.detail
+    assert after.detail.endswith(f"; {WARNING}")
 
 
 class Watched:

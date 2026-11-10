@@ -56,9 +56,11 @@ while an outage run holds it, and fails only for an injection that stays open.
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
 
-**Use.** The study's plugin passes the platform's run admission to the campaign (`admission=run_admission(config)`),
-which admits each run to the federation before anything starts (exclusive when its condition declares
-`provider_outage`) and keeps it until after the post-run check. The executor, already admitted, starts the sandbox and
+**Use.** The study's plugin passes the platform's run admission to the campaign (`admission=run_admission(config,
+schema)`, with the study's factor schema), which admits each run to the federation before anything starts (exclusive
+when its condition declares `provider_outage` or `exclusive = true`) and keeps it until after the post-run check, and
+the platform's half of the fingerprint (`platform=config.fingerprint()`), which holds the injector's sanction and
+targets. The executor, already admitted, starts the sandbox and
 the tool server, builds the injector for the target its condition declares and runs the agent inside `running`:
 
     injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
