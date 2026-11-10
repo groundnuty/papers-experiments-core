@@ -335,6 +335,15 @@ def test_R12_a_short_common_line_of_a_secret_leaves_native_json_intact_and_secre
     assert json.loads(redacted["arguments"]) == {"enabled": True, "token": "[redacted]"}
 
 
+def test_R12_a_secret_with_a_slash_is_redacted_in_jsons_escaped_slash_spelling():
+    """R12: JSON may write a slash as an escaped slash, which Python's encoder never does; another producer's JSON
+    holding the secret that way is still redacted, and decoding it recovers no part of the secret."""
+    redactor = Redactor(["abcd/efgh-4471"])
+    redacted, paths = redactor.structure({"arguments": '{"value":"abcd\\/efgh-4471"}'})
+    assert paths
+    assert "efgh-4471" not in json.loads(redacted["arguments"])["value"]
+
+
 def test_R12_extra_secrets_given_as_an_iterator_are_read_once_for_both_passes():
     """R12: the long and the short secrets are picked from one reading of `extra`, so an iterator is not used up by
     the first pass and a short value it holds is still replaced as a token."""

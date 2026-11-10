@@ -167,6 +167,7 @@ def forms_of(value: str, *, lines: bool = False, line_min: int = MIN_SECRET_LEN)
     forms, level = set(bases), set(bases)
     for _ in range(ESCAPING_LEVELS):
         level = {json.dumps(v)[1:-1] for v in level} | {json.dumps(v, ensure_ascii=False)[1:-1] for v in level}
+        level |= {v.replace("/", "\\/") for v in level if "/" in v}  # JSON may escape a slash; Python never does
         forms |= level
     return forms | {quote(v, safe="") for v in bases} | {quote_plus(v) for v in bases}
 
