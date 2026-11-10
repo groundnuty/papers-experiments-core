@@ -71,6 +71,9 @@ RUN_KEY = re.compile(r"[\x21-\x7e]{1,200}")  # it becomes an HTTP header value a
 GATE_FILES = Path(__file__).resolve().parent  # gate.py and its siblings are mounted from here into the gate container
 MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
+TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
+MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O20)
+NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O20)
 MOUNT_WAIT_S = 60.0
 READ_ONLY_PROBE = (
     "try:\n"
@@ -586,6 +589,19 @@ class DockerSandbox:
             res.gate_refusals, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
         return res
 
+    def served_bytes(self) -> dict[str, Any]:
+        """The bytes the agent read through its data path in this run (O20), as `gatelog.served` counts them, with the
+        data path and its listing mode. REST: counted once, by the collection, from the log of the gate it stopped;
+        before that every count is unknown (`gate_not_collected`). A mount: unknown (`mount_not_through_gate`), since
+        its reads go through oneclient and no gate sees them. No data path: zero, since there is nothing to read
+        through. Unknown is never zero."""
+        path = {"data_path": self.spec.mode.value, "listing": self._meta.get("listing")}
+        if self.spec.mode is DataPathMode.MOUNT:
+            return path | gatelog.served_unknown(MOUNT_NOT_THROUGH_GATE)
+        if self.spec.mode is DataPathMode.NONE:
+            return path | dict.fromkeys(gatelog.SERVED_FIELDS, 0) | {"unknown": []}
+        return path | self._meta.get("served_bytes", gatelog.served_unknown(NOT_COLLECTED))
+
     def gate_refusals(self) -> list[str]:
         """The reasons of the answers the data gate refused for its own integrity so far (O05), from its log; empty
         without a gate. A log that cannot be read stands for `gatelog.UNREADABLE`: its refusals are unknown (O16)."""
@@ -649,6 +665,7 @@ class DockerSandbox:
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
         if self.spec.mode is DataPathMode.REST:
             self._stop_gate()
+            self._meta["served_bytes"] = gatelog.served(self._gate_log_lines(), self._meta["gate_stop"])  # final (O20)
             log_file = self.dir / "gatelog" / "requests.jsonl"
             self._copy_out(log_file, dest / "gate-requests.jsonl")
             result["gate_log"] = "gate-requests.jsonl"
@@ -685,7 +702,9 @@ class DockerSandbox:
                     break
                 self._sleep(0.1)
             logs = self.host.docker("logs", self.names.gate, check=False, timeout=30)
-            note["log_write_failed"] = "GATE LOG FAILED" in logs.stderr + logs.stdout
+            said = logs.stderr + logs.stdout
+            note["log_write_failed"] = "GATE LOG FAILED" in said
+            note["teardown_incomplete"] = any(m in said for m in TEARDOWN_TROUBLE)  # a close line may be missing (O20)
         except Exception as e:
             note["error"] = describe_error(e)
 
@@ -716,6 +735,9 @@ class DockerSandbox:
                 meta["gate"] = gatelog.summarize(file.read_text(encoding="utf-8").splitlines())
             except OSError as e:
                 meta["gate"] = gatelog.unknown(f"the gate log could not be read: {e.strerror}")
+            except ValueError:  # bytes that are not UTF-8, or a line that is not JSON: unknown, never a crash
+                meta["gate"] = gatelog.unknown("the gate log could not be parsed")
+        meta["served_bytes"] = self.served_bytes()
         meta["sidecar_log"] = self.sidecar_errors() if not self._stopped else None
         return meta
 

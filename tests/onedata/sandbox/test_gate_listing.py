@@ -115,14 +115,14 @@ def served(tls, tmp_path):
     gate.CFG.clear()
 
 
-def request(world, target, body=None) -> tuple[int, bytes]:
+def request(world, target, body=None, *, method="GET", headers=None) -> tuple[int, bytes]:
     """One request to the gate over TLS: (status, the body as received)."""
     context = ssl.create_default_context(cafile=str(world.tls / "ca.pem"))
     conn = http.client.HTTPConnection(PROVIDER, timeout=30)
     raw = socket.create_connection(("127.0.0.1", world.port), timeout=30)
     conn.sock = context.wrap_socket(raw, server_hostname=PROVIDER)
-    headers = {"Content-Type": "application/json"} if body is not None else {}
-    conn.request("GET", target, body=body, headers=headers)
+    headers = dict(headers or {}) | ({"Content-Type": "application/json"} if body is not None else {})
+    conn.request(method, target, body=body, headers=headers)
     answer = conn.getresponse()
     data = answer.read()
     conn.close()
@@ -302,3 +302,48 @@ def test_o19_a_gate_given_a_listing_mode_it_does_not_know_refuses_to_start(tmp_p
     with pytest.raises(SystemExit, match="listing mode"):
         gate.main()
     gate.CFG.clear()
+
+
+@pytest.mark.parametrize("listing", ["complete", "paged"])
+def test_o20_the_bytes_served_are_what_the_client_received_in_either_listing_mode(served, listing):
+    """O20: through a real gate, every answer's line says what its body was, and the count taken from the log is the
+    bytes the client received: a file's content whole and by a range, the listing as it was served (the merged answer
+    or the server's page), the platform's other answers, and the gate's own refusal apart."""
+    data = bytes(range(256)) * 8
+    tree = {f"file-{n:05d}.bin": b"x" for n in range(1500)} | {"data.bin": data}
+    world = served(MockOnedata(tree, space_name="invented-space", token=GATE_TOKEN), listing=listing)
+    file_id = "f" + b"data.bin".hex()
+    calls = [
+        ("listing", f"{ROOT}?limit=1000", "GET", {}),
+        ("content", f"/api/v3/oneprovider/data/{file_id}/content", "GET", {}),
+        ("content", f"/api/v3/oneprovider/data/{file_id}/content", "GET", {"Range": "bytes=0-99"}),
+        ("other", f"/api/v3/oneprovider/data/{file_id}", "GET", {}),
+        ("other", f"/api/v3/oneprovider/data/f{b'nowhere'.hex()}/children", "GET", {}),
+        ("gate", f"/api/v3/oneprovider/data/{file_id}/content", "PUT", {}),
+    ]
+    received = dict.fromkeys(("content", "listing", "other", "gate"), 0)
+    statuses = []
+    for kind, target, method, headers in calls:
+        status, body = request(world, target, method=method, headers=headers)
+        statuses.append(status)
+        received[kind] += len(body)
+    assert statuses == [200, 200, 206, 200, 404, 403]
+    assert received["content"] == len(data) + 100
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        lines = world.log.read_text().splitlines()
+        if sum('"method"' in x for x in lines) == len(calls):
+            break
+        time.sleep(0.05)
+    answered = [json.loads(x) for x in lines if '"method"' in x]
+    assert sorted(r["body"] for r in answered) == sorted(kind for kind, *_ in calls)  # lines may land in either order
+    stopped = {"signalled": True, "exit_code": 0, "log_write_failed": False, "teardown_incomplete": False}
+    got = gatelog.served(lines, stopped)
+    assert got == {
+        "served_bytes": received["content"] + received["listing"] + received["other"],
+        "content_bytes": received["content"],
+        "listing_bytes": received["listing"],
+        "other_bytes": received["other"],
+        "gate_answer_bytes": received["gate"],
+        "unknown": [],
+    }

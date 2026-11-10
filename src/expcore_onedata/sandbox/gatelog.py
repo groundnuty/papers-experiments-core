@@ -11,9 +11,32 @@ refused for its own integrity (a redirect, an encoded body, its token in a heade
 listing too large to check or serve whole) carries `gate_refusal`, its reason (`refusals`): the gate cut the
 condition's read, the agent did not read less. A log that cannot be read is unknown, never zero errors, and never no
 refusal (`UNREADABLE`).
+
+**The bytes served in a run (O20, `served`).** The log of a gate that was stopped (the collection's own SIGTERM, after
+the agent's processes were stopped) holds one line per answer, each with the bytes of its body that the gate's socket
+accepted (`body_bytes`), never fewer than the agent received, and what that body was (`body`). `served` adds them up:
+
+  * `content_bytes`: the bodies of the platform's 200 and 206 answers to reads of a file's content, which is the file
+    data the agent read; a transfer the gate cut counts the part it sent;
+  * `listing_bytes`: the bodies of the platform's 200 answers to listings, each page in the paged mode and the merged
+    answer in the complete one, so the count is of what the agent was served, never of the pages the gate read;
+  * `other_bytes`: every other answer of the platform's the gate passed on (the token's scope, a file id looked up, a
+    file's attributes, the platform's own errors);
+  * `served_bytes`: the three together, the bytes of the platform's answers the agent read through the gate;
+  * `gate_answer_bytes`: the gate's own answers (a refusal, an error), kept out of `served_bytes`.
+
+It counts body bytes, never headers or TLS framing, never what the gate read upstream, and never the plain TCP
+forwards of the knowledge plane. It is a count of what was served, so it can exceed what the agent's code consumed by
+what sat unread in its socket when the agent stopped reading (a cut transfer's line and its connection's close line
+show that). Every count is None, with its reasons in `unknown`, when any line may be missing or cannot be read: the
+gate was not shown stopped (`gate_not_stopped`), its log could not be read or written whole (`gate_log_unreadable`,
+`gate_log_malformed`, `gate_log_write_failed`), it could not write the close line of every connection
+(`gate_teardown_incomplete`), or a request was still being answered when it stopped (`request_in_flight_at_stop`).
+Unknown is never zero.
 """
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -22,7 +45,6 @@ def unknown(why: str) -> dict[str, Any]:
     return {
         "unavailable": why,
         "content_requests": None,
-        "upstream_bytes": None,
         "bytes_to_sandbox": None,
         "refused_requests": None,
         "cut_transfers": None,
@@ -120,3 +142,65 @@ def summarize(lines: list[str]) -> dict[str, Any]:
         "agent_saw_gate_error": counts["gate_5xx"] + counts["gate_resets"] > 0,
         "agent_saw_upstream_error": counts["upstream_5xx"] + counts["upstream_resets"] > 0,
     }
+
+
+# Why the bytes served are unknown (O20): each makes every count None, never a partial sum taken for the whole
+GATE_NOT_STOPPED = "gate_not_stopped"
+GATE_LOG_MALFORMED = "gate_log_malformed"
+GATE_LOG_WRITE_FAILED = "gate_log_write_failed"
+GATE_TEARDOWN_INCOMPLETE = "gate_teardown_incomplete"
+REQUEST_IN_FLIGHT = "request_in_flight_at_stop"
+SERVED_FIELDS = ("served_bytes", "content_bytes", "listing_bytes", "other_bytes", "gate_answer_bytes")
+_BODY_FIELD = {
+    "content": "content_bytes",
+    "listing": "listing_bytes",
+    "other": "other_bytes",
+    "gate": "gate_answer_bytes",
+}
+
+
+def served_unknown(*reasons: str) -> dict[str, Any]:
+    """The bytes served, unknown for these reasons: every count None."""
+    return {**dict.fromkeys(SERVED_FIELDS), "unknown": sorted(set(reasons))}
+
+
+def served(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The bytes the gate served the agent in a run, from its log once it was stopped (O20; the module docstring says
+    what each count holds). `lines` are the log's lines, None when it could not be read; `stop` is what the stop of the
+    gate found (`gate_stop` of the sandbox's metadata): it must have been signalled and shown exited, with no failed
+    write of its log and every connection's close line written."""
+    reasons = set() if lines is not None else {UNREADABLE}
+    if not isinstance(stop, Mapping) or stop.get("signalled") is not True or "exit_code" not in stop:
+        reasons.add(GATE_NOT_STOPPED)
+    else:
+        if stop.get("log_write_failed") is not False:
+            reasons.add(GATE_LOG_WRITE_FAILED)
+        if stop.get("teardown_incomplete") is not False:
+            reasons.add(GATE_TEARDOWN_INCOMPLETE)
+    counts = dict.fromkeys(_BODY_FIELD.values(), 0)
+    for text in lines or ():
+        if not text.strip():
+            continue
+        try:
+            record = json.loads(text)
+        except ValueError:
+            reasons.add(GATE_LOG_MALFORMED)
+            continue
+        if not isinstance(record, dict):
+            reasons.add(GATE_LOG_MALFORMED)
+            continue
+        if record.get("event") == "conn_close" and record.get("in_request") is True:
+            reasons.add(REQUEST_IN_FLIGHT)  # its answer may have begun, and has no line
+        if "body_bytes" not in record:
+            if "method" in record:  # a request's line always has its answer's body bytes
+                reasons.add(GATE_LOG_MALFORMED)
+            continue
+        size, field = record["body_bytes"], _BODY_FIELD.get(record.get("body"))
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0 or field is None:
+            reasons.add(GATE_LOG_MALFORMED)  # a line that does not say what it served is no count
+            continue
+        counts[field] += size
+    if reasons:
+        return served_unknown(*reasons)
+    total = counts["content_bytes"] + counts["listing_bytes"] + counts["other_bytes"]
+    return {"served_bytes": total, **counts, "unknown": []}
