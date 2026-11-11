@@ -1,8 +1,9 @@
 """Measure what a range read places on a provider that lacks the bytes, and which eviction empties it again.
 
-    uv run python deploy/compose-federation/measure_granularity_and_eviction.py
+    uv run python deploy/compose-federation/measure_granularity_and_eviction.py [--layout PATH]
 
-On the running federation, as its admin, in the study space, never through the core's provisioner:
+On the running federation, as its admin, in the study space, never through the core's provisioner; the data provider is
+the study space's owner and the receiver its first mirror:
 
 1. Granularity. For each file size (64 KiB, 8 MiB, 64 MiB) and each read size (1 B, 4 KiB, 1 MiB) a fresh file is
    written through the data provider, the receiver is waited for until it sees it, and one range is read through the
@@ -17,15 +18,17 @@ On the running federation, as its admin, in the study space, never through the c
 Each step prints one JSON line; never a token or an id. Every file is removed at the end.
 """
 
+import argparse
 import json
 import time
+from pathlib import Path
 
 from fedboot import Bootstrap
-from fedcontent import Content, provider
-from fedlayout import HOLDER, PROVIDERS, STUDY_SPACE, Layout
+from fedcontent import Content
+from fedlayout import Layout
 from fedrest import PROVIDER_API, Rest, bearer
+from fedspec import load_spec
 
-RECEIVER = "birch"
 KIB, MIB = 1 << 10, 1 << 20
 FILE_SIZES = (64 * KIB, 8 * MIB, 64 * MIB)
 READ_SIZES = (1, 4 * KIB, 1 * MIB)
@@ -56,14 +59,20 @@ class Probe:
         self.rest, self.boot = rest, boot
         self.token = bearer(boot.admin_token())
         self.made: list[str] = []
+        self.spec = boot.layout.spec
+        self.holder = self.spec.holder
+        mirrors = self.spec.space(self.spec.study_space).mirrors
+        if not mirrors:
+            raise RuntimeError("the study space has no mirror to read the files through")
+        self.receiver = mirrors[0]
 
     def call(self, name: str, method: str, path: str, **options):
-        url = f"{provider(name).url}{PROVIDER_API}{path}"
+        url = f"{self.spec.provider(name).url}{PROVIDER_API}{path}"
         headers = {**self.token, **options.pop("headers", {})}
         return self.rest.call(method, url, label=f"{name} {method}", ok=ANY, headers=headers, **options)
 
     def write(self, root: str, name: str, size: int) -> str:
-        file_id = self.call(HOLDER, "POST", f"/data/{root}/children", params={"name": name, "type": "REG"}).json()[
+        file_id = self.call(self.holder, "POST", f"/data/{root}/children", params={"name": name, "type": "REG"}).json()[
             "fileId"
         ]
         self.made.append(file_id)
@@ -71,7 +80,7 @@ class Probe:
         for offset in range(0, size, WRITE_CHUNK):
             body = CHUNK[: min(WRITE_CHUNK, size - offset)]
             answer = self.call(
-                HOLDER, "PUT", f"/data/{file_id}/content", params={"offset": offset}, content=body, headers=octets
+                self.holder, "PUT", f"/data/{file_id}/content", params={"offset": offset}, content=body, headers=octets
             )
             if answer.status_code >= 300:
                 raise RuntimeError(f"a write answered {answer.status_code}")
@@ -87,7 +96,7 @@ class Probe:
         raise RuntimeError(f"{name} did not see a new file in time")
 
     def blocks(self, name: str, file_id: str) -> list[list[int]]:
-        answer = self.call(HOLDER, "GET", f"/data/{file_id}/distribution").json()
+        answer = self.call(self.holder, "GET", f"/data/{file_id}/distribution").json()
         pid = self.boot.ids.providers[name]
         entry = answer.get("distributionPerProvider", {}).get(pid, {})
         out: list[list[int]] = []
@@ -111,7 +120,7 @@ class Probe:
             "type": "eviction",
             "dataSourceType": "file",
             "fileId": file_id,
-            "evictingProviderId": self.boot.ids.providers[RECEIVER],
+            "evictingProviderId": self.boot.ids.providers[self.receiver],
         }
         tid = self.call(via, "POST", "/transfers", json=body).json()["transferId"]
         began = time.monotonic()
@@ -124,7 +133,7 @@ class Probe:
         ended = round(time.monotonic() - began, 1)
         emptied_after = None
         for tick in range(61):
-            if not self.blocks(RECEIVER, file_id):
+            if not self.blocks(self.receiver, file_id):
                 emptied_after = round(tick * 0.5, 1)
                 break
             time.sleep(0.5)
@@ -133,25 +142,25 @@ class Probe:
             "filesEvicted": record.get("filesEvicted"),
             "transfer_ended_after_s": ended,
             "receiver_empty_after_s": emptied_after,
-            "receiver_holds_after": sum(length for _, length in self.blocks(RECEIVER, file_id)),
+            "receiver_holds_after": sum(length for _, length in self.blocks(self.receiver, file_id)),
         }
 
     def run(self) -> None:
-        root = Content(self.boot).root(provider(HOLDER), STUDY_SPACE)
+        root = Content(self.boot).root(self.spec.provider(self.holder), self.spec.study_space)
         placed = []
         try:
             for size in FILE_SIZES:
                 for length in READ_SIZES:
                     file_id = self.write(root, f"granularity-{size}-{length}.bin", size)
-                    waited = self.seen(RECEIVER, file_id, size)
+                    waited = self.seen(self.receiver, file_id, size)
                     offset = offset_for(size, length)
                     answer = self.call(
-                        RECEIVER,
+                        self.receiver,
                         "GET",
                         f"/data/{file_id}/content",
                         headers={"Range": f"bytes={offset}-{offset + length - 1}"},
                     )
-                    blocks, settle = self.settled(RECEIVER, file_id)
+                    blocks, settle = self.settled(self.receiver, file_id)
                     show(
                         "a range read through the receiver",
                         file_bytes=size,
@@ -170,23 +179,26 @@ class Probe:
                     )
                     placed.append(file_id)
             for index, file_id in enumerate(placed):
-                via = RECEIVER if index % 2 == 0 else HOLDER
-                self.settled(RECEIVER, file_id)
+                via = self.receiver if index % 2 == 0 else self.holder
+                self.settled(self.receiver, file_id)
                 show("an eviction from the receiver", scheduled_through=via, **self.evict(via, file_id))
         finally:
             for file_id in self.made:
-                self.call(HOLDER, "DELETE", f"/data/{file_id}")
+                self.call(self.holder, "DELETE", f"/data/{file_id}")
             show("removed", files=len(self.made))
 
 
-def main(probe: type[Probe] = Probe) -> None:
-    """Run `probe` (this module's, or a sibling script's subclass of it) against the running federation."""
-    layout = Layout.from_environment()
+def main(probe: type[Probe] = Probe, doc: str = __doc__) -> None:
+    """Run `probe` (this module's, or a sibling script's subclass of it, whose docstring is `doc`) against the
+    running federation of the layout `--layout` names."""
+    parser = argparse.ArgumentParser(description=doc.split("\n\n")[0])
+    parser.add_argument("--layout", type=Path, help="the layout file (default: federation.toml)")
+    layout = Layout.from_environment(spec=load_spec(parser.parse_args().layout))
     rest = Rest(layout.ca_pem)
     try:
         boot = Bootstrap(rest, layout)
         boot.ensure_spaces()
-        for service in PROVIDERS:
+        for service in layout.spec.providers:
             url = service.url + PROVIDER_API + "/configuration"
             boot.ids.providers[service.name] = rest.json("GET", url, label="configuration")["providerId"]
         probe(rest, boot).run()

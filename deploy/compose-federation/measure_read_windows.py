@@ -1,12 +1,13 @@
 """Measure what a range read places when it starts inside bytes the receiver already holds, when it is longer than
 1 MiB, and when reads follow one another.
 
-    uv run python deploy/compose-federation/measure_read_windows.py
+    uv run python deploy/compose-federation/measure_read_windows.py [--layout PATH]
 
 Built on `measure_granularity_and_eviction.py`, which found that one range read through the receiver places a 1 MiB
 window from the read's own offset, clipped to the file's end. On the running federation, as its admin, in the study
 space, never through the core's provisioner; a fresh file for every case, written through the data provider and read
-through the receiver, whose block map is read from the data provider's distribution answer:
+through the receiver (the study space's first mirror), whose block map is read from the data provider's distribution
+answer:
 
 1. Overlap. A fresh 8 MiB file; a 1 MiB read at offset 0 holds [0, 1 MiB); then 4 KiB at offset 512 KiB (wholly inside
    what is held) on one file, 4 KiB at offset 1 MiB - 1 (one held byte, then unheld ones) on another, and, as a control,
@@ -24,9 +25,8 @@ removed at the end.
 
 import time
 
-from fedcontent import Content, provider
-from fedlayout import HOLDER, STUDY_SPACE
-from measure_granularity_and_eviction import KIB, MIB, RECEIVER, Probe, main, offset_for, show
+from fedcontent import Content
+from measure_granularity_and_eviction import KIB, MIB, Probe, main, offset_for, show
 
 SMALL, LARGE = 8 * MIB, 64 * MIB
 LATE_S = 5.0
@@ -66,17 +66,20 @@ class Windows(Probe):
     def fresh(self, size: int, name: str) -> str:
         """A new file written through the data provider that the receiver sees; its id. Each name is used once."""
         file_id = self.write(self.root, f"{name}-{len(self.made)}-{size}.bin", size)
-        self.seen(RECEIVER, file_id, size)
+        self.seen(self.receiver, file_id, size)
         return file_id
 
     def read(self, file_id: str, offset: int, length: int) -> dict:
         """One range read through the receiver, then its block map once it has settled and `LATE_S` after."""
         answer = self.call(
-            RECEIVER, "GET", f"/data/{file_id}/content", headers={"Range": f"bytes={offset}-{offset + length - 1}"}
+            self.receiver,
+            "GET",
+            f"/data/{file_id}/content",
+            headers={"Range": f"bytes={offset}-{offset + length - 1}"},
         )
-        blocks, settle = self.settled(RECEIVER, file_id)
+        blocks, settle = self.settled(self.receiver, file_id)
         time.sleep(LATE_S)
-        later = self.blocks(RECEIVER, file_id)
+        later = self.blocks(self.receiver, file_id)
         return {
             "read_bytes": length,
             "read_offset": offset,
@@ -127,16 +130,16 @@ class Windows(Probe):
                 before = got["receiver_holds_late"]
 
     def run(self) -> None:
-        self.root = Content(self.boot).root(provider(HOLDER), STUDY_SPACE)
+        self.root = Content(self.boot).root(self.spec.provider(self.holder), self.spec.study_space)
         try:
             self.overlap()
             self.length()
             self.sequence()
         finally:
             for file_id in self.made:
-                self.call(HOLDER, "DELETE", f"/data/{file_id}")
+                self.call(self.holder, "DELETE", f"/data/{file_id}")
             show("removed", files=len(self.made))
 
 
 if __name__ == "__main__":
-    main(Windows)
+    main(Windows, __doc__)
