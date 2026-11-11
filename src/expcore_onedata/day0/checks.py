@@ -233,8 +233,7 @@ def listing(ctx: Context) -> Result:
     if empty:
         return unknown(
             f"the root lists no entry on {len(empty)} supporting provider(s): {', '.join(empty)}; no baseline file is "
-            "in the space (one declared baseline = false in the federation's layout holds none until a study "
-            "ingests), so there is nothing to list or to walk page by page and a pass would prove nothing",
+            "in the space, so there is nothing to list or to walk page by page and a pass would prove nothing",
             providers=rows,
         )
     if any(row["consistent"] is None for row in rows.values()):

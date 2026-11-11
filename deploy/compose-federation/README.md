@@ -154,8 +154,8 @@ files written through its owner. In the default layout:
 
 - `alpha-space`, the study space, written through `pine` (the data provider): `hello.txt` (64 bytes), `replicated.bin`
   (1 MiB, also replicated to the first mirror, `birch`, so the space lists an ended transfer), `samples/sample-1.bin`
-  and `samples/sample-2.bin`, and `listing-1200/` with 1200 entries of 16 bytes, for the complete-listing test
-  (`EXPCORE_LIVE_LISTING_PATH`). A study space without a mirror gets no replica and no transfer record, and neither
+  and `samples/sample-2.bin`, and `listing-1200/` with 1200 entries of 16 bytes, for a complete-listing test (no test
+  in this repository reads a variable naming it yet). A study space without a mirror gets no replica and no transfer record, and neither
   does one declared `baseline = false`.
 - `beta-space`, written through `birch`: `beta.txt`. Every other space that keeps its baseline holds one such file,
   named after it. Its name is outside the study's prefix, so the core may never change it.
