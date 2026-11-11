@@ -12,6 +12,7 @@ import pytest
 from expcore.config.key_locations import location_finders, withhold_key_locations
 from expcore.config.loading import ConfigError
 from expcore.config.models import load_models
+from expcore.package.leaks import find_locations
 from expcore.provenance.codestamp import CodeScope, tree_hash
 from expcore.study.config import load_study, read_study_identity
 from expcore.study.pipeline import fingerprint_of
@@ -166,28 +167,64 @@ def test_k13_the_rewrite_changes_only_the_key_values_and_is_its_own_canonical_fo
     assert withhold_key_locations(plain) is plain
 
 
-@pytest.mark.parametrize(
-    ("key_file", "found", "not_found"),
-    [
-        ("key.txt", ['key_file = "key.txt"', "`key.txt`"], ["my-key.txt", "copy key.txt here", "KEY.TXT"]),
-        ("secrets", ["'secrets'"], ["import secrets", "secrets.token_hex()"]),
-        (
-            "/srv/keys/a.key",
-            ["lives in /srv/keys/a.key.", "`/srv/keys/a.key`", "KEY=/srv/keys/a.key\n"],
-            ["/srv/keys/a.keyring", "/mnt/srv/keys/a.key", "/SRV/keys/a.key"],
-        ),
-    ],
-    ids=["file name", "ordinary word", "path"],
-)
-def test_k13_a_key_file_is_found_case_sensitively_and_only_whole(key_file, found, not_found):
-    """K13: a key file's path is found as written, case-sensitively, and only as a whole token between characters no
-    path runs through (or ending a sentence); a bare file name is an ordinary word, found only quoted. So neither
-    `my-key.txt` nor `import secrets` refuses a build whose key file is `key.txt` or `secrets`."""
+FOUND = [
+    ("key.txt", 'key_file = "key.txt"'),
+    ("key.txt", "`key.txt`"),
+    ("key.txt", "cat /srv/old/key.txt"),
+    ("secrets", "'secrets'"),
+    ("/srv/keys/a.key", "lives in /srv/keys/a.key."),
+    ("/srv/keys/a.key", "`/srv/keys/a.key`"),
+    ("/srv/keys/a.key", "KEY=/srv/keys/a.key\n"),
+    ("/srv/keys/a.key", "    - /srv/keys/a.key:/run/key:ro"),  # followed by a colon
+    ("/srv/keys/a.key", "docker run -v /srv/keys/a.key:/key image"),
+    ("/srv/keys/a.key", "/srv/keys/a.key:12: the line that names it"),
+    ("~/keys/a.key", "    - ~/keys/a.key:/run/key:ro"),
+    ("/srv/keys/a.key", "file:///srv/keys/a.key"),  # a file URL
+    ("keys/lab.key", "the key is at /srv/study/keys/lab.key"),  # a relative path inside a longer one
+    ("old-study/keys/lab.key", "see /srv/old-study/keys/lab.key"),
+    ("keys/lab.key", "file:///srv/study/keys/lab.key"),
+    ("/srv/keys/a.key", "**/srv/keys/a.key**"),  # any character that cannot continue a path's part
+    ("/srv/keys/a.key", "[/srv/keys/a.key](notes.md)"),
+    ("/srv/keys/a.key", "e.g. /srv/keys/a.key..."),
+    ("/srv/keys/a.key", "scp lab:/srv/keys/a.key ."),
+]
+NOT_FOUND = [
+    ("key.txt", "my-key.txt"),
+    ("key.txt", "/srv/old/my-key.txt"),
+    ("key.txt", "copy key.txt here"),
+    ("key.txt", "KEY.TXT"),
+    ("secrets", "import secrets"),
+    ("secrets", "secrets.token_hex()"),
+    ("/srv/keys/a.key", "/srv/keys/a.keyring"),
+    ("/srv/keys/a.key", "/srv/keys/a.key.bak"),
+    ("/srv/keys/a.key", "/srv/keys/a.key/old"),
+    ("/srv/keys/a.key", "/mnt/srv/keys/a.key"),
+    ("/srv/keys/a.key", "/SRV/keys/a.key"),
+    ("keys/lab.key", "/srv/study/mykeys/lab.key"),
+    ("keys/lab.key", "keys/lab.key-old"),
+]
+
+
+def names_key_file(key_file: str, text: str) -> bool:
     finders = location_finders([SimpleNamespace(key_file=key_file, key_env=None)])
-    for text in found:
-        assert any(finder.search(text) for finder in finders), text
-    for text in not_found:
-        assert not any(finder.search(text) for finder in finders), text
+    return bool(find_locations({"notes.txt": text.encode("utf-8")}, finders))
+
+
+@pytest.mark.parametrize(("key_file", "text"), FOUND, ids=[text for _, text in FOUND])
+def test_k13_a_key_file_is_found_wherever_no_path_part_continues_it(key_file, text):
+    """K13: a key file's path is found as written wherever no part of a path continues it: after the start, white
+    space, a quote, a bracket, `=`, `:` or `/` (so inside a longer path, and in a file URL), and before the end, white
+    space, a quote, a bracket, `:` (a mount, a line number), `,`, `;`, or a full stop that ends the text there. A bare
+    file name is found as a whole part of a path, or quoted."""
+    assert names_key_file(key_file, text)
+
+
+@pytest.mark.parametrize(("key_file", "text"), NOT_FOUND, ids=[text for _, text in NOT_FOUND])
+def test_k13_a_key_file_is_not_found_inside_a_longer_name(key_file, text):
+    """K13: a key file's path is found case-sensitively, never continued by a part of a longer name, and a bare file
+    name is an ordinary word unless quoted or a part of a path. So neither `my-key.txt` nor `import secrets` refuses a
+    build whose key file is `key.txt` or `secrets`."""
+    assert not names_key_file(key_file, text)
 
 
 MODEL = '[models.a]\nbackend = "anthropic"\napi_id = "a-1"\nbase_url = "https://a.example.invalid"\n'

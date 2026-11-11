@@ -15,7 +15,8 @@ package must not show, though: a home directory, an earlier study's folder, an a
 - every replication package ships models.toml in that form, so the identity a reader recomputes from the shipped file
   is the one the records were checked under, with no transformation to take on trust. The build refuses a package
   whose models.toml still holds any other key location (`location_findings`), and one in which any file still names
-  a key location the study's models declare (`location_finders`), as safety nets behind the rewrite.
+  a key location the study's models declare, or is a declared key file (`location_finders`), as safety nets behind
+  the rewrite.
 
 The rewrite is minimal by construction, and checked. It reads the file's bytes once, as UTF-8 with no newline
 translation, which is how the table is loaded too. It marks the lines that begin a statement, outside every string,
@@ -48,7 +49,8 @@ _ASSIGNMENT = re.compile(
 )
 _LINES = re.compile(r"(?<=\n)")  # TOML ends a line at LF (CRLF included) and nowhere else
 _NAME_EDGE = r"A-Za-z0-9_"  # a variable's name is found only as a whole identifier
-_TOKEN_EDGE = r"\s\"'`<>|()\[\]{}=,;"  # what a path written in text never runs through
+_PART = r"\w\-~+@%"  # what continues a part of a path written in text, besides a full stop
+_QUOTE = "\"'`"
 
 
 class KeyLocationUnreachable(ConfigError):
@@ -221,19 +223,52 @@ def location_findings(data: bytes) -> list[str]:
 
 
 def _path_finder(path: str) -> re.Pattern[str]:
-    """What finds a key file's path, case-sensitively and only whole. A path with a directory is a token of its own
-    between characters no path written in text runs through (white space, quotes, brackets; or the start or the end),
-    and may end a sentence; a bare file name is an ordinary word (`secrets`, `key.txt`), so it is found only quoted."""
-    escaped = re.escape(path)
-    if "/" not in path and "\\" not in path:
-        return re.compile(rf"(?<=[\"'`]){escaped}(?=[\"'`])")
-    return re.compile(rf"(?<![^{_TOKEN_EDGE}]){escaped}(?=$|[{_TOKEN_EDGE}]|[.,:;!?](?:$|[{_TOKEN_EDGE}]))")
+    """What finds a key file's path in text, case-sensitively, wherever no part of a path continues it.
+
+    On the left that is the start, or any character but a letter, a digit or one of `_-~+@%.`: white space, a quote,
+    a bracket, `=`, `,`, `:`, a separator (so a relative path is found inside a longer one, and an absolute one after
+    `file://`). On the right it is the end, or any character but those and a separator: white space, a quote, a
+    bracket, `:` (a mount, a line number), `,`, `;`; a run of full stops ends it too where nothing that continues a path
+    follows. A bare file name is an ordinary word (`secrets`, `key.txt`), so on the left it is found only after a
+    separator or a quote (`/x/lab.key`, `"lab.key"`); a packaged file named as the key file is found by its path
+    (`KeyFinders.names_file`)."""
+    whole = "/" in path or "\\" in path  # a path with a directory, not a bare file name
+    left = rf"(?<![{_PART}.])" if whole else rf"(?<=[{_QUOTE}/\\])"
+    return re.compile(rf"{left}{re.escape(path)}(?![{_PART}/\\]|\.+[{_PART}/\\])")
 
 
-def location_finders(specs: Iterable[Any]) -> list[re.Pattern[str]]:
-    """What finds each key location the models declare in any text: a key file's path as written and with `~`
-    expanded (`_path_finder`), and a variable's name as a whole identifier, each case-sensitively. A placeholder is
-    never looked for.
+def _ends_with(path: str, tail: str) -> bool:
+    """Whether `tail` is the whole path or its last parts."""
+    return bool(tail) and (path == tail or path.endswith(f"/{tail}"))
+
+
+@dataclasses.dataclass(frozen=True)
+class KeyFinders:
+    """What finds each key location a study's models declare: in text (`patterns`), and as a packaged file (`files`,
+    each key file's path as written and with `~` expanded)."""
+
+    patterns: tuple[re.Pattern[str], ...] = ()
+    files: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.patterns or self.files)
+
+    def names_file(self, label: str) -> bool:
+        """Whether a packaged file can be a declared key file itself: its path, or the path of the archive member it
+        is (after the last `!` of its label), and the key file's agree on their last parts, the shorter one whole. So
+        `lab.key` and `notes/lab.key` are `lab.key`, and `lab.key` is `/srv/study/lab.key` (a key file declared from
+        another directory); `my-lab.key` is neither."""
+        parts = {label, label.rpartition("!")[2]}
+        return any(_ends_with(part, path) or _ends_with(path, part) for part in parts for path in self.files)
+
+
+NO_LOCATIONS = KeyFinders()  # nothing to look for
+
+
+def location_finders(specs: Iterable[Any]) -> KeyFinders:
+    """What finds each key location the models declare: a key file's path as written and with `~` expanded, in text
+    (`_path_finder`) and as a packaged file (`KeyFinders.names_file`), and a variable's name as a whole identifier,
+    each case-sensitively. A placeholder is never looked for.
     """
     paths, names = set(), set()
     for spec in specs:
@@ -241,7 +276,10 @@ def location_finders(specs: Iterable[Any]) -> list[re.Pattern[str]]:
             paths |= {spec.key_file, os.path.expanduser(spec.key_file)}
         if spec.key_env and spec.key_env != KEY_ENV_WITHHELD:
             names.add(spec.key_env)
-    return [
-        *(_path_finder(path) for path in sorted(paths)),
-        *(re.compile(rf"(?<![{_NAME_EDGE}]){re.escape(name)}(?![{_NAME_EDGE}])") for name in sorted(names)),
-    ]
+    return KeyFinders(
+        patterns=(
+            *(_path_finder(path) for path in sorted(paths)),
+            *(re.compile(rf"(?<![{_NAME_EDGE}]){re.escape(name)}(?![{_NAME_EDGE}])") for name in sorted(names)),
+        ),
+        files=tuple(sorted(paths)),
+    )

@@ -86,7 +86,7 @@ from expcore.package.wheels import REQUIREMENTS, Vendor, Wheel, makefile, requir
 from expcore.package.wheelscan import scan_wheels
 from expcore.package.withhold import withhold_headers
 from expcore.provenance.codestamp import STAMP, CodeVersionUnknown, covered_files, is_sha
-from expcore.provenance.environment import EnvironmentUnknown, canonical, differences, environment, is_environment
+from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_environment
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.hashfile import Hashes
 from expcore.provenance.redact import Redactor, stop_message
@@ -165,20 +165,6 @@ def _environment(study: StudyConfig, check: Mapping[str, object], where: str) ->
             "campaign's environment:\n  " + "\n  ".join(changed)
         )
     return recorded  # type: ignore[return-value]
-
-
-def _own_distributions(env: Mapping[str, Any]) -> frozenset[str]:
-    """The distributions vendored as the author's own code, which the key-location search reads (K13): those installed
-    from a local directory, a checkout on the author's machine, and never the core, whatever its source. A distribution
-    from an index, a URL or a repository is published code that cannot hold where the author's key lives, and may well
-    name a generic variable a study also uses as its key_env (the core's own redaction names API_KEY and TOKEN)."""
-    sources = env.get("sources") or {}
-    core = canonical(CORE_DISTRIBUTION)
-    return frozenset(
-        canonical(name)
-        for name, source in sources.items()
-        if isinstance(source, Mapping) and source.get("kind") == "directory" and canonical(name) != core
-    )
 
 
 def _wheels(env: Mapping[str, Any], vendor: Vendor | None, supplied: Path | None) -> list[Wheel]:
@@ -369,7 +355,6 @@ def _collect(
     opaque = _attested(spec, files, redactor)
     code = _clean_code(check, where)
     env = _environment(study, check, where)
-    own = _own_distributions(env)  # before an anonymised build drops the sources
     _require_this_core(files)
     rewritten: list[str] = []
     covered = set(covered_files(study.root, study.scope))
@@ -406,7 +391,6 @@ def _collect(
         exempt=exempt,
         redactor=redactor,
         locations=locations,
-        own={wheel.path for wheel in vendored if canonical(wheel.name) in own},
     )
     files["Makefile"] = makefile(env)
     files[PACKAGE_FILE] = _package_json(

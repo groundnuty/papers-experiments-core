@@ -9,25 +9,27 @@ import dataclasses
 import hashlib
 import io
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tarfile
 import zipfile
-from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from package_support import stand_in, stand_in_vendor, wheel_of
+from package_support import installed_distribution, stand_in, stand_in_vendor, wheel_of
 from study_support import EXAMPLE, HEAD, Campaign, clean_environment, cli, copy_campaign, finish
 
 from expcore.campaign.resume import FINGERPRINT_KEY
 from expcore.config.key_locations import location_finders
 from expcore.package import build as package_build
+from expcore.package import wheels as wheels_module
 from expcore.package.build import PACKAGE_FILE, build_package, private_hashes, verify_package
-from expcore.package.spec import PackageError
+from expcore.package.leaks import FOUND_LOCATION, find_locations
+from expcore.package.spec import Opaque, PackageError
 from expcore.package.wheels import Wheel
 from expcore.package.wheelscan import scan_wheels
 from expcore.provenance.codestamp import CodeScope, tree_hash, write_stamp
@@ -210,52 +212,203 @@ def test_k13_any_file_that_names_a_key_location_refuses_the_build(campaign, hash
     assert not any(fragment in message.lower() for fragment in FRAGMENTS)
 
 
+CLEARED = "code you did not write can name a key location by chance"  # how a third-party hit is cleared
 GENERIC = b"SECRET_NAME = re.compile(r'(?:^|_)(?:API_KEY|SECRET|TOKEN)$')\n"  # as the core's own redaction names them
 
 
-def published_vendor(distributions, supplied=None):
-    """The core as a repository install reads it, and one more distribution installed from a repository; both read
-    with every view (not from an index), both naming the generic variable the study's key_env is."""
-    wheels = []
-    for name, version in sorted(distributions.items()):
-        if name == CORE_DISTRIBUTION or not any(w.direct and w.name != CORE_DISTRIBUTION for w in wheels):
-            filename, data = wheel_of(name, version, {f"{name.replace('-', '_')}/naming.py": GENERIC})
-            wheels.append(Wheel(name, version, filename, data, from_index=False, direct=True))
-        else:
-            wheels.append(Wheel(name, version, *stand_in(name, version), from_index=True))
-    return wheels
+THIRD_PARTY = "numpy"  # a distribution of the example's environment, here installed from a repository
 
 
-def test_k13_a_generic_key_variable_named_by_the_core_or_a_published_wheel_builds(campaign, hashes, tmp_path):
-    """K13: the core, however it was installed (here from a repository, so read with every view), and any other
-    published distribution, are not the author's code and are never searched for key locations: a study whose
-    key_env is API_KEY, which the core's own redaction names, still builds."""
+def repository_vendor(*names: str):
+    """A vendor that installs each distribution in `names` from a repository, so it is read with every view, with a
+    module naming the generic variable the study's key_env is; every other distribution comes from an index."""
+
+    def vendor(distributions, supplied=None):
+        wheels = []
+        for name, version in sorted(distributions.items()):
+            if name in names:
+                filename, data = wheel_of(name, version, {f"{name.replace('-', '_')}/naming.py": GENERIC})
+                wheels.append(Wheel(name, version, filename, data, from_index=False, direct=True))
+            else:
+                wheels.append(Wheel(name, version, *stand_in(name, version), from_index=True))
+        return wheels
+
+    return vendor
+
+
+def test_k13_a_generic_key_variable_named_by_the_core_installed_from_a_repository_builds(campaign, hashes, tmp_path):
+    """K13: the core, however it was installed (here from a repository, so read with every view), is not the author's
+    code and is never searched for key locations: a study whose key_env is API_KEY, which the core's own redaction
+    names, still builds."""
     copy = copy_campaign(campaign, tmp_path, "generic")
     move_keys(copy.root, env="API_KEY")
-    archive = build_package(copy.root, tmp_path / "dist", hashes=hashes, vendor=published_vendor)
+    archive = build_package(copy.root, tmp_path / "dist", hashes=hashes, vendor=repository_vendor(CORE_DISTRIBUTION))
     assert "'key_env' = \"KEY_WITHHELD\"" in every_stream(archive)[f"{NAME}/models.toml"].decode("utf-8")
 
 
-def test_k13_only_the_authors_own_wheels_are_searched_for_key_locations(hashes):
-    """K13: a wheel of the author's own code (a distribution installed from a local directory, never the core) is
-    searched for the key locations the models declare, and refused naming the member; the same wheel, published, is
-    not searched."""
-    env = {
-        "sources": {
-            CORE_DISTRIBUTION: {"kind": "directory", "editable": True},
-            "toy-kit": {"kind": "directory", "editable": False},
-            "remote-kit": {"kind": "vcs", "vcs": "git", "url": "https://code.example.org/r", "commit": "c" * 40},
-        }
-    }
-    assert package_build._own_distributions(env) == {"toy-kit"}
-    filename, data = wheel_of("toy-kit", "1.0", {"toy_kit/naming.py": GENERIC})
-    wheel = Wheel("toy-kit", "1.0", filename, data, from_index=False, direct=True)
+def test_k13_a_key_location_in_a_wheel_from_a_repository_refuses_the_build_until_attested(campaign, hashes, tmp_path):
+    """K13: a wheel of any distribution not from an index, the core's aside, can be the author's own code, so it is
+    searched: one installed from a repository that names the study's key_env refuses the build, naming the member,
+    saying how a distribution the author did not write is cleared, and printing its attestation, never the value. Read
+    by hand and attested in [[opaque]], it builds."""
+    copy = copy_campaign(campaign, tmp_path, "third-party")
+    move_keys(copy.root, env="API_KEY")
+    vendor = repository_vendor(CORE_DISTRIBUTION, THIRD_PARTY)
+    with pytest.raises(PackageError) as refused:
+        build_package(copy.root, tmp_path / "dist", hashes=hashes, vendor=vendor)
+    message = str(refused.value)
+    member = re.search(rf"wheels/{THIRD_PARTY}-[^/]+\.whl/{THIRD_PARTY}/naming\.py", message)
+    assert member is not None, message
+    assert f"{member[0]}:1: a key location the study's models.toml declares" in message
+    assert f"{member[0]}: {CLEARED}" in message
+    digest = hashlib.sha256(GENERIC).hexdigest()
+    assert f'[[opaque]] path = "{member[0]}", sha256 = "{digest}"' in message
+    assert "API_KEY" not in message
+    assert f"{CORE_DISTRIBUTION.replace('-', '_')}/naming.py" not in message
+    attestation = f'\n[[opaque]]\npath = "{member[0]}"\nsha256 = "{digest}"\nreason = "read by hand: a generic name"\n'
+    spec = copy.root / "package.toml"
+    spec.write_text(spec.read_text(encoding="utf-8") + attestation, encoding="utf-8")
+    build_package(copy.root, tmp_path / "dist", hashes=hashes, vendor=vendor)
+
+
+SOURCES = {
+    "a git repository": {"url": "git+file:///srv/src/toy-kit", "vcs_info": {"vcs": "git", "commit_id": "c" * 40}},
+    "a private helper over ssh": {
+        "url": "git+ssh://git@code.example.org/lab/toy-kit.git",
+        "vcs_info": {"vcs": "git", "commit_id": "c" * 40},
+    },
+    "a local wheel": {
+        "url": "file:///srv/src/toy-kit/dist/toy_kit-1.0-py3-none-any.whl",
+        "archive_info": {"hashes": {"sha256": "d" * 64}},
+    },
+    "a URL": {"url": "https://code.example.org/toy_kit-1.0.tar.gz", "archive_info": {}},
+    "a directory": {"url": "file:///srv/src/toy-kit", "dir_info": {}},
+}
+
+
+def scanned(tmp_path, monkeypatch, hashes, name: str, direct_url: dict | None, attested=None) -> list[str]:
+    """The findings of the wheel scan for one distribution installed as `direct_url` says (None: from an index),
+    holding a module that names API_KEY, under models whose key_env is API_KEY."""
+    site = tmp_path / "lib" / "site-packages"
+    site.mkdir(parents=True)
+    module = f"{name.replace('-', '_')}/naming.py"
+    shown = None if direct_url is None else json.dumps(direct_url)
+    dist = installed_distribution(site, name, "1.0", {module: GENERIC}, direct_url=shown)
+    monkeypatch.setattr(wheels_module, "installed", lambda: {name: dist})
+    [wheel] = wheels_module.vendor_wheels({name: "1.0"})
     finders = location_finders([SimpleNamespace(key_file=None, key_env="API_KEY")])
-    tokens = private_hashes(hashes)
-    scan = partial(scan_wheels, [wheel], tokens, terms=None, hidden=(frozenset(), frozenset()), attested={})
-    found = scan(locations=finders, own={wheel.path}).findings
-    assert f"{wheel.path}/toy_kit/naming.py:1: a key location the study's models.toml declares" in "\n".join(found)
-    assert scan(locations=finders, own=frozenset()).findings == []
+    scan = scan_wheels(
+        [wheel],
+        private_hashes(hashes),
+        terms=None,
+        hidden=(frozenset(), frozenset()),
+        attested=attested or {},
+        locations=finders,
+    )
+    return scan.findings
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_k13_every_wheel_not_from_an_index_is_searched_whatever_its_source(tmp_path, monkeypatch, hashes, source):
+    """K13: a distribution installed from a repository, a local wheel, a URL or a directory can be the author's own
+    code, so its wheel is searched for the key locations the models declare, and refused naming the member and how a
+    distribution the author did not write is cleared, never the value; attested once read by hand, it is not."""
+    found = scanned(tmp_path, monkeypatch, hashes, "toy-kit", SOURCES[source])
+    member = "wheels/toy_kit-1.0-py3-none-any.whl/toy_kit/naming.py"
+    assert f"{member}:1: a key location the study's models.toml declares, which no package holds" in found
+    assert any(line.startswith(f"{member}: {CLEARED}") for line in found)
+    assert not any("API_KEY" in line for line in found)
+    digest = hashlib.sha256(GENERIC).hexdigest()
+    attested = {member: Opaque(member, digest, "read by hand: a generic name")}
+    assert scanned(tmp_path / "again", monkeypatch, hashes, "toy-kit", SOURCES[source], attested) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "direct_url"),
+    [("toy-kit", None), (CORE_DISTRIBUTION, SOURCES["a git repository"])],
+    ids=["from an index", "the core from a repository"],
+)
+def test_k13_a_wheel_from_an_index_and_the_cores_are_not_searched(tmp_path, monkeypatch, hashes, name, direct_url):
+    """K13: a release from an index, and the core however it was installed, are code the author did not write, and may
+    well name a generic variable a study also uses as its key_env: neither is searched for key locations."""
+    assert scanned(tmp_path, monkeypatch, hashes, name, direct_url) == []
+
+
+KEY_BYTES = b"0123456789abcdef0123456789abcdef\n"  # stands in for a key's bytes
+
+
+def tar_of(member: str, data: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        info = tarfile.TarInfo(member)
+        info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+THE_KEY_FILE = [
+    ("lab.key", "lab.key", KEY_BYTES),
+    ("lab.key", "notes/lab.key", KEY_BYTES),
+    ("keys/lab.key", "keys/lab.key", KEY_BYTES),
+    ("keys/lab.key", "old/keys/lab.key", KEY_BYTES),
+    ("study/keys/lab.key", "keys/lab.key", KEY_BYTES),  # declared from the directory above the study
+    ("/srv/study/lab.key", "lab.key", KEY_BYTES),
+    ("lab.key", "bundle.tar", tar_of("lab.key", KEY_BYTES)),  # a member of a packaged archive
+]
+NOT_THE_KEY_FILE = [
+    ("lab.key", "my-lab.key"),
+    ("lab.key", "lab.key.md"),
+    ("keys/lab.key", "mykeys/lab.key"),
+    ("keys/lab.key", "lab.key/README.md"),
+    ("/srv/study/lab.key", "notes/lab.key"),
+]
+
+
+@pytest.mark.parametrize(("key_file", "path", "data"), THE_KEY_FILE, ids=[f"{k} as {p}" for k, p, _ in THE_KEY_FILE])
+def test_k13_a_packaged_file_that_is_the_key_file_is_refused(key_file, path, data):
+    """K13: a packaged file, or a member of a packaged archive, whose path and the declared key file's agree on their
+    last parts, the shorter one whole, can be the key itself: it is refused, by its hidden name, never the value."""
+    finders = location_finders([SimpleNamespace(key_file=key_file, key_env=None)])
+    found = find_locations({path: data}, finders)
+    assert any(line.endswith(f": the path holds {FOUND_LOCATION}") for line in found), found
+    assert not any("lab.key" in line for line in found)
+
+
+@pytest.mark.parametrize(("key_file", "path"), NOT_THE_KEY_FILE, ids=[f"{k} as {p}" for k, p in NOT_THE_KEY_FILE])
+def test_k13_a_packaged_file_with_a_longer_name_is_not_the_key_file(key_file, path):
+    """K13: a packaged file is the key file only by whole parts of its path: `my-lab.key` is not `lab.key`."""
+    finders = location_finders([SimpleNamespace(key_file=key_file, key_env=None)])
+    assert find_locations({path: KEY_BYTES}, finders) == []
+
+
+def test_k13_a_wheel_member_that_is_the_key_file_is_refused_by_its_hidden_name(hashes):
+    """K13: a member of a wheel read with every view that can be the key file itself is refused, and every line about
+    it, the attestation that would clear it included, shows it by its hidden name, never its path."""
+    filename, data = wheel_of("toy-kit", "1.0", {"toy_kit/lab.key": KEY_BYTES})
+    wheel = Wheel("toy-kit", "1.0", filename, data, from_index=False, direct=True)
+    finders = location_finders([SimpleNamespace(key_file="lab.key", key_env=None)])
+    found = scan_wheels(
+        [wheel], private_hashes(hashes), terms=None, hidden=(frozenset(), frozenset()), attested={}, locations=finders
+    ).findings
+    assert any(line.endswith(f": the path holds {FOUND_LOCATION}") for line in found), found
+    assert any("[[opaque]]" in line for line in found), found
+    assert not any("lab.key" in line for line in found), found
+
+
+def test_k13_the_key_file_itself_refuses_the_build(campaign, hashes, tmp_path):
+    """K13: a key file kept in the study's directory and taken by the inclusion list would publish the key itself:
+    the build refuses it by its hidden name, never its path."""
+    copy = copy_campaign(campaign, tmp_path, "key-itself")
+    table = copy.root / "models.toml"
+    table.write_text(table.read_text(encoding="utf-8").replace(KEY_FILE, "lab.key"), encoding="utf-8")
+    (copy.root / "lab.key").write_bytes(KEY_BYTES)
+    spec = copy.root / "package.toml"
+    spec.write_text(spec.read_text(encoding="utf-8").replace('"README.md",', '"README.md",\n    "lab.key",'), "utf-8")
+    with pytest.raises(PackageError) as refused:
+        build_package(copy.root, tmp_path / "dist", hashes=hashes)
+    message = str(refused.value)
+    assert f": the path holds {FOUND_LOCATION}" in message
+    assert "lab.key" not in message
 
 
 def test_k13_another_file_named_models_toml_refuses_the_build(campaign, hashes, tmp_path):
