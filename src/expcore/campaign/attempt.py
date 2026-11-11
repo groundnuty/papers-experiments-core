@@ -204,10 +204,16 @@ class AttemptRunner:
         """The run found an outage with its pre-run check: it is the outage's one attempt, and nothing was run."""
         p = self.p
         key = row["run_key"]
-        begun, run_dir = self._begin(row)
+        begun, run_dir = self._begin(row, reserved_capped=p.reserved_capped(key))
         outcome = Outcome("infrastructure", f"pre-run health check failed: {detail}", infra_kind=p.settings.health_kind)
-        result = AttemptResult(
-            outcome, p.stamp(), 0.0, input_tokens=0, output_tokens=0, treatment_kinds=self.treatment_kinds(factors, key)
+        result = AttemptResult(  # no request was sent: known to be no turn, so it costs 0 at any price (C24)
+            outcome,
+            p.stamp(),
+            0.0,
+            input_tokens=0,
+            output_tokens=0,
+            treatment_kinds=self.treatment_kinds(factors, key),
+            turn_usage=(),
         )
         self._finish(begun, run_dir, key, result)
         return p.settings.retry_delay_s

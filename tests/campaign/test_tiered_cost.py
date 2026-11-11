@@ -8,12 +8,15 @@ import pytest
 from campaign_support import finished, planned_store, run_one
 from loop_support import ScriptedBackend
 from record_support import make_config, no_secrets_in_the_environment, record_run
+from scheduler_support import build, settings_for
 
 from expcore.campaign.attempt_bounds import attempt_costs, bound_usd
 from expcore.campaign.executor import result_from_record
+from expcore.campaign.gate import Budget
+from expcore.campaign.healthgate import Health
 from expcore.campaign.markers import MARKER_NAME, read_marker, write_marker
 from expcore.campaign.snapshot import StoreSnapshot
-from expcore.config.models import ModelSpec
+from expcore.config.models import ModelSpec, ModelTable
 from expcore.config.prices import Price, PriceTier, TieredPrice
 from expcore.models.adapters import ModelTurn, ToolCall
 from expcore.records.record import load_record
@@ -132,3 +135,31 @@ def test_c24_the_marker_keeps_the_per_turn_usage_and_an_older_marker_without_it_
     del body["result"]["turn_usage"]
     path.write_text(json.dumps(body), encoding="utf-8")
     assert read_marker(tmp_path, "k", 1).turn_usage is None
+
+
+class DownOnce:
+    """A health check that fails once, then passes: the first run finds the outage with its pre-run check."""
+
+    def __init__(self):
+        self.checks = 0
+
+    def __call__(self):
+        self.checks += 1
+        return Health(self.checks > 1, "fine" if self.checks > 1 else "platform unreachable")
+
+
+def test_c24_a_run_that_found_an_outage_before_it_started_costs_nothing_whatever_its_models_price(tmp_path):
+    """C24 and C11: the run that finds an outage with its pre-run check is the outage's one attempt and sends nothing.
+    Its usage is known to be no request at all, so a tiered model's attempt costs 0, as a flat one's does, and is never
+    charged the bound of an attempt whose usage is unknown."""
+    budget = Budget(max_usd=1_000.0)
+    settings = settings_for(recheck_s=0.01, health_timeout_s=5, budget=budget)
+    table = ModelTable({"m1": spec(TIERED)})
+    plan = {"tasks": ("task-a",), "seeds": (1,)}
+    with build(tmp_path, settings=settings, health=DownOnce(), plan=plan, models=table) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+        store = scheduler.store
+        [outage] = store.q("SELECT id, turn_usage, reserved_capped FROM attempts WHERE state='infra_fail'")
+        assert (outage["turn_usage"], outage["reserved_capped"]) == ("[]", 0)
+        costs = attempt_costs(store, {"m1": spec(TIERED)}, scheduler.agent_config.limits)
+        assert [(cost.usd, cost.bounded) for cost in costs if cost.attempt_id == outage["id"]] == [(0.0, False)]

@@ -87,6 +87,22 @@ def test_c26_a_top_up_that_fits_is_charged_at_once_counted_while_the_attempt_run
     assert "topup" in event_kinds(store)
 
 
+def test_c26_an_attempt_held_before_any_reply_costs_its_top_ups_alone_and_the_export_agrees_its_usage_is_known(
+    tmp_path,
+):
+    """C26 and C05: a failed send was topped up, then the next send was refused, so the attempt ended a budget hold
+    before any reply. Its usage is complete with no turn: nothing was answered, so it costs what its top-ups were
+    charged and no bound, and the export counts its usage as complete, from the same column the gate reads."""
+    store, key, begun = running(tmp_path)
+    store.add_topup(begun.id, TOPUP, NOW, ("topup", MODEL, f"{key}: a send that failed"))
+    kinds = store.schema.treatment_kinds[condition_of(store, key)]
+    store.finish_attempt(begun.id, infra("budget_hold", model_turns=0, turn_usage=(), treatment_kinds=kinds), 3)
+    [cost] = attempt_costs(store, {MODEL: SPEC}, LIMITS)
+    assert cost.usd == pytest.approx(TOPUP)
+    [cell] = export_run_state(store)["discarded_usage"]
+    assert (cell["attempts"], cell["usage_incomplete_attempts"]) == (1, 0)
+
+
 def test_c26_a_top_up_that_does_not_fit_is_refused_with_nothing_charged_and_the_figure_in_an_event(tmp_path):
     """C26: the figure is the gate's, the run's own reservation among the runs in flight and the top-up in place of a
     new run's bound."""

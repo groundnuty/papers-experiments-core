@@ -506,6 +506,8 @@ class Scheduler:
             if in_use >= self.settings.workers or full:
                 waiting = True
                 continue
+            if budget is not None:  # the decision a run begun before its recheck (an outage's) records (C27)
+                self._reserved_capped[key] = model in budget.capped
             return row, waiting
         return None, waiting
 

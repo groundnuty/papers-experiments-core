@@ -179,14 +179,20 @@ def measured_usd(spec: ModelSpec, row: Mapping[str, Any]) -> float | None:
     A count the endpoint did not report is unknown, never zero, so the caller bounds the attempt instead. A flat price
     is applied to the attempt's totals. A tiered price is applied to each request at the tier its prompt fell in, from
     the per-turn usage the store keeps (C24); without it, or with a turn that did not report its prompt or its reply,
-    the cost is unknown, since totals cannot say which tier each token fell in.
+    the cost is unknown, since totals cannot say which tier each token fell in. An attempt whose per-turn usage is
+    known to hold no turn (a budget hold or a failed send before any reply, a run that found an outage before it
+    started) costs 0 at either price: no request was answered, and a send that may have been billed is a top-up.
     """
     if spec.free:
         return 0.0
     if isinstance(spec.price, TieredPrice):
         requests = _requests(row["turn_usage"])
         return None if requests is None else spec.price.requests_usd(requests)
-    if spec.price is None or row["input_tokens"] is None or row["output_tokens"] is None:
+    if spec.price is None:
+        return None
+    if row["input_tokens"] is None and row["output_tokens"] is None and _requests(row["turn_usage"]) == []:
+        return 0.0  # no request was answered: no turn, so nothing reported and nothing billed beyond its top-ups
+    if row["input_tokens"] is None or row["output_tokens"] is None:
         return None
     return spec.price.usd(
         row["input_tokens"],
