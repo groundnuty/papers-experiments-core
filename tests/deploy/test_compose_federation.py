@@ -161,3 +161,38 @@ def test_the_committed_template_renders_into_a_platform_file_the_layer_loads(fed
     assert {name: p.url for name, p in config.providers.items()} == {p.name: p.url for p in layout.PROVIDERS}
     body = "\n".join(line for line in platform.read_text(encoding="utf-8").splitlines() if not line.startswith("#"))
     assert fed.cli.PLACEHOLDER.search(body) is None  # every placeholder filled
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "relative/root",
+        "/",
+        "/mnt/volume2",
+        "/mnt/volume2/expcore-federation-other",
+        "/mnt/volume2/expcore-federation/../x",
+    ],
+)
+def test_a_root_outside_the_allowed_directory_is_refused_before_anything_is_touched(fed, value, monkeypatch, capsys):
+    """Down deletes everything the root holds, so a root that is not at or below the allowed directory is refused, by
+    the command itself, before it writes a file or starts a container."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", value)
+    touched = []
+    for name in ("up", "reset", "down", "status"):
+        monkeypatch.setattr(fed.cli, name, lambda layout, name=name: touched.append(name))
+    assert fed.cli.main(["down"]) == 2
+    assert touched == []
+    assert "EXPCORE_FED_ROOT" in capsys.readouterr().err
+
+
+def test_a_root_through_a_link_is_refused_and_one_below_the_base_is_accepted(fed, tmp_path):
+    """A link from the allowed directory down to the root could redirect the deletion; a plain directory below the
+    allowed one is the federation's own, for a second federation beside the first."""
+    base = tmp_path / "allowed"
+    (base / "pilot").mkdir(parents=True)
+    (base / "linked").symlink_to(tmp_path)
+    assert fed.layout.checked_root(str(base / "pilot"), base) == base / "pilot"
+    assert fed.layout.checked_root(str(base), base) == base
+    with pytest.raises(ValueError, match="symbolic link"):
+        fed.layout.checked_root(str(base / "linked" / "data"), base)

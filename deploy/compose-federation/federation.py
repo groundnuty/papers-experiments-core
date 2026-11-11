@@ -345,7 +345,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("command", choices=("up", "reset", "down", "status"))
     command = parser.parse_args(argv).command
-    layout = Layout.from_environment()
+    try:
+        layout = Layout.from_environment()  # before anything is touched: a root elsewhere is refused
+    except ValueError as error:
+        print(f"error: {command}: {error}", file=sys.stderr)
+        return 2
     try:
         print({"up": up, "reset": reset, "down": down, "status": status}[command](layout))
     except (RuntimeError, TimeoutError, OSError) as error:

@@ -1,7 +1,9 @@
 """What the throwaway federation is: its services, ports, spaces, users, baseline files and where its data lives.
 
 Every name here is invented for this test federation. The one place on disk is the root (`EXPCORE_FED_ROOT`, default
-/mnt/volume2/expcore-federation): down removes it whole, and nothing else outside this directory is written.
+/mnt/volume2/expcore-federation): down removes it whole, and nothing else outside this directory is written. An
+override must lie at or below the default, with no link on the way, or every command refuses before it touches a file
+or a container: down deletes what the root holds.
 """
 
 import hashlib
@@ -95,6 +97,21 @@ def baseline(space: str) -> tuple[BaselineFile, ...]:
     return (BaselineFile("beta.txt", 64),)
 
 
+def checked_root(value: str, base: Path = Path(DEFAULT_ROOT)) -> Path:
+    """The federation's root from a setting, refused unless it is an absolute path at or below `base` with no symbolic
+    link from `base` down to it: down deletes everything the root holds, so a root elsewhere, or one a link redirects,
+    would delete data the federation does not own."""
+    if not value or not os.path.isabs(value):
+        raise ValueError(f"EXPCORE_FED_ROOT must be an absolute path at or below {base}")
+    root = Path(os.path.normpath(value))
+    if root != base and base not in root.parents:
+        raise ValueError(f"EXPCORE_FED_ROOT must lie at or below {base}, the only place the federation may write")
+    for step in (base, *(p for p in reversed(root.parents) if base in p.parents), root):
+        if step.is_symlink():
+            raise ValueError(f"EXPCORE_FED_ROOT may not pass through a symbolic link ({step})")
+    return root
+
+
 @dataclass(frozen=True)
 class Layout:
     """The paths below the federation's root."""
@@ -103,7 +120,7 @@ class Layout:
 
     @classmethod
     def from_environment(cls) -> "Layout":
-        return cls(Path(os.environ.get("EXPCORE_FED_ROOT", DEFAULT_ROOT)))
+        return cls(checked_root(os.environ.get("EXPCORE_FED_ROOT", DEFAULT_ROOT)))
 
     @property
     def secrets(self) -> Path:
