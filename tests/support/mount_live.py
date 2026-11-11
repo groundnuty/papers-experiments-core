@@ -14,6 +14,7 @@ Every name here is invented or public: the image names are the published ones.
 """
 
 import hashlib
+import re
 import time
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
@@ -60,8 +61,13 @@ def sandbox_table(
     network: str,
     local: str,
     local_address: str,
+    extra_args: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """The `[sandbox]` table of one mount level on the federation: `images` maps agent and oneclient to (name, id)."""
+    """The `[sandbox]` table of one mount level on the federation: `images` maps agent and oneclient to (name, id), and
+    `extra_args` are further oneclient arguments (`[sandbox.mount] extra_args`, which refuses a TLS flag)."""
+    mount: dict[str, Any] = {"path": MOUNT_PATH, "io_mode": "proxy"}  # the providers' storage is not the sidecar's
+    if extra_args:
+        mount["extra_args"] = list(extra_args)
     return {
         "work_root": str(work_root),
         "name_prefix": "fedsbx",
@@ -80,7 +86,7 @@ def sandbox_table(
             "shm_bytes": 64 << 20,
             "work_disk_bytes": 256 << 20,
         },
-        "mount": {"path": MOUNT_PATH, "io_mode": "proxy"},  # the providers' storage is not shared with the sidecar
+        "mount": mount,
         "data_paths": {LEVEL: "mount"},
         "federation": {"network": network, "providers": {local: local_address}},
     }
@@ -350,3 +356,70 @@ def unwritten_cell(files: Mapping[str, tuple[str, str]], prefix: int, size: int,
 def unwritten_cell_timeout(files: int, deadline_s: float) -> float:
     """The cell's own limit: every read blocking to its deadline and its kill's wait, with a minute to spare."""
     return files * UNWRITTEN_READS * (deadline_s + 12) + 60
+
+
+# -- can the sidecar account for what the agent read, per file? -------------------------------------------------------
+
+ACCOUNTING = """
+import errno, hashlib, json, os, time
+untouched, repeat, offset, length = {untouched!r}, {repeat!r}, {offset!r}, {length!r}
+out = {{"reads": []}}
+try:
+    out["untouched_size"] = os.stat(untouched).st_size
+except OSError as e:
+    out["untouched_size"], out["untouched_error"] = None, errno.errorcode.get(e.errno, str(e.errno))
+digests = []
+for _ in range(2):
+    began = time.perf_counter()
+    try:
+        fd = os.open(repeat, os.O_RDONLY)
+        try:
+            data = os.pread(fd, length, offset)
+        finally:
+            os.close(fd)
+        digests.append(hashlib.sha256(data).hexdigest())
+        out["reads"].append({{"bytes": len(data), "seconds": round(time.perf_counter() - began, 4)}})
+    except OSError as e:
+        out["reads"].append({{"error": errno.errorcode.get(e.errno, str(e.errno))}})
+out["same_bytes_twice"] = len(digests) == 2 and digests[0] == digests[1]
+print(json.dumps(out))
+"""
+
+
+def accounting_cell(untouched: str, repeat: str, offset: int, length: int) -> str:
+    """The agent's part of the accounting check: stat one file and never read it, and read one range of another twice
+    (each time through its own open), so the sidecar's record can be held against a known pattern: a file never read,
+    and a read repeated, which the kernel's page cache may answer without asking oneclient again."""
+    return ACCOUNTING.format(untouched=untouched, repeat=repeat, offset=offset, length=length)
+
+
+ONECLIENT_OPTION_WORDS = ("trace", "monitoring", "perf", "verbose", "metric", "statistic", "log")
+
+
+def candidate_options(help_text: str) -> list[str]:
+    """The long options in oneclient's `--help` whose name says it may record reads: a trace, monitoring, metrics,
+    statistics, performance logging, verbosity or logging. Names only, sorted, each once."""
+    names = re.findall(r"--([a-z][a-z0-9-]+)", help_text)
+    return sorted({n for n in names if any(word in n for word in ONECLIENT_OPTION_WORDS)})
+
+
+def file_guid(file_id: str) -> str | None:
+    """Best effort: the file's uuid inside a REST file id, when the id is hex of an 8-byte header and then
+    `guid#<uuid>#<space id>`; None when it is not. The encoding is not verified against a source, so a caller that
+    finds no match by it also looks for the id itself and the file's name."""
+    try:
+        text = bytes.fromhex(file_id[16:]).decode("ascii")
+    except ValueError:
+        return None
+    parts = text.split("#")
+    return parts[1] if len(parts) >= 3 and parts[0] == "guid" and parts[1] else None
+
+
+def mentions(text: str, files: Mapping[str, Mapping[str, str | None]]) -> dict[str, dict[str, int]]:
+    """For each file (label -> {form: value}), how many lines of `text` hold each non-empty form of it (its REST id,
+    its uuid, its name); a form with no value is left out."""
+    lines = text.splitlines()
+    return {
+        label: {form: sum(value in line for line in lines) for form, value in forms.items() if value}
+        for label, forms in files.items()
+    }

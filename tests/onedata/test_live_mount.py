@@ -10,7 +10,17 @@ import sys
 from types import SimpleNamespace
 
 import httpx
-from mount_live import SpaceFiles, confinement_cell, pattern, read_cell, unwritten_cell
+from mount_live import (
+    SpaceFiles,
+    accounting_cell,
+    candidate_options,
+    confinement_cell,
+    file_guid,
+    mentions,
+    pattern,
+    read_cell,
+    unwritten_cell,
+)
 
 PREFIX, SIZE = 4096, 65536
 
@@ -110,6 +120,43 @@ def test_o05_the_confinement_cell_tells_a_writable_or_crowded_mount_and_a_refuse
     assert found["mount_read_only"] is False
     (mount / "another").mkdir()
     assert run(confinement_cell(str(mount), "only-space", [], [], []))["only_the_space"] is False
+
+
+def test_o08_the_accounting_cell_stats_one_file_reads_a_range_of_another_twice_and_prints_no_bytes(tmp_path):
+    """O08: the agent's side of the accounting check is a known pattern: one file only stat'd, one range of another
+    read twice through two opens, each read's length and seconds; it prints no byte it read, and a missing file is an
+    error named by its errno."""
+    (tmp_path / "untouched").write_bytes(pattern("untouched", 1000))
+    data = pattern("repeat", 20_000)
+    (tmp_path / "repeat").write_bytes(data)
+    code = accounting_cell(str(tmp_path / "untouched"), str(tmp_path / "repeat"), 5000, 4096)
+    done = subprocess.run([sys.executable, "-"], input=code.encode(), capture_output=True, timeout=60, check=False)
+    found = json.loads(done.stdout)
+    assert found["untouched_size"] == 1000
+    assert [r["bytes"] for r in found["reads"]] == [4096, 4096]
+    assert found["same_bytes_twice"] is True
+    assert data[5000:5100] not in done.stdout  # the bytes themselves never leave the agent
+    missing = run(accounting_cell(str(tmp_path / "gone"), str(tmp_path / "gone-too"), 0, 10))
+    assert missing["untouched_error"] == "ENOENT"
+    assert [r["error"] for r in missing["reads"]] == ["ENOENT", "ENOENT"]
+    assert missing["same_bytes_twice"] is False
+
+
+def test_o08_the_sidecars_evidence_is_read_by_name_and_counted_per_file_never_judged():
+    """O08: from oneclient's help only the options whose names say they may record reads are kept; a file's REST id
+    gives its uuid only when it decodes as one (else None, never a guess); and each form of a file is counted per line
+    of a log, so the verdict is left to whoever reads the counts."""
+    help_text = "  --io-trace-log  Enable a trace\n  --monitoring-type arg\n  --force-proxy-io\n  -H [ --host ] arg\n"
+    assert candidate_options(help_text) == ["io-trace-log", "monitoring-type"]
+    invented = "0000000000ABCDEF" + b"guid#u-invented-1#s-invented".hex()
+    assert file_guid(invented) == "u-invented-1"
+    assert file_guid("not-hex-at-all-x") is None
+    assert file_guid("0000000000ABCDEF" + b"other#thing".hex()) is None
+    log = "read u-invented-1 off 0\nopen whole.bin\nread u-invented-1 off 4096\n"
+    found = mentions(
+        log, {"whole": {"id": invented, "uuid": "u-invented-1", "name": "whole.bin"}, "other": {"uuid": None}}
+    )
+    assert found == {"whole": {"id": 0, "uuid": 2, "name": 1}, "other": {}}
 
 
 def fake_space(answers):

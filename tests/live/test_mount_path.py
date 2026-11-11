@@ -4,13 +4,13 @@
     EXPCORE_LIVE_SANDBOX_POOL=<a private IPv4 range the host routes nowhere> \\
     uv run pytest tests/live/test_mount_path.py
 
-It starts containers (`EXPCORE_LIVE_DOCKER`), and it writes three files into the study space and deletes them again
+It starts containers (`EXPCORE_LIVE_DOCKER`), and it writes five files into the study space and deletes them again
 (`EXPCORE_LIVE_MUTATE`). `EXPCORE_LIVE_PLATFORM` is the Compose federation's own platform.toml
 (deploy/compose-federation, with `facts.json` beside it). The test writes a copy with a `[sandbox]` table into a
-directory of its own
-(`mount_live.derive_platform`): images pinned to the ids `EXPCORE_LIVE_AGENT_IMAGE` and `EXPCORE_LIVE_ONECLIENT_IMAGE`
-resolve to now (defaults `mount_live.AGENT_IMAGE` and `ONECLIENT_IMAGE`; nothing is pulled), the pool from
-`EXPCORE_LIVE_SANDBOX_POOL`, its work directory under pytest's temporary directory, one mount level, and
+directory of its own (`mount_live.derive_platform`): images pinned to the ids `EXPCORE_LIVE_AGENT_IMAGE` and
+`EXPCORE_LIVE_ONECLIENT_IMAGE` resolve to now (defaults `mount_live.AGENT_IMAGE` and `ONECLIENT_IMAGE`; nothing is
+pulled), the pool from `EXPCORE_LIVE_SANDBOX_POOL`, its work directory under pytest's temporary directory, one mount
+level with `EXPCORE_LIVE_ONECLIENT_ARGS` (split as a shell would) as oneclient's further arguments, and
 `[sandbox.federation]`: the oneclient sidecar on the federation's network (`EXPCORE_LIVE_FED_NETWORK`, default
 `mount_live.FED_NETWORK`), dialling the local provider by its domain there. `EXPCORE_LIVE_FACTS_OUT` names a file the
 attempt's facts are written to as JSON: outcomes, sizes and seconds, never a token, an address or a path.
@@ -23,13 +23,21 @@ The attempt runs once, in a fixture, and each test asserts one thing it showed:
 4. unwritten ranges: files at their final size with only a prefix written, through the local provider and through the
    owner, read through the mount; what each read returned, and how long it took, is recorded, never assumed;
 5. teardown: unmount, then the sidecar, then the agent; nothing of the sandbox left on the host; the federation's
-   network as it was.
+   network as it was;
+6. accounting: whether the sidecar can account for what the agent read, per file. The agent stats one file it never
+   reads and reads one range of another twice; before the stop, oneclient's options that may record reads, its whole
+   log directory (copied under the test's temporary directory, the token replaced) with the lines naming each file,
+   and the entries of the mount's FUSE connection on the host are captured. The test asserts only that the evidence
+   was captured; the verdict, with its method and a measured example or the reason it cannot, goes into the day-0
+   facts. A first run finds oneclient's options; a second, with `EXPCORE_LIVE_ONECLIENT_ARGS`, can switch one on.
 """
 
 import dataclasses
 import hashlib
 import json
 import os
+import re
+import shlex
 import time
 import uuid
 from pathlib import Path
@@ -50,8 +58,12 @@ from mount_live import (  # noqa: E402 -- only once the module is known to run
     LEASE_KEY,
     ONECLIENT_IMAGE,
     SpaceFiles,
+    accounting_cell,
+    candidate_options,
     confinement_cell,
     derive_platform,
+    file_guid,
+    mentions,
     pattern,
     read_cell,
     sandbox_table,
@@ -66,8 +78,9 @@ from expcore_onedata.placement import held_bytes, merged  # noqa: E402
 from expcore_onedata.probes import PlatformProbes  # noqa: E402
 from expcore_onedata.provision import Provisioner, resolve_provider_ids  # noqa: E402
 from expcore_onedata.rangemap import load_placement  # noqa: E402
-from expcore_onedata.sandbox import hostops  # noqa: E402
+from expcore_onedata.sandbox import hostops, teardown  # noqa: E402
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec  # noqa: E402
+from expcore_onedata.sandbox.containers import ONECLIENT_BIN, effective_log_dir, sidecar_command  # noqa: E402
 from expcore_onedata.sandbox.hostops import DockerHost  # noqa: E402
 from expcore_onedata.sandbox.provider import SandboxProbe  # noqa: E402
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox  # noqa: E402
@@ -79,6 +92,9 @@ WHOLE_SIZE = (4 << 20) + 123  # not a multiple of any block size
 PREFIX, PARTIAL_SIZE = 64 << 10, 1 << 20  # as the REST measurement of the day-0 facts, so the two compare
 READ_DEADLINE_S = 30.0  # a read through the mount that has not returned by then is recorded as blocked
 VISIBLE_TIMEOUT_S = 180.0
+REPEAT_SIZE, UNTOUCHED_SIZE = 1 << 20, 64 << 10  # the accounting check's two files
+REPEAT_OFFSET, REPEAT_LENGTH = (512 << 10) + 7, 4096  # the one range of repeat.bin the agent reads, twice
+LOG_FILE_LIMIT = 32 << 20  # a sidecar log file larger than this is listed and not copied
 
 
 def pinned(host: DockerHost, name: str) -> tuple[str, str]:
@@ -115,6 +131,7 @@ def platform_for_mount(base: Path) -> Path:
         local_address=json.loads(facts_file.read_text(encoding="utf-8"))["providers"][local][
             "domain_on_project_network"
         ],
+        extra_args=shlex.split(os.environ.get("EXPCORE_LIVE_ONECLIENT_ARGS", "")),
     )
     return derive_platform(PLATFORM, base, table)
 
@@ -207,6 +224,78 @@ def teardown_facts(host: DockerHost, sandbox: DockerSandbox, config: PlatformCon
     }
 
 
+def ground_truth() -> dict:
+    """What the agent and the harness did to each fixture file through the mount, for holding the sidecar's record
+    against: the agent's reads per file, and the touches that are not the agent's reads."""
+    return {
+        "whole": {"agent": [{"op": "read", "offset": 0, "length": WHOLE_SIZE, "times": 1}]},
+        **{
+            label: {
+                "agent": [
+                    {"op": "stat"},
+                    {"op": "read", "offset": PREFIX, "length": 4096, "times": 1},
+                    {"op": "read", "offset": PREFIX - 16, "length": 32, "times": 1},
+                    {"op": "read", "offset": 0, "length": PARTIAL_SIZE, "times": 1},
+                ]
+            }
+            for label in ("written_through_local", "written_through_owner")
+        },
+        "repeat": {"agent": [{"op": "read", "offset": REPEAT_OFFSET, "length": REPEAT_LENGTH, "times": 2}]},
+        "untouched": {"agent": [{"op": "stat"}]},
+        "not_the_agents_reads": [
+            "the start's write probe at the mount root, refused",
+            "the confinement cell's listing of the mount root and its write probe in the space, refused",
+            "each path's lookups on the way to a file",
+        ],
+    }
+
+
+def sidecar_accounting(host: DockerHost, sandbox: DockerSandbox, spec: SandboxSpec, base: Path, forms: dict) -> dict:
+    """What the sidecar itself shows of the agent's reads, read before the stop: oneclient's options that may record
+    reads, every file of its log directory (copied, the token replaced, under `base/sidecar-evidence`, never into the
+    facts) with the lines that name each fixture file by its REST id, its uuid or its name, and the entries of the
+    mount's FUSE connection on the host. Counts and names only: the verdict is written from them after the run."""
+    secret, sidecar = spec.token.reveal(), sandbox.names.sidecar
+    keep = base / "sidecar-evidence"
+    keep.mkdir(mode=0o700)
+
+    def save(name: str, text: str) -> str:
+        clean = text.replace(secret, "<token>")
+        path = keep / re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+        path.write_text(clean, encoding="utf-8")
+        path.chmod(0o600)
+        return clean
+
+    shown = host.docker("exec", sidecar, ONECLIENT_BIN, "--help", check=False, timeout=60)
+    help_text = save("oneclient-help.txt", shown.stdout + shown.stderr)
+    out: dict = {
+        "help_exit_code": shown.returncode,
+        "help_bytes": len(help_text),
+        "candidate_options": candidate_options(help_text),
+        "oneclient_args": list(sandbox.s.mount.extra_args),
+    }
+    log_dir = effective_log_dir(sidecar_command(spec.provider.host, sandbox.s))
+    listed = host.docker("exec", sidecar, "find", log_dir, "-type", "f", "-printf", "%s %p\\n", check=False, timeout=60)
+    found = [(int(size), path) for size, _, path in (line.partition(" ") for line in listed.stdout.splitlines())]
+    out["log_files"] = [{"name": os.path.relpath(path, log_dir), "bytes": size} for size, path in found]
+    texts = []
+    for size, path in found:
+        if size <= LOG_FILE_LIMIT:
+            copied = host.docker("exec", sidecar, "cat", path, check=False, timeout=120)
+            texts.append(save(os.path.relpath(path, log_dir), copied.stdout))
+    out["mentions"] = mentions("\n".join(texts), forms)
+    out["uuid_decoded"] = {label: f["uuid"] is not None for label, f in forms.items()}
+    share = teardown.host_path(sandbox.dir / "mount")
+    devices = [
+        m["dev"] for m in hostops.fuse_mounts(host.read_text("/proc/self/mountinfo")) if m["mountpoint"] == share
+    ]
+    out["fuse_connection_entries"] = None
+    if devices:
+        listing = host.run(["ls", f"/sys/fs/fuse/connections/{devices[-1].partition(':')[2]}"], 20, sudo=True)
+        out["fuse_connection_entries"] = sorted(listing.stdout.split()) if listing.returncode == 0 else None
+    return out
+
+
 def wait_visible(provisioner: Provisioner, path: str, provider: str, size: int) -> float:
     """Wait, outside the agent's time, until `provider` lists the file at its size; the seconds it took."""
     began = time.monotonic()
@@ -252,20 +341,31 @@ def attempt(tmp_path_factory):
         assert known.converged, "the fixture directory did not reach the owner"
         whole_id = files.make(owner, top, "whole.bin", "REG")
         files.write(owner, whole_id, 0, whole)
+        ids = {"whole": whole_id}
         partials = {}
         for label, through in (("written_through_local", local), ("written_through_owner", owner)):
             name = f"{label}.bin"
-            file_id = files.make(through, top, name, "REG")
+            ids[label] = file_id = files.make(through, top, name, "REG")
             files.write(through, file_id, 0, pattern(f"{run}/{name}", PREFIX))
             files.write(through, file_id, PARTIAL_SIZE, b"")  # sets the size and writes nothing
             partials[label] = name
+        for label, size in (("repeat", REPEAT_SIZE), ("untouched", UNTOUCHED_SIZE)):  # for the accounting check
+            ids[label] = files.make(local, top, f"{label}.bin", "REG")
+            files.write(local, ids[label], 0, pattern(f"{run}/{label}.bin", size))
         facts["visible_after_s"] = {
             "whole": wait_visible(probes_view, f"{run}/whole.bin", local, WHOLE_SIZE),
             **{label: wait_visible(probes_view, f"{run}/{n}", local, PARTIAL_SIZE) for label, n in partials.items()},
+            "repeat": wait_visible(probes_view, f"{run}/repeat.bin", local, REPEAT_SIZE),
+            "untouched": wait_visible(probes_view, f"{run}/untouched.bin", local, UNTOUCHED_SIZE),
         }
+        names = {"whole": "whole.bin", **{label: f"{n}" for label, n in partials.items()}}
+        names |= {"repeat": "repeat.bin", "untouched": "untouched.bin"}
+        forms = {label: {"id": ids[label], "uuid": file_guid(ids[label]), "name": names[label]} for label in ids}
+        facts["ground_truth"] = ground_truth()
         network = s.federation.network
         federation_before = network_containers(host, network)
-        sandbox = DockerSandbox.start(host, s, mount_spec(config, run))
+        spec = mount_spec(config, run)
+        sandbox = DockerSandbox.start(host, s, spec)
         try:
             facts["launch"] = launch_facts(host, sandbox, network)
             inside = f"{s.mount.path}/{config.space.name}/{run}"
@@ -302,6 +402,15 @@ def attempt(tmp_path_factory):
                 unwritten_cell(targets, PREFIX, PARTIAL_SIZE, READ_DEADLINE_S),
                 unwritten_cell_timeout(len(targets), READ_DEADLINE_S),
             )
+            facts["accounting_reads"] = cell(
+                sandbox,
+                accounting_cell(f"{inside}/untouched.bin", f"{inside}/repeat.bin", REPEAT_OFFSET, REPEAT_LENGTH),
+                120,
+            )
+            try:  # before the stop: the sidecar's log directory goes with it
+                facts["accounting"] = sidecar_accounting(host, sandbox, spec, base, forms)
+            except Exception as error:  # recorded, never guessed: the reason the evidence is missing
+                facts["accounting"] = {"error": type(error).__name__}
         finally:
             try:
                 sandbox.stop()
@@ -465,3 +574,22 @@ def test_o15_the_federation_network_is_left_as_it_was_and_the_fixture_files_are_
     assert attempt["federation_network_present"] is True
     assert attempt["federation_network_unchanged"] is True
     assert attempt["fixture_cleanup_failures"] == []
+
+
+# -- 6. accounting -----------------------------------------------------------------------------------------------------
+
+
+def test_o08_what_the_sidecar_can_show_of_the_agents_reads_is_captured_before_the_teardown(attempt):
+    """O08: the agent's known pattern ran (one file only stat'd, one range read twice with the same bytes), and before
+    the stop the sidecar's evidence was captured: oneclient's help, every file of its log directory with the lines
+    naming each fixture file, and the entries of the mount's FUSE connection. Whether that evidence accounts for the
+    reads is judged from it into the day-0 facts, never here."""
+    reads, evidence = attempt["accounting_reads"], attempt["accounting"]
+    assert reads["untouched_size"] == UNTOUCHED_SIZE
+    assert [r.get("bytes") for r in reads["reads"]] == [REPEAT_LENGTH, REPEAT_LENGTH]
+    assert reads["same_bytes_twice"] is True
+    assert evidence.get("error") is None
+    assert evidence["help_bytes"] > 0
+    assert evidence["log_files"]
+    assert set(evidence["mentions"]) == set(attempt["ground_truth"]) - {"not_the_agents_reads"}
+    assert evidence["fuse_connection_entries"]
