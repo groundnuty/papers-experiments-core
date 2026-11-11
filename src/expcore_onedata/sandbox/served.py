@@ -15,7 +15,8 @@ recorded value; nothing is measured again. Its snapshot:
    "files_total": 1, "files_cut": false,
    "listings": {"<directory id>": {"path": "/api/v3/oneprovider/data/<directory id>/children", "requests": 1,
                                    "body_bytes": 10240}},
-   "listings_total": 1, "listings_cut": false, "unknown": []}
+   "listings_total": 1, "listings_cut": false,
+   "caps": {"max_files": 1000, "max_directories": 1000, "max_ranges_per_file": 64}, "unknown": []}
 
 What each count holds is in `gatelog` (the bytes of the platform's answers the gate's socket accepted for the agent,
 by what they were; the gate's own answers apart; and the same per file whose content it served and per directory it
