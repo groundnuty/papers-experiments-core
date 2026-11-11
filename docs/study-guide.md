@@ -105,6 +105,42 @@ except ConfigError as error:
 shutil.rmtree(misspelt)
 ```
 
+### A model served by several deployments
+
+The scheduler checks that every reply of a run was served by the identity the model was first served with: its model id and its serving fingerprint (`system_fingerprint`). A run whose replies change either is set aside as `identity_kind` and run again. A load-balanced endpoint can serve one model id from several deployments, each with its own fingerprint, within one run, and then most long runs would be set aside. If the deployments are the same model (the same weights, the same precision), say so in the model's entry of `models.toml` with `accepted_fingerprints`, the fingerprints of those deployments. That decision is the study's; the core only records it and holds the runs to it:
+
+- A reply served under a fingerprint of the set is the model. One under any other fingerprint sets its run aside, as before, and so does a reply served by another model id.
+- The admission probe must be served by the model under a fingerprint of the set, or the model is not admitted.
+- A declared fingerprint is confirmed by the admission probe, or by the first run whose reply shows it. The probe reaches one deployment, so another is often confirmed only by a run. A fingerprint no reply has shown stays unconfirmed, and the report says so.
+- Each attempt records how many turns each fingerprint served. The export's `deployment_shares` and the report's "Deployments" section give, per model, each fingerprint's count and share of the analysed turns and runs, and how many runs more than one deployment served.
+- The set is in the campaign's fingerprint, so a resume under another set is refused. A model without the key is checked, recorded and fingerprinted as before.
+
+The key takes a list of fingerprints as your endpoint reports them; the `anthropic` backend records none, so it cannot take the key. The example's stubs report no fingerprint and declare none; a real model's entry would read:
+
+```python
+import tempfile
+
+from expcore.config.models import load_models
+
+with tempfile.TemporaryDirectory() as scratch:
+    table = Path(scratch) / "models.toml"
+    table.write_text(
+        """
+[models.relay-large]
+backend = "openai_compat"
+api_id = "vendor/relay-large"
+base_url = "https://llm.example.invalid/v1"
+key_env = "RELAY_KEY"
+status = "frozen"
+accepted_fingerprints = ["fp-southern-deploy", "fp-northern-deploy"]
+""",
+        encoding="utf-8",
+    )
+    relay = load_models(table).resolve("relay-large")
+assert relay.accepted_fingerprints == ("fp-northern-deploy", "fp-southern-deploy")  # a set: kept sorted
+assert study.models.resolve("alpha-stub").accepted_fingerprints == ()  # checked against a baseline, as before
+```
+
 ### Prices and the budget
 
 A model's price is `[models.<key>.price]` in `models.toml`, in US dollars per million tokens: `input_per_mtok` and `output_per_mtok`, and optionally `cache_write_per_mtok` and `cache_read_per_mtok`, which are the input price when left out. A model the study hosts itself says `free = true` instead. With a budget, every planned model that is not free also declares its endpoint's context window, `context_tokens`, for the reason given below. `run` refuses to start or resume the campaign without it, naming `models.toml` and the model's key; checking, analysing, reporting and a package's check of a finished study do not need it.

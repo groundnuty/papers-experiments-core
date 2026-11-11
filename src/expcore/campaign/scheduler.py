@@ -191,7 +191,7 @@ class Scheduler:
         )
         self.stops = HarnessStops(store, cfg.harness_stop)
         self.reconcile_accounting()
-        self.identities = ServedIdentities(store, self.stamp)
+        self.identities = ServedIdentities(store, self.stamp, {m: self.models.resolve(m) for m in self.plan_models})
         self.budget, self.ledger = None, None
         paying = None  # with a budget: the ledger admission's probes are paid from (C26)
         if cfg.budget is not None:
@@ -314,6 +314,9 @@ class Scheduler:
                 reply_cap.mark_unheld(self.store, model, self.stamp(), "reply_cap_not_shown", detail)
             if metered is not None and metered.refusal is not None:  # not sent: no reply says anything of the model
                 reason = f"the campaign's budget is spent: {metered.refusal}"
+            # a model that declares accepted fingerprints is held to them by its probe's reply (B18): read from what the
+            # one-token completion already noted, so nothing more is sent, and only for a model nothing refused before
+            reason = reason or self.identities.admit(model, backend, self.stamp())
             if reason is not None:
                 self.not_admitted[model] = reason
                 self.store.event(self.stamp(), "model_not_admitted", model, f"{model}: {reason}")
