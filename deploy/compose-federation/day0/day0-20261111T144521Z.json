@@ -1,0 +1,218 @@
+{
+  "checks": [
+    {
+      "facts": {
+        "providers": {
+          "birch": {
+            "build": "81-gf118ed9007",
+            "configuration": {
+              "attempts": 1,
+              "error": null,
+              "probe_ok": true,
+              "status": null
+            },
+            "online": true,
+            "tcp": {
+              "errors": 0,
+              "measured": true,
+              "median_ms": 0.39,
+              "min_ms": 0.31,
+              "samples": 5
+            },
+            "version": "25.0"
+          },
+          "cedar": {
+            "build": "81-gf118ed9007",
+            "configuration": {
+              "attempts": 1,
+              "error": null,
+              "probe_ok": true,
+              "status": null
+            },
+            "online": true,
+            "tcp": {
+              "errors": 0,
+              "measured": true,
+              "median_ms": 0.37,
+              "min_ms": 0.35,
+              "samples": 5
+            },
+            "version": "25.0"
+          },
+          "pine": {
+            "build": "81-gf118ed9007",
+            "configuration": {
+              "attempts": 1,
+              "error": null,
+              "probe_ok": true,
+              "status": null
+            },
+            "online": true,
+            "tcp": {
+              "errors": 0,
+              "measured": true,
+              "median_ms": 0.37,
+              "min_ms": 0.34,
+              "samples": 5
+            },
+            "version": "25.0"
+          }
+        }
+      },
+      "mutates": false,
+      "name": "reachability",
+      "seconds": 1.716,
+      "status": "pass",
+      "summary": "all 3 declared provider(s) answered",
+      "title": "Reachability of each declared provider"
+    },
+    {
+      "facts": {},
+      "mutates": false,
+      "name": "health",
+      "seconds": 0.084,
+      "status": "pass",
+      "summary": "ok: the space is supported by exactly the 3 declared provider(s)",
+      "title": "Health against the declared support set"
+    },
+    {
+      "facts": {
+        "planes": {
+          "data_path": {
+            "caveats": {
+              "data.path": 1,
+              "data.readonly": 1,
+              "interface": 1,
+              "time": 1
+            },
+            "examined": true,
+            "seconds_left": 1499.0
+          }
+        }
+      },
+      "mutates": false,
+      "name": "tokens",
+      "seconds": 0.066,
+      "status": "pass",
+      "summary": "1 token(s) minted and examined against their exact caveat set",
+      "title": "Token minting and examination, per plane"
+    },
+    {
+      "facts": {},
+      "mutates": false,
+      "name": "content_type",
+      "seconds": 0.0,
+      "status": "unknown",
+      "summary": "no data path is REST (no [sandbox], or none of its levels is rest), so nothing was measured: the data gate streams nothing, so there is no content type to check",
+      "title": "The content type of a file's content, read whole and by range on the local provider"
+    },
+    {
+      "facts": {
+        "providers": {
+          "birch": {
+            "consistent": true,
+            "entries": 4,
+            "pages": 1,
+            "walked": true
+          },
+          "cedar": {
+            "consistent": true,
+            "entries": 4,
+            "pages": 1,
+            "walked": true
+          },
+          "pine": {
+            "consistent": true,
+            "entries": 4,
+            "pages": 1,
+            "walked": true
+          }
+        }
+      },
+      "mutates": false,
+      "name": "listing",
+      "seconds": 0.434,
+      "status": "pass",
+      "summary": "the root lists on all 3 supporting provider(s), and a paged walk agrees",
+      "title": "Listing of the space root on each supporting provider"
+    },
+    {
+      "facts": {
+        "providers": {
+          "birch": {
+            "code": "posix",
+            "enforced": true,
+            "errno": "eacces",
+            "sent": true,
+            "status": 400
+          },
+          "cedar": {
+            "code": "posix",
+            "enforced": true,
+            "errno": "eacces",
+            "sent": true,
+            "status": 400
+          },
+          "pine": {
+            "code": "posix",
+            "enforced": true,
+            "errno": "eacces",
+            "sent": true,
+            "status": 400
+          }
+        }
+      },
+      "mutates": true,
+      "name": "read_only",
+      "seconds": 0.302,
+      "status": "pass",
+      "summary": "the write was refused on all 3 supporting provider(s)",
+      "title": "Read-only enforcement on each data path"
+    },
+    {
+      "facts": {
+        "bytes": 8192,
+        "bytes_match": true,
+        "cleanup_verified": true,
+        "eviction_attempts": 2,
+        "held_bytes": 8192,
+        "held_covers_range": true,
+        "held_ranges": [
+          [
+            0,
+            8192
+          ]
+        ],
+        "polls": 2,
+        "range_bytes": 4096,
+        "steps": [
+          "created",
+          "placed",
+          "read back",
+          "evicted"
+        ]
+      },
+      "mutates": true,
+      "name": "round_trip",
+      "seconds": 46.682,
+      "status": "pass",
+      "summary": "placed by range reads, confirmed by the block map, read back, evicted and removed",
+      "title": "Placement round trip on a scratch file"
+    }
+  ],
+  "counts": {
+    "fail": 0,
+    "pass": 6,
+    "unknown": 1
+  },
+  "exit_code": 3,
+  "mutation_allowed": true,
+  "platform_file_sha256": "d0392fee0a51f26bf0de910ff5561a52fcb3040b5171b11388a491d91052d5f0",
+  "providers": [
+    "birch",
+    "cedar",
+    "pine"
+  ],
+  "schema": 1,
+  "utc": "20261111T144521Z"
+}
