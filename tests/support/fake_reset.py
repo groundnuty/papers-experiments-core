@@ -20,7 +20,14 @@ and with these changes to the calls it inherits:
 
 A test bends it through plain attributes: `ignore_cancels` (a cancel answers 204 and the job goes on),
 `ignore_qos_deletes` (a removal answers 204 and the requirement stays), `qos_spawns` (adding a requirement starts a
-replication of its file into this provider id, as a requirement that selects that provider's storage would).
+replication of its file into this provider id, as a requirement that selects that provider's storage would),
+`qos_hidden_on` (requirement id to the provider ids that have not seen it yet: its summary there leaves it out and
+reading it answers 404), `spawn_on_evict` (a provider id: an eviction that ends starts a replication of the same data
+into it, a job begun while a reset runs), and `dir_stats_disabled` (a directory's distribution answers its physical
+sizes as failed, as a space without directory statistics does).
+
+A directory's distribution answers, per provider, the physical size of what that provider holds under it, as
+`distributionPerStorageBackend.{storage}.physicalSize`, with `success` true.
 """
 
 from __future__ import annotations
@@ -43,6 +50,9 @@ class FakeReset(FakeData):
         self.ignore_cancels = False
         self.ignore_qos_deletes = False
         self.qos_spawns: str | None = None
+        self.qos_hidden_on: dict[str, set[str]] = {}
+        self.spawn_on_evict: str | None = None
+        self.dir_stats_disabled = False
         self._serve = threading.RLock()
         self._qos_ids = 0
 
@@ -147,18 +157,18 @@ class FakeReset(FakeData):
             return httpx.Response(201, json={"qosRequirementId": self._new_qos(sent["fileId"], sent["expression"])})
         found = re.fullmatch(r"/qos_requirements/([^/]+)", route)
         if found:
-            return self._qos_requirement(method, found.group(1))
+            return self._qos_requirement(method, found.group(1), provider)
         found = re.fullmatch(r"/data/([^/]+)/qos/summary", route)
         if found and method == "GET":
-            return self._qos_summary(found.group(1))
+            return self._qos_summary(found.group(1), provider)
         found = re.fullmatch(r"/transfers/([^/]+)", route)
         if found and method == "DELETE":
             return self._cancel(found.group(1))
         return super()._provider_route(request, provider, route)
 
-    def _qos_requirement(self, method: str, qid: str) -> httpx.Response:
+    def _qos_requirement(self, method: str, qid: str, provider: str) -> httpx.Response:
         record = self.qos.get(qid)
-        if record is None:
+        if record is None or provider in self.qos_hidden_on.get(qid, set()):
             return self._error(404, "notFound")
         if method == "GET":
             return httpx.Response(200, json={**record, "status": "fulfilled"})
@@ -168,14 +178,18 @@ class FakeReset(FakeData):
             return httpx.Response(204)
         return self._error(404, "notFound")
 
-    def _qos_summary(self, file_id: str) -> httpx.Response:
+    def _qos_summary(self, file_id: str, provider: str) -> httpx.Response:
         if file_id not in self.nodes:
             return self._error(404, "notFound")
         chain, node = set(), self.nodes.get(file_id)
         while node is not None:
             chain.add(node.file_id)
             node = self.nodes.get(node.parent) if node.parent else None
-        requirements = {qid: "fulfilled" for qid, r in self.qos.items() if r["fileId"] in chain}
+        requirements = {
+            qid: "fulfilled"
+            for qid, r in self.qos.items()
+            if r["fileId"] in chain and provider not in self.qos_hidden_on.get(qid, set())
+        }
         return httpx.Response(200, json={"requirements": requirements, "status": "fulfilled"})
 
     def _cancel(self, tid: str) -> httpx.Response:
@@ -235,6 +249,12 @@ class FakeReset(FakeData):
         if getattr(transfer, "cancelled", False):
             return
         node = self.nodes.get(transfer.file_id)
+        if transfer.kind == "eviction" and self.spawn_on_evict is not None:
+            tid = f"tid-{next(self._ids):04d}"
+            now = int(self.clock())
+            self.transfers[tid] = Transfer(
+                "replication", transfer.file_id, self.spawn_on_evict, scheduled=now, started=now
+            )
         if transfer.kind == "eviction" and node is not None and node.kind == "DIR":
             if self.evictions_remove_blocks:
                 for file_id in self._files_under(node.file_id):
@@ -242,6 +262,23 @@ class FakeReset(FakeData):
                     self.pending.pop((file_id, transfer.provider_id), None)
             return
         super()._finish(transfer)
+
+    def _distribution(self, node: Node) -> dict:
+        """A file's as FakeData answers it; a directory's, each provider's physical size of what it holds under it."""
+        if node.kind != "DIR":
+            return super()._distribution(node)
+        files = self._files_under(node.file_id)
+        per: dict = {}
+        for provider in self.providers:
+            held = sum(n for f in files for _, n in self.blocks.get((f, provider), []))
+            backend = (
+                {"success": False, "error": {"id": "dirStatsDisabledForSpace"}}
+                if self.dir_stats_disabled
+                else {"success": True, "physicalSize": held}
+            )
+            if provider not in self.omit_providers:
+                per[provider] = {"success": True, "distributionPerStorageBackend": {"storage-1": backend}}
+        return {"type": "DIR", "distributionPerProvider": per}
 
     def _files_under(self, directory: str) -> list[str]:
         found = []

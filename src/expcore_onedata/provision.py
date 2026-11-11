@@ -167,8 +167,10 @@ class Provisioner:
     """Creates, places and removes study data in one configured space, and confirms each step by the block map.
 
     `space` is the label of the space it acts in (`[[spaces]]`); without one it is the only space, and a configuration
-    that declares several refuses an unnamed provisioner. The space's own `holder`, when its entry declares one, is the
-    data provider in place of `[placement] holder`. With several spaces every message starts with the space's position
+    that declares several refuses an unnamed provisioner. A `[[spaces]]` entry's `holder` is its data provider; the
+    one-space form's is `[placement] holder`. Either way it must support the space, or the provisioner is refused. Every
+    mutation it sends is bound to its space: the client refuses one whose target lies in any other space, whatever its
+    prefixes (`OnezoneClient.mutate`'s `space`). With several spaces every message starts with the space's position
     (`spaces[i]`), never its label or name.
     """
 
@@ -186,11 +188,11 @@ class Provisioner:
     ) -> None:
         entry = config.space_named(space)
         where = f"{entry.position}: " if len(config.spaces) > 1 else ""
-        holder = entry.holder or settings.holder
-        if holder not in config.providers:
+        holder = entry.holder if config.spaces_table else settings.holder  # [[spaces]] requires its own (spaces.py)
+        if holder is None or holder not in config.providers:
             raise ProvisionError(f"{where}the data provider named in the settings is not a declared provider")
-        if len(config.spaces) > 1 and holder not in entry.support.providers:
-            raise ProvisionError(f"{where}the data provider does not support the space; declare the space's holder")
+        if holder not in entry.support.providers:
+            raise ProvisionError(f"{where}the data provider does not support the space; nothing was sent")
         self._client, self._config, self._entry, self._where = client, config, entry, where
         self._settings = settings if holder == settings.holder else dataclasses.replace(settings, holder=holder)
         self._ids = dict(provider_ids)
@@ -220,6 +222,11 @@ class Provisioner:
     def client(self) -> OnezoneClient:
         """The client every request of this provisioner goes through."""
         return self._client
+
+    def mutate(self, method: str, path: str, **options: Any) -> Any:
+        """Send a mutation through the client's gate, bound to this provisioner's space: one whose target lies in any
+        other declared space is refused before it is sent, even under a shared prefix (O09)."""
+        return self._client.mutate(method, path, space=self._entry.space, **options)
 
     def clock(self) -> float:
         """The provisioner's clock (monotonic seconds, or a test's)."""
@@ -398,7 +405,7 @@ class Provisioner:
 
     def _create(self, parent_id: str, name: str, kind: str, path: str) -> str:
         self._verified()
-        answer = self._client.mutate(
+        answer = self.mutate(
             "POST",
             f"/data/{_segment(parent_id)}/children",
             provider=self._settings.holder,
@@ -425,7 +432,7 @@ class Provisioner:
         file_id = self._create(parent, name, "REG", path)
         self._verified()
         for offset in range(0, len(data), self._settings.chunk_bytes):
-            self._client.mutate(
+            self.mutate(
                 "PUT",
                 f"/data/{_segment(file_id)}/content",
                 provider=self._settings.holder,
@@ -505,6 +512,7 @@ class Provisioner:
             offset=offset,
             length=length,
             timeout_s=self._settings.request_timeout_s,
+            space=self._entry.space,
         )
 
     def holds(self, provider: str, file_ids: Iterable[str]) -> int:
@@ -555,7 +563,7 @@ class Provisioner:
         field_name = "replicatingProviderId" if kind == "replication" else "evictingProviderId"
         self._verified()
         self.await_visible(provider, [file_id])
-        answer = self._client.mutate(
+        answer = self.mutate(
             "POST",
             "/transfers",
             provider=provider,
@@ -613,11 +621,24 @@ class Provisioner:
         }
 
     def refuse_holder(self, from_provider: str) -> None:
-        """Refuse, before anything is sent, to evict from the data provider, by its name or by its id (O09)."""
-        if from_provider == self._settings.holder or (
-            from_provider in self._ids and self._ids[from_provider] == self._ids.get(self._settings.holder)
+        """Refuse, before anything is sent, to evict from the data provider: named by its name, by another name that
+        has its id, or by its id itself (O09)."""
+        holder_id = self._ids.get(self._settings.holder)
+        if (
+            from_provider == self._settings.holder
+            or (from_provider in self._ids and self._ids[from_provider] == holder_id)
+            or (holder_id is not None and from_provider == holder_id)
         ):
             raise Refused(f"{self._where}refusing to evict the data provider's own copy; nothing was sent")
+
+    def check_eviction(self, from_provider: str) -> None:
+        """Refuse, before anything is sent, a bulk eviction or a reset's from a provider that is the data provider
+        (`refuse_holder`), is not declared, or does not support this provisioner's space."""
+        self.refuse_holder(from_provider)
+        if from_provider not in self._config.providers:
+            raise Refused(f"{self._where}refusing to evict from a provider that is not declared; nothing was sent")
+        if from_provider not in self._entry.support.providers:
+            raise Refused(f"{self._where}refusing to evict from a provider that does not support the space")
 
     def evict(self, path: str, from_provider: str) -> dict[str, Any]:
         """Evict a file from a provider and return a record once its block map there is empty; never from the holder.
@@ -709,7 +730,7 @@ class Provisioner:
                     left.append({"path": line["path"], "reason": "holds entries this provisioner did not create"})
                     continue
             try:
-                self._client.mutate("DELETE", f"/data/{_segment(fid)}", provider=self._settings.holder)
+                self.mutate("DELETE", f"/data/{_segment(fid)}", provider=self._settings.holder)
             except PlatformError as error:
                 if not answered_absent(error):  # already gone is confirmed below; any other refusal leaves it
                     left.append({"path": line["path"], "reason": "the delete was refused or failed"})

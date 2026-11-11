@@ -14,11 +14,14 @@ seconds a file, so hundreds of files take minutes. Here the waits are shared:
 Either way the transfers' end is a report, never evidence (O01): the files are then verified **together** on the
 block maps (`require_empty_each`), each poll reading every file not yet settled with the same bound, and a file counts
 as empty once its map shows nothing held on `[placement] consecutive_polls` polls in a row (O07). A file still holding
-bytes at the bound fails the eviction, `NotPlaced` with the count, never a guess. The data provider's own copy is never
-evicted (O09): `Provisioner.refuse_holder` refuses it before anything is sent.
+bytes at the bound fails the eviction, `NotPlaced` with the count, never a guess. A caller's `quiet` check runs between
+the transfers' end and the first block-map read: the reset passes one that requires no transfer running on any provider,
+so no map is read while another job still changes it. The data provider's own copy is never
+evicted (O09): `Provisioner.check_eviction` refuses it, and a provider that does not support the space, before anything
+is sent.
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from expcore_onedata import consistency
@@ -71,10 +74,16 @@ def _wait_ended(provisioner: Provisioner, provider: str, transfer_ids: list[str]
     return done.states()
 
 
-def evict_ids(provisioner: Provisioner, file_ids: Iterable[str], from_provider: str) -> dict[str, Any]:
+def evict_ids(
+    provisioner: Provisioner,
+    file_ids: Iterable[str],
+    from_provider: str,
+    *,
+    quiet: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     """Evict files, given by id, from a provider, at most `concurrency` requests at once, and return a record once
     every file's block map there shows nothing held. Never from the data provider; no id means nothing to do."""
-    provisioner.refuse_holder(from_provider)
+    provisioner.check_eviction(from_provider)
     ids = list(dict.fromkeys(file_ids))
     if not ids:
         return {"files": 0, "transfers": 0, "transfer_states": {}, "empty": True, "polls": 0, "seconds": 0.0}
@@ -84,6 +93,8 @@ def evict_ids(provisioner: Provisioner, file_ids: Iterable[str], from_provider: 
         lambda fid: provisioner.schedule_transfer("eviction", fid, from_provider), ids, provisioner.settings.concurrency
     )
     states = _wait_ended(provisioner, from_provider, tids)
+    if quiet is not None:
+        quiet()  # before the first block-map read: a running job could still change a map
     verified = require_empty_each(provisioner, from_provider, ids)
     return {
         "files": len(ids),
@@ -95,11 +106,17 @@ def evict_ids(provisioner: Provisioner, file_ids: Iterable[str], from_provider: 
     }
 
 
-def evict_tree(provisioner: Provisioner, path: str | Entry, from_provider: str) -> dict[str, Any]:
+def evict_tree(
+    provisioner: Provisioner,
+    path: str | Entry,
+    from_provider: str,
+    *,
+    quiet: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     """Evict every file under a directory from a provider with one transfer, then verify all of them together, the
     tree listed once; return the record. Never from the data provider; `path` (or the entry a caller resolved
     already) must be a directory."""
-    provisioner.refuse_holder(from_provider)
+    provisioner.check_eviction(from_provider)
     began = provisioner.clock()
     provisioner.verify_space()
     directory = path if isinstance(path, Entry) else provisioner.resolve(path)
@@ -107,6 +124,8 @@ def evict_tree(provisioner: Provisioner, path: str | Entry, from_provider: str) 
         raise ProvisionError(f"{provisioner.where}a tree eviction names a directory; this path is not one")
     tid = provisioner.schedule_transfer("eviction", directory.file_id, from_provider)
     states = _wait_ended(provisioner, from_provider, [tid])
+    if quiet is not None:
+        quiet()
     files = [entry.file_id for entry, _ in provisioner.walk(directory.file_id) if entry.kind != "DIR"]
     verified = require_empty_each(provisioner, from_provider, files)
     return {

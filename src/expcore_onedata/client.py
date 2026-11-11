@@ -112,15 +112,18 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   clock), and a record's `type`, provider ids and times (epoch seconds), for a replication and an eviction, are
   confirmed by [L1], which also shows the eviction counter named `filesEvicted` and the state `transferStatus`, as
   [S11] reads them.
-- The reset (`reset.py`, `eviction.py`) sends a `POST /transfers` eviction of a directory, which covers every file
-  under it, confirmed by [L1] (`day0/2026-11-11-federation-facts.md`: the mirror's block map of a file in the directory
-  was empty once the directory's eviction ended). Its other calls no source sends and no live run has made yet, named
-  only by Oneprovider 25.0's REST description, so each is in `UNVERIFIED_ENDPOINTS`: `GET /data/{id}/qos/summary`
-  (answer `requirements`, keyed by requirement id), `GET` and `DELETE /qos_requirements/{qid}` (answer `fileId`), `POST
-  /qos_requirements` (body `fileId`, `expression`; a live test's only) and `DELETE /transfers/{id}` (a cancel: 204, or
-  400 for a job that has ended). A cancel's and a removal's space is read from the record right before the mutation:
-  a transfer's `spaceId`, which [L1] shows in a record, or the space of a requirement's `fileId`, found by its parent
-  links (`_record_space`).
+- The reset (`reset.py`, `eviction.py`, `occupancy.py`) sends a `POST /transfers` eviction of a directory, which covers
+  every file under it, confirmed by [L1] (`day0/2026-11-11-federation-facts.md`: the mirror's block map of a file in
+  the directory was empty once the directory's eviction ended), and reads a directory's `GET /data/{id}/distribution`
+  (per provider `distributionPerStorageBackend.{storage}.physicalSize` with `success`), its shape confirmed by [L1]
+  (`day0/2026-11-11-federation-facts-posix-and-fuse.md`). Its other calls no source sends and no live run has made yet,
+  named only by Oneprovider 25.0's REST description, so each is in `UNVERIFIED_ENDPOINTS`: `GET
+  /data/{id}/qos/summary` (answer `requirements`, keyed by requirement id), `GET` and `DELETE /qos_requirements/{qid}`
+  (answer `fileId`), `POST /qos_requirements` (body `fileId`, `expression`; a live test's only) and `DELETE
+  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended). A cancel's and a removal's space is read from the
+  record right before the mutation: a transfer's `spaceId`, which [L1] shows in a record, or the space of a
+  requirement's `fileId`, found by its parent links (`_record_space`). A caller bound to one space (`space`, a
+  provisioner's own) has every target checked against that space alone, its id, its name and its own prefixes.
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
@@ -143,7 +146,7 @@ import httpx
 
 from expcore.config.loading import ConfigError
 from expcore.records.redact import register_secret
-from expcore_onedata.config import PlatformConfig
+from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
@@ -678,12 +681,13 @@ class OnezoneClient:
         space's name, read afresh (`space_name`), so a space renamed since an earlier call changes the answer (O09)."""
         return self.space_name(self.file_space_id(file_id, provider))
 
-    def _record_space_name(self, kind: str, record_id: str, provider: str | None) -> str:
-        """Return the name of the space a transfer or a QoS requirement acts in, read now from its record through the
-        provider the request goes to: a transfer's `spaceId`, resolved by Onezone, or a requirement's `fileId`, whose
-        space its parent links give (`file_space_name`). The record is never kept. A record the provider answers absent
-        (`answered_absent`), or one without the field, raises OutOfScope; any other failure of the read propagates. A
-        transfer's `spaceId` is confirmed by [L1]; a requirement's record is not (`UNVERIFIED_ENDPOINTS`)."""
+    def _record_space(self, kind: str, record_id: str, provider: str | None) -> tuple[str, str]:
+        """Return the id and the name of the space a transfer or a QoS requirement acts in, read now from its record
+        through the provider the request goes to: a transfer's `spaceId`, named by Onezone, or the space of a
+        requirement's `fileId`, found by its parent links (`file_space_id`). The record is never kept. A record the
+        provider answers absent (`answered_absent`), or one without the field, raises OutOfScope; any other failure of
+        the read propagates. A transfer's `spaceId` is confirmed by [L1]; a requirement's record is not
+        (`UNVERIFIED_ENDPOINTS`)."""
         if provider is None:
             raise OutOfScope(
                 "the mutation names a record but no provider, so it resolves to no space; nothing was sent"
@@ -698,27 +702,30 @@ class OnezoneClient:
         value = record.get(key) if isinstance(record, dict) else None
         if not isinstance(value, str) or not value:
             raise OutOfScope(f"the target record holds no {key}, so it resolves to no space; nothing was sent")
-        return self.space_name(value) if kind == "transfers" else self.file_space_name(value, provider)
+        space_id = value if kind == "transfers" else self.file_space_id(value, provider)
+        return space_id, self.space_name(space_id)
 
-    def _target_name(self, method: str, path: str, provider: str | None, body: Any) -> str:
-        """Return the name of the space a request acts on: the space in its path, the space of the file it names, or
-        the space its transfer's or QoS requirement's record names.
+    def _target(self, method: str, path: str, provider: str | None, body: Any) -> tuple[str, str]:
+        """Return the id and the name of the space a request acts on: the space in its path, the space of the file it
+        names (`file_space_id`), or the space its transfer's or QoS requirement's record names (`_record_space`).
 
         A read made for it that fails is refused as not sent (ScopeUnread), keeping that read's status, error id and
         transport flag; a target that resolves to no space stays OutOfScope."""
         parts = _plain(path)
         try:
             if len(parts) >= 3 and parts[1] == "spaces":
-                return self.space_name(_target_space_id(path))
+                space_id = _target_space_id(path)
+                return space_id, self.space_name(space_id)
             record = _record_target(method, path)
             if record is not None:
-                return self._record_space_name(*record, provider)
+                return self._record_space(*record, provider)
             file_id = _file_target(method, path, body)
             if file_id is None or provider is None:
                 raise OutOfScope(
                     "the mutation names no space and no file, so it resolves to no space; nothing was sent"
                 )
-            return self.file_space_name(file_id, provider)
+            space_id = self.file_space_id(file_id, provider)
+            return space_id, self.space_name(space_id)
         except NotSent:
             raise
         except PlatformError as error:
@@ -730,8 +737,13 @@ class OnezoneClient:
                 transport=error.transport,
             ) from None
 
-    def _require_in_scope(self, name: str) -> None:
-        """Refuse a target space whose name starts with no declared space's prefix (every `[[spaces]]` entry's)."""
+    def _require_in_scope(self, target: tuple[str, str], space: Space | None) -> None:
+        """Refuse a target space whose name starts with no declared space's prefix (every `[[spaces]]` entry's), and,
+        for a request bound to one space (`space`), a target that is not that space: another id, another name, or a
+        name outside its own prefixes, whatever the other spaces' prefixes allow."""
+        space_id, name = target
+        if space is not None and (space_id != space.id or name != space.name or not name.startswith(space.prefixes)):
+            raise OutOfScope("the target lies in another space than the one the request is bound to; nothing was sent")
         if not name.startswith(self._config.prefixes):
             raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
 
@@ -746,6 +758,7 @@ class OnezoneClient:
         content: bytes | None = None,
         timeout_s: float | None = None,
         token: str | None = None,
+        space: Space | None = None,
     ) -> Any:
         """Send a request that can change state; refuse it, before it is sent, unless it acts on a study space.
 
@@ -758,13 +771,14 @@ class OnezoneClient:
         It is sent with the admin credential, or as `token` when one is given: day-0 sends a write as a data-path token
         to see it refused. The gate applies either way, and is resolved with the admin credential. A raw body
         (`content`) is sent as `UPLOAD_CONTENT_TYPE`, which Onedata 25.0 requires of a content write ([L1]: 415
-        without it).
+        without it). With `space` (a provisioner's, or its reset's, own space) the target must be that space alone: its
+        id, its name, and its own prefixes.
         """
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
         self._base(provider)  # an undeclared provider is refused before anything is read
-        self._require_in_scope(self._target_name(method, path, provider, json))
+        self._require_in_scope(self._target(method, path, provider, json), space)
         headers = {AUTH_HEADER: token} if token is not None else dict(self._admin)
         if content is not None:
             headers["Content-Type"] = UPLOAD_CONTENT_TYPE
@@ -780,15 +794,23 @@ class OnezoneClient:
         )
 
     def read_range(
-        self, path: str, *, provider: str, offset: int, length: int, timeout_s: float | None = None
+        self,
+        path: str,
+        *,
+        provider: str,
+        offset: int,
+        length: int,
+        timeout_s: float | None = None,
+        space: Space | None = None,
     ) -> bytes:
         """Read `length` bytes from `offset` of a file's content through a declared provider; return the bytes.
 
         This is a read, but a read through a provider that lacks the bytes makes it fetch them: the file's block map on
         that provider grows (on-the-fly replication). It changes state, so it passes the same gate as a mutation: the
         path must be `/data/{id}/content`, and the file's space must have a name that starts with a configured prefix,
-        or nothing is sent. The answer must be a 206 whose `Content-Range` starts at `offset` and matches the body, and
-        the body must be `length` bytes unless the range ends at the end of the file; anything else is refused. [S8]
+        or nothing is sent; with `space`, that space alone, as for `mutate`. The answer must be a 206 whose
+        `Content-Range` starts at `offset` and matches the body, and the body must be `length` bytes unless the range
+        ends at the end of the file; anything else is refused. [S8]
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
@@ -797,7 +819,7 @@ class OnezoneClient:
             raise OutOfScope("a range read needs a non-negative offset and a positive length")
         path = _check_path(path)
         self._base(provider)
-        self._require_in_scope(self._target_name("GET", path, provider, None))
+        self._require_in_scope(self._target("GET", path, provider, None), space)
         headers = {**self._admin, "Range": f"bytes={offset}-{offset + length - 1}"}
         response = self._request("GET", path, provider=provider, headers=headers, timeout_s=timeout_s)
         label = self._base(provider)[1]
@@ -830,7 +852,7 @@ class OnezoneClient:
             raise OutOfScope("a content read is of /data/{id}/content only")
         path = _check_path(path)
         base, label = self._base(provider)
-        self._require_in_scope(self._target_name("GET", path, provider, None))
+        self._require_in_scope(self._target("GET", path, provider, None), None)
         headers = {**self._admin, **({"Range": "bytes=0-0"} if first_byte else {})}
         try:
             with self._http.stream(

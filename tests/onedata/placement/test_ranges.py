@@ -23,8 +23,8 @@ def test_o02_a_range_placement_issues_range_reads_and_never_a_transfer_job(provi
     assert len(reads) == 2  # one read per declared range
     assert [c for c in sent_to(seeded, ALPHA_ID) if c[2].endswith("/content")] == []  # the data provider is not read
     assert seeded.held(PATH, BETA_ID) == [[0, 100], [2000, 500]]  # exactly the declared bytes, not the whole file
-    assert record["providers"]["beta"]["bytes_read"] == 600
-    assert record["providers"]["beta"]["placement"]["fully_placed"] is True
+    assert record["providers"]["providers[1]"]["bytes_read"] == 600
+    assert record["providers"]["providers[1]"]["placement"]["fully_placed"] is True
 
 
 def test_o02_the_placement_is_confirmed_by_the_block_map_after_it_lags(provisioner, seeded, ticker):

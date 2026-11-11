@@ -56,7 +56,8 @@ def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_em
 
     With `start_empty` a provider must hold nothing of the rows' files before the reads (the cold-start rule: bytes
     cached by an earlier run would otherwise pass as placed); it raises `NotPlaced` when one does. The record lists per
-    provider the files and bytes asked for, the bytes read, what was held before and after, and the polls it took.
+    provider, by its position (`providers[i]`), the files and bytes asked for, the bytes read, what was held before and
+    after, and the polls it took.
     """
     rows = list(rows)
     where = provisioner.where
@@ -85,7 +86,7 @@ def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_em
             for offset, length in _chunks(row.ranges, provisioner.settings.chunk_bytes):
                 read += provisioner.read_through(provider, entries[row.file].file_id, offset, length)
         confirmation = provisioner.confirm_placed(provider, wanted)
-        record["providers"][provider] = {
+        record["providers"][provisioner.client.provider_label(provider)] = {  # a position, never the name (O12)
             "files": len(wanted),
             "ranges": sum(len(row.ranges) for row in mine),
             "bytes_asked": sum(length for row in mine for _, length in row.ranges),

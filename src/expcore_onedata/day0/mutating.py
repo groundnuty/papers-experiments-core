@@ -198,7 +198,7 @@ def round_trip(ctx: Context) -> Result:
         file_id = provisioner.put_file(path, data)
         steps.append("created")
         record = place_ranges(provisioner, [RangeRow(path, receiver, ((0, half),))], start_empty=True)
-        placed = record["providers"][receiver]
+        placed = record["providers"][provisioner.client.provider_label(receiver)]
         held = placed["per_file"][path]
         facts.update(held_bytes=held["held_bytes"], held_ranges=held["held"], polls=placed["polls"])
         facts["held_covers_range"] = any(start <= 0 and half <= start + length for start, length in held["held"])

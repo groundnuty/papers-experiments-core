@@ -68,6 +68,7 @@ def test_every_endpoint_the_live_federation_confirmed_keeps_its_live_test():
         ("GET", "/spaces/{space}/transfers"),
         ("GET", "/transfers/{id}"),
         ("POST", "/transfers"),
+        ("GET", "/data/{id}/distribution"),
     ):
         assert f"# covers: {method} {path}\n" in live
 

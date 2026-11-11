@@ -12,15 +12,16 @@ id = "..."
 prefixes = ["..."]
 providers = ["<name>", ...]     # the providers declared to support this space (O04)
 local = "<name>"                # the agent's own provider, one of these; the same in every entry (O03)
-holder = "<name>"               # optional: this space's data provider, in place of [placement] holder (O09)
+holder = "<name>"               # this space's data provider, one of its providers: required, never [placement]'s (O09)
 tokens = ["data_path", "tool_server"]  # optional: the token planes whose caveats reach this space; both by default
 ```
 
 Each entry is a `StudySpace`. The one-space form reads as the single space `spaces[0]` with the label `space`. A
 message names an entry by its position (`spaces[1]`), never by its label, name or id, as every table of named entries
 in this layer is named (O12). Loading refuses a label, name or id given twice, a local provider that differs between
-entries (the agent is pinned to one, O03), a data provider that does not support its space, and a token plane scoped to
-no space.
+entries (the agent is pinned to one, O03), an entry without its data provider or with one that does not support its
+space, and a token plane scoped to no space. Whenever the `[[spaces]]` form is used, with one entry or several, its
+entries are in the campaign fingerprint (`PlatformConfig.fingerprint`); the one-space form's fingerprint is unchanged.
 """
 
 import hashlib
@@ -127,8 +128,8 @@ def _entry(entry: Section, position: str, providers: Collection[str]) -> StudySp
     if not LABEL.fullmatch(label):
         raise entry.fail("label", "must be letters, digits, '_' and '-', starting with a letter")
     support = parse_support(entry, providers)
-    holder = entry.optional_string("holder")
-    if holder is not None and holder not in support.providers:
+    holder = entry.string("holder")  # required: a default could make another owner's provider evictable (O09)
+    if holder not in support.providers:
         raise entry.fail("holder", "must be one of the providers that support the space")
     tokens = entry.strings("tokens") if "tokens" in entry.data else PLANES
     if len(set(tokens)) != len(tokens) or any(plane not in PLANES for plane in tokens):

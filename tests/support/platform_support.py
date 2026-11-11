@@ -132,6 +132,7 @@ def with_spaces(data: dict[str, Any], count: int = 2, **override: Any) -> None:
             "prefixes": ["study-b-" if SPACE_NAMES[i].startswith("study-b-") else SPACE_PREFIX],
             "providers": ["alpha", "beta"],
             "local": "alpha",
+            "holder": "alpha",
             **override,
         }
         for i in range(count)

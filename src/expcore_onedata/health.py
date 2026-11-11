@@ -11,8 +11,10 @@ service principal, on the host and outside every run, and compares the providers
 declared set (`[support] providers`), matching them by provider id. The declared set is the only expectation: a
 multi-provider federation passes when it reports exactly its declared providers, and a provider that is reported but not
 declared fails the check as surely as a declared one that is missing. The check also fails when the space's name differs from the declared one or a declared
-provider is reported offline. With several spaces (`[[spaces]]`) the token reaches every declared space and each is
-checked against its own support set; the first that fails is named by its position (`spaces[i]`).
+provider is reported offline. With several spaces (`[[spaces]]`) the token is a data path's, scoped to the spaces the
+data path reaches (`space_ids("data_path")`) and no others, and each of those is checked against its own support set;
+the first that fails is named by its position (`spaces[i]`). A space only the tool server's token reaches is not in the
+token's scope, so this check cannot read it.
 
 An answer that cannot be read is unhealthy, never a crash and never a pass: any failure, including an unexpected
 exception, becomes `Health(False, reason)`. The reason names positions in the file (`providers[i]`), counts and the
@@ -47,7 +49,7 @@ from expcore_onedata.federation import ReportedProvider, SpaceView, declared_nam
 from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
 from expcore_onedata.tls import WARNING
 from expcore_onedata.tokencheck import TokenRefused
-from expcore_onedata.tokens import MintedToken, TokenIssuer, data_path_spec
+from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, data_path_spec
 
 TOKEN_CAP_S = 300.0  # the check's own budget; its token outlives it by the configured margin
 REFRESH_BEFORE_S = 120.0  # a cached token is replaced this long before it expires
@@ -136,7 +138,7 @@ class PlatformHealth:
         with self._lock:
             token = self._token
             if token is None or self._clock() > token.expires_at - REFRESH_BEFORE_S:
-                spec = data_path_spec([entry.space.id for entry in self._config.spaces])  # every declared space
+                spec = data_path_spec(self._config.space_ids(Plane.DATA_PATH))  # the data path's spaces, no other
                 token = self._token = self._issuer.mint(spec, self._service, ceiling_s=TOKEN_CAP_S)
             return token
 
@@ -156,17 +158,18 @@ class PlatformHealth:
     def _space(self) -> Health:
         """Each declared space as Onezone reports it, against its declared support set; never raise.
 
-        The scope is read once, with a token that reaches every declared space. With several spaces the first space
-        that fails is named by its position (`spaces[i]`), and a pass names how many spaces were checked."""
+        The scope is read once, with a data-path token, and every space the data path reaches is checked. With several
+        spaces the first that fails is named by its position (`spaces[i]`), and a pass names how many were checked."""
         try:
             answer = self._client.query("/tokens/infer_access_token_scope", {"token": self._current_token().reveal()})
             if len(self._config.spaces) == 1:
                 return compare(parse_scope(answer, self._config.space.id), self._config)
-            for entry in self._config.spaces:
+            checked = [entry for entry in self._config.spaces if Plane.DATA_PATH in entry.tokens]
+            for entry in checked:
                 verdict = compare(parse_scope(answer, entry.space.id), self._config, entry)
                 if not verdict.ok:
                     return Health(False, f"{entry.position}: {verdict.detail}")
-            return Health(True, f"ok: each of the {len(self._config.spaces)} spaces is supported by its declared set")
+            return Health(True, f"ok: each of the {len(checked)} spaces is supported by its declared set")
         except _SAFE as error:
             return Health(False, f"health check failed: {error}")
         except Exception as error:

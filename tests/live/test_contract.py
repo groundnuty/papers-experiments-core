@@ -248,6 +248,24 @@ def test_the_read_only_day0_checks_do_not_fail_on_the_real_deployment(day0):
     assert not failures, failures
 
 
+def test_the_space_roots_distribution_gives_each_supporting_providers_physical_size(day0, tmp_path):
+    """O08: the reset's occupancy stage reads the space root's distribution on the data provider: every supporting
+    provider has a physical size there, a whole number of bytes, or the reading is unknown and the test fails (a space
+    without directory statistics cannot pass the reset). Read-only."""
+    # covers: GET /data/{id}/distribution
+    from expcore_onedata.occupancy import physical_sizes
+    from expcore_onedata.provision import Provisioner
+
+    if day0.placement is None:
+        pytest.skip("the occupancy check needs a [placement] table, which platform.toml does not have")
+    provisioner = Provisioner(
+        day0.client, day0.config, day0.placement.settings, provider_ids=day0.provider_ids, log=tmp_path / "log.jsonl"
+    )
+    sizes = physical_sizes(provisioner, day0.config.support.providers)
+    assert set(sizes) >= set(day0.config.support.providers)
+    assert all(isinstance(size, int) and size >= 0 for size in sizes.values())
+
+
 def test_a_real_block_map_has_the_documented_shape(day0, client, config):
     """The distribution answer parses; a regular file is found by listing the first supporting provider's root."""
     from expcore_onedata import consistency

@@ -188,6 +188,7 @@ class PlatformConfig:
     sandbox: SandboxSettings | None = None
     sha256: str = ""  # of the file as loaded: a record names the configuration by this, never by a value in it
     tls: TlsSettings = field(default_factory=TlsSettings)  # every client's one certificate check (`[tls]`)
+    spaces_table: bool = False  # the spaces came from [[spaces]], one entry or several, not from [space]/[support]
 
     def space_named(self, label: str | None = None) -> StudySpace:
         """Return the space a label names, or, with none, the only one; refuse, naming no label, when there is none
@@ -240,11 +241,12 @@ class PlatformConfig:
         """The platform's half of the campaign fingerprint (`StudyPlugin.platform`): what a resume must not change.
 
         It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12), and,
-        when several spaces are declared, each space's SHA-256 in the file's order (`StudySpace.digest`), so a resume
-        under another set, order or support of spaces is refused. One space adds nothing: its fingerprint is as it was.
+        whenever the `[[spaces]]` form is used (one entry or several), each entry's SHA-256 in the file's order
+        (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
+        The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was.
         """
         out: dict[str, Any] = {"tls": self.tls.record()}
-        if len(self.spaces) > 1:
+        if self.spaces_table:
             out["spaces"] = [entry.digest() for entry in self.spaces]
         return out
 
@@ -500,6 +502,7 @@ def load_platform(
         zone=Zone(_name(zone, "name", zone.string("name"), "the zone name"), _url(zone, "url")),
         providers=MappingProxyType(providers),
         spaces=load_spaces(root, providers),
+        spaces_table="spaces" in root.data,
         admin=_secret_source(credentials.section("admin"), file.parent, require=require_secrets, environ=environ),
         users=users,
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),

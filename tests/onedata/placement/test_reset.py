@@ -5,8 +5,8 @@ import threading
 
 import pytest
 from fake_reset import FakeReset
-from placement_support import ALPHA_ID, BETA_ID, DATA
-from platform_support import ADMIN_ENV, BASELINE, SPACE_IDS, SPACE_NAME, USERS
+from placement_support import ALPHA_ID, BETA_ID, DATA, with_placement
+from platform_support import ADMIN_ENV, BASELINE, SPACE_IDS, SPACE_NAME, USERS, write_platform
 
 from expcore_onedata import consistency
 from expcore_onedata.client import OutOfScope
@@ -30,11 +30,15 @@ def fake(monkeypatch, ticker) -> FakeReset:
     return federation
 
 
+def document(data):
+    """The placement settings of the tests, with the space supported by both providers, alpha holding its data."""
+    with_placement(data, transfer_settle_s=5.0, transfer_settle_polls=3, concurrency=4)
+    data["support"]["providers"] = ["alpha", "beta"]
+
+
 @pytest.fixture
 def platform_file(tmp_path):
-    from placement_support import write_with_placement
-
-    return write_with_placement(tmp_path, transfer_settle_s=5.0, transfer_settle_polls=3, concurrency=4)
+    return write_platform(tmp_path, document)
 
 
 @pytest.fixture
@@ -138,7 +142,7 @@ def test_o11_every_qos_requirement_in_the_space_is_found_removed_and_shown_gone(
     for where in (FILES[3], "study"):
         stocked.add_qos(where)
     stocked.qos["qos-root"] = {"qosRequirementId": "qos-root", "fileId": "root-0001", "expression": "anyStorage"}
-    record = SpaceReset(provisioner).run()
+    record = SpaceReset(provisioner).run({"beta": ["study"]})
     assert stocked.qos == {}
     assert record["stages"]["qos"]["found"] == record["stages"]["qos"]["removed"] == 3
     deletes = [c for c in stocked.provider_calls if c[1] == "DELETE" and c[2].startswith("/qos_requirements/")]
@@ -170,24 +174,26 @@ def test_o09_a_requirement_id_that_is_not_one_plain_segment_fails_the_reset_befo
     assert not [c for c in stocked.provider_calls if c[1] == "DELETE"]
 
 
-def test_o11_a_running_transfer_is_cancelled_and_two_observations_then_show_none(provisioner, stocked, ticker):
+def test_o11_a_running_transfer_is_cancelled_and_the_settle_count_of_observations_then_show_none(
+    provisioner, stocked, ticker
+):
     """O11: a replication the agent left running is cancelled, reports cancelled, and the listings of both providers
-    show nothing waiting or ongoing twice in a row; it never placed its blocks."""
+    show nothing waiting or ongoing `transfer_settle_polls` times in a row; it never placed its blocks."""
     stocked.add_file("other/left.bin", DATA)
     tid = stocked.add_transfer("replication", "other/left.bin", BETA_ID, scheduled=ticker.now, ended=False)
-    record = SpaceReset(provisioner).run()
+    record = SpaceReset(provisioner).run({"beta": ["study"]})
     assert stocked.transfers[tid].ended
-    assert record["stages"]["transfers"] == {**record["stages"]["transfers"], "cancelled": 1, "observations": 3}
+    assert record["stages"]["transfers"] == {**record["stages"]["transfers"], "cancelled": 1, "observations": 4}
     assert stocked.held("other/left.bin", BETA_ID) == []
 
 
 def test_o07_a_job_the_listing_shows_late_is_caught_by_a_later_observation(provisioner, stocked, ticker):
     """O07: a job the listings leave out of their first answers is found by a later observation and cancelled
-    before two clean observations end the stage."""
+    before the clean observations end the stage."""
     stocked.add_file("other/late.bin", DATA)
     tid = stocked.add_transfer("replication", "other/late.bin", BETA_ID, scheduled=ticker.now, ended=False)
-    stocked.listing_lag[tid] = 2  # the waiting and ongoing listings of the first observation miss it
-    record = SpaceReset(provisioner).run()
+    stocked.listing_lag[tid] = 4  # all four listings of the first observation (two states, two providers) miss it
+    record = SpaceReset(provisioner).run({"beta": ["study"]})
     assert record["stages"]["transfers"]["cancelled"] == 1
     assert stocked.transfers[tid].cancelled
 
@@ -216,7 +222,7 @@ def test_o08_the_ended_history_is_recorded_with_its_count_and_newest_finish_and_
     assert history["removable"] is False
     assert history["ended"] == 3  # the two, and the reset's one eviction of the directory
     assert history["newest_finish"] >= 260.0
-    assert set(history["providers"]) == {"providers[0]"}
+    assert set(history["providers"]) == {"providers[0]", "providers[1]"}
     assert not [c for c in stocked.provider_calls if c[1] == "DELETE" and c[2].startswith("/transfers/")]
 
 
@@ -225,7 +231,7 @@ def test_o08_an_ended_record_without_a_finish_time_fails_the_reset_rather_than_g
     stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=100.0)
     stocked.transfer_omit = {"finishTime"}
     with pytest.raises(ResetFailed, match="history stage") as caught:
-        SpaceReset(provisioner).run()
+        SpaceReset(provisioner).run({"beta": ["study"]})
     assert caught.value.record["stages"]["history"]["ok"] is False
 
 
