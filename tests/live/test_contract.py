@@ -508,6 +508,22 @@ def write_random(path, size, seed):
     return hasher.hexdigest()
 
 
+def copy_prefix(source, dest, size):
+    """Copy the first `size` bytes of `source` to `dest`, a MiB at a time, and return their SHA-256. A stream drawn
+    again with the same seed is no prefix: `randbytes` of a length that is not a multiple of four ends otherwise."""
+    import hashlib
+
+    hasher = hashlib.sha256()
+    with open(source, "rb") as reader, open(dest, "wb") as writer:
+        while size > 0:
+            piece = reader.read(min(1 << 20, size))
+            assert piece, "the source ended before the prefix"
+            hasher.update(piece)
+            writer.write(piece)
+            size -= len(piece)
+    return hasher.hexdigest()
+
+
 @MUTATE
 def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_back_by_its_hash(
     config, client, tmp_path
@@ -535,7 +551,7 @@ def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_
     whole, prefix = tmp_path / "whole.bin", tmp_path / "prefix.bin"
     whole_sha = write_random(whole, LARGE_FILE_BYTES, seed=127)
     cut = 2 * LARGE_FILE_CHUNK + 4321  # ends inside a chunk, as a write cut part way leaves it
-    prefix_sha = write_random(prefix, cut, seed=127)
+    prefix_sha = copy_prefix(whole, prefix, cut)
     path = f"expcore-live-{secrets.token_hex(6)}/large.bin"
     try:
         assert provisioner.upload(path, prefix).action == "created"
