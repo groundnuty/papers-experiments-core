@@ -81,12 +81,17 @@ class HashedOnlyRecord(BatchNotVerified):
 _RECORD_FILE = re.compile(r"[0-9a-f]{64}\.\d+\.json")
 
 
+def is_record_name(name: str) -> bool:
+    """Tell whether a file name is the name a run record is written under (`records.record.record_filename`)."""
+    return _RECORD_FILE.fullmatch(name) is not None
+
+
 def is_run_record(rel: str, raw: bytes) -> bool:
     """Tell whether a file is a run record: it is named as one, or it holds the record schema marker.
 
     A file that is neither (an outcome marker, a snapshot of the store, a manifest) may be hashed without being replayed.
     """
-    if _RECORD_FILE.fullmatch(Path(rel).name):
+    if is_record_name(Path(rel).name):
         return True
     try:
         data = decode(raw)
