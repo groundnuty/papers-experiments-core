@@ -8,7 +8,7 @@ All of them are `typing.Protocol`s, so a test double needs no inheritance. Signa
 
 | Architecture name | In v0.1 |
 |---|---|
-| `Study` | the study directory (`study.toml` and its siblings) plus one plugin module whose `build(context)` returns a `StudyPlugin` ([below](#the-study-plugin)) |
+| `Study` | the study directory (`study.toml` and its siblings, which may declare the [side files](#side-files-of-a-record) of its records) plus one plugin module whose `build(context)` returns a `StudyPlugin` ([below](#the-study-plugin)) |
 | `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` (leased platform users), its own `ToolProvider`s and an `Instrument` (the platform probes) through the same `StudyPlugin`; its sandbox is [described below](#the-platform-layers-sandbox). A platform of another kind is a distribution of its own that plugs in through the same `StudyPlugin` and the same protocols: [the study guide's section 10](study-guide.md#10-a-platform-of-your-own) lists what it needs, and `examples/sparql_platform/` is one |
 | `ToolProvider`, `Scorer`, `Instrument` | protocols: [`ToolProvider`](#toolprovider-and-callcontext), [`Scorer`](#scorer) and [`Instrument`](#instrument) (a protocol since step 4b2) |
 | `ModelBackend`, `RunExecutor`, `HealthCheck`, `ResourceProbe` | protocols, below |
@@ -55,6 +55,8 @@ The implementer must guarantee that every file the plugin imports is in `[study]
 The command line is `python -m expcore run|check|analyze|report|package|package-check|example` ([`cli.py`](../src/expcore/cli.py)). Output goes under `<study>/out/`; `package` writes a replication package where `--out` says, and `example` writes the example study into a new directory. How to use them is in [`study-guide.md`](study-guide.md).
 
 What the analysis may use. `check` replays every record and also copies the campaign store into the batch (`campaign-snapshot.sqlite`, made with SQLite's online backup over a read-only connection, which copies pages and so needs no particular SQLite version; then each attempt's directory is written relative to the batch and the copy is rebuilt with a plain `VACUUM`, so it holds no path of the machine the campaign ran on; and integrity-checked) and hashes the copy with the records. It lists the records it replayed (`replayed`) and refuses a run record named by a hashed-only pattern, so a check cannot replay nothing and still vouch for the records beside it. It refuses a store with attempts still running unless `--partial`, which the check records. `analyze` and `report` then use only those bytes: the snapshot, never the live store, and the replayed records, each read once and compared with the check's hash. They cross-validate the two: every record maps to an attempt of the snapshot, and every attempt scored (state `done`, a scored treatment failure included) has a replayed record that agrees with it on run key, attempt, outcome and treatment flag. Any mismatch is refused, naming it. With `--partial`, attempts still running at the check are tolerated, a final attempt no replayed record covers is left out. Every saved output (`export.json`, `analysis.json`, `report.md`) says whether the analysis is partial and lists the attempts left out (run key, attempt, reason); `analysed_attempts` holds only what was scored, and every count in the report is of that population, with the left-out runs' attempts in a column of their own.
+
+Side files are verified with the records. A file a run writes beside its record, which the record names by its SHA-256, is declared in `study.toml` ([below](#side-files-of-a-record)). `check` hashes every file of a declared name in the batch it parses into its inputs, never replays one, and pairs each with the one record in its directory; the check records the declaration (`side_files`) and each side file's hash in `inputs`. `analyze`, `report`, `regenerate` and a package's `make check` refuse a check made under another declaration, refuse a side file changed, removed or added since the check, and read each side file once to pair it with its record again, whatever the check file claims. A study that declares none is checked exactly as before, and its check file holds no `side_files`.
 
 ## ModelBackend
 
@@ -317,6 +319,31 @@ Implementer must guarantee:
 - The snapshot holds no secret and no identifier of the deployment beyond the labels the study's configuration gives.
 
 The platform's own instrument is `expcore_onedata.probes.PlatformProbes` (namespace `platform_probes`): the block map of each tracked file on each tracked provider before and after the run, the records of the transfers the provisioner scheduled, the record of every transfer of the space that started in the run's window whoever started it (`space_transfers`), the bytes moved between provider pairs, attributed to a source only where exactly one other provider held those bytes at the start, and per receiving provider the transfer bytes into it and a lower bound on the bytes fetched on demand (`on_demand`). A provider's `gained_bytes` is placement gained: the bytes of the blocks a provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire. See its module docstring and `expcore_onedata.transferlog` for the snapshot's fields.
+
+### Side files of a record
+
+An instrument whose reading is too large for the record, a compressed log of the byte ranges a run read for instance, can write it to a file beside the record and keep its SHA-256 in the snapshot. The study declares each such file in `study.toml` (`expcore.replay.side_files`, validated by `expcore.study.config` when the study loads):
+
+```toml
+[[study.side_files]]
+pattern = "extent_ranges.json.gz"               # one file name, looked for beside each record
+hash_field = "instruments.extent.side_sha256"   # the record field, a dotted path, that holds the file's SHA-256
+```
+
+- `pattern` is one literal file name, never a glob or a path, because each side file is paired with the one record in its own directory: the attempt directory `request.run_dir`, which holds one record. A name that starts with a dot is refused (the check never reads such a file), and so is a name the campaign or the check writes: a record's, `attempt-marker.json`, `campaign-snapshot.sqlite`, `replay-check.json`. A name ending in `.json` is a side file, never taken for a record.
+- `hash_field` is record keys joined by dots, looked up in the record's stored JSON. Each pattern and each field is declared once.
+- The declaration is part of `study.toml`, whose hash is in the campaign fingerprint, so a campaign resumed under another declaration is refused (C06).
+
+Core guarantees, in `check` and again wherever the analysis reads the batch (R14), each refusal naming the file:
+- a record whose field holds a hash with no such file beside it is refused;
+- a side file whose bytes do not have the hash its own record names is refused, two records' side files swapped included;
+- a file of a declared name in a directory that holds no record (left from an earlier campaign or attempt) is refused against its own path, wherever it lies in the batch, and never hashed into a passing check;
+- a side file beside a record whose field is absent or `null` is refused; a record with neither the field nor the file is fine, since that run made no side file;
+- a field that holds anything but 64 lower-case hexadecimal digits is refused;
+- a hash or a side file in a directory that holds more than one record is refused, since it cannot be paired;
+- the side files are found in exactly the batch directory the check parses, however the command names the study and the batch.
+
+Implementer must guarantee: the executor writes the side file into `request.run_dir` with the record, and the record names it. An attempt killed after writing its side file and before writing its record leaves an orphan, which `check` refuses, naming it, until it is removed. A scorer still reads only the record (R13): a measure computed from a side file's content is the study's own code reading the file, outside the bytes the analysis reads once and verifies.
 
 ## RunExecutor
 
