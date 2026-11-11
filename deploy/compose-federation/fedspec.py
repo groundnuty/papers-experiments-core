@@ -6,8 +6,10 @@ provider that owns each and the providers that mirror it, its users, support siz
 The layout is a TOML file. Without --layout it is `federation.toml` beside this file, which declares the deployment
 this directory always had: one Onezone and three Oneproviders. A space's owner is the provider its data is written
 through and kept on; its mirrors are other providers that support it and may hold replicas, which the per-run reset
-evicts. Every key is checked when the file is read, and a refusal names the file and the key. The two images stay
-pinned by the deployment itself (fedlayout.IMAGES): a layout cannot name another.
+evicts. A space declared `baseline = false` is made, supported and given its members like any other, but up writes
+none of the core's baseline files into it and `reset --clean` leaves it empty. Every key is checked when the file is
+read, and a refusal names the file and the key. The two images stay pinned by the deployment itself (fedlayout.IMAGES):
+a layout cannot name another.
 """
 
 import hashlib
@@ -53,7 +55,7 @@ TOP_KEYS = {
     "principals",
 }
 SERVICE_KEYS = {"port", "memory_limit"}
-SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible"}
+SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible", "baseline"}
 PRINCIPAL_KEYS = {"privileges", "spaces", "agent"}
 
 
@@ -86,17 +88,20 @@ class Service:
 
 @dataclass(frozen=True)
 class Space:
-    """A space, the provider that owns its data, the providers that mirror it, and whether the agent may reach it.
+    """A space, the provider that owns its data, the providers that mirror it, whether the agent may reach it, and
+    whether up writes the core's baseline files into it.
 
     A space with `agent_visible` false is for the day-0 checks alone: no user of the agent is a member of it, so no
     token the agent holds reaches it, whatever its caveats, and it is never the study space whose path the agent's
-    data-path tokens name."""
+    data-path tokens name. A space with `baseline` false is made, supported and given its members like any other, but
+    up writes nothing into it and `reset --clean` leaves it empty: its content is whatever a study puts there."""
 
     name: str
     owner: str
     mirrors: tuple[str, ...]
     support_bytes: int = DEFAULT_SUPPORT_BYTES
     agent_visible: bool = True
+    baseline: bool = True
 
     @property
     def supporters(self) -> tuple[str, ...]:
@@ -143,7 +148,7 @@ class Spec:
 
     @property
     def holder(self) -> str:
-        """The data provider: the study space's owner, through which its baseline is written."""
+        """The data provider: the study space's owner, through which its baseline is written when it has one."""
         return self.space(self.study_space).owner
 
     def members(self, space: str) -> tuple[Principal, ...]:
@@ -295,7 +300,8 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
             raise read.fail(f"{key}.mirrors", f"names the space's owner ({owner}), which holds its data already")
         size = read.integer(table.get("support_bytes", support), f"{key}.support_bytes", 1 << 20, 1 << 50)
         visible = read.boolean(table.get("agent_visible", True), f"{key}.agent_visible")
-        spaces.append(Space(name, owner, mirrors, size, visible))
+        has_baseline = read.boolean(table.get("baseline", True), f"{key}.baseline")
+        spaces.append(Space(name, owner, mirrors, size, visible, has_baseline))
     space_names = {space.name for space in spaces}
     study = read.name(top["study_space"], "study_space", space_names, "space")
     hidden = {space.name for space in spaces if not space.agent_visible}

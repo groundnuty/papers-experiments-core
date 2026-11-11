@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from expcore_onedata.client import PlatformError
 from expcore_onedata.day0.registry import Context, Result, failed, passed, register, unknown
 from expcore_onedata.health import PlatformHealth
+from expcore_onedata.precampaign import measure_content_type
 from expcore_onedata.probes import run_probe
 from expcore_onedata.tokencheck import PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import Plane, data_path_spec, tool_server_spec
@@ -104,9 +105,18 @@ def health(ctx: Context) -> Result:
     """The platform's own health check: the providers supporting the space equal the declared set."""
     if ctx.config.principals.service is None:
         return unknown("no [principals] service user is declared, so the health check cannot mint its token")
-    verdict = PlatformHealth(ctx.config, ctx.client, ctx.issuer, clock=ctx.now)()
-    detail = verdict.detail
-    return passed(detail) if verdict.ok else failed(detail)
+    platform = PlatformHealth(ctx.config, ctx.client, ctx.issuer, clock=ctx.now)
+    verdict = platform()
+    if verdict.ok:
+        return passed(verdict.detail)
+    content = platform.content_type
+    if content is not None and not content.ok and not content.measured:
+        # The health check composes the content-type check, which refused because it measured nothing (the check file
+        # may not be in the space): unknown, as its own day-0 check says, unless the space is not as declared either.
+        # With no REST data path it measures nothing and refuses nothing, so the verdict above is the space's.
+        space = platform.space()
+        return unknown(verdict.detail) if space.ok else failed(space.detail)
+    return failed(verdict.detail)
 
 
 @register("tokens", "Token minting and examination, per plane")
@@ -201,8 +211,6 @@ def content_type(ctx: Context) -> Result:
     """The pre-campaign check (`precampaign.measure_content_type`): the type the data gate streams on, when a data path
     is REST. A type that differs fails. A check that measured nothing is unknown, which is not a pass: one that could
     not read the type, and one with no REST data path to read it for, which a campaign still admits (O08)."""
-    from expcore_onedata.precampaign import measure_content_type
-
     verdict = measure_content_type(ctx.config, ctx.client)
     if not verdict.measured:
         return unknown(verdict.detail)
@@ -211,7 +219,8 @@ def content_type(ctx: Context) -> Result:
 
 @register("listing", "Listing of the space root on each supporting provider")
 def listing(ctx: Context) -> Result:
-    """The root lists on every provider in the support set, and a paged walk agrees with the single read."""
+    """The root lists on every provider in the support set, and a paged walk agrees with the single read. A root with no
+    entry has nothing to agree on, so it is unknown, never a pass."""
     from expcore_onedata import consistency
 
     rows: dict[str, Any] = {}
@@ -228,6 +237,13 @@ def listing(ctx: Context) -> Result:
             bad.append(name)
     if bad:
         return failed(f"the listing failed or disagreed on {len(bad)} provider(s): {', '.join(bad)}", providers=rows)
+    empty = [name for name, row in rows.items() if row["entries"] == 0]
+    if empty:
+        return unknown(
+            f"the root lists no entry on {len(empty)} supporting provider(s): {', '.join(empty)}; no baseline file is "
+            "in the space, so there is nothing to list or to walk page by page and a pass would prove nothing",
+            providers=rows,
+        )
     if any(row["consistent"] is None for row in rows.values()):
         return unknown("the root lists, but it is too large to walk page by page", providers=rows)
     return passed(f"the root lists on all {len(rows)} supporting provider(s), and a paged walk agrees", providers=rows)
