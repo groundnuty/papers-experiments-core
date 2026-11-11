@@ -42,7 +42,9 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
 - A bare **reset** is refused with a message naming both, so nobody wipes ingested datasets by accident.
 - **down** reads each service's peak memory, runs `docker compose down` for the project, then removes the root with
   everything in it, through a container of the project with no network (the services write their data as root), and
-  checks that no container, network or file of the project is left.
+  checks that no container, network or file of the project is left. It runs Compose only over a root that exists and
+  carries the project's mark: with the root gone and nothing of the project left it does nothing, and with the root
+  gone while containers or networks of the project remain it refuses.
 
 ## Declaring a layout
 
@@ -84,10 +86,10 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
 ## What it touches
 
 - **Docker:** only the layout's Compose project (default `expcore-fed`): its services, its network `<project>_fed`,
-  and down's short-lived `janitor`. Every container carries a label naming the root it binds, and a command refuses,
-  before it touches anything, a project whose containers bind another root or name none: that is another federation of
-  the same name. A federation brought up before containers named their root carries no such label, so take it down
-  with the code that brought it up. The two images are exactly `docker.onedata.org/onezone:ID-ba7a778696` and
+  and down's short-lived `janitor`. Every container and the project's network carry a label naming the root they
+  bind, and a command refuses, before it touches anything, a project whose containers or networks bind another root or
+  name none: that is another federation of the same name. A federation brought up before both carried that label is
+  refused, so take it down with the code that brought it up. The two images are exactly `docker.onedata.org/onezone:ID-ba7a778696` and
   `docker.onedata.org/oneprovider:ID-765309c84f`, never pulled (`pull_policy: never`) and never rebuilt. Nothing is
   pruned.
 - **Ports:** each service publishes its 443 on `127.0.0.1` only, on the port the layout gives it (the default: the

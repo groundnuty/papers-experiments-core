@@ -148,7 +148,8 @@ def model(spec: Spec) -> dict[str, Any]:
     """The Compose model of a layout: its services, the janitor and the one network."""
     services = {service.name: service_model(spec, service) for service in spec.services}
     services["janitor"] = janitor_model(spec)
-    return {"name": spec.project, "services": services, "networks": {"fed": {"driver": "bridge"}}}
+    network = {"driver": "bridge", "labels": {ROOT_LABEL: ROOT}}  # names its root, as every container does
+    return {"name": spec.project, "services": services, "networks": {"fed": network}}
 
 
 # -- YAML ------------------------------------------------------------------------------------------------------------

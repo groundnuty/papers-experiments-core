@@ -79,6 +79,11 @@ def test_every_service_has_its_declared_memory_limit_and_names_its_root(fed, any
     assert all(s["labels"] == {fed.compose.ROOT_LABEL: fed.compose.ROOT} for s in model.values())
 
 
+def test_the_projects_network_names_its_root_like_every_container(fed, any_spec):
+    networks = fed.compose.model(any_spec)["networks"]
+    assert networks == {"fed": {"driver": "bridge", "labels": {fed.compose.ROOT_LABEL: fed.compose.ROOT}}}
+
+
 def test_the_janitor_has_no_network_runs_only_when_asked_and_deletes_only_under_the_declared_mark(fed, any_spec):
     """A Compose command run by hand, outside the checked entry point, may bind another directory as the root; the
     janitor deletes only after reading the mark up writes into a root it made or found empty, holding the project."""
@@ -119,6 +124,7 @@ def test_docker_compose_reads_the_generated_file_as_the_generator_meant(fed, any
     assert done.returncode == 0, done.stderr
     model = json.loads(done.stdout)
     assert model["name"] == any_spec.project
+    assert model["networks"]["fed"]["labels"][fed.compose.ROOT_LABEL] == root
     for name, service in model["services"].items():
         assert all(p["host_ip"] == "127.0.0.1" for p in service.get("ports", []))
         assert service["labels"][fed.compose.ROOT_LABEL] == root

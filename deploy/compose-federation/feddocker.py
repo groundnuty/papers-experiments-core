@@ -76,17 +76,30 @@ def project_containers(project: str) -> list[Container]:
     return [Container(*[*line.split("\t"), "", "", ""][:4]) for line in lines]
 
 
-def project_networks(project: str) -> list[str]:
-    return docker_lines("network", "ls", "--filter", f"label={PROJECT_LABEL}={project}", "--format", "{{.Name}}")
+@dataclass(frozen=True)
+class Network:
+    """A network of the project: its name and the root its label names."""
+
+    name: str
+    root: str
+
+    def __str__(self) -> str:
+        return self.name
 
 
-def require_own(layout: Layout, containers: list[Container]) -> None:
-    """Refuse a project whose containers bind another root, or name none: that is another federation."""
-    strangers = [c for c in containers if c.root != str(layout.root)]
+def project_networks(project: str) -> list[Network]:
+    fields = ("{{.Name}}", f'{{{{.Label "{ROOT_LABEL}"}}}}')
+    lines = docker_lines("network", "ls", "--filter", f"label={PROJECT_LABEL}={project}", "--format", "\t".join(fields))
+    return [Network(*[*line.split("\t"), ""][:2]) for line in lines]
+
+
+def require_own(layout: Layout, containers: list[Container], networks: list[Network] = ()) -> None:
+    """Refuse a project whose containers or networks bind another root, or name none: that is another federation."""
+    strangers = [item for item in (*containers, *networks) if item.root != str(layout.root)]
     if strangers:
         raise RuntimeError(
-            f"{len(strangers)} container(s) of the project {layout.spec.project} bind another root than this one, or "
-            "name none; that federation is not this one, and nothing was touched"
+            f"{len(strangers)} container(s) or network(s) of the project {layout.spec.project} bind another root "
+            "than this one, or name none; that federation is not this one, and nothing was touched"
         )
 
 

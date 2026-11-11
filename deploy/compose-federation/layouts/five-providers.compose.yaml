@@ -556,3 +556,5 @@ services:
 networks:
   fed:
     driver: "bridge"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"

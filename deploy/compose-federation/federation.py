@@ -201,7 +201,7 @@ def up(layout: Layout) -> str:
     timer = Timer()
     require_images()
     containers = project_containers(layout.spec.project)
-    require_own(layout, containers)
+    require_own(layout, containers, project_networks(layout.spec.project))
     fresh = not containers
     if fresh:
         require_ports_free(layout.spec)
@@ -223,7 +223,7 @@ def up(layout: Layout) -> str:
 
 def require_up(layout: Layout) -> None:
     containers = project_containers(layout.spec.project)
-    require_own(layout, containers)
+    require_own(layout, containers, project_networks(layout.spec.project))
     if not containers or not layout.facts.exists():
         raise RuntimeError("the federation is not up; run up first")
 
@@ -263,29 +263,38 @@ def reset_replicas(layout: Layout) -> str:
 
 def down(layout: Layout) -> str:
     """Stop and remove the project, then empty and remove the root; refuse first, touching nothing, when the project's
-    containers bind another root or the root lacks this layout's mark."""
+    containers or networks bind another root or the root lacks this layout's mark.
+
+    Compose runs only over a root that exists and carries the mark naming this project: with the root gone, a compose
+    down under the project's name could only remove what another federation of that name left, its network included.
+    """
     timer = Timer()
     project = layout.spec.project
-    containers = project_containers(project)
-    require_own(layout, containers)
-    if layout.root.exists() and not layout.owned:
+    containers, networks = project_containers(project), project_networks(project)
+    require_own(layout, containers, networks)
+    if not layout.root.exists():
+        if containers or networks:
+            raise RuntimeError(
+                f"the root is missing while {len(containers)} container(s) and {len(networks)} network(s) of the "
+                f"project {project} name it; nothing stopped, since compose runs only over a marked root"
+            )
+        return timer.summary("down (already down)")
+    if not layout.owned:
         raise RuntimeError(
             f"the root is not marked as this federation's ({ROOT_MARKER} naming {project}); nothing stopped or deleted"
         )
     if layout.inner_roots:
         raise RuntimeError("the root holds another federation's root; nothing stopped or deleted")
     peaks = memory_usage(containers)
-    had = bool(containers) or layout.root.exists()
     compose(layout, "down", "--remove-orphans", "--timeout", "120")
     timer.mark("containers")
-    if layout.root.exists():
-        compose(layout, "--profile", "janitor", "run", "--rm", "--no-deps", "janitor")
-        layout.root.rmdir()
+    compose(layout, "--profile", "janitor", "run", "--rm", "--no-deps", "janitor")
+    layout.root.rmdir()
     timer.mark("data")
     left = project_containers(project) + project_networks(project)
     if left or layout.root.exists():
         raise RuntimeError(f"down left {len(left)} container(s) or network(s), or the root, behind")
-    summary = timer.summary("down" if had else "down (already down)")
+    summary = timer.summary("down")
     if peaks:
         summary += "\npeak memory: " + ", ".join(f"{name} {gib(read['peak'])}" for name, read in peaks.items())
     return summary
@@ -302,7 +311,7 @@ def status(layout: Layout) -> str:
 
 def memory(layout: Layout) -> str:
     containers = project_containers(layout.spec.project)
-    require_own(layout, containers)
+    require_own(layout, containers, project_networks(layout.spec.project))
     return "\n".join(memory_lines(layout.spec, memory_usage(containers)))
 
 

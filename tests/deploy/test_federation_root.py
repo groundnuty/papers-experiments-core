@@ -2,6 +2,7 @@
 parent or through a link, a configured parent and its stricter rule, a root without this layout's mark, containers of
 the project over another root, and a first start the host's memory cannot hold."""
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -129,13 +130,54 @@ def test_a_configured_parent_takes_a_root_strictly_below_it_and_the_default_keep
 # -- what up and down refuse before they touch anything ---------------------------------------------------------------
 
 
-def no_docker(fed, monkeypatch, containers=()):
-    """Record every compose call instead of running it, and show the given containers of the project."""
+def no_docker(fed, monkeypatch, containers=(), networks=()):
+    """Record every compose call instead of running it, and show the given containers and networks of the project."""
     ran = []
     monkeypatch.setattr(fed.cli, "compose", lambda *args, **kw: ran.append(args))
     monkeypatch.setattr(fed.cli, "project_containers", lambda project: list(containers))
-    monkeypatch.setattr(fed.cli, "project_networks", lambda project: [])
+    monkeypatch.setattr(fed.cli, "project_networks", lambda project: list(networks))
     return ran
+
+
+@dataclass(frozen=True)
+class FakeNetwork:
+    """A network of the project as docker lists it: its name and the root its label names."""
+
+    name: str
+    root: str
+
+
+def test_down_without_the_root_runs_no_compose_command(fed, tmp_path, monkeypatch):
+    """With the root gone and no container of the project, a compose down under the layout's project name could only
+    remove what another federation of that name left, its network included: down runs nothing."""
+    layout = fed.layout.Layout(tmp_path / "gone")
+    ran = no_docker(fed, monkeypatch)
+    assert "already down" in fed.cli.down(layout)
+    assert ran == []
+
+
+def test_down_refuses_a_missing_root_while_containers_of_the_project_name_it(fed, tmp_path, monkeypatch):
+    layout = fed.layout.Layout(tmp_path / "gone")
+    mine = fed.docker.Container("expcore-fed-zone-1", "zone", "exited", str(layout.root))
+    ran = no_docker(fed, monkeypatch, [mine])
+    with pytest.raises(RuntimeError, match="root is missing"):
+        fed.cli.down(layout)
+    assert ran == []
+
+
+def test_a_project_network_without_this_roots_label_is_refused_by_up_and_down(fed, tmp_path, monkeypatch):
+    """The project's network names its root like every container; one that names another root, or none, belongs to
+    another federation of the same project name, and neither up nor down touches it."""
+    layout = fed.layout.Layout(tmp_path / "mine")
+    for network in (FakeNetwork("expcore-fed_fed", ""), FakeNetwork("expcore-fed_fed", str(tmp_path / "theirs"))):
+        ran = no_docker(fed, monkeypatch, networks=[network])
+        for name in ("require_images", "require_ports_free", "require_memory_fits"):
+            monkeypatch.setattr(fed.cli, name, lambda *args: None)
+        monkeypatch.setattr(fed.cli, "prepare", lambda layout: pytest.fail("up went past another federation's network"))
+        for command in (fed.cli.up, fed.cli.down):
+            with pytest.raises(RuntimeError, match="another root"):
+                command(layout)
+        assert ran == []
 
 
 def test_up_refuses_a_root_that_holds_files_without_the_mark_and_down_deletes_nothing_there(fed, tmp_path, monkeypatch):
