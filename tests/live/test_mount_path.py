@@ -192,7 +192,8 @@ def launch_facts(host: DockerHost, sandbox: DockerSandbox, network: str, secret:
         networks = set((info.get("NetworkSettings") or {}).get("Networks") or {})
         out[role] = {
             "dev_fuse": any(d.get("PathOnHost") == "/dev/fuse" for d in config.get("Devices") or []),
-            "sys_admin": "SYS_ADMIN" in (config.get("CapAdd") or []),
+            # docker names it CAP_SYS_ADMIN in a container's configuration, whichever form `--cap-add` was given
+            "sys_admin": bool({"SYS_ADMIN", "CAP_SYS_ADMIN"} & set(config.get("CapAdd") or [])),
             "cap_drop_all": (config.get("CapDrop") or []) == ["ALL"],
             "privileged": bool(config.get("Privileged")),
             "read_only_root": bool(config.get("ReadonlyRootfs")),

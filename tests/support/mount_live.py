@@ -111,6 +111,20 @@ def derive_platform(source: Path, out_dir: Path, sandbox: Mapping[str, Any]) -> 
     return out
 
 
+def absent(answer: httpx.Response) -> bool:
+    """Whether a provider's answer says the entry is not there: a 404, or the 400 `posix` error with errno `enoent`
+    that Onedata 25.0 gives for a file it does not know (seen live on the Compose federation)."""
+    if answer.status_code == 404:
+        return True
+    if answer.status_code != 400:
+        return False
+    try:
+        error = answer.json().get("error") or {}
+    except ValueError:
+        return False
+    return error.get("id") == "posix" and (error.get("details") or {}).get("errno") == "enoent"
+
+
 class SpaceFiles:
     """Files in the study space, written through one provider's REST API as the admin; every one is deleted again."""
 
@@ -161,15 +175,16 @@ class SpaceFiles:
     ) -> list[str]:
         """Delete every created entry, newest first, through the provider that made it, and show each gone (O11).
 
-        A delete is sent again until the provider answers that the entry is gone (204 or 404) and a read of it answers
-        404, for at most `window_s`: a directory whose files were made through another provider may be refused until
-        their deletion reaches it. What is never shown gone is returned, by position."""
+        A delete is sent again until the provider answers that the entry is gone (204, or `absent`) and a read of it
+        answers that it is absent, for at most `window_s`: a directory whose files were made through another provider
+        may be refused until their deletion reaches it. What is never shown gone is returned, by position."""
         failed = []
         for position, (provider, file_id) in reversed(list(enumerate(self.created))):
             deadline = clock() + window_s
             while True:
-                status = self._call("DELETE", provider, f"/data/{file_id}").status_code
-                gone = status in (204, 404) and self._call("GET", provider, f"/data/{file_id}").status_code == 404
+                deleted = self._call("DELETE", provider, f"/data/{file_id}")
+                status = deleted.status_code
+                gone = (status == 204 or absent(deleted)) and absent(self._call("GET", provider, f"/data/{file_id}"))
                 if gone or clock() >= deadline:
                     break
                 sleep(poll_s)

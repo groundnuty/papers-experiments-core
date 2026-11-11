@@ -188,22 +188,31 @@ def test_o08_the_background_reader_outlives_its_cell_and_counts_its_reads(tmp_pa
     pid = run(reader_cell(str(tmp_path / "big"), 3 << 20, str(counter)))["pid"]
     try:
         deadline = time.monotonic() + 30
-        while not (counter.exists() and counter.read_text().strip().isdigit() and int(counter.read_text()) >= 2):
+        while True:  # one read per look: the reader truncates the file before each write
+            text = counter.read_text().strip() if counter.exists() else ""
+            if text.isdigit() and int(text) >= 2:
+                break
             assert time.monotonic() < deadline, "the reader did not count two reads"
             time.sleep(0.1)
     finally:
         os.kill(pid, 9)
 
 
+ENOENT = "enoent"
+ENOENT_BODY = {"error": {"id": "posix", "details": {"errno": "enoent"}, "description": "invented"}}
+
+
 def fake_space(answers):
-    """SpaceFiles over a scripted provider: `answers` maps (method, file id) to the statuses it gives, in turn."""
+    """SpaceFiles over a scripted provider: `answers` maps (method, file id) to what it gives, in turn: a status, or
+    `ENOENT`, Onedata 25.0's answer for a file it does not know."""
     calls = []
 
     def handler(request):
         file_id = request.url.path.rsplit("/", 1)[-1]
         calls.append((request.method, file_id))
         queue = answers.get((request.method, file_id), [404])
-        return httpx.Response(queue.pop(0) if len(queue) > 1 else queue[0])
+        given = queue.pop(0) if len(queue) > 1 else queue[0]
+        return httpx.Response(400, json=ENOENT_BODY) if given == ENOENT else httpx.Response(given)
 
     config = SimpleNamespace(
         tls=SimpleNamespace(client_verify=lambda: True),
@@ -237,3 +246,22 @@ def test_o11_the_fixture_files_are_deleted_newest_first_and_each_is_shown_gone_o
     assert deletes[-3:] == ["dir-1", "dir-1", "dir-1"]  # the directory last, tried until it went
     assert deletes.count("file-2") == 2
     assert space.created == []
+
+
+def test_o11_an_entry_the_provider_answers_400_enoent_for_is_gone_as_onedata_25_answers_a_deleted_file():
+    """O11: Onedata 25.0 answers a read of a file it no longer has, and a second delete of it, with 400 `posix` and
+    errno `enoent` rather than 404 (seen live on the Compose federation); that is the entry shown gone. Any other
+    400 is not."""
+    space, _ = fake_space(
+        {
+            ("DELETE", "file-1"): [204],
+            ("GET", "file-1"): [ENOENT],
+            ("DELETE", "file-2"): [ENOENT],  # already gone when the delete came
+            ("GET", "file-2"): [ENOENT],
+            ("DELETE", "file-3"): [204],
+            ("GET", "file-3"): [400],  # a 400 of another kind says nothing of the entry
+        }
+    )
+    space.created = [("near", "file-1"), ("near", "file-2"), ("near", "file-3")]
+    failed = space.remove_all(window_s=3, poll_s=1, sleep=lambda s: None, clock=iter(range(100)).__next__)
+    assert failed == ["entry 2: not shown gone (its last delete answered 204)"]
