@@ -7,7 +7,15 @@ from fake_federation import ZONE
 from placement_support import DATA
 from platform_support import SPACE_NAME
 
-from expcore_onedata.client import MAX_SPACE_DEPTH, NotSent, OnezoneClient, OutOfScope, PlatformError, ScopeUnread
+from expcore_onedata.client import (
+    MAX_KEPT_LINKS,
+    MAX_SPACE_DEPTH,
+    NotSent,
+    OnezoneClient,
+    OutOfScope,
+    PlatformError,
+    ScopeUnread,
+)
 
 PATH = "study/data.bin"
 OTHER = "/data/fid/content"
@@ -188,15 +196,15 @@ def test_o09_the_walk_is_kept_for_the_client_and_the_spaces_name_is_read_again_e
     assert [c for c in fake.provider_calls if c[1] == "DELETE"] == []
 
 
-def test_o09_the_spaces_root_is_kept_per_provider_and_the_links_across_providers(config, fake, client):
-    """O09: the root is read once from each provider the gate asks; the parent links, which name files by their ids,
-    are kept across providers."""
+def test_o09_the_spaces_root_and_the_parent_links_are_kept_per_provider(config, fake, client):
+    """O09: the root and the parent links are read once from each provider the gate asks, and kept as that provider's:
+    a file resolved through one provider is walked again through another, then found kept there too."""
     file_id = fake.add_file("a/data.bin", DATA)
     client.file_space_name(file_id, "alpha")
     client.file_space_name(file_id, "beta")
     client.file_space_name(file_id, "beta")
     assert [c[0] for c in root_reads(fake)] == [fake.PROVIDER_ID, fake.provider_of("beta.test")]
-    assert parent_reads(fake) == [file_id, fake.id_of("a")]
+    assert parent_reads(fake) == [file_id, fake.id_of("a")] * 2
 
 
 def test_o09_a_file_as_deep_as_the_bound_resolves_and_one_level_deeper_is_refused(config, fake, client):
@@ -293,6 +301,93 @@ def test_o09_a_parent_link_that_is_not_a_plain_id_or_null_fails_closed(config, a
     with pytest.raises(ScopeUnread):
         client.mutate("DELETE", "/data/abc", provider="alpha")
     assert "DELETE" not in [r.method for r in seen]
+
+
+def by_host(config, links):
+    """A client whose providers answer parent links from `links`, host to file id to parent (None at the top); both
+    give the space's root as `root-s`, and Onezone the space's configured name."""
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        path = request.url.path
+        if path == f"{ZONE}/spaces/{config.space.id}":
+            return httpx.Response(200, json={"name": config.space.name})
+        if path == f"{PROVIDER}/spaces/{config.space.id}":
+            return httpx.Response(200, json={"fileId": SCRIPTED_ROOT})
+        if request.url.params.get("attribute") == "parent_id":
+            return httpx.Response(200, json={"parent_id": links[request.url.host][path.rsplit("/", 1)[-1]]})
+        return httpx.Response(204)
+
+    return OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(handler))), seen
+
+
+def test_o09_a_link_one_provider_gave_never_resolves_a_file_through_another(config):
+    """O09: the links a walk keeps are the provider's that gave them. A file whose chain reaches the configured root
+    through one provider, and leaves the space through another, is refused through the second, though the first's
+    chain is kept: the second provider is asked for its own links, and nothing is sent to it."""
+    links = {
+        "alpha.test": {"fid": SCRIPTED_ROOT},
+        "beta.test": {"fid": "elsewhere-dir", "elsewhere-dir": None},  # beta's chain ends above every known root
+    }
+    client, seen = by_host(config, links)
+    client.mutate("DELETE", "/data/fid", provider="alpha")
+    with pytest.raises(OutOfScope, match="no space this configuration knows"):
+        client.mutate("DELETE", "/data/fid", provider="beta")
+    assert [(r.method, r.url.host) for r in seen if r.method == "DELETE"] == [("DELETE", "alpha.test")]
+    assert [r.url.host for r in seen if r.url.params.get("attribute") == "parent_id"] == [
+        "alpha.test",
+        "beta.test",
+        "beta.test",
+    ]
+
+
+def test_o09_a_directory_moved_up_after_a_deep_walk_is_walked_fresh_before_a_child_is_refused(config, fake, client):
+    """O09: a directory walked when it lay deep keeps its old ancestry in the client. Moved near the root, it gets a
+    child whose walk over the kept links passes the bound; before refusing, the walk drops the kept links on its chain
+    and reads every link fresh, and the child resolves. The fresh links are kept in place of the stale ones."""
+    deep = "/".join(f"d{i}" for i in range(1, MAX_SPACE_DEPTH - 1))  # 62 directories below the root
+    first = fake.add_file(f"{deep}/moved/old.bin", DATA)  # 64 links up to the root
+    assert client.file_space_name(first, "alpha") == SPACE_NAME
+    moved = fake.id_of(f"{deep}/moved")
+    fake.nodes[moved].parent = ROOT_ID  # the directory now lies right under the root
+    child = fake.add_file("moved/new/child.bin", DATA)  # 3 links up to the root, 65 over the kept ones
+    reads_before = len(parent_reads(fake))
+    assert client.file_space_name(child, "alpha") == SPACE_NAME
+    fresh = parent_reads(fake)[reads_before:]
+    assert fresh[-3:] == [child, fake.id_of("moved/new"), moved]  # the fresh walk, every link read
+    later = fake.add_file("moved/later.bin", DATA)
+    reads_before = len(parent_reads(fake))
+    assert client.file_space_name(later, "alpha") == SPACE_NAME
+    assert parent_reads(fake)[reads_before:] == [later]  # the moved directory's fresh link was kept
+
+
+def test_o09_a_walk_still_too_deep_when_walked_fresh_is_refused(config, fake, client):
+    """O09: the fresh walk is a second chance for kept links only; a file that is deeper than the bound when every
+    link is read again is refused, with nothing sent."""
+    too_deep = fake.add_file("/".join(["e"] * MAX_SPACE_DEPTH + ["past.bin"]), DATA)
+    with pytest.raises(OutOfScope, match=f"more than {MAX_SPACE_DEPTH} directories"):
+        client.mutate("DELETE", f"/data/{too_deep}", provider="alpha")
+    assert [c for c in fake.provider_calls if c[1] == "DELETE"] == []
+
+
+def test_o09_the_kept_links_are_bounded_least_recently_used_first_and_cleared_on_close(config, fake):
+    """O09: the client keeps at most `kept_links` parent links (`MAX_KEPT_LINKS` by default), dropping the least
+    recently used first, so a long campaign does not grow it without bound; a dropped link is read again when next
+    needed, and close() drops them all."""
+    client = OnezoneClient(config, http=fake.client_http(), kept_links=3)
+    files = [fake.add_file(f"dir{i}/f.bin", DATA) for i in range(3)]  # each file costs two links
+    for file_id in files:
+        client.file_space_id(file_id, "alpha")
+    assert client.kept_links() <= 3
+    reads = len(parent_reads(fake))
+    client.file_space_id(files[-1], "alpha")  # the most recent file's links are still kept
+    assert len(parent_reads(fake)) == reads
+    client.file_space_id(files[0], "alpha")  # the oldest were dropped, so they are read again
+    assert len(parent_reads(fake)) == reads + 2
+    assert MAX_KEPT_LINKS >= 10_000
+    client.close()
+    assert client.kept_links() == 0
 
 
 def test_o09_a_cycle_of_parent_links_is_refused_at_the_bound(config):

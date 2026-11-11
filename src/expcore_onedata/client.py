@@ -41,13 +41,15 @@ meets the root of a space the configuration knows (`[space] id`, whose root is t
 `GET /spaces/{id}`). The root itself needs no parent read. A walk that reaches the top of a tree (a null parent) without
 meeting a known root, or that has followed `MAX_SPACE_DEPTH` links without meeting one (a cycle among them), resolves to
 no space (`OutOfScope`). The space is never decoded from the file's id: that encoding is undocumented and may change
-between releases. A file's space does not change, so what a walk read is kept for the client's life, a run's or a
-campaign's: each provider's root of the space, kept once a provider answered it, and each parent link, which names
-files by their ids on every provider, kept only once its walk reached a known root; a walk that failed or was refused
-keeps no link, so a later request walks again. A file moved within the space keeps its space, so a link it left behind
-still leads to the right root. A file resolved before costs no request to a provider, a new file beside resolved ones
-costs one, and a cold walk costs one root read and one parent read per level. The name is then one read on Onezone,
-every time.
+between releases. A file's space does not change, so what a walk read is kept, each fact as the provider that gave it,
+never another's: each provider's root of the space, kept once it answered, and the parent links a walk read, kept only
+once the walk reached a known root, at most `MAX_KEPT_LINKS` of them (least recently used dropped first), all dropped
+by `close()`. A walk that failed or was refused keeps no link, so a later request walks again. A file moved within the
+space keeps its space, so a link it left behind still leads to the right root; but a directory moved up keeps its old,
+longer ancestry, so a walk that passes the bound over kept links drops them and walks once more, every link read anew,
+and refuses only if that walk passes the bound too. A file resolved before through a provider costs no request to it, a
+new file beside resolved ones costs one, and a cold walk costs one root read and one parent read per level. The name
+is then one read on Onezone, every time.
 
 Every read the gate makes, the walk's and the name's, is the client's own: with the admin credential, through its own
 connection pool with the platform's `[tls]`, from the core's process. None passes the data gate, so none is in the
@@ -120,6 +122,7 @@ import re
 import socket
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -147,6 +150,9 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = ()
 # The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that
 # loop, resolve to no space: the walk is bounded in requests, and a study's tree is far shallower.
 MAX_SPACE_DEPTH = 64
+# The most parent links one client keeps, least recently used dropped first. A link is two ids of a few hundred bytes
+# at most, so this stays under some tens of megabytes over a whole campaign; a dropped link is read again when needed.
+MAX_KEPT_LINKS = 50_000
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _ERRNO = re.compile(r"[a-z][a-z0-9_]{0,31}")  # a POSIX code as Onedata writes it: enoent, eacces
 # How Onedata 25.0 answers a file or directory that is not there, beside the 404 other answers use ([L1]).
@@ -298,11 +304,15 @@ class OnezoneClient:
         admin_token: str | None = None,
         environ: Mapping[str, str] | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        kept_links: int = MAX_KEPT_LINKS,
     ) -> None:
         """Build the client; the admin credential comes from `admin_token` or else from the configured source.
 
         The client it builds checks certificates as the platform's `[tls]` says (`tls.py`): its own default CAs, the
-        configured CA bundle alone, or not at all. An injected `http` is the caller's, with its own TLS."""
+        configured CA bundle alone, or not at all. An injected `http` is the caller's, with its own TLS. `kept_links`
+        bounds the parent links the gate keeps (`MAX_KEPT_LINKS` by default)."""
+        if kept_links < 1:
+            raise ValueError("the client keeps at least one parent link")
         self._config = config
         self._http = http if http is not None else httpx.Client(timeout=timeout_s, verify=config.tls.client_verify())
         self._owns_http = http is None
@@ -311,16 +321,26 @@ class OnezoneClient:
         credential = admin_token if admin_token is not None else config.admin.read(environ)
         register_secret(credential)
         self._admin = {AUTH_HEADER: credential}
-        # What the gate's walks read and keep (`file_space_id`): a file's space does not change. Guarded by the lock,
-        # since one client may serve several threads; only a walk that reached a known root adds to them.
-        self._parents: dict[str, str] = {}  # file id -> its parent's id
+        # What the gate's walks read and keep (`file_space_id`), each by the provider that answered it: a file's space
+        # does not change. Guarded by the lock, since one client may serve several threads; only a walk that reached
+        # a known root adds links, and they are dropped least recently used first past `kept_links`.
+        self._parents: OrderedDict[tuple[str, str], str] = OrderedDict()  # (provider, file id) -> its parent's id
+        self._kept_links = kept_links
         self._roots: dict[tuple[str, str], str] = {}  # (provider, space id) -> the space's root file id
         self._walk_lock = threading.Lock()
 
     def close(self) -> None:
-        """Close the connection pool when the client built it."""
+        """Drop what the gate's walks kept, and close the connection pool when the client built it."""
+        with self._walk_lock:
+            self._parents.clear()
+            self._roots.clear()
         if self._owns_http:
             self._http.close()
+
+    def kept_links(self) -> int:
+        """How many parent links the gate keeps now; at most `kept_links`."""
+        with self._walk_lock:
+            return len(self._parents)
 
     def __repr__(self) -> str:
         """Name the client without its credential."""
@@ -491,17 +511,36 @@ class OnezoneClient:
                 self._roots[(provider, space_id)] = root
         return {root: space_id}
 
+    def _kept_parent(self, provider: str, node: str) -> str | None:
+        """The parent link this provider gave for a file in an earlier walk, marked as just used; None if not kept."""
+        with self._walk_lock:
+            parent = self._parents.get((provider, node))
+            if parent is not None:
+                self._parents.move_to_end((provider, node))
+            return parent
+
+    def _keep(self, provider: str, links: Mapping[str, str]) -> None:
+        """Keep the links a walk that reached a known root read, dropping the least recently used past the bound."""
+        with self._walk_lock:
+            for node, parent in links.items():
+                self._parents[(provider, node)] = parent
+                self._parents.move_to_end((provider, node))
+            while len(self._parents) > self._kept_links:
+                self._parents.popitem(last=False)
+
+    def _forget(self, provider: str, nodes: Sequence[str]) -> None:
+        """Drop the links this provider gave for these files, so the next walk reads them again."""
+        with self._walk_lock:
+            for node in nodes:
+                self._parents.pop((provider, node), None)
+
     def _parent_of(self, node: str, provider: str, read: dict[str, str]) -> str | None:
-        """Return a file's parent id, from what earlier walks kept, what this walk read, or a read now; None at the top.
+        """Return a file's parent id, from what this walk read or a read now; None at the top of a tree.
 
         The read is `GET /data/{id}?attribute=parent_id` with the admin credential. An absence (`answered_absent`) is
         a file or directory the provider does not know, which resolves to no space (OutOfScope); any other failure, or
         an answer that is no plain id and no null, raises PlatformError. A link read now goes into `read`, which the
         caller keeps only once its walk has reached a known root."""
-        with self._walk_lock:
-            kept = self._parents.get(node)
-        if kept is not None:
-            return kept
         if node in read:
             return read[node]
         try:
@@ -533,25 +572,43 @@ class OnezoneClient:
         if not isinstance(file_id, str) or not _FILE_ID.fullmatch(file_id):
             raise OutOfScope("the target file id is not a plain id, so it resolves to no space")
         roots = self._space_roots(provider)
+        found = self._walk(file_id, provider, roots, use_kept=True)
+        if isinstance(found, list) and found:  # past the bound over links kept from earlier walks, which may be stale:
+            self._forget(provider, found)  # a directory moved up since keeps its old ancestry; walk once more, fresh
+            found = self._walk(file_id, provider, roots, use_kept=False)
+        if isinstance(found, list):
+            raise OutOfScope(
+                f"the target file lies more than {MAX_SPACE_DEPTH} directories below a known space's root, or its "
+                "parent links loop, so it resolves to no space"
+            )
+        return found
+
+    def _walk(self, file_id: str, provider: str, roots: Mapping[str, str], *, use_kept: bool) -> str | list[str]:
+        """Follow a file's parent links up to a known root and return its space's id, keeping the links it read.
+
+        Past `MAX_SPACE_DEPTH` links it returns the files of the chain whose kept links it used, so the caller can drop
+        them and walk fresh; an empty list says the walk used none, so the file itself lies too deep (or its links
+        loop). A null parent raises OutOfScope."""
         read: dict[str, str] = {}  # the links this walk read: kept only once it reaches a known root
+        used: list[str] = []  # the files whose kept links this walk followed
         node = file_id
         for depth in range(MAX_SPACE_DEPTH + 1):
             if node in roots:
-                with self._walk_lock:
-                    self._parents.update(read)
+                self._keep(provider, read)
                 return roots[node]
             if depth == MAX_SPACE_DEPTH:
                 break
-            parent = self._parent_of(node, provider, read)
+            parent = self._kept_parent(provider, node) if use_kept else None
+            if parent is not None:
+                used.append(node)
+            else:
+                parent = self._parent_of(node, provider, read)
             if parent is None:
                 raise OutOfScope(
                     "the target file lies in no space this configuration knows, so it resolves to no space"
                 )
             node = parent
-        raise OutOfScope(
-            f"the target file lies more than {MAX_SPACE_DEPTH} directories below a known space's root, or its "
-            "parent links loop, so it resolves to no space"
-        )
+        return used
 
     def file_space_name(self, file_id: str, provider: str) -> str:
         """Return the name Onezone gives, now, the space a file lies in: its space's id (`file_space_id`), then that
