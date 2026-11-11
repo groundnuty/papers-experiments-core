@@ -15,7 +15,8 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
   * mount data path: a oneclient sidecar that owns the mount and the token (from a file bound into it alone), exported
     read-only to the agent through bind propagation; the agent has neither the token, nor FUSE, nor a route to any host;
   * no token is ever given to docker, so `docker inspect` shows none, and the host's file of it goes once its holder has
-    started and again at every teardown (`_write_token_file`, `_remove_token_files`);
+    started and again at every teardown (`_write_token_file`, `_remove_token_files`); a run killed outright before that
+    leaves it until the next start on the root removes it (`reap.reap_token_files`);
   * no data path: neither;
   * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids;
   * each read-only input of the spec: copied into the run's directory, hashed into the metadata, and mounted read-only
@@ -48,7 +49,7 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool
+from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool, reap
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
@@ -192,6 +193,12 @@ class DockerSandbox:
             self._meta["reaped_orphans"] = netpool.reap_orphans(self.host, self.labels)  # never fails the start
         except Exception as e:
             self._meta["reaped_orphans"] = {"error": describe_error(e)}
+        try:  # the files of the token that a run killed outright left on this root, which `reap_orphans` never touches
+            self._meta["reaped_token_files"] = reap.reap_token_files(
+                self.host, self.s.work_root, (TOKEN_FILE, GATE_TOKEN_FILE)
+            )  # never fails the start
+        except Exception as e:
+            self._meta["reaped_token_files"] = {"error": describe_error(e)}
         try:
             self._build()
             self._checkpoint()
@@ -490,8 +497,9 @@ class DockerSandbox:
 
     def _remove_token_files(self, *only: Path) -> None:
         """Remove the host's copies of the data-path token (`only` these, else all), verified: once its holder has
-        started it keeps the token itself, so the host keeps none, and a run killed outright leaves none on disk (O05).
-        Run for every copy at every teardown."""
+        started it keeps the token itself, so the host keeps none (O05). Run for every copy at every teardown. A run
+        killed outright between writing a file and removing it (a docker call and the mount's wait, at most) leaves it,
+        and the next start on this root removes it once it is older than any start keeps one (`reap.reap_token_files`)."""
         left = []
         for path in only or tuple(self._token_files):
             self.host.run(["rm", "-f", str(path)], 20, sudo=True)

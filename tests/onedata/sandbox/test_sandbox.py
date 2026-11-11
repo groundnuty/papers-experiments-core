@@ -2,6 +2,8 @@
 
 import ipaddress
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -11,7 +13,7 @@ from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
 from expcore_onedata.sandbox.containers import GATE_TOKEN_PATH, SIDECAR_TOKEN_PATH
 from expcore_onedata.sandbox.hostops import CmdResult
-from expcore_onedata.sandbox.sandbox import GATE_TOKEN_FILE, DockerSandbox
+from expcore_onedata.sandbox.sandbox import GATE_TOKEN_FILE, TOKEN_FILE, DockerSandbox
 
 
 def start(world, level="via-gate", **kw):
@@ -220,7 +222,8 @@ def test_the_mount_token_belongs_to_the_sidecar_and_the_agent_has_none(world):
 def test_o05_docker_inspect_of_every_running_container_of_the_sandbox_shows_no_token(world, level):
     """O05: whoever can ask the docker daemon must not read the run's token: `docker inspect` of every container the
     sandbox runs (its environment, its command, its mounts), the sidecar, the gate and the agent alike, shows no token,
-    and the host keeps no copy of it once its holder has started, so a run killed outright leaves none on disk."""
+    and the host keeps no copy of it once its holder has started (a run killed before then leaves one, which the next
+    start on the root removes)."""
     sbx = start(world, level)
     assert world.host.containers  # every one the sandbox started, whatever the path
     for name in world.host.containers:
@@ -261,7 +264,6 @@ def test_o05_the_mounts_token_file_is_removed_even_when_the_fuse_mount_holds_the
     """O05: when the FUSE mount can be neither unmounted nor aborted, the teardown leaves the sidecar and the agent
     running (O15) and keeps the run's directory; the host's copy of the token goes all the same."""
     from expcore_onedata.sandbox import teardown as TD
-    from expcore_onedata.sandbox.sandbox import TOKEN_FILE
 
     sbx = start(world, "mounted")
     leftover = sbx.dir / TOKEN_FILE  # as a start cut short before the mount appeared would leave it
@@ -273,6 +275,64 @@ def test_o05_the_mounts_token_file_is_removed_even_when_the_fuse_mount_holds_the
     assert not leftover.exists()
     assert sbx.dir.exists()  # everything else is left for a retry
     monkeypatch.undo()
+    sbx.stop()
+
+
+def plant_token_file(world, run_directory: str, relative: Path, *, age_s: float) -> Path:
+    """A file of the data-path token as a run killed outright leaves it: in a run directory of the root, written `age_s`
+    seconds ago."""
+    path = world.s.work_root / run_directory / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(TOKEN, encoding="utf-8")
+    then = time.time() - age_s
+    os.utime(path, (then, then))
+    return path
+
+
+def test_o05_a_start_removes_the_token_files_a_killed_run_left_on_the_root(world):
+    """O05: a run killed between writing a token file and removing it leaves the file on disk; the next start on the
+    same root removes it, the mount sidecar's and the gate's alike."""
+    left_by_a_mount_start = plant_token_file(world, "dead-key-1a2b3c4d", TOKEN_FILE, age_s=3600)
+    left_by_a_gate_start = plant_token_file(world, "other-key-5e6f7a8b", GATE_TOKEN_FILE, age_s=3600)
+    sbx = start(world, "isolated")
+    assert not left_by_a_mount_start.exists()
+    assert not left_by_a_gate_start.exists()
+    assert sbx.metadata()["reaped_token_files"] == {"removed": 2, "left": 0}
+    sbx.stop()
+
+
+def test_o05_a_start_leaves_a_token_file_that_may_be_another_starts_and_what_no_sandbox_names(world):
+    """O05: only the files a sandbox writes, by its own naming, and only once older than any start keeps one: a file
+    written a moment ago is a start in another process that has not yet run its container, and a file elsewhere on the
+    root, or one a link points at, is not the sandbox's to remove."""
+    under_way = plant_token_file(world, "live-key-1a2b3c4d", TOKEN_FILE, age_s=5)
+    not_a_run_directory = plant_token_file(world, "notes", TOKEN_FILE, age_s=3600)
+    not_the_name = plant_token_file(world, "dead-key-5e6f7a8b", Path("sidecar-secret", "other-file"), age_s=3600)
+    target = plant_token_file(world, "elsewhere", Path("target"), age_s=3600)
+    linked = world.s.work_root / "dead-key-9c0d1e2f" / TOKEN_FILE
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(target)
+    sbx = start(world, "isolated")
+    assert [p.exists() for p in (under_way, not_a_run_directory, not_the_name, target)] == [True] * 4
+    assert linked.is_symlink()
+    assert sbx.metadata()["reaped_token_files"] == {"removed": 0, "left": 0}
+    sbx.stop()
+
+
+def test_o05_a_token_file_the_start_cannot_remove_is_counted_and_does_not_refuse_the_start(world):
+    """O05: reaping what a killed run left never fails the start that does it; the count of what stayed is recorded."""
+    stuck = plant_token_file(world, "dead-key-1a2b3c4d", TOKEN_FILE, age_s=3600)
+
+    def busy(argv):
+        if argv[-1] == str(stuck):
+            return CmdResult(1, "", "busy")
+        return world.host._run_default(argv)
+
+    world.host.run_handlers["rm"] = busy
+    sbx = start(world, "isolated")
+    assert stuck.exists()
+    assert sbx.metadata()["reaped_token_files"] == {"removed": 0, "left": 1}
+    world.host.run_handlers.clear()
     sbx.stop()
 
 
