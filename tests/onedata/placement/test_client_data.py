@@ -409,6 +409,23 @@ def test_mutate_sends_query_parameters_and_a_raw_body(config, seeded, client):
     assert sent[0].body == b"\x00\x01"
 
 
+def test_o09_a_raw_body_is_sent_as_an_octet_stream_and_nothing_else_is_marked_so(config):
+    """O09: every mutation with a raw body says it is application/octet-stream, as Onedata 25.0 requires (415
+    without), whether sent as the admin or as a token; a mutation without one, or with a JSON body, is not marked so."""
+    client, seen = scripted(config, lambda request: httpx.Response(204))
+    client.mutate("PUT", "/data/fid/content", provider="alpha", params={"offset": 0}, content=b"\x00\x01")
+    client.mutate("PUT", "/data/fid/content", provider="alpha", params={"offset": 2}, content=b"", token="t-1")
+    client.mutate("DELETE", "/data/fid", provider="alpha")
+    client.mutate("POST", "/transfers", provider="alpha", json={"fileId": "fid", "type": "eviction"})
+    sent = [r for r in seen if r.method in ("PUT", "DELETE", "POST")]
+    assert [r.headers.get("Content-Type") for r in sent] == [
+        "application/octet-stream",
+        "application/octet-stream",
+        None,
+        "application/json",
+    ]
+
+
 def test_get_sends_repeated_query_parameters(config):
     seen = {}
 

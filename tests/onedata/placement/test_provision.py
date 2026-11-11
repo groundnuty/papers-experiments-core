@@ -221,6 +221,15 @@ def test_o11_a_deletion_is_logged_only_after_absence_is_verified_so_a_second_tea
     assert not seeded.exists("scratch/a.bin")
 
 
+def test_o09_a_content_upload_says_it_is_an_octet_stream_so_the_release_takes_it(provisioner, seeded):
+    """O09: Onedata 25.0 refuses a raw body sent without a Content-Type (415), as the fake does. The provisioner's
+    upload goes through the client's mutation, which marks every raw body application/octet-stream, so each block is
+    taken and the file arrives whole."""
+    file_id = provisioner.put_file("scratch/a.bin", DATA)
+    assert bytes(seeded.nodes[file_id].content) == DATA
+    assert len([c for c in seeded.provider_calls if c[1] == "PUT"]) == 4
+
+
 def test_o09_put_file_refuses_to_adopt_a_file_that_exists(provisioner, seeded):
     """O09: a file already at the path is refused, so teardown can never delete something it did not create."""
     with pytest.raises(ProvisionError, match="already exists"):

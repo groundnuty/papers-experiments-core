@@ -88,7 +88,8 @@ after the gate's walk by parent links, with the reads that walk rests on.
   `GET /spaces/{space}` (the key `fileId` is the space's root; [L1] shows it the same on every provider),
   `GET /data/{id}/children` (query `limit`, `attribute`, `token`; answer `children`, `isLast`, `nextPageToken`),
   `POST /data/{parent}/children` (query `name`, `type`; answer
-  `fileId`), `PUT /data/{id}/content` (query `offset`, an octet-stream body), `GET /data/{id}`, `DELETE /data/{id}`,
+  `fileId`), `PUT /data/{id}/content` (query `offset`, an octet-stream body, marked so: [L1] shows 25.0 answering
+  415 to one without a `Content-Type`), `GET /data/{id}`, `DELETE /data/{id}`,
   `GET /data/{id}/distribution`, `POST /transfers` (body `type`, `dataSourceType`, `fileId`, `replicatingProviderId`
   or `evictingProviderId`) and `GET /transfers/{id}`. `read_range` is `GET /data/{id}/content` with a `Range` header,
   answered with a 206 and a `Content-Range`. `content_answer` is the same call whole or with `Range: bytes=0-0`, of
@@ -133,6 +134,7 @@ API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
 API_PROVIDER = "/api/v3/oneprovider"  # [S7]
 AUTH_HEADER = "X-Auth-Token"  # [S2]
 MUTATING = ("POST", "PUT", "PATCH", "DELETE")
+UPLOAD_CONTENT_TYPE = "application/octet-stream"  # of every raw body a mutation sends; [L1]: 25.0 refuses one without
 # POSTs that only read, and whether they are sent with the admin credential: the examination is [S4], [S5], called as
 # an admin; the scope inference is [S6], called without a header.
 READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_access_token_scope": False}
@@ -569,18 +571,23 @@ class OnezoneClient:
         prefix, and when the request names no space and no file.
 
         It is sent with the admin credential, or as `token` when one is given: day-0 sends a write as a data-path token
-        to see it refused. The gate applies either way, and is resolved with the admin credential.
+        to see it refused. The gate applies either way, and is resolved with the admin credential. A raw body
+        (`content`) is sent as `UPLOAD_CONTENT_TYPE`, which Onedata 25.0 requires of a content write ([L1]: 415
+        without it).
         """
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
         self._base(provider)  # an undeclared provider is refused before anything is read
         self._require_in_scope(self._target_name(method, path, provider, json))
+        headers = {AUTH_HEADER: token} if token is not None else dict(self._admin)
+        if content is not None:
+            headers["Content-Type"] = UPLOAD_CONTENT_TYPE
         return self._send(
             method,
             path,
             provider=provider,
-            headers={AUTH_HEADER: token} if token is not None else self._admin,
+            headers=headers,
             json=json,
             params=params,
             content=content,

@@ -24,8 +24,11 @@ waits. A test bends the fake through plain attributes:
 - `resets`: a list of `[substring, count]` or `[substring, count, provider id]`: the next `count` provider calls whose
   route contains the substring (to that provider, when named) fail with a connection reset;
 - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
-- `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
-- `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
+- `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement); `readonly_answer` is
+  how such a write is refused, 403 by default, `(400, "posix", "eacces")` as Onedata 25.0 answers it;
+- `missing_answer`: how a file or directory that is not there is answered, a 404 by default; `answer_missing_as_25`
+  makes it 400 posix enoent and keeps a deleted entry's `parent_id` readable, as 25.0 does;
+- a content write (`PUT /data/{id}/content`) without `Content-Type: application/octet-stream` is a 415, as in 25.0;
 - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status.
 - `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out).
 - `clock`: the epoch seconds a job's schedule, start and finish times are taken from (a test binds its own clock);
@@ -131,7 +134,12 @@ class FakeData(FakeFederation):
         self.omit_blocks = False  # the block map's storage backends carry no "blocks" field
         self.omit_providers: set[str] = set()  # provider ids the block map leaves out (a partial answer)
         self.ignore_deletes = False  # every DELETE answers 204 and removes nothing
-        self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat answers 403
+        self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat is refused
+        # how that refusal is answered: (status, error id, errno); Onedata 25.0 answers (400, "posix", "eacces")
+        self.readonly_answer: tuple[int, str, str | None] = (403, "forbidden", None)
+        # how a file or directory that is not there is answered: (status, error id, errno); see `answer_missing_as_25`
+        self.missing_answer: tuple[int, str, str | None] = (404, "notFound", None)
+        self.deleted_parents: dict[str, str | None] | None = None  # a deleted entry's parent link, while it is kept
         self.resets: list[list] = []
         self.statuses: list[list] = []
         self.content_type: str | None = "application/octet-stream"  # of a file's content, whole or by range
@@ -236,6 +244,8 @@ class FakeData(FakeFederation):
     def _delete(self, file_id: str) -> None:
         for child in [n.file_id for n in self.nodes.values() if n.parent == file_id]:
             self._delete(child)
+        if self.deleted_parents is not None:
+            self.deleted_parents[file_id] = self.nodes[file_id].parent
         del self.nodes[file_id]
         for table in (self.blocks, self.pending):
             for key in [k for k in table if k[0] == file_id]:
@@ -243,8 +253,22 @@ class FakeData(FakeFederation):
 
     # -- answers ---------------------------------------------------------------
     @staticmethod
-    def _error(status: int, error_id: str) -> httpx.Response:
-        return httpx.Response(status, json={"error": {"id": error_id, "details": {}}})
+    def _error(status: int, error_id: str, errno: str | None = None) -> httpx.Response:
+        details = {"errno": errno} if errno is not None else {}
+        return httpx.Response(status, json={"error": {"id": error_id, "details": details}})
+
+    def answer_missing_as_25(self, answer: tuple[int, str, str | None] = (400, "posix", "enoent")) -> None:
+        """Answer what is not there as Onedata 25.0 does: 400 posix enoent instead of a 404, while a deleted entry's
+        `parent_id` still answers its old parent (both read on the Compose federation). `answer` replaces the 400."""
+        self.missing_answer = answer
+        self.deleted_parents = {}
+
+    def _missing(self, file_id: str, query: httpx.QueryParams, method: str) -> httpx.Response:
+        """A file or directory that is not there: `missing_answer`, except a deleted entry's kept parent link."""
+        kept = self.deleted_parents or {}
+        if method == "GET" and file_id in kept and query.get("attribute") == "parent_id":
+            return httpx.Response(200, json={"parent_id": kept[file_id]})
+        return self._error(*self.missing_answer)
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         """Answer a provider call here and anything else as the federation does."""
@@ -310,7 +334,7 @@ class FakeData(FakeFederation):
             and method in ("POST", "PUT", "DELETE")
             and any(c.get("type") == "data.readonly" for c in issued["caveats"])
         ):
-            return self._error(403, "forbidden")
+            return self._error(*self.readonly_answer)
         found = re.fullmatch(r"/spaces/([^/]+)", route)
         if found and method == "GET":
             return self._space_root(found.group(1))
@@ -318,7 +342,7 @@ class FakeData(FakeFederation):
         if found:
             node = self.nodes.get(found.group(1))
             if node is None:
-                return self._error(404, "notFound")
+                return self._missing(found.group(1), query, method)
             part = found.group(2) or ""
             if part == "" and method == "GET":
                 if "path" in query.get_list("attribute"):  # Onedata 25.0 has no path attribute ([L1] in client.py)
@@ -335,6 +359,8 @@ class FakeData(FakeFederation):
             if part == "/children" and method == "POST":
                 return self._make(node, query)
             if part == "/content" and method == "PUT":
+                if request.headers.get("Content-Type") != "application/octet-stream":
+                    return httpx.Response(415)  # 25.0 refuses a raw body that does not say it is one
                 return self._write(node, provider, int(query.get("offset", "0")), request.content)
             if part == "/content" and method == "GET":
                 return self._read(node, provider, request.headers.get("Range"))
