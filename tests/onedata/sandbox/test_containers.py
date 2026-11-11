@@ -204,11 +204,13 @@ def test_o21_the_certifi_question_answers_with_the_interpreters_bundle_or_none_a
 
 
 def test_o21_the_certifi_question_runs_as_the_agent_without_a_network_and_its_bundle_is_extended_once(s):
-    """O21: the one-shot runs the image's interpreter as the agent's user with no network; the certifi bundle joins the
-    declared trust paths after them, once."""
+    """O21: the one-shot runs the image's interpreter as the agent's code runs, as the agent's user in /work, the first
+    directory of its import path, and with no network; the certifi bundle joins the declared trust paths after them,
+    once."""
     args = C.certifi_probe_args(s, "sbx-once-1", LABELS, s.agent.id)
     assert ("--network", "none") in pairs(args)
     assert ("--user", f"{s.agent_uid}:{s.agent_uid}") in pairs(args)
+    assert ("--workdir", "/work") in pairs(args)
     assert ("--entrypoint", s.python) in pairs(args)
     assert args[:2] == ["run", "--rm"]
     assert args[-3:] == [s.agent.id, "-c", C.CERTIFI_PROBE]

@@ -58,10 +58,11 @@ CERTIFI_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,4095}")  # an absolute path `-v 
 
 def certifi_probe_args(s: SandboxSettings, name: str, labels: Sequence[str], image_id: str) -> list[str]:
     """`docker run` of the one-shot container that asks the agent image's interpreter where its certifi bundle is: as
-    the agent's user, with no network, removed when it ends, and labelled like every container of the sandbox."""
+    the agent's code runs (`cells.py`), the same interpreter as the agent's user in /work, the first directory of its
+    import path; with no network, removed when it ends, and labelled like every container of the sandbox."""
     uid = s.agent_uid
     return [
-        *("run", "--rm", "--name", name, *labels, "--network", "none", "--user", f"{uid}:{uid}"),
+        *("run", "--rm", "--name", name, *labels, "--network", "none", "--user", f"{uid}:{uid}", "--workdir", "/work"),
         *("--entrypoint", s.python, image_id, "-c", CERTIFI_PROBE),
     ]
 
