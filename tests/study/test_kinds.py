@@ -5,6 +5,7 @@ Both are known before study.toml's conditions are validated: `[study] platforms`
 """
 
 import json
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -220,6 +221,61 @@ def test_c02_a_known_kind_that_is_not_treatable_can_never_be_a_treatment_and_is_
     edit(study_dir, '["gate_tamper"]', '["relay_audit"]')
     add_kinds(study_dir, 'relay_audit = { description = "the relay failed its audit", treatable = false }')
     assert "'relay_audit', which can never be a treatment: the relay failed its audit" in refused(study_dir)
+
+
+def set_scheduler(study: Path, key: str, value: str) -> Path:
+    """Set one key of `[scheduler]` in the copy's campaign.toml, replacing the line if it has one."""
+    path = study / "campaign.toml"
+    text = re.sub(rf"^{key} = .*\n", "", path.read_text(encoding="utf-8"), flags=re.M)
+    assert "[scheduler]\n" in text
+    path.write_text(text.replace("[scheduler]\n", f'[scheduler]\n{key} = "{value}"\n', 1), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    ("key", "wrong", "meant"), [("health_kind", "sandbxo", "sandbox"), ("identity_kind", "endpiont", "endpoint")]
+)
+def test_c02_a_scheduler_kind_that_names_no_known_kind_is_refused_at_load_naming_the_file_and_the_key(
+    study_dir, registry, key, wrong, meant
+):
+    """C02: a misspelt `health_kind` or `identity_kind` used to pass the load and crash `run` with a traceback that
+    named neither file nor key; it is refused when the study is loaded, with the kinds that are known."""
+    toml = set_scheduler(study_dir, key, wrong)
+    message = refused(study_dir)
+    assert message.startswith(f"{toml}: [scheduler]: key '{key}' names '{wrong}' (did you mean '{meant}'?)"), message
+    assert "which is not an infrastructure kind" in message
+    assert f"the kinds known here are: {', '.join(errors.CORE_KINDS)}" in message
+    assert "[study] platforms" in message
+    assert "[study.kinds]" in message
+
+
+def test_c02_a_platform_kind_is_a_scheduler_kind_once_its_module_is_listed_and_the_choices_then_hold_it(
+    study_dir, tmp_path, monkeypatch, registry
+):
+    """C02: the check follows `[study] platforms`: a kind only a platform registers is unknown until the module is
+    listed, and once it is listed it is accepted and is among the choices an unknown kind is refused with."""
+    module = toy_platform(tmp_path, monkeypatch, REGISTER_FLAP)
+    set_scheduler(study_dir, "health_kind", "relay_flap")
+    alone = refused(study_dir)
+    assert "key 'health_kind' names 'relay_flap'" in alone
+    assert "relay_flap" not in alone.split("the kinds known here are:")[1].split(". ")[0]
+    list_platforms(study_dir, module)
+    assert load_study(study_dir).campaign.scheduler.health_kind == "relay_flap"
+    set_scheduler(study_dir, "identity_kind", "relay_flop")
+    message = refused(study_dir)
+    assert "key 'identity_kind' names 'relay_flop' (did you mean 'relay_flap'?)" in message
+    assert "relay_flap" in message.split("the kinds known here are:")[1].split(". ")[0]
+
+
+def test_c02_a_kind_the_study_declares_is_a_scheduler_kind_while_the_study_loads_and_is_gone_after(study_dir, registry):
+    """C02: `[study.kinds]` is in the vocabulary while campaign.toml is validated, so the study's own kind can be the
+    health kind, and it leaves with the load like any of the study's kinds."""
+    add_kinds(study_dir, 'relay_flap = { description = "the relay restarted", treatable = true }')
+    set_scheduler(study_dir, "health_kind", "relay_flop")
+    assert "key 'health_kind' names 'relay_flop' (did you mean 'relay_flap'?)" in refused(study_dir)
+    set_scheduler(study_dir, "health_kind", "relay_flap")
+    assert load_study(study_dir).campaign.scheduler.health_kind == "relay_flap"
+    assert errors.infra_kinds() == errors.CORE_KINDS
 
 
 def test_c02_a_platform_module_that_cannot_be_imported_is_refused_naming_the_file_and_the_key(study_dir, registry):
