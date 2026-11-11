@@ -24,12 +24,13 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
   the root, the CA, one web certificate per service and the secrets, starts the zone, signs in as its admin, makes the
   admin's access token and the declared users, writes one registration token per provider, starts the providers, waits
   until each is online, makes the spaces, has each supported by exactly its owner and its mirrors, makes the users
-  members of their spaces with exactly their privileges, writes the baseline files, and writes `facts.json` and, from
-  the layout's platform template, `platform.toml`. Run on a federation that is up, it starts what is stopped and checks
-  every step again.
+  members of their spaces with exactly their privileges, writes the baseline files into every space that keeps them (all
+  but those declared `baseline = false`), and writes `facts.json` and, from the layout's platform template,
+  `platform.toml`. Run on a federation that is up, it starts what is stopped and checks every step again.
 - **reset --clean** returns the deployment to clean: it starts what is stopped, checks every step again, removes
-  everything in every space, ingested datasets included, and writes the baseline files again. The providers, spaces
-  and users keep their ids, so `platform.toml` stays valid. A fault-injection journal left behind is emptied.
+  everything in every space, ingested datasets included, and writes the baseline files again into the spaces that keep
+  them; a space declared `baseline = false` is left empty. The providers, spaces and users keep their ids, so
+  `platform.toml` stays valid. A fault-injection journal left behind is emptied.
 - **reset --replicas** is the reset between runs: it starts what is stopped and checks every step again, then keeps
   every owner's data and evicts only what the mirrors hold (`fedreplicas.py`). A space is supported by exactly its
   owner and its mirrors, so every non-owner that can hold a replica, the agent's local provider included, is a
@@ -64,6 +65,7 @@ is `layouts/five-providers.compose.yaml`.
 | `platform_template` | optional: the template of `platform.toml`, a relative path to a file inside the layout file's directory or this deploy directory, with no symbolic link on the way, since up copies it into the root |
 | `[zone] port`, `[providers.<name>] port` | each service's port on `127.0.0.1` |
 | `[spaces.<name>] owner`, `mirrors` | the provider the space's data is written through and kept on, and the other providers that support it |
+| `[spaces.<name>] baseline` | `false` for a space that up leaves empty and `reset --clean` empties, the study space included (default `true`: the baseline files, see "The baseline") |
 | `[spaces.<name>] agent_visible` | `false` for a space the day-0 checks alone use: no user of the agent may be a member, and it is never the study space |
 | `[principals.<user>] privileges`, `spaces` | a fixed user's exact privileges, in the study space unless `spaces` names others |
 | `[principals.<user>] agent` | `false` for a user the agent's tokens are never minted for (the harness's or the day-0 checks'); only such a user may join a space with `agent_visible = false` |
@@ -77,6 +79,13 @@ A space the agent must never reach, such as one only the day-0 checks write to, 
 No user of the agent is a member of it, so no token the agent holds reaches it whatever its caveats, and the data-path
 caveat, which names the study space, never names it. Its members are users declared `agent = false`; a layout that
 makes an agent user a member, or hides the study space, is refused.
+
+A study whose agents read the spaces can declare `baseline = false` on every space they read, so the core's baseline
+files are not agent-visible material and need no deleting after `up`, which would leave an asynchronous delete racing
+the ingest. The space is still made, supported by its owner and mirrors, and given its members and tokens; only the files
+are left out. The study space may be one of them: a check that reads a baseline file then finds none, and says so
+(see "The baseline"). A layout declares `agent_visible = false` and `baseline = false` independently, and the study
+space is refused only for the first.
 
 The Compose file is generated from the layout at every command (`fedcompose.py`), never edited: what keeps the
 federation to itself is part of the generator. `compose.yaml` here is the default layout's output, committed for
@@ -140,16 +149,33 @@ images are development builds whose provider GUI packages the zone would refuse.
 
 ## The baseline
 
-Every space's files are written through its owner. In the default layout:
+Every space that keeps its baseline, which is every space unless the layout declares `baseline = false` for it, has its
+files written through its owner. In the default layout:
 
 - `alpha-space`, the study space, written through `pine` (the data provider): `hello.txt` (64 bytes), `replicated.bin`
   (1 MiB, also replicated to the first mirror, `birch`, so the space lists an ended transfer), `samples/sample-1.bin`
   and `samples/sample-2.bin`, and `listing-1200/` with 1200 entries of 16 bytes, for the complete-listing test
-  (`EXPCORE_LIVE_LISTING_PATH`). A study space without a mirror gets no replica and no transfer record.
-- `beta-space`, written through `birch`: `beta.txt`. Every other space holds one such file, named after it. Its name
-  is outside the study's prefix, so the core may never change it.
+  (`EXPCORE_LIVE_LISTING_PATH`). A study space without a mirror gets no replica and no transfer record, and neither
+  does one declared `baseline = false`.
+- `beta-space`, written through `birch`: `beta.txt`. Every other space that keeps its baseline holds one such file,
+  named after it. Its name is outside the study's prefix, so the core may never change it.
 
 Every file's bytes are derived from its path, so each reset writes the same files.
+
+A space declared `baseline = false` holds nothing after `up`. `reset --clean` removes what a study ingested into it and
+writes nothing there, and `reset --replicas` treats it as any other space, walking what it holds and finding nothing to
+evict when it is empty. `facts.json` records `spaces.<name>.baseline`, and its `files` entry (the content file and the
+listing directory) is `null` when the study space is one of them, so nothing names a file the space does not hold.
+
+The day-0 checks never assume a baseline file. The platform file names one space, the study space, and a check runs in
+it as it is: with a baseline-off study space the `listing` check reports unknown on an empty root and the `content_type`
+check reports unknown when a data path is REST and its configured `[sandbox] content_check_file` is not there (with no
+REST data path it reads no file, as against the templates here, which set no `[sandbox]` table), each saying so, and the live
+content test (`EXPCORE_LIVE_CONTENT_PATH`) skips on a file the space does not hold, so set that variable only where the
+study space keeps `hello.txt`. The checks that read no file of the space (`reachability`, `health`, `tokens`) and the two
+that work on a scratch file of their own (`read_only`, `round_trip`) are the same on any space. There is no setting to
+point one check at another space; a pass that needs the baseline files runs against a layout whose study space keeps
+them.
 
 ## Running the core against it
 

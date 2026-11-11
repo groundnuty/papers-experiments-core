@@ -29,6 +29,7 @@ mirrors = ["birch", "cedar"]     # other providers supporting it; reset --replic
 [spaces.beta-space]              # outside the study's prefix: a mutation must never reach it
 owner = "birch"
 mirrors = ["cedar"]
+# baseline = false               # on any space (the study space too): up writes no baseline file into it and reset --clean leaves it empty
 
 [principals.alpha-reader]        # the data path's user; a member of the study space unless spaces = [...] says otherwise
 privileges = ["space_view", "space_read_data"]
