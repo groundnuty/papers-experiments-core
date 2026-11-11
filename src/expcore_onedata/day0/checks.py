@@ -28,6 +28,7 @@ from expcore_onedata.day0.registry import Context, Result, failed, passed, per_s
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.precampaign import measure_content_type
 from expcore_onedata.probes import run_probe
+from expcore_onedata.provision import next_page_token
 from expcore_onedata.tokencheck import PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import Plane, PlaneSpec, data_path_spec, tool_server_spec
 
@@ -216,15 +217,13 @@ def _names(ctx: Context, provider: str, root: str, limit: int) -> tuple[list[str
         if token:
             params["token"] = token
         page = ctx.client.get(f"/data/{root}/children", provider=provider, params=params)
+        token = next_page_token(page)  # a page without its last-page marker is refused, never the end (O22)
         names += [c["name"] for c in page["children"]]
         pages += 1
         if len(names) > WALK_CAP:
             return None
-        if page.get("isLast", True):
+        if token is None:
             return names, pages
-        token = page.get("nextPageToken")
-        if not token:
-            raise PlatformError("a listing is not on its last page but names no next page")
 
 
 @register("content_type", "The content type of a file's content, read whole and by range on the local provider")

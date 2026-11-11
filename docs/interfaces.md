@@ -617,6 +617,41 @@ Implementer (the platform layer) guarantees:
 
 Not carried over from the earlier study: the gate's whole-file mode, the tracer and its checks, the capacity probes tied to two data layouts, and the replication branch of its fourth condition. Its merged-listing mode is the complete listing above, written anew against this gate with bounds and checks the earlier one lacked.
 
+## The platform layer's files in and out
+
+`expcore_onedata.provision.Provisioner` puts a study's data into its space and reads it back; every write and every range read goes through `expcore_onedata.client.OnezoneClient`'s mutation gate, bound to the provisioner's space (`space`): the target file's space is found by its parent links and its live name read right before each request, and a target in any other space is refused unsent (O09). `Digest` and `Upload` are in `expcore_onedata.streamed`.
+
+```python
+class Provisioner:
+    def put_file(self, path: str, data: bytes, *, content_type: str = "application/octet-stream") -> str
+    def upload(self, path: str, source: Path | str, *, content_type: str = "application/octet-stream") -> Upload
+    def read_file(self, file_id: str, *, provider: str | None = None, dest: Path | str | None = None,
+                  size: int | None = None, deadline_s: float | None = None) -> Digest
+    def children(self, directory_id: str, provider: str | None = None, *, listings: Listings | None = None
+                 ) -> dict[str, Entry]
+
+class OnezoneClient:
+    def mutate(self, method: str, path: str, *, provider: str | None = None, json: Any = None,
+               params: Mapping[str, Any] | None = None, content: bytes | None = None, timeout_s: float | None = None,
+               token: str | None = None, space: Space | None = None, content_type: str | None = None) -> Any
+    def read_content(self, path: str, *, provider: str, size: int, chunk_bytes: int, deadline_s: float,
+                     sink: Callable[[bytes], None] | None = None, timeout_s: float | None = None,
+                     clock: Callable[[], float] = time.monotonic, space: Space | None = None) -> Digest
+
+@dataclass(frozen=True)
+class Digest:      # size: int, sha256: str (hex)
+@dataclass(frozen=True)
+class Upload:      # file_id: str, digest: Digest, action: "created" | "skipped" | "resumed" | "restarted", sent_bytes: int
+```
+
+`path` is relative to the space root; the provisioner works on its space's data provider (`holder` of its `[[spaces]]` entry, or `[placement] holder`).
+
+- **`put_file`** takes the content in memory, refuses a file already at the path, and verifies the size read back. It is for small files, a day-0 scratch file for one.
+- **`upload`** never holds the file: it reads and sends it `[placement] chunk_bytes` at a time, each chunk a PUT at its offset. A target that already holds the same size and SHA-256 is skipped with nothing sent, whoever created it, and stays out of the change log. One this provisioner created (the change log says so) that holds a strict prefix is resumed from where it ends by offset writes; any other it created is restarted from a write without an offset, which truncates it. A differing file it did not create is refused before anything is written (O09). The upload succeeds only when the size and the SHA-256 read back equal those of the bytes it read and sent; otherwise `ProvisionError`. Skipping or resuming reads the target back first, and verifying reads it again, so expect the bytes to cross the network about twice (O21).
+- **Every write of content carries `content_type`**, a plain `type/subtype`, `application/octet-stream` (`client.UPLOAD_CONTENT_TYPE`) unless named: Onedata 25.0 answers 415 to a write without one. Only `application/octet-stream` is confirmed on 25.0, and the fake federation refuses any other type.
+- **`read_file`** reads a file through `provider` (the data provider unless named; another provider is first waited on until it shows the file, `await_visible`) by ranges of `chunk_bytes`, each gated as a range read bound to the space (a read through a provider that lacks the bytes fetches them), streamed and hashed as it comes, and writes it to `dest` when one is given: to `<dest>.part`, moved into place only when the read is whole and removed when it fails. It is bounded in bytes by `size`, or by the size the file's attributes give, which every answer must match: each must be a 206 for exactly the range asked for, of a file of that size, with exactly its bytes. It is bounded in time by `deadline_s` (`[placement] transfer_timeout_s` unless given), checked before every range and after every piece, with no wait for the platform longer than `request_timeout_s` or what remains of the deadline. `OnezoneClient.read_content` is the same read for a caller with its own `sink`.
+- **A listing ends only on its last-page marker** (O22). A children page ends it only with a boolean `isLast` that is true, and a page of the transfer listing only with `nextPageToken` null; a page without the marker is refused (`PlatformError`, or `Unreadable` in the probes), never taken as the whole directory. `provision.next_page_token(page)` reads a children page for any caller.
+
 ## Estimator
 
 `expcore.stats.estimators`. A contrast names its estimator in `preregistration.toml` (`estimator = "..."`), with the estimator's parameters in `[estimators.<name>]`. The core registers one, `wilcoxon_cluster_bootstrap`.

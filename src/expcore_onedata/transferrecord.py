@@ -80,16 +80,23 @@ def _state(body: Mapping[str, Any]) -> str | None:
 
 
 def page_of(answer: Any) -> tuple[list[str], str | None]:
-    """Read one page of the listing: its ids, and the token of the next page or None on the last."""
+    """Read one page of the listing: its ids, and the token of the next page or None on the last.
+
+    The last page says so with `nextPageToken` null (the provider's API description: "When end of list is reached, the
+    token is returned with a null value"). A page without the key, or with one that is neither null nor a token, may
+    be cut, so it is refused, never read as the end of the listing (O22).
+    """
     if not isinstance(answer, dict) or not isinstance(answer.get("transfers"), list):
         raise Unreadable("a page of the listing has no list of transfers")
     ids = answer["transfers"]
     if not all(isinstance(t, str) and _ID.fullmatch(t) for t in ids):
         raise Unreadable("a page of the listing holds an id that is not a plain transfer id")
-    token = answer.get("nextPageToken")
-    if token is not None and not isinstance(token, str):
-        raise Unreadable("a page of the listing has a nextPageToken that is not text")
-    return list(ids), token or None
+    if "nextPageToken" not in answer:
+        raise Unreadable("a page of the listing has no nextPageToken, the marker of its last page, so it may be cut")
+    token = answer["nextPageToken"]
+    if token is not None and (not isinstance(token, str) or not token):
+        raise Unreadable("a page of the listing has a nextPageToken that is neither null nor a token")
+    return list(ids), token
 
 
 def _count(body: Mapping[str, Any], key: str) -> int | None:

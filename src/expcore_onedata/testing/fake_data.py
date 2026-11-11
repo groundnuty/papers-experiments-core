@@ -109,7 +109,8 @@ class FakeData(FakeFederation):
       GET    /data/{id}                             attributes, `parent_id` among them; asked for a path, 400 as in 25.0
       GET    /data/{id}/children                    paged by `limit` and `token`
       POST   /data/{id}/children?name&type          create a file or a directory
-      PUT    /data/{id}/content?offset              write bytes; the writing provider holds them
+      PUT    /data/{id}/content?offset              write bytes; the writing provider holds them. Without `offset`
+                                                    the file is truncated first, as the API describes
       GET    /data/{id}/content  (Range)            206; a provider lacking the bytes fetches them on the fly
       GET    /data/{id}/distribution                the block map of every provider
       DELETE /data/{id}                             remove a file or a directory with what is under it
@@ -192,7 +193,11 @@ class FakeData(FakeFederation):
     - `missing_answer`: how a file or directory that is not there is answered; `keep_deleted_parents`: a deleted
       entry's `parent_id` still answers its old parent; `answer_missing_as_25(answer)` sets both, as 25.0 has them;
     - `require_octet_stream`: a content write (`PUT /data/{id}/content`) without `Content-Type:
-      application/octet-stream` is a 415;
+      application/octet-stream` is a 415; `content_types` lists the Content-Type of every content write, in order;
+    - `corrupt_writes`: True stores every write with its first byte inverted, so the content differs from what was sent;
+    - `writes_before_reset`: the content writes that succeed before the next one fails with a connection reset, and
+      every later one with it (None: never);
+    - `children_omit`, `children_fields`: keys every children page leaves out, and keys it answers with another value;
     - `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out);
     - `clock`: the epoch seconds a job's schedule, start and finish times are taken from (a test binds its own);
     - `transfer_omit`: field names a job's record leaves out; `transfer_list_body`: an answer that replaces the
@@ -256,6 +261,11 @@ class FakeData(FakeFederation):
         self.resets: list[list] = []
         self.statuses: list[list] = []
         self.content_type: str | None = "application/octet-stream"  # of a file's content, whole or by range
+        self.content_types: list[str | None] = []  # the Content-Type of every write of content, in order
+        self.corrupt_writes = False  # every write is stored with its first byte inverted
+        self.writes_before_reset: int | None = None  # writes of content that succeed before the rest are reset
+        self.children_omit: set[str] = set()  # keys every children page leaves out
+        self.children_fields: dict = {}  # keys every children page answers with this value instead
         self.clock = lambda: 0.0  # epoch seconds of a job's schedule, start and finish times
         self.transfer_omit: set[str] = set()  # fields a job's record leaves out
         self.transfer_list_body: dict | None = None  # replaces every answer of the listing
@@ -517,9 +527,7 @@ class FakeData(FakeFederation):
             if part == "/children" and method == "POST":
                 return self._make(node, query, provider)
             if part == "/content" and method == "PUT":
-                if self.require_octet_stream and request.headers.get("Content-Type") != "application/octet-stream":
-                    return self._error(415, "unsupportedMediaType")  # 25.0 refuses a raw body that does not say so
-                return self._write(node, provider, int(query.get("offset", "0")), request.content)
+                return self._put_content(request, node, provider)
             if part == "/content" and method == "GET":
                 return self._read(node, provider, request.headers.get("Range"))
             if part == "/distribution" and method == "GET":
@@ -574,6 +582,7 @@ class FakeData(FakeFederation):
         body: dict = {"children": [self._attributes(c) for c in page], "isLast": last}
         if not last:
             body["nextPageToken"] = str(start + limit)
+        body = {key: value for key, value in {**body, **self.children_fields}.items() if key not in self.children_omit}
         return httpx.Response(200, json=body)
 
     def _make(self, parent: Node, query: httpx.QueryParams, provider: str) -> httpx.Response:
@@ -583,6 +592,28 @@ class FakeData(FakeFederation):
         if self._child(parent.file_id, name) is not None:
             return self._error(409, "posix")
         return httpx.Response(201, json={"fileId": self._create(parent.file_id, name, kind, provider)})
+
+    def _put_content(self, request: httpx.Request, node: Node, provider: str) -> httpx.Response:
+        """A write of content: 415 unless it says it is an octet stream when the shape requires that, a reset once the
+        writes run out, and without `offset` a truncation before the bytes are written, as the API describes."""
+        sent_type = request.headers.get("Content-Type")
+        self.content_types.append(sent_type)
+        if self.require_octet_stream and sent_type != "application/octet-stream":
+            return self._error(415, "unsupportedMediaType")  # 25.0 refuses a raw body that does not say so
+        if self.writes_before_reset is not None:
+            if self.writes_before_reset <= 0:
+                raise httpx.ConnectError("connection reset")
+            self.writes_before_reset -= 1
+        offset = request.url.params.get("offset")
+        if offset is None:
+            node.content = bytearray()
+            for table in (self.blocks, self.pending):
+                for key in [k for k in table if k[0] == node.file_id]:
+                    del table[key]
+        body = request.content
+        if self.corrupt_writes and body:
+            body = bytes([body[0] ^ 0xFF]) + body[1:]
+        return self._write(node, provider, int(offset or "0"), body)
 
     def _write(self, node: Node, provider: str, offset: int, body: bytes) -> httpx.Response:
         end = offset + len(body)
