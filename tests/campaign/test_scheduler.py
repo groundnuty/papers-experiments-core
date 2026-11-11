@@ -11,6 +11,7 @@ from scheduler_support import Factory, FakeExecutor, attempts_of, build, event_k
 
 from expcore.campaign.scheduler import CampaignLocked
 from expcore.errors import InfraError
+from expcore.models.adapters import ProbeReply
 
 CRASH = Path(__file__).resolve().parents[1] / "support" / "scheduler_crash.py"
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}  # three runs, one per condition
@@ -77,6 +78,29 @@ def test_c14_a_model_whose_endpoint_is_not_admitted_is_held_and_no_run_starts(tm
         assert summary.holds["m1"].kind == "not_admitted"
         assert "one-token completion failed" in summary.holds["m1"].reason
         assert summary.statuses == {"pending": 3}
+        assert "model_not_admitted" in event_kinds(scheduler.store)
+
+
+def test_b07_a_model_whose_endpoint_omits_usage_is_held_as_not_admitted_and_no_run_starts(tmp_path):
+    """B07: the token budget binds a run through the counts its replies report, so a model whose one-token completion
+    reports none is not dispatched, budget or none, and the hold says why."""
+
+    class Silent(Factory):
+        def __call__(self, spec, **options):
+            backend = super().__call__(spec, **options)
+
+            async def probe():
+                return ProbeReply(1, None, None)
+
+            backend.probe = probe
+            return backend
+
+    executor = FakeExecutor()
+    with build(tmp_path, executor=executor, factory=Silent(), plan=SMALL) as scheduler:
+        summary = scheduler.run()
+        assert executor.requests == []
+        assert summary.holds["m1"].kind == "not_admitted"
+        assert "reported no input and no output token count" in summary.holds["m1"].reason
         assert "model_not_admitted" in event_kinds(scheduler.store)
 
 

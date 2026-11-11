@@ -296,7 +296,8 @@ def test_c02_the_kinds_an_unknown_kind_error_offers_are_the_treatable_ones(tmp_p
     with pytest.raises(ConfigError) as caught:
         load_factor_schema(path)
     offered = str(caught.value).split("treatable kinds: ", 1)[1].split(";", 1)[0].split(", ")
-    assert offered == [k for k in errors.infra_kinds() if k not in ("tool_plane_integrity", "provider_tampered")]
+    untreatable = ("tool_plane_integrity", "budget_hold", "provider_tampered")
+    assert offered == [k for k in errors.infra_kinds() if k not in untreatable]
     assert "[study] platforms" in str(caught.value)
     assert "[study.kinds]" in str(caught.value)
 

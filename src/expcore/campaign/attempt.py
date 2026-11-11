@@ -12,7 +12,8 @@ The order is fixed, and each step is decided by what a kill at that point must l
    lease is released cleanly (nothing was launched, so there is no teardown to prove) and the run stays pending with no
    attempt used (C11, C17);
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
-5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`;
+5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`; with a budget,
+   under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26);
 6. the post-run health check and the served-identity check, which can turn the result into infrastructure (C11, C16);
 7. the **outcome marker**, then the **store's record** of the result, in this order, with the unit's and the
    harness-error bookkeeping in the same transaction as the result (C04, C15, C10), so a kill cannot keep the result and
@@ -27,6 +28,7 @@ and leaves the 'running' row for recovery (C17).
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import os
@@ -55,10 +57,12 @@ from expcore.campaign.lease import Lease, LeaseCancelled, LeasePool, LeaseRefuse
 from expcore.campaign.markers import AttemptResult, write_marker
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.store import Store
+from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.campaign.units import UnitHealth
 from expcore.config.models import ModelTable
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
+from expcore.models import spend
 from expcore.records.build import RunIdentity, redactor_for
 
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
@@ -90,6 +94,9 @@ class Parts:
     leases: LeasePool | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     crash_hook: Callable[[str, str], None] = lambda point, run_key: None
+    ledger: Ledger | None = None  # with a budget: the top-ups of the sends a run's token cap cannot account for (C26)
+    # with a budget: whether the assessment that admitted the run reserved it by the reply maximum (C27); None: unknown
+    reserved_capped: Callable[[str], bool | None] = lambda run_key: None
 
 
 class AttemptRunner:
@@ -175,8 +182,9 @@ class AttemptRunner:
             f"{hold.reason}",
         )
 
-    def _begin(self, row: Any, lease: Lease | None = None) -> tuple[Any, Path]:
-        """Insert the 'running' row, with a directory of its own for this try, and the lease it runs under."""
+    def _begin(self, row: Any, lease: Lease | None = None, *, reserved_capped: bool | None = None) -> tuple[Any, Path]:
+        """Insert the 'running' row, with a directory of its own for this try, the lease it runs under, and the bound
+        the budget gate reserved the run (C27; None when no gate decided it)."""
         p = self.p
         tries = len(p.store.q("SELECT 1 FROM attempts WHERE run_key=?", (row["run_key"],))) + 1
         run_dir = p.root / "runs" / row["digest"] / f"try{tries}"
@@ -188,6 +196,7 @@ class AttemptRunner:
             str(run_dir),
             lease_wait_s=None if lease is None else lease.wait_s,
             lease_outcome="none" if lease is None else "granted",
+            reserved_capped=reserved_capped,
         )
         return begun, run_dir
 
@@ -195,10 +204,16 @@ class AttemptRunner:
         """The run found an outage with its pre-run check: it is the outage's one attempt, and nothing was run."""
         p = self.p
         key = row["run_key"]
-        begun, run_dir = self._begin(row)
+        begun, run_dir = self._begin(row, reserved_capped=p.reserved_capped(key))
         outcome = Outcome("infrastructure", f"pre-run health check failed: {detail}", infra_kind=p.settings.health_kind)
-        result = AttemptResult(
-            outcome, p.stamp(), 0.0, input_tokens=0, output_tokens=0, treatment_kinds=self.treatment_kinds(factors, key)
+        result = AttemptResult(  # no request was sent: known to be no turn, so it costs 0 at any price (C24)
+            outcome,
+            p.stamp(),
+            0.0,
+            input_tokens=0,
+            output_tokens=0,
+            treatment_kinds=self.treatment_kinds(factors, key),
+            turn_usage=(),
         )
         self._finish(begun, run_dir, key, result)
         return p.settings.retry_delay_s
@@ -215,7 +230,14 @@ class AttemptRunner:
             base_url=endpoint.base_url,
             time_left=timer.time_left,
         )
-        begun, run_dir = self._begin(row, lease)
+        # The decision the run was admitted under, never the model's status read now (C27). The row keeps it as it is,
+        # so an attempt whose usage turns out unknown is charged that bound; the guard takes unknown as yes, which
+        # checks more, never less.
+        decided = p.reserved_capped(key)
+        begun, run_dir = self._begin(row, lease, reserved_capped=decided)
+        guard = None
+        if p.ledger is not None:
+            guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=True if decided is None else decided)
         defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
         request = RunRequest(
             RunIdentity(key, factors, begun.number),
@@ -231,8 +253,9 @@ class AttemptRunner:
         )
 
         async def go() -> Any:
-            try:
-                return await p.executor(request)
+            try:  # every request of the attempt, in any task or thread it starts, goes through its guard
+                with contextlib.nullcontext() if guard is None else spend.watching(guard):
+                    return await p.executor(request)
             finally:
                 await backend.aclose()
 

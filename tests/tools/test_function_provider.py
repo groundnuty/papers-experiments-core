@@ -80,9 +80,9 @@ def test_l15_blocking_waits_never_run_on_the_event_loop():
             p.execute("rendezvous", {}, timeout_s=5.0), p.execute("rendezvous", {}, timeout_s=5.0)
         )
 
-    started = time.monotonic()
+    # Run one after the other, the first call's barrier would break after its 5 s timeout and neither would answer
+    # "met": the answers themselves show the two calls ran together, with no clock to measure.
     assert asyncio.run(both()) == [ToolOutput("met"), ToolOutput("met")]
-    assert time.monotonic() - started < 4.0
 
 
 # --- the remaining time reaches a plain function (L05) ---------------------------------------------------------------

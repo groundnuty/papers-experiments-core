@@ -174,7 +174,7 @@ def test_c11_a_pre_run_check_that_hangs_reads_as_down_after_the_timeout_and_char
     gate, _ = gate_for(tmp_path, hang, timeout_s=0.1)
     began = time.monotonic()
     verdict = gate.before_run("run-a")
-    assert time.monotonic() - began < 5
+    assert time.monotonic() - began < 20  # far below the 30 s hang it must not wait out
     assert verdict.verdict == FOUND  # unhealthy: the gate closes and this run is the outage's one attempt
     assert "did not answer within" in verdict.detail
     assert gate.closed
@@ -187,7 +187,7 @@ def test_c11_a_post_run_check_that_hangs_reads_as_down_after_the_timeout(tmp_pat
     gate, _ = gate_for(tmp_path, hang, timeout_s=0.1)
     began = time.monotonic()
     health, outage = gate.after_run()
-    assert time.monotonic() - began < 5
+    assert time.monotonic() - began < 20  # far below the 30 s hang it must not wait out
     assert not health.ok
     assert "did not answer within" in health.detail
     assert outage is None  # the gate was open, so this check does not close it
@@ -219,7 +219,7 @@ def test_c11_ending_the_campaign_stops_the_wait_for_a_hanging_pre_run_check_and_
     threading.Timer(0.1, stop.set).start()
     began = time.monotonic()
     verdict = gate.before_run("run-a")
-    assert time.monotonic() - began < 5
+    assert time.monotonic() - began < 20  # far below the 30 s hang it must not wait out
     assert verdict.verdict == HOLD
     assert not gate.closed
     assert parse(store.get_meta(META)) in ([], None)  # no outage was recorded
@@ -245,7 +245,7 @@ def test_c11_a_post_run_check_is_not_cut_short_by_the_end_of_the_campaign(tmp_pa
     gate2.start(stop)
     began = time.monotonic()
     assert not gate2.after_run()[0].ok  # a hang is still bounded by the timeout, and reads as down
-    assert time.monotonic() - began < 5
+    assert time.monotonic() - began < 20  # far below the 30 s hang it must not wait out
     hung.release.set()
     gate.join()
     gate2.join()

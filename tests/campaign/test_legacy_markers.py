@@ -8,7 +8,7 @@ from campaign_support import LATER, NOW, finished, infra, keys_under, make_manif
 from expcore.campaign.markers import MARKER_NAME, MarkerError, read_marker, write_marker
 from expcore.campaign.recovery import recover
 
-NEW_FIELDS = ("model_turns", "recorded_treatment", "first_turn_rule")
+NEW_FIELDS = ("model_turns", "recorded_treatment", "first_turn_rule", "turn_usage", "replies_checked")
 
 
 def legacy_marker(run_dir, key, attempt_id, result):
@@ -39,6 +39,7 @@ def test_c04_a_schema_one_marker_reads_under_the_version_one_rule_and_is_marked_
     result = read_marker(tmp_path, "k", 1)
     assert (result.model_turns, result.recorded_treatment, result.first_turn_rule) == (0, None, False)
     assert result.legacy_marker is True
+    assert result.replies_checked is False  # written before the check: an attempt of no turn is charged its bound
     assert result.outcome.infra_kind == "endpoint"
     assert json.loads(path.read_text())["schema"] == 1
     write_marker(tmp_path, "k", 1, infra("endpoint"))  # a marker written now is schema 2 and is not legacy
@@ -108,7 +109,8 @@ def test_c04_a_schema_one_marker_with_a_field_of_schema_two_is_not_trusted(tmp_p
     body = json.loads(path.read_text())
     body["schema"] = 1
     path.write_text(json.dumps(body))
-    with pytest.raises(MarkerError, match="unknown result fields: first_turn_rule, model_turns, recorded_treatment"):
+    unknown = "unknown result fields: first_turn_rule, model_turns, recorded_treatment, replies_checked, turn_usage"
+    with pytest.raises(MarkerError, match=unknown):
         read_marker(tmp_path, "k", 1)
 
 

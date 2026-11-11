@@ -9,18 +9,24 @@ from campaign_support import LATER, NOW, finished, planned_store, run_one
 from expcore.campaign.gate import ALL, HOLDS_KEY, RELEASED_KEY, Budget, BudgetGate
 from expcore.campaign.recovery import recover
 from expcore.campaign.release import epoch_of
-from expcore.config.models import ModelSpec
+from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import Price
 
-TOKEN_BUDGET = 2_000_000  # the bound of one attempt of the priced model is 2M tokens at 15 USD per million: 30 USD
-PRICED = ModelSpec(key="m1", backend="stub", api_id="m1", status="frozen", price=Price(3.0, 15.0))
+# The bound of one attempt of the priced stub is 30 USD: its 1.9M-token cap at 15 USD per million, and the request past
+# the cap, its 100,000-token window at 15 too, since nothing caps a stub's reply (C25).
+LIMITS = Limits(
+    max_tool_rounds=10, time_cap_s=60.0, token_budget=1_900_000, output_cap_chars=100, max_output_tokens=20_000
+)
+PRICED = ModelSpec(
+    key="m1", backend="stub", api_id="m1", status="frozen", price=Price(3.0, 15.0), context_tokens=100_000
+)
 UNPRICED = ModelSpec(key="m1", backend="stub", api_id="m1", status="frozen")
 FREE = ModelSpec(key="m1", backend="stub", api_id="m1", status="frozen", free=True)
 TOKENS = {"input_tokens": 1_000_000, "output_tokens": 100_000}  # 4.5 USD
 
 
 def gate_for(store, spec=PRICED, **budget):
-    return BudgetGate(store, {"m1": spec}, Budget(**{"max_usd": 100.0, **budget}), TOKEN_BUDGET)
+    return BudgetGate(store, {"m1": spec}, Budget(**{"max_usd": 100.0, **budget}), LIMITS)
 
 
 def keys_of(manifest):
@@ -89,8 +95,8 @@ def test_c12_once_the_spend_is_unknown_every_model_is_held(tmp_path):
     """C12: an attempt of a model the table cannot price leaves the total unknown, which holds like over budget."""
     store, _, manifest = planned_store(tmp_path)
     run_one(store, keys_of(manifest)[0], finished(**TOKENS))
-    other = ModelSpec(key="m2", backend="stub", api_id="m2", status="frozen", price=Price(1.0, 1.0))
-    state = BudgetGate(store, {"m2": other}, Budget(max_usd=100.0), TOKEN_BUDGET).assess([], NOW)
+    other = ModelSpec(key="m2", backend="stub", api_id="m2", status="frozen", price=Price(1.0, 1.0), context_tokens=8)
+    state = BudgetGate(store, {"m2": other}, Budget(max_usd=100.0), LIMITS).assess([], NOW)
     assert "total spent is unknown" in state.reason("m2")
 
 
