@@ -137,6 +137,20 @@ def test_the_file_a_provider_does_not_know_resolves_to_no_space(config, seeded, 
         client.mutate("DELETE", "/data/nosuchfile", provider="alpha")
 
 
+def test_o09_a_target_25_answers_with_posix_enoent_resolves_to_no_space_and_another_400_is_unread(config, fake, client):
+    """O09: Onedata 25.0 answers a file it does not know with 400 posix enoent, which the walk reads as a 404: the
+    target resolves to no space. Another 400 is no answer about the file, so the request is refused unread."""
+    fake.answer_missing_as_25()
+    with pytest.raises(OutOfScope, match="unknown to its provider"):
+        client.mutate("DELETE", "/data/nosuchfile", provider="alpha")
+    fake.answer_missing_as_25((400, "posix", "eacces"))
+    with pytest.raises(ScopeUnread) as unread:
+        client.mutate("DELETE", "/data/nosuchfile", provider="alpha")
+    assert (unread.value.status, unread.value.code, unread.value.errno) == (400, "posix", "eacces")
+    assert "posix: eacces" in str(unread.value)
+    assert [c for c in fake.provider_calls if c[1] == "DELETE"] == []
+
+
 # -- the walk from a file up to its space's root -----------------------------------------------------------------------
 
 

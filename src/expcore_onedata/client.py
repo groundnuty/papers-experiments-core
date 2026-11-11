@@ -148,6 +148,9 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = ()
 # loop, resolve to no space: the walk is bounded in requests, and a study's tree is far shallower.
 MAX_SPACE_DEPTH = 64
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_ERRNO = re.compile(r"[a-z][a-z0-9_]{0,31}")  # a POSIX code as Onedata writes it: enoent, eacces
+# How Onedata 25.0 answers a file or directory that is not there, beside the 404 other answers use ([L1]).
+POSIX_ABSENT = (400, "posix", "enoent")
 _CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 _FILE_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a file's object id: one plain path segment
 _SPACE_ID = re.compile(r"[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}")  # one plain path segment, never "." or ".."
@@ -155,14 +158,24 @@ DEFAULT_TIMEOUT_S = 15.0
 
 
 class PlatformError(RuntimeError):
-    """A request failed or was answered with something unreadable; the message holds no URL, body or header."""
+    """A request failed or was answered with something unreadable; the message holds no URL, body or header.
+
+    `code` is Onedata's error id and `errno` the POSIX code it gives with the id `posix` (`enoent`, `eacces`), each
+    kept only when it has the plain shape of one; neither ever holds a value."""
 
     def __init__(
-        self, message: str, *, status: int | None = None, code: str | None = None, transport: bool = False
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        code: str | None = None,
+        transport: bool = False,
+        errno: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
+        self.errno = errno
         self.transport = transport  # True only when no answer came back: a reset, a refusal or a timeout (O08)
 
 
@@ -184,13 +197,35 @@ class ScopeUnread(NotSent):
     It keeps that read's status, error id and transport flag, so a caller can tell an outage from an answer."""
 
 
-def _error_code(response: httpx.Response) -> str | None:
-    """Return Onedata's error id from an error answer when it has the plain shape of one."""
+def _error_fields(response: httpx.Response) -> tuple[str | None, str | None]:
+    """Return Onedata's error id and its POSIX errno from an error answer, each None unless it has a plain shape."""
     try:
-        code = response.json()["error"]["id"]
+        error = response.json()["error"]
+        code = error["id"]
     except (ValueError, KeyError, TypeError):
-        return None
-    return code if isinstance(code, str) and _ERROR_ID.fullmatch(code) else None
+        return None, None
+    if not isinstance(code, str) or not _ERROR_ID.fullmatch(code):
+        return None, None
+    details = error.get("details") if isinstance(error, dict) else None
+    errno = details.get("errno") if isinstance(details, dict) else None
+    return code, errno if isinstance(errno, str) and _ERRNO.fullmatch(errno) else None
+
+
+def _answered(label: str, method: str, status: int, code: str | None, errno: str | None) -> str:
+    """The message of an error answer: the label, the method, the status, and the error id with its errno."""
+    shown = f"{code}: {errno}" if code and errno else code
+    return f"{label}: {method} answered {status}" + (f" ({shown})" if shown else "")
+
+
+def answered_absent(error: PlatformError) -> bool:
+    """Tell whether a provider answered that a file or directory is not there: a 404, or exactly `POSIX_ABSENT`.
+
+    Any other answer, another 400 or one whose body could not be read included, is not absence, and neither is a
+    request the client never sent (`NotSent`), which nothing answered. The answer is one provider's: it says nothing
+    of another provider or of the storage behind it, where a directory's delete may still be under way (#114)."""
+    if isinstance(error, NotSent):
+        return False
+    return error.status == 404 or (error.status, error.code, error.errno) == POSIX_ABSENT
 
 
 def _check_path(path: str) -> str:
@@ -338,11 +373,12 @@ class OnezoneClient:
         except httpx.HTTPError as error:
             raise PlatformError(f"{label}: {method} failed ({type(error).__name__})", transport=True) from None
         if response.status_code >= 400:
-            code = _error_code(response)
+            code, errno = _error_fields(response)
             raise PlatformError(
-                f"{label}: {method} answered {response.status_code}" + (f" ({code})" if code else ""),
+                _answered(label, method, response.status_code, code, errno),
                 status=response.status_code,
                 code=code,
+                errno=errno,
             )
         return response
 
@@ -434,8 +470,8 @@ class OnezoneClient:
         """Return root file id -> space id for the spaces the configuration knows, their roots as `provider` gives them.
 
         A root is the `fileId` of the provider's `GET /spaces/{id}`, read once per provider and kept once it was
-        answered. A 404 is a space the provider does not hold, which resolves to no space (OutOfScope); any other
-        failure, or an answer without a plain id, raises PlatformError and keeps nothing."""
+        answered. An absence (`answered_absent`) is a space the provider does not hold, which resolves to no space
+        (OutOfScope); any other failure, or an answer without a plain id, raises PlatformError and keeps nothing."""
         space_id = self._config.space.id
         with self._walk_lock:
             root = self._roots.get((provider, space_id))
@@ -443,7 +479,7 @@ class OnezoneClient:
             try:
                 answer = self._send("GET", f"/spaces/{space_id}", provider=provider, headers=self._admin)
             except PlatformError as error:
-                if error.status == 404:
+                if answered_absent(error):
                     raise OutOfScope(
                         "the configured space is unknown to that provider, so the target resolves to no space"
                     ) from None
@@ -458,10 +494,10 @@ class OnezoneClient:
     def _parent_of(self, node: str, provider: str, read: dict[str, str]) -> str | None:
         """Return a file's parent id, from what earlier walks kept, what this walk read, or a read now; None at the top.
 
-        The read is `GET /data/{id}?attribute=parent_id` with the admin credential. A 404 is a file or directory the
-        provider does not know, which resolves to no space (OutOfScope); any other failure, or an answer that is no
-        plain id and no null, raises PlatformError. A link read now goes into `read`, which the caller keeps only once
-        its walk has reached a known root."""
+        The read is `GET /data/{id}?attribute=parent_id` with the admin credential. An absence (`answered_absent`) is
+        a file or directory the provider does not know, which resolves to no space (OutOfScope); any other failure, or
+        an answer that is no plain id and no null, raises PlatformError. A link read now goes into `read`, which the
+        caller keeps only once its walk has reached a known root."""
         with self._walk_lock:
             kept = self._parents.get(node)
         if kept is not None:
@@ -473,7 +509,7 @@ class OnezoneClient:
                 "GET", f"/data/{node}", provider=provider, headers=self._admin, params={"attribute": "parent_id"}
             )
         except PlatformError as error:
-            if error.status == 404:
+            if answered_absent(error):
                 raise OutOfScope(
                     "the target file, or a directory above it, is unknown to its provider, so it resolves to no space"
                 ) from None
@@ -544,6 +580,7 @@ class OnezoneClient:
                 f"the gate could not read the target's space ({error}); nothing was sent",
                 status=error.status,
                 code=error.code,
+                errno=error.errno,
                 transport=error.transport,
             ) from None
 
@@ -652,13 +689,13 @@ class OnezoneClient:
                 "GET", base + path, headers=headers, timeout=timeout_s if timeout_s is not None else self._timeout_s
             ) as response:
                 status, content_type = response.status_code, response.headers.get("Content-Type")
-                code = _error_code(response) if status >= 400 and response.read() is not None else None
+                code, errno = (None, None)
+                if status >= 400 and response.read() is not None:
+                    code, errno = _error_fields(response)
         except httpx.HTTPError as error:
             raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
         if status >= 400:
-            raise PlatformError(
-                f"{label}: GET answered {status}" + (f" ({code})" if code else ""), status=status, code=code
-            )
+            raise PlatformError(_answered(label, "GET", status, code, errno), status=status, code=code, errno=errno)
         return status, content_type
 
     def mint_own_token(self, principal: Principal, caveats: Sequence[Mapping[str, Any]]) -> str:

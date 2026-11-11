@@ -17,7 +17,7 @@ import secrets
 from typing import Any
 
 from expcore_onedata import consistency
-from expcore_onedata.client import NotSent, PlatformError
+from expcore_onedata.client import NotSent, PlatformError, answered_absent
 from expcore_onedata.day0.registry import Context, Result, failed, passed, register, unknown
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.rangemap import RangeRow
@@ -27,6 +27,7 @@ from expcore_onedata.tokens import data_path_spec
 
 SCRATCH_BYTES = 8192
 REFUSALS = (401, 403)
+POSIX_REFUSAL = (400, "posix", "eacces")  # how Onedata 25.0 refuses a write made with a read-only token ([L1])
 ABSENCE_POLLS = 6  # reads of a deleted entry before its absence is given up on
 ABSENCE_POLL_S = 1.0
 CONSECUTIVE_ABSENT = 2  # reads in a row that must answer "not found" (O07)
@@ -47,12 +48,15 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
     """Delete an entry as the admin and return `cleaned`, true only when its absence was then confirmed (O11).
 
     A DELETE that answers 204 proves nothing: the entry is read until the provider answers "not found" on consecutive
-    polls, within a bounded number of polls. Any other outcome is `cleaned` False with a `cleanup_reason`.
+    polls, within a bounded number of polls. "Not found" is a 404 or Onedata 25.0's 400 posix enoent
+    (`answered_absent`), exactly; any other answer, another 400 included, is not, and the reads go on to their bound.
+    Any other outcome is `cleaned` False with a `cleanup_reason`. The absence is that provider's (#114).
     """
     try:
         ctx.client.mutate("DELETE", f"/data/{entry_id}", provider=provider)
-    except PlatformError:
-        return {"cleaned": False, "cleanup_reason": "the delete was refused or failed"}
+    except PlatformError as error:
+        if not answered_absent(error):  # already gone is confirmed by the reads below
+            return {"cleaned": False, "cleanup_reason": "the delete was refused or failed"}
     absent, reason = 0, "the entry could not be read to confirm that it is gone"
     for poll in range(ABSENCE_POLLS):
         if poll:
@@ -61,7 +65,7 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
             ctx.client.get(f"/data/{entry_id}", provider=provider)
             absent, reason = 0, "the entry was still there after the delete"
         except PlatformError as error:
-            if error.status != consistency.NOT_FOUND:
+            if not answered_absent(error):
                 absent, reason = 0, "the entry could not be read to confirm that it is gone"
                 continue
             absent, reason = absent + 1, "the entry was not found on a read, but not on consecutive reads"
@@ -70,13 +74,19 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
     return {"cleaned": False, "cleanup_reason": reason}
 
 
+def _refused(error: PlatformError) -> bool:
+    """Whether a provider refused the write: a 401 or 403, or exactly `POSIX_REFUSAL`; no other 400 is a refusal."""
+    return error.status in REFUSALS or (error.status, error.code, error.errno) == POSIX_REFUSAL
+
+
 def _attempt_write(ctx: Context, name: str, token: str) -> dict[str, Any]:
     """Send one write as the data-path token to a provider and say what became of it.
 
     `sent` is False when nothing reached the provider: the space root could not be read, or the client's gate refused
     the write or could not check it (`NotSent`), so the probe did not run there. A write that was sent is accepted
-    (`enforced` False, and removed again), refused with a 401 or 403 (`enforced` True), or neither (`enforced` None:
-    no answer, or another status, kept with Onedata's error id as `code`)."""
+    (`enforced` False, and removed again), refused (`enforced` True: a 401 or 403, or exactly `POSIX_REFUSAL`, as
+    Onedata 25.0 answers it), or neither (`enforced` None: no answer, or another status, kept with Onedata's error id
+    as `code` and its errno as `errno`)."""
     created: str | None = None
     try:
         root = consistency.space_root(ctx.client, name, ctx.config.space.id, tries=3, wait_s=1.0, sleep=ctx.sleep)
@@ -98,8 +108,9 @@ def _attempt_write(ctx: Context, name: str, token: str) -> dict[str, Any]:
         if error.transport or error.status is None:
             row = {"enforced": None, "sent": True, "error": "no answer"}
         else:
-            enforced = True if error.status in REFUSALS else None
+            enforced = True if _refused(error) else None
             row = {"enforced": enforced, "sent": True, "status": error.status, "code": error.code}
+            row.update({"errno": error.errno} if error.errno else {})
     finally:
         if created:  # the write was accepted: remove what it made, as the admin, and show that it is gone
             row.update(_remove_and_verify(ctx, name, created))
@@ -107,10 +118,11 @@ def _attempt_write(ctx: Context, name: str, token: str) -> dict[str, Any]:
 
 
 def _answered(row: dict[str, Any]) -> str:
-    """How a sent write was answered, for a summary: its status and Onedata's error id, or that none came."""
+    """How a sent write was answered, for a summary: its status, Onedata's error id and errno, or that none came."""
     if "status" not in row:
         return str(row.get("error"))
-    return f"{row['status']} {row['code']}" if row.get("code") else str(row["status"])
+    shown = f"{row['code']}: {row['errno']}" if row.get("code") and row.get("errno") else row.get("code")
+    return f"{row['status']} {shown}" if shown else str(row["status"])
 
 
 @register("read_only", "Read-only enforcement on each data path", mutates=True)
@@ -141,8 +153,8 @@ def read_only(ctx: Context) -> Result:
     if unanswered:
         answers = sorted({_answered(rows[name]) for name in unanswered})
         reasons.append(
-            f"a write was sent to {', '.join(unanswered)} and answered neither by acceptance nor by a 401 or 403 "
-            f"({', '.join(answers)})"
+            f"a write was sent to {', '.join(unanswered)} and answered neither by acceptance nor by a refusal "
+            f"(401, 403 or 400 posix: eacces), but {', '.join(answers)}"
         )
     if reasons:
         return unknown("; ".join(reasons), providers=rows)

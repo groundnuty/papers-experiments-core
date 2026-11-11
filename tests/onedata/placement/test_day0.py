@@ -202,9 +202,56 @@ def test_o08_a_write_answered_neither_way_is_unknown_and_says_it_was_sent(contex
     entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
     assert entry.ok is None
     assert "was sent" in entry.summary
-    assert "(500 internalServerError)" in entry.summary
+    assert "but 500 internalServerError" in entry.summary
     rows = entry.facts["providers"].values()
     assert {(row["sent"], row["status"], row["code"]) for row in rows} == {(True, 500, "internalServerError")}
+
+
+@pytest.mark.parametrize(
+    ("answer", "refused"),
+    [
+        ((400, "posix", "eacces"), True),  # how Onedata 25.0 refuses it
+        ((400, "posix", "eperm"), None),  # the same id with another errno
+        ((400, "posix", None), None),
+        ((400, "badValueNotAllowed", None), None),  # another 400
+    ],
+)
+def test_o05_a_write_refused_as_400_posix_eacces_is_a_refusal_and_no_other_400_is(context, fake, answer, refused):
+    """O05: Onedata 25.0 refuses a write made with the read-only token as 400 posix with errno eacces, and that exact
+    answer is a refusal, so the check passes. Another errno of the same id, none, or another 400 is not: the check is
+    unknown, with the answer as it came."""
+    fake.readonly_answer = answer
+    entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
+    assert entry.ok is refused
+    assert {row["enforced"] for row in entry.facts["providers"].values()} == {refused}
+    assert mutating_calls(fake)  # the writes were sent
+    assert not [c for c in fake.provider_calls if c[1] in ("PUT", "DELETE")]
+
+
+def test_o11_an_accepted_write_whose_directory_reads_400_posix_enoent_is_cleaned(context, fake):
+    """O11: when a broken enforcement accepts the write, its directory is deleted and read until gone; on Onedata
+    25.0 a deleted entry reads 400 posix enoent, which is absence as a 404 is, so the clean-up is confirmed."""
+    fake.enforce_readonly = False
+    fake.answer_missing_as_25()
+    entry, rows = read_only_rows(context)
+    assert entry.ok is False  # the write was accepted: that is the failure
+    assert {row["cleaned"] for row in rows} == {True}
+    assert [n.name for n in fake.nodes.values() if n.name.startswith("day0-")] == []
+
+
+@pytest.mark.parametrize("answer", [(400, "posix", "eacces"), (400, "badValueNotAllowed", None), (400, None, None)])
+def test_o11_an_accepted_write_whose_directory_reads_any_other_400_is_not_cleaned(context, fake, ticker, answer):
+    """O11: after the delete, an answer that is neither a 404 nor 400 posix enoent (another errno, another 400, a body
+    that is no error object) is not absence. The reads go on to their bound and the directory is reported not cleaned,
+    never removed."""
+    fake.enforce_readonly = False
+    fake.answer_missing_as_25(answer)
+    began = ticker.clock()
+    entry, rows = read_only_rows(context)
+    assert entry.ok is False
+    assert {row["cleaned"] for row in rows} == {False}
+    assert {row["cleanup_reason"] for row in rows} == {"the entry could not be read to confirm that it is gone"}
+    assert ticker.clock() - began >= 2 * 5.0  # each provider's reads went on to their bound, with pauses
 
 
 def attribute_reads(fake):

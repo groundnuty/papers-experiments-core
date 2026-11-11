@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata import consistency
-from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
+from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, answered_absent
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncovered
 from expcore_onedata.rangemap import PlacementSettings, safe_path
@@ -118,7 +118,7 @@ class TeardownReport:
 
     @property
     def ok(self) -> bool:
-        """True when everything the log says was created is gone."""
+        """True when everything the log says was created is gone, as the data provider reads it (#114)."""
         return not self.left
 
     def raise_if_left(self) -> None:
@@ -510,17 +510,23 @@ class Provisioner:
 
     # -- teardown --------------------------------------------------------------
     def _gone(self, file_id: str) -> bool:
-        """Tell whether the data provider has no such entry; any answer but a 404 is "no" for a read that worked."""
+        """Tell whether the data provider has no such entry: it answered a 404, or Onedata 25.0's 400 posix enoent
+        (`answered_absent`). A read that worked is "no"; any other failure, another 400 or an unreadable body among
+        them, raises, so the poll never counts as absence."""
         try:
             self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder)
         except PlatformError as error:
-            if error.status == consistency.NOT_FOUND:
+            if answered_absent(error):
                 return True
             raise
         return False
 
     def _confirm_gone(self, file_id: str) -> bool:
-        """Tell whether the data provider shows the entry absent on consecutive polls, within the bound."""
+        """Tell whether the data provider shows the entry absent on consecutive polls, within the bound.
+
+        It stops at once when it does. The absence is the data provider's, the one entries are created and deleted
+        on, and says nothing of the other providers or of storage, where a directory's delete may still be under way
+        (#114): nothing here creates a name again after its teardown, since every scratch name is new."""
         return consistency.converge(
             lambda: self._gone(file_id),
             bool,
@@ -545,14 +551,19 @@ class Provisioner:
         for line in reversed(self.logged()):
             fid = line["id"]
             if line["kind"] == "DIR":
-                strangers = [e for e in self.children(fid).values() if e.file_id not in removed]
+                try:
+                    strangers = [e for e in self.children(fid).values() if e.file_id not in removed]
+                except PlatformError as error:
+                    if not answered_absent(error):
+                        raise
+                    strangers = []  # the directory is already gone, so it holds nothing; its absence is checked below
                 if strangers:
                     left.append({"path": line["path"], "reason": "holds entries this provisioner did not create"})
                     continue
             try:
                 self._client.mutate("DELETE", f"/data/{_segment(fid)}", provider=self._settings.holder)
             except PlatformError as error:
-                if error.status != consistency.NOT_FOUND:
+                if not answered_absent(error):  # already gone is confirmed below; any other refusal leaves it
                     left.append({"path": line["path"], "reason": "the delete was refused or failed"})
                     continue
             if not self._confirm_gone(fid):

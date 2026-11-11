@@ -230,6 +230,54 @@ def test_o09_a_content_upload_says_it_is_an_octet_stream_so_the_release_takes_it
     assert len([c for c in seeded.provider_calls if c[1] == "PUT"]) == 4
 
 
+@pytest.mark.parametrize(
+    ("answer", "gone"),
+    [
+        ((404, "notFound", None), True),
+        ((400, "posix", "enoent"), True),  # how Onedata 25.0 answers a deleted entry
+        ((400, "posix", "eacces"), False),  # the same id with another errno
+        ((400, "posix", None), False),  # the id with no errno
+        ((400, "badValueNotAllowed", None), False),  # another 400
+        ((400, None, None), False),  # a body that is no error object
+    ],
+)
+def test_o11_teardown_takes_a_404_or_400_posix_enoent_as_gone_at_once_and_fails_closed_on_any_other_400(
+    provisioner, seeded, ticker, answer, gone
+):
+    """O11: a deleted entry is gone when the data provider answers it with a 404 or, as Onedata 25.0 does, with 400
+    posix enoent: teardown confirms it on consecutive reads and stops at once, without waiting out its bound. Any other
+    400, an unreadable body included, is not absence: teardown keeps reading to its bound, deletes nothing from its
+    log and reports every entry still listed, never removed, so a later run cannot start on data still there."""
+    seeded.answer_missing_as_25(answer)
+    provisioner.put_file("scratch/a.bin", DATA)
+    began = ticker.clock()
+    report = provisioner.teardown()
+    assert report.ok is gone
+    assert not seeded.exists("scratch")
+    if gone:
+        assert provisioner.logged() == []
+        assert ticker.clock() - began < provisioner.settings.settle_timeout_s  # stopped long before the bound
+    else:
+        assert report.deleted == ()
+        assert {entry["reason"] for entry in report.left} == {"still listed after its delete"}
+        assert len(report.left) == 2  # the file and its directory
+        assert len(provisioner.logged()) == 2  # both still logged, so a later teardown checks them again
+        assert ticker.clock() - began >= provisioner.settings.settle_timeout_s  # waited to the bound, never "gone"
+        with pytest.raises(ProvisionError, match="left"):
+            report.raise_if_left()
+
+
+def test_o11_a_logged_entry_someone_else_deleted_reads_as_gone_on_25(provisioner, seeded):
+    """O11: an entry deleted before teardown runs is answered 400 posix enoent by its DELETE on Onedata 25.0 (its
+    parent link still reads, so the gate lets the DELETE through); that is absence, so teardown confirms and logs it."""
+    seeded.answer_missing_as_25()
+    provisioner.put_file("scratch/a.bin", DATA)
+    seeded._delete(seeded.id_of("scratch"))
+    report = provisioner.teardown()
+    assert report.ok
+    assert provisioner.logged() == []
+
+
 def test_o09_put_file_refuses_to_adopt_a_file_that_exists(provisioner, seeded):
     """O09: a file already at the path is refused, so teardown can never delete something it did not create."""
     with pytest.raises(ProvisionError, match="already exists"):

@@ -137,8 +137,9 @@ class FakeData(FakeFederation):
         self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat is refused
         # how that refusal is answered: (status, error id, errno); Onedata 25.0 answers (400, "posix", "eacces")
         self.readonly_answer: tuple[int, str, str | None] = (403, "forbidden", None)
-        # how a file or directory that is not there is answered: (status, error id, errno); see `answer_missing_as_25`
-        self.missing_answer: tuple[int, str, str | None] = (404, "notFound", None)
+        # how a file or directory that is not there is answered: (status, error id, errno), an error id of None being a
+        # body that is no error object; see `answer_missing_as_25`
+        self.missing_answer: tuple[int, str | None, str | None] = (404, "notFound", None)
         self.deleted_parents: dict[str, str | None] | None = None  # a deleted entry's parent link, while it is kept
         self.resets: list[list] = []
         self.statuses: list[list] = []
@@ -257,7 +258,7 @@ class FakeData(FakeFederation):
         details = {"errno": errno} if errno is not None else {}
         return httpx.Response(status, json={"error": {"id": error_id, "details": details}})
 
-    def answer_missing_as_25(self, answer: tuple[int, str, str | None] = (400, "posix", "enoent")) -> None:
+    def answer_missing_as_25(self, answer: tuple[int, str | None, str | None] = (400, "posix", "enoent")) -> None:
         """Answer what is not there as Onedata 25.0 does: 400 posix enoent instead of a 404, while a deleted entry's
         `parent_id` still answers its old parent (both read on the Compose federation). `answer` replaces the 400."""
         self.missing_answer = answer
@@ -268,7 +269,10 @@ class FakeData(FakeFederation):
         kept = self.deleted_parents or {}
         if method == "GET" and file_id in kept and query.get("attribute") == "parent_id":
             return httpx.Response(200, json={"parent_id": kept[file_id]})
-        return self._error(*self.missing_answer)
+        status, error_id, errno = self.missing_answer
+        if error_id is None:  # a body that is no error object at all
+            return httpx.Response(status, text="<html><body>Bad Request</body></html>")
+        return self._error(status, error_id, errno)
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         """Answer a provider call here and anything else as the federation does."""
