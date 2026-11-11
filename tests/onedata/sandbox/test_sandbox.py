@@ -352,7 +352,7 @@ def test_o05_a_start_removes_the_token_files_a_killed_run_left_on_the_root(world
 
 
 def test_o05_a_start_leaves_a_token_file_that_may_be_another_starts_and_what_no_sandbox_names(world):
-    """O05: only the files a sandbox writes, by its own naming, and only once older than any start keeps one: a file
+    """O05: only the files a sandbox writes, by its own naming, and only once much older than a start keeps one: a file
     written a moment ago is a start in another process that has not yet run its container, and a file elsewhere on the
     root, or one a link points at, is not the sandbox's to remove."""
     under_way = plant_token_file(world, "live-key-1a2b3c4d", TOKEN_FILE, age_s=5)

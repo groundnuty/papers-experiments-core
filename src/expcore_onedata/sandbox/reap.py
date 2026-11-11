@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 
 REAPED = "reaped.jsonl"  # what was removed, written before it is removed
 YOUNG_S = 120.0  # a directory this new, with no container, may be a live start's: not touched yet
-TOKEN_FILE_GRACE_S = 600.0  # a start keeps its token file for a docker call (120 s) and the mount's wait (60 s) at most
+TOKEN_FILE_GRACE_S = 600.0  # several times what a healthy start holds its file for: a docker call and the mount's wait
 SID_DIRECTORY = re.compile(r".+-[0-9a-f]{8}")  # the name of a run's directory: its key, a dash, the eight hex of its id
 
 
@@ -158,9 +158,10 @@ def reap_token_files(
     it removed it (`DockerSandbox._write_token_file`), and nothing else removes it until `reap_run` reaches its directory.
 
     Only a regular file at one of `relatives` inside a directory of `root` that is named as a sandbox names its own
-    (key, dash, eight hex digits), and only once it is `grace_s` old: a start keeps its file for one docker call and
-    the mount's wait, so an older one belongs to no start, while a younger one may be a start in another process that
-    has not yet run its container. A link is never followed (`lstat`), a file anywhere else is not touched. Returns the
+    (key, dash, eight hex digits), and only once it is `grace_s` old, several times what a healthy start keeps its
+    file for (one docker call and the mount's or the gate's wait): a younger one may be a start in another process
+    that has not yet run its container, and removing the file of a start that did stall past the grace makes that
+    start fail, never pass on a missing token. A link is never followed (`lstat`), a file anywhere else is not touched. Returns the
     count removed and the count found and not removed, which is all a record may say of them (O12)."""
     removed = left = 0
     if not Path(root).is_dir():  # a root nothing has run on yet

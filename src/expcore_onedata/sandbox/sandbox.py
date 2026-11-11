@@ -498,8 +498,8 @@ class DockerSandbox:
     def _remove_token_files(self, *only: Path) -> None:
         """Remove the host's copies of the data-path token (`only` these, else all), verified: once its holder has
         started it keeps the token itself, so the host keeps none (O05). Run for every copy at every teardown. A run
-        killed outright between writing a file and removing it (a docker call and the mount's wait, at most) leaves it,
-        and the next start on this root removes it once it is older than any start keeps one (`reap.reap_token_files`)."""
+        killed outright between writing a file and removing it (a healthy start's docker call and wait) leaves it, and
+        the next start on this root removes it once it is several times older than that (`reap.reap_token_files`)."""
         left = []
         for path in only or tuple(self._token_files):
             self.host.run(["rm", "-f", str(path)], 20, sudo=True)
