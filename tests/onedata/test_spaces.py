@@ -39,8 +39,8 @@ def test_o12_the_one_space_form_is_the_single_space_labelled_space_with_its_fing
     TLS setting alone, as it did before several spaces could be declared."""
     config = load(tmp_path)
     assert [(e.label, e.position) for e in config.spaces] == [("space", "spaces[0]")]
-    assert config.study_space() is config.spaces[0]
-    assert config.study_space("space").space is config.space
+    assert config.space_named() is config.spaces[0]
+    assert config.space_named("space").space is config.space
     assert config.space.name == SPACE_NAME
     assert config.support.providers == ("alpha",)
     assert config.space_ids("data_path") == config.space_ids("tool_server") == ("spmock0001",)
@@ -60,8 +60,8 @@ def test_o12_several_spaces_load_each_named_by_its_label_with_its_own_support_an
     config = load(tmp_path, edit)
     assert [e.label for e in config.spaces] == list(SPACE_LABELS)
     assert [e.position for e in config.spaces] == ["spaces[0]", "spaces[1]", "spaces[2]"]
-    assert config.study_space(SPACE_LABELS[1]).holder == "beta"
-    assert config.study_space(SPACE_LABELS[2]).support.providers == ("alpha",)
+    assert config.space_named(SPACE_LABELS[1]).holder == "beta"
+    assert config.space_named(SPACE_LABELS[2]).support.providers == ("alpha",)
     assert config.space_ids("data_path") == SPACE_IDS[:2]
     assert config.space_ids("tool_server") == (SPACE_IDS[0], SPACE_IDS[2])
     assert config.prefixes == ("study-a-", "study-b-")
@@ -75,8 +75,8 @@ def test_o12_with_several_spaces_the_one_space_accessors_refuse_without_naming_a
     for read in (
         lambda: config.space,
         lambda: config.support,
-        config.study_space,
-        lambda: config.study_space("nowhere"),
+        config.space_named,
+        lambda: config.space_named("nowhere"),
     ):
         with pytest.raises(ConfigError) as caught:
             read()

@@ -9,6 +9,9 @@ ranges through that provider, which fetches what it lacks from the data provider
 never a transfer job. Each placement is then confirmed by the block map on the receiving provider (O01, `provision.py`):
 a read that returned bytes but left the block map short, as a provider that does not cache would, is `NotPlaced`.
 
+The files are resolved with one listing of each directory on their way (`Provisioner.resolve_many`), never one listing
+per file, and the rows must lie in the provisioner's space (`RangeRow.space`, with several spaces declared).
+
 The map is declared, per file and provider (`rangemap.py`); a range beyond the end of its file is refused, since
 clipping it would place less than was declared. The receiving provider's block map before and after is recorded
 (`held_before`, `held_after`), so bytes fetched later by a run's own reads show as growth and do not pass as placed,

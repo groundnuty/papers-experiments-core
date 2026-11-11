@@ -167,7 +167,7 @@ def parse_rows(rows: Any, file: Path, where: str, config: PlatformConfig, holder
         path, provider = section.string("file"), section.string("provider")
         label = section.optional_string("space")
         try:
-            entry = config.study_space(label)
+            entry = config.space_named(label)
         except ConfigError:
             raise section.fail(
                 "space", "must be the label of a declared space; with several spaces it is required"

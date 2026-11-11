@@ -602,6 +602,52 @@ Implementer must guarantee:
 
 **Where a study's estimator is registered.** The preregistration is validated when the study is loaded, before its plugin is imported, so a name only the plugin registers is unknown at that point and the contrast is refused (`unknown estimator 'name'; registered: wilcoxon_cluster_bootstrap`). A study cannot register its estimator through its plugin. It registers it at the top level of a module that `[study] platforms` names, which the loader imports before it validates anything, as it does for a platform's infrastructure kinds. That module must be importable, so it is installed code, not a file of the study directory, which is not on the module search path: a distribution of the study's own, named in `[study] requires`, so it is part of the campaign's environment and the replication package vendors its wheel. Its version speaks for its code, so change the version when the estimator changes. Once registered, the estimator stays registered for the rest of the process.
 
+## The platform layer's spaces and reset
+
+`expcore_onedata.spaces`, `provision`, `eviction` and `reset`. A federation study has one space per data owner, each supported by its owner's provider, by the agent's local provider and sometimes by a mirror. `platform.toml` declares them as an array of tables, in place of `[space]` and `[support]` (one form or the other, never both):
+
+```toml
+[[spaces]]
+label = "<label>"               # how code names the space; a message names it by its position, spaces[i]
+name = "..."                    # name, id and prefixes as in [space]
+id = "..."
+prefixes = ["..."]
+providers = ["<name>", ...]     # the providers declared to support this space (O04)
+local = "<name>"                # the agent's own provider, one of these; the same in every entry (O03)
+holder = "<name>"               # optional: this space's data provider, in place of [placement] holder (O09)
+tokens = ["data_path", "tool_server"]  # optional: the token planes whose caveats reach this space; both by default
+```
+
+A `[[placement.map]]` row (or `[[map]]` in a study's file) names its space with `space = "<label>"`, required with several spaces. `[placement] concurrency` (16 by default) bounds the requests a bulk operation has in flight.
+
+```python
+class PlatformConfig:               # config.py
+    spaces: tuple[StudySpace, ...]  # the one-space form's single space (label "space"), or the [[spaces]] entries
+    def space_named(self, label: str | None = None) -> StudySpace   # None: the only space
+    space: Space; support: Support  # the only space's; refused when several are declared
+    prefixes: tuple[str, ...]       # every space's, each once: what the mutation gate accepts
+    def space_ids(self, plane: str) -> tuple[str, ...]              # the spaces a token plane is scoped to
+
+class Provisioner:                  # provision.py: bound to one space
+    def __init__(self, client, config, settings, *, provider_ids, log, space: str | None = None, ...)
+    def resolve_many(self, paths) -> dict[str, Entry]               # one listing of each directory
+    def walk(self, directory_id=None) -> Iterator[tuple[Entry, bool]]  # every entry under a directory, and its leafness
+
+def evict_tree(provisioner, path: str | Entry, from_provider) -> dict   # eviction.py: one transfer of a directory
+def evict_ids(provisioner, file_ids, from_provider) -> dict             # files in parallel under the bound
+
+class SpaceReset:                   # reset.py
+    def __init__(self, provisioner, *, providers=None)
+    def run(self, evict: Mapping[str, Iterable[str]] | None = None) -> dict  # provider -> paths that must leave it
+```
+
+The platform layer guarantees:
+- The one-space form behaves as before, and `PlatformConfig.fingerprint()` is unchanged for it. With several spaces the fingerprint holds each entry's SHA-256 in order, never a label, name or id, so a resume under another set, order or support of spaces is refused (C06).
+- A provisioner acts in its own space alone: its live name is checked against that space's name and prefixes before the first change, its data provider's copy is never evicted (O09), and with several spaces every message starts with the space's position. Placement, eviction and the probes take the space from the provisioner, and each space's probes have their own namespace, `platform_probes_space<i>`, and name the space in their snapshot.
+- Each token plane's `data.path` caveat lists exactly the spaces it is scoped to, its principal's rights are read in each, and the examination refuses a token that misses one or adds another (O05). The tool server's launch checks and the data gate's token follow the plane's set. The health check compares each space with its own support set (O04).
+- `run` takes four stages in order, each recorded with its seconds: `qos` (every requirement, found from the summaries of the root and the leaves, removed through the gate, each then answering that it is not there and a second walk finding none), `transfers` (every waiting or ongoing job cancelled through the gate until two observations `transfer_settle_s` apart show none on any provider), `eviction` (each provider's paths, a directory in one transfer and files together, verified on the block maps, O01) and `history` (the ended listing's count and newest finish time per provider: ended transfers cannot be removed, so they are recorded, `removable` false). A stage that cannot verify what it did raises `ResetFailed` with the stages so far and runs no later stage; the caller must not start the next run. A plan that names the data provider is refused before any stage.
+- The mutation gate resolves a transfer's cancel by its record's `spaceId` and a QoS requirement's removal by its record's `fileId`, read right before the mutation and never kept. A directory's eviction and a transfer record's `spaceId` were read on the live federation (`deploy/compose-federation/day0/2026-11-11-federation-facts.md`); the cancel, the QoS summary, a requirement's record and its removal are named only by Oneprovider 25.0's REST description, so they are in `client.UNVERIFIED_ENDPOINTS`. Each has a live test (`EXPCORE_LIVE_MUTATE`; the whole reset also `EXPCORE_LIVE_RESET`).
+
 ## Other protocols the core defines
 
 | Protocol | Where | Signature |

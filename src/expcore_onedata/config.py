@@ -189,7 +189,7 @@ class PlatformConfig:
     sha256: str = ""  # of the file as loaded: a record names the configuration by this, never by a value in it
     tls: TlsSettings = field(default_factory=TlsSettings)  # every client's one certificate check (`[tls]`)
 
-    def study_space(self, label: str | None = None) -> StudySpace:
+    def space_named(self, label: str | None = None) -> StudySpace:
         """Return the space a label names, or, with none, the only one; refuse, naming no label, when there is none
         such, or when several are declared and none is named."""
         if label is None:
@@ -203,13 +203,13 @@ class PlatformConfig:
 
     @property
     def space(self) -> Space:
-        """The only space; refused when several are declared, since then a caller must name one (`study_space`)."""
-        return self.study_space().space
+        """The only space; refused when several are declared, since then a caller must name one (`space_named`)."""
+        return self.space_named().space
 
     @property
     def support(self) -> Support:
-        """The only space's support set; refused when several are declared (`study_space(label).support`)."""
-        return self.study_space().support
+        """The only space's support set; refused when several are declared (`space_named(label).support`)."""
+        return self.space_named().support
 
     @property
     def prefixes(self) -> tuple[str, ...]:

@@ -76,7 +76,7 @@ def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = 
     The detail holds no configured name, host, URL or id (O12). A declared provider is `providers[i]`, its position in
     platform.toml; a provider no declaration fits is shown by the id the federation reports for it.
     """
-    entry = entry or config.study_space()
+    entry = entry or config.space_named()
     space, support = entry.space, entry.support
     if view.name != space.name:
         return Health(False, "the study space is reported under another name than the declared one")

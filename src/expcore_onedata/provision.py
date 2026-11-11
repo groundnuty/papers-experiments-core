@@ -184,7 +184,7 @@ class Provisioner:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        entry = config.study_space(space)
+        entry = config.space_named(space)
         where = f"{entry.position}: " if len(config.spaces) > 1 else ""
         holder = entry.holder or settings.holder
         if holder not in config.providers:
