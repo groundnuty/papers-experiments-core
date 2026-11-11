@@ -190,6 +190,20 @@ def test_o08_a_day0_content_type_check_that_measured_nothing_is_unknown_never_pa
     assert content_type_check(load_platform(platform), client).ok is True
 
 
+def test_o05_a_day0_content_type_check_whose_file_the_space_does_not_hold_is_unknown_and_names_the_key(
+    platform_file, fake, tmp_path
+):
+    """A space declared baseline = false holds no file to read: the check is unknown, which is not a pass, and its
+    summary names the configured key and says the file is not in the space, without naming the file itself."""
+    client = OnezoneClient(load_platform(platform_file), http=fake.client_http())
+    found = REGISTRY["content_type"].run(build_context(platform_file, tmp_path / "out", client=client))
+    assert found.ok is None
+    assert "[sandbox] content_check_file" in found.summary
+    assert "not in the space" in found.summary
+    assert_clean(found.summary)
+    assert provider_reads(fake) == []  # nothing was read: there was no file to ask for
+
+
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 
 
