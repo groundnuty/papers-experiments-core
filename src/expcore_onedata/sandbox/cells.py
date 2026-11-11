@@ -130,6 +130,20 @@ class CellRunner:
         self._meta["earlyoom_kills"] = found
         return found
 
+    def step_earlyoom(self) -> list[dict] | None:
+        """After a harness step (O22): the host killer's kills of this run since the last cell or step, which are the
+        step's, moved past so that the agent's next cell never takes them. None when its journal could not be read."""
+        try:
+            found = self.earlyoom_scan()
+        except Exception as e:
+            self._meta["earlyoom_log_readable"] = False
+            self._meta["earlyoom_scan_error"] = describe_error(e)
+            return None
+        if self._meta.get("earlyoom_log_readable") is not True:
+            return None
+        new, self._earlyoom_seen = found[self._earlyoom_seen :], len(found)
+        return new
+
     # ------------------------------------------------------------------------------------------------ processes
     def agent_processes(self) -> list[dict] | None:
         """Every process of the agent's container except its init and the init's `sleep`; [] when it has stopped,
@@ -239,8 +253,6 @@ class CellRunner:
                 self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, wall0)
         finally:  # whatever was raised: a timer that has not fired must not kill the next cell's processes
             timer.end()
-            if not record:  # what an unrecorded run raised is its own: the next cell reads its baseline afresh (O22)
-                self._events_seen = None
         return res
 
     def _not_started(self, record: bool) -> ExecResult:

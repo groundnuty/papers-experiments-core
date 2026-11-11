@@ -9,6 +9,7 @@ in-memory host, and the gate's own mark is its real code.
 
 import json
 import signal
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -115,7 +116,14 @@ def test_o22_a_harness_step_runs_as_the_agent_and_is_recorded_apart_from_the_age
     meta = sbx.metadata()
     assert meta["cells"] == 0
     assert [{k: v for k, v in s.items() if k != "duration_s"} for s in meta["harness_steps"]] == [
-        {"step": 1, "status": "ran", "exit_code": 3, "timed_out": False, "gate_refusals": ["redirect"]}
+        {
+            "step": 1,
+            "status": "ran",
+            "exit_code": 3,
+            "timed_out": False,
+            "gate_refusals": ["redirect"],
+            "earlyoom_kills": [],
+        }
     ]
     cell = sbx.exec("print(1)", 30)
     assert cell.gate_refusals == ()
@@ -125,13 +133,12 @@ def test_o22_a_harness_step_runs_as_the_agent_and_is_recorded_apart_from_the_age
     sbx.stop()
 
 
-def test_o22_a_kill_under_a_harness_step_is_never_put_on_the_agents_next_cell(world):
-    """O22: the memory counters a harness step raised are its own: the agent's next cell takes its baseline after the
+def test_o22_a_memory_kill_under_a_harness_step_is_never_put_on_the_agents_first_cell(world):
+    """O22: the memory counters a harness step raised are its own: the agent's first cell takes its baseline after the
     step, so a kill the step met is not a kill of that cell (O17)."""
     sbx = start(world, "isolated")
     agent = world.host.containers[sbx.names.agent]
     events = next(path for path in world.host.files if agent.id in path and path.endswith("/memory.events"))
-    sbx.exec("print(1)", 30)  # an agent's cell: its counters are the next cell's baseline
 
     def killed_under_the_step(container, argv, stdin):
         world.host.files[events] = "low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\n"
@@ -140,10 +147,82 @@ def test_o22_a_kill_under_a_harness_step_is_never_put_on_the_agents_next_cell(wo
     world.host.exec_handler = killed_under_the_step
     sbx.exec("check()", 30, record=False)
     world.host.exec_handler = lambda container, argv, stdin: CmdResult(0, "", "")
-    cell = sbx.exec("print(2)", 30)
+    cell = sbx.exec("print(1)", 30)
     assert (cell.kill, cell.timed_out) == (None, False)
     assert "cell_kills" not in sbx.metadata()
     sbx.stop()
+
+
+def test_o22_a_host_kill_under_a_harness_step_is_the_steps_never_the_agents_first_cell(world):
+    """O22: a kill by the host's out-of-memory killer of a process of the step is read once the step ends and recorded
+    on the step; the agent's first cell, which the killer never touched, is no kill of the host's."""
+    sbx = start(world, "isolated")
+    agent = world.host.containers[sbx.names.agent]
+    victim = agent.pid + 100  # a process of the step's, in the agent's container
+
+    def killed_by_the_host(container, argv, stdin):
+        world.host.add_cgroup(agent, [agent.pid, victim])
+        sbx._cells.sample_pids()  # what the sampler's thread sees while the step runs
+        world.host.journal = (
+            f'{time.time():.3f} h earlyoom[1]: sending SIGTERM to process {victim} uid {world.s.agent_uid} "python": '
+            "oom_score 1, oom_score_adj 2, VmRSS 3 MiB\n"
+        )
+        return CmdResult(143, "", "")
+
+    world.host.exec_handler = killed_by_the_host
+    sbx.exec("check()", 30, record=False)
+    world.host.add_cgroup(agent, [agent.pid])  # the step's process is gone
+    world.host.exec_handler = lambda container, argv, stdin: CmdResult(0, "", "")
+    cell = sbx.exec("print(1)", 30)
+    assert (cell.kill, cell.timed_out) == (None, False)
+    assert "cell_kills" not in sbx.metadata()
+    [step] = sbx.metadata()["harness_steps"]
+    assert [kill["pid"] for kill in step["earlyoom_kills"]] == [victim]
+    sbx.stop()
+
+
+def test_o22_a_mark_is_refused_once_the_agents_first_cell_has_begun_and_while_a_step_runs(world, monkeypatch):
+    """O22: a cell of the agent's has begun when its `exec` is entered, not when it ends: a mark during the agent's
+    first cell would set that cell's reads apart, while the count reads as known, so it is refused. So is a mark while
+    a harness step still runs, whose later requests would count as the agent's."""
+    sbx = start(world)
+    the_gate_marks(world, sbx, monkeypatch)
+    refused = []
+
+    def marks_meanwhile(container, argv, stdin):
+        try:
+            sbx.mark_run_start()
+        except SandboxError as error:
+            refused.append((stdin, str(error)))
+        return CmdResult(0, "", "")
+
+    world.host.exec_handler = marks_meanwhile
+    sbx.exec("check()", 30, record=False)
+    sbx.exec("print(1)", 30)
+    assert [stdin for stdin, _ in refused] == ["check()", "print(1)"]
+    assert "run_start" not in sbx.metadata()
+    assert not [c for c in world.host.calls if c[0] == "signalled"]
+    sbx.stop()
+
+
+def test_o22_a_harness_step_is_refused_once_the_run_has_started(world, monkeypatch):
+    """O22: a harness step runs before the agent's run only. After the mark its requests would count as the agent's,
+    so a read log naming a file only the harness read would check out as served; after one of the agent's cells has
+    begun, it would take that cell's refusals and kills. Both are refused, and nothing runs."""
+    marked, begun = start(world), start(world)
+    the_gate_marks(world, marked, monkeypatch)
+    ran = []
+    world.host.exec_handler = lambda container, argv, stdin: (ran.append(stdin), CmdResult(0, "", ""))[1]
+    marked.mark_run_start()
+    with pytest.raises(SandboxError, match="before the agent's run"):
+        marked.exec("check()", 30, record=False)
+    marked.stop()
+    begun.exec("print(1)", 30)
+    with pytest.raises(SandboxError, match="before the agent's run"):
+        begun.exec("check()", 30, record=False)
+    assert ran == ["print(1)"]
+    assert "harness_steps" not in begun.metadata()
+    begun.stop()
 
 
 def test_o22_answers_before_the_mark_are_counted_apart_and_never_in_the_runs_tables():
