@@ -240,8 +240,10 @@ class AttemptSpend:
 
     async def after_reply(self, input_tokens: int | None, output_tokens: int | None) -> None:
         """Record a reply past the reply maximum of a model held to it (C27), and a reply that left a count out, which
-        takes every later request of the attempt through a top-up."""
-        if output_tokens is not None and output_tokens > self.maximum and self.reserved_capped:
+        takes every later request of the attempt through a top-up. A reply past the maximum counts whether this run was
+        reserved by it or by the window: while the campaign holds the model to it, the reply is evidence against every
+        other run of the model."""
+        if output_tokens is not None and output_tokens > self.maximum:
             await asyncio.to_thread(self._past_maximum, output_tokens)
         if input_tokens is not None and output_tokens is not None:
             return
@@ -266,6 +268,8 @@ class AttemptSpend:
             await asyncio.to_thread(self._check_if_unheld)
 
     def _past_maximum(self, output_tokens: int) -> None:
+        if not (self.reserved_capped or self.ledger.reply_capped(self.model)):
+            return  # neither this run nor the campaign holds the model to the maximum: the window covers the reply
         self.ledger.reply_over(self.run_key, self.model, output_tokens)  # each is an event; the first marks the model
 
     def _check_if_unheld(self) -> None:

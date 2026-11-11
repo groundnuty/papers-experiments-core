@@ -456,3 +456,20 @@ def test_c27_a_billed_reply_past_the_maximum_that_cannot_be_read_marks_the_model
     [record] = records
     assert record.totals["usage_incomplete"] is True
     assert replay_record(record).to_json() == record.to_json()
+
+
+def test_c27_a_reply_past_the_maximum_of_a_run_reserved_by_the_window_still_takes_a_held_model_off_it(tmp_path):
+    """C27: the run was reserved by the window, but its model is held to the reply maximum in the campaign. Its reply
+    past the maximum is evidence against every other run of the model, so it takes the model off the maximum too."""
+    store, _, manifest = planned_store(tmp_path, models=(MODEL,))
+    key = manifest.rows[0].key.text
+    begun = store.begin_attempt(key, NOW, 4321, str(tmp_path / "attempt"))
+    gate = gate_for(store)
+    ledger = Ledger(gate, store, lambda: NOW, (threading.Lock(),), lambda: [MODEL])
+    guard = AttemptSpend(ledger, begun.id, key, MODEL, reserved_capped=False)
+    asyncio.run(guard.after_reply(1_000, 4_096))  # within the maximum: nothing
+    assert "reply_over_maximum" not in event_kinds(store)
+    asyncio.run(guard.after_reply(1_000, 5_000))
+    assert "reply_over_maximum" in event_kinds(store)
+    assert MODEL in unheld(store)
+    assert gate.assess([], NOW).reserve_usd[MODEL] == pytest.approx(UNHELD)
