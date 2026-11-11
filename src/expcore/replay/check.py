@@ -27,9 +27,12 @@ at `load`.
 Side files (`replay.side_files`): a study may declare files its runs write beside each record, each named by its SHA-256
 in that record. Every file of a declared name in the batch is a hashed-only input, found by the patterns the
 declaration adds to `hashed_only_patterns`, and is paired with the one record in its directory; what does not pair
-fails the check at stage `side_file`, against the record, or against the side file when no record lies beside it. The
+fails the check at stage `side_file`, against the record, or against the side file when no record lies beside it. A
+side file larger than the cap the analysis reads (`side_files.MAX_SIDE_FILE_BYTES`) fails there too, against itself. The
 check records the declaration (`side_files`), only when there is one, so a batch of a study that declares none is
 checked exactly as before. `require_current_check` refuses a check made under another declaration than the caller's.
+The check scores nothing: scores are derived by the analysis (`expcore.records.rescore`). Every hashed-only input is
+hashed in chunks, never read into memory whole.
 
 The code identity is the one `expcore.provenance.codestamp.version` returns for the code the check covers. The analysis
 accepts a batch only while `require_current_check` finds that its check passed, that no input was added, removed or
@@ -69,11 +72,12 @@ from expcore.provenance.environment import differences
 from expcore.records.record import RunRecord, decode
 from expcore.records.redact import Redactor, redact_text
 from expcore.records.schema import SCHEMA_PREFIX, SCHEMAS, RecordError, SchemaVersion
+from expcore.replay import side_files as side_module
 from expcore.replay.divergence import ReplayDivergence
 from expcore.replay.native import has_native_parser
 from expcore.replay.replay import replay_record
 from expcore.replay.side_files import STAGE as SIDE_FILE_STAGE
-from expcore.replay.side_files import SideFile, declared, is_side_file, pair
+from expcore.replay.side_files import SideFile, declared, is_side_file, pair, too_large
 from expcore.replay.side_files import patterns as side_file_patterns
 
 CHECK_SCHEMA = "replay-check/1"
@@ -226,10 +230,16 @@ def inputs_sha256(hashes: Mapping[str, str]) -> str:
     return hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def file_sha256(path: Path) -> str:
+    """The SHA-256 of a file, read in chunks, so a large hashed-only file is never held in memory whole."""
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
 def input_hashes(batch: Path, hashed_only: Sequence[str] = ()) -> dict[str, str]:
     """Return the SHA-256 of every input of a batch, by relative path."""
     records, hashed = input_files(batch, hashed_only)
-    return {rel: hashlib.sha256((batch / rel).read_bytes()).hexdigest() for rel in [*records, *hashed]}
+    return {rel: file_sha256(batch / rel) for rel in [*records, *hashed]}
 
 
 def _redacted(text: str) -> str:
@@ -342,11 +352,16 @@ def verify_batch(
                 failures.append({"file": rel, "stage": "decision", "hook": hook.name, "error": _error(exc)})
     _refuse_hashed_records(root, hashed)
     for rel in hashed:
-        hashes[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
+        hashes[rel] = file_sha256(root / rel)
     if side_files:
         side = {rel: hashes[rel] for rel in hashed if is_side_file(rel, side_files)}
         failures += [
             {"file": file, "stage": SIDE_FILE_STAGE, "error": error} for file, error in pair(stored, side, side_files)
+        ]
+        failures += [  # the analysis would refuse it, so the check does not pass it
+            {"file": rel, "stage": SIDE_FILE_STAGE, "error": too_large()}
+            for rel in side
+            if (root / rel).stat().st_size > side_module.MAX_SIDE_FILE_BYTES
         ]
     failed_files = {f["file"] for f in failures}  # an orphan side file fails against its own path, not a record's
     check = {

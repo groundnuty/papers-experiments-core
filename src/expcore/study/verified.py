@@ -12,15 +12,20 @@ that the check holds:
   and agrees with it on the run key, the attempt, the outcome and the treatment flag;
 - every file of a name the study declares (`replay.side_files`) is found in the batch again, and one the check did not
   list is refused, so a side file added after `require_current_check` compared the batch is never passed over; each
-  the check listed is read once, compared with the check's hash, and paired again with the hash the record beside it
-  names, so a check file edited to vouch for a side file its record does not name is refused all the same.
+  the check listed is read once, within the cap (`side_files.read_side_file`), compared with the check's hash, and
+  paired again with the hash the record beside it names, so a check file edited to vouch for a side file its record
+  does not name is refused all the same.
 
 Any mismatch is refused, naming it. With `partial`, an attempt that no replayed record covers is left out of the
 analysis instead, and the report says so, and attempts still running at the check are tolerated.
+
+The side files' bytes so read are kept with the records (`VerifiedBatch.side_files_for`): they are what a scorer that
+takes `side_files` is handed, so it reads exactly the bytes verified here, and never opens a path. Every side file of
+the batch is held in memory for the analysis, as every record is.
 """
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +35,7 @@ from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, StoreSnapsho
 from expcore.records.record import RunRecord, decode, record_filename
 from expcore.records.schema import RecordError
 from expcore.replay.check import input_files
-from expcore.replay.side_files import SideFile, is_side_file, pair
+from expcore.replay.side_files import SideFile, SideFileTooLarge, beside, is_side_file, pair, read_side_file
 from expcore.replay.side_files import patterns as side_file_patterns
 
 UNCOVERED = "no replayed record covers its final attempt"  # why a partial analysis leaves a run out
@@ -42,16 +47,24 @@ class Unverified(RuntimeError):
 
 @dataclass(frozen=True)
 class VerifiedBatch:
-    """What the analysis may use: the snapshot of the store, the records by path, and what is left out and why."""
+    """What the analysis may use: the snapshot of the store, the records by path, the side files of each record, and
+    what is left out and why."""
 
     snapshot: StoreSnapshot
     records: Mapping[str, RunRecord]  # by path relative to the batch, parsed from the bytes the check hashed
     running_at_check: int = 0  # attempts the snapshot holds as still running
     excluded: tuple[str, ...] = field(default_factory=tuple)  # run keys whose final attempt no replayed record covers
+    # by record path, each side file beside it by declared pattern: the bytes read once and verified
+    side_files: Mapping[str, Mapping[str, bytes]] = field(default_factory=dict)
 
     def record_for(self, digest: str, try_name: str, run_key: str, attempt: int) -> RunRecord | None:
         """The verified record of an attempt, or None when no replayed record is there."""
         return self.records.get(record_path(digest, try_name, run_key, attempt))
+
+    def side_files_for(self, digest: str, try_name: str, run_key: str, attempt: int) -> Mapping[str, bytes]:
+        """The verified side files of an attempt's record by declared pattern; empty when it has none, or the study
+        declares none."""
+        return self.side_files.get(record_path(digest, try_name, run_key, attempt), {})
 
 
 def record_path(digest: str, try_name: str, run_key: str, attempt: int) -> str:
@@ -59,10 +72,12 @@ def record_path(digest: str, try_name: str, run_key: str, attempt: int) -> str:
     return f"{digest}/{try_name}/{record_filename(run_key, attempt)}"
 
 
-def _read_verified(batch: Path, rel: str, expected: str) -> bytes:
-    """Read a file once and return its bytes if they are the ones the check hashed."""
+def _read_verified(batch: Path, rel: str, expected: str, read: Callable[[Path], bytes] = Path.read_bytes) -> bytes:
+    """Read a file once, with `read`, and return its bytes if they are the ones the check hashed."""
     try:
-        raw = (batch / rel).read_bytes()
+        raw = read(batch / rel)
+    except SideFileTooLarge as error:
+        raise Unverified(f"{rel}: {error}") from None
     except OSError as error:
         raise Unverified(f"{rel}: cannot be read ({type(error).__name__}) although the replay check lists it") from None
     if hashlib.sha256(raw).hexdigest() != expected:
@@ -127,9 +142,10 @@ def _agree(row: Any, record: RunRecord, rel: str) -> None:
 
 def _pair_side_files(
     batch: Path, check: Mapping[str, Any], raws: Mapping[str, bytes], side_files: Sequence[SideFile]
-) -> None:
+) -> dict[str, dict[str, bytes]]:
     """Find every file of a declared name in the batch again, refuse one the check did not list, then read each the
-    check hashed once, against the check's hash, and pair it with its record."""
+    check hashed once, within the cap, against the check's hash, and pair it with its record; return the bytes so
+    read of each record's side files, by record path and declared pattern."""
     listed = [rel for rel in check["hashed_only"] if is_side_file(rel, side_files)]
     present = input_files(batch, side_file_patterns(side_files))[1]  # the same walk the check made
     unlisted = sorted(set(present) - set(listed))
@@ -138,15 +154,13 @@ def _pair_side_files(
             f"{unlisted[0]}: a side file the replay check did not list, added after it; remove it, or make the check "
             "again with `python -m expcore check`"
         )
-    side = {}
-    for rel in listed:
-        if is_side_file(rel, side_files):
-            _read_verified(batch, rel, check["inputs"][rel])
-            side[rel] = check["inputs"][rel]
+    contents = {rel: _read_verified(batch, rel, check["inputs"][rel], read_side_file) for rel in listed}
+    side = {rel: check["inputs"][rel] for rel in listed}  # each the SHA-256 of the bytes in `contents`
     problems = pair({rel: decode(raw) for rel, raw in raws.items()}, side, side_files)
     if problems:
         rel, problem = problems[0]
         raise Unverified(f"{rel}: {problem}")
+    return beside(raws, contents, side_files)
 
 
 def load_verified(
@@ -162,14 +176,13 @@ def load_verified(
     `check` is the stored check that `require_current_check` accepted. Raises `Unverified` naming the first thing that
     does not agree. With `partial` an attempt that is still running, or whose final attempt has no replayed record, does
     not refuse; the second is left out and listed in `excluded`. Each of the declared `side_files` is read and paired
-    with its record again.
+    with its record again, and its bytes are kept for the scorers (`VerifiedBatch.side_files_for`).
     """
     replayed = _replayed_set(check)
     snapshot = _load_snapshot(batch, check, schema)
     raws = {rel: _read_verified(batch, rel, check["inputs"][rel]) for rel in sorted(replayed)}
     records = {rel: _parse(rel, raw) for rel, raw in raws.items()}
-    if side_files:
-        _pair_side_files(batch, check, raws, side_files)
+    held = _pair_side_files(batch, check, raws, side_files) if side_files else {}
     attempts = _attempts(snapshot)
     expected = {record_path(a["digest"], Path(a["run_dir"]).name, a["run_key"], a["attempt"]): a for a in attempts}
     running = sum(1 for a in attempts if a["state"] == "running")
@@ -192,4 +205,4 @@ def load_verified(
                     "no replayed record covers it; pass --partial to leave it out"
                 )
             excluded.append(row["run_key"])
-    return VerifiedBatch(snapshot, records, running, tuple(sorted(set(excluded))))
+    return VerifiedBatch(snapshot, records, running, tuple(sorted(set(excluded))), held)

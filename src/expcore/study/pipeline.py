@@ -25,9 +25,11 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   It then uses only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once
   and compared with the check's hash, cross-validated against each other, and each side file paired with its record
   again. It exports from the snapshot, scores the records in memory (a record is never written after its check, since
-  that would change its hash) and runs the preregistered analysis. Every score is derived anew from a record on each
-  call and none is read back: `scores.json` is an output, so `analyze` is how a study is re-scored (R13), offline,
-  after a change to a scorer and a new check (a scorer is code the identity covers).
+  that would change its hash) and runs the preregistered analysis. A scorer that takes `side_files` is handed the
+  record's side files as the bytes `load_verified` read and verified, all of them before the plugin is loaded, so
+  no scorer runs on a batch that does not verify. Every score is derived anew from a record on each call and none is
+  read back: `scores.json` is an output, so `analyze` is how a study is re-scored (R13), offline, after a change to a
+  scorer and a new check (a scorer is code the identity covers).
 - `output_bytes` is the one place the bytes of `export.json`, `scores.json`, `analysis.json` and `report.md` are made;
   `write_analysis` and `write_report` write them and `regenerate` compares them with the files in `out/`, which is
   what a replication package's `make check` runs. Every time in them comes from the records and the store, every
@@ -418,10 +420,11 @@ def _analyse_loaded(
         verified.snapshot.close()
     rows, scores = [], {}
     for entry in export["analysed_attempts"]:
-        record = verified.record_for(entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
+        where = (entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
+        record = verified.record_for(*where)
         if record is None:  # load_verified guarantees one for every attempt it did not exclude
             raise Refused(f"no verified record for {entry['run_key']}")
-        scored = rescore(record, plugin.scorers)
+        scored = rescore(record, plugin.scorers, side_files=verified.side_files_for(*where))
         scores[entry["run_key"]] = scored.scores
         task = study.tasks[str(entry["factors"]["task"])]
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))

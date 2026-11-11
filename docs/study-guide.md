@@ -330,7 +330,7 @@ assert check["code"]["dirty"] is False and "campaign-snapshot.sqlite" in check["
 
 ### Files an agent writes
 
-A file the agent writes during a run (a report, a mask, a table) has no place in the batch unless the study declares it as a side file ([below](#side-files)). Undeclared, the check takes every `.json` file under `out/runs` as a record, so a `.json` file beside a record fails the check at `load` (`unsupported record schema None`); a file of any other kind is not among the check's inputs, so nothing vouches for it; and `analyze` reads the records alone. The scorer is a pure function of the record, so what it needs of such a file must be in the record.
+A file the agent writes during a run (a report, a mask, a table) has no place in the batch unless the study declares it as a side file ([below](#side-files)). Undeclared, the check takes every `.json` file under `out/runs` as a record, so a `.json` file beside a record fails the check at `load` (`unsupported record schema None`); a file of any other kind is not among the check's inputs, so nothing vouches for it; and `analyze` reads the records alone. The scorer is a pure function of the record and of its declared side files, so what it needs of an undeclared file must be in the record.
 
 The supported way is an instrument, as the example's `FactsServed` is. The executor makes it with access to where the agent's files land; its `finish` reads them after the loop and returns what the scorer needs as its snapshot, a JSON object: the fields or counts the scorer reads, `None` with the failure beside it for a file that is missing or cannot be parsed, and the file's SHA-256 if a reader should be able to match the snapshot to the original bytes. The snapshot is in `record.instruments[namespace]`, so it is replayed and hashed with the record and travels into the package with it. The original bytes do not: keep the files outside `out/runs`, and out of the package unless `package.toml` attests each one (the package's checks refuse a file they cannot read, binary for one).
 
@@ -340,7 +340,9 @@ A run can write a file beside its record that the analysis reads, a compressed l
 
 `check` then hashes every file of a declared name in the batch into its inputs, never replays one, and pairs each with the one record in its directory: the attempt directory, which holds one record. It refuses, naming the file, a record that names a side file by its hash with no such file beside it, a side file whose bytes do not have the hash its own record names (two side files swapped included), a side file in a directory with no record, left from an earlier campaign or attempt, a side file beside a record that names no hash for it, and a hash that is not 64 lower-case hexadecimal digits. A record with neither the hash nor the file is fine: that run made no side file. The side files are looked for in the batch the check parses, wherever `--study` puts the study. The check records the declaration under `side_files`, and `analyze` and `report` refuse a check made under another, refuse a side file changed, removed or added since the check, and pair each side file with its record again. The declaration is in `study.toml`, whose hash is in the campaign fingerprint, so a campaign resumed under another declaration is refused.
 
-An attempt killed between writing its side file and writing its record leaves a side file with no record, which `check` refuses until you remove it. A scorer still reads only the record: a measure computed from a side file's content is your code reading that file, which the analysis does not hand over as verified bytes.
+An attempt killed between writing its side file and writing its record leaves a side file with no record, which `check` refuses until you remove it.
+
+A side file may hold at most 64 MiB (`expcore.replay.side_files.MAX_SIDE_FILE_BYTES`), since the analysis reads each one whole into memory to hand it to the scorers ([section 5](#5-score-and-analyse)). `check` fails a larger one at stage `side_file`, and `analyze` refuses one that grew past the cap after the check, having read no more than one byte beyond it. Keep a larger log compressed, or split it into side files of their own names.
 
 ## 5. Score and analyse
 
@@ -349,9 +351,9 @@ uv run python -m expcore analyze my-study
 uv run python -m expcore report my-study
 ```
 
-`analyze` scores every record anew, from the record alone, with the scorers the plugin returns, and writes `export.json`, `scores.json` and `analysis.json` under `my-study/out/`. Nothing reads an earlier score back, so `analyze` is also how a study is re-scored after a scorer changes: the scorer is code, so run `check` again first. `report` writes `report.md`: every contrast with its estimate, interval, equivalence margin and interval at 1 - 2 alpha (see section 6), raw and Holm-adjusted p-value and conclusion, the pairs it used and the pairs it is missing by cause, each condition's planned runs and how they ended, the infrastructure failures by condition (every condition, zeros included), the preregistration hash, the code identity, the core version and each scorer's version. `analysis.json` carries the same counts.
+`analyze` scores every record anew, from the record and its side files alone, with the scorers the plugin returns, and writes `export.json`, `scores.json` and `analysis.json` under `my-study/out/`. Nothing reads an earlier score back, so `analyze` is also how a study is re-scored after a scorer changes: the scorer is code, so run `check` again first. `report` writes `report.md`: every contrast with its estimate, interval, equivalence margin and interval at 1 - 2 alpha (see section 6), raw and Holm-adjusted p-value and conclusion, the pairs it used and the pairs it is missing by cause, each condition's planned runs and how they ended, the infrastructure failures by condition (every condition, zeros included), the preregistration hash, the code identity, the core version and each scorer's version. `analysis.json` carries the same counts.
 
-The infrastructure failure the example declares as treatment comes after the model's first turn, so it is an analysed attempt, marked as treatment with its kind, and it is scored as its condition's outcome. A scorer is a pure function of the record: no model, no platform, no clock. It returns named numeric outcomes, and an outcome it could not compute is `None`, never 0; a `not_determined` verdict leaves every outcome that depends on the unobserved state `None`.
+The infrastructure failure the example declares as treatment comes after the model's first turn, so it is an analysed attempt, marked as treatment with its kind, and it is scored as its condition's outcome. A scorer is a pure function of the record and of its side files: no model, no platform, no clock, no path. It returns named numeric outcomes, and an outcome it could not compute is `None`, never 0; a `not_determined` verdict leaves every outcome that depends on the unobserved state `None`.
 
 A treatment outcome is what the agent achieved under the manipulation, so a scorer returns values for a treatment attempt: the failure itself (the example's agent gave no answer, so its accuracy is 0) and what the agent did before it (its rounds and lookups). `None` stays reserved for what could not be measured, and it drops the run's pair from every contrast on that outcome: the attempt is scored as treatment and then leaves the comparison it was kept for. The analysis counts these drops per contrast. A confirmatory contrast (one in the Holm family) with any drop is refused, naming the contrast, the count and the fix, unless its preregistration says how treatment attempts enter it:
 
@@ -405,6 +407,30 @@ analysis = json.loads(Path("my-study/out/analysis.json").read_text())
 relay = next(c for c in analysis["contrasts"] if c["name"] == "relay-vs-baseline")
 assert relay["treatment_outcomes"] == "scored" and relay["pairs_missing"]["treatment_outcome_none"] == 0
 assert relay["n_pairs"] == 8  # both treatment attempts stay in their own contrast
+```
+
+A measure computed from a side file's content ([section 4](#side-files)) comes from a scorer that declares a `side_files` parameter. It is handed the record's side files by declared pattern, as the bytes the loader read once, hashed and paired with the hash the record names: `analyze`, `report`, `regenerate` and a package's `make check` take them from the bytes they verified against the check, and `rescore_files(directory, scorers, side_files=study.side_files)` reads them beside the record of an attempt directory. The scorer never sees a path, so what it reads is what was verified, and the same batch gives the same scores through each of them. A record with no side file, or a study that declares none, gives an empty mapping. A side file that no longer matches is refused before any scorer runs. A scorer that takes only the record is called as before:
+
+```python
+import gzip
+
+
+class LoggedRanges:
+    """A measure from a side file's content: the bytes the analysis verified, never a path."""
+
+    name = "ranges"
+    version = "1"
+
+    def score(self, record, side_files):
+        data = side_files.get("extent_ranges.json.gz")  # by the pattern study.toml declares
+        if data is None:  # this run made no side file
+            return {"verdict": "not_determined", "outcomes": {"ranges": None}}
+        return {"verdict": "fulfilled", "outcomes": {"ranges": float(len(json.loads(gzip.decompress(data))))}}
+
+
+scored = rescore(record, [LookupCount(), LoggedRanges()], side_files={})  # the example declares no side file
+assert scored.scores["ranges"]["result"]["outcomes"] == {"ranges": None}
+assert scored.scores["lookups"]["result"]["outcomes"] == {"lookups": 1.0}
 ```
 
 ### Which tool hash to compare
