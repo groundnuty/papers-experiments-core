@@ -381,24 +381,23 @@ def test_k03_the_run_finder_does_work_linear_in_its_input(text):
     assert sum(len(decoded) for _, decoded, _ in views.payloads(text)) <= given * 5 // 4
 
 
-def best_of_five(text: str) -> float:
-    """The fastest of five full passes of the run finder and the decoder over `text`: the least loaded measurement."""
-    times = []
-    for _ in range(5):
-        start = time.perf_counter()
-        for _ in views.payloads(text):
-            pass
-        times.append(time.perf_counter() - start)
-    return min(times)
+def one_pass(text: str) -> float:
+    """The time of one full pass of the run finder and the decoder over `text`."""
+    start = time.perf_counter()
+    for _ in views.payloads(text):
+        pass
+    return time.perf_counter() - start
 
 
 def test_k03_the_run_finder_scales_linearly_against_a_baseline_measured_in_the_same_run():
     """K03: what the finder yields can be bounded while what it builds is not, so its work is also timed against a
     baseline taken in the same process: the worst shape (every line its own width) at four times the size takes about
-    four times as long, never the sixteen a quadratic finder would. A ratio, not a time, so a loaded machine moves both
-    measurements together; each is the best of five passes."""
+    four times as long, never the sixteen a quadratic finder would. The two sizes are timed in turn, small then large,
+    five times over, and the median of the five pairs' ratios is judged: each pair is measured within a few seconds, so
+    a change of load during the test spoils at most the pair it falls in, and the median sets that pair aside."""
     small, large = staircase(2000), staircase(8000)
-    assert best_of_five(large) / best_of_five(small) < 10
+    ratios = sorted(one_pass(large) / one_pass(small) for _ in range(5))
+    assert ratios[2] < 10, ratios
 
 
 @pytest.mark.benchmark
