@@ -44,9 +44,9 @@ All configuration is TOML in the study directory, validated when the study is lo
 |---|---|
 | `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the factors, the conditions and the tasks |
 | `models.toml` | the single model table: each model once, with backend, API id, sampling, limits, price and status |
-| `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the budget |
+| `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the kinds it records its failures as ([below](#the-schedulers-kinds)), and the budget |
 | `preregistration.toml` | the named contrasts, the Holm family, alpha, the estimators, the bootstrap and the power settings |
-| `package.toml` | the inclusion list of the replication package ([section 7](#7-ship-a-replication-package)) |
+| `package.toml` | the inclusion list of the replication package ([section 8](#8-ship-a-replication-package)) |
 | `platform.toml` | a platform's own settings, read by the platform layer (`expcore_onedata`), not by the core |
 
 Secrets are never written in configuration: a model names the environment variable or file that holds its key. The hash of every configuration file goes into the campaign's fingerprint, so resuming a campaign after any of them changed is refused.
@@ -59,6 +59,46 @@ assert study.name == "tiny-study"
 assert sorted(study.config_sha256) == ["campaign.toml", "models.toml", "preregistration.toml", "study.toml"]
 statuses = {key: study.models.resolve(key).status for key in study.models}
 assert statuses == {"alpha-stub": "frozen", "beta-stub": "frozen"}  # only frozen settings may start a study run
+```
+
+### The scheduler's kinds
+
+Two keys of `[scheduler]` in `campaign.toml` name the infrastructure kinds the scheduler records its own failures as:
+
+| Key | Default | The kind of |
+|---|---|---|
+| `health_kind` | `sandbox` | a failed health check: one before a run closes the gate and is recorded as the outage's attempt, and one after a run turns an attempt that would have been scored into an infrastructure failure of this kind |
+| `identity_kind` | `endpoint` | a run whose model endpoint changed its served identity (the model it names or its fingerprint) while the run was going |
+
+Both defaults are kinds of the core, and `sandbox` is the one the Onedata layer's sandbox fails with. A platform of another kind that leaves `health_kind` alone has its outages recorded as failures of a sandbox it does not have: it registers a kind of its own ([section 10](#10-a-platform-of-your-own)) and names it here. Each key must name a kind known when the study is loaded: a core kind, one the modules of `[study] platforms` register, or one of `[study.kinds]` ([section 3](#treatment-kinds)). Any other is refused at load, naming `campaign.toml` and the key and listing the kinds known then. Neither may be a kind a condition declares as its treatment, since a run that the health check stopped, or that the wrong endpoint served, would then be scored as that condition's outcome; the scheduler refuses such a campaign when it starts. The example writes both out with their defaults:
+
+```toml
+# my-study/campaign.toml
+[scheduler]
+health_kind = "sandbox"
+identity_kind = "endpoint"
+```
+
+```python
+import shutil
+from pathlib import Path
+
+from expcore.campaign.settings import SchedulerConfig
+from expcore.config.loading import ConfigError
+
+assert (SchedulerConfig().health_kind, SchedulerConfig().identity_kind) == ("sandbox", "endpoint")
+assert study.campaign.scheduler.health_kind == "sandbox" and study.campaign.scheduler.identity_kind == "endpoint"
+
+misspelt = Path("misspelt-study")
+shutil.copytree("my-study", misspelt)
+toml = misspelt / "campaign.toml"
+toml.write_text(toml.read_text().replace('health_kind = "sandbox"', 'health_kind = "sandbxo"'))
+try:
+    load_study(misspelt)
+    raise AssertionError("a health_kind that is no known kind was accepted")
+except ConfigError as error:
+    assert "campaign.toml" in str(error) and "key 'health_kind'" in str(error) and "did you mean 'sandbox'" in str(error)
+shutil.rmtree(misspelt)
 ```
 
 ### The federation's certificate
@@ -160,7 +200,7 @@ except ConfigError as error:
 shutil.rmtree(tampered)
 ```
 
-A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run. A kind named nowhere is refused as unknown, and the error lists the treatable kinds.
+A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run. A kind named nowhere is refused as unknown, and the error lists the treatable kinds. The `health_kind` and `identity_kind` of `[scheduler]` are checked against the same vocabulary when the study is loaded ([section 2](#the-schedulers-kinds)).
 
 ```python
 from expcore.errors import infra_kinds
