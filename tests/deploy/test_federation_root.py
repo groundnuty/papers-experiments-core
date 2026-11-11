@@ -154,6 +154,32 @@ def test_up_refuses_a_root_that_holds_files_without_the_mark_and_down_deletes_no
     assert (root / "their-data.txt").read_text(encoding="utf-8") == "keep me"
 
 
+def test_a_federation_root_inside_another_is_refused_and_the_outer_one_is_not_emptied(
+    fed, minimal_layout, tmp_path, monkeypatch
+):
+    """Under the default parent the default root is the parent itself, so a second root below it would lie inside the
+    first federation's root, and the first one's down would delete it: up refuses either nesting, down the outer."""
+    parent = tmp_path / "parent"
+    outer = fed.layout.Layout(parent, parent)
+    inner = fed.layout.Layout(parent / "second", parent, fed.spec.load_spec(minimal_layout))
+    ran = no_docker(fed, monkeypatch)
+    fed.pki.private_directory(parent)
+    (parent / fed.layout.ROOT_MARKER).write_text("expcore-fed\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="inside another federation's root"):
+        fed.cli.prepare(inner)
+    assert not inner.root.exists()
+    inner.root.mkdir()
+    (inner.root / fed.layout.ROOT_MARKER).write_text("expcore-test\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="holds another federation's root"):
+        fed.cli.down(outer)
+    with pytest.raises(RuntimeError, match="or holds one"):
+        fed.cli.prepare(outer)
+    assert ran == []
+    assert (inner.root / fed.layout.ROOT_MARKER).is_file()
+    beside = fed.layout.Layout(tmp_path / "elsewhere" / "third", tmp_path / "elsewhere")
+    assert beside.outer_roots == beside.inner_roots == []
+
+
 def test_a_root_marked_for_another_project_is_neither_written_nor_emptied(fed, minimal_layout, tmp_path, monkeypatch):
     """The mark holds the declared project's name, so a layout given the root of another layout's federation refuses
     it, and down stops nothing: the containers it would stop are not that root's."""

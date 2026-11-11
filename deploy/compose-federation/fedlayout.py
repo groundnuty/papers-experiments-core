@@ -135,6 +135,20 @@ class Layout:
         return self.parent == Path(DEFAULT_ROOT)
 
     @property
+    def outer_roots(self) -> list[Path]:
+        """Other federations' roots this root lies in, from the parent down: their down would delete this one."""
+        above = (p for p in self.root.parents if p == self.parent or self.parent in p.parents)
+        return [p for p in above if os.path.isfile(p / ROOT_MARKER)]
+
+    @property
+    def inner_roots(self) -> list[Path]:
+        """Other federations' roots directly inside this root: this one's down would delete them."""
+        if not os.path.isdir(self.root):
+            return []
+        inside = (c for c in self.root.iterdir() if os.path.isdir(c) and not os.path.islink(c))
+        return [c for c in inside if os.path.isfile(c / ROOT_MARKER)]
+
+    @property
     def marker(self) -> Path:
         """The file that makes the root the federation's own: down's janitor deletes nothing in a root without it."""
         return self.root / ROOT_MARKER

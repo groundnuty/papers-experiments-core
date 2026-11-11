@@ -98,7 +98,9 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
   must be named and lie strictly below it, so a parent that holds other data is never itself the root. Every command
   checks this before it touches a file or a container, and `facts.json` and `status` record the parent and which
   setting gave it. Down deletes nothing in a root without the mark (`.expcore-fed-root`) naming the layout's project,
-  so a root belongs to one layout: give a second layout's federation a root of its own. The root holds:
+  so a root holds one federation at a time. Two federations at once need two roots beside each other below the
+  parent (under the default parent, neither may be the parent itself): up refuses a root inside another federation's
+  root or holding one, and down refuses to empty a root that holds one. The root holds:
 
   | Path | Holds |
   |---|---|

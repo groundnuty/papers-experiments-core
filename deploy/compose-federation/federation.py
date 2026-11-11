@@ -128,6 +128,11 @@ def prepare(layout: Layout) -> None:
     A root that holds anything without that mark is someone else's, or another layout's, and is refused: down would
     delete what it holds."""
     spec, owned = layout.spec, layout.owned
+    if layout.outer_roots or layout.inner_roots:
+        raise RuntimeError(
+            "the root lies inside another federation's root, or holds one; refused, since down empties a root whole: "
+            "give each federation a root beside the others"
+        )
     if layout.root.exists() and not owned and any(layout.root.iterdir()):
         raise RuntimeError(
             f"the root holds files and is not marked as this federation's ({ROOT_MARKER} naming {spec.project}); "
@@ -267,6 +272,8 @@ def down(layout: Layout) -> str:
         raise RuntimeError(
             f"the root is not marked as this federation's ({ROOT_MARKER} naming {project}); nothing stopped or deleted"
         )
+    if layout.inner_roots:
+        raise RuntimeError("the root holds another federation's root; nothing stopped or deleted")
     peaks = memory_usage(containers)
     had = bool(containers) or layout.root.exists()
     compose(layout, "down", "--remove-orphans", "--timeout", "120")

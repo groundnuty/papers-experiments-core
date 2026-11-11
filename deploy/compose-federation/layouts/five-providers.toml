@@ -3,7 +3,8 @@
 #   uv run python deploy/compose-federation/federation.py --layout deploy/compose-federation/layouts/five-providers.toml up
 #
 # Every name is invented. Its project, domain and ports differ from the default layout's, so the two never share a
-# container, a network or a port; give it its own root (EXPCORE_FED_ROOT), since a root's mark names one project.
+# container, a network or a port. A root holds one federation at a time, since its mark names one project: run it
+# after the default one is down, or beside it in a root of its own, never inside the other's root.
 # five-providers.compose.yaml beside it is what it generates.
 
 project = "expcore-fed5"
