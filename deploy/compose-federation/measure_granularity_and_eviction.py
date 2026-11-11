@@ -179,7 +179,8 @@ class Probe:
             show("removed", files=len(self.made))
 
 
-def main() -> None:
+def main(probe: type[Probe] = Probe) -> None:
+    """Run `probe` (this module's, or a sibling script's subclass of it) against the running federation."""
     layout = Layout.from_environment()
     rest = Rest(layout.ca_pem)
     try:
@@ -188,7 +189,7 @@ def main() -> None:
         for service in PROVIDERS:
             url = service.url + PROVIDER_API + "/configuration"
             boot.ids.providers[service.name] = rest.json("GET", url, label="configuration")["providerId"]
-        Probe(rest, boot).run()
+        probe(rest, boot).run()
     finally:
         rest.close()
 
