@@ -93,8 +93,9 @@ def make_federation(
     and that does not support it yet, and the three users, who can log in and read. Its jobs' times and its providers'
     `Date` headers come from `clock` (a `Ticker`'s `clock`, say), and so does the visibility delay: a new file shows on
     the provider it was not made on after `visibility_delay_s` seconds of it. `error_shape` is the data API's error
-    shape (`ERRORS_25_0`, or `ERRORS_LEGACY` for the 404 shape the core's own tests were written against). The platform
-    layer reads the admin credential from the environment variable `ADMIN_ENV`: a test sets it to `fake.admin_token`.
+    shape (`ERRORS_25_0`, or `ERRORS_LEGACY` for the older 404 shape, which no live version is known to give). The
+    platform layer reads the admin credential from the environment variable `ADMIN_ENV`: a test sets it to
+    `fake.admin_token`.
     """
     federation = FakeData(space_name=SPACE_NAME, error_shape=error_shape, visibility_delay_s=visibility_delay_s)
     if clock is not None:

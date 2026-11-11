@@ -146,15 +146,15 @@ def test_the_consent_is_the_variable_set_to_exactly_one():
     assert not mutation_allowed({})
 
 
-@pytest.mark.legacy_errors
 def test_read_only_enforcement_passes_when_every_write_is_refused(context, fake):
+    """O05: every provider refuses the read-only token's write as Onedata 25.0 does, 400 posix eacces: a refusal."""
     entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
     assert entry.ok is True
-    assert {row["status"] for row in entry.facts["providers"].values()} == {403}
+    rows = entry.facts["providers"].values()
+    assert {(row["status"], row["code"], row["errno"]) for row in rows} == {(400, "posix", "eacces")}
     assert not [c for c in fake.provider_calls if c[1] in ("PUT", "DELETE")]
 
 
-@pytest.mark.legacy_errors
 def test_read_only_enforcement_fails_when_a_write_is_accepted_and_the_write_is_removed(context, fake):
     fake.enforce_readonly = False
     entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
@@ -286,7 +286,6 @@ def test_o11_a_delete_that_fails_is_not_cleaned_and_says_why(context, fake):
     assert all(row["cleanup_reason"] for row in rows)
 
 
-@pytest.mark.legacy_errors
 def test_o11_cleaned_is_true_only_when_the_provider_answers_not_found_on_consecutive_reads(context, fake, ticker):
     """O11: after a DELETE the entry is read; two 404s in a row confirm it gone, within a bounded number of reads."""
     fake.enforce_readonly = False
@@ -309,7 +308,6 @@ def test_o11_the_reads_that_confirm_absence_are_bounded(context, fake, ticker):
     assert ticker.slept.count(ABSENCE_POLL_S) == (ABSENCE_POLLS - 1) * providers
 
 
-@pytest.mark.legacy_errors
 def test_o11_the_round_trip_places_confirms_reads_back_evicts_and_cleans_up(context, fake):
     """O11: the scratch file is placed by reads, confirmed, read back, evicted and removed, and removal is verified."""
     entry = by_name(run_checks(context(allow_mutation=True), ["round_trip"]))["round_trip"]
@@ -351,7 +349,6 @@ def test_o07_the_round_trip_waits_for_the_receiver_to_see_its_scratch_file(conte
     assert entry.facts["cleanup_verified"] is True
 
 
-@pytest.mark.legacy_errors
 def test_o11_a_round_trip_that_raises_still_tears_down_and_says_so(context, fake):
     """O11: a trip that fails after creating the scratch file still removes it, in a finally, and verifies it."""
     fake.onthefly_places = False  # the placement fails after the scratch file exists
@@ -362,7 +359,6 @@ def test_o11_a_round_trip_that_raises_still_tears_down_and_says_so(context, fake
     assert [n for n in fake.nodes.values() if n.name.startswith("day0-")] == []
 
 
-@pytest.mark.legacy_errors
 def test_o11_a_scratch_that_cannot_be_removed_fails_the_check_even_when_the_trip_worked(context, fake):
     """O11: clearing is verified; a scratch entry left behind fails the check whatever else passed."""
     fake.fail_deletes = True

@@ -31,11 +31,11 @@ def calls_for(fake, route_part):
     return [c for c in fake.provider_calls if route_part in c[2]]
 
 
-@pytest.mark.legacy_errors
 def test_o08_a_real_answer_is_one_request_and_a_failed_probe_with_no_value(client, seeded, ticker):
-    """O08: a 404 is an answer; it is not retried, and the probe is failed with the value None."""
+    """O08: a file that is not there (400 posix enoent on Onedata 25.0, a 404 before) is an answer; it is not retried,
+    and the probe is failed with the value None."""
     result = run_probe(lambda: client.get("/data/missing", provider="alpha"), sleep=ticker.sleep)
-    assert (result.ok, result.value, result.attempts, result.status) == (False, None, 1, 404)
+    assert (result.ok, result.value, result.attempts, result.status) == (False, None, 1, 400)
     assert len(calls_for(seeded, "/data/missing")) == 1
     assert ticker.slept == []
 
@@ -188,10 +188,10 @@ def test_o08_a_block_map_without_a_blocks_field_is_a_failed_probe_with_a_reason_
     assert snapshot["pairs"] is None
 
 
-@pytest.mark.legacy_errors
-def test_o08_resolving_a_tracked_file_does_not_retry_a_real_404_from_the_space_root(probes, seeded, ticker):
-    """O08: a 404 from the space root, then a 200 on a second request, is a failed probe. The provisioner's wait for a
-    new space root would have asked again after a pause and succeeded, inside one attempt."""
+def test_o08_resolving_a_tracked_file_does_not_retry_a_space_root_that_is_not_there_yet(probes, seeded, ticker):
+    """O08: "not there" from the space root (400 posix enoent on Onedata 25.0), then a 200 on a second request, is a
+    failed probe. The provisioner's wait for a new space root would have asked again after a pause and succeeded,
+    inside one attempt."""
     seeded.root_enoent_polls = 1
     probes.start({})
     assert len(calls_for(seeded, "/spaces/")) == 1
@@ -199,7 +199,7 @@ def test_o08_resolving_a_tracked_file_does_not_retry_a_real_404_from_the_space_r
     snapshot = probes.finish()
     before = snapshot["files"]["data"]["providers"]["alpha"]["before"]
     assert before["probe_ok"] is False
-    assert before["status"] == 404
+    assert before["status"] == 400
     assert snapshot["ok"] is False
     assert snapshot["files"]["data"]["providers"]["alpha"]["after"]["probe_ok"] is True  # the next reading is its own
 

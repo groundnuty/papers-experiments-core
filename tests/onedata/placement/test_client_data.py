@@ -138,7 +138,6 @@ def test_o09_a_file_target_needs_a_provider_to_ask(config, seeded, client):
     assert seeded.provider_calls == []
 
 
-@pytest.mark.legacy_errors
 def test_the_file_a_provider_does_not_know_resolves_to_no_space(config, seeded, client):
     with pytest.raises(OutOfScope, match="unknown to its provider"):
         client.mutate("DELETE", "/data/nosuchfile", provider="alpha")
@@ -419,7 +418,6 @@ def test_o09_the_walk_is_the_gates_own_with_the_admin_credential_even_for_a_writ
     assert [token for kind, token in sent if kind == "POST"] == ["a-data-path-token"]
 
 
-@pytest.mark.legacy_errors
 def test_o09_every_mutation_by_file_id_reads_its_spaces_name_again_right_before_it_is_sent(config, seeded, client):
     """O09: the walk is kept, but the space's name is read for every mutation of a file, just before it."""
     file_id = seeded.id_of(PATH)
@@ -428,7 +426,6 @@ def test_o09_every_mutation_by_file_id_reads_its_spaces_name_again_right_before_
     assert gate_reads(seeded) == ["root", "parent", "parent", "name", "PUT", "name", "PUT", "name", "PUT"]
 
 
-@pytest.mark.legacy_errors
 def test_o09_a_space_renamed_out_of_scope_between_two_mutations_by_file_id_refuses_the_second(config, seeded, client):
     """O09: the name that authorised one write authorises nothing later. Onezone names the file's space otherwise
     for the second write, which is refused and not sent."""
@@ -511,7 +508,6 @@ def test_the_range_header_is_sent_to_the_named_provider_with_the_admin_credentia
     assert content.headers["X-Auth-Token"]
 
 
-@pytest.mark.legacy_errors
 def test_mutate_sends_query_parameters_and_a_raw_body(config, seeded, client):
     file_id = seeded.id_of(PATH)
     client.mutate("PUT", f"/data/{file_id}/content", provider="alpha", params={"offset": 7}, content=b"\x00\x01")

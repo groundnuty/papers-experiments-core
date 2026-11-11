@@ -8,8 +8,6 @@ from expcore_onedata.rangemap import Placement, load_placement
 from expcore_onedata.testing import (
     ADMIN_ENV,
     DATA,
-    ERRORS_25_0,
-    ERRORS_LEGACY,
     FakeData,
     Ticker,
     make_federation,
@@ -18,17 +16,14 @@ from expcore_onedata.testing import (
 
 
 @pytest.fixture
-def fake(monkeypatch, ticker, request) -> FakeData:
+def fake(monkeypatch, ticker) -> FakeData:
     """A federation with the study space, the data provider `alpha`, a second provider `beta`, and the three users.
 
     Its clock is the test's ticker, so its jobs' times and its providers' Date headers agree with the probes' clock
-    unless a test skews a provider. It answers errors in Onedata 25.0's shape, except for a test marked `legacy_errors`,
-    which gets the older 404 shape. The platform layer has three gaps against 25.0 until the core is fixed: it reads
-    only a 404 as an entry that is gone (25.0 answers 400 `posix`/`enoent`), it uploads without a Content-Type (25.0
-    answers 415), and it counts only a 401 or 403 as a refused write (25.0 answers 400 `posix`/`eacces`). Remove the
-    mark from a test when it passes without it."""
-    shape = ERRORS_LEGACY if request.node.get_closest_marker("legacy_errors") else ERRORS_25_0
-    federation = make_federation(clock=ticker.clock, error_shape=shape)
+    unless a test skews a provider. It answers errors in Onedata 25.0's shape, the fake's default, which the platform
+    layer reads: 400 `posix`/`enoent` as gone, 400 `posix`/`eacces` as a refused write, and every upload marked
+    `application/octet-stream`. A test that needs another answer sets it on the fake."""
+    federation = make_federation(clock=ticker.clock)
     monkeypatch.setenv(ADMIN_ENV, federation.admin_token)
     return federation
 
