@@ -123,7 +123,7 @@ def test_o22_the_bytes_served_add_up_each_answer_by_what_its_body_was():
         "listings_total": 1,
         "listings_cut": False,
         "caps": DEFAULT_CAPS,
-        "before_run_start": None,  # no mark of the run's start: nothing is counted apart (O22)
+        "before_run_start": None,  # no mark of the run's start: nothing is counted apart (O24)
         "unknown": [],
     }
 

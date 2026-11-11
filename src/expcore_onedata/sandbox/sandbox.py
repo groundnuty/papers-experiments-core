@@ -125,7 +125,7 @@ class DockerSandbox:
         self._mounts: list[Path] = []
         self._mount_log: list[dict[str, Any]] = []  # what the record file holds: each mount's path and identity
         self._refusals_seen = 0  # the data gate's refusals already handed back with a cell
-        self._phase = threading.Lock()  # orders the agent's first cell, the harness's steps and the mark (O22)
+        self._phase = threading.Lock()  # orders the agent's first cell, the harness's steps and the mark (O24)
         self._agent_began = False  # an agent's cell has been entered: no harness step or mark from then on
         self._steps_running = 0  # harness steps under way: no mark meanwhile
         self._containers: list[str] = []
@@ -678,7 +678,7 @@ class DockerSandbox:
         """Run Python source as the unprivileged user (see `CellRunner.run`), with the data gate's refusals that came
         while it ran (`gate_refusals`).
 
-        `record=False` makes it a step of the harness's own, a check before the agent's loop starts (O22), and it runs
+        `record=False` makes it a step of the harness's own, a check before the agent's loop starts (O24), and it runs
         only before the agent's run: it is refused once the run's start is marked or one of the agent's cells has begun,
         since after the mark its requests would count as the agent's, and between cells it would take a cell's refusals
         and kills. It runs the same way, as the agent's user in the agent's container, and is no cell of the agent's: it
@@ -701,7 +701,7 @@ class DockerSandbox:
         return res
 
     def _enter(self, record: bool) -> None:
-        """Say whose the code about to run is (O22): an agent's cell has begun once its `exec` is entered, and a harness
+        """Say whose the code about to run is (O24): an agent's cell has begun once its `exec` is entered, and a harness
         step runs only before that and before the mark. Both wait while a mark is being set."""
         with self._phase:
             if record:
@@ -723,7 +723,7 @@ class DockerSandbox:
         return new
 
     def _record_step(self, res: ExecResult) -> None:
-        """A harness step's record (O22), with the host killer's kills it met, read now so no cell of the agent's takes
+        """A harness step's record (O24), with the host killer's kills it met, read now so no cell of the agent's takes
         them (None when its journal could not be read)."""
         steps = self._meta.setdefault("harness_steps", [])
         steps.append(
@@ -739,7 +739,7 @@ class DockerSandbox:
         )
 
     def mark_run_start(self) -> dict[str, Any]:
-        """Mark where the agent's run begins (O22): the executor calls this once, after its own steps (`exec(...,
+        """Mark where the agent's run begins (O24): the executor calls this once, after its own steps (`exec(...,
         record=False)`) have returned and before the agent's loop starts. A REST data path's gate is signalled (SIGUSR1)
         and writes the mark in its own log, naming each request it had begun and not yet logged; the mark is read back
         before this returns, and an agent's cell entered meanwhile waits until it has, so no request of the agent's can
@@ -788,7 +788,7 @@ class DockerSandbox:
         through. The tables of the files and directories served follow the counts: None when they are unknown, empty
         when they are zero. Every answer records the caps of the tables, `[sandbox.served_bytes]`. Unknown is never
         zero. `run_start_marked` says whether `mark_run_start` was called: with it, a REST count holds only the answers
-        after the mark, and those before it are `before_run_start` (O22)."""
+        after the mark, and those before it are `before_run_start` (O24)."""
         path = {
             "data_path": self.spec.mode.value,
             "listing": self._meta.get("listing"),

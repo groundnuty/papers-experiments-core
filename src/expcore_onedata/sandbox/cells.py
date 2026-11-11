@@ -131,7 +131,7 @@ class CellRunner:
         return found
 
     def step_earlyoom(self) -> list[dict] | None:
-        """After a harness step (O22): the host killer's kills of this run since the last cell or step, which are the
+        """After a harness step (O24): the host killer's kills of this run since the last cell or step, which are the
         step's, moved past so that the agent's next cell never takes them. None when its journal could not be read."""
         try:
             found = self.earlyoom_scan()

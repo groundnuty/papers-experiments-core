@@ -427,8 +427,8 @@ def test_o22_the_bytes_served_are_what_the_client_received_in_either_listing_mod
     }
 
 
-def test_o22_through_a_real_gate_the_count_takes_only_the_answers_after_its_run_start_mark(served):
-    """O22: the harness's lookup is answered and the gate marks the run's start at once, whether or not the lookup's
+def test_o24_through_a_real_gate_the_count_takes_only_the_answers_after_its_run_start_mark(served):
+    """O24: the harness's lookup is answered and the gate marks the run's start at once, whether or not the lookup's
     line is written yet: the mark names it when it is not. The count of the log then holds the agent's answers alone,
     the lookup's apart, and only the agent's file has a row."""
     data = bytes(range(256)) * 4
