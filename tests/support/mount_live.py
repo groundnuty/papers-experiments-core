@@ -14,8 +14,9 @@ Every name here is invented or public: the image names are the published ones.
 """
 
 import hashlib
+import time
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -107,9 +108,9 @@ def derive_platform(source: Path, out_dir: Path, sandbox: Mapping[str, Any]) -> 
 class SpaceFiles:
     """Files in the study space, written through one provider's REST API as the admin; every one is deleted again."""
 
-    def __init__(self, config: PlatformConfig) -> None:
+    def __init__(self, config: PlatformConfig, *, transport: httpx.BaseTransport | None = None) -> None:
         self._config = config
-        self._http = httpx.Client(timeout=300, verify=config.tls.client_verify())
+        self._http = httpx.Client(timeout=300, verify=config.tls.client_verify(), transport=transport)
         self._headers = {AUTH_HEADER: config.admin.read()}
         self.created: list[tuple[str, str]] = []  # (provider, file id), oldest first
 
@@ -144,13 +145,30 @@ class SpaceFiles:
         url = self._config.providers[provider].url + API_PROVIDER + f"/data/{file_id}/content"
         self._ok(self._http.put(url, headers=headers, params={"offset": offset}, content=data), "a write")
 
-    def remove_all(self) -> list[str]:
-        """Delete every created entry, newest first, through the provider that made it; what failed, by position."""
+    def remove_all(
+        self,
+        *,
+        window_s: float = 60.0,
+        poll_s: float = 5.0,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> list[str]:
+        """Delete every created entry, newest first, through the provider that made it, and show each gone (O11).
+
+        A delete is sent again until the provider answers that the entry is gone (204 or 404) and a read of it answers
+        404, for at most `window_s`: a directory whose files were made through another provider may be refused until
+        their deletion reaches it. What is never shown gone is returned, by position."""
         failed = []
         for position, (provider, file_id) in reversed(list(enumerate(self.created))):
-            answer = self._call("DELETE", provider, f"/data/{file_id}")
-            if answer.status_code not in (204, 404):
-                failed.append(f"entry {position}: the delete answered {answer.status_code}")
+            deadline = clock() + window_s
+            while True:
+                status = self._call("DELETE", provider, f"/data/{file_id}").status_code
+                gone = status in (204, 404) and self._call("GET", provider, f"/data/{file_id}").status_code == 404
+                if gone or clock() >= deadline:
+                    break
+                sleep(poll_s)
+            if not gone:
+                failed.append(f"entry {position}: not shown gone (its last delete answered {status})")
         self.created.clear()
         return failed
 

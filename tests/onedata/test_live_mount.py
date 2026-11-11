@@ -7,8 +7,10 @@ import os
 import socket
 import subprocess
 import sys
+from types import SimpleNamespace
 
-from mount_live import confinement_cell, pattern, read_cell, unwritten_cell
+import httpx
+from mount_live import SpaceFiles, confinement_cell, pattern, read_cell, unwritten_cell
 
 PREFIX, SIZE = 4096, 65536
 
@@ -108,3 +110,47 @@ def test_o05_the_confinement_cell_tells_a_writable_or_crowded_mount_and_a_refuse
     assert found["mount_read_only"] is False
     (mount / "another").mkdir()
     assert run(confinement_cell(str(mount), "only-space", [], [], []))["only_the_space"] is False
+
+
+def fake_space(answers):
+    """SpaceFiles over a scripted provider: `answers` maps (method, file id) to the statuses it gives, in turn."""
+    calls = []
+
+    def handler(request):
+        file_id = request.url.path.rsplit("/", 1)[-1]
+        calls.append((request.method, file_id))
+        queue = answers.get((request.method, file_id), [404])
+        return httpx.Response(queue.pop(0) if len(queue) > 1 else queue[0])
+
+    config = SimpleNamespace(
+        tls=SimpleNamespace(client_verify=lambda: True),
+        admin=SimpleNamespace(read=lambda: "tok-invented"),
+        providers={"near": SimpleNamespace(url="https://near.test"), "far": SimpleNamespace(url="https://far.test")},
+        space=SimpleNamespace(id="space-invented"),
+    )
+    return SpaceFiles(config, transport=httpx.MockTransport(handler)), calls
+
+
+def test_o11_the_fixture_files_are_deleted_newest_first_and_each_is_shown_gone_or_reported():
+    """O11: the files the live test wrote are deleted in `finally`, newest first, each through the provider that made
+    it, and the deletion is verified: a directory the provider still refuses to delete (its files' deletion has not
+    reached it yet) is tried again within the window, an entry still listed after its delete is deleted again, and
+    one never shown gone is reported by position."""
+    space, calls = fake_space(
+        {
+            ("DELETE", "dir-1"): [409, 409, 204],  # refused while its files' deletion propagates, then deleted
+            ("GET", "dir-1"): [404],
+            ("DELETE", "file-2"): [204],
+            ("GET", "file-2"): [200, 404],  # still listed once after its delete
+            ("DELETE", "file-3"): [500],  # never deleted
+            ("GET", "file-3"): [200],
+        }
+    )
+    space.created = [("near", "dir-1"), ("far", "file-2"), ("far", "file-3")]
+    failed = space.remove_all(window_s=10, poll_s=1, sleep=lambda s: None, clock=iter(range(100)).__next__)
+    assert failed == ["entry 2: not shown gone (its last delete answered 500)"]
+    deletes = [file_id for method, file_id in calls if method == "DELETE"]
+    assert deletes[0] == "file-3"  # newest first
+    assert deletes[-3:] == ["dir-1", "dir-1", "dir-1"]  # the directory last, tried until it went
+    assert deletes.count("file-2") == 2
+    assert space.created == []
