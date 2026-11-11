@@ -111,16 +111,61 @@ def test_R02_version_three_adds_the_extra_usage_fields_to_the_usage_section_and_
     assert "extra" not in fields_of("usage", "expcore-record/2")
 
 
-def test_R02_a_current_record_must_carry_the_extra_usage_fields_and_an_older_one_may_not():
-    """R02: the fields are required in version 3, even empty, and refused in a record that names an older version."""
-    without = copy.deepcopy(data())
-    del without["transcript"][0]["usage"]["extra"]
-    with pytest.raises(RecordError, match=r"transcript\[0\]\.usage: missing field\(s\) \['extra'\]"):
-        validate(without)
+def test_R02_version_three_marks_the_extra_usage_fields_optional_and_no_older_version_has_any_optional_field():
+    """R02: until v0.1.0 an extension of version 3 is additive, so a field it adds is optional: a record of version 3
+    written before the field existed lacks it, and is valid."""
+    from expcore.records import schema as rules
+
+    assert SCHEMAS[-1].optional == {"usage": ("extra", "extra_cut")}
+    assert rules.optional_in("usage", "expcore-record/3") == {"extra", "extra_cut"}
+    assert rules.optional_in("usage", "expcore-record/2") == frozenset()
+    assert rules.optional_in("turn", "expcore-record/3") == frozenset()
+
+
+def test_R02_a_current_record_may_lack_the_extra_usage_fields_or_hold_either_alone_and_an_older_one_may_not_hold_any():
+    """R02: an older writer of version 3 left the fields out; absent means not recorded, and a record that holds only
+    one, or both, validates too. A record that names version 2 still refuses them, and a required field is still
+    required."""
+    plain = copy.deepcopy(data())
+    assert "extra" not in plain["transcript"][0]["usage"]
+    assert validate(plain) == CURRENT
+    for held in ({"extra": {"used_credits": 1.5}}, {"extra_cut": 2}, {"extra": {}, "extra_cut": 0}):
+        record = copy.deepcopy(data())
+        record["transcript"][0]["usage"].update(held)
+        assert validate(record) == CURRENT
     older = copy.deepcopy(data())
+    older["transcript"][0]["usage"].update(extra={}, extra_cut=0)
     older["schema_version"] = "expcore-record/2"
     with pytest.raises(RecordError, match=r"unknown field\(s\) \['extra', 'extra_cut'\] .*later schema than"):
         validate(older)
+    required = copy.deepcopy(data())
+    del required["transcript"][0]["usage"]["input_tokens"]
+    with pytest.raises(RecordError, match=r"usage: missing field\(s\) \['input_tokens'\]"):
+        validate(required)
+
+
+def test_R02_a_field_a_version_marks_optional_must_be_one_it_adds_and_the_section_must_exist():
+    """R02: the table cannot call a field optional that an earlier version already required, or one the format lacks."""
+    with pytest.raises(ValueError, match=r"optional fields .*not add"):
+        SchemaVersion("expcore-record/4", optional={"usage": ("input_tokens",)})
+    with pytest.raises(ValueError, match=r"optional fields .*not add"):
+        SchemaVersion("expcore-record/4", added={"usage": ("extra",)}, optional={"usage": ("extra_cut",)})
+    with pytest.raises(ValueError, match=r"optional fields .*not add"):
+        SchemaVersion("expcore-record/4", optional={"nope": ("x",)})
+    assert SchemaVersion("expcore-record/4", added={"usage": ("extra",)}, optional={"usage": ("extra",)})
+
+
+@pytest.mark.parametrize(
+    "held",
+    [{"extra": {"used_credits": True}}, {"extra": {"used credits": 1}}, {"extra_cut": -1}, {"extra_cut": True}],
+    ids=["bool_alone", "name_alone", "negative_cut_alone", "bool_cut_alone"],
+)
+def test_R02_an_optional_field_is_validated_when_it_is_present_even_without_its_sibling(held):
+    """R02: a field that may be absent is checked all the same when it is there."""
+    bad = copy.deepcopy(data())
+    bad["transcript"][0]["usage"].update(held)
+    with pytest.raises(RecordError, match=r"usage\.extra"):
+        validate(bad)
 
 
 OVER_THE_CAP = "one field more than the cap, built in the test"

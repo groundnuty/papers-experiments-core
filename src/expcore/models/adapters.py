@@ -98,9 +98,10 @@ class ModelTurn:
     retries: tuple[dict[str, Any], ...] = ()  # the retries this reply took, each with its error (B01)
     # The provider's other numeric usage fields (a credit count, cache or reasoning tokens) under its own names, recorded
     # only: no budget arithmetic reads them. A field the reply left out is absent, never 0; `usage_extra_cut` counts the
-    # fields the cap left out (`expcore.models.usage.extra_usage`).
-    usage_extra: dict[str, int | float] = dataclasses.field(default_factory=dict)
-    usage_extra_cut: int = 0
+    # fields the cap left out (`expcore.models.usage.extra_usage`). None means not recorded (a stub, or a backend that
+    # reads no such fields), and the record then has no field; an adapter that read a usage object gives {} and 0.
+    usage_extra: dict[str, int | float] | None = None
+    usage_extra_cut: int | None = None
 
     @property
     def hit_output_limit(self) -> bool:

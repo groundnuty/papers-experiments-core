@@ -42,6 +42,7 @@ from expcore.records.schema import (
     RecordError,
     fields_of,
     first_turn_rule,
+    optional_in,
     reply_count_rule,
     unread_replies,
 )
@@ -161,18 +162,20 @@ def call_entry(call: Any) -> dict[str, Any]:
 
 
 def usage_entry(turn: ModelTurn, schema_version: str) -> dict[str, Any]:
-    """Return the usage of one turn as a record of `schema_version` keeps it: without a field a later version added."""
+    """Return the usage of one turn as a record of `schema_version` keeps it: without a field a later version added,
+    and without an optional field the turn did not report (None), which stays absent and is never written as a null or
+    a zero."""
     usage = {
         "input_tokens": turn.input_tokens,
         "output_tokens": turn.output_tokens,
         "uncached_input_tokens": turn.uncached_input_tokens,
         "cache_creation_input_tokens": turn.cache_creation_input_tokens,
         "cache_read_input_tokens": turn.cache_read_input_tokens,
-        "extra": dict(turn.usage_extra),
+        "extra": None if turn.usage_extra is None else dict(turn.usage_extra),
         "extra_cut": turn.usage_extra_cut,
     }
-    held = fields_of("usage", schema_version)
-    return {name: value for name, value in usage.items() if name in held}
+    held, optional = fields_of("usage", schema_version), optional_in("usage", schema_version)
+    return {name: v for name, v in usage.items() if name in held and not (v is None and name in optional)}
 
 
 def turn_entry(

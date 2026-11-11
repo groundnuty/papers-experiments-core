@@ -13,11 +13,19 @@ under the rule it ran under; and bump nothing else. Older records keep loading, 
 were read from (R01), and are replayed with the defaults of their time.
 
 A version may also change a rule that the format does not show. Version 2 is that: no field was added, but an
-infrastructure outcome is flagged as treatment only after the model completed a turn (`first_turn_rule`). A record
-is validated, and replayed, under the rule of its own version, so a version-1 record that flags treatment with no
-completed turn stays valid. Version 3 adds `extra` and `extra_cut` to the `usage` of each turn: the numeric usage
-fields a provider reports beyond the counts, and how many of them the cap left out. Every new record is written as
-version 3 and keeps version 2's rule; a record of version 1 or 2 lacks both fields, and is never given them.
+infrastructure outcome is flagged as treatment only after the model completed a turn (`first_turn_rule`). A rule
+attaches to the version that wrote the record: a record is validated, and replayed, under the rule of its own version,
+and a later rule never applies to it retroactively, so a version-1 record that flags treatment with no completed turn
+stays valid.
+
+A version may mark fields it adds as optional (`SchemaVersion.optional`): a record of that version, or a later one, is
+valid with or without them, an absent field means "not recorded", and a present one is checked like any other. Writing
+a record never fills an absent optional field in as a null or a zero. Version 3 adds `extra` and `extra_cut` to the
+`usage` of each turn, both optional: the numeric usage fields a provider reports beyond the counts, and how many of them
+the cap left out. Every new record is written as version 3 and keeps version 2's rule; a record of version 1 or 2
+lacks both fields, and is never given them. Until v0.1.0 is tagged every extension of version 3 is strictly additive:
+optional fields only, no existing field changes meaning or validation, and the fixtures in `tests/data/record-v3/`,
+one per merge point, keep validating and replaying byte for byte (docs/interfaces.md).
 
 Every section is a table of field name to the types the field may hold, in the order the file writes them. Numbers are
 finite: a count the run did not obtain is `None`, never 0 and never NaN (R10).
@@ -177,16 +185,19 @@ class SchemaVersion:
     `added` maps a section name to the fields this version introduced into it. `config_before` maps a setting this
     version added to the agent configuration to the value that was in force before it existed. `first_turn_rule` says
     whether a record of this version flags an infrastructure outcome as treatment only after a completed model turn;
-    the first version predates the rule.
+    the first version predates the rule. `optional` maps a section name to the fields among those in `added` that a
+    record may lack: an absent one means "not recorded", and one that is present is validated like any other.
     """
 
     name: str
     added: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     config_before: Mapping[str, Any] = field(default_factory=dict)
     first_turn_rule: bool = False
+    optional: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Refuse a name outside the schema family and a table that lists a section or field the format lacks."""
+        """Refuse a name outside the schema family, a table that lists a section or field the format lacks, and an
+        optional field this version does not add."""
         if not self.name.startswith(SCHEMA_PREFIX) or not self.name[len(SCHEMA_PREFIX) :].isdigit():
             raise ValueError(f"schema version {self.name!r} must look like {SCHEMA_PREFIX}N")
         for section, names in self.added.items():
@@ -194,18 +205,28 @@ class SchemaVersion:
             unknown = [n for n in names if known is None or n not in known]
             if unknown:
                 raise ValueError(f"{self.name} lists fields the {section!r} section does not have: {unknown}")
+        for section, names in self.optional.items():
+            unknown = [n for n in names if n not in self.added.get(section, ())]
+            if unknown:
+                raise ValueError(f"{self.name} marks optional fields the {section!r} section does not add: {unknown}")
 
 
 # The table of versions. Version 1 is frozen from its first pushed commit: nothing was published before it, so
 # its shape is the one that ships, and a change to it breaks every record written since. After that push, a
 # change to the format is a new version in this table that lists what it added, never an edit of version 1.
 # `tests/data/golden-record-v1.json` is a record of version 1 that must keep loading and writing back byte for byte;
-# `golden-record-v2.json` is the same for version 2, which adds no field but the first-turn rule for treatment, and
-# `golden-record-v3.json` for version 3, which adds the provider's other usage fields to each turn's `usage`.
+# `golden-record-v2.json` is the same for version 2, which adds no field but the first-turn rule for treatment.
+# Version 3 is extended until v0.1.0 is tagged, each extension strictly additive (optional fields only), so it has a
+# fixture per merge point in `tests/data/record-v3/`, which must keep validating and replaying byte for byte.
 SCHEMAS: tuple[SchemaVersion, ...] = (
     SchemaVersion(f"{SCHEMA_PREFIX}1"),
     SchemaVersion(f"{SCHEMA_PREFIX}2", first_turn_rule=True),
-    SchemaVersion(f"{SCHEMA_PREFIX}3", added={"usage": ("extra", "extra_cut")}, first_turn_rule=True),
+    SchemaVersion(
+        f"{SCHEMA_PREFIX}3",
+        added={"usage": ("extra", "extra_cut")},
+        optional={"usage": ("extra", "extra_cut")},
+        first_turn_rule=True,
+    ),
 )
 CURRENT = SCHEMAS[-1].name
 
@@ -266,6 +287,13 @@ def fields_of(section: str, version: str, schemas: Sequence[SchemaVersion] = SCH
     return {name: types for name, types in SECTIONS[section].items() if name not in later}
 
 
+def optional_in(section: str, version: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> frozenset[str]:
+    """Return the fields of a section that a record of `version` may lack: those that version, or an earlier one,
+    marked optional. A later version's optional fields are not in it, as its other fields are not."""
+    upto = schemas[: position(version, schemas) + 1]
+    return frozenset(name for s in upto for name in s.optional.get(section, ()))
+
+
 def config_defaults(version: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> dict[str, Any]:
     """Return the agent-configuration settings a record of `version` predates, with the values then in force."""
     later = schemas[position(version, schemas) + 1 :]
@@ -284,7 +312,8 @@ def _fits(value: Any, types: tuple[type, ...]) -> bool:
 def check_section(
     section: str, data: Any, version: str, where: str, schemas: Sequence[SchemaVersion] = SCHEMAS
 ) -> None:
-    """Refuse a mapping whose keys are not exactly the section's fields for this version, or whose values mistype."""
+    """Refuse a mapping with a key outside the section's fields for this version, one of its required fields left out,
+    or a value that mistypes. A field the version marks optional may be absent, and is checked when it is present."""
     if not isinstance(data, dict):
         raise RecordError(f"{where}: expected an object, got {type(data).__name__}")
     expected = fields_of(section, version, schemas)
@@ -294,11 +323,12 @@ def check_section(
         late = [k for k in unknown if k in later]
         note = f" ({', '.join(late)} added by a later schema than {version})" if late else ""
         raise RecordError(f"{where}: unknown field(s) {unknown}{note}")
-    missing = [k for k in expected if k not in data]
+    optional = optional_in(section, version, schemas)
+    missing = [k for k in expected if k not in data and k not in optional]
     if missing:
         raise RecordError(f"{where}: missing field(s) {missing}")
     for name, types in expected.items():
-        if not _fits(data[name], types):
+        if name in data and not _fits(data[name], types):
             raise RecordError(
                 f"{where}.{name}: expected {' or '.join(t.__name__ for t in types)}, got {type(data[name]).__name__}"
             )
@@ -333,11 +363,12 @@ def _check_waited(waited: Any, where: str) -> None:
 
 
 def _check_usage_extra(usage: dict, where: str) -> None:
-    """Check the provider's other usage fields of a turn: at most the cap, each a plain name and a bounded number.
+    """Check the provider's other usage fields of a turn, each when it is present (both are optional): at most the
+    cap, each a plain name and a bounded number, and a cut count that is not negative.
 
     A field the reply left out is not in the mapping (never 0); `extra_cut` counts the fields the cap left out.
     """
-    extra = usage["extra"]
+    extra = usage.get("extra", {})
     if len(extra) > USAGE_EXTRA_CAP:
         raise RecordError(f"{where}.extra: at most {USAGE_EXTRA_CAP} fields, not {len(extra)}")
     for name, value in extra.items():
@@ -351,7 +382,7 @@ def _check_usage_extra(usage: dict, where: str) -> None:
                 f"{where}.extra.{name}: expected a number (an integer of 64 bits or a finite float), "
                 f"got {type(value).__name__}"
             )
-    if usage["extra_cut"] < 0:
+    if usage.get("extra_cut", 0) < 0:
         raise RecordError(f"{where}.extra_cut: is {usage['extra_cut']}, not negative")
 
 
@@ -361,7 +392,7 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
     check_section("neutral", turn["neutral"], version, f"{where}.neutral", schemas)
     _check_list("neutral_call", turn["neutral"]["tool_calls"], version, f"{where}.neutral.tool_calls", schemas)
     check_section("usage", turn["usage"], version, f"{where}.usage", schemas)
-    if "extra" in turn["usage"]:  # a record of version 3 or later
+    if "extra" in turn["usage"] or "extra_cut" in turn["usage"]:  # optional, from version 3
         _check_usage_extra(turn["usage"], f"{where}.usage")
     if turn["native"].get("role") != "assistant":
         raise RecordError(f"{where}.native: the native message of a turn must have the role 'assistant'")

@@ -183,6 +183,61 @@
     "output_tokens": 3,
     "uncached_input_tokens": null,
     "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  },
+  {
+   "index": 2,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_3_0",
+      "name": "echo",
+      "arguments": {
+       "x": "3"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_3_0",
+      "type": "function",
+      "function": {
+       "name": "echo",
+       "arguments": "{\"x\": \"3\"}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_3_0",
+     "content": "echoed 3"
+    }
+   ],
+   "request_sha256": "e767936e0acef955774a98562a244d1b1e53039c5d718560f3e318729c9ded24",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 14,
+    "output_tokens": 3,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
     "cache_read_input_tokens": null,
     "extra": {},
     "extra_cut": 0
@@ -195,7 +250,7 @@
    "infra_wait_by_kind": {}
   },
   {
-   "index": 2,
+   "index": 3,
    "neutral": {
     "text": "done",
     "reasoning": null,
@@ -206,11 +261,11 @@
     "content": "done"
    },
    "tool_messages": [],
-   "request_sha256": "e767936e0acef955774a98562a244d1b1e53039c5d718560f3e318729c9ded24",
+   "request_sha256": "fd06309cf4975cb937daab588646ca4b4f6eb0fad853b227ef924be336c40ffd",
    "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
    "stop_reason": "stop",
    "usage": {
-    "input_tokens": 14,
+    "input_tokens": 19,
     "output_tokens": 2,
     "uncached_input_tokens": null,
     "cache_creation_input_tokens": null,
@@ -279,11 +334,48 @@
    "terminal": false,
    "infra_wait_by_kind": {},
    "rendering_verified": true
+  },
+  {
+   "turn": 2,
+   "round": 3,
+   "call_id": "call_3_0",
+   "name": "echo",
+   "arguments": {
+    "x": "3"
+   },
+   "status": "ok",
+   "text": "echoed 3",
+   "raw_text": "echoed 3",
+   "raw_chars": 8,
+   "truncated": false,
+   "error_class": null,
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
   }
  ],
  "clock": [
   [
    "start",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
    1000.0
   ],
   [
@@ -328,10 +420,10 @@
   "treatment": false
  },
  "totals": {
-  "rounds": 2,
+  "rounds": 3,
   "malformed_calls": 0,
   "malformed_events": [],
-  "tokens_used": 35,
+  "tokens_used": 57,
   "usage_incomplete": false,
   "agent_s": 0.0,
   "elapsed_s": 0.0,

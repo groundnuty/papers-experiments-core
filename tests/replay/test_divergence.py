@@ -296,9 +296,10 @@ V2 = SchemaVersion(
         "record": ("instruments",),
         "turn": ("request_sha256",),
         "tool_call": ("detail",),
-        "usage": ("extra", "extra_cut"),  # a record written as version 1 is built without them, as in the real table
+        "usage": ("extra", "extra_cut"),  # the real table's version 3 fields, here added with this version
     },
     config_before={"cleanup_deadline_s": 7.0},
+    optional={"usage": ("extra", "extra_cut")},
 )
 TABLE = (V1, V2)
 
@@ -310,7 +311,6 @@ def older(data: dict) -> dict:
     del data["instruments"]
     for entry in data["transcript"]:
         del entry["request_sha256"]
-        del entry["usage"]["extra"], entry["usage"]["extra_cut"]
     for entry in data["tool_calls"]:
         del entry["detail"]
     del data["agent_config"]["cleanup_deadline_s"]

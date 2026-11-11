@@ -2,9 +2,8 @@
 
 `tests/data/golden-record-v2.json` is the same for version 2, which adds no field but changes a rule: an infrastructure
 outcome is flagged as treatment only after the model completed a turn. Both files load, write back byte for byte, and
-replay, each under the rule of its own version. `tests/data/golden-record-v3.json` is the same for version 3, which
-adds the provider's other usage fields to each turn's usage (`extra`, and `extra_cut` for the fields the cap left
-out): a run of three turns, one with a credit count and a reasoning count, one with none, one with a cut.
+replay, each under the rule of its own version. Version 3 is still being extended before v0.1.0, so it has no single
+golden: `tests/data/record-v3/` holds one fixture per merge point, and `test_v3_fixtures.py` replays them all.
 
 `tests/data/golden-record-v1.json` is a record of a synthetic run with invented names: tool calls of every outcome, a
 result the data source cut, a call the loop skipped, a secret redacted from the prompt and from a result. It must
@@ -23,7 +22,7 @@ from expcore.replay.replay import replay_record
 
 GOLDEN = Path(__file__).resolve().parents[1] / "data" / "golden-record-v1.json"
 GOLDEN_V2 = Path(__file__).resolve().parents[1] / "data" / "golden-record-v2.json"
-GOLDEN_V3 = Path(__file__).resolve().parents[1] / "data" / "golden-record-v3.json"
+V3_FIXTURES = sorted((Path(__file__).resolve().parents[1] / "data" / "record-v3").glob("*.json"))
 
 
 def test_R01_the_golden_record_of_version_one_loads_and_writes_back_byte_for_byte():
@@ -111,41 +110,6 @@ def test_R03_the_version_two_golden_passes_the_replay_check_stages():
     assert check_record(GOLDEN_V2.read_bytes()) is None
 
 
-def test_R01_the_golden_record_of_version_three_loads_and_writes_back_byte_for_byte():
-    """R01: version 3 is frozen beside versions 1 and 2: its bytes load and come back as they were."""
-    stored = GOLDEN_V3.read_bytes()
-    record = load_record(GOLDEN_V3)
-    assert record.schema_version == "expcore-record/3" == SCHEMAS[2].name
-    assert record.dumps().encode("utf-8") == stored
-    assert RunRecord.from_json(decode(stored)).dumps() == stored.decode("utf-8")
-
-
-def test_R02_only_version_three_has_the_extra_usage_fields_and_the_top_level_fields_are_the_same():
-    """R02: the older goldens' usage has no `extra` and no `extra_cut`; the version-3 golden's has both, in each turn,
-    after the counts, with a field a turn did not report absent rather than 0."""
-    assert list(decode(GOLDEN_V3.read_bytes())) == list(decode(GOLDEN.read_bytes()))
-    for older in (GOLDEN, GOLDEN_V2):
-        assert all("extra" not in t["usage"] and "extra_cut" not in t["usage"] for t in load_record(older).transcript)
-    usages = [t["usage"] for t in load_record(GOLDEN_V3).transcript]
-    assert [list(u)[-2:] for u in usages] == [["extra", "extra_cut"]] * 3
-    assert [u["extra"] for u in usages] == [
-        {"completion_tokens_details.reasoning_tokens": 7, "used_credits": 1.5},
-        {},
-        {"used_credits": 0.25},
-    ]
-    assert [u["extra_cut"] for u in usages] == [0, 0, 3]
-
-
-def test_R03_the_version_three_golden_replays_with_its_extra_usage_fields_exactly_as_recorded():
-    """R03: the replay serves each turn's usage, extra fields and cut count included, from the record: the replayed
-    record has the same transcript and writes back to the golden's bytes; the check stages pass."""
-    recorded = load_record(GOLDEN_V3)
-    replayed = replay_record(recorded)
-    assert [t["usage"] for t in replayed.transcript] == [t["usage"] for t in recorded.transcript]
-    assert replayed.dumps().encode("utf-8") == GOLDEN_V3.read_bytes()
-    assert check_record(GOLDEN_V3.read_bytes()) is None
-
-
 SECRET_SHAPED = {  # values a checking environment may hold: every form the redaction rules recognise, none in a golden
     "TOYLAB_TOKEN": "amber-line-one\ncobalt-line-two",
     "OTHER_API_KEY": "abcd/efgh-4471",
@@ -158,7 +122,7 @@ def test_R12_the_golden_records_check_and_replay_whatever_secrets_the_checking_e
     redacts nothing and the replay redacts nothing, so only a secret the record really holds can stop it."""
     for name, value in SECRET_SHAPED.items():
         monkeypatch.setenv(name, value)
-    for golden in (GOLDEN, GOLDEN_V2, GOLDEN_V3):
+    for golden in (GOLDEN, GOLDEN_V2, *V3_FIXTURES):
         assert check_record(golden.read_bytes()) is None
 
 

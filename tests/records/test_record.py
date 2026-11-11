@@ -10,12 +10,14 @@ from record_support import hand_made, record_run
 from expcore.models.adapters import ModelTurn, ToolCall
 from expcore.records.record import RunRecord, decode, load_record, record_filename
 from expcore.records.schema import CURRENT, RecordError, SchemaVersion
+from expcore.replay.replay import replay_record
 
 V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
     "expcore-record/2",
-    added={"record": ("instruments",), "turn": ("request_sha256",)},
+    added={"record": ("instruments",), "turn": ("request_sha256",), "usage": ("extra", "extra_cut")},
     config_before={"cleanup_deadline_s": 60.0},
+    optional={"usage": ("extra", "extra_cut")},  # the fields of the real table's version 3, here added with this one
 )
 TABLE = (V1, V2)
 
@@ -127,15 +129,52 @@ def test_R01_the_extra_usage_fields_are_never_written_into_a_record_of_an_older_
     current = _credit_run(CURRENT)
     assert current.transcript[0]["usage"]["extra"] == {"used_credits": 1.5, "details.reasoning_tokens": 7}
     assert current.transcript[0]["usage"]["extra_cut"] == 2
+    assert "extra" not in current.transcript[1]["usage"]  # the reply that reported none stays absent
     assert RunRecord.from_json(decode(current.dumps().encode())).dumps() == current.dumps()
 
 
-def test_R10_a_reply_that_reported_no_extra_field_leaves_the_mapping_empty_not_filled_with_zeros():
-    """R10: a field the reply left out is absent from the file; nothing is filled in as 0."""
-    record = record_run([[("echo", {})]], {"echo": lambda a: "x"})
-    usage = json.loads(record.dumps())["transcript"][0]["usage"]
-    assert usage["extra"] == {}
-    assert usage["extra_cut"] == 0
+def test_R10_a_backend_that_reports_no_extra_usage_fields_leaves_them_absent_never_null_or_zero():
+    """R10: absent means not recorded. A reply the backend gave no extra fields for has neither field in its usage,
+    in the record, in the file or in the replay, and loading and writing it back adds none."""
+    record = record_run([[("echo", {})], "done"], {"echo": lambda a: "x"})
+    assert record.schema_version == CURRENT
+    assert all("extra" not in t["usage"] and "extra_cut" not in t["usage"] for t in record.transcript)
+    text = record.dumps()
+    assert '"extra' not in text
+    again = RunRecord.from_json(decode(text.encode()))
+    assert again.dumps() == text
+    assert replay_record(again).dumps() == text
+
+
+def test_R10_a_reported_empty_mapping_is_recorded_as_such_and_differs_from_absent():
+    """R10: an adapter that read a usage object with no extra field reports `{}` and a cut of 0; that is recorded, and
+    replays to the same bytes, while another turn of the run without a report stays absent."""
+    reported = ModelTurn(
+        "", [ToolCall("call-1", "echo", {})], 10, 5, "tool_calls", 0.0, usage_extra={}, usage_extra_cut=0
+    )
+    record = record_run([reported, "done"], {"echo": lambda a: "x"})
+    first, second = (t["usage"] for t in record.transcript)
+    assert (first["extra"], first["extra_cut"]) == ({}, 0)
+    assert "extra" not in second
+    assert "extra_cut" not in second
+    text = record.dumps()
+    assert replay_record(RunRecord.from_json(decode(text.encode()))).dumps() == text
+
+
+def test_R01_a_record_of_version_three_without_the_optional_usage_fields_is_valid_and_writes_back_as_it_is():
+    """R01: a record written before an extension of version 3 existed lacks its fields; it loads, and writing it back
+    adds no null and no zero in their place."""
+    record = hand_made()
+    text = record.dumps()
+    assert '"extra' not in text
+    assert RunRecord.from_json(decode(text.encode())).dumps() == text
+    with_one = hand_made()
+    usage = {**with_one.transcript[0]["usage"], "extra_cut": 3}
+    with_one = RunRecord(**{**with_one.__dict__, "transcript": [{**with_one.transcript[0], "usage": usage}]})
+    one_text = with_one.dumps()
+    assert '"extra_cut": 3' in one_text
+    assert '"extra":' not in one_text
+    assert RunRecord.from_json(decode(one_text.encode())).dumps() == one_text
 
 
 def test_R01_a_later_field_that_holds_data_cannot_be_written_into_an_older_record():

@@ -77,6 +77,18 @@ def test_a_turn_defaults_leave_unreported_fields_none_and_a_non_limit_stop_is_no
     assert ModelTurn("t", [], 1, 1, None, 0.1).hit_output_limit is False
 
 
+def test_b10_a_turn_nobody_read_extra_usage_fields_for_has_none_and_is_not_an_empty_set_or_a_zero_cut():
+    """B10: None means not recorded: the stub and a backend of a study's own that reports no extra fields leave the
+    turn at None, so the record has no field, while an adapter that read a usage object gives {} and 0 when it held
+    nothing extra (the adapter tests)."""
+    turn = ModelTurn("t", [], 1, 1, "stop", 0.1)
+    assert (turn.usage_extra, turn.usage_extra_cut) == (None, None)
+    stub = StubAdapter(["done"])
+    stub.begin("", "task", [])
+    reply = step(stub)
+    assert (reply.usage_extra, reply.usage_extra_cut) == (None, None)
+
+
 def test_a_ready_made_turn_is_returned_as_it_is_and_a_malformed_call_enters_the_history_as_raw_text():
     bad = ToolCall("call_1", "lookup", {}, "arguments are not valid JSON (Expecting value)", '{"a":')
     turn = ModelTurn("", [bad], 10, 5, "tool_calls", 0.0)
