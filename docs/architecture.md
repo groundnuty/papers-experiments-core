@@ -45,6 +45,8 @@ src/expcore_onedata/
   users.py       leased platform users (a slot gives a run one user per token plane) and the token journal
   health.py      pre- and post-run checks against the declared support set
   day0/          registry of checks (reachability, health, tokens, listing, read-only, round trip) and a dated report
+  testing/       fakes of the platform for a study's own tests: the REST mock, a federation with every provider's data API, a clock,
+                 the default platform.toml, two stand-in MCP servers; installed with the layer, imported by no runtime module
 examples/        a toy study using only the public interfaces (#5)
 ```
 
