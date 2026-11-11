@@ -1,0 +1,42 @@
+# An invented orchard: three groves, two crews, twenty-five trees. Every node is named; the platform refuses blank nodes.
+
+@prefix o: <http://orchard.example/vocab#> .
+@prefix grove: <http://orchard.example/grove/> .
+@prefix crew: <http://orchard.example/crew/> .
+@prefix tree: <http://orchard.example/tree/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+crew:wren a o:Crew ; rdfs:label "Wren crew" .
+crew:finch a o:Crew ; rdfs:label "Finch crew" .
+
+grove:quillfen a o:Grove ; rdfs:label "Quillfen" ; o:tendedBy crew:wren .
+grove:marrowby a o:Grove ; rdfs:label "Marrowby" ; o:tendedBy crew:finch .
+grove:thistledown a o:Grove ; rdfs:label "Thistledown" ; o:tendedBy crew:wren .
+
+tree:q1 a o:Tree ; o:grove grove:quillfen ; o:fruit "plum" ; o:planted 2004 .
+tree:q2 a o:Tree ; o:grove grove:quillfen ; o:fruit "plum" ; o:planted 2006 .
+tree:q3 a o:Tree ; o:grove grove:quillfen ; o:fruit "pear" ; o:planted 2006 .
+tree:q4 a o:Tree ; o:grove grove:quillfen ; o:fruit "apple" ; o:planted 2009 .
+tree:q5 a o:Tree ; o:grove grove:quillfen ; o:fruit "apple" ; o:planted 2011 .
+tree:q6 a o:Tree ; o:grove grove:quillfen ; o:fruit "pear" ; o:planted 2014 .
+tree:q7 a o:Tree ; o:grove grove:quillfen ; o:fruit "plum" ; o:planted 2019 .
+
+tree:m1 a o:Tree ; o:grove grove:marrowby ; o:fruit "quince" ; o:planted 1987 .
+tree:m2 a o:Tree ; o:grove grove:marrowby ; o:fruit "apple" ; o:planted 1998 .
+tree:m3 a o:Tree ; o:grove grove:marrowby ; o:fruit "apple" ; o:planted 2001 .
+tree:m4 a o:Tree ; o:grove grove:marrowby ; o:fruit "cherry" ; o:planted 2003 .
+tree:m5 a o:Tree ; o:grove grove:marrowby ; o:fruit "cherry" ; o:planted 2012 .
+tree:m6 a o:Tree ; o:grove grove:marrowby ; o:fruit "pear" ; o:planted 2016 .
+
+tree:t1 a o:Tree ; o:grove grove:thistledown ; o:fruit "apple" ; o:planted 1995 .
+tree:t2 a o:Tree ; o:grove grove:thistledown ; o:fruit "apple" ; o:planted 1996 .
+tree:t3 a o:Tree ; o:grove grove:thistledown ; o:fruit "cherry" ; o:planted 1999 .
+tree:t4 a o:Tree ; o:grove grove:thistledown ; o:fruit "cherry" ; o:planted 2002 .
+tree:t5 a o:Tree ; o:grove grove:thistledown ; o:fruit "medlar" ; o:planted 2005 .
+tree:t6 a o:Tree ; o:grove grove:thistledown ; o:fruit "apple" ; o:planted 2007 .
+tree:t7 a o:Tree ; o:grove grove:thistledown ; o:fruit "plum" ; o:planted 2008 .
+tree:t8 a o:Tree ; o:grove grove:thistledown ; o:fruit "cherry" ; o:planted 2010 .
+tree:t9 a o:Tree ; o:grove grove:thistledown ; o:fruit "medlar" ; o:planted 2013 .
+tree:t10 a o:Tree ; o:grove grove:thistledown ; o:fruit "apple" ; o:planted 2015 .
+tree:t11 a o:Tree ; o:grove grove:thistledown ; o:fruit "plum" ; o:planted 2017 .
+tree:t12 a o:Tree ; o:grove grove:thistledown ; o:fruit "cherry" ; o:planted 2020 .

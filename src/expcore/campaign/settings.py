@@ -64,14 +64,20 @@ class SchedulerConfig:
         if problems:
             raise ValueError("; ".join(problems))
 
+    @property
+    def kind_roles(self) -> dict[str, str]:
+        """The kinds this campaign charges its own failures to, by the key of `[scheduler]` that names each."""
+        return {"health_kind": self.health_kind, "identity_kind": self.identity_kind}
+
     def check_kinds(self, schema: FactorSchema) -> None:
         """Refuse a health or identity kind that is unknown or that a condition declares as its treatment.
 
         The kinds a campaign charges its own failures to are untreatable for that campaign, as the registry's
         untreatable kinds are for every one (`expcore.errors.untreatable_kinds`): a failed health check or a changed
-        endpoint would otherwise be scored as the condition's fault.
+        endpoint would otherwise be scored as the condition's fault. A study's load refuses an unknown kind first
+        (`study.config.load_study`), naming campaign.toml and the key; this is the check for a scheduler built in code.
         """
-        roles = {"health_kind": self.health_kind, "identity_kind": self.identity_kind}
+        roles = self.kind_roles
         for name, kind in roles.items():
             if kind not in infra_kinds():
                 raise ValueError(

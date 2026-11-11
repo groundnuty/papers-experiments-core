@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# A second platform for the core, beside the Onedata layer: an in-process RDF store with read-only SPARQL tools, a
+# health check, an instrument and an infrastructure kind, built only on the core's documented interfaces. It is its own
+# distribution: a study names it in `[study] requires` and its replication package vendors its wheel.
+[project]
+name = "sparql-platform"
+version = "0.1.0"
+description = "An example platform for papers-experiments-core: an in-process RDF store queried read-only over SPARQL."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "papers-experiments-core>=0.1.0",
+    "pyoxigraph>=0.5.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sparql_platform"]
+
+# The example study beside the platform is not part of the distribution.
+[tool.hatch.build.targets.sdist]
+include = ["src/sparql_platform", "README.md", "pyproject.toml"]

@@ -1,0 +1,17 @@
+# The single model table. Both models are stubs that play a script, so the study needs no network and no key.
+
+[models.alpha-stub]
+backend = "stub"
+status = "frozen"
+
+[models.alpha-stub.price]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+
+[models.beta-stub]
+backend = "stub"
+status = "frozen"
+
+[models.beta-stub.price]
+input_per_mtok = 0.5
+output_per_mtok = 1.5

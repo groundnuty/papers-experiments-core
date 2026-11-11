@@ -1,6 +1,6 @@
 # Study guide
 
-How to build a study on the core: start it, configure it, declare its design, run and record it, check, score and analyse it, freeze its protocol and ship its replication package, and bring in code from an earlier study. The exact interfaces are in [`interfaces.md`](interfaces.md), and the reasons behind them in [`architecture.md`](architecture.md); this guide is the order to use them in. It follows the example study (`examples/tiny_study/`), which the core carries, so every step below runs as written. `tests/test_study_guide.py` runs every `sh` and `python` block of this file in order, in a new directory, and checks every `toml` block against the example's files. The two lines that make the project and add the core are the exception: the test runs with the core already installed, and `scripts/fresh_repo.py`, which the fresh-repo workflow runs after every push to `main`, runs those two from a pushed commit.
+How to build a study on the core: start it, configure it, declare its design, run and record it, check, score and analyse it, freeze its protocol and ship its replication package, bring in code from an earlier study, and write a platform of your own. The exact interfaces are in [`interfaces.md`](interfaces.md), and the reasons behind them in [`architecture.md`](architecture.md); this guide is the order to use them in. It follows the example study (`examples/tiny_study/`), which the core carries, so every step below runs as written; the last section points at a second example, a platform in a distribution of its own (`examples/sparql_platform/`). `tests/test_study_guide.py` runs every `sh` and `python` block of this file in order, in a new directory, and checks every `toml` block against the example's files. The two lines that make the project and add the core are the exception: the test runs with the core already installed, and `scripts/fresh_repo.py`, which the fresh-repo workflow runs after every push to `main`, runs those two from a pushed commit.
 
 ## 1. Start a study
 
@@ -22,19 +22,21 @@ The identity covers the study's directory and nothing else. Platform and backend
 
 ### What you implement
 
-The study directory holds four configuration files and one Python file, the plugin, named by `[study] plugin`. The core imports the plugin and calls `build(context)`, which returns a `StudyPlugin`:
+The study directory holds four configuration files and the plugin, the Python file `[study] plugin` names. The core imports the plugin and calls `build(context)`, which returns a `StudyPlugin`:
 
 | Part | What it is | In the example |
 |---|---|---|
 | `executor` | a `RunExecutor`: given a `RunRequest`, script or configure the backend the request carries, run the loop with `record_run`, write the record to `request.run_dir`, return it | `TinyExecutor` |
 | `scorers` | `Scorer`s: a pure function of a record, returning named numeric outcomes | `TinyScorer` |
-| `prompts`, `tools` | per condition, the SHA-256 of its prompt template and of its tool manifest; both go into the campaign fingerprint | from `PromptTemplate` and `tools_sha256` |
+| `prompts`, `tools` | per condition, the SHA-256 of its prompt template and of its tool set; both go into the campaign fingerprint | from `PromptTemplate` and `tools_sha256` ([what it hashes](interfaces.md#several-providers-and-the-hash-of-a-tool-set)) |
 | tools | `ToolProvider`s the executor passes to `record_run`: plain functions through `FunctionProvider`, or an MCP server through `McpToolProvider` | `lookup` and `submit` |
 | instruments | `Instrument`s the executor runs around the loop, fresh for every run, since each holds one run's reading and runs can overlap: `start_instruments(instruments, identity)` before `record_run`, `record = finish_instruments(record, instruments)` after, both through `asyncio.to_thread`, then write the record `finish_instruments` returned. `identity` is the request's `RunIdentity` as a plain mapping: `{"run_key": ..., "factors": {...}, "attempt": ...}`. The loop returns a record however the run ended, an infrastructure failure included, so every attempt with a record gets its snapshots. A scorer reads a snapshot at `record.instruments[namespace]`, the only platform state it may read | `FactsServed`, the stub platform's own count of the facts it served, which `TinyScorer` reads as its `served` outcome |
 | `health`, `probe`, `lease_group`, `lease_keys` | the platform's health check, resource probe and leases; the Onedata layer supplies real ones | stubs that always succeed |
 | `backend_factory` | optional: a `BackendFactory` that builds the backend of every model, for a study with a model backend of its own. Its model entries name that backend in `models.toml` with a plain lower-case `backend` value; the factory serves those and hands every other model to the core's `default_backend_factory`. It carries a `version` attribute that goes into the campaign fingerprint with its name; a factory imported from an installed package must declare the installed version of the distribution that owns its module's file, one defined in a file `[study] code` lists, which the code identity covers, may declare any, and one from anywhere else is refused. Without a factory, such a model is refused when the plugin is loaded | none: the core's factory builds the stub |
 
-The plugin names everything; the core names nothing. What each interface guarantees, and what you must guarantee in return (an executor never builds a backend, a scorer never reads the platform), is in [`interfaces.md`](interfaces.md).
+The plugin names everything; the core names nothing. What each interface guarantees, and what you must guarantee in return (an executor never builds a backend, a scorer never reads the platform), is in [`interfaces.md`](interfaces.md). So is what an executor may read of the study's configuration, such as a task's attributes (`study.tasks[task_id].attributes`) and the loop's caps (`study.campaign.agent.limits`): see [what an executor reads](interfaces.md#what-an-executor-reads). The example's prompt names each task's `region`, which its executor reads that way. How a template fills its slots is in [PromptTemplate](interfaces.md#prompttemplate): a blank value is refused, braces that enclose no slot name (a JSON example) are sent as they are, `study_run=True` refuses a draft marker, and an inner template is nested by passing its rendered text as a slot's value, which records only the outer template's hash.
+
+A plugin that outgrows one file imports the modules beside it relatively: `from .scoring import Scorer` in `plugin.py` finds `scoring.py` in the same directory. The core imports the plugin as a package of its own directory, under a name made from the plugin's path, so two studies' modules of one name never meet, and `import scoring` finds nothing (the error says to import it relatively). List every such file in `[study] code` beside `plugin.py`, and in `package.toml`. The core goes by where code comes from: it refuses to load a plugin that runs, at its top level or in `build`, a file of the study directory the list leaves out, because the code identity would not cover code that runs, or that runs one other than as a module of its package (through the module search path, or loaded by path), because that module could be served to another study. It compiles the plugin and its modules from their source on every load. It sees code only: a data file the plugin reads by path, like the example's `prompt.txt`, is covered only if you list it.
 
 ## 2. Where configuration lives
 
@@ -44,9 +46,9 @@ All configuration is TOML in the study directory, validated when the study is lo
 |---|---|
 | `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the factors, the conditions and the tasks |
 | `models.toml` | the single model table: each model once, with backend, API id, sampling, limits, price and status |
-| `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the budget |
+| `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the kinds it records its failures as ([below](#the-schedulers-kinds)), and the budget |
 | `preregistration.toml` | the named contrasts, the Holm family, alpha, the estimators, the bootstrap and the power settings |
-| `package.toml` | the inclusion list of the replication package ([section 7](#7-ship-a-replication-package)) |
+| `package.toml` | the inclusion list of the replication package ([section 8](#8-ship-a-replication-package)) |
 | `platform.toml` | a platform's own settings, read by the platform layer (`expcore_onedata`), not by the core |
 
 Secrets are never written in configuration: a model names the environment variable or file that holds its key. The hash of every configuration file goes into the campaign's fingerprint, so resuming a campaign after any of them changed is refused.
@@ -59,6 +61,65 @@ assert study.name == "tiny-study"
 assert sorted(study.config_sha256) == ["campaign.toml", "models.toml", "preregistration.toml", "study.toml"]
 statuses = {key: study.models.resolve(key).status for key in study.models}
 assert statuses == {"alpha-stub": "frozen", "beta-stub": "frozen"}  # only frozen settings may start a study run
+```
+
+### The scheduler's kinds
+
+Two keys of `[scheduler]` in `campaign.toml` name the infrastructure kinds the scheduler records its own failures as:
+
+| Key | Default | The kind of |
+|---|---|---|
+| `health_kind` | `sandbox` | a failed health check: one before a run closes the gate and is recorded as the outage's attempt, and one after a run turns an attempt that would have been scored into an infrastructure failure of this kind |
+| `identity_kind` | `endpoint` | a run whose model endpoint changed its served identity (the model it names or its fingerprint) while the run was going |
+
+Both defaults are kinds of the core, and `sandbox` is the one the Onedata layer's sandbox fails with. A platform of another kind that leaves `health_kind` alone has its outages recorded as failures of a sandbox it does not have: it registers a kind of its own ([section 10](#10-a-platform-of-your-own)) and names it here. Each key must name a kind known when the study is loaded: a core kind, one the modules of `[study] platforms` register, or one of `[study.kinds]` ([section 3](#treatment-kinds)). Any other is refused at load, naming `campaign.toml` and the key and listing the kinds known then. Neither may be a kind a condition declares as its treatment, since a run that the health check stopped, or that the wrong endpoint served, would then be scored as that condition's outcome; the scheduler refuses such a campaign when it starts. The example writes both out with their defaults:
+
+```toml
+# my-study/campaign.toml
+[scheduler]
+health_kind = "sandbox"
+identity_kind = "endpoint"
+```
+
+```python
+import shutil
+from pathlib import Path
+
+from expcore.campaign.settings import SchedulerConfig
+from expcore.config.loading import ConfigError
+
+assert (SchedulerConfig().health_kind, SchedulerConfig().identity_kind) == ("sandbox", "endpoint")
+assert study.campaign.scheduler.health_kind == "sandbox" and study.campaign.scheduler.identity_kind == "endpoint"
+
+misspelt = Path("misspelt-study")
+shutil.copytree("my-study", misspelt)
+toml = misspelt / "campaign.toml"
+toml.write_text(toml.read_text().replace('health_kind = "sandbox"', 'health_kind = "sandbxo"'))
+try:
+    load_study(misspelt)
+    raise AssertionError("a health_kind that is no known kind was accepted")
+except ConfigError as error:
+    message = str(error)
+    assert "campaign.toml" in message and "key 'health_kind'" in message
+    assert "did you mean 'sandbox'" in message
+shutil.rmtree(misspelt)
+```
+
+### What the budget reserves
+
+`[budget] max_usd` in `campaign.toml` is held by reserving, not by estimating. Before a run starts, the scheduler adds what has been spent, what the runs in flight can still cost and what this run can cost, and holds the run while that sum is over the ceiling. What a run can cost is its bound, which is what the gate reserves for it before dispatch: the loop's `token_budget` (in `[agent]`) at the model's dearest rate, the highest of its input, output and cache prices. The token budget is checked after each response, so a run can exceed its budget, and so its reservation, by up to one request (a prompt within the model's context window, plus the reply maximum), and it then ends as `token_cap`. `max_usd` can therefore be exceeded by that margin for each attempt in flight. Each run in flight is reserved its bound too, and an attempt that was killed, or whose usage was not reported, is charged its bound as spent. The mean cost of the runs so far decides nothing, because a run that overran it would pass the ceiling. `per_model_usd` caps single models the same way, and a model with neither a price nor `free = true` is held outright, since its cost is unknown.
+
+The example's bound is small: 20,000 tokens at alpha-stub's dearest rate, 2 USD per million output tokens, is 0.04 USD a run, against a ceiling of 5 USD. A real model's is not. With `token_budget = 2000000` and a model priced at 15 USD per million input tokens and 75 per million output tokens, every run reserves 2,000,000 tokens at 75 USD per million, 150 USD, however little a typical run spends. A ceiling of 50 USD then holds the campaign before its first run (0 spent, 0 in flight, 150 for this run: over 50), `run` exits 3, and the hold it prints gives those three figures. With two workers, the second run needs 300 USD of room. To run, raise `max_usd` above the bound times the runs that may be in flight, plus what has been spent, or lower `token_budget`, which is also the cap that ends a run as `token_cap`.
+
+```python
+from expcore.campaign.attempt_bounds import bound_usd
+from expcore.config.prices import Price
+
+limits = study.campaign.agent.limits
+assert (limits.token_budget, study.campaign.scheduler.budget.max_usd) == (20000, 5.0)
+assert bound_usd(study.models.resolve("alpha-stub"), limits.token_budget) == 0.04  # what each run reserves
+dear = Price(input_per_mtok=15.0, output_per_mtok=75.0)  # US dollars per million tokens
+assert dear.dearest_per_token() * 2_000_000 == 150.0  # its bound under token_budget = 2000000
 ```
 
 ### The federation's certificate
@@ -160,7 +221,7 @@ except ConfigError as error:
 shutil.rmtree(tampered)
 ```
 
-A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run. A kind named nowhere is refused as unknown, and the error lists the treatable kinds.
+A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run. A kind named nowhere is refused as unknown, and the error lists the treatable kinds. The `health_kind` and `identity_kind` of `[scheduler]` are checked against the same vocabulary when the study is loaded ([section 2](#the-schedulers-kinds)).
 
 ```python
 from expcore.errors import infra_kinds
@@ -201,6 +262,12 @@ assert check["n_ok"] == check["n_records"] == len(check["replayed"]) and not che
 assert check["code"]["dirty"] is False and "campaign-snapshot.sqlite" in check["inputs"]
 ```
 
+### Files an agent writes
+
+A file the agent writes during a run (a report, a mask, a table) has no place in the batch today. The check takes every `.json` file under `out/runs` as a record, so a `.json` file beside a record fails the check at `load` (`unsupported record schema None`); a file of any other kind is not among the check's inputs, so nothing vouches for it; and `analyze` reads the records alone. The scorer is a pure function of the record, so what it needs of such a file must be in the record.
+
+The supported way is an instrument, as the example's `FactsServed` is. The executor makes it with access to where the agent's files land; its `finish` reads them after the loop and returns what the scorer needs as its snapshot, a JSON object: the fields or counts the scorer reads, `None` with the failure beside it for a file that is missing or cannot be parsed, and the file's SHA-256 if a reader should be able to match the snapshot to the original bytes. The snapshot is in `record.instruments[namespace]`, so it is replayed and hashed with the record and travels into the package with it. The original bytes do not: keep the files outside `out/runs`, and out of the package unless `package.toml` attests each one (the package's checks refuse a file they cannot read, binary for one).
+
 ## 5. Score and analyse
 
 ```sh
@@ -237,6 +304,7 @@ assert {(e["condition"], e["infra_kind"]) for e in treated} == {("relay-down", "
 entry = treated[0]
 record = load_record(Path("my-study/out/runs") / entry["run_dir"] / record_filename(entry["run_key"], entry["attempt"]))
 assert record.instruments["facts"] == {"ok": True, "served": 1}  # the platform served one fact before the outage
+assert record.prompt["user"]["slots"]["REGION"] == study.tasks["lake"].attributes["region"] == "north"  # per task
 
 
 class LookupCount:
@@ -263,6 +331,41 @@ analysis = json.loads(Path("my-study/out/analysis.json").read_text())
 relay = next(c for c in analysis["contrasts"] if c["name"] == "relay-vs-baseline")
 assert relay["treatment_outcomes"] == "scored" and relay["pairs_missing"]["treatment_outcome_none"] == 0
 assert relay["n_pairs"] == 8  # both treatment attempts stay in their own contrast
+```
+
+### Which tool hash to compare
+
+Two hashes describe a run's tools. `tools_sha256`, which the plugin computes for each condition from the tools it declares (their names, descriptions, schemas and terminal flags), is what the campaign fingerprint holds. The record's `prompt.tools_sha256` holds the other, `ToolBox.manifest_sha256`: the definitions the model was sent, whose descriptions end with the sentence that states the output cap, and the terminal flags. They differ for the same tools, by design. To check that conditions differ only in which tools they expose, compare `tools_sha256` values: the plugin's for each condition, and the one recomputed from a record's `tools`, which the record keeps as declared, before the cap sentence ([two tool hashes](interfaces.md#two-tool-hashes)).
+
+```python
+from expcore.plugin import ToolSpec
+from expcore.study.plugin import StudyContext, load_plugin, tools_sha256
+
+plugin = load_plugin(StudyContext(study, {}))
+exposed = tools_sha256([ToolSpec(**tool) for tool in record.tools])  # the treated run's tools, as declared
+assert exposed == plugin.tools["relay-down"] == plugin.tools["baseline"] != plugin.tools["extended"]
+assert record.prompt["tools_sha256"] != exposed  # what the model was sent: the cap sentence in each description
+```
+
+### How pairs become a contrast's input
+
+What a contrast estimates is decided by how its pairs are combined, in stages of plain means:
+
+1. **Pairs.** A pair is one run of each arm with the same pairing key: task, model and seed for a contrast between two named conditions, and every other factor of the run key as well for a factor contrast. Its difference is A - B on the contrast's outcome. A pair whose outcome is missing on either side is left out and counted by its cause.
+2. **Per task and model.** The pairs of one task and one model (its seeds, and a factor contrast's levels of the other factors) are averaged into one value.
+3. **Per cluster and model.** The task values of one cluster (the tasks with one value of the contrast's `cluster` attribute) and one model are averaged, each task with equal weight whatever its number of pairs. These are the cells of the estimator's input, `PairedDifferences.matrix`: a row per cluster, a column per model, NaN where a model has no pair in a cluster.
+4. **Per cluster.** A cluster's difference is the mean over the models that have a cell in it, each model with equal weight (`cluster_differences`).
+
+`wilcoxon_cluster_bootstrap` tests those cluster differences with a signed-rank test (after snapping float noise and dropping zero differences, which it counts), its estimate is their mean, and its interval resamples whole clusters, one draw for every model. The cluster is the unit of inference: a task with more seeds, or a cluster with more tasks, weighs no more than another, and each model counts the same however many runs it has. The example has two regions, so each of its contrasts has two clusters.
+
+```python
+import numpy as np
+
+from expcore.stats.estimators import PairedDifferences
+
+cells = PairedDifferences(("north", "south"), ("alpha-stub", "beta-stub"), np.array([[1.0, 0.0], [0.5, np.nan]]))
+assert list(cells.cluster_differences) == [0.5, 0.5]  # south: beta-stub has no pair there, so alpha-stub's alone
+assert relay["n_clusters"] == len({task.attributes["region"] for task in study.tasks.values()}) == 2
 ```
 
 ### Unknown platform estimates are data
@@ -357,6 +460,45 @@ assert analysis["preregistration"]["preregistration_sha256"] == study.prereg.sha
 assert analysis["code"]["dirty"] is False
 ```
 
+### A rehearsal on stubs
+
+A dress rehearsal runs the whole plan on stub models before the real campaign: the executor, the tools, the scorers, the check, the analysis and the package, at no cost. The core's stub takes no backend's settings: `base_url`, `key_env`, `key_file`, `sampling`, `extra_body`, `prompt_cache_ttl` and `echo_reasoning_field` are refused on a `stub` entry when `models.toml` is loaded. So a rehearsal cannot run on the frozen model table with only the backend swapped; it runs on a `models.toml` of its own, whose hash is in the campaign fingerprint, and its fingerprint differs from the real campaign's. That is by design: a rehearsal's records can never be resumed into the real campaign or taken for its records.
+
+Rehearse in a copy of the study directory (a branch, or a directory of its own), so the rehearsal's `out/` stays apart: in the same `out/`, the real campaign would be refused as a resume under a changed configuration. In the copy, change `models.toml` alone. Keep every model key, so `campaign.toml`'s plan is unchanged, and `status = "frozen"`; set `backend = "stub"` and drop the settings a stub refuses; keep each model's price, `max_output_tokens` and `context_tokens`, which a stub takes, so the budget gate reserves the bound it will reserve for the real model and holds where it will hold. Keep identical what decides a result: the plan, the prompts, the tools, the scorers and the preregistration. The plugin's prompt and tool hashes and the scorers' versions are then the same in both fingerprints, and what differs comes from the model table alone: its hash and each model's entry.
+
+```python
+rehearsal = Path("rehearsal-study")
+shutil.copytree("my-study", rehearsal, ignore=shutil.ignore_patterns("out"))
+models = rehearsal / "models.toml"
+entry = '[models.alpha-stub]\nbackend = "stub"\nstatus = "frozen"\n'
+models.write_text(models.read_text().replace(entry, entry + "max_output_tokens = 256\ncontext_tokens = 200000\n"))
+assert load_study(rehearsal).config_sha256["models.toml"] != study.config_sha256["models.toml"]  # another campaign
+models.write_text(models.read_text().replace(entry, entry + 'prompt_cache_ttl = "5m"\n'))
+try:
+    load_study(rehearsal)
+    raise AssertionError("a stub took a setting of another backend")
+except ConfigError as error:
+    assert "prompt_cache_ttl applies to anthropic models only" in str(error)
+shutil.rmtree(rehearsal)
+```
+
+The example's executor runs on stubs only: it requires its backend to have `use(script)` and raises without it. A plugin meant for both the rehearsal and the real campaign scripts its backend only when the backend has `use`, and otherwise leaves the model to answer; the plugin is then the same file in both, so its code identity is the same. A stub given no script replies `done` to every turn.
+
+```python
+from expcore.models.adapters import StubAdapter
+
+
+def script_if_stub(backend, script):
+    """Script a backend that takes a script, the rehearsal's stub; a real model's backend has no `use`."""
+    use = getattr(backend, "use", None)
+    if callable(use):
+        use(script)
+
+
+script_if_stub(StubAdapter([]), ["deep"])  # the rehearsal: the stub plays the script
+script_if_stub(object(), ["deep"])  # the real campaign: a backend without `use` is left to answer
+```
+
 ## 8. Ship a replication package
 
 `package.toml` lists what the package holds; anything it does not list is left out. The example lists its configuration and code, the records with the replay check (`out/runs`), and the four outputs.
@@ -377,7 +519,7 @@ The build refuses a check made under code that is not a clean commit, outputs ma
 
 ### What a reviewer runs
 
-A reviewer needs only the package, `make` and Python. `wheels/` holds one wheel per distribution of the environment the records were checked under: the core, what `[study] requires` names, and everything they require. `make -f Makefile check` makes a fresh environment beside the package (`<package>.venv`, or `VENV=...`), installs those wheels from `wheels/` alone, with no index and no network, each pinned by its SHA-256 in `wheels/requirements.txt`, then verifies every file, the environment and the outputs. pip runs isolated from the reader's environment variables and configuration files, so neither can add a requirement or a URL. The wheels are the ones of the build's platform and Python, so the reviewer needs the same; `make check` says so if the Python differs. `make -f Makefile check-installed PYTHON=...` runs the same check with an interpreter that already holds the environment. The example's package grows by about 65 MB (52 MB of it NumPy and SciPy), and a study on a heavier stack by what that stack weighs.
+A reviewer needs only the package, `make` and Python. `wheels/` holds one wheel per distribution of the environment the records were checked under: the core, what `[study] requires` names, and everything they require. `make -f Makefile check` makes a fresh environment beside the package (`<package>.venv`, or `VENV=...`), installs those wheels from `wheels/` alone, with no index and no network, each pinned by its SHA-256 in `wheels/requirements.txt`, then verifies every file, the environment and the outputs. pip runs isolated from the reader's environment variables and configuration files, so neither can add a requirement or a URL, and without a cache, so it neither reads nor writes the reader's own. The wheels are the ones of the build's platform and Python, so the reviewer needs the same; `make check` says so if the Python differs. `make -f Makefile check-installed PYTHON=...` runs the same check with an interpreter that already holds the environment. The example's package grows by about 65 MB (52 MB of it NumPy and SciPy), and a study on a heavier stack by what that stack weighs.
 
 `PACKAGE.json` records what the package was built from: the study's commit and tree hash, the core version, `environment` (Python, every distribution's version and, for an install from a URL, its source, which is how a reader learns where the core came from), `wheels` (each with its SHA-256, how deep its text was read, the members that are not text with their hashes, and, for a wheel you supplied, the members there was nothing installed to compare with), `study_tokens_exempt` (the wheels the study-token list was not applied to, each with the hash your `uv.lock` records for it) and `uncommitted`.
 
@@ -472,3 +614,15 @@ The import reads the file as the earlier study's repository holds it at a commit
 ```
 
 `uv run python -m expcore.provenance.sanitise verify --map MAP --source BLOB --module DEST` sanitises the blob again and says whether `DEST` is still exactly the import; it is, until the first adaptation. After that, anyone who holds the map and the source repositories checks the whole history (P07 in the regression list) with `uv run python -m expcore.provenance.history --map MAP --source-repos "NAME=PATH;NAME=PATH"`, which reads `EXPCORE_SOURCE_REPOS` when `--source-repos` is not given. For each module under `src/` (`--root` names another directory) that carries a source header, it checks that the header's blob is the one the source repository holds at the commit and path the header names, and that the module as its import commit holds it, minus the header, is exactly the sanitisation of that blob under the map. The import commit is the commit that started the module's history: the latest commit that added its path, followed back through a rename only when that commit deleted the earlier path. A copy of an imported module, edited or not, is therefore checked at its own adding commit, never at the import it resembles. A merge that holds the module as none of its parents does, and whose first parent lacks it, is where its history starts, so a module a merge adds, or adds back edited, is checked at the merge; a merge that only brings a branch up to date with main is not, since its file is main's. A merge is compared with each of its parents for a rename, not only the first: when a side branch imported a module and the merge renames it, the history goes on along that side branch, to its import. The command names a module by its path and never its source repository; it prints each module that fails and exits 1, says every module holds and exits 0, and exits 2 when there is no module to check.
+
+## 10. A platform of your own
+
+A platform is what a study runs its agent against: a store, a service, a federation. The core names none. The Onedata layer (`expcore_onedata`) is one, and [`examples/sparql_platform/`](../examples/sparql_platform/) is another, an in-process RDF store built from these documents alone, and a distribution of its own. A platform shipped that way needs five things, each described where it applies:
+
+1. **The distribution, named by the study.** The study lists it in `[study] requires`, by name and without a version ([section 1](#1-start-a-study)). The campaign's environment then records its installed version, and a resume or a replay check under another is refused. An editable checkout can change its code under one version, so bump the version when the code changes, and have the platform report its version in its instrument snapshot or `info()`, as the example's snapshot does for the platform and for its store.
+2. **Its infrastructure kinds.** A module of the platform calls `register_infra_kind(kind, description, treatable=...)` at its top level and does nothing else, so that importing it is cheap. The study lists that module in `[study] platforms` ([section 3](#treatment-kinds)), and the kind is then known before the conditions and `campaign.toml` are validated, and when `check` reads a record that names it. The platform raises `InfraError(kind, ...)` for its own failures, from its tools and its instrument, and returns every failure the model should read as a `ToolOutput` with `is_error`.
+3. **Its health check, and `health_kind`.** The plugin passes the platform's `HealthCheck` as `StudyPlugin.health`. A failed check is recorded as the `health_kind` of `[scheduler]`, which is `sandbox` unless the study names another, so the study sets `health_kind` to the platform's kind in `campaign.toml` ([section 2](#the-schedulers-kinds)). Left alone, the outage is recorded as the failure of a sandbox the platform does not have.
+4. **Its settings, as `StudyPlugin.platform`.** The platform's own settings that make two starts one experiment (the example's row cap and the digest of the graph it loaded), as plain data without a secret. They go into the campaign fingerprint, so a resume under other settings is refused. The Onedata layer's are `config.fingerprint()` ([section 2](#the-federations-certificate)). A platform with none leaves the mapping empty.
+5. **Its wheel in the package.** The replication package vendors one wheel per distribution of the environment, the platform's included ([section 8](#8-ship-a-replication-package)). A platform installed in the ordinary way is packed again from its installed files. One installed editable cannot be: build its wheel in its checkout (`uv build --wheel --out-dir DIR`) and pass `--wheels DIR` to `package`. A platform that is not a public release from an index is read for private names like the study's own code, so keep its code and its metadata free of them. A file its code loads when the package's check scores the records again, the example's graph for one, is a file of the study: `[study] code` and `package.toml` list it.
+
+What the platform supplies beyond these is in [`interfaces.md`](interfaces.md): its tools (`FunctionProvider`, or `McpToolProvider` for an MCP server), an `Instrument` whose snapshot a scorer reads, and, for a resource that runs share, a `ResourceProbe` with `lease_group` and `lease_keys`. A platform that shares nothing leaves the last three out. The example's [README](../examples/sparql_platform/README.md) lists its parts, and its `study/` is a small study on it that runs end to end, with its replication package.

@@ -28,7 +28,8 @@ are the process's once imported. A study's own last only while it is loaded and 
 study.toml's hash is in the campaign fingerprint, as it always is.
 
 Everything is validated when it is loaded, with messages that name the file and the key: the models of the plan are in
-the model table, and the cluster each preregistered contrast names is an attribute of every task. Nothing is run.
+the model table, the `[scheduler]` health and identity kinds are kinds known once the platforms are imported, and the
+cluster each preregistered contrast names is an attribute of every task. Nothing is run.
 """
 
 import hashlib
@@ -43,7 +44,7 @@ from expcore.campaign.factors import FactorSchema, load_factor_schema
 from expcore.campaign.manifest import Manifest, build_manifest
 from expcore.config.loading import ConfigError, Section, close_match, load_toml
 from expcore.config.models import ModelTable, load_models
-from expcore.errors import StudyKind, check_study_kind, study_kinds
+from expcore.errors import StudyKind, check_study_kind, infra_kinds, study_kinds
 from expcore.provenance.codestamp import CodeScope, CodeScopeError
 from expcore.provenance.environment import is_requirement_name
 from expcore.stats import prereg
@@ -186,6 +187,25 @@ def _declared_kinds(top: Section) -> dict[str, StudyKind]:
     return declared
 
 
+def _check_scheduler_kinds(campaign: CampaignConfig) -> None:
+    """Refuse a `[scheduler]` health or identity kind the vocabulary does not hold, naming campaign.toml and the key.
+
+    Called once the study's platforms are imported and its own kinds are in scope, so the kinds named here are the ones
+    the scheduler will find when the study runs. Whether a condition declares one as its treatment stays the
+    scheduler's check (`SchedulerConfig.check_kinds`), which also runs when the campaign starts.
+    """
+    known = infra_kinds()
+    section = Section({}, campaign.source, "[scheduler]")
+    for key, kind in campaign.scheduler.kind_roles.items():
+        if kind not in known:
+            raise section.fail(
+                key,
+                f"names a kind that is not an infrastructure kind{close_match(kind, known)}; the kinds known here "
+                f"are: {', '.join(known)}. A platform's kinds are known once its module is listed in [study] "
+                f"platforms of {STUDY_FILE}, and the study's own are the ones it declares in [study.{KINDS_KEY}]",
+            )
+
+
 def _check_clusters(study: str, tasks: Mapping[str, Task], loaded: Preregistration) -> None:
     """Every contrast clusters by an attribute; a task without it would silently leave the contrast."""
     for contrast in loaded.contrasts.values():
@@ -224,6 +244,7 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
         tasks = _tasks(top, study_file)
         models = load_models(root / MODELS_FILE)
         campaign = load_campaign(root / CAMPAIGN_FILE)
+        _check_scheduler_kinds(campaign)
         unknown = [m for m in campaign.models if m not in models]
         if unknown:
             raise ConfigError(
