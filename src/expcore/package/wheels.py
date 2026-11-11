@@ -7,7 +7,8 @@ fresh environment with `pip install --no-index --no-deps --require-hashes`, from
 pins each wheel by name, version and SHA-256, so the reader needs neither the network nor an index. pip runs isolated
 (`--isolated`, which ignores its environment variables and the user's configuration, and `PIP_CONFIG_FILE=/dev/null`,
 which skips every configuration file): a `PIP_REQUIREMENT` or a configured requirement could otherwise add a URL to
-fetch.
+fetch. `--no-cache-dir` keeps the install from reading or writing the reader's pip cache, which an offline install
+pinned by hash has no use for, and which a sandbox may not let pip use (pip then warns that the cache is disabled).
 
 Where a wheel comes from, for each distribution:
 - a wheel the author supplies (`--wheels DIR`), named `<name>-<version>-<tags>.whl` with that name and version in
@@ -71,8 +72,8 @@ check: environment
 environment:
 \t$(PYTHON) -c 'import sys; sys.exit(sys.version_info[:2] != ({major}, {minor}) and "this needs Python {python}")'
 \t$(PYTHON) -m venv --clear "$(VENV)"
-\tPIP_CONFIG_FILE=/dev/null "$(VENV)/bin/python" -m pip install --isolated --quiet --disable-pip-version-check \\
-\t\t--no-index --no-deps --require-hashes --find-links wheels -r {requirements}
+\tPIP_CONFIG_FILE=/dev/null "$(VENV)/bin/python" -m pip install --isolated --no-cache-dir --quiet \\
+\t\t--disable-pip-version-check --no-index --no-deps --require-hashes --find-links wheels -r {requirements}
 
 check-installed:
 \t$(PYTHON) -m expcore package-check .
