@@ -166,3 +166,26 @@ def fail_copies(host, stderr: str = "disk full") -> Callable[[], None]:
         return CmdResult(1, "", stderr) if is_copy(argv) else original(argv, timeout_s, **kwargs)
 
     return around_run(host, wrapper)
+
+
+# The agent's own use of the published client (O23), as a study's agent uses it: nothing but the environment the
+# sandbox gives it, the placeholder token among it, and the trust it sets up by default. It lists the directory of
+# `{space}/{path}` and reads that file through `onedata:///` URLs (the client drops the first name after `onedata://`)
+# and prints what it saw; an image without the client prints `client: None`. Shared by the live test and the in-process
+# one, so the code the live test sends has run.
+PUBLISHED_CLIENT = """
+import hashlib, json, os, posixpath
+try:
+    import fsspec, onedatarestfsspec
+except ImportError:
+    print(json.dumps({{"client": None}}))
+    raise SystemExit
+target = {space!r} + "/" + {path!r}
+fs, root = fsspec.core.url_to_fs("onedata:///" + target)
+listing = sorted(fs.ls(posixpath.dirname(root), detail=False))
+with fsspec.open("onedata:///" + target, "rb") as handle:
+    data = handle.read()
+print(json.dumps({{"client": onedatarestfsspec.__version__, "token": os.environ.get("ONEDATA_TOKEN"),
+                  "listing": listing, "size": fs.size(root), "read": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest()}}))
+"""

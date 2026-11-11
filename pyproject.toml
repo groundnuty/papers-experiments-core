@@ -25,6 +25,11 @@ onedata = [
 
 [dependency-groups]
 dev = [
+    # The published Onedata REST client (both MIT): a development dependency only, so
+    # tests/onedata/sandbox/test_published_client.py runs it through the data gate as an agent's code would. The
+    # platform layer never imports it.
+    "onedatafilerestclient==25.2.0",
+    "onedatarestfsspec==25.2.0",
     "pytest>=8",
     "ruff>=0.8",
     # The example platform beside the Onedata layer (examples/sparql_platform), with its store, pyoxigraph: a

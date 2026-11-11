@@ -20,6 +20,10 @@ The listing and byte-count checks (O21, O22) need a level of `[sandbox.data_path
 `EXPCORE_LIVE_LISTING_PATH` naming a provisioned directory of more than 1000 entries by its path in the space: through
 the gate the agent's one listing of it must come back whole as the last page, and the collection's count must equal the
 bytes the agent's code received. A mount level's count must be unknown after its collection.
+
+The published-client check (O23) needs a REST level and an agent image with `onedatarestfsspec` installed (it skips
+without): with only the placeholder token and the default trust, the client must list the directory of
+`[sandbox] content_check_file` and read that file whole through the gate.
 """
 
 import dataclasses
@@ -143,8 +147,11 @@ def test_a_write_to_the_agents_root_is_refused_in_a_started_sandbox(config, host
 NO_CREDENTIAL = """
 import os, pathlib
 needle = {needle!r}.encode()
+placeholder = {placeholder!r}  # a REST agent's ONEDATA_TOKEN holds the placeholder, which is no credential (O23)
 hits = []
-for name in os.environ:
+for name, value in os.environ.items():
+    if (name, value) == placeholder:
+        continue
     if any(w in name.upper() for w in ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")):
         hits.append("an environment variable named like a credential")
 for pid in filter(str.isdigit, os.listdir("/proc")):
@@ -171,12 +178,16 @@ print("clean" if not hits else sorted(set(hits)))
 @needs_platform
 @pytest.mark.parametrize("level", LEVELS)
 def test_no_credential_is_visible_inside_the_agent_on_the_data_path_of_this_level(config, host, level):
-    """O05: the agent's code cannot read the data-path token: not in its environment, its files or its processes."""
+    """O05: the agent's code cannot read the data-path token: not in its environment, its files or its processes. The
+    one variable named like a token it may hold is a REST agent's ONEDATA_TOKEN, and only with the placeholder (O23)."""
+    from expcore_onedata.sandbox.containers import ENV_TOKEN
+
     spec = spec_for(config, level, f"live-cred-{int(time.time())}")
     sandbox = DockerSandbox.start(host, config.sandbox, spec)
     try:
         needle = spec.token.reveal() if spec.token is not None else "no-token-for-this-level"
-        result = sandbox.exec(NO_CREDENTIAL.format(needle=needle), 120)
+        placeholder = (ENV_TOKEN, config.sandbox.placeholder_token) if spec.mode is DataPathMode.REST else None
+        result = sandbox.exec(NO_CREDENTIAL.format(needle=needle, placeholder=placeholder), 120)
         assert result.stdout.strip() == "clean"
     finally:
         sandbox.stop()
@@ -349,6 +360,34 @@ def test_o21_o22_a_complete_level_serves_a_large_directory_whole_and_counts_the_
     assert counted["content_bytes"] == 0
     assert (counted["files"], counted["files_total"]) == ({}, 0)  # no file's content was read
     assert [row["body_bytes"] for row in counted["listings"].values()] == [said["listing"]]  # one directory listed
+
+
+@needs_platform
+def test_o23_the_published_client_lists_and_reads_through_the_gate_with_the_placeholder(config, host):
+    """O23: in a REST level's agent, the published client (`onedatarestfsspec`, which the agent image must have; the
+    test skips otherwise) starts with the placeholder token, verifies the gate against the image's certifi bundle that
+    the sandbox extended with the run's CA, lists the directory of `[sandbox] content_check_file` and reads that file
+    whole, as many bytes as its size. The code it sends is the one the in-process test runs
+    (`tests/onedata/sandbox/test_published_client.py`)."""
+    import json
+
+    from sandbox_support import PUBLISHED_CLIENT
+
+    level = level_of(config, DataPathMode.REST)
+    check = config.sandbox.content_check_file
+    sandbox = DockerSandbox.start(host, config.sandbox, spec_for(config, level, f"live-client-{int(time.time())}"))
+    try:
+        code = PUBLISHED_CLIENT.format(space=config.space.name, path=check)
+        said = json.loads(sandbox.exec(code, 300).stdout.strip())
+        certifi = sandbox.metadata()["certifi"]
+    finally:
+        sandbox.stop()
+    if said["client"] is None:
+        pytest.skip("the agent image does not have the published client, onedatarestfsspec")
+    assert certifi == "run_ca_added"
+    assert said["token"] == config.sandbox.placeholder_token
+    assert f"{config.space.name}/{check}" in said["listing"]
+    assert said["read"] == said["size"] > 0
 
 
 @needs_platform
