@@ -22,6 +22,7 @@ from expcore_onedata.sandbox import inputs
 from expcore_onedata.sandbox.api import ReadOnlyInput, SandboxError, StartRefused
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.testing import NOW
 
 TARGET = "/opt/analysis"
 EROFS_REPLY = {
@@ -289,7 +290,6 @@ def test_o20_c06_a_campaign_does_not_resume_with_changed_read_only_inputs(world,
     inputs resume, a changed script refuses the resume, and the refusal names neither the host's path nor the
     script."""
     from campaign_support import make_fingerprint, make_manifest, make_schema
-    from platform_support import NOW
 
     from expcore.campaign.resume import FingerprintMismatch, open_campaign
 

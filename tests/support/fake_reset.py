@@ -38,7 +38,8 @@ import re
 import threading
 
 import httpx
-from fake_data import ROOT_ID, FakeData, Node, Transfer
+
+from expcore_onedata.testing.fake_data import ROOT_ID, FakeData, Node, Transfer
 
 
 class FakeReset(FakeData):

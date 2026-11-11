@@ -812,9 +812,8 @@ def test_o05_the_fakes_widest_listing_at_the_maximum_stays_under_the_cap_and_is_
     """O05, O16: a page of MAX_LIST_LIMIT entries, each with every attribute the fake has (a path included), names of
     255 control characters and the fake's longest top-level file id, is under the gate's buffer cap, so the gate checks
     it whole and serves it, and the next page is reached by its token."""
-    from fake_onedata import MockOnedata
-
     from expcore_onedata.sandbox import gateboundary, gatepolicy
+    from expcore_onedata.testing.fake_onedata import MockOnedata
 
     mock = MockOnedata(
         dict.fromkeys(_widest_names(gatepolicy.MAX_LIST_LIMIT + 1), b""),
@@ -843,9 +842,8 @@ def test_o05_every_other_non_content_answer_is_one_bounded_object_far_under_the_
     """O05, O16: the scope of the token, a file id looked up and one file's attributes are each one object whose size
     does not grow with a request; the fake's widest (a name of 255 control characters, every attribute) is a few
     kilobytes, served whole after the check."""
-    from fake_onedata import MockOnedata
-
     from expcore_onedata.sandbox import gateboundary, gatepolicy
+    from expcore_onedata.testing.fake_onedata import MockOnedata
 
     name = _widest_names(1)[0]
     plain = "n" * 255  # a name the lookup takes as it is written: the fake's longest top-level file id

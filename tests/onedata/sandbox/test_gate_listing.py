@@ -16,10 +16,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from fake_onedata import MockOnedata
 
 from expcore_onedata.sandbox import gate, gatelog, kinds
 from expcore_onedata.sandbox.hostops import DockerHost
+from expcore_onedata.testing import MockOnedata
 
 pytestmark = pytest.mark.skipif(shutil.which("openssl") is None, reason="the openssl command makes the run CA")
 

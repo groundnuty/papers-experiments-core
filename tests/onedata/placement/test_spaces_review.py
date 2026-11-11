@@ -7,20 +7,6 @@ import base64
 import pytest
 from campaign_support import make_fingerprint, make_manifest, make_schema
 from fake_reset import FakeReset
-from placement_support import ALPHA_ID, BETA_ID, DATA, with_placement
-from platform_support import (
-    ADMIN_ENV,
-    BASELINE,
-    NOW,
-    SPACE_IDS,
-    SPACE_LABELS,
-    SPACE_NAME,
-    SPACE_NAMES,
-    SVC,
-    USERS,
-    with_spaces,
-    write_platform,
-)
 
 from expcore.campaign.resume import FingerprintMismatch, open_campaign
 from expcore.config.loading import ConfigError
@@ -31,6 +17,20 @@ from expcore_onedata.health import PlatformHealth
 from expcore_onedata.provision import Provisioner, ProvisionError, Refused, resolve_provider_ids
 from expcore_onedata.rangemap import load_placement
 from expcore_onedata.reset import SpaceReset
+from expcore_onedata.testing import (
+    ADMIN_ENV,
+    ALPHA_ID,
+    BASELINE,
+    BETA_ID,
+    DATA,
+    NOW,
+    SERVICE_USER,
+    SPACE_NAME,
+    USERS,
+    with_placement,
+    write_platform,
+)
+from expcore_onedata.testing.world import SPACE_IDS, SPACE_LABELS, SPACE_NAMES, with_spaces
 from expcore_onedata.tokens import TokenIssuer
 
 
@@ -152,7 +152,7 @@ def test_o04_the_health_token_reaches_only_the_spaces_the_data_path_reaches(tmp_
         data["spaces"][1]["tokens"] = ["tool_server"]
 
     fake.supports.pop(BETA_ID)
-    del fake.privileges[(SPACE_IDS[1], SVC.user_id)]
+    del fake.privileges[(SPACE_IDS[1], SERVICE_USER.user_id)]
     config = load_platform(written(tmp_path, edit))
     client = OnezoneClient(config, http=fake.client_http())
     health = PlatformHealth(config, client, TokenIssuer(client, config, clock=ticker.clock), clock=ticker.clock)

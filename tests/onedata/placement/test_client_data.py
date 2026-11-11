@@ -2,10 +2,6 @@
 
 import httpx
 import pytest
-from fake_data import PROVIDER, ROOT_ID
-from fake_federation import ZONE
-from placement_support import DATA
-from platform_support import SPACE_NAME
 
 from expcore_onedata.client import (
     MAX_KEPT_LINKS,
@@ -16,6 +12,8 @@ from expcore_onedata.client import (
     PlatformError,
     ScopeUnread,
 )
+from expcore_onedata.testing import DATA, PROVIDER, ROOT_ID, SPACE_NAME
+from expcore_onedata.testing.fake_federation import ZONE
 
 PATH = "study/data.bin"
 OTHER = "/data/fid/content"

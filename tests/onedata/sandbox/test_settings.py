@@ -1,12 +1,12 @@
 """The [sandbox] table: every image, pool, limit, mount option and data path is read from platform.toml (O12-O14)."""
 
 import pytest
-from platform_support import write_platform
 from sandbox_support import AGENT_IMAGE_ID, COMPLETE_LEVEL, GATE_IMAGE_ID, LEVELS, POOL, add_sandbox
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.testing import NOW, write_platform
 
 
 def load(tmp_path, edit=None, *, with_table=True):
@@ -255,7 +255,6 @@ def test_o21_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(t
     """O21, C06: the platform's half of the fingerprint holds each level's kind and a REST level's listing mode, so a
     campaign started with one listing mode for a level is refused a resume with the other; the same mode resumes."""
     from campaign_support import make_fingerprint, make_manifest, make_schema
-    from platform_support import NOW
 
     from expcore.campaign.resume import FingerprintMismatch, open_campaign
 
@@ -341,7 +340,6 @@ def test_o22_an_unknown_key_of_the_caps_is_refused_so_a_misspelt_cap_cannot_leav
 def caps_campaign(tmp_path):
     """A campaign store's resume under a platform fingerprint: `resume(fingerprint)` opens it, refusing a change."""
     from campaign_support import make_fingerprint, make_manifest, make_schema
-    from platform_support import NOW
 
     from expcore.campaign.resume import open_campaign
 

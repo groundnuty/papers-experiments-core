@@ -5,14 +5,24 @@ import threading
 
 import pytest
 from fake_reset import FakeReset
-from placement_support import ALPHA_ID, BETA_ID, DATA, with_placement
-from platform_support import ADMIN_ENV, BASELINE, SPACE_IDS, SPACE_NAME, USERS, write_platform
 
 from expcore_onedata import consistency
 from expcore_onedata.client import OutOfScope
 from expcore_onedata.eviction import evict_ids, evict_tree
 from expcore_onedata.provision import NotPlaced, Refused
 from expcore_onedata.reset import STAGES, ResetFailed, SpaceReset
+from expcore_onedata.testing import (
+    ADMIN_ENV,
+    ALPHA_ID,
+    BASELINE,
+    BETA_ID,
+    DATA,
+    SPACE_NAME,
+    USERS,
+    with_placement,
+    write_platform,
+)
+from expcore_onedata.testing.world import SPACE_IDS
 
 FILES = [f"study/part-{i:02d}.bin" for i in range(12)]
 

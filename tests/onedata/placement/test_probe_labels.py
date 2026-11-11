@@ -3,12 +3,11 @@
 import json
 
 import pytest
-from placement_support import DATA, with_placement
-from platform_support import write_platform
 
 from expcore_onedata.probes import VERSION, PlatformProbes
 from expcore_onedata.rangemap import RangeRow
 from expcore_onedata.ranges import place_ranges
+from expcore_onedata.testing import DATA, with_placement, write_platform
 
 PATH = "study/data.bin"
 NAMES = ("quokkasite", "wombatsite")  # distinctive configured names, so a leak is found wherever it lands

@@ -4,18 +4,6 @@ directory once."""
 
 import pytest
 from fake_reset import FakeReset
-from placement_support import ALPHA_ID, BETA_ID, DATA, with_placement
-from platform_support import (
-    ADMIN_ENV,
-    BASELINE,
-    SPACE_IDS,
-    SPACE_LABELS,
-    SPACE_NAME,
-    SPACE_NAMES,
-    USERS,
-    with_spaces,
-    write_platform,
-)
 from sandbox_support import add_sandbox
 
 from expcore.config.loading import ConfigError
@@ -29,6 +17,18 @@ from expcore_onedata.provision import Provisioner, ProvisionError, Refused, reso
 from expcore_onedata.rangemap import RangeRow, load_placement
 from expcore_onedata.ranges import place_ranges
 from expcore_onedata.reset import SpaceReset
+from expcore_onedata.testing import (
+    ADMIN_ENV,
+    ALPHA_ID,
+    BASELINE,
+    BETA_ID,
+    DATA,
+    SPACE_NAME,
+    USERS,
+    with_placement,
+    write_platform,
+)
+from expcore_onedata.testing.world import SPACE_IDS, SPACE_LABELS, SPACE_NAMES, with_spaces
 from expcore_onedata.tokens import TokenIssuer
 
 OWNED = SPACE_LABELS[1]  # the second space, whose own data provider is beta

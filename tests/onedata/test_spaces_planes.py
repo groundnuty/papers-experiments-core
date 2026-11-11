@@ -4,25 +4,23 @@ declared set of spaces, its principal's rights are read in each, and every messa
 import base64
 
 import pytest
-from platform_support import (
-    ALPHA_ID,
-    BASELINE,
-    BETA_ID,
-    CEILING_S,
-    DATA,
-    NOW,
-    SPACE_IDS,
-    SPACE_NAMES,
-    TOOLS,
-    USERS,
-    with_spaces,
-    write_platform,
-)
 
 from expcore_onedata import toolserver
 from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
 from expcore_onedata.config import load_platform
 from expcore_onedata.health import PlatformHealth
+from expcore_onedata.testing import (
+    ALPHA_ID,
+    BASELINE,
+    BETA_ID,
+    CEILING_S,
+    DATA_PATH_USER,
+    NOW,
+    TOOL_SERVER_USER,
+    USERS,
+    write_platform,
+)
+from expcore_onedata.testing.world import SPACE_IDS, SPACE_NAMES, with_spaces
 from expcore_onedata.tokencheck import CaveatSpec, PrivilegesMismatch, TokenRefused, require_examined
 from expcore_onedata.tokens import Plane, TokenIssuer, data_path_spec, tool_server_spec
 
@@ -56,7 +54,7 @@ def test_o05_a_one_space_token_is_minted_as_before_whichever_way_its_space_is_na
     """O05: a sequence of one space id gives the same caveats as the id itself, so the one-space form's tokens do not
     change with several spaces in the layer."""
     assert data_path_spec(["spmock0001"]) == data_path_spec("spmock0001")
-    token = issuer.mint(data_path_spec(("spmock0001",)), DATA, ceiling_s=CEILING_S)
+    token = issuer.mint(data_path_spec(("spmock0001",)), DATA_PATH_USER, ceiling_s=CEILING_S)
     assert whitelist(fake, token) == ["/spmock0001"]
 
 
@@ -69,7 +67,7 @@ def test_o05_each_planes_token_reaches_exactly_the_spaces_it_is_scoped_to(tmp_pa
         data["spaces"][2]["tokens"] = ["tool_server"]
 
     config, _, issuer = configure(tmp_path, fake, count=3, edit=planes)
-    tokens = issuer.mint_run_tokens(data=DATA, ceiling_s=CEILING_S, tool_server=(TOOLS, "read"))
+    tokens = issuer.mint_run_tokens(data=DATA_PATH_USER, ceiling_s=CEILING_S, tool_server=(TOOL_SERVER_USER, "read"))
     assert whitelist(fake, tokens.data_path) == [f"/{SPACE_IDS[0]}", f"/{SPACE_IDS[1]}"]
     assert whitelist(fake, tokens.tool_server) == [f"/{SPACE_IDS[0]}", f"/{SPACE_IDS[2]}"]
     assert config.space_ids(Plane.DATA_PATH) == SPACE_IDS[:2]
@@ -98,9 +96,9 @@ def test_o05_a_principal_without_the_rights_in_one_space_is_refused_naming_that_
     """O05: the plane's rights are read in every space its token reaches; a principal set up for other rights in the
     second space is refused before anything is minted, and the refusal names `spaces[1]`, never its id or name."""
     config, _, issuer = configure(tmp_path, fake)
-    fake.grant(DATA.user_id, ["space_view"], space=SPACE_IDS[1])
+    fake.grant(DATA_PATH_USER.user_id, ["space_view"], space=SPACE_IDS[1])
     with pytest.raises(PrivilegesMismatch) as caught:
-        issuer.mint(data_path_spec(config.space_ids(Plane.DATA_PATH)), DATA, ceiling_s=CEILING_S)
+        issuer.mint(data_path_spec(config.space_ids(Plane.DATA_PATH)), DATA_PATH_USER, ceiling_s=CEILING_S)
     assert str(caught.value).startswith("spaces[1]: ")
     assert fake.issued == {}
 
@@ -110,10 +108,12 @@ def test_o05_the_tool_server_launch_checks_its_token_against_every_space_of_its_
     for the first space alone does not pass it, and one minted for the plane's spaces does."""
     config, _, issuer = configure(tmp_path, fake)
     condition = config.condition("read")
-    narrow = issuer.mint(tool_server_spec(SPACE_IDS[0], condition), TOOLS, ceiling_s=CEILING_S)
+    narrow = issuer.mint(tool_server_spec(SPACE_IDS[0], condition), TOOL_SERVER_USER, ceiling_s=CEILING_S)
     with pytest.raises(TokenRefused, match=r"data\.path caveat"):
         toolserver._prepare(issuer, config, condition, narrow, CEILING_S)
-    scoped = issuer.mint(tool_server_spec(config.space_ids(Plane.TOOL_SERVER), condition), TOOLS, ceiling_s=CEILING_S)
+    scoped = issuer.mint(
+        tool_server_spec(config.space_ids(Plane.TOOL_SERVER), condition), TOOL_SERVER_USER, ceiling_s=CEILING_S
+    )
     toolserver._prepare(issuer, config, condition, scoped, CEILING_S)
 
 

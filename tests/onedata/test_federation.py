@@ -1,7 +1,6 @@
 """O03: discovery returns every provider of the space; the agent is pinned to its declared local provider or refused."""
 
 import pytest
-from platform_support import CEILING_S, SVC
 
 from expcore_onedata.federation import (
     FederationUnreadable,
@@ -11,6 +10,8 @@ from expcore_onedata.federation import (
     pin_provider,
     read_space,
 )
+from expcore_onedata.testing import CEILING_S
+from expcore_onedata.testing import SERVICE_USER as SVC
 from expcore_onedata.tokens import data_path_spec
 
 SPACE = "spmock0001"

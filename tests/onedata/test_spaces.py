@@ -4,20 +4,13 @@ import json
 
 import pytest
 from campaign_support import make_fingerprint, make_manifest, make_schema
-from platform_support import (
-    ADMIN_ENV,
-    NOW,
-    SPACE_IDS,
-    SPACE_LABELS,
-    SPACE_NAME,
-    leaked_values,
-    with_spaces,
-    write_platform,
-)
+from platform_support import leaked_values
 
 from expcore.campaign.resume import FingerprintMismatch, open_campaign
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
+from expcore_onedata.testing import ADMIN_ENV, NOW, SPACE_NAME, write_platform
+from expcore_onedata.testing.world import SPACE_IDS, SPACE_LABELS, with_spaces
 
 
 @pytest.fixture(autouse=True)

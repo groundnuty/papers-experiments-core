@@ -123,7 +123,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
 "src/expcore_onedata/rangemap.py" = ["E501"]
 "src/expcore_onedata/probes.py" = ["E501"]
 "src/expcore_onedata/users.py" = ["E501"]
-"tests/support/fake_onedata.py" = ["E501"]
+"src/expcore_onedata/testing/fake_onedata.py" = ["E501"]
 
 [tool.uv.sources]
 sparql-platform = { path = "examples/sparql_platform", editable = true }

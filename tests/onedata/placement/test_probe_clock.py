@@ -1,9 +1,9 @@
 """The transfer log reads each provider's clock offset from its Date header and widens the run's window by it (O08)."""
 
 import pytest
-from placement_support import BETA_ID, DATA
 
 from expcore_onedata.probes import PlatformProbes
+from expcore_onedata.testing import BETA_ID, DATA
 
 PATH = "study/data.bin"
 MORE = "study/more.bin"

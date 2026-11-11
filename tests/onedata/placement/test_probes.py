@@ -4,7 +4,6 @@ import json
 
 import httpx
 import pytest
-from placement_support import ALPHA_ID, BETA_ID, DATA
 
 from expcore.plugin import Instrument
 from expcore.records.instruments import finish_instruments, start_instruments
@@ -12,6 +11,7 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.probes import NAMESPACE, PlatformProbes, bytes_by_pair, run_probe
 from expcore_onedata.rangemap import RangeRow
 from expcore_onedata.ranges import place_ranges
+from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA
 
 PATH = "study/data.bin"
 ROW = RangeRow(PATH, "beta", ((0, 100), (2000, 500)))
@@ -32,9 +32,10 @@ def calls_for(fake, route_part):
 
 
 def test_o08_a_real_answer_is_one_request_and_a_failed_probe_with_no_value(client, seeded, ticker):
-    """O08: a 404 is an answer; it is not retried, and the probe is failed with the value None."""
+    """O08: a file that is not there (400 posix enoent on Onedata 25.0, a 404 before) is an answer; it is not retried,
+    and the probe is failed with the value None."""
     result = run_probe(lambda: client.get("/data/missing", provider="alpha"), sleep=ticker.sleep)
-    assert (result.ok, result.value, result.attempts, result.status) == (False, None, 1, 404)
+    assert (result.ok, result.value, result.attempts, result.status) == (False, None, 1, 400)
     assert len(calls_for(seeded, "/data/missing")) == 1
     assert ticker.slept == []
 
@@ -187,9 +188,10 @@ def test_o08_a_block_map_without_a_blocks_field_is_a_failed_probe_with_a_reason_
     assert snapshot["pairs"] is None
 
 
-def test_o08_resolving_a_tracked_file_does_not_retry_a_real_404_from_the_space_root(probes, seeded, ticker):
-    """O08: a 404 from the space root, then a 200 on a second request, is a failed probe. The provisioner's wait for a
-    new space root would have asked again after a pause and succeeded, inside one attempt."""
+def test_o08_resolving_a_tracked_file_does_not_retry_a_space_root_that_is_not_there_yet(probes, seeded, ticker):
+    """O08: "not there" from the space root (400 posix enoent on Onedata 25.0), then a 200 on a second request, is a
+    failed probe. The provisioner's wait for a new space root would have asked again after a pause and succeeded,
+    inside one attempt."""
     seeded.root_enoent_polls = 1
     probes.start({})
     assert len(calls_for(seeded, "/spaces/")) == 1
@@ -197,7 +199,7 @@ def test_o08_resolving_a_tracked_file_does_not_retry_a_real_404_from_the_space_r
     snapshot = probes.finish()
     before = snapshot["files"]["data"]["providers"]["providers[0]"]["before"]
     assert before["probe_ok"] is False
-    assert before["status"] == 404
+    assert before["status"] == 400
     assert snapshot["ok"] is False
     # the next reading is its own
     assert snapshot["files"]["data"]["providers"]["providers[0]"]["after"]["probe_ok"] is True

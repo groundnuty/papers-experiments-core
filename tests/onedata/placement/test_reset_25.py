@@ -4,12 +4,20 @@ judged by the block map alone, a provider that does not see an entry yet is wait
 
 import pytest
 from fake_reset import FakeReset
-from placement_support import BETA_ID, DATA, with_placement
-from platform_support import ADMIN_ENV, BASELINE, SPACE_NAME, USERS, write_platform
 
 from expcore_onedata.eviction import evict_ids, evict_tree
 from expcore_onedata.provision import EVICTION_ATTEMPTS, NotPlaced
 from expcore_onedata.reset import ResetFailed, SpaceReset
+from expcore_onedata.testing import (
+    ADMIN_ENV,
+    BASELINE,
+    BETA_ID,
+    DATA,
+    SPACE_NAME,
+    USERS,
+    with_placement,
+    write_platform,
+)
 
 FILES = [f"study/part-{i:02d}.bin" for i in range(4)]
 
