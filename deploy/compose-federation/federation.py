@@ -50,7 +50,7 @@ from feddocker import (
     require_own,
     require_ports_free,
 )
-from fedfacts import describe, root_parent, write_facts
+from fedfacts import baseline_left_behind, describe, root_parent, write_facts
 from fedlayout import NODE, ROOT_MARKER, Layout
 from fedpki import (
     ensure_secret,
@@ -202,6 +202,13 @@ def up(layout: Layout) -> str:
     require_images()
     containers = project_containers(layout.spec.project)
     require_own(layout, containers, project_networks(layout.spec.project))
+    left = baseline_left_behind(layout)
+    if left:
+        raise RuntimeError(
+            f"the layout now declares baseline = false for {', '.join(left)}, brought up with baseline files; up on a "
+            "federation that is up writes and removes no baseline file, so they would stay where an agent can read "
+            "them: run reset --clean, which empties a baseline-off space, then up again"
+        )
     fresh = not containers
     if fresh:
         require_ports_free(layout.spec)

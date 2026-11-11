@@ -3,6 +3,7 @@ leaves it empty, and the facts written after up say so. The writer runs here aga
 for the providers, so nothing starts a container."""
 
 import itertools
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -246,3 +247,59 @@ def test_a_baseline_off_study_space_still_writes_facts_and_the_platform_file_wit
     assert facts["data_provider"] == "oak"
     assert facts["files"] is None
     assert fed.facts.placeholders(facts)["space_name"] == "alpha-space"
+
+
+def facts_file(layout, spaces: dict | str) -> None:
+    layout.root.mkdir(parents=True, exist_ok=True)
+    text = spaces if isinstance(spaces, str) else json.dumps({"spaces": spaces})
+    layout.facts.write_text(text, encoding="utf-8")
+
+
+def stale_layout(fed, tmp_path):
+    return fed.layout.Layout(tmp_path / "fed", spec=fed.spec.load_spec(write(tmp_path, WITH_BASELINE_OFF)))
+
+
+@pytest.mark.parametrize(
+    ("recorded", "left"),
+    [
+        ({"alpha-space": {"baseline": True}, "scratch-space": {"baseline": True}}, ["scratch-space"]),
+        ({"alpha-space": {"baseline": True}, "scratch-space": {}}, ["scratch-space"]),  # facts from before the key
+        ({"alpha-space": {"baseline": True}, "scratch-space": {"baseline": False}}, []),
+        ({"alpha-space": {"baseline": True}}, []),  # a space the federation was not brought up with
+    ],
+    ids=["had files", "recorded no flag", "had none", "not there before"],
+)
+def test_a_space_brought_up_with_baseline_files_and_now_declared_off_is_found_from_the_facts(
+    fed, tmp_path, recorded, left
+):
+    layout = stale_layout(fed, tmp_path)
+    facts_file(layout, recorded)
+    assert fed.facts.baseline_left_behind(layout) == left
+
+
+def test_no_facts_means_no_baseline_files_left_behind_and_unreadable_facts_are_an_error(fed, tmp_path):
+    layout = stale_layout(fed, tmp_path)
+    assert fed.facts.baseline_left_behind(layout) == []  # a first up: nothing was written yet
+    for text in ("not json", "[]", '{"spaces": 3}'):
+        facts_file(layout, text)
+        with pytest.raises(RuntimeError, match=r"facts\.json cannot be read"):
+            fed.facts.baseline_left_behind(layout)
+
+
+def test_up_on_a_federation_whose_layout_now_declares_a_space_baseline_off_refuses_before_touching_anything(
+    fed, tmp_path, monkeypatch
+):
+    """Up on a federation that is up writes and removes no baseline file, so the files of a space now declared off would
+    stay where an agent can read them: it refuses, says reset --clean, and starts nothing."""
+    layout = stale_layout(fed, tmp_path)
+    facts_file(layout, {"alpha-space": {"baseline": True}, "scratch-space": {"baseline": True}})
+    touched = []
+    monkeypatch.setattr(fed.cli, "require_images", lambda: None)
+    monkeypatch.setattr(fed.cli, "project_containers", lambda project: [])
+    monkeypatch.setattr(fed.cli, "project_networks", lambda project: [])
+    monkeypatch.setattr(fed.cli, "require_own", lambda *arguments: None)
+    for name in ("require_ports_free", "require_memory_fits", "prepare", "bring_up"):
+        monkeypatch.setattr(fed.cli, name, lambda *arguments, name=name: touched.append(name))
+    with pytest.raises(RuntimeError, match=r"scratch-space.*reset --clean"):
+        fed.cli.up(layout)
+    assert touched == []

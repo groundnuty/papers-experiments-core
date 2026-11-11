@@ -26,7 +26,8 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
   until each is online, makes the spaces, has each supported by exactly its owner and its mirrors, makes the users
   members of their spaces with exactly their privileges, writes the baseline files into every space that keeps them (all
   but those declared `baseline = false`), and writes `facts.json` and, from the layout's platform template,
-  `platform.toml`. Run on a federation that is up, it starts what is stopped and checks every step again.
+  `platform.toml`. Run on a federation that is up, it starts what is stopped and checks every step again, and writes
+  no baseline file (see "The baseline" for changing a space's `baseline` key).
 - **reset --clean** returns the deployment to clean: it starts what is stopped, checks every step again, removes
   everything in every space, ingested datasets included, and writes the baseline files again into the spaces that keep
   them; a space declared `baseline = false` is left empty. The providers, spaces and users keep their ids, so
@@ -175,15 +176,21 @@ writes nothing there, and `reset --replicas` treats it as any other space, walki
 evict when it is empty. `facts.json` records `spaces.<name>.baseline`, and its `files` entry (the content file and the
 listing directory) is `null` when the study space is one of them, so nothing names a file the space does not hold.
 
+Changing the key on a federation that is up takes `reset --clean`, since `up` there writes and removes no baseline file.
+`up` refuses a space brought up with baseline files that the layout now declares `baseline = false`, naming the space
+and saying `reset --clean`: the files would stay where an agent can read them. `reset --clean` empties the space and
+writes nothing into it. A space declared `true` again gets its files at the next `reset --clean`.
+
 The day-0 checks never assume a baseline file. The platform file names one space, the study space, and a check runs in
-it as it is: with a baseline-off study space the `listing` check reports unknown on an empty root and the `content_type`
-check reports unknown when a data path is REST and its configured `[sandbox] content_check_file` is not there (with no
-REST data path it reads no file, as against the templates here, which set no `[sandbox]` table), each saying so, and the live
-content test (`EXPCORE_LIVE_CONTENT_PATH`) skips on a file the space does not hold, so set that variable only where the
-study space keeps `hello.txt`. The checks that read no file of the space (`reachability`, `health`, `tokens`) and the two
-that work on a scratch file of their own (`read_only`, `round_trip`) are the same on any space. There is no setting to
-point one check at another space; a pass that needs the baseline files runs against a layout whose study space keeps
-them.
+it as it is. With a baseline-off study space the `listing` check reports unknown on an empty root. The `content_type`
+check, and the `health` check, which composes it, report unknown when a data path is REST and the configured
+`[sandbox] content_check_file` is not there, each saying so; `health` still fails on a support set that differs from the
+declared one and on a content type that was measured wrong. With no REST data path neither reads a file, as against the
+templates here, which set no `[sandbox]` table. The live content test (`EXPCORE_LIVE_CONTENT_PATH`) skips on a file the
+space does not hold, so set that variable only where the study space keeps `hello.txt`. `reachability` and `tokens` read
+no file of the space, and `read_only` and `round_trip` work on a scratch file of their own: all four are the same on any
+space. There is no setting to point one check at another space; a pass that needs the baseline files runs against a
+layout whose study space keeps them.
 
 ## Running the core against it
 

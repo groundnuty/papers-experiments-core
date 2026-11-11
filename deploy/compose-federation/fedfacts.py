@@ -35,6 +35,23 @@ def baseline_files(spec: Spec) -> dict | None:
     return {"content": CONTENT_FILE, "listing_directory": LISTING_DIR, "listing_entries": LISTING_ENTRIES}
 
 
+def baseline_left_behind(layout: Layout) -> list[str]:
+    """The spaces the recorded facts show were brought up with baseline files and the layout now declares
+    `baseline = false`: up on a federation that is up writes and removes none, so those files would stay where an agent
+    can read them. Facts from before the flag was recorded count as having had the files; a space the facts do not list
+    had none; no facts.json (a first up) means nothing was written."""
+    if not layout.facts.is_file():
+        return []
+    try:
+        recorded = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]
+        had_files = {name: space.get("baseline", True) for name, space in recorded.items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RuntimeError(
+            f"{layout.facts.name} cannot be read as the facts up writes ({type(error).__name__})"
+        ) from None
+    return [s.name for s in layout.spec.spaces if not s.baseline and had_files.get(s.name, False)]
+
+
 def facts_of(boot: Bootstrap) -> dict:
     """What an integrator needs to write platform.toml: addresses, ids, names and where the credentials are.
 
