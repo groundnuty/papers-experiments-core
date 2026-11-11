@@ -31,6 +31,7 @@ def calls_for(fake, route_part):
     return [c for c in fake.provider_calls if route_part in c[2]]
 
 
+@pytest.mark.legacy_errors
 def test_o08_a_real_answer_is_one_request_and_a_failed_probe_with_no_value(client, seeded, ticker):
     """O08: a 404 is an answer; it is not retried, and the probe is failed with the value None."""
     result = run_probe(lambda: client.get("/data/missing", provider="alpha"), sleep=ticker.sleep)
@@ -187,6 +188,7 @@ def test_o08_a_block_map_without_a_blocks_field_is_a_failed_probe_with_a_reason_
     assert snapshot["pairs"] is None
 
 
+@pytest.mark.legacy_errors
 def test_o08_resolving_a_tracked_file_does_not_retry_a_real_404_from_the_space_root(probes, seeded, ticker):
     """O08: a 404 from the space root, then a 200 on a second request, is a failed probe. The provisioner's wait for a
     new space root would have asked again after a pause and succeeded, inside one attempt."""

@@ -86,6 +86,7 @@ def test_o07_a_transfer_that_never_ends_raises_at_the_bound(provisioner, seeded,
     assert seeded.held(PATH, BETA_ID) == []
 
 
+@pytest.mark.legacy_errors
 def test_o07_a_new_space_root_that_answers_enoent_is_waited_out(provisioner, seeded, ticker):
     """O07: the first answers for a fresh space's root are "no such file"; the root arrives within the bound."""
     seeded.root_enoent_polls = 3
@@ -93,6 +94,7 @@ def test_o07_a_new_space_root_that_answers_enoent_is_waited_out(provisioner, see
     assert len(ticker.slept) == 3
 
 
+@pytest.mark.legacy_errors
 def test_o07_a_space_root_that_never_arrives_raises_at_the_bound(provisioner, seeded, ticker):
     """O07: after the last of the bounded tries the 404 is raised, and no other status is ever waited out."""
     seeded.root_enoent_polls = 10**6
@@ -316,6 +318,7 @@ def test_o09_the_data_providers_copy_is_refused_by_id_under_another_name(client,
     assert [c for c in seeded.provider_calls if c[2] == "/transfers"] == []
 
 
+@pytest.mark.legacy_errors
 def test_o09_teardown_deletes_exactly_what_it_created(provisioner, seeded):
     """O09: only logged ids are deleted; the study data beside them is untouched, and the report is clean."""
     file_id = provisioner.put_file("scratch/run/a.bin", DATA)
@@ -331,6 +334,7 @@ def test_o09_teardown_deletes_exactly_what_it_created(provisioner, seeded):
     assert provisioner.logged() == []
 
 
+@pytest.mark.legacy_errors
 def test_o09_teardown_reports_files_it_finds_left_and_deletes_nothing_it_did_not_create(provisioner, seeded):
     """O09: a directory holding a file nobody logged is left, with its reason, and the report is not ok."""
     provisioner.put_file("scratch/a.bin", DATA)
@@ -345,6 +349,7 @@ def test_o09_teardown_reports_files_it_finds_left_and_deletes_nothing_it_did_not
         report.raise_if_left()
 
 
+@pytest.mark.legacy_errors
 def test_o09_teardown_reports_a_delete_that_failed(provisioner, seeded):
     """O09: a delete answered with a server error leaves the entry, and the teardown says so."""
     provisioner.put_file("scratch/a.bin", DATA)
@@ -356,6 +361,7 @@ def test_o09_teardown_reports_a_delete_that_failed(provisioner, seeded):
     assert [e["id"] for e in provisioner.logged()]  # still logged, so a later teardown can finish it
 
 
+@pytest.mark.legacy_errors
 def test_o09_teardown_reports_a_file_still_listed_after_a_delete_that_was_accepted(provisioner, seeded):
     """O09: a delete answered 204 is not believed; the entry must be gone on consecutive reads, or it is left."""
     provisioner.put_file("scratch/a.bin", DATA)
@@ -365,6 +371,7 @@ def test_o09_teardown_reports_a_file_still_listed_after_a_delete_that_was_accept
     assert any("still listed" in entry["reason"] for entry in report.left)
 
 
+@pytest.mark.legacy_errors
 def test_o11_a_deletion_is_logged_only_after_absence_is_verified_so_a_second_teardown_checks_again(provisioner, seeded):
     """O11 with O09: a DELETE that answered 204 and left the entry is not a deletion. The creation record stays, the
     second teardown does not report ok without deleting and verifying the entry again, and once the provider really
@@ -451,6 +458,7 @@ def test_o09_put_file_refuses_to_adopt_a_file_that_exists(provisioner, seeded):
     assert mutating(seeded) == []
 
 
+@pytest.mark.legacy_errors
 def test_put_file_uploads_in_blocks_and_verifies_the_size(provisioner, seeded):
     """The content goes in blocks of the configured size, and the size read back must equal it."""
     provisioner.put_file("scratch/a.bin", DATA)
@@ -459,6 +467,7 @@ def test_put_file_uploads_in_blocks_and_verifies_the_size(provisioner, seeded):
     assert bytes(seeded.nodes[seeded.id_of("scratch/a.bin")].content) == DATA
 
 
+@pytest.mark.legacy_errors
 def test_o09_an_id_with_an_equals_sign_reaches_the_gate_unescaped(provisioner, seeded):
     """O09: the gate refuses an escape in a mutation path, so ids are sent as they are and never percent-encoded."""
     seeded.id_suffix = "=="

@@ -9,15 +9,16 @@ what it does not; the study guide shows them in use ("Testing a study's instrume
 
 - `MockOnedata`, `Request`: the provider REST surface the fsspec client uses, over a real local HTTP socket.
 - `FakeFederation`: an in-process Onezone (tokens, privileges, the scope of the study space).
-- `FakeData`, `Node`, `Transfer`, `PROVIDER`, `ROOT_ID`: Onezone plus every provider's data API: files, block maps,
-  range reads, transfers and their delays.
+- `FakeData`, `Node`, `Transfer`, `PROVIDER`, `ROOT_ID`, `ERRORS_25_0`, `ERRORS_LEGACY`: Onezone plus every provider's
+  data API: files, per-provider block maps, per-reader visibility delays, transfers, and Onedata 25.0's error shapes
+  (or the older 404 shape).
 - `Ticker` and the test world (`make_federation`, `write_platform`, `write_with_placement`, `tool_plane_replicates`
   and the names the default `platform.toml` holds).
 - Two stand-in MCP servers, run as `python -m expcore_onedata.testing.fake_mcp_server` and `... .fake_onedata_mcp`.
   They are not imported here, so importing this package does not load the MCP SDK.
 """
 
-from expcore_onedata.testing.fake_data import PROVIDER, ROOT_ID, FakeData, Node, Transfer
+from expcore_onedata.testing.fake_data import ERRORS_25_0, ERRORS_LEGACY, PROVIDER, ROOT_ID, FakeData, Node, Transfer
 from expcore_onedata.testing.fake_federation import FakeFederation
 from expcore_onedata.testing.fake_onedata import MockOnedata, Request
 from expcore_onedata.testing.world import (
@@ -57,6 +58,8 @@ __all__ = [
     "CREDENTIALS_DIR",
     "DATA",
     "DATA_PATH_USER",
+    "ERRORS_25_0",
+    "ERRORS_LEGACY",
     "MANAGE",
     "NOW",
     "PROVIDER",

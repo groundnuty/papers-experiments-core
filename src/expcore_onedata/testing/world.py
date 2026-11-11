@@ -19,7 +19,7 @@ import httpx
 
 from expcore_onedata.client import AUTH_HEADER, OnezoneClient
 from expcore_onedata.credentials import Principal
-from expcore_onedata.testing.fake_data import PROVIDER, FakeData
+from expcore_onedata.testing.fake_data import ERRORS_25_0, PROVIDER, FakeData
 from expcore_onedata.testing.fake_federation import FakeFederation
 
 NOW = 1_800_000_000.0  # the issuer's clock in tests
@@ -84,15 +84,19 @@ def add_users(federation: FakeFederation) -> None:
         federation.grant(user_id, BASELINE)
 
 
-def make_federation(*, clock: Callable[[], float] | None = None) -> FakeData:
+def make_federation(
+    *, clock: Callable[[], float] | None = None, error_shape: str = ERRORS_25_0, visibility_delay_s: float = 0.0
+) -> FakeData:
     """Return the federation the default `platform.toml` describes, as a `FakeData`.
 
     It has the study space, the data provider `alpha` that supports it, a second provider `beta` that Onezone knows
     and that does not support it yet, and the three users, who can log in and read. Its jobs' times and its providers'
-    `Date` headers come from `clock` (a `Ticker`'s `clock`, say). The platform layer reads the admin credential from
-    the environment variable `ADMIN_ENV`: a test sets it to `fake.admin_token`.
+    `Date` headers come from `clock` (a `Ticker`'s `clock`, say), and so does the visibility delay: a new file shows on
+    the provider it was not made on after `visibility_delay_s` seconds of it. `error_shape` is the data API's error
+    shape (`ERRORS_25_0`, or `ERRORS_LEGACY` for the 404 shape the core's own tests were written against). The platform
+    layer reads the admin credential from the environment variable `ADMIN_ENV`: a test sets it to `fake.admin_token`.
     """
-    federation = FakeData(space_name=SPACE_NAME)
+    federation = FakeData(space_name=SPACE_NAME, error_shape=error_shape, visibility_delay_s=visibility_delay_s)
     if clock is not None:
         federation.clock = clock
     federation.add_provider(BETA_ID, "beta.test", supports=False)

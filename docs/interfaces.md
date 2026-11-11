@@ -608,7 +608,10 @@ Implementer must guarantee:
 
 ```python
 class FakeData(FakeFederation):     # fake_data.py: Onezone plus every provider's data API
+    def __init__(self, *, error_shape: str = ERRORS_25_0, visibility_delay_s: float = 0.0, **kwargs)
     def add_file(self, path: str, content: bytes, *, holder: str | None = None) -> str
+    def add_tree(self, root_id: str, path: str) -> str                     # a tree of a space no configuration knows
+    def answer_missing_as_25(self, answer=(400, "posix", "enoent")) -> None # what is gone, as 25.0 answers it
     def add_transfer(self, kind, path, provider_id, *, scheduled, source_id=None, ended=True, waiting=False,
                      finished=None, bytes_replicated=None) -> str          # a job no request to /transfers made
     def end_transfer(self, tid: str, *, at: float | None = None) -> None    # places or removes the blocks, as of then
@@ -617,7 +620,8 @@ class FakeData(FakeFederation):     # fake_data.py: Onezone plus every provider'
     def client_http(self) -> httpx.Client                                   # the client the platform layer takes
     def respond(self, request: httpx.Request) -> httpx.Response
 
-def make_federation(*, clock: Callable[[], float] | None = None) -> FakeData
+def make_federation(*, clock: Callable[[], float] | None = None, error_shape: str = ERRORS_25_0,
+                    visibility_delay_s: float = 0.0) -> FakeData
 def write_platform(directory: Path, edit: Callable[[dict], None] | None = None) -> Path
 def write_with_placement(directory: Path, rows: str = "", **override) -> Path
 def tool_plane_replicates(fake: FakeData, client: OnezoneClient, path: str, target_id: str) -> str
@@ -631,7 +635,7 @@ def tool_plane_replicates(fake: FakeData, client: OnezoneClient, path: str, targ
 |---|---|---|---|
 | `MockOnedata`, `Request` | the provider REST surface the fsspec client uses, served over a real local HTTP socket from a fixed file set; `Request` is what it records of each call | lookup, attributes, paged children (a `limit` over the maximum is refused, not clamped), ranged content, the one token it accepts | writes, transfers, block maps, file times and permissions, more than one space |
 | `FakeFederation` | an in-process Onezone: `client_http()` answers through an `httpx.MockTransport`, no socket | token examination and scope, temporary tokens with a time caveat, privileges (direct and effective), the study space and others | other Onezone calls, a token's expiry or revocation, group-derived privileges |
-| `FakeData`, `Node`, `Transfer`, `PROVIDER`, `ROOT_ID` | Onezone plus the data API of every provider it reports, with files, block maps, range reads and transfer jobs; time is counted in calls | files, directories, block maps per provider, on-the-fly fetch, replication, eviction and migration jobs, the transfer listing and a job's record, provider clock skew and listing lag, injected faults | a transfer's duration, partial replication, QoS, storage backends beyond one, quotas, a token's space or interface caveats |
+| `FakeData`, `Node`, `Transfer`, `PROVIDER`, `ROOT_ID`, `ERRORS_25_0`, `ERRORS_LEGACY` | Onezone plus the data API of every provider it reports, with files, block maps, range reads and transfer jobs; time is counted in calls, or in seconds of the fake's own `clock` | files, directories, per-provider block maps that a range read, a replication and an eviction change, per-reader views with a visibility delay, replication, eviction and migration jobs, the transfer listing and a job's record, provider clock skew and listing lag, Onedata 25.0's error shapes (or the older one), injected faults | a transfer's duration, partial replication or eviction, QoS, storage backends beyond one, quotas, a token's space or interface caveats, a delete that other providers show late |
 | `Ticker` | a clock that moves only when something sleeps: `clock`, `sleep`, `now` | a bounded wait that runs instantly and exactly | real time, threads |
 | `make_federation`, `add_users` | the federation the default `platform.toml` describes: the study space, `alpha` supporting it, `beta` known and not supporting it, the three users with the baseline privileges | what `write_platform` names | a federation of another shape: build `FakeData` and bend it |
 | `write_platform`, `platform_document`, `write_with_placement`, `with_placement` | the default `platform.toml` as a dictionary and as a file, with the credential files and empty manifests it names, and a `[placement]` table with test settings | a document `load_platform` accepts | a real federation's names: every one is invented (`.test` hosts, `login-*` users) |
@@ -640,6 +644,21 @@ def tool_plane_replicates(fake: FakeData, client: OnezoneClient, path: str, targ
 The names the default document and the federation share are `ADMIN_ENV` (the variable that holds the admin credential, which a test sets to `fake.admin_token`), `ALPHA_ID` and `BETA_ID` (the providers' ids), `SPACE_NAME` and `SPACE_PREFIX`, `USERS` (login to password and user id), `DATA_PATH_USER`, `TOOL_SERVER_USER` and `SERVICE_USER` (the three principals), `CREDENTIALS_DIR`, `BASELINE` and `MANAGE` (privilege sets), `NOW` and `CEILING_S` (the issuer's clock and a run's ceiling), `SETTINGS` (the `[placement]` table), `DATA` (4096 bytes whose every offset has its own value) and `TOOL_SERVER_ARGS` (the stand-in tool server's arguments after the interpreter).
 
 Two stand-in MCP servers are run, not imported, so importing the package does not load the MCP SDK: `python -m expcore_onedata.testing.fake_mcp_server --tools echo,add` is a real MCP stdio server with a small catalogue and a tool allow-list, and `python -m expcore_onedata.testing.fake_onedata_mcp` is the Onedata tool server's stand-in, configured by environment as the real one is (`TOOL_SERVER_ARGS` is its command line). Neither models the real server's tools.
+
+**Per-reader views.** A file or directory is made on one provider (`add_file`'s holder, or the provider a `POST` of children was sent to), and every other provider shows it only after `visibility_delay_s` seconds of the fake's `clock` (`visibility_delay_by_provider` gives one reader its own delay; the default is none). Until then that reader's reads of it answer as a deleted entry does, and its parent's listing leaves it out. The delay is counted on the fake's clock, which a test binds to a `Ticker`, so a test of a six-second delay takes no time. About 6 s was seen live on Onedata 25.0.
+
+**Error shapes, by version.** `FakeData.error_shape` selects what the data API answers with when an entry is gone, a write is refused or an upload is untyped:
+
+| | `ERRORS_25_0` (the default) | `ERRORS_LEGACY` |
+|---|---|---|
+| Belongs to | Onedata 25.0, as measured live (`deploy/compose-federation/day0/`) | none known: the fake's first shape, kept for a study that targets an older platform |
+| An entry that is deleted or not visible yet (`missing_answer`, `unseen_answer`) | 400, error `posix`, `errno` `enoent` | 404, error `notFound` |
+| A deleted entry's `parent_id` (`keep_deleted_parents`) | still its old parent | gone with the entry |
+| The space root before it is there (`root_enoent_answer`) | 400, error `posix`, `errno` `enoent` | 404, error `posix`, `errno` `enoent` |
+| A write with a read-only token (`readonly_answer`) | 400, error `posix`, `errno` `eacces` | 403, error `forbidden` |
+| An upload (`PUT` of content) not marked `application/octet-stream` (`require_octet_stream`) | 415, error `unsupportedMediaType` | accepted |
+
+The statuses and the `posix` errors of the first column are what was seen. 25.0 was seen to answer 415 to an upload with no Content-Type at all; that the fake refuses every other type too, and the error id of its 415, are its own. Setting `error_shape` sets each attribute named in the table to that column's; a test sets one after it to bend one answer, as the core's tests do to see it fail closed on another 400. A job a provider does not show yet answers `transfer_unseen_answer`, 404 `notFound` in both shapes. The platform layer reads both columns: a 404 or exactly 400 `posix`/`enoent` is absence, 403 or 400 `posix`/`eacces` a refusal, and every upload is marked `application/octet-stream`.
 
 **Transfers carried over.** A job carries the times the platform reports. The fake does not decide which jobs belong to a run's window: `PlatformProbes` does, from those times and the providers' `Date` headers. A job that started before the window and had not ended when it opened is carried over (`space_transfers.carried_over`, and `transfer_carried_over` among the reasons an `on_demand` bound is unknown): it is not one of the run's records and its bytes are not in `transfer_bytes_in`, even if it places them during the run. A job that ended before the window is neither. A stand-in that sums every job it holds counts the first kind and differs from the core there; the tests that pin this are in `tests/onedata/test_testing_module.py`.
 

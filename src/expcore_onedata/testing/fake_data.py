@@ -17,6 +17,35 @@ from expcore_onedata.testing.fake_onedata import Request
 PROVIDER = "/api/v3/oneprovider"
 ROOT_ID = "root-0001"
 
+# The shapes of the data API's errors a `FakeData` can answer with (`FakeData.error_shape`).
+ERRORS_25_0 = "25.0"  # as seen live on Onedata 25.0: an entry that is gone answers 400 posix/enoent, and so on
+ERRORS_LEGACY = "legacy"  # this fake's first shape: 404 notFound, 403 forbidden, no Content-Type check; not seen live
+ERROR_SHAPES = (ERRORS_25_0, ERRORS_LEGACY)
+
+Answer = tuple[int, str | None, str | None]  # (status, error id, errno); an error id of None: a body no error object
+
+# What each shape sets: how an entry that is not there, one a reader does not show yet, a space root not there yet and
+# a read-only write are answered, whether a deleted entry's parent link still reads, and whether an upload must say it
+# is an octet stream. A test may set any of these attributes after the shape, to bend one answer.
+_SHAPES: dict[str, dict[str, object]] = {
+    ERRORS_25_0: {
+        "missing_answer": (400, "posix", "enoent"),
+        "unseen_answer": (400, "posix", "enoent"),
+        "root_enoent_answer": (400, "posix", "enoent"),
+        "readonly_answer": (400, "posix", "eacces"),
+        "keep_deleted_parents": True,
+        "require_octet_stream": True,
+    },
+    ERRORS_LEGACY: {
+        "missing_answer": (404, "notFound", None),
+        "unseen_answer": (404, "notFound", None),
+        "root_enoent_answer": (404, "posix", "enoent"),
+        "readonly_answer": (403, "forbidden", None),
+        "keep_deleted_parents": False,
+        "require_octet_stream": False,
+    },
+}
+
 
 @dataclass
 class Node:
@@ -27,6 +56,8 @@ class Node:
     kind: str  # "REG" or "DIR"
     parent: str | None
     content: bytearray = field(default_factory=bytearray)
+    created: float = 0.0  # the fake's clock when it was made
+    origin: str | None = None  # the provider it was made on: the others show it only after the visibility delay
 
 
 @dataclass
@@ -85,8 +116,41 @@ class FakeData(FakeFederation):
       POST   /transfers, GET /transfers/{id}        replication, eviction and migration jobs
       GET    /spaces/{space}/transfers              the ids of the space's jobs in one state (`limit`, `page_token`)
 
-    and, from Onezone, `GET /spaces/{space}` (the live name). Time is counted in calls, never in seconds, so a test
-    never waits.
+    and, from Onezone, `GET /spaces/{space}` (the live name). Time is counted in calls, and where a delay is in
+    seconds it is seconds of the fake's own `clock`, never of the wall, so a test never waits.
+
+    **Block maps.** Each provider holds ranges of each file (`GET /data/{id}/distribution`, `held`). The provider a file
+    is made on holds all of it (`add_file`'s `holder`) or the bytes it wrote. A range read through a provider that lacks
+    the bytes fetches them there, on the fly, and they show in its map after `fetch_lag` polls of the map. A
+    replication places the whole file on its target, and an eviction removes all of the evicting provider's blocks of
+    the file (a migration does both); no provider's map changes another's.
+
+    **Per-reader views.** A file or a directory is made on one provider, and every other provider shows it only
+    after `visibility_delay_s` seconds of `clock` (`visibility_delay_by_provider` gives a reader its own; the default is
+    0, at once). Until then that reader's attributes, children, content and block-map reads of it answer
+    `unseen_answer`, and the listing of its parent leaves it out. About 6 s was seen live on Onedata 25.0. A test can
+    also hold a file back from one reader for a number of reads instead of seconds (`unseen`, `unseen_after_create`):
+    each read of the file through that provider answers `unseen_answer` until they are used up; the listing is not
+    counted and shows the file.
+
+    **Error shapes**, chosen with `error_shape` and documented by the version each belongs to:
+
+    - `ERRORS_25_0` (the default), as measured live on Onedata 25.0 (the dated facts in
+      `deploy/compose-federation/day0/`): an entry that is deleted or not visible yet, and a space root that is not
+      there yet, answer 400 with error id `posix` and `errno` `enoent`, while a deleted entry's `parent_id` still
+      reads its old parent; a write made with a token that has the read-only caveat answers 400 `posix`/`eacces`; an
+      upload (`PUT` of content) without `Content-Type: application/octet-stream` answers 415. The statuses and the
+      `posix` errors are what was seen. A 415 was seen for an upload with no Content-Type at all; that this fake
+      refuses any other type too, and the error id of its 415, `unsupportedMediaType`, are its own.
+    - `ERRORS_LEGACY`: the shape this fake had before those observations: 404 `notFound` for an entry that is gone
+      or not shown yet (404 `posix`/`enoent` for the space root), no parent link for a deleted entry, 403 `forbidden`
+      for a read-only write, and no Content-Type check. No live version is known to answer so; it is kept for a study
+      that targets an older platform.
+
+    Setting `error_shape` sets `missing_answer`, `unseen_answer`, `root_enoent_answer`, `readonly_answer`,
+    `keep_deleted_parents` and `require_octet_stream` to that version's; a test sets one of them after it to bend one
+    answer (another 400, say, to see the core fail closed on it). A job not found yet answers `transfer_unseen_answer`,
+    404 `notFound` in both shapes, since no 25.0 answer for it is recorded.
 
     A job carries the times the platform reports: `scheduleTime`, `startTime` and `finishTime`, taken from `clock`.
     The fake does not decide which jobs fall in a run's window: the core does, from those times and the providers'
@@ -98,10 +162,16 @@ class FakeData(FakeFederation):
     it), partial replication (a replication places the whole file, as Onedata's does), QoS requirements, file
     metadata other than the id, name, type, size and parent, storage backends beyond one per provider, concurrent
     writers, quotas, symbolic links, a token's space or interface caveats (only the read-only caveat is enforced, and
-    `enforce_readonly=False` turns that off), and any provider call that is not listed above.
+    `enforce_readonly=False` turns that off), a delete that other providers show late (it shows everywhere at once),
+    the visibility delay for scheduling a transfer of a file the provider does not show yet (the job is accepted),
+    eviction of part of a file (it removes all of a provider's blocks), other errors than those above, and any
+    provider call that is not listed above.
 
     A test bends the fake through plain attributes:
 
+    - `error_shape` (also a constructor argument): `ERRORS_25_0` or `ERRORS_LEGACY`; any other value is refused;
+    - `visibility_delay_s` (also a constructor argument) and `visibility_delay_by_provider`: seconds of `clock` before
+      a new file shows on a provider it was not made on, for all readers and for one;
     - `fetch_lag`: polls of the file's block map before bytes fetched by a range read or a replication show in it;
     - `onthefly_places`: False makes a range read answer without ever adding a block (a provider that does not cache);
     - `transfers_place_blocks`: False makes a replication end as `completed` with no block placed;
@@ -109,20 +179,20 @@ class FakeData(FakeFederation):
       `evictions_noop_first` does that, with `filesEvicted` 0, for the next N evictions only;
     - `onthefly_unit`: a range read through a provider lacking the bytes places at least this many from its offset;
     - `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at
-      all, each answered `transfer_unseen_answer` (a 404 by default); a fresh space root answers `root_enoent_answer`
-      (a 404 of posix enoent by default) for `root_enoent_polls` reads;
+      all, each answered `transfer_unseen_answer`; a fresh space root answers `root_enoent_answer` for
+      `root_enoent_polls` reads;
     - `resets`: a list of `[substring, count]` or `[substring, count, provider id]`: the next `count` provider calls
       whose route contains the substring (to that provider, when named) fail with a connection reset;
     - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status;
     - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
     - `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
-      `readonly_answer` is how such a write is refused, 403 by default, `(400, "posix", "eacces")` as Onedata 25.0
-      answers it;
-    - `unseen`, `unseen_after_create`: a provider that sees a new file only after so many reads of it, each answered
-      `unseen_answer` (a 404 by default), as a second provider of 25.0 does for some seconds after a write elsewhere;
-    - `missing_answer`: how a file or directory that is not there is answered, a 404 by default;
-      `answer_missing_as_25` makes it 400 posix enoent and keeps a deleted entry's `parent_id` readable, as 25.0 does;
-    - a content write (`PUT /data/{id}/content`) without `Content-Type: application/octet-stream` is a 415, as in 25.0;
+      `readonly_answer` is how such a write is refused;
+    - `unseen` (`(provider id, file id)` to reads) and `unseen_after_create` (provider id to reads, for every file made
+      from then on): a provider that sees a new file only after so many reads of it, each answered `unseen_answer`;
+    - `missing_answer`: how a file or directory that is not there is answered; `keep_deleted_parents`: a deleted
+      entry's `parent_id` still answers its old parent; `answer_missing_as_25(answer)` sets both, as 25.0 has them;
+    - `require_octet_stream`: a content write (`PUT /data/{id}/content`) without `Content-Type:
+      application/octet-stream` is a 415;
     - `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out);
     - `clock`: the epoch seconds a job's schedule, start and finish times are taken from (a test binds its own);
     - `transfer_omit`: field names a job's record leaves out; `transfer_list_body`: an answer that replaces the
@@ -139,8 +209,19 @@ class FakeData(FakeFederation):
     call, so a test can assert what was sent where.
     """
 
-    def __init__(self, **kwargs) -> None:
+    # Set by `error_shape`, each to that version's (see _SHAPES); a test may set one after it.
+    missing_answer: Answer
+    unseen_answer: Answer
+    root_enoent_answer: Answer
+    readonly_answer: Answer
+    keep_deleted_parents: bool
+    require_octet_stream: bool
+
+    def __init__(self, *, error_shape: str = ERRORS_25_0, visibility_delay_s: float = 0.0, **kwargs) -> None:
         super().__init__(**kwargs)
+        self.error_shape = error_shape  # which version's error answers the data API gives: see ERROR_SHAPES
+        self.visibility_delay_s = visibility_delay_s  # seconds of `clock` before a new entry shows on another provider
+        self.visibility_delay_by_provider: dict[str, float] = {}  # provider id -> its own delay, over the one above
         self.nodes: dict[str, Node] = {ROOT_ID: Node(ROOT_ID, "", "DIR", None)}
         self.blocks: dict[tuple[str, str], list[list[int]]] = {}
         self.pending: dict[tuple[str, str], list[list[int]]] = {}  # [offset, length, polls left]
@@ -163,9 +244,7 @@ class FakeData(FakeFederation):
         # not there; `unseen_after_create` (provider id -> reads) sets that for every file made from then on.
         self.unseen: dict[tuple[str, str], int] = {}
         self.unseen_after_create: dict[str, int] = {}
-        self.unseen_answer: tuple[int, str | None, str | None] = (404, "notFound", None)
-        self.root_enoent_answer: tuple[int, str | None, str | None] = (404, "posix", "enoent")  # a fresh root's
-        self.transfer_unseen_answer: tuple[int, str | None, str | None] = (404, "notFound", None)  # a job not seen yet
+        self.transfer_unseen_answer: Answer = (404, "notFound", None)  # a job not seen yet, in either shape
         self.page_size = 1000
         self.id_suffix = ""  # appended to every file id made from now on, for ids with characters like "="
         self.fail_deletes = False  # every DELETE answers 500
@@ -173,12 +252,7 @@ class FakeData(FakeFederation):
         self.omit_providers: set[str] = set()  # provider ids the block map leaves out (a partial answer)
         self.ignore_deletes = False  # every DELETE answers 204 and removes nothing
         self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat is refused
-        # how that refusal is answered: (status, error id, errno); Onedata 25.0 answers (400, "posix", "eacces")
-        self.readonly_answer: tuple[int, str, str | None] = (403, "forbidden", None)
-        # how a file or directory that is not there is answered: (status, error id, errno), an error id of None being a
-        # body that is no error object; see `answer_missing_as_25`
-        self.missing_answer: tuple[int, str | None, str | None] = (404, "notFound", None)
-        self.deleted_parents: dict[str, str | None] | None = None  # a deleted entry's parent link, while it is kept
+        self.deleted_parents: dict[str, str | None] = {}  # a deleted entry's parent, read if `keep_deleted_parents`
         self.resets: list[list] = []
         self.statuses: list[list] = []
         self.content_type: str | None = "application/octet-stream"  # of a file's content, whole or by range
@@ -193,19 +267,35 @@ class FakeData(FakeFederation):
         self._ids = itertools.count(1)
         self._root_polls = 0
 
+    @property
+    def error_shape(self) -> str:
+        """The shape of the data API's errors: `ERRORS_25_0` (the default) or `ERRORS_LEGACY`."""
+        return self._error_shape
+
+    @error_shape.setter
+    def error_shape(self, shape: str) -> None:
+        if shape not in ERROR_SHAPES:
+            raise ValueError(f"error_shape must be one of {ERROR_SHAPES}, not {shape!r}")
+        self._error_shape = shape
+        for name, value in _SHAPES[shape].items():
+            setattr(self, name, value)
+
     # -- setup helpers ---------------------------------------------------------
     def provider_of(self, host: str) -> str | None:
         """Return the id of the provider that answers for a host."""
         return next((i for i, p in self.providers.items() if p["domain"] == host), None)
 
     def add_file(self, path: str, content: bytes, *, holder: str | None = None) -> str:
-        """Create a file at a path of the space (directories on the way as needed); the holder has all its blocks."""
+        """Create a file at a path of the space (directories on the way as needed); the holder has all its blocks.
+
+        The holder is also the provider the entries are made on, so another provider shows them only after the
+        visibility delay (none by default)."""
         holder = holder or self.PROVIDER_ID
         parent = ROOT_ID
         *dirs, name = path.strip("/").split("/")
         for part in dirs:
-            parent = self._child(parent, part) or self._create(parent, part, "DIR")
-        file_id = self._create(parent, name, "REG")
+            parent = self._child(parent, part) or self._create(parent, part, "DIR", holder)
+        file_id = self._create(parent, name, "REG", holder)
         self.nodes[file_id].content = bytearray(content)
         if content:
             self.blocks[(file_id, holder)] = [[0, len(content)]]
@@ -279,19 +369,32 @@ class FakeData(FakeFederation):
     def _child(self, parent: str, name: str) -> str | None:
         return next((n.file_id for n in self.nodes.values() if n.parent == parent and n.name == name), None)
 
-    def _create(self, parent: str, name: str, kind: str) -> str:
+    def _create(self, parent: str, name: str, kind: str, origin: str | None = None) -> str:
         file_id = f"fid-{next(self._ids):04d}{self.id_suffix}"
-        self.nodes[file_id] = Node(file_id, name, kind, parent)
+        self.nodes[file_id] = Node(file_id, name, kind, parent, created=self.clock(), origin=origin)
         if kind == "REG":  # a provider that sees a file sees the directories above it, made before it
             for provider_id, reads in self.unseen_after_create.items():
                 self.unseen[(provider_id, file_id)] = reads
         return file_id
 
+    def _visible(self, node: Node, provider: str) -> bool:
+        """Tell whether a provider shows an entry: the one it was made on does at once, the others after their delay."""
+        delay = self.visibility_delay_by_provider.get(provider, self.visibility_delay_s)
+        return node.origin in (None, provider) or delay <= 0 or self.clock() >= node.created + delay
+
+    def _shown(self, node: Node, provider: str) -> bool:
+        """Tell whether a provider shows an entry to a read of it: not while `unseen` holds reads of it back (this read
+        uses one up), and not before its visibility delay has run out."""
+        lag = (provider, node.file_id)
+        if self.unseen.get(lag, 0) > 0:
+            self.unseen[lag] -= 1
+            return False
+        return self._visible(node, provider)
+
     def _delete(self, file_id: str) -> None:
         for child in [n.file_id for n in self.nodes.values() if n.parent == file_id]:
             self._delete(child)
-        if self.deleted_parents is not None:
-            self.deleted_parents[file_id] = self.nodes[file_id].parent
+        self.deleted_parents[file_id] = self.nodes[file_id].parent
         del self.nodes[file_id]
         for table in (self.blocks, self.pending):
             for key in [k for k in table if k[0] == file_id]:
@@ -303,20 +406,20 @@ class FakeData(FakeFederation):
         details = {"errno": errno} if errno is not None else {}
         return httpx.Response(status, json={"error": {"id": error_id, "details": details}})
 
-    def answer_missing_as_25(self, answer: tuple[int, str | None, str | None] = (400, "posix", "enoent")) -> None:
+    def answer_missing_as_25(self, answer: Answer = (400, "posix", "enoent")) -> None:
         """Answer what is not there as Onedata 25.0 does: 400 posix enoent instead of a 404, while a deleted entry's
         `parent_id` still answers its old parent (both read on the Compose federation). `answer` replaces the 400."""
         self.missing_answer = answer
-        self.deleted_parents = {}
+        self.keep_deleted_parents = True
 
     def _missing(self, file_id: str, query: httpx.QueryParams, method: str) -> httpx.Response:
         """A file or directory that is not there: `missing_answer`, except a deleted entry's kept parent link."""
-        kept = self.deleted_parents or {}
+        kept = self.deleted_parents if self.keep_deleted_parents else {}
         if method == "GET" and file_id in kept and query.get("attribute") == "parent_id":
             return httpx.Response(200, json={"parent_id": kept[file_id]})
         return self._answer(self.missing_answer)
 
-    def _answer(self, answer: tuple[int, str | None, str | None]) -> httpx.Response:
+    def _answer(self, answer: Answer) -> httpx.Response:
         """An error answer from (status, error id, errno); an error id of None is a body that is no error object."""
         status, error_id, errno = answer
         if error_id is None:
@@ -387,19 +490,17 @@ class FakeData(FakeFederation):
             and method in ("POST", "PUT", "DELETE")
             and any(c.get("type") == "data.readonly" for c in issued["caveats"])
         ):
-            return self._error(*self.readonly_answer)
+            return self._answer(self.readonly_answer)
         found = re.fullmatch(r"/spaces/([^/]+)", route)
         if found and method == "GET":
             return self._space_root(found.group(1))
         found = re.fullmatch(r"/data/([^/]+)(/children|/content|/distribution)?", route)
         if found:
             node = self.nodes.get(found.group(1))
-            lag = (provider, found.group(1))
-            if node is not None and self.unseen.get(lag, 0) > 0:  # this provider does not see the new file yet
-                self.unseen[lag] -= 1
-                return self._answer(self.unseen_answer)
             if node is None:
                 return self._missing(found.group(1), query, method)
+            if not self._shown(node, provider):  # this provider does not see the new entry yet
+                return self._answer(self.unseen_answer)
             part = found.group(2) or ""
             if part == "" and method == "GET":
                 if "path" in query.get_list("attribute"):  # Onedata 25.0 has no path attribute ([L1] in client.py)
@@ -412,12 +513,12 @@ class FakeData(FakeFederation):
                     self._delete(node.file_id)
                 return httpx.Response(204)
             if part == "/children" and method == "GET":
-                return self._list(node, query)
+                return self._list(node, query, provider)
             if part == "/children" and method == "POST":
-                return self._make(node, query)
+                return self._make(node, query, provider)
             if part == "/content" and method == "PUT":
-                if request.headers.get("Content-Type") != "application/octet-stream":
-                    return httpx.Response(415)  # 25.0 refuses a raw body that does not say it is one
+                if self.require_octet_stream and request.headers.get("Content-Type") != "application/octet-stream":
+                    return self._error(415, "unsupportedMediaType")  # 25.0 refuses a raw body that does not say so
                 return self._write(node, provider, int(query.get("offset", "0")), request.content)
             if part == "/content" and method == "GET":
                 return self._read(node, provider, request.headers.get("Range"))
@@ -461,10 +562,11 @@ class FakeData(FakeFederation):
             parent = self._child(parent, part) or self._create(parent, part, "DIR")
         return parent
 
-    def _list(self, node: Node, query: httpx.QueryParams) -> httpx.Response:
+    def _list(self, node: Node, query: httpx.QueryParams, provider: str) -> httpx.Response:
         if node.kind != "DIR":
             return self._error(400, "posix")
-        children = sorted((n for n in self.nodes.values() if n.parent == node.file_id), key=lambda n: n.name)
+        shown = (n for n in self.nodes.values() if n.parent == node.file_id and self._visible(n, provider))
+        children = sorted(shown, key=lambda n: n.name)
         start = int(query.get("token", "0"))
         limit = min(int(query.get("limit", self.page_size)), self.page_size)
         page = children[start : start + limit]
@@ -474,13 +576,13 @@ class FakeData(FakeFederation):
             body["nextPageToken"] = str(start + limit)
         return httpx.Response(200, json=body)
 
-    def _make(self, parent: Node, query: httpx.QueryParams) -> httpx.Response:
+    def _make(self, parent: Node, query: httpx.QueryParams, provider: str) -> httpx.Response:
         name, kind = query.get("name"), query.get("type")
         if parent.kind != "DIR" or not name or kind not in ("REG", "DIR"):
             return self._error(400, "badValueNotAllowed")
         if self._child(parent.file_id, name) is not None:
             return self._error(409, "posix")
-        return httpx.Response(201, json={"fileId": self._create(parent.file_id, name, kind)})
+        return httpx.Response(201, json={"fileId": self._create(parent.file_id, name, kind, provider)})
 
     def _write(self, node: Node, provider: str, offset: int, body: bytes) -> httpx.Response:
         end = offset + len(body)
@@ -637,4 +739,4 @@ class FakeData(FakeFederation):
             self.pending.pop(evicted, None)
 
 
-__all__ = ["PROVIDER", "ROOT_ID", "FakeData", "Node", "Transfer"]
+__all__ = ["ERRORS_25_0", "ERRORS_LEGACY", "ERROR_SHAPES", "PROVIDER", "ROOT_ID", "FakeData", "Node", "Transfer"]

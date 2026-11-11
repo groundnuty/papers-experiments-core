@@ -55,6 +55,9 @@ markers = [
 ]
 # Helper modules shared by several test files live here, outside any package, and are imported by plain name.
 pythonpath = ["tests/support"]
+markers = [
+    "legacy_errors: the test needs the fake federation's older 404 error shape, not Onedata 25.0's (see tests/onedata/placement/conftest.py)",
+]
 
 [tool.ruff]
 line-length = 120

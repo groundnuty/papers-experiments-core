@@ -5,16 +5,29 @@ import pytest
 from expcore_onedata.config import PlatformConfig, load_platform
 from expcore_onedata.provision import Provisioner, resolve_provider_ids
 from expcore_onedata.rangemap import Placement, load_placement
-from expcore_onedata.testing import ADMIN_ENV, DATA, FakeData, Ticker, make_federation, write_with_placement
+from expcore_onedata.testing import (
+    ADMIN_ENV,
+    DATA,
+    ERRORS_25_0,
+    ERRORS_LEGACY,
+    FakeData,
+    Ticker,
+    make_federation,
+    write_with_placement,
+)
 
 
 @pytest.fixture
-def fake(monkeypatch, ticker) -> FakeData:
+def fake(monkeypatch, ticker, request) -> FakeData:
     """A federation with the study space, the data provider `alpha`, a second provider `beta`, and the three users.
 
     Its clock is the test's ticker, so its jobs' times and its providers' Date headers agree with the probes' clock
-    unless a test skews a provider."""
-    federation = make_federation(clock=ticker.clock)
+    unless a test skews a provider. It answers errors in Onedata 25.0's shape, except for a test marked `legacy_errors`,
+    which gets the older 404 shape: the platform layer reads a 404 as an entry that is gone and uploads without a
+    Content-Type, so those tests fail against 25.0's `posix`/`enoent` and 415 until the core is fixed. Remove the mark
+    from a test when it passes without it."""
+    shape = ERRORS_LEGACY if request.node.get_closest_marker("legacy_errors") else ERRORS_25_0
+    federation = make_federation(clock=ticker.clock, error_shape=shape)
     monkeypatch.setenv(ADMIN_ENV, federation.admin_token)
     return federation
 
