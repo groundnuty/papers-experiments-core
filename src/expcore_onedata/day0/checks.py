@@ -211,7 +211,8 @@ def content_type(ctx: Context) -> Result:
 
 @register("listing", "Listing of the space root on each supporting provider")
 def listing(ctx: Context) -> Result:
-    """The root lists on every provider in the support set, and a paged walk agrees with the single read."""
+    """The root lists on every provider in the support set, and a paged walk agrees with the single read. A root with no
+    entry has nothing to agree on, so it is unknown, never a pass."""
     from expcore_onedata import consistency
 
     rows: dict[str, Any] = {}
@@ -228,6 +229,14 @@ def listing(ctx: Context) -> Result:
             bad.append(name)
     if bad:
         return failed(f"the listing failed or disagreed on {len(bad)} provider(s): {', '.join(bad)}", providers=rows)
+    empty = [name for name, row in rows.items() if row["entries"] == 0]
+    if empty:
+        return unknown(
+            f"the root lists no entry on {len(empty)} supporting provider(s): {', '.join(empty)}; no baseline file is "
+            "in the space (one declared baseline = false in the federation's layout holds none until a study "
+            "ingests), so there is nothing to list or to walk page by page and a pass would prove nothing",
+            providers=rows,
+        )
     if any(row["consistent"] is None for row in rows.values()):
         return unknown("the root lists, but it is too large to walk page by page", providers=rows)
     return passed(f"the root lists on all {len(rows)} supporting provider(s), and a paged walk agrees", providers=rows)

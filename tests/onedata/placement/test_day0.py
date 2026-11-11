@@ -79,6 +79,7 @@ def test_a_check_is_registered_once():
 
 
 def test_the_read_only_checks_pass_against_a_conforming_federation(context, fake):
+    fake.add_file("item.bin", b"x")  # a space that holds something: an empty one measures nothing for the listing
     entries = by_name(run_checks(context(), ["reachability", "health", "tokens", "listing"]))
     # the fixed tool-server user holds the baseline only, so the condition that needs more is not checked with it
     assert {n: e.ok for n, e in entries.items()} == {
@@ -131,6 +132,36 @@ def test_a_listing_is_read_by_the_servers_pages_and_two_at_a_time_and_the_two_ag
     entry = by_name(run_checks(context(), ["listing"]))["listing"]
     assert entry.ok is True  # whole and paged reads agree, so the walk is exercised and passes
     assert entry.facts["providers"]["alpha"]["pages"] >= 2
+
+
+def test_an_empty_listing_is_unknown_naming_the_missing_baseline_never_a_pass(context, fake):
+    """A study space declared baseline = false holds nothing until a study ingests: a root with no entry has nothing to
+    list or to walk page by page, so the listing check reports unknown, which is not a pass, and says why."""
+    entry = by_name(run_checks(context(), ["listing"]))["listing"]
+    assert entry.ok is None
+    assert "no entry on 2 supporting provider(s): alpha, beta" in entry.summary
+    assert "no baseline file is in the space" in entry.summary
+    assert {row["entries"] for row in entry.facts["providers"].values()} == {0}
+
+
+def test_a_study_space_with_no_baseline_files_fails_no_check_and_passes_none_that_needs_them(context, fake):
+    """The baseline-off study space through the whole run: the checks that read no file of the space are as they are
+    on any space (the two that change state work on a scratch file of their own and remove it) and the listing is
+    unknown. The content type reads the configured check file, which a baseline-off space lacks: it is unknown when a
+    data path is REST (test_o05_the_check_is_a_day0_check_too) and has no file to read when none is. Nothing fails for
+    want of a file and nothing passes on one."""
+    assert [n for n in fake.nodes.values() if n.parent is not None] == []
+    entries = by_name(run_checks(context(allow_mutation=True)))
+    assert {n: e.ok for n, e in entries.items()} == {
+        "reachability": True,
+        "health": True,
+        "tokens": None,  # the fixed tool-server user holds the baseline rights only, as in every run here
+        "content_type": True,  # no data path is REST here, so no file is read
+        "listing": None,
+        "read_only": True,
+        "round_trip": True,
+    }
+    assert [n for n in fake.nodes.values() if n.name.startswith("day0-")] == []
 
 
 def test_o11_without_consent_the_checks_that_change_state_are_unknown_and_send_nothing(context, fake):
@@ -394,6 +425,7 @@ def test_an_unknown_check_name_is_a_usage_error(context):
 
 
 def test_run_writes_a_dated_report_in_json_and_markdown_with_unknown_apart(platform, fake, tmp_path, ticker):
+    fake.add_file("item.bin", b"x")
     client = OnezoneClient(load_config(platform), http=fake.client_http())
     code, json_path, md_path = run(
         platform,
