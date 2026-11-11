@@ -23,7 +23,9 @@ kept sorted; an empty list, a repeat or a value that joins several fingerprints 
 `anthropic` model, whose adapter records no fingerprint to check it against.
 
 Secrets never appear here. An entry points at an environment variable (`key_env`) or a file (`key_file`), and the
-key is read when a request is built, not when the table is loaded.
+key is read when a request is built, not when the table is loaded. Where a key lives is not part of the experiment:
+the identity and the fingerprint leave it out, and a replication package withholds it (`config.key_locations`), so the
+table refuses a key location written where that rewrite cannot reach it.
 
 A price is `[models.<key>.price]`, in dollars per million tokens, flat or in tiers by the prompt's length, a request
 priced, its reply included, at the tier its prompt fell in (`expcore.config.price_table`, C24).
@@ -38,6 +40,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+from expcore.config.key_locations import KeyLocationUnreachable, withhold_key_locations
 from expcore.config.loading import ConfigError, Section, close_match, load_toml
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
 from expcore.config.price_table import read_price
@@ -493,7 +496,12 @@ def _accepted(section: Section) -> tuple[str, ...]:
 
 def load_models(path: str | os.PathLike[str]) -> ModelTable:
     """Load and validate `models.toml`; fail at once, naming the file and the key, on the first bad entry."""
-    return parse_models(load_toml(path), path)
+    models = parse_models(load_toml(path), path)
+    try:
+        withhold_key_locations(Path(path).read_bytes())  # a package must be able to withhold each key location
+    except KeyLocationUnreachable as error:
+        raise ConfigError(f"{path}: {error}") from None
+    return models
 
 
 def parse_models(data: Mapping[str, Any], path: str | os.PathLike[str]) -> ModelTable:

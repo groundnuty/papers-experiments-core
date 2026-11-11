@@ -10,19 +10,22 @@
 3. refuse a check made under code that is not a clean commit, outputs made by another core version, and a check that
    records no environment or another one than the build's (`provenance.environment`); warn about every other included
    file no commit holds and list it, and refuse one in an anonymised build unless the author allows it (`tracking`);
-4. with an anonymisation list (`anonymise`), rewrite the prose and metadata files it names, give the package a code
-   identity by tree hash alone: no commit id and no source URL anywhere (`identity`), and withhold the provenance
-   headers of the vendored code (`withhold`);
+4. in every build, write each key location of models.toml (`key_file`, `key_env`) as its fixed placeholder: where a key
+   lives is outside the code identity and the campaign fingerprint, so the file still verifies (`config.key_locations`,
+   K13). With an anonymisation list (`anonymise`), also rewrite the prose and metadata files it names, give the
+   package a code identity by tree hash alone: no commit id and no source URL anywhere (`identity`), and withhold the
+   provenance headers of the vendored code (`withhold`);
 5. add the generated files: `.code-stamp.json` (the commit and tree hash the check names, dated by the check), one
    wheel per distribution of the check's environment under `wheels/` with `wheels/requirements.txt` pinning each by
    hash (`wheels`), a `Makefile` whose `check` target installs those wheels into a fresh environment, offline, and
    runs `python -m expcore package-check .` with it, `PACKAGE.json` (what was built from what, under which core and
    environment, from which wheels, and the study's declaration of side files when it has one) and `SHA256SUMS`
    (`archive`);
-6. refuse the package if a path or content of any file matches a study token, or holds a term of the anonymisation
-   list. The token check is `expcore.provenance.study_tokens`' own scanner with the hashes of names that are private
-   everywhere (hosts, addresses, users, spaces, providers: the `all` scope): a study's own condition, dataset or model
-   names belong in its own package. Both checks fail closed: a file goes in only if they can read all of it (text,
+6. refuse the package if a path or content of any file matches a study token, holds a term of the anonymisation
+   list, or if its models.toml still holds a key location other than the placeholder. The token check is
+   `expcore.provenance.study_tokens`' own scanner with the hashes of names that are private everywhere (hosts,
+   addresses, users, spaces, providers: the `all` scope): a study's own condition, dataset or model names belong in
+   its own package. Both checks fail closed: a file goes in only if they can read all of it (text,
    SQLite databases and archives of them, `views`); anything else is refused, unless package.toml attests that exact
    file by its SHA-256 with a reason (`[[opaque]]`), and then it goes in unread. Every text member of every wheel is
    read too, and every member that is not text is attested by its hash and listed in PACKAGE.json (`wheelscan`); a
@@ -51,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.snapshot import SNAPSHOT_FILE
+from expcore.config.key_locations import withhold_key_locations
 from expcore.config.loading import ConfigError
 from expcore.models.route import sdk_version
 from expcore.package.anonymise import Anonymisation, holds_term, load_anonymisation, refuse_models, rewrite
@@ -89,7 +93,7 @@ from expcore.provenance.study_tokens import count_hashes
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.replay.check import CHECK_FILE, BatchNotVerified
 from expcore.replay.side_files import declared
-from expcore.study.config import CONFIG_FILES, StudyConfig, load_study
+from expcore.study.config import CONFIG_FILES, MODELS_FILE, StudyConfig, load_study
 from expcore.study.pipeline import ANALYSIS_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, regenerate
 
 PACKAGE_FILE = "PACKAGE.json"
@@ -195,6 +199,10 @@ def _package_json(
             "tree hash only: every commit id is the first 40 hexadecimal digits of its tree hash, and no source is kept"
             if rewritten_identity
             else "commit and tree hash"
+        ),
+        "key_locations": (
+            f"withheld: every key_file and key_env of {MODELS_FILE} is a fixed placeholder; where a key lives is not "
+            "part of the code identity or the campaign fingerprint, so the file verifies as it is"
         ),
         "checked_at": check.get("checked_at"),
         "environment": env,
@@ -332,6 +340,7 @@ def _collect(
     warn: Callable[[str], None],
 ) -> tuple[PackageSpec, dict[str, bytes]]:
     study, spec, files, check = _selection(study_root)
+    files[MODELS_FILE] = withhold_key_locations(files[MODELS_FILE])  # in every build; the identity agrees (K13)
     if terms is not None:
         refuse_models(terms, _model_names(study))
     where = f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}"

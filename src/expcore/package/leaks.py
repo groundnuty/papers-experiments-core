@@ -2,7 +2,8 @@
 """The leak checks a package's files pass: the study-token scan, and for an anonymised package its terms and identity.
 
 `scan_tokens` is the study-token scanner run over every stream of every file, under every view (`views`), with the
-hashes of the names private everywhere. `findings_in` adds what an anonymised package must not hold either.
+hashes of the names private everywhere. `findings_in` adds a key location models.toml still holds, which no package
+may (`config.key_locations`), and what an anonymised package must not hold either.
 """
 
 import importlib.resources
@@ -12,6 +13,7 @@ from collections.abc import Collection, Mapping
 from pathlib import Path
 
 import expcore
+from expcore.config.key_locations import location_findings
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term
 from expcore.package.identity import find_identity
 from expcore.package.spec import PackageError
@@ -19,6 +21,7 @@ from expcore.package.views import JOINED, PARSED, Stream, streams, views
 from expcore.provenance.hashfile import Hashes, parse_hash_file
 from expcore.provenance.redact import Redactor
 from expcore.provenance.scanner import Finding, scan_source
+from expcore.study.config import MODELS_FILE
 
 HASHES_NAME = "study_tokens.sha256"
 PRIVATE_NAME = "a private name"
@@ -159,8 +162,8 @@ def findings_in(
     generated: Collection[str] = frozenset(),
     redactor: Redactor | None = None,
 ) -> list[str]:
-    """Every leak the checks find: study tokens, and for an anonymised package its terms and its identity, each
-    naming a path through the one `redactor`.
+    """Every leak the checks find: a key location left in models.toml (K13), study tokens, and for an anonymised package
+    its terms and its identity, each naming a path through the one `redactor`.
 
     The files in `generated` are the build's own (SHA256SUMS, PACKAGE.json, ...), which list the package's paths. A
     path whose own finding reports it is not reported again through them: they are read with each exact mention of it
@@ -170,7 +173,10 @@ def findings_in(
         redactor = Redactor(tokens, (lambda text: holds_term(terms, text)) if terms is not None else None)
     reported = reported_paths(files, tokens, terms, opaque)
     files = {path: without_paths(data, reported) if path in generated else data for path, data in files.items()}
-    findings = scan_tokens(files, tokens, opaque=opaque, redactor=redactor)
+    findings = (
+        [f"{MODELS_FILE}: {found}" for found in location_findings(files[MODELS_FILE])] if MODELS_FILE in files else []
+    )
+    findings += scan_tokens(files, tokens, opaque=opaque, redactor=redactor)
     if terms is not None:
         findings += find_terms(files, terms, opaque=opaque, redactor=redactor)
         findings += find_identity(files, commits, urls, opaque=opaque, redactor=redactor)

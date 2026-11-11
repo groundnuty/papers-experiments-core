@@ -53,6 +53,15 @@ All configuration is TOML in the study directory, validated when the study is lo
 
 Secrets are never written in configuration: a model names the environment variable or file that holds its key. The hash of every configuration file goes into the campaign's fingerprint, so resuming a campaign after any of them changed is refused.
 
+Where a key lives (`key_env`, `key_file`) is deployment, not experiment: the key goes into the request's authorisation, never into what the model receives. So the code identity and the fingerprint hash `models.toml` with each of those values replaced by a fixed placeholder, and every other byte of the file counts as usual. Moving a key file or renaming its variable never stops a campaign from resuming; any other edit to the file does. A replication package ships `models.toml` in that same form, `key_file = "<withheld>"` and `key_env = "KEY_WITHHELD"`, so where your keys live is never published ([section 8](#where-keys-live)). Write each key location on a line of its own in its model's table, as below. One in an inline table, under a dotted key or in a multi-line string is refused when the table is loaded, since a package could not withhold it. For a study you will package, prefer `key_env`: a variable's name rarely says more than which key it is, while a file's path often names your home directory, an account or an earlier study's folder. The package withholds either, but the path you also wrote in a README or a note stays yours to remove.
+
+```python
+from expcore.config.key_locations import withhold_key_locations
+
+keyed = b'[models.remote]\nbackend = "anthropic"\napi_id = "model-1"\nkey_env = "MY_LAB_KEY"  # a line of its own\n'
+assert withhold_key_locations(keyed) == keyed.replace(b'"MY_LAB_KEY"', b'"KEY_WITHHELD"')  # what a package ships
+```
+
 ```python
 from expcore.study.config import load_study
 
@@ -815,6 +824,10 @@ The wheels are made at package time. A distribution is packed again from its ins
 Every wheel is opened, whatever it was installed from. Each text member (Python source, `METADATA`, `RECORD`, entry points, licences) is read with the study-token list, and in an anonymised build with the terms of the anonymisation list and the identity it must not hold; a member that is not text (a compiled extension, a scientific library's test data) is attested by its hash and named in `PACKAGE.json`. Your own code (the core, a wheel from a URL or a directory, a wheel you supplied) is read with every view the checks use for any file; a release from an index is read as it is, line by line, since its text runs to tens of megabytes.
 
 A public library's code can hold a word that the study-token list also holds, so that list applies by provenance. A wheel is a public release, read without the study-token list, only when its SHA-256 equals a hash your `uv.lock` records for a wheel of that name and version from the pypi.org registry; a matching name and version are not enough. The lock is the nearest `uv.lock` from the study directory up to the top of its repository (only the study's own directory for a study outside a repository); with none, one that cannot be read (the build warns, naming it, and refuses nothing for it), or a package it does not hold, every wheel gets the list. A wheel the build packs again from installed files never has the published artifact's bytes, so it is never exempt: to exempt a release, put its published wheel (the file whose URL and hash the lock records) in the `--wheels` directory, where it goes in byte for byte once its code is shown to be what is installed. The core's own wheel, and the wheel of anything installed from a URL, a repository or a directory, editable or not, always get the list. The anonymisation list and the identity apply to every wheel, always. Any other member that holds a listed word makes the build name it and print the `[[opaque]]` entry (`path = "wheels/<wheel file>/<member>"` and its SHA-256) that attests it once you have read it.
+
+### Where keys live
+
+Every build, the plain one included, writes each `key_file` and `key_env` of `models.toml` as a fixed placeholder (`key_file = "<withheld>"`, `key_env = "KEY_WITHHELD"`), keeping every other byte of the file, and `PACKAGE.json` says so under `key_locations`. The camera-ready copy needs this as much as the submission: a key's path can name your home directory, an account or an earlier study. The code identity and the campaign fingerprint already hash the file in that form ([section 2](#2-where-configuration-lives)), so the shipped file is exactly what the records were checked under, and `make check` passes on it as it is. The build's own scan refuses a package whose `models.toml` still holds any other key location, naming the model and the key, never the value. The package's check reads no key; a reader who wants to call a model again sets `KEY_WITHHELD` or edits the placeholder. The placeholder covers `models.toml` only: a path you wrote into a README or a note is yours to remove, and the study-token check finds it only if your list names it. So prefer `key_env` for a study you will package.
 
 ### A double-blind submission
 

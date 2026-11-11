@@ -57,6 +57,7 @@ from expcore.campaign.factors import FactorSchema, load_factor_schema
 from expcore.campaign.manifest import Manifest, build_manifest
 from expcore.campaign.markers import MARKER_NAME
 from expcore.campaign.snapshot import SNAPSHOT_FILE
+from expcore.config.key_locations import hashed_form
 from expcore.config.loading import ConfigError, Section, close_match, load_toml
 from expcore.config.models import ModelTable, load_models
 from expcore.errors import StudyKind, check_study_kind, infra_kinds, study_kinds
@@ -159,7 +160,7 @@ def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope, tuple[
     if not roots:
         raise section.fail("code", "must list the files the code identity covers")
     try:
-        scope = CodeScope.of(roots)
+        scope = CodeScope.of(roots, canonical={MODELS_FILE: hashed_form})  # where a key lives is not code (K13)
     except CodeScopeError as error:
         raise section.fail("code", str(error)) from None
     missing = [r for r in roots if not (root / r).exists()]
@@ -294,6 +295,12 @@ def read_study_identity(path: str | os.PathLike[str]) -> StudyIdentity:
     return StudyIdentity(root, study_file, plugin_file, scope, _platforms(top), kinds, requires, side_files)
 
 
+def _hashed_bytes(root: Path, file: str) -> bytes:
+    """The bytes of a configuration file the campaign fingerprint hashes: models.toml without its key locations."""
+    data = (root / file).read_bytes()
+    return hashed_form(data) if file == MODELS_FILE else data
+
+
 def load_study(path: str | os.PathLike[str]) -> StudyConfig:
     """Load and cross-check the configuration of a study directory; raise ConfigError naming the file and the key."""
     root = Path(path).resolve()
@@ -317,7 +324,7 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
             )
         loaded = prereg.load(root / PREREG_FILE, schema)
         _check_clusters(name, tasks, loaded)
-    hashes = {file: hashlib.sha256((root / file).read_bytes()).hexdigest() for file in CONFIG_FILES}
+    hashes = {file: hashlib.sha256(_hashed_bytes(root, file)).hexdigest() for file in CONFIG_FILES}
     return StudyConfig(
         root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds, requires, side_files
     )
