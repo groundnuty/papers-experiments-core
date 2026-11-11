@@ -133,7 +133,7 @@ class Sandbox(Protocol):
 
     def exec(self, code: str, timeout_s: float, *, record: bool = True) -> ExecResult:
         """Run Python source as the unprivileged user; `record=False` makes it the harness's own step, never a cell of
-        the agent's (O21)."""
+        the agent's (O22)."""
         ...
 
     def collect(self, dest_dir: str | Path) -> dict[str, Any]:

@@ -37,7 +37,7 @@ with the reasons, so a file a cap left out reads as unknown (`files_cut`), never
 `run_start_marked` says whether the executor marked where the agent's run began (`DockerSandbox.mark_run_start`, after
 its own checks through the sandbox): with the mark, the counts, the tables and so every lookup hold only the answers
 after it, and those before it are counted in `before_run_start`; without it every answer is the run's and
-`before_run_start` is None (O21). A snapshot recorded before these two keys existed lacks them: not recorded.
+`before_run_start` is None (O22). A snapshot recorded before these two keys existed lacks them: not recorded.
 """
 
 import math

@@ -62,7 +62,7 @@ request following, one `conn_close` event line says how (see `Handler._peer_gone
 (SIGTERM or SIGINT: `serve`; or the server closed: `GateServer.server_close`), every connection still open gets that line with `ended` "teardown", before the process
 exits (`teardown`), and then one `teardown_complete` line once every such line is written; a gate that is killed (SIGKILL, `docker rm -f`) cannot write
 either, and a log without `teardown_complete` says so. SIGUSR1 is the harness's mark of where the agent's run begins: one `run_start` line naming every request
-begun and not yet logged (`mark_run_start`), so the count of the bytes served keeps the harness's own requests apart (O21).
+begun and not yet logged (`mark_run_start`), so the count of the bytes served keeps the harness's own requests apart (O22).
 
 Errors and retries, identical on every path: an upstream attempt that fails before any byte of
 an answer arrives (connect, handshake, send, or the peer closing first) is retried once, on a new connection, before
@@ -1227,7 +1227,7 @@ def teardown() -> None:
         print("GATE TEARDOWN FAILED", repr(e)[:200], file=sys.stderr, flush=True)
 
 
-RUN_START = "run_start"  # the harness's mark: the agent's run begins after it (gatelog, O21)
+RUN_START = "run_start"  # the harness's mark: the agent's run begins after it (gatelog, O22)
 
 
 def mark_run_start() -> None:
@@ -1235,7 +1235,7 @@ def mark_run_start() -> None:
     `run_start` line. Every open connection is read first, and a request one has begun and not yet logged is named in
     `before` by its `conn` and `conn_request`, so its line, which comes after the mark, still counts as before it; a
     request begun after that reading is the run's. Never raises: a mark that could not be written is missing from the
-    log, and the run's count of the bytes served is then unknown (gatelog, O21)."""
+    log, and the run's count of the bytes served is then unknown (gatelog, O22)."""
     try:
         with _LIVE_LOCK:
             live = list(_LIVE.values())
@@ -1424,7 +1424,7 @@ def main() -> None:
     # a gate that cannot log does not start, and one that started leaves a log, so a missing log is lost evidence, not zero errors
     with open(CFG["log"], "a"):
         pass
-    signal.signal(signal.SIGUSR1, _on_run_start)  # before "ready": by default SIGUSR1 ends the process (O21)
+    signal.signal(signal.SIGUSR1, _on_run_start)  # before "ready": by default SIGUSR1 ends the process (O22)
     print("gate ready", flush=True)
     serve(httpd)
 

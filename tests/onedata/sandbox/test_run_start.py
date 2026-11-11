@@ -1,4 +1,4 @@
-"""O21: a harness step before the agent's loop, and its requests through the data gate, kept apart from the agent's.
+"""O22: a harness step before the agent's loop, and its requests through the data gate, kept apart from the agent's.
 
 A study's executor checks the sandbox as the agent's user before its loop starts (`exec(..., record=False)`), then
 marks where the agent's run begins (`mark_run_start`): the gate writes the mark in its own log, naming every request
@@ -94,8 +94,8 @@ def the_gate_marks(world, sbx, monkeypatch, live=None) -> None:
     world.host.signal_handlers["USR1"] = lambda container: gate.mark_run_start()
 
 
-def test_o21_a_harness_step_runs_as_the_agent_and_is_recorded_apart_from_the_agents_cells(world):
-    """O21: `exec(..., record=False)` runs the code in the agent's container as before, and records it as a harness
+def test_o22_a_harness_step_runs_as_the_agent_and_is_recorded_apart_from_the_agents_cells(world):
+    """O22: `exec(..., record=False)` runs the code in the agent's container as before, and records it as a harness
     step with its exit status, never as a cell of the agent's: the cells count none, the agent's first cell is still
     cell 1, and a refusal of the gate during the step is the step's, never handed to that cell."""
     sbx = start(world)
@@ -125,8 +125,8 @@ def test_o21_a_harness_step_runs_as_the_agent_and_is_recorded_apart_from_the_age
     sbx.stop()
 
 
-def test_o21_a_kill_under_a_harness_step_is_never_put_on_the_agents_next_cell(world):
-    """O21: the memory counters a harness step raised are its own: the agent's next cell takes its baseline after the
+def test_o22_a_kill_under_a_harness_step_is_never_put_on_the_agents_next_cell(world):
+    """O22: the memory counters a harness step raised are its own: the agent's next cell takes its baseline after the
     step, so a kill the step met is not a kill of that cell (O17)."""
     sbx = start(world, "isolated")
     agent = world.host.containers[sbx.names.agent]
@@ -146,8 +146,8 @@ def test_o21_a_kill_under_a_harness_step_is_never_put_on_the_agents_next_cell(wo
     sbx.stop()
 
 
-def test_o21_answers_before_the_mark_are_counted_apart_and_never_in_the_runs_tables():
-    """O21: with the mark, the run's counts and tables hold only the answers after it, and the answers before it are
+def test_o22_answers_before_the_mark_are_counted_apart_and_never_in_the_runs_tables():
+    """O22: with the mark, the run's counts and tables hold only the answers after it, and the answers before it are
     counted apart (`before_run_start`), so nothing is hidden; an answer begun before the mark and logged after it is
     one of those, by the request the mark names. A lookup reads only the run's rows: a file or directory the harness
     alone read was not served to the agent."""
@@ -163,8 +163,8 @@ def test_o21_answers_before_the_mark_are_counted_apart_and_never_in_the_runs_tab
     assert served.lookup_file(got, FILE).state == "served"
 
 
-def test_o21_without_a_mark_every_answer_is_the_runs_and_the_snapshot_says_no_mark_was_set(world, tmp_path):
-    """O21: a run whose start was never marked is counted as before: every answer is the run's, nothing is counted
+def test_o22_without_a_mark_every_answer_is_the_runs_and_the_snapshot_says_no_mark_was_set(world, tmp_path):
+    """O22: a run whose start was never marked is counted as before: every answer is the run's, nothing is counted
     apart (`before_run_start` None), and the snapshot says no mark was set."""
     got = gatelog.served(log(*CHECK, LATE, *RUN, END), STOPPED)
     assert (got["served_bytes"], got["before_run_start"], got["unknown"]) == (1655, None, [])
@@ -218,8 +218,8 @@ def test_o21_without_a_mark_every_answer_is_the_runs_and_the_snapshot_says_no_ma
         "in-flight-at-stop",
     ],
 )
-def test_o21_a_mark_the_log_does_not_confirm_leaves_the_count_unknown(lines, run_start, reasons):
-    """O21: a mark the sandbox set must be in the log, once, before the gate's teardown mark, and must have been read
+def test_o22_a_mark_the_log_does_not_confirm_leaves_the_count_unknown(lines, run_start, reasons):
+    """O22: a mark the sandbox set must be in the log, once, before the gate's teardown mark, and must have been read
     back before the agent's loop started; a mark line lost or cut, one never seen, two of them or one after the
     teardown make every count unknown, never "everything after" taken for the run. So does a mark line nobody set, or
     one that does not name its requests. The rules that were there hold as before."""
@@ -228,8 +228,8 @@ def test_o21_a_mark_the_log_does_not_confirm_leaves_the_count_unknown(lines, run
     assert all(got[field] is None for field in (*gatelog.SERVED_FIELDS, *TABLES, "before_run_start"))
 
 
-def test_o21_the_gate_writes_the_mark_and_the_collection_counts_only_what_came_after_it(world, tmp_path, monkeypatch):
-    """O21: the executor's check runs as a harness step, then `mark_run_start` signals the gate, which writes the mark
+def test_o22_the_gate_writes_the_mark_and_the_collection_counts_only_what_came_after_it(world, tmp_path, monkeypatch):
+    """O22: the executor's check runs as a harness step, then `mark_run_start` signals the gate, which writes the mark
     in its own log, naming the request it had answered and not yet logged; the sandbox reads the mark back before it
     returns. The collection then counts the agent's answers alone, the check's apart, and the instrument records both
     and the mark, whose note the metadata keeps."""
@@ -255,8 +255,8 @@ def test_o21_the_gate_writes_the_mark_and_the_collection_counts_only_what_came_a
     sbx.stop()
 
 
-def test_o21_a_mark_the_gate_never_logged_is_unconfirmed_and_the_runs_count_unknown(world, tmp_path):
-    """O21: a gate that took the signal and wrote no mark (its log write failed, say) leaves the mark unconfirmed: the
+def test_o22_a_mark_the_gate_never_logged_is_unconfirmed_and_the_runs_count_unknown(world, tmp_path):
+    """O22: a gate that took the signal and wrote no mark (its log write failed, say) leaves the mark unconfirmed: the
     sandbox says so when it returns, and the run's count is unknown, never every answer taken for the run's."""
     sbx = start(world)
     world.host.signal_handlers["USR1"] = lambda container: None
@@ -268,10 +268,10 @@ def test_o21_a_mark_the_gate_never_logged_is_unconfirmed_and_the_runs_count_unkn
     sbx.stop()
 
 
-def test_o21_the_run_start_is_marked_once_before_the_agents_first_cell_and_before_the_collection(
+def test_o22_the_run_start_is_marked_once_before_the_agents_first_cell_and_before_the_collection(
     world, tmp_path, monkeypatch
 ):
-    """O21: a mark after one of the agent's cells would set that cell's reads apart from the run's, and one after the
+    """O22: a mark after one of the agent's cells would set that cell's reads apart from the run's, and one after the
     collection would come after the count: both are refused, and so is a second mark."""
     sbx = start(world)
     the_gate_marks(world, sbx, monkeypatch)
@@ -293,8 +293,8 @@ def test_o21_the_run_start_is_marked_once_before_the_agents_first_cell_and_befor
     collected.stop()
 
 
-def test_o21_without_a_gate_the_mark_is_recorded_and_nothing_is_signalled(world):
-    """O21: a mount or no data path has no gate to mark: the mark is recorded, nothing is signalled, a mount's count
+def test_o22_without_a_gate_the_mark_is_recorded_and_nothing_is_signalled(world):
+    """O22: a mount or no data path has no gate to mark: the mark is recorded, nothing is signalled, a mount's count
     stays unknown and no data path served nothing before the mark either."""
     zero = dict.fromkeys(BEFORE, 0)
     for level, before in (("mounted", None), ("isolated", zero)):
@@ -306,8 +306,8 @@ def test_o21_without_a_gate_the_mark_is_recorded_and_nothing_is_signalled(world)
         sbx.stop()
 
 
-def test_o21_the_gates_mark_names_each_request_begun_and_not_yet_logged(tmp_path, monkeypatch):
-    """O21: the gate reads its open connections and writes one mark: a request a connection has begun and not yet
+def test_o22_the_gates_mark_names_each_request_begun_and_not_yet_logged(tmp_path, monkeypatch):
+    """O22: the gate reads its open connections and writes one mark: a request a connection has begun and not yet
     logged (its line comes after the mark) is named in `before`, and one whose line is written is not."""
     log_file = tmp_path / "requests.jsonl"
     log_file.touch()
@@ -325,8 +325,8 @@ def test_o21_the_gates_mark_names_each_request_begun_and_not_yet_logged(tmp_path
     assert (line["event"], line["connections"], line["before"]) == (gatelog.RUN_START, 2, [["1-1", 3]])
 
 
-def test_o21_the_gate_takes_its_mark_signal_before_it_says_it_is_ready(tmp_path, monkeypatch):
-    """O21: the gate handles SIGUSR1, whose default would end it, from before it says it is ready, so a mark sent to a
+def test_o22_the_gate_takes_its_mark_signal_before_it_says_it_is_ready(tmp_path, monkeypatch):
+    """O22: the gate handles SIGUSR1, whose default would end it, from before it says it is ready, so a mark sent to a
     gate the sandbox has seen ready is written, never the gate's death."""
 
     class Server:

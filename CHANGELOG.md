@@ -228,7 +228,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | O20 | A read-only input is read-only in the agent's container and named by its hash in the record | `tests/live/test_sandbox.py`, `tests/onedata/sandbox/test_inputs.py`, `tests/onedata/sandbox/test_provider.py` |
 | O21 | A complete listing of an unchanging directory is complete or refused, never a part taken for the whole | `tests/live/test_sandbox.py`, `tests/onedata/sandbox/test_gate_listing.py`, `tests/onedata/sandbox/test_gatepolicy.py`, `tests/onedata/sandbox/test_provider.py`, `tests/onedata/sandbox/test_sandbox.py`, `tests/onedata/sandbox/test_settings.py` |
 | O22 | The bytes a run's agent read through its data path are counted, and unknown is never zero | `tests/live/test_sandbox.py`, `tests/onedata/sandbox/test_gate_listing.py`, `tests/onedata/sandbox/test_served.py`, `tests/onedata/sandbox/test_settings.py` |
-| O21 | A harness step before the agent's loop is kept apart from the agent's evidence | `tests/onedata/sandbox/test_gate_listing.py`, `tests/onedata/sandbox/test_run_start.py` |
+| O22 | A harness step before the agent's loop is kept apart from the agent's evidence | `tests/onedata/sandbox/test_gate_listing.py`, `tests/onedata/sandbox/test_run_start.py` |
 | K01 | A check with no input fails | `tests/package/test_archive.py`, `tests/package/test_build.py`, `tests/package/test_spec.py`, `tests/test_study_tokens.py` |
 | K03 | The private name list never enters the repository or the output | `tests/package/test_anonymise.py`, `tests/package/test_build.py`, `tests/package/test_scan.py`, `tests/package/test_spec.py` |
 | K04 | Anonymisation must not change numbers, model names or parseability | `tests/package/test_anonymise.py` |

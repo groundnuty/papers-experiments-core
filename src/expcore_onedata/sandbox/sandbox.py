@@ -675,7 +675,7 @@ class DockerSandbox:
         """Run Python source as the unprivileged user (see `CellRunner.run`), with the data gate's refusals that came
         while it ran (`gate_refusals`).
 
-        `record=False` makes it a step of the harness's own, such as a check before the agent's loop starts (O21): it
+        `record=False` makes it a step of the harness's own, such as a check before the agent's loop starts (O22): it
         runs the same way, as the agent's user in the agent's container, and is no cell of the agent's. It is recorded
         under `harness_steps` with its exit status and refusals, the agent's next cell takes its own baseline after it,
         and its only time limit is the backstop `timeout` in the container (`CAP_MARGIN_S` after `timeout_s`): the
@@ -704,7 +704,7 @@ class DockerSandbox:
         return res
 
     def mark_run_start(self) -> dict[str, Any]:
-        """Mark where the agent's run begins (O21): the executor calls this once, after its own steps (`exec(...,
+        """Mark where the agent's run begins (O22): the executor calls this once, after its own steps (`exec(...,
         record=False)`) have returned and before the agent's loop starts. A REST data path's gate is signalled (SIGUSR1)
         and writes the mark in its own log, naming each request it had begun and not yet logged; the mark is read back
         before this returns, so no request of the agent's can come before it. The count of the bytes served then takes
@@ -744,7 +744,7 @@ class DockerSandbox:
         through. The tables of the files and directories served follow the counts: None when they are unknown, empty
         when they are zero. Every answer records the caps of the tables, `[sandbox.served_bytes]`. Unknown is never
         zero. `run_start_marked` says whether `mark_run_start` was called: with it, a REST count holds only the answers
-        after the mark, and those before it are `before_run_start` (O21)."""
+        after the mark, and those before it are `before_run_start` (O22)."""
         path = {
             "data_path": self.spec.mode.value,
             "listing": self._meta.get("listing"),

@@ -62,7 +62,7 @@ effect are in the result (`caps`), whatever else is known. Whenever the run's co
 (None, with the same reasons), and an answer of a file's content or a listing whose path names no file or directory
 makes the log malformed. How a reader tells a row the cap left out from a file never served is `served.lookup_file`.
 
-**The run's start (O21).** A harness that reads through the gate before the agent's loop (a check of the data path as
+**The run's start (O22).** A harness that reads through the gate before the agent's loop (a check of the data path as
 the agent's user) marks where the agent's run begins: the gate writes one `run_start` line, naming each request it had
 begun and not yet logged (`before`, by `conn` and `conn_request`). Given what the sandbox's mark found, `served` counts
 and tables only the answers after that line, and counts those before it, or named in it, apart (`before_run_start`:
@@ -206,7 +206,7 @@ GATE_OUTPUT_UNREADABLE = "gate_output_unreadable"
 REQUEST_IN_FLIGHT = "request_in_flight_at_stop"
 RUN_START_UNCONFIRMED = "run_start_unconfirmed"
 TEARDOWN_COMPLETE = "teardown_complete"  # the event the gate logs last, once every close line is written (gate.py)
-RUN_START = "run_start"  # the harness's mark: the agent's run begins after it (gate.py, O21)
+RUN_START = "run_start"  # the harness's mark: the agent's run begins after it (gate.py, O22)
 SERVED_FIELDS = ("served_bytes", "content_bytes", "listing_bytes", "other_bytes", "gate_answer_bytes")
 _BODY_FIELD = {
     "content": "content_bytes",
@@ -387,7 +387,7 @@ def _stop_reasons(stop: Mapping[str, Any] | None) -> set[str]:
 
 
 def _run_start_reasons(run_start: Mapping[str, Any] | None, marks: int, late: bool) -> set[str]:
-    """Why the mark of the run's start leaves the count unknown (O21): a mark the sandbox set must have been read back
+    """Why the mark of the run's start leaves the count unknown (O22): a mark the sandbox set must have been read back
     before the agent's loop started (`confirmed`) and stand in the log once, before the gate's teardown mark; a mark in
     the log of a run that set none is a malformed log."""
     if run_start is None:
@@ -409,7 +409,7 @@ def served(
     bound the tables. The log must hold the gate's `teardown_complete` line, whatever its exit code. `run_start` is what
     the sandbox's mark of the run's start found (`run_start` of its metadata), None when none was set, and then every
     answer is the run's; with one, the run's are the answers after the mark's line, except those it names as begun
-    before it, which are counted apart (`before_run_start`) and never in the tables (O21)."""
+    before it, which are counted apart (`before_run_start`) and never in the tables (O22)."""
     reasons = _stop_reasons(stop) | (set() if lines is not None else {UNREADABLE})
     counts, tables = dict.fromkeys(_BODY_FIELD.values(), 0), _Tables(caps)
     before, held = {"requests": 0, **counts}, _Tables(caps)  # the answers before the mark, checked as the run's are
