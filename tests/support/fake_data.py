@@ -19,7 +19,9 @@ waits. A test bends the fake through plain attributes:
 - `fetch_lag`: polls of the file's block map before bytes fetched by a range read or a replication show in it;
 - `onthefly_places`: False makes a range read answer without ever adding a block (a provider that does not cache);
 - `transfers_place_blocks`: False makes a replication end as `completed` with no block placed (the O01 fake);
-- `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks;
+- `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks; `evictions_noop_first`
+  does that, with `filesEvicted` 0, for the next N evictions only;
+- `onthefly_unit`: a range read through a provider lacking the bytes places at least this many from its offset;
 - `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at all,
   each answered `transfer_unseen_answer` (a 404 by default); a fresh space root answers `root_enoent_answer` (a 404 of
   posix enoent by default) for `root_enoent_polls` reads;
@@ -94,6 +96,7 @@ class Transfer:
     finished: int = 0
     waiting: bool = False
     bytes_replicated: int | None = None  # the counter the record reports, when a test scripts it
+    noop: bool = False  # an eviction that completed and evicted nothing (`evictions_noop_first`)
 
     @property
     def replicates(self) -> bool:
@@ -129,6 +132,12 @@ class FakeData(FakeFederation):
         self.onthefly_places = True
         self.transfers_place_blocks = True
         self.evictions_remove_blocks = True
+        self.evictions_noop_first = 0  # the next N evictions complete with filesEvicted 0 and remove nothing, as 25.0's
+        # do when scheduled right after a provider fetched the bytes on the fly
+        self.onthefly_unit: int | None = (
+            None  # a range read places [offset, offset + max(length, unit)), clipped to the
+        )
+        # file, as 25.0 does with 1 MiB; None places exactly the range read
         self.transfer_flip_after = 1
         self.transfer_visible_after = 0
         self.root_enoent_polls = 0
@@ -472,7 +481,12 @@ class FakeData(FakeFederation):
             return self._error(416, "rangeNotSatisfiable")
         length = last - first + 1
         if not self._holds(node.file_id, provider, first, length) and self.onthefly_places:
-            self.pending.setdefault((node.file_id, provider), []).append([first, length, self.fetch_lag])
+            placed = (
+                length
+                if self.onthefly_unit is None
+                else min(max(length, self.onthefly_unit), len(node.content) - first)
+            )
+            self.pending.setdefault((node.file_id, provider), []).append([first, placed, self.fetch_lag])
             self._promote(node.file_id, provider)
         return httpx.Response(
             206,
@@ -571,7 +585,7 @@ class FakeData(FakeFederation):
             "finishTime": transfer.finished,
             "bytesReplicated": moved if transfer.ended and transfer.replicates else 0,
             "filesReplicated": 1 if transfer.ended and transfer.replicates else 0,
-            "filesEvicted": 1 if transfer.ended and transfer.kind != "replication" else 0,
+            "filesEvicted": 1 if transfer.ended and transfer.kind != "replication" and not transfer.noop else 0,
             "filesFailed": 0,
         }
         view = self._view(tid, provider)
@@ -592,6 +606,10 @@ class FakeData(FakeFederation):
             self.pending.setdefault(key, []).append([0, size, self.fetch_lag])
             self._promote(*key)
         evicted = (transfer.file_id, transfer.source_id) if transfer.kind == "migration" else key
+        if transfer.kind == "eviction" and self.evictions_noop_first > 0:  # completed, and nothing evicted
+            self.evictions_noop_first -= 1
+            transfer.noop = True
+            return
         if transfer.kind != "replication" and self.evictions_remove_blocks:
             self.blocks.pop(evicted, None)
             self.pending.pop(evicted, None)

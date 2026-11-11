@@ -11,7 +11,10 @@ a read that returned bytes but left the block map short, as a provider that does
 
 The map is declared, per file and provider (`rangemap.py`); a range beyond the end of its file is refused, since
 clipping it would place less than was declared. The receiving provider's block map before and after is recorded
-(`held_before`, `held_after`), so bytes fetched later by a run's own reads show as growth and do not pass as placed.
+(`held_before`, `held_after`), so bytes fetched later by a run's own reads show as growth and do not pass as placed,
+and per file (`per_file`) the ranges asked for beside the ranges the block map holds: a provider places more than it
+is asked (Onedata 25.0 places at least 1 MiB from a read's offset, clipped to the file), and what is recorded as held
+is always what the block map shows, never the request.
 
 The wait for the block map to show the placement is a consistency wait of provisioning (O07). Call `place_ranges`
 before a run starts or after it ends, never inside the agent's time.
@@ -20,7 +23,7 @@ before a run starts or after it ends, never inside the agent's time.
 from collections.abc import Iterable
 from typing import Any
 
-from expcore_onedata.placement import Range
+from expcore_onedata.placement import Range, held_bytes, merged
 from expcore_onedata.provision import NotPlaced, Provisioner, ProvisionError
 from expcore_onedata.rangemap import RangeRow
 
@@ -32,6 +35,17 @@ def _chunks(ranges: Iterable[Range], limit: int) -> Iterable[Range]:
             step = min(length, limit)
             yield offset, step
             offset, length = offset + step, length - step
+
+
+def _held(provisioner: Provisioner, provider: str, file_id: str, row: RangeRow) -> dict[str, Any]:
+    """One file's ranges asked for beside what the provider's block map holds of it now, as the probes read it."""
+    held = merged(provisioner.blocks(file_id, provider))
+    return {
+        "asked": [list(r) for r in row.ranges],
+        "asked_bytes": sum(length for _, length in row.ranges),
+        "held": [list(r) for r in held],
+        "held_bytes": held_bytes(held),
+    }
 
 
 def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_empty: bool = False) -> dict[str, Any]:
@@ -55,9 +69,8 @@ def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_em
     for provider in providers:
         mine = [row for row in rows if row.provider == provider]
         wanted = {entries[row.file].file_id: list(row.ranges) for row in mine}
-        provisioner.await_visible(
-            provider, wanted
-        )  # the receiver must see each file before anything is read through it
+        # the receiver must see each file before anything is read through it
+        provisioner.await_visible(provider, wanted)
         before = provisioner.holds(provider, wanted)
         if start_empty and before:
             raise NotPlaced(f"the provider already holds {before} B of the files, so it does not start empty")
@@ -75,6 +88,7 @@ def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_em
             "held_after": confirmation.report.held_bytes,
             "polls": confirmation.polls,
             "placement": confirmation.report.to_json(),
+            "per_file": {row.file: _held(provisioner, provider, entries[row.file].file_id, row) for row in mine},
         }
         if not confirmation.placed:
             raise NotPlaced(

@@ -180,6 +180,39 @@ def test_o07_replicate_and_fetch_wait_until_the_provider_sees_a_file_just_writte
     assert seeded.unseen[(BETA_ID, other)] == 0
 
 
+def evictions(fake):
+    return [t for t in fake.transfers.values() if t.kind == "eviction"]
+
+
+def test_o01_an_eviction_that_completes_with_nothing_evicted_is_scheduled_again_until_the_map_is_empty(
+    provisioner, seeded, ticker
+):
+    """O01: on Onedata 25.0 an eviction scheduled right after a provider fetched the bytes completes with filesEvicted
+    0 and removes nothing, whichever provider schedules it; the same eviction a little later works. The block map is
+    the evidence, so the eviction is scheduled again after a pause while the provider still holds bytes, bounded by
+    `EVICTION_ATTEMPTS`, and the record says how many it took."""
+    provisioner.replicate(PATH, "beta")
+    seeded.evictions_noop_first = 2
+    record = provisioner.evict(PATH, "beta")
+    assert record["empty"] is True
+    assert record["attempts"] == 3
+    assert seeded.held(PATH, BETA_ID) == []
+    assert [t.noop for t in evictions(seeded)] == [True, True, False]
+
+
+def test_o01_an_eviction_that_never_removes_anything_fails_closed_after_its_attempts(provisioner, seeded):
+    """O01: a provider whose evictions all complete and remove nothing is never reported empty: after
+    `EVICTION_ATTEMPTS` evictions the block map still shows the bytes, and the eviction raises `NotPlaced`."""
+    from expcore_onedata.provision import EVICTION_ATTEMPTS
+
+    provisioner.replicate(PATH, "beta")
+    seeded.evictions_remove_blocks = False
+    with pytest.raises(NotPlaced):
+        provisioner.evict(PATH, "beta")
+    assert len(evictions(seeded)) == EVICTION_ATTEMPTS
+    assert seeded.held(PATH, BETA_ID) == [[0, len(DATA)]]
+
+
 OTHER_400S = [(400, "posix", "eacces"), (400, "posix", None), (400, "badValueNotAllowed", None), (400, None, None)]
 
 

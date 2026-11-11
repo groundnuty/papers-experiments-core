@@ -319,6 +319,21 @@ def test_o11_the_round_trip_places_confirms_reads_back_evicts_and_cleans_up(cont
     assert not [c for c in fake.provider_calls if c[1] == "POST" and c[2] == "/transfers" and c[0] == "prmock0001"]
 
 
+def test_o11_the_round_trip_accepts_held_bytes_that_cover_the_range_read_and_records_both(context, fake):
+    """O11: on Onedata 25.0 reading half of the 8 KiB scratch file through the receiver places all of it, and an
+    eviction right after completes with nothing evicted. The round trip passes when the block map covers the range
+    read, records the bytes held (8192) beside the bytes read (4096) with the held ranges, and evicts again until the
+    receiver holds nothing."""
+    fake.onthefly_unit = 1 << 20
+    fake.evictions_noop_first = 1
+    entry = by_name(run_checks(context(allow_mutation=True), ["round_trip"]))["round_trip"]
+    assert entry.ok is True, entry.summary
+    assert (entry.facts["range_bytes"], entry.facts["held_bytes"]) == (4096, 8192)
+    assert entry.facts["held_ranges"] == [[0, 8192]]
+    assert entry.facts["eviction_attempts"] == 2
+    assert entry.facts["cleanup_verified"] is True
+
+
 @pytest.mark.parametrize("answer", [(404, "notFound", None), (400, "posix", "enoent")])
 def test_o07_the_round_trip_waits_for_the_receiver_to_see_its_scratch_file(context, fake, answer):
     """O07: as on Onedata 25.0, the receiver sees the scratch file written through the data provider only after some

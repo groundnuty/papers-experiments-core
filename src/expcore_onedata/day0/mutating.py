@@ -170,7 +170,11 @@ def _receiver(ctx: Context) -> str | None:
 @register("round_trip", "Placement round trip on a scratch file", mutates=True)
 def round_trip(ctx: Context) -> Result:
     """Create a scratch file, place half of it on another provider by range reads, confirm it by the block map, read it
-    back and compare its hash, evict it again, and tear the scratch down, verifying that it is gone (O11)."""
+    back and compare its hash, evict it again, and tear the scratch down, verifying that it is gone (O11).
+
+    The placement passes when the receiver's block map holds a range that covers the half read; a provider may place
+    more (Onedata 25.0 placed the whole 8 KiB file), so the facts give the bytes and ranges held beside the bytes read
+    (`range_bytes`), and how many evictions it took (`eviction_attempts`)."""
     if not ctx.allow_mutation:
         return unknown(f"the round trip {NEEDS_CONSENT}")
     if ctx.placement is None:
@@ -195,12 +199,14 @@ def round_trip(ctx: Context) -> Result:
         steps.append("created")
         record = place_ranges(provisioner, [RangeRow(path, receiver, ((0, half),))], start_empty=True)
         placed = record["providers"][receiver]
-        facts.update(held_bytes=placed["held_after"], polls=placed["polls"])
+        held = placed["per_file"][path]
+        facts.update(held_bytes=held["held_bytes"], held_ranges=held["held"], polls=placed["polls"])
+        facts["held_covers_range"] = any(start <= 0 and half <= start + length for start, length in held["held"])
         steps.append("placed")
         back = provisioner.fetch(receiver, file_id, 0, half)
         facts["bytes_match"] = hashlib.sha256(back).digest() == hashlib.sha256(data[:half]).digest()
         steps.append("read back")
-        provisioner.evict(path, receiver)
+        facts["eviction_attempts"] = provisioner.evict(path, receiver)["attempts"]
         steps.append("evicted")
     except (ProvisionError, PlatformError, consistency.WaitTimeout) as error:
         failure = f"{type(error).__name__} after {steps[-1] if steps else 'nothing'}"
@@ -211,8 +217,8 @@ def round_trip(ctx: Context) -> Result:
         return failed(f"the round trip failed ({failure}); scratch {'removed' if cleanup else 'NOT removed'}", **facts)
     if not cleanup:
         return failed("the round trip worked but the scratch it made was not removed and shown gone (O11)", **facts)
-    if facts["bytes_match"] is not True or facts["held_bytes"] != half:
-        return failed("the bytes read back, or the bytes held, are not what was placed", **facts)
+    if facts["bytes_match"] is not True or facts["held_covers_range"] is not True:
+        return failed("the bytes read back, or the ranges held, do not cover what was placed", **facts)
     return passed("placed by range reads, confirmed by the block map, read back, evicted and removed", **facts)
 
 

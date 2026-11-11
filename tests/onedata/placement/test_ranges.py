@@ -35,6 +35,20 @@ def test_o02_the_placement_is_confirmed_by_the_block_map_after_it_lags(provision
     assert seeded.held(PATH, BETA_ID) == [[0, 100], [2000, 500]]
 
 
+def test_o02_placement_records_per_file_what_the_block_map_holds_beside_what_was_asked(provisioner, seeded):
+    """O02: on Onedata 25.0 a range read places at least 1 MiB from its offset, clipped to the file, whatever it asked
+    for. Placement records, per file, the ranges and bytes asked for and the ranges and bytes the receiver's block map
+    holds afterwards, never the requested ones as held."""
+    seeded.onthefly_unit = 1024
+    record = place_ranges(provisioner, [RangeRow(PATH, "beta", ((100, 10), (3500, 10)))])
+    per_file = record["providers"]["beta"]["per_file"][PATH]
+    assert per_file["asked"] == [[100, 10], [3500, 10]]
+    assert per_file["asked_bytes"] == 20
+    assert per_file["held"] == [[100, 1024], [3500, 596]]  # the second clipped at the file's end
+    assert per_file["held_bytes"] == 1620
+    assert record["providers"]["beta"]["held_after"] == 1620
+
+
 UNSEEN = [(404, "notFound", None), (400, "posix", "enoent")]
 
 
