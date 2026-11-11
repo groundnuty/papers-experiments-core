@@ -249,7 +249,8 @@ def _shard_of(
     """A shard's part of the plan, its shares of the caps and the budget and the identity it runs against.
 
     Every refusal is made here, before the store is opened: a shard with no run, a total smaller than the number of
-    shards (the message names the key) and an environment identity that is not names mapped to SHA-256 digests.
+    shards (the message names the key) and an environment identity that the plugin cannot give or that is not names
+    mapped to SHA-256 digests (the message names the plugin).
     """
     manifest = shard_manifest(study.manifest, spec)
     if not manifest.rows:
@@ -259,10 +260,29 @@ def _shard_of(
         )
     try:
         shared, shares = share_settings(settings, spec)
-        identity = check_identity({} if plugin.environment_identity is None else plugin.environment_identity())
     except ShardError as error:
         raise Refused(str(error)) from None
-    return manifest, shared, ShardStart(spec, identity, shares)
+    return manifest, shared, ShardStart(spec, _identity_of(study, plugin), shares)
+
+
+def _identity_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, str]:
+    """The plugin's environment identity, read once and checked; empty when it declares none.
+
+    The plugin's own function can raise, and what it returns can be of a form no identity has: each is a refusal that
+    names the plugin's file (by its name, not the path of this machine), not a traceback.
+    """
+    if plugin.environment_identity is None:
+        return {}
+    where = f"{study.plugin_file.name}: the plugin's environment_identity()"
+    try:
+        given = plugin.environment_identity()
+    except Exception as error:  # the plugin is the study's code, and whatever it raises is the study's to fix
+        detail = f": {error}" if str(error) else ""
+        raise Refused(f"{where} raised {type(error).__name__}{detail}") from error
+    try:
+        return check_identity(given)
+    except ShardError as error:
+        raise Refused(f"{where} gave an unusable identity: {error}") from None
 
 
 def _say_hold(line: str) -> None:

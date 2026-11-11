@@ -202,13 +202,14 @@ def check_identity(identity: Mapping[str, str]) -> dict[str, str]:
     """Return an environment identity sorted by name, refusing anything but names mapped to SHA-256 hex digests."""
     if not isinstance(identity, Mapping):
         raise ShardError("an environment identity is a mapping of names to SHA-256 hex digests")
-    checked: dict[str, str] = {}
-    for name in sorted(identity):
-        digest = identity[name]
+    for name in identity:  # every name is checked before they are sorted: keys of two types cannot be
         if not isinstance(name, str) or not _NAME.fullmatch(name):
             raise ShardError(
                 f"an environment identity name is 1 to 64 lower-case letters, digits, '.', '_' or '-': {name!r}"
             )
+    checked: dict[str, str] = {}
+    for name in sorted(identity):
+        digest = identity[name]
         if not isinstance(digest, str) or not _HEX64.fullmatch(digest):
             raise ShardError(f"environment identity {name!r} is not a SHA-256 hex digest")
         checked[name] = digest

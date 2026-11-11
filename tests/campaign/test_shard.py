@@ -176,6 +176,14 @@ def test_c29_an_environment_identity_is_names_to_digests_only():
     assert check_identity({}) == {}
 
 
+def test_c29_names_of_two_types_are_a_refusal_and_not_a_type_error():
+    """C29: sorting names of different types raised a TypeError that came out as a traceback."""
+    digest = "a" * 64
+    for bad in ({1: digest, "layout": digest}, {"layout": digest, None: digest}, {3: digest}):
+        with pytest.raises(ShardError, match="identity name"):
+            check_identity(bad)
+
+
 @pytest.mark.parametrize("count", [2, 3, 7])
 def test_c30_a_model_ceiling_of_zero_holds_it_entirely_so_every_shard_shares_zero(count):
     """C30: a `per_model_usd` ceiling of 0 is not "less than the N shards": it is zero for every shard, beside the

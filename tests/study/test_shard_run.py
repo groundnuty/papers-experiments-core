@@ -228,6 +228,32 @@ def test_c29_an_environment_identity_that_is_not_names_mapped_to_sha256_digests_
     assert not (study / "out" / "state.sqlite").exists()
 
 
+def test_c29_a_plugin_whose_environment_identity_raises_is_refused_naming_the_plugin_and_not_a_traceback(
+    study, monkeypatch
+):
+    """C29: the function is the study's code; what it raises is a refusal that names the plugin's file and the error,
+    raised before the store is opened."""
+
+    def broken():
+        raise RuntimeError("the manifest of the space is unreadable")
+
+    with_identity(monkeypatch, broken)
+    with pytest.raises(
+        Refused, match=r"plugin\.py: the plugin's environment_identity\(\) raised RuntimeError: the manifest"
+    ):
+        run_study(study, shard=FIRST)
+    assert not (study / "out" / "state.sqlite").exists()
+
+
+@pytest.mark.parametrize("identity", [{1: DIGEST, "platform-config": DIGEST}, {None: DIGEST}], ids=["mixed", "not str"])
+def test_c29_an_identity_with_a_name_that_is_not_text_is_refused_naming_the_plugin(study, monkeypatch, identity):
+    """C29: keys of two types cannot be sorted, which was a TypeError; it is a refusal, as for any other bad name."""
+    with_identity(monkeypatch, identity)
+    with pytest.raises(Refused, match=r"plugin\.py: the plugin's environment_identity\(\) gave an unusable identity"):
+        run_study(study, shard=FIRST)
+    assert not (study / "out" / "state.sqlite").exists()
+
+
 def test_c29_a_shard_resumed_against_another_environment_identity_is_refused(study, monkeypatch):
     """C29: the identity is read at every start and must be the one the shard started with."""
     with_identity(monkeypatch, {"platform-config": DIGEST})
