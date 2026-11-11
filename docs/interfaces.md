@@ -106,6 +106,19 @@ Implementer must guarantee:
 
 Only a transient error is retried, so `kind` is one of five: `rate_limit` (429), `timeout` (408, or a timeout while connecting or sending), `conflict` (409), `server` (5xx) and `connection` (the endpoint could not be reached). The retrier's other kinds never become an entry: `auth` (401 or 403) raises `InfraError("key_rejected", ...)`, `read_timeout` (the request went out and the reply is late) is never resent and abandons the request, `context_overflow` (a 400 or 413 whose code or message names the context) ends the run as the agent's outcome, and `not_found` and `bad_request` are raised unchanged. The record checks the keys and not the words, so a backend of its own uses these five for the same errors, and a reader can then count retries by kind across backends.
 
+### Usage fields beyond the counts
+
+A provider may report more in its usage object than input and output tokens: an endpoint's own credit count, cache reads and writes, reasoning tokens. `ModelTurn.usage_extra` keeps the numeric ones, per turn, under the provider's own names, and the record holds them in the turn's usage as `transcript[i].usage.extra` (a mapping of name to number) with `extra_cut` beside it (an integer). They are recorded only: the token budget, the totals and the prices read the counts above and nothing here, and no price is looked up for a field until a model's price table names one.
+
+- **Taken as reported.** The reply's usage object is read as a mapping, an SDK model or a plain object. A field is kept when its value is an integer of 64 bits or a finite float and its name is a plain ASCII identifier (at most 80 characters). An object one level down is read the same way under `parent.child`: `completion_tokens_details.reasoning_tokens`, `prompt_tokens_details.cached_tokens` and `cache_creation.ephemeral_5m_input_tokens` are fields. Text, flags, null, lists, non-finite numbers and other names are left out. A zero the provider reported is kept as a zero.
+- **Absent, never 0.** A field the reply leaves out is not in the mapping, so a sum of a named field over a run's turns is "not reported" for a turn that lacks it, never a short total. A reply with no extra field gives `{}` and `extra_cut` 0.
+- **Not repeated.** The counts a turn already holds are not among them: `prompt_tokens`, `completion_tokens` and `total_tokens` (their sum) of an OpenAI-compatible reply, and `input_tokens`, `output_tokens` and the two cache counts of an Anthropic reply, which stay in their own fields.
+- **Bounded.** At most `expcore.models.usage.USAGE_EXTRA_CAP` (32) fields are kept per turn: the first by name, so the same reply always keeps the same ones, and `extra_cut` is the number of numeric fields the cap left out. A field left out for its type or name is not counted as cut.
+- **Replay.** A replay serves the recorded mapping and count exactly, and the replayed record has the same bytes.
+- **Record version.** This is record schema version 3 (`expcore-record/3`), which adds `extra` and `extra_cut` to the usage of each turn. A record of version 1 or 2 lacks both and stays valid: it loads, writes back to its own bytes and replays, and a replay of it never writes them. Every new record is version 3 and keeps version 2's first-turn rule. The frozen file `tests/data/golden-record-v3.json` pins the shape.
+
+A backend of a study's own fills `usage_extra` and `usage_extra_cut` with `expcore.models.usage.extra_usage(usage, skip=...)`, which applies these rules, or leaves them at their defaults (`{}` and 0). A value outside the rules (a flag, text, more than the cap, a name that is not a plain identifier) makes the record invalid: writing it raises `RecordError`, as for a retry entry.
+
 ### BackendFactory
 
 ```python

@@ -292,7 +292,12 @@ def test_R03_a_record_with_an_unknown_field_is_refused_before_replay():
 V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
     "expcore-record/2",
-    added={"record": ("instruments",), "turn": ("request_sha256",), "tool_call": ("detail",)},
+    added={
+        "record": ("instruments",),
+        "turn": ("request_sha256",),
+        "tool_call": ("detail",),
+        "usage": ("extra", "extra_cut"),  # a record written as version 1 is built without them, as in the real table
+    },
     config_before={"cleanup_deadline_s": 7.0},
 )
 TABLE = (V1, V2)
@@ -305,6 +310,7 @@ def older(data: dict) -> dict:
     del data["instruments"]
     for entry in data["transcript"]:
         del entry["request_sha256"]
+        del entry["usage"]["extra"], entry["usage"]["extra_cut"]
     for entry in data["tool_calls"]:
         del entry["detail"]
     del data["agent_config"]["cleanup_deadline_s"]

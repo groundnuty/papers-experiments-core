@@ -7,8 +7,9 @@ import os
 import pytest
 from record_support import hand_made, record_run
 
+from expcore.models.adapters import ModelTurn, ToolCall
 from expcore.records.record import RunRecord, decode, load_record, record_filename
-from expcore.records.schema import RecordError, SchemaVersion
+from expcore.records.schema import CURRENT, RecordError, SchemaVersion
 
 V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
@@ -98,6 +99,43 @@ def test_R01_a_field_a_later_schema_added_is_never_written_into_an_older_record(
     assert "instruments" not in json.loads(text)
     assert "request_sha256" not in text
     assert RunRecord.from_json(decode(text), TABLE).dumps(TABLE) == text
+
+
+def _credit_run(version):
+    """A scripted run whose first reply reports an extra usage field, built as the given record version."""
+    first = ModelTurn(
+        "",
+        [ToolCall("call-1", "echo", {"x": "a"})],
+        10,
+        5,
+        "tool_calls",
+        0.0,
+        usage_extra={"used_credits": 1.5, "details.reasoning_tokens": 7},
+        usage_extra_cut=2,
+    )
+    return record_run([first, "done"], {"echo": lambda a: "x"}, record_options={"schema_version": version})
+
+
+def test_R01_the_extra_usage_fields_are_never_written_into_a_record_of_an_older_version():
+    """R01: the same run written as version 2 holds neither field of version 3 and still validates and reads back to
+    its bytes; written as the current version it holds them, and reads back to its bytes too."""
+    older = _credit_run("expcore-record/2")
+    usage = older.transcript[0]["usage"]
+    assert "extra" not in usage
+    assert "extra_cut" not in usage
+    assert RunRecord.from_json(decode(older.dumps().encode())).dumps() == older.dumps()
+    current = _credit_run(CURRENT)
+    assert current.transcript[0]["usage"]["extra"] == {"used_credits": 1.5, "details.reasoning_tokens": 7}
+    assert current.transcript[0]["usage"]["extra_cut"] == 2
+    assert RunRecord.from_json(decode(current.dumps().encode())).dumps() == current.dumps()
+
+
+def test_R10_a_reply_that_reported_no_extra_field_leaves_the_mapping_empty_not_filled_with_zeros():
+    """R10: a field the reply left out is absent from the file; nothing is filled in as 0."""
+    record = record_run([[("echo", {})]], {"echo": lambda a: "x"})
+    usage = json.loads(record.dumps())["transcript"][0]["usage"]
+    assert usage["extra"] == {}
+    assert usage["extra_cut"] == 0
 
 
 def test_R01_a_later_field_that_holds_data_cannot_be_written_into_an_older_record():

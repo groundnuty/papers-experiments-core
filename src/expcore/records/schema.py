@@ -15,7 +15,9 @@ were read from (R01), and are replayed with the defaults of their time.
 A version may also change a rule that the format does not show. Version 2 is that: no field was added, but an
 infrastructure outcome is flagged as treatment only after the model completed a turn (`first_turn_rule`). A record
 is validated, and replayed, under the rule of its own version, so a version-1 record that flags treatment with no
-completed turn stays valid, and every new record is written as version 2.
+completed turn stays valid. Version 3 adds `extra` and `extra_cut` to the `usage` of each turn: the numeric usage
+fields a provider reports beyond the counts, and how many of them the cap left out. Every new record is written as
+version 3 and keeps version 2's rule; a record of version 1 or 2 lacks both fields, and is never given them.
 
 Every section is a table of field name to the types the field may hold, in the order the file writes them. Numbers are
 finite: a count the run did not obtain is `None`, never 0 and never NaN (R10).
@@ -33,6 +35,7 @@ from expcore.errors import infra_kinds
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
+from expcore.models.usage import USAGE_EXTRA_CAP, USAGE_EXTRA_NAME_MAX, usage_name_ok, usage_number_ok
 from expcore.plugin import WAIT_KINDS
 
 SCHEMA_PREFIX = "expcore-record/"
@@ -97,6 +100,8 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "uncached_input_tokens": (int, NONE),
         "cache_creation_input_tokens": (int, NONE),
         "cache_read_input_tokens": (int, NONE),
+        "extra": (dict,),
+        "extra_cut": (int,),
     },
     "tool_call": {
         "turn": (int,),
@@ -195,10 +200,12 @@ class SchemaVersion:
 # its shape is the one that ships, and a change to it breaks every record written since. After that push, a
 # change to the format is a new version in this table that lists what it added, never an edit of version 1.
 # `tests/data/golden-record-v1.json` is a record of version 1 that must keep loading and writing back byte for byte;
-# `golden-record-v2.json` is the same for version 2, which adds no field but the first-turn rule for treatment.
+# `golden-record-v2.json` is the same for version 2, which adds no field but the first-turn rule for treatment, and
+# `golden-record-v3.json` for version 3, which adds the provider's other usage fields to each turn's `usage`.
 SCHEMAS: tuple[SchemaVersion, ...] = (
     SchemaVersion(f"{SCHEMA_PREFIX}1"),
     SchemaVersion(f"{SCHEMA_PREFIX}2", first_turn_rule=True),
+    SchemaVersion(f"{SCHEMA_PREFIX}3", added={"usage": ("extra", "extra_cut")}, first_turn_rule=True),
 )
 CURRENT = SCHEMAS[-1].name
 
@@ -325,12 +332,37 @@ def _check_waited(waited: Any, where: str) -> None:
         raise RecordError(f"{where}: seconds waited are given per kind of {tuple(WAIT_KINDS)}, not {sorted(bad)}")
 
 
+def _check_usage_extra(usage: dict, where: str) -> None:
+    """Check the provider's other usage fields of a turn: at most the cap, each a plain name and a bounded number.
+
+    A field the reply left out is not in the mapping (never 0); `extra_cut` counts the fields the cap left out.
+    """
+    extra = usage["extra"]
+    if len(extra) > USAGE_EXTRA_CAP:
+        raise RecordError(f"{where}.extra: at most {USAGE_EXTRA_CAP} fields, not {len(extra)}")
+    for name, value in extra.items():
+        if not usage_name_ok(name):
+            raise RecordError(
+                f"{where}.extra: the field name {str(name)[:40]!r} is not a plain identifier of at most "
+                f"{USAGE_EXTRA_NAME_MAX} characters, or two joined by one dot"
+            )
+        if not usage_number_ok(value):
+            raise RecordError(
+                f"{where}.extra.{name}: expected a number (an integer of 64 bits or a finite float), "
+                f"got {type(value).__name__}"
+            )
+    if usage["extra_cut"] < 0:
+        raise RecordError(f"{where}.extra_cut: is {usage['extra_cut']}, not negative")
+
+
 def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVersion]) -> None:
     """Check the parts of one turn entry."""
     _check_waited(turn["infra_wait_by_kind"], f"{where}.infra_wait_by_kind")
     check_section("neutral", turn["neutral"], version, f"{where}.neutral", schemas)
     _check_list("neutral_call", turn["neutral"]["tool_calls"], version, f"{where}.neutral.tool_calls", schemas)
     check_section("usage", turn["usage"], version, f"{where}.usage", schemas)
+    if "extra" in turn["usage"]:  # a record of version 3 or later
+        _check_usage_extra(turn["usage"], f"{where}.usage")
     if turn["native"].get("role") != "assistant":
         raise RecordError(f"{where}.native: the native message of a turn must have the role 'assistant'")
     for i, retry in enumerate(turn["retries"]):

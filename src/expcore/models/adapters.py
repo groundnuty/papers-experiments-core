@@ -19,7 +19,8 @@ Per-backend tool-calling adaptation:
     with tool results (B05).
 
 Every request is built once, and the record's settings come from that request object (B15). Usage is counted the
-moment a reply arrives and unreported counts stay None (B10).
+moment a reply arrives and unreported counts stay None (B10). The provider's other numeric usage fields ride on the
+turn as `usage_extra`, recorded only.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from expcore.errors import InfraError
 from expcore.models.retry import Retrier, RetryPolicy, SupportsUniform
 from expcore.models.route import public_url, sdk_version, settings_sent
 from expcore.models.served import Served, requested_from_sent
-from expcore.models.usage import UsageTally, token_count
+from expcore.models.usage import ANTHROPIC_COUNTED, OPENAI_COUNTED, UsageTally, extra_usage, token_count
 
 PROBE_PROMPT = "ping"
 # The probe of the reply maximum (C27): a request that asks for a reply far longer than the max_tokens it carries.
@@ -95,6 +96,11 @@ class ModelTurn:
     served_model: str | None = None  # the id the server said it ran (B06)
     system_fingerprint: str | None = None
     retries: tuple[dict[str, Any], ...] = ()  # the retries this reply took, each with its error (B01)
+    # The provider's other numeric usage fields (a credit count, cache or reasoning tokens) under its own names, recorded
+    # only: no budget arithmetic reads them. A field the reply left out is absent, never 0; `usage_extra_cut` counts the
+    # fields the cap left out (`expcore.models.usage.extra_usage`).
+    usage_extra: dict[str, int | float] = dataclasses.field(default_factory=dict)
+    usage_extra_cut: int = 0
 
     @property
     def hit_output_limit(self) -> bool:
@@ -318,6 +324,7 @@ class OpenAICompatAdapter(_SdkBackend):
         in_tok, out_tok = token_count(usage, "prompt_tokens"), token_count(usage, "completion_tokens")
         self.served.note(resp)
         self._count(in_tok, out_tok)
+        usage_extra, usage_cut = extra_usage(usage, skip=OPENAI_COUNTED)
         choices = getattr(resp, "choices", None)
         if not isinstance(choices, (list, tuple)) or not choices:
             raise InfraError(
@@ -363,6 +370,8 @@ class OpenAICompatAdapter(_SdkBackend):
             served_model=str(resp.model) if getattr(resp, "model", None) else None,
             system_fingerprint=str(fingerprint) if fingerprint else None,
             retries=retries,
+            usage_extra=usage_extra,
+            usage_extra_cut=usage_cut,
         )
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
@@ -503,6 +512,7 @@ class AnthropicAdapter(_SdkBackend):
         in_tok, out_tok = _anthropic_counts(ua)  # the prompt size the budget counts, cached parts included
         self.served.note(resp)
         self._count(in_tok, out_tok)
+        usage_extra, usage_cut = extra_usage(ua, skip=ANTHROPIC_COUNTED)
         if not isinstance(getattr(resp, "content", None), (list, tuple)):
             raise InfraError(
                 "endpoint", "reply carried no content blocks; usage already counted", billed=(in_tok, out_tok)
@@ -542,6 +552,8 @@ class AnthropicAdapter(_SdkBackend):
             cache_read_input_tokens=read,
             served_model=str(resp.model) if getattr(resp, "model", None) else None,
             retries=retries,
+            usage_extra=usage_extra,
+            usage_extra_cut=usage_cut,
         )
 
     def add_tool_results(self, results: list[ToolResult]) -> None:

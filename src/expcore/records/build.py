@@ -28,7 +28,7 @@ from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import LoopResult, TurnRecord
 from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
-from expcore.models.adapters import ModelBackend
+from expcore.models.adapters import ModelBackend, ModelTurn
 from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
 from expcore.prompt.templates import RenderedPrompt, sha256_of
@@ -37,7 +37,14 @@ from expcore.records.digest import digest, plain
 from expcore.records.record import RunRecord
 from expcore.records.recording import Captured, RecordingBackend
 from expcore.records.redact import Redactor
-from expcore.records.schema import CURRENT, RecordError, first_turn_rule, reply_count_rule, unread_replies
+from expcore.records.schema import (
+    CURRENT,
+    RecordError,
+    fields_of,
+    first_turn_rule,
+    reply_count_rule,
+    unread_replies,
+)
 from expcore.records.seal import mark_unverified, seal
 
 CONTEXT_OVERFLOW = "ContextOverflow"
@@ -153,7 +160,24 @@ def call_entry(call: Any) -> dict[str, Any]:
     return entry
 
 
-def turn_entry(index: int, captured: Captured, settings_sha256: str, loop_turn: TurnRecord) -> dict[str, Any]:
+def usage_entry(turn: ModelTurn, schema_version: str) -> dict[str, Any]:
+    """Return the usage of one turn as a record of `schema_version` keeps it: without a field a later version added."""
+    usage = {
+        "input_tokens": turn.input_tokens,
+        "output_tokens": turn.output_tokens,
+        "uncached_input_tokens": turn.uncached_input_tokens,
+        "cache_creation_input_tokens": turn.cache_creation_input_tokens,
+        "cache_read_input_tokens": turn.cache_read_input_tokens,
+        "extra": dict(turn.usage_extra),
+        "extra_cut": turn.usage_extra_cut,
+    }
+    held = fields_of("usage", schema_version)
+    return {name: value for name, value in usage.items() if name in held}
+
+
+def turn_entry(
+    index: int, captured: Captured, settings_sha256: str, loop_turn: TurnRecord, schema_version: str = CURRENT
+) -> dict[str, Any]:
     """Return one model turn as the record keeps it: the neutral and the native message, and what surrounded them."""
     turn = captured.turn
     return {
@@ -168,13 +192,7 @@ def turn_entry(index: int, captured: Captured, settings_sha256: str, loop_turn: 
         "request_sha256": "",  # filled in by `seal`, over the redacted conversation
         "settings_sha256": settings_sha256,
         "stop_reason": turn.stop_reason,
-        "usage": {
-            "input_tokens": turn.input_tokens,
-            "output_tokens": turn.output_tokens,
-            "uncached_input_tokens": turn.uncached_input_tokens,
-            "cache_creation_input_tokens": turn.cache_creation_input_tokens,
-            "cache_read_input_tokens": turn.cache_read_input_tokens,
-        },
+        "usage": usage_entry(turn, schema_version),
         "latency_s": turn.latency_s,
         "served_model": turn.served_model,
         "system_fingerprint": turn.system_fingerprint,
@@ -309,7 +327,7 @@ def _build_record(
     sets: dict[str, Any] = {}
     turns = []
     for index, c in enumerate(captured):
-        turns.append(turn_entry(index, c, digest(c.settings), result.turns[index]))
+        turns.append(turn_entry(index, c, digest(c.settings), result.turns[index], schema_version))
         sets[digest(c.settings)] = c.settings
     failed = None
     if recording.failure is not None:

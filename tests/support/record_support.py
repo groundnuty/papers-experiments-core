@@ -44,6 +44,8 @@ def hand_made(**overrides: Any) -> RunRecord:
             "uncached_input_tokens": None,
             "cache_creation_input_tokens": None,
             "cache_read_input_tokens": None,
+            "extra": {},
+            "extra_cut": 0,
         },
         "latency_s": 0.5,
         "served_model": "m1",

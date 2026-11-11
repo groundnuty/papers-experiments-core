@@ -202,6 +202,8 @@ class RecordedBackend:
             served_model=entry["served_model"],
             system_fingerprint=entry["system_fingerprint"],
             retries=tuple(copy.deepcopy(entry["retries"])),
+            usage_extra=dict(usage.get("extra", {})),  # a record of version 1 or 2 has none
+            usage_extra_cut=usage.get("extra_cut", 0),
         )
 
     async def _raise_failure(self, failed: dict[str, Any]) -> None:
