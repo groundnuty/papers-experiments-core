@@ -1,11 +1,14 @@
 """The docker arguments of each container: read-only everywhere, images by id, no secret in an argument (O05, O13)."""
 
+import dataclasses
 from pathlib import Path
 
 import pytest
+from sandbox_support import FED_LOCAL, FED_NETWORK
 
 from expcore_onedata.sandbox import containers as C
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.sandbox.settings import FederationNetwork
 from expcore_onedata.tls import TlsSettings
 
 LABELS = ["--label", "org.test.sandbox=1"]
@@ -150,6 +153,41 @@ def test_the_limits_come_from_the_settings(s, names):
     assert flags["--pids-limit"] == str(s.limits.pids)
     assert flags["--ulimit"] == f"nofile={s.limits.nofile}:{s.limits.nofile}"
     assert flags["--user"] == f"{s.agent_uid}:{s.agent_uid}"
+
+
+def test_o03_with_a_federation_network_the_sidecar_starts_on_it_and_dials_the_local_providers_name(s, names):
+    """O03: with `[sandbox.federation]` the sidecar starts on the federation's own network, never also on the
+    default bridge, and dials the local provider by its name there, not the host of the URL the host reaches.
+    Without the table it starts as it always has: on the default bridge, dialling the URL's host."""
+    federated = dataclasses.replace(s, federation=FederationNetwork(FED_NETWORK, FED_LOCAL))
+    args = C.sidecar_run_args(federated, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test")
+    assert [v for f, v in pairs(args) if f == "--network"] == [FED_NETWORK]
+    assert args[args.index("-H") + 1] == FED_LOCAL
+    assert "p.test" not in args
+    plain = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test")
+    assert [v for f, v in pairs(plain) if f == "--network"] == ["bridge"]
+    assert plain[plain.index("-H") + 1] == "p.test"
+
+
+@pytest.mark.parametrize("mode", list(DataPathMode))
+def test_o05_the_federation_network_is_the_sidecars_alone_and_the_agent_never_joins_it(s, names, mode):
+    """O05: the sidecar is on the federation network and the agent is not: it stays on its own internal network in
+    every data path, so it reaches the federation through the mount and nothing else."""
+    federated = dataclasses.replace(s, federation=FederationNetwork(FED_NETWORK, FED_LOCAL))
+    sidecar = C.sidecar_run_args(federated, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test")
+    assert dict(pairs(sidecar))["--network"] == FED_NETWORK
+    extra = {
+        DataPathMode.REST: {"gate_ip": "10.1.0.2", "gate_hosts": ["h.test"], "ca": Path("/w/ca.pem"), "zone_host": "z"},
+        DataPathMode.MOUNT: {"share": Path("/w/mount")},
+        DataPathMode.NONE: {},
+    }[mode]
+    args, _ = C.agent_run_args(
+        federated, names, LABELS, image_id=s.agent.id, mode=mode, work=Path("/w/work"),
+        **({"share": None, "gate_ip": None, "gate_hosts": [], "ca": None, "trust_bundles": {}, "zone_host": None}
+           | extra),
+    )  # fmt: skip
+    assert [v for f, v in pairs(args) if f == "--network"] == [names.net]
+    assert not [a for a in args if FED_NETWORK in a]
 
 
 def test_the_oneclient_log_directory_is_the_last_one_given():

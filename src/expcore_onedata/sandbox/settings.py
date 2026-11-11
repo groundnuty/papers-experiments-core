@@ -51,6 +51,12 @@ extra_args = []                 # further oneclient arguments, never one that ch
 
 [sandbox.served_bytes]          # optional: how much a run's tables of the bytes served list (gatelog.Caps, O22)
 max_files = 1000                # files, the first read; max_directories = 1000; max_ranges_per_file = 64
+
+[sandbox.federation]            # optional, with a mount level: the federation reached on a docker network of its own
+network = "fed_net"             # an existing network of the federation's deployment (a Compose project's); the
+                                # oneclient sidecar starts on it instead of docker's default bridge; the agent never
+providers.<local> = "host"      # the local provider's host name on that network, the one its certificate holds;
+                                # keyed by [support] local, the only provider accepted (the agent is pinned to it)
 ```
 
 `listing` is a REST data path's option (O21): `paged`, the default, passes the server's page of a listing as it comes,
@@ -59,6 +65,13 @@ on a mount or no data path, where no gate serves a listing. A study selects it p
 condition gives its `data_path` factor. The run's metadata records it (`listing`), and so does the campaign fingerprint
 (`config.PlatformConfig.fingerprint`, from `data_path_record`), so two modes are never one experiment. A declared
 `[sandbox.served_bytes]` is in the fingerprint too (`served_caps_declared`); an absent one leaves it as it was.
+
+Without `[sandbox.federation]` the sidecar starts on docker's default bridge and dials the host of the local provider's
+URL, which suits a federation with public addresses. A federation the host reaches at addresses no container can use,
+such as a Compose project whose ports are published on the host's loopback, needs the table: the sidecar joins the
+federation's network, where the provider's name resolves, and dials it on oneclient's default port. The network must
+exist when a mount sandbox starts (it is never made, changed or removed by the sandbox), and the REST data path's gate
+does not use it.
 
 The certificate check of the data gate's upstream and of oneclient is not declared here either: it is the platform's one
 `[tls]` setting (`tls.py`), which `load_platform` hands to `load_sandbox` and which every client of the federation
@@ -72,7 +85,7 @@ table `[sandbox.users]` of earlier versions is refused at load, with a message t
 import itertools
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
@@ -91,6 +104,9 @@ COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
 SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under the space root
 IO_MODES = ("direct", "proxy")
 FORBIDDEN_ARGS = {"-i", "--insecure"}  # TLS is set by the platform's [tls] only
+NETWORK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # a docker network's name; no `container:<id>`
+NOT_A_FEDERATION_NETWORK = ("bridge", "default", "host", "none")  # docker's own: no name resolves, or no isolation
+HOST_NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 
 
 @dataclass(frozen=True)
@@ -134,6 +150,14 @@ class MountSettings:
 
 
 @dataclass(frozen=True)
+class FederationNetwork:
+    """The docker network the oneclient sidecar reaches the federation on, and the local provider's name there."""
+
+    network: str  # an existing network of the federation's own deployment; the sidecar joins it, the agent never
+    local_provider: str  # the host name the sidecar dials on it: the local provider's, which its certificate holds
+
+
+@dataclass(frozen=True)
 class SandboxSettings:
     """Everything the sandbox needs from platform.toml."""
 
@@ -157,6 +181,7 @@ class SandboxSettings:
     listings: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))  # rest level -> its listing
     served_caps: Caps = DEFAULT_CAPS  # [sandbox.served_bytes]: the bounds of a run's tables of the bytes served (O22)
     served_caps_declared: bool = False  # the table is in the file: its caps are in the campaign fingerprint (C06)
+    federation: FederationNetwork | None = None  # [sandbox.federation]: None puts the sidecar on the default bridge
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -328,6 +353,35 @@ def _data_paths(section: Section) -> tuple[Mapping[str, DataPathMode], Mapping[s
     return MappingProxyType(modes), MappingProxyType(listings)
 
 
+def _federation(section: Section, providers: Sequence[str], local: str | None) -> FederationNetwork:
+    """Read [sandbox.federation]: the docker network the sidecar joins, and the local provider's name on it (O03).
+
+    The name is keyed by the provider it belongs to, and only the local one's is accepted, so a `[support] local`
+    changed without this table is refused here and never mounts through another provider. Every name is configured,
+    so a message names a provider entry by its position and never echoes the network or a name."""
+    section.reject_unknown(("network", "providers"))
+    network = section.string("network")
+    if not NETWORK_NAME.fullmatch(network) or network in NOT_A_FEDERATION_NETWORK:
+        raise section.fail(
+            "network",
+            "must name the federation's own docker network: not docker's default bridge, the host's network, none or "
+            "a container's",
+        )
+    table = section.section("providers")
+    address = None
+    for position, name in enumerate(table.data):
+        if name not in providers:
+            raise table.fail(None, f"entry {position}: is not a provider declared in [providers]")
+        if name != local:
+            raise table.fail(None, f"entry {position}: only the local provider's name is read, the agent's pinned one")
+        address = _entry_string(table, name, position)
+        if not HOST_NAME.fullmatch(address):
+            raise table.fail(None, f"entry {position}: must be a host name on that network, with no scheme or port")
+    if address is None:
+        raise table.fail(None, "must name the local provider ([support] local), the provider the agent is pinned to")
+    return FederationNetwork(network, address)
+
+
 def _space_path(section: Section, key: str) -> str | None:
     """Read an optional path under the space root: plain names joined by '/', none of them '.' or '..'."""
     if key not in section.data:
@@ -347,10 +401,19 @@ def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, .
     return tuple(words)
 
 
-def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None) -> SandboxSettings:
+def load_sandbox(
+    section: Section,
+    base: Path,
+    *,
+    tls: TlsSettings | None = None,
+    providers: Sequence[str] = (),
+    local: str | None = None,
+) -> SandboxSettings:
     """Validate the `[sandbox]` table; raise ConfigError naming the file and key, never a value.
 
-    `tls` is the platform's `[tls]`, already loaded; without it the sandbox's clients verify against their defaults."""
+    `tls` is the platform's `[tls]`, already loaded; without it the sandbox's clients verify against their defaults.
+    `providers` and `local` are the platform's declared providers and `[support] local`, which `[sandbox.federation]`
+    is checked against."""
     keys = (
         "work_root",
         "name_prefix",
@@ -368,7 +431,7 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
             "is no longer read: declare the platform users a run leases as [slots.<name>], each with a data_path and "
             "a toolserver user, so one lease key gives a run both planes' users (C19)",
         )
-    section.reject_unknown((*keys, "images", "network", "limits", "mount", "data_paths", "served_bytes"))
+    section.reject_unknown((*keys, "images", "network", "limits", "mount", "data_paths", "served_bytes", "federation"))
     work_root = (base / section.string("work_root")).resolve()
     prefix = section.optional_string("name_prefix") or "sbx"
     namespace = section.optional_string("label_namespace") or "org.expcore"
@@ -381,6 +444,11 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
     mount = _mount(section.section("mount")) if "mount" in section.data else None
     if DataPathMode.MOUNT in data_paths.values() and (mount is None or oneclient is None):
         raise section.fail("mount", "and [sandbox.images.oneclient] are required when a data path is a mount")
+    federation = None
+    if "federation" in section.data:
+        if DataPathMode.MOUNT not in data_paths.values():
+            raise section.fail("federation", "is read by the mount sidecar alone, and no data path is a mount")
+        federation = _federation(section.section("federation"), providers, local)
     check_file = _space_path(section, "content_check_file")
     if DataPathMode.REST in data_paths.values() and check_file is None:
         raise section.fail(
@@ -412,7 +480,17 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
         listings=listings,
         served_caps=_served_caps(section.section("served_bytes")) if "served_bytes" in section.data else DEFAULT_CAPS,
         served_caps_declared="served_bytes" in section.data,
+        federation=federation,
     )
 
 
-__all__ = ["ConfigError", "ImageRef", "Limits", "MountSettings", "NetworkSettings", "SandboxSettings", "load_sandbox"]
+__all__ = [
+    "ConfigError",
+    "FederationNetwork",
+    "ImageRef",
+    "Limits",
+    "MountSettings",
+    "NetworkSettings",
+    "SandboxSettings",
+    "load_sandbox",
+]

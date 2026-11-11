@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
-from sandbox_support import COMPLETE_LEVEL, TOKEN, fail_copies, make_spec, start_options
+from sandbox_support import COMPLETE_LEVEL, FED_LOCAL, FED_NETWORK, TOKEN, fail_copies, make_spec, start_options
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
@@ -461,8 +461,9 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     sbx = start(world, "mounted")
     meta = sbx.metadata()
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
-    assert set(meta["mount"]) == {"io_mode", "log_dir_from", "wait_s"}
+    assert set(meta["mount"]) == {"io_mode", "log_dir_from", "network", "wait_s"}
     assert meta["mount"]["log_dir_from"] == "default"
+    assert meta["mount"]["network"] in ("default bridge", "federation")  # the kind of network, never its name
     text = json.dumps(meta, default=str)
     assert world.s.network.pools[0] not in text
     assert str(world.s.work_root) not in text
@@ -735,3 +736,60 @@ def test_o15_a_stop_that_ran_during_the_start_is_not_the_last_word_on_the_sandbo
     sbx.stop(force=True)
     assert sbx.stopped
     assert nothing_left(world)
+
+
+# -- [sandbox.federation]: the sidecar on the federation's own network ------------------------------------------------
+
+
+def test_o03_a_mount_sidecar_reaches_the_federation_on_its_network_and_the_agent_stays_on_its_own(fed_world):
+    """O03: with `[sandbox.federation]` the sidecar is started on the federation's own network, and on no other, and
+    mounts through the local provider's name there; the agent is on the sandbox's internal network alone. The record
+    says which kind of network the sidecar was on, never its name (O12)."""
+    sbx = start(fed_world, "mounted")
+    sidecar, agent = (fed_world.host.containers[n] for n in (sbx.names.sidecar, sbx.names.agent))
+    assert set(sidecar.networks) == {FED_NETWORK}
+    assert sidecar.command[sidecar.command.index("-H") + 1] == FED_LOCAL
+    assert set(agent.networks) == {sbx.names.net}
+    assert sbx.metadata()["mount"]["network"] == "federation"
+    sbx.stop()
+
+
+def test_o03_without_the_table_the_record_says_the_sidecar_was_on_the_default_bridge(world):
+    """O03: a sandbox without `[sandbox.federation]` records that its sidecar was on docker's default bridge."""
+    sbx = start(world, "mounted")
+    assert sbx.metadata()["mount"]["network"] == "default bridge"
+    sbx.stop()
+
+
+def test_o15_a_federation_network_that_is_not_there_refuses_the_start_before_anything_is_created(fed_world):
+    """O15: the federation's network is the federation deployment's, never the sandbox's to make; one that is not on
+    the host refuses a mount sandbox's start before any container, network, mount or directory exists, so there is
+    nothing to tear down, and the message names the table and not the network. A run with another data path never
+    asks for that network, and starts."""
+    del fed_world.host.networks[FED_NETWORK]
+    with pytest.raises(StartRefused, match=r"\[sandbox\.federation\]") as caught:
+        start(fed_world, "mounted")
+    assert FED_NETWORK not in str(caught.value)
+    assert nothing_left(fed_world)
+    assert not fed_world.s.work_root.exists() or not list(fed_world.s.work_root.iterdir())
+    start(fed_world, "isolated").stop()
+    assert nothing_left(fed_world)
+
+
+def test_o15_the_teardown_takes_the_sidecar_off_the_federation_network_and_leaves_the_network_as_it_was(fed_world):
+    """O15: the sidecar is on the federation's network while the sandbox runs; the ordered teardown removes it, which
+    takes it off that network, and the network itself is never disconnected, removed or reaped. The probe then shows
+    the sandbox gone (C19)."""
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    before = dict(fed_world.host.networks[FED_NETWORK])
+    sbx = start(fed_world, "mounted", lease_key=KEY)
+    assert set(fed_world.host.containers[sbx.names.sidecar].networks) == {FED_NETWORK}
+    sbx.stop()
+    assert set(fed_world.host.networks) == {FED_NETWORK}
+    assert fed_world.host.networks[FED_NETWORK] == before
+    assert not fed_world.host.containers
+    assert not fed_world.host.mounts
+    touched = [c for c in fed_world.host.calls if c[0] == "docker" and c[1] == "network" and FED_NETWORK in c[2][1:]]
+    assert touched == [], "only a lookup of the federation network by name is allowed"
+    assert SandboxProbe(fed_world.host, fed_world.s).resource_gone(KEY, {}) is True

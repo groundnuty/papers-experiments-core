@@ -180,6 +180,7 @@ class DockerSandbox:
         TERM.raise_if_requested()  # a SIGTERM reached this process: nothing new starts
         self._validate()
         self._pin_images()  # a moved tag refuses the start (O13), before anything exists
+        self._require_federation_network()  # likewise a network the sidecar would join and that is not there
         self._checkpoint()
         self._stopped = False  # from here, `stop` has something to verify
         self._meta["pending_cleanups_left"] = self.registry.drain()
@@ -236,6 +237,19 @@ class DockerSandbox:
             if resolved != ref.id:
                 raise StartRefused(f"the {role} image no longer resolves to the id it is pinned to")
             self._meta["images"][role] = resolved
+
+    def _require_federation_network(self) -> None:
+        """A mount sidecar that joins `[sandbox.federation]`'s network needs it on this host: it is the federation's own
+        deployment's, never the sandbox's to make, so one docker does not show refuses the start before anything
+        exists (O15). Only a lookup by name: the network is never inspected for more, changed or removed."""
+        federation = self.s.federation
+        if self.spec.mode is not DataPathMode.MOUNT or federation is None:
+            return
+        found = hostops.network_exists(self.host, federation.network)
+        if found is None:
+            raise StartRefused("docker could not say whether the network [sandbox.federation] names is on this host")
+        if not found:
+            raise StartRefused("the network [sandbox.federation] names is not on this host: bring the federation up")
 
     def _cleanup_after(self, exc: BaseException) -> None:
         """Stop what a failed start left. A cleanup that fails too is registered for the next start, and reachable on the
@@ -464,9 +478,10 @@ class DockerSandbox:
         host_name = sp.provider.host
         command = sidecar_command(host_name, s)
         self._log_dir = effective_log_dir(command)
-        self._meta["mount"] = {  # the keys that set it, never a path (O12); its TLS is the run's `tls`
+        self._meta["mount"] = {  # the keys that set it, never a path or a name (O12); its TLS is the run's `tls`
             "io_mode": s.mount.io_mode,
             "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != ONECLIENT_LOG_DIR else "default",
+            "network": "federation" if s.federation is not None else "default bridge",  # `sidecar_route`'s, by kind
         }
         self._register_container(names.sidecar)
         t0 = time.monotonic()

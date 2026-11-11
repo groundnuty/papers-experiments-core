@@ -37,6 +37,7 @@ ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gat
 ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
 ENV_CA_BUNDLES = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+DEFAULT_BRIDGE = "bridge"  # docker's default network: the sidecar's without [sandbox.federation]
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,18 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
         *mount.extra_args,
         SIDECAR_MOUNT,
     ]
+
+
+def sidecar_route(settings: SandboxSettings, provider_host: str) -> tuple[str, str]:
+    """The network the sidecar starts on and the provider host it dials there (O03).
+
+    With `[sandbox.federation]`, the federation's own network and the local provider's name on it: a federation whose
+    providers the host reaches at addresses no container can use (a Compose project's ports on the host's loopback) is
+    reached there, by the name its certificate holds. Without it, docker's default bridge and the host of the local
+    provider's URL, which a federation with public addresses needs. The agent joins neither (`agent_run_args`)."""
+    if settings.federation is None:
+        return DEFAULT_BRIDGE, provider_host
+    return settings.federation.network, settings.federation.local_provider
 
 
 def effective_log_dir(args: Sequence[str], default: str = ONECLIENT_LOG_DIR) -> str:
@@ -138,17 +151,19 @@ def sidecar_run_args(
 ) -> list[str]:
     """`docker run` for the mount sidecar: it owns the mount and the token; the agent gets neither, nor FUSE. With the
     platform's `ca_file`, `ca_copy`, the run's own copy of the verified bundle, is mounted read-only at
-    `SIDECAR_CA_PATH` (see `sidecar_command`)."""
+    `SIDECAR_CA_PATH` (see `sidecar_command`). Its network and the host it dials are `sidecar_route`'s: the
+    federation's own network when `[sandbox.federation]` names one, and never a second network beside it."""
     lim = s.limits
+    network, dialled = sidecar_route(s, provider_host)
     return [
-        *("run", "-d", "--name", names.sidecar, "--network", "bridge", *labels),
+        *("run", "-d", "--name", names.sidecar, "--network", network, *labels),
         *("--cpus", str(lim.cpus), "--memory", str(lim.memory_bytes), "--memory-swap", str(lim.memory_bytes)),
         *("--pids-limit", str(lim.pids), "--cap-add", "SYS_ADMIN", "--device", "/dev/fuse"),
         *("--security-opt", "apparmor:unconfined", "--tmpfs", "/root/.local:size=1g"),
         *_ca_mount(s, ca_copy, SIDECAR_CA_PATH),
         *("-e", ENV_ACCESS_TOKEN),
         *("--mount", f"type=bind,src={share},dst={SIDECAR_MOUNT},bind-propagation=rshared"),
-        *("--entrypoint", "env", image_id, *sidecar_command(provider_host, s)),
+        *("--entrypoint", "env", image_id, *sidecar_command(dialled, s)),
     ]
 
 
