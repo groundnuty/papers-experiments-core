@@ -119,7 +119,7 @@ def test_the_minimal_layout_the_refusals_start_from_is_itself_usable(fed, tmp_pa
 def test_a_bad_layout_refuses_every_command_before_anything_is_touched(fed, tmp_path, monkeypatch, capsys):
     path = write(tmp_path, MINIMAL.replace("port = 29645", "port = 29643"))
     touched = []
-    for name in ("up", "reset", "down", "status"):
+    for name in ("up", "reset_clean", "reset_replicas", "down", "status"):
         monkeypatch.setattr(fed.cli, name, lambda layout, name=name: touched.append(name))
     assert fed.cli.main(["--layout", str(path), "up"]) == 2
     assert touched == []

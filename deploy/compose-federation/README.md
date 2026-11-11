@@ -8,7 +8,8 @@ Oneproviders. Every name in a layout is invented.
 
 ```sh
 uv run python deploy/compose-federation/federation.py up       # from nothing to a bootstrapped federation
-uv run python deploy/compose-federation/federation.py reset    # back to the baseline, keeping every id
+uv run python deploy/compose-federation/federation.py reset --clean     # back to the baseline: ingested data gone
+uv run python deploy/compose-federation/federation.py reset --replicas  # between runs: only mirrors' replicas go
 uv run python deploy/compose-federation/federation.py down     # nothing of it left, on Docker or on disk
 uv run python deploy/compose-federation/federation.py status   # the project's containers, the root's parent
 uv run python deploy/compose-federation/federation.py memory   # each service's limit, current use and peak
@@ -26,9 +27,19 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
   members of their spaces with exactly their privileges, writes the baseline files, and writes `facts.json` and, from
   the layout's platform template, `platform.toml`. Run on a federation that is up, it starts what is stopped and checks
   every step again.
-- **reset** starts what is stopped, checks every step again, removes everything in every space and writes the baseline
-  files again. The providers, spaces and users keep their ids, so `platform.toml` stays valid. A fault-injection
-  journal left behind is emptied.
+- **reset --clean** returns the deployment to clean: it starts what is stopped, checks every step again, removes
+  everything in every space, ingested datasets included, and writes the baseline files again. The providers, spaces
+  and users keep their ids, so `platform.toml` stays valid. A fault-injection journal left behind is emptied.
+- **reset --replicas** is the reset between runs: it starts what is stopped and checks every step again, then keeps
+  every owner's data and evicts only what the mirrors hold (`fedreplicas.py`). It refuses, evicting nothing in any
+  space, unless every owner's block map holds each of its files whole, since a file only a mirror holds is an original.
+  It schedules one eviction of the space's root on each mirror that holds anything, and accepts the result only from
+  the block maps, read through the platform layer's own parser: every mirror holding none of each file and the owner
+  still holding each whole, on two sweeps in a row. No file is removed. After it, the default layout's `birch` no
+  longer holds its replica of `replicated.bin`; the ended transfer record stays. QoS requirements and running
+  transfers are not touched: the platform layer's per-run reset (#118) is to take them, and to replace the directory
+  eviction and the sweep behind the same function, `evict_replicas(boot, timeout_s)`.
+- A bare **reset** is refused with a message naming both, so nobody wipes ingested datasets by accident.
 - **down** reads each service's peak memory, runs `docker compose down` for the project, then removes the root with
   everything in it, through a container of the project with no network (the services write their data as root), and
   checks that no container, network or file of the project is left.

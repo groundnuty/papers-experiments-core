@@ -2,7 +2,7 @@
 declares it.
 
     uv run python deploy/compose-federation/federation.py [--layout PATH] up
-    uv run python deploy/compose-federation/federation.py [--layout PATH] reset
+    uv run python deploy/compose-federation/federation.py [--layout PATH] reset --clean | --replicas
     uv run python deploy/compose-federation/federation.py [--layout PATH] down
     uv run python deploy/compose-federation/federation.py [--layout PATH] status | memory | describe | compose
 
@@ -10,8 +10,12 @@ declares it.
   providers, register and support, add the fixed users, write the baseline files, and write facts.json (and
   platform.toml, from the layout's platform template). On a federation that is already up it starts what is stopped
   and checks every step again, and leaves the files as they are.
-- reset: start whatever is stopped, check every step again, and bring the spaces' content back to the baseline. The ids
-  of the providers, the spaces and the users stay, so platform.toml stays valid.
+- reset --clean: start whatever is stopped, check every step again, and bring every space's content back to the
+  baseline, removing whatever was ingested. The ids of the providers, the spaces and the users stay, so platform.toml
+  stays valid.
+- reset --replicas: start whatever is stopped, check every step again, keep every owner's data, and evict only what
+  the mirrors hold, verified on the block maps (fedreplicas.py). For between runs. A bare `reset` is refused, naming
+  both, so nobody wipes ingested datasets by accident.
 - down: remove the project's containers and network, then the root with everything in it, the CA and the secrets
   included. Nothing of the federation is left on disk, and the next up makes everything anew.
 - status: the project's containers, the root's allowed parent, and whether facts.json exists.
@@ -57,6 +61,7 @@ from fedpki import (
     verify_leaf,
     write_secret,
 )
+from fedreplicas import evict_replicas
 from fedrest import Rest
 from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, load_spec
 
@@ -211,12 +216,17 @@ def up(layout: Layout) -> str:
     return timer.summary("up" if fresh else "up (already up: checked)") + f"\n{written}"
 
 
-def reset(layout: Layout) -> str:
-    timer = Timer()
+def require_up(layout: Layout) -> None:
     containers = project_containers(layout.spec.project)
     require_own(layout, containers)
     if not containers or not layout.facts.exists():
         raise RuntimeError("the federation is not up; run up first")
+
+
+def reset_clean(layout: Layout) -> str:
+    """Back to clean: every space emptied and its baseline written again, whatever a run or a study ingested."""
+    timer = Timer()
+    require_up(layout)
     rest = Rest(layout.ca_pem)
     try:
         boot = Bootstrap(rest, layout)
@@ -228,7 +238,22 @@ def reset(layout: Layout) -> str:
         write_facts(layout, boot)
     finally:
         rest.close()
-    return timer.summary("reset")
+    return timer.summary("reset --clean")
+
+
+def reset_replicas(layout: Layout) -> str:
+    """Between runs: every owner keeps its data, and every mirror's replicas are evicted and verified gone."""
+    timer = Timer()
+    require_up(layout)
+    rest = Rest(layout.ca_pem)
+    try:
+        boot = Bootstrap(rest, layout)
+        bring_up(layout, boot, timer)
+        evicted = evict_replicas(boot, TRANSFER_TIMEOUT_S)
+        timer.mark("replicas")
+    finally:
+        rest.close()
+    return "\n".join([timer.summary("reset --replicas"), *(f"{space}: {done}" for space, done in evicted.items())])
 
 
 def down(layout: Layout) -> str:
@@ -274,13 +299,39 @@ def memory(layout: Layout) -> str:
     return "\n".join(memory_lines(layout.spec, memory_usage(containers)))
 
 
+RESET_CHOICE = (
+    "say which reset: 'reset --clean' empties every space and writes its baseline again, removing whatever was "
+    "ingested, to bring the deployment back to clean; 'reset --replicas' keeps every owner's data and evicts only the "
+    "replicas on the providers that mirror a space, between runs"
+)
+
+
 def main(argv: list[str] | None = None) -> int:
-    commands = {"up": up, "reset": reset, "down": down, "status": status, "memory": memory, "describe": describe}
+    commands = {
+        "up": up,
+        "reset --clean": reset_clean,
+        "reset --replicas": reset_replicas,
+        "down": down,
+        "status": status,
+        "memory": memory,
+        "describe": describe,
+    }
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--layout", type=Path, help="the layout file (default: federation.toml beside this script)")
-    parser.add_argument("command", choices=(*commands, "compose"))
+    which = parser.add_mutually_exclusive_group()
+    which.add_argument("--clean", action="store_true", help="reset: back to the baseline, ingested data removed")
+    which.add_argument("--replicas", action="store_true", help="reset: evict the mirrors' replicas, keep all data")
+    parser.add_argument("command", choices=("up", "reset", "down", "status", "memory", "describe", "compose"))
     args = parser.parse_args(argv)
     command = args.command
+    if command == "reset" and not (args.clean or args.replicas):
+        print(f"error: reset: {RESET_CHOICE}", file=sys.stderr)  # nobody wipes ingested data by accident
+        return 2
+    if command != "reset" and (args.clean or args.replicas):
+        print(f"error: {command}: --clean and --replicas belong to reset", file=sys.stderr)
+        return 2
+    if command == "reset":
+        command = "reset --clean" if args.clean else "reset --replicas"
     try:
         spec: Spec = load_spec(args.layout)
     except LayoutError as error:

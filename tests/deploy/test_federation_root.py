@@ -25,7 +25,7 @@ def test_a_root_outside_the_allowed_directory_is_refused_before_anything_is_touc
     monkeypatch.delenv("EXPCORE_FED_ROOT_PARENT", raising=False)
     monkeypatch.setenv("EXPCORE_FED_ROOT", value)
     touched = []
-    for name in ("up", "reset", "down", "status"):
+    for name in ("up", "reset_clean", "reset_replicas", "down", "status"):
         monkeypatch.setattr(fed.cli, name, lambda layout, name=name: touched.append(name))
     assert fed.cli.main(["down"]) == 2
     assert touched == []
@@ -100,7 +100,7 @@ def test_a_configured_parent_gets_every_check_and_its_root_must_lie_strictly_bel
     for name, value in environ.items():
         monkeypatch.setenv(name, value)
     touched = []
-    for name in ("up", "reset", "down", "status"):
+    for name in ("up", "reset_clean", "reset_replicas", "down", "status"):
         monkeypatch.setattr(fed.cli, name, lambda layout, name=name: touched.append(name))
     assert fed.cli.main(["down"]) == 2
     assert touched == []
@@ -179,7 +179,7 @@ def test_containers_of_the_project_over_another_root_are_never_touched(fed, tmp_
     for containers in ([other], [unlabelled]):
         ran = no_docker(fed, monkeypatch, containers)
         monkeypatch.setattr(fed.cli, "require_images", lambda: None)
-        for command in (fed.cli.up, fed.cli.reset, fed.cli.down, fed.cli.memory):
+        for command in (fed.cli.up, fed.cli.reset_clean, fed.cli.reset_replicas, fed.cli.down, fed.cli.memory):
             with pytest.raises(RuntimeError, match="bind another root"):
                 command(layout)
         assert ran == []

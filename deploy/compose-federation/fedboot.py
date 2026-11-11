@@ -1,9 +1,9 @@
 """Bootstrap the federation through its REST interfaces: the admin's token, the users, the providers' registration,
-the spaces, their support and the study space's members with exactly their privileges.
+the spaces, their support by their owners and mirrors, and each space's members with exactly their privileges.
 
-Every step reads first and changes only what is missing or different, so up and reset run it alike. The calls are the
-ones the images' own demo scripts make (named and temporary invite tokens, the panel's support call), with certificate
-verification on. Nothing here prints a token or a password.
+Every step reads first and changes only what is missing or different, so up and both resets run it alike. The calls
+are the ones the images' own demo scripts make (named and temporary invite tokens, the panel's support call), with
+certificate verification on. Nothing here prints a token or a password.
 """
 
 import secrets
@@ -30,7 +30,7 @@ class Ids:
 
 
 class Bootstrap:
-    """The steps of up and reset that talk to the federation."""
+    """The steps of up and the resets that talk to the federation."""
 
     def __init__(self, rest: Rest, layout: Layout) -> None:
         self.rest = rest

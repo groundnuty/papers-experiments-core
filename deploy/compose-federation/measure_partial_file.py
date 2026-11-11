@@ -7,7 +7,8 @@ write its first 64 KiB, set its size to 1 MiB with an empty write at offset 1 Mi
 provider and through the study space's first mirror, by range and whole. Each step prints one JSON line: the status,
 the headers that matter, the lengths, whether the prefix's bytes and the unwritten range's bytes are what they should
 be, the block map per provider, and the seconds; never a token or an id. Whether the data gate would stream an answer
-is `gateboundary.streams` of its status and type. The file is removed at the end, and reset removes anything left.
+is `gateboundary.streams` of its status and type. The file is removed at the end, and `reset --clean` removes anything
+left.
 """
 
 import argparse
