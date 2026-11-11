@@ -116,6 +116,18 @@ COUNT_DEFINITIONS = [
     "because the top-up it needed would have passed the ceiling. Set aside like a failure, and never a treatment.",
 ]
 
+SHARD_NOTES = [
+    "This batch was merged from shards: one campaign run as several parts, each by one driver on its own host. Each",
+    "run belongs to one shard, and a pair of runs is never split between two. Planned counts the condition's runs in",
+    "that shard; the three rates are the shares of those planned runs that were analysed, exhausted or unfinished (a",
+    "run a partial analysis leaves out is in none of the three), and `n/a` where the shard ran none of the",
+    "condition's runs.",
+    "",
+    "The shards are a check that the hosts are interchangeable, not a factor of the design: no test across shards is",
+    "made, the contrasts above pool the runs of every shard, and a difference in these rates is for the reader to",
+    "weigh. A condition whose rates differ by shard is worth a look at the shards before it is read as an effect.",
+]
+
 BUDGET_HOLD_NOTES = [
     "Attempts set aside by a budget hold: attempts that ended because a request the token cap could not account for",
     "(a resend after a failure that may have been billed, or a request after a reply without usage) needed a top-up",
