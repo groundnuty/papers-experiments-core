@@ -26,17 +26,19 @@ The change log is a JSON-lines file: one line per creation and per deletion with
 no token and no credential.
 """
 
+import dataclasses
 import json
 import re
+import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from expcore_onedata import consistency
 from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, answered_absent
-from expcore_onedata.config import PlatformConfig
+from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncovered
 from expcore_onedata.rangemap import PlacementSettings, safe_path
 
@@ -51,6 +53,8 @@ SHORT_FILES_SHOWN = 50
 EVICTION_ATTEMPTS = 5
 EVICTION_RETRY_PAUSE_S = 10.0
 EVICTION_CHECK_S = 10.0
+
+Listings = dict[tuple[str, str], dict[str, "Entry"]]  # (provider, directory id) -> its entries, for one operation
 
 
 class ProvisionError(RuntimeError):
@@ -160,7 +164,15 @@ def listing_entry(item: Any) -> Entry:
 
 
 class Provisioner:
-    """Creates, places and removes study data in the configured space, and confirms each step by the block map."""
+    """Creates, places and removes study data in one configured space, and confirms each step by the block map.
+
+    `space` is the label of the space it acts in (`[[spaces]]`); without one it is the only space, and a configuration
+    that declares several refuses an unnamed provisioner. A `[[spaces]]` entry's `holder` is its data provider; the
+    one-space form's is `[placement] holder`. Either way it must support the space, or the provisioner is refused. Every
+    mutation it sends is bound to its space: the client refuses one whose target lies in any other space, whatever its
+    prefixes (`OnezoneClient.mutate`'s `space`). With several spaces every message starts with the space's position
+    (`spaces[i]`), never its label or name.
+    """
 
     def __init__(
         self,
@@ -170,14 +182,22 @@ class Provisioner:
         *,
         provider_ids: Mapping[str, str],
         log: Path | str,
+        space: str | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        if settings.holder not in config.providers:
-            raise ProvisionError("the data provider named in the settings is not a declared provider")
-        self._client, self._config, self._settings = client, config, settings
+        entry = config.space_named(space)
+        where = f"{entry.position}: " if len(config.spaces) > 1 else ""
+        holder = entry.holder if config.spaces_table else settings.holder  # [[spaces]] requires its own (spaces.py)
+        if holder is None or holder not in config.providers:
+            raise ProvisionError(f"{where}the data provider named in the settings is not a declared provider")
+        if holder not in entry.support.providers:
+            raise ProvisionError(f"{where}the data provider does not support the space; nothing was sent")
+        self._client, self._config, self._entry, self._where = client, config, entry, where
+        self._settings = settings if holder == settings.holder else dataclasses.replace(settings, holder=holder)
         self._ids = dict(provider_ids)
         self._log = Path(log)
+        self._log_lock = threading.Lock()
         self._clock, self._sleep = clock, sleep
         self._verified_name: str | None = None
         self._root: str | None = None
@@ -185,8 +205,36 @@ class Provisioner:
 
     @property
     def settings(self) -> PlacementSettings:
-        """The bounds and the data provider this provisioner works to."""
+        """The bounds and the data provider this provisioner works to: the space's own holder when it declares one."""
         return self._settings
+
+    @property
+    def space(self) -> StudySpace:
+        """The declared space this provisioner acts in."""
+        return self._entry
+
+    @property
+    def where(self) -> str:
+        """The start of every message: the space's position and a colon when several spaces are declared, else empty."""
+        return self._where
+
+    @property
+    def client(self) -> OnezoneClient:
+        """The client every request of this provisioner goes through."""
+        return self._client
+
+    def mutate(self, method: str, path: str, **options: Any) -> Any:
+        """Send a mutation through the client's gate, bound to this provisioner's space: one whose target lies in any
+        other declared space is refused before it is sent, even under a shared prefix (O09)."""
+        return self._client.mutate(method, path, space=self._entry.space, **options)
+
+    def clock(self) -> float:
+        """The provisioner's clock (monotonic seconds, or a test's)."""
+        return self._clock()
+
+    def sleep(self, seconds: float) -> None:
+        """The provisioner's sleep (or a test's, which only moves its clock)."""
+        self._sleep(seconds)
 
     # -- scope -----------------------------------------------------------------
     def verify_space(self) -> str:
@@ -195,14 +243,15 @@ class Provisioner:
         The name is Onezone's, read by the client (`space_name`, read again on every call). The client's own gate refuses every
         mutation whose target space lies outside the prefixes; this adds that the space is the configured one.
         """
+        space = self._entry.space
         try:
-            name = self._client.space_name(self._config.space.id)
+            name = self._client.space_name(space.id)
         except OutOfScope:
-            raise Refused("the configured space is unknown to Onezone; nothing was changed") from None
-        if not name.startswith(self._config.space.prefixes):
-            raise Refused("the space's live name is outside the configured prefixes; nothing was changed")
-        if name != self._config.space.name:
-            raise Refused("the space's live name is not the configured one; nothing was changed")
+            raise Refused(f"{self._where}the configured space is unknown to Onezone; nothing was changed") from None
+        if not name.startswith(space.prefixes):
+            raise Refused(f"{self._where}the space's live name is outside the configured prefixes; nothing was changed")
+        if name != space.name:
+            raise Refused(f"{self._where}the space's live name is not the configured one; nothing was changed")
         self._verified_name = name
         return name
 
@@ -214,9 +263,11 @@ class Provisioner:
     def provider_id(self, name: str) -> str:
         """Return a declared provider's Onezone id, or refuse when it is unknown."""
         if name not in self._config.providers:
-            raise Refused("the provider is not declared")
+            raise Refused(f"{self._where}the provider is not declared")
         if name not in self._ids:
-            raise Refused("the provider's id is unknown: declare it in platform.toml or resolve it from the space view")
+            raise Refused(
+                f"{self._where}the provider's id is unknown: declare it in platform.toml or resolve it from the space view"
+            )
         return self._ids[name]
 
     def provider_named(self, provider_id: str) -> str | None:
@@ -225,8 +276,8 @@ class Provisioner:
 
     @property
     def space_id(self) -> str:
-        """The configured space's id."""
-        return self._config.space.id
+        """The id of the space this provisioner acts in."""
+        return self._entry.space.id
 
     def root(self, *, wait: bool = True) -> str:
         """Return the space's root directory id on the data provider.
@@ -238,7 +289,7 @@ class Provisioner:
             self._root = consistency.space_root(
                 self._client,
                 self._settings.holder,
-                self._config.space.id,
+                self._entry.space.id,
                 **({} if wait else {"tries": 1}),
                 sleep=self._sleep,
             )
@@ -249,7 +300,7 @@ class Provisioner:
         """Append one line to the change log; fail loudly, since an unlogged creation could never be torn down."""
         self._log.parent.mkdir(parents=True, exist_ok=True)
         line = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "action": action, **fields}
-        with open(self._log, "a", encoding="utf-8") as handle:
+        with self._log_lock, open(self._log, "a", encoding="utf-8") as handle:  # a bulk eviction writes from threads
             handle.write(json.dumps(line, sort_keys=True) + "\n")
             handle.flush()
 
@@ -269,9 +320,23 @@ class Provisioner:
         return list(created.values())
 
     # -- listing and creation --------------------------------------------------
-    def children(self, directory_id: str, provider: str | None = None) -> dict[str, Entry]:
-        """Return every entry of a directory by name, following the pages to the end."""
+    def children(
+        self, directory_id: str, provider: str | None = None, *, listings: Listings | None = None
+    ) -> dict[str, Entry]:
+        """Return every entry of a directory by name, following the pages to the end.
+
+        `listings` is one operation's cache: a directory it holds is not listed again, and one listed whole is added to
+        it, so an operation over many files lists each directory once. A listing that fails adds nothing."""
         provider = provider or self._settings.holder
+        if listings is not None and (provider, directory_id) in listings:
+            return listings[(provider, directory_id)]
+        entries = self._list_pages(directory_id, provider)
+        if listings is not None:
+            listings[(provider, directory_id)] = entries
+        return entries
+
+    def _list_pages(self, directory_id: str, provider: str) -> dict[str, Entry]:
+        """List one directory on a provider, following the pages to the end."""
         entries: dict[str, Entry] = {}
         params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
         while True:
@@ -288,18 +353,42 @@ class Provisioner:
                 raise PlatformError("a listing is not on its last page but names no next page")
             params = {**params, "token": token}
 
-    def resolve(self, path: str, provider: str | None = None, *, wait: bool = True) -> Entry:
+    def resolve(
+        self, path: str, provider: str | None = None, *, wait: bool = True, listings: Listings | None = None
+    ) -> Entry:
         """Walk a space-relative path down from the root and return its entry; raise KeyError naming the part missing.
 
         `wait` is as for `root`: an instrument passes False so that no real answer is retried inside its read.
+        `listings` is the operation's cache of directory listings (`children`), shared by every path it resolves.
         """
         node = Entry(self.root(wait=wait), "", 0, "DIR")
         for part in safe_path(path):
-            found = self.children(node.file_id, provider).get(part)
+            found = self.children(node.file_id, provider, listings=listings).get(part)
             if found is None:
                 raise KeyError(f"no entry {part!r} on the way down the path")
             node = found
         return node
+
+    def resolve_many(self, paths: Iterable[str], provider: str | None = None) -> dict[str, Entry]:
+        """Resolve many space-relative paths with one listing of each directory on their way, never one per path."""
+        listings: Listings = {}
+        return {path: self.resolve(path, provider, listings=listings) for path in dict.fromkeys(paths)}
+
+    def walk(self, directory_id: str | None = None, provider: str | None = None) -> Iterator[tuple[Entry, bool]]:
+        """Yield every entry under a directory (the space's root by default), each directory listed once, with
+        whether it is a leaf: a file, or a directory with nothing in it. Directories are entered breadth first."""
+        listings: Listings = {}
+        pending = [directory_id or self.root()]
+        while pending:
+            current = pending.pop(0)
+            for entry in self.children(current, provider, listings=listings).values():
+                if entry.kind == "DIR":
+                    inside = self.children(entry.file_id, provider, listings=listings)
+                    yield entry, not inside
+                    pending.append(entry.file_id)
+                else:
+                    yield entry, True
+            listings.pop((provider or self._settings.holder, current), None)  # entered: no longer needed
 
     def make_dir(self, path: str) -> str:
         """Create every directory of a path that is missing, log each creation, and return the last one's id."""
@@ -308,7 +397,7 @@ class Provisioner:
             existing = self.children(parent).get(part)
             if existing is not None:
                 if existing.kind != "DIR":
-                    raise ProvisionError("a part of the path exists and is not a directory")
+                    raise ProvisionError(f"{self._where}a part of the path exists and is not a directory")
                 parent = existing.file_id
                 continue
             parent = self._create(parent, part, "DIR", path)
@@ -316,7 +405,7 @@ class Provisioner:
 
     def _create(self, parent_id: str, name: str, kind: str, path: str) -> str:
         self._verified()
-        answer = self._client.mutate(
+        answer = self.mutate(
             "POST",
             f"/data/{_segment(parent_id)}/children",
             provider=self._settings.holder,
@@ -337,11 +426,13 @@ class Provisioner:
         *directory, name = safe_path(path)
         parent = self.make_dir("/".join(directory)) if directory else self.root()
         if name in self.children(parent):
-            raise ProvisionError("the file already exists; this provisioner will not overwrite or adopt it")
+            raise ProvisionError(
+                f"{self._where}the file already exists; this provisioner will not overwrite or adopt it"
+            )
         file_id = self._create(parent, name, "REG", path)
         self._verified()
         for offset in range(0, len(data), self._settings.chunk_bytes):
-            self._client.mutate(
+            self.mutate(
                 "PUT",
                 f"/data/{_segment(file_id)}/content",
                 provider=self._settings.holder,
@@ -351,7 +442,7 @@ class Provisioner:
             )
         size = self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder).get("size")
         if size != len(data):
-            raise ProvisionError("the size read back after an upload is not the size uploaded")
+            raise ProvisionError(f"{self._where}the size read back after an upload is not the size uploaded")
         return file_id
 
     # -- visibility ------------------------------------------------------------
@@ -421,6 +512,7 @@ class Provisioner:
             offset=offset,
             length=length,
             timeout_s=self._settings.request_timeout_s,
+            space=self._entry.space,
         )
 
     def holds(self, provider: str, file_ids: Iterable[str]) -> int:
@@ -457,16 +549,21 @@ class Provisioner:
         )
         report = PlacementReport(len(file_ids), int(result.value or 0), 0, 0, ())
         if not result.converged:
-            raise NotPlaced(f"the provider still holds {report.held_bytes} B of the files after the bound", report)
+            raise NotPlaced(
+                f"{self._where}the provider still holds {report.held_bytes} B of the files after the bound", report
+            )
         return Confirmation(True, report, len(result.checks), 0.0)
 
     # -- transfers -------------------------------------------------------------
-    def _schedule(self, kind: str, file_id: str, provider: str) -> str:
-        """Schedule a replication to, or an eviction from, a provider, through it, once it sees the file."""
+    def schedule_transfer(self, kind: str, file_id: str, provider: str) -> str:
+        """Schedule a replication to, or an eviction from, a provider of a file (or of a directory, which covers every
+        file under it), through that provider once it sees the entry (`await_visible`), through the mutation gate; log
+        it and return the transfer's id. Its end is a report, never placement (O01): a caller confirms by the block
+        map."""
         field_name = "replicatingProviderId" if kind == "replication" else "evictingProviderId"
         self._verified()
         self.await_visible(provider, [file_id])
-        answer = self._client.mutate(
+        answer = self.mutate(
             "POST",
             "/transfers",
             provider=provider,
@@ -494,10 +591,10 @@ class Provisioner:
         self._verified()
         entry = self.resolve(path)
         if entry.size < 1:
-            raise ProvisionError("an empty file has nothing to place")
+            raise ProvisionError(f"{self._where}an empty file has nothing to place")
         wanted = {entry.file_id: [(0, entry.size)]}
         began = self._clock()
-        tid = self._schedule("replication", entry.file_id, to_provider)
+        tid = self.schedule_transfer("replication", entry.file_id, to_provider)
         done = consistency.require_ended(
             consistency.wait_transfers(
                 self._client,
@@ -513,7 +610,7 @@ class Provisioner:
         confirmation = self.confirm_placed(to_provider, wanted)
         if not confirmation.placed:
             raise NotPlaced(
-                f"the transfer reported {done.states()} but the block map does not cover the file "
+                f"{self._where}the transfer reported {done.states()} but the block map does not cover the file "
                 f"({confirmation.report.bytes_short} B short)",
                 confirmation.report,
             )
@@ -523,6 +620,26 @@ class Provisioner:
             "seconds": round(self._clock() - began, 3),
         }
 
+    def refuse_holder(self, from_provider: str) -> None:
+        """Refuse, before anything is sent, to evict from the data provider: named by its name, by another name that
+        has its id, or by its id itself (O09)."""
+        holder_id = self._ids.get(self._settings.holder)
+        if (
+            from_provider == self._settings.holder
+            or (from_provider in self._ids and self._ids[from_provider] == holder_id)
+            or (holder_id is not None and from_provider == holder_id)
+        ):
+            raise Refused(f"{self._where}refusing to evict the data provider's own copy; nothing was sent")
+
+    def check_eviction(self, from_provider: str) -> None:
+        """Refuse, before anything is sent, a bulk eviction or a reset's from a provider that is the data provider
+        (`refuse_holder`), is not declared, or does not support this provisioner's space."""
+        self.refuse_holder(from_provider)
+        if from_provider not in self._config.providers:
+            raise Refused(f"{self._where}refusing to evict from a provider that is not declared; nothing was sent")
+        if from_provider not in self._entry.support.providers:
+            raise Refused(f"{self._where}refusing to evict from a provider that does not support the space")
+
     def evict(self, path: str, from_provider: str) -> dict[str, Any]:
         """Evict a file from a provider and return a record once its block map there is empty; never from the holder.
 
@@ -530,15 +647,14 @@ class Provisioner:
         reset does. A transfer that ended is never the evidence (O01): while the provider's block map still shows bytes,
         the eviction is scheduled again after `EVICTION_RETRY_PAUSE_S`, up to `EVICTION_ATTEMPTS` in all, and after the
         last the whole settle bound is waited before `NotPlaced` refuses it. The record says how many attempts it took.
+        Many files go through `eviction.evict_ids` or `eviction.evict_tree`, which verify them together under the same
+        retry rule.
         """
-        if from_provider == self._settings.holder or (
-            from_provider in self._ids and self._ids[from_provider] == self._ids.get(self._settings.holder)
-        ):
-            raise Refused("refusing to evict the data provider's own copy; nothing was sent")
+        self.refuse_holder(from_provider)
         self._verified()
         entry = self.resolve(path)
         for attempt in range(1, EVICTION_ATTEMPTS + 1):
-            tid = self._schedule("eviction", entry.file_id, from_provider)
+            tid = self.schedule_transfer("eviction", entry.file_id, from_provider)
             done = consistency.require_ended(
                 consistency.wait_transfers(
                     self._client,
@@ -614,7 +730,7 @@ class Provisioner:
                     left.append({"path": line["path"], "reason": "holds entries this provisioner did not create"})
                     continue
             try:
-                self._client.mutate("DELETE", f"/data/{_segment(fid)}", provider=self._settings.holder)
+                self.mutate("DELETE", f"/data/{_segment(fid)}", provider=self._settings.holder)
             except PlatformError as error:
                 if not answered_absent(error):  # already gone is confirmed below; any other refusal leaves it
                     left.append({"path": line["path"], "reason": "the delete was refused or failed"})

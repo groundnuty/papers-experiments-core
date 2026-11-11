@@ -108,10 +108,12 @@ def measure_content_type(config: PlatformConfig, client: OnezoneClient) -> Conte
         return ContentTypeVerdict(
             False, False, f"{REFUSED}: {CHECK_KEY} is not set, so the content type the gate streams on is unknown"
         )
-    local = config.support.local
+    # The file lies under the root of the first space the data path's token reaches: the only space, or with several
+    # (`[[spaces]]`) the first entry whose `tokens` hold the data path, read through the agent's one local provider.
+    local, space_id = config.local_provider.name, config.space_ids("data_path")[0]
     label = client.provider_label(local)
     try:
-        node = consistency.space_root(client, local, config.space.id, tries=1)
+        node = consistency.space_root(client, local, space_id, tries=1)
         for part in safe_path(sandbox.content_check_file):
             node = _child(client, local, node, part)
         whole = client.content_answer(f"/data/{node}/content", provider=local, first_byte=False)

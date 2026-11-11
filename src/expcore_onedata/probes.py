@@ -25,6 +25,11 @@ snapshot and never the live platform (R13). The snapshot holds, for the files th
   jobs in the window that replicate into it, and `on_demand_lower_bound`, the gained bytes less those, floored at zero
   and only a lower bound (`transferwindow.py` names the conditions); None when the block maps or the listing are unknown.
 
+Every provider in the snapshot is named by its position in platform.toml, `providers[i]`: the tracked providers, the
+keys of each file's readings, of `pairs` and their `from`, of `on_demand`, and each transfer record's `provider`. A
+record is published in a replication package, so it holds no configured provider name (O12). Snapshot version 3 is
+the first so keyed; version 2 named them by configuration.
+
 **`gained_bytes` is placement gained, not a net change and not bytes on the wire.** It is the bytes of the blocks a
 provider's block map (`GET /data/{id}/distribution`) shows at run end that it did not show at run start; what the map
 showed at the start and no longer does is `lost_bytes`, kept apart, so replacing 100 bytes with 100 others gains 100
@@ -48,12 +53,12 @@ from typing import Any
 
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.placement import Range, held_bytes, merged, uncovered
-from expcore_onedata.provision import Provisioner
+from expcore_onedata.provision import Listings, Provisioner
 from expcore_onedata.transferlog import MAX_LISTED, PAGE_LIMIT, TransferLog
 from expcore_onedata.transferwindow import Window, split_gained
 
 NAMESPACE = "platform_probes"
-VERSION = 2
+VERSION = 3  # 3: every provider is keyed by its position (`providers[i]`), never by its configured name
 BLOCKS_SHOWN = 2000  # the most merged blocks recorded per file and provider; the count is always recorded
 
 
@@ -189,6 +194,12 @@ class PlatformProbes:
         transfer listing, and past `max_listed` distinct ids the listing is unknown.
         """
         self._client, self._provisioner = client, provisioner
+        # One instrument per space: with several declared, each has a namespace of its own (`platform_probes_space1`
+        # for spaces[1]) and its snapshot names its space by position; one space keeps the namespace it always had.
+        several = bool(provisioner.where)  # a position starts every message only when several spaces are declared
+        index = provisioner.space.position.removeprefix("spaces[").removesuffix("]")
+        self.namespace = f"{NAMESPACE}_space{index}" if several else NAMESPACE
+        self._space = provisioner.space.position if several else None
         positions: dict[str, int] = {}
         for index, path in enumerate(files.values()):  # one file tracked twice would count its gained bytes twice
             if path in positions:
@@ -215,27 +226,30 @@ class PlatformProbes:
         settings = self._provisioner.settings
         return run_probe(read, attempts=settings.probe_attempts, backoff_s=settings.probe_backoff_s, sleep=self._sleep)
 
-    def _file_id(self, path: str) -> ProbeResult:
+    def _file_id(self, path: str, listings: Listings) -> ProbeResult:
         """Resolve a path to its entry; a path that is no longer there is a failed probe, not an exception.
 
         The read does not wait: the provisioner's wait for a new space root would retry a real 404 inside one attempt,
         out of sight of the probe (O08). The only retry is the probe's own, of a network reset, and it is counted.
+        `listings` is the reading's cache: a directory listed for one tracked file is not listed again for the next,
+        and a listing that failed is not in it, so the next file's probe reads it afresh.
         """
 
         def read() -> Any:
             try:
-                return self._provisioner.resolve(path, wait=False)
+                return self._provisioner.resolve(path, wait=False, listings=listings)
             except KeyError:
                 raise PlatformError("the tracked file is not in the space", status=404) from None
 
         return self._probe(read)
 
     def _read_maps(self) -> tuple[dict[str, ProbeResult], dict[str, dict[str, ProbeResult]]]:
-        """Read every tracked file's entry and each tracked provider's block map of it."""
+        """Read every tracked file's entry, listing each directory once, and each tracked provider's block map of it."""
         entries: dict[str, ProbeResult] = {}
         maps: dict[str, dict[str, ProbeResult]] = {}
+        listings: Listings = {}
         for label, path in self._files.items():
-            entries[label] = entry = self._file_id(path)
+            entries[label] = entry = self._file_id(path, listings)
             maps[label] = {}
             for provider in self._providers:
                 if entry.ok:
@@ -252,6 +266,11 @@ class PlatformProbes:
         entries, self._before = self._read_maps()
         self._before_ids = {label: entry.value.file_id for label, entry in entries.items() if entry.ok}
 
+    def _label_of_id(self, provider_id: str) -> str | None:
+        """The position label (`providers[i]`) of the declared provider an id belongs to, or None for none."""
+        name = self._provisioner.provider_named(provider_id)
+        return None if name is None else self._client.provider_label(name)
+
     def _transfer_records(self) -> list[dict[str, Any]]:
         records = []
         for provider, tid, kind in self._transfers():
@@ -259,7 +278,7 @@ class PlatformProbes:
             body = found.value if found.ok and isinstance(found.value, dict) else {}
             records.append(
                 {
-                    "provider": provider,
+                    "provider": self._client.provider_label(provider),
                     "transfer_id": tid,
                     "kind": kind,
                     **found.to_json(),
@@ -292,7 +311,7 @@ class PlatformProbes:
             if file_id is not None:
                 counted[file_id] = label
             readings = {
-                p: {
+                self._client.provider_label(p): {
                     "before": _blocks_json(before[label][p]) if label in before else None,
                     "after": _blocks_json(after[label][p]),
                 }
@@ -307,10 +326,10 @@ class PlatformProbes:
                 and all(before[label][p].ok and after[label][p].ok for p in self._providers)
             )
             complete = complete and usable
-            pairs = (
+            pairs = (  # keyed, destination and source alike, by position: a record holds no provider's name (O12)
                 bytes_by_pair(
-                    {p: merged(before[label][p].value) for p in self._providers},
-                    {p: merged(after[label][p].value) for p in self._providers},
+                    {self._client.provider_label(p): merged(before[label][p].value) for p in self._providers},
+                    {self._client.provider_label(p): merged(after[label][p].value) for p in self._providers},
                 )
                 if usable
                 else None
@@ -334,17 +353,16 @@ class PlatformProbes:
         gained = {p: row["gained_bytes"] for p, row in pair_totals.items()}
         return {
             "version": VERSION,
+            **({} if self._space is None else {"space": self._space}),  # its position, with several spaces only
             "ok": ok,
-            "providers": list(self._providers),
+            "providers": [self._client.provider_label(p) for p in self._providers],
             "seconds": None if self._started is None else round(self._now() - self._started, 3),
             "files": files,
             "transfers": transfers,
             "space_transfers": log.section,
             "pairs": pair_totals if complete else None,
             "on_demand": (
-                split_gained(
-                    gained, log.inside, self._provisioner.provider_named, flagged=log.flagged, everywhere=log.everywhere
-                )
+                split_gained(gained, log.inside, self._label_of_id, flagged=log.flagged, everywhere=log.everywhere)
                 if complete and log.inside is not None
                 else None
             ),

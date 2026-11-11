@@ -347,7 +347,7 @@ Implementer must guarantee:
 - `finish` records what it read and never guesses: a reading that failed is `None` (with the failure beside it), not zero, and anything derived from it is `None` too (R10).
 - The snapshot holds no secret and no identifier of the deployment beyond the labels the study's configuration gives.
 
-The platform has two instruments. The first is `expcore_onedata.probes.PlatformProbes` (namespace `platform_probes`): the block map of each tracked file on each tracked provider before and after the run, the records of the transfers the provisioner scheduled, the record of every transfer of the space that started in the run's window whoever started it (`space_transfers`), the bytes moved between provider pairs, attributed to a source only where exactly one other provider held those bytes at the start, and per receiving provider the transfer bytes into it and a lower bound on the bytes fetched on demand (`on_demand`). A provider's `gained_bytes` is placement gained: the bytes of the blocks a provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire. See its module docstring and `expcore_onedata.transferlog` for the snapshot's fields.
+The platform has two instruments. The first is `expcore_onedata.probes.PlatformProbes` (namespace `platform_probes`): the block map of each tracked file on each tracked provider before and after the run, the records of the transfers the provisioner scheduled, the record of every transfer of the space that started in the run's window whoever started it (`space_transfers`), the bytes moved between provider pairs, attributed to a source only where exactly one other provider held those bytes at the start, and per receiving provider the transfer bytes into it and a lower bound on the bytes fetched on demand (`on_demand`). Every provider in the snapshot (version 3) is named by its position, `providers[i]`, never by its configured name, since records are published. A provider's `gained_bytes` is placement gained: the bytes of the blocks a provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire. See its module docstring and `expcore_onedata.transferlog` for the snapshot's fields.
 
 The second is `expcore_onedata.sandbox.served.ServedBytes(sandbox)` (namespace `served_bytes`): the bytes the run's agent read through its data path (O22), for a measure such as bytes moved but never consumed. Build it once `SandboxPlatform.launch` has yielded the run's sandbox, and call `sandbox.collect(...)` before `finish_instruments`: the collection stops the data gate and counts its log once, and `finish` records that count, so replay serves the recorded value and nothing measures it again. The snapshot is `{"version": 1, "data_path", "listing", "served_bytes", "content_bytes", "listing_bytes", "other_bytes", "gate_answer_bytes", "files", "files_total", "files_cut", "listings", "listings_total", "listings_cut", "caps", "unknown"}`:
 - what it counts: the body bytes of the platform's answers that the gate's socket accepted for the agent, after any cap or cut; `content_bytes` are the 200 and 206 answers to reads of a file's content (a cut transfer's part included), `listing_bytes` the 200 answers to listings as they were served (each page in the paged mode, the merged answer in the complete one), `other_bytes` every other answer of the platform's (the token's scope, a looked-up file id, a file's attributes, the platform's errors), and `served_bytes` the three together. `gate_answer_bytes`, the gate's own refusals and errors, is kept out of `served_bytes`;
@@ -649,6 +649,53 @@ Implementer must guarantee:
 
 **Where a study's estimator is registered.** The preregistration is validated when the study is loaded, before its plugin is imported, so a name only the plugin registers is unknown at that point and the contrast is refused (`unknown estimator 'name'; registered: wilcoxon_cluster_bootstrap`). A study cannot register its estimator through its plugin. It registers it at the top level of a module that `[study] platforms` names, which the loader imports before it validates anything, as it does for a platform's infrastructure kinds. That module must be importable, so it is installed code, not a file of the study directory, which is not on the module search path: a distribution of the study's own, named in `[study] requires`, so it is part of the campaign's environment and the replication package vendors its wheel. Its version speaks for its code, so change the version when the estimator changes. Once registered, the estimator stays registered for the rest of the process.
 
+## The platform layer's spaces and reset
+
+`expcore_onedata.spaces`, `provision`, `eviction` and `reset`. A federation study has one space per data owner, each supported by its owner's provider, by the agent's local provider and sometimes by a mirror. `platform.toml` declares them as an array of tables, in place of `[space]` and `[support]` (one form or the other, never both):
+
+```toml
+[[spaces]]
+label = "<label>"               # how code names the space; a message names it by its position, spaces[i]
+name = "..."                    # name, id and prefixes as in [space]
+id = "..."
+prefixes = ["..."]
+providers = ["<name>", ...]     # the providers declared to support this space (O04)
+local = "<name>"                # the agent's own provider, one of these; the same in every entry (O03)
+holder = "<name>"               # this space's data provider, one of its providers: required (O09)
+tokens = ["data_path", "tool_server"]  # optional: the token planes whose caveats reach this space; both by default
+```
+
+A `[[placement.map]]` row (or `[[map]]` in a study's file) names its space with `space = "<label>"`, required with several spaces. `[placement] concurrency` (16 by default) bounds the requests a bulk operation has in flight.
+
+```python
+class PlatformConfig:               # config.py
+    spaces: tuple[StudySpace, ...]  # the one-space form's single space (label "space"), or the [[spaces]] entries
+    def space_named(self, label: str | None = None) -> StudySpace   # None: the only space
+    space: Space; support: Support  # the only space's; refused when several are declared
+    prefixes: tuple[str, ...]       # every space's, each once: what the mutation gate accepts
+    def space_ids(self, plane: str) -> tuple[str, ...]              # the spaces a token plane is scoped to
+
+class Provisioner:                  # provision.py: bound to one space
+    def __init__(self, client, config, settings, *, provider_ids, log, space: str | None = None, ...)
+    def resolve_many(self, paths) -> dict[str, Entry]               # one listing of each directory
+    def walk(self, directory_id=None) -> Iterator[tuple[Entry, bool]]  # every entry under a directory, and its leafness
+
+def evict_tree(provisioner, path: str | Entry, from_provider) -> dict   # eviction.py: one transfer of a directory
+def evict_ids(provisioner, file_ids, from_provider) -> dict             # files in parallel under the bound
+
+class SpaceReset:                   # reset.py
+    def __init__(self, provisioner, *, providers=None)
+    def run(self, evict: Mapping[str, Iterable[str]] | None = None,   # provider -> paths that must leave it
+            allowed: Mapping[str, int] | None = None) -> dict          # provider -> physical bytes it may keep
+```
+
+The platform layer guarantees:
+- The one-space form behaves as before, and `PlatformConfig.fingerprint()` is unchanged for it. Whenever `[[spaces]]` is used, with one entry or several, the fingerprint holds each entry's SHA-256 in order, never a label, name or id, so a resume under another set, order, support, data provider or token planes is refused (C06).
+- A provisioner acts in its own space alone: its live name is checked against that space's name and prefixes before the first change, every mutation it sends is bound to that space (the gate refuses a target in any other space, even under a shared prefix), its data provider, which must support the space, is never evicted, by name or by id (O09), and with several spaces every message starts with the space's position. Placement, eviction and the probes take the space from the provisioner, and each space's probes have their own namespace, `platform_probes_space<i>`, and name the space in their snapshot.
+- Each token plane's `data.path` caveat lists exactly the spaces it is scoped to, its principal's rights are read in each, and the examination refuses a token that misses one or adds another (O05). The tool server's launch checks and the data gate's token follow the plane's set. The health check's token is the data path's, scoped to the spaces the data path reaches, and it compares each of them with its own support set (O04); its content-type check reads `[sandbox] content_check_file` under the root of the first space the data path reaches.
+- `run` first refuses a plan that names the data provider (by name or id) or a provider that does not support the space, and verifies the space's live name; then it takes five stages in order, each read on every supporting provider and recorded with its seconds: `qos` (every requirement, found from the summaries of the root and the leaves, removed through the gate, each then answering that it is not there (`answered_absent`) on every provider and a second walk on each finding none), `transfers` (every waiting or ongoing job cancelled on every provider that lists it until `transfer_settle_polls` observations in a row, `transfer_settle_s` apart, show none), `eviction` (each provider's paths, a directory in one transfer and files together, verified on the block maps only once no transfer runs on any provider, and none running after, O01; what still holds bytes is scheduled again, as `Provisioner.evict` does, since an eviction on 25.0 can complete having evicted nothing, up to `EVICTION_ATTEMPTS`), `occupancy` (with no transfer running, the space root's per-provider physical size, never the lagging logical figures: a provider other than the data provider holding more than `allowed` fails the reset) and `history` (the ended listing's count and newest finish time per provider: ended transfers cannot be removed, so they are recorded, `removable` false). A stage that cannot verify what it did raises `ResetFailed` with the stages so far and runs no later stage; the caller must not start the next run.
+- The mutation gate resolves a transfer's cancel by its record's `spaceId` and a QoS requirement's removal by its record's `fileId`, read right before the mutation and never kept. A directory's eviction and a transfer record's `spaceId` were read on the live federation (`deploy/compose-federation/day0/2026-11-11-federation-facts.md`), and so was the shape of a directory's distribution (`day0/2026-11-11-federation-facts-posix-and-fuse.md`); the cancel, the QoS summary, a requirement's record and its removal are named only by Oneprovider 25.0's REST description, so they are in `client.UNVERIFIED_ENDPOINTS`. Each has a live test (`EXPCORE_LIVE_MUTATE`; the whole reset also `EXPCORE_LIVE_RESET`).
+
 ## The platform layer's testing module
 
 `expcore_onedata.testing`, installed with the platform layer (the `[onedata]` extra). It holds the fakes of the Onedata platform that the core's own tests use, so a study tests its instruments, probes and scorers against the same stand-ins without a live federation. [`study-guide.md`](study-guide.md#testing-a-studys-instruments-and-scorers) shows them in use.
@@ -681,7 +728,7 @@ def tool_plane_replicates(fake: FakeData, client: OnezoneClient, path: str, targ
 | Name | What it is | Models | Does not model |
 |---|---|---|---|
 | `MockOnedata`, `Request` | the provider REST surface the fsspec client uses, served over a real local HTTP socket from a fixed file set; `Request` is what it records of each call | lookup, attributes, paged children (a `limit` over the maximum is refused, not clamped), ranged content, the one token it accepts | writes, transfers, block maps, file times and permissions, more than one space |
-| `FakeFederation` | an in-process Onezone: `client_http()` answers through an `httpx.MockTransport`, no socket | token examination and scope, temporary tokens with a time caveat, privileges (direct and effective), the study space and others | other Onezone calls, a token's expiry or revocation, group-derived privileges |
+| `FakeFederation` | an in-process Onezone: `client_http()` answers through an `httpx.MockTransport`, no socket | token examination and scope, temporary tokens with a time caveat, privileges (direct and effective), the study space and others added by `add_space`, with `grant(..., space=)` for their privileges | other Onezone calls, a token's expiry or revocation, group-derived privileges, files in an added space |
 | `FakeData`, `Node`, `Transfer`, `PROVIDER`, `ROOT_ID`, `ERRORS_25_0`, `ERRORS_LEGACY` | Onezone plus the data API of every provider it reports, with files, block maps, range reads and transfer jobs; time is counted in calls, or in seconds of the fake's own `clock` | files, directories, per-provider block maps that a range read, a replication and an eviction change, per-reader views with a visibility delay, replication, eviction and migration jobs, the transfer listing and a job's record, provider clock skew and listing lag, Onedata 25.0's error shapes (or the older one), injected faults | a transfer's duration, partial replication or eviction, QoS, storage backends beyond one, quotas, a token's space or interface caveats, a delete that other providers show late |
 | `Ticker` | a clock that moves only when something sleeps: `clock`, `sleep`, `now` | a bounded wait that runs instantly and exactly | real time, threads |
 | `make_federation`, `add_users` | the federation the default `platform.toml` describes: the study space, `alpha` supporting it, `beta` known and not supporting it, the three users with the baseline privileges | what `write_platform` names | a federation of another shape: build `FakeData` and bend it |

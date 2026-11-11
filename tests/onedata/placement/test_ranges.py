@@ -23,8 +23,8 @@ def test_o02_a_range_placement_issues_range_reads_and_never_a_transfer_job(provi
     assert len(reads) == 2  # one read per declared range
     assert [c for c in sent_to(seeded, ALPHA_ID) if c[2].endswith("/content")] == []  # the data provider is not read
     assert seeded.held(PATH, BETA_ID) == [[0, 100], [2000, 500]]  # exactly the declared bytes, not the whole file
-    assert record["providers"]["beta"]["bytes_read"] == 600
-    assert record["providers"]["beta"]["placement"]["fully_placed"] is True
+    assert record["providers"]["providers[1]"]["bytes_read"] == 600
+    assert record["providers"]["providers[1]"]["placement"]["fully_placed"] is True
 
 
 def test_o02_the_placement_is_confirmed_by_the_block_map_after_it_lags(provisioner, seeded, ticker):
@@ -41,12 +41,12 @@ def test_o02_placement_records_per_file_what_the_block_map_holds_beside_what_was
     holds afterwards, never the requested ones as held."""
     seeded.onthefly_unit = 1024
     record = place_ranges(provisioner, [RangeRow(PATH, "beta", ((100, 10), (3500, 10)))])
-    per_file = record["providers"]["beta"]["per_file"][PATH]
+    per_file = record["providers"]["providers[1]"]["per_file"][PATH]
     assert per_file["asked"] == [[100, 10], [3500, 10]]
     assert per_file["asked_bytes"] == 20
     assert per_file["held"] == [[100, 1024], [3500, 596]]  # the second clipped at the file's end
     assert per_file["held_bytes"] == 1620
-    assert record["providers"]["beta"]["held_after"] == 1620
+    assert record["providers"]["providers[1]"]["held_after"] == 1620
 
 
 UNSEEN = [(404, "notFound", None), (400, "posix", "enoent")]
@@ -63,7 +63,7 @@ def test_o07_placement_waits_until_the_receiver_sees_a_file_written_through_the_
     seeded.unseen[(BETA_ID, file_id)] = 3
     seeded.unseen_answer = answer
     record = place_ranges(provisioner, [ROW])
-    assert record["providers"]["beta"]["placement"]["fully_placed"] is True
+    assert record["providers"]["providers[1]"]["placement"]["fully_placed"] is True
     assert seeded.held(PATH, BETA_ID) == [[0, 100], [2000, 500]]
     assert seeded.unseen[(BETA_ID, file_id)] == 0
     assert len(ticker.slept) >= 3  # it waited, with pauses, for the three reads that did not see the file

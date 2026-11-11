@@ -84,14 +84,14 @@ def test_o08_a_transfer_that_started_before_the_run_is_reported_carried_over_and
     assert snapshot["ok"] is True
     assert snapshot["space_transfers"]["records"] == []
     assert snapshot["space_transfers"]["carried_over"] == 1
-    assert snapshot["on_demand"]["beta"] == {
+    assert snapshot["on_demand"]["providers[1]"] == {
         "gained_bytes": len(DATA),
         "transfer_bytes_in": 0,
         "difference": len(DATA),
         "on_demand_lower_bound": None,
         "unknown": ["transfer_carried_over"],
     }
-    assert snapshot["on_demand"]["alpha"]["on_demand_lower_bound"] == 0
+    assert snapshot["on_demand"]["providers[0]"]["on_demand_lower_bound"] == 0
 
 
 def test_o08_the_same_transfer_started_inside_the_run_is_counted(world):
@@ -105,9 +105,9 @@ def test_o08_the_same_transfer_started_inside_the_run_is_counted(world):
     snapshot = world.probes.finish()
     assert [record["transfer_id"] for record in snapshot["space_transfers"]["records"]] == [started]
     assert snapshot["space_transfers"]["carried_over"] == 0
-    assert snapshot["on_demand"]["beta"]["transfer_bytes_in"] == len(DATA)
-    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] == 0
-    assert snapshot["on_demand"]["beta"]["unknown"] is None
+    assert snapshot["on_demand"]["providers[1]"]["transfer_bytes_in"] == len(DATA)
+    assert snapshot["on_demand"]["providers[1]"]["on_demand_lower_bound"] == 0
+    assert snapshot["on_demand"]["providers[1]"]["unknown"] is None
 
 
 def test_o08_a_transfer_that_started_and_ended_before_the_run_is_outside_it_and_not_carried_over(world):
@@ -121,7 +121,7 @@ def test_o08_a_transfer_that_started_and_ended_before_the_run_is_outside_it_and_
     snapshot = world.probes.finish()
     assert snapshot["space_transfers"]["records"] == []
     assert snapshot["space_transfers"]["carried_over"] == 0
-    assert snapshot["on_demand"]["beta"] == {
+    assert snapshot["on_demand"]["providers[1]"] == {
         "gained_bytes": 0,
         "transfer_bytes_in": 0,
         "difference": 0,

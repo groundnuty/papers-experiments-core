@@ -20,7 +20,7 @@ def mint_for_condition(
 
     The skip reason names no condition, so a study's condition names never reach the test report.
     """
-    spec = tool_server_spec(config.space.id, config.condition(name))
+    spec = tool_server_spec(config.space_ids("tool_server"), config.condition(name))
     try:
         return issuer.mint(spec, principal, ceiling_s=ceiling_s)
     except PrivilegesMismatch:

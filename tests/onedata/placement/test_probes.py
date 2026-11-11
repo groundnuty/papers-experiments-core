@@ -131,14 +131,14 @@ def test_the_snapshot_records_the_distribution_before_and_after_and_the_bytes_pe
     place_ranges(provisioner, [ROW])
     snapshot = probes.finish()
     assert snapshot["ok"] is True
-    beta = snapshot["files"]["data"]["providers"]["beta"]
+    beta = snapshot["files"]["data"]["providers"]["providers[1]"]
     assert beta["before"]["held_bytes"] == 0
     assert beta["after"]["held_bytes"] == 600
     assert beta["after"]["blocks"] == [[0, 100], [2000, 500]]
     assert snapshot["files"]["data"]["size"] == len(DATA)
-    assert snapshot["pairs"]["beta"]["from"] == {"alpha": 600}
-    assert snapshot["pairs"]["alpha"]["gained_bytes"] == 0
-    assert snapshot["files"]["data"]["providers"]["alpha"]["after"]["held_bytes"] == len(DATA)
+    assert snapshot["pairs"]["providers[1]"]["from"] == {"providers[0]": 600}
+    assert snapshot["pairs"]["providers[0]"]["gained_bytes"] == 0
+    assert snapshot["files"]["data"]["providers"]["providers[0]"]["after"]["held_bytes"] == len(DATA)
     json.dumps(snapshot, allow_nan=False)  # plain JSON
 
 
@@ -163,13 +163,13 @@ def test_o08_a_provider_that_cannot_be_read_makes_its_readings_none_and_the_snap
     seeded.resets.append(["/distribution", 99, BETA_ID])
     snapshot = probes.finish()
     assert snapshot["ok"] is False
-    beta = snapshot["files"]["data"]["providers"]["beta"]
+    beta = snapshot["files"]["data"]["providers"]["providers[1]"]
     assert beta["after"]["probe_ok"] is False
     assert beta["after"]["held_bytes"] is None
     assert beta["after"]["blocks"] is None
     assert snapshot["files"]["data"]["pairs"] is None
     assert snapshot["pairs"] is None
-    assert snapshot["files"]["data"]["providers"]["alpha"]["after"]["held_bytes"] == len(DATA)
+    assert snapshot["files"]["data"]["providers"]["providers[0]"]["after"]["held_bytes"] == len(DATA)
 
 
 def test_o08_a_block_map_without_a_blocks_field_is_a_failed_probe_with_a_reason_not_an_empty_reading(probes, seeded):
@@ -179,7 +179,7 @@ def test_o08_a_block_map_without_a_blocks_field_is_a_failed_probe_with_a_reason_
     seeded.omit_blocks = True
     snapshot = probes.finish()
     assert snapshot["ok"] is False
-    for provider in ("alpha", "beta"):
+    for provider in ("providers[0]", "providers[1]"):
         after = snapshot["files"]["data"]["providers"][provider]["after"]
         assert after["probe_ok"] is False
         assert after["error"]
@@ -197,11 +197,12 @@ def test_o08_resolving_a_tracked_file_does_not_retry_a_space_root_that_is_not_th
     assert len(calls_for(seeded, "/spaces/")) == 1
     assert ticker.slept == []  # no wait of the space-root kind
     snapshot = probes.finish()
-    before = snapshot["files"]["data"]["providers"]["alpha"]["before"]
+    before = snapshot["files"]["data"]["providers"]["providers[0]"]["before"]
     assert before["probe_ok"] is False
     assert before["status"] == 400
     assert snapshot["ok"] is False
-    assert snapshot["files"]["data"]["providers"]["alpha"]["after"]["probe_ok"] is True  # the next reading is its own
+    # the next reading is its own
+    assert snapshot["files"]["data"]["providers"]["providers[0]"]["after"]["probe_ok"] is True
 
 
 def test_o08_a_reset_inside_the_resolution_is_retried_and_counted_in_the_probes_attempts(probes, seeded, ticker):
@@ -222,11 +223,11 @@ def test_o08_a_provider_the_block_map_leaves_out_is_a_failed_probe_with_a_reason
     seeded.omit_providers = {BETA_ID}
     snapshot = probes.finish()
     assert snapshot["ok"] is False
-    beta = snapshot["files"]["data"]["providers"]["beta"]["after"]
+    beta = snapshot["files"]["data"]["providers"]["providers[1]"]["after"]
     assert beta["probe_ok"] is False
     assert beta["error"]
     assert (beta["held_bytes"], beta["blocks"]) == (None, None)
-    assert snapshot["files"]["data"]["providers"]["alpha"]["after"]["probe_ok"] is True
+    assert snapshot["files"]["data"]["providers"]["providers[0]"]["after"]["probe_ok"] is True
     assert snapshot["files"]["data"]["pairs"] is None
     assert snapshot["pairs"] is None
 
@@ -236,7 +237,7 @@ def test_o01_a_block_with_a_negative_length_is_a_failed_probe_not_a_zero_reading
     probes.start({})
     seeded.blocks[(seeded.id_of(PATH), BETA_ID)] = [[0, -1]]
     snapshot = probes.finish()
-    beta = snapshot["files"]["data"]["providers"]["beta"]["after"]
+    beta = snapshot["files"]["data"]["providers"]["providers[1]"]["after"]
     assert beta["probe_ok"] is False
     assert (beta["held_bytes"], beta["blocks"]) == (None, None)
     assert snapshot["ok"] is False
@@ -248,7 +249,7 @@ def test_a_snapshot_without_a_start_has_no_before_and_no_pairs(probes, seeded):
     snapshot = probes.finish()
     assert snapshot["ok"] is False
     assert snapshot["pairs"] is None
-    assert snapshot["files"]["data"]["providers"]["alpha"]["before"] is None
+    assert snapshot["files"]["data"]["providers"]["providers[0]"]["before"] is None
 
 
 def test_a_tracked_file_that_is_gone_is_a_failed_probe_not_an_error(probes, seeded):
@@ -271,7 +272,7 @@ def test_the_probes_are_an_instrument_and_their_snapshot_goes_into_the_record(pr
     record = finish_instruments(hand_made(), [probes])
     snapshot = record.instruments[NAMESPACE]
     assert snapshot["ok"] is True
-    assert snapshot["pairs"]["beta"]["gained_bytes"] == 600
+    assert snapshot["pairs"]["providers[1]"]["gained_bytes"] == 600
 
 
 def test_the_retry_attempts_come_from_the_placement_settings(probes, seeded, ticker):

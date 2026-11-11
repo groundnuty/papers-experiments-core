@@ -517,7 +517,7 @@ assert relay["n_clusters"] == len({task.attributes["region"] for task in study.t
 
 ### Unknown platform estimates are data
 
-A study on the Onedata platform reads the run-end platform probes from each record's instruments (`platform_probes`). Per tracked provider they give `gained_bytes` (placement gained: the bytes of the blocks the provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire), `transfer_bytes_in` (what the transfers in the run window moved into it), and `on_demand_lower_bound`, which is `None` whenever one of its inputs is not established, with each reason in `unknown` (`transfer_not_ended`, `transfer_carried_over`, `listing_not_settled`, ...).
+A study on the Onedata platform reads the run-end platform probes from each record's instruments (`platform_probes`). Per tracked provider, keyed by its position in `platform.toml` (`providers[i]`, never its name, since records are published), they give `gained_bytes` (placement gained: the bytes of the blocks the provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire), `transfer_bytes_in` (what the transfers in the run window moved into it), and `on_demand_lower_bound`, which is `None` whenever one of its inputs is not established, with each reason in `unknown` (`transfer_not_ended`, `transfer_carried_over`, `listing_not_settled`, ...).
 
 That missingness is informative. An estimate is unknown exactly when, for example, the agent starts a transfer and its run ends first, which is likelier under conditions that encourage placement, so dropping the unknowns would bias a comparison between conditions. Count them per condition and reason over every attempt, set-aside and excluded ones as well as those analysed, and report the counts beside any analysis of the bound; never drop them silently. `gained_bytes` and `transfer_bytes_in` are missing far less often, when a block map or the transfer listing could not be read or a tracked path named another file at the run's end than at its start, but they too can be missing (the split is then `None`), so count those as well, under `no_split`, whichever measure you analyse; or analyse the bound and state its missingness as a limitation. A study without the platform has no probes, and the count is empty:
 
@@ -611,7 +611,7 @@ snapshot = probes.finish()
 
 # Beta gained the bytes during the run, and the core reports the job as carried over, not as a transfer of the run.
 assert snapshot["space_transfers"]["carried_over"] == 1 and snapshot["space_transfers"]["records"] == []
-beta = snapshot["on_demand"]["beta"]
+beta = snapshot["on_demand"]["providers[1]"]  # keyed by position in the tracked list, never by name: beta is [1]
 assert (beta["gained_bytes"], beta["transfer_bytes_in"]) == (len(DATA), 0)
 assert beta["on_demand_lower_bound"] is None and beta["unknown"] == ["transfer_carried_over"]
 
@@ -623,7 +623,7 @@ class OnDemandBytes:
     version = "1"
 
     def score(self, record):
-        bound = record.instruments["platform_probes"]["on_demand"]["beta"]["on_demand_lower_bound"]
+        bound = record.instruments["platform_probes"]["on_demand"]["providers[1]"]["on_demand_lower_bound"]
         if bound is None:
             return {"verdict": "not_determined", "outcomes": {"on_demand_bytes": None}}
         return {"verdict": "fulfilled", "outcomes": {"on_demand_bytes": float(bound)}}

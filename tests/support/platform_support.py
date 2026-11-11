@@ -7,6 +7,7 @@ what stays here is what only this repository's tests need.
 from pathlib import Path
 
 from expcore_onedata.testing import platform_document
+from expcore_onedata.testing.world import SPACE_IDS, SPACE_LABELS, SPACE_NAMES
 
 
 def configured_values(tmp_path: Path) -> list[str]:
@@ -22,6 +23,7 @@ def configured_values(tmp_path: Path) -> list[str]:
         values += [name, provider["url"], provider["url"].split("//")[1], provider["id"]]
     zone, space = document["zone"], document["space"]
     values += [zone["url"], zone["url"].split("//")[1], space["name"], space["id"], *space["prefixes"]]
+    values += [*SPACE_IDS, *SPACE_NAMES, *SPACE_LABELS, "study-b-"]  # the several-space form's (`with_spaces`)
     for principal in document["principals"].values():
         values += [principal["username"], principal["user_id"]]
     credentials = document["credentials"]

@@ -115,7 +115,7 @@ def test_o09_a_transfer_is_scoped_by_the_file_its_body_names(config, seeded, cli
     [
         ("POST", "/lookup-file-id/space/path", None),  # nothing maps a path to a space
         ("POST", "/replicas-id/abc", None),
-        ("DELETE", "/transfers/abc", None),  # a cancel names no file
+        ("DELETE", "/transfers/a%2Fb", None),  # a cancel is resolved through its record, never one with an escape
         ("POST", "/transfers", {"type": "eviction"}),  # no fileId
         ("POST", "/transfers", {"fileId": 5}),  # not a plain id
         ("PUT", "/data/a%2Fb/content", None),  # an escape the server could read as another path

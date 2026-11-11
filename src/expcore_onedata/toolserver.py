@@ -161,7 +161,7 @@ def _prepare(
     if token.plane is not Plane.TOOL_SERVER:
         raise ValueError("the tool server takes the tool-server plane's token, not another plane's")
     verify_configured(_server(config))
-    spec = tool_server_spec(config.space.id, condition)
+    spec = tool_server_spec(config.space_ids(Plane.TOOL_SERVER), condition)
     issuer.examine(token.reveal(), spec, token.subject, token_window(ceiling_s, config.tokens))
     issuer.check_user(spec, token.subject)
 
@@ -188,7 +188,7 @@ def _recheck(
 ) -> None:
     """The checks at teardown: the token examined again and the principal's privileges read again, against the
     condition's exact set. The run is over, so the token only has to be unexpired, not to outlast a run."""
-    spec = tool_server_spec(config.space.id, condition)
+    spec = tool_server_spec(config.space_ids(Plane.TOOL_SERVER), condition)
     window = dataclasses.replace(token_window(ceiling_s, config.tokens), min_ttl_s=0)
     issuer.examine(token.reveal(), spec, token.subject, window)
     issuer.check_user(spec, token.subject)

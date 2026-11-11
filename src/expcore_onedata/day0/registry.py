@@ -8,15 +8,20 @@ allowed it; without that it returns unknown and does nothing.
 
 No check runs without an explicit target configuration: a `Context` is built from a loaded platform.toml and there is no
 default one.
+
+A check about a space runs in each space it is about (`per_space`). With one declared space its result is the one
+space's, as it was before several spaces could be declared; with several (`[[spaces]]`) it is the worst over the spaces,
+failed before unknown before passed, and each space is named by its position, `spaces[i]`, never by its label or name.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from expcore_onedata.client import OnezoneClient
-from expcore_onedata.config import PlatformConfig
+from expcore_onedata.config import PlatformConfig, StudySpace
+from expcore_onedata.day0.report import status
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.rangemap import Placement
 from expcore_onedata.tokens import TokenIssuer
@@ -63,23 +68,63 @@ class Context:
     sleep: Callable[[float], None] = lambda seconds: None
     now: Callable[[], float] = lambda: 0.0
     provider_ids: dict[str, str] = field(default_factory=dict)
-    _provisioner: Provisioner | None = field(default=None, repr=False)
+    _provisioners: dict[str, Provisioner] = field(default_factory=dict, repr=False)  # by the label of their space
 
-    def provisioner(self) -> Provisioner:
-        """Return the provisioner of this run, with its change log in the output directory."""
+    def provisioner(self, space: str | None = None) -> Provisioner:
+        """Return this run's provisioner in a space, named by its label (the only space by default), with its change
+        log in the output directory: `day0-changes.jsonl` with one space, and with several one log per space, named by
+        its position (`day0-changes-spaces-1.jsonl`), so that no space's teardown reads another space's creations."""
         if self.placement is None:
             raise LookupError("platform.toml has no [placement] table")
-        if self._provisioner is None:
-            self._provisioner = Provisioner(
+        entry = self.config.space_named(space)
+        if entry.label not in self._provisioners:
+            log = "day0-changes.jsonl"
+            if len(self.config.spaces) > 1:
+                log = f"day0-changes-{entry.position.replace('[', '-').rstrip(']')}.jsonl"
+            self._provisioners[entry.label] = Provisioner(
                 self.client,
                 self.config,
                 self.placement.settings,
                 provider_ids=self.provider_ids,
-                log=self.out_dir / "day0-changes.jsonl",
+                log=self.out_dir / log,
+                space=entry.label,
                 clock=self.clock,
                 sleep=self.sleep,
             )
-        return self._provisioner
+        return self._provisioners[entry.label]
+
+
+def worst(verdicts: Iterable[bool | None]) -> bool | None:
+    """The worst of several verdicts: failed beats unknown, and unknown beats passed."""
+    seen = list(verdicts)
+    if any(ok is False for ok in seen):
+        return False
+    return None if any(ok is None for ok in seen) else True
+
+
+def per_space(ctx: Context, entries: Iterable[StudySpace], check: Callable[[StudySpace], Result]) -> Result:
+    """Run a check's part about one space in each of `entries` and return one result, the worst over the spaces.
+
+    With one declared space it is that space's result as it is, so a one-space report reads as it did before several
+    spaces could be declared. With several, the facts hold each space's result, summary and facts under its position,
+    and the summary names, with its own summary, each space that did not pass, or on a pass each space. Spaces are
+    named by their position alone (O12). No space to run in measures nothing, so it is unknown, never a pass."""
+    if len(ctx.config.spaces) == 1:
+        return check(ctx.config.spaces[0])
+    results = {entry.position: check(entry) for entry in entries}
+    if not results:
+        return unknown("no declared space is one this check is about, so nothing was measured")
+    ok = worst(result.ok for result in results.values())
+    facts = {
+        position: {**result.facts, "result": status(result.ok), "summary": result.summary}
+        for position, result in results.items()
+    }
+    if ok is True:
+        shown = "; ".join(f"{position}: {result.summary}" for position, result in results.items())
+        return passed(f"passed in each of the {len(results)} spaces: {shown}", spaces=facts)
+    behind = [(position, result) for position, result in results.items() if result.ok is not True]
+    shown = "; ".join(f"{position} ({status(result.ok)}): {result.summary}" for position, result in behind)
+    return Result(ok, f"{len(behind)} of {len(results)} spaces did not pass: {shown}", {"spaces": facts})
 
 
 @dataclass(frozen=True)

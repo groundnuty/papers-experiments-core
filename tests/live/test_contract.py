@@ -29,7 +29,15 @@ from live_support import (  # noqa: E402 -- only once the module is known to run
 )
 
 from expcore_onedata import consistency  # noqa: E402
-from expcore_onedata.client import API_PROVIDER, AUTH_HEADER, OnezoneClient, PlatformError  # noqa: E402
+from expcore_onedata.client import (  # noqa: E402
+    API_PROVIDER,
+    AUTH_HEADER,
+    NotSent,
+    OnezoneClient,
+    PlatformError,
+    _error_fields,
+    answered_absent,
+)
 from expcore_onedata.config import load_platform  # noqa: E402
 from expcore_onedata.federation import pin_local_provider, read_space  # noqa: E402
 from expcore_onedata.health import PlatformHealth  # noqa: E402
@@ -173,6 +181,15 @@ def test_the_health_check_reads_the_declared_support_set(config, client, issuer)
     assert result.ok, result.detail
 
 
+def lookup_absent(answer: httpx.Response) -> bool:
+    """Whether a provider's raw answer says the entry is not there, read as the client reads absence
+    (`answered_absent`): a 404, or Onedata 25.0's 400 posix enoent. Any other answer is not absence."""
+    if answer.status_code < 400:
+        return False
+    code, errno = _error_fields(answer)
+    return answered_absent(PlatformError("the lookup", status=answer.status_code, code=code, errno=errno))
+
+
 def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_streams(config, issuer):
     """O05: the data gate streams only a 200 or 206 of a file's content with the data content type, and buffers every
     other answer up to 4 MiB (gateboundary.streams). Read a provisioned file whole and by range through the provider's
@@ -187,7 +204,7 @@ def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_st
     # The platform's one [tls], as every client of the federation takes it: a federation's own CA, or the defaults.
     with httpx.Client(timeout=120, verify=config.tls.client_verify()) as http:
         found = http.post(f"{base}/lookup-file-id/{config.space.name}/{CONTENT_PATH.strip('/')}", headers=headers)
-        if found.status_code == consistency.NOT_FOUND:  # unknown, never a pass or a failure of the platform
+        if lookup_absent(found):  # unknown, never a pass or a failure of the platform
             pytest.skip(
                 "EXPCORE_LIVE_CONTENT_PATH names a file the space does not hold: a space declared baseline = false "
                 "holds none, so set it only where the file was provisioned"
@@ -252,6 +269,24 @@ def test_the_read_only_day0_checks_do_not_fail_on_the_real_deployment(day0):
     entries = run_checks(day0, ["reachability", "health", "tokens", "listing"])
     failures = {e.name: e.summary for e in entries if e.ok is False}
     assert not failures, failures
+
+
+def test_the_space_roots_distribution_gives_each_supporting_providers_physical_size(day0, tmp_path):
+    """O08: the reset's occupancy stage reads the space root's distribution on the data provider: every supporting
+    provider has a physical size there, a whole number of bytes, or the reading is unknown and the test fails (a space
+    without directory statistics cannot pass the reset). Read-only."""
+    # covers: GET /data/{id}/distribution
+    from expcore_onedata.occupancy import physical_sizes
+    from expcore_onedata.provision import Provisioner
+
+    if day0.placement is None:
+        pytest.skip("the occupancy check needs a [placement] table, which platform.toml does not have")
+    provisioner = Provisioner(
+        day0.client, day0.config, day0.placement.settings, provider_ids=day0.provider_ids, log=tmp_path / "log.jsonl"
+    )
+    sizes = physical_sizes(provisioner, day0.config.support.providers)
+    assert set(sizes) >= set(day0.config.support.providers)
+    assert all(isinstance(size, int) and size >= 0 for size in sizes.values())
 
 
 def test_a_real_block_map_has_the_documented_shape(day0, client, config):
@@ -339,3 +374,115 @@ def test_a_day0_check_that_changes_state_passes_and_shows_its_cleanup(day0, name
         require_cleaned(entry)
     else:
         require_every_provider_refused(entry)
+
+
+# -- the reset's calls (issue #118) -----------------------------------------------------------------------------------
+# Each makes scratch files under the configured prefixes, acts on them alone and tears them down: EXPCORE_LIVE_MUTATE=1.
+# The last runs a whole reset of the space, which removes every QoS requirement and cancels every running transfer in
+# it, so it needs EXPCORE_LIVE_RESET=1 as well: never set it on a federation another run is using.
+
+RESET = pytest.mark.skipif(
+    os.environ.get("EXPCORE_LIVE_RESET") != "1",
+    reason="EXPCORE_LIVE_RESET=1 is not set; this test resets the whole configured space",
+)
+
+
+@pytest.fixture
+def scratch(day0, tmp_path):
+    """A provisioner with a scratch directory of two small files, the provider they are replicated to, and their
+    teardown afterwards; skipped when platform.toml has no [placement] or no provider besides the data provider."""
+    from expcore_onedata.provision import Provisioner
+
+    missing = prerequisite_missing("round_trip", day0)
+    if missing is not None:
+        pytest.skip(missing)
+    holder = day0.placement.settings.holder
+    receiver = next(p for p in day0.config.support.providers if p != holder)
+    provisioner = Provisioner(
+        day0.client, day0.config, day0.placement.settings, provider_ids=day0.provider_ids, log=tmp_path / "log.jsonl"
+    )
+    directory = f"expcore-live-reset-{int(time.time())}"
+    ids = [provisioner.put_file(f"{directory}/part-{i}.bin", bytes(range(256)) * 4) for i in range(2)]
+    try:
+        yield provisioner, receiver, directory, ids
+    finally:
+        require_torn_down(provisioner.teardown())
+
+
+def require_torn_down(report):
+    assert report.ok, f"the scratch files were not all removed: {len(report.left)} left"
+
+
+@MUTATE
+def test_a_directory_eviction_covers_every_file_under_it(scratch):
+    """O01: a scratch directory's two files, replicated to a provider, leave it with one eviction of the directory,
+    and both block maps then show nothing held there (`eviction.evict_tree` verifies them)."""
+    # covers: POST /transfers
+    from expcore_onedata.eviction import evict_tree
+
+    provisioner, receiver, directory, _ = scratch
+    for i in range(2):
+        provisioner.replicate(f"{directory}/part-{i}.bin", receiver)
+    record = evict_tree(provisioner, directory, receiver)
+    assert (record["files"], record["transfers"], record["empty"]) == (2, 1, True)
+
+
+@MUTATE
+def test_a_running_transfer_is_cancelled_through_the_gate_and_then_reports_an_ended_state(scratch):
+    """O11: a replication of a scratch file is cancelled at once, the gate having read the record's spaceId; the
+    cancel answers 204, or 400 when the job ended first, and the record then reports an ended state."""
+    # covers: DELETE /transfers/{id}
+    provisioner, receiver, _, ids = scratch
+    tid = provisioner.schedule_transfer("replication", ids[0], receiver)
+    statuses = []
+    try:
+        provisioner.client.mutate("DELETE", f"/transfers/{tid}", provider=receiver)
+    except NotSent:
+        raise  # the gate never sent the cancel: its own read failed, so this test has not shown the DELETE
+    except PlatformError as error:
+        statuses.append(error.status)
+    assert statuses in ([], [400])  # 400: the job ended before the cancel reached it
+    done = consistency.wait_transfers(provisioner.client, receiver, [tid], timeout_s=120, poll_s=2)
+    assert not done.timed_out
+    assert consistency.transfer_state(done.records[tid]) in consistency.ENDED_STATES
+
+
+@MUTATE
+def test_a_qos_requirement_is_listed_by_its_files_summary_read_and_removed(scratch):
+    """O11: a requirement put on a scratch file appears, keyed by its id, in the file's summary; its record names the
+    file, which the gate of its removal resolves; once removed it answers that it is not there (`answered_absent`)."""
+    # covers: GET /data/{id}/qos/summary
+    # covers: GET /qos_requirements/{qid}
+    # covers: DELETE /qos_requirements/{qid}
+    provisioner, _, _, ids = scratch
+    holder = provisioner.settings.holder
+    body = {"fileId": ids[0], "expression": "anyStorage", "replicasNum": 1}
+    qid = provisioner.client.mutate("POST", "/qos_requirements", provider=holder, json=body)["qosRequirementId"]
+    summary = provisioner.client.get(f"/data/{ids[0]}/qos/summary", provider=holder)
+    assert qid in summary["requirements"]
+    assert provisioner.client.get(f"/qos_requirements/{qid}", provider=holder)["fileId"] == ids[0]
+    provisioner.client.mutate("DELETE", f"/qos_requirements/{qid}", provider=holder)
+    with pytest.raises(PlatformError) as gone:
+        provisioner.client.get(f"/qos_requirements/{qid}", provider=holder)
+    assert answered_absent(gone.value), (gone.value.status, gone.value.code, gone.value.errno)
+
+
+@MUTATE
+@RESET
+def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_the_history(scratch):
+    """O11: with a requirement and a running replication left on the scratch files, the reset passes every stage:
+    the requirement is gone, no job is waiting or ongoing, the receiver holds nothing of the directory, and the ended
+    history is recorded with its count, never removed. Each stage has its seconds."""
+    from expcore_onedata.reset import STAGES, SpaceReset
+
+    provisioner, receiver, directory, ids = scratch
+    holder = provisioner.settings.holder
+    body = {"fileId": ids[1], "expression": "anyStorage", "replicasNum": 1}
+    provisioner.client.mutate("POST", "/qos_requirements", provider=holder, json=body)
+    provisioner.schedule_transfer("replication", ids[0], receiver)
+    record = SpaceReset(provisioner).run({receiver: [directory]})
+    assert record["ok"] is True
+    assert list(record["stages"]) == list(STAGES)
+    assert record["stages"]["qos"]["removed"] >= 1
+    assert record["stages"]["history"]["removable"] is False
+    assert all(isinstance(stage["seconds"], float) for stage in record["stages"].values())

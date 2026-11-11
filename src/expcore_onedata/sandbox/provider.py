@@ -53,7 +53,7 @@ from expcore_onedata.sandbox.inputs import InputsRecord
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
 from expcore_onedata.sandbox.settings import SandboxSettings
-from expcore_onedata.tokens import MintedToken, RunTokens, TokenIssuer, data_path_spec
+from expcore_onedata.tokens import MintedToken, Plane, RunTokens, TokenIssuer, data_path_spec
 from expcore_onedata.users import GROUP, SlotProbe, Slots, SlotTokens, TokenJournal
 
 if TYPE_CHECKING:
@@ -323,7 +323,7 @@ class SandboxPlatform:
                 raise ValueError("a run with a tool server needs a leased slot: its tool-server user is the slot's")
             if mode is DataPathMode.NONE:
                 return None
-            spec = data_path_spec(self._config.space.id, mode.interface or "rest")
+            spec = data_path_spec(self._config.space_ids(Plane.DATA_PATH), mode.interface or "rest")
             return RunTokens(self._issuer.mint(spec, self._fixed(), ceiling_s=ceiling_s), None)
         if mode is DataPathMode.NONE and condition is None:
             return None  # a run that needs neither plane mints nothing, whatever it holds
