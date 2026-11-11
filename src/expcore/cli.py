@@ -36,6 +36,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from expcore.campaign.attempts import ResumeRefused
+from expcore.campaign.export import ExportError
 from expcore.campaign.factors import PlanError
 from expcore.campaign.merge import MergeRefused
 from expcore.campaign.scheduler import CampaignLocked
@@ -73,6 +74,8 @@ _REFUSALS = (
     ExampleError,
     ShardError,
     MergeRefused,
+    ShardError,
+    ExportError,
 )
 _GUARDED = frozenset({"package", "package-check"})  # commands whose every message goes through the redactor
 

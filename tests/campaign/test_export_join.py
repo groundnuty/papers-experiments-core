@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from expcore.campaign.deployments import deployment_shares
 from expcore.campaign.export import FORMAT, ExportError
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.merge import MergeRefused, read_merge
@@ -230,3 +231,68 @@ def test_c29_a_merge_file_that_is_not_the_shards_one_to_n_is_refused():
             read_merge(json.dumps(broken).encode())
     with pytest.raises(MergeRefused, match="not JSON"):
         read_merge(b"{")
+
+
+# --- the deployment shares of models that declare accepted fingerprints (B18) -----------------------------------------
+
+PROBE = {"by": "admission_probe", "run": None, "at": "2026-03-01T10:00:01Z"}
+SEEN_IN_TWO = {"by": "run", "run": "d", "at": "2026-03-02T10:05:00Z"}
+
+
+def served(*turns) -> dict:
+    """An analysed attempt's row as `deployment_shares` reads it: the turns each fingerprint served, or no mix."""
+    return {"deployments": json.dumps([list(pair) for pair in turns]) if turns else None}
+
+
+def declared(confirmed: dict) -> dict:
+    """The store's record of the declared sets, with model-a's confirmations as given."""
+    return {
+        "model-a": {"accepted": ["fp-east", "fp-west"], "confirmed": confirmed},
+        "model-b": {"accepted": ["fp-solo"], "confirmed": {}},
+    }
+
+
+ONE = [
+    ("model-a", served(("fp-east", 3))),
+    ("model-a", served(("fp-east", 2), ("fp-west", 1))),
+    ("model-a", served((None, 1), ("fp-east", 1))),
+    ("model-b", served()),
+]
+TWO = [
+    ("model-a", served(("fp-west", 4))),
+    ("model-a", served(("fp-other", 2))),
+    ("model-a", served()),
+    ("model-b", served(("fp-solo", 5))),
+]
+
+
+def with_shares(key: str, shares: list) -> dict:
+    return export(analysed=[entry(key)], deployment_shares=shares)
+
+
+def test_b18_the_deployment_shares_of_shards_that_differ_join_into_one_drivers():
+    """B18, C29: each model's and fingerprint's runs and turns are summed over the shards, every share is computed
+    again from the sums, a fingerprint seen by one shard only is kept, and a fingerprint is confirmed when any shard
+    confirmed it, by the witness of the first shard that did: what one driver of every run gives."""
+    one = deployment_shares(declared({"fp-east": PROBE}), ONE)
+    two = deployment_shares(declared({"fp-east": SEEN_IN_TWO, "fp-west": SEEN_IN_TWO}), TWO)
+    assert one != two
+    joined = join_exports({1: with_shares("a", one), 2: with_shares("b", two)}, plan("a", "b"), SHARDS)
+    whole = deployment_shares(declared({"fp-east": PROBE, "fp-west": SEEN_IN_TWO}), ONE + TWO)
+    assert joined["deployment_shares"] == whole
+    assert json.dumps(joined["deployment_shares"]) == json.dumps(whole)  # the export's bytes: the keys' order too
+
+
+def test_b18_shards_whose_deployment_shares_agree_are_summed_not_taken_from_one():
+    """B18, C29: two shards that happen to report the same shares still served twice the runs and turns."""
+    shares = deployment_shares(declared({"fp-east": PROBE}), ONE)
+    joined = join_exports({1: with_shares("a", shares), 2: with_shares("b", shares)}, plan("a", "b"), SHARDS)
+    assert joined["deployment_shares"] == deployment_shares(declared({"fp-east": PROBE}), ONE + ONE)
+
+
+def test_b18_shards_that_declare_other_accepted_fingerprints_are_refused():
+    """B18, C29: one campaign declares one set per model, so shards that report another are not joined."""
+    one = deployment_shares(declared({}), ONE)
+    other = deployment_shares({**declared({}), "model-b": {"accepted": ["fp-else"], "confirmed": {}}}, TWO)
+    with pytest.raises(ExportError, match="model-b"):
+        join_exports({1: with_shares("a", one), 2: with_shares("b", other)}, plan("a", "b"), SHARDS)

@@ -11,6 +11,9 @@ snapshot and this module joins the results:
   `discarded_usage`, `retries_by_kind`, `infrastructure_by_condition` and `budget_holds`, one row per key, in the order
   the unsharded export sorts them. `partial` holds when any shard's does, and `kinds` is the core's kinds followed by
   every other kind any shard used, sorted;
+- `deployment_shares` (B18), when the campaign has it: per model and fingerprint the runs and turns are summed and
+  every share is computed again from the sums; a fingerprint is confirmed when any shard confirmed it, by the witness
+  of the first shard, in index order, that did;
 - `shards` is merge.json's list of shards, as it is.
 
 The joined run lists must hold every run of the whole plan exactly once, and the planned runs must add up to it: a
@@ -25,6 +28,7 @@ import collections
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from expcore.campaign.deployments import fingerprint_order
 from expcore.campaign.export import RUN_LISTS, ExportError, none_last
 from expcore.campaign.shard import EXPORT_KEY
 from expcore.errors import CORE_KINDS
@@ -39,6 +43,9 @@ _TABLES = {
     "infrastructure_by_condition": ("condition", "kind"),
     "budget_holds": ("condition", "model"),
 }
+DEPLOYMENTS = "deployment_shares"
+_MODEL_SUMS = ("analysed_runs", "runs_without_mix", "mixed_runs", "turns")
+_FINGERPRINT_SUMS = ("turns", "runs")
 
 
 def join_exports(
@@ -72,6 +79,8 @@ def join_exports(
         elif key == "kinds":
             seen = {kind for part in parts for kind in part}
             joined[key] = [*CORE_KINDS, *sorted(seen - set(CORE_KINDS))]
+        elif key == DEPLOYMENTS:
+            joined[key] = _join_deployments(parts)
         else:  # the format and the factors: every shard says the same
             if any(part != value for part in parts):
                 raise ExportError(f"the shards' exports disagree on {key!r}")
@@ -117,6 +126,49 @@ def _in_plan_order(
     if unplanned:
         raise ExportError(f"run {unplanned[0]} of the shards' exports is not in the plan")
     return sorted(entries, key=lambda entry: seq_of[entry["run_key"]])
+
+
+def _join_deployments(parts: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict[str, Any]]:
+    """Join the shards' `deployment_shares` (B18), given in shard order, into the whole campaign's: per model, in model
+    order, the sums of the runs and turns and the fingerprints of every shard, each share computed again from the
+    sums as `deployments.deployment_shares` computes it. Every shard declares the model's set the same way."""
+    models: dict[str, dict[str, Any]] = {}
+    for part in parts:
+        for entry in part:
+            held = models.get(entry["model"])
+            if held is None:  # a copy, in the entry's own order of keys, which the export's bytes keep
+                models[entry["model"]] = {**entry, "fingerprints": [dict(f) for f in entry["fingerprints"]]}
+                continue
+            if held["accepted_fingerprints"] != entry["accepted_fingerprints"]:
+                raise ExportError(f"the shards' exports declare other accepted fingerprints for {entry['model']!r}")
+            for field in _MODEL_SUMS:
+                held[field] += entry[field]
+            _join_fingerprints(held["fingerprints"], entry["fingerprints"])
+    for held in models.values():
+        with_mix = held["analysed_runs"] - held["runs_without_mix"]
+        order = fingerprint_order(held["accepted_fingerprints"])
+        held["fingerprints"].sort(key=lambda cell: order(cell["fingerprint"]))
+        for cell in held["fingerprints"]:
+            cell["turn_share"] = cell["turns"] / held["turns"] if held["turns"] else None
+            cell["run_share"] = cell["runs"] / with_mix if with_mix else None
+    return [models[model] for model in sorted(models)]
+
+
+def _join_fingerprints(held: list[dict[str, Any]], more: Sequence[Mapping[str, Any]]) -> None:
+    """Add one shard's fingerprints of a model to those joined so far (`held`, the join's own copies, changed in
+    place): the runs and turns summed, a fingerprint new to the join kept. A fingerprint is confirmed when any shard
+    confirmed it; its witness, the step and the run that confirmed it, is the first shard's that did."""
+    by_name = {cell["fingerprint"]: cell for cell in held}
+    for row in more:
+        cell = by_name.get(row["fingerprint"])
+        if cell is None:
+            held.append(dict(row))
+            by_name[row["fingerprint"]] = held[-1]
+            continue
+        for field in _FINGERPRINT_SUMS:
+            cell[field] += row[field]
+        if cell["confirmed_by"] is None and row["confirmed_by"] is not None:
+            cell["confirmed_by"], cell["confirming_run"] = row["confirmed_by"], row["confirming_run"]
 
 
 def _sum_table(name: str, key_fields: tuple[str, ...], parts: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict]:

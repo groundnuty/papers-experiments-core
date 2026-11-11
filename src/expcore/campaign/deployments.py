@@ -10,7 +10,7 @@ data each deployment produced, and whether a deployment the study declared was e
 
 import collections
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Any
 
 from expcore.models.served import MIXED_FINGERPRINTS, is_mixed
@@ -37,6 +37,12 @@ def deployment_shares(declared: Mapping[str, Any], analysed: Iterable[tuple[str,
         raise DeploymentsUnreadable(f"the deployment record cannot be read ({type(error).__name__}: {error})") from None
 
 
+def fingerprint_order(accepted: Collection[str]) -> Callable[[str | None], tuple]:
+    """The order of a model's fingerprints in its entry: the declared ones by name, then the others, then None (the
+    turns no fingerprint served)."""
+    return lambda fingerprint: (fingerprint is None, fingerprint not in accepted, fingerprint or "")
+
+
 def _model_shares(model: str, entry: Mapping[str, Any], attempts: list[Any]) -> dict[str, Any]:
     accepted, confirmed = list(entry["accepted"]), dict(entry["confirmed"])
     mixes = [json.loads(a["deployments"]) for a in attempts if a["deployments"] is not None]
@@ -50,7 +56,7 @@ def _model_shares(model: str, entry: Mapping[str, Any], attempts: list[Any]) -> 
             turns[fingerprint] += int(served)
             runs[fingerprint] += 1
     total = sum(turns.values())
-    names = sorted(set(accepted) | set(turns), key=lambda f: (f is None, f not in accepted, f or ""))
+    names = sorted(set(accepted) | set(turns), key=fingerprint_order(accepted))
     return {
         "model": model,
         "accepted_fingerprints": accepted,
