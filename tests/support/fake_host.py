@@ -20,6 +20,7 @@ from typing import Any
 
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.hostops import CmdResult
+from expcore_onedata.sandbox.inputs import PROBE_MARK
 
 VALUED = {
     "--name", "--network", "--label", "-l", "--user", "-u", "--cpus", "--memory", "--memory-swap", "--pids-limit",
@@ -140,7 +141,12 @@ class FakeHost:
 
     @staticmethod
     def _default_exec(container: FakeContainer, argv: list[str], stdin: str | None) -> CmdResult:
-        """The agent's code does nothing, and the read-only probe is refused as a read-only filesystem refuses it."""
+        """The agent's code does nothing, and the read-only probes are refused as a read-only filesystem refuses them:
+        the root's and the mount's write, and every change to a read-only input, which the agent can still read and
+        run."""
+        if stdin and PROBE_MARK in stdin:
+            refused = dict.fromkeys(("write", "beside", "mkdir", "rename", "chmod", "delete"), 30)
+            return CmdResult(0, json.dumps({"read": "done", "run": True, **refused, "work": "done"}) + "\n")
         if stdin and "open(" in stdin and "'w'" in stdin:
             return CmdResult(0, "blocked 30\n")
         return CmdResult(0)

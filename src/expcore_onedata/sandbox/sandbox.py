@@ -15,11 +15,14 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
   * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
     propagation; the agent has neither the token, nor FUSE, nor a route to any host;
   * no data path: neither;
-  * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids.
+  * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids;
+  * each read-only input of the spec: copied into the run's directory, hashed into the metadata, and mounted read-only
+    in the agent from that copy (inputs.py, O20).
 
 The data path is read-only in every condition (O05). The token is examined by `tokens.py` before it gets here; the gate
 passes only reads; the mount and the root filesystem are read-only, and `start` proves the last two by trying to write
-and requiring the refusal, so a sandbox whose root or mount is writable is never handed out. Images are started by the
+and requiring the refusal, so a sandbox whose root or mount is writable is never handed out; a read-only input is
+proved the same way, every change refused with EROFS, and hashed again. Images are started by the
 resolved id they were pinned to, and a moved tag refuses the start before anything is created (O13). Teardown runs on
 every path that ends a sandbox, in order, and is verified (O15).
 """
@@ -41,13 +44,21 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import copyout, gatelog, hostops, kinds, netpool
+from expcore_onedata.sandbox import copyout, gatelog, hostops, inputs, kinds, netpool
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
-from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, SandboxSpec, StartRefused
+from expcore_onedata.sandbox.api import (
+    DataPathMode,
+    ExecResult,
+    ReadOnlyInput,
+    SandboxError,
+    SandboxSpec,
+    StartRefused,
+)
 from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
+    CA_PATH,
     ENV_ACCESS_TOKEN,
     ENV_GATE_TOKEN,
     GATE_CA_PATH,
@@ -128,6 +139,8 @@ class DockerSandbox:
         self._cells: CellRunner | None = None
         self._ca_bytes: bytes | None = None  # the verified bytes of the platform's CA bundle, when a data path takes it
         self._ca_copy: Path | None = None  # the run's own read-only copy of them, which the containers mount
+        self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
+        self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
         self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
         self._uptime0: float | None = None
@@ -195,6 +208,8 @@ class DockerSandbox:
                 self._ca_bytes = s.tls.bundle()
             except ConfigError as error:
                 raise StartRefused(str(error)) from None
+        taken = [*inputs.TAKEN, CA_PATH, *s.trust_paths, *([s.mount.path] if s.mount else [])]
+        self._inputs = inputs.validate(sp.inputs, taken)  # in every data path, so an input never differs by condition
 
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
@@ -232,6 +247,7 @@ class DockerSandbox:
         self.dir.mkdir(parents=True, exist_ok=False)
         if self._ca_bytes is not None:  # written once, from the bytes that were hashed, before any container exists
             self._ca_copy = tls.write_private_copy(self._ca_bytes, self.dir)
+        self._input_copies = self._snapshot_inputs()  # copied and hashed before any container exists
         self._started = time.time()
         self._meta.update(host=self.host.host_facts(), started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         work = self.dir / "work"
@@ -260,6 +276,7 @@ class DockerSandbox:
             roles["sidecar"] = self.names.sidecar
         self._cells = CellRunner(self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started)
         self._verify_read_only()
+        self._verify_inputs()
         self._cells.sample_pids()
         self._start_sampler()
 
@@ -482,6 +499,7 @@ class DockerSandbox:
             s, self.names, self._label_args(), image_id=s.agent.id, mode=sp.mode, work=work, share=share,
             gate_ip=gate_ip, gate_hosts=gate_hosts, ca=self.dir / "tls" / "ca.pem" if rest else None,
             trust_bundles=self._trust_bundles() if rest else {}, zone_host=sp.zone.host if rest and sp.zone else None,
+            inputs=self._input_copies,
         )  # fmt: skip
         self._register_container(self.names.agent)
         self.host.docker(*args, env=env)
@@ -500,6 +518,49 @@ class DockerSandbox:
                 raise SandboxError(f"the {what} is not read-only for the agent")
             proved[what] = True
         self._meta["read_only_verified"] = proved
+
+    def _snapshot_inputs(self) -> list[tuple[Path, str]]:
+        """Copy each read-only input into the run's directory and record its hash, its files and bytes, and its path in
+        the agent (never the host's) under `read_only_inputs`; the copy is what the agent's container mounts (O20)."""
+        if not self._inputs:
+            return []
+        base = self.dir / "inputs"
+        base.mkdir(mode=0o700)
+        base.chmod(0o700)  # the copies are the driver's, and no other user of the host reaches them
+        copies, recorded = [], []
+        for n, item in enumerate(self._inputs):
+            copy = base / str(n)
+            try:
+                facts = inputs.snapshot(item.source, copy)
+            except (OSError, inputs.InputUnsafe) as error:
+                log.error("read-only input %d could not be copied: %s", n, describe_error(error))
+                raise SandboxError(f"read-only input {n} could not be copied into the run's directory") from None
+            recorded.append({"path": item.target, **facts})
+            copies.append((copy, item.target))
+        self._meta["read_only_inputs"] = recorded
+        return copies
+
+    def _verify_inputs(self) -> None:
+        """Prove from inside the agent that each read-only input refuses every change as a read-only file system does,
+        while the agent can read it and run its executable file, then show its copy and its source unchanged since they
+        were hashed; refuse to hand out a sandbox where either fails (O20)."""
+        recorded = self._meta.get("read_only_inputs", [])
+        for n, ((copy, target), item, facts) in enumerate(zip(self._input_copies, self._inputs, recorded, strict=True)):
+            name, runnable = inputs.probe_targets(copy)
+            r = self._cells.run(inputs.probe_source(target, name, runnable), 60, record=False)
+            why = inputs.judge(r.stdout, runnable is not None)
+            if why is not None:
+                log.error("read-only input %d: %s (%s)", n, why, describe_stderr(r.stderr))
+                raise SandboxError(f"read-only input {n} is not read-only for the agent: {why}")
+            for what, root in (("copy", copy), ("source", item.source)):
+                try:
+                    same = inputs.digest(root)["sha256"] == facts["sha256"]
+                except (OSError, inputs.InputUnsafe):
+                    same = False
+                if not same:
+                    raise SandboxError(f"read-only input {n} changed between its hash and its mount ({what})")
+        if self._inputs:
+            self._meta["read_only_verified"]["inputs"] = True
 
     # ------------------------------------------------------------------------------------------------ watching
     def watch_container(self, role: str, container: str) -> None:

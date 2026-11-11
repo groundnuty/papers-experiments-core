@@ -743,3 +743,27 @@ def test_c19_a_launch_cancelled_while_its_mint_is_blocked_holds_the_slot_until_t
     tokens_ended(stage)
     assert probe.resource_gone(KEY, {}) is True
     assert pool.settle_quarantines() == [KEY]
+
+
+def test_o20_launch_hands_a_read_only_input_to_the_runs_sandbox(stage, tmp_path):
+    """O20: `launch(..., inputs=...)` gives the run's sandbox the study's read-only input: mounted read-only in the
+    agent from the run's own copy, and recorded by its hash in the run's metadata."""
+    from expcore_onedata.sandbox.api import ReadOnlyInput
+
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    (supplied / "analyse.py").write_text("print('analysed')\n", encoding="utf-8")
+    seen = {}
+
+    async def go():
+        item = ReadOnlyInput(supplied, "/opt/analysis")
+        async with stage.platform.launch(
+            RecordingContext(), run_key="run-1", level="isolated", ceiling_s=CEILING_S, inputs=[item]
+        ) as sandbox:
+            seen.update(sandbox.metadata()["read_only_inputs"][0])
+            seen["mounts"] = stage.host.containers[sandbox.names.agent].options["--mount"]
+
+    asyncio.run(go())
+    assert seen["path"] == "/opt/analysis"
+    assert len(seen["sha256"]) == 64
+    assert any(m.endswith(",dst=/opt/analysis,readonly") for m in seen["mounts"])
