@@ -169,6 +169,55 @@ def test_a_day0_space_an_agent_user_could_reach_is_refused(fed, tmp_path, change
         fed.spec.load_spec(write(tmp_path, WITH_DAY0.replace(old, new)))
 
 
+def with_template(value: str) -> str:
+    return MINIMAL.replace('study_space = "alpha-space"', f'study_space = "alpha-space"\nplatform_template = "{value}"')
+
+
+def template_cases(tmp: Path) -> tuple[Path, dict[str, str]]:
+    """A layouts directory beside a 0600 secret, and the platform_template values that would copy it into the root."""
+    layouts = tmp / "layouts"
+    layouts.mkdir()
+    secret = tmp / "secret.key"
+    secret.write_text("not to be copied", encoding="utf-8")
+    secret.chmod(0o600)
+    (tmp / "elsewhere").mkdir()
+    (tmp / "elsewhere" / "t.template").write_text("x = 1\n", encoding="utf-8")
+    (layouts / "link.template").symlink_to(secret)
+    (layouts / "linked-dir").symlink_to(tmp / "elsewhere")
+    return layouts, {
+        "absolute": str(secret),
+        "outside, through ..": "../secret.key",
+        "a link to a file": "link.template",
+        "through a linked directory": "linked-dir/t.template",
+    }
+
+
+@pytest.mark.parametrize("case", ["absolute", "outside, through ..", "a link to a file", "through a linked directory"])
+def test_a_platform_template_outside_the_layouts_or_deploy_directory_or_through_a_link_is_refused(fed, tmp_path, case):
+    """Up copies the template, filled, into the root: a template that is any host file (a 0600 secret included) would
+    be copied there, so it must be a relative path inside the layout file's directory or the deploy directory, with no
+    symbolic link on the way."""
+    layouts, values = template_cases(tmp_path)
+    path = layouts / "federation.toml"
+    path.write_text(with_template(values[case]), encoding="utf-8")
+    with pytest.raises(fed.spec.LayoutError, match="platform_template"):
+        fed.spec.load_spec(path)
+
+
+def test_a_platform_template_inside_the_layouts_or_the_deploy_directory_is_taken(fed, tmp_path, monkeypatch):
+    deploy = tmp_path / "deploy"
+    layouts = deploy / "layouts"
+    layouts.mkdir(parents=True)
+    (layouts / "own.template").write_text("x = 1\n", encoding="utf-8")
+    (deploy / "shared.template").write_text("x = 2\n", encoding="utf-8")
+    monkeypatch.setattr(fed.spec, "HERE", deploy)
+    path = layouts / "federation.toml"
+    taken = {"own.template": layouts / "own.template", "../shared.template": deploy / "shared.template"}
+    for value, expected in taken.items():
+        path.write_text(with_template(value), encoding="utf-8")
+        assert fed.spec.load_spec(path).platform_template == expected
+
+
 def test_the_minimal_layout_the_refusals_start_from_is_itself_usable(fed, tmp_path):
     spec = fed.spec.load_spec(write(tmp_path, MINIMAL))
     assert spec.holder == "oak"

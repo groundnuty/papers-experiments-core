@@ -233,6 +233,18 @@ def test_each_committed_template_renders_into_a_platform_file_the_layer_loads(fe
     assert fed.facts.PLACEHOLDER.search(body) is None  # every placeholder filled
 
 
+def test_platform_toml_is_written_private_even_over_an_open_one(fed, tmp_path):
+    """platform.toml names where the credentials are and is rendered from a template: it is written 0600, and a
+    rewrite at reset tightens one left open."""
+    layout = fed.layout.Layout(tmp_path)
+    boot = fake_boot(fed, layout)
+    layout.platform.write_text("stale-content-sentinel\n", encoding="utf-8")
+    layout.platform.chmod(0o644)
+    fed.facts.write_facts(layout, boot)
+    assert layout.platform.stat().st_mode & 0o777 == 0o600
+    assert "stale-content-sentinel" not in layout.platform.read_text(encoding="utf-8")
+
+
 def test_a_layout_without_a_template_writes_facts_and_says_there_is_no_platform_file(fed, minimal_layout, tmp_path):
     layout = fed.layout.Layout(tmp_path, spec=fed.spec.load_spec(minimal_layout))
     assert "no platform.toml" in fed.facts.write_facts(layout, fake_boot(fed, layout))

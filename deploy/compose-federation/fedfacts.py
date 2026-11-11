@@ -6,7 +6,9 @@ rendered from the layout's template with those facts. `describe` gives the deplo
 """
 
 import json
+import os
 import re
+from pathlib import Path
 
 from fedboot import Bootstrap
 from feddocker import gib
@@ -101,8 +103,17 @@ def write_facts(layout: Layout, boot: Bootstrap) -> str:
     template = layout.spec.platform_template
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
-    layout.platform.write_text(render(template.read_text(encoding="utf-8"), placeholders(facts)), encoding="utf-8")
+    write_private(layout.platform, render(template.read_text(encoding="utf-8"), placeholders(facts)))
     return "facts.json and platform.toml written"
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a file of mode 0600, tightening one that exists, never through a symbolic link: platform.toml says where
+    the credentials are."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
 
 
 def describe(layout: Layout) -> str:

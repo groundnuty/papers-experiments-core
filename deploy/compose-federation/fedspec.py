@@ -11,6 +11,7 @@ pinned by the deployment itself (fedlayout.IMAGES): a layout cannot name another
 """
 
 import hashlib
+import os
 import re
 import tomllib
 from collections.abc import Mapping
@@ -219,6 +220,27 @@ class _Reader:
         return tuple(value)
 
 
+def checked_template(read: _Reader, layout_file: Path, value: Any) -> Path:
+    """The platform template: a relative path to a regular file inside the layout file's directory or the deploy
+    directory, with no symbolic link from that directory down to it. Up copies the template, filled, into the root, so
+    a template that could be any host file, a secret included, would be copied there."""
+    key = "platform_template"
+    if not isinstance(value, str) or not value or os.path.isabs(value):
+        raise read.fail(key, "must be a path relative to the layout file")
+    own = Path(os.path.abspath(layout_file.parent))
+    target = Path(os.path.normpath(own / value))
+    inside = [base for base in (own, Path(os.path.abspath(HERE))) if base in target.parents]
+    if not inside:
+        raise read.fail(key, "must lie inside the layout file's directory or the deploy directory")
+    base = inside[0]
+    for step in (base, *(p for p in reversed(target.parents) if base in p.parents), target):
+        if step.is_symlink():
+            raise read.fail(key, f"may not pass through a symbolic link ({step.name})")
+    if not target.is_file():
+        raise read.fail(key, "names no regular file, relative to the layout file")
+    return target
+
+
 def load_spec(path: Path | None = None) -> Spec:
     """Read and check a layout file; the default is `federation.toml` beside this file."""
     path = DEFAULT_LAYOUT if path is None else Path(path)
@@ -304,14 +326,7 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
             )
         principals.append(Principal(name, tuple(rights), member_of, agent))
 
-    template = None
-    if "platform_template" in top:
-        if not isinstance(top["platform_template"], str) or not top["platform_template"]:
-            raise read.fail("platform_template", "must be a path relative to the layout file")
-        template = (path.parent / top["platform_template"]).resolve()
-        if not template.is_file():
-            raise read.fail("platform_template", "names no file, relative to the layout file")
-
+    template = checked_template(read, path, top["platform_template"]) if "platform_template" in top else None
     return Spec(
         source=path.name,
         digest=digest,

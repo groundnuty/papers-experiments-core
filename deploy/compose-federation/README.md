@@ -57,7 +57,7 @@ is `layouts/five-providers.compose.yaml`.
 | `study_space` | the space the core studies; its owner is the data provider |
 | `memory_limit` | each service's memory limit (default `6g`); `[zone]` and `[providers.<name>]` may set their own |
 | `support_bytes` | each provider's support of each space (default 10 GiB); `[spaces.<name>]` may set its own |
-| `platform_template` | optional: the template of `platform.toml`, relative to the layout file |
+| `platform_template` | optional: the template of `platform.toml`, a relative path to a file inside the layout file's directory or this deploy directory, with no symbolic link on the way, since up copies it into the root |
 | `[zone] port`, `[providers.<name>] port` | each service's port on `127.0.0.1` |
 | `[spaces.<name>] owner`, `mirrors` | the provider the space's data is written through and kept on, and the other providers that support it |
 | `[spaces.<name>] agent_visible` | `false` for a space the day-0 checks alone use: no user of the agent may be a member, and it is never the study space |
@@ -117,7 +117,7 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
   | `<service>/persistence` | each service's state; up seeds the certificates and the CA into it before the first start |
   | `<provider>/storage` | each provider's POSIX storage |
   | `facts.json` | what an integrator needs to write `platform.toml`: addresses, ids, names, where the credentials are; no secret |
-  | `platform.toml` | rendered from the layout's template, next to the CA and the secrets it names by relative path |
+  | `platform.toml` (0600) | rendered from the layout's template, next to the CA and the secrets it names by relative path |
   | `fault-journal/` | the fault injector's journal, when the fault test runs |
 
   Nothing is kept between a down and the next up: up makes a new CA and new secrets every time.
