@@ -176,6 +176,27 @@ def test_c29_an_environment_identity_is_names_to_digests_only():
     assert check_identity({}) == {}
 
 
+@pytest.mark.parametrize("count", [2, 3, 7])
+def test_c30_a_model_ceiling_of_zero_holds_it_entirely_so_every_shard_shares_zero(count):
+    """C30: a `per_model_usd` ceiling of 0 is not "less than the N shards": it is zero for every shard, beside the
+    shares of the other ceilings."""
+    for spec in (ShardSpec(i, count, f"shard-{i}") for i in range(1, count + 1)):
+        parts = budget_shares(15.0, {"model-falcon": 0, "model-heron": 5.0}, spec)
+        assert parts["per_model_usd"]["model-falcon"] == 0.0
+        assert 0.0 < parts["per_model_usd"]["model-heron"] <= 5.0 / count + 0.000001
+        assert parts["max_usd"] > 0.0
+
+
+def test_c30_a_zero_total_is_refused_everywhere_but_a_model_ceiling():
+    """C30: a zero `max_usd` or a zero whole-number cap still leaves a shard nothing, and the message says the total."""
+    spec = ShardSpec(1, 2, "shard-1")
+    with pytest.raises(ShardError, match=r"\[budget\] max_usd is 0, less than the 2 shards"):
+        budget_shares(0.0, {}, spec)
+    with pytest.raises(ShardError, match="less than the 2 shards"):
+        share(0, spec, what="cap")
+    assert share_usd(0, spec, what="ceiling", allow_zero=True) == 0.0
+
+
 def test_c30_caps_and_budget_shares_over_all_shards_sum_within_the_totals():
     """C30: each unit's cap is shared exactly; the budget and each model's ceiling never in sum exceed their totals."""
     caps = {"relay-falcon": 20, "relay-heron": 9}

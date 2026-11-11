@@ -167,6 +167,24 @@ def test_c30_a_total_below_the_number_of_shards_is_refused_at_start_naming_its_k
     assert not (copy / "out" / "state.sqlite").exists()  # refused before the store was opened
 
 
+def test_c30_a_model_ceiling_of_zero_is_shared_as_zero_through_the_pipeline(tmp_path):
+    """C30: `per_model_usd = { m = 0 }` holds that model entirely; sharding it is not refused as "less than the N
+    shards", the fingerprint keeps the total of 0, and every shard's share of it is 0 beside the others' shares."""
+    totals = {"max_usd = 0.00001": "max_usd = 0.00001\nper_model_usd = { alpha-stub = 0 }"}
+    shares = {}
+    for name, spec in (("one", FIRST), ("two", SECOND)):
+        copy = stamped_copy(
+            tmp_path, name, **totals, **{"alpha-stub = 1": "alpha-stub = 2", "beta-stub = 1": "beta-stub = 2"}
+        )
+        run_study(copy, shard=spec)
+        meta = meta_of(copy)
+        assert json.loads(meta["fingerprint"])["caps"]["budget"]["per_model_usd"] == {"alpha-stub": 0.0}
+        shares[name] = json.loads(meta[META_SHARES])["budget"]
+    assert [shares[name] for name in ("one", "two")] == [
+        {"max_usd": 0.000005, "per_model_usd": {"alpha-stub": 0.0}}
+    ] * 2
+
+
 def test_c28_a_shard_with_no_run_is_refused_before_the_store_is_opened(tmp_path):
     """C28: more shards than pairs leaves a shard with nothing to run; it is refused, saying to use fewer shards."""
     copy = stamped_copy(tmp_path, "wide", **{"alpha-stub = 1": "alpha-stub = 9", "beta-stub = 1": "beta-stub = 9"})

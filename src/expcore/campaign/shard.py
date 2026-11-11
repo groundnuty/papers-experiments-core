@@ -18,7 +18,8 @@ merge can take the union.
 **Shares never sum past the totals (C30).** `[scheduler.unit_caps]`, `[budget] max_usd` and `per_model_usd` are
 campaign totals. Shard i of N gets `share(total, spec)`: an equal part, the remainder going to the first shards, so
 the N shares sum to the total exactly. Dollars are shared in whole micro-dollars, rounded down, so they sum to at
-most the total. A total smaller than N is refused, since some shard would get nothing.
+most the total. A total smaller than N is refused, since some shard would get nothing. The one exception is a
+`per_model_usd` ceiling of zero, which holds a model entirely: it is zero for every shard.
 
 **A shard records what it ran against.** A study may declare its environment's identity: a mapping of names to
 SHA-256 digests (the platform's configuration, the layout of its federation, each space's verified ingest
@@ -48,7 +49,8 @@ META_STARTED = "shard_started_utc"
 META_ENVIRONMENT = "environment_identity"
 """Store meta key: the environment identity as sorted JSON, pinned at the first start."""
 META_SHARES = "shard_shares"
-"""Store meta key: the shard's shares, `{"unit_caps": {...}, "max_usd": x, "per_model_usd": {...}}`."""
+"""Store meta key: the shard's shares, `{"unit_caps": {...}, "budget": {"max_usd": x, "per_model_usd": {...}}}`, the
+budget being null when the campaign has none."""
 EXPORT_KEY = "shard"
 """Top-level export key, present only in a sharded campaign's export: the spec, start, identity and shares."""
 MERGE_FILE = "merge.json"
@@ -165,9 +167,15 @@ def share(total: int, spec: ShardSpec, *, what: str) -> int:
     return total // spec.count + (1 if spec.index <= total % spec.count else 0)
 
 
-def share_usd(total: float, spec: ShardSpec, *, what: str) -> float:
-    """Shard `spec.index`'s part of a dollar total, in whole micro-dollars rounded down: shares sum to at most it."""
+def share_usd(total: float, spec: ShardSpec, *, what: str, allow_zero: bool = False) -> float:
+    """Shard `spec.index`'s part of a dollar total, in whole micro-dollars rounded down: shares sum to at most it.
+
+    A total of zero is refused like any total below the shard count, unless `allow_zero`: then it is zero for every
+    shard. Only a ceiling that holds something entirely may be zero (`per_model_usd`); `Budget` refuses a total of 0.
+    """
     micro = int((Decimal(str(total)) * _MICRO).to_integral_value(rounding=ROUND_FLOOR))
+    if allow_zero and micro == 0:
+        return 0.0
     return float(Decimal(share(micro, spec, what=what)) / _MICRO)
 
 
@@ -177,11 +185,14 @@ def caps_shares(unit_caps: Mapping[str, int], spec: ShardSpec) -> dict[str, int]
 
 
 def budget_shares(max_usd: float, per_model_usd: Mapping[str, float], spec: ShardSpec) -> dict[str, Any]:
-    """Shard `spec`'s part of `[budget] max_usd` and of each `per_model_usd` ceiling, in micro-dollars rounded down."""
+    """Shard `spec`'s part of `[budget] max_usd` and of each `per_model_usd` ceiling, in micro-dollars rounded down.
+
+    A model's ceiling of zero holds that model entirely, so every shard gets zero of it.
+    """
     return {
         "max_usd": share_usd(max_usd, spec, what="[budget] max_usd"),
         "per_model_usd": {
-            model: share_usd(ceiling, spec, what=f"[budget.per_model_usd] {model}")
+            model: share_usd(ceiling, spec, what=f"[budget.per_model_usd] {model}", allow_zero=True)
             for model, ceiling in sorted(per_model_usd.items())
         },
     }
