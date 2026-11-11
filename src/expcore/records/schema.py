@@ -23,10 +23,12 @@ valid with or without them, an absent field means "not recorded", and a present 
 a record never fills an absent optional field in as a null or a zero. Version 3 adds `extra` and `extra_cut` to the
 `usage` of each turn, both optional: the numeric usage fields a provider reports beyond the counts, and how many of them
 the cap left out. Every new record is written as version 3 and keeps version 2's rule; a record of version 1 or 2
-lacks both fields, and is never given them. Until v0.1.0 is tagged every extension of version 3 is strictly additive:
-optional fields only, no existing field changes meaning or validation, the fields version 3 had at its first merge
-point keep the shape frozen in `tests/data/record-v3-fields.json`, and the fixtures in `tests/data/record-v3/`, one
-per merge point, keep validating and replaying byte for byte (docs/interfaces.md).
+lacks both fields, and is never given them. Version 3 is also the first under the reply-count rule
+(`REPLY_COUNT_RULE_FROM`): its totals are incomplete when the backend counted a billed reply that became no turn.
+Until v0.1.0 is tagged every extension of version 3 is strictly additive: optional fields only, no existing field
+changes meaning or validation, the fields version 3 had at its first merge point keep the shape frozen in
+`tests/data/record-v3-fields.json`, and the fixtures in `tests/data/record-v3/`, one per merge point, keep validating
+and replaying byte for byte (docs/interfaces.md).
 
 Every section is a table of field name to the types the field may hold, in the order the file writes them. An object
 that a record may hold none of, such as an outcome's `defect` or a malformed event of the totals, is a section too, so

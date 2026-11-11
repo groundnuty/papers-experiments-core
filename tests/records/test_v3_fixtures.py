@@ -30,7 +30,15 @@ from pathlib import Path
 import pytest
 
 from expcore.records.record import RunRecord, decode, load_record
-from expcore.records.schema import SCHEMAS, SECTIONS, SchemaVersion, fields_of, optional_in, validate
+from expcore.records.schema import (
+    SCHEMAS,
+    SECTIONS,
+    SchemaVersion,
+    fields_of,
+    optional_in,
+    reply_count_rule,
+    validate,
+)
 from expcore.replay.check import check_record
 from expcore.replay.replay import replay_record
 
@@ -191,3 +199,17 @@ def test_R02_the_first_fixture_pins_the_extra_usage_fields_present_absent_report
     assert [u.get("extra_cut") for u in usages] == [0, None, 0, 3]
     assert "extra" not in usages[1]
     assert "extra_cut" not in usages[1]
+
+
+def test_C26_the_second_fixture_pins_a_billed_reply_that_became_no_turn_as_incomplete_usage():
+    """C26 and R03: version 3 is the first under the reply-count rule, which changes what a version-3 record writes, so
+    the second fixture was written by the code that applies it: a tool round, then a billed reply the adapter counted
+    and could not read. The backend counted one reply more than the record kept turns, the totals say the usage is
+    incomplete, and the record replays to those bytes."""
+    second = [p for p in FIXTURES if p.name.startswith("02-")]
+    assert [p.name for p in second] == ["02-billed-unread-reply.json"]
+    record = load_record(second[0])
+    assert reply_count_rule(record.schema_version)
+    assert record.route["usage_seen"]["responses"] == len(record.transcript) + 1 == 2
+    assert record.failed_request["kind"] == "infra"
+    assert record.totals["usage_incomplete"] is True
