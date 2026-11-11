@@ -6,10 +6,14 @@ plan. Shard i of N is given on the command line (`run --shard i/N --shard-label 
 every shard has the campaign fingerprint of the whole plan. Without `--shard` a campaign is unsharded, and nothing
 in this module is consulted: its store, records and exports are byte for byte what they were before shards existed.
 
-**The partition is by pair (C28).** A run belongs to shard `shard_of(task, model, seed, count)`. Every pair a
-contrast forms shares task, model and seed (`stats.pairing`), so a pair never crosses shards. The hash is SHA-256 of
-a canonical text, so every host and Python version computes the same partition. Inside a shard the runs keep their
-plan order (C08) and their place in the whole plan, so a merge can take the union.
+**The partition is by pair, balanced per model (C28).** `assign(pairs, count)` takes every (task, model, seed) of
+the whole plan, ranks each model's pairs by the SHA-256 of their canonical text, and deals them round the shards from a
+starting shard that the model's own hash picks: so every shard gets the floor or the ceiling of n/N of each model's
+pairs, and the shards that get the ceiling differ from model to model, so no shard collects every remainder. Every pair
+a contrast forms shares task, model and seed (`stats.pairing`), so a pair never crosses shards. The assignment depends
+only on the plan and N, so every host computes the same one; it depends on the whole plan, so a sharded campaign's plan
+cannot grow on resume. Inside a shard the runs keep their plan order (C08) and their place in the whole plan, so a
+merge can take the union.
 
 **Shares never sum past the totals (C30).** `[scheduler.unit_caps]`, `[budget] max_usd` and `per_model_usd` are
 campaign totals. Shard i of N gets `share(total, spec)`: an equal part, the remainder going to the first shards, so
@@ -29,12 +33,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
-RULE = "expcore-shard/1: sha256(json [task, model, seed]) mod count, plus 1"
+RULE = "expcore-shard/2: per model, pairs ranked by sha256(json [task, model, seed]), dealt round the shards"
 """The partition rule's name, kept with every shard spec; a store made under another rule is refused."""
 
 META_SHARD = "shard_spec"
@@ -105,17 +109,37 @@ class ShardSpec:
         return cls(data["index"], data["count"], data["label"], data["rule"])
 
 
-def shard_of(task: str, model: str, seed: int, count: int) -> int:
-    """The 1-based shard of every run of this task, model and seed, out of `count` (C28)."""
+def pair_of(factors: Mapping[str, Any]) -> tuple[str, str, int]:
+    """The pair a run belongs to: its task, model and seed, which every contrast's pairs share."""
+    return (factors["task"], factors["model"], factors["seed"])
+
+
+def _digest(*parts: Any) -> str:
+    text = json.dumps(list(parts), separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def assign(pairs: Iterable[tuple[str, str, int]], count: int) -> dict[tuple[str, str, int], int]:
+    """The 1-based shard of every pair of the whole plan, out of `count`, balanced per model (C28)."""
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ShardError(f"a shard count is a positive whole number, not {count!r}")
-    text = json.dumps([task, model, seed], separators=(",", ":"), ensure_ascii=False)
-    return int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16) % count + 1
+    by_model: dict[str, list[tuple[str, tuple[str, str, int]]]] = {}
+    for pair in set(pairs):
+        by_model.setdefault(pair[1], []).append((_digest(*pair), pair))
+    assignment: dict[tuple[str, str, int], int] = {}
+    for model, ranked in by_model.items():
+        start = int(_digest("model", model), 16) % count
+        for rank, (_, pair) in enumerate(sorted(ranked)):
+            assignment[pair] = (start + rank) % count + 1
+    return assignment
 
 
-def in_shard(factors: Mapping[str, Any], spec: ShardSpec) -> bool:
-    """Whether a run, by its factor values, belongs to `spec`'s shard."""
-    return shard_of(factors["task"], factors["model"], factors["seed"], spec.count) == spec.index
+def in_shard(factors: Mapping[str, Any], spec: ShardSpec, assignment: Mapping[tuple[str, str, int], int]) -> bool:
+    """Whether a run, by its factor values, belongs to `spec`'s shard under the whole plan's `assignment`."""
+    pair = pair_of(factors)
+    if pair not in assignment:
+        raise ShardError("a run's task, model and seed are not in the plan the shards were assigned from")
+    return assignment[pair] == spec.index
 
 
 def share(total: int, spec: ShardSpec, *, what: str) -> int:
@@ -177,11 +201,12 @@ __all__ = [
     "RULE",
     "ShardError",
     "ShardSpec",
+    "assign",
     "budget_shares",
     "caps_shares",
     "check_identity",
     "in_shard",
-    "shard_of",
+    "pair_of",
     "share",
     "share_usd",
 ]

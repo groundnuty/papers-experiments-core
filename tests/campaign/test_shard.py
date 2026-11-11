@@ -11,11 +11,11 @@ from expcore.campaign.shard import (
     RULE,
     ShardError,
     ShardSpec,
+    assign,
     budget_shares,
     caps_shares,
     check_identity,
     in_shard,
-    shard_of,
     share,
     share_usd,
 )
@@ -25,34 +25,53 @@ MODELS = ["model-falcon", "model-heron", "model-osprey"]
 SEEDS = [1, 2, 3, 4, 5]
 
 
+PAIRS = list(itertools.product(TASKS, MODELS, SEEDS))
+
+
 @pytest.mark.parametrize("count", [2, 3, 4, 7, 16])
 def test_c28_the_partition_is_disjoint_and_covering_and_never_splits_a_pair(count):
     """C28: every run of one task, model and seed lands in one shard, each run in exactly one, all runs in some."""
+    assignment = assign(PAIRS, count)
     conditions = ["cond-plain", "cond-other", "cond-third"]
     seen: dict[tuple, set[int]] = {}
     for task, model, seed, condition in itertools.product(TASKS, MODELS, SEEDS, conditions):
         factors = {"task": task, "model": model, "seed": seed, "condition": condition}
-        owners = {i for i in range(1, count + 1) if in_shard(factors, ShardSpec(i, count, f"shard-{i}"))}
+        owners = {i for i in range(1, count + 1) if in_shard(factors, ShardSpec(i, count, f"shard-{i}"), assignment)}
         assert len(owners) == 1  # disjoint and covering
         seen.setdefault((task, model, seed), set()).update(owners)
     assert all(len(owners) == 1 for owners in seen.values())  # a pair never crosses shards
 
 
-def test_c28_the_partition_is_the_same_on_every_host():
-    """C28: the shard of a run is a fixed function of its text, pinned here so no change of hash goes unseen."""
-    assert shard_of("task-000", "model-falcon", 1, 4) == shard_of("task-000", "model-falcon", 1, 4)
-    pinned = [shard_of(task, "model-heron", 3, 5) for task in TASKS[:8]]
-    assert pinned == [shard_of(task, "model-heron", 3, 5) for task in TASKS[:8]]
-    assert all(1 <= p <= 5 for p in pinned)
-    assert shard_of("task-000", "model-falcon", 1, 1) == 1
+@pytest.mark.parametrize("count", [2, 3, 4, 7, 16])
+def test_c28_each_shard_gets_the_floor_or_the_ceiling_of_each_models_pairs(count):
+    """C28: per model, shard sizes differ by at most one, so no shard runs much longer than the others."""
+    assignment = assign(PAIRS, count)
+    for model in MODELS:
+        sizes = [sum(1 for p, shard in assignment.items() if p[1] == model and shard == i) for i in range(1, count + 1)]
+        assert max(sizes) - min(sizes) <= 1
+        assert sum(sizes) == len(TASKS) * len(SEEDS)
 
 
-def test_c28_shards_get_a_fair_spread_of_pairs():
-    """C28: with many pairs no shard is left nearly empty, so N hosts share the work."""
-    counts = [0] * 4
-    for task, model, seed in itertools.product(TASKS, MODELS, SEEDS):
-        counts[shard_of(task, model, seed, 4) - 1] += 1
-    assert min(counts) > 0.7 * (len(TASKS) * len(MODELS) * len(SEEDS) / 4)
+def test_c28_the_remainders_do_not_pile_onto_one_shard():
+    """C28: when n/N leaves a remainder for several models, the shards that take it differ from model to model."""
+    models = [f"model-{n:02d}" for n in range(12)]
+    pairs = list(itertools.product(TASKS[:10], models, [1]))  # 10 pairs per model over 4 shards: remainder 2 each
+    totals = [0] * 4
+    for shard in assign(pairs, 4).values():
+        totals[shard - 1] += 1
+    assert max(totals) - min(totals) < 12  # every remainder on the same two shards would put them 12 apart
+
+
+def test_c28_the_assignment_is_the_same_on_every_host_and_in_any_order():
+    """C28: the assignment depends only on the plan's pairs and the count, never on their order or the host."""
+    assert assign(PAIRS, 4) == assign(list(reversed(PAIRS)), 4)
+    assert set(assign(PAIRS, 1).values()) == {1}
+
+
+def test_c28_a_run_outside_the_assigned_plan_is_refused():
+    """C28: a run whose pair the assignment does not hold was not in the plan the shards were made from."""
+    with pytest.raises(ShardError):
+        in_shard({"task": "task-999", "model": "model-falcon", "seed": 1}, ShardSpec(1, 2, "shard-1"), assign(PAIRS, 2))
 
 
 @pytest.mark.parametrize(
