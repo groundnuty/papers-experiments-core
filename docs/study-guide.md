@@ -252,7 +252,7 @@ The agent's container never reaches the federation itself. It sits on an interna
 |---|---|
 | the agent reads `[sandbox.mount] path` | a read-only bind of the run's mount directory on the host into the agent, with slave propagation; the agent has no token, no `/dev/fuse` and no capability |
 | the run's mount directory on the host | a shared bind mount the sandbox makes, so the FUSE mount made inside the sidecar appears there and from there in the agent |
-| oneclient's FUSE mount | the oneclient sidecar: the only container with `/dev/fuse` and `SYS_ADMIN`, and the only one holding the data-path token; read-only (`-o ro`) |
+| oneclient's FUSE mount | the oneclient sidecar: the only container with `/dev/fuse` and `SYS_ADMIN`, and the only one holding the data-path token, which it reads from a file bound into it read-only, so `docker inspect` never shows it; read-only (`-o ro`) |
 | oneclient to the local provider | the sidecar's network, below; TLS as `[tls]` says, with the run's read-only copy of the `ca_file` bundle |
 | the local provider to the provider that holds the bytes | the federation's own network: a block the local provider lacks is fetched on demand from a provider that holds it, without the sandbox taking part |
 

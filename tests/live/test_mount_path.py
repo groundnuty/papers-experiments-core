@@ -83,7 +83,7 @@ from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, Sa
 from expcore_onedata.sandbox.containers import ONECLIENT_BIN, effective_log_dir, sidecar_command  # noqa: E402
 from expcore_onedata.sandbox.hostops import DockerHost  # noqa: E402
 from expcore_onedata.sandbox.provider import SandboxProbe  # noqa: E402
-from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox  # noqa: E402
+from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, TOKEN_FILE, DockerSandbox  # noqa: E402
 from expcore_onedata.tokens import TokenIssuer, data_path_spec  # noqa: E402
 
 PLATFORM = Path(os.environ["EXPCORE_LIVE_PLATFORM"])
@@ -163,11 +163,13 @@ def network_containers(host: DockerHost, network: str) -> dict[str, str]:
     return {cid: str(c.get("IPv4Address", "")).split("/")[0] for cid, c in (json.loads(found.stdout) or {}).items()}
 
 
-def launch_facts(host: DockerHost, sandbox: DockerSandbox, network: str) -> dict:
-    """From the host: which container has FUSE and SYS_ADMIN, and which networks each is on, by role."""
+def launch_facts(host: DockerHost, sandbox: DockerSandbox, network: str, secret: str) -> dict:
+    """From the host: which container has FUSE and SYS_ADMIN, which networks each is on, and whether `docker inspect`
+    of it shows the run's token (`secret`, only ever compared), by role."""
     out = {}
     for role, name in (("sidecar", sandbox.names.sidecar), ("agent", sandbox.names.agent)):
-        info = hostops.inspect(host, name) or {}
+        shown = host.docker("inspect", name, check=False, timeout=30)
+        info = hostops.inspect_from(shown) or {}
         config = info.get("HostConfig") or {}
         networks = set((info.get("NetworkSettings") or {}).get("Networks") or {})
         out[role] = {
@@ -176,6 +178,8 @@ def launch_facts(host: DockerHost, sandbox: DockerSandbox, network: str) -> dict
             "cap_drop_all": (config.get("CapDrop") or []) == ["ALL"],
             "privileged": bool(config.get("Privileged")),
             "read_only_root": bool(config.get("ReadonlyRootfs")),
+            "inspected": shown.returncode == 0,
+            "token_in_inspect": secret in shown.stdout,
             "networks": sorted(
                 "federation" if n == network else "sandbox" if n == sandbox.names.net else "other" for n in networks
             ),
@@ -367,7 +371,8 @@ def attempt(tmp_path_factory):
         spec = mount_spec(config, run)
         sandbox = DockerSandbox.start(host, s, spec)
         try:
-            facts["launch"] = launch_facts(host, sandbox, network)
+            facts["launch"] = launch_facts(host, sandbox, network, spec.token.reveal())
+            facts["token_file_left_on_host"] = (sandbox.dir / TOKEN_FILE).exists()  # gone once oneclient started
             inside = f"{s.mount.path}/{config.space.name}/{run}"
             urls = [config.zone.url, *(p.url for p in config.providers.values())]
             ports = sorted({Endpoint.from_url(url).port for url in urls})  # the host's, through the agent's loopback
@@ -452,6 +457,17 @@ def test_o03_the_sidecar_alone_is_on_the_federation_network_and_mounted_with_the
     assert launch["mount"]["network"] == "federation"
     assert launch["mount"]["wait_s"] is not None
     assert launch["tls_mode"] == "ca_file"
+
+
+def test_o05_docker_inspect_of_the_running_sidecar_and_agent_shows_no_token(attempt):
+    """O05: anyone with access to the docker daemon reads a container's configuration with `docker inspect`; on the
+    running sidecar and agent it shows no token, and the host kept no copy of the token once oneclient had started
+    (issue 137: the token was given to the sidecar as an environment variable, which docker keeps)."""
+    launch = attempt["launch"]
+    for role in ("sidecar", "agent"):
+        assert launch[role]["inspected"] is True, role
+        assert launch[role]["token_in_inspect"] is False, role
+    assert attempt["token_file_left_on_host"] is False
 
 
 def test_o05_only_the_sidecar_holds_fuse_and_sys_admin(attempt):

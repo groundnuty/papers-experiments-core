@@ -60,7 +60,6 @@ from expcore_onedata.sandbox.api import (
 )
 from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
-    ENV_ACCESS_TOKEN,
     ENV_GATE_TOKEN,
     GATE_CA_PATH,
     ONECLIENT_LOG_DIR,
@@ -82,6 +81,7 @@ log = logging.getLogger(__name__)
 RUN_KEY = re.compile(r"[\x21-\x7e]{1,200}")  # it becomes an HTTP header value at the gate
 GATE_FILES = Path(__file__).resolve().parent  # gate.py and its siblings are mounted from here into the gate container
 MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
+TOKEN_FILE = Path("sidecar-secret", "oneclient-token")  # under the run directory, owner-only, while the sidecar starts
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
 TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
 MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
@@ -146,6 +146,7 @@ class DockerSandbox:
         self._ca_copy: Path | None = None  # the run's own read-only copy of them, which the containers mount
         self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
         self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
+        self._token_file: Path | None = None  # the mount's token for the sidecar, on the host only while it starts
         self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
         self._uptime0: float | None = None
@@ -466,8 +467,27 @@ class DockerSandbox:
             self._sleep(0.1)
         raise SandboxError("the gate did not become ready")
 
+    def _write_token_file(self) -> Path:
+        """The run's file of the mount's token, owner-only, for the sidecar to read at its start (`sidecar_run_args`)."""
+        self._token_file = self.dir / TOKEN_FILE
+        self._token_file.parent.mkdir(mode=0o700)
+        handle = os.open(self._token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(self.spec.token.reveal())
+        return self._token_file
+
+    def _remove_token_file(self) -> None:
+        """Remove the host's copy of the mount's token, verified: once oneclient has started it holds the token itself,
+        so the host keeps none, and a run killed outright leaves none on disk (O05). Run again at every teardown."""
+        if self._token_file is None:
+            return
+        self.host.run(["rm", "-f", str(self._token_file)], 20, sudo=True)
+        if self._token_file.exists():
+            raise SandboxError("the run's copy of the mount's token could not be removed")
+
     def _start_mount(self) -> Path:
-        """Start the oneclient sidecar on a shared mount point; the token goes in its environment, never an argument."""
+        """Start the oneclient sidecar on a shared mount point; its token goes in a file bound into it alone, read-only,
+        never in an argument or in docker's configuration of the container (O05)."""
         s, sp, names = self.s, self.spec, self.names
         share = self.dir / "mount"
         share.mkdir()
@@ -485,8 +505,11 @@ class DockerSandbox:
         }
         self._register_container(names.sidecar)
         t0 = time.monotonic()
-        args = sidecar_run_args(s, names, self._label_args(), share, s.oneclient.id, host_name, ca_copy=self._ca_copy)
-        self.host.docker(*args, env={ENV_ACCESS_TOKEN: sp.token.reveal()})
+        args = sidecar_run_args(
+            s, names, self._label_args(), share, s.oneclient.id, host_name,
+            token_file=self._write_token_file(), ca_copy=self._ca_copy,
+        )  # fmt: skip
+        self.host.docker(*args)
         deadline = time.monotonic() + MOUNT_WAIT_S
         while not hostops.is_fuse_mounted(self.host.read_text("/proc/self/mountinfo"), str(share)):
             if (hostops.inspect(self.host, names.sidecar) or {}).get("State", {}).get("Running") is not True:
@@ -496,6 +519,7 @@ class DockerSandbox:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(0.2)
         self._meta["mount"]["wait_s"] = round(time.monotonic() - t0, 3)
+        self._remove_token_file()  # oneclient read it as it started; its bind in the sidecar outlives the host's copy
         self.watch_container("sidecar", names.sidecar)
         return share
 
@@ -964,6 +988,8 @@ class DockerSandbox:
             for c in reversed(self._containers):
                 if c not in held:
                     self._step(errors, hostops.remove_container, self.host, c)
+            # on every path, a held sandbox's and a kept run's included: a secret is never evidence (O05)
+            self._step(errors, self._remove_token_file)
             if held:  # the network and the mounts cannot go while those two live: all of it is left for a retry
                 errors.append("the sidecar and the agent are left running with a FUSE mount that could not be released")
             else:

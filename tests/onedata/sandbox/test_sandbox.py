@@ -9,6 +9,7 @@ from sandbox_support import COMPLETE_LEVEL, FED_LOCAL, FED_NETWORK, TOKEN, fail_
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
+from expcore_onedata.sandbox.containers import SIDECAR_TOKEN_PATH
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 
@@ -19,8 +20,8 @@ def start(world, level="via-gate", **kw):
 
 
 def flat(container) -> str:
-    """Every argument docker was given for a container, as text (its environment is separate)."""
-    arguments = {k: v for k, v in container.options.items() if k != "_env"}
+    """Every argument docker was given for a container, as text (the fake's own records, `_env` and `_files`, apart)."""
+    arguments = {k: v for k, v in container.options.items() if not k.startswith("_")}
     return json.dumps(arguments, default=str) + " ".join(container.command)
 
 
@@ -164,15 +165,77 @@ def test_the_mount_path_has_a_read_only_mount_a_sidecar_and_no_gate(world):
 
 
 def test_the_mount_token_belongs_to_the_sidecar_and_the_agent_has_none(world):
-    """O05: the agent has neither the token nor FUSE nor a route; the sidecar takes the token from its environment."""
+    """O05: the agent has neither the token nor FUSE nor a route; the sidecar takes the token from a file bound into it
+    read-only, and from nowhere else: not an argument, not its environment as docker keeps it."""
     sbx = start(world, "mounted")
     agent, sidecar = (world.host.containers[n] for n in (sbx.names.agent, sbx.names.sidecar))
-    assert sidecar.options["_env"]["ONECLIENT_ACCESS_TOKEN"] == TOKEN
+    assert sidecar.options["_files"] == {SIDECAR_TOKEN_PATH: TOKEN}
+    assert any(spec.endswith(f":{SIDECAR_TOKEN_PATH}:ro") for spec in sidecar.options["-v"])
     assert TOKEN not in flat(sidecar)
+    assert TOKEN not in json.dumps(sidecar.options["_env"])
     assert TOKEN not in json.dumps(agent.options["_env"])
+    assert not agent.options["_files"]
     assert "--device" not in agent.options
     assert sbx.names.net in agent.networks
     assert "bridge" not in agent.networks
+    sbx.stop()
+
+
+def test_o05_docker_inspect_of_the_running_sidecar_and_agent_shows_no_token(world):
+    """O05: whoever can ask the docker daemon must not read the run's token: `docker inspect` of the running sidecar
+    (its environment, its command, its mounts) and of the agent shows no token, and the host keeps no copy of it once
+    oneclient has started, so a run killed outright leaves none on disk either."""
+    sbx = start(world, "mounted")
+    for name in (sbx.names.sidecar, sbx.names.agent):
+        assert TOKEN not in world.host.docker("inspect", name).stdout
+    assert not [p for p in sbx.dir.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+    sbx.stop()
+
+
+def test_o05_the_mounts_token_file_is_gone_after_a_failed_start_and_after_a_kept_run(world, tmp_path):
+    """O05: the host's copy of the token is removed on every path that ends a sandbox: a start whose sidecar exited
+    before the mount appeared, and a run whose disks are kept as evidence after a failed collection."""
+    original = world.host._run_container
+
+    def exiting(args, env):
+        result = original(args, env)
+        for container in world.host.containers.values():
+            if container.name.endswith("-oneclient"):
+                container.running = False
+        return result
+
+    world.host._run_container = exiting
+    world.host.oneclient_images.clear()  # the sidecar exits and no mount appears
+    with pytest.raises(SandboxError, match="sidecar exited"):
+        start(world, "mounted")
+    leftovers = [p for p in world.s.work_root.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+    assert leftovers == []
+    world.host._run_container = original
+    world.host.oneclient_images.add(world.s.oneclient.id)
+    sbx = start(world, "mounted")
+    sbx.keep_evidence = True
+    sbx.stop()
+    kept = world.s.work_root / "_kept_evidence"
+    assert kept.exists()
+    assert not [p for p in kept.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+
+
+def test_o05_the_mounts_token_file_is_removed_even_when_the_fuse_mount_holds_the_containers(world, monkeypatch):
+    """O05: when the FUSE mount can be neither unmounted nor aborted, the teardown leaves the sidecar and the agent
+    running (O15) and keeps the run's directory; the host's copy of the token goes all the same."""
+    from expcore_onedata.sandbox import teardown as TD
+    from expcore_onedata.sandbox.sandbox import TOKEN_FILE
+
+    sbx = start(world, "mounted")
+    leftover = sbx.dir / TOKEN_FILE  # as a start cut short before the mount appeared would leave it
+    leftover.write_text(TOKEN, encoding="utf-8")
+    held = TD.TeardownResult(fuse_safe=False, removed=[], errors=["the mount is held"], log=[])
+    monkeypatch.setattr(TD, "ordered_fuse_teardown", lambda *a, **k: held)
+    with pytest.raises(SandboxError, match="left running"):
+        sbx.stop()
+    assert not leftover.exists()
+    assert sbx.dir.exists()  # everything else is left for a retry
+    monkeypatch.undo()
     sbx.stop()
 
 
@@ -180,7 +243,8 @@ def test_the_tls_mode_of_the_mount_comes_from_the_settings_alone(world):
     sbx = start(world, "mounted")
     command = world.host.containers[sbx.names.sidecar].command
     assert "--insecure" not in command
-    assert command[:2] == ["-u", "ONECLIENT_INSECURE"]
+    oneclient = command[command.index("-u") :]  # after the shell that reads the token file
+    assert oneclient[:2] == ["-u", "ONECLIENT_INSECURE"]
     sbx.stop()
 
 
