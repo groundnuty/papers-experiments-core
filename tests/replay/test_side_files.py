@@ -7,6 +7,7 @@ import hashlib
 import json
 
 import pytest
+from read_support import whole_reads
 from record_support import CODE
 from replay_scenarios import SCENARIOS
 
@@ -176,6 +177,33 @@ def test_r14_the_check_fails_a_side_file_larger_than_the_cap_against_its_own_pat
     write_check(batch, made)
     with pytest.raises(BatchNotVerified, match="the replay check failed"):
         require_current_check(batch, code=CODE, side_files=[LOGGED])
+
+
+def test_r14_the_check_and_the_analysis_never_read_a_side_file_over_the_cap_whole(batch, monkeypatch):
+    """R14: a side file is never taken for a record, so neither the check nor the analysis's comparison of the batch
+    reads it whole to look for one: a side file over the cap is hashed in chunks and refused at stage `side_file`."""
+    name_side_file(lone_record(batch), b"r" * 4096)
+    monkeypatch.setattr(side_module, "MAX_SIDE_FILE_BYTES", 64)
+    whole = whole_reads(monkeypatch, LOGGED.pattern)
+    made = verify_batch(batch, code=CODE, side_files=[LOGGED])
+    assert [(f["file"], f["stage"]) for f in made["failures"]] == [(f"shard-2/{LOGGED.pattern}", "side_file")]
+    assert "more than 64 bytes" in made["failures"][0]["error"]
+    write_check(batch, made)
+    with pytest.raises(BatchNotVerified, match="the replay check failed"):
+        require_current_check(batch, code=CODE, side_files=[LOGGED])
+    assert whole == []
+
+
+def test_r14_a_side_file_whose_bytes_hold_a_record_is_a_side_file_still(batch):
+    """R14: by its declaration a side file is never a record, so one whose bytes are a record's is hashed and paired
+    with the record beside it, never refused as a record named by a hashed-only pattern."""
+    inside = dataclasses.replace(SCENARIOS["tools"][0](), run_key="run-inside").dumps(environ={}).encode("utf-8")
+    name_side_file(lone_record(batch), inside)
+    made = verify_batch(batch, code=CODE, side_files=[LOGGED])
+    assert (made["n_records"], made["n_ok"], made["failures"]) == (4, 4, [])
+    assert made["hashed_only"] == [f"shard-2/{LOGGED.pattern}"]
+    write_check(batch, made)
+    assert require_current_check(batch, code=CODE, side_files=[LOGGED])["n_ok"] == 4
 
 
 @pytest.mark.parametrize(

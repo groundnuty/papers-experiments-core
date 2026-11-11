@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from package_support import stand_in_vendor
+from read_support import counting_open, whole_reads
 from side_file_support import (
     SIDE,
     changed_log,
@@ -249,3 +250,25 @@ def test_r14_a_side_file_over_the_cap_is_refused_by_the_analysis_and_by_the_chec
     failures = [f for f in stored_check(copy.runs)["failures"] if f["stage"] == "side_file"]
     assert sorted(f["file"] for f in failures) == [rel(copy.runs, path) for path in side_files(copy.runs)]
     assert all("more than 8 bytes" in f["error"] for f in failures)
+
+
+def test_r14_neither_analyze_nor_check_reads_a_side_file_over_the_cap_whole(
+    copy, clean_environment, handed, monkeypatch
+):
+    """R14: under a cap below the side files' size, `analyze` and `check` refuse them without reading any whole: the
+    comparison of the batch with the check and the check's own look for misplaced records skip side files, the hashes
+    are taken in chunks, and the analysis's reader stops one byte past the cap."""
+    count = len(side_files(copy.runs))
+    monkeypatch.setattr(side_module, "MAX_SIDE_FILE_BYTES", 8)
+    whole = whole_reads(monkeypatch, SIDE)
+    served: dict[str, int] = {}
+    counting_open(monkeypatch, side_module, served)
+    code, error = cli({}, "analyze", str(copy.root))
+    assert code == 1
+    assert "more than 8 bytes" in error
+    assert served[SIDE] <= 9  # the first side file read, one byte past the cap, refused
+    code, _ = cli(clean_environment, "check", str(copy.runs))
+    assert code == 1
+    assert sum(1 for f in stored_check(copy.runs)["failures"] if "more than 8 bytes" in f["error"]) == count
+    assert whole == []
+    assert handed == []
