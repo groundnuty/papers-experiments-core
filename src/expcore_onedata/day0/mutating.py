@@ -7,9 +7,10 @@ Both run only when the caller allowed mutation (`EXPCORE_LIVE_MUTATE=1` on the c
 unknown and sends nothing. A write that is expected to be refused still counts: if the enforcement were broken it would
 succeed, so it is gated like any other change.
 
-Everything they create is under the configured space, by the provisioner's scoped client, with a name of its own, and is
+Everything they create is under a configured space, by the provisioner's scoped client, with a name of its own, and is
 removed in a `finally` whose result is then verified (O11): a scratch entry that is still there fails the check even
-when everything else passed.
+when everything else passed. With several spaces each runs in every space it is meant for, and the verdict is the worst
+over them: read-only enforcement in each space the data path reaches, the round trip in each declared space.
 """
 
 import hashlib
@@ -18,12 +19,13 @@ from typing import Any
 
 from expcore_onedata import consistency
 from expcore_onedata.client import NotSent, PlatformError, answered_absent
-from expcore_onedata.day0.registry import Context, Result, failed, passed, register, unknown
-from expcore_onedata.provision import ProvisionError
+from expcore_onedata.config import StudySpace
+from expcore_onedata.day0.registry import Context, Result, failed, passed, per_space, register, unknown
+from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.rangemap import RangeRow
 from expcore_onedata.ranges import place_ranges
 from expcore_onedata.tokencheck import TokenRefused
-from expcore_onedata.tokens import data_path_spec
+from expcore_onedata.tokens import Plane, data_path_spec
 
 SCRATCH_BYTES = 8192
 REFUSALS = (401, 403)
@@ -79,8 +81,8 @@ def _refused(error: PlatformError) -> bool:
     return error.status in REFUSALS or (error.status, error.code, error.errno) == POSIX_REFUSAL
 
 
-def _attempt_write(ctx: Context, name: str, token: str) -> dict[str, Any]:
-    """Send one write as the data-path token to a provider and say what became of it.
+def _attempt_write(ctx: Context, name: str, space_id: str, token: str) -> dict[str, Any]:
+    """Send one write as the data-path token to a provider, at the root of a space, and say what became of it.
 
     `sent` is False when nothing reached the provider: the space root could not be read, or the client's gate refused
     the write or could not check it (`NotSent`), so the probe did not run there. A write that was sent is accepted
@@ -89,7 +91,7 @@ def _attempt_write(ctx: Context, name: str, token: str) -> dict[str, Any]:
     as `code` and its errno as `errno`)."""
     created: str | None = None
     try:
-        root = consistency.space_root(ctx.client, name, ctx.config.space.id, tries=3, wait_s=1.0, sleep=ctx.sleep)
+        root = consistency.space_root(ctx.client, name, space_id, tries=3, wait_s=1.0, sleep=ctx.sleep)
     except PlatformError as error:
         return {"enforced": None, "sent": False, "error": "the space root could not be read", "status": error.status}
     try:
@@ -130,18 +132,31 @@ def read_only(ctx: Context) -> Result:
     """Send a write as the data-path token to each supporting provider; every one must refuse it.
 
     It passes only when every provider refused a write it was sent. A write that was never sent measured nothing, so
-    the probe could not run there and the check is unknown with that reason, never a refusal it could not read (O08)."""
+    the probe could not run there and the check is unknown with that reason, never a refusal it could not read (O08).
+
+    The token is the one a run mints, scoped to every space the data path reaches, and with several spaces the writes go
+    to the root of each of those spaces, on the providers of its own support set; the verdict is the worst over them
+    (`per_space`). A space the data path does not reach is not written to: the token's scope would refuse the write
+    there, which says nothing of its read-only caveat."""
     if not ctx.allow_mutation:
         return unknown(f"the write attempt {NEEDS_CONSENT}")
     if ctx.config.principals.data_path is None:
         return unknown("no fixed [principals] data-path user is declared, so no token can be minted")
     try:
         token = ctx.issuer.mint(
-            data_path_spec(ctx.config.space.id), ctx.config.principals.data_path, ceiling_s=ctx.ceiling_s
+            data_path_spec(ctx.config.space_ids(Plane.DATA_PATH)),
+            ctx.config.principals.data_path,
+            ceiling_s=ctx.ceiling_s,
         )
     except (TokenRefused, PlatformError) as error:
         return unknown(f"the probe could not run: no data-path token was minted, so no write was sent ({error})"[:300])
-    rows = {name: _attempt_write(ctx, name, token.reveal()) for name in ctx.config.support.providers}
+    reached = [entry for entry in ctx.config.spaces if Plane.DATA_PATH in entry.tokens]
+    return per_space(ctx, reached, lambda entry: _enforced_in(ctx, entry, token.reveal()))
+
+
+def _enforced_in(ctx: Context, entry: StudySpace, token: str) -> Result:
+    """Read-only enforcement in one space: a write to its root on each provider of its support set."""
+    rows = {name: _attempt_write(ctx, name, entry.space.id, token) for name in entry.support.providers}
     if any(row["enforced"] is False for row in rows.values()):
         return failed("a write made with the read-only data-path token was ACCEPTED", providers=rows)
     unsent = [name for name, row in rows.items() if row["sent"] is False]
@@ -161,10 +176,11 @@ def read_only(ctx: Context) -> Result:
     return passed(f"the write was refused on all {len(rows)} supporting provider(s)", providers=rows)
 
 
-def _receiver(ctx: Context) -> str | None:
-    """The first provider of the support set that is not the data provider, or None."""
-    holder = ctx.placement.settings.holder if ctx.placement else None
-    return next((p for p in ctx.config.support.providers if p != holder), None)
+def _holder(ctx: Context, entry: StudySpace) -> str | None:
+    """A space's data provider, as its provisioner takes it: a `[[spaces]]` entry's own, else `[placement] holder`."""
+    if ctx.config.spaces_table:
+        return entry.holder
+    return ctx.placement.settings.holder if ctx.placement else None
 
 
 @register("round_trip", "Placement round trip on a scratch file", mutates=True)
@@ -174,20 +190,30 @@ def round_trip(ctx: Context) -> Result:
 
     The placement passes when the receiver's block map holds a range that covers the half read; a provider may place
     more (Onedata 25.0 placed the whole 8 KiB file), so the facts give the bytes and ranges held beside the bytes read
-    (`range_bytes`), and how many evictions it took (`eviction_attempts`)."""
+    (`range_bytes`), and how many evictions it took (`eviction_attempts`).
+
+    With several spaces the trip runs in each declared space, since each has its own data provider and support set:
+    its own scratch file, placed from that space's data provider onto the first other provider of its support set, by
+    a provisioner bound to that space with a change log of its own. The verdict is the worst over them (`per_space`)."""
     if not ctx.allow_mutation:
         return unknown(f"the round trip {NEEDS_CONSENT}")
     if ctx.placement is None:
         return unknown("platform.toml has no [placement] table, so the data provider is not declared")
-    receiver = _receiver(ctx)
+    return per_space(ctx, ctx.config.spaces, lambda entry: _round_trip_in(ctx, entry))
+
+
+def _round_trip_in(ctx: Context, entry: StudySpace) -> Result:
+    """The round trip in one declared space."""
+    holder = _holder(ctx, entry)
+    receiver = next((p for p in entry.support.providers if p != holder), None)
     if receiver is None:
         return unknown("the support set has no provider besides the data provider to place bytes on")
-    missing = [p for p in (ctx.placement.settings.holder, receiver) if p not in ctx.provider_ids]
+    missing = [p for p in (holder, receiver) if p not in ctx.provider_ids]
     if missing:
         return unknown(
             "a provider's id is neither declared in platform.toml nor read from the space", missing=len(missing)
         )
-    provisioner = ctx.provisioner()
+    provisioner = ctx.provisioner(entry.label)
     data, path = _content(), f"{_scratch_name()}/scratch.bin"
     half = len(data) // 2
     facts: dict[str, Any] = {"bytes": len(data), "range_bytes": half, "steps": []}
@@ -197,7 +223,8 @@ def round_trip(ctx: Context) -> Result:
         provisioner.verify_space()
         file_id = provisioner.put_file(path, data)
         steps.append("created")
-        record = place_ranges(provisioner, [RangeRow(path, receiver, ((0, half),))], start_empty=True)
+        row = RangeRow(path, receiver, ((0, half),), space=entry.label)
+        record = place_ranges(provisioner, [row], start_empty=True)
         placed = record["providers"][provisioner.client.provider_label(receiver)]
         held = placed["per_file"][path]
         facts.update(held_bytes=held["held_bytes"], held_ranges=held["held"], polls=placed["polls"])
@@ -211,7 +238,7 @@ def round_trip(ctx: Context) -> Result:
     except (ProvisionError, PlatformError, consistency.WaitTimeout) as error:
         failure = f"{type(error).__name__} after {steps[-1] if steps else 'nothing'}"
     finally:
-        cleanup = _clean_up(ctx, path)
+        cleanup = _clean_up(provisioner, path)
     facts["cleanup_verified"] = cleanup
     if failure is not None:
         return failed(f"the round trip failed ({failure}); scratch {'removed' if cleanup else 'NOT removed'}", **facts)
@@ -222,9 +249,8 @@ def round_trip(ctx: Context) -> Result:
     return passed("placed by range reads, confirmed by the block map, read back, evicted and removed", **facts)
 
 
-def _clean_up(ctx: Context, path: str) -> bool:
+def _clean_up(provisioner: Provisioner, path: str) -> bool:
     """Tear down what the provisioner logged and verify that the scratch is gone and the log holds nothing."""
-    provisioner = ctx.provisioner()
     try:
         report = provisioner.teardown()
         gone = False
