@@ -35,6 +35,7 @@ from expcore_onedata.client import (  # noqa: E402
     NotSent,
     OnezoneClient,
     PlatformError,
+    _error_fields,
     answered_absent,
 )
 from expcore_onedata.config import load_platform  # noqa: E402
@@ -180,6 +181,15 @@ def test_the_health_check_reads_the_declared_support_set(config, client, issuer)
     assert result.ok, result.detail
 
 
+def lookup_absent(answer: httpx.Response) -> bool:
+    """Whether a provider's raw answer says the entry is not there, read as the client reads absence
+    (`answered_absent`): a 404, or Onedata 25.0's 400 posix enoent. Any other answer is not absence."""
+    if answer.status_code < 400:
+        return False
+    code, errno = _error_fields(answer)
+    return answered_absent(PlatformError("the lookup", status=answer.status_code, code=code, errno=errno))
+
+
 def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_streams(config, issuer):
     """O05: the data gate streams only a 200 or 206 of a file's content with the data content type, and buffers every
     other answer up to 4 MiB (gateboundary.streams). Read a provisioned file whole and by range through the provider's
@@ -194,7 +204,7 @@ def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_st
     # The platform's one [tls], as every client of the federation takes it: a federation's own CA, or the defaults.
     with httpx.Client(timeout=120, verify=config.tls.client_verify()) as http:
         found = http.post(f"{base}/lookup-file-id/{config.space.name}/{CONTENT_PATH.strip('/')}", headers=headers)
-        if found.status_code == consistency.NOT_FOUND:  # unknown, never a pass or a failure of the platform
+        if lookup_absent(found):  # unknown, never a pass or a failure of the platform
             pytest.skip(
                 "EXPCORE_LIVE_CONTENT_PATH names a file the space does not hold: a space declared baseline = false "
                 "holds none, so set it only where the file was provisioned"
