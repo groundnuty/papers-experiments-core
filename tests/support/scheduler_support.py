@@ -129,11 +129,21 @@ class FakeExecutor:
 PRICE = Price(3.0, 15.0)
 
 
-def models_for(*keys: str, price: Price | None = PRICE, free: bool = False) -> ModelTable:
-    """A model table of stub models, all with one price (or free, or none)."""
+def models_for(
+    *keys: str, price: Price | None = PRICE, free: bool = False, context_tokens: int | None = 16_000
+) -> ModelTable:
+    """A model table of stub models, all with one price (or free, or none) and a context window (or none)."""
     return ModelTable(
         {
-            k: ModelSpec(key=k, backend="stub", api_id=k, status="frozen", price=None if free else price, free=free)
+            k: ModelSpec(
+                key=k,
+                backend="stub",
+                api_id=k,
+                status="frozen",
+                price=None if free else price,
+                free=free,
+                context_tokens=context_tokens,
+            )
             for k in keys
         }
     )

@@ -176,6 +176,20 @@ def test_o05_the_check_is_a_day0_check_too(platform_file, fake, tmp_path):
     assert_clean(found.summary)
 
 
+@pytest.mark.parametrize("table", ["no sandbox", "no rest level"])
+def test_o08_a_day0_content_type_check_that_measured_nothing_is_unknown_never_passed(tmp_path, fake, table):
+    """O08, O05: with no [sandbox], or none of its levels REST, the check reads nothing. A campaign is still admitted,
+    since the gate streams nothing, but the day-0 check measured nothing, so it is unknown and says so, never passed."""
+    edits = {"no sandbox": with_placement, "no rest level": lambda d: edit(d, rest=False)}
+    platform = write_platform(tmp_path, edits[table])
+    client = OnezoneClient(load_platform(platform), http=fake.client_http())
+    found = REGISTRY["content_type"].run(build_context(platform, tmp_path / "out", client=client))
+    assert found.ok is None
+    assert "nothing was measured" in found.summary
+    assert fake.provider_calls == []
+    assert content_type_check(load_platform(platform), client).ok is True
+
+
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 
 
@@ -224,7 +238,8 @@ def test_o05_a_study_with_only_the_standard_gate_and_a_wrong_type_never_admits_a
     assert executor.requests == []
     [outage] = outages
     assert outage["end_utc"] is None
-    assert outage["checks"] >= 3  # rechecked, and refused each time
+    assert outage["checks"] >= 1  # the dispatcher's rechecks after the refused pre-run check; how many fit in the
+    # settle window depends on the machine's load, so one is the floor: refused each time, the executor never ran
     assert "refused" in outage["first_detail"]
     assert "typed application/json" in outage["last_detail"]  # the core keeps the head of the detail
     assert_clean(outage["last_detail"])

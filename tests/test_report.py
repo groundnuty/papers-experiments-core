@@ -60,6 +60,9 @@ def analysis(*results: ContrastResult, family=None) -> AnalysisResult:
     return AnalysisResult(tuple(results), holm, 0.05, dict(MANIFEST))
 
 
+RUN_PARTS = ("analysed_attempts", "exhausted_runs", "unfinished_runs", "excluded_attempts")
+
+
 def export(**changes):
     base = {
         "planned_runs": 4,
@@ -72,8 +75,14 @@ def export(**changes):
             {"run_key": "k3", "condition": "cond-b", "dispatch_seq": 3},
         ],
         "infrastructure_by_condition": [],
+        "retries_by_kind": [],
+        "budget_holds": [],
     }
-    return {**base, **changes}
+    data = {**base, **changes}
+    for part in RUN_PARTS:  # an export names each run's model among its factors; these runs are of one model
+        if part in data:
+            data[part] = [{"factors": {"model": "model-a"}, **entry} for entry in data[part]]
+    return data
 
 
 def render(result, data=None, **options):
@@ -565,3 +574,112 @@ def test_c23_an_interval_level_is_named_with_its_fraction_never_rounded_to_anoth
     result = dataclasses.replace(analysis(member), alpha=alpha)
     header = table_of(render(result, interval_level=level), "## Preregistered contrasts")["Contrast"]
     assert header[4:7] == [f"{interval} interval", "Margin", f"{equivalence} equivalence interval"]
+
+
+# --- a preregistration that makes no confirmatory claim (S12) ------------------------------------------------------
+
+NO_CLAIM = "makes no confirmatory claim"
+
+
+def exploratory_only(*names: str) -> AnalysisResult:
+    """An analysis of an exploratory-only preregistration: every contrast exploratory, no Holm decision."""
+    results = [contrast(name, "difference", in_family=False, exploratory=True) for name in names]
+    return dataclasses.replace(analysis(*results, family=[]), exploratory_only=True)
+
+
+def test_s12_the_summary_says_plainly_that_no_confirmatory_claim_is_made():
+    """S12: the report's provenance summary says, before any table, that the preregistration makes no confirmatory
+    claim; a report of a preregistration with a family says nothing of the kind."""
+    report = render(exploratory_only("pilot-a", "pilot-b"))
+    summary = report.split("## Provenance", 1)[1].split("\n## ", 1)[0]
+    assert NO_CLAIM in summary
+    assert "exploratory_only = true" in summary
+    assert NO_CLAIM not in render(analysis(contrast("member", "difference")))
+
+
+def test_s12_every_contrast_is_in_the_exploratory_table_and_there_is_no_family_table():
+    """S12: no empty family table and no family pairs table: every contrast is shown once, labelled exploratory."""
+    report = render(exploratory_only("pilot-a", "pilot-b"))
+    assert "## Preregistered contrasts" not in report
+    assert "Holm family of" not in report
+    assert "No contrast in the family." not in report
+    assert "### Pairs of the family's contrasts" not in report
+    shown = table_of(report, "## Exploratory contrasts")
+    assert set(shown) - {"Contrast"} == {"pilot-a", "pilot-b"}
+    for name in ("pilot-a", "pilot-b"):
+        assert row(report, name)[8:10] == ["exploratory", "difference (exploratory)"]
+    assert set(table_of(report, "### Pairs of the exploratory contrasts")) - {"Contrast"} == {"pilot-a", "pilot-b"}
+
+
+def test_s12_the_notes_say_nothing_of_a_holm_family_there_is_not():
+    """S12: the notes beside the table explain the conclusion words without the family's p = 1 rule."""
+    report = render(exploratory_only("pilot-a"))
+    assert "Holm family" not in report
+    assert "Conclusions: `difference`" in report
+
+
+def test_s12_the_terminal_summary_says_no_confirmatory_claim_is_made_before_the_contrasts():
+    """S12: the first line printed says so; every contrast after it is labelled exploratory."""
+    lines = summary_lines(exploratory_only("pilot-a", "pilot-b"))
+    assert NO_CLAIM in lines[0]
+    assert [line.split(":")[0] for line in lines[1:]] == ["pilot-a", "pilot-b"]
+    assert all(line.endswith("Holm p exploratory, difference (exploratory)") for line in lines[1:])
+    assert not any(NO_CLAIM in line for line in summary_lines(analysis(contrast("member", "difference"))))
+
+
+def test_s12_an_exploratory_only_result_with_a_confirmatory_contrast_is_refused():
+    """S12: a result that says it makes no confirmatory claim and holds a member of a family cannot be shown either
+    way without mislabelling it."""
+    bad = dataclasses.replace(analysis(contrast("member", "difference")), exploratory_only=True)
+    with pytest.raises(ValueError, match="exploratory_only"):
+        render(bad)
+    with pytest.raises(ValueError, match="exploratory_only"):
+        summary_lines(bad)
+
+
+def budget_hold(condition: str, model: str, attempts: int) -> dict:
+    return {"condition": condition, "model": model, "attempts": attempts}
+
+
+def test_c26_budget_holds_are_counted_per_condition_and_model_so_a_reader_sees_where_they_cluster():
+    """C26: the attempts a budget hold set aside, by condition and model, from the export's `budget_holds`; the
+    retries of another kind are not counted, and a model that met the ceiling more often stands out."""
+    analysed = [
+        {"run_key": "k1", "condition": "cond-a", "factors": {"model": "model-a"}},
+        {"run_key": "k2", "condition": "cond-a", "factors": {"model": "model-b"}},
+        {"run_key": "k3", "condition": "cond-b", "factors": {"model": "model-a"}},
+        {"run_key": "k4", "condition": "cond-b", "factors": {"model": "model-b"}},
+    ]
+    holds = [budget_hold("cond-a", "model-b", 3), budget_hold("cond-b", "model-b", 2)]
+    retries = [  # the export's retries are not where the report counts holds
+        {
+            "condition": "cond-a",
+            "model": "model-a",
+            "kind": kind,
+            "state": "infra_fail",
+            "charged": False,
+            "attempts": 5,
+        }
+        for kind in ("endpoint", "budget_hold")
+    ]
+    data = export(analysed_attempts=analysed, retries_by_kind=retries, budget_holds=holds)
+    report = render(analysis(contrast("primary", "difference")), data)
+    holds = report.split("### Budget holds by condition and model", 1)[1]
+    assert "| Condition | Model | Attempts set aside by a budget hold |" in holds
+    rows = [line for line in holds.splitlines() if line.startswith("| cond-")]
+    assert rows == [
+        "| cond-a | model-a | 0 |",
+        "| cond-a | model-b | 3 |",
+        "| cond-b | model-a | 0 |",
+        "| cond-b | model-b | 2 |",
+    ]
+    assert "top-up" in holds
+
+
+def test_c26_a_campaign_without_a_budget_hold_has_a_row_of_zeros_for_every_condition_and_model_it_ran():
+    """C26: 0 is never mistaken for "not reported": each pair the plan runs has its row, a run left unfinished or
+    exhausted included."""
+    data = export(planned_runs=5, exhausted_runs=[{"run_key": "k5", "condition": "cond-c"}])
+    holds = render(analysis(contrast("primary", "difference")), data).split("### Budget holds by condition", 1)[1]
+    for name in ("cond-a", "cond-b", "cond-c"):
+        assert f"| {name} | model-a | 0 |" in holds

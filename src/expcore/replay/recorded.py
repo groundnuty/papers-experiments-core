@@ -247,7 +247,7 @@ class RecordedBackend:
         return copy.deepcopy(self._conversation)
 
     async def probe(self) -> None:
-        """Nothing to probe."""
+        """Nothing to probe: a replay is never admitted, so it reports no usage."""
 
     async def aclose(self) -> None:
         """Nothing to release."""

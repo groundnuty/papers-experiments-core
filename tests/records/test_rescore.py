@@ -1,15 +1,20 @@
-"""Re-scoring (R13): scorers run on saved records with no network, and the record keeps each scorer's version."""
+"""Re-scoring (R13): scorers run on saved records with no network, and the record keeps each scorer's version; a scorer
+that takes `side_files` gets the record's side files as verified bytes, never a path (R14)."""
 
 import dataclasses
+import hashlib
 import json
 import socket
 
 import pytest
 from replay_scenarios import SCENARIOS
 
+from expcore.records import rescore as rescore_module
 from expcore.records.record import RunRecord, decode, load_record
 from expcore.records.rescore import rescore, rescore_files, scorer_name, scorer_version
 from expcore.records.schema import RecordError
+from expcore.replay import side_files as side_module
+from expcore.replay.side_files import SideFile
 
 
 @pytest.fixture(autouse=True)
@@ -214,3 +219,163 @@ def test_R13_a_treatment_attempt_is_scored_like_any_other_scored_attempt():
     assert scored is not record
     assert scored.scores["turns"]["result"]["outcomes"]["turns"] == len(record.transcript)
     assert scored.outcome == record.outcome
+
+
+# --- the side files of a record --------------------------------------------------------------------------------------
+
+LOGGED = SideFile("ranges_log.gz", "instruments.ranges.side_sha256")
+CONTENT = b"\x1f\x8b an invented log of byte ranges"
+
+
+class RangeBytes:
+    """A scorer that takes the side files of the record: a measure computed from a side file's content."""
+
+    name = "ranges"
+    version = "1"
+
+    def __init__(self) -> None:
+        self.handed: list[dict[str, bytes]] = []
+
+    def score(self, record: RunRecord, side_files):
+        self.handed.append(dict(side_files))
+        data = side_files.get(LOGGED.pattern)
+        return {"outcomes": {"logged": None if data is None else float(len(data))}, "names": sorted(side_files)}
+
+
+def logged_length(record, *, side_files):
+    """A scorer that is a plain function and takes the side files as a keyword."""
+    return {"outcomes": {"logged": float(sum(len(data) for data in side_files.values()))}}
+
+
+def test_R13_a_scorer_that_takes_only_the_record_is_called_as_before_when_side_files_are_handed_over():
+    """R13: a scorer without a `side_files` parameter is called with the record alone, whatever is handed over, and
+    scores exactly as it did."""
+    record = SCENARIOS["tools"][0]()
+    before = rescore(record, [TurnCount(), untouched])
+    after = rescore(record, [TurnCount(), untouched], side_files={LOGGED.pattern: CONTENT})
+    assert after.scores == before.scores
+    assert after.dumps() == before.dumps()
+
+
+def test_R14_a_scorer_that_takes_side_files_gets_the_bytes_handed_over_keyed_by_pattern():
+    """R14: the scorer gets each side file of the record by its declared pattern, the bytes as handed over, in a method
+    or a plain function, positional or keyword-only."""
+    scorer = RangeBytes()
+    scored = rescore(SCENARIOS["tools"][0](), [scorer, logged_length], side_files={LOGGED.pattern: CONTENT})
+    assert scorer.handed == [{LOGGED.pattern: CONTENT}]
+    assert scored.scores["ranges"]["result"] == {"outcomes": {"logged": float(len(CONTENT))}, "names": [LOGGED.pattern]}
+    assert scored.scores["logged_length"]["result"] == {"outcomes": {"logged": float(len(CONTENT))}}
+
+
+def test_R14_a_record_without_a_side_file_gives_the_scorer_an_empty_mapping():
+    """R14: a record that has no side file, or a study that declares none, hands the scorer an empty mapping."""
+    scorer = RangeBytes()
+    scored = rescore(SCENARIOS["tools"][0](), [scorer], side_files={})
+    assert scorer.handed == [{}]
+    assert scored.scores["ranges"]["result"] == {"outcomes": {"logged": None}, "names": []}
+
+
+def test_R14_a_scorer_that_takes_side_files_is_refused_when_none_are_handed_over():
+    """R14: a caller that hands over no side files at all leaves a scorer that takes them unrun, named, rather than
+    giving it an empty mapping it would take for a record without one."""
+    with pytest.raises(RecordError, match="scorer 'ranges' takes the side files of the record"):
+        rescore(SCENARIOS["tools"][0](), [RangeBytes()])
+
+
+def test_R14_the_side_files_a_scorer_gets_are_read_only_and_its_own():
+    """R14: a scorer cannot change the side files the next scorer gets, nor the caller's."""
+    handed = {LOGGED.pattern: CONTENT}
+
+    def meddler(record, side_files):
+        side_files[LOGGED.pattern] = b"rewritten"
+        return {}
+
+    with pytest.raises(TypeError, match="does not support item assignment"):
+        rescore(SCENARIOS["tools"][0](), [meddler], side_files=handed)
+    assert handed == {LOGGED.pattern: CONTENT}
+
+
+@pytest.fixture
+def attempt(tmp_path):
+    """An attempt directory: one record, which names the side file beside it by its SHA-256."""
+    root = tmp_path / "try1"
+    record = dataclasses.replace(SCENARIOS["tools"][0](), run_key="run-sided")
+    instruments = {**record.instruments, "ranges": {"ok": True, "side_sha256": hashlib.sha256(CONTENT).hexdigest()}}
+    dataclasses.replace(record, instruments=instruments).write(root, environ={})
+    (root / LOGGED.pattern).write_bytes(CONTENT)
+    return root
+
+
+def test_R14_rescore_files_hands_each_scorer_the_side_file_beside_the_record_read_once_and_paired(attempt):
+    """R14: with the study's declaration, the side file beside the record is read, paired with the hash the record
+    names, and handed to the scorer, which gets what it gets through `analyze`."""
+    scorer = RangeBytes()
+    [written] = rescore_files(attempt, [scorer], side_files=[LOGGED])
+    assert scorer.handed == [{LOGGED.pattern: CONTENT}]
+    assert load_record(written).scores["ranges"]["result"]["outcomes"] == {"logged": float(len(CONTENT))}
+
+
+def test_R14_rescore_files_hands_an_empty_mapping_for_a_record_that_names_no_side_file(tmp_path):
+    """R14: a record with neither the hash nor the file beside it gets an empty mapping."""
+    root = tmp_path / "try1"
+    dataclasses.replace(SCENARIOS["tools"][0](), run_key="run-plain").write(root)
+    scorer = RangeBytes()
+    rescore_files(root, [scorer], side_files=[LOGGED])
+    assert scorer.handed == [{}]
+
+
+@pytest.mark.parametrize("change", ["changed", "removed", "too-large"])
+def test_R14_rescore_files_refuses_a_side_file_that_does_not_pair_before_any_scorer_runs(attempt, monkeypatch, change):
+    """R14: a side file changed, removed while its record names it, or over the cap is refused, naming it, before any
+    scorer runs and before any file is written."""
+    side = attempt / LOGGED.pattern
+    if change == "changed":
+        side.write_bytes(CONTENT + b" edited")
+        problem = "does not have the SHA-256 the record names"
+    elif change == "removed":
+        side.unlink()
+        problem = "no such file lies beside it"
+    else:
+        monkeypatch.setattr(side_module, "MAX_SIDE_FILE_BYTES", 8)
+        problem = "more than 8 bytes"
+    before = written_files(attempt)
+    scorer = RangeBytes()
+    with pytest.raises(RecordError, match=problem):
+        rescore_files(attempt, [scorer], side_files=[LOGGED])
+    assert scorer.handed == []
+    assert written_files(attempt) == before
+
+
+def test_R14_rescore_files_reads_a_side_file_named_like_json_only_as_a_side_file(tmp_path, monkeypatch):
+    """R14: a declared side file whose name ends in `.json` is never loaded as a record, even when its bytes hold one,
+    so it is read only through the bounded reader and handed to the scorer."""
+    named = SideFile("ranges_log.json", "instruments.ranges.side_sha256")
+    content = dataclasses.replace(SCENARIOS["tools"][0](), run_key="run-inside").dumps(environ={}).encode("utf-8")
+    root = tmp_path / "try1"
+    record = dataclasses.replace(SCENARIOS["tools"][0](), run_key="run-sided")
+    instruments = {**record.instruments, "ranges": {"ok": True, "side_sha256": hashlib.sha256(content).hexdigest()}}
+    dataclasses.replace(record, instruments=instruments).write(root, environ={})
+    (root / named.pattern).write_bytes(content)
+    handed: list[dict[str, bytes]] = []
+
+    def logged(record, side_files):
+        handed.append(dict(side_files))
+        return {"outcomes": {"logged": float(len(side_files[named.pattern]))}}
+
+    reads: list[str] = []
+    real = side_module.read_side_file
+    monkeypatch.setattr(rescore_module, "read_side_file", lambda path: reads.append(path.name) or real(path))
+    [written] = rescore_files(root, [logged], side_files=[named])
+    assert load_record(written).run_key == "run-sided"
+    assert handed == [{named.pattern: content}]
+    assert reads == [named.pattern]
+
+
+def test_R14_rescore_files_without_the_declaration_refuses_a_scorer_that_takes_side_files(attempt):
+    """R14: without the study's declaration nothing is read beside the records, so a scorer that takes side files is
+    refused before any file is written; a scorer of the record alone needs no declaration."""
+    before = written_files(attempt)
+    with pytest.raises(RecordError, match="takes the side files of the record"):
+        rescore_files(attempt, [RangeBytes()])
+    assert written_files(attempt) == before
+    assert len(rescore_files(attempt, [TurnCount()])) == 1

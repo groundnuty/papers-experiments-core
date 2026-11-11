@@ -17,15 +17,17 @@ import secrets
 from typing import Any
 
 from expcore_onedata import consistency
-from expcore_onedata.client import PlatformError
+from expcore_onedata.client import NotSent, PlatformError, answered_absent
 from expcore_onedata.day0.registry import Context, Result, failed, passed, register, unknown
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.rangemap import RangeRow
 from expcore_onedata.ranges import place_ranges
+from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import data_path_spec
 
 SCRATCH_BYTES = 8192
 REFUSALS = (401, 403)
+POSIX_REFUSAL = (400, "posix", "eacces")  # how Onedata 25.0 refuses a write made with a read-only token ([L1])
 ABSENCE_POLLS = 6  # reads of a deleted entry before its absence is given up on
 ABSENCE_POLL_S = 1.0
 CONSECUTIVE_ABSENT = 2  # reads in a row that must answer "not found" (O07)
@@ -46,12 +48,15 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
     """Delete an entry as the admin and return `cleaned`, true only when its absence was then confirmed (O11).
 
     A DELETE that answers 204 proves nothing: the entry is read until the provider answers "not found" on consecutive
-    polls, within a bounded number of polls. Any other outcome is `cleaned` False with a `cleanup_reason`.
+    polls, within a bounded number of polls. "Not found" is a 404 or Onedata 25.0's 400 posix enoent
+    (`answered_absent`), exactly; any other answer, another 400 included, is not, and the reads go on to their bound.
+    Any other outcome is `cleaned` False with a `cleanup_reason`. The absence is that provider's (#114).
     """
     try:
         ctx.client.mutate("DELETE", f"/data/{entry_id}", provider=provider)
-    except PlatformError:
-        return {"cleaned": False, "cleanup_reason": "the delete was refused or failed"}
+    except PlatformError as error:
+        if not answered_absent(error):  # already gone is confirmed by the reads below
+            return {"cleaned": False, "cleanup_reason": "the delete was refused or failed"}
     absent, reason = 0, "the entry could not be read to confirm that it is gone"
     for poll in range(ABSENCE_POLLS):
         if poll:
@@ -60,7 +65,7 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
             ctx.client.get(f"/data/{entry_id}", provider=provider)
             absent, reason = 0, "the entry was still there after the delete"
         except PlatformError as error:
-            if error.status != consistency.NOT_FOUND:
+            if not answered_absent(error):
                 absent, reason = 0, "the entry could not be read to confirm that it is gone"
                 continue
             absent, reason = absent + 1, "the entry was not found on a read, but not on consecutive reads"
@@ -69,44 +74,90 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
     return {"cleaned": False, "cleanup_reason": reason}
 
 
+def _refused(error: PlatformError) -> bool:
+    """Whether a provider refused the write: a 401 or 403, or exactly `POSIX_REFUSAL`; no other 400 is a refusal."""
+    return error.status in REFUSALS or (error.status, error.code, error.errno) == POSIX_REFUSAL
+
+
+def _attempt_write(ctx: Context, name: str, token: str) -> dict[str, Any]:
+    """Send one write as the data-path token to a provider and say what became of it.
+
+    `sent` is False when nothing reached the provider: the space root could not be read, or the client's gate refused
+    the write or could not check it (`NotSent`), so the probe did not run there. A write that was sent is accepted
+    (`enforced` False, and removed again), refused (`enforced` True: a 401 or 403, or exactly `POSIX_REFUSAL`, as
+    Onedata 25.0 answers it), or neither (`enforced` None: no answer, or another status, kept with Onedata's error id
+    as `code` and its errno as `errno`)."""
+    created: str | None = None
+    try:
+        root = consistency.space_root(ctx.client, name, ctx.config.space.id, tries=3, wait_s=1.0, sleep=ctx.sleep)
+    except PlatformError as error:
+        return {"enforced": None, "sent": False, "error": "the space root could not be read", "status": error.status}
+    try:
+        answer = ctx.client.mutate(
+            "POST",
+            f"/data/{root}/children",
+            provider=name,
+            params={"name": _scratch_name(), "type": "DIR"},
+            token=token,
+        )
+        created = answer.get("fileId") if isinstance(answer, dict) else None
+        row: dict[str, Any] = {"enforced": False, "sent": True, "status": "accepted"}
+    except NotSent as error:  # the gate's own refusal or failed lookup: no write reached the provider
+        row = {"enforced": None, "sent": False, "error": str(error)[:200]}
+    except PlatformError as error:
+        if error.transport or error.status is None:
+            row = {"enforced": None, "sent": True, "error": "no answer"}
+        else:
+            enforced = True if _refused(error) else None
+            row = {"enforced": enforced, "sent": True, "status": error.status, "code": error.code}
+            row.update({"errno": error.errno} if error.errno else {})
+    finally:
+        if created:  # the write was accepted: remove what it made, as the admin, and show that it is gone
+            row.update(_remove_and_verify(ctx, name, created))
+    return row
+
+
+def _answered(row: dict[str, Any]) -> str:
+    """How a sent write was answered, for a summary: its status, Onedata's error id and errno, or that none came."""
+    if "status" not in row:
+        return str(row.get("error"))
+    shown = f"{row['code']}: {row['errno']}" if row.get("code") and row.get("errno") else row.get("code")
+    return f"{row['status']} {shown}" if shown else str(row["status"])
+
+
 @register("read_only", "Read-only enforcement on each data path", mutates=True)
 def read_only(ctx: Context) -> Result:
-    """Send a write as the data-path token to each supporting provider; every one must refuse it."""
+    """Send a write as the data-path token to each supporting provider; every one must refuse it.
+
+    It passes only when every provider refused a write it was sent. A write that was never sent measured nothing, so
+    the probe could not run there and the check is unknown with that reason, never a refusal it could not read (O08)."""
     if not ctx.allow_mutation:
         return unknown(f"the write attempt {NEEDS_CONSENT}")
     if ctx.config.principals.data_path is None:
         return unknown("no fixed [principals] data-path user is declared, so no token can be minted")
-    space = ctx.config.space
-    token = ctx.issuer.mint(data_path_spec(space.id), ctx.config.principals.data_path, ceiling_s=ctx.ceiling_s)
-    rows: dict[str, Any] = {}
-    for name in ctx.config.support.providers:
-        created: str | None = None
-        try:
-            root = consistency.space_root(ctx.client, name, space.id, tries=3, wait_s=1.0, sleep=ctx.sleep)
-            try:
-                answer = ctx.client.mutate(
-                    "POST",
-                    f"/data/{root}/children",
-                    provider=name,
-                    params={"name": _scratch_name(), "type": "DIR"},
-                    token=token.reveal(),
-                )
-                created = answer.get("fileId") if isinstance(answer, dict) else None
-                rows[name] = {"enforced": False, "status": "accepted"}
-            except PlatformError as error:
-                if error.transport or error.status is None:
-                    rows[name] = {"enforced": None, "error": "no answer"}
-                else:
-                    rows[name] = {"enforced": True if error.status in REFUSALS else None, "status": error.status}
-        except PlatformError as error:
-            rows[name] = {"enforced": None, "error": "the space root could not be read", "status": error.status}
-        finally:
-            if created:  # the write was accepted: remove what it made, as the admin, and show that it is gone
-                rows[name].update(_remove_and_verify(ctx, name, created))
+    try:
+        token = ctx.issuer.mint(
+            data_path_spec(ctx.config.space.id), ctx.config.principals.data_path, ceiling_s=ctx.ceiling_s
+        )
+    except (TokenRefused, PlatformError) as error:
+        return unknown(f"the probe could not run: no data-path token was minted, so no write was sent ({error})"[:300])
+    rows = {name: _attempt_write(ctx, name, token.reveal()) for name in ctx.config.support.providers}
     if any(row["enforced"] is False for row in rows.values()):
         return failed("a write made with the read-only data-path token was ACCEPTED", providers=rows)
-    if any(row["enforced"] is None for row in rows.values()):
-        return unknown("a write was not refused with a 401 or 403, and its refusal could not be read", providers=rows)
+    unsent = [name for name, row in rows.items() if row["sent"] is False]
+    unanswered = [name for name, row in rows.items() if row["sent"] is True and row["enforced"] is None]
+    reasons = []
+    if unsent:
+        first = rows[unsent[0]]["error"]
+        reasons.append(f"the probe could not run on {', '.join(unsent)}: no write was sent ({first})")
+    if unanswered:
+        answers = sorted({_answered(rows[name]) for name in unanswered})
+        reasons.append(
+            f"a write was sent to {', '.join(unanswered)} and answered neither by acceptance nor by a refusal "
+            f"(401, 403 or 400 posix: eacces), but {', '.join(answers)}"
+        )
+    if reasons:
+        return unknown("; ".join(reasons), providers=rows)
     return passed(f"the write was refused on all {len(rows)} supporting provider(s)", providers=rows)
 
 
@@ -119,7 +170,11 @@ def _receiver(ctx: Context) -> str | None:
 @register("round_trip", "Placement round trip on a scratch file", mutates=True)
 def round_trip(ctx: Context) -> Result:
     """Create a scratch file, place half of it on another provider by range reads, confirm it by the block map, read it
-    back and compare its hash, evict it again, and tear the scratch down, verifying that it is gone (O11)."""
+    back and compare its hash, evict it again, and tear the scratch down, verifying that it is gone (O11).
+
+    The placement passes when the receiver's block map holds a range that covers the half read; a provider may place
+    more (Onedata 25.0 placed the whole 8 KiB file), so the facts give the bytes and ranges held beside the bytes read
+    (`range_bytes`), and how many evictions it took (`eviction_attempts`)."""
     if not ctx.allow_mutation:
         return unknown(f"the round trip {NEEDS_CONSENT}")
     if ctx.placement is None:
@@ -144,12 +199,14 @@ def round_trip(ctx: Context) -> Result:
         steps.append("created")
         record = place_ranges(provisioner, [RangeRow(path, receiver, ((0, half),))], start_empty=True)
         placed = record["providers"][receiver]
-        facts.update(held_bytes=placed["held_after"], polls=placed["polls"])
+        held = placed["per_file"][path]
+        facts.update(held_bytes=held["held_bytes"], held_ranges=held["held"], polls=placed["polls"])
+        facts["held_covers_range"] = any(start <= 0 and half <= start + length for start, length in held["held"])
         steps.append("placed")
         back = provisioner.fetch(receiver, file_id, 0, half)
         facts["bytes_match"] = hashlib.sha256(back).digest() == hashlib.sha256(data[:half]).digest()
         steps.append("read back")
-        provisioner.evict(path, receiver)
+        facts["eviction_attempts"] = provisioner.evict(path, receiver)["attempts"]
         steps.append("evicted")
     except (ProvisionError, PlatformError, consistency.WaitTimeout) as error:
         failure = f"{type(error).__name__} after {steps[-1] if steps else 'nothing'}"
@@ -160,8 +217,8 @@ def round_trip(ctx: Context) -> Result:
         return failed(f"the round trip failed ({failure}); scratch {'removed' if cleanup else 'NOT removed'}", **facts)
     if not cleanup:
         return failed("the round trip worked but the scratch it made was not removed and shown gone (O11)", **facts)
-    if facts["bytes_match"] is not True or facts["held_bytes"] != half:
-        return failed("the bytes read back, or the bytes held, are not what was placed", **facts)
+    if facts["bytes_match"] is not True or facts["held_covers_range"] is not True:
+        return failed("the bytes read back, or the ranges held, do not cover what was placed", **facts)
     return passed("placed by range reads, confirmed by the block map, read back, evicted and removed", **facts)
 
 

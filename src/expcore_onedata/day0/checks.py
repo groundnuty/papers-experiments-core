@@ -198,14 +198,15 @@ def _names(ctx: Context, provider: str, root: str, limit: int) -> tuple[list[str
 
 @register("content_type", "The content type of a file's content, read whole and by range on the local provider")
 def content_type(ctx: Context) -> Result:
-    """The pre-campaign check (`precampaign.content_type_check`): the type the data gate streams on, when a data path is
-    REST. A type that differs fails; one that cannot be measured is unknown, which is not a pass."""
-    from expcore_onedata.precampaign import content_type_check
+    """The pre-campaign check (`precampaign.measure_content_type`): the type the data gate streams on, when a data path
+    is REST. A type that differs fails. A check that measured nothing is unknown, which is not a pass: one that could
+    not read the type, and one with no REST data path to read it for, which a campaign still admits (O08)."""
+    from expcore_onedata.precampaign import measure_content_type
 
-    verdict = content_type_check(ctx.config, ctx.client)
-    if verdict.ok:
-        return passed(verdict.detail)
-    return unknown(verdict.detail) if "could not be measured" in verdict.detail else failed(verdict.detail)
+    verdict = measure_content_type(ctx.config, ctx.client)
+    if not verdict.measured:
+        return unknown(verdict.detail)
+    return passed(verdict.detail) if verdict.ok else failed(verdict.detail)
 
 
 @register("listing", "Listing of the space root on each supporting provider")

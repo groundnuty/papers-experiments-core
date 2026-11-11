@@ -111,6 +111,172 @@ def test_o07_a_space_root_failing_for_another_reason_is_not_waited_out(provision
     assert ticker.slept == []
 
 
+def test_o09_every_provisioning_path_is_walked_never_asks_for_a_path_and_uploads_octets(
+    config, placement, seeded, ticker, tmp_path
+):
+    """O09: put, fetch, replicate, evict and teardown each pass the client's gate, which finds a file's space by its
+    parent links. No request of any of them asks a provider for the path attribute 25.0 does not have (every value of
+    every `attribute` parameter is read, not only the last), the walk reads parent links, each mutation and range read
+    comes right after the gate's read of the space's name, and every content upload is marked an octet stream."""
+    import httpx
+
+    from expcore_onedata.client import OnezoneClient
+    from expcore_onedata.provision import Provisioner, resolve_provider_ids
+
+    sent = []
+
+    def recording(request):
+        sent.append(request)
+        return seeded.respond(request)
+
+    client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(recording)))
+    provisioner = Provisioner(
+        client,
+        config,
+        placement.settings,
+        provider_ids=resolve_provider_ids(config),
+        log=tmp_path / "changes.jsonl",
+        clock=ticker.clock,
+        sleep=ticker.sleep,
+    )
+    seeded.evictions_remove_blocks = True
+    file_id = provisioner.put_file("scratch/a.bin", DATA)
+    provisioner.fetch("beta", file_id, 0, 100)
+    provisioner.replicate(PATH, "beta")
+    provisioner.evict(PATH, "beta")
+    assert provisioner.teardown().ok
+    assert not [r for r in sent if "path" in r.url.params.get_list("attribute")]
+    walked = [r.method for r in sent if r.url.params.get("attribute") == "parent_id"]
+    assert walked
+    gated = [r for r in sent if r.method in ("POST", "PUT", "DELETE") or r.headers.get("Range")]
+    assert {r.method for r in gated} >= {"POST", "PUT", "DELETE", "GET"}  # creates, uploads, transfers, deletes, reads
+    for request in gated:  # the gate read the space's name from Onezone right before each one
+        previous = sent[sent.index(request) - 1]
+        assert (previous.method, previous.url.path) == ("GET", f"/api/v3/onezone/spaces/{config.space.id}")
+    uploads = [r for r in sent if r.method == "PUT" and r.url.path.endswith("/content")]
+    assert uploads
+    assert {r.headers.get("Content-Type") for r in uploads} == {"application/octet-stream"}
+
+
+@pytest.mark.parametrize("answer", [(404, "notFound", None), (400, "posix", "enoent")])
+def test_o07_replicate_and_fetch_wait_until_the_provider_sees_a_file_just_written_elsewhere(
+    provisioner, seeded, ticker, answer
+):
+    """O07: a file just written through the data provider is not yet visible through another for some reads. Before a
+    transfer is scheduled through that provider, and before a range is read through it, the provisioner waits until
+    the provider reports the file at its size; it checks each provider and file once, so a second read waits for
+    nothing."""
+    seeded.unseen_after_create = {BETA_ID: 3}
+    seeded.unseen_answer = answer
+    file_id = provisioner.put_file("scratch/a.bin", DATA)
+    assert provisioner.fetch("beta", file_id, 0, 100) == DATA[:100]
+    slept = len(ticker.slept)
+    assert slept >= 3
+    provisioner.fetch("beta", file_id, 100, 100)
+    assert len(ticker.slept) == slept  # no second wait
+    other = provisioner.put_file("scratch/b.bin", DATA)
+    provisioner.replicate("scratch/b.bin", "beta")
+    assert seeded.held("scratch/b.bin", BETA_ID) == [[0, len(DATA)]]
+    assert seeded.unseen[(BETA_ID, other)] == 0
+
+
+def evictions(fake):
+    return [t for t in fake.transfers.values() if t.kind == "eviction"]
+
+
+def test_o01_an_eviction_that_completes_with_nothing_evicted_is_scheduled_again_until_the_map_is_empty(
+    provisioner, seeded, ticker
+):
+    """O01: on Onedata 25.0 an eviction scheduled right after a provider fetched the bytes completes with filesEvicted
+    0 and removes nothing, whichever provider schedules it; the same eviction a little later works. The block map is
+    the evidence, so the eviction is scheduled again after a pause while the provider still holds bytes, bounded by
+    `EVICTION_ATTEMPTS`, and the record says how many it took."""
+    provisioner.replicate(PATH, "beta")
+    seeded.evictions_noop_first = 2
+    record = provisioner.evict(PATH, "beta")
+    assert record["empty"] is True
+    assert record["attempts"] == 3
+    assert seeded.held(PATH, BETA_ID) == []
+    assert [t.noop for t in evictions(seeded)] == [True, True, False]
+
+
+def test_o01_an_eviction_that_never_removes_anything_fails_closed_after_its_attempts(provisioner, seeded):
+    """O01: a provider whose evictions all complete and remove nothing is never reported empty: after
+    `EVICTION_ATTEMPTS` evictions the block map still shows the bytes, and the eviction raises `NotPlaced`."""
+    from expcore_onedata.provision import EVICTION_ATTEMPTS
+
+    provisioner.replicate(PATH, "beta")
+    seeded.evictions_remove_blocks = False
+    with pytest.raises(NotPlaced):
+        provisioner.evict(PATH, "beta")
+    assert len(evictions(seeded)) == EVICTION_ATTEMPTS
+    assert seeded.held(PATH, BETA_ID) == [[0, len(DATA)]]
+
+
+OTHER_400S = [(400, "posix", "eacces"), (400, "posix", None), (400, "badValueNotAllowed", None), (400, None, None)]
+
+
+@pytest.mark.parametrize("answer", [(404, "posix", "enoent"), (400, "posix", "enoent")])
+def test_o07_a_fresh_space_root_answered_404_or_400_posix_enoent_is_waited_out(provisioner, seeded, ticker, answer):
+    """O07: a fresh space's root that is not there yet, answered with a 404 or, as Onedata 25.0 answers it, with 400
+    posix enoent, is waited out until it arrives within the bound."""
+    seeded.root_enoent_polls = 3
+    seeded.root_enoent_answer = answer
+    assert provisioner.root() == "root-0001"
+    assert len(ticker.slept) == 3
+
+
+@pytest.mark.parametrize("answer", OTHER_400S)
+def test_o07_a_space_root_answered_any_other_400_is_raised_at_once_and_never_waited_for(
+    provisioner, seeded, ticker, answer
+):
+    """O07: any other 400 (another errno, none, another id, a body that is no error object) is no "not there yet":
+    the root read fails closed at once, never waited out as if the root were coming."""
+    seeded.root_enoent_polls = 3
+    seeded.root_enoent_answer = answer
+    with pytest.raises(PlatformError) as raised:
+        provisioner.root()
+    assert raised.value.status == 400
+    assert ticker.slept == []
+
+
+@pytest.mark.parametrize("answer", [(404, "notFound", None), (400, "posix", "enoent")])
+def test_o07_a_transfer_not_seen_yet_answered_404_or_400_posix_enoent_is_waited(provisioner, seeded, ticker, answer):
+    """O07: a job its provider does not show yet, answered with a 404 or 400 posix enoent, is waited for like a running
+    one, and counts once it has ended."""
+    seeded.transfer_visible_after = 3
+    seeded.transfer_unseen_answer = answer
+    provisioner.replicate(PATH, "beta")
+    assert len(ticker.slept) >= 3
+
+
+@pytest.mark.parametrize("answer", OTHER_400S)
+def test_o07_a_transfer_answered_any_other_400_fails_closed_and_is_never_waited(provisioner, seeded, ticker, answer):
+    """O07: any other 400 for a job is no "not visible yet": the wait raises at once instead of polling on."""
+    seeded.transfer_visible_after = 3
+    seeded.transfer_unseen_answer = answer
+    with pytest.raises(PlatformError) as raised:
+        provisioner.replicate(PATH, "beta")
+    assert raised.value.status == 400
+    assert ticker.slept == []
+
+
+@pytest.mark.parametrize(("answer", "gone"), [((400, "posix", "enoent"), True), *((a, False) for a in OTHER_400S)])
+def test_o11_the_data_providers_read_shows_a_file_gone_on_400_posix_enoent_and_on_no_other_400(
+    provisioner, seeded, answer, gone
+):
+    """O11: the read teardown confirms absence with says gone on a 404 or exactly 400 posix enoent. Any other 400 is no
+    absence: the read raises, so a poll can never count it as gone."""
+    file_id = provisioner.put_file("scratch/a.bin", DATA)
+    seeded.answer_missing_as_25(answer)
+    seeded._delete(file_id)
+    if gone:
+        assert provisioner._gone(file_id) is True
+    else:
+        with pytest.raises(PlatformError):
+            provisioner._gone(file_id)
+
+
 def test_o09_a_space_whose_live_name_is_outside_the_prefixes_is_refused(provisioner, seeded):
     """O09: the live name is read before anything changes; one outside the prefixes stops every mutation."""
     seeded.space_name = "unrelated-space"
@@ -219,6 +385,63 @@ def test_o11_a_deletion_is_logged_only_after_absence_is_verified_so_a_second_tea
     assert file_id in third.deleted
     assert provisioner.logged() == []
     assert not seeded.exists("scratch/a.bin")
+
+
+def test_o09_a_content_upload_says_it_is_an_octet_stream_so_the_release_takes_it(provisioner, seeded):
+    """O09: Onedata 25.0 refuses a raw body sent without a Content-Type (415), as the fake does. The provisioner's
+    upload goes through the client's mutation, which marks every raw body application/octet-stream, so each block is
+    taken and the file arrives whole."""
+    file_id = provisioner.put_file("scratch/a.bin", DATA)
+    assert bytes(seeded.nodes[file_id].content) == DATA
+    assert len([c for c in seeded.provider_calls if c[1] == "PUT"]) == 4
+
+
+@pytest.mark.parametrize(
+    ("answer", "gone"),
+    [
+        ((404, "notFound", None), True),
+        ((400, "posix", "enoent"), True),  # how Onedata 25.0 answers a deleted entry
+        ((400, "posix", "eacces"), False),  # the same id with another errno
+        ((400, "posix", None), False),  # the id with no errno
+        ((400, "badValueNotAllowed", None), False),  # another 400
+        ((400, None, None), False),  # a body that is no error object
+    ],
+)
+def test_o11_teardown_takes_a_404_or_400_posix_enoent_as_gone_at_once_and_fails_closed_on_any_other_400(
+    provisioner, seeded, ticker, answer, gone
+):
+    """O11: a deleted entry is gone when the data provider answers it with a 404 or, as Onedata 25.0 does, with 400
+    posix enoent: teardown confirms it on consecutive reads and stops at once, without waiting out its bound. Any other
+    400, an unreadable body included, is not absence: teardown keeps reading to its bound, deletes nothing from its
+    log and reports every entry still listed, never removed, so a later run cannot start on data still there."""
+    seeded.answer_missing_as_25(answer)
+    provisioner.put_file("scratch/a.bin", DATA)
+    began = ticker.clock()
+    report = provisioner.teardown()
+    assert report.ok is gone
+    assert not seeded.exists("scratch")
+    if gone:
+        assert provisioner.logged() == []
+        assert ticker.clock() - began < provisioner.settings.settle_timeout_s  # stopped long before the bound
+    else:
+        assert report.deleted == ()
+        assert {entry["reason"] for entry in report.left} == {"still listed after its delete"}
+        assert len(report.left) == 2  # the file and its directory
+        assert len(provisioner.logged()) == 2  # both still logged, so a later teardown checks them again
+        assert ticker.clock() - began >= provisioner.settings.settle_timeout_s  # waited to the bound, never "gone"
+        with pytest.raises(ProvisionError, match="left"):
+            report.raise_if_left()
+
+
+def test_o11_a_logged_entry_someone_else_deleted_reads_as_gone_on_25(provisioner, seeded):
+    """O11: an entry deleted before teardown runs is answered 400 posix enoent by its DELETE on Onedata 25.0 (its
+    parent link still reads, so the gate lets the DELETE through); that is absence, so teardown confirms and logs it."""
+    seeded.answer_missing_as_25()
+    provisioner.put_file("scratch/a.bin", DATA)
+    seeded._delete(seeded.id_of("scratch"))
+    report = provisioner.teardown()
+    assert report.ok
+    assert provisioner.logged() == []
 
 
 def test_o09_put_file_refuses_to_adopt_a_file_that_exists(provisioner, seeded):

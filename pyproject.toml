@@ -50,6 +50,9 @@ dev-mode-dirs = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --import-mode=importlib"
+markers = [
+    "benchmark: a generous wall-time bound on top of a work-count test; deselect with -m 'not benchmark'",
+]
 # Helper modules shared by several test files live here, outside any package, and are imported by plain name.
 pythonpath = ["tests/support"]
 

@@ -161,12 +161,16 @@ def power_table(
     """Power at the target number of clusters and difference, for each SD, at alpha and at alpha / n_contrasts.
 
     The SDs default to the settings' grid. A NaN SD, or `simulate=False`, gives a NaN power, so a gap shows. One
-    generator, seeded from the settings, serves the rows in order.
+    generator, seeded from the settings, serves the rows in order. With no contrast to correct for (`n_contrasts` 0,
+    a preregistration with no confirmatory family) there is only the row at alpha.
     """
+    if isinstance(n_contrasts, bool) or not isinstance(n_contrasts, int) or n_contrasts < 0:
+        raise ValueError(f"n_contrasts must be a count, zero or more, got {n_contrasts!r}")
+    levels = [("alpha", alpha)] + ([("alpha_over_contrasts", alpha / n_contrasts)] if n_contrasts else [])
     rng = np.random.default_rng(settings.seed)
     rows = []
     for sd in sds if sds is not None else settings.sd_grid:
-        for label, level in (("alpha", alpha), ("alpha_over_contrasts", alpha / n_contrasts)):
+        for label, level in levels:
             runnable = simulate and not math.isnan(sd)
             power = (
                 power_sim(
