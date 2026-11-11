@@ -369,6 +369,24 @@ def test_o05_a_start_leaves_a_token_file_that_may_be_another_starts_and_what_no_
     sbx.stop()
 
 
+def test_o05_a_token_file_reached_through_a_linked_directory_is_not_removed(world):
+    """O05: the reaping follows no link anywhere on the way to a token file: a run directory whose secret directory is a
+    link to a directory elsewhere, holding a file of a token file's name, leaves that file alone."""
+    elsewhere = world.s.work_root.parent / "outside-root"
+    outside = elsewhere / TOKEN_FILE.name
+    outside.parent.mkdir(parents=True)
+    outside.write_text(TOKEN, encoding="utf-8")
+    then = time.time() - 3600
+    os.utime(outside, (then, then))
+    run_directory = world.s.work_root / "dead-key-3e4f5a6b"
+    run_directory.mkdir(parents=True)
+    (run_directory / TOKEN_FILE.parent).symlink_to(elsewhere, target_is_directory=True)
+    sbx = start(world, "isolated")
+    assert outside.exists()
+    assert sbx.metadata()["reaped_token_files"] == {"removed": 0, "left": 0}
+    sbx.stop()
+
+
 def test_o05_a_token_file_the_start_cannot_remove_is_counted_and_does_not_refuse_the_start(world):
     """O05: reaping what a killed run left never fails the start that does it; the count of what stayed is recorded."""
     stuck = plant_token_file(world, "dead-key-1a2b3c4d", TOKEN_FILE, age_s=3600)

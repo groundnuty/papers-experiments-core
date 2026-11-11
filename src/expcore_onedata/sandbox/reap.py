@@ -151,6 +151,19 @@ def _reap_one(host: HostOps, log_dir: Path, x: Path, outputs: Sequence[str], max
     return not x.exists()  # verified, not assumed: a mount left behind keeps the directory
 
 
+def _real_directories(base: Path, relative: Path) -> bool:
+    """Whether every directory from `base` down through `relative` is a directory itself and not a link to one."""
+    here = base
+    for part in relative.parts:
+        here = here / part
+        try:
+            if not stat.S_ISDIR(here.lstat().st_mode):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def reap_token_files(
     host: HostOps, root: Path, relatives: Sequence[Path], *, grace_s: float = TOKEN_FILE_GRACE_S
 ) -> dict[str, int]:
@@ -161,7 +174,7 @@ def reap_token_files(
     (key, dash, eight hex digits), and only once it is `grace_s` old, several times what a healthy start keeps its
     file for (one docker call and the mount's or the gate's wait): a younger one may be a start in another process
     that has not yet run its container, and removing the file of a start that did stall past the grace makes that
-    start fail, never pass on a missing token. A link is never followed (`lstat`), a file anywhere else is not touched. Returns the
+    start fail, never pass on a missing token. A link is never followed, at the file or at any directory on the way to it (`lstat` each), so a file anywhere else is not touched. Returns the
     count removed and the count found and not removed, which is all a record may say of them (O12)."""
     removed = left = 0
     if not Path(root).is_dir():  # a root nothing has run on yet
@@ -172,6 +185,8 @@ def reap_token_files(
             continue
         for relative in relatives:
             path = run_dir / relative
+            if not _real_directories(run_dir, Path(relative).parent):  # a link on the way leads off the root
+                continue
             try:
                 facts = path.lstat()
             except FileNotFoundError:
