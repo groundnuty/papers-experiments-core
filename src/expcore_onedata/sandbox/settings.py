@@ -14,7 +14,8 @@ agent_uid = 10001               # the unprivileged user the agent's code runs as
 python = "python"               # the interpreter in the agent image that runs the agent's code
 sudo = ["sudo", "-n"]           # the privilege command for host steps; [] when the driver runs as root
 earlyoom_comm = "expcore-drv"   # optional: the process name the host's earlyoom is told to spare
-trust_paths = []                # optional: paths in the agent image of CA bundles that must also trust the run's CA
+trust_paths = []                # optional: paths in the agent image of CA bundles that must also trust the run's CA;
+                                # on a rest data path the image's certifi bundle is added to them, found at the start
 content_check_file = "dir/f"    # a provisioned file under the space root, read once before a campaign to confirm
                                 # the content type the gate streams on (`precampaign.py`); required with a rest level
 placeholder_token = "placeholder"  # optional: the agent's ONEDATA_TOKEN on a rest data path, never a credential (O21)

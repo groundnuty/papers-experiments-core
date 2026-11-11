@@ -185,3 +185,33 @@ def test_the_oneclient_log_directory_is_the_last_one_given():
     assert C.effective_log_dir(["-f"]) == C.ONECLIENT_LOG_DIR
     assert C.effective_log_dir(["--log-dir", "/a", "--log-dir=/b"]) == "/b"
     assert C.effective_log_dir(["-l", "/c"]) == "/c"
+
+
+def test_o21_the_certifi_question_answers_with_the_interpreters_bundle_or_none_and_is_read_back_exactly():
+    """O21: the probe the sandbox runs in the agent image, run here with this interpreter, prints the path certifi
+    gives, which `certifi_bundle` reads back; an interpreter without certifi prints `certifi:none`, read as None."""
+    import subprocess
+    import sys
+
+    import certifi
+
+    found = subprocess.run([sys.executable, "-c", C.CERTIFI_PROBE], capture_output=True, text=True, check=True)
+    assert C.certifi_bundle(found.stdout) == certifi.where()
+    hidden = "import sys\nsys.modules['certifi'] = None\n" + C.CERTIFI_PROBE  # an import of it raises ImportError
+    absent = subprocess.run([sys.executable, "-c", hidden], capture_output=True, text=True, check=True)
+    assert absent.stdout == "certifi:none\n"
+    assert C.certifi_bundle(absent.stdout) is None
+
+
+def test_o21_the_certifi_question_runs_as_the_agent_without_a_network_and_its_bundle_is_extended_once(s):
+    """O21: the one-shot runs the image's interpreter as the agent's user with no network; the certifi bundle joins the
+    declared trust paths after them, once."""
+    args = C.certifi_probe_args(s, "sbx-once-1", LABELS, s.agent.id)
+    assert ("--network", "none") in pairs(args)
+    assert ("--user", f"{s.agent_uid}:{s.agent_uid}") in pairs(args)
+    assert ("--entrypoint", s.python) in pairs(args)
+    assert args[:2] == ["run", "--rm"]
+    assert args[-3:] == [s.agent.id, "-c", C.CERTIFI_PROBE]
+    assert C.trust_targets(("/etc/a.pem",), "/lib/cacert.pem") == ("/etc/a.pem", "/lib/cacert.pem")
+    assert C.trust_targets(("/lib/cacert.pem",), "/lib/cacert.pem") == ("/lib/cacert.pem",)
+    assert C.trust_targets(("/etc/a.pem",), None) == ("/etc/a.pem",)

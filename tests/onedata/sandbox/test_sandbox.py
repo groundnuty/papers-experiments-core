@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from fake_host import CERTIFI_BUNDLE
 from sandbox_support import COMPLETE_LEVEL, TOKEN, fail_copies, make_spec, start_options
 
 from expcore.errors import InfraError
@@ -552,13 +553,17 @@ def rest_start_with_a_bundle(world, lease_key="login-data"):
 
 
 def test_c19_the_temporary_trust_bundle_container_carries_the_labels_of_every_other_container(world):
-    """C19: sandbox, owner and lease key, like the gate and the agent, from the moment it is created."""
+    """C19: sandbox, owner and lease key, like the gate and the agent, from the moment it is created: each temporary
+    container, the one that asks the image where its certifi bundle is and the one that reads each bundle (O21)."""
     sbx = rest_start_with_a_bundle(world)
-    (one_shot,) = world.host.one_shots
+    probe, *reads = world.host.one_shots
+    assert probe.options["--entrypoint"] == world.s.python
+    assert [read.command for read in reads] == [["/etc/ssl/bundle.pem"], [CERTIFI_BUNDLE]]
     others = [world.host.containers[sbx.names.agent], world.host.containers[sbx.names.gate]]
-    assert one_shot.labels == others[0].labels == others[1].labels
-    assert one_shot.labels["org.test.lease"] == "login-data"
-    assert {"org.test.sandbox", "org.test.owner", "org.test.dir"} <= set(one_shot.labels)
+    for one_shot in world.host.one_shots:
+        assert one_shot.labels == others[0].labels == others[1].labels
+        assert one_shot.labels["org.test.lease"] == "login-data"
+        assert {"org.test.sandbox", "org.test.owner", "org.test.dir"} <= set(one_shot.labels)
     sbx.stop()
 
 
@@ -569,7 +574,7 @@ def test_c19_a_trust_bundle_container_that_docker_did_not_remove_blocks_the_prob
 
     world.host.stuck_one_shots = True
     sbx = rest_start_with_a_bundle(world)
-    (one_shot,) = world.host.one_shots
+    one_shot = world.host.one_shots[1]  # the one that read the declared bundle
     world.host.fail_remove.add(one_shot.name)
     with pytest.raises(SandboxError, match="cleanup incomplete"):
         sbx.stop()
@@ -583,6 +588,87 @@ def test_c19_a_trust_bundle_container_that_docker_did_not_remove_blocks_the_prob
     assert one_shot.name not in world.host.containers
     sbx.stop()
     assert probe.resource_gone("login-data", {}) is True
+
+
+def agent_mounts(world, sbx) -> dict[str, str]:
+    """The agent container's read-only bind mounts: the path in the agent -> the host file."""
+    specs = world.host.containers[sbx.names.agent].options.get("-v", [])
+    return {spec.split(":")[1]: spec.split(":")[0] for spec in specs if spec.endswith(":ro")}
+
+
+def test_o21_a_rest_start_extends_the_images_certifi_bundle_with_the_runs_ca_and_records_it(world):
+    """O21: the published client verifies the gate against the certifi bundle of the agent's image and reads none of
+    the CA variables, so a REST start asks the image's interpreter where that bundle is, in a container with no network
+    and as the agent's user, and mounts the bundle with the run's CA appended over it, read-only, as it does for a
+    declared trust path. The metadata says so."""
+    sbx = start(world, "via-gate")
+    (probe,) = world.host.one_shots[:1]
+    assert (probe.options["--entrypoint"], probe.options["--network"]) == (world.s.python, "none")
+    assert probe.options["--user"] == f"{world.s.agent_uid}:{world.s.agent_uid}"
+    assert probe.command[0] == "-c"
+    assert [read.command for read in world.host.one_shots[1:]] == [[CERTIFI_BUNDLE]]
+    bundle = Path(agent_mounts(world, sbx)[CERTIFI_BUNDLE])
+    ca = (sbx.dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+    assert bundle.read_text(encoding="utf-8") == world.host.base_bundle + "\n" + ca
+    assert sbx.metadata()["certifi"] == "run_ca_added"
+    sbx.stop()
+
+
+def test_o21_an_agent_image_without_certifi_starts_without_it_and_the_metadata_says_so(world):
+    """O21: an image with no certifi has no bundle to extend: the sandbox starts as before, mounts nothing over a
+    bundle, and records `not_in_image`, so a run whose client could not verify the gate can be told apart."""
+    world.host.certifi_probe = CmdResult(0, "certifi:none\n")
+    sbx = start(world, "via-gate")
+    assert len(world.host.one_shots) == 1  # the question, and no bundle read
+    assert [path for path in agent_mounts(world, sbx) if "certifi" in path] == []
+    assert sbx.metadata()["certifi"] == "not_in_image"
+    sbx.stop()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        CmdResult(127, "", "exec: python: not found"),
+        CmdResult(1, "", "Traceback: a broken certifi"),
+        CmdResult(0, "a banner\ncertifi:/usr/lib/cacert.pem\n"),
+        CmdResult(0, "certifi:relative/cacert.pem\n"),
+        CmdResult(0, "certifi:/usr/lib/../etc/cacert.pem\n"),
+        CmdResult(0, "certifi:/usr/lib/with space/cacert.pem\n"),
+        CmdResult(0, "certifi:/usr/lib/with:colon/cacert.pem\n"),
+        CmdResult(0, ""),
+    ],
+    ids=["no-interpreter", "import-error", "extra-output", "relative", "dot-dot", "space", "colon", "silent"],
+)
+def test_o21_a_certifi_question_the_image_cannot_answer_plainly_refuses_the_start_and_leaves_nothing(world, answer):
+    """O21: fail closed. Only `certifi:none` says the image has no certifi; an interpreter that fails, or an answer
+    that is not one absolute path the sandbox can mount over, is no answer, and the start ends with nothing left. The
+    message names neither the path nor the interpreter's words."""
+    world.host.certifi_probe = answer
+    with pytest.raises(SandboxError, match="certifi") as caught:
+        start(world, "via-gate")
+    assert "cacert" not in str(caught.value)
+    assert "Traceback" not in str(caught.value)
+    assert nothing_left(world)
+
+
+def test_o21_a_declared_trust_path_that_is_the_certifi_bundle_is_extended_once(world):
+    """O21: a study that already declares the certifi bundle in `trust_paths` gets it read and mounted once."""
+    from dataclasses import replace
+
+    settings = replace(world.s, trust_paths=(CERTIFI_BUNDLE,))
+    sbx = DockerSandbox.start(world.host, settings, make_spec(world, "via-gate"), **start_options(world))
+    assert [read.command for read in world.host.one_shots[1:]] == [[CERTIFI_BUNDLE]]
+    assert list(agent_mounts(world, sbx)).count(CERTIFI_BUNDLE) == 1
+    sbx.stop()
+
+
+@pytest.mark.parametrize("level", ["mounted", "isolated"])
+def test_o21_no_bundle_is_extended_without_a_rest_data_path(world, level):
+    """O21: only a REST agent reaches the gate; a mount or no data path asks the image nothing and records nothing."""
+    sbx = start(world, level)
+    assert world.host.one_shots == []
+    assert sbx.metadata()["certifi"] is None
+    sbx.stop()
 
 
 KEY = "login-data"

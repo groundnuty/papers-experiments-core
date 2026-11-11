@@ -34,6 +34,7 @@ VALUED = {
 }  # fmt: skip
 REPEATED = {"--label", "-l", "-v", "--volume", "--mount", "-e", "--env", "--add-host", "--cap-add", "--cap-drop"}
 BOOT_ID = "0f0f0f0f-1111-2222-3333-444455556666"
+CERTIFI_BUNDLE = "/usr/lib/python3/site-packages/certifi/cacert.pem"  # where the fake agent image keeps certifi's
 PID_NS = "pid:[4026531836]"
 
 
@@ -154,6 +155,8 @@ class FakeHost:
         self.oneclient_images: set[str] = set()
         self.pause_without_freezing = False  # a `docker pause` that answers 0 but leaves the cgroup unfrozen
         self.base_bundle = "BASE BUNDLE\n"
+        # what the agent image's interpreter answers the sandbox's question of where its certifi bundle is
+        self.certifi_probe = CmdResult(0, f"certifi:{CERTIFI_BUNDLE}\n")
         self.add_process(__import__("os").getpid(), start=777)
 
     @staticmethod
@@ -387,6 +390,8 @@ class FakeHost:
             self.one_shots.append(one_shot)
             if self.stuck_one_shots:
                 self.containers[one_shot.name] = one_shot
+            if command[:1] == ["-c"] and "certifi" in command[1]:
+                return self.certifi_probe
             return CmdResult(0, self.base_bundle if options.get("--entrypoint") == "cat" else "oneclient 1.0\n")
         name = options["--name"]
         if name in self.fail_run:

@@ -12,7 +12,9 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
   * REST data path: the data gate (gate.py, gatepolicy.py, gateboundary.py), whose files are mounted from this package,
     read-only. It holds the token, in its environment, and adds it to the requests it forwards, and no answer it passes
     back holds the token; the agent holds no credential, only the placeholder token the published client needs to
-    start (O21), which the gate drops;
+    start (O21), which the gate drops. The agent trusts the run's CA through the CA variables, each declared trust path
+    and its image's certifi bundle, which the published client verifies against: one-shot containers of the agent
+    image find that bundle and read each one, and the run's copy with the CA appended is mounted over it read-only;
   * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
     propagation; the agent has neither the token, nor FUSE, nor a route to any host;
   * no data path: neither;
@@ -67,10 +69,13 @@ from expcore_onedata.sandbox.containers import (
     ONECLIENT_LOG_DIR,
     Names,
     agent_run_args,
+    certifi_bundle,
+    certifi_probe_args,
     effective_log_dir,
     gate_run_args,
     sidecar_command,
     sidecar_run_args,
+    trust_targets,
 )
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr, stderr_digest
 from expcore_onedata.sandbox.observe import Observer
@@ -133,6 +138,7 @@ class DockerSandbox:
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,  # the gate's listing mode (O21)
             "images": {},
             "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
+            "certifi": None,  # a REST agent's: `run_ca_added`, or `not_in_image` (O21); never the bundle's path
         }
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
@@ -489,14 +495,40 @@ class DockerSandbox:
         self.watch_container("sidecar", names.sidecar)
         return share
 
+    def _one_shot_name(self) -> str:
+        """The name of a one-shot container of the agent image, registered before it is created, so a `stop` that runs
+        meanwhile looks for it."""
+        name = f"{self.names.agent}-once-{uuid.uuid4().hex[:6]}"
+        self._checkpoint()
+        self._register_container(name)
+        return name
+
+    def _certifi(self) -> str | None:
+        """Where the agent image keeps its certifi bundle, which the published client verifies the gate against (O21),
+        or None, recorded, when the image has no certifi. An interpreter that fails, or an answer that is not one path
+        the sandbox can mount over, refuses the start: no answer is taken for `none`."""
+        name = self._one_shot_name()
+        result = self.host.docker(*certifi_probe_args(self.s, name, self._label_args(), self.s.agent.id), check=False)
+        if result.returncode != 0:
+            raise SandboxError(
+                f"the agent image did not say where its certifi bundle is ({describe_stderr(result.stderr)})"
+            )
+        try:
+            found = certifi_bundle(result.stdout)
+        except ValueError:
+            raise SandboxError(
+                "the agent image's answer about its certifi bundle is not one path to mount over"
+            ) from None
+        self._meta["certifi"] = "not_in_image" if found is None else "run_ca_added"
+        return found
+
     def _trust_bundles(self) -> dict[str, Path]:
-        """For each configured path of a CA bundle in the agent image: the image's own bundle plus the run's CA."""
+        """For each configured path of a CA bundle in the agent image, and its certifi bundle when it has one (O21): the
+        image's own bundle plus the run's CA."""
         out: dict[str, Path] = {}
         ca = (self.dir / "tls" / "ca.pem").read_text(encoding="utf-8")
-        for n, path in enumerate(self.s.trust_paths):
-            name = f"{self.names.agent}-once-{uuid.uuid4().hex[:6]}"
-            self._checkpoint()
-            self._register_container(name)  # registered before it is created
+        for n, path in enumerate(trust_targets(self.s.trust_paths, self._certifi())):
+            name = self._one_shot_name()
             # labelled like every other container of the sandbox, so that the probe and the orphan reaper find it if the
             # docker call is cut off before `--rm` has removed it (C19)
             base = self.host.docker(
