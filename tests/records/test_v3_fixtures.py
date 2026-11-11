@@ -31,6 +31,7 @@ import pytest
 
 from expcore.records.record import RunRecord, decode, load_record
 from expcore.records.schema import (
+    RETRY_FIELDS,
     SCHEMAS,
     SECTIONS,
     SchemaVersion,
@@ -213,3 +214,17 @@ def test_C26_the_second_fixture_pins_a_billed_reply_that_became_no_turn_as_incom
     assert record.route["usage_seen"]["responses"] == len(record.transcript) + 1 == 2
     assert record.failed_request["kind"] == "infra"
     assert record.totals["usage_incomplete"] is True
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [{}, dict.fromkeys(RETRY_FIELDS)],
+    ids=["no-key", "every-key-null"],
+)
+def test_R02_a_retry_entry_of_version_three_needs_no_key_and_takes_any_value(entry):
+    """R02: retry entries are checked by a key list rather than a section, so neither the frozen fields nor the
+    fixtures (whose turns hold no retry) would see a later branch make a retry key required or typed: a version 3
+    record whose retry entry holds no key, or every key null (a connection error writes no status), stays valid."""
+    record = decode(FIXTURES[0].read_bytes())
+    record["transcript"][0]["retries"] = [entry]
+    assert validate(record) == V3
