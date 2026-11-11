@@ -28,7 +28,14 @@ from live_support import (  # noqa: E402 -- only once the module is known to run
     require_passed,
 )
 
-from expcore_onedata.client import API_PROVIDER, AUTH_HEADER, OnezoneClient, PlatformError, answered_absent  # noqa: E402
+from expcore_onedata.client import (  # noqa: E402
+    API_PROVIDER,
+    AUTH_HEADER,
+    NotSent,
+    OnezoneClient,
+    PlatformError,
+    answered_absent,
+)
 from expcore_onedata.config import load_platform  # noqa: E402
 from expcore_onedata.federation import pin_local_provider, read_space  # noqa: E402
 from expcore_onedata.health import PlatformHealth  # noqa: E402
@@ -417,6 +424,8 @@ def test_a_running_transfer_is_cancelled_through_the_gate_and_then_reports_an_en
     statuses = []
     try:
         provisioner.client.mutate("DELETE", f"/transfers/{tid}", provider=receiver)
+    except NotSent:
+        raise  # the gate never sent the cancel: its own read failed, so this test has not shown the DELETE
     except PlatformError as error:
         statuses.append(error.status)
     assert statuses in ([], [400])  # 400: the job ended before the cancel reached it
