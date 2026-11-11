@@ -41,6 +41,7 @@ from expcore.accounting import condition_accounting
 from expcore.report_notes import (
     CONDITION_NOTES,
     COUNT_DEFINITIONS,
+    DEPLOYMENT_NOTES,
     MDE_NOTES,
     MISSING_PAIRS,
     NO_KIND,
@@ -326,6 +327,41 @@ def _left_out(excluded: Sequence[Mapping[str, Any]]) -> list[str]:
     return [*lines, *_table(["Run key", "Attempt", "Reason"], rows), ""]
 
 
+def _deployments(export: Mapping[str, Any]) -> list[str]:
+    """Each declared deployment's share of the analysed turns and runs of its model (B18); nothing for an export
+    without `deployment_shares`, which no model declaring accepted fingerprints has."""
+    if "deployment_shares" not in export:
+        return []
+    rows, totals = [], []
+    for model in export["deployment_shares"]:
+        for entry in model["fingerprints"]:
+            witness = entry["confirmed_by"]
+            confirmed = {"admission_probe": "admission probe", "run": f"run {entry['confirming_run']}"}.get(witness)
+            rows.append(
+                [
+                    model["model"],
+                    "not reported" if entry["fingerprint"] is None else entry["fingerprint"],
+                    "yes" if entry["accepted"] else "no",
+                    confirmed or ("unconfirmed" if entry["accepted"] else "-"),
+                    entry["turns"],
+                    _share(entry["turn_share"]),
+                    entry["runs"],
+                    _share(entry["run_share"]),
+                ]
+            )
+        totals.append(
+            f"- {model['model']}: {model['analysed_runs']} analysed run(s), {model['mixed_runs']} served by more than "
+            f"one deployment, {model['runs_without_mix']} without a recorded mix"
+        )
+    header = ["Model", "Fingerprint", "Accepted", "Confirmed by", "Turns", "Share of turns", "Runs", "Share of runs"]
+    return ["## Deployments", "", *_table(header, rows), "", *totals, "", *DEPLOYMENT_NOTES, ""]
+
+
+def _share(value: float | None) -> str:
+    """A fraction as a percentage to four significant figures; n/a without a denominator."""
+    return UNKNOWN if value is None else f"{value * 100:.4g}%"
+
+
 def _scorers(scorers: Mapping[str, str] | None) -> str:
     """Each scorer's name and version in name order, or n/a when the report was not given them."""
     return ", ".join(f"{name} `{version}`" for name, version in sorted((scorers or {}).items())) or UNKNOWN
@@ -372,4 +408,5 @@ def render_report(
         _partial_line(export),
         "",
     ]
-    return "\n".join(lines + _contrasts(result, interval_level) + _conditions(export) + _left_out(left_out))
+    body = _contrasts(result, interval_level) + _conditions(export) + _deployments(export) + _left_out(left_out)
+    return "\n".join(lines + body)

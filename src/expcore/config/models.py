@@ -17,6 +17,11 @@ entry with such a backend and a problem of its own (a missing `api_id`, a rule i
 not build its backend, so a misspelt core backend is never reported as a missing key, and a name close to a core
 backend is named with it.
 
+`accepted_fingerprints` declares the serving fingerprints (`system_fingerprint`) a load-balanced endpoint serves the
+model under, each a deployment the study decided is the same model (B18, `expcore.campaign.identity`). It is a set,
+kept sorted; an empty list, a repeat or a value that joins several fingerprints is refused, and so is the key on an
+`anthropic` model, whose adapter records no fingerprint to check it against.
+
 Secrets never appear here. An entry points at an environment variable (`key_env`) or a file (`key_file`), and the
 key is read when a request is built, not when the table is loaded.
 """
@@ -33,6 +38,7 @@ from typing import Any
 from expcore.config.loading import ConfigError, Section, close_match, load_toml
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
 from expcore.config.prices import Price
+from expcore.models.served import MIXED_FINGERPRINTS
 
 BACKENDS = ("openai_compat", "anthropic", "stub")  # the backends the core builds; a plugin's factory serves others
 STATUSES = ("frozen", "draft")
@@ -118,9 +124,15 @@ class ModelSpec:
     prompt_cache_ttl: str | None = None  # anthropic: cache lifetime ("5m" or "1h"); None sends no cache marker
     price: Price | None = None  # dollars per million tokens; None with free=False is an unknown cost (C12)
     free: bool = False  # a model that costs nothing per token (hosted by the study): priced without a price
+    # the deployments' fingerprints the study declares the same model (B18); () checks against a baseline (C16)
+    accepted_fingerprints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """Refuse an entry whose settings break a rule, before any request can be built from it."""
+        """Keep the accepted fingerprints sorted, then refuse an entry whose settings break a rule, before any request
+        can be built from it."""
+        accepted = self.accepted_fingerprints
+        if isinstance(accepted, list | tuple) and all(isinstance(f, str) for f in accepted):
+            object.__setattr__(self, "accepted_fingerprints", tuple(sorted(accepted)))
         problems = _rule_problems(self)
         if problems:
             raise RuleViolation(self.key, problems)
@@ -185,6 +197,29 @@ def _rule_problems(spec: ModelSpec) -> list[str]:
     problems += _endpoint_problems(spec)
     problems += _limit_problems(spec)
     problems += _request_problems(spec)
+    problems += _fingerprint_problems(spec)
+    return problems
+
+
+def _fingerprint_problems(spec: ModelSpec) -> list[str]:
+    """Rules for the declared set of accepted fingerprints (B18): distinct, single, non-empty fingerprints, on a
+    backend whose replies carry one."""
+    accepted = spec.accepted_fingerprints
+    if not isinstance(accepted, tuple) or not all(isinstance(f, str) and f.strip() for f in accepted):
+        return ["accepted_fingerprints must be a list of non-empty strings"]
+    problems = [
+        f"accepted_fingerprints lists {f!r} twice" for f in sorted({f for f in accepted if accepted.count(f) > 1})
+    ]
+    problems += [
+        f"accepted_fingerprints entry {f!r} holds several fingerprints joined by {MIXED_FINGERPRINTS.strip()!r}; list "
+        "each on its own"
+        for f in accepted
+        if MIXED_FINGERPRINTS in f
+    ]
+    if accepted and spec.backend == "anthropic":
+        problems.append(
+            "accepted_fingerprints cannot apply to an anthropic model: its adapter records no system fingerprint"
+        )
     return problems
 
 
@@ -355,6 +390,7 @@ _ENTRY_KEYS = (
     "prompt_cache_ttl",
     "price",
     "free",
+    "accepted_fingerprints",
 )
 _PRICE_KEYS = ("input_per_mtok", "output_per_mtok", "cache_write_per_mtok", "cache_read_per_mtok")
 
@@ -446,7 +482,16 @@ def _entry_args(section: Section, key: str, backend: str) -> dict[str, Any]:
         "prompt_cache_ttl": section.optional_string("prompt_cache_ttl"),
         "price": _price(section),
         "free": _flag(section, "free"),
+        "accepted_fingerprints": _accepted(section),
     }
+
+
+def _accepted(section: Section) -> tuple[str, ...]:
+    """Read the optional set of accepted fingerprints (B18); a key that lists none is refused, as it declares nothing."""
+    accepted = section.strings("accepted_fingerprints")
+    if "accepted_fingerprints" in section.data and not accepted:
+        raise section.fail("accepted_fingerprints", "must list at least one fingerprint; leave it out to declare none")
+    return accepted
 
 
 def load_models(path: str | os.PathLike[str]) -> ModelTable:

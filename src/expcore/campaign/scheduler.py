@@ -184,7 +184,7 @@ class Scheduler:
         )
         self.stops = HarnessStops(store, cfg.harness_stop)
         self.reconcile_accounting()
-        self.identities = ServedIdentities(store, self.stamp)
+        self.identities = ServedIdentities(store, self.stamp, {m: self.models.resolve(m) for m in self.plan_models})
         self.budget = None
         if cfg.budget is not None:
             specs = {m: self.models.resolve(m) for m in self.plan_models}
@@ -259,7 +259,8 @@ class Scheduler:
                 finally:
                     await backend.aclose()
 
-            reason = asyncio.run(check())
+            # a model that declares accepted fingerprints is held to them by its probe's reply (B18)
+            reason = asyncio.run(check()) or self.identities.admit(model, backend, self.stamp())
             if reason is not None:
                 self.not_admitted[model] = reason
                 self.store.event(self.stamp(), "model_not_admitted", model, f"{model}: {reason}")

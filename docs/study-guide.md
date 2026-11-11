@@ -105,6 +105,42 @@ except ConfigError as error:
 shutil.rmtree(misspelt)
 ```
 
+### A model served by several deployments
+
+The scheduler checks that every reply of a run was served by the identity the model was first served with: its model id and its serving fingerprint (`system_fingerprint`). A run whose replies change either is set aside as `identity_kind` and run again. A load-balanced endpoint can serve one model id from several deployments, each with its own fingerprint, within one run, and then most long runs would be set aside. If the deployments are the same model (the same weights, the same precision), say so in the model's entry of `models.toml` with `accepted_fingerprints`, the fingerprints of those deployments. That decision is the study's; the core only records it and holds the runs to it:
+
+- A reply served under a fingerprint of the set is the model. One under any other fingerprint sets its run aside, as before, and so does a reply served by another model id.
+- The admission probe must be served by the model under a fingerprint of the set, or the model is not admitted.
+- A declared fingerprint is confirmed by the admission probe, or by the first run whose reply shows it. The probe reaches one deployment, so another is often confirmed only by a run. A fingerprint no reply has shown stays unconfirmed, and the report says so.
+- Each attempt records how many turns each fingerprint served. The export's `deployment_shares` and the report's "Deployments" section give, per model, each fingerprint's count and share of the analysed turns and runs, and how many runs more than one deployment served.
+- The set is in the campaign's fingerprint, so a resume under another set is refused. A model without the key is checked, recorded and fingerprinted as before.
+
+The key takes a list of fingerprints as your endpoint reports them; the `anthropic` backend records none, so it cannot take the key. The example's stubs report no fingerprint and declare none; a real model's entry would read:
+
+```python
+import tempfile
+
+from expcore.config.models import load_models
+
+with tempfile.TemporaryDirectory() as scratch:
+    table = Path(scratch) / "models.toml"
+    table.write_text(
+        """
+[models.relay-large]
+backend = "openai_compat"
+api_id = "vendor/relay-large"
+base_url = "https://llm.example.invalid/v1"
+key_env = "RELAY_KEY"
+status = "frozen"
+accepted_fingerprints = ["fp-southern-deploy", "fp-northern-deploy"]
+""",
+        encoding="utf-8",
+    )
+    relay = load_models(table).resolve("relay-large")
+assert relay.accepted_fingerprints == ("fp-northern-deploy", "fp-southern-deploy")  # a set: kept sorted
+assert study.models.resolve("alpha-stub").accepted_fingerprints == ()  # checked against a baseline, as before
+```
+
 ### What the budget reserves
 
 `[budget] max_usd` in `campaign.toml` is held by reserving, not by estimating. Before a run starts, the scheduler adds what has been spent, what the runs in flight can still cost and what this run can cost, and holds the run while that sum is over the ceiling. What a run can cost is its bound, which is what the gate reserves for it before dispatch: the loop's `token_budget` (in `[agent]`) at the model's dearest rate, the highest of its input, output and cache prices. The token budget is checked after each response, so a run can exceed its budget, and so its reservation, by up to one request (a prompt within the model's context window, plus the reply maximum), and it then ends as `token_cap`. `max_usd` can therefore be exceeded by that margin for each attempt in flight. Each run in flight is reserved its bound too, and an attempt that was killed, or whose usage was not reported, is charged its bound as spent. The mean cost of the runs so far decides nothing, because a run that overran it would pass the ceiling. `per_model_usd` caps single models the same way, and a model with neither a price nor `free = true` is held outright, since its cost is unknown.

@@ -76,6 +76,17 @@ CONDITION_NOTES = [
     "the dispatch column has none); a condition whose runs came late has a higher one.",
 ]
 
+DEPLOYMENT_NOTES = [
+    "A model listed here declares `accepted_fingerprints`: the deployments of its endpoint, each named by its serving",
+    "fingerprint, that the study decided are the same model. A reply served under any other fingerprint set its run",
+    "aside, so these counts are over the analysed runs alone. *Turns*: the analysed replies each fingerprint served,",
+    "and their share of the model's analysed replies. *Runs*: the analysed runs it served at least one reply of, and",
+    "their share of the model's analysed runs; a run served by two deployments counts for both, so the shares of runs",
+    "can add up to more than 100%. *Confirmed by*: the admission probe or the first run whose reply showed the",
+    "fingerprint under the model's own id; `unconfirmed` for a declared fingerprint no reply has shown. A run without",
+    "a recorded mix (one recovered from its outcome marker) is counted in neither column.",
+]
+
 COUNT_DEFINITIONS = [
     f"- *Kind* `{NO_KIND}`: the condition met no infrastructure failure and declares no treatment kind; every count is "
     "0.",

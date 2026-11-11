@@ -81,11 +81,13 @@ Core guarantees:
 - The scheduler builds the backend of a run from the endpoint the campaign admitted (`probe` succeeded once, B07), through a `BackendFactory` (below); a run never resolves a URL of its own (C14). A model that is not frozen (B08), whose settings cannot be sent together (B16) or, with a budget, has no price (C12) is refused before a run starts.
 - The backend is closed (`aclose`) after the executor returns, whatever happens.
 - Retries of transient errors, the served-model check and usage totals are the adapters' (B01 to B16); the stub adapter takes a script (`StubAdapter.use(script)`, items: text, a list of `(tool, arguments)`, `{"text", "stop"}`, a ready-made `ModelTurn`, or an exception it raises).
+- A model whose entry declares `accepted_fingerprints` (B18) is admitted only when its probe was served by the model (its `api_id` or an alias) under a fingerprint of the set. Admission reads what the probe's reply said it ran from the admission backend's `info()`, as `served_model_ids` and `system_fingerprints`, which the core's OpenAI-compatible adapter fills from the probe; a backend whose `info()` has neither confirms nothing at admission and is not refused for it. Each run's replies are then checked against the set instead of a fingerprint baseline, the served model id against its baseline as before (C16). A declared fingerprint is confirmed by the probe or by the first run whose reply shows it under the model's id, which is a record and not a gate; each attempt records the turns each fingerprint served, and the export's `deployment_shares` and the report's "Deployments" section give the shares. A model that declares no set is admitted, checked and fingerprinted as before.
 
 Implementer must guarantee:
 - `step` returns one reply per call. A token count the reply did not report is `None`, never 0 (R10).
 - A failure of the endpoint that outlasts the retries is raised as `InfraError("endpoint", ...)`; a refused key as `InfraError("key_rejected", ...)`. A reply cut at the output limit sets `stop_reason` to a limit stop.
 - `info()` and `transcript()` never contain a credential; the base URL has none (R12).
+- A backend of a study's own that serves a model declaring `accepted_fingerprints` sets `ModelTurn.system_fingerprint` on each reply that reports one, and after `probe` gives the probe's served model id and fingerprint in `info()` (`served_model_ids`, `system_fingerprints`, each a list); without them no declared fingerprint is confirmed at admission.
 - An executor that needs more than the protocol (the example's executor scripts the stub with `use`) checks for that method, never for a class, so a backend that wraps or replaces the stub serves it too.
 
 ### Retries of a reply

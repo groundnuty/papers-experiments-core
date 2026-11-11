@@ -38,6 +38,15 @@ set aside, not a population analysed. Without `excluded` the export has none of 
 `excluded_attempts` counts them with the other lists of runs.
 
 Empty lists are valid and must be written out: `read_export` rejects a file with a missing key.
+
+A campaign with a model that declares accepted fingerprints (B18, `expcore.campaign.identity`) also exports
+`deployment_shares`: per such model, each declared fingerprint (and any other its analysed turns carried) with the
+analysed turns and runs it served, their fractions, and whether the admission probe or a run confirmed it. The
+fractions of turns are over the turns of the model's analysed runs that recorded their mix; those of runs are over
+those runs, and a run served by two deployments counts for both, so they can add up to more than 1. `mixed_runs`
+counts the runs served by more than one, and `runs_without_mix` the analysed runs whose attempt recorded none (one
+recovery committed from its marker). A campaign without such a model has no `deployment_shares`, so its export is
+the one it had before the key.
 """
 
 import collections
@@ -50,6 +59,7 @@ from contextlib import AbstractContextManager
 from pathlib import Path, PurePath
 from typing import Any, Protocol
 
+from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, deployment_shares
 from expcore.campaign.factors import FactorSchema, RunKey
 from expcore.errors import CORE_KINDS
 
@@ -111,8 +121,10 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         for attempt in store.q("SELECT * FROM attempts ORDER BY id"):
             attempts[attempt["run_key"]].append(attempt)
         identities = {run["run_key"]: _identity(store, run) for run in runs}
+        declared = store.q("SELECT value FROM meta WHERE key=?", (ACCEPTED_META,))
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
+    scored: list[tuple[str, Any]] = []  # the model and the analysed attempt of each analysed run
     for run in runs:
         who, tried = identities[run["run_key"]], attempts[run["run_key"]]
         if run["status"] == "infra_exhausted":
@@ -139,6 +151,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
                     **_dispatch(done[0]),
                 }
             )
+            scored.append((who["factors"]["model"], done[0]))
         else:
             raise ExportError(f"run {run['run_key']}: unknown status {run['status']!r}")
     unknown = sorted(set(left_out) - {entry["run_key"] for entry in left})
@@ -158,6 +171,11 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         ),
         "kinds": _study_kinds(attempts, store.schema.treatment_kinds),
     }
+    if declared:  # only a campaign with a declared set has the key (B18)
+        try:
+            data["deployment_shares"] = deployment_shares(json.loads(declared[0]["value"]), scored)
+        except (ValueError, DeploymentsUnreadable) as error:
+            raise ExportError(f"the store's {ACCEPTED_META} cannot be exported: {error}") from None
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)

@@ -77,6 +77,8 @@ _ADDED_COLUMNS = (
     ("attempts", "dispatch_seq", "INTEGER"),  # place in the campaign's dispatch sequence; grows with every attempt
     ("attempts", "lease_wait_s", "REAL"),  # seconds waited for the lease the attempt ran under; NULL: none or unknown
     ("attempts", "lease_outcome", "TEXT"),  # how the lease was obtained (attempts.LEASE_OUTCOMES); NULL: unknown
+    # JSON [[fingerprint or null, turns], ...] of a model that declares accepted fingerprints (B18); NULL: none kept
+    ("attempts", "deployments", "TEXT"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -441,6 +443,11 @@ class Store:
     def running_attempts(self) -> list[sqlite3.Row]:
         """Return the attempts now marked running."""
         return self.q("SELECT id, run_key, run_dir FROM attempts WHERE state='running' ORDER BY id")
+
+    def record_deployments(self, attempt_id: int, mix: str) -> None:
+        """Keep an attempt's deployment mix (B18): the JSON pairs of a fingerprint and the turns it served. Called from
+        the `also` step of `finish_attempt`, it joins that transaction, so the mix stands or falls with the result."""
+        self.transact(lambda: self.db.execute("UPDATE attempts SET deployments=? WHERE id=?", (mix, attempt_id)))
 
     def finish_attempt(
         self, attempt_id: int, result: AttemptResult, max_attempts: int, *, also: Callable[[], None] | None = None

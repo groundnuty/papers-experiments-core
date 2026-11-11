@@ -54,6 +54,7 @@ from expcore.campaign.manifest import build_fingerprint
 from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
 from expcore.provenance.codestamp import require_known
@@ -125,6 +126,15 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
 
+def model_digest(spec: ModelSpec) -> str:
+    """The digest of a model entry in the campaign fingerprint: every field of it, its declared set of accepted
+    fingerprints only when it declares one (B18), so an entry without one keeps the digest it had before the key."""
+    entry = dataclasses.asdict(spec)
+    if not entry["accepted_fingerprints"]:
+        del entry["accepted_fingerprints"]
+    return _digest(entry)
+
+
 def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:
     """The environment of the study's code: the core and what `[study] requires` names, with their requirements."""
     try:
@@ -149,7 +159,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
     return build_fingerprint(
         study.schema,
         tasks={task.id: _digest(dict(task.attributes)) for task in study.tasks.values()},
-        models={key: _digest(dataclasses.asdict(study.models.resolve(key))) for key in study.campaign.models},
+        models={key: model_digest(study.models.resolve(key)) for key in study.campaign.models},
         seeds=study.campaign.seeds,
         caps=study.campaign.caps(),
         prompts=plugin.prompts,
