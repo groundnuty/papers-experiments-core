@@ -424,6 +424,19 @@ def test_r14_each_change_to_the_side_files_of_an_unpacked_package_fails_its_make
     assert named in done.stdout + done.stderr
 
 
+def test_r14_a_package_whose_package_json_records_another_declaration_fails_its_check(built, tmp_path):
+    """R14: the package's check compares the declaration PACKAGE.json records with its study.toml's, so a declaration
+    dropped from PACKAGE.json, with SHA256SUMS made to agree, fails it."""
+    root = unpack(built, tmp_path)
+    package = json.loads((root / PACKAGE_FILE).read_text(encoding="utf-8"))
+    package["side_files"] = DECLARED[:1]
+    (root / PACKAGE_FILE).write_text(json.dumps(package, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    resum(root)
+    assert verify_package(root) == [
+        f"{PACKAGE_FILE} records another declaration of side files than the package's study.toml"
+    ]
+
+
 def test_r14_a_package_whose_inclusion_list_leaves_a_side_file_out_is_refused(copy, hashes, tmp_path):
     """R14: the package's check needs every side file the replay check hashed, so a list that selects the records and
     leaves the side files out is refused, naming one."""
