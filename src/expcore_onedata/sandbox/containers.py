@@ -33,6 +33,9 @@ ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image'
 ONECLIENT_LOG_DIR = "/tmp/oneclient/0"  # where it writes its log unless told otherwise
 # The published REST client's settings (its environment), not names of any federation.
 ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
+# The client refuses to start without a token, so a REST agent's holds the configured placeholder (O21), never a
+# credential: the gate drops it with any other token the agent sends and adds its own.
+ENV_TOKEN = "ONEDATA_TOKEN"
 ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gate.TOKEN_ENV); the agent has no token
 ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
@@ -172,8 +175,9 @@ def agent_run_args(
 
     In REST mode the agent resolves the zone and the provider to the gate and trusts the run's CA. It holds no token
     and no other credential, in its environment or in a file: the gate adds the token to the requests it forwards, and
-    the sidecar owns the mount's (O05). In mount mode the read-only mount is bound in with `readonly`. With no data path
-    it has neither. Each read-only input, the run's own copy and the path the agent sees it at, is bound in with
+    the sidecar owns the mount's (O05). Its `ONEDATA_TOKEN` is the configured placeholder, which only lets the published
+    client start (O21); the gate drops it. In mount mode the read-only mount is bound in with `readonly`. With no data
+    path it has neither. Each read-only input, the run's own copy and the path the agent sees it at, is bound in with
     `readonly` too, in every data path (O20).
     """
     lim, uid = s.limits, s.agent_uid
@@ -196,12 +200,14 @@ def agent_run_args(
         for name in gate_hosts:
             args += ["--add-host", f"{name}:{gate_ip}"]
         env = dict.fromkeys(ENV_CA_BUNDLES, CA_PATH) | {ENV_ZONE_HOST: zone_host, ENV_VERIFY_SSL: "true"}
+        env[ENV_TOKEN] = s.placeholder_token  # not a credential: the client's start needs a value (O21)
     elif mode is DataPathMode.MOUNT:
         if share is None or s.mount is None:
             raise ValueError("a mount data path needs the shared mount point and [sandbox.mount]")
         args += ["--mount", f"type=bind,src={share},dst={s.mount.path},readonly,bind-propagation=rslave"]
     for copy, target in inputs:
         args += ["--mount", f"type=bind,src={copy},dst={target},readonly"]
-    for name in env:  # settings only, never a credential; their values travel in the docker client's environment
+    # settings and the placeholder, never a credential; their values travel in the docker client's environment
+    for name in env:
         args += ["-e", name]
     return [*args, image_id, "sleep", "infinity"], env

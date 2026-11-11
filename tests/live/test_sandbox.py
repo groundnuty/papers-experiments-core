@@ -143,8 +143,11 @@ def test_a_write_to_the_agents_root_is_refused_in_a_started_sandbox(config, host
 NO_CREDENTIAL = """
 import os, pathlib
 needle = {needle!r}.encode()
+placeholder = {placeholder!r}  # a REST agent's ONEDATA_TOKEN holds the placeholder, which is no credential (O21)
 hits = []
-for name in os.environ:
+for name, value in os.environ.items():
+    if (name, value) == placeholder:
+        continue
     if any(w in name.upper() for w in ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")):
         hits.append("an environment variable named like a credential")
 for pid in filter(str.isdigit, os.listdir("/proc")):
@@ -171,12 +174,16 @@ print("clean" if not hits else sorted(set(hits)))
 @needs_platform
 @pytest.mark.parametrize("level", LEVELS)
 def test_no_credential_is_visible_inside_the_agent_on_the_data_path_of_this_level(config, host, level):
-    """O05: the agent's code cannot read the data-path token: not in its environment, its files or its processes."""
+    """O05: the agent's code cannot read the data-path token: not in its environment, its files or its processes. The
+    one variable named like a token it may hold is a REST agent's ONEDATA_TOKEN, and only with the placeholder (O21)."""
+    from expcore_onedata.sandbox.containers import ENV_TOKEN
+
     spec = spec_for(config, level, f"live-cred-{int(time.time())}")
     sandbox = DockerSandbox.start(host, config.sandbox, spec)
     try:
         needle = spec.token.reveal() if spec.token is not None else "no-token-for-this-level"
-        result = sandbox.exec(NO_CREDENTIAL.format(needle=needle), 120)
+        placeholder = (ENV_TOKEN, config.sandbox.placeholder_token) if spec.mode is DataPathMode.REST else None
+        result = sandbox.exec(NO_CREDENTIAL.format(needle=needle, placeholder=placeholder), 120)
         assert result.stdout.strip() == "clean"
     finally:
         sandbox.stop()

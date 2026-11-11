@@ -22,6 +22,7 @@ import pytest
 
 from expcore_onedata.sandbox import gate
 from expcore_onedata.sandbox.hostops import DockerHost
+from expcore_onedata.sandbox.settings import PLACEHOLDER_TOKEN
 
 pytestmark = pytest.mark.skipif(shutil.which("openssl") is None, reason="the openssl command makes the run CA")
 
@@ -248,9 +249,9 @@ def test_o05_a_token_scope_inference_carries_the_gates_token_in_its_body(world):
     conn.close()
 
 
-# What an agent may send as a token: a plain placeholder, and an invented one shaped like a real token, which the agent
-# could have guessed.
-AGENT_TOKENS = ("placeholder", "MDAx-guessed-by-the-agent-0123")
+# What an agent may send as a token: the placeholder its environment holds on a REST data path by default (O21), and
+# an invented one shaped like a real token, which the agent could have guessed.
+AGENT_TOKENS = (PLACEHOLDER_TOKEN, "MDAx-guessed-by-the-agent-0123")
 # Every request header in which the platform reads a token (ctool `src/auth/tokens.erl`, `headers.hrl`): the access
 # token in X-Auth-Token, Authorization with Bearer, or the deprecated Macaroon, which it still parses; and the consumer
 # and service tokens it verifies beside the access token. It reads none from a query string.

@@ -9,6 +9,7 @@ from sandbox_support import COMPLETE_LEVEL, TOKEN, fail_copies, make_spec, start
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
+from expcore_onedata.sandbox.containers import ENV_TOKEN
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 
@@ -111,7 +112,12 @@ def where_a_credential_is_visible(world, sbx, token: str) -> list[str]:
     found = []
     if token in json.dumps(env):
         found.append("the environment")
-    found += [f"environment variable {n}" for n in env if any(w in n.upper() for w in CREDENTIAL_WORDS)]
+    placeholder = (ENV_TOKEN, world.s.placeholder_token)  # named like a token, holding the placeholder: none (O21)
+    found += [
+        f"environment variable {n}"
+        for n, v in env.items()
+        if any(w in n.upper() for w in CREDENTIAL_WORDS) and (n, v) != placeholder
+    ]
     if token in flat(agent) or any(token in word for word in agent.command):
         found.append("the process arguments")
     for source in bound_sources(agent):
@@ -134,6 +140,30 @@ def test_o05_no_credential_is_visible_inside_the_agent_on_any_data_path(world, l
     assert seen
     assert not [1 for argv, stdin in seen if TOKEN in " ".join(argv) or TOKEN in (stdin or "")]
     sbx.stop()
+
+
+def test_o21_a_rest_agent_holds_the_placeholder_as_its_token_and_the_gate_the_runs(world):
+    """O21, O05: the REST agent's ONEDATA_TOKEN is the configured placeholder, which is not the run's token; the gate's
+    environment holds the run's token. Neither container holds the other's value."""
+    sbx = start(world, "via-gate")
+    agent, gate = (world.host.containers[name].options["_env"] for name in (sbx.names.agent, sbx.names.gate))
+    assert agent[ENV_TOKEN] == world.s.placeholder_token != TOKEN
+    assert TOKEN not in json.dumps(agent)
+    assert world.s.placeholder_token not in json.dumps(gate)
+    sbx.stop()
+
+
+def test_o21_o05_a_placeholder_that_is_the_runs_token_refuses_the_start_before_anything_exists(world):
+    """O21, O05: a placeholder configured as the run's own token would put the token in the agent's environment; the
+    start is refused before anything is created, and the message names the key, never the value."""
+    from dataclasses import replace
+
+    settings = replace(world.s, placeholder_token=TOKEN)
+    with pytest.raises(StartRefused, match="placeholder_token") as caught:
+        DockerSandbox.start(world.host, settings, make_spec(world, "via-gate"), **start_options(world))
+    assert TOKEN not in str(caught.value)
+    assert nothing_left(world)
+    assert not [call for call in world.host.calls if call[:2] == ("docker", "run")]
 
 
 def test_o05_the_gate_holds_the_rest_token_in_its_environment_and_nowhere_on_disk_or_in_an_argument(world):

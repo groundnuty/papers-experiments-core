@@ -119,7 +119,36 @@ def test_the_rest_agent_trusts_only_the_runs_ca_and_resolves_the_hosts_to_the_ga
     assert env["SSL_CERT_FILE"] == C.CA_PATH
     names_given = {v for f, v in pairs(args) if f == "-e"}
     assert names_given == set(env)
-    assert not [n for n in names_given if any(w in n.upper() for w in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))]
+    credential_like = [
+        n for n in names_given if any(w in n.upper() for w in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))
+    ]
+    assert credential_like == [C.ENV_TOKEN]  # the placeholder alone (O21)
+    assert env[C.ENV_TOKEN] == s.placeholder_token
+
+
+@pytest.mark.parametrize("mode", list(DataPathMode))
+def test_o21_only_a_rest_agent_gets_the_placeholder_token_and_only_by_name(s, names, mode):
+    """O21: on a REST data path the agent's ONEDATA_TOKEN is the configured placeholder, so the published client
+    starts; it is named with -e, its value in the docker client's environment like every other. A mount or no data path
+    gets no token variable at all."""
+    extra = {
+        DataPathMode.REST: {
+            "gate_ip": "10.1.0.2",
+            "gate_hosts": ["z.test"],
+            "ca": Path("/w/ca.pem"),
+            "zone_host": "z.test",
+        },
+        DataPathMode.MOUNT: {"share": Path("/w/mount")},
+        DataPathMode.NONE: {},
+    }[mode]
+    args, env = agent(s, names, mode, **extra)
+    if mode is DataPathMode.REST:
+        assert C.ENV_TOKEN == "ONEDATA_TOKEN"  # the name the published client reads
+        assert env[C.ENV_TOKEN] == s.placeholder_token == "placeholder"
+        assert ("-e", C.ENV_TOKEN) in pairs(args)
+    else:
+        assert C.ENV_TOKEN not in env
+    assert not [a for a in args if a.startswith(f"{C.ENV_TOKEN}=")]  # never NAME=value
 
 
 def test_a_rest_agent_without_a_gate_is_refused(s, names):

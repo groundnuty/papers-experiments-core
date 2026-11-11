@@ -11,7 +11,8 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
     gate container, the agent's only network peer (O14);
   * REST data path: the data gate (gate.py, gatepolicy.py, gateboundary.py), whose files are mounted from this package,
     read-only. It holds the token, in its environment, and adds it to the requests it forwards, and no answer it passes
-    back holds the token; the agent holds no credential;
+    back holds the token; the agent holds no credential, only the placeholder token the published client needs to
+    start (O21), which the gate drops;
   * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
     propagation; the agent has neither the token, nor FUSE, nor a route to any host;
   * no data path: neither;
@@ -206,6 +207,10 @@ class DockerSandbox:
             raise StartRefused("a data path needs the agent's local provider")
         if sp.mode is DataPathMode.REST and sp.zone is None:
             raise StartRefused("a REST data path needs the zone")
+        if sp.mode is DataPathMode.REST and sp.token is not None and s.placeholder_token == sp.token.reveal():
+            raise StartRefused(  # the agent's environment would hold the run's token (O05, O21)
+                "[sandbox] placeholder_token is the run's data-path token: the agent may hold no credential"
+            )
         if sp.mode is DataPathMode.MOUNT and (s.mount is None or s.oneclient is None):
             raise StartRefused("a mount data path needs [sandbox.mount] and the oneclient image")
         if sp.listing not in gatepolicy.LISTINGS or (
