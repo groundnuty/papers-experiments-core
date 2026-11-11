@@ -47,6 +47,7 @@ class FakeFederation(MockOnedata):
         self.examine_hook: Callable[[dict], Any] | None = None
         self.status_override: int | None = None
         self.other_spaces: dict[str, str] = {}  # id -> name of the spaces besides the study space that Onezone knows
+        self.space_supports: dict[str, dict] = {}  # id -> supports of an added space, as the scope answer shows it
         self.users: dict[str, tuple[str, str]] = {}  # login name -> (password, user id)
         self._sequence = itertools.count(1)
 
@@ -55,13 +56,29 @@ class FakeFederation(MockOnedata):
         """Register a user who can log in with HTTP Basic and mint its own tokens."""
         self.users[username] = (password, user_id)
 
-    def grant(self, user: str, direct: Iterable[str], effective: Iterable[str] | None = None) -> None:
-        """Give a user's privileges in the study space, direct and effective (the same unless said otherwise)."""
+    def grant(
+        self, user: str, direct: Iterable[str], effective: Iterable[str] | None = None, *, space: str | None = None
+    ) -> None:
+        """Give a user's privileges in the study space (or the space `space` names), direct and effective (the same
+        unless said otherwise)."""
         direct = sorted(direct)
-        self.privileges[(self.SPACE_ID, user)] = {
+        self.privileges[(space or self.SPACE_ID, user)] = {
             "direct": direct,
             "effective": direct if effective is None else sorted(effective),
         }
+
+    def add_space(self, space_id: str, name: str, supports: Iterable[str]) -> None:
+        """Add a space besides the study space: Onezone knows its name, and a token's scope shows it supported by these
+        provider ids (`space_supports`), as a federation study's second space is."""
+        self.other_spaces[space_id] = name
+        self.space_supports[space_id] = {provider: {"readonly": False} for provider in supports}
+
+    def _scope(self) -> dict:
+        """The scope answer, with every added space beside the study space."""
+        answer = super()._scope()
+        for space_id, supports in self.space_supports.items():
+            answer["dataAccessScope"]["spaces"][space_id] = {"name": self.other_spaces[space_id], "supports": supports}
+        return answer
 
     def add_provider(self, provider_id: str, domain: str, *, supports: bool = True, online: bool = True) -> None:
         """Add a provider the federation reports; by default it supports the space."""

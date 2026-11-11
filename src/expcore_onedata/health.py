@@ -11,7 +11,8 @@ service principal, on the host and outside every run, and compares the providers
 declared set (`[support] providers`), matching them by provider id. The declared set is the only expectation: a
 multi-provider federation passes when it reports exactly its declared providers, and a provider that is reported but not
 declared fails the check as surely as a declared one that is missing. The check also fails when the space's name differs from the declared one or a declared
-provider is reported offline.
+provider is reported offline. With several spaces (`[[spaces]]`) the token reaches every declared space and each is
+checked against its own support set; the first that fails is named by its position (`spaces[i]`).
 
 An answer that cannot be read is unhealthy, never a crash and never a pass: any failure, including an unexpected
 exception, becomes `Health(False, reason)`. The reason names positions in the file (`providers[i]`), counts and the
@@ -41,8 +42,8 @@ from collections.abc import Callable
 from expcore.campaign.healthgate import Health
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
-from expcore_onedata.config import PlatformConfig
-from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, read_space
+from expcore_onedata.config import PlatformConfig, StudySpace
+from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
 from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
 from expcore_onedata.tls import WARNING
 from expcore_onedata.tokencheck import TokenRefused
@@ -64,17 +65,20 @@ def _reported_ids(reported: list[ReportedProvider]) -> str:
     return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
 
 
-def compare(view: SpaceView, config: PlatformConfig) -> Health:
-    """Compare the providers the federation reports for the space with the declared set; any difference fails.
+def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = None) -> Health:
+    """Compare the providers the federation reports for a space with its declared set; any difference fails.
 
-    Reported providers are matched to declared ones by provider id. A reported provider no declaration fits, and a
-    declared provider that more than one reported provider fits (or a reported provider that fits several declarations),
-    fail the check: the first match is never taken, so a second provider cannot hide behind the declared one.
+    `entry` is the declared space (`[[spaces]]`); without one it is the only space. Reported providers are matched to
+    declared ones by provider id. A reported provider no declaration fits, and a declared provider that more than one
+    reported provider fits (or a reported provider that fits several declarations), fail the check: the first match is
+    never taken, so a second provider cannot hide behind the declared one.
 
     The detail holds no configured name, host, URL or id (O12). A declared provider is `providers[i]`, its position in
     platform.toml; a provider no declaration fits is shown by the id the federation reports for it.
     """
-    if view.name != config.space.name:
+    entry = entry or config.study_space()
+    space, support = entry.space, entry.support
+    if view.name != space.name:
         return Health(False, "the study space is reported under another name than the declared one")
     matched: dict[str, list[bool]] = {}
     strangers: list[ReportedProvider] = []
@@ -88,8 +92,8 @@ def compare(view: SpaceView, config: PlatformConfig) -> Health:
         else:
             matched.setdefault(names[0], []).append(reported.online)
     ambiguous.update(name for name, online in matched.items() if len(online) > 1)
-    missing = set(config.support.providers) - set(matched)
-    unexpected = set(matched) - set(config.support.providers)
+    missing = set(support.providers) - set(matched)
+    unexpected = set(matched) - set(support.providers)
     if missing or strangers or unexpected or ambiguous:
         parts = []
         if missing:
@@ -132,7 +136,7 @@ class PlatformHealth:
         with self._lock:
             token = self._token
             if token is None or self._clock() > token.expires_at - REFRESH_BEFORE_S:
-                spec = data_path_spec(self._config.space.id)
+                spec = data_path_spec([entry.space.id for entry in self._config.spaces])  # every declared space
                 token = self._token = self._issuer.mint(spec, self._service, ceiling_s=TOKEN_CAP_S)
             return token
 
@@ -150,10 +154,19 @@ class PlatformHealth:
         return verdict
 
     def _space(self) -> Health:
-        """The space as Onezone reports it, against the declared support set; never raise."""
+        """Each declared space as Onezone reports it, against its declared support set; never raise.
+
+        The scope is read once, with a token that reaches every declared space. With several spaces the first space
+        that fails is named by its position (`spaces[i]`), and a pass names how many spaces were checked."""
         try:
-            view = read_space(self._client, self._current_token().reveal(), self._config.space.id)
-            return compare(view, self._config)
+            answer = self._client.query("/tokens/infer_access_token_scope", {"token": self._current_token().reveal()})
+            if len(self._config.spaces) == 1:
+                return compare(parse_scope(answer, self._config.space.id), self._config)
+            for entry in self._config.spaces:
+                verdict = compare(parse_scope(answer, entry.space.id), self._config, entry)
+                if not verdict.ok:
+                    return Health(False, f"{entry.position}: {verdict.detail}")
+            return Health(True, f"ok: each of the {len(self._config.spaces)} spaces is supported by its declared set")
         except _SAFE as error:
             return Health(False, f"health check failed: {error}")
         except Exception as error:

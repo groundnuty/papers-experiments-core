@@ -85,7 +85,7 @@ class StudySpace:
         return hashlib.sha256(text.encode()).hexdigest()
 
 
-def read_space(section: Section) -> Space:
+def parse_space(section: Section) -> Space:
     """Read a space's name, id and the prefixes the name must start with ([space], or an entry of [[spaces]])."""
     prefixes = section.strings("prefixes")
     if not prefixes or len(set(prefixes)) != len(prefixes):
@@ -96,7 +96,7 @@ def read_space(section: Section) -> Space:
     return Space(name, section.string("id"), prefixes)
 
 
-def read_support(section: Section, providers: Collection[str]) -> Support:
+def parse_support(section: Section, providers: Collection[str]) -> Support:
     """Read a support set ([support], or an entry of [[spaces]]) and check it against the declared providers."""
     names = section.strings("providers")
     if not names or len(set(names)) != len(names):
@@ -114,10 +114,10 @@ def _one_space(root: Section, providers: Collection[str]) -> tuple[StudySpace, .
     """Read the one-space form, [space] and [support], as the single space `spaces[0]`."""
     space_table = root.section("space")
     space_table.reject_unknown(SPACE_KEYS)
-    space = read_space(space_table)
+    space = parse_space(space_table)
     support_table = root.section("support")
     support_table.reject_unknown(SUPPORT_KEYS)
-    return (StudySpace(ONE_SPACE_LABEL, "spaces[0]", space, read_support(support_table, providers)),)
+    return (StudySpace(ONE_SPACE_LABEL, "spaces[0]", space, parse_support(support_table, providers)),)
 
 
 def _entry(entry: Section, position: str, providers: Collection[str]) -> StudySpace:
@@ -126,14 +126,14 @@ def _entry(entry: Section, position: str, providers: Collection[str]) -> StudySp
     label = entry.string("label")
     if not LABEL.fullmatch(label):
         raise entry.fail("label", "must be letters, digits, '_' and '-', starting with a letter")
-    support = read_support(entry, providers)
+    support = parse_support(entry, providers)
     holder = entry.optional_string("holder")
     if holder is not None and holder not in support.providers:
         raise entry.fail("holder", "must be one of the providers that support the space")
     tokens = entry.strings("tokens") if "tokens" in entry.data else PLANES
     if len(set(tokens)) != len(tokens) or any(plane not in PLANES for plane in tokens):
         raise entry.fail("tokens", f"must list token planes, each once; known: {', '.join(PLANES)}")
-    return StudySpace(label, position, read_space(entry), support, holder, tuple(tokens))
+    return StudySpace(label, position, parse_space(entry), support, holder, tuple(tokens))
 
 
 def _several(root: Section, providers: Collection[str]) -> tuple[StudySpace, ...]:
