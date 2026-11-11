@@ -97,7 +97,9 @@ try:
     load_study(misspelt)
     raise AssertionError("a health_kind that is no known kind was accepted")
 except ConfigError as error:
-    assert "campaign.toml" in str(error) and "key 'health_kind'" in str(error) and "did you mean 'sandbox'" in str(error)
+    message = str(error)
+    assert "campaign.toml" in message and "key 'health_kind'" in message
+    assert "did you mean 'sandbox'" in message
 shutil.rmtree(misspelt)
 ```
 
