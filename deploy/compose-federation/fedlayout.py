@@ -1,13 +1,16 @@
 """What the throwaway federation is: its services, ports, spaces, users, baseline files and where its data lives.
 
-Every name here is invented for this test federation. The one place on disk is the root (`EXPCORE_FED_ROOT`, default
-/mnt/volume2/expcore-federation): down removes it whole, and nothing else outside this directory is written. An
-override must lie at or below the default, with no link on the way, or every command refuses before it touches a file
-or a container: down deletes what the root holds.
+Every name here is invented for this test federation. The one place on disk is the root (`EXPCORE_FED_ROOT`): down
+removes it whole, and nothing else outside this directory is written. The root lies in the allowed parent
+(`EXPCORE_FED_ROOT_PARENT`, default /mnt/volume2/expcore-federation), with no link from the parent down to it, or every
+command refuses before it touches a file or a container: down deletes what the root holds. Under the default parent
+the root defaults to the parent itself; under any other parent the root must be named and lie strictly below it, so a
+parent that holds other data is never itself the root.
 """
 
 import hashlib
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -98,30 +101,68 @@ def baseline(space: str) -> tuple[BaselineFile, ...]:
     return (BaselineFile("beta.txt", 64),)
 
 
-def checked_root(value: str, base: Path = Path(DEFAULT_ROOT)) -> Path:
-    """The federation's root from a setting, refused unless it is an absolute path at or below `base` with no symbolic
-    link from `base` down to it: down deletes everything the root holds, so a root elsewhere, or one a link redirects,
-    would delete data the federation does not own."""
+def checked_parent(value: str) -> Path:
+    """The allowed parent from a setting, refused unless it is an absolute path other than `/`."""
     if not value or not os.path.isabs(value):
-        raise ValueError(f"EXPCORE_FED_ROOT must be an absolute path at or below {base}")
+        raise ValueError("EXPCORE_FED_ROOT_PARENT must be an absolute path")
+    parent = Path(os.path.normpath(value))
+    if parent == Path("/"):
+        raise ValueError("EXPCORE_FED_ROOT_PARENT may not be /: the root must lie in a directory of its own")
+    return parent
+
+
+def checked_root(value: str, base: Path = Path(DEFAULT_ROOT), *, strict: bool = False) -> Path:
+    """The federation's root from a setting, refused unless it is an absolute path at or below `base` (strictly below,
+    when `strict`) with no symbolic link from `base` down to it: down deletes everything the root holds, so a root
+    elsewhere, or one a link redirects, would delete data the federation does not own."""
+    where = "strictly below" if strict else "at or below"
+    if not value or not os.path.isabs(value):
+        raise ValueError(f"EXPCORE_FED_ROOT must be an absolute path {where} {base}")
     root = Path(os.path.normpath(value))
-    if root != base and base not in root.parents:
-        raise ValueError(f"EXPCORE_FED_ROOT must lie at or below {base}, the only place the federation may write")
+    if base not in root.parents and (strict or root != base):
+        raise ValueError(f"EXPCORE_FED_ROOT must lie {where} {base}, the only place the federation may write")
     for step in (base, *(p for p in reversed(root.parents) if base in p.parents), root):
         if step.is_symlink():
             raise ValueError(f"EXPCORE_FED_ROOT may not pass through a symbolic link ({step})")
     return root
 
 
+def root_from_environment(environ: Mapping[str, str]) -> tuple[Path, Path]:
+    """The allowed parent and the root, from EXPCORE_FED_ROOT_PARENT and EXPCORE_FED_ROOT.
+
+    Under the default parent the root may be the parent itself, and is by default, as it always was: down removes it
+    and up makes it again. Any other parent must exist, and the root must be named and lie strictly below it, so a
+    parent that holds other data is never used as the root and never emptied by down."""
+    configured = environ.get("EXPCORE_FED_ROOT_PARENT")
+    parent = checked_parent(DEFAULT_ROOT if configured is None else configured)
+    default = parent == Path(DEFAULT_ROOT)
+    value = environ.get("EXPCORE_FED_ROOT")
+    if value is None and not default:
+        raise ValueError(
+            f"EXPCORE_FED_ROOT must name a directory strictly below EXPCORE_FED_ROOT_PARENT ({parent}): a parent "
+            "other than the default is never the root itself"
+        )
+    root = checked_root(DEFAULT_ROOT if value is None else value, parent, strict=not default)
+    if root != parent and not parent.is_dir():
+        raise ValueError(f"EXPCORE_FED_ROOT_PARENT must be an existing directory ({parent})")
+    return parent, root
+
+
 @dataclass(frozen=True)
 class Layout:
-    """The paths below the federation's root."""
+    """The paths below the federation's root, and the allowed parent it was checked against."""
 
     root: Path
+    parent: Path = Path(DEFAULT_ROOT)
 
     @classmethod
-    def from_environment(cls) -> "Layout":
-        return cls(checked_root(os.environ.get("EXPCORE_FED_ROOT", DEFAULT_ROOT)))
+    def from_environment(cls, environ: Mapping[str, str] | None = None) -> "Layout":
+        parent, root = root_from_environment(os.environ if environ is None else environ)
+        return cls(root, parent)
+
+    @property
+    def parent_is_default(self) -> bool:
+        return self.parent == Path(DEFAULT_ROOT)
 
     @property
     def marker(self) -> Path:

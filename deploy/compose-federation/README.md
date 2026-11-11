@@ -37,8 +37,13 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
 - **Ports:** each service publishes its 443 on `127.0.0.1` only: the zone on 29443, `pine` on 29444, `birch` on
   29445, `cedar` on 29446. Nothing else is published. On the project's network the services reach one another by
   their domains (`zone.expcore-fed.test`, `pine.expcore-fed.test`, ...), which resolve nowhere else.
-- **Disk:** the root, `EXPCORE_FED_ROOT` (default `/mnt/volume2/expcore-federation`, mode 0700), and nothing outside
-  it:
+- **Disk:** the root, `EXPCORE_FED_ROOT` (mode 0700), and nothing outside it. The root must lie in the allowed parent,
+  `EXPCORE_FED_ROOT_PARENT` (default `/mnt/volume2/expcore-federation`), which must be absolute and not `/`, with no
+  symbolic link from it down to the root. Under the default parent the root defaults to the parent itself. A study
+  confined to a directory of its own names that directory as the parent; it must then exist, and `EXPCORE_FED_ROOT`
+  must be named and lie strictly below it, so a parent that holds other data is never itself the root. Every command
+  checks this before it touches a file or a container, and `facts.json` and `status` record the parent and which
+  setting gave it. Down deletes nothing in a root without the federation's mark (`.expcore-fed-root`). The root holds:
 
   | Path | Holds |
   |---|---|

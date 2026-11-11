@@ -239,6 +239,15 @@ def facts_of(boot: Bootstrap) -> dict:
         "ca_file": "ca/federation-ca.pem",
         "files": {"content": CONTENT_FILE, "listing_directory": LISTING_DIR, "listing_entries": LISTING_ENTRIES},
         "paths_relative_to": "the directory holding this file",
+        "root_parent": root_parent(boot.layout),
+    }
+
+
+def root_parent(layout: Layout) -> dict:
+    """Where the root was allowed to lie, and which setting said so: the day-0 report records it."""
+    return {
+        "path": str(layout.parent),
+        "set_by": "default" if layout.parent_is_default else "EXPCORE_FED_ROOT_PARENT",
     }
 
 
@@ -348,6 +357,8 @@ def down(layout: Layout) -> str:
 
 def status(layout: Layout) -> str:
     lines = project_containers() or ["no container of the project"]
+    parent = root_parent(layout)
+    lines.append(f"root parent: {parent['path']} ({parent['set_by']})")
     lines.append(f"facts: {'present' if layout.facts.exists() else 'absent'}")
     return "\n".join(lines)
 

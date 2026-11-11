@@ -142,6 +142,7 @@ def test_the_committed_template_renders_into_a_platform_file_the_layer_loads(fed
 
     layout = fed.layout
     boot = Bootstrap.__new__(Bootstrap)
+    boot.layout = layout.Layout(tmp_path)
     boot.ids = Ids(
         users={user: f"u{i}" for i, user in enumerate(layout.PRINCIPALS)},
         providers={p.name: f"p{i}" for i, p in enumerate(layout.PROVIDERS)},
@@ -149,7 +150,9 @@ def test_the_committed_template_renders_into_a_platform_file_the_layer_loads(fed
     )
     platform = tmp_path / "platform.toml"
     template = layout.TEMPLATE.read_text(encoding="utf-8")
-    platform.write_text(fed.cli.render(template, fed.cli.placeholders(fed.cli.facts_of(boot))), encoding="utf-8")
+    facts = fed.cli.facts_of(boot)
+    assert facts["root_parent"] == {"path": layout.DEFAULT_ROOT, "set_by": "default"}
+    platform.write_text(fed.cli.render(template, fed.cli.placeholders(facts)), encoding="utf-8")
     (tmp_path / "ca").mkdir()
     fed.pki.make_ca(tmp_path / "ca" / "federation-ca.pem", tmp_path / "ca.key", "test CA")
     config = load_platform(platform, require_secrets=False)
@@ -177,6 +180,7 @@ def test_the_committed_template_renders_into_a_platform_file_the_layer_loads(fed
 def test_a_root_outside_the_allowed_directory_is_refused_before_anything_is_touched(fed, value, monkeypatch, capsys):
     """Down deletes everything the root holds, so a root that is not at or below the allowed directory is refused, by
     the command itself, before it writes a file or starts a container."""
+    monkeypatch.delenv("EXPCORE_FED_ROOT_PARENT", raising=False)
     monkeypatch.setenv("EXPCORE_FED_ROOT", value)
     touched = []
     for name in ("up", "reset", "down", "status"):
@@ -196,6 +200,85 @@ def test_a_root_through_a_link_is_refused_and_one_below_the_base_is_accepted(fed
     assert fed.layout.checked_root(str(base), base) == base
     with pytest.raises(ValueError, match="symbolic link"):
         fed.layout.checked_root(str(base / "linked" / "data"), base)
+
+
+def parent_cases(tmp: Path) -> dict[str, tuple[dict[str, str], str]]:
+    """Settings of a non-default parent that every command refuses, each with the words its refusal must hold."""
+    allowed = tmp / "study"
+    (allowed / "other-data").mkdir(parents=True)
+    (allowed / "link").symlink_to(tmp)
+    (tmp / "linked-parent").symlink_to(allowed)
+    return {
+        "relative parent": ({"EXPCORE_FED_ROOT_PARENT": "study", "EXPCORE_FED_ROOT": str(allowed / "f")}, "absolute"),
+        "the filesystem root": ({"EXPCORE_FED_ROOT_PARENT": "/", "EXPCORE_FED_ROOT": "/fed"}, "may not be /"),
+        "missing parent": (
+            {"EXPCORE_FED_ROOT_PARENT": str(tmp / "absent"), "EXPCORE_FED_ROOT": str(tmp / "absent" / "f")},
+            "existing directory",
+        ),
+        "root not named": ({"EXPCORE_FED_ROOT_PARENT": str(allowed)}, "strictly below"),
+        "root is the parent": (
+            {"EXPCORE_FED_ROOT_PARENT": str(allowed), "EXPCORE_FED_ROOT": str(allowed)},
+            "strictly below",
+        ),
+        "root outside": ({"EXPCORE_FED_ROOT_PARENT": str(allowed), "EXPCORE_FED_ROOT": str(tmp / "f")}, "below"),
+        "root through a link": (
+            {"EXPCORE_FED_ROOT_PARENT": str(allowed), "EXPCORE_FED_ROOT": str(allowed / "link" / "f")},
+            "symbolic link",
+        ),
+        "parent is a link": (
+            {"EXPCORE_FED_ROOT_PARENT": str(tmp / "linked-parent"), "EXPCORE_FED_ROOT": str(tmp / "linked-parent/f")},
+            "symbolic link",
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "relative parent",
+        "the filesystem root",
+        "missing parent",
+        "root not named",
+        "root is the parent",
+        "root outside",
+        "root through a link",
+        "parent is a link",
+    ],
+)
+def test_a_configured_parent_gets_every_check_and_its_root_must_lie_strictly_below_it(
+    fed, case, tmp_path, monkeypatch, capsys
+):
+    """A study confined to its own directory names it as the parent: it must be absolute, existing and not `/`, with no
+    link from it down to the root, and the root must be named and lie strictly below it, so a parent holding other data
+    is never the root that down empties. Every command refuses before it touches anything."""
+    environ, words = parent_cases(tmp_path)[case]
+    monkeypatch.delenv("EXPCORE_FED_ROOT", raising=False)
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+    touched = []
+    for name in ("up", "reset", "down", "status"):
+        monkeypatch.setattr(fed.cli, name, lambda layout, name=name: touched.append(name))
+    assert fed.cli.main(["down"]) == 2
+    assert touched == []
+    err = capsys.readouterr().err
+    assert words in err
+    assert "EXPCORE_FED_ROOT" in err
+
+
+def test_a_configured_parent_takes_a_root_strictly_below_it_and_the_default_keeps_todays_root(fed, tmp_path):
+    allowed = tmp_path / "study"
+    allowed.mkdir()
+    environ = {"EXPCORE_FED_ROOT_PARENT": str(allowed), "EXPCORE_FED_ROOT": str(allowed / "fed" / "one")}
+    layout = fed.layout.Layout.from_environment(environ)
+    assert (layout.parent, layout.root) == (allowed, allowed / "fed" / "one")
+    assert not layout.parent_is_default
+    default = fed.layout.Layout.from_environment({})
+    assert default.root == default.parent == Path(fed.layout.DEFAULT_ROOT)
+    assert default.parent_is_default
+    named = fed.layout.Layout.from_environment({"EXPCORE_FED_ROOT_PARENT": fed.layout.DEFAULT_ROOT})
+    assert named == default  # the default named explicitly is still the default
+    assert fed.cli.root_parent(layout) == {"path": str(allowed), "set_by": "EXPCORE_FED_ROOT_PARENT"}
+    assert fed.cli.root_parent(default)["set_by"] == "default"
 
 
 def test_the_janitor_deletes_nothing_in_a_root_without_the_federations_mark(fed):
