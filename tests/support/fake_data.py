@@ -20,7 +20,9 @@ waits. A test bends the fake through plain attributes:
 - `onthefly_places`: False makes a range read answer without ever adding a block (a provider that does not cache);
 - `transfers_place_blocks`: False makes a replication end as `completed` with no block placed (the O01 fake);
 - `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks;
-- `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at all;
+- `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at all,
+  each answered `transfer_unseen_answer` (a 404 by default); a fresh space root answers `root_enoent_answer` (a 404 of
+  posix enoent by default) for `root_enoent_polls` reads;
 - `resets`: a list of `[substring, count]` or `[substring, count, provider id]`: the next `count` provider calls whose
   route contains the substring (to that provider, when named) fail with a connection reset;
 - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
@@ -128,6 +130,8 @@ class FakeData(FakeFederation):
         self.transfer_flip_after = 1
         self.transfer_visible_after = 0
         self.root_enoent_polls = 0
+        self.root_enoent_answer: tuple[int, str | None, str | None] = (404, "posix", "enoent")  # a fresh root's
+        self.transfer_unseen_answer: tuple[int, str | None, str | None] = (404, "notFound", None)  # a job not seen yet
         self.page_size = 1000
         self.id_suffix = ""  # appended to every file id made from now on, for ids with characters like "="
         self.fail_deletes = False  # every DELETE answers 500
@@ -269,8 +273,12 @@ class FakeData(FakeFederation):
         kept = self.deleted_parents or {}
         if method == "GET" and file_id in kept and query.get("attribute") == "parent_id":
             return httpx.Response(200, json={"parent_id": kept[file_id]})
-        status, error_id, errno = self.missing_answer
-        if error_id is None:  # a body that is no error object at all
+        return self._answer(self.missing_answer)
+
+    def _answer(self, answer: tuple[int, str | None, str | None]) -> httpx.Response:
+        """An error answer from (status, error id, errno); an error id of None is a body that is no error object."""
+        status, error_id, errno = answer
+        if error_id is None:
             return httpx.Response(status, text="<html><body>Bad Request</body></html>")
         return self._error(status, error_id, errno)
 
@@ -385,7 +393,7 @@ class FakeData(FakeFederation):
             return self._error(404, "notFound")
         self._root_polls += 1
         if self._root_polls <= self.root_enoent_polls:
-            return httpx.Response(404, json={"error": {"id": "posix", "details": {"errno": "enoent"}}})
+            return self._answer(self.root_enoent_answer)
         return httpx.Response(200, json={"fileId": ROOT_ID, "name": self.space_name})
 
     def _attributes(self, node: Node) -> dict:
@@ -532,7 +540,7 @@ class FakeData(FakeFederation):
             return self._error(404, "notFound")
         transfer.asked += 1
         if transfer.asked <= self.transfer_visible_after:
-            return self._error(404, "notFound")
+            return self._answer(self.transfer_unseen_answer)
         if not transfer.ended and transfer.asked > self.transfer_visible_after + self.transfer_flip_after:
             self.end_transfer(tid)
         state = "completed" if transfer.ended else "scheduled" if transfer.waiting else "active"

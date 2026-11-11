@@ -111,6 +111,70 @@ def test_o07_a_space_root_failing_for_another_reason_is_not_waited_out(provision
     assert ticker.slept == []
 
 
+OTHER_400S = [(400, "posix", "eacces"), (400, "posix", None), (400, "badValueNotAllowed", None), (400, None, None)]
+
+
+@pytest.mark.parametrize("answer", [(404, "posix", "enoent"), (400, "posix", "enoent")])
+def test_o07_a_fresh_space_root_answered_404_or_400_posix_enoent_is_waited_out(provisioner, seeded, ticker, answer):
+    """O07: a fresh space's root that is not there yet, answered with a 404 or, as Onedata 25.0 answers it, with 400
+    posix enoent, is waited out until it arrives within the bound."""
+    seeded.root_enoent_polls = 3
+    seeded.root_enoent_answer = answer
+    assert provisioner.root() == "root-0001"
+    assert len(ticker.slept) == 3
+
+
+@pytest.mark.parametrize("answer", OTHER_400S)
+def test_o07_a_space_root_answered_any_other_400_is_raised_at_once_and_never_waited_for(
+    provisioner, seeded, ticker, answer
+):
+    """O07: any other 400 (another errno, none, another id, a body that is no error object) is no "not there yet":
+    the root read fails closed at once, never waited out as if the root were coming."""
+    seeded.root_enoent_polls = 3
+    seeded.root_enoent_answer = answer
+    with pytest.raises(PlatformError) as raised:
+        provisioner.root()
+    assert raised.value.status == 400
+    assert ticker.slept == []
+
+
+@pytest.mark.parametrize("answer", [(404, "notFound", None), (400, "posix", "enoent")])
+def test_o07_a_transfer_not_seen_yet_answered_404_or_400_posix_enoent_is_waited(provisioner, seeded, ticker, answer):
+    """O07: a job its provider does not show yet, answered with a 404 or 400 posix enoent, is waited for like a running
+    one, and counts once it has ended."""
+    seeded.transfer_visible_after = 3
+    seeded.transfer_unseen_answer = answer
+    provisioner.replicate(PATH, "beta")
+    assert len(ticker.slept) >= 3
+
+
+@pytest.mark.parametrize("answer", OTHER_400S)
+def test_o07_a_transfer_answered_any_other_400_fails_closed_and_is_never_waited(provisioner, seeded, ticker, answer):
+    """O07: any other 400 for a job is no "not visible yet": the wait raises at once instead of polling on."""
+    seeded.transfer_visible_after = 3
+    seeded.transfer_unseen_answer = answer
+    with pytest.raises(PlatformError) as raised:
+        provisioner.replicate(PATH, "beta")
+    assert raised.value.status == 400
+    assert ticker.slept == []
+
+
+@pytest.mark.parametrize(("answer", "gone"), [((400, "posix", "enoent"), True), *((a, False) for a in OTHER_400S)])
+def test_o11_the_data_providers_read_shows_a_file_gone_on_400_posix_enoent_and_on_no_other_400(
+    provisioner, seeded, answer, gone
+):
+    """O11: the read teardown confirms absence with says gone on a 404 or exactly 400 posix enoent. Any other 400 is no
+    absence: the read raises, so a poll can never count it as gone."""
+    file_id = provisioner.put_file("scratch/a.bin", DATA)
+    seeded.answer_missing_as_25(answer)
+    seeded._delete(file_id)
+    if gone:
+        assert provisioner._gone(file_id) is True
+    else:
+        with pytest.raises(PlatformError):
+            provisioner._gone(file_id)
+
+
 def test_o09_a_space_whose_live_name_is_outside_the_prefixes_is_refused(provisioner, seeded):
     """O09: the live name is read before anything changes; one outside the prefixes stops every mutation."""
     seeded.space_name = "unrelated-space"

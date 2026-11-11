@@ -27,12 +27,13 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from expcore_onedata.client import OnezoneClient, PlatformError
+from expcore_onedata.client import OnezoneClient, PlatformError, answered_absent
 
 # The states in which a transfer has ended: the earlier study's working code stopped polling at these four.
 ENDED_STATES = ("completed", "failed", "cancelled", "skipped")
 STATE_FIELDS = ("transferStatus", "replicationStatus", "evictionStatus")
-NOT_FOUND = 404  # the provider's answer for a file or a transfer that is not there (yet)
+# A file or a transfer that is not there (yet) is told by `client.answered_absent`, the one rule for it: a 404, or
+# exactly Onedata 25.0's 400 posix enoent. Any other answer, another 400 among them, is never "not there yet".
 
 
 class WaitTimeout(RuntimeError):
@@ -139,7 +140,8 @@ def wait_transfers(
 ) -> TransferReport:
     """Poll each transfer until it has ended, or `timeout_s`. An ended transfer is a report, not evidence of placement.
 
-    A transfer the provider does not show yet (a 404) is pending, like a running one. Any other failure propagates.
+    A transfer the provider does not show yet (`answered_absent`: a 404 or 400 posix enoent) is pending, like a running
+    one. Any other failure, another 400 included, propagates at once.
     """
     guard()
     pending = list(dict.fromkeys(transfer_ids))
@@ -150,7 +152,7 @@ def wait_transfers(
             try:
                 record = client.get(f"/transfers/{tid}", provider=provider)
             except PlatformError as error:
-                if error.status != NOT_FOUND:
+                if not answered_absent(error):
                     raise
                 continue
             if transfer_state(record) in ENDED_STATES:
@@ -183,15 +185,16 @@ def space_root(
 ) -> str:
     """Return the id of the space's root directory on a provider, waiting out "no such file" on a fresh space.
 
-    Only a 404 is waited out, and at most `tries` times; any other answer, and the last 404, propagate. This is a
-    consistency wait (O07), not a probe: a probe records its failure instead (O08, `probes.py`).
+    Only "not there yet" (`answered_absent`: a 404, or 25.0's 400 posix enoent) is waited out, and at most `tries`
+    times; any other answer, another 400 included, and the last absence, propagate. This is a consistency wait (O07),
+    not a probe: a probe records its failure instead (O08, `probes.py`).
     """
     guard()
     for attempt in range(1, tries + 1):
         try:
             answer = client.get(f"/spaces/{space_id}", provider=provider)
         except PlatformError as error:
-            if error.status != NOT_FOUND or attempt == tries:
+            if not answered_absent(error) or attempt == tries:
                 raise
             sleep(wait_s)
             continue
