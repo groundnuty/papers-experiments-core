@@ -503,10 +503,14 @@ class DockerSandbox:
         left = []
         for path in only or tuple(self._token_files):
             self.host.run(["rm", "-f", str(path)], 20, sudo=True)
-            if path.exists():
+            if os.path.lexists(path):
                 left.append(path)
         if left:
             raise SandboxError(f"{len(left)} of the run's copies of the data-path token could not be removed")
+
+    def _token_files_left(self) -> bool:
+        """Whether any of the run's copies of the token is still on the host: looked at, never assumed from a step."""
+        return any(os.path.lexists(path) for path in self._token_files)
 
     def _start_mount(self) -> Path:
         """Start the oneclient sidecar on a shared mount point; its token goes in a file bound into it alone, read-only,
@@ -1061,6 +1065,13 @@ class DockerSandbox:
             # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)
             errors.append(
                 "the run directory is left where it is: a mount under it may be live, or one of its own elsewhere"
+            )
+            return
+        if self.keep_evidence and self._token_files_left():  # a secret is never evidence: the run stays where it is
+            self._meta["evidence_kept"]["left_in_place"] = "a copy of the data-path token could not be removed"
+            errors.append(
+                "the run directory is left where it is: a copy of the data-path token in it could not be removed, "
+                "so it is not kept as evidence"
             )
             return
         if self.keep_evidence:  # the copy failed: the disks hold the only record of the run

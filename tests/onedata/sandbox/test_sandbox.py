@@ -301,6 +301,33 @@ def test_o05_the_token_files_go_before_the_ordered_teardown_and_whatever_it_does
     sbx.stop()
 
 
+def test_o05_a_run_whose_token_file_cannot_be_removed_is_not_moved_into_the_kept_evidence(world):
+    """O05: a secret is never evidence. When the host's copy of the token cannot be removed, the run directory that
+    holds it is left where it is and the teardown says why, rather than moving the file into the evidence; once the
+    file can go, the next teardown keeps the evidence."""
+    sbx = start(world, "mounted")
+    sbx.keep_evidence = True
+    leftover = sbx.dir / TOKEN_FILE  # as a start cut short before the mount appeared would leave it
+    leftover.write_text(TOKEN, encoding="utf-8")
+
+    def busy(argv):
+        if "-f" in argv and argv[-1] == str(leftover):
+            return CmdResult(1, "", "busy")
+        return world.host._run_default(argv)
+
+    world.host.run_handlers["rm"] = busy
+    with pytest.raises(SandboxError, match="token"):
+        sbx.stop()
+    kept = world.s.work_root / "_kept_evidence" / sbx.sid
+    assert leftover.exists()
+    assert not kept.exists()
+    assert sbx.metadata()["evidence_kept"]["relocated"] is False
+    world.host.run_handlers.clear()
+    sbx.stop()
+    assert kept.is_dir()
+    assert not [p for p in kept.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+
+
 def plant_token_file(world, run_directory: str, relative: Path, *, age_s: float) -> Path:
     """A file of the data-path token as a run killed outright leaves it: in a run directory of the root, written `age_s`
     seconds ago."""
