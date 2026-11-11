@@ -16,11 +16,14 @@ attempt is discarded, and so are all the attempts of an exhausted run. Interrupt
 attempts are reported in their own rows of `discarded_usage`, never folded into one another.
 
 Infrastructure retries are grouped by the kind from the closed vocabulary in `expcore.errors`, each under its own name
-(C02). `infrastructure_by_condition` adds, per condition and kind, how many attempts were set aside and run again and
-how many were scored as treatment, with the kinds each condition declares, so a reader sees whether a condition's
-fault was measured or re-run away. Field names are generic: a run is named by its key, its condition, its model and its
-factor values. The file is written to a temporary file in its directory and moved into place, so a reader sees the old
-file or the new one; it is owner-only (0600), because an export can carry study data.
+(C02), per condition and model; an outage-discarded attempt is counted under the outage's kind.
+`infrastructure_by_condition` adds, per condition and kind, how many attempts were set aside and run again and how many
+were scored as treatment, with the kinds each condition declares, so a reader sees whether a condition's fault was
+measured or re-run away. `budget_holds` counts, per condition and model the plan runs (a row of zeros for a pair with
+none), the attempts a budget hold ended (C26), by the kind of their own outcome, so an outage that overlapped one does
+not hide it. Field names are generic: a run is named by its key, its condition, its model and its factor values. The
+file is written to a temporary file in its directory and moved into place, so a reader sees the old file or the new
+one; it is owner-only (0600), because an export can carry study data.
 
 Each analysed attempt also says when and how it began (`dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`), so
 an analysis can check the balance of the conditions over time: holds and unit caps can push one condition's runs late.
@@ -61,7 +64,7 @@ from typing import Any, Protocol
 
 from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, deployment_shares
 from expcore.campaign.factors import FactorSchema, RunKey
-from expcore.errors import CORE_KINDS
+from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
 FORMAT = "campaign-export-1"
 RUN_LISTS = ("exhausted_runs", "unfinished_runs", "analysed_attempts")
@@ -73,6 +76,7 @@ REQUIRED_KEYS = (
     "discarded_usage",
     "retries_by_kind",
     "infrastructure_by_condition",
+    "budget_holds",
     "kinds",
 )
 _DISCARDED_STATES = ("infra_fail", "outage_discarded", "interrupted", "harness_error")
@@ -169,6 +173,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         "infrastructure_by_condition": _infrastructure_by_condition(
             identities, attempts, store.schema.treatment_kinds, None if excluded is None else frozenset(left_out)
         ),
+        "budget_holds": _budget_holds(identities, attempts),
         "kinds": _study_kinds(attempts, store.schema.treatment_kinds),
     }
     if declared:  # only a campaign with a declared set has the key (B18)
@@ -283,6 +288,22 @@ def _retries_by_kind(identities: dict[str, dict], attempts: dict[str, list[Any]]
     return [
         {"condition": condition, "model": model, "kind": kind, "state": state, "charged": charged, "attempts": n}
         for (condition, model, kind, state, charged), n in sorted(counts.items(), key=_none_last)
+    ]
+
+
+def _budget_holds(identities: dict[str, dict], attempts: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    """Count the attempts a budget hold ended, per condition and model, with a row of zeros for each pair the plan runs.
+
+    An attempt is counted by the kind of its own outcome, `infra_kind`, whatever outage overlapped it: `retries_by_kind`
+    counts an outage-discarded attempt under the outage's kind, which would hide that the budget stopped it (C26).
+    """
+    counts = collections.Counter({(who["condition"], who["factors"]["model"]): 0 for who in identities.values()})
+    for key, tried in attempts.items():
+        who = identities[key]
+        counts[(who["condition"], who["factors"]["model"])] += sum(a["infra_kind"] == BUDGET_HOLD for a in tried)
+    return [
+        {"condition": condition, "model": model, "attempts": n}
+        for (condition, model), n in sorted(counts.items(), key=_none_last)
     ]
 
 

@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata import consistency
-from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
+from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, answered_absent
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncovered
 from expcore_onedata.rangemap import PlacementSettings, safe_path
@@ -44,6 +44,13 @@ LISTING_LIMIT = 1000
 _SEGMENT = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # the charset of a file id the client accepts
 LISTING_ATTRIBUTES = ["name", "file_id", "size", "type"]  # Onedata 25 names attributes in snake case
 SHORT_FILES_SHOWN = 50
+# An eviction scheduled right after a provider fetched the bytes on the fly completes on Onedata 25.0 with
+# filesEvicted 0 and removes nothing, whichever provider schedules it; the same eviction about 30 s later works. So
+# while the block map still shows bytes after an eviction has ended, it is scheduled again after a pause, at most this
+# many times in all; each check waits this long for the map to show the provider empty.
+EVICTION_ATTEMPTS = 5
+EVICTION_RETRY_PAUSE_S = 10.0
+EVICTION_CHECK_S = 10.0
 
 
 class ProvisionError(RuntimeError):
@@ -118,7 +125,7 @@ class TeardownReport:
 
     @property
     def ok(self) -> bool:
-        """True when everything the log says was created is gone."""
+        """True when everything the log says was created is gone, as the data provider reads it (#114)."""
         return not self.left
 
     def raise_if_left(self) -> None:
@@ -174,6 +181,7 @@ class Provisioner:
         self._clock, self._sleep = clock, sleep
         self._verified_name: str | None = None
         self._root: str | None = None
+        self._visible: set[tuple[str, str]] = set()  # (provider, file id) seen at its size there (`await_visible`)
 
     @property
     def settings(self) -> PlacementSettings:
@@ -346,6 +354,32 @@ class Provisioner:
             raise ProvisionError("the size read back after an upload is not the size uploaded")
         return file_id
 
+    # -- visibility ------------------------------------------------------------
+    def await_visible(self, provider: str, file_ids: Iterable[str]) -> float:
+        """Wait, bounded, until a provider sees each file at its size on the data provider; return the seconds waited.
+
+        A file written through the data provider is not visible through another at once (Onedata 25.0 answers it with
+        a 404 or 400 posix enoent for some seconds), so a read or a transfer through that provider waits here first
+        (`consistency.wait_visible`, bounded by `VISIBLE_TIMEOUT_S`; past it, `NotVisible` names the provider by its
+        label, and any other error fails closed). The data provider, the writer, needs no wait, and a provider and file
+        seen once are not asked again. Instruments never call this: a probe records what it reads (O08)."""
+        if provider == self._settings.holder:
+            return 0.0
+        waited = 0.0
+        for file_id in file_ids:
+            if (provider, file_id) in self._visible:
+                continue
+            size = self._client.get(
+                f"/data/{_segment(file_id)}", provider=self._settings.holder, params={"attribute": "size"}
+            ).get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise PlatformError("the data provider's answer for a file's size holds no size")
+            waited += consistency.wait_visible(
+                self._client, provider, _segment(file_id), size=size, clock=self._clock, sleep=self._sleep
+            )
+            self._visible.add((provider, file_id))
+        return round(waited, 3)
+
     # -- block maps ------------------------------------------------------------
     def blocks(self, file_id: str, provider: str, *, reader: str | None = None) -> list[Range]:
         """Return the blocks a provider holds of a file, read from the block map as the `reader` provider sees it."""
@@ -377,9 +411,10 @@ class Provisioner:
         """Read a range of a file through a provider, which fetches what it lacks; return the bytes.
 
         This is a range read and never a transfer job (O02). It is gated like a mutation, because it changes the
-        provider's block map.
+        provider's block map. The provider must see the file first (`await_visible`).
         """
         self._verified()
+        self.await_visible(provider, [file_id])
         return self._client.read_range(
             f"/data/{_segment(file_id)}/content",
             provider=provider,
@@ -407,12 +442,14 @@ class Provisioner:
         report = result.value if result.value is not None else PlacementReport(len(wanted), 0, len(wanted), 0, ())
         return Confirmation(result.converged, report, len(result.checks), round(self._clock() - began, 3))
 
-    def require_empty(self, provider: str, file_ids: list[str]) -> Confirmation:
-        """Wait for `provider` to hold nothing of these files, by consecutive block-map polls; raise NotPlaced if not."""
+    def require_empty(self, provider: str, file_ids: list[str], *, timeout_s: float | None = None) -> Confirmation:
+        """Wait for `provider` to hold nothing of these files, by consecutive block-map polls; raise NotPlaced if not.
+
+        The wait is bounded by `timeout_s`, the settings' `settle_timeout_s` unless given."""
         result = consistency.converge(
             lambda: self.holds(provider, file_ids),
             lambda held: held == 0,
-            timeout_s=self._settings.settle_timeout_s,
+            timeout_s=self._settings.settle_timeout_s if timeout_s is None else timeout_s,
             poll_s=self._settings.poll_s,
             consecutive=self._settings.consecutive_polls,
             clock=self._clock,
@@ -425,8 +462,10 @@ class Provisioner:
 
     # -- transfers -------------------------------------------------------------
     def _schedule(self, kind: str, file_id: str, provider: str) -> str:
+        """Schedule a replication to, or an eviction from, a provider, through it, once it sees the file."""
         field_name = "replicatingProviderId" if kind == "replication" else "evictingProviderId"
         self._verified()
+        self.await_visible(provider, [file_id])
         answer = self._client.mutate(
             "POST",
             "/transfers",
@@ -485,42 +524,62 @@ class Provisioner:
         }
 
     def evict(self, path: str, from_provider: str) -> dict[str, Any]:
-        """Evict a file from a provider and return a record once its block map there is empty; never from the holder."""
+        """Evict a file from a provider and return a record once its block map there is empty; never from the holder.
+
+        The eviction is scheduled through that provider, with `evictingProviderId` naming it, as the federation's own
+        reset does. A transfer that ended is never the evidence (O01): while the provider's block map still shows bytes,
+        the eviction is scheduled again after `EVICTION_RETRY_PAUSE_S`, up to `EVICTION_ATTEMPTS` in all, and after the
+        last the whole settle bound is waited before `NotPlaced` refuses it. The record says how many attempts it took.
+        """
         if from_provider == self._settings.holder or (
             from_provider in self._ids and self._ids[from_provider] == self._ids.get(self._settings.holder)
         ):
             raise Refused("refusing to evict the data provider's own copy; nothing was sent")
         self._verified()
         entry = self.resolve(path)
-        tid = self._schedule("eviction", entry.file_id, from_provider)
-        done = consistency.require_ended(
-            consistency.wait_transfers(
-                self._client,
-                from_provider,
-                [tid],
-                timeout_s=self._settings.transfer_timeout_s,
-                poll_s=self._settings.poll_s,
-                clock=self._clock,
-                sleep=self._sleep,
-            ),
-            "eviction",
-        )
-        confirmation = self.require_empty(from_provider, [entry.file_id])
-        return {"transfer_states": done.states(), "empty": confirmation.placed}
+        for attempt in range(1, EVICTION_ATTEMPTS + 1):
+            tid = self._schedule("eviction", entry.file_id, from_provider)
+            done = consistency.require_ended(
+                consistency.wait_transfers(
+                    self._client,
+                    from_provider,
+                    [tid],
+                    timeout_s=self._settings.transfer_timeout_s,
+                    poll_s=self._settings.poll_s,
+                    clock=self._clock,
+                    sleep=self._sleep,
+                ),
+                "eviction",
+            )
+            if attempt == EVICTION_ATTEMPTS:  # the last: wait the whole settle bound, then refuse (NotPlaced)
+                confirmation = self.require_empty(from_provider, [entry.file_id])
+                break
+            try:
+                confirmation = self.require_empty(from_provider, [entry.file_id], timeout_s=EVICTION_CHECK_S)
+                break
+            except NotPlaced:  # completed, and the block map still holds bytes: never evicted; schedule it again
+                self._sleep(EVICTION_RETRY_PAUSE_S)
+        return {"transfer_states": done.states(), "empty": confirmation.placed, "attempts": attempt}
 
     # -- teardown --------------------------------------------------------------
     def _gone(self, file_id: str) -> bool:
-        """Tell whether the data provider has no such entry; any answer but a 404 is "no" for a read that worked."""
+        """Tell whether the data provider has no such entry: it answered a 404, or Onedata 25.0's 400 posix enoent
+        (`answered_absent`). A read that worked is "no"; any other failure, another 400 or an unreadable body among
+        them, raises, so the poll never counts as absence."""
         try:
             self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder)
         except PlatformError as error:
-            if error.status == consistency.NOT_FOUND:
+            if answered_absent(error):
                 return True
             raise
         return False
 
     def _confirm_gone(self, file_id: str) -> bool:
-        """Tell whether the data provider shows the entry absent on consecutive polls, within the bound."""
+        """Tell whether the data provider shows the entry absent on consecutive polls, within the bound.
+
+        It stops at once when it does. The absence is the data provider's, the one entries are created and deleted
+        on, and says nothing of the other providers or of storage, where a directory's delete may still be under way
+        (#114): nothing here creates a name again after its teardown, since every scratch name is new."""
         return consistency.converge(
             lambda: self._gone(file_id),
             bool,
@@ -545,14 +604,19 @@ class Provisioner:
         for line in reversed(self.logged()):
             fid = line["id"]
             if line["kind"] == "DIR":
-                strangers = [e for e in self.children(fid).values() if e.file_id not in removed]
+                try:
+                    strangers = [e for e in self.children(fid).values() if e.file_id not in removed]
+                except PlatformError as error:
+                    if not answered_absent(error):
+                        raise
+                    strangers = []  # the directory is already gone, so it holds nothing; its absence is checked below
                 if strangers:
                     left.append({"path": line["path"], "reason": "holds entries this provisioner did not create"})
                     continue
             try:
                 self._client.mutate("DELETE", f"/data/{_segment(fid)}", provider=self._settings.holder)
             except PlatformError as error:
-                if error.status != consistency.NOT_FOUND:
+                if not answered_absent(error):  # already gone is confirmed below; any other refusal leaves it
                     left.append({"path": line["path"], "reason": "the delete was refused or failed"})
                     continue
             if not self._confirm_gone(fid):

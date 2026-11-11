@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
-from expcore.models.adapters import ModelBackend, ModelTurn, ToolResult
+from expcore.models import spend
+from expcore.models.adapters import ModelBackend, ModelTurn, ProbeReply, ToolResult
 from expcore.records.digest import digest, plain
 from expcore.records.schema import RecordError
 
@@ -96,14 +97,24 @@ class RecordingBackend:
         return plain(self.inner.info().get("settings_sent", {}))
 
     async def step(self) -> ModelTurn:
-        """Ask the inner backend for a reply and keep what surrounds it; a request that raises is the failure."""
+        """Ask the inner backend for a reply and keep what surrounds it; a request that raises is the failure.
+
+        The attempt's spend guard, if the campaign installed one, clears the request first and is told what its reply
+        reported (`expcore.models.spend`, C26). A request it refuses is this request's failure, a budget hold, which a
+        replay serves again from the record. A reply the endpoint answered, and so billed, but the backend refused to
+        read (`InfraError.billed`) is told to the guard too, so a reply past the reply maximum is never missed (C27).
+        """
         try:
+            await spend.before_request()
             turn = await self.inner.step()
         except asyncio.CancelledError:
             self._fail(None)
             raise
         except Exception as exc:
             self._fail(exc)
+            billed = getattr(exc, "billed", None)
+            if billed is not None:
+                await spend.after_reply(*billed)
             raise
         conversation = self.inner.transcript()
         native = conversation[-1] if conversation else {}
@@ -111,6 +122,7 @@ class RecordingBackend:
             raise RecordError("the backend's conversation does not end with an assistant message after a reply")
         self.captured.append(Captured(turn, native, self._settings()))
         self._known = len(conversation)
+        await spend.after_reply(turn.input_tokens, turn.output_tokens)
         return turn
 
     def _fail(self, exc: BaseException | None) -> None:
@@ -131,9 +143,9 @@ class RecordingBackend:
         """Return the inner backend's conversation."""
         return self.inner.transcript()
 
-    async def probe(self) -> None:
-        """Probe through the inner backend."""
-        await self.inner.probe()
+    async def probe(self) -> ProbeReply | None:
+        """Probe through the inner backend, and return what its reply reported."""
+        return await self.inner.probe()
 
     async def aclose(self) -> None:
         """Close the inner backend."""

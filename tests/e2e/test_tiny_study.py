@@ -382,6 +382,65 @@ def test_s10_a_scorer_that_leaves_treatment_attempts_none_is_refused_until_the_c
     assert table(report, "## Preregistered contrasts")["relay-vs-baseline"][12] == "excluded (2 pair(s) left out)"
 
 
+FAMILY = 'holm_family = ["extended-vs-baseline", "relay-vs-baseline"]'
+
+
+def test_s12_an_exploratory_only_preregistration_runs_through_analyze_and_report_with_no_confirmatory_claim(
+    resumed, tmp_path, clean_environment, capsys
+):
+    """S12: through the command line: with the family replaced by exploratory_only = true, check, analyze and report
+    succeed; analysis.json says so and holds no Holm decision; every contrast is exploratory in it, in the report's
+    one exploratory table and on the terminal; the report's summary says no confirmatory claim is made; and an empty
+    family alone is refused, naming exploratory_only."""
+    copy = copy_campaign(resumed, tmp_path, "exploratory-only")
+    prereg = copy.root / "preregistration.toml"
+    edit_once(prereg, FAMILY, "holm_family = []")
+    code, errors = cli(clean_environment, "analyze", str(copy.root))  # refused at load, before the code is looked at
+    assert code == 1
+    assert "key 'holm_family' is empty" in errors
+    assert "exploratory_only = true" in errors
+    edit_once(prereg, "holm_family = []", "exploratory_only = true")
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
+    assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)
+    analysis = copy.read("analysis.json")
+    assert (analysis["exploratory_only"], analysis["holm"]) == (True, [])
+    assert {c["name"]: (c["exploratory"], c["in_family"]) for c in analysis["contrasts"]} == dict.fromkeys(
+        CONTRASTS, (True, False)
+    )
+    report = (copy.root / "out" / "report.md").read_text(encoding="utf-8")
+    assert "makes no confirmatory claim" in report.split("## Exploratory contrasts")[0]
+    assert "## Preregistered contrasts" not in report
+    assert set(table(report, "## Exploratory contrasts")) - {"Contrast"} == set(CONTRASTS)
+    capsys.readouterr()
+    assert main(["analyze", str(copy.root)]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    summary = [line for line in printed if "estimate" in line]
+    assert any("No confirmatory claim" in line for line in printed[: printed.index(summary[0])])
+    assert len(summary) == len(CONTRASTS)
+    assert all(line.endswith("(exploratory)") for line in summary)
+
+
+def test_c25_a_budgeted_study_without_context_windows_still_analyses_reports_and_regenerates_but_does_not_run(
+    resumed, tmp_path, clean_environment
+):
+    """C25: the context window bounds what a run is reserved, so only starting or resuming a run needs it: a finished
+    study whose models declare none (one made before the rule) is checked, analysed, reported and regenerated as a
+    replication package's check does, and `run` refuses it, naming models.toml and the models."""
+    copy = copy_campaign(resumed, tmp_path, "no-windows")
+    models = copy.root / "models.toml"
+    models.write_text(models.read_text(encoding="utf-8").replace("context_tokens = 8192\n", ""), encoding="utf-8")
+    assert "context_tokens" not in models.read_text(encoding="utf-8")
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
+    assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)
+    assert regenerate(copy.root, stamped=True) == []
+    code, errors = cli(clean_environment, "run", str(copy.root))
+    assert code != 0
+    assert "models.toml" in errors
+    assert "no context window for model(s) 'alpha-stub', 'beta-stub'" in errors
+
+
 def test_c23_an_exhausted_run_is_counted_under_its_condition_and_as_the_cause_of_the_pairs_it_costs(
     tmp_path, clean_environment
 ):

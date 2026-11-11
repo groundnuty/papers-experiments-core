@@ -3,7 +3,7 @@
 `FakeData` adds to `FakeFederation` the calls of `/api/v3/oneprovider`, chosen by the request's host:
 
   GET    /spaces/{space}                        the root directory of the space (ENOENT for `root_enoent_polls` calls)
-  GET    /data/{id}                             attributes
+  GET    /data/{id}                             attributes, `parent_id` among them; asked for a path, 400 as in 25.0
   GET    /data/{id}/children                    paged by `limit` and `token`
   POST   /data/{id}/children?name&type          create a file or a directory
   PUT    /data/{id}/content?offset              write bytes; the writing provider holds them
@@ -19,13 +19,22 @@ waits. A test bends the fake through plain attributes:
 - `fetch_lag`: polls of the file's block map before bytes fetched by a range read or a replication show in it;
 - `onthefly_places`: False makes a range read answer without ever adding a block (a provider that does not cache);
 - `transfers_place_blocks`: False makes a replication end as `completed` with no block placed (the O01 fake);
-- `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks;
-- `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at all;
+- `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks; `evictions_noop_first`
+  does that, with `filesEvicted` 0, for the next N evictions only;
+- `onthefly_unit`: a range read through a provider lacking the bytes places at least this many from its offset;
+- `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at all,
+  each answered `transfer_unseen_answer` (a 404 by default); a fresh space root answers `root_enoent_answer` (a 404 of
+  posix enoent by default) for `root_enoent_polls` reads;
 - `resets`: a list of `[substring, count]` or `[substring, count, provider id]`: the next `count` provider calls whose
   route contains the substring (to that provider, when named) fail with a connection reset;
 - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
-- `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
-- `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
+- `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement); `readonly_answer` is
+  how such a write is refused, 403 by default, `(400, "posix", "eacces")` as Onedata 25.0 answers it;
+- `unseen`, `unseen_after_create`: a provider that sees a new file only after so many reads of it, each answered
+  `unseen_answer` (a 404 by default), as a second provider of 25.0 does for some seconds after a write elsewhere;
+- `missing_answer`: how a file or directory that is not there is answered, a 404 by default; `answer_missing_as_25`
+  makes it 400 posix enoent and keeps a deleted entry's `parent_id` readable, as 25.0 does;
+- a content write (`PUT /data/{id}/content`) without `Content-Type: application/octet-stream` is a 415, as in 25.0;
 - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status.
 - `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out).
 - `clock`: the epoch seconds a job's schedule, start and finish times are taken from (a test binds its own clock);
@@ -87,6 +96,7 @@ class Transfer:
     finished: int = 0
     waiting: bool = False
     bytes_replicated: int | None = None  # the counter the record reports, when a test scripts it
+    noop: bool = False  # an eviction that completed and evicted nothing (`evictions_noop_first`)
 
     @property
     def replicates(self) -> bool:
@@ -122,16 +132,35 @@ class FakeData(FakeFederation):
         self.onthefly_places = True
         self.transfers_place_blocks = True
         self.evictions_remove_blocks = True
+        self.evictions_noop_first = 0  # the next N evictions complete with filesEvicted 0 and remove nothing, as 25.0's
+        # do when scheduled right after a provider fetched the bytes on the fly
+        self.onthefly_unit: int | None = (
+            None  # a range read places [offset, offset + max(length, unit)), clipped to the
+        )
+        # file, as 25.0 does with 1 MiB; None places exactly the range read
         self.transfer_flip_after = 1
         self.transfer_visible_after = 0
         self.root_enoent_polls = 0
+        # A provider that sees a new file only after some reads: (provider id, file id) -> reads of it answered as
+        # not there; `unseen_after_create` (provider id -> reads) sets that for every file made from then on.
+        self.unseen: dict[tuple[str, str], int] = {}
+        self.unseen_after_create: dict[str, int] = {}
+        self.unseen_answer: tuple[int, str | None, str | None] = (404, "notFound", None)
+        self.root_enoent_answer: tuple[int, str | None, str | None] = (404, "posix", "enoent")  # a fresh root's
+        self.transfer_unseen_answer: tuple[int, str | None, str | None] = (404, "notFound", None)  # a job not seen yet
         self.page_size = 1000
         self.id_suffix = ""  # appended to every file id made from now on, for ids with characters like "="
         self.fail_deletes = False  # every DELETE answers 500
         self.omit_blocks = False  # the block map's storage backends carry no "blocks" field
         self.omit_providers: set[str] = set()  # provider ids the block map leaves out (a partial answer)
         self.ignore_deletes = False  # every DELETE answers 204 and removes nothing
-        self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat answers 403
+        self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat is refused
+        # how that refusal is answered: (status, error id, errno); Onedata 25.0 answers (400, "posix", "eacces")
+        self.readonly_answer: tuple[int, str, str | None] = (403, "forbidden", None)
+        # how a file or directory that is not there is answered: (status, error id, errno), an error id of None being a
+        # body that is no error object; see `answer_missing_as_25`
+        self.missing_answer: tuple[int, str | None, str | None] = (404, "notFound", None)
+        self.deleted_parents: dict[str, str | None] | None = None  # a deleted entry's parent link, while it is kept
         self.resets: list[list] = []
         self.statuses: list[list] = []
         self.content_type: str | None = "application/octet-stream"  # of a file's content, whole or by range
@@ -231,11 +260,16 @@ class FakeData(FakeFederation):
     def _create(self, parent: str, name: str, kind: str) -> str:
         file_id = f"fid-{next(self._ids):04d}{self.id_suffix}"
         self.nodes[file_id] = Node(file_id, name, kind, parent)
+        if kind == "REG":  # a provider that sees a file sees the directories above it, made before it
+            for provider_id, reads in self.unseen_after_create.items():
+                self.unseen[(provider_id, file_id)] = reads
         return file_id
 
     def _delete(self, file_id: str) -> None:
         for child in [n.file_id for n in self.nodes.values() if n.parent == file_id]:
             self._delete(child)
+        if self.deleted_parents is not None:
+            self.deleted_parents[file_id] = self.nodes[file_id].parent
         del self.nodes[file_id]
         for table in (self.blocks, self.pending):
             for key in [k for k in table if k[0] == file_id]:
@@ -243,8 +277,29 @@ class FakeData(FakeFederation):
 
     # -- answers ---------------------------------------------------------------
     @staticmethod
-    def _error(status: int, error_id: str) -> httpx.Response:
-        return httpx.Response(status, json={"error": {"id": error_id, "details": {}}})
+    def _error(status: int, error_id: str, errno: str | None = None) -> httpx.Response:
+        details = {"errno": errno} if errno is not None else {}
+        return httpx.Response(status, json={"error": {"id": error_id, "details": details}})
+
+    def answer_missing_as_25(self, answer: tuple[int, str | None, str | None] = (400, "posix", "enoent")) -> None:
+        """Answer what is not there as Onedata 25.0 does: 400 posix enoent instead of a 404, while a deleted entry's
+        `parent_id` still answers its old parent (both read on the Compose federation). `answer` replaces the 400."""
+        self.missing_answer = answer
+        self.deleted_parents = {}
+
+    def _missing(self, file_id: str, query: httpx.QueryParams, method: str) -> httpx.Response:
+        """A file or directory that is not there: `missing_answer`, except a deleted entry's kept parent link."""
+        kept = self.deleted_parents or {}
+        if method == "GET" and file_id in kept and query.get("attribute") == "parent_id":
+            return httpx.Response(200, json={"parent_id": kept[file_id]})
+        return self._answer(self.missing_answer)
+
+    def _answer(self, answer: tuple[int, str | None, str | None]) -> httpx.Response:
+        """An error answer from (status, error id, errno); an error id of None is a body that is no error object."""
+        status, error_id, errno = answer
+        if error_id is None:
+            return httpx.Response(status, text="<html><body>Bad Request</body></html>")
+        return self._error(status, error_id, errno)
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         """Answer a provider call here and anything else as the federation does."""
@@ -310,17 +365,23 @@ class FakeData(FakeFederation):
             and method in ("POST", "PUT", "DELETE")
             and any(c.get("type") == "data.readonly" for c in issued["caveats"])
         ):
-            return self._error(403, "forbidden")
+            return self._error(*self.readonly_answer)
         found = re.fullmatch(r"/spaces/([^/]+)", route)
         if found and method == "GET":
             return self._space_root(found.group(1))
         found = re.fullmatch(r"/data/([^/]+)(/children|/content|/distribution)?", route)
         if found:
             node = self.nodes.get(found.group(1))
+            lag = (provider, found.group(1))
+            if node is not None and self.unseen.get(lag, 0) > 0:  # this provider does not see the new file yet
+                self.unseen[lag] -= 1
+                return self._answer(self.unseen_answer)
             if node is None:
-                return self._error(404, "notFound")
+                return self._missing(found.group(1), query, method)
             part = found.group(2) or ""
             if part == "" and method == "GET":
+                if "path" in query.get_list("attribute"):  # Onedata 25.0 has no path attribute ([L1] in client.py)
+                    return self._error(400, "badValueNotAllowed")
                 return httpx.Response(200, json=self._attributes(node))
             if part == "" and method == "DELETE":
                 if self.fail_deletes:
@@ -333,6 +394,8 @@ class FakeData(FakeFederation):
             if part == "/children" and method == "POST":
                 return self._make(node, query)
             if part == "/content" and method == "PUT":
+                if request.headers.get("Content-Type") != "application/octet-stream":
+                    return httpx.Response(415)  # 25.0 refuses a raw body that does not say it is one
                 return self._write(node, provider, int(query.get("offset", "0")), request.content)
             if part == "/content" and method == "GET":
                 return self._read(node, provider, request.headers.get("Range"))
@@ -353,25 +416,28 @@ class FakeData(FakeFederation):
             return self._error(404, "notFound")
         self._root_polls += 1
         if self._root_polls <= self.root_enoent_polls:
-            return httpx.Response(404, json={"error": {"id": "posix", "details": {"errno": "enoent"}}})
+            return self._answer(self.root_enoent_answer)
         return httpx.Response(200, json={"fileId": ROOT_ID, "name": self.space_name})
 
-    def _path_of(self, node: Node) -> str:
-        parts = []
-        while node.parent is not None:
-            parts.append(node.name)
-            node = self.nodes[node.parent]
-        return "/" + "/".join([self.space_name, *reversed(parts)])
-
     def _attributes(self, node: Node) -> dict:
+        """A file's attributes as Onedata 25.0 names them; `parent_id` is its parent's id, null for a space's root."""
         return {
             "fileId": node.file_id,
             "file_id": node.file_id,
             "name": node.name,
             "type": node.kind,
             "size": len(node.content),
-            "path": self._path_of(node),
+            "parent_id": node.parent,
         }
+
+    def add_tree(self, root_id: str, path: str) -> str:
+        """Make a tree that is no part of the study space: a root of its own, with no parent, and a path below it;
+        return the id of the path's last entry. It stands for a file of a space this configuration does not know."""
+        self.nodes[root_id] = Node(root_id, "", "DIR", None)
+        parent = root_id
+        for part in path.strip("/").split("/"):
+            parent = self._child(parent, part) or self._create(parent, part, "DIR")
+        return parent
 
     def _list(self, node: Node, query: httpx.QueryParams) -> httpx.Response:
         if node.kind != "DIR":
@@ -415,7 +481,12 @@ class FakeData(FakeFederation):
             return self._error(416, "rangeNotSatisfiable")
         length = last - first + 1
         if not self._holds(node.file_id, provider, first, length) and self.onthefly_places:
-            self.pending.setdefault((node.file_id, provider), []).append([first, length, self.fetch_lag])
+            placed = (
+                length
+                if self.onthefly_unit is None
+                else min(max(length, self.onthefly_unit), len(node.content) - first)
+            )
+            self.pending.setdefault((node.file_id, provider), []).append([first, placed, self.fetch_lag])
             self._promote(node.file_id, provider)
         return httpx.Response(
             206,
@@ -497,7 +568,7 @@ class FakeData(FakeFederation):
             return self._error(404, "notFound")
         transfer.asked += 1
         if transfer.asked <= self.transfer_visible_after:
-            return self._error(404, "notFound")
+            return self._answer(self.transfer_unseen_answer)
         if not transfer.ended and transfer.asked > self.transfer_visible_after + self.transfer_flip_after:
             self.end_transfer(tid)
         state = "completed" if transfer.ended else "scheduled" if transfer.waiting else "active"
@@ -514,7 +585,7 @@ class FakeData(FakeFederation):
             "finishTime": transfer.finished,
             "bytesReplicated": moved if transfer.ended and transfer.replicates else 0,
             "filesReplicated": 1 if transfer.ended and transfer.replicates else 0,
-            "filesEvicted": 1 if transfer.ended and transfer.kind != "replication" else 0,
+            "filesEvicted": 1 if transfer.ended and transfer.kind != "replication" and not transfer.noop else 0,
             "filesFailed": 0,
         }
         view = self._view(tid, provider)
@@ -535,6 +606,10 @@ class FakeData(FakeFederation):
             self.pending.setdefault(key, []).append([0, size, self.fetch_lag])
             self._promote(*key)
         evicted = (transfer.file_id, transfer.source_id) if transfer.kind == "migration" else key
+        if transfer.kind == "eviction" and self.evictions_noop_first > 0:  # completed, and nothing evicted
+            self.evictions_noop_first -= 1
+            transfer.noop = True
+            return
         if transfer.kind != "replication" and self.evictions_remove_blocks:
             self.blocks.pop(evicted, None)
             self.pending.pop(evicted, None)

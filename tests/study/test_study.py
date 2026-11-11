@@ -79,6 +79,31 @@ def test_p06_a_model_of_the_plan_the_table_lacks_is_refused_listing_the_table_wi
     )
 
 
+WINDOW = "context_tokens = 8192\n"
+
+
+def test_c25_a_budgeted_study_without_a_context_window_loads_and_only_its_run_is_refused(study_dir):
+    """C25: the context window bounds what a run is reserved, so loading the study for an analysis, a report or a
+    package's check never needs it; the check a run makes refuses a planned model that declares none, naming
+    models.toml, the key and what to add, and lets a free model through."""
+    models = (study_dir / "models.toml").read_text(encoding="utf-8")
+    assert models.count(WINDOW) == 2  # the example declares one for each of its models
+    edit(study_dir, "models.toml", "[models.beta-stub]\nbackend = \"stub\"\nstatus = \"frozen\"\n" + WINDOW,
+         "[models.beta-stub]\nbackend = \"stub\"\nstatus = \"frozen\"\n")  # fmt: skip
+    study = load_study(study_dir)
+    assert study.campaign.scheduler.budget is not None
+    with pytest.raises(ConfigError) as caught:
+        study.models.require_context_window(study.campaign.models)
+    text = str(caught.value)
+    assert text.startswith(f"{study_dir.resolve() / 'models.toml'}: no context window for model(s) 'beta-stub':")
+    assert "max_usd" in text
+    assert "context_tokens" in text
+    edit(study_dir, "models.toml", "\n[models.beta-stub.price]\ninput_per_mtok = 0.5\noutput_per_mtok = 1.5\n",
+         "\nfree = true\n")  # fmt: skip
+    free = load_study(study_dir)
+    free.models.require_context_window(free.campaign.models)  # a free model costs nothing past its cap
+
+
 def test_a_cluster_that_a_task_lacks_is_refused_naming_the_contrast_and_the_task(study_dir):
     edit(study_dir, "study.toml", '[tasks.dune]\nregion = "south"', '[tasks.dune]\nzone = "south"')
     refused(study_dir, "preregistration.toml", "extended-vs-baseline", "'region'", "'dune'")

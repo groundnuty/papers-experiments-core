@@ -446,9 +446,11 @@ def _analyse_loaded(
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds: the preregistration, the code, the core, each condition's planned runs and how they
     ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
-    Holm decision."""
+    Holm decision. `exploratory_only` is true when the preregistration makes no confirmatory claim (S12): there is then
+    no Holm decision, and every contrast is exploratory."""
     return {
         "preregistration": dict(analysis.result.manifest),
+        "exploratory_only": analysis.result.exploratory_only,
         "alpha": analysis.result.alpha,
         "code": {key: analysis.code.get(key) for key in ("commit", "tree_sha256", "dirty")},
         "core_version": analysis.core_version,
