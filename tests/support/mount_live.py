@@ -472,8 +472,9 @@ child = (
     "while True:\\n"
     "    os.pread(fd, 1 << 20, random.randrange(0, max(1, size - (1 << 20))))\\n"
     "    count += 1\\n"
-    "    with open(sys.argv[3], 'w') as handle:\\n"
+    "    with open(sys.argv[3] + '.next', 'w') as handle:\\n"
     "        handle.write(str(count))\\n"
+    "    os.replace(sys.argv[3] + '.next', sys.argv[3])\\n"  # whole, so a look never finds it empty
 )
 reader = subprocess.Popen([sys.executable, "-c", child, {path!r}, str({size!r}), {counter!r}],
                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
