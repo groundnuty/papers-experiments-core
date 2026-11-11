@@ -1,4 +1,7 @@
+# Provenance: new
 """A stand-in for the Onedata MCP server: the generic fake server, configured the way the real one is, by environment.
+
+    python -m expcore_onedata.testing.fake_onedata_mcp [--hang]
 
 The allow-list comes from ONEDATA_MCP_TOOLS, as the real server reads it. When FAKE_MCP_RECORD names a file, the
 server writes the Onedata settings it received there as JSON, so a test can see what the launcher passed it, with the
@@ -10,6 +13,11 @@ does (SSL_CERT_FILE), and records each answer's status, or that the connection w
 is this stand-in's own, written to open the federation the way the real server is known to (an httpx client whose
 `verify` is that flag): it checks what the launcher passes, not the real server's behaviour, which the gated live test
 in `tests/onedata/test_toolserver.py` checks (EXPCORE_LIVE_TOOLSERVER).
+
+Models: how the real server is started and configured (its environment variables, its tool allow-list, its start
+and its hang) and a small catalogue of tools behind it. Does not model: the real server's tools (`echo`, `add` and the
+rest are not Onedata's), its answers, or what it does with the federation: a launcher that passes it a token learns
+only that the token arrived.
 """
 
 import hashlib
@@ -18,7 +26,7 @@ import os
 import stat
 import sys
 
-from fake_mcp_server import build
+from expcore_onedata.testing.fake_mcp_server import build
 
 SETTINGS = (
     "ONEDATA_ONEZONE_HOST",

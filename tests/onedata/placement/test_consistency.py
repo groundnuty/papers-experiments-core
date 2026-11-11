@@ -4,10 +4,10 @@ import asyncio
 
 import httpx
 import pytest
-from placement_support import Ticker
 
 from expcore_onedata import consistency
 from expcore_onedata.client import OnezoneClient, PlatformError
+from expcore_onedata.testing import Ticker
 
 
 def scripted(values):

@@ -1,12 +1,12 @@
 """The [sandbox] table: every image, pool, limit, mount option and data path is read from platform.toml (O12-O14)."""
 
 import pytest
-from platform_support import write_platform
 from sandbox_support import AGENT_IMAGE_ID, GATE_IMAGE_ID, LEVELS, POOL, add_sandbox
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.testing import write_platform
 
 
 def load(tmp_path, edit=None, *, with_table=True):

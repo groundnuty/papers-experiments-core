@@ -43,6 +43,18 @@ class Request:
 
 
 class MockOnedata:
+    """The REST surface above, served over a real local HTTP socket (`start`, `stop`, `.port`) from a fixed file set.
+
+    Models: the five calls listed in the module docstring, with the paging rule measured on the real federation, byte
+    ranges (206 with `Content-Range`, 416 past the end), file ids made from paths, the single token it accepts, and a
+    space whose providers (`providers`) and the ones that support it (`supports`) a test changes. Every request is in
+    `.requests`.
+
+    Does not model: writes, deletes, transfers or block maps (`FakeData` has them), tokens other than the one it was
+    given (a subclass adds the ones it issues), file times (always 0) and permissions (always 644), more than one
+    space, and symbolic links. The file set is fixed when the mock is made.
+    """
+
     SPACE_ID = "spmock0001"
     PROVIDER_ID = "prmock0001"
 

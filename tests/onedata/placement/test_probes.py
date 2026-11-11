@@ -4,7 +4,6 @@ import json
 
 import httpx
 import pytest
-from placement_support import ALPHA_ID, BETA_ID, DATA
 
 from expcore.plugin import Instrument
 from expcore.records.instruments import finish_instruments, start_instruments
@@ -12,6 +11,7 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.probes import NAMESPACE, PlatformProbes, bytes_by_pair, run_probe
 from expcore_onedata.rangemap import RangeRow
 from expcore_onedata.ranges import place_ranges
+from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA
 
 PATH = "study/data.bin"
 ROW = RangeRow(PATH, "beta", ((0, 100), (2000, 500)))

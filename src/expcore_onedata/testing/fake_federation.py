@@ -1,20 +1,5 @@
-"""An in-process Onezone for the platform layer's tests: tokens, privileges and the scope of the study space.
-
-It extends `fake_onedata.MockOnedata`, whose scope answer it shares, and answers through an `httpx.MockTransport`, so
-a test hands the platform client `fake.client_http()` and no socket is opened. It implements the calls the layer makes:
-
-  POST   /api/v3/onezone/tokens/examine                           (admin credential)
-  POST   /api/v3/onezone/tokens/infer_access_token_scope          (the token in the body)
-  POST   /api/v3/onezone/user/tokens/temporary                    (HTTP Basic of the user itself)
-  GET    /api/v3/onezone/spaces/{space}                           (admin credential; the study space and `other_spaces`)
-  GET    /api/v3/onezone/spaces/{space}/users/{user}/privileges            (direct)
-  GET    /api/v3/onezone/spaces/{space}/effective_users/{user}/privileges  (effective)
-
-A test bends it through plain attributes: `mint_hook` changes the caveats the fake stores for a token (what a server
-that dropped or added one would do), `examine_hook` replaces an examination's answer, `status_override` makes every call
-fail with that status, and `providers`/`supports` (from MockOnedata) change the federation's view of the space.
-Every request is recorded in `.requests`, so a test can assert that a refused mutation sent nothing.
-"""
+# Provenance: new
+"""An in-process Onezone for the platform layer's tests: tokens, privileges and the scope of the study space."""
 
 from __future__ import annotations
 
@@ -34,7 +19,33 @@ ZONE = "/api/v3/onezone"
 
 
 class FakeFederation(MockOnedata):
-    """Onezone with one study space, its providers, and the users and tokens a test creates."""
+    """Onezone with one study space, its providers, and the users and tokens a test creates.
+
+    It extends `MockOnedata`, whose scope answer it shares, and answers through an `httpx.MockTransport`: a test hands
+    the platform client `fake.client_http()` and no socket is opened.
+
+    Models: the calls the platform layer makes of Onezone,
+
+      POST   /api/v3/onezone/tokens/examine                           (admin credential)
+      POST   /api/v3/onezone/tokens/infer_access_token_scope          (the token in the body)
+      POST   /api/v3/onezone/user/tokens/temporary                    (HTTP Basic of the user itself)
+      GET    /api/v3/onezone/spaces/{space}                           (admin credential; the study space and more)
+      GET    /api/v3/onezone/spaces/{space}/users/{user}/privileges            (direct)
+      GET    /api/v3/onezone/spaces/{space}/effective_users/{user}/privileges  (effective)
+
+    A temporary token needs a time caveat, as the real one does, and is stored with the caveats the server keeps.
+
+    Does not model: any other Onezone call (users, groups, spaces made or changed, provider registration); the expiry
+    of a token (its time caveat is stored, never enforced); the revocation of a token; how a token's other caveats
+    limit what it may read (the data API is `FakeData`'s, which enforces only the read-only caveat); the effective
+    privileges a space would derive from groups (`grant` sets both lists, and a test sets them apart to make a
+    difference); more than one study space.
+
+    A test bends it through plain attributes: `mint_hook` changes the caveats the fake stores for a token (what a
+    server that dropped or added one would do), `examine_hook` replaces an examination's answer, `status_override`
+    makes every call fail with that status, and `providers`/`supports` (from MockOnedata) change the federation's view
+    of the space. Every request is recorded in `.requests`, so a test can assert that a refused mutation sent nothing.
+    """
 
     ADMIN = "fake-admin-credential-0001"
 

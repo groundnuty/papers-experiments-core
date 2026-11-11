@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 from mcp import StdioServerParameters
-from platform_support import BASELINE, CEILING_S, DATA, FAKE_TOOL_SERVER, MANAGE, NOW, TOOLS, write_platform
 from record_support import make_config
 from tls_support import HAS_OPENSSL, TlsServer, make_federation_ca, swap_after_check
 
@@ -29,6 +28,9 @@ from expcore.tools.manifest import FrozenManifest, ManifestError, live_manifest
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.pin import PinError
+from expcore_onedata.testing import BASELINE, CEILING_S, MANAGE, NOW, TOOL_SERVER_ARGS, write_platform
+from expcore_onedata.testing import DATA_PATH_USER as DATA
+from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
 from expcore_onedata.tls import CA_BUNDLE_ENV
 from expcore_onedata.tokens import Plane, TokenIssuer, data_path_spec, token_window, tool_server_spec
 from expcore_onedata.toolserver import (
@@ -64,7 +66,7 @@ class RecordingContext:
 
 def freeze(path, tools):
     """Freeze the manifest of the stand-in server with this allow-list into a file."""
-    params = StdioServerParameters(command=sys.executable, args=[FAKE_TOOL_SERVER], env={ENV_TOOLS: tools})
+    params = StdioServerParameters(command=sys.executable, args=TOOL_SERVER_ARGS, env={ENV_TOOLS: tools})
     path.write_text(FrozenManifest.from_live(asyncio.run(live_manifest(params))).dump(), encoding="utf-8")
 
 

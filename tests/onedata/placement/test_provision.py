@@ -1,11 +1,11 @@
 """Provisioning: placement confirmed by the block map (O01), bounded waits (O07) and scoped mutations (O09)."""
 
 import pytest
-from placement_support import ALPHA_ID, BETA_ID, DATA
 
 from expcore_onedata import consistency
 from expcore_onedata.client import PlatformError
 from expcore_onedata.provision import NotPlaced, ProvisionError, Refused
+from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA
 
 PATH = "study/data.bin"
 

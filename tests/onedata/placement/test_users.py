@@ -4,12 +4,11 @@ import os
 import stat
 
 import pytest
-from placement_support import with_placement
-from platform_support import BASELINE, CEILING_S, CREDENTIALS_DIR, MANAGE, NOW, write_platform
 
 from expcore.campaign.lease import LeasePool
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
+from expcore_onedata.testing import BASELINE, CEILING_S, CREDENTIALS_DIR, MANAGE, NOW, with_placement, write_platform
 from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import DroppedToken, ExpiryMismatch, TokenIssuer, token_window
 from expcore_onedata.users import (

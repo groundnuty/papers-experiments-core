@@ -1,56 +1,5 @@
-"""The fake federation with its providers' data API: files, block maps, range reads, transfers and their delays.
-
-`FakeData` adds to `FakeFederation` the calls of `/api/v3/oneprovider`, chosen by the request's host:
-
-  GET    /spaces/{space}                        the root directory of the space (ENOENT for `root_enoent_polls` calls)
-  GET    /data/{id}                             attributes, `parent_id` among them; asked for a path, 400 as in 25.0
-  GET    /data/{id}/children                    paged by `limit` and `token`
-  POST   /data/{id}/children?name&type          create a file or a directory
-  PUT    /data/{id}/content?offset              write bytes; the writing provider holds them
-  GET    /data/{id}/content  (Range)            206; a provider lacking the bytes fetches them on the fly
-  GET    /data/{id}/distribution                the block map of every provider
-  DELETE /data/{id}                             remove a file or a directory with what is under it
-  POST   /transfers, GET /transfers/{id}        replication, eviction and migration jobs
-  GET    /spaces/{space}/transfers              the ids of the space's jobs in one state, paged by `limit`, `page_token`
-
-and, from Onezone, `GET /spaces/{space}` (the live name). Time is counted in calls, never in seconds, so a test never
-waits. A test bends the fake through plain attributes:
-
-- `fetch_lag`: polls of the file's block map before bytes fetched by a range read or a replication show in it;
-- `onthefly_places`: False makes a range read answer without ever adding a block (a provider that does not cache);
-- `transfers_place_blocks`: False makes a replication end as `completed` with no block placed (the O01 fake);
-- `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks; `evictions_noop_first`
-  does that, with `filesEvicted` 0, for the next N evictions only;
-- `onthefly_unit`: a range read through a provider lacking the bytes places at least this many from its offset;
-- `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at all,
-  each answered `transfer_unseen_answer` (a 404 by default); a fresh space root answers `root_enoent_answer` (a 404 of
-  posix enoent by default) for `root_enoent_polls` reads;
-- `resets`: a list of `[substring, count]` or `[substring, count, provider id]`: the next `count` provider calls whose
-  route contains the substring (to that provider, when named) fail with a connection reset;
-- `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
-- `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement); `readonly_answer` is
-  how such a write is refused, 403 by default, `(400, "posix", "eacces")` as Onedata 25.0 answers it;
-- `unseen`, `unseen_after_create`: a provider that sees a new file only after so many reads of it, each answered
-  `unseen_answer` (a 404 by default), as a second provider of 25.0 does for some seconds after a write elsewhere;
-- `missing_answer`: how a file or directory that is not there is answered, a 404 by default; `answer_missing_as_25`
-  makes it 400 posix enoent and keeps a deleted entry's `parent_id` readable, as 25.0 does;
-- a content write (`PUT /data/{id}/content`) without `Content-Type: application/octet-stream` is a 415, as in 25.0;
-- `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status.
-- `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out).
-- `clock`: the epoch seconds a job's schedule, start and finish times are taken from (a test binds its own clock);
-- `transfer_omit`: field names a job's record leaves out; `transfer_list_body`: an answer that replaces the listing's;
-- `provider_view`: `(job id, provider id)` to what that provider says of the job where it differs: `state` (the list
-  it is in, and its record's status) and record fields such as `bytesReplicated`;
-- `listing_lag`: job id to how many listing answers, counted from the first, leave the job out (its record is read
-  at once, as a real provider's is while its listing lags);
-- every data-API answer has a `Date` header of `clock` moved by `provider_skew` (provider id to seconds ahead,
-  negative when behind); `date_override` (provider id to a header value, or None for none) replaces it;
-
-`add_transfer` makes a job that no request to `/transfers` made, as a QoS requirement or another client does, with the
-times and the state a test gives it.
-
-`provider_calls` lists `(provider id, method, route)` of every provider call, so a test can assert what was sent where.
-"""
+# Provenance: new
+"""The fake federation with its providers' data API: files, block maps, range reads, transfers and their delays."""
 
 from __future__ import annotations
 
@@ -61,8 +10,8 @@ from dataclasses import dataclass, field
 from email.utils import formatdate
 
 import httpx
-from fake_federation import FakeFederation
 
+from expcore_onedata.testing.fake_federation import FakeFederation
 from expcore_onedata.testing.fake_onedata import Request
 
 PROVIDER = "/api/v3/oneprovider"
@@ -120,7 +69,75 @@ def _merge(blocks: list[list[int]]) -> list[list[int]]:
 
 
 class FakeData(FakeFederation):
-    """Onezone plus the data API of every provider it reports."""
+    """Onezone plus the data API of every provider it reports, with files, block maps and transfers.
+
+    Models: the calls of `/api/v3/oneprovider`, chosen by the request's host (a provider is the one whose domain is
+    that host),
+
+      GET    /spaces/{space}                        the space's root directory (ENOENT for `root_enoent_polls` calls)
+      GET    /data/{id}                             attributes, `parent_id` among them; asked for a path, 400 as in 25.0
+      GET    /data/{id}/children                    paged by `limit` and `token`
+      POST   /data/{id}/children?name&type          create a file or a directory
+      PUT    /data/{id}/content?offset              write bytes; the writing provider holds them
+      GET    /data/{id}/content  (Range)            206; a provider lacking the bytes fetches them on the fly
+      GET    /data/{id}/distribution                the block map of every provider
+      DELETE /data/{id}                             remove a file or a directory with what is under it
+      POST   /transfers, GET /transfers/{id}        replication, eviction and migration jobs
+      GET    /spaces/{space}/transfers              the ids of the space's jobs in one state (`limit`, `page_token`)
+
+    and, from Onezone, `GET /spaces/{space}` (the live name). Time is counted in calls, never in seconds, so a test
+    never waits.
+
+    A job carries the times the platform reports: `scheduleTime`, `startTime` and `finishTime`, taken from `clock`.
+    The fake does not decide which jobs fall in a run's window: the core does, from those times and the providers'
+    `Date` headers, so a job made with `add_transfer(..., scheduled=<before the run>)` and not ended is reported as the
+    core reports it, carried over into the run and not counted in its transfer bytes. A stand-in that sums every job it
+    holds counts it, and differs from the core there.
+
+    Does not model: a transfer's duration (it ends after `transfer_flip_after` polls of its record, or when a test ends
+    it), partial replication (a replication places the whole file, as Onedata's does), QoS requirements, file
+    metadata other than the id, name, type, size and parent, storage backends beyond one per provider, concurrent
+    writers, quotas, symbolic links, a token's space or interface caveats (only the read-only caveat is enforced, and
+    `enforce_readonly=False` turns that off), and any provider call that is not listed above.
+
+    A test bends the fake through plain attributes:
+
+    - `fetch_lag`: polls of the file's block map before bytes fetched by a range read or a replication show in it;
+    - `onthefly_places`: False makes a range read answer without ever adding a block (a provider that does not cache);
+    - `transfers_place_blocks`: False makes a replication end as `completed` with no block placed;
+    - `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks;
+      `evictions_noop_first` does that, with `filesEvicted` 0, for the next N evictions only;
+    - `onthefly_unit`: a range read through a provider lacking the bytes places at least this many from its offset;
+    - `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at
+      all, each answered `transfer_unseen_answer` (a 404 by default); a fresh space root answers `root_enoent_answer`
+      (a 404 of posix enoent by default) for `root_enoent_polls` reads;
+    - `resets`: a list of `[substring, count]` or `[substring, count, provider id]`: the next `count` provider calls
+      whose route contains the substring (to that provider, when named) fail with a connection reset;
+    - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status;
+    - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
+    - `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
+      `readonly_answer` is how such a write is refused, 403 by default, `(400, "posix", "eacces")` as Onedata 25.0
+      answers it;
+    - `unseen`, `unseen_after_create`: a provider that sees a new file only after so many reads of it, each answered
+      `unseen_answer` (a 404 by default), as a second provider of 25.0 does for some seconds after a write elsewhere;
+    - `missing_answer`: how a file or directory that is not there is answered, a 404 by default;
+      `answer_missing_as_25` makes it 400 posix enoent and keeps a deleted entry's `parent_id` readable, as 25.0 does;
+    - a content write (`PUT /data/{id}/content`) without `Content-Type: application/octet-stream` is a 415, as in 25.0;
+    - `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out);
+    - `clock`: the epoch seconds a job's schedule, start and finish times are taken from (a test binds its own);
+    - `transfer_omit`: field names a job's record leaves out; `transfer_list_body`: an answer that replaces the
+      listing's;
+    - `provider_view`: `(job id, provider id)` to what that provider says of the job where it differs: `state` (the
+      list it is in, and its record's status) and record fields such as `bytesReplicated`;
+    - `listing_lag`: job id to how many listing answers, counted from the first, leave the job out (its record is read
+      at once, as a real provider's is while its listing lags);
+    - every data-API answer has a `Date` header of `clock` moved by `provider_skew` (provider id to seconds ahead,
+      negative when behind); `date_override` (provider id to a header value, or None for none) replaces it.
+
+    `add_transfer` makes a job that no request to `/transfers` made, as a QoS requirement or another client does, with
+    the times and the state a test gives it. `provider_calls` lists `(provider id, method, route)` of every provider
+    call, so a test can assert what was sent where.
+    """
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -230,7 +247,11 @@ class FakeData(FakeFederation):
         bytes_replicated: int | None = None,
     ) -> str:
         """Make a job no request to `/transfers` made (a QoS requirement's, another client's) and return its id; one
-        that has ended has placed or removed its blocks, and finished at `finished` (default: when it was scheduled)."""
+        that has ended has placed or removed its blocks, and finished at `finished` (default: when it was scheduled).
+
+        `scheduled` is when the job started, on `clock`'s scale. A job made before a run's window opens, with
+        `ended=False`, is still running when the window does: the core reports it as carried over, never as a transfer
+        of the run. `end_transfer` ends it later, inside the window, and places its blocks then."""
         tid = f"tid-{next(self._ids):04d}"
         self.transfers[tid] = Transfer(
             kind,
@@ -616,4 +637,4 @@ class FakeData(FakeFederation):
             self.pending.pop(evicted, None)
 
 
-__all__ = ["PROVIDER", "ROOT_ID", "FakeData"]
+__all__ = ["PROVIDER", "ROOT_ID", "FakeData", "Node", "Transfer"]

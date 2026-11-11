@@ -4,9 +4,6 @@ import json
 
 import httpx
 import pytest
-from fake_federation import ZONE
-from placement_support import BETA_ID, with_placement
-from platform_support import write_platform
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient
@@ -23,6 +20,8 @@ from expcore_onedata.day0.runner import (
     run,
     run_checks,
 )
+from expcore_onedata.testing import BETA_ID, with_placement, write_platform
+from expcore_onedata.testing.fake_federation import ZONE
 
 NAMES = ("reachability", "health", "tokens", "content_type", "listing", "read_only", "round_trip")
 
@@ -93,7 +92,7 @@ def test_the_read_only_checks_pass_against_a_conforming_federation(context, fake
 
 def test_every_condition_passes_when_the_fixed_user_matches_its_rights(context, fake):
     """Tokens: with a user whose rights equal every condition's, each plane is minted and examined."""
-    from platform_support import BASELINE
+    from expcore_onedata.testing import BASELINE
 
     fake.grant("u-tools", BASELINE)
     entries = by_name(run_checks(context(), ["tokens"]))
