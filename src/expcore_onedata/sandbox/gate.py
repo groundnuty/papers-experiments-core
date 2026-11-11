@@ -33,8 +33,10 @@ read-only), or not at all when `verify_ssl` is false. `tcp_forwards` are plain T
 pass-through for the knowledge plane. Every request is logged as one JSON line.
 
 The gate holds the data-path token (from its environment, never from the configuration file or an argument) and adds it
-to every request it forwards; an `X-Auth-Token`, `Authorization` or `Cookie` header the client sent is dropped, and a
-token-scope inference carries the gate's token in its body. So the agent's code holds no credential at all (O05). Every
+to every request it forwards; every header the client sent in which the platform reads a token (`X-Auth-Token`,
+`Authorization`, `Macaroon`, `X-Onedata-Consumer-Token`, `X-Onedata-Service-Token`) is dropped, and so is `Cookie`, and
+a token-scope inference carries the gate's token in its body. So the agent's code holds no credential at all, and no
+token it sends reaches the platform (O05). Every
 answer passes the response boundary (`gateboundary.py`) on its way back, so none hands the token to the agent: a redirect
 or an encoded body becomes a 502 and is never followed or passed on, a header holding the token in any form makes the
 answer a 502, a credential header without it is withheld, and a body in which the token appears is cut before any byte
@@ -125,7 +127,18 @@ TOKEN_ENV = (
     "GATE_ACCESS_TOKEN"  # the data-path token, in the gate's environment: the agent's code never holds one (O05)
 )
 AUTH_HEADER = "X-Auth-Token"
-CLIENT_CREDENTIALS = {AUTH_HEADER.lower(), "authorization", "cookie"}  # whatever the agent sends of these is dropped
+# Whatever the agent sends of these is dropped (O05): every request header in which the platform reads a token, the
+# access token's three (X-Auth-Token, Authorization with Bearer, and Macaroon, deprecated but still parsed) and the
+# consumer and service tokens it verifies beside it (ctool `src/auth/tokens.erl`, `include/http/headers.hrl`), and the
+# session cookie. The platform reads no token from a query string.
+CLIENT_CREDENTIALS = {
+    AUTH_HEADER.lower(),
+    "authorization",
+    "macaroon",
+    "x-onedata-consumer-token",
+    "x-onedata-service-token",
+    "cookie",
+}
 UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split between two reads is still found
 # How many answers the gate buffers at once (O05): an answer that is no file content is read whole, up to
 # gateboundary.BUFFER_CAP (4 MiB), and checked before it goes. At most 16 such buffers are held, 64 MiB, and a check

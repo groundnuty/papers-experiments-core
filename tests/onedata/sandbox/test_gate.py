@@ -54,6 +54,7 @@ class Upstream(ThreadingHTTPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), UpstreamHandler)
         self.seen: list[tuple[str, str, dict]] = []
+        self.header_lines: list[list[tuple[str, str]]] = []  # every header line of each request, repeats included
         self.bodies: list[bytes] = []
         self.mode = "ok"
         self.answer_headers: list[tuple[str, str]] = []  # mode "fixed": the answer's status, extra headers and body
@@ -70,6 +71,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.server.seen.append((self.command, self.path, dict(self.headers)))
+        self.server.header_lines.append(list(self.headers.items()))
         self.server.bodies.append(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
         answer = b"{}"
         self.send_response(200)
@@ -79,6 +81,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.seen.append((self.command, self.path, dict(self.headers)))
+        self.server.header_lines.append(list(self.headers.items()))
         if self.server.mode == "stall":
             self._stall()
             return
@@ -243,6 +246,73 @@ def test_o05_a_token_scope_inference_carries_the_gates_token_in_its_body(world):
     assert [json.loads(b).get("token") for b in world.upstream.bodies] == [GATE_TOKEN, GATE_TOKEN]
     assert json.loads(world.upstream.bodies[1])["other"] == 1
     conn.close()
+
+
+# What an agent may send as a token: a plain placeholder, and an invented one shaped like a real token, which the agent
+# could have guessed.
+AGENT_TOKENS = ("placeholder", "MDAx-guessed-by-the-agent-0123")
+# Every request header in which the platform reads a token (ctool `src/auth/tokens.erl`, `headers.hrl`): the access
+# token in X-Auth-Token, Authorization with Bearer, or the deprecated Macaroon, which it still parses; and the consumer
+# and service tokens it verifies beside the access token. It reads none from a query string.
+TOKEN_FORMS = {
+    "x-auth-token": lambda t: [("X-Auth-Token", t)],
+    "bearer": lambda t: [("Authorization", f"Bearer {t}")],
+    "macaroon": lambda t: [("Macaroon", t)],
+    "consumer-token": lambda t: [("X-Onedata-Consumer-Token", t)],
+    "service-token": lambda t: [("X-Onedata-Service-Token", t)],
+    "other-case": lambda t: [("x-AUTH-token", t), ("AUTHORIZATION", f"bearer {t}"), ("MACAROON", t)],
+    "repeated": lambda t: [("X-Auth-Token", t), ("X-Auth-Token", t + "-again"), ("Macaroon", t), ("Macaroon", t)],
+    # white space before the colon, which a lenient server reads as the name without it: the gate's parser ends the
+    # header block at such a line, so neither it nor any line after it is a header the gate could forward
+    "space-before-colon": lambda t: [("X-Auth-Token ", t), ("Macaroon\t", t)],
+}
+PLATFORM_TOKEN_HEADERS = {"authorization", "macaroon", "x-onedata-consumer-token", "x-onedata-service-token"}
+
+
+def send_lines(conn, method, target, lines, body=None) -> int:
+    """A request with these header lines as given, repeats and case included, and its answer's status."""
+    conn.putrequest(method, target, skip_accept_encoding=True)
+    for name, value in lines:
+        conn.putheader(name, value)
+    if body is not None:
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(body)))
+    conn.endheaders(body)
+    answer = conn.getresponse()
+    answer.read()
+    return answer.status
+
+
+@pytest.mark.parametrize("agent_token", AGENT_TOKENS)
+@pytest.mark.parametrize("form", list(TOKEN_FORMS))
+def test_o05_a_token_the_agent_sends_in_any_header_the_platform_reads_never_reaches_it(world, form, agent_token):
+    """O05: whatever the agent sends as a token, the placeholder of its environment or one it guessed, in any header
+    in which the platform reads one, in any case and however often, is dropped: the upstream gets the gate's token
+    once, in X-Auth-Token, and no header that holds the agent's value or names a token the platform would read."""
+    conn = connect(world)
+    assert send_lines(conn, "GET", FILE, TOKEN_FORMS[form](agent_token)) == 200
+    conn.close()
+    (lines,) = world.upstream.header_lines
+    assert [v for k, v in lines if k.lower() == "x-auth-token"] == [GATE_TOKEN]
+    assert {k.lower() for k, _ in lines} & PLATFORM_TOKEN_HEADERS == set()
+    assert agent_token not in json.dumps(lines)
+
+
+@pytest.mark.parametrize("agent_token", AGENT_TOKENS)
+def test_o05_a_scope_inference_carries_the_gates_token_whatever_the_agent_put_in_its_body_and_headers(
+    world, agent_token
+):
+    """O05: the token-scope inference names its token in the body; the agent's value there, and in every header the
+    platform reads one from, is replaced by the gate's token, and no byte of the agent's value reaches the zone."""
+    every_form = [line for make in TOKEN_FORMS.values() for line in make(agent_token)]
+    conn = connect(world, ZONE)
+    body = json.dumps({"token": agent_token}).encode()
+    assert send_lines(conn, "POST", SCOPE, every_form, body) == 200
+    conn.close()
+    assert json.loads(world.upstream.bodies[0]) == {"token": GATE_TOKEN}
+    (lines,) = world.upstream.header_lines
+    assert [v for k, v in lines if k.lower() == "x-auth-token"] == [GATE_TOKEN]
+    assert agent_token not in json.dumps(lines) + world.upstream.bodies[0].decode()
 
 
 def test_o05_a_token_scope_inference_that_is_not_a_json_object_is_refused_and_not_forwarded(world):
