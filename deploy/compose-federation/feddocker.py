@@ -18,8 +18,13 @@ from fedspec import LOOPBACK, Spec
 
 PROJECT_LABEL = "com.docker.compose.project"
 SERVICE_LABEL = "com.docker.compose.service"
-CGROUP = "/sys/fs/cgroup"  # a container's own cgroup (v2), as it sees it
-MEMORY_FILES = ("memory.peak", "memory.current", "memory.max")
+CGROUP = "/sys/fs/cgroup"  # a container's own cgroup, as it sees it
+MEMORY_FILES = {  # each figure's file under cgroup v2, then under v1
+    "peak": ("memory.peak", "memory/memory.max_usage_in_bytes"),
+    "current": ("memory.current", "memory/memory.usage_in_bytes"),
+    "max": ("memory.max", "memory/memory.limit_in_bytes"),
+}
+EXEC_TIMEOUT_S = 20.0  # a wedged service must not hang down, which reads the peaks before it stops anything
 MEMINFO = Path("/proc/meminfo")
 
 
@@ -126,18 +131,34 @@ def require_memory_fits(spec: Spec, meminfo: Path = MEMINFO) -> None:
 
 
 def cgroup_value(container: str, name: str) -> int | None:
-    """One memory figure of a running container's own cgroup, in bytes, or None when it cannot be read."""
-    done = subprocess.run(
-        ["docker", "exec", container, "cat", f"{CGROUP}/{name}"], capture_output=True, text=True, check=False
-    )
+    """One memory figure of a running container's own cgroup, in bytes, or None when it cannot be read in time."""
+    try:
+        done = subprocess.run(
+            ["docker", "exec", container, "cat", f"{CGROUP}/{name}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=EXEC_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     value = done.stdout.strip()
     return int(value) if done.returncode == 0 and value.isdigit() else None
+
+
+def memory_figure(container: str, figure: str) -> int | None:
+    """A figure from the cgroup v2 file, or from the v1 file when the v2 one reads nothing."""
+    for name in MEMORY_FILES[figure]:
+        value = cgroup_value(container, name)
+        if value is not None:
+            return value
+    return None
 
 
 def memory_usage(containers: list[Container]) -> dict[str, dict[str, int | None]]:
     """For each running service: its peak since the container started, its current use and its cgroup's limit."""
     return {
-        c.service: {name.removeprefix("memory."): cgroup_value(c.name, name) for name in MEMORY_FILES}
+        c.service: {figure: memory_figure(c.name, figure) for figure in MEMORY_FILES}
         for c in containers
         if c.state == "running"
     }

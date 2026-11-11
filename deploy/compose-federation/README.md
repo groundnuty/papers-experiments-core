@@ -68,7 +68,8 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
 - **Docker:** only the layout's Compose project (default `expcore-fed`): its services, its network `<project>_fed`,
   and down's short-lived `janitor`. Every container carries a label naming the root it binds, and a command refuses,
   before it touches anything, a project whose containers bind another root or name none: that is another federation of
-  the same name. The two images are exactly `docker.onedata.org/onezone:ID-ba7a778696` and
+  the same name. A federation brought up before containers named their root carries no such label, so take it down
+  with the code that brought it up. The two images are exactly `docker.onedata.org/onezone:ID-ba7a778696` and
   `docker.onedata.org/oneprovider:ID-765309c84f`, never pulled (`pull_policy: never`) and never rebuilt. Nothing is
   pruned.
 - **Ports:** each service publishes its 443 on `127.0.0.1` only, on the port the layout gives it (the default: the

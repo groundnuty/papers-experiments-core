@@ -211,3 +211,20 @@ def test_memory_shows_each_services_limit_current_use_and_peak(fed, monkeypatch)
     lines = fed.docker.memory_lines(spec, usage)
     assert lines[0] == "zone: limit 6g (cgroup 6.00 GiB), current 2.00 GiB, peak 3.00 GiB"
     assert "birch: limit 6g, not running" in lines
+
+
+def test_memory_falls_back_to_cgroup_v1_and_a_wedged_service_reads_as_unknown(fed, monkeypatch):
+    """A daemon on cgroup v1 still gives a peak; a service that does not answer in time gives none, and down, which
+    reads the peaks before it stops anything, never hangs on it."""
+    v1 = {"memory/memory.max_usage_in_bytes": 4 << 30, "memory/memory.usage_in_bytes": 1 << 30}
+    monkeypatch.setattr(fed.docker, "cgroup_value", lambda container, name: v1.get(name))
+    usage = fed.docker.memory_usage([fed.docker.Container("expcore-fed-zone-1", "zone", "running", "/r")])
+    assert usage["zone"] == {"peak": 4 << 30, "current": 1 << 30, "max": None}
+    monkeypatch.undo()
+
+    def wedged(*args, **kwargs):
+        assert kwargs["timeout"] == fed.docker.EXEC_TIMEOUT_S
+        raise fed.docker.subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(fed.docker.subprocess, "run", wedged)
+    assert fed.docker.cgroup_value("expcore-fed-zone-1", "memory.peak") is None
