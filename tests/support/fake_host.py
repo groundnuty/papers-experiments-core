@@ -2,12 +2,16 @@
 
 It implements `HostOps` (expcore_onedata.sandbox.hostops) and records every effect in `calls`, in order, so a test can
 assert the order of a teardown. Work that needs a real directory (the sandbox's own files) uses the test's `tmp_path`.
-Names, images and addresses are invented. The fake knows only the docker commands the package uses; anything else
-fails loudly, so a new command shows up as a test failure and not as a silent pass.
+The file commands of a copy out of the sandbox (`find`, `cp`, `chown`) run for real, as this user and never under sudo,
+on the test's own directories, so a test sees what the host's GNU tools do with a link, a FIFO or an odd name; a test
+that wants another answer sets a handler. Names, images and addresses are invented. The fake knows only the docker
+commands the package uses; anything else fails loudly, so a new command shows up as a test failure and not as a silent
+pass.
 """
 
 import json
 import shutil
+import subprocess
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -255,14 +259,8 @@ class FakeHost:
                 return CmdResult(0, self.routes)
             case "journalctl":
                 return CmdResult(0, self.journal)
-            case "cp":
-                src, dst = Path(argv[-2]), Path(argv[-1])
-                if src.is_dir():
-                    shutil.copytree(src, dst, dirs_exist_ok=True)
-                else:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
-                return CmdResult(0)
+            case "cp" | "find" | "chown":
+                return self.real(argv)
             case "dmesg":
                 return CmdResult(0, self.dmesg)
             case "cat":
@@ -295,9 +293,17 @@ class FakeHost:
                 shutil.move(argv[-2], argv[-1])
                 self.relocate_mounts(argv[-2], argv[-1])
                 return CmdResult(0)
-            case "mount" | "nsenter" | "sh" | "find" | "test" | "truncate" | "chown":
+            case "mount" | "nsenter" | "sh" | "test" | "truncate":
                 return CmdResult(0)
         raise AssertionError(f"the fake host does not know the command {argv[0]!r}")
+
+    @staticmethod
+    def real(argv: list[str]) -> CmdResult:
+        """Run a file command for real, as this user and never under sudo, on the test's own directories."""
+        done = subprocess.run(
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=False
+        )
+        return CmdResult(done.returncode, done.stdout, done.stderr)
 
     # ---------------------------------------------------------------- HostOps: docker
     def docker(

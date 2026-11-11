@@ -10,19 +10,28 @@ never from an exit code. Their categories map to the core's vocabulary of infras
 - `unknown`: counters unreadable, evidence conflicting, or a kill nothing attributes. Infrastructure kind
   `unattributed_kill`, retried within the attempt limit.
 
-Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). One kind is the platform's own, registered
-here, when this module is first imported: `data_gate_integrity`, the data gate's refusal of an answer it cannot pass to
-the agent (a redirect, an encoded body, its token in a header, its token in a body) or a gate log that cannot be read
-(`gate_error`). Such a run is neither the agent's
-doing nor a condition's manipulation, so the kind is not treatable: the run is set aside and counted per condition, and
-the factor schema refuses a condition that declares the kind (O05, O16, C01).
+Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). Two kinds are the platform's own, registered
+here, when this module is first imported, and neither is treatable:
+
+- `data_gate_integrity`: the data gate's refusal of an answer it cannot pass to the agent (a redirect, an encoded body,
+  its token in a header, its token in a body) or a gate log that cannot be read (`gate_error`). Such a run is neither
+  the agent's doing nor a condition's manipulation: the run is set aside and counted per condition, and the factor
+  schema refuses a condition that declares the kind (O05, O16, C01).
+- `unsafe_output`: the collection refused what the run left, because it held a link, a special file or more than its
+  disk holds, which the harness cannot copy out safely (`copyout.py`, `output_error`). The harness never read the
+  output, so there is no evidence to score in either direction: a pass cannot be told, and counting the refusal as the
+  agent's failure would score the harness's own limit as the agent's outcome (C01). It is infrastructure, set aside
+  and run again within the attempt limit, and since an agent can leave a link on purpose, no condition may declare it
+  as its treatment (O19).
 """
 
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 from expcore.errors import InfraError, register_infra_kind
 from expcore_onedata.sandbox import infradeath
+from expcore_onedata.sandbox.copyout import described
 
 DATA_GATE_INTEGRITY = "data_gate_integrity"
 register_infra_kind(
@@ -30,6 +39,14 @@ register_infra_kind(
     "the data gate refused an answer of the platform it could not pass to the agent (a redirect, an encoded body, or "
     "its token in a header or a body), or its log could not be read: the run says nothing about the agent or the "
     "manipulation",
+    treatable=False,
+)
+UNSAFE_OUTPUT = "unsafe_output"
+register_infra_kind(
+    UNSAFE_OUTPUT,
+    "the collection refused what the run left in its sandbox (a link, a special file, or more than its disk holds), "
+    "which the harness cannot copy out safely: the output was never read, so the run says nothing about the agent or "
+    "the manipulation, and an agent could leave one on purpose",
     treatable=False,
 )
 
@@ -90,4 +107,24 @@ def gate_error(refusals: Iterable[str]) -> InfraError | None:
     )
 
 
-__all__ = ["DATA_GATE_INTEGRITY", "KIND_OF_CATEGORY", "death_error", "gate_error", "kill_error", "kind_of"]
+def output_error(refused: Iterable[Any]) -> InfraError:
+    """The error a refused collection makes of its attempt: kind `unsafe_output`, with the refusals (each with a
+    `what`) counted by what they are. Never a path: the agent named them, and the run's metadata keeps them."""
+    found = described(Counter(str(r.what) for r in refused))
+    detail = (
+        f"the sandbox's output holds what the harness cannot copy out safely ({found}): the run is set aside, and its "
+        "metadata names each by its path under unsafe_output"
+    )
+    return InfraError(UNSAFE_OUTPUT, detail[:600])
+
+
+__all__ = [
+    "DATA_GATE_INTEGRITY",
+    "KIND_OF_CATEGORY",
+    "UNSAFE_OUTPUT",
+    "death_error",
+    "gate_error",
+    "kill_error",
+    "kind_of",
+    "output_error",
+]

@@ -41,7 +41,7 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import gatelog, hostops, netpool
+from expcore_onedata.sandbox import copyout, gatelog, hostops, kinds, netpool
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
@@ -608,8 +608,12 @@ class DockerSandbox:
     def collect(self, dest_dir: str | Path, outputs: Sequence[str] = ()) -> dict[str, Any]:
         """Stop whatever of the agent's still runs, then copy out the run's evidence and the named files of /work.
 
-        A copy that fails raises, and the sandbox's disks are then kept when it stops: a source is never deleted after a
-        failed copy. An agent that could not be shown stopped also fails the collection: its outputs may still change."""
+        The copy runs as root and never follows or keeps a link (`copyout.py`, O19): an output that holds a link, a
+        special file, a hard link out of it or more than the working disk holds is refused before anything of the
+        outputs is copied, named by its path in the metadata's `unsafe_output`, never a link's target, and the
+        collection raises `InfraError` of kind `unsafe_output` once the metadata is written. A copy that fails raises,
+        and the sandbox's disks are then kept when it stops: a source is never deleted after a failed copy, nor after a
+        refused one. An agent that could not be shown stopped also fails the collection: its outputs may still change."""
         try:
             state = self._cells.quiesce("before collection")
             if not CellRunner.quiet(state):
@@ -620,33 +624,36 @@ class DockerSandbox:
             self.keep_evidence = True
             raise
 
-    def _copy_out(self, src: Path, dst: Path) -> None:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        r = self.host.run(["cp", "-r", "--no-preserve=ownership", str(src), str(dst)], 600, sudo=True)
-        owner = self.host.run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", str(dst)], 60, sudo=True)
-        if r.returncode != 0 or owner.returncode != 0:
-            log.error("copying out failed: %s", describe_stderr(r.stderr or owner.stderr))
-            raise SandboxError("copying a file out of the sandbox failed")
-
     def _collect(self, dest: Path, outputs: Sequence[str]) -> dict[str, Any]:
         for rel in outputs:
             if rel.startswith("/") or ".." in Path(rel).parts:
                 raise SandboxError("an output to collect must be a relative path inside the working directory")
         dest.mkdir(parents=True, exist_ok=True)
-        got = {}
-        for rel in outputs:
-            src = self.dir / "work" / rel
-            got[rel] = src.exists()
-            if got[rel]:
-                self._copy_out(src, dest / "work" / rel)
+        refused: list[tuple[str, copyout.Refusal]] = []
+        got: dict[str, bool] = {}
+        try:
+            copies = [(rel, dest / "work" / rel) for rel in outputs]
+            copied = copyout.copy_tree(self.host, self.dir / "work", copies, max_bytes=self.s.limits.work_disk_bytes)
+            got = {rel: copied[rel] is not None for rel in outputs}
+        except copyout.UnsafeOutput as unsafe:
+            refused += [("work", r) for r in unsafe.refused]
         self._meta["infra_check"] = check = self.infra_container_check()  # while everything runs
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
         if self.spec.mode is DataPathMode.REST:
             self._stop_gate()
-            log_file = self.dir / "gatelog" / "requests.jsonl"
-            self._copy_out(log_file, dest / "gate-requests.jsonl")
-            result["gate_log"] = "gate-requests.jsonl"
+            try:  # the gate's own file, in a directory the gate writes as root: held to the same rule
+                log_copy = [("requests.jsonl", dest / "gate-requests.jsonl")]
+                if copyout.copy_tree(self.host, self.dir / "gatelog", log_copy, max_bytes=None)["requests.jsonl"]:
+                    result["gate_log"] = "gate-requests.jsonl"
+                else:  # `_prepare_gate` made it: a log that is gone is unreadable, as it was to the copy before
+                    raise SandboxError("copying a file out of the sandbox failed: the gate log is missing")
+            except copyout.UnsafeOutput as unsafe:
+                refused += [("gate log", r) for r in unsafe.refused]
+        if refused:
+            self._meta["unsafe_output"] = copyout.record(refused)
         (dest / "metadata.json").write_text(json.dumps(self.metadata(), indent=1, default=str), encoding="utf-8")
+        if refused:
+            raise kinds.output_error(r for _, r in refused)
         return result
 
     def _stop_on_purpose(self, role: str) -> None:

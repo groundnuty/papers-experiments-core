@@ -27,7 +27,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from expcore_onedata.sandbox import hostops, netpool
+from expcore_onedata.sandbox import copyout, hostops, netpool
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -62,50 +62,29 @@ def _sudo(host: HostOps, *argv: str, timeout_s: float):
     return host.run(list(argv), timeout_s, sudo=True)
 
 
-def _facts(host: HostOps, path: Path) -> tuple[int, int]:
-    """(files, bytes) under `path`, read as root: an agent's files need not be readable by us."""
-    r = _sudo(host, "find", str(path), "-type", "f", "-printf", "%s\\n", timeout_s=120.0)
-    if r.returncode != 0:
-        raise CollectFailed(f"listing a directory failed ({r.returncode}): {describe_stderr(r.stderr)}")
-    sizes = [int(s) for s in r.stdout.split()]
-    return len(sizes), sum(sizes)
+def _kept(what: str, copied: dict[str, int] | None) -> dict:
+    """An entry of the record: what was copied, its files and bytes, or that it was absent."""
+    return {"what": what, "absent": True} if copied is None else {"what": what, **copied}
 
 
-def _sudo_refused(r) -> bool:
-    """sudo's own failures (a password asked for, an unknown user) exit 1 as well, the code of a `test -d` that says no,
-    but write `sudo: ...` to stderr, which `test` never does."""
-    return any(x.startswith("sudo:") and "unable to resolve host" not in x for x in str(r.stderr).splitlines())
-
-
-def _copy(host: HostOps, what: str, src: Path, dst: Path) -> dict:
-    """Copy a directory or file out as root and check it by file count and bytes."""
-    t = _sudo(host, "test", "-e", str(src), timeout_s=30.0)
-    if t.returncode == 1 and not _sudo_refused(t):
-        return {"what": what, "absent": True}  # the attempt never got that far: nothing to keep, and not a failure
-    if t.returncode != 0:  # a timeout, a command that could not start, a sudo that refused: nothing is known
-        raise CollectFailed(f"testing for {what}: exit {t.returncode}, {describe_stderr(t.stderr)}")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    for argv in (("cp", "-r", str(src), str(dst)), ("chown", "-R", f"{os.getuid()}:{os.getgid()}", str(dst))):
-        r = _sudo(host, *argv, timeout_s=600.0)
-        if r.returncode != 0:
-            raise CollectFailed(f"{argv[0]} of {what}: {describe_stderr(r.stderr)}")
-    want, got = _facts(host, src), _facts(host, dst)
-    if want != got:
-        raise CollectFailed(f"{what}: {want} files and bytes there, {got} copied")
-    return {"what": what, "files": got[0], "bytes": got[1]}
-
-
-def collect(host: HostOps, x: Path, keep: Path, outputs: Sequence[str]) -> list[dict]:
+def collect(host: HostOps, x: Path, keep: Path, outputs: Sequence[str], *, max_bytes: int | None = None) -> list[dict]:
     """What a killed attempt did, into its record: its disk mounted if it no longer is (after a reboot), then the named
-    outputs and the gate log, each checked."""
+    outputs and the gate log, copied as root under the rule of `copyout.py` (O19) and checked file by file against the
+    listing. An output or log the attempt never got to is absent, which is not a failure; one holding a link, a special
+    file or more bytes than the working disk (`max_bytes`, else the size of its disk image) refuses the collection, so
+    the disks stay for an operator."""
     work = x / "work"
-    if (x / "work.img").exists() and work not in set(mounts_under(host, x)):
+    image = x / "work.img"
+    if image.exists() and work not in set(mounts_under(host, x)):
         work.mkdir(exist_ok=True)
-        r = _sudo(host, "mount", "-o", "loop,ro", str(x / "work.img"), str(work), timeout_s=60.0)
+        r = _sudo(host, "mount", "-o", "loop,ro", str(image), str(work), timeout_s=60.0)
         if r.returncode != 0:
             raise CollectFailed(f"mounting the working disk: {describe_stderr(r.stderr)}")
-    kept = [_copy(host, rel, work / rel, keep / "work" / rel) for rel in outputs]
-    return [*kept, _copy(host, "gate log", x / "gatelog", keep / "gatelog")]
+    if max_bytes is None and image.exists():
+        max_bytes = image.stat().st_size  # the disk's own size: what an output on it can hold, unless it is sparse
+    copied = copyout.copy_tree(host, work, [(rel, keep / "work" / rel) for rel in outputs], max_bytes=max_bytes)
+    log_copy = copyout.copy_tree(host, x / "gatelog", [(".", keep / "gatelog")], max_bytes=None)  # the gate's own
+    return [*(_kept(rel, copied[rel]) for rel in outputs), _kept("gate log", log_copy["."])]
 
 
 def reap_dirs(
@@ -116,9 +95,11 @@ def reap_dirs(
     dir_label: str,
     outputs: Sequence[str] = (),
     young_s: float = YOUNG_S,
+    *,
+    max_bytes: int | None = None,
 ) -> bool:
     """True when no directory of these names is left. Only with no container of them left, and none younger than
-    `young_s` (nothing yet shows whose it is)."""
+    `young_s` (nothing yet shows whose it is). `max_bytes` bounds what an output may hold (see `collect`)."""
     try:
         dirs = [x for x in Path(root).iterdir() if names.fullmatch(x.name) and x.is_dir()]
     except OSError as e:  # a root that is missing (an unmounted volume, a wrong path): "nothing there" is not "gone"
@@ -138,14 +119,14 @@ def reap_dirs(
             return False
         if ps.stdout.split() or now - x.stat().st_mtime < young_s:
             return False
-    return all(_reap_one(host, log_dir, x, outputs) for x in dirs)
+    return all(_reap_one(host, log_dir, x, outputs, max_bytes) for x in dirs)
 
 
-def _reap_one(host: HostOps, log_dir: Path, x: Path, outputs: Sequence[str]) -> bool:
+def _reap_one(host: HostOps, log_dir: Path, x: Path, outputs: Sequence[str], max_bytes: int | None) -> bool:
     keep = Path(log_dir) / "reaped" / x.name
     try:
         keep.mkdir(parents=True, exist_ok=True)
-        kept = collect(host, x, keep, outputs)
+        kept = collect(host, x, keep, outputs, max_bytes=max_bytes)
         sizes = {f.name: f.stat().st_blocks * 512 for f in x.iterdir() if f.is_file() and not f.is_symlink()}
         with open(Path(log_dir) / REAPED, "a") as f:
             record = {"t": time.time(), "dir": _named(x), "kept": kept, "allocated_bytes": sizes}
@@ -179,4 +160,13 @@ def reap_run(
     True when shown gone."""
     labels = netpool.Labels(settings.label_namespace)
     netpool.reap_orphans(host, labels)
-    return reap_dirs(host, log_dir, settings.work_root, sid_pattern(key), labels.dir, outputs, young_s)
+    return reap_dirs(
+        host,
+        log_dir,
+        settings.work_root,
+        sid_pattern(key),
+        labels.dir,
+        outputs,
+        young_s,
+        max_bytes=settings.limits.work_disk_bytes,
+    )

@@ -150,16 +150,13 @@ def dead_run(world):
 
 
 def run_handlers(host):
-    """The root commands the reaper uses, performed on the test's real temporary directory."""
+    """The root commands the reaper uses, performed on the test's real temporary directory (`find`, `cp` and `chown`
+    run for real in the fake host)."""
 
     def test_e(argv):
         return CmdResult(0 if Path(argv[-1]).exists() else 1)
 
-    def find(argv):
-        files = [p for p in Path(argv[1]).rglob("*") if p.is_file()]
-        return CmdResult(0, "".join(f"{p.stat().st_size}\n" for p in files))
-
-    host.run_handlers.update({"test": test_e, "find": find})
+    host.run_handlers.update({"test": test_e})
 
 
 def test_reaping_a_dead_run_copies_checks_and_only_then_removes_the_directory(world, dead_run, tmp_path):
