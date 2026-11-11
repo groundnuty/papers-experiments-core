@@ -7,6 +7,7 @@ the machine the shards ran on reaches it. Every build vendors stand-in wheels (`
 
 import hashlib
 import json
+import sqlite3
 import tarfile
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from package_support import stand_in_vendor
 from shard_support import run_shard
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
-from expcore.campaign.shard import MERGE_FILE
+from expcore.campaign.shard import MERGE_FILE, META_ENVIRONMENT
 from expcore.package import build as package_build
 from expcore.package.build import build_package, verify_package
 from expcore.package.spec import PackageError
@@ -138,3 +139,43 @@ def test_c29_an_anonymised_package_of_a_merged_batch_has_no_source_and_hashes_th
     check = json.loads(files["out/runs/replay-check.json"])
     assert check["merge"]["sha256"] == hashlib.sha256(files["out/merge.json"]).hexdigest()
     assert verify_package(root) == []
+
+
+def edit_merge_file(root: Path) -> None:
+    """Give merge.json another environment identity and fingerprint after the check, as the merge would write it."""
+    path = root / "out" / MERGE_FILE
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document.update(environment_identity={"layout": "e" * 64}, fingerprint="f" * 64)
+    path.write_text(json.dumps(document, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def edit_snapshot(root: Path) -> None:
+    """Give shard 2's snapshot another environment identity after the check."""
+    connection = sqlite3.connect(root / "out" / "shards" / "2" / SNAPSHOT)
+    try:
+        identity = json.dumps({"layout": "d" * 64}, sort_keys=True)
+        connection.execute("UPDATE meta SET value=? WHERE key=?", (identity, META_ENVIRONMENT))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("anonymised", [False, True], ids=["plain", "anonymised"])
+@pytest.mark.parametrize(
+    ("edit", "refusal"),
+    [
+        (edit_merge_file, rf"out/{MERGE_FILE} differs from what the replay check hashed"),
+        (edit_snapshot, rf"out/shards/2/{SNAPSHOT} differs from the snapshot out/{MERGE_FILE} names"),
+    ],
+    ids=["merge-file", "snapshot"],
+)
+def test_c29_a_merged_batch_edited_after_its_check_is_refused_before_anything_is_rewritten(
+    campaign, hashes, anonymisation, tmp_path, anonymised, edit, refusal
+):
+    """C29: a build compares merge.json with the hash the replay check names, and each shard's snapshot with the hash
+    merge.json names, before it reads or rewrites either: an anonymised build would otherwise rewrite the edited
+    bytes, hash them again and make a check that vouches for them."""
+    root = copy_campaign(campaign, tmp_path, "edited").root
+    edit(root)
+    with pytest.raises(PackageError, match=refusal):
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation if anonymised else None)

@@ -67,6 +67,7 @@ from expcore.package.identity import (
     replayed_records,
     stamp_bytes,
     verify_inputs,
+    verify_merged_inputs,
 )
 from expcore.package.leaks import default_hashes, findings_in, private_hashes, scan_tokens
 from expcore.package.lockfile import PYPI, lock_hashes, token_exempt
@@ -351,6 +352,7 @@ def _collect(
     warn: Callable[[str], None],
 ) -> tuple[PackageSpec, dict[str, bytes]]:
     study, spec, files, check = _selection(study_root)
+    verify_merged_inputs(files, check)  # before merge.json or a snapshot is read or rewritten, in every build
     if terms is not None:
         refuse_models(terms, _model_names(study))
     where = f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}"
