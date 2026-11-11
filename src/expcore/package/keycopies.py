@@ -9,8 +9,11 @@ but its limits: no kind of content is refused, and an attestation changes nothin
 Each stream is compared by size and then SHA-256 with each key file (`KeyFinders.is_key_file`), and what it holds is
 walked in turn, read as the scanner reads it (its classifiers are shared): the members of a zip (at offset 0, or
 wherever the zip reader finds one) or a tar, and their comments; what a gzip, bzip2, xz or zlib stream decompresses
-to; each value of an SQLite database; and in text, every base64 and hex run, decoded as the scanner decodes it
-(`views.payloads`). A stream of any other kind (a PNG, a PDF, a compiled binary) is compared as the bytes it is.
+to; each value of an SQLite database, in WAL mode or not; and in text, every base64 and hex run, decoded as the scanner
+decodes it (`views.payloads`). A tar member is read whenever the reader gives a stream for it, whatever its type,
+links aside (GNU tar extracts one of an unknown type as a file); a tar with bytes after its last member that are not
+the zero blocks ending it is unchecked, because the reader stops at a header it cannot read where GNU tar goes on to
+the next. A stream of any other kind (a PNG, a PDF, a compiled binary) is compared as the bytes it is.
 
 The limits are the scanner's, for each packaged file and each wheel member alone: containers nested `MAX_DEPTH` deep
 (a decoded run is not a level of its own: each one is shorter than the text it is in, so runs inside runs end on their
@@ -215,15 +218,20 @@ class _State:
         with archive:
             self._count(len(infos))
             for info in infos:
-                if info.isfile():
-                    yield self._member(f"{label}!{info.name}", lambda info=info: _extracted(archive, info))
+                if info.islnk() or info.issym():  # a link's data is its target's, a member of its own
+                    continue
+                handle = archive.extractfile(info)  # a stream for a regular member and for one of a type the reader
+                if handle is not None:  # does not know, as GNU tar extracts it; None for a directory or a device
+                    yield self._member(f"{label}!{info.name}", lambda handle=handle: handle)
+            if not _zeros_from(data, archive.offset):
+                yield label, None, "bytes follow its last member that are not the zero blocks ending a tar"
 
 
-def _extracted(archive: tarfile.TarFile, info: tarfile.TarInfo):
-    handle = archive.extractfile(info)
-    if handle is None:
-        raise tarfile.ReadError("a regular member with no data")
-    return handle
+def _zeros_from(data: bytes, start: int) -> bool:
+    """Whether `data` is all zero bytes from `start` on. After the last member the tar reader has read, a tar holds
+    only the zero blocks that end it (and the padding after them): the reader stops without a word at a header it
+    cannot read, where GNU tar skips to the next one, so any other byte there is a member left unread."""
+    return data.count(0, start) == len(data) - start
 
 
 def _values(label: str, data: bytes) -> Iterator[tuple[str, bytes | None, str]]:
@@ -233,7 +241,7 @@ def _values(label: str, data: bytes) -> Iterator[tuple[str, bytes | None, str]]:
     connection.text_factory = bytes
     try:
         try:
-            connection.deserialize(data)
+            connection.deserialize(_rollback_journal(data))
             connection.execute("PRAGMA query_only = ON")
             schema = connection.execute("SELECT type, name, sql FROM sqlite_master").fetchall()
         except sqlite3.Error as error:
@@ -256,6 +264,15 @@ def _values(label: str, data: bytes) -> Iterator[tuple[str, bytes | None, str]]:
                         yield f"{label}!{name}.{column}#{number}", value, ""
     finally:
         connection.close()
+
+
+def _rollback_journal(data: bytes) -> bytes:
+    """The database file with its header's write and read versions (bytes 18 and 19) at 1, the rollback journal, when
+    either is 2, the write-ahead log: `Connection.deserialize` refuses a database in WAL mode, and its tables are read
+    the same either way. Only the in-memory copy is changed."""
+    if 2 in data[18:20]:
+        return data[:18] + b"\x01\x01" + data[20:]
+    return data
 
 
 def _why(refused: _Refused) -> str:

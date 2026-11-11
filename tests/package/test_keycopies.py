@@ -5,6 +5,7 @@ import base64
 import gzip
 import hashlib
 import io
+import sqlite3
 import tarfile
 import zipfile
 from types import SimpleNamespace
@@ -49,14 +50,55 @@ def zipped(*members: tuple[str, bytes], stored: bool = False) -> bytes:
     return buffer.getvalue()
 
 
-def tarred(*members: tuple[str, bytes]) -> bytes:
+def tarred(*members: tuple[str, bytes], kind: bytes = tarfile.REGTYPE) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
         for name, data in members:
             info = tarfile.TarInfo(name)
             info.size = len(data)
+            info.type = kind
             archive.addfile(info, io.BytesIO(data))
     return buffer.getvalue()
+
+
+def tar_with_bad_header() -> bytes:
+    """A tar whose second header's checksum is wrong: the tar reader stops there, as it does at the end of an archive,
+    while GNU tar skips to the next header and extracts the key file."""
+    data = bytearray(tarred(("a.txt", b"first\n"), ("b.txt", b"second\n"), ("k.bin", KEY)))
+    data[1024 + 148] ^= 0x1
+    return bytes(data)
+
+
+def tar_with_a_lone_zero_block() -> bytes:
+    """A tar with one zero block (not the two that end an archive) after its first member, and a member after it."""
+    first, key = tarred(("a.txt", b"first\n"))[:1024], tarred(("k.bin", KEY))
+    return first + bytes(512) + key
+
+
+def tar_of_links() -> bytes:
+    """A tar of a directory, a symlink and a hard link (both to nothing in the archive): members with no data."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, kind in (("d", tarfile.DIRTYPE), ("s", tarfile.SYMTYPE), ("h", tarfile.LNKTYPE)):
+            info = tarfile.TarInfo(name)
+            info.type, info.linkname = kind, "absent"
+            archive.addfile(info)
+    return buffer.getvalue()
+
+
+def sqlite_of(directory, *blobs: bytes, wal: bool = False) -> bytes:
+    """The bytes of an SQLite database file, in WAL mode or not, with one row per BLOB."""
+    path = directory / "runs.db"
+    connection = sqlite3.connect(path)
+    if wal:
+        connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("CREATE TABLE runs (id INTEGER, note TEXT, blob BLOB)")
+    connection.executemany(
+        "INSERT INTO runs VALUES (?, ?, ?)", [(n, "a result row", b) for n, b in enumerate(blobs, 1)]
+    )
+    connection.commit()
+    connection.close()
+    return path.read_bytes()
 
 
 def nested(levels: int) -> bytes:
@@ -118,6 +160,8 @@ CANNOT_FINISH = [  # what it is, the file's bytes, the scanner's limits for the 
     ("too many bytes", gzip.compress(b"\0" * 4096), {"MAX_TOTAL_BYTES": 1024}, "over 1024 bytes", "!(gzip)"),
     ("an encrypted member", encrypted(), {}, "it is encrypted", "!k.bin"),
     ("a damaged member", damaged(), {}, "it fails to decompress (BadZipFile)", "!k.bin"),
+    ("a tar header damaged", tar_with_bad_header(), {}, "bytes follow its last member", ""),
+    ("a tar with a lone zero block", tar_with_a_lone_zero_block(), {}, "bytes follow its last member", ""),
 ]
 
 
@@ -137,6 +181,45 @@ def test_k13_a_walk_for_a_copy_that_cannot_finish_refuses_naming_where_it_stoppe
         assert len(found) == 1, found
         assert found[0].startswith(f"data/a.bin{where}: could not be checked for a copy of the key file"), found
         assert why in found[0], found
+
+
+def test_k13_what_can_be_read_of_a_tar_with_a_damaged_header_is_still_compared(finders):
+    """K13: a tar the reader stops in before its end (GNU tar skips a damaged header and goes on) is refused as
+    unchecked, and a copy of the key file among the members before that is still found."""
+    data = bytearray(tarred(("k.bin", KEY), ("b.txt", b"second\n"), ("c.txt", b"third\n")))
+    data[data.index(b"c.txt") + 148] ^= 0x1
+    found = find_locations({"data/a.tar": bytes(data)}, finders, opaque={"data/a.tar"})
+    assert f"data/a.tar!k.bin: {FOUND_COPY}" in found, found
+    assert any(UNCHECKED in line and line.startswith("data/a.tar:") for line in found), found
+
+
+def test_k13_a_copy_of_the_key_file_in_a_tar_member_of_an_unknown_type_is_found(finders):
+    """K13: a tar member whose type flag the reader does not know is read as a regular file, as GNU tar extracts it, so
+    a copy of the key file in one is refused by its path, attested or not."""
+    data = tarred(("k.bin", KEY), kind=b"Z")
+    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+        assert not archive.getmembers()[0].isfile()
+    for opaque in (frozenset({"data/a.tar"}), frozenset()):
+        found = find_locations({"data/a.tar": data}, finders, opaque=opaque)
+        assert f"data/a.tar!k.bin: {FOUND_COPY}" in found, found
+
+
+def test_k13_a_tar_of_directories_and_links_passes_the_walk(finders):
+    """K13: members that hold no data (a directory, a symlink, a hard link to nothing in the archive) are not read, and
+    do not stop the walk."""
+    assert find_locations({"data/a.tar": tar_of_links()}, finders, opaque={"data/a.tar"}) == []
+
+
+def test_k13_a_wal_mode_sqlite_database_is_read_for_a_copy_of_the_key_file(finders, tmp_path):
+    """K13: a database in WAL mode (which SQLite will not deserialise as it is) with no copy of the key file passes,
+    attested; one with the key file in a BLOB is refused by the BLOB's path."""
+    clean = sqlite_of(tmp_path, b"\0" + KEY, wal=True)
+    assert clean[18:20] == b"\x02\x02"
+    assert find_locations({"out/runs.db": clean}, finders, opaque={"out/runs.db"}) == []
+    (tmp_path / "runs.db").unlink()
+    holding = sqlite_of(tmp_path, b"one", KEY, wal=True)
+    found = find_locations({"out/runs.db": holding}, finders, opaque={"out/runs.db"})
+    assert found == [f"out/runs.db!runs.blob#2: {FOUND_COPY}"], found
 
 
 def test_k13_nothing_is_walked_for_a_copy_when_no_key_file_can_be_read(tmp_path):
