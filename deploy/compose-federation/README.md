@@ -85,7 +85,15 @@ files are not agent-visible material and need no deleting after `up`, which woul
 the ingest. The space is still made, supported by its owner and mirrors, and given its members and tokens; only the files
 are left out. The study space may be one of them: a check that reads a baseline file then finds none, and says so
 (see "The baseline"). A layout declares `agent_visible = false` and `baseline = false` independently, and the study
-space is refused only for the first.
+space is refused only for the first. The key sits in the space's table, beside its owner and mirrors; neither committed
+layout sets it, so both keep every baseline file:
+
+```toml
+[spaces.alpha-space]             # the study space, left empty by up and by reset --clean
+owner = "pine"
+mirrors = ["birch", "cedar"]
+baseline = false
+```
 
 The Compose file is generated from the layout at every command (`fedcompose.py`), never edited: what keeps the
 federation to itself is part of the generator. `compose.yaml` here is the default layout's output, committed for

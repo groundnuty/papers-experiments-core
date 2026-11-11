@@ -40,7 +40,6 @@ owner = "larch"
 
 [spaces.gamma-space]
 owner = "alder"
-# baseline = false               # a study that reads this space would add this: up then writes no file into it, and reset --clean leaves it empty
 
 [spaces.delta-space]             # owned by hazel and mirrored by alder, the owner of gamma-space
 owner = "hazel"
