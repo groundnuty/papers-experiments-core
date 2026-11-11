@@ -25,6 +25,11 @@ snapshot and never the live platform (R13). The snapshot holds, for the files th
   jobs in the window that replicate into it, and `on_demand_lower_bound`, the gained bytes less those, floored at zero
   and only a lower bound (`transferwindow.py` names the conditions); None when the block maps or the listing are unknown.
 
+Every provider in the snapshot is named by its position in platform.toml, `providers[i]`: the tracked providers, the
+keys of each file's readings, of `pairs` and their `from`, of `on_demand`, and each transfer record's `provider`. A
+record is published in a replication package, so it holds no configured provider name (O12). Snapshot version 3 is
+the first so keyed; version 2 named them by configuration.
+
 **`gained_bytes` is placement gained, not a net change and not bytes on the wire.** It is the bytes of the blocks a
 provider's block map (`GET /data/{id}/distribution`) shows at run end that it did not show at run start; what the map
 showed at the start and no longer does is `lost_bytes`, kept apart, so replacing 100 bytes with 100 others gains 100
@@ -53,7 +58,7 @@ from expcore_onedata.transferlog import MAX_LISTED, PAGE_LIMIT, TransferLog
 from expcore_onedata.transferwindow import Window, split_gained
 
 NAMESPACE = "platform_probes"
-VERSION = 2
+VERSION = 3  # 3: every provider is keyed by its position (`providers[i]`), never by its configured name
 BLOCKS_SHOWN = 2000  # the most merged blocks recorded per file and provider; the count is always recorded
 
 
@@ -261,6 +266,11 @@ class PlatformProbes:
         entries, self._before = self._read_maps()
         self._before_ids = {label: entry.value.file_id for label, entry in entries.items() if entry.ok}
 
+    def _label_of_id(self, provider_id: str) -> str | None:
+        """The position label (`providers[i]`) of the declared provider an id belongs to, or None for none."""
+        name = self._provisioner.provider_named(provider_id)
+        return None if name is None else self._client.provider_label(name)
+
     def _transfer_records(self) -> list[dict[str, Any]]:
         records = []
         for provider, tid, kind in self._transfers():
@@ -268,7 +278,7 @@ class PlatformProbes:
             body = found.value if found.ok and isinstance(found.value, dict) else {}
             records.append(
                 {
-                    "provider": provider,
+                    "provider": self._client.provider_label(provider),
                     "transfer_id": tid,
                     "kind": kind,
                     **found.to_json(),
@@ -301,7 +311,7 @@ class PlatformProbes:
             if file_id is not None:
                 counted[file_id] = label
             readings = {
-                p: {
+                self._client.provider_label(p): {
                     "before": _blocks_json(before[label][p]) if label in before else None,
                     "after": _blocks_json(after[label][p]),
                 }
@@ -316,10 +326,10 @@ class PlatformProbes:
                 and all(before[label][p].ok and after[label][p].ok for p in self._providers)
             )
             complete = complete and usable
-            pairs = (
+            pairs = (  # keyed, destination and source alike, by position: a record holds no provider's name (O12)
                 bytes_by_pair(
-                    {p: merged(before[label][p].value) for p in self._providers},
-                    {p: merged(after[label][p].value) for p in self._providers},
+                    {self._client.provider_label(p): merged(before[label][p].value) for p in self._providers},
+                    {self._client.provider_label(p): merged(after[label][p].value) for p in self._providers},
                 )
                 if usable
                 else None
@@ -345,16 +355,14 @@ class PlatformProbes:
             "version": VERSION,
             **({} if self._space is None else {"space": self._space}),  # its position, with several spaces only
             "ok": ok,
-            "providers": list(self._providers),
+            "providers": [self._client.provider_label(p) for p in self._providers],
             "seconds": None if self._started is None else round(self._now() - self._started, 3),
             "files": files,
             "transfers": transfers,
             "space_transfers": log.section,
             "pairs": pair_totals if complete else None,
             "on_demand": (
-                split_gained(
-                    gained, log.inside, self._provisioner.provider_named, flagged=log.flagged, everywhere=log.everywhere
-                )
+                split_gained(gained, log.inside, self._label_of_id, flagged=log.flagged, everywhere=log.everywhere)
                 if complete and log.inside is not None
                 else None
             ),

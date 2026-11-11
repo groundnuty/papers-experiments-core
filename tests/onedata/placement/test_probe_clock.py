@@ -34,7 +34,7 @@ def test_o08_a_transfer_timed_by_a_provider_10_s_behind_is_counted_or_makes_the_
     assert tid in {r["transfer_id"] for r in section["records"]}
     assert section["clock"]["offsets"][client.provider_label("beta")]["min_s"] == -10.0
     assert section["clock"]["offsets"][client.provider_label("alpha")]["max_s"] == 0.0
-    beta = snapshot["on_demand"]["beta"]
+    beta = snapshot["on_demand"]["providers[1]"]
     assert beta["on_demand_lower_bound"] is None
     assert "transfer_near_window_edge" in beta["unknown"]
 
@@ -47,9 +47,9 @@ def test_o08_a_transfer_that_ended_just_before_the_runs_end_makes_its_targets_bo
     ticker.sleep(30)
     seeded.add_transfer("replication", MORE, BETA_ID, scheduled=ticker.now - 10, finished=ticker.now - 1)
     split = probes.finish()["on_demand"]
-    assert split["beta"]["on_demand_lower_bound"] is None
-    assert "transfer_near_window_edge" in split["beta"]["unknown"]
-    assert split["alpha"]["on_demand_lower_bound"] == 0
+    assert split["providers[1]"]["on_demand_lower_bound"] is None
+    assert "transfer_near_window_edge" in split["providers[1]"]["unknown"]
+    assert split["providers[0]"]["on_demand_lower_bound"] == 0
 
 
 @pytest.mark.parametrize("date", [None, "not a date"])
@@ -62,7 +62,7 @@ def test_o08_a_provider_whose_clock_cannot_be_read_makes_every_bound_unknown(pro
     seeded.add_transfer("replication", MORE, BETA_ID, scheduled=ticker.now)
     ticker.sleep(30)
     snapshot = probes.finish()
-    for provider in ("alpha", "beta"):
+    for provider in ("providers[0]", "providers[1]"):
         assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
         assert "clock_offset_unknown" in snapshot["on_demand"][provider]["unknown"]
     assert snapshot["space_transfers"]["clock"]["known"] is False
