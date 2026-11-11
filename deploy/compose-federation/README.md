@@ -183,14 +183,15 @@ writes nothing into it. A space declared `true` again gets its files at the next
 
 The day-0 checks never assume a baseline file. The platform file names one space, the study space, and a check runs in
 it as it is. With a baseline-off study space the `listing` check reports unknown on an empty root. The `content_type`
-check, and the `health` check, which composes it, report unknown when a data path is REST and the configured
-`[sandbox] content_check_file` is not there, each saying so; `health` still fails on a support set that differs from the
-declared one and on a content type that was measured wrong. With no REST data path neither reads a file, as against the
-templates here, which set no `[sandbox]` table. The live content test (`EXPCORE_LIVE_CONTENT_PATH`) skips on a file the
-space does not hold, so set that variable only where the study space keeps `hello.txt`. `reachability` and `tokens` read
-no file of the space, and `read_only` and `round_trip` work on a scratch file of their own: all four are the same on any
-space. There is no setting to point one check at another space; a pass that needs the baseline files runs against a
-layout whose study space keeps them.
+check reports unknown whenever it measured nothing: with no REST data path, as against the templates here, which set no
+`[sandbox]` table, and with one when the configured `[sandbox] content_check_file` is not there. The `health` check
+composes it. With a REST data path and no file it is unknown, saying why, unless the support set differs from the
+declared one, which fails it; a content type that was measured wrong fails it too. With no REST data path nothing is
+refused, and its verdict is the support set's alone. The live content test (`EXPCORE_LIVE_CONTENT_PATH`) skips on a
+file the space does not hold, so set that variable only where the study space keeps `hello.txt`. `reachability` and
+`tokens` read no file of the space, and `read_only` and `round_trip` work on a scratch file of their own: all four are
+the same on any space. There is no setting to point one check at another space; a pass that needs the baseline files
+runs against a layout whose study space keeps them.
 
 ## Running the core against it
 
