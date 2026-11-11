@@ -26,6 +26,7 @@ are the same text: no clock, no path and no random number enters it.
   condition and infrastructure kind the infrastructure failures, with a row of zeros for a condition that had none, so
   0 is never mistaken for "not reported" (C23); and per condition and model the attempts a budget hold set aside, a row
   of zeros for each pair the plan runs, so a reader sees whether the budget stopped one model more than another (C26).
+  Those come from the export's `budget_holds`, which counts a hold by its own kind even where an outage overlapped it.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
@@ -41,7 +42,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore.accounting import condition_accounting
-from expcore.errors import BUDGET_HOLD
 from expcore.report_notes import (
     BUDGET_HOLD_NOTES,
     CONDITION_NOTES,
@@ -333,9 +333,8 @@ def _budget_holds(export: Mapping[str, Any]) -> list[str]:
     """The attempts a budget hold set aside, per condition and model, with a row of zeros for each pair the plan runs,
     so a reader sees whether the budget stopped one model's runs more than another's (C26)."""
     counts: Counter[tuple[str, str]] = Counter()
-    for row in export["retries_by_kind"]:
-        if row["kind"] == BUDGET_HOLD:
-            counts[(row["condition"], row["model"])] += row["attempts"]
+    for row in export["budget_holds"]:  # by each attempt's own kind, not the outage's that set it aside
+        counts[(row["condition"], row["model"])] += row["attempts"]
     planned = {
         (entry["condition"], entry["factors"]["model"])
         for part in ("analysed_attempts", "exhausted_runs", "unfinished_runs", "excluded_attempts")

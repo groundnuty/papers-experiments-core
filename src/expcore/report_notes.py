@@ -109,6 +109,7 @@ BUDGET_HOLD_NOTES = [
     "Attempts set aside by a budget hold: attempts that ended because a request the token cap could not account for",
     "(a resend after a failure that may have been billed, or a request after a reply without usage) needed a top-up",
     "the campaign's budget could not cover, so it was not sent. They are among the attempts set aside above, and are",
-    "counted over every run of the campaign, a run a partial analysis leaves out included. A model with more of them",
-    "had its runs stopped by the budget more often than the others.",
+    "counted by the kind of their own outcome: one an outage overlapped, which the table above counts under the",
+    "outage's kind, is counted here too. They are counted over every run of the campaign, a run a partial analysis",
+    "leaves out included. A model with more of them had its runs stopped by the budget more often than the others.",
 ]

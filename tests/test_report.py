@@ -76,6 +76,7 @@ def export(**changes):
         ],
         "infrastructure_by_condition": [],
         "retries_by_kind": [],
+        "budget_holds": [],
     }
     data = {**base, **changes}
     for part in RUN_PARTS:  # an export names each run's model among its factors; these runs are of one model
@@ -637,33 +638,32 @@ def test_s12_an_exploratory_only_result_with_a_confirmatory_contrast_is_refused(
 
 
 def budget_hold(condition: str, model: str, attempts: int) -> dict:
-    return {
-        "condition": condition,
-        "model": model,
-        "kind": "budget_hold",
-        "state": "infra_fail",
-        "charged": False,
-        "attempts": attempts,
-    }
+    return {"condition": condition, "model": model, "attempts": attempts}
 
 
 def test_c26_budget_holds_are_counted_per_condition_and_model_so_a_reader_sees_where_they_cluster():
-    """C26: the attempts a budget hold set aside, by condition and model, from the export; another kind's attempts
-    are not counted, and a model that met the ceiling more often stands out."""
+    """C26: the attempts a budget hold set aside, by condition and model, from the export's `budget_holds`; the
+    retries of another kind are not counted, and a model that met the ceiling more often stands out."""
     analysed = [
         {"run_key": "k1", "condition": "cond-a", "factors": {"model": "model-a"}},
         {"run_key": "k2", "condition": "cond-a", "factors": {"model": "model-b"}},
         {"run_key": "k3", "condition": "cond-b", "factors": {"model": "model-a"}},
         {"run_key": "k4", "condition": "cond-b", "factors": {"model": "model-b"}},
     ]
-    retries = [
-        budget_hold("cond-a", "model-b", 3),
-        budget_hold("cond-b", "model-b", 2),
-        {**budget_hold("cond-a", "model-a", 5), "kind": "endpoint", "charged": True},
+    holds = [budget_hold("cond-a", "model-b", 3), budget_hold("cond-b", "model-b", 2)]
+    retries = [  # the export's retries are not where the report counts holds
+        {
+            "condition": "cond-a",
+            "model": "model-a",
+            "kind": kind,
+            "state": "infra_fail",
+            "charged": False,
+            "attempts": 5,
+        }
+        for kind in ("endpoint", "budget_hold")
     ]
-    report = render(
-        analysis(contrast("primary", "difference")), export(analysed_attempts=analysed, retries_by_kind=retries)
-    )
+    data = export(analysed_attempts=analysed, retries_by_kind=retries, budget_holds=holds)
+    report = render(analysis(contrast("primary", "difference")), data)
     holds = report.split("### Budget holds by condition and model", 1)[1]
     assert "| Condition | Model | Attempts set aside by a budget hold |" in holds
     rows = [line for line in holds.splitlines() if line.startswith("| cond-")]

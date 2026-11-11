@@ -5,7 +5,7 @@ import json
 import threading
 
 import pytest
-from campaign_support import NOW, finished, planned_store
+from campaign_support import NOW, finished, infra, planned_store
 from loop_support import FakeProvider
 from record_support import CODE
 from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, models_for, settings_for
@@ -50,11 +50,15 @@ def running(tmp_path):
     return store, key, store.begin_attempt(key, NOW, 4321, str(tmp_path / "attempt"))
 
 
+def condition_of(store, key) -> str:
+    """The condition of a run."""
+    factors = json.loads(store.q("SELECT factors FROM runs WHERE run_key=?", (key,))[0]["factors"])
+    return store.schema.condition_named(factors, key)
+
+
 def measured(store, key, **usage):
     """A finished result with the given usage, carrying the treatment kinds of the run's condition."""
-    factors = json.loads(store.q("SELECT factors FROM runs WHERE run_key=?", (key,))[0]["factors"])
-    kinds = store.schema.treatment_kinds[store.schema.condition_named(factors, key)]
-    return finished(treatment_kinds=kinds, **usage)
+    return finished(treatment_kinds=store.schema.treatment_kinds[condition_of(store, key)], **usage)
 
 
 def charged(store, attempt_id):
@@ -240,6 +244,31 @@ def test_c26_a_request_the_budget_cannot_top_up_is_not_sent_and_its_attempt_is_a
         assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "budget_hold")
         assert record.set_aside
         assert replay_record(record).to_json() == record.to_json()  # the refusal is the request's recorded failure
+
+
+def test_c26_a_budget_hold_an_outage_overlapped_is_still_counted_as_a_budget_hold_in_the_export_and_the_report(
+    tmp_path,
+):
+    """C26: an outage sets the held attempt aside under the outage's kind, but the attempt ended because the budget
+    refused a send, so the export's `budget_holds` and the report's table count it by its own kind; another kind's
+    attempt is not counted, and a pair the plan runs without a hold has its row of zeros."""
+    store, _, manifest = planned_store(tmp_path, models=(MODEL,))
+    (held_key, held_condition), (other_key, other_condition) = [
+        (row.key.text, condition_of(store, row.key.text)) for row in manifest.rows[:2]
+    ]
+    for key, kind in ((held_key, "budget_hold"), (other_key, "endpoint")):
+        begun = store.begin_attempt(key, NOW, 4321, str(tmp_path / kind))
+        kinds = store.schema.treatment_kinds[condition_of(store, key)]
+        store.finish_attempt(begun.id, infra(kind, outage_kind="endpoint", treatment_kinds=kinds), 3)
+    assert {r["state"] for r in store.q("SELECT state FROM attempts")} == {"outage_discarded"}
+    export = export_run_state(store)
+    report = render_report(NO_CONTRASTS, export, study="topup-study", code=STAMP, core_version="0.1.0")
+    table = report.split("### Budget holds by condition and model")[1]
+    assert f"| {held_condition} | {MODEL} | 1 |" in table
+    assert f"| {other_condition} | {MODEL} | 0 |" in table
+    counted = {(r["condition"], r["model"]): r["attempts"] for r in export["budget_holds"]}
+    planned = {(condition_of(store, row.key.text), MODEL) for row in manifest.rows}
+    assert counted == {pair: int(pair == (held_condition, MODEL)) for pair in planned}
 
 
 def test_c26_a_request_the_budget_can_top_up_is_sent_and_its_top_up_is_part_of_what_the_run_cost(tmp_path):
