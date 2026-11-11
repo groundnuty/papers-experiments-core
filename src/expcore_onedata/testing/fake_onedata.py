@@ -40,7 +40,6 @@ class Request:
     range: str | None
     token: str | None
     body: bytes = b""
-    run_headers: tuple = ()  # every X-dataset-192 header value received
 
 
 class MockOnedata:
@@ -51,7 +50,7 @@ class MockOnedata:
         self,
         files: Mapping[str, bytes | pathlib.Path],
         *,
-        space_name: str = "dataset-176",
+        space_name: str = "test-space",
         zone_host: str = "onezone.mock",
         provider_host: str = "provider.mock",
         max_limit: int | None = 10000,
@@ -159,7 +158,6 @@ class MockOnedata:
                             self.headers.get("Range"),
                             tok,
                             body,
-                            tuple(self.headers.get_all("X-dataset-192") or ()),
                         )
                     )
                 if self.command == "POST" and u.path.endswith("/onezone/tokens/infer_access_token_scope"):

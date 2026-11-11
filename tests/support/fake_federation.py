@@ -27,7 +27,8 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 import httpx
-from fake_onedata import MockOnedata, Request
+
+from expcore_onedata.testing.fake_onedata import MockOnedata, Request
 
 ZONE = "/api/v3/onezone"
 

@@ -62,7 +62,8 @@ from email.utils import formatdate
 
 import httpx
 from fake_federation import FakeFederation
-from fake_onedata import Request
+
+from expcore_onedata.testing.fake_onedata import Request
 
 PROVIDER = "/api/v3/oneprovider"
 ROOT_ID = "root-0001"
