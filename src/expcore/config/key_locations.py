@@ -53,6 +53,11 @@ _LINES = re.compile(r"(?<=\n)")  # TOML ends a line at LF (CRLF included) and no
 _NAME_EDGE = r"A-Za-z0-9_"  # a variable's name is found only as a whole identifier
 _PART = r"\w\-~+@%"  # what continues a part of a path written in text, besides a full stop
 _QUOTE = "\"'`"
+_RIGHT = rf"(?![{_PART}/\\]|\.+[{_PART}/\\])"  # nothing that continues a part or a path follows
+_HOME_DIRECTORY = re.compile(r"/(?:home/[^/]+|Users/[^/]+|root)/(?P<tail>.+)")  # a home directory of any machine
+_HOMES = (  # what a tail is written behind: `~`, `~name`, a variable, a home directory of any machine
+    rf"(?:~[{_PART}.]*|\$HOME|\$\{{HOME\}}|%(?:USERPROFILE|HOME)%|/home/[{_PART}.]+|/Users/[{_PART}.]+|/root)"
+)
 MAX_KEY_FILE_BYTES = 2**20  # a key is a small secret: a file over 1 MiB is not one
 
 
@@ -236,28 +241,53 @@ def _path_finder(path: str) -> re.Pattern[str]:
     after a separator or a quote (`/x/lab.key`, `"lab.key"`); one with a full stop or a hyphen (`prior-study.key`) is
     a path of one part, found like any other (a `.gitignore` line, `KEY_FILE=prior-study.key`, a sentence). A packaged
     file named as the key file is found by its path (`KeyFinders.names_file`)."""
-    whole = any(char in path for char in "/\\.-")  # a path with a directory, or a name that is not a plain word
-    left = rf"(?<![{_PART}.])" if whole else rf"(?<=[{_QUOTE}/\\])"
-    return re.compile(rf"{left}{re.escape(path)}(?![{_PART}/\\]|\.+[{_PART}/\\])")
+    left = rf"(?<![{_PART}.])" if _is_path(path) else rf"(?<=[{_QUOTE}/\\])"
+    return re.compile(rf"{left}{re.escape(path)}{_RIGHT}")
 
 
-def _spellings(key_file: str) -> set[str]:
-    """The ways a declared key file's path is written elsewhere: as declared, with `~` expanded, without a leading
-    `./`, and the tail after the home directory (after `~/` or `~user/`, or after this machine's home for an absolute
-    path under it), which `$HOME/`, `${HOME}/`, `~/` and another host's home precede. Each is searched as a whole
-    relative path; no tail is empty."""
+def _is_path(text: str) -> bool:
+    """Whether the text is a path with a directory, or a name that is not a plain word (`False` for `key`)."""
+    return any(char in text for char in "/\\.-")
+
+
+def _home_finder(tail: str) -> re.Pattern[str]:
+    """What finds a tail that is one bare word, only behind a home directory (`_HOMES`): `~/key`, `$HOME/key`,
+    `${HOME}/key`, `/home/someone/key`. On its own it is an ordinary word (`d["key"]`, `{"token": t}`)."""
+    return re.compile(rf"(?<![{_PART}.]){_HOMES}/{re.escape(tail)}{_RIGHT}")
+
+
+def _tails(key_file: str) -> set[str]:
+    """What follows the home directory in a declared key file's path: after `~/` or `~user/`, after this machine's
+    home for a path under it, and after `/home/<name>/`, `/Users/<name>/` or `/root/` for a path of any machine's
+    (`$HOME/`, `${HOME}/`, `~/` and another host's home precede it where it is written). None is empty."""
+    expanded = os.path.expanduser(key_file)
+    tails = set()
+    if key_file.startswith("~"):
+        tails.add(key_file.partition("/")[2])
+    home = os.path.expanduser("~").rstrip("/")
+    if home.startswith("/") and expanded.startswith(f"{home}/"):
+        tails.add(expanded[len(home) + 1 :])
+    for path in {key_file, expanded}:
+        if (under := _HOME_DIRECTORY.fullmatch(path)) is not None:
+            tails.add(under["tail"])
+    return {tail for tail in tails if tail.strip("./\\")}
+
+
+def _spellings(key_file: str) -> tuple[set[str], set[str]]:
+    """The ways a declared key file's path is written elsewhere, as (whole, bare). `whole` is searched as a relative
+    path: as declared, with `~` expanded, without a leading `./`, and each tail after a home directory (`_tails`).
+    `bare` is the tails that are one word (`~/key`'s `key`): searched only behind a home directory (`_home_finder`)."""
     expanded = os.path.expanduser(key_file)
     spellings = {key_file, expanded}
     unrooted = key_file
     while unrooted.startswith("./"):
         unrooted = unrooted[2:]
     spellings.add(unrooted)
-    home = os.path.expanduser("~").rstrip("/")
-    if key_file.startswith("~"):
-        spellings.add(key_file.partition("/")[2])
-    if home.startswith("/") and expanded.startswith(f"{home}/"):
-        spellings.add(expanded[len(home) + 1 :])
-    return {spelling for spelling in spellings if spelling.strip("./\\")}
+    tails = _tails(key_file)
+    spellings |= {tail for tail in tails if _is_path(tail)}
+    return {spelling for spelling in spellings if spelling.strip("./\\")}, {
+        tail for tail in tails if not _is_path(tail)
+    }
 
 
 def _ends_with(path: str, tail: str) -> bool:
@@ -320,14 +350,16 @@ def _key_file_digest(spec: Any) -> tuple[int, str] | None:
 
 def location_finders(specs: Iterable[Any]) -> KeyFinders:
     """What finds each key location the models declare: a key file's path in the spellings of `_spellings`, in text
-    (`_path_finder`) and as a packaged file (`KeyFinders.names_file`); the key file itself as a copy under any name,
-    when it can be read now (`_key_file_digest`); and a variable's name as a whole identifier. Text is searched
-    case-sensitively. A placeholder is never looked for.
+    (`_path_finder`, `_home_finder`) and as a packaged file (`KeyFinders.names_file`); the key file itself as a copy
+    under any name, when it can be read now (`_key_file_digest`); and a variable's name as a whole identifier. Text is
+    searched case-sensitively. A placeholder is never looked for.
     """
-    paths, names, digests = set(), set(), set()
+    paths, bare, names, digests = set(), set(), set(), set()
     for spec in specs:
         if spec.key_file and spec.key_file != KEY_FILE_WITHHELD:
-            paths |= _spellings(spec.key_file)
+            whole, words = _spellings(spec.key_file)
+            paths |= whole
+            bare |= words
             digest = _key_file_digest(spec)
             if digest is not None:
                 digests.add(digest)
@@ -336,6 +368,7 @@ def location_finders(specs: Iterable[Any]) -> KeyFinders:
     return KeyFinders(
         patterns=(
             *(_path_finder(path) for path in sorted(paths)),
+            *(_home_finder(tail) for tail in sorted(bare)),
             *(re.compile(rf"(?<![{_NAME_EDGE}]){re.escape(name)}(?![{_NAME_EDGE}])") for name in sorted(names)),
         ),
         files=tuple(sorted(paths)),

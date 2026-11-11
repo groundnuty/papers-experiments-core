@@ -197,6 +197,17 @@ FOUND = [
     (f"{HOME}/prior-study/lab.key", "- ${HOME}/prior-study/lab.key:/run/key:ro"),
     ("./keys/lab.key", "cat keys/lab.key"),
     ("./keys/lab.key", "cat ./keys/lab.key"),
+    # a tail that is one bare identifier is found only behind a home directory
+    ("~/key", "cat ~/key"),
+    ("~/key", "cat $HOME/key"),
+    ("~/key", "    - ${HOME}/key:/run/key:ro"),
+    ("~/key", "error: /home/someone/key missing"),
+    ("~/key", "see /Users/someone/key"),
+    ("~/key", "ls /root/key"),
+    ("~/key", "cat ~bob/key"),
+    ("~/OPENAI_API_KEY", "export F=$HOME/OPENAI_API_KEY"),
+    (f"{HOME}/key", "cat $HOME/key"),
+    ("/home/someone/key", "cat ~/key"),
     # a bare file name with a full stop or a hyphen is a path of one part: found wherever no part continues it
     ("prior-study.key", "__pycache__/\nprior-study.key\n"),  # a .gitignore line
     ("prior-study.key", "[k](prior-study.key)"),
@@ -227,6 +238,14 @@ NOT_FOUND = [
     ("prior-study.key", "prior-study.key.bak"),
     ("prior-study.key", "prior-study.keys"),
     ("prior-study.key", "PRIOR-STUDY.KEY"),
+    # a tail that is one bare identifier is an ordinary word on its own: a key of a dict, a field, a variable
+    ("~/key", 'd["key"]'),
+    ("~/token", '{"token": t}'),
+    ("~/OPENAI_API_KEY", 'os.environ["OPENAI_API_KEY"]'),
+    ("/Users/someone/key", "sorted(rows, key=len)\nrow = {'key': 1}"),
+    ("~/key", "/home/someone/keys"),
+    ("~/key", "/home/someone/key/old"),
+    ("~/key", "$HOME/mykey"),
 ]
 
 
@@ -252,6 +271,34 @@ def test_k13_a_key_file_is_not_found_inside_a_longer_name(key_file, text):
     identifier is an ordinary word unless quoted or a part of a path. So neither `my-key.txt` nor `import secrets`
     refuses a build whose key file is `key.txt` or `secrets`."""
     assert not names_key_file(key_file, text)
+
+
+ANY_HOME = [
+    ("/Users/someone/prior-study/lab.key", "cat ~/prior-study/lab.key"),
+    ("/Users/someone/prior-study/lab.key", "cat $HOME/prior-study/lab.key"),
+    ("/Users/someone/prior-study/lab.key", "error: /home/other/prior-study/lab.key missing"),
+    ("/home/someone/prior-study/lab.key", "cat ~/prior-study/lab.key"),
+    ("/root/prior-study/lab.key", "cat ${HOME}/prior-study/lab.key"),
+    ("/Users/someone/lab.key", "cat ~/lab.key"),
+    ("/Users/someone/key", "cat ~/key"),
+]
+
+
+@pytest.mark.parametrize(("key_file", "text"), ANY_HOME, ids=[f"{k} in {t}" for k, t in ANY_HOME])
+def test_k13_a_key_file_is_found_by_its_tail_under_any_home_not_only_this_machines(
+    monkeypatch, tmp_path, key_file, text
+):
+    """K13: the tail of a declared absolute key file after `/home/<name>/`, `/Users/<name>/` or `/root/` is searched
+    whatever this machine's home is, so a study declared on one machine and built on another is still refused when a
+    file writes the path from its own home, from `~`, `$HOME` or another user's."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert names_key_file(key_file, text)
+
+
+def test_k13_a_key_file_declared_under_another_home_is_not_found_in_another_folder(monkeypatch, tmp_path):
+    """K13: the tail is a whole relative path: a longer folder name does not hold it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert not names_key_file("/Users/someone/prior-study/lab.key", "cat ~/old-prior-study/lab.key")
 
 
 MODEL = '[models.a]\nbackend = "anthropic"\napi_id = "a-1"\nbase_url = "https://a.example.invalid"\n'
