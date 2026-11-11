@@ -11,9 +11,10 @@ directory of its own (`mount_live.derive_platform`): images pinned to the ids `E
 `EXPCORE_LIVE_ONECLIENT_IMAGE` resolve to now (defaults `mount_live.AGENT_IMAGE` and `ONECLIENT_IMAGE`; nothing is
 pulled), the pool from `EXPCORE_LIVE_SANDBOX_POOL`, its work directory under pytest's temporary directory, one mount
 level with `EXPCORE_LIVE_ONECLIENT_ARGS` (split as a shell would) as oneclient's further arguments, and
-`[sandbox.federation]`: the oneclient sidecar on the federation's network (`EXPCORE_LIVE_FED_NETWORK`, default
-`mount_live.FED_NETWORK`), dialling the local provider by its domain there. `EXPCORE_LIVE_FACTS_OUT` names a file the
-attempt's facts are written to as JSON: outcomes, sizes and seconds, never a token, an address or a path.
+`[sandbox.federation]`: the oneclient sidecar on the federation's network (`EXPCORE_LIVE_FED_NETWORK`, default the
+layout's project's network, from facts.json), dialling the local provider by its domain there.
+`EXPCORE_LIVE_FACTS_OUT` names a file the attempt's facts are written to as JSON: outcomes, sizes and seconds, never a
+token, an address or a path.
 
 The attempt runs once, in a fixture, and each test asserts one thing it showed:
 1. launch: the sidecar alone has /dev/fuse and SYS_ADMIN, and it alone is on the federation's network;
@@ -54,7 +55,6 @@ if any(os.environ.get(gate) != "1" for gate in GATES) or not os.environ.get("EXP
 
 from mount_live import (  # noqa: E402 -- only once the module is known to run
     AGENT_IMAGE,
-    FED_NETWORK,
     LEASE_KEY,
     ONECLIENT_IMAGE,
     SpaceFiles,
@@ -62,10 +62,13 @@ from mount_live import (  # noqa: E402 -- only once the module is known to run
     candidate_options,
     confinement_cell,
     derive_platform,
+    federation_network,
     file_guid,
     mentions,
     pattern,
     read_cell,
+    reader_cell,
+    reads_cell,
     sandbox_table,
     unwritten_cell,
     unwritten_cell_timeout,
@@ -74,7 +77,7 @@ from mount_live import (  # noqa: E402 -- only once the module is known to run
 from expcore_onedata import consistency  # noqa: E402
 from expcore_onedata.client import OnezoneClient  # noqa: E402
 from expcore_onedata.config import PlatformConfig, load_platform  # noqa: E402
-from expcore_onedata.placement import held_bytes, merged  # noqa: E402
+from expcore_onedata.placement import held_bytes, merged, uncovered  # noqa: E402
 from expcore_onedata.probes import PlatformProbes  # noqa: E402
 from expcore_onedata.provision import Provisioner, resolve_provider_ids  # noqa: E402
 from expcore_onedata.rangemap import load_placement  # noqa: E402
@@ -95,6 +98,22 @@ VISIBLE_TIMEOUT_S = 180.0
 REPEAT_SIZE, UNTOUCHED_SIZE = 1 << 20, 64 << 10  # the accounting check's two files
 REPEAT_OFFSET, REPEAT_LENGTH = (512 << 10) + 7, 4096  # the one range of repeat.bin the agent reads, twice
 LOG_FILE_LIMIT = 32 << 20  # a sidecar log file larger than this is listed and not copied
+MIB = 1 << 20
+GRANULAR_SIZES = {"8m": 8 * MIB, "64m": 64 * MIB}  # files only the owner holds, read through the mount by range
+# (label, file, reads as (offset, length), read in order by one descriptor); None: computed from the block map then
+GRANULARITY = (
+    ("1 B at 0", "8m", [(0, 1)], False),
+    ("1 B at 3 MiB + 5", "8m", [(3 * MIB + 5, 1)], False),
+    ("4 KiB at 5 MiB + 100", "8m", [(5 * MIB + 100, 4096)], False),
+    ("1 MiB at 6 MiB + 7", "8m", [(6 * MIB + 7, MIB)], False),
+    ("1 MiB from 4 KiB before the end of a held block", "8m", None, False),
+    ("1 B at 10 MiB + 3", "64m", [(10 * MIB + 3, 1)], False),
+    ("4 KiB at 20 MiB", "64m", [(20 * MIB, 4096)], False),
+    ("1 MiB at 30 MiB + 12345", "64m", [(30 * MIB + 12345, MIB)], False),
+    ("5 MiB at 40 MiB", "64m", [(40 * MIB, 5 * MIB)], False),
+    ("three 1 MiB reads in order from 50 MiB", "64m", [(50 * MIB, MIB), (51 * MIB, MIB), (52 * MIB, MIB)], True),
+)
+SETTLE_TIMEOUT_S, SETTLE_POLL_S = 60.0, 2.0  # a block map is settled when two reads this far apart agree
 
 
 def pinned(host: DockerHost, name: str) -> tuple[str, str]:
@@ -117,6 +136,7 @@ def platform_for_mount(base: Path) -> Path:
         pytest.skip("no facts.json beside the platform file: the local provider's domain on its network is read there")
     source = load_platform(PLATFORM, require_secrets=False)
     local = source.support.local
+    facts = json.loads(facts_file.read_text(encoding="utf-8"))
     host = DockerHost()
     images = {
         "agent": pinned(host, os.environ.get("EXPCORE_LIVE_AGENT_IMAGE") or AGENT_IMAGE),
@@ -126,11 +146,9 @@ def platform_for_mount(base: Path) -> Path:
         work_root=base / "work",
         images=images,
         pool=pool,
-        network=os.environ.get("EXPCORE_LIVE_FED_NETWORK") or FED_NETWORK,
+        network=os.environ.get("EXPCORE_LIVE_FED_NETWORK") or federation_network(facts),
         local=local,
-        local_address=json.loads(facts_file.read_text(encoding="utf-8"))["providers"][local][
-            "domain_on_project_network"
-        ],
+        local_address=facts["providers"][local]["domain_on_project_network"],
         extra_args=shlex.split(os.environ.get("EXPCORE_LIVE_ONECLIENT_ARGS", "")),
     )
     return derive_platform(PLATFORM, base, table)
@@ -246,6 +264,21 @@ def ground_truth() -> dict:
         },
         "repeat": {"agent": [{"op": "read", "offset": REPEAT_OFFSET, "length": REPEAT_LENGTH, "times": 2}]},
         "untouched": {"agent": [{"op": "stat"}]},
+        **{
+            f"gran-{which}": {
+                "agent": [
+                    {"op": "read", "step": label, "reads": [list(r) for r in reads] if reads else "computed"}
+                    for label, of, reads, _ in GRANULARITY
+                    if of == which
+                ]
+                + (
+                    [{"op": "read", "step": "the freeze check's reader: 1 MiB at random offsets, until killed"}]
+                    if which == "64m"
+                    else []
+                )
+            }
+            for which in GRANULAR_SIZES
+        },
         "not_the_agents_reads": [
             "the start's write probe at the mount root, refused",
             "the confinement cell's listing of the mount root and its write probe in the space, refused",
@@ -298,6 +331,122 @@ def sidecar_accounting(host: DockerHost, sandbox: DockerSandbox, spec: SandboxSp
         listing = host.run(["ls", f"/sys/fs/fuse/connections/{devices[-1].partition(':')[2]}"], 20, sudo=True)
         out["fuse_connection_entries"] = sorted(listing.stdout.split()) if listing.returncode == 0 else None
     return out
+
+
+def settled_blocks(view: Provisioner, file_id: str, provider: str) -> tuple[list, float, bool]:
+    """A provider's block map of a file once two reads `SETTLE_POLL_S` apart agree (oneclient may go on fetching after
+    the agent's read returned); the map, the seconds it took, and whether it settled within `SETTLE_TIMEOUT_S`."""
+    began, last = time.monotonic(), None
+    while True:
+        now = merged(view.blocks(file_id, provider))
+        if now == last:
+            return now, round(time.monotonic() - began, 1), True
+        if time.monotonic() - began > SETTLE_TIMEOUT_S:
+            return now, round(time.monotonic() - began, 1), False
+        last = now
+        time.sleep(SETTLE_POLL_S)
+
+
+def inside_held(blocks: list, size: int) -> list[tuple[int, int]]:
+    """A 1 MiB read that starts 4 KiB before the end of the last held block that leaves room for it, so it begins in
+    bytes the provider holds and runs past them; at the file's start when nothing is held."""
+    for offset, length in reversed(blocks):
+        start = offset + length - 4096
+        if start >= 0 and start + MIB <= size:
+            return [(start, MIB)]
+    return [(0, MIB)]
+
+
+def granularity(sandbox: DockerSandbox, view: Provisioner, local: str, inside: str, ids: dict) -> list[dict]:
+    """What the local provider's block map gains for each read through the mount of files only the owner held: each
+    step's reads, what they returned, the map's growth (the ranges it gained and their bytes) once settled."""
+    out = []
+    for label, which, reads, sequential in GRANULARITY:
+        file_id, size = ids[f"gran-{which}"], GRANULAR_SIZES[which]
+        before, _, _ = settled_blocks(view, file_id, local)
+        reads = reads if reads is not None else inside_held(before, size)
+        done = cell(sandbox, reads_cell(f"{inside}/gran-{which}.bin", reads, sequential=sequential), 300)
+        after, seconds, settled = settled_blocks(view, file_id, local)
+        gained = merged(uncovered(before, after))
+        out.append(
+            {
+                "step": label,
+                "file_bytes": size,
+                "reads": [list(r) for r in reads],
+                "sequential": sequential,
+                "returned": done,
+                "held_before": held_bytes(before),
+                "gained": [list(g) for g in gained],
+                "gained_bytes": held_bytes(gained),
+                "held_after": held_bytes(after),
+                "blocks_after": len(after),
+                "settle_s": seconds,
+                "settled": settled,
+            }
+        )
+    return out
+
+
+def reader_count(sandbox: DockerSandbox) -> int | None:
+    """How many reads the background reader has done, from its counter in the agent's working disk, read by the host."""
+    try:
+        return int((sandbox.dir / "work" / "reader-count").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def moves(sandbox: DockerSandbox, seconds: float = 3.0) -> bool | None:
+    """Whether the background reader's count changes over `seconds`; None when it cannot be read."""
+    first = reader_count(sandbox)
+    time.sleep(seconds)
+    second = reader_count(sandbox)
+    return None if first is None or second is None else first != second
+
+
+def freeze_facts(host: DockerHost, sandbox: DockerSandbox, path: str, size: int) -> dict:
+    """Whether the collection's freeze of the agent's container (`docker pause`, confirmed by `frozen 1` in its cgroup)
+    holds while a reader in the agent keeps reading through the FUSE mount: the reader's count before, during and after
+    the freeze, and how long the freeze took or why it failed. The freeze is #129/#130's (`_frozen`); without it, only
+    the reader is measured."""
+    out: dict = {"freeze_available": hasattr(sandbox, "_frozen")}
+    started = cell(sandbox, reader_cell(path, size, "/work/reader-count"), 60)
+    out["reader_started"] = "pid" in started
+    deadline = time.monotonic() + 30
+    while (reader_count(sandbox) or 0) < 3 and time.monotonic() < deadline:
+        time.sleep(0.5)
+    out["reader_moving_before"] = moves(sandbox)
+    if not out["freeze_available"]:
+        return out
+    began = time.monotonic()
+    try:
+        with sandbox._frozen():
+            out["frozen_after_s"] = round(time.monotonic() - began, 3)
+            out["frozen_confirmed"] = sandbox._meta.get("frozen_for_collection") is True
+            out["reader_moving_while_frozen"] = moves(sandbox)
+    except SandboxError as error:
+        out["freeze_error"] = str(error)
+        out["failed_after_s"] = round(time.monotonic() - began, 3)
+    state = (hostops.inspect(host, sandbox.names.agent) or {}).get("State", {})
+    out["paused_after_thaw"] = state.get("Paused")
+    out["reader_moving_after_thaw"] = moves(sandbox)
+    return out
+
+
+def collect_facts(sandbox: DockerSandbox, base: Path) -> dict:
+    """The run's real collection, with the background reader still reading: it stops the agent's processes, freezes
+    the container (with #129/#130), copies the named output out and thaws it. What it returned, or why it failed."""
+    began = time.monotonic()
+    try:
+        result = sandbox.collect(base / "collected", outputs=["reader-count"])
+    except Exception as error:  # recorded, never guessed: the attempt's tests read it
+        return {"error": type(error).__name__, "seconds": round(time.monotonic() - began, 3)}
+    return {
+        "outputs": result["outputs"],
+        "refused_output": result.get("refused_output"),
+        "frozen_for_collection": sandbox._meta.get("frozen_for_collection"),
+        "copied": (base / "collected" / "work" / "reader-count").is_file(),
+        "seconds": round(time.monotonic() - began, 3),
+    }
 
 
 def wait_visible(provisioner: Provisioner, path: str, provider: str, size: int) -> float:
@@ -356,7 +505,14 @@ def attempt(tmp_path_factory):
         for label, size in (("repeat", REPEAT_SIZE), ("untouched", UNTOUCHED_SIZE)):  # for the accounting check
             ids[label] = files.make(local, top, f"{label}.bin", "REG")
             files.write(local, ids[label], 0, pattern(f"{run}/{label}.bin", size))
+        for which, size in GRANULAR_SIZES.items():  # only the owner holds them: every byte the mount reads is fetched
+            ids[f"gran-{which}"] = files.make(owner, top, f"gran-{which}.bin", "REG")
+            files.write(owner, ids[f"gran-{which}"], 0, pattern(f"{run}/gran-{which}.bin", size))
         facts["visible_after_s"] = {
+            **{
+                f"gran-{w}": wait_visible(probes_view, f"{run}/gran-{w}.bin", local, n)
+                for w, n in GRANULAR_SIZES.items()
+            },
             "whole": wait_visible(probes_view, f"{run}/whole.bin", local, WHOLE_SIZE),
             **{label: wait_visible(probes_view, f"{run}/{n}", local, PARTIAL_SIZE) for label, n in partials.items()},
             "repeat": wait_visible(probes_view, f"{run}/repeat.bin", local, REPEAT_SIZE),
@@ -364,6 +520,7 @@ def attempt(tmp_path_factory):
         }
         names = {"whole": "whole.bin", **{label: f"{n}" for label, n in partials.items()}}
         names |= {"repeat": "repeat.bin", "untouched": "untouched.bin"}
+        names |= {f"gran-{which}": f"gran-{which}.bin" for which in GRANULAR_SIZES}
         forms = {label: {"id": ids[label], "uuid": file_guid(ids[label]), "name": names[label]} for label in ids}
         facts["ground_truth"] = ground_truth()
         network = s.federation.network
@@ -416,6 +573,9 @@ def attempt(tmp_path_factory):
                 facts["accounting"] = sidecar_accounting(host, sandbox, spec, base, forms)
             except Exception as error:  # recorded, never guessed: the reason the evidence is missing
                 facts["accounting"] = {"error": type(error).__name__}
+            facts["granularity"] = granularity(sandbox, probes_view, local, inside, ids)
+            facts["freeze"] = freeze_facts(host, sandbox, f"{inside}/gran-64m.bin", GRANULAR_SIZES["64m"])
+            facts["collect"] = collect_facts(sandbox, base)
         finally:
             try:
                 sandbox.stop()
@@ -609,3 +769,49 @@ def test_o08_what_the_sidecar_can_show_of_the_agents_reads_is_captured_before_th
     assert evidence["log_files"]
     assert set(evidence["mentions"]) == set(attempt["ground_truth"]) - {"not_the_agents_reads"}
     assert evidence["fuse_connection_entries"]
+
+
+# -- 7. placement granularity through the mount ------------------------------------------------------------------------
+
+
+def test_o08_each_read_through_the_mount_has_its_block_map_growth_recorded_once_settled(attempt):
+    """O08: for every read of the granularity steps (1 B, 4 KiB and 1 MiB at several offsets, one starting inside held
+    bytes, one of 5 MiB, three in order), the bytes it returned and the local provider's settled block-map growth are
+    recorded; what that growth is, is a fact for the day-0 report, never assumed here."""
+    steps = attempt["granularity"]
+    assert [s["step"] for s in steps] == [label for label, *_ in GRANULARITY]
+    for step in steps:
+        assert step["settled"] is True, step["step"]
+        assert [r.get("bytes") for r in step["returned"]] == [n for _, n in step["reads"]], step["step"]
+        assert step["held_after"] >= step["held_before"], step["step"]
+
+
+# -- 8. the collection's freeze with a reader in the agent ------------------------------------------------------------
+
+
+def test_o08_the_collections_freeze_holds_a_reader_that_reads_through_the_mount(attempt):
+    """O08: with a reader in the agent reading through the FUSE mount, the collection's freeze (`docker pause`,
+    confirmed by `frozen 1` in the agent's cgroup) is reached, the reader stops while frozen and goes on once thawed.
+    Measured only where the freeze exists (#129/#130); the reader's own movement is recorded either way."""
+    freeze = attempt["freeze"]
+    assert freeze["reader_started"] is True
+    assert freeze["reader_moving_before"] is True
+    if not freeze["freeze_available"]:
+        pytest.skip("this tree has no collection freeze (#129/#130); the reader was measured alone")
+    assert freeze.get("freeze_error") is None
+    assert freeze["frozen_confirmed"] is True
+    assert freeze["reader_moving_while_frozen"] is False
+    assert freeze["paused_after_thaw"] is False
+    assert freeze["reader_moving_after_thaw"] is True
+
+
+def test_o08_the_runs_collection_copies_its_output_with_a_reader_still_running(attempt):
+    """O08: the run's collection, started while the reader still reads through the mount, stops the agent's
+    processes, copies the named output out (frozen while it copies, where the freeze exists) and returns normally."""
+    collected = attempt["collect"]
+    assert collected.get("error") is None
+    assert collected["outputs"] == {"reader-count": True}
+    assert collected["copied"] is True
+    assert collected["refused_output"] is None
+    if attempt["freeze"]["freeze_available"]:
+        assert collected["frozen_for_collection"] is True

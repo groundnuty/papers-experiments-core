@@ -415,6 +415,64 @@ def file_guid(file_id: str) -> str | None:
     return parts[1] if len(parts) >= 3 and parts[0] == "guid" and parts[1] else None
 
 
+READS = """
+import errno, json, os, time
+path, reads, sequential = {path!r}, {reads!r}, {sequential!r}
+out = []
+fd = os.open(path, os.O_RDONLY)
+try:
+    if sequential:
+        os.lseek(fd, reads[0][0], os.SEEK_SET)
+    for offset, length in reads:
+        began, got = time.perf_counter(), 0
+        try:
+            while got < length:
+                chunk = os.read(fd, length - got) if sequential else os.pread(fd, length - got, offset + got)
+                if not chunk:
+                    break
+                got += len(chunk)
+            out.append({{"offset": offset, "length": length, "bytes": got,
+                         "seconds": round(time.perf_counter() - began, 4)}})
+        except OSError as e:
+            out.append({{"offset": offset, "length": length, "error": errno.errorcode.get(e.errno, str(e.errno))}})
+finally:
+    os.close(fd)
+print(json.dumps(out))
+"""
+
+
+def reads_cell(path: str, reads: Sequence[tuple[int, int]], *, sequential: bool = False) -> str:
+    """Read the given (offset, length) ranges of one file through one descriptor: each by `pread`, or, `sequential`,
+    one after the other by `read` from the first offset, as a program reading a file in order does (the kernel's
+    read-ahead follows such a reader). Each read's bytes and seconds, or its errno's name; never the bytes."""
+    return READS.format(path=path, reads=[list(r) for r in reads], sequential=sequential)
+
+
+READER = """
+import json, subprocess, sys
+child = (
+    "import os, random, sys\\n"
+    "fd = os.open(sys.argv[1], os.O_RDONLY)\\n"
+    "size, count = int(sys.argv[2]), 0\\n"
+    "while True:\\n"
+    "    os.pread(fd, 1 << 20, random.randrange(0, max(1, size - (1 << 20))))\\n"
+    "    count += 1\\n"
+    "    with open(sys.argv[3], 'w') as handle:\\n"
+    "        handle.write(str(count))\\n"
+)
+reader = subprocess.Popen([sys.executable, "-c", child, {path!r}, str({size!r}), {counter!r}],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          start_new_session=True)
+print(json.dumps({{"pid": reader.pid}}))
+"""
+
+
+def reader_cell(path: str, size: int, counter: str) -> str:
+    """Start a reader that outlives the cell: it reads 1 MiB at a random offset of the file, again and again, and
+    writes how many reads it has done to `counter`, so the host sees whether it moves (a frozen reader does not)."""
+    return READER.format(path=path, size=size, counter=counter)
+
+
 def mentions(text: str, files: Mapping[str, Mapping[str, str | None]]) -> dict[str, dict[str, int]]:
     """For each file (label -> {form: value}), how many lines of `text` hold each non-empty form of it (its REST id,
     its uuid, its name); a form with no value is left out."""

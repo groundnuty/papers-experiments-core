@@ -19,6 +19,8 @@ from mount_live import (
     mentions,
     pattern,
     read_cell,
+    reader_cell,
+    reads_cell,
     unwritten_cell,
 )
 
@@ -157,6 +159,40 @@ def test_o08_the_sidecars_evidence_is_read_by_name_and_counted_per_file_never_ju
         log, {"whole": {"id": invented, "uuid": "u-invented-1", "name": "whole.bin"}, "other": {"uuid": None}}
     )
     assert found == {"whole": {"id": 0, "uuid": 2, "name": 1}, "other": {}}
+
+
+def test_o08_the_reads_cell_reports_each_reads_bytes_by_pread_or_in_order_and_never_the_bytes(tmp_path):
+    """O08: each requested range is read and reported with its length and seconds, by `pread` at its offset or, in
+    order, by `read` from the first offset; a read past the end is short, never padded; no byte read is printed."""
+    data = pattern("granular", 100_000)
+    (tmp_path / "g").write_bytes(data)
+    reads = [(0, 1), (4096, 4096), (99_000, 4096)]
+    done = subprocess.run(
+        [sys.executable, "-"], input=reads_cell(str(tmp_path / "g"), reads).encode(), capture_output=True, check=False
+    )
+    found = json.loads(done.stdout)
+    assert [r["bytes"] for r in found] == [1, 4096, 1000]
+    assert data[4096:4196] not in done.stdout
+    in_order = run(reads_cell(str(tmp_path / "g"), [(10, 100), (110, 100), (210, 100)], sequential=True))
+    assert [r["bytes"] for r in in_order] == [100, 100, 100]
+    assert run(reads_cell(str(tmp_path / "g"), [(0, 1)]))[0]["seconds"] >= 0
+
+
+def test_o08_the_background_reader_outlives_its_cell_and_counts_its_reads(tmp_path):
+    """O08: the reader the freeze check runs keeps reading after the cell that started it has ended, and writes how
+    many reads it has done, so a host that sees the count stop knows the reader stopped."""
+    import time
+
+    (tmp_path / "big").write_bytes(pattern("big", 3 << 20))
+    counter = tmp_path / "count"
+    pid = run(reader_cell(str(tmp_path / "big"), 3 << 20, str(counter)))["pid"]
+    try:
+        deadline = time.monotonic() + 30
+        while not (counter.exists() and counter.read_text().strip().isdigit() and int(counter.read_text()) >= 2):
+            assert time.monotonic() < deadline, "the reader did not count two reads"
+            time.sleep(0.1)
+    finally:
+        os.kill(pid, 9)
 
 
 def fake_space(answers):
