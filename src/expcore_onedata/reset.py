@@ -21,9 +21,11 @@ read and every check is made on each provider that supports the space, since eac
    nothing waiting or ongoing on every provider in `transfer_settle_polls` observations in a row, `transfer_settle_s`
    apart (the listing's lag, O07), within twice that many observations.
 3. **eviction**: the files the caller names leave each provider named (`eviction.py`): a directory in one transfer, a
-   set of files in parallel under `[placement] concurrency`. Once the eviction's transfers have ended, the listings
-   must show no transfer running on any provider before the block maps are read, so a map is never read while a job
-   still changes it (O01); and once every eviction is verified, the listings must show none running again.
+   set of files in parallel under `[placement] concurrency`, each scheduled again while its block map still shows bytes
+   after the transfers ended (an eviction on 25.0 can complete having evicted nothing), up to `EVICTION_ATTEMPTS`.
+   Once the eviction's transfers have ended, the listings must show no transfer running on any provider before the
+   block maps are read, so a map is never read while a job still changes it (O01); and once every eviction is verified,
+   the listings must show none running again.
 4. **occupancy**: with no transfer running on any provider (the listings are read first, as above), the space root's
    distribution gives each provider's physical size, the bytes its storage holds of the space; never the logical
    figures, which lag. A provider other than the data provider that holds more than the caller allows (nothing by
@@ -320,6 +322,7 @@ class SpaceReset:
                 "files": sum(r["files"] for r in results),
                 "transfers": sum(r["transfers"] for r in results),
                 "polls": max((r["polls"] for r in results), default=0),
+                "attempts": max((r["attempts"] for r in results), default=0),
             }
         self._require_quiet()
         return {"providers": out}

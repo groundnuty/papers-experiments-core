@@ -5,26 +5,27 @@ that can be cancelled, directory evictions, and concurrent callers.
 
   POST   /qos_requirements                     a requirement on a file or a directory (body fileId, expression)
   GET    /qos_requirements/{qid}               the requirement: qosRequirementId, fileId, expression, status
-  DELETE /qos_requirements/{qid}               remove it (204; 404 once gone)
+  DELETE /qos_requirements/{qid}               remove it (204; once gone, answered as `missing_answer`)
   GET    /data/{id}/qos/summary                the requirements on the entry and its ancestors, keyed by id
   DELETE /transfers/{tid}                      cancel a job that has not ended (204), or 400 for one that has
 
 and with these changes to the calls it inherits:
 
-- `add_data_space` adds a space with a root of its own, which `GET /spaces/{space}` answers on a provider, a file's
-  `path` starts with its name, and the transfer listing of the space holds only the jobs on its files; `add_file`,
+- `add_data_space` adds a space with a root of its own, which `GET /spaces/{space}` answers on a provider and at which
+  a file's parent links end, and the transfer listing of the space holds only the jobs on its files; `add_file`,
   `id_of`, `held` and `exists` take `space=` (the study space by default);
 - a job's record has the `spaceId` of its file's space, and a cancelled job reports `cancelled`;
-- an eviction scheduled on a directory evicts every file under it when it ends;
+- an eviction scheduled on a directory evicts every file under it when it ends, unless `evictions_noop_first` makes
+  it one that evicted nothing, as FakeData's file evictions are;
 - every provider call is answered under one lock, so a bulk operation's threads never interleave inside the fake.
 
 A test bends it through plain attributes: `ignore_cancels` (a cancel answers 204 and the job goes on),
 `ignore_qos_deletes` (a removal answers 204 and the requirement stays), `qos_spawns` (adding a requirement starts a
 replication of its file into this provider id, as a requirement that selects that provider's storage would),
 `qos_hidden_on` (requirement id to the provider ids that have not seen it yet: its summary there leaves it out and
-reading it answers 404), `spawn_on_evict` (a provider id: an eviction that ends starts a replication of the same data
-into it, a job begun while a reset runs), and `dir_stats_disabled` (a directory's distribution answers its physical
-sizes as failed, as a space without directory statistics does).
+reading it answers as a requirement that is not there, `missing_answer`), `spawn_on_evict` (a provider id: an eviction
+that ends starts a replication of the same data into it, a job begun while a reset runs), and `dir_stats_disabled` (a
+directory's distribution answers its physical sizes as failed, as a space without directory statistics does).
 
 A directory's distribution answers, per provider, the physical size of what that provider holds under it, as
 `distributionPerStorageBackend.{storage}.physicalSize`, with `success` true.
@@ -134,15 +135,6 @@ class FakeReset(FakeData):
             return httpx.Response(200, json={"fileId": self.space_roots[space], "name": self.other_spaces[space]})
         return super()._space_root(space)
 
-    def _path_of(self, node: Node) -> str:
-        parts = []
-        while node.parent is not None:
-            parts.append(node.name)
-            node = self.nodes[node.parent]
-        space = next(s for s, root in self.space_roots.items() if root == node.file_id)
-        name = self.space_name if space == self.SPACE_ID else self.other_spaces[space]
-        return "/" + "/".join([name, *reversed(parts)])
-
     def _provider_route(self, request: httpx.Request, provider: str, route: str) -> httpx.Response:
         """The reset's calls first, then everything FakeData answers."""
         method = request.method
@@ -169,7 +161,7 @@ class FakeReset(FakeData):
     def _qos_requirement(self, method: str, qid: str, provider: str) -> httpx.Response:
         record = self.qos.get(qid)
         if record is None or provider in self.qos_hidden_on.get(qid, set()):
-            return self._error(404, "notFound")
+            return self._answer(self.missing_answer)  # a 404, or 25.0's 400 posix enoent (`answer_missing_as_25`)
         if method == "GET":
             return httpx.Response(200, json={**record, "status": "fulfilled"})
         if method == "DELETE":
@@ -256,6 +248,10 @@ class FakeReset(FakeData):
                 "replication", transfer.file_id, self.spawn_on_evict, scheduled=now, started=now
             )
         if transfer.kind == "eviction" and node is not None and node.kind == "DIR":
+            if self.evictions_noop_first > 0:  # completed, and nothing evicted
+                self.evictions_noop_first -= 1
+                transfer.noop = True
+                return
             if self.evictions_remove_blocks:
                 for file_id in self._files_under(node.file_id):
                     self.blocks.pop((file_id, transfer.provider_id), None)

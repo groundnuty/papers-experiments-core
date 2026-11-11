@@ -138,7 +138,7 @@ def test_o11_a_clean_space_resets_with_every_stage_verified_and_timed(provisione
 
 def test_o11_every_qos_requirement_in_the_space_is_found_removed_and_shown_gone(provisioner, stocked):
     """O11: requirements on a file, on a directory and on the root are found from the summaries of the root and the
-    leaves, removed through the gate, each answers 404 after, and a second walk finds none."""
+    leaves, removed through the gate, each answers that it is not there after, and a second walk finds none."""
     for where in (FILES[3], "study"):
         stocked.add_qos(where)
     stocked.qos["qos-root"] = {"qosRequirementId": "qos-root", "fileId": "root-0001", "expression": "anyStorage"}
@@ -268,12 +268,12 @@ def test_o09_a_cancel_is_scoped_by_the_space_its_transfer_record_names(client, s
 
 
 def test_o09_a_qos_removal_is_scoped_by_the_file_its_requirement_names(client, stocked):
-    """O09: the gate reads the requirement's fileId and that file's space; a requirement in a space outside the
-    prefixes is not removed."""
+    """O09: the gate reads the requirement's fileId and walks that file's parent links to its space; a requirement on
+    a file of a space the configuration does not declare resolves to no space and is not removed."""
     stocked.add_data_space(SPACE_IDS[2], "unrelated-space", [ALPHA_ID])
     stocked.add_file("foreign.bin", b"keep", space=SPACE_IDS[2])
     foreign = stocked.add_qos("foreign.bin", space=SPACE_IDS[2])
-    with pytest.raises(OutOfScope, match="configured prefixes"):
+    with pytest.raises(OutOfScope, match="no space this configuration knows"):
         client.mutate("DELETE", f"/qos_requirements/{foreign}", provider="alpha")
     assert foreign in stocked.qos
     mine = stocked.add_qos(FILES[0])

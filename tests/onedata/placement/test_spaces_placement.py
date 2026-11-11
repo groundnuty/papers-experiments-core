@@ -237,6 +237,8 @@ def test_o05_the_content_type_check_reads_its_file_in_the_first_space_the_data_p
     fake.add_file("study/probing.bin", DATA, space=SPACE_IDS[1])
     verdict = content_type_check(config, client)
     assert verdict.ok, verdict.detail
-    assert {c[2] for c in fake.provider_calls if c[2].startswith("/spaces/")} == {f"/spaces/{SPACE_IDS[1]}"}
+    listed = {c[2] for c in fake.provider_calls if c[2].endswith("/children")}  # the gate reads every space's root
+    assert f"/data/{fake.space_roots[SPACE_IDS[1]]}/children" in listed
+    assert f"/data/{fake.space_roots[SPACE_IDS[0]]}/children" not in listed
     health = PlatformHealth(config, client, TokenIssuer(client, config, clock=ticker.clock), clock=ticker.clock)
     assert health().ok
