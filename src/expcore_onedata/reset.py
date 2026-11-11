@@ -36,6 +36,7 @@ several are declared, and a provider by its position, never a name.
 The waits happen between runs, never in an agent's time (`consistency.guard`).
 """
 
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
@@ -50,6 +51,7 @@ STAGES = ("qos", "transfers", "eviction", "history")
 ACTIVE = ("waiting", "ongoing")  # the listing's states of a job that has not ended
 LISTED_MAX = 100_000  # transfer ids one provider's listing may hold before it counts as unreadable, not cut
 _FAILURES = (PlatformError, ProvisionError, consistency.WaitTimeout, Unreadable, KeyError)
+_PLAIN_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a requirement id the client accepts as one path segment
 
 
 class ResetFailed(ProvisionError):
@@ -119,8 +121,10 @@ class SpaceReset:
         """The ids of the QoS requirements on an entry and its ancestors, from its summary on the data provider."""
         answer = self._p.client.get(f"/data/{file_id}/qos/summary", provider=self._p.settings.holder)
         requirements = answer.get("requirements") if isinstance(answer, dict) else None
-        if not isinstance(requirements, Mapping) or not all(isinstance(q, str) and q for q in requirements):
+        if not isinstance(requirements, Mapping) or not all(isinstance(q, str) for q in requirements):
             raise Unreadable("a QoS summary holds no table of requirements keyed by id")
+        if not all(_PLAIN_ID.fullmatch(q) for q in requirements):  # an id becomes a path segment of the next calls
+            raise Unreadable("a QoS summary holds a requirement id that is not one plain path segment")
         return set(requirements)
 
     def _requirements(self) -> tuple[list[str], int]:

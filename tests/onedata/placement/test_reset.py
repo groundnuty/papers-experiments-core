@@ -159,6 +159,17 @@ def test_o11_a_removal_the_provider_accepts_and_ignores_fails_the_reset_and_runs
     assert all(stocked.held(path, BETA_ID) for path in FILES)  # nothing was evicted
 
 
+def test_o09_a_requirement_id_that_is_not_one_plain_segment_fails_the_reset_before_any_removal(provisioner, stocked):
+    """O09: an id from a summary becomes a path of the next calls, so one with a separator is refused as unreadable
+    and nothing is removed, not even the plain requirements beside it."""
+    stocked.add_qos(FILES[0])
+    stocked.qos["zz/inner"] = {"qosRequirementId": "zz/inner", "fileId": "root-0001", "expression": "anyStorage"}
+    with pytest.raises(ResetFailed, match="qos stage"):
+        SpaceReset(provisioner).run()
+    assert len(stocked.qos) == 2
+    assert not [c for c in stocked.provider_calls if c[1] == "DELETE"]
+
+
 def test_o11_a_running_transfer_is_cancelled_and_two_observations_then_show_none(provisioner, stocked, ticker):
     """O11: a replication the agent left running is cancelled, reports cancelled, and the listings of both providers
     show nothing waiting or ongoing twice in a row; it never placed its blocks."""
