@@ -24,11 +24,14 @@ a record never fills an absent optional field in as a null or a zero. Version 3 
 `usage` of each turn, both optional: the numeric usage fields a provider reports beyond the counts, and how many of them
 the cap left out. Every new record is written as version 3 and keeps version 2's rule; a record of version 1 or 2
 lacks both fields, and is never given them. Until v0.1.0 is tagged every extension of version 3 is strictly additive:
-optional fields only, no existing field changes meaning or validation, and the fixtures in `tests/data/record-v3/`,
-one per merge point, keep validating and replaying byte for byte (docs/interfaces.md).
+optional fields only, no existing field changes meaning or validation, the fields version 3 had at its first merge
+point keep the shape frozen in `tests/data/record-v3-fields.json`, and the fixtures in `tests/data/record-v3/`, one
+per merge point, keep validating and replaying byte for byte (docs/interfaces.md).
 
-Every section is a table of field name to the types the field may hold, in the order the file writes them. Numbers are
-finite: a count the run did not obtain is `None`, never 0 and never NaN (R10).
+Every section is a table of field name to the types the field may hold, in the order the file writes them. An object
+that a record may hold none of, such as an outcome's `defect` or a malformed event of the totals, is a section too, so
+its keys are versioned like the others. Numbers are finite: a count the run did not obtain is `None`, never 0 and never
+NaN (R10).
 """
 
 import dataclasses
@@ -152,6 +155,8 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "defect": (dict, NONE),
         "treatment": (bool,),
     },
+    "defect": {"exception": (str,), "stack_sha256": (str,)},
+    "malformed_event": {"round": (int,), "call_id": (str,), "name": (str,), "error": (str,), "raw": (str,)},
     "totals": {
         "rounds": (int,),
         "malformed_calls": (int,),
@@ -401,18 +406,23 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
 
 
 def _check_outcome(
-    outcome: dict, treatment_kinds: Any, completed_turns: int, first_turn_rule: bool, where: str
+    outcome: dict,
+    treatment_kinds: Any,
+    completed_turns: int,
+    version: str,
+    where: str,
+    schemas: Sequence[SchemaVersion],
 ) -> None:
     """Build the outcome through the loop's own vocabulary check, so a name or kind outside it is refused here too.
 
-    The `treatment` flag must be what the outcome, the record's `treatment_kinds` and its transcript make it: true
-    exactly when the outcome is infrastructure of a kind in the list that can be a treatment and, under the first-turn
-    rule of the record's version, the transcript holds at least one completed turn. A record whose flag says
-    otherwise contradicts itself (R02).
+    A defect is checked as the `defect` section of the record's version. The `treatment` flag must be what the outcome,
+    the record's `treatment_kinds` and its transcript make it: true exactly when the outcome is infrastructure of a kind
+    in the list that can be a treatment and, under the first-turn rule of the record's version, the transcript holds at
+    least one completed turn. A record whose flag says otherwise contradicts itself (R02).
     """
     defect = outcome["defect"]
     if defect is not None:
-        _check_keys(f"{where}.defect", defect, ("exception", "stack_sha256"))
+        check_section("defect", defect, version, f"{where}.defect", schemas)
     try:
         held = None
         if defect is not None:
@@ -420,7 +430,7 @@ def _check_outcome(
         built = Outcome(outcome["name"], outcome["detail"], outcome["infra_kind"], outcome["error_type"], held)
     except (KeyError, TypeError, ValueError) as exc:
         raise RecordError(f"{where}: {type(exc).__name__}: {exc}") from None
-    expected = built.is_treatment(treatment_kinds, completed_turns, first_turn_rule=first_turn_rule)
+    expected = built.is_treatment(treatment_kinds, completed_turns, first_turn_rule=first_turn_rule(version, schemas))
     if outcome["treatment"] is not expected:
         raise RecordError(
             f"{where}.treatment: is {outcome['treatment']} but the outcome, treatment_kinds and the {completed_turns} "
@@ -501,13 +511,10 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
             raise RecordError(f"clock[{i}]: expected [label, seconds]")
     _check_treatment_kinds(body["treatment_kinds"])
     check_section("outcome", body["outcome"], version, "outcome", schemas)
-    _check_outcome(
-        body["outcome"], body["treatment_kinds"], len(body["transcript"]), first_turn_rule(version, schemas), "outcome"
-    )
+    _check_outcome(body["outcome"], body["treatment_kinds"], len(body["transcript"]), version, "outcome", schemas)
     check_section("totals", body["totals"], version, "totals", schemas)
     _check_waited(body["totals"]["infra_wait_by_kind"], "totals.infra_wait_by_kind")
-    for i, event in enumerate(body["totals"]["malformed_events"]):
-        _check_keys(f"totals.malformed_events[{i}]", event, ("round", "call_id", "name", "error", "raw"))
+    _check_list("malformed_event", body["totals"]["malformed_events"], version, "totals.malformed_events", schemas)
     _check_configuration(body["agent_config"], version, schemas)
     _check_keys("code", body["code"], CODE_FIELDS)
     _check_route(body["route"])
