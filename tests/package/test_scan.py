@@ -396,7 +396,11 @@ def test_k03_the_run_finder_scales_linearly_against_a_baseline_measured_in_the_s
     five times over, and the median of the five pairs' ratios is judged: each pair is measured within a few seconds, so
     a change of load during the test spoils at most the pair it falls in, and the median sets that pair aside."""
     small, large = staircase(2000), staircase(8000)
-    ratios = sorted(one_pass(large) / one_pass(small) for _ in range(5))
+    ratios = []
+    for _ in range(5):
+        small_s = one_pass(small)  # small then large, back to back
+        ratios.append(one_pass(large) / small_s)
+    ratios.sort()
     assert ratios[2] < 10, ratios
 
 
