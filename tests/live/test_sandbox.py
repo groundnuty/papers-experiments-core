@@ -285,7 +285,8 @@ print(json.dumps({{"lookup": len(found), "listing": len(body), "entries": len(na
 def test_o19_o20_a_complete_level_serves_a_large_directory_whole_and_counts_the_bytes_it_served(config, host, tmp_path):
     """O19, O20: through the gate of a level whose listing is complete, one listing of a directory of more than 1000
     entries comes back whole as the last page, with each name once; after the collection stopped the gate, its count
-    is known and equals the bytes the agent's code received: the listing and the lookup, and no file content."""
+    is known and equals the bytes the agent's code received: the listing and the lookup, and no file content. Its
+    tables list the one directory, with the listing's bytes, and no file."""
     import json
 
     if not LISTING_PATH:
@@ -312,6 +313,8 @@ def test_o19_o20_a_complete_level_serves_a_large_directory_whole_and_counts_the_
         said["lookup"],
     )
     assert counted["content_bytes"] == 0
+    assert (counted["files"], counted["files_total"]) == ({}, 0)  # no file's content was read
+    assert [row["body_bytes"] for row in counted["listings"].values()] == [said["listing"]]  # one directory listed
 
 
 @needs_platform
@@ -327,3 +330,4 @@ def test_o20_a_mount_levels_count_is_unknown_after_its_collection(config, host, 
         sandbox.stop()
     assert counted["unknown"] == ["mount_not_through_gate"]
     assert counted["served_bytes"] is None
+    assert counted["files"] is None

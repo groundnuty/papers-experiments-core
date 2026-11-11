@@ -36,9 +36,33 @@ could not be read or written whole (`gate_log_unreadable`, `gate_log_malformed`,
 output could not be read to show neither went wrong (`gate_output_unreadable`), it could not write the close line of
 every connection (`gate_teardown_incomplete`), or a request was still being answered when it stopped
 (`request_in_flight_at_stop`). Unknown is never zero.
+
+**The bytes served per file and per directory (O20, `served`).** The same lines, each answer of a file's content or a
+listing put under the file or directory its path names, so a study can check an agent's claimed reads file by file,
+which a run's total cannot (a read log that moves reads between files keeps the total):
+
+  * `files`: every file whose content the platform served (a `content` answer), keyed by its file id as the request's
+    path names it (`/api/v3/oneprovider/data/<file id>/content`, never decoded), with the path as the gate logged it
+    (`path`, which names the file by its id, never by a name), the number of its answers (`requests`), the byte ranges
+    they served merged where they overlap or touch (`ranges`, each `[start, stop]` with `stop` excluded, lowest
+    first), the bytes in those ranges, each once (`range_bytes`), and every body byte of its answers (`body_bytes`). A
+    range begins where the platform's answer says: a 200 at the file's start, a 206 at the first byte of its
+    `Content-Range` (`content_range` on the line), and runs for the bytes the gate's socket accepted. An answer the
+    log cannot place (a 206 whose `Content-Range` is not one range that holds its bytes, or a line with no status of
+    the platform's) leaves that file's `ranges`, `range_bytes` and `ranges_cut` None, never a part of them; a file
+    whose attributes alone were read, or whose content read was refused or failed, served no content and has no row;
+  * `listings`: every directory whose listing the platform served (a `listing` answer), keyed by its id as the path
+    names it (`/api/v3/oneprovider/data/<directory id>/children`), with `path`, `requests` and `body_bytes`.
+
+Each table is bounded: at most `MAX_FILES_LISTED` files and `MAX_DIRECTORIES_LISTED` directories, the first the log
+shows, and at most `MAX_RANGES_LISTED` ranges a file, the lowest; `files_total` and `listings_total` count every one
+read, `files_cut`, `listings_cut` and a file's `ranges_cut` say a bound cut the list, and `range_bytes` counts every
+range whatever the bound. Whenever the run's count is unknown, so is every table (None, with the same reasons), and an
+answer of a file's content or a listing whose path names no file or directory makes the log malformed.
 """
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -165,28 +189,136 @@ _BODY_FIELD = {
 }
 
 
+TABLE_FIELDS = ("files", "files_total", "files_cut", "listings", "listings_total", "listings_cut")
+MAX_FILES_LISTED = 1000  # the files a run's table lists, the first read; `files_cut` says when there were more
+MAX_DIRECTORIES_LISTED = 1000  # the directories its listings table lists, the first listed; `listings_cut` likewise
+MAX_RANGES_LISTED = 64  # the ranges a file's row lists, the lowest; `ranges_cut` says when it had more
+_DATA_PATH = "/api/v3/oneprovider/data/"  # gatepolicy's routes of a file's content and of a listing
+_CONTENT_PATH = re.compile(re.escape(_DATA_PATH) + r"([^/]+)/content")
+_LISTING_PATH = re.compile(re.escape(_DATA_PATH) + r"([^/]+)/children")
+_CONTENT_RANGE = re.compile(r"bytes ([0-9]{1,18})-([0-9]{1,18})/(?:[0-9]{1,18}|\*)")
+
+
 def served_unknown(*reasons: str) -> dict[str, Any]:
-    """The bytes served, unknown for these reasons: every count None."""
-    return {**dict.fromkeys(SERVED_FIELDS), "unknown": sorted(set(reasons))}
+    """The bytes served, unknown for these reasons: every count None, and every table."""
+    return {**dict.fromkeys(SERVED_FIELDS), **dict.fromkeys(TABLE_FIELDS), "unknown": sorted(set(reasons))}
+
+
+def served_nothing() -> dict[str, Any]:
+    """The bytes served through no data path: every count zero, and every table empty."""
+    return {**dict.fromkeys(SERVED_FIELDS, 0), **_Tables().snapshot(), "unknown": []}
+
+
+def _span(record: Mapping[str, Any], size: int) -> tuple[int, int] | None:
+    """Where in its file one answer's `size` bytes of content lie, as [start, stop) with stop excluded: from the start
+    for the platform's 200, from the first byte of its `Content-Range` for its 206. None when the line cannot place
+    them: a 206 whose `Content-Range` is not one range holding `size` bytes, or no status of the platform's (a cut
+    transfer's line carries it as `upstream_status`)."""
+    status = record.get("upstream_status", record.get("status"))
+    if status == 200:
+        return 0, size
+    value = record.get("content_range")
+    found = _CONTENT_RANGE.fullmatch(value) if status == 206 and isinstance(value, str) else None
+    if found is None or size > int(found[2]) - int(found[1]) + 1:
+        return None
+    return int(found[1]), int(found[1]) + size
+
+
+def _merged(spans: list[tuple[int, int]]) -> list[list[int]]:
+    """The intervals joined where they overlap or touch, lowest first."""
+    out: list[list[int]] = []
+    for start, stop in sorted(spans):
+        if out and start <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], stop)
+        else:
+            out.append([start, stop])
+    return out
+
+
+class _Tables:
+    """The rows of the files and directories one log's answers served (the module docstring says what each holds)."""
+
+    def __init__(self) -> None:
+        self._files: dict[str, dict[str, Any]] = {}
+        self._file_ids: set[str] = set()  # every file read, listed or not
+        self._listings: dict[str, dict[str, Any]] = {}
+        self._dir_ids: set[str] = set()
+
+    def add(self, record: Mapping[str, Any], field: str, size: int) -> bool:
+        """Put one answer's line under its file or directory; False when its path names none (a malformed line)."""
+        if field not in ("content_bytes", "listing_bytes"):
+            return True
+        content = field == "content_bytes"
+        path = record.get("path")
+        found = (_CONTENT_PATH if content else _LISTING_PATH).fullmatch(path) if isinstance(path, str) else None
+        if found is None:
+            return False
+        rows, seen, bound = (
+            (self._files, self._file_ids, MAX_FILES_LISTED)
+            if content
+            else (self._listings, self._dir_ids, MAX_DIRECTORIES_LISTED)
+        )
+        seen.add(found[1])
+        row = rows.get(found[1])
+        if row is None:
+            if len(rows) >= bound:
+                return True  # counted in the total, and the table says it was cut
+            row = rows[found[1]] = {"path": path, "requests": 0, "body_bytes": 0} | ({"spans": []} if content else {})
+        row["requests"] += 1
+        row["body_bytes"] += size
+        if content and size and row["spans"] is not None:
+            span = _span(record, size)
+            if span is None:
+                row["spans"] = None  # one answer it cannot place: the file's ranges are unknown, never a part
+            else:
+                row["spans"].append(span)  # the row is this table's own accumulator
+        return True
+
+    def snapshot(self) -> dict[str, Any]:
+        files = {}
+        for file_id, row in self._files.items():
+            spans = row["spans"]
+            merged = None if spans is None else _merged(spans)
+            files[file_id] = {
+                "path": row["path"],
+                "requests": row["requests"],
+                "ranges": None if merged is None else merged[:MAX_RANGES_LISTED],
+                "range_bytes": None if merged is None else sum(stop - start for start, stop in merged),
+                "ranges_cut": None if merged is None else len(merged) > MAX_RANGES_LISTED,
+                "body_bytes": row["body_bytes"],
+            }
+        return {
+            "files": files,
+            "files_total": len(self._file_ids),
+            "files_cut": len(self._file_ids) > len(files),
+            "listings": {dir_id: dict(row) for dir_id, row in self._listings.items()},
+            "listings_total": len(self._dir_ids),
+            "listings_cut": len(self._dir_ids) > len(self._listings),
+        }
+
+
+def _stop_reasons(stop: Mapping[str, Any] | None) -> set[str]:
+    """Why what the gate's stop found leaves its log possibly short: it must have been signalled and shown exited, with
+    its own output read and showing no failed write of its log and no close line it could not write."""
+    if not isinstance(stop, Mapping) or stop.get("signalled") is not True or "exit_code" not in stop:
+        return {GATE_NOT_STOPPED}
+    if stop.get("output_read") is not True:  # the gate's output not read: whether a write failed is not known
+        return {GATE_OUTPUT_UNREADABLE}
+    reasons = set()
+    if stop.get("log_write_failed") is not False:
+        reasons.add(GATE_LOG_WRITE_FAILED)
+    if stop.get("teardown_incomplete") is not False:
+        reasons.add(GATE_TEARDOWN_INCOMPLETE)
+    return reasons
 
 
 def served(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The bytes the gate served the agent in a run, from its log once it was stopped (O20; the module docstring says
-    what each count holds). `lines` are the log's lines, None when it could not be read; `stop` is what the stop of the
-    gate found (`gate_stop` of the sandbox's metadata): it must have been signalled and shown exited, with its own
-    output read and showing no failed write of its log and no close line it could not write. The log must hold the
-    gate's `teardown_complete` line, whatever its exit code."""
-    reasons = set() if lines is not None else {UNREADABLE}
-    if not isinstance(stop, Mapping) or stop.get("signalled") is not True or "exit_code" not in stop:
-        reasons.add(GATE_NOT_STOPPED)
-    elif stop.get("output_read") is not True:  # the gate's output not read: whether a write failed is not known
-        reasons.add(GATE_OUTPUT_UNREADABLE)
-    else:
-        if stop.get("log_write_failed") is not False:
-            reasons.add(GATE_LOG_WRITE_FAILED)
-        if stop.get("teardown_incomplete") is not False:
-            reasons.add(GATE_TEARDOWN_INCOMPLETE)
-    counts = dict.fromkeys(_BODY_FIELD.values(), 0)
+    """The bytes the gate served the agent in a run, in all and per file and directory, from its log once it was
+    stopped (O20; the module docstring says what each count holds). `lines` are the log's lines, None when it could not
+    be read; `stop` is what the stop of the gate found (`gate_stop` of the sandbox's metadata, `_stop_reasons`). The
+    log must hold the gate's `teardown_complete` line, whatever its exit code."""
+    reasons = _stop_reasons(stop) | (set() if lines is not None else {UNREADABLE})
+    counts, tables = dict.fromkeys(_BODY_FIELD.values(), 0), _Tables()
     confirmed = False
     for text in lines or ():
         if not text.strip():
@@ -213,9 +345,11 @@ def served(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str,
             reasons.add(GATE_LOG_MALFORMED)  # a line that does not say what it served is no count
             continue
         counts[field] += size
+        if not tables.add(record, field, size):
+            reasons.add(GATE_LOG_MALFORMED)  # content or a listing of no file or directory the log can name
     if lines is not None and not confirmed:  # an exit is no proof: a gate killed by its memory limit exits as well
         reasons.add(GATE_TEARDOWN_UNCONFIRMED)
     if reasons:
         return served_unknown(*reasons)
     total = counts["content_bytes"] + counts["listing_bytes"] + counts["other_bytes"]
-    return {"served_bytes": total, **counts, "unknown": []}
+    return {"served_bytes": total, **counts, **tables.snapshot(), "unknown": []}

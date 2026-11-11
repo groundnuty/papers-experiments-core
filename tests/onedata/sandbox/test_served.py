@@ -22,14 +22,56 @@ STOPPED = {
     "log_write_failed": False,
     "teardown_incomplete": False,
 }
+ALPHA, BRAVO, CHARLIE = "fileidalpha", "fileidbravo", "fileidcharlie"  # invented file ids
+FOLDER, NOWHERE = "diridfolder", "diridnowhere"  # invented directory ids
+TABLES = ("files", "files_total", "files_cut", "listings", "listings_total", "listings_cut")
+
+
+def content(file_id: str) -> str:
+    return f"/api/v3/oneprovider/data/{file_id}/content"
+
+
+def children(dir_id: str) -> str:
+    return f"/api/v3/oneprovider/data/{dir_id}/children"
+
+
+def read(file_id: str, size: int, first: int | None = None) -> dict:
+    """The gate's line of one answer of a file's content: a 200 from the start, or a 206 from `first`."""
+    line = {"method": "GET", "path": content(file_id), "tag": "content", "status": 200, "body": "content"}
+    if first is not None:
+        line |= {"status": 206, "content_range": f"bytes {first}-{first + size - 1}/100000"}
+    return line | {"body_bytes": size}
+
+
+def listed(dir_id: str, size: int, status: int = 200) -> dict:
+    """The gate's line of one answer of a listing: the platform's 200 is a listing, its error another answer."""
+    body = "listing" if status == 200 else "other"
+    return {
+        "method": "GET",
+        "path": children(dir_id),
+        "tag": "children",
+        "status": status,
+        "body": body,
+        "body_bytes": size,
+    }
+
+
+CUT = {"status": 502, "upstream_status": 206, "content_range": "bytes 100-199/5000", "cut": True, "unread_bytes": 60}
 ANSWERS = [  # a run's answers, as the gate logs them
-    {"method": "GET", "tag": "content", "status": 200, "body": "content", "body_bytes": 1000},
-    {"method": "GET", "tag": "content", "status": 206, "body": "content", "body_bytes": 24},
-    {"method": "GET", "tag": "content", "status": 502, "body": "content", "body_bytes": 40, "cut": True},
-    {"method": "GET", "tag": "children", "status": 200, "body": "listing", "body_bytes": 300, "complete_listing": True},
-    {"method": "GET", "tag": "attrs", "status": 200, "body": "other", "body_bytes": 90},
-    {"method": "GET", "tag": "children", "status": 404, "body": "other", "body_bytes": 50},
-    {"method": "PUT", "decision": "deny", "status": 403, "body": "gate", "body_bytes": 70},
+    read(ALPHA, 1000),
+    read(ALPHA, 24, first=10),
+    read(BRAVO, 40, first=100) | CUT,  # a transfer cut after 40 of its 100 bytes
+    listed(FOLDER, 300) | {"complete_listing": True},
+    {
+        "method": "GET",
+        "path": f"/api/v3/oneprovider/data/{CHARLIE}",  # a file only looked at: its attributes, never its content
+        "tag": "attrs",
+        "status": 200,
+        "body": "other",
+        "body_bytes": 90,
+    },
+    listed(NOWHERE, 50, status=404),
+    {"method": "PUT", "path": content(CHARLIE), "decision": "deny", "status": 403, "body": "gate", "body_bytes": 70},
     {"event": "request_error", "status": 400, "body": "gate", "body_bytes": 11},
     {"event": "request_error", "status": None, "reason": "request headers not received in time"},
     {"event": "conn_close", "conn": "1-1", "after_request": 3, "ended": "eof"},
@@ -54,6 +96,29 @@ def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
         "listing_bytes": 300,
         "other_bytes": 140,
         "gate_answer_bytes": 81,
+        "files": {
+            ALPHA: {
+                "path": content(ALPHA),
+                "requests": 2,
+                "ranges": [[0, 1000]],
+                "range_bytes": 1000,
+                "ranges_cut": False,
+                "body_bytes": 1024,
+            },
+            BRAVO: {
+                "path": content(BRAVO),
+                "requests": 1,
+                "ranges": [[100, 140]],
+                "range_bytes": 40,
+                "ranges_cut": False,
+                "body_bytes": 40,
+            },
+        },
+        "files_total": 2,
+        "files_cut": False,
+        "listings": {FOLDER: {"path": children(FOLDER), "requests": 1, "body_bytes": 300}},
+        "listings_total": 1,
+        "listings_cut": False,
         "unknown": [],
     }
 
@@ -81,6 +146,9 @@ def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
             "gate_log_malformed",
         ),
         (log(*ANSWERS, ["not", "an", "object"]), STOPPED, "gate_log_malformed"),
+        (log(*UNMARKED, read(ALPHA, 5) | {"path": None}, ANSWERS[-1]), STOPPED, "gate_log_malformed"),
+        (log(*UNMARKED, read(ALPHA, 5) | {"path": children(ALPHA)}, ANSWERS[-1]), STOPPED, "gate_log_malformed"),
+        (log(*UNMARKED, listed(FOLDER, 5) | {"path": content(FOLDER)}, ANSWERS[-1]), STOPPED, "gate_log_malformed"),
         (log(*UNMARKED), {**STOPPED, "exit_code": 137}, "gate_teardown_unconfirmed"),
         (log(*UNMARKED), STOPPED, "gate_teardown_unconfirmed"),
         (log(*ANSWERS), {**STOPPED, "output_read": False}, "gate_output_unreadable"),
@@ -99,6 +167,9 @@ def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
         "no-body-kind",
         "negative",
         "not-an-object",
+        "content-no-path",
+        "content-not-a-file",
+        "listing-not-a-directory",
         "killed-no-mark",
         "exited-no-mark",
         "output-not-read",
@@ -107,10 +178,132 @@ def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
 )
 def test_o20_a_count_that_may_be_missing_a_line_is_unknown_never_zero(lines, stop, reason):
     """O20: a log that may lack a line, or holds one that does not say what it served, makes every count None with the
-    reason, never a partial sum taken for the whole."""
+    reason, never a partial sum taken for the whole: the tables of the files and directories too, never a part of them
+    taken for the whole (an answer of a file's content or a listing must name the file or directory it served)."""
     got = gatelog.served(lines, stop)
     assert got["unknown"] == [reason]
     assert all(got[field] is None for field in gatelog.SERVED_FIELDS)
+    assert all(got[field] is None for field in TABLES)
+
+
+def tables(*records) -> dict:
+    """The tables of a whole log of these answers, from a gate that stopped cleanly."""
+    got = gatelog.served(log(*records, ANSWERS[-1]), STOPPED)
+    assert got["unknown"] == []
+    return got
+
+
+def test_o20_two_files_read_in_overlapping_ranges_each_keep_their_own_merged_ranges():
+    """O20: each file read through the gate has its own row: the answers of its content, the byte ranges they served
+    merged where they overlap or touch, the bytes in those ranges, and the body bytes of every answer; a range of one
+    file never merges with another file's. The rows add up to the run's content bytes."""
+    got = tables(
+        read(ALPHA, 100, first=0),
+        read(BRAVO, 100, first=200),
+        read(ALPHA, 100, first=50),
+        read(BRAVO, 150, first=250),
+        read(BRAVO, 50, first=600),
+        read(BRAVO, 10, first=400),  # touches 250-399: one range
+    )
+    assert got["files"] == {
+        ALPHA: {
+            "path": content(ALPHA),
+            "requests": 2,
+            "ranges": [[0, 150]],
+            "range_bytes": 150,
+            "ranges_cut": False,
+            "body_bytes": 200,
+        },
+        BRAVO: {
+            "path": content(BRAVO),
+            "requests": 4,
+            "ranges": [[200, 410], [600, 650]],
+            "range_bytes": 260,
+            "ranges_cut": False,
+            "body_bytes": 310,
+        },
+    }
+    assert (got["files_total"], got["files_cut"]) == (2, False)
+    assert sum(row["body_bytes"] for row in got["files"].values()) == got["content_bytes"]
+
+
+def test_o20_a_file_read_again_counts_every_request_and_its_bytes_once_in_its_ranges():
+    """O20: a file read whole twice and then by a range inside it was served its bytes three times: three requests and
+    every body byte, but its unique ranges hold each byte once, which is what a claimed read is checked against."""
+    got = tables(read(ALPHA, 500), read(ALPHA, 500), read(ALPHA, 100, first=100))
+    row = got["files"][ALPHA]
+    assert (row["requests"], row["body_bytes"]) == (3, 1100)
+    assert (row["ranges"], row["range_bytes"]) == ([[0, 500]], 500)
+
+
+def test_o20_a_file_only_looked_at_is_not_in_the_table_and_a_listing_counts_under_its_directory():
+    """O20: a file whose attributes were read, whose content read was refused or answered with the platform's error,
+    served none of its content, so it has no row. A listing's answers count under the directory listed, keyed by the
+    directory's id as its path names it; a listing the platform answered with an error is no listing."""
+    attributes = {"method": "GET", "path": f"/api/v3/oneprovider/data/{CHARLIE}", "tag": "attrs", "status": 200}
+    refused = {"method": "GET", "path": content(CHARLIE), "decision": "deny", "status": 403, "body": "gate"}
+    missing = {"method": "GET", "path": content(CHARLIE), "tag": "content", "status": 404, "body": "other"}
+    got = tables(
+        attributes | {"body": "other", "body_bytes": 90},
+        refused | {"body_bytes": 70},
+        missing | {"body_bytes": 40},
+        listed(FOLDER, 300),
+        listed(FOLDER, 280),
+        listed(NOWHERE, 50, status=404),
+    )
+    assert (got["files"], got["files_total"], got["files_cut"]) == ({}, 0, False)
+    assert got["listings"] == {FOLDER: {"path": children(FOLDER), "requests": 2, "body_bytes": 580}}
+    assert (got["listings_total"], got["listings_cut"]) == (1, False)
+
+
+@pytest.mark.parametrize(
+    "unplaced",
+    [
+        {k: v for k, v in read(ALPHA, 20, first=40).items() if k != "content_range"},  # a 206 with no Content-Range
+        read(ALPHA, 20, first=40) | {"content_range": "bytes 40-49/100000"},  # more bytes than its range holds
+        read(ALPHA, 20, first=40) | {"content_range": "bytes 40-59,80-99/100000"},  # not one range
+        read(ALPHA, 20) | {"status": 502},  # the gate's own failure after its body began: no status of the platform's
+    ],
+    ids=["no-content-range", "range-too-short", "several-ranges", "no-platform-status"],
+)
+def test_o20_a_range_the_log_cannot_place_leaves_that_files_ranges_unknown_and_its_bytes_counted(unplaced):
+    """O20: where an answer's bytes began in its file is read from the platform's own answer (a 200 from the start, a
+    206 from its Content-Range), never guessed; an answer the log cannot place leaves its file's ranges unknown, never
+    a part of them, while its requests and body bytes, and every other file's row, stay known."""
+    got = tables(read(ALPHA, 100), unplaced, read(BRAVO, 30, first=5))
+    assert got["files"][ALPHA] == {
+        "path": content(ALPHA),
+        "requests": 2,
+        "ranges": None,
+        "range_bytes": None,
+        "ranges_cut": None,
+        "body_bytes": 120,
+    }
+    assert (got["files"][BRAVO]["ranges"], got["files"][BRAVO]["range_bytes"]) == ([[5, 35]], 30)
+    nothing = read(ALPHA, 0) | {"status": None, "client_aborted": True}  # the client went before any byte: no range
+    assert tables(read(ALPHA, 100), nothing)["files"][ALPHA]["ranges"] == [[0, 100]]
+
+
+def test_o20_the_tables_are_bounded_and_say_when_their_bound_cut_them():
+    """O20: a run lists at most `MAX_FILES_LISTED` files and `MAX_DIRECTORIES_LISTED` directories, the first read, and
+    each file at most `MAX_RANGES_LISTED` ranges, the lowest; a table the bound cut says so, with the number of files
+    or directories read, and a file's unique bytes still count every range. The run's own counts are never cut."""
+    files = [read(f"fileid{n:05d}", 10) for n in range(gatelog.MAX_FILES_LISTED + 1)]
+    got = tables(*files)
+    assert len(got["files"]) == gatelog.MAX_FILES_LISTED
+    assert list(got["files"]) == [f"fileid{n:05d}" for n in range(gatelog.MAX_FILES_LISTED)]
+    assert (got["files_total"], got["files_cut"]) == (gatelog.MAX_FILES_LISTED + 1, True)
+    assert got["content_bytes"] == 10 * (gatelog.MAX_FILES_LISTED + 1)
+    assert tables(*files[:-1])["files_cut"] is False
+    directories = [listed(f"folderid{n:05d}", 10) for n in range(gatelog.MAX_DIRECTORIES_LISTED + 1)]
+    got = tables(*directories)
+    assert len(got["listings"]) == gatelog.MAX_DIRECTORIES_LISTED
+    assert (got["listings_total"], got["listings_cut"]) == (gatelog.MAX_DIRECTORIES_LISTED + 1, True)
+    spread = [read(ALPHA, 10, first=100 * n) for n in reversed(range(gatelog.MAX_RANGES_LISTED + 1))]
+    row = tables(*spread)["files"][ALPHA]
+    assert row["ranges"] == [[100 * n, 100 * n + 10] for n in range(gatelog.MAX_RANGES_LISTED)]
+    assert (row["ranges_cut"], row["range_bytes"]) == (True, 10 * (gatelog.MAX_RANGES_LISTED + 1))
+    assert tables(*spread[1:])["files"][ALPHA]["ranges_cut"] is False
 
 
 def start(world, level):
@@ -127,16 +320,19 @@ def test_o20_a_rest_runs_count_is_taken_once_by_the_collection_and_the_instrumen
 ):
     """O20: before its collection a REST run's count is unknown, since its gate still runs; the collection stops the
     gate and counts its log once, the metadata and the instrument's snapshot carry that count with the data path and
-    its listing mode, and it stays the same after the sandbox and its log are gone."""
+    its listing mode, and it stays the same after the sandbox and its log are gone. So do the tables of the files and
+    directories, which replay serves as recorded."""
     sbx = start(world, level)
     instrument = ServedBytes(sbx)
     start_instruments([instrument], {"run_key": "run-key-1", "factors": {}, "attempt": 1})
     assert sbx.served_bytes()["unknown"] == ["gate_not_collected"]
     assert sbx.served_bytes()["served_bytes"] is None
+    assert all(sbx.served_bytes()[field] is None for field in TABLES)
     write_log(sbx, *ANSWERS)
     sbx.collect(tmp_path / "evidence")
     write_log(sbx)  # the log changing after the collection does not change the count
     expected = {"data_path": "rest", "listing": listing, **gatelog.served(log(*ANSWERS), STOPPED)}
+    assert set(expected["files"]) == {ALPHA, BRAVO}
     assert sbx.served_bytes() == expected
     assert json.loads((tmp_path / "evidence" / "metadata.json").read_text())["served_bytes"] == expected
     snapshot = instrument.finish()
@@ -183,12 +379,21 @@ def test_o20_a_mounts_reads_are_unknown_and_no_data_path_read_nothing(world):
     got = mounted.served_bytes()
     assert (got["data_path"], got["listing"], got["unknown"]) == ("mount", None, ["mount_not_through_gate"])
     assert all(got[field] is None for field in gatelog.SERVED_FIELDS)
+    assert all(got[field] is None for field in TABLES)  # no file's count is known either
     assert ServedBytes(mounted).finish()["served_bytes"] is None
     mounted.stop()
     isolated = start(world, "isolated")
     got = isolated.served_bytes()
     assert (got["data_path"], got["unknown"]) == ("none", [])
     assert all(got[field] == 0 for field in gatelog.SERVED_FIELDS)
+    assert {field: got[field] for field in TABLES} == {
+        "files": {},
+        "files_total": 0,
+        "files_cut": False,
+        "listings": {},
+        "listings_total": 0,
+        "listings_cut": False,
+    }
     isolated.stop()
 
 
@@ -324,7 +529,7 @@ def test_o20_a_request_that_starts_once_the_stop_began_answers_nothing(monkeypat
 
 def test_o20_a_request_line_after_the_teardown_mark_leaves_the_count_unknown():
     """O20: a line the mark did not cover means the mark proves nothing, so the count is unknown, never a total."""
-    after = {"event": "request", "method": "GET", "body": "content", "body_bytes": 5, "conn": "1-2"}
+    after = read(ALPHA, 5) | {"event": "request", "conn": "1-2"}
     lines = log(*ANSWERS, after)  # ANSWERS ends with the teardown mark
     assert gatelog.served(lines, STOPPED)["unknown"] == [gatelog.GATE_TEARDOWN_UNCONFIRMED]
 

@@ -347,15 +347,17 @@ def test_o19_a_gate_given_a_listing_mode_it_does_not_know_refuses_to_start(tmp_p
 def test_o20_the_bytes_served_are_what_the_client_received_in_either_listing_mode(served, listing):
     """O20: through a real gate, every answer's line says what its body was, and the count taken from the log is the
     bytes the client received: a file's content whole and by a range, the listing as it was served (the merged answer
-    or the server's page), the platform's other answers, and the gate's own refusal apart."""
+    or the server's page), the platform's other answers, and the gate's own refusal apart. Each file read has its row,
+    with the ranges the platform's answers say they served, and the listing counts under its directory."""
     data = bytes(range(256)) * 8
-    tree = {f"file-{n:05d}.bin": b"x" for n in range(1500)} | {"data.bin": data}
+    tree = {f"file-{n:05d}.bin": b"x" for n in range(1500)} | {"data.bin": data, "tail.bin": bytes(300)}
     world = served(MockOnedata(tree, space_name="invented-space", token=GATE_TOKEN), listing=listing)
-    file_id = "f" + b"data.bin".hex()
+    file_id, tail_id = "f" + b"data.bin".hex(), "f" + b"tail.bin".hex()
     calls = [
         ("listing", f"{ROOT}?limit=1000", "GET", {}),
         ("content", f"/api/v3/oneprovider/data/{file_id}/content", "GET", {}),
         ("content", f"/api/v3/oneprovider/data/{file_id}/content", "GET", {"Range": "bytes=0-99"}),
+        ("content", f"/api/v3/oneprovider/data/{tail_id}/content", "GET", {"Range": "bytes=100-"}),  # open-ended
         ("other", f"/api/v3/oneprovider/data/{file_id}", "GET", {}),
         ("other", f"/api/v3/oneprovider/data/f{b'nowhere'.hex()}/children", "GET", {}),
         ("gate", f"/api/v3/oneprovider/data/{file_id}/content", "PUT", {}),
@@ -366,13 +368,16 @@ def test_o20_the_bytes_served_are_what_the_client_received_in_either_listing_mod
         status, body = request(world, target, method=method, headers=headers)
         statuses.append(status)
         received[kind] += len(body)
-    assert statuses == [200, 200, 206, 200, 404, 403]
-    assert received["content"] == len(data) + 100
+    assert statuses == [200, 200, 206, 206, 200, 404, 403]
+    assert received["content"] == len(data) + 100 + 200
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        lines = world.log.read_text().splitlines()
+    while time.monotonic() < deadline:  # the gate logs a line after its answer has gone: wait for every line
+        text = world.log.read_text()
+        lines = text[: text.rfind("\n") + 1].splitlines()  # a line still being written is not one yet
         if sum('"method"' in x for x in lines) == len(calls):
             break
+        time.sleep(0.05)
+    while gate._LIVE and time.monotonic() < deadline:  # a handler between its line and its count would be in flight
         time.sleep(0.05)
     answered = [json.loads(x) for x in lines if '"method"' in x]
     assert sorted(r["body"] for r in answered) == sorted(kind for kind, *_ in calls)  # lines may land in either order
@@ -393,5 +398,28 @@ def test_o20_the_bytes_served_are_what_the_client_received_in_either_listing_mod
         "listing_bytes": received["listing"],
         "other_bytes": received["other"],
         "gate_answer_bytes": received["gate"],
+        "files": {
+            file_id: {
+                "path": f"/api/v3/oneprovider/data/{file_id}/content",
+                "requests": 2,
+                "ranges": [[0, len(data)]],
+                "range_bytes": len(data),
+                "ranges_cut": False,
+                "body_bytes": len(data) + 100,
+            },
+            tail_id: {  # where its bytes began comes from the platform's Content-Range on the gate's line
+                "path": f"/api/v3/oneprovider/data/{tail_id}/content",
+                "requests": 1,
+                "ranges": [[100, 300]],
+                "range_bytes": 200,
+                "ranges_cut": False,
+                "body_bytes": 200,
+            },
+        },
+        "files_total": 2,
+        "files_cut": False,
+        "listings": {MockOnedata.SPACE_ID: {"path": ROOT, "requests": 1, "body_bytes": received["listing"]}},
+        "listings_total": 1,
+        "listings_cut": False,
         "unknown": [],
     }

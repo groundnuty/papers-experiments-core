@@ -594,12 +594,13 @@ class DockerSandbox:
         data path and its listing mode. REST: counted once, by the collection, from the log of the gate it stopped;
         before that every count is unknown (`gate_not_collected`). A mount: unknown (`mount_not_through_gate`), since
         its reads go through oneclient and no gate sees them. No data path: zero, since there is nothing to read
-        through. Unknown is never zero."""
+        through. The tables of the files and directories served follow the counts: None when they are unknown, empty
+        when they are zero. Unknown is never zero."""
         path = {"data_path": self.spec.mode.value, "listing": self._meta.get("listing")}
         if self.spec.mode is DataPathMode.MOUNT:
             return path | gatelog.served_unknown(MOUNT_NOT_THROUGH_GATE)
         if self.spec.mode is DataPathMode.NONE:
-            return path | dict.fromkeys(gatelog.SERVED_FIELDS, 0) | {"unknown": []}
+            return path | gatelog.served_nothing()
         return path | self._meta.get("served_bytes", gatelog.served_unknown(NOT_COLLECTED))
 
     def gate_refusals(self) -> list[str]:

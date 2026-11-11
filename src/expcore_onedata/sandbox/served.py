@@ -8,13 +8,22 @@
 recorded value; nothing is measured again. Its snapshot:
 
   {"version": 1, "data_path": "rest", "listing": "complete", "served_bytes": 51234, "content_bytes": 40960,
-   "listing_bytes": 10240, "other_bytes": 34, "gate_answer_bytes": 0, "unknown": []}
+   "listing_bytes": 10240, "other_bytes": 34, "gate_answer_bytes": 0,
+   "files": {"<file id>": {"path": "/api/v3/oneprovider/data/<file id>/content", "requests": 3,
+                           "ranges": [[0, 32768], [36864, 40960]], "range_bytes": 36864, "ranges_cut": false,
+                           "body_bytes": 40960}},
+   "files_total": 1, "files_cut": false,
+   "listings": {"<directory id>": {"path": "/api/v3/oneprovider/data/<directory id>/children", "requests": 1,
+                                   "body_bytes": 10240}},
+   "listings_total": 1, "listings_cut": false, "unknown": []}
 
 What each count holds is in `gatelog` (the bytes of the platform's answers the gate's socket accepted for the agent,
-by what they were; the gate's own answers apart). A REST data path is counted from the log of the gate the collection
-stopped, so `finish` before `collect` records every count unknown (`gate_not_collected`); a mount's reads go through
-oneclient, which no gate sees, so its counts are unknown (`mount_not_through_gate`); a run with no data path read
-nothing through one, zero. Every count is None whenever `unknown` names a reason, and unknown is never zero.
+by what they were; the gate's own answers apart; and the same per file whose content it served and per directory it
+listed, keyed by the id the request's path names, each range `[start, stop]` with `stop` excluded). A REST data path is
+counted from the log of the gate the collection stopped, so `finish` before `collect` records every count unknown
+(`gate_not_collected`); a mount's reads go through oneclient, which no gate sees, so its counts are unknown
+(`mount_not_through_gate`); a run with no data path read nothing through one, zero, with empty tables. Every count and
+every table is None whenever `unknown` names a reason, and unknown is never zero.
 """
 
 from collections.abc import Mapping
