@@ -7,7 +7,9 @@ a scientific wheel's test data), which no check can read: it goes in attested by
 `PACKAGE.json` (`binaries`). Text is read with the study-token list, and in an anonymised package with the terms of
 the anonymisation list and the identity it must not hold (`identity.find_identity`'s commits and URLs). The one
 exception is the study-token list for a wheel proven to be a pypi.org release, whose bytes the study's `uv.lock`
-records (`lockfile`): the anonymisation list and the identity still apply to it.
+records (`lockfile`): the anonymisation list and the identity still apply to it. Apart from these checks, every member
+of every wheel is walked whole for a copy of a key file the study declares (`keycopies`), whatever its kind and
+wherever its wheel came from.
 
 How deep a member is read depends on where its wheel came from. A wheel of a distribution installed from a direct
 URL, or supplied by the author, can be the author's own code, so its text members get every view the package's
@@ -143,10 +145,11 @@ def scan_wheels(
     with every view but the core's: whatever it was installed from, a repository, a local wheel, a URL or a directory,
     it can be the author's own code (K13). A member that names one is refused with how a distribution the author did
     not write, which can name a generic variable a study also uses as its `key_env`, is cleared: attested once read.
-    The core's own code names such variables (its redaction names API_KEY), and holds nothing of the author's. A
-    member that is a copy of a declared key file, or a text member that holds one in a stream of its own (decoded, or
-    archived), is refused whether attested or not, naming its path and saying to remove it; it gets no attestation
-    hint, and nothing prints its SHA-256.
+    The core's own code names such variables (its redaction names API_KEY), and holds nothing of the author's. Every
+    member of every wheel, from an index or not, the core's included, is walked whole for a copy of a declared key file
+    (`leaks.find_copies`): a member that is one, or holds one at any depth (archived, compressed, decoded), is refused
+    whether attested or not, naming its path and saying to remove it, and so is one the walk could not finish; it gets
+    no attestation hint and no entry in `binaries`, and nothing prints its SHA-256.
 
     A wheel in `exempt` (`lockfile.token_exempt`: a pypi.org release whose bytes the study's lock records) is read as
     a release, without the study-token list; the terms and identity of an anonymised package still apply to it. Every
@@ -165,12 +168,12 @@ def scan_wheels(
         for member, data in members(wheel, redactor):
             label = f"{wheel.path}/{member}"
             seen.add(label)
-            digest = hashlib.sha256(data).hexdigest()
-            text = as_text(data)
-            copies = find_copies({label: data}, searched, unopened={label} if text is None else (), redactor=redactor)
-            if copies:  # removed, never attested: no hint, which would carry its digest, and no clearing
+            copies = find_copies({label: data}, locations, redactor=redactor)  # every wheel's, walked whole
+            if copies:  # removed, never attested: no hint or binaries entry, which would carry its digest
                 findings += copies
                 continue
+            digest = hashlib.sha256(data).hexdigest()
+            text = as_text(data)
             if label in attested:
                 if attested[label].sha256 != digest:
                     findings.append(

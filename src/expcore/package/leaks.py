@@ -9,13 +9,14 @@ may (`config.key_locations`), and what an anonymised package must not hold eithe
 import importlib.resources
 import json
 import re
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 import expcore
 from expcore.config.key_locations import NO_LOCATIONS, KeyFinders, location_findings
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term
 from expcore.package.identity import find_identity
+from expcore.package.keycopies import Walk, walk
 from expcore.package.spec import WHEELS_DIR, PackageError
 from expcore.package.views import JOINED, PARSED, Stream, streams, views
 from expcore.provenance.hashfile import Hashes, parse_hash_file
@@ -198,14 +199,8 @@ def path_holds(label: str, locations: KeyFinders) -> bool:
     return locations.names_file(label) or any(found.search(label) for found in locations.patterns)
 
 
-def _copies(streams_of: Iterable[tuple[str, bytes]], locations: KeyFinders, redactor: Redactor) -> set[str]:
-    """One finding for each (path, bytes) that is a copy of a declared key file by size and SHA-256 (`FOUND_COPY`),
-    naming the path, hidden when it holds a key location. It never says how to attest the copy and prints no digest."""
-    return {
-        f"{redactor.name(label, hide=path_holds(label, locations))}: {FOUND_COPY}"
-        for label, data in streams_of
-        if locations.is_key_file(data)
-    }
+UNCHECKED = "could not be checked for a copy of the key file of a model the study's models.toml declares"
+UNCHECKED_FIX = "leave it out, or package what it holds in a form the build can open"
 
 
 def find_copies(
@@ -215,18 +210,25 @@ def find_copies(
     unopened: Collection[str] = frozenset(),
     redactor: Redactor | None = None,
 ) -> list[str]:
-    """One finding per file, and per stream inside it (an archive member, a decoded run), that is a copy of a declared
-    key file under any name (`FOUND_COPY`). A file in `unopened` is compared by its own bytes only. Nothing clears a
-    copy: it is removed, never attested in `[[opaque]]`."""
+    """One finding per file, and per stream inside it at any depth (an archive member, a decompressed stream, a
+    database value, a decoded run), that is a copy of a declared key file under any name (`FOUND_COPY`), and one per
+    stream the walk could not finish (`UNCHECKED`): each file is walked whole on its own (`keycopies.walk`), whatever
+    the content scanner refuses in it and whether it is attested or not. A file in `unopened` (a vendored wheel, whose
+    members `wheelscan` walks) is compared by its own bytes only. Each finding names its path, hidden when it holds a
+    key location; none prints a digest or says how to attest it. Nothing clears a copy: it is removed, never attested
+    in `[[opaque]]`."""
     if not locations.digests:
         return []
     redactor = Redactor() if redactor is None else redactor
     findings: set[str] = set()
     for name in sorted(files):
-        found = [(name, files[name])]
-        if name not in unopened:
-            found += [(stream.label, stream.data) for stream in streams(name, files[name])[0]]
-        findings |= _copies(found, locations, redactor)
+        if name in unopened:
+            found = Walk(copies=[name] if locations.is_key_file(files[name]) else [])
+        else:
+            found = walk(name, files[name], locations)
+        shown = {label: redactor.name(label, hide=path_holds(label, locations)) for label in found.labels()}
+        findings |= {f"{shown[label]}: {FOUND_COPY}" for label in found.copies}
+        findings |= {f"{shown[label]}: {UNCHECKED}: {why}; {UNCHECKED_FIX}" for label, why in found.unchecked}
     return sorted(findings)
 
 
@@ -240,25 +242,20 @@ def find_locations(
 ) -> list[str]:
     """One finding per stream and line that holds a key location (`key_locations.location_finders`), never the value:
     every stream of every file, under every view, as the token check reads it; and the path of each stream
-    (`path_holds`), shown by its hidden name when it holds one. A file, or a stream inside one (an archive member), that
-    is a copy of a declared key file under any name, by size and SHA-256, is one finding naming its path (`copies`,
-    `FOUND_COPY`); a file the checks cannot open is searched as the bytes it is. The files in `opaque` were attested by
-    hash and are not read, but a copy of a key file is not attested away: each is opened for one, except a vendored
-    wheel, which is compared by its own bytes (`wheelscan` reads its members). Empty when nothing is looked for."""
+    (`path_holds`), shown by its hidden name when it holds one. Every file, and every stream inside one at any depth,
+    that is a copy of a declared key file under any name, by size and SHA-256, is one finding naming its path, and so
+    is every stream that walk could not finish (`copies`, `find_copies`). The files in `opaque` were attested by hash
+    and are not read, but a copy of a key file is not attested away: each is walked for one like any file, except a
+    vendored wheel, which is compared by its own bytes (`wheelscan` walks its members). Empty when nothing is looked
+    for."""
     if not locations:
         return []
     redactor = Redactor() if redactor is None else redactor
     findings: set[str] = set()
     for name in sorted(files):
-        if name in opaque:  # attested: not read, but opened for a copy of a key file, unless a wheel (read by member)
-            if copies:
-                wheel = name.startswith(f"{WHEELS_DIR}/")
-                findings.update(
-                    find_copies({name: files[name]}, locations, unopened={name} if wheel else (), redactor=redactor)
-                )
+        if name in opaque:  # attested: not read
             continue
-        opened = streams(name, files[name])[0]
-        for stream in opened:
+        for stream in streams(name, files[name])[0]:
             held = path_holds(stream.label, locations)
             shown = redactor.name(stream.label, hide=held)
             if held:
@@ -267,10 +264,9 @@ def find_locations(
                 found_at = (m.start() for found in locations.patterns for m in found.finditer(text))
                 lines = {text.count("\n", 0, start) + 1 for start in found_at}
                 findings |= {f"{shown}:{line}: {FOUND_LOCATION}" for line in lines}
-        if copies:
-            findings |= _copies(
-                [(name, files[name]), *((stream.label, stream.data) for stream in opened)], locations, redactor
-            )
+    if copies:
+        wheels = {name for name in opaque if name.startswith(f"{WHEELS_DIR}/")}
+        findings.update(find_copies(files, locations, unopened=wheels, redactor=redactor))
     return sorted(findings)
 
 

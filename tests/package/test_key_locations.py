@@ -7,6 +7,7 @@ withholding keeps them out of the package. The campaign runs once per module.
 
 import base64
 import dataclasses
+import gzip
 import hashlib
 import io
 import json
@@ -595,6 +596,34 @@ def test_k13_a_renamed_copy_of_the_key_file_refuses_the_build(campaign, hashes, 
     message = str(refused.value)
     assert "notes.txt: a copy of a key file" in message
     assert not any(part in message for part in KEPT)
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 64  # what the content scanner refuses, so an author attests it
+
+
+def test_k13_with_the_key_file_there_the_example_and_an_attested_archive_without_a_copy_build(
+    campaign, hashes, tmp_path
+):
+    """K13: with the key file where models.toml says, every file of the example's package and every member of its
+    wheels is walked for a copy of it, and the package builds, with an attested archive that holds what the content
+    scanner refuses (a PNG, a compressed tar) and no copy of the key."""
+    copy = copy_campaign(campaign, tmp_path, "walked")
+    key = kept_key(tmp_path / "home", KEY_BYTES)
+    table = copy.root / "models.toml"
+    table.write_text(table.read_text(encoding="utf-8").replace(KEY_FILE, key), encoding="utf-8")
+    inner = tar_of("notes/plot.png", PNG)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("figures/plot.png", PNG)
+        archive.writestr("figures/inner.tar.gz", gzip.compress(inner))
+        archive.writestr("figures/near.bin", b"\0" + KEY_BYTES)  # holds the key among other bytes: not a copy
+    (copy.root / "figures.zip").write_bytes(buffer.getvalue())
+    digest = hashlib.sha256(buffer.getvalue()).hexdigest()
+    spec = copy.root / "package.toml"
+    text = spec.read_text(encoding="utf-8").replace('"README.md",', '"README.md",\n    "figures.zip",')
+    spec.write_text(f'{text}\n[[opaque]]\npath = "figures.zip"\nsha256 = "{digest}"\nreason = "figures"\n', "utf-8")
+    archive = build_package(copy.root, tmp_path / "dist", hashes=hashes)
+    assert f"{NAME}/figures.zip" in every_stream(archive)
 
 
 def test_k13_another_file_named_models_toml_refuses_the_build(campaign, hashes, tmp_path):

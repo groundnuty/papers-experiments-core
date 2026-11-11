@@ -452,6 +452,18 @@ def test_k03_a_damaged_zlib_stream_with_bytes_after_it_is_still_read():
     assert found({"record.json": b'{"blob": "' + b64(bytes(broken) + b"\n") + b'"}\n'})
 
 
+def test_k03_a_run_wrapped_in_lines_shorter_than_the_shortest_run_is_still_decoded():
+    """K03: the run finder passes over the short words of text without splitting them, but a run wrapped in lines each
+    shorter than the shortest run decoded, or one that reaches that length only with its padding, is decoded."""
+    from expcore.package import views
+
+    encoded = b64(zlib.compress(TEXT))
+    assert found({"attachment.txt": b"\n".join(encoded[i : i + 8] for i in range(0, len(encoded), 8)) + b"\n"})
+    padded = base64.b64encode(b"x" * 10)  # 14 characters and two of padding
+    assert len(padded.rstrip(b"=")) < views.MIN_RUN <= len(padded)
+    assert [run for _, run in views._runs(f"a = {padded.decode()}\n")] == [padded.decode()]
+
+
 def test_k03_a_digest_that_looks_like_a_tiny_deflate_stream_is_never_refused():
     """K03: random bytes can carry a valid zlib header and a terminating deflate block by chance; such a digest,
     raw in hex or in base64, refuses nothing."""
