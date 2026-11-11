@@ -276,8 +276,8 @@ def _counted_key_locations(study: StudyConfig, recorded: Mapping[str, Any] | Non
     if not leaves:
         return ""
     return (
-        f" ({', '.join(leaves)} hold where each key lives, which the core that started the campaign counted and this "
-        "one leaves out (K13); finish the campaign with that core, or start a new store)"
+        f" ({', '.join(leaves)}: recorded with where each key lives, which the core that started the campaign counted "
+        "and this one leaves out (K13); finish the campaign with that core, or start a new store)"
     )
 
 

@@ -245,7 +245,7 @@ def test_k13_a_campaign_an_earlier_core_started_is_refused_a_resume_saying_why_a
     earlier = as_an_earlier_core_left_it(copy)
     code, errors = cli(clean_environment, "run", str(copy.root))
     assert code != 0
-    assert "configs.models.toml hold where each key lives, which the core that started the campaign counted" in errors
+    assert "configs.models.toml: recorded with where each key lives, which the core that started the campaign" in errors
     assert "(K13); finish the campaign with that core, or start a new store" in errors
     code, errors = cli(clean_environment, "analyze", str(copy.root))
     assert code != 0
