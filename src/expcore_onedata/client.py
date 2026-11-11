@@ -643,7 +643,8 @@ class OnezoneClient:
             ) from None
 
     def _require_in_scope(self, name: str) -> None:
-        if not name.startswith(self._config.space.prefixes):
+        """Refuse a target space whose name starts with no declared space's prefix (every `[[spaces]]` entry's)."""
+        if not name.startswith(self._config.prefixes):
             raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
 
     def mutate(

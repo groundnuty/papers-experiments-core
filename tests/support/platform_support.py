@@ -87,21 +87,55 @@ def _value(value: Any) -> str:
     return json.dumps(value)
 
 
+def _tables(value: Any) -> bool:
+    """Whether a value is an array of tables (rendered `[[key]]`), as `[[spaces]]` is."""
+    return isinstance(value, list) and bool(value) and all(isinstance(v, dict) for v in value)
+
+
 def render(data: dict[str, Any]) -> str:
-    """Render a nested dictionary of tables, scalars and lists as TOML."""
+    """Render a nested dictionary of tables, arrays of tables, scalars and lists as TOML."""
     lines: list[str] = []
 
-    def emit(prefix: str, table: dict[str, Any]) -> None:
-        scalars = {k: v for k, v in table.items() if not isinstance(v, dict)}
-        if prefix and (scalars or not any(isinstance(v, dict) for v in table.values())):
+    def emit(prefix: str, table: dict[str, Any], *, array: bool = False) -> None:
+        scalars = {k: v for k, v in table.items() if not isinstance(v, dict) and not _tables(v)}
+        if array:
+            lines.append(f"[[{prefix}]]")
+        elif prefix and (scalars or not any(isinstance(v, dict) or _tables(v) for v in table.values())):
             lines.append(f"[{prefix}]")
         lines.extend(f"{k} = {_value(v)}" for k, v in scalars.items())
         for key, sub in table.items():
+            name = f"{prefix}.{key}" if prefix else key
             if isinstance(sub, dict):
-                emit(f"{prefix}.{key}" if prefix else key, sub)
+                emit(name, sub)
+            elif _tables(sub):
+                for entry in sub:
+                    emit(name, entry, array=True)
 
     emit("", data)
     return "\n".join(lines) + "\n"
+
+
+SPACE_IDS = ("spmock0001", "sp-second-0002", "sp-third-0003")  # the fake's study space first, then two invented ones
+SPACE_NAMES = (SPACE_NAME, "study-a-mirror", "study-b-owned")
+SPACE_LABELS = ("lakeside", "hillcrest", "riverbend")
+
+
+def with_spaces(data: dict[str, Any], count: int = 2, **override: Any) -> None:
+    """Edit a platform document into the several-space form: `count` [[spaces]] entries in place of [space] and
+    [support], the first being the fake's study space; `override` updates every entry."""
+    del data["space"], data["support"]
+    data["spaces"] = [
+        {
+            "label": SPACE_LABELS[i],
+            "name": SPACE_NAMES[i],
+            "id": SPACE_IDS[i],
+            "prefixes": ["study-b-" if SPACE_NAMES[i].startswith("study-b-") else SPACE_PREFIX],
+            "providers": ["alpha", "beta"],
+            "local": "alpha",
+            **override,
+        }
+        for i in range(count)
+    ]
 
 
 def write_platform(tmp_path: Path, edit: Callable[[dict[str, Any]], None] | None = None) -> Path:
@@ -127,6 +161,7 @@ def configured_values(tmp_path: Path) -> list[str]:
         values += [name, provider["url"], provider["url"].split("//")[1], provider["id"]]
     zone, space = document["zone"], document["space"]
     values += [zone["url"], zone["url"].split("//")[1], space["name"], space["id"], *space["prefixes"]]
+    values += [*SPACE_IDS, *SPACE_NAMES, *SPACE_LABELS, "study-b-"]  # the several-space form's (`with_spaces`)
     for principal in document["principals"].values():
         values += [principal["username"], principal["user_id"]]
     credentials = document["credentials"]
