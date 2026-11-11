@@ -103,6 +103,7 @@ except ConfigError as error:
     assert "campaign.toml" in message and "key 'health_kind'" in message
     assert "did you mean 'sandbox'" in message
 shutil.rmtree(misspelt)
+```
 
 ### What the budget reserves
 
