@@ -244,6 +244,25 @@ A complete listing is complete only for a directory that does not change while t
 
 Two conditions that differ only in the listing mode are two levels of the factor, so they can run side by side in one campaign. The run's metadata records the mode, and `config.fingerprint()` holds every level's kind and mode, so changing a level's data path or its listing between starts is refused like any other change of the experiment. `listing` on a mount or `none` level is refused at load. What else each data path guarantees is in [`interfaces.md`](interfaces.md#the-platform-layers-sandbox).
 
+### How the sandbox reaches the federation
+
+The agent's container never reaches the federation itself. It sits on an internal Docker network of its own, drawn from `[sandbox.network] pools`, with no route out and no peer but the data gate on the REST path. On the mount path its one way to the data is the read-only mount, and every hop of that path belongs to another container or to the host:
+
+| Hop | Who holds it |
+|---|---|
+| the agent reads `[sandbox.mount] path` | a read-only bind of the run's mount directory on the host into the agent, with slave propagation; the agent has no token, no `/dev/fuse` and no capability |
+| the run's mount directory on the host | a shared bind mount the sandbox makes, so the FUSE mount made inside the sidecar appears there and from there in the agent |
+| oneclient's FUSE mount | the oneclient sidecar: the only container with `/dev/fuse` and `SYS_ADMIN`, and the only one holding the data-path token; read-only (`-o ro`) |
+| oneclient to the local provider | the sidecar's network, below; TLS as `[tls]` says, with the run's read-only copy of the `ca_file` bundle |
+| the local provider to the provider that holds the bytes | the federation's own network: a block the local provider lacks is fetched on demand from a provider that holds it, without the sandbox taking part |
+
+Which network the sidecar is on depends on how containers can reach the federation:
+
+- **Without `[sandbox.federation]`**, the sidecar starts on Docker's default bridge and dials the host of the local provider's URL in `[providers]`. This is right for a federation at public addresses, which containers reach as the host does.
+- **With `[sandbox.federation]`**, the sidecar starts on the federation's own Docker network instead, never on both, and dials the local provider by its name on that network: the name its certificate holds, on oneclient's default port. A federation the host reaches at addresses a container cannot use needs this. One example is a Compose deployment that publishes its providers on the host's loopback, since inside a container the loopback is the container itself. The table has two keys. `network` names an existing network of the federation's deployment, never Docker's default bridge, the host's network or `none`. `providers.<name> = "<host name>"` gives the local provider's name there, keyed by `[support] local`; any other provider is refused, and so is a table that no longer names the local one. The table is accepted only with a mount level in `[sandbox.data_paths]`.
+
+The sandbox never creates, changes or removes the federation's network: a mount run whose network is not on the host is refused before anything exists, and removing the sidecar at teardown takes it off the network. Each run's metadata records the kind of network the sidecar was on (`mount.network`: `default bridge` or `federation`), never its name. The REST path's data gate does not read the table: it stays on the default bridge and forwards to the URLs of `[zone]` and `[providers]`, so a federation reachable only on its own network has no REST path from the sandbox yet.
+
 ## 3. Declare the design
 
 ### Factors and conditions

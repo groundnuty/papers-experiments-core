@@ -1,0 +1,110 @@
+"""The code the live mount-path test runs inside the agent, run here against local files, so its classification is known
+before the one live run that cannot be repeated cheaply: what it reports is what happened, never a guess (O08)."""
+
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+
+from mount_live import confinement_cell, pattern, read_cell, unwritten_cell
+
+PREFIX, SIZE = 4096, 65536
+
+
+def run(code: str, timeout: float = 60) -> dict:
+    """Run a cell's code as the agent would, in a fresh interpreter, and return the JSON line it printed."""
+    done = subprocess.run(
+        [sys.executable, "-"], input=code, capture_output=True, text=True, timeout=timeout, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def partial(path, label, *, size=SIZE, tail=None):
+    """A file at `size` with only its prefix written (sparse), or with `tail` written after the prefix."""
+    with open(path, "wb") as handle:
+        handle.write(pattern(label, PREFIX))
+        if tail is not None:
+            handle.write(tail)
+        handle.truncate(size)
+
+
+def test_o08_an_unwritten_range_that_reads_as_zeros_is_reported_as_zeros_with_the_prefix_intact(tmp_path):
+    """O08: a sparse file at its final size reads its unwritten range as zeros: each read is `zeros`, at its full
+    length, the prefix's bytes it returned are the ones written, and the size is the final size."""
+    partial(tmp_path / "f", "label-zeros")
+    found = run(unwritten_cell({"f": (str(tmp_path / "f"), "label-zeros")}, PREFIX, SIZE, 5))["f"]
+    assert found["size"] == SIZE
+    for name, length in (("unwritten", 4096), ("across_prefix_end", 32), ("whole", SIZE)):
+        assert found[name]["outcome"] == "zeros", name
+        assert found[name]["bytes"] == length
+        assert found[name]["prefix_matches"] is True
+        assert found[name]["seconds"] >= 0
+
+
+def test_o08_short_nonzero_and_error_reads_are_each_named_and_never_taken_for_zeros(tmp_path):
+    """O08: a file that ends at its prefix reads short, one whose unwritten range holds bytes reads `nonzero`, and a
+    missing one is an error named by its errno; none of them is reported as zeros."""
+    partial(tmp_path / "short", "label-short", size=PREFIX)
+    partial(tmp_path / "dirty", "label-dirty", tail=b"\x07" * 100)
+    files = {
+        "short": (str(tmp_path / "short"), "label-short"),
+        "dirty": (str(tmp_path / "dirty"), "label-dirty"),
+        "missing": (str(tmp_path / "missing"), "label-missing"),
+    }
+    found = run(unwritten_cell(files, PREFIX, SIZE, 5))
+    assert found["short"]["unwritten"] == {**found["short"]["unwritten"], "outcome": "short", "bytes": 0}
+    assert found["short"]["whole"]["outcome"] == "short"
+    assert found["short"]["whole"]["prefix_matches"] is True
+    assert found["dirty"]["across_prefix_end"]["outcome"] == "nonzero"
+    assert found["dirty"]["unwritten"]["outcome"] == "nonzero"
+    assert found["missing"]["stat_error"] == "ENOENT"
+    assert found["missing"]["unwritten"]["outcome"] == "error"
+    assert found["missing"]["unwritten"]["error"] == "ENOENT"
+
+
+def test_o08_a_read_that_does_not_return_by_its_deadline_is_blocked_and_the_files_later_reads_are_not_tried(tmp_path):
+    """O08: a read that has not returned by its deadline (here: opening a pipe nobody writes to) is `blocked`, its
+    reader is killed, and the file's later reads are `not_tried`, never guessed."""
+    os.mkfifo(tmp_path / "pipe")
+    found = run(unwritten_cell({"pipe": (str(tmp_path / "pipe"), "label-pipe")}, PREFIX, SIZE, 1))["pipe"]
+    assert found["unwritten"]["outcome"] == "blocked"
+    assert found["unwritten"]["killed"] is True
+    assert found["unwritten"]["seconds"] >= 1
+    assert found["across_prefix_end"]["outcome"] == "not_tried"
+    assert found["whole"]["outcome"] == "not_tried"
+
+
+def test_o08_the_read_cell_reports_the_size_the_bytes_and_their_digest_or_the_errno(tmp_path):
+    """O08: a whole-file read reports its size, the bytes it read and their SHA-256, never the bytes; a file that does
+    not appear within the wait is an error named by its errno."""
+    data = pattern("whole", 300_001)
+    (tmp_path / "w").write_bytes(data)
+    found = run(read_cell(str(tmp_path / "w"), wait_s=0))
+    assert found["size"] == found["read"] == len(data)
+    assert found["sha256"] == hashlib.sha256(data).hexdigest()
+    assert "error" not in found
+    assert run(read_cell(str(tmp_path / "absent"), wait_s=0))["error"] == "ENOENT"
+
+
+def test_o05_the_confinement_cell_tells_a_writable_or_crowded_mount_and_a_refused_connection(tmp_path):
+    """O05: the cell that checks the agent's view reports a mount holding more than the space, a space it can write
+    to, and every way to the federation it tried by a word (never `connected` for a closed port or a name that does
+    not resolve), so a confinement that does not hold shows in its output."""
+    mount = tmp_path / "mount"
+    (mount / "only-space").mkdir(parents=True)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed = probe.getsockname()[1]  # free once the socket closes: nothing listens there
+    found = run(confinement_cell(str(mount), "only-space", ["name.invalid"], [], [closed]))
+    assert found["only_the_space"] is True
+    assert found["write_in_the_space"] == "WRITABLE"
+    assert found["by_name"] == ["unresolved"]
+    assert found["by_address"] == []
+    assert found["loopback_ports"] != ["connected"]
+    assert found["mount_lines"] == 0  # not a mount here: the live test requires one, read-only
+    assert found["mount_read_only"] is False
+    (mount / "another").mkdir()
+    assert run(confinement_cell(str(mount), "only-space", [], [], []))["only_the_space"] is False

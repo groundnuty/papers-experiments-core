@@ -203,8 +203,36 @@ EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_SLOW=1 uv run pytest tests/live/test_contract
 uv run python -m expcore_onedata.day0 /mnt/volume2/expcore-federation/platform.toml --out <directory>
 ```
 
-The sandbox tests (`EXPCORE_LIVE_DOCKER`) start containers and networks of their own, outside this project, so they
-are not run against it here.
+## The sandbox's mount path against it
+
+The sandbox starts its containers outside this project, and inside a container `127.0.0.1` is the container itself, so
+no container reaches the providers at the loopback ports `platform.toml` names. The mount path crosses on the
+project's own network instead, through `[sandbox.federation]`
+([study guide](../../docs/study-guide.md#how-the-sandbox-reaches-the-federation)):
+
+- the oneclient sidecar starts on `expcore-fed_fed`, and on no other network, with `/dev/fuse` and `SYS_ADMIN`;
+- it dials the local provider as `pine.expcore-fed.test` on port 443, its domain on that network, which Docker's
+  resolver there answers and its certificate names; TLS is verified against `ca/federation-ca.pem`;
+- the agent's container stays on the sandbox's own internal network, with no route out, no capability and no FUSE, and
+  reads the space only through the read-only mount;
+- `pine` fetches what `birch` or `cedar` holds over the project's network, on demand;
+- the sandbox never changes or removes `expcore-fed_fed`; its teardown removes the sidecar, which takes it off.
+
+`platform.toml` has no `[sandbox]` table, since its images are pinned on each host and its address pool is the host's
+own. The live test of the mount path (`tests/live/test_mount_path.py`) writes a copy with one into a directory of its
+own, and needs a pool the host routes nowhere:
+
+```sh
+EXPCORE_LIVE_DOCKER=1 EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_PLATFORM=/mnt/volume2/expcore-federation/platform.toml \
+EXPCORE_LIVE_SANDBOX_POOL=<a private IPv4 range> EXPCORE_LIVE_FACTS_OUT=<file> uv run pytest tests/live/test_mount_path.py
+```
+
+Run it outside any sandbox, after up: it needs Docker, `sudo` for the sandbox's mounts, and `python:3.12-slim` and
+`onedata/oneclient:25.0` on the host (never pulled). It writes three files into `alpha-space` and deletes them again;
+a reset removes anything an interrupted run leaves there. The test docstring lists what it asserts.
+
+The other sandbox tests (`tests/live/test_sandbox.py`) need a platform file with a `[sandbox]` table, which this one
+lacks, so they are not run against it here. The REST path's data gate does not cross to the project's network.
 
 `day0/` holds the dated reports: the day-0 checks' own (`day0-<UTC>.md` and `.json`) and the facts they do not
 measure (`<date>-federation-facts.md`): releases, live test results, the fault test, what listens on the host, the
