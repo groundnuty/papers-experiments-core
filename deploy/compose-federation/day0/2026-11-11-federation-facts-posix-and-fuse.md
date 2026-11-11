@@ -83,3 +83,66 @@ REST data path the second run measured zeros at once, at full length.
 
 After the probe, `docker ps -a` filtered to the project listed only its four services, and the root of `alpha-space`
 no longer held the probe's file.
+
+## Directory sizes per provider, and one file's distribution read
+
+Measured on a fourth fresh `up` later the same day (the third had been taken down), as the admin, with
+`../measure_dir_distribution.py` and direct reads; `<base>` is a provider's REST base, `<zone>` the zone's. These
+measurements decide how long a per-run reset takes. The host was shared with other agents' test suites throughout.
+
+### The calls and what 25.0 answers
+
+| Call | Answer |
+|---|---|
+| `GET <base>/data/{dir}/distribution`, the space root or a subdirectory | 200, the same shape through each provider: `{"type": "DIR", "distributionPerProvider": {<provider id>: {"virtualSize": int, "logicalSize": int, "success": bool, "locationsPerStorageBackend": {<storage id>: {"success": bool, "location": str or null}}, "distributionPerStorageBackend": {<storage id>: {"success": bool, "physicalSize": int}}}}}`. No blocks, no timestamp, no flag that a figure is being computed; `location` is null for a provider that holds nothing |
+| `GET <base>/data/{dir}?attribute=size` | 200 `{"size": int}`: the directory's logical size, as the provider asked sees it |
+| `GET <base>/data/{dir}/dir_size_stats?mode=layout` | 200: the series `dir_count`, `dir_error_count`, `file_error_count`, `logical_size`, `physical_size_<storage id>`, `reg_file_and_link_count` and `virtual_size`, each by `minute`, `hour`, `day` and `month`. Another `mode` is 400 `badValueNotAllowed`, allowed `layout` and `slice` |
+| `GET <base>/data/{dir}/dir_size_stats`, JSON body `{"mode": "slice", "layout": {"logical_size": ["minute"]}}` | 200 `{"slice": {"logical_size": {"minute": [{"value": int, "timestamp": int}, ...]}}}`, newest first, each window's start in epoch seconds. With `layout` in the query string, 400 `badValueJSON` |
+| `GET <base>/data/{dir}/dir_stats` | 404 |
+| `GET <zone>/spaces/{space}` | `supportParametersRegistry`, per provider `{"dirStatsServiceStatus": "enabled", "dirStatsServiceEnabled": true, "accountingEnabled": false}`, and `providers`, per provider its support size |
+
+So 25.0 gives a directory's size per provider over REST: physical bytes per storage backend and logical and virtual
+sizes, in the directory's distribution, and the same as time series in `dir_size_stats`. Nothing says whether a figure
+is current, beyond the series' window timestamps and the service's state, `enabled` on all three providers here.
+
+### How fast they follow a change
+
+The space root against the sum of its files' physical sizes, per provider, over all 1204 regular files, each file's
+own distribution read through `pine`:
+
+| When | pine | birch | cedar | The root's distribution, through each provider |
+|---|---|---|---|---|
+| Baseline | 1395520 | 1048576 | 0 | equal at the first read |
+| After replicating `samples/sample-1.bin` (65536 bytes) to `cedar` | 1395520 | 1048576 | 65536 | equal at the first read after the transfer's end, 0.1 s |
+| After evicting it from `cedar` again | 1395520 | 1048576 | 0 | equal at the first read after the transfer's end, 0.1 s |
+
+The transfer's end is seen by polling its record every 0.5 s, so up to that much may hide in the 0.1 s; a full recount
+after each change equalled what was expected.
+
+A write and a delete in `samples/` (300000 bytes, through `pine`; polls every 0.5 s, bound 180 s):
+
+| Figure | Through pine | Through birch |
+|---|---|---|
+| `pine`'s logical and physical size in the distribution | 0.1 s | 0.1 s |
+| `birch`'s and `cedar`'s logical size in the distribution | 5.6 s after the write, 4.5 s after the delete | the same |
+| The `size` attribute | 0.1 s | 5.6 s, 4.5 s |
+| `dir_size_stats`, `logical_size`, newest minute | 0.1 s | 5.6 s, 4.5 s |
+
+The providers that hold none of the bytes kept a physical size of 0 throughout. An earlier, coarser run (1 s polls)
+measured 6.5 s and 7.2 s through `birch`. So a provider's physical bytes in a directory's distribution follow a
+placement or an eviction at once, while another provider's logical figures follow a write or a delete about 5 s later.
+
+### One file's distribution read
+
+`GET <base>/data/{file}/distribution` for `hello.txt` (64 bytes, held by `pine` alone), 200 reads after one warm-up:
+
+| Through | Holds the file | Concurrency | Median ms | 95th percentile ms | Max ms | Reads per second |
+|---|---|---|---|---|---|---|
+| pine | yes | 1 | 8.88 | 17.10 | 48.26 | 97 |
+| pine | yes | 4 | 14.84 | 31.85 | 74.32 | 239 |
+| birch | no | 1 | 8.59 | 18.54 | 50.19 | 96 |
+| birch | no | 4 | 14.24 | 30.90 | 50.52 | 238 |
+
+The same probe's first run measured 7.29 and 12.77, 11.33 and 21.96, 9.33 and 21.84, and 14.29 and 27.76 (median and
+95th percentile, in the order above). The owner and a non-owner answer alike; four at once makes each read about 1.7
+times slower at the median and the throughput about 2.5 times higher.
