@@ -382,6 +382,42 @@ def test_r14_analyze_pairs_each_side_file_with_its_record_again_whatever_the_che
     assert f"{subject}: {CHANGES[change][1]}" in error
 
 
+PLACEMENTS = ["beside-a-record-that-names-none", "where-no-record-is"]
+UNLISTED = "a side file the replay check did not list"
+
+
+def unlisted_place(runs: Path, placement: str) -> Path:
+    """Where a side file the check never saw lies: beside a record that names none, or where no record is."""
+    if placement == "beside-a-record-that-names-none":
+        return records_without_side_file(runs)[0].parent / SIDE
+    return side_files(runs)[0].parent.parent / "try9" / SIDE
+
+
+def added_after_the_scan(monkeypatch, target: Path, data: bytes) -> None:
+    """Add a side file once `require_current_check` has compared the batch with the check, before the analysis reads
+    the batch: the window between the two."""
+    scan = pipeline.require_current_check
+
+    def scan_then_add(*args, **kwargs):
+        stored = scan(*args, **kwargs)
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes(data)
+        return stored
+
+    monkeypatch.setattr(pipeline, "require_current_check", scan_then_add)
+
+
+@pytest.mark.parametrize("placement", PLACEMENTS)
+def test_r14_analyze_refuses_a_side_file_added_after_the_check_compared_the_batch(copy, monkeypatch, placement):
+    """R14: the analysis enumerates the declared side files of the batch again when it reads it, so one added after
+    `require_current_check` compared the batch with the check, which the check never listed, is refused, named."""
+    target = unlisted_place(copy.runs, placement)
+    added_after_the_scan(monkeypatch, target, side_files(copy.runs)[0].read_bytes())
+    code, error = cli({}, "analyze", str(copy.root))
+    assert code == 1
+    assert f"{rel(copy.runs, target)}: {UNLISTED}" in error
+
+
 # --- the replication package -----------------------------------------------------------------------------------------
 
 
@@ -422,6 +458,20 @@ def test_r14_each_change_to_the_side_files_of_an_unpacked_package_fails_its_make
     done = make_check(root, clean_environment)
     assert done.returncode != 0
     assert named in done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("placement", PLACEMENTS)
+def test_r14_a_package_check_refuses_a_side_file_added_after_the_check_compared_the_batch(
+    built, tmp_path, monkeypatch, placement
+):
+    """R14: the package's check (what `make check` runs) reads the batch as the analysis does, so a side file added
+    after SHA256SUMS and the replay check were compared with the files, which the check never listed, is refused."""
+    root = unpack(built, tmp_path)
+    runs = root / "out" / "runs"
+    target = unlisted_place(runs, placement)
+    added_after_the_scan(monkeypatch, target, side_files(runs)[0].read_bytes())
+    [problem] = verify_package(root)
+    assert f"{rel(runs, target)}: {UNLISTED}" in problem
 
 
 def test_r14_a_package_whose_package_json_records_another_declaration_fails_its_check(built, tmp_path):

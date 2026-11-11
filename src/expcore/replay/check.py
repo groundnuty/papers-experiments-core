@@ -281,8 +281,8 @@ def check_record(raw: bytes, *, schemas: Sequence[SchemaVersion] = SCHEMAS) -> t
 
 
 def with_side_files(hashed_only: Sequence[str], side_files: Sequence[SideFile]) -> list[str]:
-    """The hashed-only patterns with those that find the declared side files added, each pattern once."""
-    return list(dict.fromkeys([*hashed_only, *side_file_patterns(side_files)]))
+    """The hashed-only patterns as given, followed by each pattern that finds a declared side file and is not given."""
+    return [*hashed_only, *(pattern for pattern in side_file_patterns(side_files) if pattern not in hashed_only)]
 
 
 def recorded_side_files(check: Mapping[str, Any], where: object = "the replay check") -> tuple[SideFile, ...]:

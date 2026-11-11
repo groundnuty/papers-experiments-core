@@ -68,6 +68,16 @@ def test_r14_a_check_without_a_declaration_records_exactly_what_it_recorded_befo
     assert json.dumps(empty, indent=1) == json.dumps(made, indent=1)
 
 
+def test_r14_the_hashed_only_patterns_a_caller_gives_are_recorded_as_given_with_the_side_files_after_them(batch):
+    """R14: a caller's patterns are recorded exactly as given, a repeated one included, with no declaration; a
+    declaration only appends the patterns of its side files that the caller did not give already."""
+    made = verify_batch(batch, code=CODE, hashed_only=["*attempt-marker.json", "*attempt-marker.json"])
+    assert made["hashed_only_patterns"] == ["*attempt-marker.json", "*attempt-marker.json"]
+    given = ["*attempt-marker.json", "*attempt-marker.json", LOGGED.pattern]
+    made = verify_batch(batch, code=CODE, hashed_only=given, side_files=[LOGGED])
+    assert made["hashed_only_patterns"] == [*given, f"*/{LOGGED.pattern}"]
+
+
 def test_r14_a_side_file_named_like_a_json_file_is_hashed_and_paired_never_taken_for_a_record(batch):
     """R14: a declared name ending in `.json` is a side file, hashed and not replayed, and pairs with its record;
     without the declaration the same file fails the check as a record that does not load."""
