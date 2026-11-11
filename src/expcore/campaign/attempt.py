@@ -95,6 +95,8 @@ class Parts:
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     crash_hook: Callable[[str, str], None] = lambda point, run_key: None
     ledger: Ledger | None = None  # with a budget: the top-ups of the sends a run's token cap cannot account for (C26)
+    # with a budget: whether the assessment that admitted the run reserved it by the reply maximum (C27); unknown is yes
+    reserved_capped: Callable[[str], bool] = lambda run_key: True
 
 
 class AttemptRunner:
@@ -221,7 +223,9 @@ class AttemptRunner:
             time_left=timer.time_left,
         )
         begun, run_dir = self._begin(row, lease)
-        guard = None if p.ledger is None else AttemptSpend(p.ledger, begun.id, key, model)
+        guard = None
+        if p.ledger is not None:  # the decision the run was admitted under, never the model's status read now (C27)
+            guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=p.reserved_capped(key))
         defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
         request = RunRequest(
             RunIdentity(key, factors, begun.number),

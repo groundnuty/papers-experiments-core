@@ -96,6 +96,7 @@ class BudgetState:
     reserve_usd: Mapping[str, float | None]  # per model, what one pending or running run is reserved: its bound
     ceiling_usd: float
     estimate_usd: Mapping[str, float | None] = field(default_factory=dict)  # per model, the mean run else the bound
+    capped: frozenset[str] = frozenset()  # the models whose runs this assessment reserved by the reply maximum (C27)
 
     def reason(self, model: str) -> str | None:
         """Return why the model may not start a run now, or None when it may."""
@@ -199,7 +200,12 @@ class BudgetGate:
                     over.setdefault(hold.scope, hold.reason)
         self._record_stops(holds, over, now, exact or now)
         return BudgetState(
-            {m: tuple(v) for m, v in found.items()}, spent, reserve, self.ceiling(ALL, released) or 0.0, estimate
+            {m: tuple(v) for m, v in found.items()},
+            spent,
+            reserve,
+            self.ceiling(ALL, released) or 0.0,
+            estimate,
+            capped,
         )
 
     def refusal(self, model: str, in_flight: Sequence[str], extra_usd: float, label: str = "this top-up") -> str | None:

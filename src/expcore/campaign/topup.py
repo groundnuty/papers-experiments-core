@@ -21,7 +21,9 @@ not touched: the cap is part of the experiment. Without a budget there is no led
 A model whose runs were reserved by the reply maximum and one of whose replies reports more output than it is taken off
 it (`expcore.campaign.reply_cap`, C27): the reply is a `reply_over_maximum` event, the model's runs are reserved by the
 window from then on, those in flight included, and each later request of a run that was reserved the smaller bound is
-sent only while the campaign is within its ceilings, else that run ends as a budget hold too.
+sent only while the campaign is within its ceilings, else that run ends as a budget hold too. Which bound a run was
+reserved is the decision of the assessment that admitted it, carried into its guard by the scheduler; the guard never
+reads it back from the model's status, which another attempt may have changed in between.
 
 The ledger's work reads and writes the store, so the guard does it in a thread, never on the attempt's event loop
 (L15).
@@ -129,26 +131,27 @@ class Ledger:
 class AttemptSpend:
     """The spend guard of one attempt (`expcore.models.spend.SpendGuard`), installed by the attempt runner."""
 
-    def __init__(self, ledger: Ledger, attempt_id: int, run_key: str, model: str):
-        """Take the ledger and the attempt; read, before the attempt's loop starts, whether its run was reserved by
-        the reply maximum."""
+    def __init__(self, ledger: Ledger, attempt_id: int, run_key: str, model: str, *, reserved_capped: bool):
+        """Take the ledger, the attempt, and whether the assessment that admitted its run reserved it by the reply
+        maximum (C27). That decision is carried in, never read from the model's status here: another attempt may
+        have taken the model off the maximum since, and the run must still be checked as the run it was admitted as."""
         self.ledger, self.attempt_id, self.run_key, self.model = ledger, attempt_id, run_key, model
         self.unaccounted = False  # a reply left a count out: from then on the cap does not bound the run
         self.maximum = ledger.maximum(model)
-        self.capped_at_start = ledger.reply_capped(model)  # the run was reserved by the reply maximum
+        self.reserved_capped = reserved_capped  # the run was admitted with the reservation by the reply maximum
 
     async def before_request(self) -> None:
         """Top up a request that follows a reply without usage, or end the attempt as a budget hold. A run reserved
         by the reply maximum of a model since taken off it sends its next request only within the ceilings (C27)."""
         if self.unaccounted:
             await asyncio.to_thread(self._reserve_or_hold, "a request after a reply that did not report its usage")
-        elif self.capped_at_start:
+        elif self.reserved_capped:
             await asyncio.to_thread(self._check_if_unheld)
 
     async def after_reply(self, input_tokens: int | None, output_tokens: int | None) -> None:
         """Record a reply past the reply maximum of a model held to it (C27), and a reply that left a count out, which
         takes every later request of the attempt through a top-up."""
-        if output_tokens is not None and output_tokens > self.maximum and self.capped_at_start:
+        if output_tokens is not None and output_tokens > self.maximum and self.reserved_capped:
             await asyncio.to_thread(self._past_maximum, output_tokens)
         if input_tokens is not None and output_tokens is not None:
             return

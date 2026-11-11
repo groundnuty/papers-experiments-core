@@ -137,6 +137,8 @@ class Scheduler:
             threading.Lock()
         )  # the budget is assessed by the dispatcher and by the workers' recheck, one at a time
         self._not_before: dict[str, float] = {}  # run key -> monotonic time before which it does not start again
+        # run key -> whether the assessment that admitted the run reserved it by the reply maximum (C27)
+        self._reserved_capped: dict[str, bool] = {}
         self._workers: list[threading.Thread] = []
         self._run_thread: threading.Thread | None = None  # the thread inside `run`, while there is one
         self._fatal: BaseException | None = None
@@ -236,6 +238,7 @@ class Scheduler:
                 lease_group=self.lease_group,
                 crash_hook=self.crash_hook,
                 ledger=self.ledger,
+                reserved_capped=self._admitted_capped,
             )
         )
 
@@ -367,7 +370,8 @@ class Scheduler:
         """Tell why a run that holds its lease may not start after all, or None: the gates dispatch looked at, again.
 
         A worker calls it once its lease is in hand, because the wait for a lease can be long. The run is not counted
-        among the runs in flight for the budget, as at dispatch, so its own bound is reserved once.
+        among the runs in flight for the budget, as at dispatch, so its own bound is reserved once. A run it lets start
+        keeps whether this assessment reserved it by the reply maximum, for its spend guard (C27).
         """
         if self.stop.is_set():
             return Hold("shutdown", "the campaign is ending", temporary=True)
@@ -376,11 +380,21 @@ class Scheduler:
             others = [m for k, (m, _) in self._inflight.items() if k != key]
         stopped, stopped_all = self.stops.stopped()
         budget = self._assessed(others, self.stamp())
-        return (
+        hold = (
             self._all_hold(stopped_all)
             or self._model_hold(model, stopped, budget)
             or self._unit_hold(self.endpoints[model].unit)
         )
+        if hold is None and budget is not None:
+            with self._cv:
+                self._reserved_capped[key] = model in budget.capped
+        return hold
+
+    def _admitted_capped(self, run_key: str) -> bool:
+        """Tell whether the assessment that admitted the run reserved it by the reply maximum; unknown is yes, which
+        checks more, never less (C27)."""
+        with self._cv:
+            return self._reserved_capped.get(run_key, True)
 
     def _all_hold(self, stopped_all: bool) -> Hold | None:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
@@ -488,6 +502,7 @@ class Scheduler:
         finally:
             with self._cv:
                 self._inflight.pop(key, None)
+                self._reserved_capped.pop(key, None)
                 self._cv.notify_all()
 
     def run(self, max_dispatch: int | None = None) -> RunSummary:

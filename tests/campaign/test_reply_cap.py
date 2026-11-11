@@ -6,11 +6,14 @@ import threading
 import openai
 import pytest
 from campaign_support import NOW, planned_store
+from loop_support import FakeProvider
 from openai.types.chat import ChatCompletion
+from record_support import CODE
 from scheduler_support import Factory, FakeExecutor, build, event_kinds, settings_for
 
+from expcore.campaign.attempt import AttemptRunner
 from expcore.campaign.attempt_bounds import bound_usd, request_bound_usd
-from expcore.campaign.executor import default_backend_factory
+from expcore.campaign.executor import default_backend_factory, record_run
 from expcore.campaign.gate import Budget, BudgetGate
 from expcore.campaign.reply_cap import UNHELD_KEY, mark_unheld, probed, unheld
 from expcore.campaign.topup import AttemptSpend, Ledger
@@ -83,7 +86,7 @@ def test_c27_a_reply_past_the_maximum_takes_the_model_off_it_and_its_runs_in_fli
     room = HELD + 0.1  # room for the run as it was reserved, not for the bound by the window
     gate = gate_for(store, max_usd=room)
     ledger = Ledger(gate, store, lambda: NOW, (threading.Lock(),), lambda: [MODEL])
-    guard = AttemptSpend(ledger, begun.id, key, MODEL)
+    guard = AttemptSpend(ledger, begun.id, key, MODEL, reserved_capped=True)
 
     async def go():
         await guard.before_request()
@@ -107,7 +110,8 @@ def test_c27_a_reply_past_the_maximum_of_a_model_not_held_to_it_is_nothing_new(t
     key = manifest.rows[0].key.text
     begun = store.begin_attempt(key, NOW, 4321, str(tmp_path / "attempt"))
     gate = BudgetGate(store, {MODEL: SPEC}, Budget(max_usd=10.0), LIMITS)
-    guard = AttemptSpend(Ledger(gate, store, lambda: NOW, (threading.Lock(),), lambda: [MODEL]), begun.id, key, MODEL)
+    ledger = Ledger(gate, store, lambda: NOW, (threading.Lock(),), lambda: [MODEL])
+    guard = AttemptSpend(ledger, begun.id, key, MODEL, reserved_capped=False)
     asyncio.run(guard.after_reply(1_000, 20_000))
     asyncio.run(guard.before_request())
     assert "reply_over_maximum" not in event_kinds(store)
@@ -217,3 +221,48 @@ def test_c27_without_a_budget_no_probe_of_the_reply_maximum_is_sent(tmp_path, en
     with opened(tmp_path, default_backend_factory, budget=None) as scheduler:
         assert scheduler.budget is None
     assert [request["max_tokens"] for request in BUILT[0].requests] == [1]
+
+
+async def through_the_adapter(request):
+    """The study's executor: the real loop and recording over the attempt's own backend, the core's adapter."""
+    return await record_run(
+        request,
+        [FakeProvider({"look": lambda arguments: "ok"})],
+        "be brief",
+        "do the task",
+        FakeExecutor().config,
+        code=dict(CODE),
+        core_version="0.1.0",
+    )
+
+
+def test_c27_a_run_admitted_by_the_maximum_keeps_that_decision_when_the_model_is_taken_off_before_its_guard_is_built(
+    tmp_path, endpoint, monkeypatch
+):
+    """C27: the run was admitted with the smaller reservation; another attempt takes the model off the maximum after
+    that and before the run's spend guard exists. The guard carries the decision made when the run was admitted, never
+    the model's status as it reads it later, so the run's first request is checked against the ceiling, does not fit
+    the bound by the window, and is a budget hold, sent to no endpoint."""
+    original = AttemptRunner._begin
+
+    def begin_after_a_mark(runner, row, lease=None):
+        mark_unheld(runner.p.store, MODEL, NOW, "reply_over_maximum", "another attempt's reply of 5000 output tokens")
+        return original(runner, row, lease)
+
+    monkeypatch.setattr(AttemptRunner, "_begin", begin_after_a_mark)
+    plan = {"models": (MODEL,), "tasks": ("task-a",), "seeds": (1,)}
+    room = Budget(max_usd=HELD + 0.1)  # room for a run reserved by the maximum, not for one reserved by the window
+    with build(
+        tmp_path / "campaign",
+        executor=FakeExecutor(default=through_the_adapter),
+        factory=default_backend_factory,
+        settings=settings_for(budget=room),
+        plan=plan,
+        models=ModelTable({MODEL: SPEC}),
+    ) as scheduler:
+        summary = scheduler.run()
+        first = scheduler.store.q("SELECT state, infra_kind FROM attempts ORDER BY id")[0]
+        assert (first["state"], first["infra_kind"]) == ("infra_fail", "budget_hold")
+        assert BUILT[1].requests == []  # the attempt's client: nothing reached the endpoint
+        assert "topup_refused" in event_kinds(scheduler.store)
+        assert summary.holds[MODEL].kind == "budget"

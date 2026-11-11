@@ -124,7 +124,7 @@ def test_c26_after_a_reply_that_left_a_count_out_every_later_request_is_topped_u
     """C26: the loop counts a missing count as 0, so from that reply on the cap does not bound the run: each later
     request reserves its own bound, and the one that does not fit is a budget hold. The reply is an event."""
     store, key, begun = running(tmp_path)
-    guard = AttemptSpend(ledger_for(store, BOUND + 2 * TOPUP + 0.01), begun.id, key, MODEL)
+    guard = AttemptSpend(ledger_for(store, BOUND + 2 * TOPUP + 0.01), begun.id, key, MODEL, reserved_capped=False)
 
     async def go():
         await guard.before_request()  # the first request: the cap accounts for it
@@ -149,7 +149,7 @@ def test_c26_every_send_that_failed_after_it_may_have_been_billed_is_charged_whe
     hold, and the failed send is charged all the same, as is the last failed send of a request, after which nothing
     is sent again."""
     store, key, begun = running(tmp_path)
-    guard = AttemptSpend(ledger_for(store, max_usd), begun.id, key, MODEL)
+    guard = AttemptSpend(ledger_for(store, max_usd), begun.id, key, MODEL, reserved_capped=False)
     if max_usd == 10.0:
         asyncio.run(guard.after_failed_send("server", resend=True))
         asyncio.run(guard.after_failed_send("connection", resend=False))

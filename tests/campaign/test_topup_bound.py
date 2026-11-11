@@ -189,7 +189,7 @@ def one_run(rng: random.Random, spec: ModelSpec, limits: Limits, mode: str) -> t
     box = ToolBox([FakeProvider({"look": lambda arguments: "ok"})], cap_chars=limits.output_cap_chars)
 
     async def go():
-        with spend.watching(AttemptSpend(tally, 1, "run-quince", "quince")):
+        with spend.watching(AttemptSpend(tally, 1, "run-quince", "quince", reserved_capped=tally.capped)):
             backend = RecordingBackend(adapter)
             return await run_agent(backend, box, "be brief", "do the task", config, clock=FakeClock(), sleep=never)
 
