@@ -4,10 +4,11 @@ import ast
 from pathlib import Path
 
 import pytest
-from platform_support import DATA, SPACE_NAME, SPACE_PREFIX
 
 from expcore_onedata.client import AUTH_HEADER, OnezoneClient, OutOfScope, PlatformError
 from expcore_onedata.credentials import Principal
+from expcore_onedata.testing import DATA_PATH_USER as DATA
+from expcore_onedata.testing import SPACE_NAME, SPACE_PREFIX
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "expcore_onedata"
 
@@ -268,7 +269,10 @@ def test_o09_no_other_module_of_the_platform_layer_imports_httpx():
     for path in sorted(SRC.rglob("*.py")):
         # The data gate is a separate program that runs in its own container and passes read calls only (O16); it
         # imports nothing of this package, which test_gate checks. It is the one file besides the client with HTTP.
-        if path.name == "client.py" or path.relative_to(SRC).as_posix() == "sandbox/gate.py":
+        # The testing package answers HTTP, as the federation does, and no runtime module imports it (the import
+        # boundary test), so it is no caller that could bypass the wrapper.
+        relative = path.relative_to(SRC).as_posix()
+        if path.name == "client.py" or relative == "sandbox/gate.py" or relative.startswith("testing/"):
             continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             names = [a.name for a in node.names] if isinstance(node, ast.Import) else []

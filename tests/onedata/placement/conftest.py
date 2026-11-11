@@ -1,13 +1,18 @@
 """Fixtures for provisioning and placement: the fake federation with its data API, two providers and a ticking clock."""
 
 import pytest
-from fake_data import FakeData
-from placement_support import BETA_ID, DATA, Ticker, write_with_placement
-from platform_support import ADMIN_ENV, BASELINE, SPACE_NAME, USERS
 
 from expcore_onedata.config import PlatformConfig, load_platform
 from expcore_onedata.provision import Provisioner, resolve_provider_ids
 from expcore_onedata.rangemap import Placement, load_placement
+from expcore_onedata.testing import (
+    ADMIN_ENV,
+    DATA,
+    FakeData,
+    Ticker,
+    make_federation,
+    write_with_placement,
+)
 
 
 @pytest.fixture
@@ -15,14 +20,11 @@ def fake(monkeypatch, ticker) -> FakeData:
     """A federation with the study space, the data provider `alpha`, a second provider `beta`, and the three users.
 
     Its clock is the test's ticker, so its jobs' times and its providers' Date headers agree with the probes' clock
-    unless a test skews a provider."""
-    federation = FakeData(space_name=SPACE_NAME)
-    federation.clock = ticker.clock
-    federation.add_provider(BETA_ID, "beta.test", supports=False)
+    unless a test skews a provider. It answers errors in Onedata 25.0's shape, the fake's default, which the platform
+    layer reads: 400 `posix`/`enoent` as gone, 400 `posix`/`eacces` as a refused write, and every upload marked
+    `application/octet-stream`. A test that needs another answer sets it on the fake."""
+    federation = make_federation(clock=ticker.clock)
     monkeypatch.setenv(ADMIN_ENV, federation.admin_token)
-    for login, (password, user_id) in USERS.items():
-        federation.add_user(login, password, user_id)
-        federation.grant(user_id, BASELINE)
     return federation
 
 

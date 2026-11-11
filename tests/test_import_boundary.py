@@ -1,7 +1,14 @@
-"""The layer boundary: expcore imports only the standard library and itself, expcore_onedata also expcore."""
+"""The layer boundary: expcore imports only the standard library and itself, expcore_onedata also expcore.
+
+The platform layer's testing package (`expcore_onedata.testing`) is held to the same rule, which keeps pytest and every
+test tree out of it, and no runtime path may import it: the core, the platform layer's other modules, the CLI and the
+shipped example.
+"""
 
 import ast
+import importlib.util
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -10,6 +17,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+EXAMPLES = ROOT / "examples"
+TESTING = "expcore_onedata.testing"
 STDLIB = set(sys.stdlib_module_names)
 _DYNAMIC_IMPORTERS = {"import_module", "__import__"}
 _IMPORT_MODULES = {"importlib", "builtins"}
@@ -171,3 +180,192 @@ def test_allowed_imports_inside_expcore(source):
 def test_onedata_may_import_expcore_but_not_other_third_party_code():
     assert violations("from expcore.provenance import headers\nimport os\n", "expcore_onedata") == []
     assert violations("import requests\n", "expcore_onedata") == ["requests"]
+
+
+# -- the testing package is never part of a runtime path --------------------------------------------------------------
+
+
+def _dynamic_module(call: ast.Call, here: str = "") -> str | None:
+    """Return the full dotted name a literal dynamic import names, a relative one resolved against its package.
+
+    `here` is the package of the file the call is in. A relative name whose package argument is not a literal
+    (`__package__`, `__spec__.parent`, a variable) is resolved against it: that is what the idiom means, and for a
+    guard it is the side to err on, since a name it cannot resolve would otherwise pass unseen."""
+    keywords = {k.arg: k.value for k in call.keywords}
+    name = _constant_string(call.args[0] if call.args else keywords.get("name"))
+    if name is None or not name.startswith("."):
+        return name
+    given = call.args[1] if len(call.args) > 1 else keywords.get("package")
+    if given is None:
+        return None  # a relative name with no package raises; it imports nothing
+    package = _constant_string(given) if isinstance(given, ast.Constant) else here
+    if not package:
+        return None
+    try:
+        return importlib.util.resolve_name(name, package)
+    except ImportError:  # more dots than the package has levels: it cannot name a module
+        return None
+
+
+def _from_base(node: ast.ImportFrom, package: str) -> str | None:
+    """Return the dotted module a `from ... import` statement reads, a relative one resolved against `package`."""
+    if node.level == 0:
+        return node.module
+    parts = package.split(".") if package else []
+    kept = parts[: len(parts) - (node.level - 1)] if node.level - 1 <= len(parts) else []
+    if not kept:
+        return None
+    return ".".join([*kept, *([node.module] if node.module else [])])
+
+
+def imported_modules(source: str, package: str) -> set[str]:
+    """Return every dotted module name an import statement or a literal dynamic import can load.
+
+    `package` is the dotted package of the file the source is in, which relative imports are resolved against. For
+    `from M import a` both `M` and `M.a` are returned, since `a` may be a submodule.
+    """
+    tree = ast.parse(source)
+    importers = _dynamic_importers(tree)
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = _from_base(node, package)
+            if base:
+                found.add(base)
+                found.update(f"{base}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.Call) and _is_importer(node.func, importers):
+            name = _dynamic_module(node, package)
+            if name:
+                found.add(name)
+                found.update(f"{name}.{item}" for item in _fromlist(node))  # __import__(m, fromlist=[a]) loads m.a
+    return found
+
+
+def _fromlist(call: ast.Call) -> list[str]:
+    """The literal names an `__import__` call's `fromlist` gives (its fourth argument, or the keyword), each of which
+    may be a submodule it loads; none for any other importer or a fromlist that is not a literal list or tuple."""
+    keywords = {k.arg: k.value for k in call.keywords}
+    given = call.args[3] if len(call.args) > 3 else keywords.get("fromlist")
+    if not isinstance(given, (ast.List, ast.Tuple)):
+        return []
+    return [name for item in given.elts if (name := _constant_string(item))]
+
+
+def imports_testing(source: str, package: str) -> bool:
+    """Tell whether the source can load `expcore_onedata.testing` or anything below it."""
+    return any(name == TESTING or name.startswith(f"{TESTING}.") for name in imported_modules(source, package))
+
+
+def runtime_files() -> list[tuple[Path, str]]:
+    """Every Python file a runtime path can load, with its package: all of src/ but the testing package, and the
+    example study the distribution ships."""
+    files = [
+        (path, ".".join(path.relative_to(SRC).parts[:-1]))
+        for path in sorted(SRC.rglob("*.py"))
+        if path.relative_to(SRC).parts[:2] != ("expcore_onedata", "testing")
+    ]
+    return files + [(path, "") for path in sorted((EXAMPLES / "tiny_study").rglob("*.py"))]
+
+
+def test_no_runtime_module_imports_the_testing_package():
+    files = runtime_files()
+    assert len(files) > 100, "the runtime modules were not found"
+    offenders = [
+        str(path.relative_to(ROOT)) for path, package in files if imports_testing(path.read_text("utf-8"), package)
+    ]
+    assert not offenders, f"imported from a runtime path: {offenders}"
+
+
+def test_importing_every_runtime_module_loads_no_testing_module():
+    """The check above reads the source; this one runs it: whatever the runtime modules import, by whatever means, the
+    testing package is not among the loaded modules."""
+    names = sorted(
+        ".".join(path.relative_to(SRC).with_suffix("").parts).removesuffix(".__init__")
+        for path, _ in runtime_files()
+        if path.is_relative_to(SRC) and path.name != "__main__.py"
+    )
+    program = (
+        "import importlib, sys\n"
+        f"for name in {names!r}:\n    importlib.import_module(name)\n"
+        f"print(sorted(m for m in sys.modules if m == {TESTING!r} or m.startswith({TESTING + '.'!r})))\n"
+    )
+    done = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.strip() == "[]", f"loaded by importing the runtime modules: {done.stdout.strip()}"
+
+
+@pytest.mark.parametrize(
+    ("source", "package"),
+    [
+        ("import expcore_onedata.testing\n", ""),
+        ("import expcore_onedata.testing.fake_data as fake\n", ""),
+        ("from expcore_onedata.testing import FakeData\n", ""),
+        ("from expcore_onedata.testing.world import Ticker\n", ""),
+        ("from expcore_onedata import testing\n", ""),
+        ("from expcore_onedata import health, testing as fakes\n", ""),
+        ("def late():\n    from expcore_onedata.testing import FakeData\n", ""),
+        ("from . import testing\n", "expcore_onedata"),
+        ("from .testing import Ticker\n", "expcore_onedata"),
+        ("from .testing.world import Ticker\n", "expcore_onedata"),
+        ("from .. import testing\n", "expcore_onedata.sandbox"),
+        ("from ..testing import Ticker\n", "expcore_onedata.sandbox"),
+        ("import importlib\nimportlib.import_module('expcore_onedata.testing')\n", ""),
+        ("import importlib\nimportlib.import_module(name='expcore_onedata.testing.world')\n", ""),
+        ("import importlib\nimportlib.import_module('.testing', 'expcore_onedata')\n", ""),
+        ("import importlib\nimportlib.import_module('..testing', package='expcore_onedata.sandbox')\n", ""),
+        ("__import__('expcore_onedata.testing')\n", ""),
+        ("def load():\n    return __import__('expcore_onedata', fromlist=['testing']).testing\n", ""),
+        ("__import__('expcore_onedata', None, None, ('testing',))\n", ""),
+        (
+            "import importlib\ndef fakes():\n    return importlib.import_module('.testing', __package__)\n",
+            "expcore_onedata",
+        ),
+        ("import importlib\nimportlib.import_module('.testing', package=__spec__.parent)\n", "expcore_onedata"),
+        ("import importlib\nimportlib.import_module('..testing', __package__)\n", "expcore_onedata.sandbox"),
+        ("from importlib import import_module as load\nload('expcore_onedata.testing')\n", ""),
+        ("import importlib as il\nil.import_module(name='expcore_onedata.testing.fake_data')\n", ""),
+    ],
+)
+def test_planted_import_of_the_testing_package_is_found(source, package):
+    assert imports_testing(source, package), "the boundary test did not notice a planted import of the testing package"
+
+
+@pytest.mark.parametrize(
+    ("source", "package"),
+    [
+        ("import expcore_onedata\n", ""),
+        ("from expcore_onedata import tokens\n", ""),
+        ("from expcore_onedata.sandbox import gate\n", ""),
+        ("import expcore_onedata.testing_helpers\n", ""),
+        ("from . import tokens\n", "expcore_onedata"),
+        ("from .testing_notes import text\n", "expcore_onedata"),
+        ("from .. import gate\n", "expcore_onedata.sandbox"),
+        ("import importlib\nimportlib.import_module('expcore_onedata.health')\n", ""),
+        ("import importlib\nimportlib.import_module('.health', 'expcore_onedata')\n", ""),
+        ("NAME = 'expcore_onedata.testing'\n", ""),
+        ("__import__('expcore_onedata', fromlist=['health'])\n", ""),
+        ("import importlib\nimportlib.import_module('.health', __package__)\n", "expcore_onedata"),
+    ],
+)
+def test_other_imports_are_not_taken_for_the_testing_package(source, package):
+    assert not imports_testing(source, package)
+
+
+def test_the_testing_package_imports_no_pytest_and_no_test_tree():
+    modules = sorted((SRC / "expcore_onedata" / "testing").rglob("*.py"))
+    assert len(modules) > 5, "the testing package was not found"
+    forbidden = {"pytest", "_pytest", "tests", "conftest"}
+    found = {
+        str(path.relative_to(ROOT)): hit
+        for path in modules
+        if (hit := imported_roots(path.read_text(encoding="utf-8")) & forbidden)
+    }
+    assert not found, f"the testing package imports test machinery: {found}"
+    for source, root in [
+        ("import pytest\n", "pytest"),
+        ("from tests.support import x\n", "tests"),
+        ("from fake_data import X\n", "fake_data"),
+    ]:
+        assert violations(source, "expcore_onedata") == [root]

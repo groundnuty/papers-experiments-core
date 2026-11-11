@@ -4,9 +4,6 @@ import json
 
 import httpx
 import pytest
-from fake_federation import ZONE
-from placement_support import BETA_ID, with_placement
-from platform_support import write_platform
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient
@@ -23,6 +20,8 @@ from expcore_onedata.day0.runner import (
     run,
     run_checks,
 )
+from expcore_onedata.testing import BETA_ID, with_placement, write_platform
+from expcore_onedata.testing.fake_federation import ZONE
 
 NAMES = ("reachability", "health", "tokens", "content_type", "listing", "read_only", "round_trip")
 
@@ -94,7 +93,7 @@ def test_the_read_only_checks_pass_against_a_conforming_federation(context, fake
 
 def test_every_condition_passes_when_the_fixed_user_matches_its_rights(context, fake):
     """Tokens: with a user whose rights equal every condition's, each plane is minted and examined."""
-    from platform_support import BASELINE
+    from expcore_onedata.testing import BASELINE
 
     fake.grant("u-tools", BASELINE)
     entries = by_name(run_checks(context(), ["tokens"]))
@@ -180,9 +179,11 @@ def test_the_consent_is_the_variable_set_to_exactly_one():
 
 
 def test_read_only_enforcement_passes_when_every_write_is_refused(context, fake):
+    """O05: every provider refuses the read-only token's write as Onedata 25.0 does, 400 posix eacces: a refusal."""
     entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
     assert entry.ok is True
-    assert {row["status"] for row in entry.facts["providers"].values()} == {403}
+    rows = entry.facts["providers"].values()
+    assert {(row["status"], row["code"], row["errno"]) for row in rows} == {(400, "posix", "eacces")}
     assert not [c for c in fake.provider_calls if c[1] in ("PUT", "DELETE")]
 
 

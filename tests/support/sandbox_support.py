@@ -1,7 +1,7 @@
 """Helpers for the sandbox tests: the `[sandbox]` document, specs for each data path, and options for a fast start.
 
-Every name here is invented. `add_sandbox` is an `edit` for `platform_support.write_platform`, so the sandbox table is
-added to the platform document without that module knowing it.
+Every name here is invented. `add_sandbox` is an `edit` for `expcore_onedata.testing.write_platform`, so the sandbox
+table is added to the platform document without that module knowing it.
 """
 
 import sys

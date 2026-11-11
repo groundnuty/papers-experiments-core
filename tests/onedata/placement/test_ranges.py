@@ -1,11 +1,11 @@
 """Range placement: bytes are placed by range reads through the receiving provider, confirmed by the block map (O02)."""
 
 import pytest
-from placement_support import ALPHA_ID, BETA_ID, DATA
 
 from expcore_onedata.provision import NotPlaced, ProvisionError
 from expcore_onedata.rangemap import RangeRow
 from expcore_onedata.ranges import place_ranges
+from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA
 
 PATH = "study/data.bin"
 ROW = RangeRow(PATH, "beta", ((0, 100), (2000, 500)))
