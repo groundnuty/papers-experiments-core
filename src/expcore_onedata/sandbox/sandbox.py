@@ -595,13 +595,14 @@ class DockerSandbox:
         before that every count is unknown (`gate_not_collected`). A mount: unknown (`mount_not_through_gate`), since
         its reads go through oneclient and no gate sees them. No data path: zero, since there is nothing to read
         through. The tables of the files and directories served follow the counts: None when they are unknown, empty
-        when they are zero. Unknown is never zero."""
-        path = {"data_path": self.spec.mode.value, "listing": self._meta.get("listing")}
+        when they are zero. Every answer records the caps of the tables, `[sandbox.served_bytes]`. Unknown is never
+        zero."""
+        path, caps = {"data_path": self.spec.mode.value, "listing": self._meta.get("listing")}, self.s.served_caps
         if self.spec.mode is DataPathMode.MOUNT:
-            return path | gatelog.served_unknown(MOUNT_NOT_THROUGH_GATE)
+            return path | gatelog.served_unknown(MOUNT_NOT_THROUGH_GATE, caps=caps)
         if self.spec.mode is DataPathMode.NONE:
-            return path | gatelog.served_nothing()
-        return path | self._meta.get("served_bytes", gatelog.served_unknown(NOT_COLLECTED))
+            return path | gatelog.served_nothing(caps)
+        return path | self._meta.get("served_bytes", gatelog.served_unknown(NOT_COLLECTED, caps=caps))
 
     def gate_refusals(self) -> list[str]:
         """The reasons of the answers the data gate refused for its own integrity so far (O05), from its log; empty
@@ -667,7 +668,8 @@ class DockerSandbox:
         if self.spec.mode is DataPathMode.REST:
             self._stop_gate()
             if "served_bytes" not in self._meta:  # counted once (O20): a second collection finds the gate already gone
-                self._meta["served_bytes"] = gatelog.served(self._gate_log_lines(), self._meta["gate_stop"])
+                lines, caps = self._gate_log_lines(), self.s.served_caps
+                self._meta["served_bytes"] = gatelog.served(lines, self._meta["gate_stop"], caps)
             log_file = self.dir / "gatelog" / "requests.jsonl"
             self._copy_out(log_file, dest / "gate-requests.jsonl")
             result["gate_log"] = "gate-requests.jsonl"

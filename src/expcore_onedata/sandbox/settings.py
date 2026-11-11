@@ -48,6 +48,9 @@ extra_args = []                 # further oneclient arguments, never one that ch
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
 <level> = "rest"                # the kind alone; a rest level then pages its listings as the server does
 <level> = { kind = "rest", listing = "complete" }  # or a table: a rest level's listing, "paged" or "complete"
+
+[sandbox.served_bytes]          # optional: how much a run's tables of the bytes served list (gatelog.Caps, O20)
+max_files = 1000                # files, the first read; max_directories = 1000; max_ranges_per_file = 64
 ```
 
 `listing` is a REST data path's option (O19): `paged`, the default, passes the server's page of a listing as it comes,
@@ -69,12 +72,13 @@ import itertools
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
 
 from expcore.config.loading import ConfigError, Section
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.sandbox.gatelog import DEFAULT_CAPS, Caps
 from expcore_onedata.sandbox.gatepolicy import LISTINGS, PAGED
 from expcore_onedata.sandbox.hostops import strict_networks
 from expcore_onedata.tls import TlsSettings, moved
@@ -150,6 +154,7 @@ class SandboxSettings:
     content_check_file: str | None = None  # the file the pre-campaign check reads (`precampaign.py`)
     tls: TlsSettings = field(default_factory=TlsSettings)  # the platform's [tls]: the gate's upstream and oneclient
     listings: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))  # rest level -> its listing
+    served_caps: Caps = DEFAULT_CAPS  # [sandbox.served_bytes]: the bounds of a run's tables of the bytes served (O20)
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -240,6 +245,15 @@ def _limits(section: Section) -> Limits:
     values = {key: int(_number(section, key, minimum=1, integer=True)) for key in keys[1:7]}
     gate = int(_number(section, "gate_memory_bytes", minimum=1 << 20, integer=True, default=1 << 30))
     return Limits(float(_number(section, "cpus", minimum=0.1)), gate_memory_bytes=gate, **values)
+
+
+def _served_caps(section: Section) -> Caps:
+    """Read [sandbox.served_bytes] (O20): each cap a whole number of at least 1, the default where none is declared."""
+    keys = tuple(f.name for f in fields(Caps))
+    section.reject_unknown(keys)
+    return Caps(
+        **{k: int(_number(section, k, minimum=1, integer=True, default=getattr(DEFAULT_CAPS, k))) for k in keys}
+    )
 
 
 def _mount(section: Section) -> MountSettings:
@@ -352,7 +366,7 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
             "is no longer read: declare the platform users a run leases as [slots.<name>], each with a data_path and "
             "a toolserver user, so one lease key gives a run both planes' users (C19)",
         )
-    section.reject_unknown((*keys, "images", "network", "limits", "mount", "data_paths"))
+    section.reject_unknown((*keys, "images", "network", "limits", "mount", "data_paths", "served_bytes"))
     work_root = (base / section.string("work_root")).resolve()
     prefix = section.optional_string("name_prefix") or "sbx"
     namespace = section.optional_string("label_namespace") or "org.expcore"
@@ -394,6 +408,7 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
         content_check_file=check_file,
         tls=tls if tls is not None else TlsSettings(),
         listings=listings,
+        served_caps=_served_caps(section.section("served_bytes")) if "served_bytes" in section.data else DEFAULT_CAPS,
     )
 
 

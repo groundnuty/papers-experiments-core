@@ -290,3 +290,49 @@ def test_o19_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(t
     assert caught.value.differences
     assert all(line.startswith("platform.data_paths") for line in caught.value.differences)
     resume(paged)
+
+
+def test_o20_the_caps_of_the_tables_of_the_bytes_served_are_declared_and_default_to_1000_1000_and_64(tmp_path):
+    """O20: `[sandbox.served_bytes]` declares how many files, directories and ranges a file a run's tables of the bytes
+    served may list; a table that declares none, or only some, keeps the defaults for the rest."""
+    assert load(tmp_path).served_caps.record() == {
+        "max_files": 1000,
+        "max_directories": 1000,
+        "max_ranges_per_file": 64,
+    }
+
+    def edit(data):
+        data["sandbox"]["served_bytes"] = {"max_files": 4000, "max_ranges_per_file": 256}
+
+    assert load(tmp_path, edit).served_caps.record() == {
+        "max_files": 4000,
+        "max_directories": 1000,
+        "max_ranges_per_file": 256,
+    }
+
+
+@pytest.mark.parametrize("key", ["max_files", "max_directories", "max_ranges_per_file"])
+@pytest.mark.parametrize("value", [0, -5, 2.5, True, "2000"], ids=["zero", "negative", "fraction", "boolean", "text"])
+def test_o20_a_cap_that_is_not_a_whole_number_of_at_least_one_is_refused_at_load_naming_the_file_and_key(
+    tmp_path, key, value
+):
+    """O20: a cap must be an integer of at least 1, so a table can always list something and a typo cannot pass as a
+    number; the error names the platform file and the key."""
+
+    def edit(data):
+        data["sandbox"]["served_bytes"] = {key: value}
+
+    with pytest.raises(ConfigError, match=rf"\[sandbox\.served_bytes\]: key '{key}' must be an integer of at least 1"):
+        load(tmp_path, edit)
+    with pytest.raises(ConfigError, match=r"platform\.toml"):
+        load(tmp_path, edit)
+
+
+def test_o20_an_unknown_key_of_the_caps_is_refused_so_a_misspelt_cap_cannot_leave_the_default(tmp_path):
+    """O20: a misspelt cap would silently keep the default and cut the table it was meant to widen; it is refused."""
+
+    def edit(data):
+        data["sandbox"]["served_bytes"] = {"max_file": 4000}
+
+    with pytest.raises(ConfigError, match=r"\[sandbox\.served_bytes\]: key 'max_file' is not a known key"):
+        load(tmp_path, edit)

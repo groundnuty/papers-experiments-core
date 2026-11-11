@@ -421,5 +421,6 @@ def test_o20_the_bytes_served_are_what_the_client_received_in_either_listing_mod
         "listings": {MockOnedata.SPACE_ID: {"path": ROOT, "requests": 1, "body_bytes": received["listing"]}},
         "listings_total": 1,
         "listings_cut": False,
+        "caps": {"max_files": 1000, "max_directories": 1000, "max_ranges_per_file": 64},
         "unknown": [],
     }

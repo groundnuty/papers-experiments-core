@@ -8,10 +8,12 @@ the gate writes, with invented values; the sandbox runs over the in-memory host.
 import json
 
 import pytest
-from sandbox_support import COMPLETE_LEVEL, make_spec, start_options
+from platform_support import write_platform
+from sandbox_support import COMPLETE_LEVEL, add_sandbox, make_spec, start_options
 
 from expcore.records.instruments import finish_instruments, start_instruments
-from expcore_onedata.sandbox import gatelog
+from expcore_onedata.config import load_platform
+from expcore_onedata.sandbox import gatelog, served
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 from expcore_onedata.sandbox.served import NAMESPACE, ServedBytes
 
@@ -25,6 +27,7 @@ STOPPED = {
 ALPHA, BRAVO, CHARLIE = "fileidalpha", "fileidbravo", "fileidcharlie"  # invented file ids
 FOLDER, NOWHERE = "diridfolder", "diridnowhere"  # invented directory ids
 TABLES = ("files", "files_total", "files_cut", "listings", "listings_total", "listings_cut")
+DEFAULT_CAPS = {"max_files": 1000, "max_directories": 1000, "max_ranges_per_file": 64}  # without [sandbox.served_bytes]
 
 
 def content(file_id: str) -> str:
@@ -119,6 +122,7 @@ def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
         "listings": {FOLDER: {"path": children(FOLDER), "requests": 1, "body_bytes": 300}},
         "listings_total": 1,
         "listings_cut": False,
+        "caps": DEFAULT_CAPS,
         "unknown": [],
     }
 
@@ -285,25 +289,76 @@ def test_o20_a_range_the_log_cannot_place_leaves_that_files_ranges_unknown_and_i
 
 
 def test_o20_the_tables_are_bounded_and_say_when_their_bound_cut_them():
-    """O20: a run lists at most `MAX_FILES_LISTED` files and `MAX_DIRECTORIES_LISTED` directories, the first read, and
-    each file at most `MAX_RANGES_LISTED` ranges, the lowest; a table the bound cut says so, with the number of files
-    or directories read, and a file's unique bytes still count every range. The run's own counts are never cut."""
-    files = [read(f"fileid{n:05d}", 10) for n in range(gatelog.MAX_FILES_LISTED + 1)]
+    """O20: a run lists at most its caps' `max_files` files and `max_directories` directories, the first read, and each
+    file at most `max_ranges_per_file` ranges, the lowest (1000, 1000 and 64 unless `[sandbox.served_bytes]` declares
+    others); a table the bound cut says so, with the number of files or directories read, and a file's unique bytes
+    still count every range. The run's own counts are never cut."""
+    caps = gatelog.Caps()
+    assert caps.record() == DEFAULT_CAPS
+    files = [read(f"fileid{n:05d}", 10) for n in range(caps.max_files + 1)]
     got = tables(*files)
-    assert len(got["files"]) == gatelog.MAX_FILES_LISTED
-    assert list(got["files"]) == [f"fileid{n:05d}" for n in range(gatelog.MAX_FILES_LISTED)]
-    assert (got["files_total"], got["files_cut"]) == (gatelog.MAX_FILES_LISTED + 1, True)
-    assert got["content_bytes"] == 10 * (gatelog.MAX_FILES_LISTED + 1)
+    assert len(got["files"]) == caps.max_files
+    assert list(got["files"]) == [f"fileid{n:05d}" for n in range(caps.max_files)]
+    assert (got["files_total"], got["files_cut"]) == (caps.max_files + 1, True)
+    assert got["content_bytes"] == 10 * (caps.max_files + 1)
     assert tables(*files[:-1])["files_cut"] is False
-    directories = [listed(f"folderid{n:05d}", 10) for n in range(gatelog.MAX_DIRECTORIES_LISTED + 1)]
+    directories = [listed(f"folderid{n:05d}", 10) for n in range(caps.max_directories + 1)]
     got = tables(*directories)
-    assert len(got["listings"]) == gatelog.MAX_DIRECTORIES_LISTED
-    assert (got["listings_total"], got["listings_cut"]) == (gatelog.MAX_DIRECTORIES_LISTED + 1, True)
-    spread = [read(ALPHA, 10, first=100 * n) for n in reversed(range(gatelog.MAX_RANGES_LISTED + 1))]
+    assert len(got["listings"]) == caps.max_directories
+    assert (got["listings_total"], got["listings_cut"]) == (caps.max_directories + 1, True)
+    spread = [read(ALPHA, 10, first=100 * n) for n in reversed(range(caps.max_ranges_per_file + 1))]
     row = tables(*spread)["files"][ALPHA]
-    assert row["ranges"] == [[100 * n, 100 * n + 10] for n in range(gatelog.MAX_RANGES_LISTED)]
-    assert (row["ranges_cut"], row["range_bytes"]) == (True, 10 * (gatelog.MAX_RANGES_LISTED + 1))
+    assert row["ranges"] == [[100 * n, 100 * n + 10] for n in range(caps.max_ranges_per_file)]
+    assert (row["ranges_cut"], row["range_bytes"]) == (True, 10 * (caps.max_ranges_per_file + 1))
     assert tables(*spread[1:])["files"][ALPHA]["ranges_cut"] is False
+
+
+def test_o20_a_byte_range_past_a_files_range_cap_reads_as_cut_and_one_below_it_stays_known():
+    """O20: a file's row keeps its lowest ranges, so every byte below the end of the last one listed is known: inside a
+    range it was served, in a gap it was not. A byte past that end, in a row the cap cut, is unknown, never "not
+    served", and a range the log could not place is unknown too. Raised far enough, the cap lists them all."""
+    spread = [read(ALPHA, 10, first=0), read(ALPHA, 10, first=100), read(ALPHA, 10, first=200)]
+    capped = gatelog.served(log(*spread, ANSWERS[-1]), STOPPED, gatelog.Caps(max_ranges_per_file=2))
+    assert (capped["files"][ALPHA]["ranges"], capped["files"][ALPHA]["ranges_cut"]) == ([[0, 10], [100, 110]], True)
+    assert capped["caps"] == DEFAULT_CAPS | {"max_ranges_per_file": 2}
+    assert served.lookup_bytes(capped, ALPHA, 100, 110).state == "served"
+    assert served.lookup_bytes(capped, ALPHA, 0, 5).state == "served"
+    assert served.lookup_bytes(capped, ALPHA, 20, 30).state == "not_served"  # a gap below the cut: known unread
+    assert served.lookup_bytes(capped, ALPHA, 5, 15).state == "not_served"  # its bytes 10 to 14 were never served
+    beyond = served.lookup_bytes(capped, ALPHA, 200, 210)
+    assert (beyond.state, beyond.reasons) == ("unknown", ("ranges_cut",))  # served, but past what the row lists
+    assert served.lookup_bytes(capped, ALPHA, 105, 120).state == "unknown"  # its tail lies past the cut
+    whole = gatelog.served(log(*spread, ANSWERS[-1]), STOPPED, gatelog.Caps(max_ranges_per_file=3))
+    assert served.lookup_bytes(whole, ALPHA, 200, 210).state == "served"
+    assert served.lookup_bytes(whole, ALPHA, 250, 260).state == "not_served"
+    unplaced = tables(read(ALPHA, 10) | {"status": 502})
+    assert (served.lookup_bytes(unplaced, ALPHA, 0, 5).state, served.lookup_bytes(unplaced, ALPHA, 0, 5).reasons) == (
+        "unknown",
+        ("ranges_unknown",),
+    )
+
+
+def test_o20_a_lookup_in_an_unknown_run_is_unknown_with_the_runs_reasons_and_a_cut_directory_reads_as_cut():
+    """O20: when the run's count is unknown, so is every file, range and directory a reader looks up, with the run's
+    own reasons. A directory left out of a cut listings table is unknown, never "not served"; with no cut, a directory
+    without a row was not listed."""
+    unknown = gatelog.served(None, STOPPED)
+    for found in (
+        served.lookup_file(unknown, ALPHA),
+        served.lookup_bytes(unknown, ALPHA, 0, 1),
+        served.lookup_directory(unknown, FOLDER),
+    ):
+        assert (found.state, found.reasons) == ("unknown", ("gate_log_unreadable",))
+    folders = [listed(FOLDER, 300), listed(NOWHERE, 50)]
+    capped = gatelog.served(log(*folders, ANSWERS[-1]), STOPPED, gatelog.Caps(max_directories=1))
+    assert served.lookup_directory(capped, FOLDER).row == {"path": children(FOLDER), "requests": 1, "body_bytes": 300}
+    assert (served.lookup_directory(capped, NOWHERE).state, served.lookup_directory(capped, NOWHERE).reasons) == (
+        "unknown",
+        ("listings_cut",),
+    )
+    assert served.lookup_directory(tables(*folders), "diridunlisted").state == "not_served"
+    with pytest.raises(ValueError, match="not a snapshot of the bytes served"):
+        served.lookup_file({"served_bytes": 10}, ALPHA)
 
 
 def start(world, level):
@@ -312,6 +367,74 @@ def start(world, level):
 
 def write_log(sbx, *records) -> None:
     (sbx.dir / "gatelog" / "requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records), "utf-8")
+
+
+def declared(world, **caps):
+    """The world's `[sandbox]` table with `[sandbox.served_bytes]` declaring these caps, loaded from its file."""
+
+    def edit(data):
+        add_sandbox(data)
+        data["sandbox"]["served_bytes"] = caps
+
+    return load_platform(write_platform(world.tmp_path, edit), require_secrets=False).sandbox
+
+
+THREE_FILES = (read(ALPHA, 100), read(BRAVO, 50, first=10), read(CHARLIE, 70), ANSWERS[-1])
+
+
+def collected(world, tmp_path, settings, *records) -> dict:
+    """The instrument's snapshot of a REST run under these settings whose gate logged these lines."""
+    sbx = DockerSandbox.start(world.host, settings, make_spec(world, "via-gate"), **start_options(world))
+    instrument = ServedBytes(sbx)
+    write_log(sbx, *records)
+    sbx.collect(tmp_path / "evidence")
+    snapshot = instrument.finish()
+    sbx.stop()
+    return snapshot
+
+
+def test_o20_a_file_past_the_declared_cap_reads_as_cut_never_as_served_zero_or_unread(world, tmp_path):
+    """O20: a run that read more files than `[sandbox.served_bytes] max_files` lists the first it read and says the
+    table was cut. A file left out has no row, and a lookup of it is unknown ("files_cut"), never served with 0 bytes
+    and never "not served": once the table is cut, a file without a row may have been read, so even an unread one
+    reads unknown."""
+    snapshot = collected(world, tmp_path, declared(world, max_files=2), *THREE_FILES)
+    assert snapshot["caps"] == DEFAULT_CAPS | {"max_files": 2}
+    assert list(snapshot["files"]) == [ALPHA, BRAVO]
+    assert (snapshot["files_total"], snapshot["files_cut"]) == (3, True)
+    for found in (served.lookup_file(snapshot, CHARLIE), served.lookup_bytes(snapshot, CHARLIE, 0, 70)):
+        assert (found.state, found.reasons, found.row) == ("unknown", ("files_cut",), None)
+    assert served.lookup_file(snapshot, "fileidunread").state == "unknown"
+    assert served.lookup_file(snapshot, ALPHA).row["body_bytes"] == 100
+    assert snapshot["content_bytes"] == 220  # the run's own count is never cut
+
+
+def test_o20_the_same_run_with_a_raised_cap_lists_every_file_and_an_unread_one_reads_as_not_served(world, tmp_path):
+    """O20: the run above, with a cap that holds its files, lists all three and is not cut; the third file's row has its
+    bytes, and a file without a row was not served."""
+    snapshot = collected(world, tmp_path, declared(world, max_files=3), *THREE_FILES)
+    assert snapshot["caps"] == DEFAULT_CAPS | {"max_files": 3}
+    assert list(snapshot["files"]) == [ALPHA, BRAVO, CHARLIE]
+    assert (snapshot["files_total"], snapshot["files_cut"]) == (3, False)
+    assert served.lookup_file(snapshot, CHARLIE).row["ranges"] == [[0, 70]]
+    assert served.lookup_bytes(snapshot, BRAVO, 10, 60).state == "served"
+    found = served.lookup_file(snapshot, "fileidunread")
+    assert (found.state, found.reasons, found.row) == ("not_served", (), None)
+
+
+def test_o20_the_caps_in_effect_are_recorded_in_every_snapshot(world, tmp_path):
+    """O20: the snapshot says what its tables were allowed, whatever the data path and whether or not the count is
+    known: the caps `[sandbox.served_bytes]` declares, or the defaults when it declares none."""
+    settings = declared(world, max_files=5, max_directories=7, max_ranges_per_file=9)
+    caps = {"max_files": 5, "max_directories": 7, "max_ranges_per_file": 9}
+    for level in ("via-gate", "mounted", "isolated"):
+        sbx = DockerSandbox.start(world.host, settings, make_spec(world, level), **start_options(world))
+        assert ServedBytes(sbx).finish()["caps"] == caps  # before the collection too, with every count unknown
+        sbx.stop()
+    assert collected(world, tmp_path, settings, *ANSWERS)["caps"] == caps
+    plain = start(world, "via-gate")  # the world's own table declares no caps
+    assert plain.served_bytes()["caps"] == DEFAULT_CAPS
+    plain.stop()
 
 
 @pytest.mark.parametrize(("level", "listing"), [(COMPLETE_LEVEL, "complete"), ("via-gate", "paged")])

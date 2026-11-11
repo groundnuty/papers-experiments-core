@@ -54,13 +54,16 @@ which a run's total cannot (a read log that moves reads between files keeps the 
   * `listings`: every directory whose listing the platform served (a `listing` answer), keyed by its id as the path
     names it (`/api/v3/oneprovider/data/<directory id>/children`), with `path`, `requests` and `body_bytes`.
 
-Each table is bounded: at most `MAX_FILES_LISTED` files and `MAX_DIRECTORIES_LISTED` directories, the first the log
-shows, and at most `MAX_RANGES_LISTED` ranges a file, the lowest; `files_total` and `listings_total` count every one
-read, `files_cut`, `listings_cut` and a file's `ranges_cut` say a bound cut the list, and `range_bytes` counts every
-range whatever the bound. Whenever the run's count is unknown, so is every table (None, with the same reasons), and an
-answer of a file's content or a listing whose path names no file or directory makes the log malformed.
+Each table is bounded by the run's `Caps`, which `[sandbox.served_bytes]` of platform.toml declares (`settings.py`): at
+most `max_files` files and `max_directories` directories, the first the log shows, and at most `max_ranges_per_file`
+ranges a file, the lowest; `files_total` and `listings_total` count every one read, `files_cut`, `listings_cut` and a
+file's `ranges_cut` say a bound cut the list, and `range_bytes` counts every range whatever the bound. The caps in
+effect are in the result (`caps`), whatever else is known. Whenever the run's count is unknown, so is every table
+(None, with the same reasons), and an answer of a file's content or a listing whose path names no file or directory
+makes the log malformed. How a reader tells a row the cap left out from a file never served is `served.lookup_file`.
 """
 
+import dataclasses
 import json
 import re
 from collections.abc import Mapping
@@ -190,23 +193,39 @@ _BODY_FIELD = {
 
 
 TABLE_FIELDS = ("files", "files_total", "files_cut", "listings", "listings_total", "listings_cut")
-MAX_FILES_LISTED = 1000  # the files a run's table lists, the first read; `files_cut` says when there were more
-MAX_DIRECTORIES_LISTED = 1000  # the directories its listings table lists, the first listed; `listings_cut` likewise
-MAX_RANGES_LISTED = 64  # the ranges a file's row lists, the lowest; `ranges_cut` says when it had more
+
+
+@dataclasses.dataclass(frozen=True)
+class Caps:
+    """How much a run's tables of the bytes served may list (`[sandbox.served_bytes]` of platform.toml, O20): the
+    files, the first read (`files_cut` says when there were more), the directories, the first listed (`listings_cut`),
+    and the ranges of one file, the lowest (`ranges_cut`). Each is a whole number of at least 1."""
+
+    max_files: int = 1000
+    max_directories: int = 1000
+    max_ranges_per_file: int = 64
+
+    def record(self) -> dict[str, int]:
+        """The caps as the snapshot records them, by the keys platform.toml declares them under."""
+        return dataclasses.asdict(self)
+
+
+DEFAULT_CAPS = Caps()
 _DATA_PATH = "/api/v3/oneprovider/data/"  # gatepolicy's routes of a file's content and of a listing
 _CONTENT_PATH = re.compile(re.escape(_DATA_PATH) + r"([^/]+)/content")
 _LISTING_PATH = re.compile(re.escape(_DATA_PATH) + r"([^/]+)/children")
 _CONTENT_RANGE = re.compile(r"bytes ([0-9]{1,18})-([0-9]{1,18})/(?:[0-9]{1,18}|\*)")
 
 
-def served_unknown(*reasons: str) -> dict[str, Any]:
-    """The bytes served, unknown for these reasons: every count None, and every table."""
-    return {**dict.fromkeys(SERVED_FIELDS), **dict.fromkeys(TABLE_FIELDS), "unknown": sorted(set(reasons))}
+def served_unknown(*reasons: str, caps: Caps = DEFAULT_CAPS) -> dict[str, Any]:
+    """The bytes served, unknown for these reasons: every count None, and every table; the caps are still the run's."""
+    tables = dict.fromkeys(TABLE_FIELDS)
+    return {**dict.fromkeys(SERVED_FIELDS), **tables, "caps": caps.record(), "unknown": sorted(set(reasons))}
 
 
-def served_nothing() -> dict[str, Any]:
+def served_nothing(caps: Caps = DEFAULT_CAPS) -> dict[str, Any]:
     """The bytes served through no data path: every count zero, and every table empty."""
-    return {**dict.fromkeys(SERVED_FIELDS, 0), **_Tables().snapshot(), "unknown": []}
+    return {**dict.fromkeys(SERVED_FIELDS, 0), **_Tables(caps).snapshot(), "unknown": []}
 
 
 def _span(record: Mapping[str, Any], size: int) -> tuple[int, int] | None:
@@ -238,7 +257,8 @@ def _merged(spans: list[tuple[int, int]]) -> list[list[int]]:
 class _Tables:
     """The rows of the files and directories one log's answers served (the module docstring says what each holds)."""
 
-    def __init__(self) -> None:
+    def __init__(self, caps: Caps = DEFAULT_CAPS) -> None:
+        self._caps = caps
         self._files: dict[str, dict[str, Any]] = {}
         self._file_ids: set[str] = set()  # every file read, listed or not
         self._listings: dict[str, dict[str, Any]] = {}
@@ -254,9 +274,9 @@ class _Tables:
         if found is None:
             return False
         rows, seen, bound = (
-            (self._files, self._file_ids, MAX_FILES_LISTED)
+            (self._files, self._file_ids, self._caps.max_files)
             if content
-            else (self._listings, self._dir_ids, MAX_DIRECTORIES_LISTED)
+            else (self._listings, self._dir_ids, self._caps.max_directories)
         )
         seen.add(found[1])
         row = rows.get(found[1])
@@ -275,16 +295,16 @@ class _Tables:
         return True
 
     def snapshot(self) -> dict[str, Any]:
-        files = {}
+        files, most = {}, self._caps.max_ranges_per_file
         for file_id, row in self._files.items():
             spans = row["spans"]
             merged = None if spans is None else _merged(spans)
             files[file_id] = {
                 "path": row["path"],
                 "requests": row["requests"],
-                "ranges": None if merged is None else merged[:MAX_RANGES_LISTED],
+                "ranges": None if merged is None else merged[:most],
                 "range_bytes": None if merged is None else sum(stop - start for start, stop in merged),
-                "ranges_cut": None if merged is None else len(merged) > MAX_RANGES_LISTED,
+                "ranges_cut": None if merged is None else len(merged) > most,
                 "body_bytes": row["body_bytes"],
             }
         return {
@@ -294,6 +314,7 @@ class _Tables:
             "listings": {dir_id: dict(row) for dir_id, row in self._listings.items()},
             "listings_total": len(self._dir_ids),
             "listings_cut": len(self._dir_ids) > len(self._listings),
+            "caps": self._caps.record(),
         }
 
 
@@ -312,13 +333,13 @@ def _stop_reasons(stop: Mapping[str, Any] | None) -> set[str]:
     return reasons
 
 
-def served(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str, Any]:
+def served(lines: list[str] | None, stop: Mapping[str, Any] | None, caps: Caps = DEFAULT_CAPS) -> dict[str, Any]:
     """The bytes the gate served the agent in a run, in all and per file and directory, from its log once it was
     stopped (O20; the module docstring says what each count holds). `lines` are the log's lines, None when it could not
-    be read; `stop` is what the stop of the gate found (`gate_stop` of the sandbox's metadata, `_stop_reasons`). The
-    log must hold the gate's `teardown_complete` line, whatever its exit code."""
+    be read; `stop` is what the stop of the gate found (`gate_stop` of the sandbox's metadata, `_stop_reasons`); `caps`
+    bound the tables. The log must hold the gate's `teardown_complete` line, whatever its exit code."""
     reasons = _stop_reasons(stop) | (set() if lines is not None else {UNREADABLE})
-    counts, tables = dict.fromkeys(_BODY_FIELD.values(), 0), _Tables()
+    counts, tables = dict.fromkeys(_BODY_FIELD.values(), 0), _Tables(caps)
     confirmed = False
     for text in lines or ():
         if not text.strip():
@@ -350,6 +371,6 @@ def served(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str,
     if lines is not None and not confirmed:  # an exit is no proof: a gate killed by its memory limit exits as well
         reasons.add(GATE_TEARDOWN_UNCONFIRMED)
     if reasons:
-        return served_unknown(*reasons)
+        return served_unknown(*reasons, caps=caps)
     total = counts["content_bytes"] + counts["listing_bytes"] + counts["other_bytes"]
     return {"served_bytes": total, **counts, **tables.snapshot(), "unknown": []}
