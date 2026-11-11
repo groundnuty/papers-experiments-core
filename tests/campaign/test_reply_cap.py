@@ -3,6 +3,7 @@
 import asyncio
 import threading
 
+import httpx
 import openai
 import pytest
 from campaign_support import NOW, planned_store
@@ -20,6 +21,8 @@ from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.config.models import Limits, ModelSpec, ModelTable
 from expcore.config.prices import Price
 from expcore.errors import BudgetHold
+from expcore.models import spend
+from expcore.models.retry import Retrier, RetryPolicy
 
 MODEL = "teasel"
 LIMITS = Limits(
@@ -266,3 +269,62 @@ def test_c27_a_run_admitted_by_the_maximum_keeps_that_decision_when_the_model_is
         assert BUILT[1].requests == []  # the attempt's client: nothing reached the endpoint
         assert "topup_refused" in event_kinds(scheduler.store)
         assert summary.holds[MODEL].kind == "budget"
+
+
+# --- a resend is cleared again right before it goes out -------------------------------------------------------------
+
+HELD_TOPUP, UNHELD_TOPUP = 0.07296, 0.32  # one request's bound, by the maximum and by the window
+
+
+class FailsOnce:
+    """A send that fails once with a 503, after which the request may have been billed, then answers."""
+
+    def __init__(self):
+        self.sends = 0
+
+    async def __call__(self):
+        self.sends += 1
+        if self.sends == 1:
+            request = httpx.Request("POST", "https://llm.example.invalid/v1/chat/completions")
+            raise openai.InternalServerError("busy", response=httpx.Response(503, request=request), body=None)
+        return "answer"
+
+
+@pytest.mark.parametrize("room", ["enough", "short"])
+def test_c27_a_resend_whose_model_was_taken_off_the_maximum_during_its_wait_reserves_the_rest_of_its_bound_or_holds(
+    tmp_path, room
+):
+    """C27 and C26: the resend's top-up was reserved before the wait, by the maximum; during the wait another attempt
+    takes the model off it. Right before the resend goes out it is cleared again: the rest of its bound by the window
+    is reserved, or, with no room for it, the resend is not sent and the attempt is a budget hold, its failed send
+    charged all the same."""
+    store, _, manifest = planned_store(tmp_path, models=(MODEL,))
+    key = manifest.rows[0].key.text
+    begun = store.begin_attempt(key, NOW, 4321, str(tmp_path / "attempt"))
+    max_usd = 10.0 if room == "enough" else HELD + HELD_TOPUP + 0.01  # short: no room for the bound by the window
+    ledger = Ledger(gate_for(store, max_usd=max_usd), store, lambda: NOW, (threading.Lock(),), lambda: [MODEL])
+    guard = AttemptSpend(ledger, begun.id, key, MODEL, reserved_capped=True)
+
+    async def wait_while_another_attempt_marks_the_model(seconds: float) -> None:
+        mark_unheld(store, MODEL, NOW, "reply_over_maximum", "another attempt's reply of 5000 output tokens")
+
+    policy = RetryPolicy(max_retries=3, base_delay_s=1.0, max_delay_s=10.0, jitter=0.0)
+    retrier = Retrier(policy, sleep=wait_while_another_attempt_marks_the_model)
+    send = FailsOnce()
+
+    async def go():
+        with spend.watching(guard):
+            return await retrier.call(send)
+
+    if room == "enough":
+        reply, _ = asyncio.run(go())
+        assert (reply, send.sends) == ("answer", 2)
+        charged = store.q("SELECT topups, topup_usd FROM attempts WHERE id=?", (begun.id,))[0]
+        assert charged["topup_usd"] == pytest.approx(UNHELD_TOPUP)  # by the maximum before the wait, the rest after
+        return
+    with pytest.raises(BudgetHold, match="over the ceiling"):
+        asyncio.run(go())
+    assert send.sends == 1
+    charged = store.q("SELECT topups, topup_usd FROM attempts WHERE id=?", (begun.id,))[0]
+    assert (charged["topups"], charged["topup_usd"]) == (1, pytest.approx(HELD_TOPUP))
+    assert "topup_refused" in event_kinds(store)

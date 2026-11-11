@@ -15,11 +15,12 @@ POLICY = RetryPolicy(max_retries=3, base_delay_s=1.0, max_delay_s=10.0, jitter=0
 
 
 class Guard:
-    """A guard that logs what it is told and refuses the n-th clearance it is asked for (resends and requests alike)."""
+    """A guard that logs what it is told and refuses the n-th clearance it is asked for (resends and requests alike),
+    and, with `refuse_resend`, every resend it is asked to clear again after the wait."""
 
-    def __init__(self, refuse_at: int | None = None):
+    def __init__(self, refuse_at: int | None = None, refuse_resend: bool = False):
         self.log: list[tuple] = []
-        self.refuse_at, self.asked = refuse_at, 0
+        self.refuse_at, self.asked, self.refuse_resend = refuse_at, 0, refuse_resend
 
     def _clear(self, what: str) -> None:
         self.asked += 1
@@ -37,6 +38,11 @@ class Guard:
         self.log.append(("failed", kind, resend))
         if resend:
             self._clear("the resend")
+
+    async def before_resend(self, kind) -> None:
+        self.log.append(("resend", kind))
+        if self.refuse_resend:
+            raise BudgetHold("the resend no longer fits")
 
 
 class Sends:
@@ -65,13 +71,21 @@ def test_c26_a_send_that_failed_after_it_may_have_been_billed_is_told_to_the_gua
     make_error, make_connection_error, sleeps
 ):
     """C26: a 5xx and a connection error may come after the request was billed, so each is told to the guard, which
-    clears the resend; a 429 and a 408 are refused before any work and are not; the reply after them counts as usual."""
+    clears the resend; a 429 and a 408 are refused before any work and are not; the reply after them counts as usual.
+    Every resend, whatever failure it follows, is cleared again right before it goes out (C27)."""
     send = Sends(make_error(503), make_connection_error(), make_error(429), make_error(408))
     guard = Guard()
     policy = RetryPolicy(max_retries=4, base_delay_s=1.0, max_delay_s=10.0, jitter=0.0)
     reply, events = call_under(guard, Retrier(policy, sleep=sleeps, rng=_Fixed()), send)
     assert (reply, send.sends, len(events)) == ("answer", 5, 4)
-    assert guard.log == [("failed", "server", True), ("failed", "connection", True)]
+    assert guard.log == [
+        ("failed", "server", True),
+        ("resend", "server"),
+        ("failed", "connection", True),
+        ("resend", "connection"),
+        ("resend", "rate_limit"),
+        ("resend", "timeout"),
+    ]
 
 
 def test_c26_the_last_failed_send_of_a_request_is_told_to_the_guard_too_with_nothing_sent_after_it(make_error, sleeps):
@@ -81,7 +95,7 @@ def test_c26_the_last_failed_send_of_a_request_is_told_to_the_guard_too_with_not
     with pytest.raises(InfraError, match="after 3 retries") as caught:
         call_under(guard, Retrier(POLICY, sleep=sleeps, rng=_Fixed()), send)
     assert caught.value.kind == "endpoint"
-    assert guard.log == [("failed", "server", True)] * 3 + [("failed", "server", False)]
+    assert guard.log == [("failed", "server", True), ("resend", "server")] * 3 + [("failed", "server", False)]
 
 
 def test_c26_a_resend_the_guard_refuses_is_never_sent_and_no_retry_is_recorded_for_it(make_error, sleeps):
@@ -95,6 +109,23 @@ def test_c26_a_resend_the_guard_refuses_is_never_sent_and_no_retry_is_recorded_f
     assert send.sends == 2
     assert [event["retry"] for event in retrier.events] == [1]  # the first resend went out; the second never did
     assert len(sleeps.waits) == 1
+
+
+def test_c27_a_resend_is_cleared_again_after_the_wait_and_one_that_no_longer_fits_is_never_sent(make_error):
+    """C27 and C26: what the guard cleared before the wait may not hold after it, so it is asked again right before the
+    resend goes out; a refusal then ends the request as a budget hold, with nothing more sent to the endpoint."""
+    send = Sends(make_error(502))
+    guard = Guard(refuse_resend=True)
+
+    async def wait(seconds: float) -> None:
+        guard.log.append(("wait", seconds))
+
+    retrier = Retrier(POLICY, sleep=wait, rng=_Fixed())
+    with pytest.raises(BudgetHold, match="no longer fits") as caught:
+        call_under(guard, retrier, send)
+    assert caught.value.kind == "budget_hold"
+    assert send.sends == 1
+    assert guard.log == [("failed", "server", True), ("wait", 1.0), ("resend", "server")]
 
 
 def test_c26_without_a_guard_the_retrier_behaves_as_before(make_error, sleeps):

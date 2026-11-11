@@ -56,11 +56,18 @@ class Tally:
     def check(self, run_key, model, why) -> str | None:
         return "no room left" if self.rng.random() < self.refuse_share else None
 
-    def reserve(self, attempt_id, run_key, model, why) -> str | None:
+    def reserve_send(self, attempt_id, run_key, model, why) -> tuple[float, str | None]:
         if self.rng.random() < self.refuse_share:
-            return "no room left"
+            return self.bound(model), "no room left"
         self.charged += self.bound(model)
-        return None
+        return self.bound(model), None
+
+    def revalidate(self, attempt_id, run_key, model, why, cleared) -> tuple[float, str | None]:
+        if self.rng.random() < self.refuse_share:
+            return cleared, "no room left"
+        extra = max(self.bound(model) - cleared, 0.0)  # the model taken off its maximum since the send was cleared
+        self.charged += extra
+        return cleared + extra, None
 
     def charge(self, attempt_id, run_key, model, why) -> None:
         self.charged += self.bound(model)

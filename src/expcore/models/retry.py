@@ -18,7 +18,8 @@ The SDKs' own retries are switched off by the adapters, so every retry is counte
 
 A connection error or a 5xx may come after the request reached the model and was billed. The attempt's spend guard,
 when the campaign installed one, is told of each such send: it charges it, and clears the send that follows, before
-the wait, or ends the attempt as a budget hold (`expcore.models.spend`, C26).
+the wait, or ends the attempt as a budget hold (`expcore.models.spend`, C26). After the wait, immediately before any
+resend goes out, the guard clears it again, since what it needs may have changed during the wait (C27).
 """
 
 import asyncio
@@ -285,6 +286,7 @@ class Retrier:
                 await spend.after_failed_send(info.kind, resend=True)  # a budget hold here: nothing is sent again
                 made.append(self._record(info, wait, len(made)))
                 await self.sleep(wait)
+                await spend.before_resend(info.kind)  # the clearance again, as it stands after the wait
 
     def _refuse_final(self, exc: Exception, info: ErrorInfo) -> None:
         """Raise the right error for an error that is never retried; return when the error is transient."""

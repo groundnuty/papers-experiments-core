@@ -6,8 +6,8 @@ counts every token billed. Two kinds of send it does not count, and each is char
 (`attempt_bounds.request_bound_usd`):
 
 - **a send that failed after it may have been billed** (a connection error or a 5xx, `expcore.models.spend`): its
-  top-up is reserved before the retrier sends the request again, and the last such send of a request, after which
-  nothing is sent again, is charged too, so no failed send is left out of what was spent;
+  top-up is reserved before the retrier waits to send the request again, and the last such send of a request, after
+  which nothing is sent again, is charged too, so no failed send is left out of what was spent;
 - **every request after a reply that left its input or its output unreported**: the loop counts the missing count as
   0, so from that reply on the cap no longer bounds the run. The reply is recorded as a `usage_unreported` event.
 
@@ -24,6 +24,11 @@ window from then on, those in flight included, and each later request of a run t
 sent only while the campaign is within its ceilings, else that run ends as a budget hold too. Which bound a run was
 reserved is the decision of the assessment that admitted it, carried into its guard by the scheduler; the guard never
 reads it back from the model's status, which another attempt may have changed in between.
+
+A resend is cleared again right before it goes out, after the retrier's wait (`Ledger.revalidate`): if the model was
+taken off the maximum during the wait, the rest of its top-up's bound by the window is reserved, or the resend is
+refused, and either way the campaign must still be within its ceilings. Marks are made under the ledger's locks, so a
+bound read there and the charge made from it never straddle one.
 
 The ledger's work reads and writes the store, so the guard does it in a thread, never on the attempt's event loop
 (L15).
@@ -77,12 +82,14 @@ class Ledger:
         return model in self.gate.capped()
 
     def reply_over(self, run_key: str, model: str, output_tokens: int) -> None:
-        """Take a model off the reply maximum for the rest of the campaign: one of its replies went past it (C27)."""
+        """Take a model off the reply maximum for the rest of the campaign: one of its replies went past it (C27). The
+        mark is made under the locks, so no top-up is charged by a bound read before it and recorded after it."""
         detail = (
             f"{run_key}: a reply reported {output_tokens} output tokens, over the reply maximum of "
             f"{self.maximum(model)}; the model's runs are reserved by its context window from now on"
         )
-        reply_cap.mark_unheld(self.store, model, self.stamp(), "reply_over_maximum", detail)
+        with self._held():
+            reply_cap.mark_unheld(self.store, model, self.stamp(), "reply_over_maximum", detail)
 
     def check(self, run_key: str, model: str, why: str) -> str | None:
         """Tell why a run in flight may not send its next request, or None: the campaign is past a ceiling now that its
@@ -95,10 +102,16 @@ class Ledger:
 
     def reserve(self, attempt_id: int, run_key: str, model: str, why: str) -> str | None:
         """Reserve one top-up for a run in flight and charge it; return None, or why it does not fit, uncharged."""
-        usd = self.bound(model)
-        if usd == 0.0:
-            return None  # a free model's request costs nothing
+        return self.reserve_send(attempt_id, run_key, model, why)[1]
+
+    def reserve_send(self, attempt_id: int, run_key: str, model: str, why: str) -> tuple[float | None, str | None]:
+        """Reserve one top-up for a send of a run in flight at the model's bound, read under the locks, and charge it.
+        Return the bound, which is what the send is cleared with (0 for a free model, whose send costs nothing), and
+        None, or why it does not fit, uncharged."""
         with self._held():
+            usd = self.bound(model)
+            if usd == 0.0:
+                return 0.0, None
             refusal = (
                 f"model {model} has no price: its request has no bound"
                 if usd is None
@@ -106,18 +119,45 @@ class Ledger:
             )
             if refusal is not None:
                 self.store.event(self.stamp(), "topup_refused", model, f"{run_key}: {why}: {refusal}")
-                return refusal
+                return usd, refusal
             assert usd is not None
             self._add(attempt_id, run_key, model, why, usd)
-        return None
+        return usd, None
+
+    def revalidate(
+        self, attempt_id: int, run_key: str, model: str, why: str, cleared: float
+    ) -> tuple[float, str | None]:
+        """Clear a send again right before it goes out, against the bound and the ceilings as they are now (C26, C27).
+
+        `cleared` is what the send's top-up was reserved at. The model may have been taken off its reply maximum since,
+        so its bound grew: the difference is reserved and charged. Whether or not it grew, the campaign must still be
+        within its ceilings. Return what the send is cleared with now, and None, or why it may not go out (nothing more
+        is charged then).
+        """
+        with self._held():
+            usd = self.bound(model)
+            if usd == 0.0:
+                return cleared, None  # a free model's send costs nothing
+            extra = 0.0 if usd is None else max(usd - cleared, 0.0)
+            refusal = (
+                f"model {model} has no price: its request has no bound"
+                if usd is None
+                else self.gate.refusal(model, self.in_flight(), extra, "this resend")
+            )
+            if refusal is not None:
+                self.store.event(self.stamp(), "topup_refused", model, f"{run_key}: {why}: {refusal}")
+                return cleared, refusal
+            if extra > 0.0:
+                rest = f"{why}: the rest of its bound, the model taken off its reply maximum since it was cleared"
+                self._add(attempt_id, run_key, model, rest, extra)
+        return cleared + extra, None
 
     def charge(self, attempt_id: int, run_key: str, model: str, why: str) -> None:
         """Charge one top-up for a send already made, whether or not it fits: what it may have cost is spent."""
-        usd = self.bound(model)
-        if not usd:  # free, or unpriced: a model without a price never runs under a budget (C12)
-            return
         with self._held():
-            self._add(attempt_id, run_key, model, why, usd)
+            usd = self.bound(model)
+            if usd:  # free, or unpriced: a model without a price never runs under a budget (C12)
+                self._add(attempt_id, run_key, model, why, usd)
 
     def _add(self, attempt_id: int, run_key: str, model: str, why: str, usd: float) -> None:
         """Charge the attempt one top-up, with its event; call with the locks held."""
@@ -139,10 +179,13 @@ class AttemptSpend:
         self.unaccounted = False  # a reply left a count out: from then on the cap does not bound the run
         self.maximum = ledger.maximum(model)
         self.reserved_capped = reserved_capped  # the run was admitted with the reservation by the reply maximum
+        # what the next send of the current request was cleared with by a top-up; None: the run's reservation covers it
+        self.cleared: float | None = None
 
     async def before_request(self) -> None:
         """Top up a request that follows a reply without usage, or end the attempt as a budget hold. A run reserved
         by the reply maximum of a model since taken off it sends its next request only within the ceilings (C27)."""
+        self.cleared = None
         if self.unaccounted:
             await asyncio.to_thread(self._reserve_or_hold, "a request after a reply that did not report its usage")
         elif self.reserved_capped:
@@ -166,6 +209,15 @@ class AttemptSpend:
         """Charge a send that failed after it may have been billed; clear the resend, or end as a budget hold."""
         await asyncio.to_thread(self._failed_send, kind, resend)
 
+    async def before_resend(self, kind: str) -> None:
+        """Clear a resend again right before it goes out, after the retrier's wait: a top-up given before the wait is
+        checked against the bound and the ceilings now (`Ledger.revalidate`); a send the run's reservation covers is
+        checked as a request is, within the ceilings for a run reserved by the maximum of a model since taken off it."""
+        if self.cleared is not None:
+            await asyncio.to_thread(self._revalidate, kind)
+        elif self.reserved_capped:
+            await asyncio.to_thread(self._check_if_unheld)
+
     def _past_maximum(self, output_tokens: int) -> None:
         self.ledger.reply_over(self.run_key, self.model, output_tokens)  # each is an event; the first marks the model
 
@@ -178,7 +230,15 @@ class AttemptSpend:
             raise BudgetHold(f"{why} was not sent: {refusal}")
 
     def _reserve_or_hold(self, why: str) -> None:
-        refusal = self.ledger.reserve(self.attempt_id, self.run_key, self.model, why)
+        usd, refusal = self.ledger.reserve_send(self.attempt_id, self.run_key, self.model, why)
+        if refusal is not None:
+            raise BudgetHold(f"{why} was not sent: {refusal}")
+        self.cleared = usd
+
+    def _revalidate(self, kind: str) -> None:
+        assert self.cleared is not None
+        why = f"a resend after a {kind} failure"
+        self.cleared, refusal = self.ledger.revalidate(self.attempt_id, self.run_key, self.model, why, self.cleared)
         if refusal is not None:
             raise BudgetHold(f"{why} was not sent: {refusal}")
 
@@ -187,8 +247,11 @@ class AttemptSpend:
         if not resend:
             self.ledger.charge(self.attempt_id, self.run_key, self.model, f"{why}, the last of its request")
             return
-        refusal = self.ledger.reserve(self.attempt_id, self.run_key, self.model, f"{why}, before it is sent again")
+        usd, refusal = self.ledger.reserve_send(
+            self.attempt_id, self.run_key, self.model, f"{why}, before it is sent again"
+        )
         if refusal is None:
+            self.cleared = usd
             return
         self.ledger.charge(self.attempt_id, self.run_key, self.model, f"{why}, not sent again")
         raise BudgetHold(f"the request was not sent again after a {kind} failure: {refusal}")

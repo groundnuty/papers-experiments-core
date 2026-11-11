@@ -10,8 +10,11 @@ kinds of send it cannot account for:
   so from then on the cap no longer bounds the run.
 
 The campaign installs a `SpendGuard` for the length of an attempt (`watching`). The guard is told of each failed send
-that may have been billed, before the retrier sends again, and of each request and reply as the recording sees them
-(`expcore.records.recording.RecordingBackend`), so a refusal is recorded as the request's failure and replays as one.
+that may have been billed, before the retrier waits to send again, and of each request and reply as the recording sees
+them (`expcore.records.recording.RecordingBackend`), so a refusal is recorded as the request's failure and replays as
+one. A clearance given before the wait may no longer hold after it (the model may have been taken off its reply maximum
+meanwhile, C27), so every resend, whatever failure it follows, is cleared again right before it goes out
+(`before_resend`).
 A guard refuses by raising `BudgetHold`, an infrastructure failure of kind `budget_hold`: the request is not sent and
 the attempt ends, set aside. Without a guard, as in a campaign without a budget, in a replay or outside a campaign,
 every call here does nothing.
@@ -29,7 +32,15 @@ from typing import Protocol
 
 from expcore.errors import BudgetHold
 
-__all__ = ["POSSIBLY_BILLED", "BudgetHold", "SpendGuard", "after_failed_send", "after_reply", "before_request"]
+__all__ = [
+    "POSSIBLY_BILLED",
+    "BudgetHold",
+    "SpendGuard",
+    "after_failed_send",
+    "after_reply",
+    "before_request",
+    "before_resend",
+]
 
 # The retry kinds (`expcore.models.retry.classify`) after which the request may have reached the model and been billed.
 # A rate limit, a 408, a 409 and a timeout before the request was written are refused before any work is done.
@@ -50,6 +61,10 @@ class SpendGuard(Protocol):
     async def after_failed_send(self, kind: str, *, resend: bool) -> None:
         """Charge a send that failed after it may have been billed; with `resend`, clear the send that follows it, or
         raise `BudgetHold`, in which case it is not sent."""
+        ...
+
+    async def before_resend(self, kind: str) -> None:
+        """Clear a resend again immediately before it goes out, after the retrier's wait, or raise `BudgetHold`."""
         ...
 
 
@@ -85,3 +100,11 @@ async def after_failed_send(kind: str, *, resend: bool) -> None:
     guard = _guard.get()
     if guard is not None and kind in POSSIBLY_BILLED:
         await guard.after_failed_send(kind, resend=resend)
+
+
+async def before_resend(kind: str) -> None:
+    """Ask the attempt's guard, if there is one, to clear a resend again right before it goes out, whatever the retry
+    kind of the failure it follows."""
+    guard = _guard.get()
+    if guard is not None:
+        await guard.before_resend(kind)
