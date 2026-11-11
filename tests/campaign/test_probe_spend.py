@@ -1,6 +1,9 @@
-"""Admission probes are paid from the campaign's budget: each send is reserved before it goes out and charged (C26)."""
+"""Admission probes are paid from the campaign's budget: each send is reserved before it goes out and charged (C26).
+A model that declares accepted fingerprints is checked from what its paid one-token completion carried (B18)."""
 
 import asyncio
+import dataclasses
+import json
 import threading
 
 import httpx
@@ -12,6 +15,7 @@ from scheduler_support import build, event_kinds, settings_for
 
 from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.gate import Budget, BudgetGate
+from expcore.campaign.identity import ACCEPTED_META
 from expcore.campaign.probe_spend import MeteredProbes, charged
 from expcore.campaign.topup import Ledger
 from expcore.config.models import Limits, ModelSpec, ModelTable
@@ -197,3 +201,75 @@ def test_c26_a_probe_resent_after_a_failure_that_may_have_been_billed_reserves_t
     assert backend.sends == 1
     assert metered.refusal is not None
     assert charged(ledger.store) == {MODEL: pytest.approx(PROBE_BOUND)}
+
+
+FINGERPRINT = "fp-sorrel-east"
+DECLARED = dataclasses.replace(SPEC, accepted_fingerprints=(FINGERPRINT,))
+
+
+class Fingerprinted(Endpoint):
+    """An endpoint whose replies carry a serving fingerprint, the one-token completion's reporting a prompt of
+    `prompt` tokens."""
+
+    def __init__(self, prompt: int):
+        super().__init__()
+        self.prompt = prompt
+
+    async def create(self, **request):
+        self.requests.append(request)
+        tokens = request["max_tokens"]
+        prompt = self.prompt if tokens == 1 else 20
+        return ChatCompletion.model_validate(
+            {
+                "id": "cmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "vendor/sorrel-1",
+                "system_fingerprint": FINGERPRINT,
+                "choices": [{"index": 0, "finish_reason": "length", "message": {"role": "assistant", "content": "1"}}],
+                "usage": {"prompt_tokens": prompt, "completion_tokens": tokens, "total_tokens": prompt + tokens},
+            }
+        )
+
+
+def declared(tmp_path, monkeypatch, budget: Budget, *, prompt: int = 20):
+    def client(**options):
+        made = Fingerprinted(prompt)
+        BUILT.append(made)
+        return made
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", client)
+    plan = {"models": (MODEL,), "tasks": ("task-a",), "seeds": (1,)}
+    return build(
+        tmp_path / "campaign",
+        factory=default_backend_factory,
+        settings=settings_for(budget=budget),
+        plan=plan,
+        models=ModelTable({MODEL: DECLARED}),
+    )
+
+
+def confirmed(store) -> dict[str, str]:
+    return {f: w["by"] for f, w in json.loads(store.get_meta(ACCEPTED_META))[MODEL]["confirmed"].items()}
+
+
+def test_b18_under_a_budget_the_declared_set_is_checked_from_the_paid_probe_and_nothing_more_is_sent(
+    tmp_path, monkeypatch
+):
+    """B18: with a budget, admission sends its two paid probes and no third; the declared set is checked from what the
+    one-token completion's reply carried through the metered backend, and that reply confirms its fingerprint."""
+    with declared(tmp_path, monkeypatch, Budget(max_usd=100.0)) as scheduler:
+        assert scheduler.not_admitted == {}
+        assert sent() == 2  # the one-token completion and the probe of the reply maximum
+        assert confirmed(scheduler.store) == {FINGERPRINT: "admission_probe"}
+
+
+def test_b18_a_model_the_budget_refused_is_not_confirmed_by_the_probe_it_did_send(tmp_path, monkeypatch):
+    """B18: the one-token completion is answered under the declared fingerprint, but its reply's prompt, settled at
+    0.03 USD, leaves no room under 0.34 for the probe of the reply maximum's 0.32 bound, which is not sent. The model
+    is refused for the budget, and the reply it did get confirms nothing: a model not admitted is no witness."""
+    with declared(tmp_path, monkeypatch, Budget(max_usd=0.34), prompt=30_000) as scheduler:
+        assert scheduler.not_admitted[MODEL].startswith("the campaign's budget is spent:")
+        assert sent() == 1
+        assert confirmed(scheduler.store) == {}
+        assert "accepted_fingerprint_confirmed" not in event_kinds(scheduler.store)

@@ -117,7 +117,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | B14 | Vendor extras pass through | `tests/models/test_adapters_anthropic.py`, `tests/models/test_adapters_openai.py` |
 | B15 | Record what was sent, not what was meant | `tests/e2e/test_tiny_study.py`, `tests/models/test_adapters_anthropic.py`, `tests/models/test_adapters_openai.py`, `tests/models/test_route.py`, `tests/prompt/test_templates.py` |
 | B16 | Incompatible per-model rules are refused before any request | `tests/config/test_model_checks.py`, `tests/config/test_models.py`, `tests/models/test_factory.py`, `tests/study/test_backend_factory.py` |
-| B18 | A model served by several declared deployments is one model | `tests/campaign/test_accepted_fingerprints.py`, `tests/config/test_accepted_fingerprints.py`, `tests/models/test_probe_served.py` |
+| B18 | A model served by several declared deployments is one model | `tests/campaign/test_accepted_fingerprints.py`, `tests/campaign/test_probe_spend.py`, `tests/config/test_accepted_fingerprints.py`, `tests/models/test_probe_served.py` |
 | L01 | Malformed tool-call arguments are never run as `{}` | `tests/loop/test_agent_loop.py` |
 | L02 | Unknown tools and wrong argument types are tool errors, not crashes | `tests/loop/test_agent_loop.py` |
 | L03 | Turn cap counts rounds | `tests/loop/test_agent_loop.py` |
