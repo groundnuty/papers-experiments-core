@@ -36,6 +36,13 @@ guarantee. A stub's scripted usage beyond the model's context window, or a backe
 outgrows it, is outside it too. A free model's bound is 0. A model whose cost is unknown (no price, not free) has no
 cost at all: `None`, never 0, and the budget gate holds it (C12).
 
+**An attempt whose usage is unknown is bounded as its run was reserved** (C27): by the budget gate's decision when it
+let the run start, recorded on the attempt's row at dispatch, so a restart charges it the same before admission has
+shown any model held to R. The row records the decision, not the dollars: the bound follows from it, the model's
+table entry and the limits, which the campaign's fingerprint fixes, and a model the store takes off R afterwards takes
+its attempts to the bound by the window too, since the reply past R may have been one of theirs. A row from before
+the record follows the caller's view of the model now, which can only charge more before admission has run.
+
 A measured attempt of a model with a flat price costs its totals at that price. One of a model with a tiered price
 costs each of its requests at the tier its prompt fell in, from the per-turn usage the store keeps (C24); an attempt
 whose per-turn usage is unknown is charged its bound, since its totals cannot say which tier each token fell in.
@@ -207,14 +214,22 @@ def _requests(stored: str | None) -> list[tuple[int, int, int, int]] | None:
 
 
 def attempt_costs(
-    store: RunState, models: Mapping[str, ModelSpec], limits: Limits, *, reply_capped: Collection[str] = ()
+    store: RunState,
+    models: Mapping[str, ModelSpec],
+    limits: Limits,
+    *,
+    reply_capped: Collection[str] = (),
+    taken_off: Collection[str] = (),
 ) -> list[AttemptCost]:
     """Return the cost of every attempt that spent tokens, in attempt order, each charged as the module docstring says.
 
     `models` maps a run's model key to its table entry; a key it lacks is an unknown cost. `limits` are the caps the
-    attempts ran under, which bound one whose usage is unknown, by the reply maximum for the models in `reply_capped`. Each attempt's top-ups are added to its cost (C26),
-    and a running attempt with top-ups is listed with them alone, since they were charged when they were reserved; an
-    attempt with a top-up is `bounded`, its cost being in part a ceiling.
+    attempts ran under, which bound one whose usage is unknown, by the bound its row records it was reserved at
+    dispatch (C27). A row without that record, written before it existed, is bounded by the reply maximum for the
+    models in `reply_capped` (the caller's view now) and by the window for any other. Either way an attempt of a model
+    in `taken_off`, which the store has taken off the reply maximum, is bounded by the window. Each attempt's top-ups
+    are added to its cost (C26), and a running attempt with top-ups is listed with them alone, since they were charged
+    when they were reserved; an attempt with a top-up is `bounded`, its cost being in part a ceiling.
     """
     states = (*BILLED_STATES, "running")
     marks = ",".join("?" * len(states))
@@ -222,10 +237,11 @@ def attempt_costs(
     columns = {row["name"] for row in store.q("PRAGMA table_info(attempts)")}
     turn_usage = "a.turn_usage" if "turn_usage" in columns else "NULL AS turn_usage"
     topup_usd = "a.topup_usd" if "topup_usd" in columns else "0 AS topup_usd"
+    reserved = "a.reserved_capped" if "reserved_capped" in columns else "NULL AS reserved_capped"
     rows = store.q(
         "SELECT a.id, a.run_key, a.state, r." + column_for("model") + " AS model, a.input_tokens, a.output_tokens, "
         f"a.cache_creation_tokens, a.cache_read_tokens, {turn_usage}, COALESCE(a.usage_complete,1) AS complete, "
-        f"{topup_usd} FROM attempts a JOIN runs r USING(run_key) WHERE a.state IN ({marks}) ORDER BY a.id",
+        f"{topup_usd}, {reserved} FROM attempts a JOIN runs r USING(run_key) WHERE a.state IN ({marks}) ORDER BY a.id",
         states,
     )
     costs = []
@@ -235,7 +251,7 @@ def attempt_costs(
             if topped:
                 costs.append(AttemptCost(row["id"], row["run_key"], row["model"], "running", topped, True))
             continue
-        usd, bounded = _base_cost(spec, row, limits, row["model"] in reply_capped)
+        usd, bounded = _base_cost(spec, row, limits, _reserved_capped(row, reply_capped, taken_off))
         costs.append(
             AttemptCost(
                 row["id"], row["run_key"], row["model"], row["state"],
@@ -243,6 +259,14 @@ def attempt_costs(
             )
         )  # fmt: skip
     return costs
+
+
+def _reserved_capped(row: Mapping[str, Any], reply_capped: Collection[str], taken_off: Collection[str]) -> bool:
+    """Tell whether an attempt is bounded by the reply maximum: as its row records it was reserved at dispatch, else as
+    the caller holds its model now, and never once the store has taken its model off the maximum (C27)."""
+    recorded = row["reserved_capped"]
+    capped = row["model"] in reply_capped if recorded is None else bool(recorded)
+    return capped and row["model"] not in taken_off
 
 
 def _base_cost(

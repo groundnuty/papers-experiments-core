@@ -22,8 +22,9 @@ A model whose runs were reserved by the reply maximum and one of whose replies r
 it (`expcore.campaign.reply_cap`, C27): the reply is a `reply_over_maximum` event, the model's runs are reserved by the
 window from then on, those in flight included, and each later request of a run that was reserved the smaller bound is
 sent only while the campaign is within its ceilings, else that run ends as a budget hold too. Which bound a run was
-reserved is the decision of the assessment that admitted it, carried into its guard by the scheduler; the guard never
-reads it back from the model's status, which another attempt may have changed in between.
+reserved is the decision of the assessment that admitted it, carried into its guard by the scheduler and recorded on
+its attempt's row; the guard never reads it back from the model's status, which another attempt may have changed in
+between.
 
 A resend is cleared again right before it goes out, after the retrier's wait (`Ledger.revalidate`): if the model was
 taken off the maximum during the wait, the rest of its top-up's bound by the window is reserved, or the resend is

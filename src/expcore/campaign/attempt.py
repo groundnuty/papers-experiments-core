@@ -95,8 +95,8 @@ class Parts:
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     crash_hook: Callable[[str, str], None] = lambda point, run_key: None
     ledger: Ledger | None = None  # with a budget: the top-ups of the sends a run's token cap cannot account for (C26)
-    # with a budget: whether the assessment that admitted the run reserved it by the reply maximum (C27); unknown is yes
-    reserved_capped: Callable[[str], bool] = lambda run_key: True
+    # with a budget: whether the assessment that admitted the run reserved it by the reply maximum (C27); None: unknown
+    reserved_capped: Callable[[str], bool | None] = lambda run_key: None
 
 
 class AttemptRunner:
@@ -182,8 +182,9 @@ class AttemptRunner:
             f"{hold.reason}",
         )
 
-    def _begin(self, row: Any, lease: Lease | None = None) -> tuple[Any, Path]:
-        """Insert the 'running' row, with a directory of its own for this try, and the lease it runs under."""
+    def _begin(self, row: Any, lease: Lease | None = None, *, reserved_capped: bool | None = None) -> tuple[Any, Path]:
+        """Insert the 'running' row, with a directory of its own for this try, the lease it runs under, and the bound
+        the budget gate reserved the run (C27; None when no gate decided it)."""
         p = self.p
         tries = len(p.store.q("SELECT 1 FROM attempts WHERE run_key=?", (row["run_key"],))) + 1
         run_dir = p.root / "runs" / row["digest"] / f"try{tries}"
@@ -195,6 +196,7 @@ class AttemptRunner:
             str(run_dir),
             lease_wait_s=None if lease is None else lease.wait_s,
             lease_outcome="none" if lease is None else "granted",
+            reserved_capped=reserved_capped,
         )
         return begun, run_dir
 
@@ -222,10 +224,14 @@ class AttemptRunner:
             base_url=endpoint.base_url,
             time_left=timer.time_left,
         )
-        begun, run_dir = self._begin(row, lease)
+        # The decision the run was admitted under, never the model's status read now (C27). The row keeps it as it is,
+        # so an attempt whose usage turns out unknown is charged that bound; the guard takes unknown as yes, which
+        # checks more, never less.
+        decided = p.reserved_capped(key)
+        begun, run_dir = self._begin(row, lease, reserved_capped=decided)
         guard = None
-        if p.ledger is not None:  # the decision the run was admitted under, never the model's status read now (C27)
-            guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=p.reserved_capped(key))
+        if p.ledger is not None:
+            guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=True if decided is None else decided)
         defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
         request = RunRequest(
             RunIdentity(key, factors, begun.number),

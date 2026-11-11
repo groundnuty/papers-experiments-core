@@ -14,8 +14,10 @@ model **holds its replies to R** in a campaign only when both are true:
 The probe is sent only with a budget, at each start of the campaign. A model it does not show, and a model one of
 whose replies later reports more output than R (a `reply_over_maximum` event), is marked in the store (`unheld`),
 and from then on its runs are reserved the bound by the window for the rest of the campaign, a resume included: the
-attempts in flight, settled ones whose usage is unknown, and every top-up (C26). The reply that broke the rule is
-itself outside the guarantee; every request after it is covered.
+attempts in flight, settled ones whose usage is unknown, whatever bound their rows record they were reserved, and
+every top-up (C26). The reply that broke the rule is itself outside the guarantee; every request after it is covered.
+Short of a mark, a settled attempt whose usage is unknown keeps the bound its row records, so a start whose probes
+have not yet run, or that shows a model held which an attempt was not reserved as, charges it the same.
 """
 
 import json

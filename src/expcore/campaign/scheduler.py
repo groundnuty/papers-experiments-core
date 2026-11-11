@@ -196,7 +196,9 @@ class Scheduler:
         paying = None  # with a budget: the ledger admission's probes are paid from (C26)
         if cfg.budget is not None:
             specs = {m: self.models.resolve(m) for m in self.plan_models}
-            early = BudgetGate(store, specs, cfg.budget, self.agent_config.limits)  # no model is shown held to R yet
+            # No model is shown held to R yet; an attempt whose usage is unknown is charged the bound its row records
+            # it was reserved at dispatch, so the probes find the room the campaign really has (C27).
+            early = BudgetGate(store, specs, cfg.budget, self.agent_config.limits)
             early.take_releases(self.stamp())  # a release given for a stopped campaign makes room for its probes
             paying = self._ledger(early)
         held = self._admit_models(paying)  # before the gate: which models are held to the reply maximum (C27)
@@ -413,11 +415,11 @@ class Scheduler:
                 self._reserved_capped[key] = model in budget.capped
         return hold
 
-    def _admitted_capped(self, run_key: str) -> bool:
-        """Tell whether the assessment that admitted the run reserved it by the reply maximum; unknown is yes, which
-        checks more, never less (C27)."""
+    def _admitted_capped(self, run_key: str) -> bool | None:
+        """Tell whether the assessment that admitted the run reserved it by the reply maximum; None when none did, as
+        without a budget (C27). The attempt's row records it as it is; its spend guard takes None as yes."""
         with self._cv:
-            return self._reserved_capped.get(run_key, True)
+            return self._reserved_capped.get(run_key)
 
     def _all_hold(self, stopped_all: bool) -> Hold | None:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""

@@ -12,10 +12,12 @@ from openai.types.chat import ChatCompletion
 from record_support import CODE
 from scheduler_support import Factory, FakeExecutor, build, event_kinds, settings_for
 
+from expcore.campaign import probe_spend
 from expcore.campaign.attempt import AttemptRunner
 from expcore.campaign.attempt_bounds import bound_usd, request_bound_usd
 from expcore.campaign.executor import default_backend_factory, record_run
 from expcore.campaign.gate import Budget, BudgetGate
+from expcore.campaign.recovery import recover
 from expcore.campaign.reply_cap import UNHELD_KEY, mark_unheld, probed, unheld
 from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.config.models import Limits, ModelSpec, ModelTable
@@ -248,9 +250,9 @@ def test_c27_a_run_admitted_by_the_maximum_keeps_that_decision_when_the_model_is
     the bound by the window, and is a budget hold, sent to no endpoint."""
     original = AttemptRunner._begin
 
-    def begin_after_a_mark(runner, row, lease=None):
+    def begin_after_a_mark(runner, row, lease=None, **recorded):
         mark_unheld(runner.p.store, MODEL, NOW, "reply_over_maximum", "another attempt's reply of 5000 output tokens")
-        return original(runner, row, lease)
+        return original(runner, row, lease, **recorded)
 
     monkeypatch.setattr(AttemptRunner, "_begin", begin_after_a_mark)
     plan = {"models": (MODEL,), "tasks": ("task-a",), "seeds": (1,)}
@@ -328,3 +330,96 @@ def test_c27_a_resend_whose_model_was_taken_off_the_maximum_during_its_wait_rese
     charged = store.q("SELECT topups, topup_usd FROM attempts WHERE id=?", (begun.id,))[0]
     assert (charged["topups"], charged["topup_usd"]) == (1, pytest.approx(HELD_TOPUP))
     assert "topup_refused" in event_kinds(store)
+
+
+# --- an attempt whose usage is unknown is charged the bound its run was reserved, across a restart ------------------
+
+CEILING = Budget(max_usd=1.20)  # the bound by the maximum and one probe fit under it; the bound by the window does not
+
+
+def killed_before_marker(point, run_key):
+    """The process dies once the attempt's 'running' row is committed, before anything else of it is written."""
+    if point == "before_marker":
+        raise OSError("the process is killed here")
+
+
+def started(tmp_path, factory, executor, budget: Budget, **options):
+    plan = {"models": (MODEL,), "tasks": ("task-a",), "seeds": (1,)}
+    return build(
+        tmp_path / "campaign",
+        executor=executor,
+        factory=factory,
+        settings=settings_for(budget=budget),
+        plan=plan,
+        models=ModelTable({MODEL: SPEC}),
+        **options,
+    )
+
+
+def test_c27_a_restart_charges_an_interrupted_attempt_the_bound_by_the_maximum_it_was_reserved_and_resumes(
+    tmp_path, endpoint
+):
+    """C27 and C05: a run reserved by the reply maximum is killed before its usage was recorded. At the restart the
+    early gate, which pays for admission's probes before any model is shown held to the maximum, charges the
+    interrupted attempt the bound its row records, 0.54 USD, not the bound by the window, 1.32 USD. Under a ceiling of
+    1.20 USD, which the real total fits, the probes go out, the model is admitted, and the run is run again."""
+    executor = FakeExecutor(default=through_the_adapter)
+    killing = started(tmp_path, default_backend_factory, executor, CEILING, crash_hook=killed_before_marker)
+    with killing as killed, pytest.raises(RuntimeError, match="unexpected error"):
+        killed.run()
+    with started(tmp_path, default_backend_factory, executor, CEILING) as restart:
+        assert restart.not_admitted == {}
+        assert restart.run().statuses == {"done": 3}  # one run of each of the support schema's three conditions
+        attempts = restart.store.q("SELECT state, reserved_capped FROM attempts ORDER BY id")
+        assert [(entry["state"], entry["reserved_capped"]) for entry in attempts] == [("interrupted", 1)] + [
+            ("done", 1)
+        ] * 3
+
+
+def test_c27_an_interrupted_attempt_reserved_by_the_window_stays_charged_so_after_a_restart_that_shows_the_model_held(
+    tmp_path, endpoint
+):
+    """C27 and C05: a run of a model a plugin's factory builds, never probed and so reserved by the window, is killed
+    before its usage was recorded. The restart builds the model with the core's factory, whose probe shows it held to
+    the reply maximum: new runs are reserved the smaller bound, and the interrupted attempt is still charged the bound
+    by the window it was reserved."""
+    roomy = Budget(max_usd=100.0)
+    killing = started(tmp_path, Factory(), FakeExecutor(), roomy, crash_hook=killed_before_marker)
+    with killing as killed, pytest.raises(RuntimeError, match="unexpected error"):
+        killed.run()
+    with started(tmp_path, default_backend_factory, FakeExecutor(), roomy) as restart:
+        assessed = restart.budget.assess([], NOW)
+        assert assessed.reserve_usd[MODEL] == pytest.approx(HELD)  # this start shows the model held
+        probes = sum(probe_spend.charged(restart.store).values())
+        assert assessed.spent_usd == pytest.approx(UNHELD + probes)
+        [attempt] = restart.store.q("SELECT state, reserved_capped FROM attempts")
+        assert (attempt["state"], attempt["reserved_capped"]) == ("interrupted", 0)
+
+
+def interrupted_store(tmp_path, **recorded):
+    """A store with one attempt of the model killed before its usage was recorded, settled by recovery."""
+    store, _, manifest = planned_store(tmp_path, models=(MODEL,))
+    store.begin_attempt(manifest.rows[0].key.text, NOW, 4321, "", **recorded)
+    recover(store, NOW, 3)
+    return store
+
+
+def test_c27_an_attempt_from_before_its_reservation_was_recorded_follows_the_gates_view_of_the_model(tmp_path):
+    """C27 and C05: a row written before the column existed keeps the earlier rule: the bound by the maximum only for a
+    model the gate holds to it, so the early gate, which holds none, charges the bound by the window and can only
+    refuse more."""
+    store = interrupted_store(tmp_path)
+    early = BudgetGate(store, {MODEL: SPEC}, Budget(max_usd=10.0), LIMITS)
+    assert early.assess([], NOW).spent_usd == pytest.approx(UNHELD)
+    assert gate_for(store).assess([], NOW).spent_usd == pytest.approx(HELD)
+
+
+def test_c27_an_attempt_recorded_by_the_maximum_is_charged_by_the_window_once_the_store_takes_its_model_off(tmp_path):
+    """C27 and C05: the reply past the maximum may have been one of the interrupted attempt's own, so its record does
+    not outlast the mark, at any gate."""
+    store = interrupted_store(tmp_path, reserved_capped=True)
+    early = BudgetGate(store, {MODEL: SPEC}, Budget(max_usd=10.0), LIMITS)
+    assert early.assess([], NOW).spent_usd == pytest.approx(HELD)
+    mark_unheld(store, MODEL, NOW, "reply_over_maximum", "a reply of 5000 output tokens")
+    assert early.assess([], NOW).spent_usd == pytest.approx(UNHELD)
+    assert gate_for(store).assess([], NOW).spent_usd == pytest.approx(UNHELD)

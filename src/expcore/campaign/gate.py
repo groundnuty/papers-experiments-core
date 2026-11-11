@@ -5,10 +5,11 @@
 """The budget gate: budgets are enforced, not only estimated (C12), and a hold is lifted by a release file (C13).
 
 Before a run starts, the gate asks whether the campaign can afford one more of its model. The answer is the dollars
-spent so far (attempts counted by their counts, an interrupted one by its bound, C05), plus what the runs in flight can
-cost, plus what this run can cost, against a ceiling. **What a run can cost is always its bound**, the most one attempt's
-caps let it cost, the request it can make past its token cap included (`attempt_bounds.bound_usd`, C25), by the reply
-maximum only for a model the campaign holds to it (C27), never the mean of the runs that finished: a reservation for a
+spent so far (attempts counted by their counts, an interrupted one by the bound its run was reserved, which its row
+records, C05, C27), plus what the runs in flight can cost, plus what this run can cost, against a ceiling. **What a
+run can cost is always its bound**, the most one attempt's caps let it cost, the request it can make past its token
+cap included (`attempt_bounds.bound_usd`, C25), by the reply maximum only for a model the campaign holds to it (C27),
+never the mean of the runs that finished: a reservation for a
 pending or running attempt is the worst case, because an attempt that overruns its mean is still inside the ceiling
 only if the bound was set aside for it. A run starts only when the remaining budget covers the bound. The historical mean is an estimate for
 the status and the reports (`BudgetState.estimate_usd`) and decides nothing.
@@ -39,7 +40,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from expcore.campaign import probe_spend, release, reply_cap
-from expcore.campaign.attempt_bounds import attempt_costs, bound_usd, mean_run_usd, request_bound_usd, spent_usd
+from expcore.campaign.attempt_bounds import (
+    AttemptCost,
+    attempt_costs,
+    bound_usd,
+    mean_run_usd,
+    request_bound_usd,
+    spent_usd,
+)
 from expcore.campaign.store import Store
 from expcore.config.models import Limits, ModelSpec
 
@@ -194,8 +202,7 @@ class BudgetGate:
         `now` at full precision (fractional seconds), with which a stop that begins is dated.
         """
         holds, released = self._apply_releases(self._json(HOLDS_KEY), self._json(RELEASED_KEY), now)
-        capped = self.capped()
-        costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped)
+        costs, capped = self._costs()
         probes = probe_spend.charged(self.store)
         spent = _with_probes(spent_usd(costs), probes)
         reserve = {m: self._reserve(m, capped) for m in self.models}
@@ -227,8 +234,7 @@ class BudgetGate:
         either. A total that is unknown refuses too.
         """
         released = self._json(RELEASED_KEY)
-        capped = self.capped()
-        costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped)
+        costs, capped = self._costs()
         probes = probe_spend.charged(self.store)
         spent = _with_probes(spent_usd(costs), probes)
         reserve = {m: self._reserve(m, capped) for m in self.models}
@@ -239,8 +245,21 @@ class BudgetGate:
 
     def capped(self) -> frozenset[str]:
         """The models whose runs are reserved by the reply maximum now: shown at this start and not taken off since."""
-        marks = reply_cap.unheld(self.store)
-        return frozenset(m for m in self.shown_capped if not reply_cap.is_unheld(marks, m))
+        return self.shown_capped - self._taken_off(reply_cap.unheld(self.store))
+
+    def _taken_off(self, marks: Mapping) -> frozenset[str]:
+        """The models the store's marks take off the reply maximum for the rest of the campaign (C27)."""
+        return frozenset(m for m in {*self.models, *self.shown_capped} if reply_cap.is_unheld(marks, m))
+
+    def _costs(self) -> tuple[list[AttemptCost], frozenset[str]]:
+        """Every attempt's cost, and the models reserved by the reply maximum now, from one reading of the store's
+        marks. An attempt whose usage is unknown is charged the bound its row records it was reserved at dispatch, not
+        this gate's view of its model, which before admission holds none to the maximum; by the window once the store
+        has taken its model off it (C05, C27)."""
+        taken_off = self._taken_off(reply_cap.unheld(self.store))
+        capped = self.shown_capped - taken_off
+        costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped, taken_off=taken_off)
+        return costs, capped
 
     def request_bound(self, model: str) -> float | None:
         """What one request of the model can cost now: the bound of a top-up (C26); None when unpriced."""

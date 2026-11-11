@@ -80,6 +80,8 @@ _ADDED_COLUMNS = (
     ("attempts", "turn_usage", "TEXT"),  # JSON: each turn's [input, output, cache writes, cache reads]; NULL: unknown
     ("attempts", "topups", "INTEGER NOT NULL DEFAULT 0"),  # sends the token cap could not account for (C26)
     ("attempts", "topup_usd", "REAL NOT NULL DEFAULT 0"),  # what they were charged, each its bound, never refunded
+    # the bound the run was reserved at dispatch (C27): 1 by the reply maximum, 0 by the window; NULL: not recorded
+    ("attempts", "reserved_capped", "INTEGER"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -408,17 +410,22 @@ class Store:
         *,
         lease_wait_s: float | None = None,
         lease_outcome: str = "none",
+        reserved_capped: bool | None = None,
     ) -> BegunAttempt:
         """Insert the 'running' row before the run starts; refuse in the transaction a run that is not pending.
 
         The attempt number is one more than the run's charged attempts, so an interrupted or uncharged attempt is
         run again under the number it had. The row also takes the next place in the campaign's dispatch sequence (one
         more than the largest so far, in the same write transaction, so it grows with every attempt and a restart
-        carries on from where the dead process stopped) and the lease it runs under: how long it waited for it and
-        how it was obtained (`LEASE_OUTCOMES`).
+        carries on from where the dead process stopped), the lease it runs under: how long it waited for it and
+        how it was obtained (`LEASE_OUTCOMES`), and the bound the budget gate reserved the run when it let it start:
+        by the reply maximum or by the window (`reserved_capped`, C27; None when no gate decided it). An attempt whose
+        usage turns out unknown is charged that bound, at this start or any later one (`attempt_bounds`).
         """
         if lease_outcome not in LEASE_OUTCOMES:
             raise ValueError(f"lease_outcome {lease_outcome!r} must be one of: {', '.join(LEASE_OUTCOMES)}")
+        if reserved_capped is not None and not isinstance(reserved_capped, bool):
+            raise ValueError(f"reserved_capped is True, False or None, not {reserved_capped!r}")
 
         def go() -> BegunAttempt:
             run = self.db.execute("SELECT status FROM runs WHERE run_key=?", (run_key,)).fetchone()
@@ -432,10 +439,11 @@ class Store:
                 "SELECT COALESCE(SUM(charged),0)+1 FROM attempts WHERE run_key=?", (run_key,)
             ).fetchone()[0]
             sequence = self.db.execute("SELECT COALESCE(MAX(dispatch_seq),0)+1 FROM attempts").fetchone()[0]
+            capped = None if reserved_capped is None else int(reserved_capped)
             cursor = self.db.execute(
                 "INSERT INTO attempts(run_key,attempt,state,started_utc,pid,run_dir,dispatch_seq,lease_wait_s,"
-                "lease_outcome) VALUES(?,?,?,?,?,?,?,?,?)",
-                (run_key, number, "running", started, pid, run_dir, sequence, lease_wait_s, lease_outcome),
+                "lease_outcome,reserved_capped) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (run_key, number, "running", started, pid, run_dir, sequence, lease_wait_s, lease_outcome, capped),
             )
             return BegunAttempt(int(cursor.lastrowid), number, int(sequence))
 
