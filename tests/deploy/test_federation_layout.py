@@ -138,3 +138,15 @@ def test_describe_records_the_layout_the_root_parent_and_the_memory_limits(fed, 
     assert "| Root parent | `/mnt/volume2/expcore-federation` (default) |" in table
     assert "| Space `delta-space` | owner `hazel`, mirrors `alder`, support 5.00 GiB each |" in table
     assert "| Memory limits together | 36.00 GiB for 6 services |" in table
+
+
+def test_the_day0_template_has_every_row_describe_prints_and_a_peak_per_service(fed, tmp_path):
+    """The dated facts file starts from the template, so the deployment rows describe prints and the per-service
+    peak have a place in it."""
+    template = (DEPLOY / "day0" / "federation-facts.template.md").read_text(encoding="utf-8")
+    rows = [line.split("|")[1].strip() for line in fed.facts.describe(fed.layout.Layout(tmp_path)).splitlines()[2:]]
+    kinds = {row.split("`")[0] for row in rows}  # one per kind of row: a provider, a space, a user stand for all
+    assert all(f"| {kind}" in template for kind in kinds)
+    assert "| Layout | Service | Declared limit | Cgroup limit | Peak after up |" in template
+    for command in ("reset --replicas", "reset --clean", "up from clean", "down"):
+        assert f"| {command} |" in template
