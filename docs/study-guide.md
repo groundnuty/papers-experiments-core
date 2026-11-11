@@ -547,7 +547,8 @@ rehearsal = Path("rehearsal-study")
 shutil.copytree("my-study", rehearsal, ignore=shutil.ignore_patterns("out"))
 models = rehearsal / "models.toml"
 entry = '[models.alpha-stub]\nbackend = "stub"\nstatus = "frozen"\n'
-models.write_text(models.read_text().replace(entry, entry + "max_output_tokens = 256\n"))  # the example already declares a context window
+# the example already declares a context window, so only the reply cap is added
+models.write_text(models.read_text().replace(entry, entry + "max_output_tokens = 256\n"))
 assert load_study(rehearsal).config_sha256["models.toml"] != study.config_sha256["models.toml"]  # another campaign
 models.write_text(models.read_text().replace(entry, entry + 'prompt_cache_ttl = "5m"\n'))
 try:
