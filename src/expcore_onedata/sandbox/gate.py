@@ -1424,7 +1424,8 @@ def main() -> None:
     # a gate that cannot log does not start, and one that started leaves a log, so a missing log is lost evidence, not zero errors
     with open(CFG["log"], "a"):
         pass
-    signal.signal(signal.SIGUSR1, _on_run_start)  # before "ready": by default SIGUSR1 ends the process (O22)
+    # before "ready": unhandled, SIGUSR1 ends a process, and the container's PID 1 ignores it, so no mark is written (O22)
+    signal.signal(signal.SIGUSR1, _on_run_start)
     print("gate ready", flush=True)
     serve(httpd)
 

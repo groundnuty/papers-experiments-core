@@ -326,8 +326,9 @@ def test_o22_the_gates_mark_names_each_request_begun_and_not_yet_logged(tmp_path
 
 
 def test_o22_the_gate_takes_its_mark_signal_before_it_says_it_is_ready(tmp_path, monkeypatch):
-    """O22: the gate handles SIGUSR1, whose default would end it, from before it says it is ready, so a mark sent to a
-    gate the sandbox has seen ready is written, never the gate's death."""
+    """O22: the gate handles SIGUSR1 from before it says it is ready, so a mark sent to a gate the sandbox has seen
+    ready is written. Unhandled, the signal would end a process, and the container's PID 1, the gate, would ignore it:
+    either way no mark."""
 
     class Server:
         request_queue_size = 256

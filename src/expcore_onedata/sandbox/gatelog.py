@@ -450,7 +450,7 @@ def served(
         mine = run and _request_of(record) not in begun
         into, rows = (counts, tables) if mine else (before, held)
         into[field] += size
-        before["requests"] += not mine
+        before["requests"] += 0 if mine else 1
         if not rows.add(record, field, size):
             reasons.add(GATE_LOG_MALFORMED)  # content or a listing of no file or directory the log can name
     reasons |= _run_start_reasons(run_start, marks, late)
