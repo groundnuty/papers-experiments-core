@@ -215,8 +215,18 @@ class PlatformConfig:
     def fingerprint(self) -> dict[str, Any]:
         """The platform's half of the campaign fingerprint (`StudyPlugin.platform`): what a resume must not change.
 
-        It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12)."""
-        return {"tls": self.tls.record()}
+        It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12), and,
+        with a `[sandbox]`, every level of the data path with its kind and a REST level's listing mode (O21), so a
+        resume after a level changed its data path or its listing is refused. A declared `[sandbox.served_bytes]` puts
+        the caps of the tables of the bytes served there too (O22), since they decide what a run's evidence can show;
+        without the table the fingerprint keeps the shape it had before the caps could be declared, so a campaign that
+        ran under the defaults still resumes."""
+        out: dict[str, Any] = {"tls": self.tls.record()}
+        if self.sandbox is not None:
+            out["data_paths"] = self.sandbox.data_path_record()
+            if self.sandbox.served_caps_declared:
+                out["served_bytes"] = self.sandbox.served_caps.record()
+        return out
 
     def condition_label(self, name: str) -> str:
         """Name a declared condition for a message by its position in the file, `conditions[i]`, never by its name."""

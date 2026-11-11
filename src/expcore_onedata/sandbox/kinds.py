@@ -14,9 +14,10 @@ Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). Two k
 here, when this module is first imported, and neither is treatable:
 
 - `data_gate_integrity`: the data gate's refusal of an answer it cannot pass to the agent (a redirect, an encoded body,
-  its token in a header, its token in a body) or a gate log that cannot be read (`gate_error`). Such a run is neither
-  the agent's doing nor a condition's manipulation: the run is set aside and counted per condition, and the factor
-  schema refuses a condition that declares the kind (O05, O16, C01).
+  its token in a header or a body, an answer larger than it checks whole, a complete listing larger than it serves
+  whole) or a gate log that cannot be read (`gate_error`). Such a run is neither the agent's doing nor a condition's
+  manipulation: the run is set aside and counted per condition, and the factor schema refuses a condition that
+  declares the kind (O05, O16, O21, C01).
 - `output_collection`: collecting what the run left failed for a reason the agent did not cause (`copyout.py`,
   `collection_error`): the agent's container could not be frozen for the copy, a copy command or the disk failed, a
   copy did not hold what the listing showed (a name swapped after the listing included), the gate's log, in a
@@ -36,9 +37,9 @@ from expcore_onedata.sandbox import infradeath
 DATA_GATE_INTEGRITY = "data_gate_integrity"
 register_infra_kind(
     DATA_GATE_INTEGRITY,
-    "the data gate refused an answer of the platform it could not pass to the agent (a redirect, an encoded body, or "
-    "its token in a header or a body), or its log could not be read: the run says nothing about the agent or the "
-    "manipulation",
+    "the data gate refused an answer of the platform it could not pass to the agent (a redirect, an encoded body, its "
+    "token in a header or a body, an answer or a complete listing too large to check or serve whole), or its log could "
+    "not be read: the run says nothing about the agent or the manipulation",
     treatable=False,
 )
 OUTPUT_COLLECTION = "output_collection"

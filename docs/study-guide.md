@@ -233,6 +233,17 @@ On the Onedata platform four clients talk to the federation: the platform layer'
 
 The two keys never go together, and the per-client keys of earlier versions (`insecure_tls` under `[toolserver]`, `tls` under `[sandbox.mount]`) are refused at load. Each run's sandbox metadata records the mode, `verify`, `ca_file` with the bundle's SHA-256, or `insecure`, and never the bundle's path or contents. To make the mode part of the campaign's fingerprint, the plugin passes the platform's half of it, `StudyPlugin(..., platform=config.fingerprint())` with `config` the loaded `platform.toml`; a resume under another mode or another bundle is then refused.
 
+### Data paths on the Onedata platform
+
+A study selects each condition's data path through its `data_path` factor: the condition gives the factor a level in the study's own words, and `[sandbox.data_paths]` of `platform.toml` maps each level to a kind, `mount` (a read-only mount of the space), `rest` (the REST interface, through the data gate) or `none`. A REST level can also name how its listings are served, as a table in place of the kind:
+
+- `level = "rest"`, or `listing = "paged"`: a listing is the server's page, as it comes. The official client's `ls` reads one page, so a directory of more than 1000 entries shows its first 1000.
+- `level = { kind = "rest", listing = "complete" }`: the gate answers every listing with all of the directory's entries, as one last page. A listing it cannot serve whole (past 64 MiB or 10,000 pages) ends the run as `data_gate_integrity`, so the run is set aside and never scored on a part of the directory; a listing that names where to start (`token`, `index`, `offset`) gets a 400 the agent reads.
+
+A complete listing is complete only for a directory that does not change while the gate reads it, since Onedata gives a listing no snapshot. Keep the study's data fixed while runs read it, as a study's data should be anyway. An entry another client adds during the read makes one entry come twice, and the gate refuses that listing with a 502. An entry removed during the read can make another one drop out of the answer unseen, and nothing shows that it happened.
+
+Two conditions that differ only in the listing mode are two levels of the factor, so they can run side by side in one campaign. The run's metadata records the mode, and `config.fingerprint()` holds every level's kind and mode, so changing a level's data path or its listing between starts is refused like any other change of the experiment. `listing` on a mount or `none` level is refused at load. What else each data path guarantees is in [`interfaces.md`](interfaces.md#the-platform-layers-sandbox).
+
 ## 3. Declare the design
 
 ### Factors and conditions
@@ -548,6 +559,14 @@ records = [p for p in Path("my-study/out/runs").glob("*/try*/*.json") if p.name.
 assert records and all(load_record(p).run_key for p in records)  # every attempt's record is read
 assert counts == Counter()  # the example study runs without the platform
 ```
+
+### Bytes the agent read
+
+For a measure such as bytes moved but never consumed, the Onedata layer counts the bytes each run's agent read through its data path with a second instrument, `ServedBytes(sandbox)` from `expcore_onedata.sandbox.served` (namespace `served_bytes`). Build it once the platform's `launch` has given you the run's sandbox, and call `sandbox.collect(...)` before `finish_instruments`: the collection stops the data gate and counts its log once, and the record keeps that count, so re-scoring and replay read it and nothing measures it again. `content_bytes` is the file data the gate served the agent, `listing_bytes` the listings as served (the merged answer in the complete mode), `other_bytes` the platform's other answers, and `served_bytes` the three together; the gate's own refusals are apart, in `gate_answer_bytes`. A count of what was served can exceed what the agent's code consumed by what sat unread in its socket when it stopped reading.
+
+To check an agent's claimed reads file by file, read `files`: one row per file whose content the gate served, keyed by its file id, with the answers it got (`requests`), the unique byte ranges they served (`ranges`, each `[start, stop]` with `stop` excluded) and the bytes in them (`range_bytes`), and every body byte (`body_bytes`). Map your own file paths to file ids from the data you provisioned; the table names files by id only. `listings` does the same per directory listed. Check each claimed read with `lookup_bytes(snapshot, file_id, start, stop)` from `expcore_onedata.sandbox.served` rather than by reading the table yourself: it answers `served`, `not_served` (a read the gate never served) or `unknown`, and it reads a cut table correctly. The tables are bounded, 1000 files, 1000 directories and 64 ranges a file by default; a file a cap left out reads as `unknown`, never as not served. If your runs read more, raise the caps so every file is checkable: a `[sandbox.served_bytes]` table in `platform.toml` takes `max_files`, `max_directories` and `max_ranges_per_file`, each an integer of at least 1 (`max_files = 4000`, say). Declare them before the campaign starts: a declared table is in the campaign fingerprint, so a resume under other caps is refused. Each run's snapshot records the caps it had (`caps`), and a file's `ranges` are `None` when the log cannot place one of its answers.
+
+The count is `None`, with its reasons in `unknown`, wherever it is not known: always on a mount (`mount_not_through_gate`, since oneclient's reads pass no gate), and on a REST run whose gate log may lack a line. The tables are `None` with it, never a part of the run's reads. As with the probes' estimates, count those per condition and reason over every attempt and report them beside the analysis; never treat one as zero. A run with no data path reads zero, with empty tables. [`interfaces.md`](interfaces.md#instrument) lists every field and reason.
 
 ## 6. What a conclusion may say
 

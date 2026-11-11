@@ -76,8 +76,9 @@ class StudyPlugin:
       group of leases it needs (None: no lease) and `lease_keys` the keys of a group; `probe` answers for holders and
       resources. Leave them out for a study that shares nothing.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
-      Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash). They go into the campaign
-      fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
+      Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, and each level's data path and
+      listing mode). They go into the campaign fingerprint, so a resume under another is refused. Leave it empty for a
+      study without a platform.
     - `backend_factory`: builds the backend of every model, for admission and for each run, in place of the core's
       `default_backend_factory`; None keeps the core's. A model whose backend the core does not build
       (`config.models.BACKENDS`) needs one, and the factory decides which models it serves: it hands the others to

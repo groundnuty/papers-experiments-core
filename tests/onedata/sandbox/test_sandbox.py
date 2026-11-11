@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
-from sandbox_support import TOKEN, fail_copies, make_spec, start_options
+from sandbox_support import COMPLETE_LEVEL, TOKEN, fail_copies, make_spec, start_options
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
@@ -429,6 +429,31 @@ def test_the_data_path_modes_of_a_start_are_recorded_by_name(world):
     sbx = start(world, "mounted")
     assert sbx.metadata()["data_path"] == DataPathMode.MOUNT.value
     sbx.stop()
+
+
+@pytest.mark.parametrize(("level", "listing"), [(COMPLETE_LEVEL, "complete"), ("via-gate", "paged")])
+def test_o21_a_rest_level_tells_its_gate_its_listing_mode_and_the_run_records_it(world, level, listing):
+    """O21: the gate's configuration carries the level's listing mode, and the run's metadata records it beside the
+    data path, so a record says which listings its agent was served."""
+    sbx = start(world, level)
+    assert json.loads((sbx.dir / "gate.json").read_text())["listing"] == listing
+    assert (sbx.metadata()["data_path"], sbx.metadata()["listing"]) == ("rest", listing)
+    sbx.stop()
+    mounted = start(world, "mounted")
+    assert mounted.metadata()["listing"] is None  # no gate lists anything on a mount
+    mounted.stop()
+
+
+@pytest.mark.parametrize(("level", "listing"), [("mounted", "complete"), ("isolated", "complete"), ("via-gate", "all")])
+def test_o21_a_listing_mode_where_no_gate_lists_or_one_it_does_not_know_refuses_the_start(world, level, listing):
+    """O21: a complete listing on a mount or no data path, or a mode the gate does not know, is refused before anything
+    is created."""
+    from dataclasses import replace
+
+    spec = replace(make_spec(world, level), listing=listing)
+    with pytest.raises(StartRefused, match="listing mode"):
+        DockerSandbox.start(world.host, world.s, spec, **start_options(world))
+    assert nothing_left(world)
 
 
 def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_hash(world):

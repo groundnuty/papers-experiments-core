@@ -21,6 +21,7 @@ ONECLIENT_IMAGE_ID = "sha256:" + "c" * 64
 POOL = "10.77.0.0/24"
 MOUNT_PATH = "/data"
 LEVELS = {"mounted": "mount", "via-gate": "rest", "isolated": "none"}  # invented levels of a data_path factor
+COMPLETE_LEVEL = "via-gate-whole"  # an invented REST level whose gate answers every listing complete (O21)
 CHECK_FILE = "checks/content.bin"  # an invented file under the space root, read by the pre-campaign check
 SLOT_USERS = {  # login name -> (password, user id) of the users of the two slots below; all invented
     "slot-a-data": ("pw-slot-a-data", "u-slot-a-data"),
@@ -76,7 +77,7 @@ def sandbox_data() -> dict[str, Any]:
             "work_disk_bytes": 1 << 28,
         },
         "mount": {"path": MOUNT_PATH},
-        "data_paths": dict(LEVELS),
+        "data_paths": {**LEVELS, COMPLETE_LEVEL: {"kind": "rest", "listing": "complete"}},
         "content_check_file": CHECK_FILE,
     }
 
@@ -114,6 +115,7 @@ def make_spec(world, level="via-gate", *, token=TOKEN, lease_key=None, run_key="
         zone=None if none else Endpoint.from_url(world.config.zone.url),
         provider=None if none else Endpoint.from_url(world.config.local_provider.url),
         lease_key=lease_key,
+        listing=world.s.listing_of(level) or "paged",
     )
 
 

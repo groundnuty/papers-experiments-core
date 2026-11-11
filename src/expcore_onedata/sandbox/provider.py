@@ -47,6 +47,7 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.sandbox import gatelog, kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
+from expcore_onedata.sandbox.gatepolicy import PAGED
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, mount_identity, parse_mountinfo
 from expcore_onedata.sandbox.inputs import InputsRecord
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
@@ -291,11 +292,12 @@ class SandboxPlatform:
     def _spec(
         self,
         run_key: str,
-        mode: DataPathMode,
+        level: str,
         token: MintedToken | None,
         lease: Lease | None,
         inputs: Sequence[ReadOnlyInput] = (),
     ) -> SandboxSpec:
+        mode = self._s.mode_of(level)
         lease_key, given = (lease.key if lease else None), tuple(inputs)
         if mode is DataPathMode.NONE:
             return SandboxSpec(run_key=run_key, mode=mode, lease_key=lease_key, inputs=given)
@@ -306,6 +308,7 @@ class SandboxPlatform:
             zone=Endpoint.from_url(self._config.zone.url),
             provider=Endpoint.from_url(self._config.local_provider.url),  # the agent is pinned to its local provider
             lease_key=lease_key,
+            listing=self._s.listing_of(level) or PAGED,  # the level's listing mode (O21)
             inputs=given,
         )
 
@@ -343,7 +346,7 @@ class SandboxPlatform:
     def _prepare(
         self,
         run_key: str,
-        mode: DataPathMode,
+        level: str,
         lease: Lease | None,
         tokens: RunTokens | None,
         condition: str | None,
@@ -355,7 +358,7 @@ class SandboxPlatform:
         sandbox = DockerSandbox(
             self._host,
             self._s,
-            self._spec(run_key, mode, data, lease, inputs),
+            self._spec(run_key, level, data, lease, inputs),
             registry=self._registry,
             config_sha256=self._config.sha256,
             **self._options,
@@ -433,7 +436,7 @@ class SandboxPlatform:
                 )
                 minting.add_done_callback(lambda _: minted())  # a task that never got to run has no thread to end
                 tokens = await asyncio.shield(minting)
-                sandbox = self._prepare(run_key, mode, lease, tokens, condition, inputs)
+                sandbox = self._prepare(run_key, level, lease, tokens, condition, inputs)
                 ended = self._threads.began(lease.key if lease is not None else None)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end
