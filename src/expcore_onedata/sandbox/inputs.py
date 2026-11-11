@@ -12,7 +12,8 @@ so the bytes hashed are the bytes the agent sees, whatever happens to the source
 The hash covers each entry's path relative to the input, whether it is a directory, and for a file whether it is
 executable, its size and its SHA-256, in path order (`digest`). The run's metadata records it under
 `read_only_inputs`, with the path in the agent and the input's files and bytes, beside the other inputs of the run it
-records by hash (the images, the TLS mode, the platform file), so a changed input changes the record.
+records by hash (the images, the TLS mode, the platform file), so a changed input changes the record. The plugin
+declares its inputs in the campaign fingerprint too (`fingerprint`), so a resume whose inputs changed is refused.
 
 Once the agent runs, the start proves the mount read-only from inside it (`probe_source`, `judge`): the agent reads a
 file and may execute an executable one, while writing it, renaming, chmod-ing and deleting it, and creating a file or a
@@ -31,7 +32,7 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -178,6 +179,24 @@ def snapshot(source: Path, copy: Path) -> dict[str, Any]:
     return {"sha256": total.hexdigest(), "files": files, "bytes": size}
 
 
+def fingerprint(declared: Mapping[str, Sequence[ReadOnlyInput]]) -> dict[str, Any]:
+    """The read-only inputs' part of the campaign fingerprint, for the plugin to add to its platform half:
+    `StudyPlugin(platform={**config.fingerprint(), **fingerprint(declared)})`. For each name the plugin declares inputs
+    under (a condition, or one name for every run), each input's path in the agent and the hash of its content, in
+    order. The plugin passes the same inputs to `launch`, so a resume whose inputs changed is refused (C06). Inputs
+    that cannot be delivered raise `StartRefused`, naming the position, never a path."""
+    out: dict[str, list[dict[str, str]]] = {}
+    for name, items in declared.items():
+        try:
+            checked = validate(items, TAKEN)
+            out[str(name)] = [{"path": item.target, "sha256": digest(item.source)["sha256"]} for item in checked]
+        except (OSError, InputUnsafe) as error:
+            raise StartRefused(
+                f"the read-only inputs of a declared name cannot be read ({describe_error(error)})"
+            ) from None
+    return {"read_only_inputs": out}
+
+
 def probe_targets(copy: Path) -> tuple[str, str | None]:
     """The file of an input the probe tries to change (the first in path order) and the first executable one, if any,
     each relative to the input."""
@@ -269,4 +288,14 @@ def judge(stdout: str, runnable: bool) -> str | None:
     return None
 
 
-__all__ = ["PROBE_MARK", "InputUnsafe", "digest", "judge", "probe_source", "probe_targets", "snapshot", "validate"]
+__all__ = [
+    "PROBE_MARK",
+    "InputUnsafe",
+    "digest",
+    "fingerprint",
+    "judge",
+    "probe_source",
+    "probe_targets",
+    "snapshot",
+    "validate",
+]

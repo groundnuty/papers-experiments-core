@@ -280,3 +280,30 @@ def test_o20_two_inputs_are_each_copied_mounted_proved_and_recorded(world, scrip
         assert f"type=bind,src={sbx.dir / 'inputs' / str(n)},dst={target},readonly" in mounts
     assert [r["path"] for r in sbx.metadata()["read_only_inputs"]] == [TARGET, "/opt/tables"]
     sbx.stop()
+
+
+def test_o20_c06_a_campaign_does_not_resume_with_changed_read_only_inputs(scripts, tmp_path):
+    """O20, C06: the plugin declares its read-only inputs in the platform's half of the campaign fingerprint
+    (`inputs.fingerprint`), by their path in the agent and the hash of their content: the same inputs resume, a changed
+    script refuses the resume, and the refusal names neither the host's path nor the script."""
+    from campaign_support import make_fingerprint, make_manifest, make_schema
+    from platform_support import NOW
+
+    from expcore.campaign.resume import FingerprintMismatch, open_campaign
+
+    schema, manifest = make_schema(), make_manifest(make_schema())
+
+    def resume():
+        declared = inputs.fingerprint({"every-run": [ReadOnlyInput(scripts, TARGET)]})
+        fingerprint = make_fingerprint(schema, platform=declared)
+        store, _ = open_campaign(tmp_path / "campaign.db", schema, manifest, fingerprint, now=NOW, max_attempts=3)
+        store.close()
+
+    resume()
+    resume()
+    (scripts / "analyse.py").write_text("print('changed')\n", encoding="utf-8")
+    with pytest.raises(FingerprintMismatch) as caught:
+        resume()
+    assert caught.value.differences
+    assert all(line.startswith("platform.read_only_inputs") for line in caught.value.differences)
+    assert str(scripts) not in str(caught.value)
