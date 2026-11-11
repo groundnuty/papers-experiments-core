@@ -34,6 +34,27 @@ def load_toml(path: str | os.PathLike[str]) -> dict[str, Any]:
         raise ConfigError(f"{file}: not valid TOML: {error}") from None
 
 
+def load_toml_bytes(path: str | os.PathLike[str]) -> tuple[bytes, dict[str, Any]]:
+    """Read a TOML file's bytes once and parse them as they are, UTF-8 with no newline translation; return both.
+
+    For a file whose bytes are also rewritten (models.toml, `key_locations`): what is parsed is exactly what is
+    rewritten and hashed, so a bare carriage return, which reading as text would turn into a newline, is refused here.
+    """
+    file = Path(path)
+    try:
+        data = file.read_bytes()
+    except FileNotFoundError:
+        raise ConfigError(f"{file}: file not found") from None
+    except OSError as error:
+        raise ConfigError(f"{file}: cannot be read ({type(error).__name__})") from None
+    try:
+        return data, tomllib.loads(data.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ConfigError(f"{file}: cannot be read ({type(error).__name__})") from None
+    except tomllib.TOMLDecodeError as error:
+        raise ConfigError(f"{file}: not valid TOML: {error}") from None
+
+
 def close_match(name: object, choices: Iterable[str]) -> str:
     """A hint to put right after a name that is none of `choices`: ` (did you mean 'x'?)` for the closest one,
     ignoring case, or "" when none is close."""

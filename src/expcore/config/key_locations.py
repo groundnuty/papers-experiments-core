@@ -14,20 +14,25 @@ package must not show, though: a home directory, an earlier study's folder, an a
   either. A table that names no key location is its own form, so its hashes are what they always were;
 - every replication package ships models.toml in that form, so the identity a reader recomputes from the shipped file
   is the one the records were checked under, with no transformation to take on trust. The build refuses a package
-  whose models.toml still holds any other key location (`location_findings`), a safety net behind the rewrite.
+  whose models.toml still holds any other key location (`location_findings`), and one in which any file still names
+  a key location the study's models declare (`location_finders`), as safety nets behind the rewrite.
 
-The rewrite is textual and checked. A value is replaced only on a line of its own in a model's table
-(`key_file = "..."`, the key bare or quoted, the value a one-line string, a comment after it kept), and the file is
-parsed before and after: every value but the key locations must be unchanged, and every key location must now be the
-placeholder. A key location written any other way (in an inline table, under a dotted key, as a multi-line string)
-cannot be withheld, so loading the table refuses it, naming the model and the key, and no such study runs. Hashing
-never refuses: a file the rewrite cannot reach is hashed as it is, and only a table the load refuses can be one.
+The rewrite is minimal by construction, and checked. It reads the file's bytes once, as UTF-8 with no newline
+translation, which is how the table is loaded too. It marks the lines that begin a statement, outside every string,
+array and inline table (`_statement_starts`); a value is replaced only on such a line that is a plain assignment
+(`key_file = "..."` or `key_env = '...'`, the key bare or quoted, the value a one-line string, a comment after it kept)
+directly under a `[models.<key>]` header. Then every key location the parsed table declares must have been found
+exactly once, only those lines may differ, and the rewritten file must parse to the original with exactly those values
+replaced. Anything else, a key location in an inline table, under a dotted key or as a multi-line string, or bytes that
+are not a TOML table as they are, raises KeyLocationUnreachable: loading the table refuses it, naming the file, and so
+does hashing it, so no such study runs, is checked or ships.
 """
 
 import dataclasses
+import os
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from expcore.config.loading import ConfigError
@@ -42,21 +47,59 @@ _ASSIGNMENT = re.compile(
     r"(?P<value>\"(?:[^\"\\]|\\.)*\"|'[^']*')(?P<rest>[ \t]*(?:#.*)?)"
 )
 _LINES = re.compile(r"(?<=\n)")  # TOML ends a line at LF (CRLF included) and nowhere else
+_NAME_EDGE = r"A-Za-z0-9_"  # a variable's name is found only as a whole identifier
 
 
 class KeyLocationUnreachable(ConfigError):
-    """A key location the textual rewrite cannot replace, so a package could not withhold it."""
+    """A key location the rewrite cannot replace, or a file it cannot read: a package could not withhold it."""
+
+
+def _statement_starts(text: str) -> list[bool]:
+    """For each line of the text, whether it begins outside every string, array and inline table: only such a line
+    can begin a statement. Comments are skipped; a multi-line string may close on up to five quotes, of which the last
+    three are its delimiter; a backslash in a basic string escapes the next character, a newline included."""
+    starts: list[bool] = []
+    quote: str | None = None  # the open string's delimiter: ", ', """ or '''
+    depth = 0  # brackets and braces open around the position (a header's open and close on its own line)
+    line_start, i, size = True, 0, len(text)
+    while i < size:
+        if line_start:
+            starts.append(quote is None and depth == 0)
+            line_start = False
+        char = text[i]
+        if quote is None:
+            if char == "#":
+                end = text.find("\n", i)
+                i = size if end < 0 else end
+                continue
+            if char in "\"'":
+                quote = char * 3 if text.startswith(char * 3, i) else char
+                i += len(quote)
+                continue
+            depth += (char in "[{") - (char in "]}")
+        elif char == "\\" and quote[0] == '"':
+            line_start = text.startswith("\n", i + 1)
+            i += 2
+            continue
+        elif text.startswith(quote, i):
+            run = len(quote)
+            while 3 <= run < 5 and text.startswith(quote[0], i + run):
+                run += 1
+            quote, i = None, i + run
+            continue
+        line_start = char == "\n"
+        i += 1
+    return starts
 
 
 def _header(line: str) -> tuple[str, ...] | None:
-    """The keys of a standard table header (`[models."a.b"]`), or None for any other line."""
-    start = line.lstrip()
-    if not start.startswith("[") or start.startswith("[["):
+    """The keys of a standard table header (`[models."a.b"]`); None for an array of tables or anything else."""
+    if line.lstrip().startswith("[["):
         return None
     try:
         parsed: Any = tomllib.loads(line)
     except tomllib.TOMLDecodeError:
-        return None  # not a header: a line of a multi-line array, say
+        return None
     path: list[str] = []
     while isinstance(parsed, dict) and len(parsed) == 1:
         key, parsed = next(iter(parsed.items()))
@@ -64,22 +107,29 @@ def _header(line: str) -> tuple[str, ...] | None:
     return tuple(path) if path and parsed == {} else None
 
 
-def _replaced(text: str) -> tuple[str, int]:
-    """The text with each key location on a line of its own in a model's table replaced, and how many were."""
-    table: tuple[str, ...] = ()
-    out, count = [], 0
-    for line in _LINES.split(text):
+def _assignments(lines: list[str], starts: list[bool]) -> list[tuple[int, str, re.Match[str]]]:
+    """Each line that is a plain key-location assignment directly under a `[models.<key>]` header, beginning a
+    statement: its number, the model's key and the match. Any header resets the table, an array of tables to none."""
+    table: tuple[str, ...] | None = ()
+    found = []
+    for number, (line, start) in enumerate(zip(lines, starts, strict=False)):
         content = line.rstrip("\n").removesuffix("\r")
-        ending = line[len(content) :]
-        table = _header(content) or table
-        match = _ASSIGNMENT.fullmatch(content) if len(table) == 2 and table[0] == "models" else None
-        if match is None:
-            out.append(line)
+        if not start:
             continue
-        value = PLACEHOLDERS[match["name"]]
-        out.append(f'{match["lead"]}{match["key"]}{match["eq"]}"{value}"{match["rest"]}{ending}')
-        count += 1
-    return "".join(out), count
+        if content.lstrip().startswith("["):
+            table = _header(content)
+            continue
+        match = _ASSIGNMENT.fullmatch(content)
+        if match is not None and table is not None and len(table) == 2 and table[0] == "models":
+            found.append((number, table[1], match))
+    return found
+
+
+def _rewritten(line: str, match: re.Match[str]) -> str:
+    """A plain key-location assignment with its value replaced by the placeholder, everything else of it kept."""
+    ending = line[len(match.string) :]
+    value = PLACEHOLDERS[match["name"]]
+    return f'{match["lead"]}{match["key"]}{match["eq"]}"{value}"{match["rest"]}{ending}'
 
 
 def _entries(parsed: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -93,54 +143,56 @@ def _entries(parsed: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 def _expected(parsed: dict[str, Any]) -> dict[str, Any]:
     """The parsed table with every key location of every model replaced by its placeholder, and nothing else changed."""
     entries = _entries(parsed)
-    if not entries:
-        return parsed
     models = {key: {f: PLACEHOLDERS.get(f, v) for f, v in entry.items()} for key, entry in entries.items()}
-    return {**parsed, "models": {**parsed["models"], **models}}
+    return {**parsed, "models": {**parsed["models"], **models}} if entries else parsed
 
 
-def _unreached(got: dict[str, Any], wanted: dict[str, Any]) -> str:
-    """Name the first key location the rewrite did not replace: `[models.<key>]: key '<field>'`."""
-    now = _entries(got)
-    for key, entry in _entries(wanted).items():
-        for field in PLACEHOLDERS:
-            if field in entry and now.get(key, {}).get(field) != entry[field]:
-                return f"[models.{key}]: key {field!r}"
-    return "a key location"
+def _unreachable(where: str) -> KeyLocationUnreachable:
+    return KeyLocationUnreachable(
+        f"{where} cannot be withheld from a replication package as it is written; write it on a line of its own in "
+        'the model\'s table, as key_file = "..." or key_env = "...", outside any multi-line string'
+    )
 
 
 def withhold_key_locations(data: bytes) -> bytes:
     """models.toml with every key location replaced by its placeholder, and every other byte as it was.
 
-    The bytes come back unchanged, the same object, when they name no key location or are not a TOML table at all
-    (which loading the table refuses). A placeholder already there is written again in the one form, so two tables
-    that differ only in where their keys live give the same bytes. Raises KeyLocationUnreachable, naming the model
-    and the key, when a key location is written where the rewrite cannot reach it.
+    The bytes come back unchanged, the same object, when they name no key location. A placeholder already there is
+    written again in the one form, so two tables that differ only in where their keys live give the same bytes.
+    Raises KeyLocationUnreachable, naming the model and the key, when a key location is written where the rewrite
+    cannot reach it, and when the bytes are not a TOML table as they are (UTF-8, no bare carriage return).
     """
     try:
         text = data.decode("utf-8")
         parsed = tomllib.loads(text)
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
-        return data
-    if not any(field in entry for entry in _entries(parsed).values() for field in PLACEHOLDERS):
-        return data
-    rewritten, count = _replaced(text)
-    got = tomllib.loads(rewritten) if count else parsed
-    wanted = _expected(parsed)
-    if got != wanted:
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise KeyLocationUnreachable(
-            f"{_unreached(got, wanted)} cannot be withheld from a replication package as it is written; write it on "
-            'a line of its own in the model\'s table, as key_file = "..." or key_env = "..."'
-        )
-    return rewritten.encode("utf-8") if count else data
-
-
-def hashed_form(data: bytes) -> bytes:
-    """The bytes the identity hashes for models.toml: its withheld form, or the bytes as they are when it has none."""
+            f"cannot be read as a TOML table as its bytes are ({type(error).__name__}), so its key locations cannot "
+            "be withheld"
+        ) from None
+    declared = [(key, field) for key, entry in _entries(parsed).items() for field in PLACEHOLDERS if field in entry]
+    if not declared:
+        return data
+    lines = _LINES.split(text)
+    found = _assignments(lines, _statement_starts(text))
+    pairs = [(key, match["name"]) for _, key, match in found]
+    for key, field in declared:
+        if pairs.count((key, field)) != 1:
+            raise _unreachable(f"[models.{key}]: key {field!r}")
+    if len(pairs) != len(declared):
+        raise _unreachable("a line taken for a key location")
+    out = list(lines)
+    for number, _, match in found:
+        out[number] = _rewritten(lines[number], match)
+    rewritten = "".join(out)
+    changed = {number for number, (before, after) in enumerate(zip(lines, out, strict=True)) if before != after}
     try:
-        return withhold_key_locations(data)
-    except KeyLocationUnreachable:
-        return data  # only a table the load refuses, which never runs; hashed as it is, it counts more, not less
+        same = changed <= {number for number, _, _ in found} and tomllib.loads(rewritten) == _expected(parsed)
+    except tomllib.TOMLDecodeError:
+        same = False
+    if not same:
+        raise _unreachable("a key location")
+    return rewritten.encode("utf-8")
 
 
 def withheld_entry(spec: Any) -> dict[str, Any]:
@@ -164,4 +216,21 @@ def location_findings(data: bytes) -> list[str]:
         for key, entry in _entries(parsed).items()
         for field, placeholder in PLACEHOLDERS.items()
         if field in entry and entry[field] != placeholder
+    ]
+
+
+def location_finders(specs: Iterable[Any]) -> list[re.Pattern[str]]:
+    """What finds each key location the models declare in any text: a key file's path as written and with `~`
+    expanded, ignoring case, wherever it does not continue a word (whatever follows it: a path that holds it whole
+    still names it), and a variable's name as a whole identifier. A placeholder is never looked for.
+    """
+    paths, names = set(), set()
+    for spec in specs:
+        if spec.key_file and spec.key_file != KEY_FILE_WITHHELD:
+            paths |= {spec.key_file, os.path.expanduser(spec.key_file)}
+        if spec.key_env and spec.key_env != KEY_ENV_WITHHELD:
+            names.add(spec.key_env)
+    return [
+        *(re.compile(rf"(?<!\w){re.escape(path)}", re.IGNORECASE) for path in sorted(paths)),
+        *(re.compile(rf"(?<![{_NAME_EDGE}]){re.escape(name)}(?![{_NAME_EDGE}])") for name in sorted(names)),
     ]

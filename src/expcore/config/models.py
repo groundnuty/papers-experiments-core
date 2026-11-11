@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.config.key_locations import KeyLocationUnreachable, withhold_key_locations
-from expcore.config.loading import ConfigError, Section, close_match, load_toml
+from expcore.config.loading import ConfigError, Section, close_match, load_toml_bytes
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
 from expcore.config.price_table import read_price
 from expcore.config.prices import Price, TieredPrice
@@ -495,10 +495,13 @@ def _accepted(section: Section) -> tuple[str, ...]:
 
 
 def load_models(path: str | os.PathLike[str]) -> ModelTable:
-    """Load and validate `models.toml`; fail at once, naming the file and the key, on the first bad entry."""
-    models = parse_models(load_toml(path), path)
+    """Load and validate `models.toml`; fail at once, naming the file and the key, on the first bad entry.
+
+    The bytes are read once, and both parsed and checked for their key locations as they are (K13)."""
+    raw, data = load_toml_bytes(path)
+    models = parse_models(data, path)
     try:
-        withhold_key_locations(Path(path).read_bytes())  # a package must be able to withhold each key location
+        withhold_key_locations(raw)  # a package must be able to withhold each key location
     except KeyLocationUnreachable as error:
         raise ConfigError(f"{path}: {error}") from None
     return models

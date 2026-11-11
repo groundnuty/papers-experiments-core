@@ -28,6 +28,7 @@ refused: that file names a URL and a commit.
 
 import hashlib
 import io
+import re
 import zipfile
 import zlib
 from collections.abc import Collection, Iterable, Mapping, Sequence
@@ -35,7 +36,7 @@ from dataclasses import dataclass, field
 
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term, term_lines
 from expcore.package.identity import FOUND_COMMIT, FOUND_URL, commit_lines, find_identity, url_lines
-from expcore.package.leaks import describe_hit, scan_tokens
+from expcore.package.leaks import describe_hit, find_locations, scan_tokens
 from expcore.package.spec import Opaque, PackageError
 from expcore.package.wheels import Wheel
 from expcore.provenance.hashfile import Hashes
@@ -98,11 +99,18 @@ def _plain(
 
 
 def _deep(
-    label: str, data: bytes, tokens: Hashes, terms: Anonymisation | None, hidden, redactor: Redactor
+    label: str,
+    data: bytes,
+    tokens: Hashes,
+    terms: Anonymisation | None,
+    hidden,
+    redactor: Redactor,
+    locations: Sequence[re.Pattern[str]] = (),
 ) -> list[str]:
-    """Read a member of the author's own code with every view the checks use for a file."""
+    """Read a member of the author's own code with every view the checks use for a file, the key locations the
+    study's models declare included (K13)."""
     one = {label: data}
-    found = scan_tokens(one, tokens, redactor=redactor)
+    found = find_locations(one, locations, redactor=redactor) + scan_tokens(one, tokens, redactor=redactor)
     if terms is not None:
         found += find_terms(one, terms, redactor=redactor) + find_identity(one, *hidden, opaque=(), redactor=redactor)
     return found
@@ -117,8 +125,13 @@ def scan_wheels(
     attested: Mapping[str, Opaque],
     exempt: Collection[str] = frozenset(),
     redactor: Redactor | None = None,
+    locations: Sequence[re.Pattern[str]] = (),
 ) -> WheelScan:
     """Read every text member of every wheel; list the members that are not text; refuse nothing on its own.
+
+    The key locations the study's models declare (`locations`) are looked for in the author's own code, the wheels read
+    with every view. A release from an index is code the author did not write, so it cannot hold where their key
+    lives, and a vendor's SDK names its own default variable (one a study may well use as its `key_env`).
 
     A wheel in `exempt` (`lockfile.token_exempt`: a pypi.org release whose bytes the study's lock records) is read as
     a release, without the study-token list; the terms and identity of an anonymised package still apply to it. Every
@@ -156,7 +169,7 @@ def scan_wheels(
             elif wheel.from_index:
                 found = _plain(label, text, tokens, terms, hidden, redactor)
             else:
-                found = _deep(label, data, tokens, terms, hidden, redactor)
+                found = _deep(label, data, tokens, terms, hidden, redactor, locations)
             if found:
                 findings += found
                 findings.append(_attest_hint(label, digest, redactor))

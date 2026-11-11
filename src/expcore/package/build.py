@@ -22,7 +22,8 @@
    environment, from which wheels, and the study's declaration of side files when it has one) and `SHA256SUMS`
    (`archive`);
 6. refuse the package if a path or content of any file matches a study token, holds a term of the anonymisation
-   list, or if its models.toml still holds a key location other than the placeholder. The token check is
+   list, or names a key location the study's models declare, or if its models.toml still holds a key location other
+   than the placeholder; another file named models.toml is refused before that. The token check is
    `expcore.provenance.study_tokens`' own scanner with the hashes of names that are private everywhere (hosts,
    addresses, users, spaces, providers: the `all` scope): a study's own condition, dataset or model names belong in
    its own package. Both checks fail closed: a file goes in only if they can read all of it (text,
@@ -50,11 +51,11 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from expcore.campaign.snapshot import SNAPSHOT_FILE
-from expcore.config.key_locations import withhold_key_locations
+from expcore.config.key_locations import location_finders, withhold_key_locations
 from expcore.config.loading import ConfigError
 from expcore.models.route import sdk_version
 from expcore.package.anonymise import Anonymisation, holds_term, load_anonymisation, refuse_models, rewrite
@@ -341,6 +342,13 @@ def _collect(
 ) -> tuple[PackageSpec, dict[str, bytes]]:
     study, spec, files, check = _selection(study_root)
     files[MODELS_FILE] = withhold_key_locations(files[MODELS_FILE])  # in every build; the identity agrees (K13)
+    other = sorted(path for path in files if PurePosixPath(path).name == MODELS_FILE and path != MODELS_FILE)
+    if other:
+        raise PackageError(
+            f"{other[0]}: a file named {MODELS_FILE} beside the study's own; a package withholds the key locations of "
+            f"the study's {MODELS_FILE} only, so leave this one out of [package] include (K13)"
+        )
+    locations = location_finders(study.models.models.values())  # the values the rewrite withheld, looked for anywhere
     if terms is not None:
         refuse_models(terms, _model_names(study))
     where = f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}"
@@ -382,6 +390,7 @@ def _collect(
         attested=attested,
         exempt=exempt,
         redactor=redactor,
+        locations=locations,
     )
     files["Makefile"] = makefile(env)
     files[PACKAGE_FILE] = _package_json(
@@ -405,7 +414,15 @@ def _collect(
     files[SUMS_FILE] = render_sums(files)
     generated = {*GENERATED, REQUIREMENTS}
     findings = read.findings + findings_in(
-        files, tokens, terms, hidden_commits, hidden_urls, opaque, generated=generated, redactor=redactor
+        files,
+        tokens,
+        terms,
+        hidden_commits,
+        hidden_urls,
+        opaque,
+        generated=generated,
+        redactor=redactor,
+        locations=locations,
     )
     if findings:
         raise PackageError("refusing to build the package:" + "".join(f"\n  {finding}" for finding in findings))

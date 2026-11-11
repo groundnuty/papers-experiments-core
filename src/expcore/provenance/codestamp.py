@@ -52,7 +52,8 @@ class CodeScope:
     log of amendments, so that adding a row to one does not change the identity. `skip_dirs` are never entered.
     `canonical` pairs a covered file, by its path relative to the tree root, with the function that gives the bytes
     hashed for it: a canonical form that leaves out what never reaches a run, such as where a model's key lives
-    (`expcore.config.key_locations`). The file is still covered, and every other byte of it still counts.
+    (`expcore.config.key_locations`). The file is still covered, and every other byte of it still counts. A function
+    that cannot make the form refuses the file, and hashing raises its error: such a file is never vouched for.
     """
 
     roots: tuple[str, ...]

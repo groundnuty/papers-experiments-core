@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from expcore.config.key_locations import hashed_form, withhold_key_locations
+from expcore.config.key_locations import withhold_key_locations
 from expcore.config.loading import ConfigError
 from expcore.config.models import load_models
 from expcore.provenance.codestamp import CodeScope, tree_hash
-from expcore.study.config import load_study
+from expcore.study.config import load_study, read_study_identity
 from expcore.study.pipeline import fingerprint_of
 from expcore.study.plugin import StudyContext, load_plugin
 
@@ -160,7 +160,60 @@ def test_k13_the_rewrite_changes_only_the_key_values_and_is_its_own_canonical_fo
         b'[models."delta.v1".extra_body]\r\nkey_file = "an extra"\r\n'
         b'[models.gamma]\nbackend = "openai_compat"\nkey_env = "KEY_WITHHELD"\n'
     )
-    assert withhold_key_locations(withheld) == withheld == hashed_form(table)
+    assert withhold_key_locations(withheld) == withheld
     plain = b'[models.alpha]\nbackend = "stub"\n'
     assert withhold_key_locations(plain) is plain
-    assert hashed_form(b"not = [toml") == b"not = [toml"
+
+
+MODEL = '[models.a]\nbackend = "anthropic"\napi_id = "a-1"\nbase_url = "https://a.example.invalid"\n'
+
+
+@pytest.mark.parametrize(
+    "vendor",
+    [
+        "key_file = '<withheld>'",  # already the placeholder's value, in another quoting: no byte of it may change
+        'key_file = "/vendor/item"',
+        "key_env = 'VENDOR_ITEM'",
+    ],
+)
+def test_k13_a_key_field_under_an_array_of_tables_is_a_vendor_value_and_never_rewritten(vendor):
+    """K13: an array-of-tables header ends the model's table, so a `key_file` or `key_env` of an item under
+    `[[models.a.extra_body.items]]`, a value the request carries, keeps every byte, even one that already reads as the
+    placeholder; only the model's own key location is replaced."""
+    table = f'{MODEL}key_file = "/real/a.key"\n[[models.a.extra_body.items]]\n{vendor}\n'.encode()
+    assert withhold_key_locations(table) == table.replace(b'"/real/a.key"', b'"<withheld>"')
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"""\nkey_env = "INSIDE"\n"""',  # a line inside a multi-line basic string
+        "'''\nkey_file = '/inside'\n'''",  # and inside a multi-line literal one
+        '"""first \\\nkey_env = "INSIDE"\n"""',  # after a line-ending backslash, which escapes the newline
+        '"""\nkey_env = "INSIDE"\nx"""""',  # closing on five quotes, two of them the string's own
+    ],
+    ids=["basic", "literal", "escaped newline", "five quotes"],
+)
+def test_k13_a_line_inside_a_multi_line_string_is_never_rewritten(value):
+    """K13: a line that reads like a key location but lies inside a multi-line string is part of that string's value,
+    so it keeps every byte; the model's own key location after the string is replaced."""
+    table = (MODEL.replace('"a-1"', value) + 'key_env = "REAL_KEY"\n').encode()
+    assert withhold_key_locations(table) == table.replace(b'"REAL_KEY"', b'"KEY_WITHHELD"')
+
+
+def test_k13_a_models_toml_that_is_not_toml_as_its_bytes_are_is_refused_at_load_and_never_hashed(study_dir):
+    """K13: the table is loaded from the very bytes that are rewritten and hashed, so a bare carriage return, which a
+    reading as text would turn into a newline, is refused when the table is loaded and when the identity is hashed,
+    naming the file and never the key location; it is never hashed, run or shipped as it is."""
+    keyed = MODEL.replace('base_url = "https://a.example.invalid"\n', 'base_url = "https://a.example.invalid"\r')
+    raw = (study_dir / "models.toml").read_bytes() + (keyed + 'key_file = "/srv/hidden/a.key"\n').encode()
+    (study_dir / "models.toml").write_bytes(raw)
+    with pytest.raises(ConfigError) as loading:
+        load_models(study_dir / "models.toml")
+    with pytest.raises(ConfigError) as hashing:
+        tree_hash(study_dir, read_study_identity(study_dir).scope)
+    assert str(loading.value).startswith(f"{study_dir / 'models.toml'}: ")
+    assert str(hashing.value).startswith("models.toml: cannot be read as a TOML table as its bytes are")
+    assert "/srv/hidden" not in str(loading.value) + str(hashing.value)
+    with pytest.raises(ConfigError, match="cannot be read as a TOML table"):
+        withhold_key_locations(b"not = [toml")

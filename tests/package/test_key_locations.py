@@ -185,6 +185,37 @@ def test_k13_a_package_whose_models_toml_still_holds_a_key_location_is_refused(c
     assert not list((tmp_path / "dist").glob("*.tar.gz"))
 
 
+def test_k13_any_file_that_names_a_key_location_refuses_the_build(campaign, hashes, tmp_path):
+    """K13: the build looks for every key location the study's models declare in every file it packages, under every
+    view, here a README naming the key file's path and an encoded copy of the variable's name, and refuses each,
+    naming the file and the line and never the value."""
+    copy = copy_campaign(campaign, tmp_path, "named")
+    readme = copy.root / "README.md"
+    escaped = "".join(f"\\u{ord(char):04x}" for char in KEY_ENV)  # the name only an escape-decoding view shows
+    readme.write_text(
+        readme.read_text(encoding="utf-8") + f"\nOur key lives in {KEY_FILE}.\n\nSet `{escaped}`.\n", encoding="utf-8"
+    )
+    lines = readme.read_text(encoding="utf-8").count("\n")
+    with pytest.raises(PackageError) as caught:
+        build_package(copy.root, tmp_path / "dist", hashes=hashes)
+    message = str(caught.value)
+    assert f"README.md:{lines - 2}: a key location the study's models.toml declares" in message
+    assert f"README.md:{lines}: a key location the study's models.toml declares" in message
+    assert not any(fragment in message.lower() for fragment in FRAGMENTS)
+
+
+def test_k13_another_file_named_models_toml_refuses_the_build(campaign, hashes, tmp_path):
+    """K13: a package withholds the key locations of the study's own models.toml only, so another file of that name
+    that the inclusion list takes, which could hold a key location of its own, refuses the build."""
+    copy = copy_campaign(campaign, tmp_path, "second")
+    (copy.root / "notes").mkdir()
+    (copy.root / "notes" / "models.toml").write_text('[models.old]\nbackend = "stub"\n', encoding="utf-8")
+    spec = copy.root / "package.toml"
+    spec.write_text(spec.read_text(encoding="utf-8").replace('"README.md",', '"README.md",\n    "notes",'), "utf-8")
+    with pytest.raises(PackageError, match=r"notes/models\.toml: a file named models\.toml beside the study's own"):
+        build_package(copy.root, tmp_path / "dist", hashes=hashes)
+
+
 def move_keys(root: Path) -> None:
     table = root / "models.toml"
     text = table.read_text(encoding="utf-8")

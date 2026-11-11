@@ -9,7 +9,7 @@ may (`config.key_locations`), and what an anonymised package must not hold eithe
 import importlib.resources
 import json
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
 import expcore
@@ -161,9 +161,11 @@ def findings_in(
     *,
     generated: Collection[str] = frozenset(),
     redactor: Redactor | None = None,
+    locations: Sequence[re.Pattern[str]] = (),
 ) -> list[str]:
-    """Every leak the checks find: a key location left in models.toml (K13), study tokens, and for an anonymised package
-    its terms and its identity, each naming a path through the one `redactor`.
+    """Every leak the checks find: a key location left in models.toml, or one of `locations` (what finds each key
+    location the study's models declare) anywhere (K13); study tokens; and for an anonymised package its terms and its
+    identity, each naming a path through the one `redactor`.
 
     The files in `generated` are the build's own (SHA256SUMS, PACKAGE.json, ...), which list the package's paths. A
     path whose own finding reports it is not reported again through them: they are read with each exact mention of it
@@ -176,11 +178,43 @@ def findings_in(
     findings = (
         [f"{MODELS_FILE}: {found}" for found in location_findings(files[MODELS_FILE])] if MODELS_FILE in files else []
     )
+    findings += find_locations(files, locations, opaque=opaque, redactor=redactor)
     findings += scan_tokens(files, tokens, opaque=opaque, redactor=redactor)
     if terms is not None:
         findings += find_terms(files, terms, opaque=opaque, redactor=redactor)
         findings += find_identity(files, commits, urls, opaque=opaque, redactor=redactor)
     return findings
+
+
+FOUND_LOCATION = "a key location the study's models.toml declares, which no package holds"
+
+
+def find_locations(
+    files: Mapping[str, bytes],
+    locations: Sequence[re.Pattern[str]],
+    *,
+    opaque: Collection[str] = frozenset(),
+    redactor: Redactor | None = None,
+) -> list[str]:
+    """One finding per stream and line that holds a key location (`key_locations.location_finders`), never the value:
+    every stream of every file, under every view, as the token check reads it; and the path of each stream. The
+    files in `opaque` were attested by hash and are not read. Empty when there is nothing to look for."""
+    if not locations:
+        return []
+    redactor = Redactor() if redactor is None else redactor
+    findings: set[str] = set()
+    for name in sorted(files):
+        if name in opaque:
+            continue
+        for stream in streams(name, files[name])[0]:
+            held = any(found.search(stream.label) for found in locations)
+            shown = redactor.name(stream.label, hide=held)
+            if held:
+                findings.add(f"{shown}: the path holds {FOUND_LOCATION}")
+            for _, text in views(stream):
+                lines = {text.count("\n", 0, m.start()) + 1 for found in locations for m in found.finditer(text)}
+                findings |= {f"{shown}:{line}: {FOUND_LOCATION}" for line in lines}
+    return sorted(findings)
 
 
 def reported_paths(

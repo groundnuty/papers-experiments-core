@@ -62,7 +62,7 @@ from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import ShardError, ShardSpec, check_identity
 from expcore.campaign.shard_run import ShardStart, environment_block, share_settings
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
-from expcore.config.key_locations import hashed_form, withheld_entry
+from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
@@ -267,7 +267,7 @@ def _counted_key_locations(study: StudyConfig, recorded: Mapping[str, Any] | Non
     models = recorded.get("models") if isinstance(recorded, Mapping) else None
     raw = (study.root / MODELS_FILE).read_bytes()
     leaves = []
-    if isinstance(configs, Mapping) and raw != hashed_form(raw):
+    if isinstance(configs, Mapping) and raw != withhold_key_locations(raw):
         leaves += [f"configs.{MODELS_FILE}"] if configs.get(MODELS_FILE) == hashlib.sha256(raw).hexdigest() else []
     for key in study.campaign.models if isinstance(models, Mapping) else ():
         spec = study.models.resolve(key)
