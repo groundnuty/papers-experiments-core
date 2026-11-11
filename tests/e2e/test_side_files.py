@@ -1,82 +1,50 @@
 """R14: a study whose runs write a side file beside each record, which the record names by its SHA-256, has it verified
 by `check`, `analyze`, `regenerate` and its replication package's own check, every one of them fail-closed.
 
-The example study is copied and the copy given a small instrument, `RangeLog`, which writes `extent_ranges.json.gz`
-beside each record and records its SHA-256 at `instruments.extent.side_sha256`; the runs of task `dune` make none. The
-copy's study.toml declares that side file, and a second one, `surplus_ranges.json.gz`, that no run writes. The example
-itself is unchanged. One campaign is run, checked, analysed and reported for the module; each test changes a copy of it
+The study is the example's copy with side files (`side_file_support.side_study`): an instrument writes
+`extent_ranges.json.gz` beside each record but those of task `dune`, and study.toml declares it and a second side file
+that no run writes. One campaign is run, checked, analysed and reported for the module; each test changes a copy of it
 and asks the commands what they make of it. Every refusal is made the same way (`tamper`) for `check`, for `analyze`
 after a passing check, for `analyze` under a check file edited to vouch for the change, and for an unpacked package.
 """
 
 import dataclasses
-import gzip
 import hashlib
 import json
 import shutil
-import subprocess
-import sys
-import tarfile
 from pathlib import Path
 
 import pytest
 from package_support import stand_in_vendor
-from study_support import HEAD, Campaign, clean_environment, cli, copy_campaign, finish, make_copy
+from side_file_support import (
+    DECLARED,
+    FIELD,
+    SIDE,
+    SURPLUS,
+    SURPLUS_FIELD,
+    changed_log,
+    doctor,
+    edit,
+    make_check,
+    record_beside,
+    rel,
+    side_files,
+    side_study,
+    stored_check,
+    unpack,
+)
+from study_support import Campaign, clean_environment, cli, copy_campaign, finish
 
 from expcore.package import build as package_build
 from expcore.package.archive import SUMS_FILE, render_sums
 from expcore.package.build import PACKAGE_FILE, build_package, verify_package
-from expcore.provenance.codestamp import write_stamp
 from expcore.provenance.hashfile import render_hash_file
 from expcore.records.record import RunRecord, decode
-from expcore.replay.check import CHECK_FILE, input_files, input_hashes, inputs_sha256
 from expcore.study import pipeline
-from expcore.study.config import load_study
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
-SIDE = "extent_ranges.json.gz"
-SURPLUS = "surplus_ranges.json.gz"
-FIELD = "instruments.extent.side_sha256"
-SURPLUS_FIELD = "instruments.surplus.side_sha256"
-DECLARED = [{"pattern": SIDE, "hash_field": FIELD}, {"pattern": SURPLUS, "hash_field": SURPLUS_FIELD}]
 PRIVATE = "quorvantelle"  # invented; the package's hash file treats it as a name private everywhere
-NAME = "tiny-study-package"
-
-INSTRUMENT = '''
-
-class RangeLog:
-    """A test instrument: writes the run's log of byte ranges beside its record and names it by its SHA-256."""
-
-    namespace = "extent"
-
-    def __init__(self, run_dir: Path, shelf: Shelf) -> None:
-        self.run_dir = Path(run_dir)
-        self.shelf = shelf
-        self.identity: dict[str, Any] = {}
-
-    def start(self, identity: Mapping[str, Any]) -> None:
-        self.identity = dict(identity)
-
-    def finish(self) -> dict[str, Any]:
-        if self.identity["factors"]["task"] == "dune":
-            return {"ok": True}  # this run makes no side file
-        text = json.dumps({"run_key": self.identity["run_key"], "served": self.shelf.served}, sort_keys=True)
-        data = gzip.compress(text.encode("utf-8"), mtime=0)
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        (self.run_dir / "extent_ranges.json.gz").write_bytes(data)
-        return {"ok": True, "side_sha256": hashlib.sha256(data).hexdigest()}
-'''
-
-DECLARATION = f"""
-[[study.side_files]]
-pattern = "{SIDE}"
-hash_field = "{FIELD}"
-
-[[study.side_files]]
-pattern = "{SURPLUS}"
-hash_field = "{SURPLUS_FIELD}"
-"""
 
 # Each refusal of R14 made after a passing check: how `require_current_check` names what it did, and the problem the
 # pairing finds in it.
@@ -90,24 +58,6 @@ CHANGES = {
 }
 SIDE_CHANGES = [c for c in CHANGES if c != "malformed"]  # a malformed hash changes its record: R04 refuses that
 PACKAGE_CHANGES = [(c, False) for c in SIDE_CHANGES] + [(c, True) for c in CHANGES]
-
-
-def edit(path: Path, old: str, new: str) -> None:
-    text = path.read_text(encoding="utf-8")
-    assert old in text, old
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
-
-
-def side_study(base: Path) -> Path:
-    """A stamped copy of the example whose runs write a side file, and whose study.toml declares it."""
-    root = make_copy(base, "study")
-    plugin = root / "plugin.py"
-    edit(plugin, "import asyncio\n", "import asyncio\nimport gzip\nimport hashlib\nimport json\n")
-    edit(plugin, "\n\n# --- the stub model's script", f"{INSTRUMENT}\n\n# --- the stub model's script")
-    edit(plugin, "[FactsServed(shelf)]", "[FactsServed(shelf), RangeLog(request.run_dir, shelf)]")
-    (root / "study.toml").write_text((root / "study.toml").read_text(encoding="utf-8") + DECLARATION, "utf-8")
-    write_stamp(root, HEAD, load_study(root).scope)  # the plugin and study.toml changed: stamp the copy again
-    return root
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -144,36 +94,13 @@ def built(finished, hashes, tmp_path_factory) -> Path:
     return build_package(finished.root, tmp_path_factory.mktemp("dist"), hashes=hashes)
 
 
-def side_files(runs: Path) -> list[Path]:
-    return sorted(runs.rglob(SIDE))
-
-
-def record_beside(path: Path) -> Path:
-    """The one record in the directory of a side file."""
-    [record] = [p for p in path.parent.glob("*.json") if not p.name.endswith("attempt-marker.json")]
-    return record
-
-
 def records_without_side_file(runs: Path) -> list[Path]:
     return sorted(p for p in runs.rglob("*.*.json") if not (p.parent / SIDE).exists())
-
-
-def stored_check(runs: Path) -> dict:
-    return json.loads((runs / CHECK_FILE).read_text(encoding="utf-8"))
 
 
 def side_failures(runs: Path) -> dict[str, str]:
     """The check's failures at stage `side_file`, by the file each names, relative to the batch."""
     return {f["file"]: f["error"] for f in stored_check(runs)["failures"] if f["stage"] == "side_file"}
-
-
-def rel(runs: Path, path: Path) -> str:
-    return path.relative_to(runs).as_posix()
-
-
-def changed_log(path: Path) -> None:
-    """Replace a side file with another log, as a hand-edited one would be."""
-    path.write_bytes(gzip.compress(b'{"run_key": "edited", "served": 99}', mtime=0))
 
 
 def rename_hash(record_file: Path, named: object) -> None:
@@ -214,42 +141,15 @@ def tamper(runs: Path, change: str) -> tuple[list[str], str]:
     return sorted(rel(runs, path) for path in touched), rel(runs, subject)
 
 
-def doctor(runs: Path) -> None:
-    """Edit the check file to vouch for the batch as it is now, as someone covering up a change would."""
-    check_file = stored_check(runs)
-    patterns = check_file["hashed_only_patterns"]
-    check_file["replayed"], check_file["hashed_only"] = input_files(runs, patterns)
-    check_file["n_records"] = check_file["n_ok"] = len(check_file["replayed"])
-    check_file["inputs"] = input_hashes(runs, patterns)
-    check_file["inputs_sha256"] = inputs_sha256(check_file["inputs"])
-    (runs / CHECK_FILE).write_text(json.dumps(check_file, indent=1) + "\n", encoding="utf-8")
-
-
 def check(env: dict[str, str], runs: Path, *more: str) -> int:
     code, _ = cli(env, "check", str(runs), *more)
     return code
-
-
-def unpack(archive: Path, where: Path) -> Path:
-    with tarfile.open(archive) as members:
-        members.extractall(where, filter="data")
-    return where / NAME
 
 
 def resum(root: Path) -> None:
     """Make SHA256SUMS agree with the package's files again, as a careful tamperer would."""
     files = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
     (root / SUMS_FILE).write_bytes(render_sums(files))
-
-
-def make_check(root: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
-    """The package's own `make check`, with the interpreter that already holds its environment."""
-    return subprocess.run(
-        ["make", "-C", str(root), "-f", "Makefile", "check-installed", f"PYTHON={sys.executable}"],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
 
 
 # --- the passing case ------------------------------------------------------------------------------------------------
