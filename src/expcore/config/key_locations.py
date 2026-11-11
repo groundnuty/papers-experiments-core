@@ -48,6 +48,7 @@ _ASSIGNMENT = re.compile(
 )
 _LINES = re.compile(r"(?<=\n)")  # TOML ends a line at LF (CRLF included) and nowhere else
 _NAME_EDGE = r"A-Za-z0-9_"  # a variable's name is found only as a whole identifier
+_TOKEN_EDGE = r"\s\"'`<>|()\[\]{}=,;"  # what a path written in text never runs through
 
 
 class KeyLocationUnreachable(ConfigError):
@@ -219,10 +220,20 @@ def location_findings(data: bytes) -> list[str]:
     ]
 
 
+def _path_finder(path: str) -> re.Pattern[str]:
+    """What finds a key file's path, case-sensitively and only whole. A path with a directory is a token of its own
+    between characters no path written in text runs through (white space, quotes, brackets; or the start or the end),
+    and may end a sentence; a bare file name is an ordinary word (`secrets`, `key.txt`), so it is found only quoted."""
+    escaped = re.escape(path)
+    if "/" not in path and "\\" not in path:
+        return re.compile(rf"(?<=[\"'`]){escaped}(?=[\"'`])")
+    return re.compile(rf"(?<![^{_TOKEN_EDGE}]){escaped}(?=$|[{_TOKEN_EDGE}]|[.,:;!?](?:$|[{_TOKEN_EDGE}]))")
+
+
 def location_finders(specs: Iterable[Any]) -> list[re.Pattern[str]]:
     """What finds each key location the models declare in any text: a key file's path as written and with `~`
-    expanded, ignoring case, wherever it does not continue a word (whatever follows it: a path that holds it whole
-    still names it), and a variable's name as a whole identifier. A placeholder is never looked for.
+    expanded (`_path_finder`), and a variable's name as a whole identifier, each case-sensitively. A placeholder is
+    never looked for.
     """
     paths, names = set(), set()
     for spec in specs:
@@ -231,6 +242,6 @@ def location_finders(specs: Iterable[Any]) -> list[re.Pattern[str]]:
         if spec.key_env and spec.key_env != KEY_ENV_WITHHELD:
             names.add(spec.key_env)
     return [
-        *(re.compile(rf"(?<!\w){re.escape(path)}", re.IGNORECASE) for path in sorted(paths)),
+        *(_path_finder(path) for path in sorted(paths)),
         *(re.compile(rf"(?<![{_NAME_EDGE}]){re.escape(name)}(?![{_NAME_EDGE}])") for name in sorted(names)),
     ]

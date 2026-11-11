@@ -15,17 +15,23 @@ import subprocess
 import sys
 import tarfile
 import zipfile
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from package_support import stand_in_vendor
+from package_support import stand_in, stand_in_vendor, wheel_of
 from study_support import EXAMPLE, HEAD, Campaign, clean_environment, cli, copy_campaign, finish
 
 from expcore.campaign.resume import FINGERPRINT_KEY
+from expcore.config.key_locations import location_finders
 from expcore.package import build as package_build
-from expcore.package.build import PACKAGE_FILE, build_package, verify_package
+from expcore.package.build import PACKAGE_FILE, build_package, private_hashes, verify_package
 from expcore.package.spec import PackageError
+from expcore.package.wheels import Wheel
+from expcore.package.wheelscan import scan_wheels
 from expcore.provenance.codestamp import CodeScope, tree_hash, write_stamp
+from expcore.provenance.environment import CORE_DISTRIBUTION
 from expcore.provenance.hashfile import render_hash_file
 from expcore.records.record import RunRecord, decode
 from expcore.replay.check import CHECK_FILE, inputs_sha256
@@ -204,6 +210,54 @@ def test_k13_any_file_that_names_a_key_location_refuses_the_build(campaign, hash
     assert not any(fragment in message.lower() for fragment in FRAGMENTS)
 
 
+GENERIC = b"SECRET_NAME = re.compile(r'(?:^|_)(?:API_KEY|SECRET|TOKEN)$')\n"  # as the core's own redaction names them
+
+
+def published_vendor(distributions, supplied=None):
+    """The core as a repository install reads it, and one more distribution installed from a repository; both read
+    with every view (not from an index), both naming the generic variable the study's key_env is."""
+    wheels = []
+    for name, version in sorted(distributions.items()):
+        if name == CORE_DISTRIBUTION or not any(w.direct and w.name != CORE_DISTRIBUTION for w in wheels):
+            filename, data = wheel_of(name, version, {f"{name.replace('-', '_')}/naming.py": GENERIC})
+            wheels.append(Wheel(name, version, filename, data, from_index=False, direct=True))
+        else:
+            wheels.append(Wheel(name, version, *stand_in(name, version), from_index=True))
+    return wheels
+
+
+def test_k13_a_generic_key_variable_named_by_the_core_or_a_published_wheel_builds(campaign, hashes, tmp_path):
+    """K13: the core, however it was installed (here from a repository, so read with every view), and any other
+    published distribution, are not the author's code and are never searched for key locations: a study whose
+    key_env is API_KEY, which the core's own redaction names, still builds."""
+    copy = copy_campaign(campaign, tmp_path, "generic")
+    move_keys(copy.root, env="API_KEY")
+    archive = build_package(copy.root, tmp_path / "dist", hashes=hashes, vendor=published_vendor)
+    assert "'key_env' = \"KEY_WITHHELD\"" in every_stream(archive)[f"{NAME}/models.toml"].decode("utf-8")
+
+
+def test_k13_only_the_authors_own_wheels_are_searched_for_key_locations(hashes):
+    """K13: a wheel of the author's own code (a distribution installed from a local directory, never the core) is
+    searched for the key locations the models declare, and refused naming the member; the same wheel, published, is
+    not searched."""
+    env = {
+        "sources": {
+            CORE_DISTRIBUTION: {"kind": "directory", "editable": True},
+            "toy-kit": {"kind": "directory", "editable": False},
+            "remote-kit": {"kind": "vcs", "vcs": "git", "url": "https://code.example.org/r", "commit": "c" * 40},
+        }
+    }
+    assert package_build._own_distributions(env) == {"toy-kit"}
+    filename, data = wheel_of("toy-kit", "1.0", {"toy_kit/naming.py": GENERIC})
+    wheel = Wheel("toy-kit", "1.0", filename, data, from_index=False, direct=True)
+    finders = location_finders([SimpleNamespace(key_file=None, key_env="API_KEY")])
+    tokens = private_hashes(hashes)
+    scan = partial(scan_wheels, [wheel], tokens, terms=None, hidden=(frozenset(), frozenset()), attested={})
+    found = scan(locations=finders, own={wheel.path}).findings
+    assert f"{wheel.path}/toy_kit/naming.py:1: a key location the study's models.toml declares" in "\n".join(found)
+    assert scan(locations=finders, own=frozenset()).findings == []
+
+
 def test_k13_another_file_named_models_toml_refuses_the_build(campaign, hashes, tmp_path):
     """K13: a package withholds the key locations of the study's own models.toml only, so another file of that name
     that the inclusion list takes, which could hold a key location of its own, refuses the build."""
@@ -216,10 +270,10 @@ def test_k13_another_file_named_models_toml_refuses_the_build(campaign, hashes, 
         build_package(copy.root, tmp_path / "dist", hashes=hashes)
 
 
-def move_keys(root: Path) -> None:
+def move_keys(root: Path, *, env: str = MOVED_ENV) -> None:
     table = root / "models.toml"
     text = table.read_text(encoding="utf-8")
-    table.write_text(text.replace(KEY_FILE, MOVED_FILE).replace(KEY_ENV, MOVED_ENV), encoding="utf-8")
+    table.write_text(text.replace(KEY_FILE, MOVED_FILE).replace(KEY_ENV, env), encoding="utf-8")
 
 
 def test_k13_moving_a_key_leaves_the_campaign_one_experiment(campaign, tmp_path, clean_environment):

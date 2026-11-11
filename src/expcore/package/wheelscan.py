@@ -126,12 +126,14 @@ def scan_wheels(
     exempt: Collection[str] = frozenset(),
     redactor: Redactor | None = None,
     locations: Sequence[re.Pattern[str]] = (),
+    own: Collection[str] = frozenset(),
 ) -> WheelScan:
     """Read every text member of every wheel; list the members that are not text; refuse nothing on its own.
 
-    The key locations the study's models declare (`locations`) are looked for in the author's own code, the wheels read
-    with every view. A release from an index is code the author did not write, so it cannot hold where their key
-    lives, and a vendor's SDK names its own default variable (one a study may well use as its `key_env`).
+    The key locations the study's models declare (`locations`) are looked for only in the wheels of the author's own
+    code (`own`, by path: `build._own_distributions`), with every view. The core and every published distribution are
+    code the author did not write: they cannot hold where the author's key lives, and may well name a generic variable
+    a study also uses as its `key_env` (the core's redaction names API_KEY, an SDK its own default).
 
     A wheel in `exempt` (`lockfile.token_exempt`: a pypi.org release whose bytes the study's lock records) is read as
     a release, without the study-token list; the terms and identity of an anonymised package still apply to it. Every
@@ -169,7 +171,7 @@ def scan_wheels(
             elif wheel.from_index:
                 found = _plain(label, text, tokens, terms, hidden, redactor)
             else:
-                found = _deep(label, data, tokens, terms, hidden, redactor, locations)
+                found = _deep(label, data, tokens, terms, hidden, redactor, locations if wheel.path in own else ())
             if found:
                 findings += found
                 findings.append(_attest_hint(label, digest, redactor))

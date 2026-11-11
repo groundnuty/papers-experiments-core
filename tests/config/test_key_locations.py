@@ -5,10 +5,11 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from expcore.config.key_locations import withhold_key_locations
+from expcore.config.key_locations import location_finders, withhold_key_locations
 from expcore.config.loading import ConfigError
 from expcore.config.models import load_models
 from expcore.provenance.codestamp import CodeScope, tree_hash
@@ -163,6 +164,30 @@ def test_k13_the_rewrite_changes_only_the_key_values_and_is_its_own_canonical_fo
     assert withhold_key_locations(withheld) == withheld
     plain = b'[models.alpha]\nbackend = "stub"\n'
     assert withhold_key_locations(plain) is plain
+
+
+@pytest.mark.parametrize(
+    ("key_file", "found", "not_found"),
+    [
+        ("key.txt", ['key_file = "key.txt"', "`key.txt`"], ["my-key.txt", "copy key.txt here", "KEY.TXT"]),
+        ("secrets", ["'secrets'"], ["import secrets", "secrets.token_hex()"]),
+        (
+            "/srv/keys/a.key",
+            ["lives in /srv/keys/a.key.", "`/srv/keys/a.key`", "KEY=/srv/keys/a.key\n"],
+            ["/srv/keys/a.keyring", "/mnt/srv/keys/a.key", "/SRV/keys/a.key"],
+        ),
+    ],
+    ids=["file name", "ordinary word", "path"],
+)
+def test_k13_a_key_file_is_found_case_sensitively_and_only_whole(key_file, found, not_found):
+    """K13: a key file's path is found as written, case-sensitively, and only as a whole token between characters no
+    path runs through (or ending a sentence); a bare file name is an ordinary word, found only quoted. So neither
+    `my-key.txt` nor `import secrets` refuses a build whose key file is `key.txt` or `secrets`."""
+    finders = location_finders([SimpleNamespace(key_file=key_file, key_env=None)])
+    for text in found:
+        assert any(finder.search(text) for finder in finders), text
+    for text in not_found:
+        assert not any(finder.search(text) for finder in finders), text
 
 
 MODEL = '[models.a]\nbackend = "anthropic"\napi_id = "a-1"\nbase_url = "https://a.example.invalid"\n'
