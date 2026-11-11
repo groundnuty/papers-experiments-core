@@ -1,0 +1,169 @@
+# Provenance: new
+"""What one shard of a campaign pins in its store at its first start, and what a resume of it must keep (#154).
+
+`campaign.shard` names the partition, the shares and the identity check; this module is the run side that uses them.
+A start with a `ShardStart` pins four facts in the store's meta table inside the start's own transaction, as the order
+seed is pinned: the spec (`META_SHARD`), when the shard first started (`META_STARTED`), the environment identity it
+ran against (`META_ENVIRONMENT`) and its shares of the caps and the budget (`META_SHARES`), the last three read from
+the plugin and the settings once, when the shard starts. A later start of the same store must give the same spec, the
+same identity and the same shares; it never moves the first start's time.
+
+A resume refuses (`ShardMismatch`), naming the difference and leaving the store as it was: another spec, label or rule;
+a sharded store resumed without a shard, and an unsharded one resumed with a shard; a changed environment identity;
+changed shares. A start without a shard reads one meta row and writes nothing, so an unsharded campaign's store is what
+it was before shards existed.
+
+The totals stay in the campaign fingerprint, which every shard shares; the shares are applied to the settings after it
+is computed (`share_settings`), so they never reach it.
+"""
+
+import dataclasses
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from expcore.campaign.attempts import ResumeRefused
+from expcore.campaign.shard import (
+    META_ENVIRONMENT,
+    META_SHARD,
+    META_SHARES,
+    META_STARTED,
+    ShardSpec,
+    budget_shares,
+    caps_shares,
+)
+from expcore.campaign.store import Store
+
+if TYPE_CHECKING:
+    from expcore.campaign.settings import SchedulerConfig
+
+PINNED = (META_SHARD, META_ENVIRONMENT, META_SHARES)  # compared at every start; META_STARTED is only ever written once
+GROWTH_HINT = (
+    " (a sharded campaign's plan cannot grow: the shards' assignment of pairs depends on the whole plan; "
+    "start new stores for a new plan)"
+)
+_DIGEST_SHOWN = 12
+
+
+class ShardMismatch(ResumeRefused):
+    """A start's shard, environment identity or shares differ from what the store recorded at its first start."""
+
+
+@dataclass(frozen=True)
+class ShardStart:
+    """A shard's start: its spec, the environment identity it reads, checked, and the shares of the caps and budget."""
+
+    spec: ShardSpec
+    environment: Mapping[str, str]
+    shares: Mapping[str, Any]  # {"unit_caps": {unit: n}, "budget": {"max_usd": x, "per_model_usd": {...}} or None}
+
+    def pinned(self) -> dict[str, str]:
+        """The three facts a start compares, by meta key, as canonical JSON text."""
+        return {
+            META_SHARD: canonical(self.spec.to_json()),
+            META_ENVIRONMENT: canonical(dict(self.environment)),
+            META_SHARES: canonical(self.shares),
+        }
+
+
+def canonical(value: Any) -> str:
+    """Sorted, compact JSON: the one text a pinned fact is kept and compared as."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def share_settings(settings: "SchedulerConfig", spec: ShardSpec) -> tuple["SchedulerConfig", dict[str, Any]]:
+    """Shard `spec`'s settings: each unit's cap and the budget's ceilings replaced by its shares of those totals (C30).
+
+    Returns them with the shares as the store and the export keep them. A total below the shard count raises
+    `ShardError`, naming the key it came from. The release step and file of a budget are the host's own and stay.
+    """
+    caps = caps_shares(settings.unit_caps, spec)
+    budget = settings.budget
+    if budget is None:
+        return dataclasses.replace(settings, unit_caps=caps), {"unit_caps": caps, "budget": None}
+    parts = budget_shares(budget.max_usd, budget.per_model_usd, spec)
+    shared = dataclasses.replace(budget, max_usd=parts["max_usd"], per_model_usd=parts["per_model_usd"])
+    return dataclasses.replace(settings, unit_caps=caps, budget=shared), {"unit_caps": caps, "budget": parts}
+
+
+def pin_shard(store: Store, shard: ShardStart | None, started: bool, now: str) -> None:
+    """Pin a first start's shard facts, or compare a later start's with them; inside the caller's transaction.
+
+    `started` says the store has been started before (it records a fingerprint). Without a shard this reads one row
+    and writes nothing. Raises ShardMismatch for each refusal above.
+    """
+    rows = store.db.execute("SELECT key, value FROM meta WHERE key IN (?,?,?,?)", (*PINNED, META_STARTED)).fetchall()
+    held = {row["key"]: row["value"] for row in rows}
+    if shard is None:
+        if META_SHARD in held:
+            recorded = json.loads(held[META_SHARD])
+            raise ShardMismatch(
+                f"this store belongs to shard {recorded['index']} of {recorded['count']} ({recorded['label']!r}) of a "
+                f"sharded campaign, and this start gives no shard: resume it with --shard "
+                f"{recorded['index']}/{recorded['count']} --shard-label {recorded['label']}"
+            )
+        return
+    if META_SHARD not in held:
+        if started:
+            raise ShardMismatch(
+                "this store holds an unsharded campaign, and this start gives a shard: a campaign is sharded from "
+                "its first start (start a new store for the shard)"
+            )
+        for key, text in shard.pinned().items():
+            store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (key, text, now))
+        store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (META_STARTED, now, now))
+        return
+    recorded_spec = json.loads(held[META_SHARD])
+    differences = {
+        META_SHARD: _spec_differences(recorded_spec, shard.spec.to_json()),
+        META_ENVIRONMENT: _identity_differences(json.loads(held.get(META_ENVIRONMENT, "{}")), shard.environment),
+        META_SHARES: _share_differences(json.loads(held.get(META_SHARES, "null")), shard.shares),
+    }
+    refused = {key: lines for key, lines in differences.items() if lines}
+    if not refused:
+        return
+    first = next(iter(refused))
+    lines = "\n  ".join(line for found in refused.values() for line in found)
+    raise ShardMismatch(f"{_REASONS[first].format(**recorded_spec)}:\n  {lines}")
+
+
+_REASONS = {
+    META_SHARD: (
+        "this store started as shard {index} of {count} ({label!r}), and this start gives another spec, label or "
+        "rule: a shard resumes only as itself"
+    ),
+    META_ENVIRONMENT: (
+        "this shard's environment identity changed since its first start (shard {index} of {count}): it would no "
+        "longer have run against what its first runs did"
+    ),
+    META_SHARES: (
+        "this shard's shares of the caps and the budget changed since its first start (shard {index} of {count}): "
+        "they are fixed when it starts, so that the shards' shares never sum past the totals"
+    ),
+}
+
+
+def _spec_differences(recorded: Mapping[str, Any], now: Mapping[str, Any]) -> list[str]:
+    return [
+        f"{name}: recorded {recorded.get(name)!r}, now {now.get(name)!r}"
+        for name in ("rule", "index", "count", "label")
+        if recorded.get(name) != now.get(name)
+    ]
+
+
+def _identity_differences(recorded: Mapping[str, str], now: Mapping[str, str]) -> list[str]:
+    def shown(digest: str | None) -> str:
+        return "absent" if digest is None else digest[:_DIGEST_SHOWN]
+
+    return [
+        f"{name}: recorded {shown(recorded.get(name))}, now {shown(now.get(name))}"
+        for name in sorted(set(recorded) | set(now))
+        if recorded.get(name) != now.get(name)
+    ]
+
+
+def _share_differences(recorded: Any, now: Mapping[str, Any]) -> list[str]:
+    if recorded == json.loads(canonical(now)):
+        return []
+    return [f"recorded {canonical(recorded)}, now {canonical(now)}"]
