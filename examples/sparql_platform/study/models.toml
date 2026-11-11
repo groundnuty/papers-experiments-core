@@ -1,8 +1,11 @@
-# The single model table. Both models are stubs that play a script, so the study needs no network and no key.
+# The single model table. Both models are stubs that play a script, so the study needs no network and no key. The
+# campaign has a budget, so each priced model declares the context window that bounds the request a run can make past
+# its token cap.
 
 [models.alpha-stub]
 backend = "stub"
 status = "frozen"
+context_tokens = 8192
 
 [models.alpha-stub.price]
 input_per_mtok = 1.0
@@ -11,6 +14,7 @@ output_per_mtok = 2.0
 [models.beta-stub]
 backend = "stub"
 status = "frozen"
+context_tokens = 8192
 
 [models.beta-stub.price]
 input_per_mtok = 0.5

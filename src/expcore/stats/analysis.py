@@ -23,7 +23,9 @@ margin (the interval form of two one-sided tests at alpha).
 - "untestable": no pair was used. It is not evidence of anything, least of all of no effect.
 
 A contrast outside the preregistered Holm family is `exploratory`: nothing controls its multiplicity, it is judged by
-its raw p-value at alpha, and every table or report that shows its conclusion shows that label with it.
+its raw p-value at alpha, and every table or report that shows its conclusion shows that label with it. A
+preregistration with `exploratory_only = true` has no family, so every contrast is exploratory, Holm decides nothing,
+and the result says that no confirmatory claim is made (S12).
 
 A treatment attempt (a run that ended in an infrastructure failure its condition declares as its treatment) is scored
 as its condition's outcome, so a scorer that returns None for it takes its pair out of every contrast on that outcome,
@@ -118,12 +120,17 @@ class HolmDecision:
 
 @dataclasses.dataclass(frozen=True)
 class AnalysisResult:
-    """Every declared contrast, the decisions over the family, and the manifest entries of the preregistration."""
+    """Every declared contrast, the decisions over the family, and the manifest entries of the preregistration.
+
+    `exploratory_only` is the preregistration's statement that it makes no confirmatory claim (S12): there is no Holm
+    decision, and every contrast is exploratory.
+    """
 
     contrasts: tuple[ContrastResult, ...]
     holm: tuple[HolmDecision, ...]
     alpha: float
     manifest: Mapping[str, str]
+    exploratory_only: bool = False
 
     def contrast(self, name: str) -> ContrastResult:
         """Return the result of the contrast with this name."""
@@ -322,7 +329,7 @@ def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[Absen
         else r
         for r in results
     )
-    return AnalysisResult(decided, decisions, prereg.alpha, prereg.manifest())
+    return AnalysisResult(decided, decisions, prereg.alpha, prereg.manifest(), prereg.exploratory_only)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -334,7 +341,8 @@ class PowerResult:
 
 
 def power_study(prereg: Preregistration, simulate: bool = True) -> PowerResult:
-    """The power table of the preregistration's [power] settings, at alpha and at alpha divided by the family size.
+    """The power table of the preregistration's [power] settings, at alpha and at alpha divided by the family size;
+    at alpha only when the preregistration has no family (S12).
 
     It reads nothing but the preregistration and runs scipy's test directly (see power), so it checks the design
     without touching the pipeline.

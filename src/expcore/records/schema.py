@@ -221,6 +221,32 @@ def first_turn_rule(version: str, schemas: Sequence[SchemaVersion] = SCHEMAS) ->
     return schemas[position(version, schemas)].first_turn_rule
 
 
+# The first version whose totals are incomplete when the backend counted a reply that became no turn (C26): a 200 that
+# carried usage and nothing the backend could read was billed, and the turns' totals miss it. Earlier versions keep the
+# totals they were written with, so their records replay to the same bytes.
+REPLY_COUNT_RULE_FROM = f"{SCHEMA_PREFIX}3"
+
+
+def reply_count_rule(version: str) -> bool:
+    """Tell whether a record of `version` counts a billed reply that became no turn as incomplete usage."""
+    return _number(version) >= _number(REPLY_COUNT_RULE_FROM)
+
+
+def _number(version: str) -> int:
+    """The number of a version of the schema family; refuse a name outside it."""
+    digits = version[len(SCHEMA_PREFIX) :] if version.startswith(SCHEMA_PREFIX) else ""
+    if not digits.isdigit():
+        raise RecordError(f"unsupported record schema {version!r}")
+    return int(digits)
+
+
+def unread_replies(usage_seen: Mapping[str, Any] | None, turns: int) -> bool:
+    """Tell whether a backend counted more replies than the record kept turns: a billed reply it could not read.
+    `usage_seen` is the backend's tally as the route keeps it; a backend without one counts nothing."""
+    responses = (usage_seen or {}).get("responses")
+    return isinstance(responses, int) and not isinstance(responses, bool) and responses > turns
+
+
 def added_after(version: str, section: str, schemas: Sequence[SchemaVersion] = SCHEMAS) -> frozenset[str]:
     """Return the fields of a section that versions later than `version` introduced."""
     later = schemas[position(version, schemas) + 1 :]

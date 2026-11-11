@@ -11,7 +11,8 @@ changed settings cannot pass for one computed from the file. The loaded object i
 mapping is a read-only view and every list a tuple, so no edit in place can change a preregistration without the mark.
 
     alpha = 0.05
-    holm_family = ["a-vs-b"]
+    holm_family = ["a-vs-b"]   # the confirmatory contrasts; a preregistration that makes no confirmatory claim (a
+                               # pilot) leaves it out and says `exploratory_only = true` instead
 
     [bootstrap]
     replicates = 2000
@@ -70,7 +71,7 @@ from expcore.stats.power import PowerSettings
 OVERRIDE_MARK = "+override"
 DEFAULT_CI_LEVEL = 0.95
 DEFAULT_TARGET_POWER = 0.8
-_TOP_KEYS = ("alpha", "holm_family", "bootstrap", "power", "estimators", "contrasts")
+_TOP_KEYS = ("alpha", "holm_family", "exploratory_only", "bootstrap", "power", "estimators", "contrasts")
 _CONTRAST_KEYS = (
     "conditions",
     "factor",
@@ -109,6 +110,9 @@ def freeze(value: Any) -> Any:
 class Preregistration:
     """A loaded preregistration. `sha256` is the hash of the file, or of the file plus `+override` for a test copy.
 
+    `exploratory_only` is the preregistration's statement that it makes no confirmatory claim: it has no Holm family,
+    and every contrast is exploratory (S12). Exactly one of the two holds: a family, or that statement.
+
     The mappings and sequences it holds are frozen when it is built, whichever way it is built: assigning into one
     raises TypeError, and a mapping or list handed in is copied, so the caller's own object stays the caller's (P04).
     """
@@ -122,11 +126,17 @@ class Preregistration:
     power: PowerSettings | None = None
     estimator_params: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
     schema_digest: str | None = None  # the factor schema the contrasts were validated against
+    exploratory_only: bool = False  # no confirmatory claim: no Holm family, every contrast exploratory (S12)
 
     def __post_init__(self) -> None:
-        """Deep-freeze the contrasts, the family and the estimator parameters into fresh read-only containers."""
+        """Deep-freeze the contrasts, the family and the estimator parameters into fresh read-only containers; refuse a
+        family beside `exploratory_only`, and neither of them (S12)."""
         for name in ("contrasts", "holm_family", "estimator_params"):
             object.__setattr__(self, name, freeze(getattr(self, name)))
+        if self.exploratory_only and self.holm_family:
+            raise ValueError("a preregistration with exploratory_only has no Holm family, and this one names one")
+        if not self.exploratory_only and not self.holm_family:
+            raise ValueError("a preregistration needs a Holm family, or exploratory_only to make no confirmatory claim")
 
     def with_override(self, **changes: Any) -> Preregistration:
         """Return a copy with fields replaced, for tests and never for production; its hash ends in `+override` (P04).
@@ -198,10 +208,22 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
     }
     if not contrasts:
         raise root.fail("contrasts", "must declare at least one contrast")
-    family = _family(root, contrasts)
+    exploratory_only = _flag(root, "exploratory_only")
+    family = () if exploratory_only else _family(root, contrasts)
+    _check_family_claims(root, contrasts, family, exploratory_only)
     power = _power(_table_section(root, "power")) if "power" in raw else None
     params = {name: _estimator_params(source, name, table) for name, table in _tables(root, "estimators").items()}
-    return Preregistration(source, sha256, alpha, bootstrap, contrasts, family, power, params, schema.digest)
+    return Preregistration(
+        source, sha256, alpha, bootstrap, contrasts, family, power, params, schema.digest, exploratory_only
+    )
+
+
+def _flag(section: Section, key: str) -> bool:
+    """Return an optional boolean; absent is False."""
+    value = section.data.get(key, False)
+    if not isinstance(value, bool):
+        raise section.fail(key, f"must be true or false, got {type(value).__name__}")
+    return value
 
 
 def _table_section(root: Section, key: str) -> Section:
@@ -404,10 +426,25 @@ def _check_factor(section: Section, factor: str, levels: tuple[str, str], schema
 
 
 def _family(root: Section, contrasts: Mapping[str, ContrastSpec]) -> tuple[str, ...]:
-    """Read holm_family: a non-empty list of declared contrast names, each once."""
+    """Read holm_family: a non-empty list of declared contrast names, each once.
+
+    An empty list is refused rather than read as "no confirmatory claim": it is more likely a family that was never
+    filled in than a choice, so that choice is made explicitly, with `exploratory_only = true` (S12).
+    """
+    if "holm_family" not in root.data:
+        raise root.fail(
+            "holm_family",
+            "is required: name the confirmatory contrasts or, if the preregistration makes no confirmatory claim "
+            "(a pilot), say so with exploratory_only = true",
+        )
     family = root.strings("holm_family")
     if not family:
-        raise root.fail("holm_family", "is required and must name at least one contrast")
+        raise root.fail(
+            "holm_family",
+            "is empty, which is more likely a mistake than a choice: name at least one contrast or, if the "
+            "preregistration makes no confirmatory claim (a pilot), leave holm_family out and say so with "
+            "exploratory_only = true",
+        )
     for name in family:
         if name not in contrasts:
             raise root.fail(
@@ -415,11 +452,29 @@ def _family(root: Section, contrasts: Mapping[str, ContrastSpec]) -> tuple[str, 
             )
     if len(set(family)) != len(family):
         raise root.fail("holm_family", "names a contrast twice")
+    return family
+
+
+def _check_family_claims(
+    root: Section, contrasts: Mapping[str, ContrastSpec], family: tuple[str, ...], exploratory_only: bool
+) -> None:
+    """Refuse a family beside `exploratory_only`, and a setting only a member of the family uses on a contrast that is
+    not one (S10, S12)."""
+    if exploratory_only and "holm_family" in root.data:
+        raise root.fail(
+            "holm_family",
+            "is given with exploratory_only = true, which says no contrast is confirmatory: leave holm_family out, "
+            "or set exploratory_only = false",
+        )
     for name, spec in contrasts.items():
         if spec.max_unscored_treatment and name not in family:
+            if exploratory_only:
+                key, why = (
+                    "exploratory_only",
+                    f"is true, so there is no family and the max_unscored_treatment of {name!r}",
+                )
+            else:
+                key, why = "holm_family", f"does not name {name!r}, whose max_unscored_treatment"
             raise root.fail(
-                "holm_family",
-                f"does not name {name!r}, whose max_unscored_treatment would do nothing: only a member of the family "
-                "is refused for a treatment attempt left None",
+                key, f"{why} would do nothing: only a member of the family is refused for a treatment attempt left None"
             )
-    return family

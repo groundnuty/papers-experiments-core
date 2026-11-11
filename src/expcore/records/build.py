@@ -37,7 +37,7 @@ from expcore.records.digest import digest, plain
 from expcore.records.record import RunRecord
 from expcore.records.recording import Captured, RecordingBackend
 from expcore.records.redact import Redactor
-from expcore.records.schema import CURRENT, RecordError, first_turn_rule
+from expcore.records.schema import CURRENT, RecordError, first_turn_rule, reply_count_rule, unread_replies
 from expcore.records.seal import mark_unverified, seal
 
 CONTEXT_OVERFLOW = "ContextOverflow"
@@ -344,7 +344,8 @@ def _build_record(
             "malformed_calls": result.malformed_calls,
             "malformed_events": plain(result.malformed_events),
             "tokens_used": result.tokens_used,
-            "usage_incomplete": result.usage_incomplete,
+            "usage_incomplete": result.usage_incomplete
+            or (reply_count_rule(schema_version) and unread_replies(result.backend_info.get("usage_seen"), len(turns))),
             "agent_s": result.agent_s,
             "elapsed_s": result.elapsed_s,
             "infra_wait_s": result.infra_wait_s,

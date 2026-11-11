@@ -174,6 +174,19 @@ def test_c12_a_study_run_with_an_unpriced_model_is_refused_at_the_start_unless_i
         assert free.run().statuses == {"done": 3}
 
 
+def test_c25_a_campaign_with_a_budget_refuses_to_open_with_a_priced_model_that_has_no_context_window(tmp_path):
+    """C25: what bounds the request a run can make past its token cap is the context window, so a budget needs one for
+    every model that is not free; without a budget, or for a free model, none is needed."""
+    settings = settings_for(budget=Budget(max_usd=1000.0))
+    with pytest.raises(ConfigError, match=r"no context window for model\(s\) 'm1'"):
+        build(tmp_path / "a", settings=settings, models=models_for("m1", context_tokens=None), plan=SMALL).open()
+    free = models_for("m1", free=True, context_tokens=None)
+    with build(tmp_path / "b", settings=settings, models=free, plan=SMALL) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+    with build(tmp_path / "c", models=models_for("m1", context_tokens=None), plan=SMALL) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+
+
 def test_c12_and_c13_budgets_are_enforced_and_a_release_lets_the_campaign_go_on_by_its_step(tmp_path):
     """C12 and C13: runs stop being dispatched at the budget; a release written after the stop adds its step, once."""
     plan = {"tasks": ("task-a", "task-b"), "seeds": (1,)}  # six runs, each about 1.13 USD of output

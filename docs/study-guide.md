@@ -45,9 +45,9 @@ All configuration is TOML in the study directory, validated when the study is lo
 | File | Holds |
 |---|---|
 | `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the side files of its records ([section 4](#side-files)), the factors, the conditions and the tasks |
-| `models.toml` | the single model table: each model once, with backend, API id, sampling, limits, price and status |
+| `models.toml` | the single model table: each model once, with backend, API id, sampling, limits and context window, price (flat or in tiers, [below](#prices-and-the-budget)) and status |
 | `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the kinds it records its failures as ([below](#the-schedulers-kinds)), and the budget |
-| `preregistration.toml` | the named contrasts, the Holm family, alpha, the estimators, the bootstrap and the power settings |
+| `preregistration.toml` | the named contrasts, the Holm family (or `exploratory_only = true`, [section 6](#6-what-a-conclusion-may-say)), alpha, the estimators, the bootstrap and the power settings |
 | `package.toml` | the inclusion list of the replication package ([section 8](#8-ship-a-replication-package)) |
 | `platform.toml` | a platform's own settings, read by the platform layer (`expcore_onedata`), not by the core |
 
@@ -105,21 +105,87 @@ except ConfigError as error:
 shutil.rmtree(misspelt)
 ```
 
-### What the budget reserves
+### Prices and the budget
 
-`[budget] max_usd` in `campaign.toml` is held by reserving, not by estimating. Before a run starts, the scheduler adds what has been spent, what the runs in flight can still cost and what this run can cost, and holds the run while that sum is over the ceiling. What a run can cost is its bound, which is what the gate reserves for it before dispatch: the loop's `token_budget` (in `[agent]`) at the model's dearest rate, the highest of its input, output and cache prices. The token budget is checked after each response, so a run can exceed its budget, and so its reservation, by up to one request (a prompt within the model's context window, plus the reply maximum), and it then ends as `token_cap`. `max_usd` can therefore be exceeded by that margin for each attempt in flight. Each run in flight is reserved its bound too, and an attempt that was killed, or whose usage was not reported, is charged its bound as spent. The mean cost of the runs so far decides nothing, because a run that overran it would pass the ceiling. `per_model_usd` caps single models the same way, and a model with neither a price nor `free = true` is held outright, since its cost is unknown.
+A model's price is `[models.<key>.price]` in `models.toml`, in US dollars per million tokens: `input_per_mtok` and `output_per_mtok`, and optionally `cache_write_per_mtok` and `cache_read_per_mtok`, which are the input price when left out. A model the study hosts itself says `free = true` instead. With a budget, every planned model that is not free also declares its endpoint's context window, `context_tokens`, for the reason given below. `run` refuses to start or resume the campaign without it, naming `models.toml` and the model's key; checking, analysing, reporting and a package's check of a finished study do not need it.
 
-The example's bound is small: 20,000 tokens at alpha-stub's dearest rate, 2 USD per million output tokens, is 0.04 USD a run, against a ceiling of 5 USD. A real model's is not. With `token_budget = 2000000` and a model priced at 15 USD per million input tokens and 75 per million output tokens, every run reserves 2,000,000 tokens at 75 USD per million, 150 USD, however little a typical run spends. A ceiling of 50 USD then holds the campaign before its first run (0 spent, 0 in flight, 150 for this run: over 50), `run` exits 3, and the hold it prints gives those three figures. With two workers, the second run needs 300 USD of room. To run, raise `max_usd` above the bound times the runs that may be in flight, plus what has been spent, or lower `token_budget`, which is also the cap that ends a run as `token_cap`.
+```toml
+# my-study/models.toml
+[models.alpha-stub]
+context_tokens = 8192
+
+[models.alpha-stub.price]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+```
+
+A price that depends on the prompt's length is two or more `[[models.<key>.price.tiers]]` tables in place of the flat keys, each with those four prices. Every tier but the last has `up_to_prompt_tokens`, the longest prompt it takes, increasing from tier to tier; the last takes every longer prompt. A request, its reply included, takes the prices of the tier its whole prompt, cached part included, fell in. A run's cost is the sum over its requests, from the usage each turn of its record reports, so the cost the campaign charged is the cost its records give again. A model without tiers is priced from a run's totals.
 
 ```python
-from expcore.campaign.attempt_bounds import bound_usd
-from expcore.config.prices import Price
+import tomllib
 
-limits = study.campaign.agent.limits
-assert (limits.token_budget, study.campaign.scheduler.budget.max_usd) == (20000, 5.0)
-assert bound_usd(study.models.resolve("alpha-stub"), limits.token_budget) == 0.04  # what each run reserves
-dear = Price(input_per_mtok=15.0, output_per_mtok=75.0)  # US dollars per million tokens
-assert dear.dearest_per_token() * 2_000_000 == 150.0  # its bound under token_budget = 2000000
+from expcore.config.models import parse_models
+
+LONG_CONTEXT = """
+[models.long-context]
+backend = "openai_compat"
+api_id = "vendor/long-context-1"
+base_url = "https://llm.example.invalid/v1"
+key_env = "LONG_CONTEXT_KEY"
+status = "frozen"
+context_tokens = 200000
+
+[[models.long-context.price.tiers]]
+up_to_prompt_tokens = 128000
+input_per_mtok = 0.25
+output_per_mtok = 1.25
+cache_write_per_mtok = 0.3125
+
+[[models.long-context.price.tiers]]
+input_per_mtok = 0.5
+output_per_mtok = 2.5
+cache_write_per_mtok = 0.625
+"""
+model = parse_models(tomllib.loads(LONG_CONTEXT), "models.toml").resolve("long-context")
+assert model.price.for_prompt(128_000).input_per_mtok == 0.25  # at the boundary: the lower tier
+assert model.price.request_usd(150_000, 2_000) == (150_000 * 0.5 + 2_000 * 2.5) / 1e6  # past it, reply included
+```
+
+`[budget]` of `campaign.toml` sets the ceiling, `max_usd`. Before a run starts, the budget gate reserves the most the run can cost, and the run starts only when what was spent, the reservations of the runs in flight and its own fit under the ceiling. What a run can cost follows from its caps in `[agent]`:
+
+- The token cap, `token_budget` (C below), counts each reply's input and output tokens, the whole prompt with its cached part, summed over the run's requests. The budget is checked after each response and before each request, so a run can exceed it by at most one request: the last request goes out while the run is under its cap, and its prompt and reply then count. That request's prompt is within the context window (W, `context_tokens`), its reply within the reply maximum (R, `max_output_tokens`, or the model's own when lower) where the endpoint holds replies to it, and the run then ends as `token_cap`.
+- A run makes at most one request more than its tool rounds, so the requests before the last carry at most O = `max_tool_rounds` x R output tokens.
+- Let p_out be the dearest output price of any tier and p_in the dearest input price of any tier, the input or a cache price, whichever is higher.
+
+The reservation of one run is then the most its requests within the cap can cost, plus the most the request past it can. For a model **held to its reply maximum**, the requests within the cap cost at most O x p_out + (C - O) x p_in when p_out is at least p_in and O is at most C, and C x max(p_in, p_out) otherwise, which is never more than the whole cap at the dearest rate; the request past the cap adds W x p_in + R x p_out. For every other model the requests within the cap are reserved the whole cap at the dearest rate, C x max(p_in, p_out), and the request past it W x max(p_in, p_out), since only the window holds its prompt and reply together.
+
+A model is held to its reply maximum only when the campaign has shown it, never from the backend's name. Two things must hold: the core's own factory builds its backend, an OpenAI-compatible or Anthropic adapter that sends R as `max_tokens` in every request (a plugin's `backend_factory` may wrap that adapter or replace it, so a model it builds is never held to R); and with a budget, at each start of the campaign, admission sends the model a request with a `max_tokens` of 16 that asks for a long reply, and the reply comes back cut at that limit, its output count within it. A model the probe does not show is still admitted, with the larger reservation and a `reply_cap_not_shown` event; so is a model whose one-token completion at admission comes back with more than one output token, which is marked at once and not sent the probe. A reply that later reports more output than R takes the model off the smaller bound for the rest of the campaign, a resume included: the reply is a `reply_over_maximum` event, every run of the model is reserved the larger bound from then on, those in flight too, and each later request of a run that was reserved the smaller one goes out only while the campaign is within its ceilings. A resend is cleared again right before it goes out, after the retrier's wait, because the model may have been taken off its maximum during the wait: a top-up reserved by the smaller bound then reserves the rest of the larger one, or the resend is not sent and the attempt is a budget hold.
+
+Two kinds of send are beyond what the token cap counts, and each is **topped up**: a send that failed after it may have been billed (a connection error or a 5xx), which the retrier sends again, and every request after a reply that did not report its input or its output tokens, since the loop counts a missing count as 0 and the cap then no longer bounds the run. A top-up is one request's bound, the same as the request past the cap above. It is reserved against the ceilings before the send goes out, charged at once and never refunded, because what that send cost is unknown; the last failed send of a request, after which nothing is sent again, is charged too. A reply without usage is a `usage_unreported` event. If a top-up does not fit, the send is not made and the attempt ends as a **budget hold**: infrastructure of kind `budget_hold`, set aside and run again when the budget allows, never a treatment, not charged against the run's attempts, and counted per condition and model in the export and the report. The loop's token counting and its `token_cap` ending are not changed. Without a budget nothing is topped up, and no probe of the reply maximum is sent.
+
+Every model's one-token completion at admission must report its input and output tokens, budget or none: the token cap is held from the counts each reply reports, so an endpoint that omits them would be the one model the cap does not bind, and the model is not admitted.
+
+With a budget, admission's probes are paid from it too, at every start of the campaign: each send of the one-token completion and of the probe of the reply maximum, a resend after a failure that may have been billed included, is reserved one request's bound by the window against the ceilings before it goes out and charged in the store at once, and a reply that reports both counts settles it to what they cost at the dearest rates. A send that failed keeps its bound. A probe the budget cannot cover is not sent, and its model is not admitted, its hold saying the budget is spent; a release written for a stopped campaign is taken at the start, before the probes ask for room. The stub sends nothing an endpoint could bill, so its probes are free, and a model without a price is not probed under a budget, which holds it for its unknown cost.
+
+So a run never costs more than its reservation and its top-ups together, as long as the endpoint refuses a request longer than its window and, for a model held to R, applies the `max_tokens` it is sent; a reply found past R is itself outside that guarantee, and every request after it is covered. What was priced by R before that reply was seen falls inside the same limit: a top-up charged by R for a send already made is not raised when the model is taken off R, and an attempt reserved by R whose usage is unknown, an interrupted one among them, is charged that bound, at a restart too, until a reply past R takes its model off it. A stub's scripted usage beyond the model's context window, or a request of a study's own backend that outgrows it, is outside it too. An attempt killed before its usage was recorded, or whose usage is unknown, is charged its reservation, and its top-ups on top. Which bound that is, by the reply maximum or by the window, is written on the attempt's row when it starts, so a later start charges it the same before admission has shown any model held to R, and a start that shows its model held does not charge an attempt reserved by the window less; a model taken off R charges its attempts by the window, whatever their rows say.
+
+For the tiered model above, with a 10M-token cap, 30 rounds and replies of at most 8,000 tokens, the upper tier's prices apply. Held to its reply maximum, the replies before the last carry at most 240,000 output tokens at $2.50 per million, $0.60, and the rest of the cap is input at its dearest rate, the cache write's $0.625, $6.10. The request past the cap adds a 200,000-token prompt at $0.625 and an 8,000-token reply at $2.50, $0.145, which is also what each of its top-ups is charged. The reservation, $6.845, is far below the $25.50 the model is reserved when it is not held: the whole cap and the whole window at $2.50. The example's stubs are never held, and reserve their whole cap and their whole window at the dearest rate:
+
+```python
+from expcore.campaign.attempt_bounds import bound_usd, cap_bound_usd, overshoot_usd, request_bound_usd
+from expcore.config.models import Limits
+
+limits = Limits(
+    max_tool_rounds=30, time_cap_s=600.0, token_budget=10_000_000, output_cap_chars=8000, max_output_tokens=8000
+)
+assert round(cap_bound_usd(model, limits, reply_capped=True), 6) == 6.70  # 240,000 x 2.50 + 9,760,000 x 0.625
+assert round(overshoot_usd(model, limits, reply_capped=True), 6) == 0.145  # 200,000 x 0.625 + 8,000 x 2.50
+assert round(bound_usd(model, limits, reply_capped=True), 6) == 6.845
+assert round(request_bound_usd(model, limits, reply_capped=True), 6) == 0.145  # one top-up
+assert round(bound_usd(model, limits), 6) == 25.5  # not held: (10,000,000 + 200,000) x 2.50, per million
+
+alpha = study.models.resolve("alpha-stub")
+assert round(bound_usd(alpha, study.campaign.agent.limits), 6) == 0.056384  # (20,000 + 8,192) x 2, per million
 ```
 
 ### The federation's certificate
@@ -196,7 +262,7 @@ tools = "basic"
 infrastructure_is_treatment = ["knowledge"]
 ```
 
-Two rules bound this. A failure before the model's first turn is never treatment, whatever the condition declares: nothing the agent did can have met the manipulation, so the attempt is set aside and run again. And a kind may be non-treatable: `tool_plane_integrity` (the tool server's rights or token could not be verified) can never be a treatment, nor can a kind a platform registers with `treatable=False`, and loading a study whose condition declares one is refused, naming the file and the key. The scheduler also refuses a campaign in which a condition declares the kind its health check or its endpoint-identity check reports.
+Two rules bound this. A failure before the model's first turn is never treatment, whatever the condition declares: nothing the agent did can have met the manipulation, so the attempt is set aside and run again. And a kind may be non-treatable: `tool_plane_integrity` (the tool server's rights or token could not be verified) and `budget_hold` (the budget stopped the run, [section 2](#prices-and-the-budget)) can never be a treatment, nor can a kind a platform registers with `treatable=False`, and loading a study whose condition declares one is refused, naming the file and the key. The scheduler also refuses a campaign in which a condition declares the kind its health check or its endpoint-identity check reports.
 
 ```python
 import shutil
@@ -429,6 +495,8 @@ Every contrast ends in one of five words, `difference`, `trivial_difference`, `e
 
 A contrast outside the preregistered Holm family is exploratory. It is judged by its raw p-value, nothing controls its multiplicity, and every table and report shows it apart, labelled exploratory, never as confirmatory. Only the Holm family carries the study's confirmatory claims.
 
+A preregistration that makes no confirmatory claim, such as a pilot's, says so with `exploratory_only = true` in place of `holm_family`. Every contrast is then exploratory: `analysis.json` has `"exploratory_only": true` and no Holm decision, the report has one table, of exploratory contrasts, and its summary and `analyze`'s terminal output say that no confirmatory claim is made. An empty `holm_family = []` is refused, because it is more likely a family never filled in than a choice; the flag is the way to make that choice. The flag is in the file, so in the preregistration's hash, and a pilot's runs analysed under it never enter a confirmatory test.
+
 A contrast that declares `treatment_outcomes = "excluded"` compares its arms without the runs the outage ended, so its conclusion says nothing about the outage itself, and `not_detected` there is not the absence of an outage effect. The report puts `excluded` and the pairs it left out in the contrast's own row, beside its conclusion.
 
 ```python
@@ -479,7 +547,8 @@ rehearsal = Path("rehearsal-study")
 shutil.copytree("my-study", rehearsal, ignore=shutil.ignore_patterns("out"))
 models = rehearsal / "models.toml"
 entry = '[models.alpha-stub]\nbackend = "stub"\nstatus = "frozen"\n'
-models.write_text(models.read_text().replace(entry, entry + "max_output_tokens = 256\ncontext_tokens = 200000\n"))
+# the example already declares a context window, so only the reply cap is added
+models.write_text(models.read_text().replace(entry, entry + "max_output_tokens = 256\n"))
 assert load_study(rehearsal).config_sha256["models.toml"] != study.config_sha256["models.toml"]  # another campaign
 models.write_text(models.read_text().replace(entry, entry + 'prompt_cache_ttl = "5m"\n'))
 try:
