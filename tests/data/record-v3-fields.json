@@ -1,0 +1,153 @@
+{
+ "sections": {
+  "record": {
+   "run_key": "str",
+   "factors": "dict",
+   "attempt": "int",
+   "treatment_kinds": "list",
+   "route": "dict",
+   "prompt": "dict",
+   "tools": "list",
+   "agent_config": "dict",
+   "agent_config_sha256": "str",
+   "code": "dict",
+   "core_version": "str | NoneType",
+   "transcript": "list",
+   "failed_request": "dict | NoneType",
+   "tool_calls": "list",
+   "clock": "list",
+   "outcome": "dict",
+   "totals": "dict",
+   "instruments": "dict",
+   "scores": "dict",
+   "redacted_paths": "list"
+  },
+  "prompt": {
+   "system": "dict",
+   "user": "dict",
+   "tools_sha256": "str"
+  },
+  "prompt_part": {
+   "text": "str",
+   "sha256": "str",
+   "template_sha256": "str | NoneType",
+   "slots": "dict | NoneType"
+  },
+  "tool": {
+   "name": "str",
+   "description": "str",
+   "input_schema": "dict",
+   "terminal": "bool"
+  },
+  "turn": {
+   "index": "int",
+   "neutral": "dict",
+   "native": "dict",
+   "tool_messages": "list",
+   "request_sha256": "str",
+   "settings_sha256": "str",
+   "stop_reason": "str | NoneType",
+   "usage": "dict",
+   "latency_s": "float | int",
+   "served_model": "str | NoneType",
+   "system_fingerprint": "str | NoneType",
+   "retries": "list",
+   "waits_left_open": "int",
+   "infra_wait_by_kind": "dict"
+  },
+  "neutral": {
+   "text": "str",
+   "reasoning": "str | NoneType",
+   "tool_calls": "list"
+  },
+  "neutral_call": {
+   "id": "str",
+   "name": "str",
+   "arguments": "dict",
+   "parse_error": "str | NoneType",
+   "raw_arguments": "str | NoneType"
+  },
+  "usage": {
+   "input_tokens": "int | NoneType",
+   "output_tokens": "int | NoneType",
+   "uncached_input_tokens": "int | NoneType",
+   "cache_creation_input_tokens": "int | NoneType",
+   "cache_read_input_tokens": "int | NoneType",
+   "extra": "dict",
+   "extra_cut": "int"
+  },
+  "tool_call": {
+   "turn": "int",
+   "round": "int",
+   "call_id": "str",
+   "name": "str",
+   "arguments": "dict",
+   "status": "str",
+   "text": "str",
+   "raw_text": "str",
+   "raw_chars": "int",
+   "truncated": "bool",
+   "error_class": "str | NoneType",
+   "raw_arguments": "str | NoneType",
+   "infra_wait_s": "int | float",
+   "started_s": "int | float | NoneType",
+   "ended_s": "int | float | NoneType",
+   "detail": "str",
+   "source_truncated": "bool | NoneType",
+   "waits_left_open": "int",
+   "terminal": "bool",
+   "infra_wait_by_kind": "dict",
+   "rendering_verified": "bool"
+  },
+  "failed_request": {
+   "kind": "str",
+   "infra_kind": "str | NoneType",
+   "detail": "str | NoneType",
+   "status": "int | NoneType",
+   "pattern": "str | NoneType",
+   "error_type": "str | NoneType",
+   "settings_sha256": "str",
+   "request_sha256": "str"
+  },
+  "outcome": {
+   "name": "str",
+   "detail": "str",
+   "infra_kind": "str | NoneType",
+   "error_type": "str | NoneType",
+   "defect": "dict | NoneType",
+   "treatment": "bool"
+  },
+  "defect": {
+   "exception": "str",
+   "stack_sha256": "str"
+  },
+  "malformed_event": {
+   "round": "int",
+   "call_id": "str",
+   "name": "str",
+   "error": "str",
+   "raw": "str"
+  },
+  "totals": {
+   "rounds": "int",
+   "malformed_calls": "int",
+   "malformed_events": "list",
+   "tokens_used": "int",
+   "usage_incomplete": "bool",
+   "agent_s": "int | float",
+   "elapsed_s": "int | float",
+   "infra_wait_s": "int | float",
+   "infra_wait_by_kind": "dict",
+   "cleanup_s": "int | float",
+   "cleanup_timed_out": "bool",
+   "abandoned_threads": "int",
+   "final_text": "str | NoneType"
+  }
+ },
+ "optional": {
+  "usage": [
+   "extra",
+   "extra_cut"
+  ]
+ }
+}

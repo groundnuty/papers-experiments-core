@@ -2,12 +2,21 @@
 
 It implements `HostOps` (expcore_onedata.sandbox.hostops) and records every effect in `calls`, in order, so a test can
 assert the order of a teardown. Work that needs a real directory (the sandbox's own files) uses the test's `tmp_path`.
-Names, images and addresses are invented. The fake knows only the docker commands the package uses; anything else
-fails loudly, so a new command shows up as a test failure and not as a silent pass.
+The copy helper of a copy out of the sandbox (`copyhelper.py`, run with this interpreter) and `chmod` run for real, as
+this user and never under sudo, on the test's own directories, so a test sees what the helper does with a link, a FIFO
+or an odd name; a test that wants another answer wraps `run`. `chown` only records (this user cannot give a file to
+root), and `rm -rf` makes read-only directories writable before it removes them, as root needs not. `docker pause`
+freezes a container: its cgroup says `frozen 1` until `unpause`, and nothing can be run in it meanwhile. Names, images
+and addresses are invented. The fake knows only the docker
+commands the package uses; anything else fails loudly, so a new command shows up as a test failure and not as a silent
+pass.
 """
 
 import json
+import os
 import shutil
+import subprocess
+import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -16,6 +25,7 @@ from typing import Any
 
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.hostops import CmdResult
+from expcore_onedata.sandbox.inputs import PROBE_MARK
 
 VALUED = {
     "--name", "--network", "--label", "-l", "--user", "-u", "--cpus", "--memory", "--memory-swap", "--pids-limit",
@@ -42,6 +52,7 @@ class FakeContainer:
     oom_killed: bool = False
     logs: str = ""
     started_at: str = "2026-01-01T00:00:00Z"
+    paused: bool = False
 
     def mount_specs(self) -> list[str]:
         return [*self.options.get("-v", []), *self.options.get("--mount", [])]
@@ -59,6 +70,15 @@ def _mounts_json(c: FakeContainer) -> list[dict[str, str]]:
     return out
 
 
+def writable(path: str) -> None:
+    """Make every directory under `path` writable by this user, as root needs not, so that it can be removed."""
+    for top, dirs, _ in os.walk(path):
+        for name in [".", *dirs]:
+            full = os.path.join(top, name)
+            if not os.path.islink(full):
+                os.chmod(full, 0o700)
+
+
 def _inspect_json(c: FakeContainer) -> dict[str, Any]:
     return {
         "Id": c.id,
@@ -66,8 +86,9 @@ def _inspect_json(c: FakeContainer) -> dict[str, Any]:
         "Image": c.image,
         "Config": {"Labels": c.labels},
         "State": {
-            "Status": "running" if c.running else "exited",
+            "Status": ("paused" if c.paused else "running") if c.running else "exited",
             "Running": c.running,
+            "Paused": c.paused,
             "Pid": c.pid if c.running else 0,
             "ExitCode": c.exit_code,
             "OOMKilled": c.oom_killed,
@@ -131,12 +152,18 @@ class FakeHost:
         self.one_shots: list[FakeContainer] = []  # the `--rm` containers that were run, as they were labelled
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
+        self.pause_without_freezing = False  # a `docker pause` that answers 0 but leaves the cgroup unfrozen
         self.base_bundle = "BASE BUNDLE\n"
         self.add_process(__import__("os").getpid(), start=777)
 
     @staticmethod
     def _default_exec(container: FakeContainer, argv: list[str], stdin: str | None) -> CmdResult:
-        """The agent's code does nothing, and the read-only probe is refused as a read-only filesystem refuses it."""
+        """The agent's code does nothing, and the read-only probes are refused as a read-only filesystem refuses them:
+        the root's and the mount's write, and every change to a read-only input, which the agent can still read and
+        run."""
+        if stdin and PROBE_MARK in stdin:
+            refused = dict.fromkeys(("write", "beside", "mkdir", "rename", "chmod", "delete"), 30)
+            return CmdResult(0, json.dumps({"read": "done", "run": True, **refused, "work": "done"}) + "\n")
         if stdin and "open(" in stdin and "'w'" in stdin:
             return CmdResult(0, "blocked 30\n")
         return CmdResult(0)
@@ -247,6 +274,8 @@ class FakeHost:
             handler = self.run_handlers.get(argv[0])
             if handler is not None:
                 return handler(argv)
+            if argv[0] == sys.executable and "-c" in argv:  # the copy helper, run for real
+                return self.real(argv, input)
             return self._run_default(argv)
 
     def _run_default(self, argv: list[str]) -> CmdResult:
@@ -255,13 +284,9 @@ class FakeHost:
                 return CmdResult(0, self.routes)
             case "journalctl":
                 return CmdResult(0, self.journal)
-            case "cp":
-                src, dst = Path(argv[-2]), Path(argv[-1])
-                if src.is_dir():
-                    shutil.copytree(src, dst, dirs_exist_ok=True)
-                else:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
+            case "chmod":
+                return self.real(argv)
+            case "chown":  # this user cannot give a file to root: the command is recorded, and nothing changes
                 return CmdResult(0)
             case "dmesg":
                 return CmdResult(0, self.dmesg)
@@ -283,6 +308,7 @@ class FakeHost:
                 self.mounts.pop(target, None)
                 return CmdResult(0)
             case "rm" if "-rf" in argv:
+                writable(argv[-1])  # root removes what is read-only; this user must make it writable first
                 shutil.rmtree(argv[-1], ignore_errors=True)
                 return CmdResult(0)
             case "rm" if "-f" in argv:  # one file; a missing one is not an error, as with the real command
@@ -295,9 +321,24 @@ class FakeHost:
                 shutil.move(argv[-2], argv[-1])
                 self.relocate_mounts(argv[-2], argv[-1])
                 return CmdResult(0)
-            case "mount" | "nsenter" | "sh" | "find" | "test" | "truncate" | "chown":
+            case "mount" | "nsenter" | "sh" | "test" | "truncate":
                 return CmdResult(0)
         raise AssertionError(f"the fake host does not know the command {argv[0]!r}")
+
+    @staticmethod
+    def real(argv: list[str], input: str | None = None) -> CmdResult:
+        """Run a command for real, as this user and never under sudo, on the test's own directories."""
+        done = subprocess.run(
+            argv,
+            input=input,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        return CmdResult(done.returncode, done.stdout, done.stderr)
 
     # ---------------------------------------------------------------- HostOps: docker
     def docker(
@@ -326,7 +367,7 @@ class FakeHost:
             return self._run_container(rest, env)
         if command == "exec":
             return self._exec(rest, stdin)
-        if command in ("rm", "stop", "inspect", "ps", "logs", "kill"):
+        if command in ("rm", "stop", "inspect", "ps", "logs", "kill", "pause", "unpause"):
             return getattr(self, f"_{command}")(rest)
         if command == "network":
             return getattr(self, f"_net_{rest[0]}")(rest[1:])
@@ -384,7 +425,33 @@ class FakeHost:
         container = self.containers.get(args[i])
         if container is None or not container.running:
             return CmdResult(126, "", f"Error response from daemon: container {args[i]} is not running")
+        if container.paused:
+            return CmdResult(126, "", f"Error response from daemon: container {args[i]} is paused")
         return self.exec_handler(container, args[i + 1 :], stdin)
+
+    def _cgroup_events(self, container: FakeContainer, frozen: bool) -> None:
+        self.files[f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope/cgroup.events"] = (
+            f"populated 1\nfrozen {int(frozen)}\n"
+        )
+
+    def _pause(self, args: list[str]) -> CmdResult:
+        container = self._find(args[-1])
+        if container is None or not container.running:
+            return CmdResult(1, "", "No such container, or it is not running")
+        container.paused = True
+        if not self.pause_without_freezing:
+            self._cgroup_events(container, True)
+        self.calls.append(("paused", container.name))
+        return CmdResult(0, container.name + "\n")
+
+    def _unpause(self, args: list[str]) -> CmdResult:
+        container = self._find(args[-1])
+        if container is None:
+            return CmdResult(1, "", "No such container")
+        container.paused = False
+        self._cgroup_events(container, False)
+        self.calls.append(("unpaused", container.name))
+        return CmdResult(0, container.name + "\n")
 
     def _rm(self, args: list[str]) -> CmdResult:
         target = args[-1]

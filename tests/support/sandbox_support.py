@@ -4,11 +4,14 @@ Every name here is invented. `add_sandbox` is an `edit` for `expcore_onedata.tes
 table is added to the platform document without that module knowing it.
 """
 
+import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox import teardown
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxSpec
+from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.tokens import Secret
 
 TOKEN = "tok-test-0123456789"  # an invented token value
@@ -18,6 +21,7 @@ ONECLIENT_IMAGE_ID = "sha256:" + "c" * 64
 POOL = "10.77.0.0/24"
 MOUNT_PATH = "/data"
 LEVELS = {"mounted": "mount", "via-gate": "rest", "isolated": "none"}  # invented levels of a data_path factor
+COMPLETE_LEVEL = "via-gate-whole"  # an invented REST level whose gate answers every listing complete (O21)
 CHECK_FILE = "checks/content.bin"  # an invented file under the space root, read by the pre-campaign check
 SLOT_USERS = {  # login name -> (password, user id) of the users of the two slots below; all invented
     "slot-a-data": ("pw-slot-a-data", "u-slot-a-data"),
@@ -73,7 +77,7 @@ def sandbox_data() -> dict[str, Any]:
             "work_disk_bytes": 1 << 28,
         },
         "mount": {"path": MOUNT_PATH},
-        "data_paths": dict(LEVELS),
+        "data_paths": {**LEVELS, COMPLETE_LEVEL: {"kind": "rest", "listing": "complete"}},
         "content_check_file": CHECK_FILE,
     }
 
@@ -111,9 +115,54 @@ def make_spec(world, level="via-gate", *, token=TOKEN, lease_key=None, run_key="
         zone=None if none else Endpoint.from_url(world.config.zone.url),
         provider=None if none else Endpoint.from_url(world.config.local_provider.url),
         lease_key=lease_key,
+        listing=world.s.listing_of(level) or "paged",
     )
 
 
 def start_options(world) -> dict:
     """No sampler thread, no real sleeping, short teardown waits, and the test's own registry."""
     return {"registry": world.registry, "waits": FAST, "sample_period_s": None, "sleep": lambda seconds: None}
+
+
+def is_listing(argv: Sequence[str]) -> bool:
+    """Whether a host command lists what a run left: the copy helper's `list`, or `find` as earlier versions listed."""
+    return argv[0] == "find" or (argv[0] == sys.executable and argv[-1] == "list")
+
+
+def is_copy(argv: Sequence[str]) -> bool:
+    """Whether a host command copies what a run left: the copy helper's `copy`, or `cp` as earlier versions copied."""
+    return argv[0] == "cp" or (argv[0] == sys.executable and argv[-1] == "copy")
+
+
+def around_run(host, wrapper: Callable[..., CmdResult]) -> Callable[[], None]:
+    """Put `wrapper(original, argv, timeout_s, sudo=, input=)` around the host's `run`; return what undoes it."""
+    original = host.run
+
+    def run(argv, timeout_s, *, sudo=False, input=None):
+        return wrapper(original, list(argv), timeout_s, sudo=sudo, input=input)
+
+    host.run = run
+    return lambda: setattr(host, "run", original)
+
+
+def after_first(host, matches: Callable[[Sequence[str]], bool], action: Callable[[], None]) -> None:
+    """Run `action` once, right after the first host command that `matches` has returned."""
+    done: list[bool] = []
+
+    def wrapper(original, argv, timeout_s, **kwargs):
+        result = original(argv, timeout_s, **kwargs)
+        if not done and matches(argv):
+            done.append(True)
+            action()
+        return result
+
+    around_run(host, wrapper)
+
+
+def fail_copies(host, stderr: str = "disk full") -> Callable[[], None]:
+    """Make every copy out of the sandbox fail as a full disk makes it fail; return what undoes it."""
+
+    def wrapper(original, argv, timeout_s, **kwargs):
+        return CmdResult(1, "", stderr) if is_copy(argv) else original(argv, timeout_s, **kwargs)
+
+    return around_run(host, wrapper)

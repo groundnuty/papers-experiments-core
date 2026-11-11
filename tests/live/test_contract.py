@@ -28,6 +28,7 @@ from live_support import (  # noqa: E402 -- only once the module is known to run
     require_passed,
 )
 
+from expcore_onedata import consistency  # noqa: E402
 from expcore_onedata.client import API_PROVIDER, AUTH_HEADER, OnezoneClient, PlatformError  # noqa: E402
 from expcore_onedata.config import load_platform  # noqa: E402
 from expcore_onedata.federation import pin_local_provider, read_space  # noqa: E402
@@ -186,6 +187,11 @@ def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_st
     # The platform's one [tls], as every client of the federation takes it: a federation's own CA, or the defaults.
     with httpx.Client(timeout=120, verify=config.tls.client_verify()) as http:
         found = http.post(f"{base}/lookup-file-id/{config.space.name}/{CONTENT_PATH.strip('/')}", headers=headers)
+        if found.status_code == consistency.NOT_FOUND:  # unknown, never a pass or a failure of the platform
+            pytest.skip(
+                "EXPCORE_LIVE_CONTENT_PATH names a file the space does not hold: a space declared baseline = false "
+                "holds none, so set it only where the file was provisioned"
+            )
         assert found.status_code == 200
         content = f"{base}/data/{found.json()['fileId']}/content"
         whole = http.get(content, headers=headers)
@@ -250,7 +256,6 @@ def test_the_read_only_day0_checks_do_not_fail_on_the_real_deployment(day0):
 
 def test_a_real_block_map_has_the_documented_shape(day0, client, config):
     """The distribution answer parses; a regular file is found by listing the first supporting provider's root."""
-    from expcore_onedata import consistency
     from expcore_onedata.placement import provider_blocks
 
     provider = config.support.providers[0]

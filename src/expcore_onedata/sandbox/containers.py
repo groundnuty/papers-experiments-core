@@ -166,13 +166,15 @@ def agent_run_args(
     ca: Path | None,
     trust_bundles: Mapping[str, Path],
     zone_host: str | None,
+    inputs: Sequence[tuple[Path, str]] = (),
 ) -> tuple[list[str], dict[str, str]]:
     """`docker run` for the agent and the environment names it takes: read-only root, no capability, no new privilege.
 
     In REST mode the agent resolves the zone and the provider to the gate and trusts the run's CA. It holds no token
     and no other credential, in its environment or in a file: the gate adds the token to the requests it forwards, and
     the sidecar owns the mount's (O05). In mount mode the read-only mount is bound in with `readonly`. With no data path
-    it has neither.
+    it has neither. Each read-only input, the run's own copy and the path the agent sees it at, is bound in with
+    `readonly` too, in every data path (O20).
     """
     lim, uid = s.limits, s.agent_uid
     args = [
@@ -198,6 +200,8 @@ def agent_run_args(
         if share is None or s.mount is None:
             raise ValueError("a mount data path needs the shared mount point and [sandbox.mount]")
         args += ["--mount", f"type=bind,src={share},dst={s.mount.path},readonly,bind-propagation=rslave"]
+    for copy, target in inputs:
+        args += ["--mount", f"type=bind,src={copy},dst={target},readonly"]
     for name in env:  # settings only, never a credential; their values travel in the docker client's environment
         args += ["-e", name]
     return [*args, image_id, "sleep", "infinity"], env

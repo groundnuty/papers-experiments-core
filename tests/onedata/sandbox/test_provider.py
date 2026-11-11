@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from sandbox_support import FAST
+from sandbox_support import COMPLETE_LEVEL, FAST
 
 from expcore.campaign.lease import LeasePool
 from expcore.errors import InfraError
@@ -162,6 +162,15 @@ def test_o05_each_data_path_gets_a_read_only_token_of_its_own_interface_minted_b
     assert sandbox.metadata()["data_path_token"]["slot"] == 0  # the first of [slots], by position
     assert sandbox.spec.token.subject == stage.slots.get(KEY).data_path.user_id
     assert "token" not in json.dumps(sandbox.metadata()["data_path_token"]).lower().replace("data_path_token", "")
+
+
+@pytest.mark.parametrize(("level", "listing"), [(COMPLETE_LEVEL, "complete"), ("via-gate", "paged"), ("mounted", None)])
+def test_o21_the_launch_gives_a_run_the_listing_mode_its_level_selects(stage, level, listing):
+    """O21: a study selects the listing mode per condition through the level of its data path; the launch gives the
+    run's sandbox that level's mode, and the run's metadata records it."""
+    sandbox, _ = run_launch(stage, level)
+    assert sandbox.spec.listing == (listing or "paged")
+    assert sandbox.metadata()["listing"] == listing
 
 
 def test_o12_the_platform_launch_records_the_hash_of_the_platform_file(stage):
@@ -743,3 +752,94 @@ def test_c19_a_launch_cancelled_while_its_mint_is_blocked_holds_the_slot_until_t
     tokens_ended(stage)
     assert probe.resource_gone(KEY, {}) is True
     assert pool.settle_quarantines() == [KEY]
+
+
+def declared_platform(stage, tmp_path):
+    """The stage's platform with one declared read-only input, and that input as declared."""
+    from expcore_onedata.sandbox import inputs
+    from expcore_onedata.sandbox.api import ReadOnlyInput
+
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    (supplied / "analyse.py").write_text("print('analysed')\n", encoding="utf-8")
+    declared = inputs.declare(stage.s, {"every-run": [ReadOnlyInput(supplied, "/opt/analysis")]})
+    options = {"waits": FAST, "sample_period_s": None, "sleep": lambda seconds: None}
+    platform = SandboxPlatform(
+        stage.config,
+        stage.issuer,
+        stage.host,
+        slots=stage.slots,
+        journal=stage.journal,
+        events=stage.record_event,
+        registry=stage.registry,
+        sandbox_options=options,
+        clock=lambda: stage.now[0],
+        read_only_inputs=declared,
+    )
+    return platform, declared["every-run"][0], supplied
+
+
+def test_o20_launch_hands_a_read_only_input_to_the_runs_sandbox_and_its_record(stage, tmp_path):
+    """O20: `launch(..., inputs=..., inputs_record=...)` gives the run's sandbox a declared read-only input, mounted
+    read-only in the agent from the run's own copy, and puts its hash in the run's record itself, through the
+    instrument the executor finishes into `RunRecord.instruments["read_only_inputs"]`."""
+    from record_support import hand_made
+
+    from expcore.plugin import Instrument
+    from expcore.records.instruments import finish_instruments
+    from expcore_onedata.sandbox import inputs
+
+    platform, item, _ = declared_platform(stage, tmp_path)
+    kept = inputs.InputsRecord()
+    assert isinstance(kept, Instrument)
+    kept.start({"run_key": "run-1"})
+    seen = {}
+
+    async def go():
+        async with platform.launch(
+            RecordingContext(),
+            run_key="run-1",
+            level="isolated",
+            ceiling_s=CEILING_S,
+            inputs=[item],
+            inputs_record=kept,
+        ) as sandbox:
+            seen["mounts"] = stage.host.containers[sandbox.names.agent].options["--mount"]
+
+    asyncio.run(go())
+    assert any(m.endswith(",dst=/opt/analysis,readonly") for m in seen["mounts"])
+    record = finish_instruments(hand_made(), [kept])
+    [recorded] = record.instruments["read_only_inputs"]["inputs"]
+    assert record.instruments["read_only_inputs"]["ok"] is True
+    assert (recorded["path"], recorded["sha256"]) == ("/opt/analysis", item.sha256)
+
+
+def test_o20_launch_refuses_an_input_it_was_not_declared_or_a_record_it_was_not_given(stage, tmp_path):
+    """O20: an input the platform was not declared with (another source, path or hash), and an input with no
+    instrument to keep it in the run's record, are refused before any token is minted or anything is created."""
+    import dataclasses
+
+    from expcore_onedata.sandbox import inputs
+    from expcore_onedata.sandbox.api import ReadOnlyInput, StartRefused
+
+    platform, item, supplied = declared_platform(stage, tmp_path)
+    undeclared = [ReadOnlyInput(supplied, "/opt/analysis"), dataclasses.replace(item, target="/opt/elsewhere")]
+
+    async def go(given, record):
+        async with platform.launch(
+            RecordingContext(),
+            run_key="run-1",
+            level="isolated",
+            ceiling_s=CEILING_S,
+            inputs=given,
+            inputs_record=record,
+        ):
+            pass
+
+    for given in undeclared:
+        with pytest.raises(StartRefused, match="not declared"):
+            asyncio.run(go([given], inputs.InputsRecord()))
+    with pytest.raises(ValueError, match="record"):
+        asyncio.run(go([item], None))
+    assert not stage.host.containers
+    assert not stage.host.networks

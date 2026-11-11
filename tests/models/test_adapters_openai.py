@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -172,6 +173,85 @@ def test_b10_usage_adds_up_over_replies(make_spec, limits, completion, fake_clie
     step(backend)
     step(backend)
     assert backend.info()["usage_seen"] == {"responses": 2, "input": 40, "output": 6, "missing": 0}
+
+
+def test_b10_an_endpoints_own_numeric_usage_fields_ride_on_the_turn_under_their_own_names(
+    make_spec, limits, completion, fake_client
+):
+    """B10: a credit count and the reasoning and cache counts an endpoint reports are kept per turn, recorded only:
+    the two counts the budget uses are unchanged and the counts the turn already holds are not repeated."""
+    extra = {
+        "used_credits": 3.5,
+        "completion_tokens_details": {"reasoning_tokens": 12},
+        "prompt_tokens_details": {"cached_tokens": 40},
+    }
+    client = fake_client(completion("a", usage=(120, 30), usage_extra=extra))
+    backend = adapter(make_spec(), limits, client)
+    backend.begin("", "go", [])
+    turn = step(backend)
+    assert turn.usage_extra == {
+        "completion_tokens_details.reasoning_tokens": 12,
+        "prompt_tokens_details.cached_tokens": 40,
+        "used_credits": 3.5,
+    }
+    assert turn.usage_extra_cut == 0
+    assert (turn.input_tokens, turn.output_tokens) == (120, 30)
+    assert backend.info()["usage_seen"] == {"responses": 1, "input": 120, "output": 30, "missing": 0}
+
+
+def test_b10_a_field_the_reply_does_not_carry_is_absent_never_zero(make_spec, limits, completion, fake_client):
+    """B10: a reply with no extra field has an empty mapping, and a later reply without the field does not get a 0."""
+    client = fake_client(completion(usage=(10, 2), usage_extra={"used_credits": 1.5}), completion(usage=(10, 2)))
+    backend = adapter(make_spec(), limits, client)
+    backend.begin("", "go", [])
+    first, second = step(backend), step(backend)
+    assert first.usage_extra == {"used_credits": 1.5}
+    assert second.usage_extra == {}
+    assert second.usage_extra_cut == 0
+
+
+def test_b10_a_usage_that_is_a_plain_object_is_read_by_its_attributes(make_spec, limits, completion, fake_client):
+    """B10: a client that hands back a plain object instead of the SDK's model gives its numeric attributes too, and
+    one that lacks a count invents none."""
+    reply = completion()
+    reply.usage = SimpleNamespace(prompt_tokens=50, completion_tokens=None, used_credits=2.5, tier="gold")
+    backend = adapter(make_spec(), limits, fake_client(reply))
+    backend.begin("", "go", [])
+    turn = step(backend)
+    assert (turn.input_tokens, turn.output_tokens) == (50, None)
+    assert turn.usage_extra == {"used_credits": 2.5}
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["gold", True, None, [1, 2], float("nan"), float("inf"), {"label": "x"}],
+    ids=["text", "bool", "null", "list", "nan", "inf", "object_of_text"],
+)
+def test_b10_a_field_that_is_not_a_number_is_left_out(make_spec, limits, completion, fake_client, value):
+    """B10: only numbers are kept: text, a flag, null, a list, a non-finite float and an object with no number in it
+    are left out, and a number beside them is kept."""
+    client = fake_client(completion(usage=(10, 2), usage_extra={"odd_field": value, "used_credits": 2}))
+    backend = adapter(make_spec(), limits, client)
+    backend.begin("", "go", [])
+    turn = step(backend)
+    assert turn.usage_extra == {"used_credits": 2}
+    assert turn.usage_extra_cut == 0
+
+
+def test_b10_more_fields_than_the_cap_keep_the_first_by_name_and_count_the_rest_as_cut(
+    make_spec, limits, completion, fake_client
+):
+    """B10: a reply that reports more numeric fields than the cap cannot grow the record: the first by name are kept
+    and the number left out is recorded."""
+    from expcore.models import usage as rules
+
+    many = {f"field_{i:03d}": i for i in range(rules.USAGE_EXTRA_CAP + 5)}
+    client = fake_client(completion(usage=(10, 2), usage_extra=dict(reversed(many.items()))))
+    backend = adapter(make_spec(), limits, client)
+    backend.begin("", "go", [])
+    turn = step(backend)
+    assert list(turn.usage_extra) == sorted(many)[: rules.USAGE_EXTRA_CAP]
+    assert turn.usage_extra_cut == 5
 
 
 def test_b11_a_model_with_a_lower_maximum_sends_its_own_value(make_spec, limits, completion, fake_client):

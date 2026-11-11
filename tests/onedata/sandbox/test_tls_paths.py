@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from sandbox_support import TOKEN, add_sandbox, make_spec, start_options
+from sandbox_support import TOKEN, add_sandbox, fail_copies, make_spec, start_options
 from tls_support import HAS_OPENSSL, TlsServer, make_federation_ca, swap_after_check
 
 from expcore_onedata.config import load_platform
@@ -313,15 +313,14 @@ def test_o12_the_run_record_names_the_tls_mode_and_a_bundle_by_its_sha256_alone(
 def test_o05_the_runs_copy_of_the_bundle_is_never_kept_with_the_evidence(tmp_path, federation):
     """O05: when collection fails and the run directory is kept as evidence, the run's copy of the CA bundle is
     removed first: the bundle is configuration, not evidence of the run."""
-    from expcore_onedata.sandbox.hostops import CmdResult
 
     world = world_with(tmp_path / "kept", MODES["ca_file"], federation)
     sbx = start(world, "via-gate")
     assert any(p.read_bytes() == federation.ca.read_bytes() for p in sbx.dir.glob("*.pem"))
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
+    undo = fail_copies(world.host)
     with contextlib.suppress(Exception):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
-    world.host.run_handlers.pop("cp")
+    undo()
     sbx.stop()
     kept = world.s.work_root / "_kept_evidence" / sbx.sid
     assert kept.exists()
