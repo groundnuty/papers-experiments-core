@@ -266,7 +266,16 @@ TOKEN_FORMS = {
     # white space before the colon, which a lenient server reads as the name without it: the gate's parser ends the
     # header block at such a line, so neither it nor any line after it is a header the gate could forward
     "space-before-colon": lambda t: [("X-Auth-Token ", t), ("Macaroon\t", t)],
+    # a line folded onto the one before it, by a space and by a tab (RFC 7230 3.2.4, obsolete): the gate's parser reads
+    # the fold into the earlier header's value, which the upstream would read as headers of their own. The gate answers
+    # 400 and forwards nothing, so this form is in no test that expects the request to arrive.
+    "folded": lambda t: [
+        ("X-Foo", f"bar\r\n X-Onedata-Consumer-Token: {t}"),
+        ("X-Bar", f"baz\r\n\tMacaroon: {t}"),
+    ],
 }
+REFUSED_FORMS = {"folded"}
+FORWARDED_FORMS = [form for form in TOKEN_FORMS if form not in REFUSED_FORMS]
 PLATFORM_TOKEN_HEADERS = {"authorization", "macaroon", "x-onedata-consumer-token", "x-onedata-service-token"}
 
 
@@ -285,7 +294,7 @@ def send_lines(conn, method, target, lines, body=None) -> int:
 
 
 @pytest.mark.parametrize("agent_token", AGENT_TOKENS)
-@pytest.mark.parametrize("form", list(TOKEN_FORMS))
+@pytest.mark.parametrize("form", FORWARDED_FORMS)
 def test_o05_a_token_the_agent_sends_in_any_header_the_platform_reads_never_reaches_it(world, form, agent_token):
     """O05: whatever the agent sends as a token, the placeholder of its environment or one it guessed, in any header
     in which the platform reads one, in any case and however often, is dropped: the upstream gets the gate's token
@@ -299,13 +308,88 @@ def test_o05_a_token_the_agent_sends_in_any_header_the_platform_reads_never_reac
     assert agent_token not in json.dumps(lines)
 
 
+def raw_status(world, head: bytes) -> int:
+    """The status the gate answers to a GET whose header block is the Host header and then `head`, sent as given: what
+    http.client refuses to write (a line that starts with white space) goes out too."""
+    conn = connect(world)
+    conn.sock.sendall(b"GET " + FILE.encode() + b" HTTP/1.1\r\nHost: " + PROVIDER.encode() + b"\r\n" + head + b"\r\n")
+    answer = b""
+    while b"\r\n" not in answer:
+        chunk = conn.sock.recv(4096)
+        if not chunk:
+            break
+        answer += chunk
+    conn.close()
+    return int(answer.split(b" ", 2)[1])
+
+
+# Header blocks that fold a line, or put a CR or LF inside one, in each way a line can end or start; `{t}` is the token.
+FOLDS = {
+    "space": b"X-Foo: bar\r\n X-Onedata-Consumer-Token: {t}\r\n",
+    "tab": b"X-Foo: bar\r\n\tMacaroon: {t}\r\n",
+    "lf-only": b"X-Foo: bar\n X-Auth-Token: {t}\r\n",
+    "cr-then-tab": b"X-Foo: bar\r\tMacaroon: {t}\r\n",  # one line to the reader, a fold to the parser
+    "bare-cr": b"X-Foo: bar\rMacaroon: {t}\r\n",  # one line to the reader, two headers to the parser
+    "first-line": b" Macaroon: {t}\r\nX-Foo: bar\r\n",  # a continuation of no header, which the parser drops
+    "after-bad-line": b"Macaroon : {t}\r\n X-Foo: bar\r\n",  # after a line that ends the parser's block
+}
+
+
+@pytest.mark.parametrize("agent_token", AGENT_TOKENS)
+@pytest.mark.parametrize("fold", list(FOLDS))
+def test_o21_a_request_with_a_folded_header_line_is_refused_and_nothing_reaches_the_upstream(world, fold, agent_token):
+    """O21: a header block with a folded line (one that starts with a space or a tab), or a CR or LF inside a line, is
+    answered 400 before anything is forwarded, the agent's token in it or not: the parser would read the fold into the
+    value of the header before it, and the upstream would read the folded line as a header of its own."""
+    assert raw_status(world, FOLDS[fold].replace(b"{t}", agent_token.encode())) == 400
+    assert world.upstream.seen == []
+    assert world.upstream.header_lines == []
+
+
+@pytest.mark.parametrize("agent_token", AGENT_TOKENS)
+@pytest.mark.parametrize("form", sorted(REFUSED_FORMS))
+def test_o21_the_refused_token_forms_get_a_400_and_nothing_reaches_the_upstream(world, form, agent_token):
+    """O21: the forms the gate refuses outright, sent as an ordinary client writes them, are answered 400 and not
+    forwarded; the agent's token in them is in no line the upstream receives."""
+    conn = connect(world)
+    assert send_lines(conn, "GET", FILE, TOKEN_FORMS[form](agent_token)) == 400
+    conn.close()
+    assert world.upstream.seen == []
+    assert world.upstream.header_lines == []
+
+
+@pytest.mark.parametrize("agent_token", AGENT_TOKENS)
+def test_o21_the_refusal_of_a_fold_is_logged_with_no_header_value(world, agent_token):
+    """O21: the refusal is a deny line like the gate's others, and holds no value of any header: not the agent's token,
+    and not a header the log would otherwise show (a folded User-Agent, whose value the line would carry)."""
+    head = b"User-Agent: ua-0123\r\n X-Onedata-Consumer-Token: " + agent_token.encode() + b"\r\nRange: bytes=0-1\r\n"
+    assert raw_status(world, head) == 400
+    line = wait_for(world, lambda r: r.get("status") == 400 and r.get("method") == "GET")
+    assert (line["decision"], line["reason"]) == ("deny", "request header folding not allowed")
+    assert line["req_headers"] == {}
+    assert line["range"] is None
+    text = world.log.read_text()
+    assert agent_token not in text
+    assert "ua-0123" not in text
+    assert "bytes=0-1" not in text
+
+
+def test_o21_white_space_inside_a_header_line_is_no_fold(world):
+    """O21: a value with a tab or spaces inside it, or around it, is no fold: the request is forwarded as before."""
+    conn = connect(world)
+    assert send_lines(conn, "GET", FILE, [("X-Foo", "a \t b"), ("X-Bar", " c ")]) == 200
+    conn.close()
+    (lines,) = world.upstream.header_lines
+    assert ("x-foo", "a \t b") in lines  # the gate hands its headers on in lower case
+
+
 @pytest.mark.parametrize("agent_token", AGENT_TOKENS)
 def test_o05_a_scope_inference_carries_the_gates_token_whatever_the_agent_put_in_its_body_and_headers(
     world, agent_token
 ):
     """O05: the token-scope inference names its token in the body; the agent's value there, and in every header the
     platform reads one from, is replaced by the gate's token, and no byte of the agent's value reaches the zone."""
-    every_form = [line for make in TOKEN_FORMS.values() for line in make(agent_token)]
+    every_form = [line for form in FORWARDED_FORMS for line in TOKEN_FORMS[form](agent_token)]
     conn = connect(world, ZONE)
     body = json.dumps({"token": agent_token}).encode()
     assert send_lines(conn, "POST", SCOPE, every_form, body) == 200

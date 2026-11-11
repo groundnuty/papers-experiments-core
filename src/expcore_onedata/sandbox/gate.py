@@ -470,6 +470,35 @@ class _CountingWriter:
         return getattr(self.raw, name)
 
 
+class _HeadLines:
+    """The reader of a request's header block, which keeps the raw lines it hands to the parser: the parser unfolds them."""
+
+    def __init__(self, raw) -> None:
+        self.raw = raw
+        self.lines: list[bytes] = []
+
+    def readline(self, limit: int = -1) -> bytes:
+        line = self.raw.readline(limit)
+        self.lines.append(line)
+        return line
+
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
+
+def _has_fold(lines: list[bytes], headers) -> bool:
+    """O21: whether a request's header block folds a line or holds a CR or LF inside one. `lines` are the raw lines of the block; `headers` are
+    its parsed (name, value) pairs. A line that starts with a space or a tab continues the line before it (obs-fold, RFC 7230 3.2.4), and the
+    parser joins the two into one value that http.client writes upstream as given, where the line it carries is a header of its own: a token the
+    gate drops by name. A CR or LF inside a line is the same fold, or a line end the parser and the upstream read differently. The line's own
+    end is not one: that is the CRLF, or the LF alone, that closes it."""
+    for line in lines:
+        text = line.removesuffix(b"\n").removesuffix(b"\r")
+        if text[:1] in (b" ", b"\t") or b"\r" in text or b"\n" in text:
+            return True
+    return any(c in name or c in value for name, value in headers for c in "\r\n")  # the parsed form of the same
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "gate"
@@ -515,6 +544,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_one_request(self) -> None:
         self.connection.settimeout(IDLE_TIMEOUT_S)  # only while waiting for a request: `_handle` lifts it
         self.raw_requestline = b""  # set by the parser once a request line has arrived
+        self._head_folded = False  # set by `parse_request` once the request's header block is read
         self._w.reset()
         self._timed_out = False
         after = self._served
@@ -524,6 +554,18 @@ class Handler(BaseHTTPRequestHandler):
         if after and not self.raw_requestline and not self._timed_out:
             # the TLS read came back empty after a response: the connection ended with no request, and the raw peek had taken the first bytes (a close_notify) for one
             self._conn_close("tls_close", after)
+
+    def parse_request(self) -> bool:
+        """The standard parse, with the raw lines of the header block kept to tell whether it folds a line (`_has_fold`): `_handle` answers
+        that with a 400. A request the parser itself refuses is answered as before."""
+        head = _HeadLines(self.rfile)
+        self.rfile = head
+        try:
+            ok = super().parse_request()
+        finally:
+            self.rfile = head.raw
+        self._head_folded = ok and _has_fold(head.lines, self.headers.items())
+        return ok
 
     def _input_waiting(self) -> bool:
         """Bytes already taken off the socket and not yet used: decrypted by TLS (`pending`) or in the request reader's buffer. The kernel's queue does not show them,
@@ -799,16 +841,21 @@ class Handler(BaseHTTPRequestHandler):
         hcfg = CFG["hosts"].get(host)
         url = urlsplit(self.path)
         headers = {k.lower(): v for k, v in self.headers.items()}
+        folded = self._head_folded  # a folded line's value is no header's to log: the line shows none
         rec = {
             "host": hcfg["role"] if hcfg is not None else "not_configured",  # the role it is served in, never its name
             "method": self.command,
             "path": url.path,
             "query": url.query,
-            "range": headers.get("range"),
+            "range": None if folded else headers.get("range"),
             "conn": self._conn,
             "conn_request": self._served,
-            "req_headers": _logged_headers(headers),
+            "req_headers": {} if folded else _logged_headers(headers),
         }
+        if folded:  # before the body is read or anything is forwarded: the upstream would read a fold as headers of its own (O21)
+            rec.update(decision="deny", reason="request header folding not allowed", status=400)
+            self._answer(rec, 400, {"error": {"id": "badRequest", "details": "request header folding not allowed"}})
+            return
         n = headers.get("content-length") or "0"
         if "transfer-encoding" in headers or not n.isdecimal():
             # only a declared length frames a body here: anything else could leave bytes to be read as the next request
