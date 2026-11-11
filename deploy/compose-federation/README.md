@@ -60,12 +60,19 @@ is `layouts/five-providers.compose.yaml`.
 | `platform_template` | optional: the template of `platform.toml`, relative to the layout file |
 | `[zone] port`, `[providers.<name>] port` | each service's port on `127.0.0.1` |
 | `[spaces.<name>] owner`, `mirrors` | the provider the space's data is written through and kept on, and the other providers that support it |
+| `[spaces.<name>] agent_visible` | `false` for a space the day-0 checks alone use: no user of the agent may be a member, and it is never the study space |
 | `[principals.<user>] privileges`, `spaces` | a fixed user's exact privileges, in the study space unless `spaces` names others |
+| `[principals.<user>] agent` | `false` for a user the agent's tokens are never minted for (the harness's or the day-0 checks'); only such a user may join a space with `agent_visible = false` |
 
 Every key is checked when the file is read, and a refusal names the file and the key: names are unique and usable as
 Compose services and domain labels, ports lie in 1024-65535 and never clash, every owner and mirror is a declared
 provider, the study space and every member's space are declared, and nothing but `127.0.0.1` can be named as an
 address. The images stay the two pinned ones whatever the layout says.
+
+A space the agent must never reach, such as one only the day-0 checks write to, is declared `agent_visible = false`.
+No user of the agent is a member of it, so no token the agent holds reaches it whatever its caveats, and the data-path
+caveat, which names the study space, never names it. Its members are users declared `agent = false`; a layout that
+makes an agent user a member, or hides the study space, is refused.
 
 The Compose file is generated from the layout at every command (`fedcompose.py`), never edited: what keeps the
 federation to itself is part of the generator. `compose.yaml` here is the default layout's output, committed for

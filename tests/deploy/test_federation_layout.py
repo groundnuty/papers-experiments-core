@@ -2,10 +2,11 @@
 directory always had, the example holds five providers and four spaces with a mirror of a second owner's space, and
 every refusal names the file and the key."""
 
+import re
 from pathlib import Path
 
 import pytest
-from federation_support import DEPLOY, EXAMPLE, MINIMAL
+from federation_support import DEPLOY, EXAMPLE, MINIMAL, WITH_DAY0
 
 
 def test_the_default_layout_is_the_deployment_this_directory_always_had(fed):
@@ -108,6 +109,64 @@ def test_a_layout_that_cannot_be_used_is_refused_naming_the_file_and_the_key(fed
     message = str(refused.value)
     assert message.startswith(f"{path}: ")
     assert words in message
+
+
+def test_a_space_for_the_day0_checks_alone_has_no_user_of_the_agent_among_its_members(fed, tmp_path):
+    """A study's day-0 checks may need a space the agent never reaches: no agent user is a member of it, so no token
+    the agent holds reaches it whatever its caveats, and it is never the study space the data-path caveat names."""
+    from fedboot import Ids
+
+    spec = fed.spec.load_spec(write(tmp_path, WITH_DAY0))
+    day0 = spec.space("day0-space")
+    assert not day0.agent_visible
+    assert spec.space(spec.study_space).agent_visible
+    assert [p.name for p in spec.members("day0-space")] == ["day0-checker"]
+    assert all(p.agent for p in spec.members(spec.study_space))
+    assert [f.path for f in fed.layout.baseline("day0-space", spec.study_space)] == ["day0.txt"]
+    layout = fed.layout.Layout(tmp_path / "fed", spec=spec)
+    boot = fed.boot.Bootstrap.__new__(fed.boot.Bootstrap)
+    boot.layout = layout
+    boot.ids = Ids(
+        users={"alpha-reader": "user-id-one", "day0-checker": "user-id-two"},
+        providers={"oak": "provider-id-one", "elm": "provider-id-two"},
+        spaces={"alpha-space": "space-id-one", "day0-space": "space-id-two"},
+    )
+    facts = fed.facts.facts_of(boot)
+    assert facts["spaces"]["day0-space"]["agent_visible"] is False
+    assert facts["principals"]["day0-checker"]["agent"] is False
+    assert facts["principals"]["alpha-reader"]["agent"] is True
+    rows = fed.facts.describe(layout).splitlines()
+    day0_row = "| Space `day0-space` | owner `elm`, mirrors none, support 10.00 GiB each; day-0 only, no agent user |"
+    assert day0_row in rows
+    assert any(row.startswith("| Principal `day0-checker` |") and row.endswith("; not an agent user |") for row in rows)
+
+
+DAY0_REFUSED = [
+    (
+        "an agent user in the day-0 space",
+        ('spaces = ["day0-space"]\nagent = false', 'spaces = ["day0-space"]'),
+        "principals.day0-checker.spaces: names day0-space, which no user of the agent may reach",
+    ),
+    (
+        "an agent user added to it",
+        ('"space_read_data"]\n\n[spaces', '"space_read_data"]\nspaces = ["alpha-space", "day0-space"]\n\n[spaces'),
+        "principals.alpha-reader.spaces",
+    ),
+    (
+        "the study space hidden from the agent",
+        ('mirrors = ["elm"]', 'mirrors = ["elm"]\nagent_visible = false'),
+        "spaces.alpha-space.agent_visible: is false for the study space",
+    ),
+    ("not a boolean", ("agent_visible = false", 'agent_visible = "no"'), "spaces.day0-space.agent_visible"),
+]
+
+
+@pytest.mark.parametrize(("change", "words"), [c[1:] for c in DAY0_REFUSED], ids=[c[0] for c in DAY0_REFUSED])
+def test_a_day0_space_an_agent_user_could_reach_is_refused(fed, tmp_path, change, words):
+    old, new = change
+    assert WITH_DAY0.count(old) == 1
+    with pytest.raises(fed.spec.LayoutError, match=re.escape(words)):
+        fed.spec.load_spec(write(tmp_path, WITH_DAY0.replace(old, new)))
 
 
 def test_the_minimal_layout_the_refusals_start_from_is_itself_usable(fed, tmp_path):

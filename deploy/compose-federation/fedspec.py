@@ -52,8 +52,8 @@ TOP_KEYS = {
     "principals",
 }
 SERVICE_KEYS = {"port", "memory_limit"}
-SPACE_KEYS = {"owner", "mirrors", "support_bytes"}
-PRINCIPAL_KEYS = {"privileges", "spaces"}
+SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible"}
+PRINCIPAL_KEYS = {"privileges", "spaces", "agent"}
 
 
 class LayoutError(ValueError):
@@ -85,12 +85,17 @@ class Service:
 
 @dataclass(frozen=True)
 class Space:
-    """A space, the provider that owns its data, and the providers that mirror it."""
+    """A space, the provider that owns its data, the providers that mirror it, and whether the agent may reach it.
+
+    A space with `agent_visible` false is for the day-0 checks alone: no user of the agent is a member of it, so no
+    token the agent holds reaches it, whatever its caveats, and it is never the study space whose path the agent's
+    data-path tokens name."""
 
     name: str
     owner: str
     mirrors: tuple[str, ...]
     support_bytes: int = DEFAULT_SUPPORT_BYTES
+    agent_visible: bool = True
 
     @property
     def supporters(self) -> tuple[str, ...]:
@@ -100,11 +105,14 @@ class Space:
 
 @dataclass(frozen=True)
 class Principal:
-    """A fixed user, the spaces it is a member of, and exactly the privileges it holds in each."""
+    """A fixed user, the spaces it is a member of, exactly the privileges it holds in each, and whether the agent's
+    tokens may be minted for it (the data path's and the tool server's users); a user only the harness or the day-0
+    checks use is declared `agent = false`, and only such a user may be a member of a space the agent may not reach."""
 
     name: str
     privileges: tuple[str, ...]
     spaces: tuple[str, ...]
+    agent: bool = True
 
 
 @dataclass(frozen=True)
@@ -183,6 +191,11 @@ class _Reader:
             raise self.fail(key, f"must be {what} (pattern {pattern.pattern})")
         return value
 
+    def boolean(self, value: Any, key: str) -> bool:
+        if not isinstance(value, bool):
+            raise self.fail(key, "must be true or false")
+        return value
+
     def integer(self, value: Any, key: str, low: int, high: int) -> int:
         if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
             raise self.fail(key, f"must be an integer from {low} to {high}")
@@ -259,9 +272,13 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         if owner in mirrors:
             raise read.fail(f"{key}.mirrors", f"names the space's owner ({owner}), which holds its data already")
         size = read.integer(table.get("support_bytes", support), f"{key}.support_bytes", 1 << 20, 1 << 50)
-        spaces.append(Space(name, owner, mirrors, size))
+        visible = read.boolean(table.get("agent_visible", True), f"{key}.agent_visible")
+        spaces.append(Space(name, owner, mirrors, size, visible))
     space_names = {space.name for space in spaces}
     study = read.name(top["study_space"], "study_space", space_names, "space")
+    hidden = {space.name for space in spaces if not space.agent_visible}
+    if study in hidden:
+        raise read.fail(f"spaces.{study}.agent_visible", "is false for the study space, which the agent works in")
 
     users = read.named_tables(top["principals"], "principals", USER_NAME, "user") if "principals" in top else {}
     principals = []
@@ -277,7 +294,15 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         if len(set(rights)) != len(rights):
             raise read.fail(f"{key}.privileges", "names a privilege twice")
         member_of = read.names(table.get("spaces", [study]), f"{key}.spaces", space_names, "space", empty=False)
-        principals.append(Principal(name, tuple(rights), member_of))
+        agent = read.boolean(table.get("agent", True), f"{key}.agent")
+        unreachable = sorted(hidden & set(member_of))
+        if agent and unreachable:
+            raise read.fail(
+                f"{key}.spaces",
+                f"names {unreachable[0]}, which no user of the agent may reach (spaces.{unreachable[0]}.agent_visible "
+                "= false); only a user declared agent = false may be a member of it",
+            )
+        principals.append(Principal(name, tuple(rights), member_of, agent))
 
     template = None
     if "platform_template" in top:

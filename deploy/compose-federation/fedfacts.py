@@ -46,13 +46,19 @@ def facts_of(boot: Bootstrap) -> dict:
                 "owner": s.owner,
                 "mirrors": list(s.mirrors),
                 "supported_by": list(s.supporters),
+                "agent_visible": s.agent_visible,
             }
             for s in spec.spaces
         },
         "study_space": spec.study_space,
         "data_provider": spec.holder,
         "principals": {
-            p.name: {"user_id": ids.users[p.name], "privileges": list(p.privileges), "spaces": list(p.spaces)}
+            p.name: {
+                "user_id": ids.users[p.name],
+                "privileges": list(p.privileges),
+                "spaces": list(p.spaces),
+                "agent": p.agent,
+            }
             for p in spec.principals
         },
         "credentials": {
@@ -114,12 +120,16 @@ def describe(layout: Layout) -> str:
             (
                 f"Space `{s.name}`" + (" (study space)" if s.name == spec.study_space else ""),
                 f"owner `{s.owner}`, mirrors {', '.join(f'`{m}`' for m in s.mirrors) or 'none'}, "
-                f"support {gib(s.support_bytes)} each",
+                f"support {gib(s.support_bytes)} each" + ("" if s.agent_visible else "; day-0 only, no agent user"),
             )
             for s in spec.spaces
         ),
         *(
-            (f"Principal `{p.name}`", f"{', '.join(p.privileges)} in {', '.join(f'`{s}`' for s in p.spaces)}")
+            (
+                f"Principal `{p.name}`",
+                f"{', '.join(p.privileges)} in {', '.join(f'`{s}`' for s in p.spaces)}"
+                + ("" if p.agent else "; not an agent user"),
+            )
             for p in spec.principals
         ),
         ("Memory limits together", f"{gib(spec.memory_bytes)} for {len(spec.services)} services"),

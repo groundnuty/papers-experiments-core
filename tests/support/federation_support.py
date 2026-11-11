@@ -27,3 +27,18 @@ mirrors = ["elm"]
 [principals.alpha-reader]
 privileges = ["space_view", "space_read_data"]
 """
+
+# The same with a space for the day-0 checks alone: no user of the agent is a member of it.
+WITH_DAY0 = (
+    MINIMAL
+    + """
+[spaces.day0-space]
+owner = "elm"
+agent_visible = false
+
+[principals.day0-checker]
+privileges = ["space_view", "space_read_data", "space_write_data"]
+spaces = ["day0-space"]
+agent = false
+"""
+)
