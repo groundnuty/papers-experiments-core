@@ -60,7 +60,7 @@ from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
 from expcore.config.models import ModelTable
 from expcore.loop.config import AgentConfig
-from expcore.models.admission import admit, reply_cap_unshown
+from expcore.models.admission import admit_reading, max_tokens_ignored, reply_cap_unshown
 
 __all__ = ["CampaignLocked", "RunSummary", "Scheduler", "iso", "utc_now"]
 
@@ -274,7 +274,9 @@ class Scheduler:
         """Admit each model's endpoint once (C14). The endpoint checked here is the one every run of the model uses.
 
         With a budget, a model of the core's own factory is also probed for the reply maximum; return the models the
-        probe showed held to it, and mark in the store those it did not (C27).
+        probe showed held to it, and mark in the store those it did not (C27). A one-token completion answered with
+        more than one output token shows the endpoint ignores max_tokens: the model is marked at once, and the probe of
+        the reply maximum is not sent.
 
         With a budget (`paying`), every send of a probe is paid from it (C26): reserved one request's bound before it
         goes out, charged in the store, and settled to what an answered reply's counts cost. A probe that does not fit
@@ -297,22 +299,27 @@ class Scheduler:
 
             async def check(
                 backend: Any = backend, probing: Any = metered or backend, probed: bool = probed
-            ) -> tuple[str | None, str | None]:
+            ) -> tuple[str | None, str | None, str | None]:
                 try:
-                    reason = await admit(probing)
-                    return reason, await reply_cap_unshown(probing) if reason is None and probed else None
+                    reason, reply = await admit_reading(probing)
+                    ignored = max_tokens_ignored(reply)  # the one-token reply went past its max_tokens of 1 (C27)
+                    asked = reason is None and probed and ignored is None
+                    return reason, ignored, await reply_cap_unshown(probing) if asked else None
                 finally:
                     await backend.aclose()
 
-            reason, unshown = asyncio.run(check())
+            reason, ignored, unshown = asyncio.run(check())
+            if ignored is not None and self.settings.budget is not None:  # at once: no later probe can be refused first
+                detail = f"{model}: {ignored}; its runs are reserved by its context window"
+                reply_cap.mark_unheld(self.store, model, self.stamp(), "reply_cap_not_shown", detail)
             if metered is not None and metered.refusal is not None:  # not sent: no reply says anything of the model
                 reason = f"the campaign's budget is spent: {metered.refusal}"
             if reason is not None:
                 self.not_admitted[model] = reason
                 self.store.event(self.stamp(), "model_not_admitted", model, f"{model}: {reason}")
-            elif probed and unshown is None:
+            elif probed and unshown is None and ignored is None:
                 held.add(model)
-            elif probed:
+            elif probed and unshown is not None:
                 detail = f"{model}: {unshown}; its runs are reserved by its context window"
                 reply_cap.mark_unheld(self.store, model, self.stamp(), "reply_cap_not_shown", detail)
         return frozenset(held)

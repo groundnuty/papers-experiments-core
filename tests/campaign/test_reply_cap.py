@@ -130,14 +130,17 @@ class Endpoint:
     """Stands in for the OpenAI client the core's adapter builds: answers the one-token completion and the probe of
     the reply maximum, with a reply of `long_reply` output tokens and `finish` as its stop reason."""
 
-    def __init__(self, *, long_reply: int, finish: str, run_unreadable: int | None = None):
+    def __init__(self, *, long_reply: int, finish: str, run_unreadable: int | None = None, one_token_reply: int = 1):
         self.long_reply, self.finish, self.requests = long_reply, finish, []
+        self.one_token_reply = one_token_reply  # what the one-token completion's reply reports as its output
         self.run_unreadable = run_unreadable  # a run's request gets a billed reply of this many tokens and no choices
         self.chat = type("Chat", (), {"completions": type("Completions", (), {"create": self.create})()})()
 
     async def create(self, **request):
         self.requests.append(request)
-        tokens, finish = (1, "length") if request["max_tokens"] == 1 else (self.long_reply, self.finish)
+        tokens, finish = (
+            (self.one_token_reply, "length") if request["max_tokens"] == 1 else (self.long_reply, self.finish)
+        )
         choices = [{"index": 0, "finish_reason": finish, "message": {"role": "assistant", "content": "1"}}]
         if self.run_unreadable is not None and request["max_tokens"] > 16:  # neither probe: a run's request
             tokens, choices = self.run_unreadable, []
@@ -473,3 +476,20 @@ def test_c27_a_reply_past_the_maximum_of_a_run_reserved_by_the_window_still_take
     assert "reply_over_maximum" in event_kinds(store)
     assert MODEL in unheld(store)
     assert gate.assess([], NOW).reserve_usd[MODEL] == pytest.approx(UNHELD)
+
+
+def test_c27_a_one_token_completion_answered_past_its_max_tokens_takes_the_model_off_the_maximum_at_once(
+    tmp_path, endpoint
+):
+    """C27: admission sends a max_tokens of 1, and the endpoint answered 50 output tokens: it does not apply the
+    max_tokens it is sent. The model is taken off the reply maximum then and there, before any later probe is sent
+    that the budget could refuse, and the probe of the reply maximum is not sent at all; the model is admitted and
+    reserved by its window."""
+    endpoint.update(one_token_reply=50)
+    with opened(tmp_path, default_backend_factory) as scheduler:
+        assert scheduler.not_admitted == {}
+        assert scheduler.budget.assess([], NOW).reserve_usd[MODEL] == pytest.approx(UNHELD)
+        [event] = scheduler.store.q("SELECT detail FROM events WHERE kind='reply_cap_not_shown'")
+        assert "50 output tokens for a max_tokens of 1" in event["detail"]
+        assert MODEL in unheld(scheduler.store)
+    assert [request["max_tokens"] for request in BUILT[0].requests] == [1]

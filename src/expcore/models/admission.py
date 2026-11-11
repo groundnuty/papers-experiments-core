@@ -15,7 +15,9 @@ requests after it are topped up and it is an event (`expcore.models.spend`, C26)
 With a budget, a model of the core's own adapters is also asked whether its endpoint holds a reply to the max_tokens it
 is sent (`reply_cap_unshown`, C27): a request for a long reply under a small max_tokens must come back cut at that
 limit, its output count within it. What it shows decides only which bound the budget reserves
-(`expcore.campaign.reply_cap`); a model it does not show is admitted all the same.
+(`expcore.campaign.reply_cap`); a model it does not show is admitted all the same. A one-token completion answered with
+more than one output token already shows the endpoint does not apply its max_tokens (`max_tokens_ignored`), so the
+model is not held to the reply maximum and that probe is not sent.
 """
 
 from typing import Protocol
@@ -38,23 +40,38 @@ async def admit(backend: ModelBackend) -> str | None:
 
     The check never reads a model listing. Errors that are not the provider's (a bug in the harness) are raised.
     """
+    return (await admit_reading(backend))[0]
+
+
+async def admit_reading(backend: ModelBackend) -> tuple[str | None, ProbeReply | None]:
+    """Do what `admit` does, and return the one-token completion's reply with its verdict (None when none was read),
+    so the caller can see whether the endpoint applied the max_tokens of 1 it was sent (`max_tokens_ignored`, C27)."""
     limit, context = backend.output_limit, backend.context_tokens
     if limit is not None and context is not None and limit >= context:
-        return f"the output limit of {limit} tokens does not fit the endpoint's context of {context} tokens"
+        return f"the output limit of {limit} tokens does not fit the endpoint's context of {context} tokens", None
     try:
         reply = await backend.probe()
     except InfraError as error:
-        return f"the one-token completion failed: {error.kind}: {error.detail}"
+        return f"the one-token completion failed: {error.kind}: {error.detail}", None
     except ContextOverflow as error:
-        return f"the one-token completion overflowed the context ({error.pattern})"
+        return f"the one-token completion overflowed the context ({error.pattern})", None
     except RequestAbandoned:
-        return "the one-token completion was sent and not answered in time"
+        return "the one-token completion was sent and not answered in time", None
     except Exception as error:
         info = classify(error)
         if info is None:
             raise
-        return f"the endpoint refused the one-token completion: {describe(info)}"
-    return unreported_usage(reply)
+        return f"the endpoint refused the one-token completion: {describe(info)}", None
+    return unreported_usage(reply), reply
+
+
+def max_tokens_ignored(reply: ProbeReply | None) -> str | None:
+    """Return why a probe's reply shows the endpoint does not apply the max_tokens it is sent: an output count above
+    it (C27); None when it does not show that."""
+    if reply is None or reply.output_tokens is None or reply.output_tokens <= reply.max_tokens:
+        return None
+    what = "the one-token completion" if reply.max_tokens == 1 else "the probe"
+    return f"{what} reported {reply.output_tokens} output tokens for a max_tokens of {reply.max_tokens}"
 
 
 async def reply_cap_unshown(backend: ReplyCapProbe) -> str | None:
