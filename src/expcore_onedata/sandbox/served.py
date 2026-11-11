@@ -7,7 +7,8 @@
 (`DockerSandbox.served_bytes`), so a scorer reads it at `record.instruments["served_bytes"]` and replay serves the
 recorded value; nothing is measured again. Its snapshot:
 
-  {"version": 1, "data_path": "rest", "listing": "complete", "served_bytes": 51234, "content_bytes": 40960,
+  {"version": 1, "data_path": "rest", "listing": "complete", "run_start_marked": true, "served_bytes": 51234,
+   "content_bytes": 40960,
    "listing_bytes": 10240, "other_bytes": 34, "gate_answer_bytes": 0,
    "files": {"<file id>": {"path": "/api/v3/oneprovider/data/<file id>/content", "requests": 3,
                            "ranges": [[0, 32768], [36864, 40960]], "range_bytes": 36864, "ranges_cut": false,
@@ -16,7 +17,9 @@ recorded value; nothing is measured again. Its snapshot:
    "listings": {"<directory id>": {"path": "/api/v3/oneprovider/data/<directory id>/children", "requests": 1,
                                    "body_bytes": 10240}},
    "listings_total": 1, "listings_cut": false,
-   "caps": {"max_files": 1000, "max_directories": 1000, "max_ranges_per_file": 64}, "unknown": []}
+   "caps": {"max_files": 1000, "max_directories": 1000, "max_ranges_per_file": 64},
+   "before_run_start": {"requests": 2, "served_bytes": 340, "content_bytes": 0, "listing_bytes": 300,
+                        "other_bytes": 40, "gate_answer_bytes": 0}, "unknown": []}
 
 What each count holds is in `gatelog` (the bytes of the platform's answers the gate's socket accepted for the agent,
 by what they were; the gate's own answers apart; and the same per file whose content it served and per directory it
@@ -30,6 +33,11 @@ every table is None whenever `unknown` names a reason, and unknown is never zero
 says so (`files_cut`, `listings_cut`, a row's `ranges_cut`), and then a file without a row may have been read: read a
 snapshot through `lookup_file`, `lookup_bytes` and `lookup_directory`, which answer `served`, `not_served` or `unknown`
 with the reasons, so a file a cap left out reads as unknown (`files_cut`), never as not served and never as 0 bytes.
+
+`run_start_marked` says whether the executor marked where the agent's run began (`DockerSandbox.mark_run_start`, after
+its own checks through the sandbox): with the mark, the counts, the tables and so every lookup hold only the answers
+after it, and those before it are counted in `before_run_start`; without it every answer is the run's and
+`before_run_start` is None (O21). A snapshot recorded before these two keys existed lacks them: not recorded.
 """
 
 import math

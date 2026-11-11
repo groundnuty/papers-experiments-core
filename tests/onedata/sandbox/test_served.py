@@ -123,6 +123,7 @@ def test_o22_the_bytes_served_add_up_each_answer_by_what_its_body_was():
         "listings_total": 1,
         "listings_cut": False,
         "caps": DEFAULT_CAPS,
+        "before_run_start": None,  # no mark of the run's start: nothing is counted apart (O21)
         "unknown": [],
     }
 
@@ -454,7 +455,12 @@ def test_o22_a_rest_runs_count_is_taken_once_by_the_collection_and_the_instrumen
     write_log(sbx, *ANSWERS)
     sbx.collect(tmp_path / "evidence")
     write_log(sbx)  # the log changing after the collection does not change the count
-    expected = {"data_path": "rest", "listing": listing, **gatelog.served(log(*ANSWERS), STOPPED)}
+    expected = {
+        "data_path": "rest",
+        "listing": listing,
+        "run_start_marked": False,
+        **gatelog.served(log(*ANSWERS), STOPPED),
+    }
     assert set(expected["files"]) == {ALPHA, BRAVO}
     assert sbx.served_bytes() == expected
     assert json.loads((tmp_path / "evidence" / "metadata.json").read_text())["served_bytes"] == expected

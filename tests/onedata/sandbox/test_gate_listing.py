@@ -422,5 +422,47 @@ def test_o22_the_bytes_served_are_what_the_client_received_in_either_listing_mod
         "listings_total": 1,
         "listings_cut": False,
         "caps": {"max_files": 1000, "max_directories": 1000, "max_ranges_per_file": 64},
+        "before_run_start": None,
         "unknown": [],
     }
+
+
+def test_o21_through_a_real_gate_the_count_takes_only_the_answers_after_its_run_start_mark(served):
+    """O21: the harness's lookup is answered and the gate marks the run's start at once, whether or not the lookup's
+    line is written yet: the mark names it when it is not. The count of the log then holds the agent's answers alone,
+    the lookup's apart, and only the agent's file has a row."""
+    data = bytes(range(256)) * 4
+    tree = {"data.bin": data, "seen.bin": bytes(50)}
+    world = served(MockOnedata(tree, space_name="invented-space", token=GATE_TOKEN), listing="paged")
+    file_id, seen_id = "f" + b"data.bin".hex(), "f" + b"seen.bin".hex()
+    status, looked = request(world, f"/api/v3/oneprovider/data/{seen_id}")  # the harness's check of the data path
+    assert status == 200
+    gate.mark_run_start()  # the executor's mark, as soon as its check returned
+    assert request(world, f"/api/v3/oneprovider/data/{file_id}/content") == (200, data)  # the agent's read
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:  # every answer's line, and no handler between its line and its count
+        lines = world.log.read_text().splitlines()
+        if sum('"method"' in x for x in lines) == 2 and not gate._LIVE:
+            break
+        time.sleep(0.05)
+    gate.teardown()
+    stopped = {
+        "signalled": True,
+        "exit_code": 0,
+        "output_read": True,
+        "log_write_failed": False,
+        "teardown_incomplete": False,
+    }
+    marked = {"gate": True, "signalled": True, "confirmed": True}
+    got = gatelog.served(world.log.read_text().splitlines(), stopped, run_start=marked)
+    assert got["unknown"] == []
+    assert (got["served_bytes"], got["content_bytes"], got["other_bytes"]) == (len(data), len(data), 0)
+    assert got["before_run_start"] == {
+        "requests": 1,
+        "served_bytes": len(looked),
+        "content_bytes": 0,
+        "listing_bytes": 0,
+        "other_bytes": len(looked),
+        "gate_answer_bytes": 0,
+    }
+    assert set(got["files"]) == {file_id}

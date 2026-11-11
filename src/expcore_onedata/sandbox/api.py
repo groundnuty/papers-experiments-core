@@ -131,8 +131,9 @@ class Sandbox(Protocol):
     code did; `stop` is idempotent and raises when anything is not verifiably gone; `metadata` holds no secret.
     """
 
-    def exec(self, code: str, timeout_s: float) -> ExecResult:
-        """Run Python source as the unprivileged user."""
+    def exec(self, code: str, timeout_s: float, *, record: bool = True) -> ExecResult:
+        """Run Python source as the unprivileged user; `record=False` makes it the harness's own step, never a cell of
+        the agent's (O21)."""
         ...
 
     def collect(self, dest_dir: str | Path) -> dict[str, Any]:

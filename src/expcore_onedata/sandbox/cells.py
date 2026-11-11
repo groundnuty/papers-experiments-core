@@ -239,6 +239,8 @@ class CellRunner:
                 self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, wall0)
         finally:  # whatever was raised: a timer that has not fired must not kill the next cell's processes
             timer.end()
+            if not record:  # what an unrecorded run raised is its own: the next cell reads its baseline afresh (O21)
+                self._events_seen = None
         return res
 
     def _not_started(self, record: bool) -> ExecResult:
