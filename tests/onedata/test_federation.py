@@ -124,8 +124,9 @@ BREAKS = [
 
 @pytest.mark.parametrize(("field", "breakage"), BREAKS)
 def test_o03_a_provider_field_that_is_absent_or_shaped_otherwise_is_refused_by_name(field, breakage):
-    """O03: nothing is guessed. The name and online fields are unconfirmed by any source, the domain is confirmed;
-    a supporting provider without any of them, or with another shape, makes the answer unreadable, naming the field."""
+    """O03: nothing is guessed. The name and online fields are confirmed only by one live release, the domain by a
+    source; a supporting provider without any of them, or with another shape, makes the answer unreadable, naming the
+    field."""
     broken = dict(GOOD_PROVIDER)
     if breakage == "absent":
         del broken[field]

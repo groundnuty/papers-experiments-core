@@ -177,6 +177,8 @@ Of the gate's two option modes, the merged listing is carried over as the comple
 
 The only basis for the content type of a file's content, which the data gate streams on (`expcore_onedata/sandbox/gateboundary.py`, listed in `UNVERIFIED_ENDPOINTS`), is ICSA's mock of a provider: its content handler answers 200, or 206 for a range, with `application/octet-stream` (`icsa/sandbox/mock_onedata.py:170-195` at 6fc798cf). No source shows a real provider answering so; the live contract test does.
 
+The only source for the content type of a file's content, which the data gate streams on (`expcore_onedata/sandbox/gateboundary.py`), is ICSA's mock of a provider: its content handler answers 200, or 206 for a range, with `application/octet-stream` (`icsa/sandbox/mock_onedata.py:170-195` at 6fc798cf). No source shows a real provider answering so; the live contract test showed Onedata 25.0 answering so on the Compose federation (#29), and it left `UNVERIFIED_ENDPOINTS`.
+
 ### 7. Recording, transcripts and replay
 
 | Study | Where | Size, tests | Study-specific | Handles | Verdict |

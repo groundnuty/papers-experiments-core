@@ -6,7 +6,8 @@ study.toml names one Python file (`[study] plugin`). The core loads it and calls
 
     def build(context: StudyContext) -> StudyPlugin: ...
 
-The module is the study's own code and lives in the study directory, so the code identity covers it. Nothing in the core
+The module is the study's own code and lives in the study directory, so the code identity covers it. It may import
+modules beside it relatively (`from .scoring import Scorer`), each a file `[study] code` lists. Nothing in the core
 imports a study by name.
 """
 
@@ -14,8 +15,9 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
+import os
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -29,12 +31,22 @@ from expcore.campaign.lease import ResourceProbe
 from expcore.config.loading import ConfigError, Section
 from expcore.config.models import ModelTable, not_built_by_core
 from expcore.plugin import ToolSpec
+from expcore.provenance.codestamp import covered_files
+from expcore.provenance.environment import EnvironmentUnknown, closure
 from expcore.records.build import redactor_for
 from expcore.records.rescore import Scorer, scorer_name, scorer_version
-from expcore.study.config import OUT_DIR, StudyConfig
+from expcore.study.config import OUT_DIR, STUDY_FILE, StudyConfig, StudyIdentity
+from expcore.study.plugin_import import (
+    PLUGIN_MODULE_PREFIX,
+    Locator,
+    SourceOnlyLoader,
+    forget,
+    in_package,
+    resolved,
+    watching,
+)
 
 BUILD = "build"
-PLUGIN_MODULE_PREFIX = "expcore_study_plugin_"  # the rest of a plugin's module name is a hash of its path
 
 
 @dataclass(frozen=True)
@@ -93,14 +105,19 @@ class StudyPlugin:
     def backend_factory_identity(self) -> dict[str, str] | None:
         """The factory's name and version for the campaign fingerprint; None when the plugin supplies no factory.
 
-        The name is qualified by its module, except that a factory in the plugin file goes by its name alone: a
-        plugin's module name holds the path of the study directory, and moving a study is not another experiment.
+        The name is qualified by its module, except that a factory in the plugin file goes by its name alone, and one in
+        a module beside the plugin by that module's name below the plugin's: a plugin's module name holds the path of
+        the study directory, and moving a study is not another experiment.
         """
         factory = self.backend_factory
         if factory is None:
             return None
         module, qualname = factory_name(factory)
-        name = qualname if module.startswith(PLUGIN_MODULE_PREFIX) else f"{module}.{qualname}"
+        head, _, below = module.partition(".")
+        if head.startswith(PLUGIN_MODULE_PREFIX):
+            name = f"{below}.{qualname}" if below else qualname
+        else:
+            name = f"{module}.{qualname}"
         return {"name": name, "version": factory.version}
 
 
@@ -121,9 +138,19 @@ def tools_sha256(specs: Sequence[ToolSpec]) -> str:
 
 
 def import_plugin_module(
-    file: Path, *, error_text: bool = True, models: ModelTable | None = None, log_root: Path | None = None
+    study: StudyConfig | StudyIdentity,
+    *,
+    error_text: bool = True,
+    models: ModelTable | None = None,
+    log_root: Path | None = None,
 ) -> ModuleType:
     """Import the study's plugin module from its file, running its top level, and return it; ConfigError if it cannot.
+
+    The plugin is imported as a package whose path is its own directory, under a name made from a hash of its path, so
+    it imports a module beside it relatively (`from .scoring import Scorer`), and two studies' modules of one name never
+    meet. Every import compiles the files anew from their source, after dropping every module an earlier import of the
+    study left (`plugin_import`). Every file of the study directory whose code runs must be a module of the package and
+    a file `[study] code` lists (`check_plugin_modules`).
 
     `build` is not called, so no model or key is read. What the module registers when imported, the native parser of a
     backend of the study's own, is then there for a step that needs nothing else of the plugin: the replay check. That
@@ -134,37 +161,132 @@ def import_plugin_module(
     the diagnostic; and with `log_root` (a study's `out/`) the redacted
     traceback goes to the harness-error log there, which the message names.
     """
+    file = study.plugin_file
     module_name = f"{PLUGIN_MODULE_PREFIX}{hashlib.sha256(str(file).encode()).hexdigest()[:12]}"
-    spec = importlib.util.spec_from_file_location(module_name, file)
+    loader = SourceOnlyLoader(module_name, str(file))
+    spec = importlib.util.spec_from_file_location(
+        module_name, file, loader=loader, submodule_search_locations=[str(file.parent)]
+    )
     if spec is None or spec.loader is None:
         raise ConfigError(f"{file}: cannot be loaded as a Python module")
+    _forget(study, module_name)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module  # dataclasses and pickling look the module up by name
     try:
-        spec.loader.exec_module(module)
+        with watching() as ran:
+            spec.loader.exec_module(module)
     except Exception as error:
-        del sys.modules[module_name]
+        _forget(study, module_name)
+        hint = _beside_hint(file, error)
         if not error_text:
-            raise ConfigError(f"{file}: failed on import ({type(error).__name__})") from None
+            raise ConfigError(f"{file}: failed on import ({type(error).__name__}){hint}") from None
         redactor = partial(redactor_for, None, models=models, short_tokens=True)
-        message = f"{file}: failed on import ({type(error).__name__}: {redactor().with_lines().text(str(error))})"
+        text = redactor().with_lines().text(str(error))
+        message = f"{file}: failed on import ({type(error).__name__}: {text}){hint}"
         if log_root is not None:
             stamp = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
             title = f"importing {file.name}: {type(error).__name__}"
             logged = write_failure(log_root, error, title=title, stamp=stamp, redactor=redactor)
             message += f"; its traceback, redacted, is in {logged}"
         raise ConfigError(message) from error
+    check_plugin_modules(study, module, ran)
     return module
+
+
+def _where(study: StudyConfig | StudyIdentity) -> tuple[str, frozenset[str], frozenset[str]]:
+    """The study directory, resolved, the directories the code identity never enters, and the distributions the
+    environment record covers (their names only: no source is read). A required distribution that is not installed
+    is refused here, by name, so it is never mistaken for uncovered study code."""
+    try:
+        recorded = frozenset(closure(getattr(study, "requires", ())))
+    except EnvironmentUnknown as error:  # the real cause, before any file is refused as uncovered for want of it
+        raise ConfigError(f"{study.root / 'study.toml'}: [study] requires: {error}") from None
+    return os.path.realpath(study.root), frozenset(study.scope.skip_dirs), recorded
+
+
+def _forget(study: StudyConfig | StudyIdentity, module_name: str) -> None:
+    """Drop the plugin's package and every module whose file lies in the study directory, so none is served again."""
+    forget(module_name, *_where(study))
+
+
+def _beside_hint(file: Path, error: Exception) -> str:
+    """The fix for an absolute import of a module that lies beside the plugin; empty for any other error.
+
+    It names a file of the study, never the exception's text, so the replay check may show it too.
+    """
+    name = getattr(error, "name", None) if isinstance(error, ModuleNotFoundError) else None
+    if not isinstance(name, str) or "." in name:
+        return ""
+    if not ((file.parent / f"{name}.py").is_file() or (file.parent / name).is_dir()):
+        return ""
+    return (
+        f"; {name!r} is a module beside the plugin: import it relatively (from .{name} import ...) and list its file "
+        "in [study] code"
+    )
+
+
+def check_plugin_modules(study: StudyConfig | StudyIdentity, module: ModuleType, ran: Iterable[str] = ()) -> None:
+    """Refuse code of the study directory that the code identity does not vouch for, and forget the study's modules.
+
+    The files are found by location (`plugin_import`): every module in `sys.modules` whose file lies in the study
+    directory, and every file whose code ran (`ran`, from `plugin_import.watching`). Each must be a file `[study] code`
+    covers, or a change to it would leave the identity, and so the replay check's and the package's claims about the
+    code, as they were. Each must also be a module of the plugin's package: one found through the module search path or
+    loaded by path is cached under a name another study could be served, or runs from cached bytecode.
+    """
+    root, skip_dirs, recorded = _where(study)
+    package = module.__name__
+    locator = Locator(root, skip_dirs, recorded)
+    modules = locator.modules(package)
+    own = {code.path for name, code in modules.items() if in_package(name, package)}
+    elsewhere = {code.path: name for name, code in sorted(modules.items()) if not in_package(name, package)}
+    found = {code.path: code for code in modules.values()}
+    for file in ran:
+        if resolved(file) not in found and (code := locator.locate(file)) is not None:
+            found[code.path] = code
+    listed = [os.path.join(root, name) for name in covered_files(root, study.scope)]
+    covered = {resolved(file) for file in listed} | {os.path.realpath(file) for file in listed}  # links either side
+    section = Section({}, Path(root) / STUDY_FILE, "[study]")
+    ordered = sorted(found.values(), key=lambda code: code.relative)
+    for code in ordered:
+        if code.path not in covered and os.path.realpath(code.path) not in covered:
+            _forget(study, package)
+            raise section.fail(
+                "code",
+                f"does not list {code.relative!r}, whose code runs when the plugin is loaded; list every file of the "
+                "study directory the plugin runs in [study] code, so the code identity covers the code that runs",
+            )
+    for code in ordered:
+        if code.path not in own:
+            _forget(study, package)
+            shown = f" (as {elsewhere[code.path]!r})" if code.path in elsewhere else ""
+            raise section.fail(
+                None,
+                f"{code.relative!r} runs from the study directory outside the plugin's package{shown}; "
+                f"{_relative_import(study, code.path)}, so it is compiled from the source the code identity hashed and "
+                "no other study can be served it",
+            )
+
+
+def _relative_import(study: StudyConfig | StudyIdentity, path: str) -> str:
+    """How the plugin imports a file relatively, by the file's path from the plugin's own directory."""
+    home = os.path.realpath(study.plugin_file.parent)
+    if not path.startswith(home + os.sep):
+        return "move it into the plugin's directory and import it relatively from the plugin"
+    stem = Path(os.path.relpath(path, home)).with_suffix("").as_posix().replace("/", ".").removesuffix(".__init__")
+    return f"import it relatively from the plugin (from .{stem} import ...)"
 
 
 def load_plugin(context: StudyContext) -> StudyPlugin:
     """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve."""
     file = context.study.plugin_file
-    module = import_plugin_module(file, models=context.study.models, log_root=context.study.root / OUT_DIR)
+    module = import_plugin_module(context.study, models=context.study.models, log_root=context.study.root / OUT_DIR)
     build = getattr(module, BUILD, None)
     if not callable(build):
         raise ConfigError(f"{file}: must define a function {BUILD}(context) that returns a StudyPlugin")
-    plugin = build(context)
+    with watching() as ran:
+        plugin = build(context)
+    check_plugin_modules(context.study, module, ran)  # again: `build` may import or run a file of the study too
     if not isinstance(plugin, StudyPlugin):
         raise ConfigError(f"{file}: {BUILD}(context) returned {type(plugin).__name__}, not a StudyPlugin")
     _check(file, context.study, plugin)

@@ -185,12 +185,8 @@ class FactorSchema:
         for name, assignment in self.conditions.items():
             where = Section(assignment, self.file, f"[conditions.{name}]")
             for factor, level in assignment.items():
-                if factor in BUILTIN_FACTORS:
-                    raise where.fail(factor, "is built in; a condition assigns declared factors only")
-                if factor not in self.declared:
-                    raise where.fail(
-                        factor, f"is not a declared factor; declared: {', '.join(self.declared) or 'none'}"
-                    )
+                check_condition_key(where, factor, self.declared)
+                where.string(factor)  # then the value: a non-empty string, named by its type when it is not one
                 if level not in self.declared[factor]:
                     raise where.fail(
                         factor, f"has unknown level {level!r}; levels of {factor!r}: {', '.join(self.declared[factor])}"
@@ -371,6 +367,18 @@ def _distinct(label: str, values: Iterable[Any]) -> list[Any]:
     return out
 
 
+def check_condition_key(where: Section, factor: str, declared: Mapping[str, Any]) -> None:
+    """Refuse a key of a condition that is not a factor it may assign: a built-in one, or one the study never declared.
+
+    It runs before the key's value is typed, so a list on a key that is no factor (`seeds = [1]`) is refused for the
+    key, and the message never suggests that a string would be accepted.
+    """
+    if factor in BUILTIN_FACTORS:
+        raise where.fail(factor, "is built in; a condition assigns declared factors only")
+    if factor not in declared:
+        raise where.fail(factor, f"is not a declared factor; declared: {', '.join(declared) or 'none'}")
+
+
 def _table(parent: Section, key: str, where: str) -> Section:
     """Return a required sub-table of `parent` named `where` in messages, as TOML writes the table."""
     return Section(parent.section(key).data, parent.file, where)
@@ -393,7 +401,8 @@ def load_factor_schema(path: str | os.PathLike[str]) -> FactorSchema:
     all_conditions = _table(top, "conditions", "[conditions]")
     for name in all_conditions.data:
         section = _table(all_conditions, name, f"[conditions.{name}]")
-        conditions[name] = {f: section.string(f) for f in section.data if f not in (TREATMENT_KEY, TASKS_KEY)}
+        # As written: the schema checks each key as a factor before it checks the value's type, after the factors
+        conditions[name] = {f: v for f, v in section.data.items() if f not in (TREATMENT_KEY, TASKS_KEY)}
         treatment[name] = section.strings(TREATMENT_KEY)
         if TASKS_KEY in section.data:
             tasks[name] = section.strings(TASKS_KEY)

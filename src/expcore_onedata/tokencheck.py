@@ -104,7 +104,8 @@ def _parse(info: Any) -> tuple[str, str, list[Mapping[str, Any]]]:
     """Return the token id, the subject's id and the caveats of an examination answer; refuse if any is not as read.
 
     `id` and `caveats` are the fields the earlier code read from a real examination. The subject's shape (an `id`
-    under `subject`) is not confirmed by any source, so a subject that is not exactly that is a refusal.
+    under `subject`) is confirmed only by the live run against Onedata 25.0 (`[L1]` in `client.py`), so a subject that
+    is not exactly that is a refusal.
     """
     if not isinstance(info, Mapping):
         raise _unparsed("the answer", "an object")

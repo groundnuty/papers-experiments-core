@@ -81,7 +81,8 @@ def parse_scope(answer: Any, space_id: str) -> SpaceView:
         raise FederationUnreadable("zone: the scope answer does not describe the study space") from None
     # The sources only iterate `supports` for provider ids (sandbox.py:500, health.py:64), so it is read as a mapping
     # keyed by id or as a list of ids. They read the space's `name` and `providers[id]["domain"]`; `providers[id].name`
-    # and `.online` are not confirmed by any source, so a provider without either, or with another shape, is refused.
+    # and `.online` are confirmed only by the live run against Onedata 25.0 ([L1] in client.py), so a provider without
+    # either, or with another shape, is refused.
     listed = isinstance(supports, Mapping) or (isinstance(supports, list) and all(isinstance(i, str) for i in supports))
     ids = sorted(supports) if listed else []
     if not ids or not isinstance(details, Mapping):

@@ -1,0 +1,560 @@
+# The Compose file of the federation layout five-providers.toml (project expcore-fed5), made by fedcompose.py.
+#
+# Never edit it, and never run it with docker compose alone: federation.py generates it from the layout at
+# every command, makes the CA, the certificates and the secrets these services read, and bootstraps the
+# federation. To see what a layout generates: federation.py --layout PATH compose
+name: "expcore-fed5"
+services:
+  zone:
+    image: "docker.onedata.org/onezone:ID-ba7a778696"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/onezone.sh"]
+    hostname: "node1"
+    domainname: "zone.expcore-fed5.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/zone.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEZONE_CONFIG: |
+        cluster:
+          domainName: "zone.expcore-fed5.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+        onezone:
+          name: "expcore-fed5-zone"
+          domainName: "zone.expcore-fed5.test"
+          letsEncryptEnabled: false
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/zone/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29543"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["zone.expcore-fed5.test"]
+  aspen:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/oneprovider.sh"]
+    hostname: "node1"
+    domainname: "aspen.expcore-fed5.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/aspen.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "aspen.expcore-fed5.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "aspen"
+          adminEmail: "admin@aspen.expcore-fed5.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "aspen.expcore-fed5.test"
+        onezone:
+          domainName: "zone.expcore-fed5.test"
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/aspen/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/aspen/storage"
+        target: "/volumes/storage"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/aspen.regtoken"
+        target: "/expcore/registration-token"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29544"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["aspen.expcore-fed5.test"]
+  larch:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/oneprovider.sh"]
+    hostname: "node1"
+    domainname: "larch.expcore-fed5.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/larch.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "larch.expcore-fed5.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "larch"
+          adminEmail: "admin@larch.expcore-fed5.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "larch.expcore-fed5.test"
+        onezone:
+          domainName: "zone.expcore-fed5.test"
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/larch/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/larch/storage"
+        target: "/volumes/storage"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/larch.regtoken"
+        target: "/expcore/registration-token"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29545"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["larch.expcore-fed5.test"]
+  rowan:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/oneprovider.sh"]
+    hostname: "node1"
+    domainname: "rowan.expcore-fed5.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/rowan.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "rowan.expcore-fed5.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "rowan"
+          adminEmail: "admin@rowan.expcore-fed5.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "rowan.expcore-fed5.test"
+        onezone:
+          domainName: "zone.expcore-fed5.test"
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/rowan/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/rowan/storage"
+        target: "/volumes/storage"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/rowan.regtoken"
+        target: "/expcore/registration-token"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29546"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["rowan.expcore-fed5.test"]
+  alder:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/oneprovider.sh"]
+    hostname: "node1"
+    domainname: "alder.expcore-fed5.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/alder.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "alder.expcore-fed5.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "alder"
+          adminEmail: "admin@alder.expcore-fed5.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "alder.expcore-fed5.test"
+        onezone:
+          domainName: "zone.expcore-fed5.test"
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/alder/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/alder/storage"
+        target: "/volumes/storage"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/alder.regtoken"
+        target: "/expcore/registration-token"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29547"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["alder.expcore-fed5.test"]
+  hazel:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/oneprovider.sh"]
+    hostname: "node1"
+    domainname: "hazel.expcore-fed5.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/hazel.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "hazel.expcore-fed5.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "hazel"
+          adminEmail: "admin@hazel.expcore-fed5.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "hazel.expcore-fed5.test"
+        onezone:
+          domainName: "zone.expcore-fed5.test"
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/hazel/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/hazel/storage"
+        target: "/volumes/storage"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/hazel.regtoken"
+        target: "/expcore/registration-token"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29548"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["hazel.expcore-fed5.test"]
+  janitor:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    profiles: ["janitor"]
+    network_mode: "none"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    entrypoint: ["sh", "-c", "test \"$$(cat /fed/.expcore-fed-root 2>/dev/null)\" = expcore-fed5 || { echo \"not this federation root\" >&2; exit 3; }; find /fed -mindepth 1 -delete"]
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}"
+        target: "/fed"
+        bind:
+          create_host_path: false
+networks:
+  fed:
+    driver: "bridge"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"

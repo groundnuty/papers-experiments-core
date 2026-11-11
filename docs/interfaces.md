@@ -8,14 +8,14 @@ All of them are `typing.Protocol`s, so a test double needs no inheritance. Signa
 
 | Architecture name | In v0.1 |
 |---|---|
-| `Study` | the study directory (`study.toml` and its siblings) plus one plugin module whose `build(context)` returns a `StudyPlugin` ([below](#the-study-plugin)) |
+| `Study` | the study directory (`study.toml` and its siblings, which may declare the [side files](#side-files-of-a-record) of its records) plus one plugin module whose `build(context)` returns a `StudyPlugin` ([below](#the-study-plugin)) |
 | `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` (leased platform users), its own `ToolProvider`s and two `Instrument`s (the platform probes, and the bytes the agent read through its data path) through the same `StudyPlugin`; its sandbox is [described below](#the-platform-layers-sandbox). A platform of another kind is a distribution of its own that plugs in through the same `StudyPlugin` and the same protocols: [the study guide's section 10](study-guide.md#10-a-platform-of-your-own) lists what it needs, and `examples/sparql_platform/` is one |
 | `ToolProvider`, `Scorer`, `Instrument` | protocols: [`ToolProvider`](#toolprovider-and-callcontext), [`Scorer`](#scorer) and [`Instrument`](#instrument) (a protocol since step 4b2) |
 | `ModelBackend`, `RunExecutor`, `HealthCheck`, `ResourceProbe` | protocols, below |
 
 ## The study plugin
 
-A study directory holds `study.toml`, `models.toml`, `campaign.toml`, `preregistration.toml` and one Python file named by `[study] plugin`; `[study] requires` names the distributions beyond the core that the study's code imports. `expcore.study.config.load_study(directory)` validates all of them against each other. `expcore.study.plugin.load_plugin` imports the file and calls
+A study directory holds `study.toml`, `models.toml`, `campaign.toml`, `preregistration.toml` and the plugin, the Python file `[study] plugin` names, with any modules it imports from beside it; `[study] requires` names the distributions beyond the core that the study's code imports. `expcore.study.config.load_study(directory)` validates all of them against each other. `expcore.study.plugin.load_plugin` imports the file and calls
 
 ```python
 def build(context: StudyContext) -> StudyPlugin: ...
@@ -46,9 +46,17 @@ The core guarantees: the code identity is computed once, from the study director
 
 The implementer must guarantee: `build` has no side effects beyond constructing objects; the hashes describe what the model sees under each condition; nothing is named by the core, so every name lives in the study.
 
+**A plugin over several files.** `import_plugin_module` imports the plugin as a package whose path is the plugin's own directory, named `expcore_study_plugin_` plus a hash of the plugin's path. A module beside it is imported relatively (`from .scoring import Scorer`, or `from . import scoring`) and is named below that package, so two studies' `scoring.py` never meet in one process. Every module of the package is compiled from its file's bytes on each load, never from cached bytecode, so what runs is what the code identity hashed, and no bytecode is written into the study. `import scoring` finds nothing, since the study directory is not on the module search path; the refusal names the fix.
+
+The core holds the code that runs to the code identity by where it comes from, not by its module name (`expcore.study.plugin_import`). While the plugin is imported and while `build` runs, it records every file whose code is executed, and it then finds every module in `sys.modules` whose file lies in the study directory; code the recorded environment covers does not count: the core's own packages, the running environment (a virtual environment inside the study directory, for one) and any installed distribution's code, editable or not, found as the environment record finds it (its `RECORD`, or for an editable install where it imports from), as does code below a directory the identity skips. It refuses the load, naming `study.toml` and the file relative to the study, when such a file is one `[study] code` does not cover, and when it is not a module of the plugin's package: a file imported through the module search path, or loaded by path (`spec_from_file_location`), would be cached under a name another study could be served, or run from stale bytecode. Before every import, and after a refused one, it drops every module of the study's own code, whatever its name, and every module of the package, so no study is served another's; it never drops a module of the core or of an installed distribution. The replay check's import is held to the same rules.
+
+The implementer must guarantee that every file the plugin imports is in `[study] code` (and so in `package.toml`, whose build requires every file the identity covers), and that it imports each at the plugin's top level or in `build`: a module first imported while a run is under way escapes the check. The check sees code only: a data file the plugin reads by path (a prompt, a table) is not checked, and the identity covers it only if `[study] code` lists it, as the example lists `prompt.txt`. A backend factory in a module beside the plugin enters the fingerprint as `scoring.Factory`, without the hashed name.
+
 The command line is `python -m expcore run|check|analyze|report|package|package-check|example` ([`cli.py`](../src/expcore/cli.py)). Output goes under `<study>/out/`; `package` writes a replication package where `--out` says, and `example` writes the example study into a new directory. How to use them is in [`study-guide.md`](study-guide.md).
 
 What the analysis may use. `check` replays every record and also copies the campaign store into the batch (`campaign-snapshot.sqlite`, made with SQLite's online backup over a read-only connection, which copies pages and so needs no particular SQLite version; then each attempt's directory is written relative to the batch and the copy is rebuilt with a plain `VACUUM`, so it holds no path of the machine the campaign ran on; and integrity-checked) and hashes the copy with the records. It lists the records it replayed (`replayed`) and refuses a run record named by a hashed-only pattern, so a check cannot replay nothing and still vouch for the records beside it. It refuses a store with attempts still running unless `--partial`, which the check records. `analyze` and `report` then use only those bytes: the snapshot, never the live store, and the replayed records, each read once and compared with the check's hash. They cross-validate the two: every record maps to an attempt of the snapshot, and every attempt scored (state `done`, a scored treatment failure included) has a replayed record that agrees with it on run key, attempt, outcome and treatment flag. Any mismatch is refused, naming it. With `--partial`, attempts still running at the check are tolerated, a final attempt no replayed record covers is left out. Every saved output (`export.json`, `analysis.json`, `report.md`) says whether the analysis is partial and lists the attempts left out (run key, attempt, reason); `analysed_attempts` holds only what was scored, and every count in the report is of that population, with the left-out runs' attempts in a column of their own.
+
+Side files are verified with the records. A file a run writes beside its record, which the record names by its SHA-256, is declared in `study.toml` ([below](#side-files-of-a-record)). `check` hashes every file of a declared name in the batch it parses into its inputs, never replays one, and pairs each with the one record in its directory; the check records the declaration (`side_files`) and each side file's hash in `inputs`. `analyze`, `report`, `regenerate` and a package's `make check` refuse a check made under another declaration, refuse a side file changed, removed or added since the check, and read each side file once to pair it with its record again, whatever the check file claims. A study that declares none is checked exactly as before, and its check file holds no `side_files`.
 
 ## ModelBackend
 
@@ -176,6 +184,19 @@ def tools_sha256(specs: Sequence[ToolSpec]) -> str  # expcore.study.plugin
 ```
 
 `tools_sha256` is the SHA-256 of a tool set: each tool's name, description, `input_schema` and `terminal` flag, in name order. A study gives one per condition as `StudyPlugin.tools`, over the specs its executor passes to `record_run` under that condition, and it goes into the campaign fingerprint: a changed description or schema, an added tool or a changed `terminal` flag refuses a resume (C06). It does not see a name clash, which shows at the first run as above. It is not the hash a record carries. `RunRecord.prompt["tools_sha256"]` is the tool box's, taken over the descriptions as the model saw them, each with the output-cap sentence appended, so it also changes with `output_cap_chars` (L06). The core compares neither with the other, nor the declared hash with the tools the executor then passes: the plugin guarantees that the hash describes what the model sees under the condition.
+
+### Two tool hashes
+
+Two hashes describe a run's tools, over different text, so they differ even for the same tools, by design:
+
+| Hash | What it covers | Where it goes |
+|---|---|---|
+| `expcore.study.plugin.tools_sha256(specs)` | the tools as the study declares them: each `ToolSpec`'s name, description, input schema and terminal flag, in name order | the plugin's `StudyPlugin.tools`, one per condition, which the campaign fingerprint holds (C06) |
+| `ToolBox.manifest_sha256` (`expcore.loop.toolbox`) | the definitions the model is sent: each tool's name, input schema and description with the output-cap sentence the tool box appends (`describe_cap`, which states `output_cap_chars`), plus each tool's terminal flag, which the model is not told | the record, as `prompt.tools_sha256` despite its name; the replay check rebuilds the tool box from the record's `tools` and the cap and refuses a record whose hash differs (R03) |
+
+The record also keeps `tools`, each tool as its provider gave it, before the cap sentence: exactly what `tools_sha256` hashes. The cap itself is in the fingerprint through the loop's caps, so neither hash leaves it unguarded.
+
+To check that conditions differ only in which tools they expose, compare `tools_sha256` values: the plugin's per condition before the runs (conditions meant to differ only in tools have equal `prompts` hashes and different `tools` hashes), and, after them, the hash recomputed from each record's `tools` (`tools_sha256([ToolSpec(**t) for t in record.tools])`) against the plugin's hash for the run's condition, which shows that the executor exposed what the plugin declared. That value does not depend on the output cap, so it compares across campaigns too. The records' `prompt.tools_sha256` values may be compared with each other within one campaign, where every run has the same cap, but never with a `tools_sha256`. An MCP server's frozen manifest has a third hash, `FrozenManifest.sha256` ([below](#the-frozen-manifest)), over the server's own tool listing.
 
 ### McpToolProvider
 
@@ -314,6 +335,31 @@ The second is `expcore_onedata.sandbox.served.ServedBytes(sandbox)` (namespace `
 
 The count is taken once, when the collection stops the gate, and the record keeps it: replay and re-scoring read the recorded snapshot, tables included, and never measure them again.
 
+### Side files of a record
+
+An instrument whose reading is too large for the record, a compressed log of the byte ranges a run read for instance, can write it to a file beside the record and keep its SHA-256 in the snapshot. The study declares each such file in `study.toml` (`expcore.replay.side_files`, validated by `expcore.study.config` when the study loads):
+
+```toml
+[[study.side_files]]
+pattern = "extent_ranges.json.gz"               # one file name, looked for beside each record
+hash_field = "instruments.extent.side_sha256"   # the record field, a dotted path, that holds the file's SHA-256
+```
+
+- `pattern` is one literal file name, never a glob or a path, because each side file is paired with the one record in its own directory: the attempt directory `request.run_dir`, which holds one record. A name that starts with a dot is refused (the check never reads such a file), and so is a name the campaign or the check writes: a record's, `attempt-marker.json`, `campaign-snapshot.sqlite`, `replay-check.json`. A name ending in `.json` is a side file, never taken for a record.
+- `hash_field` is record keys joined by dots, looked up in the record's stored JSON. Each pattern and each field is declared once.
+- The declaration is part of `study.toml`, whose hash is in the campaign fingerprint, so a campaign resumed under another declaration is refused (C06).
+
+Core guarantees, in `check` and again wherever the analysis reads the batch (R14), each refusal naming the file:
+- a record whose field holds a hash with no such file beside it is refused;
+- a side file whose bytes do not have the hash its own record names is refused, two records' side files swapped included;
+- a file of a declared name in a directory that holds no record (left from an earlier campaign or attempt) is refused against its own path, wherever it lies in the batch, and never hashed into a passing check;
+- a side file beside a record whose field is absent or `null` is refused; a record with neither the field nor the file is fine, since that run made no side file;
+- a field that holds anything but 64 lower-case hexadecimal digits is refused;
+- a hash or a side file in a directory that holds more than one record is refused, since it cannot be paired;
+- the side files are found in exactly the batch directory the check parses, however the command names the study and the batch.
+
+Implementer must guarantee: the executor writes the side file into `request.run_dir` with the record, and the record names it. An attempt killed after writing its side file and before writing its record leaves an orphan, which `check` refuses, naming it, until it is removed. A scorer still reads only the record (R13): a measure computed from a side file's content is the study's own code reading the file, outside the bytes the analysis reads once and verifies.
+
 ## RunExecutor
 
 `expcore.campaign.executor.RunExecutor`.
@@ -362,6 +408,61 @@ Implementer must guarantee:
 - Script or configure the backend through the request; never build one.
 - Pass `request.treatment_kinds` unchanged (`record_run` does) and the code identity from `StudyContext.code`.
 - Close nothing the core owns (backend, timer, lease).
+
+### What an executor reads
+
+An executor keeps the `StudyContext` that `build` received (the example's keeps it as `self.context`) and reads the loaded configuration from `context.study`, an `expcore.study.config.StudyConfig`, beside what the request carries. All of it is read-only, and every field comes from the study's configuration files, whose hashes are in the campaign fingerprint, so nothing an executor reads there can change under a resumed campaign (C06).
+
+| To get | Read | What it is |
+|---|---|---|
+| the run's levels | `request.identity.factors` | every factor of the run key: the declared ones and the built-in `task`, `model` and `seed` |
+| the run's condition | `study.schema.condition_named(factors, request.run_key)` | the condition's name |
+| a task's attributes | `study.tasks[task_id].attributes` | the text keys of `[tasks.<id>]` in `study.toml`; `study.tasks[task_id].id` is the id |
+| the loop's caps | `study.campaign.agent.limits` | `max_tool_rounds`, `time_cap_s`, `token_budget`, `output_cap_chars` and `max_output_tokens` (`expcore.config.models.Limits`); `study.campaign.agent`, the whole loop configuration, goes to `record_run` |
+| the plan | `study.campaign.models`, `.seeds`, `.order_seed`; `study.manifest` | the models and seeds of the plan, its order seed, and every run in the seeded order |
+| a model's entry | `study.models.resolve(key)` with the run's `factors["model"]`; `request.models` is the same table (`ModelTable \| None`) | a `ModelSpec`: backend, API id, limits, price, status; the run's backend itself is `request.backend` |
+| a condition's settings | `study.schema.conditions[name]`, `.condition_tasks[name]`, `.treatment_kinds[name]` | its levels, its task list (`None`: every task) and its treatment kinds; the run's own kinds are `request.treatment_kinds`, passed on unchanged |
+| the study's name, its own kinds, its distributions | `study.name`, `study.kinds`, `study.requires` | |
+| the code identity | `context.code` | passed to `record_run` unchanged |
+
+The rest has no place in a run: `study.prereg` is the analysis plan, and `study.root`, `study.plugin_file` and `study.scope` hold paths of the machine, which must reach neither a prompt nor a record (the plugin finds its own files from `__file__`, as the example's `HERE` does). A prompt filled per task takes its values from these fields, as the example's does with the task's `region` (a value that is not text is rendered with `str`):
+
+```python
+task, limits = study.tasks[factors["task"]], study.campaign.agent.limits
+slots = {"TASK": task.id, "REGION": task.attributes["region"], "ROUNDS": limits.max_tool_rounds}
+user = template.render(slots, study_run=True)  # for a template with a {ROUNDS} slot, which the example's has not
+model = study.models.resolve(factors["model"])  # the run's ModelSpec, looked up by the model key of its run key
+```
+
+## PromptTemplate
+
+`expcore.prompt.templates`. A template is text with named slots. The executor renders it for each run and passes the result to `record_run`, which records the text with the template's hash and the values of its slots.
+
+```python
+@dataclass(frozen=True)
+class PromptTemplate:
+    text: str
+    slot_names: tuple[str, ...]  # a property: the template's slots, sorted, each once
+    sha256: str                  # a property: the SHA-256 of the template's text
+    @classmethod
+    def from_file(cls, path: Path, *, expected_sha256: str | None = None) -> PromptTemplate
+    def render(self, values: Mapping[str, Any], *, study_run: bool = False) -> RenderedPrompt
+
+@dataclass(frozen=True)
+class RenderedPrompt:
+    text: str
+    template_sha256: str
+    rendered_sha256: str
+    slots: dict[str, str]  # the values inserted, as text
+```
+
+- **Slots.** A slot is `{NAME}`: an opening brace, a capital letter, any capital letters, digits and underscores, and a closing brace. Every other brace is text and is sent as it is, so a JSON example in a prompt (`{"answer": "...", "sources": [{"id": 1}]}`), `{}` or `{lower}` needs no escape. The slot form itself has no escape: to show `{NAME}` to the model, give it as the value of a slot.
+- **Values.** `render` needs a value for every slot, and refuses a value for a name the template does not have, or for a name that cannot be a slot. A value is made text with `str`, and one that is `None` or blank (empty, or only whitespace) is refused, so a condition with nothing to add in a slot still says something short (the example's `HINTS`). A value is inserted as it is and never searched for slots again.
+- **`study_run=True`** refuses the draft marker `PLACEHOLDER`, in any case, in the template or in any value, so a draft prompt never reaches a model of a study run; it changes nothing else. The example's executor passes it. A pilot or a test that renders a draft leaves it off.
+- **`from_file(path, expected_sha256=...)`** reads a template as UTF-8 and, given `expected_sha256`, refuses a file whose text has another hash, to pin the template to the hash a protocol froze.
+- **Refusals** raise `PromptError`, a `ValueError` that names the slot. Raised in an executor, it makes the attempt a harness defect (C10).
+- **The record.** Pass the `RenderedPrompt` itself to `record_run` as `system` or `user`: the record keeps its `text`, the text's `sha256`, `template_sha256` and `slots`. A plain string is recorded with neither a template hash nor slots. The hash a plugin gives for a condition (`StudyPlugin.prompts`) is the template rendered with what the condition decides and stand-ins for what each task fills in, as the example's `build` does; the tasks' values come from `study.toml`, whose hash the fingerprint holds.
+- **Nesting.** To compose templates, render the inner one first and pass its `text` as the value of a slot of the outer one, as in `outer.render({"RULES": inner.render(rules).text, ...})`. A value is never searched again, so the inner text's braces stay as they are. **Known limit:** the record then holds the outer template's hash and the inner text as that slot's value, and neither the inner template's hash nor its slot values. A study that needs them pins the inner template with `expected_sha256`, or records its hash and slots itself, in an instrument's snapshot for instance.
 
 ## HealthCheck
 
@@ -459,11 +560,61 @@ Implementer (the platform layer) guarantees:
 
 Not carried over from the earlier study: the gate's whole-file mode, the tracer and its checks, the capacity probes tied to two data layouts, and the replication branch of its fourth condition. Its merged-listing mode is the complete listing above, written anew against this gate with bounds and checks the earlier one lacked.
 
+## Estimator
+
+`expcore.stats.estimators`. A contrast names its estimator in `preregistration.toml` (`estimator = "..."`), with the estimator's parameters in `[estimators.<name>]`. The core registers one, `wilcoxon_cluster_bootstrap`.
+
+```python
+class Estimator(Protocol):
+    def __call__(self, paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult
+
+@dataclass(frozen=True)
+class PairedDifferences:
+    clusters: tuple[str, ...]  # the rows: the clusters with at least one paired cell, sorted
+    models: tuple[str, ...]    # the columns: the models with at least one paired cell, sorted
+    matrix: np.ndarray         # clusters x models, the mean difference A - B of each cell; NaN where it has no pair
+    cluster_differences: np.ndarray  # a property: per cluster, the equal-weight mean over its models with a cell
+
+@dataclass(frozen=True)
+class EstimatorSettings:
+    replicates: int            # [bootstrap] replicates
+    level: float               # the interval's level: [bootstrap] ci_level, or 1 - 2 alpha for the equivalence test
+    seed: tuple[int, ...]      # [bootstrap] seed and a digest of the contrast's name: the only entropy
+    params: Mapping[str, Any]  # [estimators.<name>] as preregistered
+
+@dataclass(frozen=True)
+class EstimatorResult:
+    estimate: float            # the effect A - B; NaN where it cannot be computed, as every float here
+    p_value: float             # two-sided
+    ci_low: float
+    ci_high: float
+    n_clusters: int
+    per_model: tuple[ModelEstimate, ...] = ()  # ModelEstimate(model, estimate, ci_low, ci_high, n_undefined_replicates)
+    counts: Mapping[str, int] = field(default_factory=dict)  # the estimator's own counts, such as zero_dropped
+
+def register(name: str, *, check_params=None, p_values=None)  # a decorator: @register("name") above the function
+```
+
+How pairs become the matrix's cells is in [the study guide's section 5](study-guide.md#how-pairs-become-a-contrasts-input).
+
+Core guarantees:
+- The matrix is read-only, and no row or column of it is all NaN; a contrast with no pair at all gets a `PairedDifferences` with no cluster.
+- `check_params(params)`, given at registration, is called when the preregistration is loaded, so a bad parameter is refused naming `[estimators.<name>]`; without one, any parameter is refused.
+- For a contrast with an `equivalence_margin` the analysis calls the estimator a second time with `level` at 1 - 2 alpha and the same seed. A NaN p-value counts as p = 1 in the Holm family.
+- `p_values`, given at registration, is used to simulate the minimum detectable effect with the contrast's own parameters (S06, S09). Without it the contrast's minimum detectable effect is NaN (`null` in `analysis.json`).
+
+Implementer must guarantee:
+- The estimator is a pure function of its arguments: called twice with equal settings, it returns equal results, whatever ran in between. NaN, never a guess, where it cannot compute a value.
+- `p_values(studies, params)` returns, for each row of a studies x clusters array of cluster differences, exactly the p-value the estimator reports for that row.
+- The name is lower-case letters, digits and underscores, registered once: a second registration of a name is refused.
+
+**Where a study's estimator is registered.** The preregistration is validated when the study is loaded, before its plugin is imported, so a name only the plugin registers is unknown at that point and the contrast is refused (`unknown estimator 'name'; registered: wilcoxon_cluster_bootstrap`). A study cannot register its estimator through its plugin. It registers it at the top level of a module that `[study] platforms` names, which the loader imports before it validates anything, as it does for a platform's infrastructure kinds. That module must be importable, so it is installed code, not a file of the study directory, which is not on the module search path: a distribution of the study's own, named in `[study] requires`, so it is part of the campaign's environment and the replication package vendors its wheel. Its version speaks for its code, so change the version when the estimator changes. Once registered, the estimator stays registered for the rest of the process.
+
 ## Other protocols the core defines
 
 | Protocol | Where | Signature |
 |---|---|---|
-| `Estimator` | `expcore.stats.estimators` | `__call__(self, paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult`; registered by name with `estimators.register`, named by a contrast in `preregistration.toml` |
+| `Estimator` | `expcore.stats.estimators` | `__call__(self, paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult`, [above](#estimator) |
 | `Recompute` | `expcore.replay.check` | `name: str`, `version: str`, `__call__(self, record: RunRecord) -> int`; recomputes a recorded decision offline and raises on a contradiction (R05) |
 
 ## Closed vocabularies

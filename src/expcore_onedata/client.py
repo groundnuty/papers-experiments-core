@@ -44,17 +44,21 @@ or a record through it.
 
 Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S11]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
-client test in a source sends it and reads the answer as this layer does.
+client test in a source sends it and reads the answer as this layer does. `[L1]` is the live contract tests
+(`tests/live/test_contract.py`) and the direct reads recorded beside them, run against Onedata 25.0, the release the
+deployments of record run, on the Compose federation of `deploy/compose-federation` on 10 Nov 2026: its day-0 report
+and `day0/2026-11-10-federation-facts.md`, which says which fact a test showed and which a direct read (an eviction's
+record was read directly, since no live test ran one).
 
 - Authentication: the header `X-Auth-Token` with an access token. Confirmed by [S2].
 - `get`: `GET /spaces/{space}/users/{user}/privileges` and `GET /spaces/{space}/effective_users/{user}/privileges`; the
   answer key is `privileges`. Confirmed by [S3].
-- `space_name`: `GET /spaces/{space}` with the admin token, the answer key `name`. Unconfirmed: see
-  `UNVERIFIED_ENDPOINTS`.
+- `space_name`: `GET /spaces/{space}` with the admin token, the answer key `name`. Confirmed by [L1].
 - `query`: `POST /tokens/examine`, body `{"token"}`, sent with the admin token; the answer keys `id` and `caveats` are
-  read. Confirmed by [S4] and [S5].
+  read. Confirmed by [S4] and [S5]; the subject's id, under `subject`, by [L1].
 - `query`: `POST /tokens/infer_access_token_scope`, body `{"token"}`, no header; the answer's
-  `dataAccessScope.spaces[*].name` and `.supports` and `.providers[*].domain` are read. Confirmed by [S6].
+  `dataAccessScope.spaces[*].name` and `.supports` and `.providers[*].domain` are read. Confirmed by [S6]; the
+  providers' `name` and `online` by [L1]. A token past its time caveat is answered 400 `tokenCaveatUnverified` [L1].
 - `mint_own_token`: `POST /user/tokens/temporary` with `Authorization: Basic` of the user itself, body
   `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
 - Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
@@ -62,24 +66,28 @@ client test in a source sends it and reads the answer as this layer does.
   `GET /spaces/{space}` (the key `fileId` is the space's root), `GET /data/{id}/children` (query `limit`, `attribute`,
   `token`; answer `children`, `isLast`, `nextPageToken`), `POST /data/{parent}/children` (query `name`, `type`; answer
   `fileId`), `PUT /data/{id}/content` (query `offset`, an octet-stream body), `GET /data/{id}`, `DELETE /data/{id}`,
-  `GET /data/{id}/distribution`, `POST /transfers` (body `type`, `fileId`, `replicatingProviderId` or
-  `evictingProviderId`) and `GET /transfers/{id}`. `read_range` is `GET /data/{id}/content` with a `Range` header,
+  `GET /data/{id}/distribution`, `POST /transfers` (body `type`, `dataSourceType`, `fileId`, `replicatingProviderId`
+  or `evictingProviderId`) and `GET /transfers/{id}`. `read_range` is `GET /data/{id}/content` with a `Range` header,
   answered with a 206 and a `Content-Range`. `content_answer` is the same call whole or with `Range: bytes=0-0`, of
-  which only the status and the `Content-Type` are read: the type is the unconfirmed detail it measures
-  (`precampaign.py`).
+  which only the status and the `Content-Type` are read: the type it measures (`precampaign.py`),
+  `application/octet-stream` for both, is confirmed by [L1].
 - `file_space_name`: `GET /data/{id}` with the query `attribute=path`, the answer key `path`, whose first segment is
-  the name of the space the file lies in. Unconfirmed against a real provider: [S9] is the earlier study's mock of what
-  the official client calls, and it answers `path` as `/{space name}/...`; see `UNVERIFIED_ENDPOINTS`.
+  the name of the space the file lies in. [S9] is the earlier study's mock of what the official client calls, and it
+  answers `path` as `/{space name}/...`. **Refuted by [L1]**: Onedata 25.0 has no `path` attribute, so on that release
+  every mutation and range read by file id is refused before it is sent; see `UNVERIFIED_ENDPOINTS`.
 - The probes' transfer log (`transferlog.py`) reads `GET /spaces/{space}/transfers` on a provider (query `state`,
   `limit`, `page_token`; answer `transfers`, a list of ids, and `nextPageToken`, followed until empty), confirmed by
   [S10] for the states `ongoing` and `ended`, and each id's `GET /transfers/{id}`, whose `fileId` [S10] and state and
-  counters [S11] are confirmed. The state `waiting`, a record's `type`, provider ids and times, and the listing
-  answer's `Date` header (`get_dated`, the provider's clock) are unconfirmed; see `UNVERIFIED_ENDPOINTS`.
+  counters [S11] are confirmed. The state `waiting`, the listing answer's `Date` header (`get_dated`, the provider's
+  clock), and a record's `type`, provider ids and times (epoch seconds), for a replication and an eviction, are
+  confirmed by [L1], which also shows the eviction counter named `filesEvicted` and the state `transferStatus`, as
+  [S11] reads them.
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
-which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what no source confirms, and
-each entry has a live contract test (`tests/live/test_contract.py`) that fails if the deployment answers otherwise.
+which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
+[L1] confirms, and what [L1] refuted; each entry has a live contract test (`tests/live/test_contract.py`) that fails if
+the deployment answers otherwise.
 """
 
 import base64
@@ -104,53 +112,18 @@ MUTATING = ("POST", "PUT", "PATCH", "DELETE")
 # an admin; the scope inference is [S6], called without a header.
 READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_access_token_scope": False}
 
-# What no source confirms: (method, path, what is unconfirmed). Each has a test in tests/live/test_contract.py marked
-# `covers:` with its method and path; a unit test holds that none is missing there.
+# What no source and no live run confirms, or a live run refuted: (method, path, what). Each has a test in
+# tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
+# The six entries [L1] confirmed left the list; their live tests stay, so a later release that answers otherwise fails.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     (
         "GET",
-        "/spaces/{space}",
-        "the whole call: no source reads a space's details; the answer's name field is what the mutation gate checks",
-    ),
-    (
-        "GET",
         "/data/{id}",
-        "the `path` attribute: no source reads it from a real provider; the earlier study's mock [S9] answers it as"
-        " /{space name}/..., and the first segment is what the gate of a mutation by file id checks",
-    ),
-    (
-        "POST",
-        "/tokens/examine",
-        "the shape of the answer's subject (an id under subject); the sources read id and caveats [S4]",
-    ),
-    (
-        "POST",
-        "/tokens/infer_access_token_scope",
-        "the providers' name and online fields; the sources read the space's name and supports and the domain [S6]",
-    ),
-    (
-        "GET",
-        "/data/{file}/content",
-        "a provider call: the Content-Type of a file's content read whole (200) and by range (206), "
-        "application/octet-stream, the only answer the data gate streams (sandbox/gateboundary.py); the only basis is "
-        "the earlier study's mock of a provider, its content handler (docs/inventory.md cites it)",
-    ),
-    (
-        "GET",
-        "/spaces/{space}/transfers",
-        "a provider call: the state value waiting; running code lists ongoing and ended [S10], and waiting is named "
-        "only by the provider's API description, which [S10]'s client accepts; and the answer's Date header, from "
-        "which the transfer log estimates the provider's clock offset (`get_dated`): HTTP requires it, and no source "
-        "reads it",
-    ),
-    (
-        "GET",
-        "/transfers/{id}",
-        "a provider call: a record's type, replicatingProviderId, evictingProviderId, scheduleTime, startTime and "
-        "finishTime; running code reads only the state and counters [S11] and fileId [S10], and the rest is named only "
-        "by the API description and a mocked client test of [S10], which also names the eviction counter "
-        "fileReplicasEvicted where [S11] reads filesEvicted, and the state transferState where [S11] reads "
-        "transferStatus",
+        "the `path` attribute, which the gate of a mutation by file id reads the space's name from (its first "
+        "segment): the earlier study's mock [S9] answers it as /{space name}/..., and [L1] refuted it: Onedata 25.0 "
+        "answers attribute=path with 400 badValueNotAllowed (its attributes are file_id, parent_id, name and the "
+        "like, with no path), so on that release the gate refuses every mutation and range read by file id, fail "
+        "closed, until it reads a file's space another way",
     ),
 )
 _ERROR_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -427,8 +400,8 @@ class OnezoneClient:
         Every call reads: nothing is kept, so a file moved or a space renamed since the last call changes the answer
         (O09). The path must be canonical (`_space_of_path`) and its first segment is its space's name. A file the
         provider does not know, or an answer without a canonical path, raises OutOfScope; any other failure of the
-        read raises PlatformError. Neither message holds the id or a name. The read is unconfirmed against a real
-        provider (`UNVERIFIED_ENDPOINTS`).
+        read raises PlatformError. Neither message holds the id or a name. Onedata 25.0 has no `path` attribute and
+        answers 400, so there every caller fails closed with PlatformError (`UNVERIFIED_ENDPOINTS`).
         """
         if not isinstance(file_id, str) or not _FILE_ID.fullmatch(file_id):
             raise OutOfScope("the target file id is not a plain id, so it resolves to no space")

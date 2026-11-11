@@ -17,16 +17,14 @@ the file of the factory's module (the module of its class, for a callable instan
   nothing behind its version, and is refused, naming the module.
 """
 
-import json
 import sys
-from importlib import metadata
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import covered_files
-from expcore.provenance.environment import editable_roots, installed, pth_directories, top_level_location
+from expcore.provenance.environment import installed, owns_file
 from expcore.study.config import StudyConfig
 from expcore.study.plugin import StudyPlugin, factory_name
 
@@ -44,47 +42,6 @@ def _covered(study: StudyConfig, file: Path) -> bool:
     except ValueError:
         return False
     return relative in set(covered_files(root, study.scope))
-
-
-def _editable(dist: metadata.Distribution) -> bool:
-    try:
-        data = json.loads(dist.read_text("direct_url.json") or "{}")
-    except ValueError:
-        return False
-    info = data.get("dir_info") if isinstance(data, dict) else None
-    return isinstance(info, dict) and info.get("editable") is True
-
-
-def _top_level_names(dist: metadata.Distribution) -> set[str]:
-    """The top-level names a distribution declares in `top_level.txt`, which setuptools writes for an editable install
-    too; none when it declares none."""
-    return set((dist.read_text("top_level.txt") or "").split())
-
-
-def _owns(dist: metadata.Distribution, file: Path, top: str) -> bool:
-    """Whether an installed distribution's code holds the file of a module under top-level name `top`: listed in its
-    RECORD, or, for an editable install, inside one of its top-level packages where it imports from (directly below a
-    directory its `.pth` puts on the path, else where an import hook loads it inside the project), never merely
-    somewhere below the project."""
-    if _editable(dist):
-        pth = pth_directories(dist)
-        if pth:
-            homes = [d / top for d in pth if (d / top).is_dir()]
-            return any(h.resolve() in file.parents for h in homes) or any(
-                (d / f"{top}.py").resolve() == file for d in pth
-            )
-        directories, module = top_level_location(top, editable_roots(dist))
-        if any(d.resolve() in file.parents for d in directories):
-            return True
-        # A single top-level module counts only when the distribution names it among its top-level names, so a loose
-        # module of the project on a path added by hand is not taken for the distribution's code.
-        return module is not None and module.resolve() == file and top in _top_level_names(dist)
-    site = Path(str(dist.locate_file(""))).resolve()
-    try:
-        relative = PurePosixPath(file.relative_to(site).as_posix())
-    except ValueError:
-        return False
-    return any(PurePosixPath(item.as_posix()) == relative for item in dist.files or [])
 
 
 def _same_version(declared: str, owned: str) -> bool:
@@ -105,7 +62,7 @@ def check_factory_version(plugin: StudyPlugin, study: StudyConfig) -> None:
     if file is not None and _covered(study, file):
         return  # the study's own code: the code identity covers it
     top = module.split(".", 1)[0]
-    owners = [dist for dist in installed().values() if _owns(dist, file, top)] if file is not None else []
+    owners = [dist for dist in installed().values() if owns_file(dist, file, top)] if file is not None else []
     if not owners:
         raise ConfigError(
             f"{where} comes from module {module}, which no installed distribution owns and the study's code identity "

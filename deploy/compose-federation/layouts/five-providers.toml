@@ -1,0 +1,60 @@
+# An example layout: five Oneproviders and four spaces, one provider mirroring a second owner's space.
+#
+#   uv run python deploy/compose-federation/federation.py --layout deploy/compose-federation/layouts/five-providers.toml up
+#
+# Every name is invented. Its project, domain and ports differ from the default layout's, so the two never share a
+# container, a network or a port. A root holds one federation at a time, since its mark names one project: run it
+# after the default one is down, or beside it in a root of its own, never inside the other's root.
+# five-providers.compose.yaml beside it is what it generates.
+
+project = "expcore-fed5"
+domain = "expcore-fed5.test"
+study_space = "alpha-space"
+memory_limit = "6g"              # six services: their limits together must fit in the host's available memory
+platform_template = "five-providers.platform.toml.template"
+
+[zone]
+port = 29543
+
+[providers.aspen]
+port = 29544
+
+[providers.larch]
+port = 29545
+
+[providers.rowan]
+port = 29546
+
+[providers.alder]
+port = 29547
+
+[providers.hazel]
+port = 29548
+
+[spaces.alpha-space]             # the study space: owned by aspen, mirrored by rowan, which owns nothing itself
+owner = "aspen"
+mirrors = ["rowan"]
+
+[spaces.beta-space]
+owner = "larch"
+
+[spaces.gamma-space]
+owner = "alder"
+
+[spaces.delta-space]             # owned by hazel and mirrored by alder, the owner of gamma-space
+owner = "hazel"
+mirrors = ["alder"]
+support_bytes = 5368709120       # 5 GiB on each of its providers
+
+[principals.alpha-reader]
+privileges = ["space_view", "space_read_data"]
+
+[principals.alpha-tools]
+privileges = ["space_view", "space_read_data"]
+
+[principals.alpha-health]
+privileges = ["space_view", "space_read_data"]
+
+[principals.delta-reader]        # a member of the mirrored space only
+privileges = ["space_view", "space_read_data"]
+spaces = ["delta-space"]

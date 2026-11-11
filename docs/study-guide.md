@@ -22,7 +22,7 @@ The identity covers the study's directory and nothing else. Platform and backend
 
 ### What you implement
 
-The study directory holds four configuration files and one Python file, the plugin, named by `[study] plugin`. The core imports the plugin and calls `build(context)`, which returns a `StudyPlugin`:
+The study directory holds four configuration files and the plugin, the Python file `[study] plugin` names. The core imports the plugin and calls `build(context)`, which returns a `StudyPlugin`:
 
 | Part | What it is | In the example |
 |---|---|---|
@@ -34,7 +34,9 @@ The study directory holds four configuration files and one Python file, the plug
 | `health`, `probe`, `lease_group`, `lease_keys` | the platform's health check, resource probe and leases; the Onedata layer supplies real ones | stubs that always succeed |
 | `backend_factory` | optional: a `BackendFactory` that builds the backend of every model, for a study with a model backend of its own. Its model entries name that backend in `models.toml` with a plain lower-case `backend` value; the factory serves those and hands every other model to the core's `default_backend_factory`. It carries a `version` attribute that goes into the campaign fingerprint with its name; a factory imported from an installed package must declare the installed version of the distribution that owns its module's file, one defined in a file `[study] code` lists, which the code identity covers, may declare any, and one from anywhere else is refused. Without a factory, such a model is refused when the plugin is loaded | none: the core's factory builds the stub |
 
-The plugin names everything; the core names nothing. What each interface guarantees, and what you must guarantee in return (an executor never builds a backend, a scorer never reads the platform), is in [`interfaces.md`](interfaces.md).
+The plugin names everything; the core names nothing. What each interface guarantees, and what you must guarantee in return (an executor never builds a backend, a scorer never reads the platform), is in [`interfaces.md`](interfaces.md). So is what an executor may read of the study's configuration, such as a task's attributes (`study.tasks[task_id].attributes`) and the loop's caps (`study.campaign.agent.limits`): see [what an executor reads](interfaces.md#what-an-executor-reads). The example's prompt names each task's `region`, which its executor reads that way. How a template fills its slots is in [PromptTemplate](interfaces.md#prompttemplate): a blank value is refused, braces that enclose no slot name (a JSON example) are sent as they are, `study_run=True` refuses a draft marker, and an inner template is nested by passing its rendered text as a slot's value, which records only the outer template's hash.
+
+A plugin that outgrows one file imports the modules beside it relatively: `from .scoring import Scorer` in `plugin.py` finds `scoring.py` in the same directory. The core imports the plugin as a package of its own directory, under a name made from the plugin's path, so two studies' modules of one name never meet, and `import scoring` finds nothing (the error says to import it relatively). List every such file in `[study] code` beside `plugin.py`, and in `package.toml`. The core goes by where code comes from: it refuses to load a plugin that runs, at its top level or in `build`, a file of the study directory the list leaves out, because the code identity would not cover code that runs, or that runs one other than as a module of its package (through the module search path, or loaded by path), because that module could be served to another study. It compiles the plugin and its modules from their source on every load. It sees code only: a data file the plugin reads by path, like the example's `prompt.txt`, is covered only if you list it.
 
 ## 2. Where configuration lives
 
@@ -42,7 +44,7 @@ All configuration is TOML in the study directory, validated when the study is lo
 
 | File | Holds |
 |---|---|
-| `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the factors, the conditions and the tasks |
+| `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the side files of its records ([section 4](#side-files)), the factors, the conditions and the tasks |
 | `models.toml` | the single model table: each model once, with backend, API id, sampling, limits, price and status |
 | `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the kinds it records its failures as ([below](#the-schedulers-kinds)), and the budget |
 | `preregistration.toml` | the named contrasts, the Holm family, alpha, the estimators, the bootstrap and the power settings |
@@ -101,6 +103,23 @@ except ConfigError as error:
     assert "campaign.toml" in message and "key 'health_kind'" in message
     assert "did you mean 'sandbox'" in message
 shutil.rmtree(misspelt)
+```
+
+### What the budget reserves
+
+`[budget] max_usd` in `campaign.toml` is held by reserving, not by estimating. Before a run starts, the scheduler adds what has been spent, what the runs in flight can still cost and what this run can cost, and holds the run while that sum is over the ceiling. What a run can cost is its bound, which is what the gate reserves for it before dispatch: the loop's `token_budget` (in `[agent]`) at the model's dearest rate, the highest of its input, output and cache prices. The token budget is checked after each response, so a run can exceed its budget, and so its reservation, by up to one request (a prompt within the model's context window, plus the reply maximum), and it then ends as `token_cap`. `max_usd` can therefore be exceeded by that margin for each attempt in flight. Each run in flight is reserved its bound too, and an attempt that was killed, or whose usage was not reported, is charged its bound as spent. The mean cost of the runs so far decides nothing, because a run that overran it would pass the ceiling. `per_model_usd` caps single models the same way, and a model with neither a price nor `free = true` is held outright, since its cost is unknown.
+
+The example's bound is small: 20,000 tokens at alpha-stub's dearest rate, 2 USD per million output tokens, is 0.04 USD a run, against a ceiling of 5 USD. A real model's is not. With `token_budget = 2000000` and a model priced at 15 USD per million input tokens and 75 per million output tokens, every run reserves 2,000,000 tokens at 75 USD per million, 150 USD, however little a typical run spends. A ceiling of 50 USD then holds the campaign before its first run (0 spent, 0 in flight, 150 for this run: over 50), `run` exits 3, and the hold it prints gives those three figures. With two workers, the second run needs 300 USD of room. To run, raise `max_usd` above the bound times the runs that may be in flight, plus what has been spent, or lower `token_budget`, which is also the cap that ends a run as `token_cap`.
+
+```python
+from expcore.campaign.attempt_bounds import bound_usd
+from expcore.config.prices import Price
+
+limits = study.campaign.agent.limits
+assert (limits.token_budget, study.campaign.scheduler.budget.max_usd) == (20000, 5.0)
+assert bound_usd(study.models.resolve("alpha-stub"), limits.token_budget) == 0.04  # what each run reserves
+dear = Price(input_per_mtok=15.0, output_per_mtok=75.0)  # US dollars per million tokens
+assert dear.dearest_per_token() * 2_000_000 == 150.0  # its bound under token_budget = 2000000
 ```
 
 ### The federation's certificate
@@ -254,6 +273,20 @@ assert check["n_ok"] == check["n_records"] == len(check["replayed"]) and not che
 assert check["code"]["dirty"] is False and "campaign-snapshot.sqlite" in check["inputs"]
 ```
 
+### Files an agent writes
+
+A file the agent writes during a run (a report, a mask, a table) has no place in the batch unless the study declares it as a side file ([below](#side-files)). Undeclared, the check takes every `.json` file under `out/runs` as a record, so a `.json` file beside a record fails the check at `load` (`unsupported record schema None`); a file of any other kind is not among the check's inputs, so nothing vouches for it; and `analyze` reads the records alone. The scorer is a pure function of the record, so what it needs of such a file must be in the record.
+
+The supported way is an instrument, as the example's `FactsServed` is. The executor makes it with access to where the agent's files land; its `finish` reads them after the loop and returns what the scorer needs as its snapshot, a JSON object: the fields or counts the scorer reads, `None` with the failure beside it for a file that is missing or cannot be parsed, and the file's SHA-256 if a reader should be able to match the snapshot to the original bytes. The snapshot is in `record.instruments[namespace]`, so it is replayed and hashed with the record and travels into the package with it. The original bytes do not: keep the files outside `out/runs`, and out of the package unless `package.toml` attests each one (the package's checks refuse a file they cannot read, binary for one).
+
+### Side files
+
+A run can write a file beside its record that the analysis reads, a compressed log of the byte ranges a run read for instance, with the file's SHA-256 kept in the record, typically in an instrument's snapshot. Declare each such file in `study.toml`, one `[[study.side_files]]` table per file, with two keys: `pattern`, the file's name as the executor writes it into `request.run_dir` (one literal name, no glob and no directory), and `hash_field`, the record field that holds its SHA-256, as record keys joined by dots (`instruments.extent.side_sha256`). The exact form is in [`interfaces.md`](interfaces.md#side-files-of-a-record). The example declares none, and a study that declares none is checked exactly as before.
+
+`check` then hashes every file of a declared name in the batch into its inputs, never replays one, and pairs each with the one record in its directory: the attempt directory, which holds one record. It refuses, naming the file, a record that names a side file by its hash with no such file beside it, a side file whose bytes do not have the hash its own record names (two side files swapped included), a side file in a directory with no record, left from an earlier campaign or attempt, a side file beside a record that names no hash for it, and a hash that is not 64 lower-case hexadecimal digits. A record with neither the hash nor the file is fine: that run made no side file. The side files are looked for in the batch the check parses, wherever `--study` puts the study. The check records the declaration under `side_files`, and `analyze` and `report` refuse a check made under another, refuse a side file changed, removed or added since the check, and pair each side file with its record again. The declaration is in `study.toml`, whose hash is in the campaign fingerprint, so a campaign resumed under another declaration is refused.
+
+An attempt killed between writing its side file and writing its record leaves a side file with no record, which `check` refuses until you remove it. A scorer still reads only the record: a measure computed from a side file's content is your code reading that file, which the analysis does not hand over as verified bytes.
+
 ## 5. Score and analyse
 
 ```sh
@@ -290,6 +323,7 @@ assert {(e["condition"], e["infra_kind"]) for e in treated} == {("relay-down", "
 entry = treated[0]
 record = load_record(Path("my-study/out/runs") / entry["run_dir"] / record_filename(entry["run_key"], entry["attempt"]))
 assert record.instruments["facts"] == {"ok": True, "served": 1}  # the platform served one fact before the outage
+assert record.prompt["user"]["slots"]["REGION"] == study.tasks["lake"].attributes["region"] == "north"  # per task
 
 
 class LookupCount:
@@ -316,6 +350,41 @@ analysis = json.loads(Path("my-study/out/analysis.json").read_text())
 relay = next(c for c in analysis["contrasts"] if c["name"] == "relay-vs-baseline")
 assert relay["treatment_outcomes"] == "scored" and relay["pairs_missing"]["treatment_outcome_none"] == 0
 assert relay["n_pairs"] == 8  # both treatment attempts stay in their own contrast
+```
+
+### Which tool hash to compare
+
+Two hashes describe a run's tools. `tools_sha256`, which the plugin computes for each condition from the tools it declares (their names, descriptions, schemas and terminal flags), is what the campaign fingerprint holds. The record's `prompt.tools_sha256` holds the other, `ToolBox.manifest_sha256`: the definitions the model was sent, whose descriptions end with the sentence that states the output cap, and the terminal flags. They differ for the same tools, by design. To check that conditions differ only in which tools they expose, compare `tools_sha256` values: the plugin's for each condition, and the one recomputed from a record's `tools`, which the record keeps as declared, before the cap sentence ([two tool hashes](interfaces.md#two-tool-hashes)).
+
+```python
+from expcore.plugin import ToolSpec
+from expcore.study.plugin import StudyContext, load_plugin, tools_sha256
+
+plugin = load_plugin(StudyContext(study, {}))
+exposed = tools_sha256([ToolSpec(**tool) for tool in record.tools])  # the treated run's tools, as declared
+assert exposed == plugin.tools["relay-down"] == plugin.tools["baseline"] != plugin.tools["extended"]
+assert record.prompt["tools_sha256"] != exposed  # what the model was sent: the cap sentence in each description
+```
+
+### How pairs become a contrast's input
+
+What a contrast estimates is decided by how its pairs are combined, in stages of plain means:
+
+1. **Pairs.** A pair is one run of each arm with the same pairing key: task, model and seed for a contrast between two named conditions, and every other factor of the run key as well for a factor contrast. Its difference is A - B on the contrast's outcome. A pair whose outcome is missing on either side is left out and counted by its cause.
+2. **Per task and model.** The pairs of one task and one model (its seeds, and a factor contrast's levels of the other factors) are averaged into one value.
+3. **Per cluster and model.** The task values of one cluster (the tasks with one value of the contrast's `cluster` attribute) and one model are averaged, each task with equal weight whatever its number of pairs. These are the cells of the estimator's input, `PairedDifferences.matrix`: a row per cluster, a column per model, NaN where a model has no pair in a cluster.
+4. **Per cluster.** A cluster's difference is the mean over the models that have a cell in it, each model with equal weight (`cluster_differences`).
+
+`wilcoxon_cluster_bootstrap` tests those cluster differences with a signed-rank test (after snapping float noise and dropping zero differences, which it counts), its estimate is their mean, and its interval resamples whole clusters, one draw for every model. The cluster is the unit of inference: a task with more seeds, or a cluster with more tasks, weighs no more than another, and each model counts the same however many runs it has. The example has two regions, so each of its contrasts has two clusters.
+
+```python
+import numpy as np
+
+from expcore.stats.estimators import PairedDifferences
+
+cells = PairedDifferences(("north", "south"), ("alpha-stub", "beta-stub"), np.array([[1.0, 0.0], [0.5, np.nan]]))
+assert list(cells.cluster_differences) == [0.5, 0.5]  # south: beta-stub has no pair there, so alpha-stub's alone
+assert relay["n_clusters"] == len({task.attributes["region"] for task in study.tasks.values()}) == 2
 ```
 
 ### Unknown platform estimates are data
@@ -418,6 +487,45 @@ assert analysis["preregistration"]["preregistration_sha256"] == study.prereg.sha
 assert analysis["code"]["dirty"] is False
 ```
 
+### A rehearsal on stubs
+
+A dress rehearsal runs the whole plan on stub models before the real campaign: the executor, the tools, the scorers, the check, the analysis and the package, at no cost. The core's stub takes no backend's settings: `base_url`, `key_env`, `key_file`, `sampling`, `extra_body`, `prompt_cache_ttl` and `echo_reasoning_field` are refused on a `stub` entry when `models.toml` is loaded. So a rehearsal cannot run on the frozen model table with only the backend swapped; it runs on a `models.toml` of its own, whose hash is in the campaign fingerprint, and its fingerprint differs from the real campaign's. That is by design: a rehearsal's records can never be resumed into the real campaign or taken for its records.
+
+Rehearse in a copy of the study directory (a branch, or a directory of its own), so the rehearsal's `out/` stays apart: in the same `out/`, the real campaign would be refused as a resume under a changed configuration. In the copy, change `models.toml` alone. Keep every model key, so `campaign.toml`'s plan is unchanged, and `status = "frozen"`; set `backend = "stub"` and drop the settings a stub refuses; keep each model's price, `max_output_tokens` and `context_tokens`, which a stub takes, so the budget gate reserves the bound it will reserve for the real model and holds where it will hold. Keep identical what decides a result: the plan, the prompts, the tools, the scorers and the preregistration. The plugin's prompt and tool hashes and the scorers' versions are then the same in both fingerprints, and what differs comes from the model table alone: its hash and each model's entry.
+
+```python
+rehearsal = Path("rehearsal-study")
+shutil.copytree("my-study", rehearsal, ignore=shutil.ignore_patterns("out"))
+models = rehearsal / "models.toml"
+entry = '[models.alpha-stub]\nbackend = "stub"\nstatus = "frozen"\n'
+models.write_text(models.read_text().replace(entry, entry + "max_output_tokens = 256\ncontext_tokens = 200000\n"))
+assert load_study(rehearsal).config_sha256["models.toml"] != study.config_sha256["models.toml"]  # another campaign
+models.write_text(models.read_text().replace(entry, entry + 'prompt_cache_ttl = "5m"\n'))
+try:
+    load_study(rehearsal)
+    raise AssertionError("a stub took a setting of another backend")
+except ConfigError as error:
+    assert "prompt_cache_ttl applies to anthropic models only" in str(error)
+shutil.rmtree(rehearsal)
+```
+
+The example's executor runs on stubs only: it requires its backend to have `use(script)` and raises without it. A plugin meant for both the rehearsal and the real campaign scripts its backend only when the backend has `use`, and otherwise leaves the model to answer; the plugin is then the same file in both, so its code identity is the same. A stub given no script replies `done` to every turn.
+
+```python
+from expcore.models.adapters import StubAdapter
+
+
+def script_if_stub(backend, script):
+    """Script a backend that takes a script, the rehearsal's stub; a real model's backend has no `use`."""
+    use = getattr(backend, "use", None)
+    if callable(use):
+        use(script)
+
+
+script_if_stub(StubAdapter([]), ["deep"])  # the rehearsal: the stub plays the script
+script_if_stub(object(), ["deep"])  # the real campaign: a backend without `use` is left to answer
+```
+
 ## 8. Ship a replication package
 
 `package.toml` lists what the package holds; anything it does not list is left out. The example lists its configuration and code, the records with the replay check (`out/runs`), and the four outputs.
@@ -434,13 +542,13 @@ tar -xzf dist/tiny-study-package.tar.gz -C dist
 make -C dist/tiny-study-package -f Makefile check PYTHON="uv run python"
 ```
 
-The build refuses a check made under code that is not a clean commit, outputs made by another core version, a check made under another environment than the build's, a file the package's check needs and the list leaves out, and any path or content that matches a name private everywhere in the core's study-token hashes (`--hashes` takes your own list in place of the core's: see [the study-token hashes](#the-study-token-hashes)). Before it writes the archive it runs the package's own check on the staged files: every file against `SHA256SUMS`, the environment against the check's, then `export.json`, `scores.json`, `analysis.json` and `report.md` derived anew from the records and compared byte for byte. That check is what `make -f Makefile check` runs for a reader; naming the Makefile matters, because the package may hold no other file make would read first, and the build refuses one, but a reader's copy could. The archive is deterministic: two builds of one tree are the same bytes.
+The build refuses a check made under code that is not a clean commit, outputs made by another core version, a check made under another environment than the build's, a file the package's check needs and the list leaves out (every side file the replay check hashed is one), and any path or content that matches a name private everywhere in the core's study-token hashes (`--hashes` takes your own list in place of the core's: see [the study-token hashes](#the-study-token-hashes)). Before it writes the archive it runs the package's own check on the staged files: every file against `SHA256SUMS`, the environment against the check's, then `export.json`, `scores.json`, `analysis.json` and `report.md` derived anew from the records and compared byte for byte. Deriving them goes through the same refusals as `analyze`, so a study's [side files](#side-files) are verified too: one changed, removed or added in an unpacked package fails `make check` even when `SHA256SUMS` was made to agree, and so does one that no longer pairs with its record. That check is what `make -f Makefile check` runs for a reader; naming the Makefile matters, because the package may hold no other file make would read first, and the build refuses one, but a reader's copy could. The archive is deterministic: two builds of one tree are the same bytes.
 
 ### What a reviewer runs
 
 A reviewer needs only the package, `make` and Python. `wheels/` holds one wheel per distribution of the environment the records were checked under: the core, what `[study] requires` names, and everything they require. `make -f Makefile check` makes a fresh environment beside the package (`<package>.venv`, or `VENV=...`), installs those wheels from `wheels/` alone, with no index and no network, each pinned by its SHA-256 in `wheels/requirements.txt`, then verifies every file, the environment and the outputs. pip runs isolated from the reader's environment variables and configuration files, so neither can add a requirement or a URL, and without a cache, so it neither reads nor writes the reader's own. The wheels are the ones of the build's platform and Python, so the reviewer needs the same; `make check` says so if the Python differs. `make -f Makefile check-installed PYTHON=...` runs the same check with an interpreter that already holds the environment. The example's package grows by about 65 MB (52 MB of it NumPy and SciPy), and a study on a heavier stack by what that stack weighs.
 
-`PACKAGE.json` records what the package was built from: the study's commit and tree hash, the core version, `environment` (Python, every distribution's version and, for an install from a URL, its source, which is how a reader learns where the core came from), `wheels` (each with its SHA-256, how deep its text was read, the members that are not text with their hashes, and, for a wheel you supplied, the members there was nothing installed to compare with), `study_tokens_exempt` (the wheels the study-token list was not applied to, each with the hash your `uv.lock` records for it) and `uncommitted`.
+`PACKAGE.json` records what the package was built from: the study's commit and tree hash, the core version, `environment` (Python, every distribution's version and, for an install from a URL, its source, which is how a reader learns where the core came from), `wheels` (each with its SHA-256, how deep its text was read, the members that are not text with their hashes, and, for a wheel you supplied, the members there was nothing installed to compare with), `study_tokens_exempt` (the wheels the study-token list was not applied to, each with the hash your `uv.lock` records for it), `uncommitted` and, for a study that declares side files, `side_files`, the declaration, which `make check` compares with the package's `study.toml`.
 
 The wheels are made at package time. A distribution is packed again from its installed files, each checked against its `RECORD`. An editable install cannot be, since its installed files only point at a checkout: build its wheel (`uv build --wheel --out-dir DIR`) and pass `--wheels DIR`. A wheel given there goes in byte for byte once its code is shown to be what is installed. For an installed distribution, each member must equal the installed file its `RECORD` names, byte for byte (the hash `RECORD` records is not trusted, since an installed file can be edited after the install), and every installed file must be in the wheel. For an editable install, each member must equal the checkout's file it was built from, looked for first where the install imports from: below a directory its `.pth` puts on the path, then where its top-level package imports from (which finds a src layout behind an import hook). Only a member found in neither is looked for elsewhere, so a stale copy in the checkout never stands in for what is imported: at the project root when the `.pth` names no directory, then through the wheel mapping your `pyproject.toml` declares (hatch's `sources` and `force-include`; with none declared, the member's path below the project with its top-level package stripped). Every Python file the install imports, directory links followed, must be in the wheel, a Python member found nowhere is refused, and a data member found nowhere goes in, listed in `PACKAGE.json`. A wheel of older code under the same version is refused, naming the member. An editable checkout is also part of the environment by a digest of its Python source, so editing it changes the environment like a new version would.
 

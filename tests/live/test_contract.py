@@ -127,7 +127,8 @@ def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_st
         )
     token = issuer.mint(data_path_spec(config.space.id), service_user(config), ceiling_s=CEILING_S).reveal()
     base, headers = config.local_provider.url + API_PROVIDER, {AUTH_HEADER: token}
-    with httpx.Client(timeout=120) as http:
+    # The platform's one [tls], as every client of the federation takes it: a federation's own CA, or the defaults.
+    with httpx.Client(timeout=120, verify=config.tls.client_verify()) as http:
         found = http.post(f"{base}/lookup-file-id/{config.space.name}/{CONTENT_PATH.strip('/')}", headers=headers)
         assert found.status_code == 200
         content = f"{base}/data/{found.json()['fileId']}/content"
@@ -151,7 +152,9 @@ def test_each_condition_mints_and_examines_its_tool_server_token(index, config, 
 
 @SLOW
 def test_a_token_stops_working_when_its_lifetime_ends(config, client):
-    """Tokens are not revoked; they expire. Mint with a minimal lifetime, wait it out, expect a refusal (401 or 403)."""
+    """Tokens are not revoked; they expire. Mint with a minimal lifetime, wait it out, expect a refusal: 401 or 403, or
+    the 400 `tokenCaveatUnverified` with which Onedata 25.0 answers the scope inference of a token past its time
+    caveat (seen on the Compose federation of deploy/compose-federation, 10 Nov 2026)."""
     user = service_user(config)
     caveats = CaveatSpec(config.space.id, readonly=True, interface="rest").caveats(int(time.time()) + EXPIRY_S)
     value = client.mint_own_token(user, caveats)
@@ -159,7 +162,8 @@ def test_a_token_stops_working_when_its_lifetime_ends(config, client):
     time.sleep(EXPIRY_S + 5)
     with pytest.raises(PlatformError) as refused:
         read_space(client, value, config.space.id)
-    assert refused.value.status in (401, 403)
+    answer = (refused.value.status, refused.value.code)
+    assert answer[0] in (401, 403) or answer == (400, "tokenCaveatUnverified")
 
 
 # -- step 4b2: placement, probes and day-0 checks ----------------------------------------------------------------------
