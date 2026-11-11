@@ -56,7 +56,7 @@ The command line is `python -m expcore run|check|analyze|report|package|package-
 
 What the analysis may use. `check` replays every record and also copies the campaign store into the batch (`campaign-snapshot.sqlite`, made with SQLite's online backup over a read-only connection, which copies pages and so needs no particular SQLite version; then each attempt's directory is written relative to the batch and the copy is rebuilt with a plain `VACUUM`, so it holds no path of the machine the campaign ran on; and integrity-checked) and hashes the copy with the records. It lists the records it replayed (`replayed`) and refuses a run record named by a hashed-only pattern, so a check cannot replay nothing and still vouch for the records beside it. It refuses a store with attempts still running unless `--partial`, which the check records. `analyze` and `report` then use only those bytes: the snapshot, never the live store, and the replayed records, each read once and compared with the check's hash. They cross-validate the two: every record maps to an attempt of the snapshot, and every attempt scored (state `done`, a scored treatment failure included) has a replayed record that agrees with it on run key, attempt, outcome and treatment flag. Any mismatch is refused, naming it. With `--partial`, attempts still running at the check are tolerated, a final attempt no replayed record covers is left out. Every saved output (`export.json`, `analysis.json`, `report.md`) says whether the analysis is partial and lists the attempts left out (run key, attempt, reason); `analysed_attempts` holds only what was scored, and every count in the report is of that population, with the left-out runs' attempts in a column of their own.
 
-Side files are verified with the records. A file a run writes beside its record, which the record names by its SHA-256, is declared in `study.toml` ([below](#side-files-of-a-record)). `check` hashes every file of a declared name in the batch it parses into its inputs, never replays one, and pairs each with the one record in its directory; the check records the declaration (`side_files`) and each side file's hash in `inputs`. `analyze`, `report`, `regenerate` and a package's `make check` refuse a check made under another declaration, refuse a side file changed, removed or added since the check, and read each side file once to pair it with its record again, whatever the check file claims. A study that declares none is checked exactly as before, and its check file holds no `side_files`.
+Side files are verified with the records. A file a run writes beside its record, which the record names by its SHA-256, is declared in `study.toml` ([below](#side-files-of-a-record)). `check` hashes every file of a declared name in the batch it parses into its inputs, never replays one, and pairs each with the one record in its directory; the check records the declaration (`side_files`) and each side file's hash in `inputs`. `analyze`, `report`, `regenerate` and a package's `make check` refuse a check made under another declaration, refuse a side file changed, removed or added since the check, and read each side file once to pair it with its record again, whatever the check file claims; the bytes so read are what a [scorer](#scorer) that takes `side_files` is handed. A study that declares none is checked exactly as before, and its check file holds no `side_files`.
 
 ## ModelBackend
 
@@ -83,11 +83,13 @@ Core guarantees:
 - With a budget, a send the token cap cannot account for reserves its own bound before it goes out (C26): a resend after a connection error or a 5xx from the core's retrier, and every request after a reply that left a count out. The guard reaches the core's adapters through a context variable the attempt runner installs (`expcore.models.spend`), so a core adapter a plugin's backend wraps is covered; a backend of the study's own that resends on its own is not. A top-up that does not fit ends the attempt as infrastructure of kind `budget_hold`.
 - The backend is closed (`aclose`) after the executor returns, whatever happens.
 - Retries of transient errors, the served-model check and usage totals are the adapters' (B01 to B16); the stub adapter takes a script (`StubAdapter.use(script)`, items: text, a list of `(tool, arguments)`, `{"text", "stop"}`, a ready-made `ModelTurn`, or an exception it raises).
+- A model whose entry declares `accepted_fingerprints` (B18) is admitted only when its probe was served by the model (its `api_id` or an alias) under a fingerprint of the set. Admission reads what the probe's reply said it ran from the admission backend's `info()`, as `served_model_ids` and `system_fingerprints`, which the core's OpenAI-compatible adapter fills from the probe; a backend whose `info()` has neither confirms nothing at admission and is not refused for it. Each run's replies are then checked against the set instead of a fingerprint baseline, the served model id against its baseline as before (C16). A declared fingerprint is confirmed by the probe or by the first run whose reply shows it under the model's id, which is a record and not a gate; each attempt records the turns each fingerprint served, and the export's `deployment_shares` and the report's "Deployments" section give the shares. A model that declares no set is admitted, checked and fingerprinted as before.
 
 Implementer must guarantee:
 - `step` returns one reply per call. A token count the reply did not report is `None`, never 0 (R10).
 - A failure of the endpoint that outlasts the retries is raised as `InfraError("endpoint", ...)`; a refused key as `InfraError("key_rejected", ...)`. A reply cut at the output limit sets `stop_reason` to a limit stop.
 - `info()` and `transcript()` never contain a credential; the base URL has none (R12).
+- A backend of a study's own that serves a model declaring `accepted_fingerprints` sets `ModelTurn.system_fingerprint` on each reply that reports one, and after `probe` gives the probe's served model id and fingerprint in `info()` (`served_model_ids`, `system_fingerprints`, each a list); without them no declared fingerprint is confirmed at admission.
 - An executor that needs more than the protocol (the example's executor scripts the stub with `use`) checks for that method, never for a class, so a backend that wraps or replaces the stub serves it too.
 
 ### Retries of a reply
@@ -257,22 +259,34 @@ python -m expcore.tools.manifest check --pass-env NOTES_TOKEN manifests/basic.js
 
 ## Scorer
 
-`expcore.records.rescore.Scorer`.
+`expcore.records.rescore.Scorer`, and `SideFileScorer` for a scorer that reads the record's [side files](#side-files-of-a-record).
 
 ```python
 class Scorer(Protocol):
     name: str
     version: str
     def score(self, record: RunRecord) -> Mapping[str, Any]
+
+class SideFileScorer(Protocol):
+    name: str
+    version: str
+    def score(self, record: RunRecord, side_files: Mapping[str, bytes]) -> Mapping[str, Any]
+
+def rescore(record: RunRecord, scorers: Iterable[Any], *, side_files: Mapping[str, bytes] | None = None) -> RunRecord
+def rescore_files(source, scorers, *, out_dir=None, side_files: Sequence[SideFile] | None = None) -> list[Path]
 ```
+
+A scorer, or a plain function used as one, that declares a parameter named `side_files` (positional or keyword-only) is passed it by keyword; one that does not is called with the record alone, exactly as before. The parameter is chosen over a `StudyContext` accessor because a scorer is built once in `build`, before any record exists, while the parameter is scoped to the one call that scores one record.
 
 Core guarantees:
 - A scorer receives a deep copy of the record. The result is kept in `record.scores[name] = {"version", "result"}`, apart from instrument output, and a scorer without `version` is versioned by the hash of its source file.
+- A scorer that takes `side_files` gets the record's side files as a read-only mapping of its own from declared pattern to bytes: the bytes the loader read once, within the cap, whose SHA-256 it compared with the hash the record names, never a path or a handle to reopen. They are bytes rather than a handle because the loader must hold them to hash them, and bytes cannot be read twice differently or moved between one scorer and the next. `analyze`, `report`, `regenerate` and a package's `make check` hand over the bytes `study.verified.load_verified` read against the replay check, all of them read and paired before the plugin is loaded, so a side file that no longer matches is refused before any scorer runs. `rescore_files` with the study's declaration reads them beside the record of an attempt directory and pairs them as the check does. The same batch therefore gives the same scores, byte for byte, through each. `check` scores nothing. A record with no side file, or a study that declares none, gives an empty mapping; a caller that hands over nothing (`rescore` without `side_files`, `rescore_files` without the declaration) refuses such a scorer, naming it, rather than give it an empty mapping for a record that has a side file.
+- A side file holds at most `expcore.replay.side_files.MAX_SIDE_FILE_BYTES`, 64 MiB. Every side file of a batch is held in memory while it is analysed, as every record is, so a larger one is refused with an error naming the file and the cap: `check` fails it at stage `side_file`, and the loader stops reading one byte past the cap. Neither the check nor the comparison of the batch with it reads a side file whole: a side file is never looked into for a record, and it is hashed in chunks.
 - An attempt that is set aside (infrastructure not declared as treatment, or a harness defect) is never scored. An attempt that ends in a declared treatment kind, after the model completed at least one turn, is, so the scorer must handle a partial record; the same kind before the first turn is set aside.
 - The analysis reads `result["outcomes"]` and nothing else (`expcore.study.pipeline`). The pipeline scores in memory and never writes into a checked batch. `analyze` derives every score anew from the verified records and reads no stored score, so it is the re-scoring command (R13): after a scorer changes, `check` again (the scorer is code, so the code identity changed), then `analyze` and `report`. `scores.json` and the report name each scorer's version.
 
 Implementer must guarantee:
-- The score is a pure function of the record: no model, no platform, no clock (R13). The platform axis comes from run-end snapshots in the record.
+- The score is a pure function of the record, and of `side_files` for a scorer that takes them: no model, no platform, no clock, and no file opened by path (R13). The platform axis comes from run-end snapshots in the record.
 - The result is JSON. By convention: `axes` (two named axes, what the agent did and what the platform's state shows), `verdict` (`fulfilled`, `violated` or `not_determined`; not enforced by the core) and `outcomes`, a mapping from a name to a finite number or `None`.
 - An outcome that could not be computed is `None`, never 0, and a `not_determined` verdict leaves every outcome that depends on the unobserved state `None` (R10, S05).
 - A treatment attempt (`record.outcome["treatment"]` is true) gets values: what the agent achieved under the manipulation (the failure itself, for example no answer and zero coverage) and what it did before it. `None` drops the run's pair from every contrast on that outcome; the analysis counts those drops per contrast, and refuses a contrast in the Holm family that has any, unless its preregistration declares `treatment_outcomes = "excluded"`; `"scored"` is a claim the analysis checks, so such a contrast is refused too, past its preregistered `max_unscored_treatment` (0 unless set) (S10).
@@ -360,7 +374,7 @@ Core guarantees, in `check` and again wherever the analysis reads the batch (R14
 - a hash or a side file in a directory that holds more than one record is refused, since it cannot be paired;
 - the side files are found in exactly the batch directory the check parses, however the command names the study and the batch.
 
-Implementer must guarantee: the executor writes the side file into `request.run_dir` with the record, and the record names it. An attempt killed after writing its side file and before writing its record leaves an orphan, which `check` refuses, naming it, until it is removed. A scorer still reads only the record (R13): a measure computed from a side file's content is the study's own code reading the file, outside the bytes the analysis reads once and verifies.
+Implementer must guarantee: the executor writes the side file into `request.run_dir` with the record, and the record names it. An attempt killed after writing its side file and before writing its record leaves an orphan, which `check` refuses, naming it, until it is removed. A side file holds at most 64 MiB (`MAX_SIDE_FILE_BYTES`). A measure computed from a side file's content is a [scorer](#scorer) that takes `side_files`, which is handed the bytes the analysis read once and verified; the scorer never opens the file.
 
 ## RunExecutor
 

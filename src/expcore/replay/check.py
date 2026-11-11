@@ -15,7 +15,9 @@ offline through the real loop. The result is written beside the records as `repl
 
 `replayed` lists the records that loaded, wrote back and replayed. A run record is never hashed only: a pattern
 that names one is refused when the check is made (`HashedOnlyRecord`), and `require_current_check` refuses a stored
-check that has one, so a check that replayed nothing cannot vouch for the records beside it.
+check that has one, so a check that replayed nothing cannot vouch for the records beside it. A hashed-only file is a
+record when it is named as one or holds the record schema marker; one larger than `RECORD_PROBE_BYTES` is looked at by
+its size and a prefix only, and refused when that prefix opens a JSON object, which could be a record.
 
 `stage` is `load`, `roundtrip`, `secret` (the record holds a value of this environment's secrets), `replay`,
 `decision` (a failure at `decision` also names the `hook`) or `side_file`. Paths are relative to the batch, so a batch
@@ -27,9 +29,16 @@ at `load`.
 Side files (`replay.side_files`): a study may declare files its runs write beside each record, each named by its SHA-256
 in that record. Every file of a declared name in the batch is a hashed-only input, found by the patterns the
 declaration adds to `hashed_only_patterns`, and is paired with the one record in its directory; what does not pair
-fails the check at stage `side_file`, against the record, or against the side file when no record lies beside it. The
+fails the check at stage `side_file`, against the record, or against the side file when no record lies beside it. A
+side file larger than the cap the analysis reads (`side_files.MAX_SIDE_FILE_BYTES`) fails there too, against itself. The
 check records the declaration (`side_files`), only when there is one, so a batch of a study that declares none is
 checked exactly as before. `require_current_check` refuses a check made under another declaration than the caller's.
+The check scores nothing: scores are derived by the analysis (`expcore.records.rescore`).
+
+What is held in memory: every hashed-only input is hashed in chunks. A declared side file is never read whole, by the
+check or by `require_current_check`: by its declaration it is no record, so neither looks into it for one, and the cap
+is checked by its size. Any other hashed-only file is read whole only when it holds at most `RECORD_PROBE_BYTES`, and a
+larger one only up to `RECORD_PREFIX_BYTES`. Records are read whole, to be replayed.
 
 The code identity is the one `expcore.provenance.codestamp.version` returns for the code the check covers. The analysis
 accepts a batch only while `require_current_check` finds that its check passed, that no input was added, removed or
@@ -69,17 +78,22 @@ from expcore.provenance.environment import differences
 from expcore.records.record import RunRecord, decode
 from expcore.records.redact import Redactor, redact_text
 from expcore.records.schema import SCHEMA_PREFIX, SCHEMAS, RecordError, SchemaVersion
+from expcore.replay import side_files as side_module
 from expcore.replay.divergence import ReplayDivergence
 from expcore.replay.native import has_native_parser
 from expcore.replay.replay import replay_record
 from expcore.replay.side_files import STAGE as SIDE_FILE_STAGE
-from expcore.replay.side_files import SideFile, declared, is_side_file, pair
+from expcore.replay.side_files import SideFile, declared, is_side_file, pair, too_large
 from expcore.replay.side_files import patterns as side_file_patterns
 
 CHECK_SCHEMA = "replay-check/1"
 CHECK_FILE = "replay-check.json"
 ERROR_LIMIT = 500
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
+# The most of a hashed-only file read whole to tell whether it is a run record, and the prefix a larger one is looked
+# at by instead. Both are read where they are used, never bound as defaults.
+RECORD_PROBE_BYTES = 64 * 1024 * 1024
+RECORD_PREFIX_BYTES = 4096
 
 
 class BatchNotVerified(Exception):
@@ -113,13 +127,43 @@ def is_run_record(rel: str, raw: bytes) -> bool:
     return isinstance(marker, str) and marker.startswith(SCHEMA_PREFIX)
 
 
-def _refuse_hashed_records(root: Path, hashed: Sequence[str], rerun: str | None = None) -> None:
-    """Raise HashedOnlyRecord for the first hashed-only file that is a run record."""
+IS_A_RECORD = "is a run record, so it must be replayed"
+
+
+def _record_problem(path: Path, rel: str) -> str | None:
+    """Why a hashed-only file not named as a record may not be hashed only, or None: it holds the record schema
+    marker, or it is too large to tell.
+
+    The file is read whole only when it holds at most RECORD_PROBE_BYTES; a larger one is looked at by its size and a
+    prefix of RECORD_PREFIX_BYTES. A record is a JSON object in UTF-8 (`records.record.decode`), so a large file whose
+    prefix does not open one is no record; a JSON object that large cannot be told from a record without reading it
+    whole, so it is refused.
+    """
+    limit = RECORD_PROBE_BYTES
+    with open(path, "rb") as handle:
+        if os.fstat(handle.fileno()).st_size > limit:
+            if not handle.read(RECORD_PREFIX_BYTES).lstrip(b" \t\r\n").startswith(b"{"):
+                return None
+            return f"is a JSON object of more than {limit} bytes, too large to tell whether it is a run record"
+        raw = handle.read(limit + 1)
+    return IS_A_RECORD if is_run_record(rel, raw) else None
+
+
+def _refuse_hashed_records(
+    root: Path, hashed: Sequence[str], side_files: Sequence[SideFile], rerun: str | None = None
+) -> None:
+    """Raise HashedOnlyRecord for the first hashed-only file that is a run record, or too large to tell. A file named
+    as a record is one whatever it holds; a declared side file is never one, so it is not read here at all."""
     for rel in hashed:
-        if is_run_record(rel, (root / rel).read_bytes()):
+        if is_record_name(Path(rel).name):
+            problem: str | None = IS_A_RECORD
+        elif is_side_file(rel, side_files):
+            continue
+        else:
+            problem = _record_problem(root / rel, rel)
+        if problem is not None:
             raise HashedOnlyRecord(
-                f"{root}: {rel} is a run record, so it must be replayed; a hashed-only pattern may not name one"
-                + (f"; {rerun}" if rerun else "")
+                f"{root}: {rel} {problem}; a hashed-only pattern may not name one" + (f"; {rerun}" if rerun else "")
             )
 
 
@@ -226,10 +270,16 @@ def inputs_sha256(hashes: Mapping[str, str]) -> str:
     return hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def file_sha256(path: Path) -> str:
+    """The SHA-256 of a file, read in chunks, so a large hashed-only file is never held in memory whole."""
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
 def input_hashes(batch: Path, hashed_only: Sequence[str] = ()) -> dict[str, str]:
     """Return the SHA-256 of every input of a batch, by relative path."""
     records, hashed = input_files(batch, hashed_only)
-    return {rel: hashlib.sha256((batch / rel).read_bytes()).hexdigest() for rel in [*records, *hashed]}
+    return {rel: file_sha256(batch / rel) for rel in [*records, *hashed]}
 
 
 def _redacted(text: str) -> str:
@@ -340,13 +390,18 @@ def verify_batch(
             except Exception as exc:
                 stat["failures"] += 1
                 failures.append({"file": rel, "stage": "decision", "hook": hook.name, "error": _error(exc)})
-    _refuse_hashed_records(root, hashed)
+    _refuse_hashed_records(root, hashed, side_files)
     for rel in hashed:
-        hashes[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
+        hashes[rel] = file_sha256(root / rel)
     if side_files:
         side = {rel: hashes[rel] for rel in hashed if is_side_file(rel, side_files)}
         failures += [
             {"file": file, "stage": SIDE_FILE_STAGE, "error": error} for file, error in pair(stored, side, side_files)
+        ]
+        failures += [  # the analysis would refuse it, so the check does not pass it
+            {"file": rel, "stage": SIDE_FILE_STAGE, "error": too_large()}
+            for rel in side
+            if (root / rel).stat().st_size > side_module.MAX_SIDE_FILE_BYTES
         ]
     failed_files = {f["file"] for f in failures}  # an orphan side file fails against its own path, not a record's
     check = {
@@ -509,7 +564,7 @@ def require_current_check(
         raise BatchNotVerified(
             f"{root}: the lists of replayed and hashed-only inputs in {CHECK_FILE} were altered; {rerun}"
         )
-    _refuse_hashed_records(root, hashed, rerun)
+    _refuse_hashed_records(root, hashed, recorded, rerun)
     made = check.get("code") or {}
     problem = _code_problem(code, "the code in use", allow_dirty) or _code_problem(
         made, "the code the check was made under", allow_dirty

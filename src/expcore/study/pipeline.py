@@ -25,9 +25,11 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   It then uses only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once
   and compared with the check's hash, cross-validated against each other, and each side file paired with its record
   again. It exports from the snapshot, scores the records in memory (a record is never written after its check, since
-  that would change its hash) and runs the preregistered analysis. Every score is derived anew from a record on each
-  call and none is read back: `scores.json` is an output, so `analyze` is how a study is re-scored (R13), offline,
-  after a change to a scorer and a new check (a scorer is code the identity covers).
+  that would change its hash) and runs the preregistered analysis. A scorer that takes `side_files` is handed the
+  record's side files as the bytes `load_verified` read and verified, all of them before the plugin is loaded, so
+  no scorer runs on a batch that does not verify. Every score is derived anew from a record on each call and none is
+  read back: `scores.json` is an output, so `analyze` is how a study is re-scored (R13), offline, after a change to a
+  scorer and a new check (a scorer is code the identity covers).
 - `output_bytes` is the one place the bytes of `export.json`, `scores.json`, `analysis.json` and `report.md` are made;
   `write_analysis` and `write_report` write them and `regenerate` compares them with the files in `out/`, which is
   what a replication package's `make check` runs. Every time in them comes from the records and the store, every
@@ -54,6 +56,7 @@ from expcore.campaign.manifest import build_fingerprint
 from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
 from expcore.provenance.codestamp import require_known
@@ -125,6 +128,15 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
 
+def model_digest(spec: ModelSpec) -> str:
+    """The digest of a model entry in the campaign fingerprint: every field of it, its declared set of accepted
+    fingerprints only when it declares one (B18), so an entry without one keeps the digest it had before the key."""
+    entry = dataclasses.asdict(spec)
+    if not entry["accepted_fingerprints"]:
+        del entry["accepted_fingerprints"]
+    return _digest(entry)
+
+
 def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:
     """The environment of the study's code: the core and what `[study] requires` names, with their requirements."""
     try:
@@ -149,7 +161,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
     return build_fingerprint(
         study.schema,
         tasks={task.id: _digest(dict(task.attributes)) for task in study.tasks.values()},
-        models={key: _digest(dataclasses.asdict(study.models.resolve(key))) for key in study.campaign.models},
+        models={key: model_digest(study.models.resolve(key)) for key in study.campaign.models},
         seeds=study.campaign.seeds,
         caps=study.campaign.caps(),
         prompts=plugin.prompts,
@@ -418,10 +430,11 @@ def _analyse_loaded(
         verified.snapshot.close()
     rows, scores = [], {}
     for entry in export["analysed_attempts"]:
-        record = verified.record_for(entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
+        where = (entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
+        record = verified.record_for(*where)
         if record is None:  # load_verified guarantees one for every attempt it did not exclude
             raise Refused(f"no verified record for {entry['run_key']}")
-        scored = rescore(record, plugin.scorers)
+        scored = rescore(record, plugin.scorers, side_files=verified.side_files_for(*where))
         scores[entry["run_key"]] = scored.scores
         task = study.tasks[str(entry["factors"]["task"])]
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))

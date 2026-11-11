@@ -1,13 +1,11 @@
 """Price tiers by prompt length: each request is priced at the tier its prompt fell in (C24)."""
 
-import dataclasses
-
 import pytest
 
 from expcore.config.loading import ConfigError
 from expcore.config.models import ModelSpec, load_models
 from expcore.config.prices import Price, PriceTier, TieredPrice
-from expcore.study.pipeline import _digest
+from expcore.study.pipeline import model_digest
 
 HEAD = """
 [models.long]
@@ -120,4 +118,4 @@ def test_c24_a_model_without_tiers_keeps_its_price_and_its_fingerprint():
         price=Price(0.5, 2.5, None, 0.05),
     )
     before = "8bc96d05e697f299fe2e848ac8ef915dadef06b1d8471d9656dc053da4678af2"  # computed before tiers existed
-    assert _digest(dataclasses.asdict(spec)) == before
+    assert model_digest(spec) == before  # the entry's digest in the fingerprint; it declares no accepted fingerprints

@@ -1,16 +1,18 @@
 """R14: the replay check's side files on a batch of its own: what a check records with and without a declaration, the
-pairing of a directory that holds several records, a side file named like a record, and the analysis's refusal of a
-check made under another declaration than the one in use."""
+pairing of a directory that holds several records, a side file named like a record, the cap on a side file's size, and
+the analysis's refusal of a check made under another declaration than the one in use."""
 
 import dataclasses
 import hashlib
 import json
 
 import pytest
+from read_support import whole_reads
 from record_support import CODE
 from replay_scenarios import SCENARIOS
 
 from expcore.records.record import RunRecord, decode
+from expcore.replay import side_files as side_module
 from expcore.replay.check import CHECK_FILE, BatchNotVerified, require_current_check, verify_batch, write_check
 from expcore.replay.side_files import SideFile
 
@@ -128,6 +130,80 @@ def test_r14_the_analysis_refuses_a_check_made_under_another_declaration_than_th
     write_check(batch, verify_batch(batch, code=CODE))
     with pytest.raises(BatchNotVerified, match="another declaration of side files"):
         require_current_check(batch, code=CODE, side_files=[LOGGED])
+
+
+def test_r14_the_cap_on_a_side_file_is_64_mib():
+    """R14: the most a side file may hold, since the analysis reads each whole into memory for the scorers."""
+    assert side_module.MAX_SIDE_FILE_BYTES == 64 * 1024 * 1024
+
+
+def test_r14_a_side_file_larger_than_the_cap_is_refused_without_reading_past_it(tmp_path, monkeypatch):
+    """R14: the reader returns a side file of exactly the cap whole, and refuses one byte more, naming the cap, after
+    reading at most one byte past it: a file of any size is never read into memory whole."""
+    monkeypatch.setattr(side_module, "MAX_SIDE_FILE_BYTES", 16)
+    path = tmp_path / LOGGED.pattern
+    path.write_bytes(b"r" * 16)
+    assert side_module.read_side_file(path) == b"r" * 16
+    path.write_bytes(b"r" * (1 << 20))
+    served: list[int] = []
+    opened = open
+
+    def counting(file, mode="r", *args, **kwargs):
+        handle = opened(file, mode, *args, **kwargs)
+        reader = handle.read
+
+        def read(size=-1):
+            data = reader(size)
+            served.append(len(data))
+            return data
+
+        handle.read = read
+        return handle
+
+    monkeypatch.setattr(side_module, "open", counting, raising=False)
+    with pytest.raises(side_module.SideFileTooLarge, match="more than 16 bytes"):
+        side_module.read_side_file(path)
+    assert sum(served) <= 17
+
+
+def test_r14_the_check_fails_a_side_file_larger_than_the_cap_against_its_own_path(batch, monkeypatch):
+    """R14: a side file over the cap fails the check at stage `side_file`, so a check never passes a batch whose
+    analysis would refuse it."""
+    name_side_file(lone_record(batch), b'{"ranges": [[0, 512]]}')
+    monkeypatch.setattr(side_module, "MAX_SIDE_FILE_BYTES", 8)
+    made = verify_batch(batch, code=CODE, side_files=[LOGGED])
+    assert [(f["file"], f["stage"]) for f in made["failures"]] == [(f"shard-2/{LOGGED.pattern}", "side_file")]
+    assert "more than 8 bytes" in made["failures"][0]["error"]
+    write_check(batch, made)
+    with pytest.raises(BatchNotVerified, match="the replay check failed"):
+        require_current_check(batch, code=CODE, side_files=[LOGGED])
+
+
+def test_r14_the_check_and_the_analysis_never_read_a_side_file_over_the_cap_whole(batch, monkeypatch):
+    """R14: a side file is never taken for a record, so neither the check nor the analysis's comparison of the batch
+    reads it whole to look for one: a side file over the cap is hashed in chunks and refused at stage `side_file`."""
+    name_side_file(lone_record(batch), b"r" * 4096)
+    monkeypatch.setattr(side_module, "MAX_SIDE_FILE_BYTES", 64)
+    whole = whole_reads(monkeypatch, LOGGED.pattern)
+    made = verify_batch(batch, code=CODE, side_files=[LOGGED])
+    assert [(f["file"], f["stage"]) for f in made["failures"]] == [(f"shard-2/{LOGGED.pattern}", "side_file")]
+    assert "more than 64 bytes" in made["failures"][0]["error"]
+    write_check(batch, made)
+    with pytest.raises(BatchNotVerified, match="the replay check failed"):
+        require_current_check(batch, code=CODE, side_files=[LOGGED])
+    assert whole == []
+
+
+def test_r14_a_side_file_whose_bytes_hold_a_record_is_a_side_file_still(batch):
+    """R14: by its declaration a side file is never a record, so one whose bytes are a record's is hashed and paired
+    with the record beside it, never refused as a record named by a hashed-only pattern."""
+    inside = dataclasses.replace(SCENARIOS["tools"][0](), run_key="run-inside").dumps(environ={}).encode("utf-8")
+    name_side_file(lone_record(batch), inside)
+    made = verify_batch(batch, code=CODE, side_files=[LOGGED])
+    assert (made["n_records"], made["n_ok"], made["failures"]) == (4, 4, [])
+    assert made["hashed_only"] == [f"shard-2/{LOGGED.pattern}"]
+    write_check(batch, made)
+    assert require_current_check(batch, code=CODE, side_files=[LOGGED])["n_ok"] == 4
 
 
 @pytest.mark.parametrize(

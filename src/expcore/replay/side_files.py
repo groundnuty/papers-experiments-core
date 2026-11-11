@@ -21,16 +21,30 @@ replayed. `pair` then refuses, each as a failure of the check at stage `side_fil
 - an ambiguous pairing: a hash or a side file in a directory that holds more than one record.
 
 A record that names no hash and has no such file beside it is fine: that run made no side file.
+
+A scorer reads a side file's content only as the loader hands it over (#144): the bytes `read_side_file` read once,
+whose SHA-256 the loader compared with the hash the record names, by declared pattern (`beside`), never a path. The
+loader holds each side file whole in memory, so one larger than `MAX_SIDE_FILE_BYTES` is refused: the reader stops one
+byte past the cap, and the check fails such a file at stage `side_file` too, so a check never passes a batch whose
+analysis would refuse it.
 """
 
+import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
 STAGE = "side_file"  # the stage of a check failure that a side file causes
 SHA256 = re.compile(r"[0-9a-f]{64}")
+# The most a side file may hold, 64 MiB: the loader reads each whole into memory to hand it to the scorers. It is read
+# where it is used, never bound as a default, so the one value holds for the check, the analysis and re-scoring.
+MAX_SIDE_FILE_BYTES = 64 * 1024 * 1024
+
+
+class SideFileTooLarge(ValueError):
+    """A side file holds more than MAX_SIDE_FILE_BYTES; the message says so and names the cap."""
 
 
 @dataclass(frozen=True)
@@ -62,6 +76,42 @@ def patterns(side_files: Sequence[SideFile]) -> list[str]:
 def is_side_file(rel: str, side_files: Sequence[SideFile]) -> bool:
     """Tell whether a path of the batch has a declared side file's name."""
     return PurePosixPath(rel).name in {side.pattern for side in side_files}
+
+
+def too_large() -> str:
+    """Why a side file over the cap is refused, naming the cap in force."""
+    return (
+        f"holds more than {MAX_SIDE_FILE_BYTES} bytes, the most a side file may hold (MAX_SIDE_FILE_BYTES): the "
+        "analysis reads each side file whole into memory to hand it to the scorers"
+    )
+
+
+def read_side_file(path: str | os.PathLike[str]) -> bytes:
+    """Read a side file once, whole, and return its bytes; raise SideFileTooLarge, having read at most one byte past
+    the cap, for one that holds more than MAX_SIDE_FILE_BYTES."""
+    limit = MAX_SIDE_FILE_BYTES
+    with open(path, "rb") as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise SideFileTooLarge(too_large())
+    return data
+
+
+def beside(
+    records: Iterable[str], contents: Mapping[str, bytes], side_files: Sequence[SideFile]
+) -> dict[str, dict[str, bytes]]:
+    """The side files of each record, by declared pattern: the bytes in `contents` of each file of a declared name in
+    the record's directory, an empty mapping for a record with none.
+
+    `contents` maps each side file, by path, to the bytes the loader read; call this only once `pair` found nothing
+    to refuse, so each of them has the hash the record beside it names.
+    """
+    held: dict[str, dict[str, bytes]] = {}
+    for rel in records:
+        directory = PurePosixPath(rel).parent
+        found = {d.pattern: (directory / d.pattern).as_posix() for d in side_files}
+        held[rel] = {pattern: contents[path] for pattern, path in found.items() if path in contents}
+    return held
 
 
 def named_hash(data: Mapping[str, Any], field: str) -> Any:

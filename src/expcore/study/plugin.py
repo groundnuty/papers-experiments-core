@@ -34,7 +34,7 @@ from expcore.plugin import ToolSpec
 from expcore.provenance.codestamp import covered_files
 from expcore.provenance.environment import EnvironmentUnknown, closure
 from expcore.records.build import redactor_for
-from expcore.records.rescore import Scorer, scorer_name, scorer_version
+from expcore.records.rescore import Scorer, SideFileScorer, scorer_name, scorer_version
 from expcore.study.config import OUT_DIR, STUDY_FILE, StudyConfig, StudyIdentity
 from expcore.study.plugin_import import (
     PLUGIN_MODULE_PREFIX,
@@ -66,7 +66,9 @@ class StudyPlugin:
     """What a study supplies.
 
     - `executor`: runs one attempt and returns its record (`campaign.executor.RunExecutor`).
-    - `scorers`: pure functions of a record (`records.rescore.Scorer`); their names must differ.
+    - `scorers`: pure functions of a record (`records.rescore.Scorer`), or of a record and its side files, handed over
+      verified, for one that declares a `side_files` parameter (`records.rescore.SideFileScorer`); their names must
+      differ.
     - `prompts`, `tools`: for each condition, the SHA-256 of its prompt template and of its tool manifest
       (`tools_sha256`); they go into the campaign fingerprint, so a resume cannot change either unnoticed.
     - `health`: the platform's quick look at whether runs can start; None when it has no such check.
@@ -87,7 +89,7 @@ class StudyPlugin:
     """
 
     executor: RunExecutor
-    scorers: Sequence[Scorer]
+    scorers: Sequence[Scorer | SideFileScorer]
     prompts: Mapping[str, str]
     tools: Mapping[str, str]
     health: HealthCheck | None = None
