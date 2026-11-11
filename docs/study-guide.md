@@ -442,6 +442,14 @@ The shares are fixed, never pooled. A shard whose pairs run longer, or cost more
 
 A shard's own `check`, `analyze` and `report` work as for any campaign, over its own runs. Its store pins four facts at the first start, with the order seed: the spec, when the shard first started, the identity and the shares. A resume is refused when it gives another spec, label or rule, when a sharded store is resumed without `--shard` or an unsharded one with it, or when the identity or the shares differ. The export of a shard has one more top-level key, `shard`, holding those facts; its run entries are the ones any export has.
 
+### Merging shards
+
+A campaign run as shards (one `out/` per host) is merged into one batch before anything is analysed. Copy the study, at the commit the shards ran, to the machine that merges, and run `python -m expcore merge STUDY/out SHARD_OUT...` with the `out/` of every shard, each given once. The merge reads the shards and writes only `STUDY/out`, which must not exist or must be empty: `STUDY/out/runs` holds the union of their runs, `STUDY/out/shards/<index>/campaign-snapshot.sqlite` each shard's snapshot of its store, and `STUDY/out/merge.json` the shards (label, start time, shares, number of runs) with the SHA-256 of each snapshot.
+
+It refuses, naming the shard by its index and label and saying why, shards that are not one campaign run against one environment: a different partition rule or count, a missing or repeated index, one label twice, a different campaign fingerprint, runs in two shards, a run in a shard it does not belong to under the partition of the whole plan, a run of the plan that no shard holds, a record that fails the replay check (the same one `check` makes, under the code and environment in use), a shard with attempts still running, and shards whose environment identities differ. Nothing is written when it refuses.
+
+`check STUDY/out/runs`, `analyze STUDY` and `report STUDY` then work as on any batch. `check` records merge.json's hash and compares each snapshot with the hash merge.json names; `analyze` reads each snapshot once against it. The batch's export joins the shards': its run lists are in plan order with each entry tagged `"shard": <index>`, a top-level `"shards"` repeats merge.json's list, and the figures that are sums (planned runs, discarded usage, retries, budget holds) are summed. The scores, the analysis and the report equal those of one driver of the whole campaign. What differs is what belongs to a shard's own sequence: `dispatch_seq`, `started_at` and `lease_wait_s` of an attempt, and so the report's median dispatch position, which pools every shard's own positions. To package a merged study, list `out/merge.json` and `out/shards` in `package.toml` beside `out/runs`.
+
 ## 5. Score and analyse
 
 ```sh
