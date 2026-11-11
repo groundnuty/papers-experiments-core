@@ -16,15 +16,20 @@ from platform_support import (
     with_spaces,
     write_platform,
 )
+from sandbox_support import add_sandbox
 
 from expcore.config.loading import ConfigError
+from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.eviction import evict_tree
+from expcore_onedata.health import PlatformHealth
+from expcore_onedata.precampaign import content_type_check
 from expcore_onedata.probes import NAMESPACE, PlatformProbes
 from expcore_onedata.provision import Provisioner, ProvisionError, Refused, resolve_provider_ids
 from expcore_onedata.rangemap import RangeRow, load_placement
 from expcore_onedata.ranges import place_ranges
 from expcore_onedata.reset import SpaceReset
+from expcore_onedata.tokens import TokenIssuer
 
 OWNED = SPACE_LABELS[1]  # the second space, whose own data provider is beta
 
@@ -214,3 +219,24 @@ def test_o11_a_reset_of_one_space_reads_and_changes_that_space_alone(owned, fake
     assert fake.transfers[mine].cancelled
     assert not fake.transfers[theirs].ended
     assert {c[2] for c in fake.provider_calls if c[2].endswith("/transfers")} == {f"/spaces/{SPACE_IDS[1]}/transfers"}
+
+
+def test_o05_the_content_type_check_reads_its_file_in_the_first_space_the_data_path_reaches(tmp_path, fake, ticker):
+    """O05: with several spaces and a REST data path, the pre-campaign check finds its file under the root of the first
+    space the data path's token reaches, here the second, through the agent's local provider; and the platform's
+    health check, which composes it, reads every space without refusing on the several-space configuration."""
+
+    def document(data):
+        two_spaces(data)
+        add_sandbox(data)
+        data["sandbox"]["content_check_file"] = "study/probing.bin"
+        data["spaces"][0]["tokens"] = ["tool_server"]
+
+    config = load_platform(write_platform(tmp_path, document))
+    client = OnezoneClient(config, http=fake.client_http())
+    fake.add_file("study/probing.bin", DATA, space=SPACE_IDS[1])
+    verdict = content_type_check(config, client)
+    assert verdict.ok, verdict.detail
+    assert {c[2] for c in fake.provider_calls if c[2].startswith("/spaces/")} == {f"/spaces/{SPACE_IDS[1]}"}
+    health = PlatformHealth(config, client, TokenIssuer(client, config, clock=ticker.clock), clock=ticker.clock)
+    assert health().ok
