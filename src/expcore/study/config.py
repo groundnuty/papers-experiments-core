@@ -227,6 +227,7 @@ def _check_scheduler_kinds(campaign: CampaignConfig) -> None:
                 f"platforms of {STUDY_FILE}, and the study's own are the ones it declares in [study.{KINDS_KEY}]",
             )
 
+
 def _side_files(top: Section) -> tuple[SideFile, ...]:
     """Read and check the side files the study declares (`[[study.side_files]]`); none when it declares none."""
     section = Section(top.section("study").data, top.file, "[study]")
