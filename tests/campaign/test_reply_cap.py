@@ -25,6 +25,7 @@ from expcore.config.prices import Price
 from expcore.errors import BudgetHold
 from expcore.models import spend
 from expcore.models.retry import Retrier, RetryPolicy
+from expcore.records.schema import reply_count_rule
 from expcore.replay.replay import replay_record
 
 MODEL = "teasel"
@@ -439,7 +440,8 @@ def test_c27_a_billed_reply_past_the_maximum_that_cannot_be_read_marks_the_model
     """C27 and C26: a run's request is answered 200 with 5000 output tokens and no choices. The adapter counts the
     reply and refuses it before the record keeps a turn, so the record's totals miss it: the attempt's usage is
     incomplete and it is charged its bound, never the 0 its empty totals would give, and the reply past the reply
-    maximum still takes the model off it, so that bound is the window's. The record replays as it was written."""
+    maximum still takes the model off it, so that bound is the window's. The record's own totals follow the rule of its
+    version, and it replays as it was written."""
     endpoint.update(run_unreadable=5_000)
     records = []
 
@@ -457,7 +459,7 @@ def test_c27_a_billed_reply_past_the_maximum_that_cannot_be_read_marks_the_model
         probes = sum(probe_spend.charged(scheduler.store).values())
         assert scheduler.budget.assess([], NOW).spent_usd == pytest.approx(UNHELD + probes)
     [record] = records
-    assert record.totals["usage_incomplete"] is True
+    assert record.totals["usage_incomplete"] is reply_count_rule(record.schema_version)
     assert replay_record(record).to_json() == record.to_json()
 
 

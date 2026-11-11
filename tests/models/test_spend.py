@@ -1,15 +1,22 @@
 """The spend guard's seam (C26): what the retrier and the recording tell an attempt's guard, and what a refusal does."""
 
 import asyncio
+import json
 
 import pytest
-from loop_support import ScriptedBackend
+from loop_support import FakeProvider, ScriptedBackend
+from record_support import CODE, IDENTITY, make_config
 
+from expcore.campaign.executor import result_from_record
 from expcore.errors import BudgetHold, InfraError
 from expcore.models import spend
 from expcore.models.adapters import AnthropicAdapter, ModelTurn, OpenAICompatAdapter
 from expcore.models.retry import Retrier, RetryPolicy
+from expcore.records.build import record_attempt
+from expcore.records.record import RunRecord
 from expcore.records.recording import RecordingBackend
+from expcore.records.schema import CURRENT, reply_count_rule
+from expcore.replay.replay import replay_record
 
 POLICY = RetryPolicy(max_retries=3, base_delay_s=1.0, max_delay_s=10.0, jitter=0.0)
 
@@ -208,3 +215,51 @@ def test_c27_a_billed_reply_the_adapter_cannot_read_still_tells_the_guard_what_i
         asyncio.run(go())
     assert guard.log == [("request",), ("reply", counted, 5_000)]
     assert recording.failure["kind"] == "infra"
+
+
+def billed_unread_record(make_spec, completion, fake_client):
+    """The record of a tool round, then a billed 200 with usage and no choices: one reply more than its turns."""
+    config = make_config()
+    client = fake_client(
+        completion(None, finish="tool_calls", tool_calls=[("look", "{}")]),
+        completion(choices=False, usage=(900, 50)),
+    )
+    backend = OpenAICompatAdapter(make_spec(), 7, config.limits, client=client, sleep=_no_sleep)
+    provider = FakeProvider({"look": lambda arguments: "ok"})
+    return asyncio.run(
+        record_attempt(
+            backend, [provider], "be brief", "do the task", config, IDENTITY, code=dict(CODE), core_version="0.1.0"
+        )
+    )
+
+
+def test_c26_a_record_of_a_version_before_the_reply_count_rule_keeps_its_totals_and_replays_unchanged(
+    make_spec, completion, fake_client
+):
+    """C26 and C05: the rule that a billed reply which became no turn leaves the totals incomplete belongs to the record
+    versions from the one that introduced it; a record of an earlier version keeps the totals it was written with and
+    replays to the same bytes. The campaign still charges that attempt its bound: its result reads the replies the
+    route counted against the turns the record kept, whatever the record's version."""
+    record = billed_unread_record(make_spec, completion, fake_client)
+    assert record.schema_version == "expcore-record/2"
+    assert record.route["usage_seen"]["responses"] == len(record.transcript) + 1
+    assert record.totals["usage_incomplete"] is False
+    again = RunRecord.from_json(json.loads(json.dumps(record.to_json())))
+    assert replay_record(again).to_json() == record.to_json()
+    assert result_from_record(record, ended_utc="2026-01-01T00:10:00Z").usage_complete is False
+
+
+@pytest.mark.skipif(
+    not reply_count_rule(CURRENT),
+    reason="needs expcore-record/3, which #142 defines: the reply-count rule starts at that version",
+)
+def test_c26_a_record_of_a_version_with_the_reply_count_rule_leaves_its_totals_incomplete_and_round_trips(
+    make_spec, completion, fake_client
+):
+    """C26 and C05: a record written under the reply-count rule keeps, in its own totals, that a billed reply became no
+    turn, and replays to the same bytes."""
+    record = billed_unread_record(make_spec, completion, fake_client)
+    assert reply_count_rule(record.schema_version)
+    assert record.totals["usage_incomplete"] is True
+    again = RunRecord.from_json(json.loads(json.dumps(record.to_json())))
+    assert replay_record(again).to_json() == record.to_json()

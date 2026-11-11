@@ -416,13 +416,8 @@ class _Run:
         usage = info.get("usage_seen") or {}
         # The terminal tools change what the run does, so they are part of the configuration the record keeps and hashes.
         record = {**self.config.as_dict(), "terminal_tools": self.toolbox.terminal_names}
-        # A reply the backend counted that never became a turn (a 200 without choices) was billed, and the turns' totals
-        # miss it: they are a lower bound, and the attempt is charged its bound (C05, C26). The route keeps the counts,
-        # so a replay reaches the same verdict.
-        unread = (usage.get("responses") or 0) > len(self.turns)
-        incomplete = (
-            self.usage_incomplete or bool(info.get("abandoned_request")) or bool(usage.get("missing")) or unread
-        )
+        # A billed reply that became no turn is judged by the record, by the rule of its version (`reply_count_rule`).
+        incomplete = self.usage_incomplete or bool(info.get("abandoned_request")) or bool(usage.get("missing"))
         return LoopResult(
             outcome=self.outcome,
             turns=self.turns,

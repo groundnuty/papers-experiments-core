@@ -29,7 +29,7 @@ from expcore.plugin import ToolProvider
 from expcore.prompt.templates import RenderedPrompt
 from expcore.records.build import DefectSink, PromptText, RunIdentity, record_attempt
 from expcore.records.record import RunRecord
-from expcore.records.schema import first_turn_rule
+from expcore.records.schema import first_turn_rule, unread_replies
 
 
 @dataclass(frozen=True)
@@ -186,11 +186,14 @@ def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | Non
     its treatment kinds, the turns it completed and the treatment flag it carries (the store checks that flag against
     its own decision).
 
-    A count no turn reported is unknown, and totals the loop knows to be short are marked incomplete (C05). The wall
-    time is the record's elapsed time unless the caller gives one.
+    A count no turn reported is unknown, and totals the loop knows to be short are marked incomplete (C05), and so are
+    totals that miss a billed reply the backend counted and could not read, whatever rule the record's version keeps
+    in its own totals (C26): the campaign charges such an attempt its bound. The wall time is the record's elapsed time
+    unless the caller gives one.
     """
     turns = record.transcript
     elapsed = record.totals.get("elapsed_s")
+    unread = unread_replies(record.route.get("usage_seen"), len(turns))
     return AttemptResult(
         outcome=outcome_of(record.outcome),
         ended_utc=ended_utc,
@@ -199,7 +202,7 @@ def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | Non
         output_tokens=_total(turns, "output_tokens"),
         cache_creation_tokens=_total(turns, "cache_creation_input_tokens"),
         cache_read_tokens=_total(turns, "cache_read_input_tokens"),
-        usage_complete=not record.totals.get("usage_incomplete", False),
+        usage_complete=not record.totals.get("usage_incomplete", False) and not unread,
         treatment_kinds=tuple(record.treatment_kinds),
         model_turns=len(turns),
         recorded_treatment=bool(record.outcome["treatment"]),
