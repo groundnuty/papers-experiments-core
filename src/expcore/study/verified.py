@@ -16,6 +16,10 @@ that the check holds:
   paired again with the hash the record beside it names, so a check file edited to vouch for a side file its record
   does not name is refused all the same.
 
+A merged batch (`campaign.merge`) has the snapshot of each of its shards instead of one: the check records the SHA-256
+of its merge.json (`check["merge"]`), merge.json records each snapshot's, and each is read once and compared with the
+hash that names it. The records are cross-validated against all the snapshots together.
+
 Any mismatch is refused, naming it. With `partial`, an attempt that no replayed record covers is left out of the
 analysis instead, and the report says so, and attempts still running at the check are tolerated.
 
@@ -31,6 +35,8 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.factors import FactorSchema
+from expcore.campaign.merge import CHECK_KEY, SHARDS_DIR, MergeRefused, read_merge
+from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, StoreSnapshot
 from expcore.records.record import RunRecord, decode, record_filename
 from expcore.records.schema import RecordError
@@ -50,12 +56,18 @@ class VerifiedBatch:
     """What the analysis may use: the snapshot of the store, the records by path, the side files of each record, and
     what is left out and why."""
 
-    snapshot: StoreSnapshot
+    snapshots: Mapping[int | None, StoreSnapshot]  # the store's, under None; a merged batch's, by shard index
     records: Mapping[str, RunRecord]  # by path relative to the batch, parsed from the bytes the check hashed
-    running_at_check: int = 0  # attempts the snapshot holds as still running
+    running_at_check: int = 0  # attempts the snapshots hold as still running
     excluded: tuple[str, ...] = field(default_factory=tuple)  # run keys whose final attempt no replayed record covers
     # by record path, each side file beside it by declared pattern: the bytes read once and verified
     side_files: Mapping[str, Mapping[str, bytes]] = field(default_factory=dict)
+    shards: tuple[Mapping[str, Any], ...] = ()  # merge.json's list of shards for a merged batch, else empty
+
+    def close(self) -> None:
+        """Close every snapshot."""
+        for snapshot in self.snapshots.values():
+            snapshot.close()
 
     def record_for(self, digest: str, try_name: str, run_key: str, attempt: int) -> RunRecord | None:
         """The verified record of an attempt, or None when no replayed record is there."""
@@ -107,6 +119,33 @@ def _load_snapshot(batch: Path, check: Mapping[str, Any], schema: FactorSchema) 
         return StoreSnapshot(raw, schema)
     except SnapshotError as error:
         raise Unverified(f"{SNAPSHOT_FILE}: {error}") from None
+
+
+def _load_shards(batch: Path, merge: Any, schema: FactorSchema) -> tuple[dict[int | None, StoreSnapshot], tuple]:
+    """The snapshots of a merged batch's shards, each verified against the hash merge.json names, and the shard list."""
+    out = batch.parent
+    expected = merge.get("sha256") if isinstance(merge, dict) else None
+    if not isinstance(merge, dict) or merge.get("file") != MERGE_FILE or not isinstance(expected, str):
+        raise Unverified(
+            "the replay check's record of the merge was altered; make it again with `python -m expcore check`"
+        )
+    try:
+        document = read_merge(_read_verified(out, MERGE_FILE, expected), MERGE_FILE)
+    except MergeRefused as error:
+        raise Unverified(str(error)) from None
+    snapshots: dict[int | None, StoreSnapshot] = {}
+    try:
+        for shard in document["shards"]:
+            rel = f"{SHARDS_DIR}/{shard['index']}/{SNAPSHOT_FILE}"
+            try:
+                snapshots[shard["index"]] = StoreSnapshot(_read_verified(out, rel, shard["snapshot_sha256"]), schema)
+            except SnapshotError as error:
+                raise Unverified(f"{rel}: {error}") from None
+    except Unverified:
+        for opened in snapshots.values():
+            opened.close()
+        raise
+    return snapshots, tuple(document["shards"])
 
 
 def _parse(rel: str, raw: bytes) -> RunRecord:
@@ -179,12 +218,40 @@ def load_verified(
     with its record again, and its bytes are kept for the scorers (`VerifiedBatch.side_files_for`).
     """
     replayed = _replayed_set(check)
-    snapshot = _load_snapshot(batch, check, schema)
+    merge = check.get(CHECK_KEY)
+    shards: tuple = ()
+    if merge is None:
+        snapshots: dict[int | None, StoreSnapshot] = {None: _load_snapshot(batch, check, schema)}
+    else:
+        snapshots, shards = _load_shards(batch, merge, schema)
+    try:
+        return _cross_validated(batch, check, snapshots, shards, replayed, partial, side_files)
+    except Unverified:
+        for snapshot in snapshots.values():
+            snapshot.close()
+        raise
+
+
+def _cross_validated(
+    batch: Path,
+    check: Mapping[str, Any],
+    snapshots: Mapping[int | None, StoreSnapshot],
+    shards: tuple,
+    replayed: set[str],
+    partial: bool,
+    side_files: Sequence[SideFile],
+) -> VerifiedBatch:
+    """Read the replayed records once each and cross-validate them with the attempts of every snapshot."""
     raws = {rel: _read_verified(batch, rel, check["inputs"][rel]) for rel in sorted(replayed)}
     records = {rel: _parse(rel, raw) for rel, raw in raws.items()}
     held = _pair_side_files(batch, check, raws, side_files) if side_files else {}
-    attempts = _attempts(snapshot)
-    expected = {record_path(a["digest"], Path(a["run_dir"]).name, a["run_key"], a["attempt"]): a for a in attempts}
+    attempts = [a for snapshot in snapshots.values() for a in _attempts(snapshot)]
+    expected: dict[str, Any] = {}
+    for a in attempts:
+        where = record_path(a["digest"], Path(a["run_dir"]).name, a["run_key"], a["attempt"])
+        if where in expected:
+            raise Unverified(f"{where}: more than one attempt of the campaign snapshots lies here")
+        expected[where] = a
     running = sum(1 for a in attempts if a["state"] == "running")
     if running and not partial:
         raise Unverified(
@@ -205,4 +272,4 @@ def load_verified(
                     "no replayed record covers it; pass --partial to leave it out"
                 )
             excluded.append(row["run_key"])
-    return VerifiedBatch(snapshot, records, running, tuple(sorted(set(excluded))), held)
+    return VerifiedBatch(dict(snapshots), records, running, tuple(sorted(set(excluded))), held, shards)

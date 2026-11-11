@@ -54,12 +54,15 @@ from typing import Any
 from expcore.accounting import condition_accounting
 from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
+from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
+from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
+from expcore.campaign.merge import MergeRefused, read_merge, sha256_of, shard_snapshot_path
 from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.settings import SchedulerConfig
-from expcore.campaign.shard import ShardError, ShardSpec, check_identity
+from expcore.campaign.shard import MERGE_FILE, ShardError, ShardSpec, check_identity
 from expcore.campaign.shard_run import ShardStart, environment_block, share_settings
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
 from expcore.config.models import ModelSpec
@@ -94,7 +97,7 @@ from expcore.study.config import (
 )
 from expcore.study.factory_version import check_factory_version
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
-from expcore.study.verified import UNCOVERED, Unverified, load_verified
+from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
 
 RUNS_DIR = "runs"
 MARKER_PATTERN = "*attempt-marker.json"
@@ -324,6 +327,12 @@ def _check_batch_of(
         raise Refused(f"{directory}: no batch of records here; run the study first")
     env = study_environment(study)
     store = out_dir(study) / STATE_FILE
+    if (out_dir(study) / MERGE_FILE).is_file():
+        if store.is_file():
+            raise Refused(
+                f"{out_dir(study)}: holds a merged batch ({MERGE_FILE}) and a campaign store; use one or the other"
+            )
+        return _check_merged(study, directory, code, env, partial)
     if store.is_file():  # without a store, take_snapshot refuses below
         changed = differences(campaign_environment(read_fingerprint(store)), env)
         if changed:
@@ -331,7 +340,7 @@ def _check_batch_of(
                 f"{store}: the campaign ran under another environment than this check would; check under the "
                 "campaign's environment:\n  " + "\n  ".join(changed)
             )
-    _import_what_the_records_need(study, directory)
+    import_what_the_records_need(study, directory)
     try:
         running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
@@ -344,7 +353,44 @@ def _check_batch_of(
     return check
 
 
-def _import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
+def _check_merged(
+    study: StudyIdentity, directory: Path, code: Mapping[str, Any], env: Mapping[str, Any], partial: bool
+) -> dict[str, Any]:
+    """The replay check of a merged batch: merge.json is bound by its hash, each shard's snapshot is compared with the
+    hash merge.json names and read under the environment in use, and the records are replayed as one batch.
+
+    There is no live store to copy: the shards' snapshots were taken at the merge. The check records the SHA-256 of
+    merge.json (`check["merge"]`), and the analysis reads the snapshots against the hashes that file holds."""
+    out = out_dir(study)
+    raw = (out / MERGE_FILE).read_bytes()
+    try:
+        merged = read_merge(raw, out / MERGE_FILE)
+    except MergeRefused as error:
+        raise Refused(str(error)) from None
+    for shard in merged["shards"]:
+        name, path = f"shard {shard['index']} ({shard['label']})", shard_snapshot_path(out, shard["index"])
+        if not path.is_file():
+            raise Refused(f"{name}: its snapshot {path} is missing from the merged batch")
+        if sha256_of(path) != shard["snapshot_sha256"]:
+            raise Refused(
+                f"{name}: its snapshot changed since the merge ({MERGE_FILE} names another SHA-256); merge again"
+            )
+        changed = differences(campaign_environment(read_fingerprint(path)), env)
+        if changed:
+            raise Refused(
+                f"{name}: its campaign ran under another environment than this check would; check under the "
+                "campaign's environment:\n  " + "\n  ".join(changed)
+            )
+    import_what_the_records_need(study, directory)
+    check = verify_batch(
+        directory, code=code, hashed_only=[MARKER_PATTERN], environment=env, side_files=study.side_files
+    )
+    check[MERGE_KEY] = {"file": MERGE_FILE, "sha256": hashlib.sha256(raw).hexdigest(), "partial": partial}
+    write_check(directory, check)
+    return check
+
+
+def import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
     """Import only what a record of the batch cannot be read without, and say so first.
 
     The study's own kinds are in scope already, read as data. A record that names a kind still unknown imports the
@@ -473,19 +519,27 @@ def _analyse_loaded(
             compare_sources=not stamped,
             side_files=study.side_files,
         )
+        if (out / MERGE_FILE).is_file() and MERGE_KEY not in check:
+            raise BatchNotVerified(
+                f"{batch}: the replay check was made without {MERGE_FILE}, which is here now; "
+                f"run `python -m expcore check {batch}` again"
+            )
         verified = load_verified(batch, check, study.schema, partial=partial, side_files=study.side_files)
     except (BatchNotVerified, Unverified) as error:
         raise Refused(str(error)) from None
-    rows = verified.snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
-    changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])
-    if changed:
-        verified.snapshot.close()
-        raise Refused("the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed))
+    for snapshot in verified.snapshots.values():
+        rows = snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
+        changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])
+        if changed:
+            verified.close()
+            raise Refused(
+                "the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed)
+            )
     plugin = load_plugin(StudyContext(study, code))
     try:
-        export = export_run_state(verified.snapshot, excluded=dict.fromkeys(verified.excluded, UNCOVERED))
+        export = _export_of(verified, study.manifest)
     finally:
-        verified.snapshot.close()
+        verified.close()
     rows, scores = [], {}
     for entry in export["analysed_attempts"]:
         where = (entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
@@ -502,6 +556,19 @@ def _analyse_loaded(
         raise Refused(str(error)) from None
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)
+
+
+def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
+    """The export the analysis reads: the campaign's from its snapshot, or, for a merged batch, the shards' exports
+    joined in the order of the whole plan (`campaign.export_join`)."""
+    left_out = dict.fromkeys(verified.excluded, UNCOVERED)
+    if None in verified.snapshots:
+        return export_run_state(verified.snapshots[None], excluded=left_out)
+    parts = {}
+    for index, snapshot in verified.snapshots.items():
+        held = {row["run_key"] for row in snapshot.q("SELECT run_key FROM runs")}
+        parts[index] = export_run_state(snapshot, excluded={key: why for key, why in left_out.items() if key in held})
+    return join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
 
 
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
