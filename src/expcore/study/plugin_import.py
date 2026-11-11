@@ -40,7 +40,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from expcore.provenance.environment import editable_roots, installed, is_editable, owns_file
+from expcore.provenance.environment import canonical, editable_roots, installed, is_editable, owns_file
 
 PLUGIN_MODULE_PREFIX = "expcore_study_plugin_"  # the rest of a plugin's module name is a hash of its path
 CORE_PACKAGES = ("expcore", "expcore_onedata")  # the core's own packages: the environment's code, never the study's
@@ -144,40 +144,36 @@ def _environment() -> tuple[str, ...]:
 
 
 class _Installed:
-    """Whether a file of the study directory is an installed distribution's code, editable or not, so that the recorded
-    environment covers it rather than `[study] code`; the distributions are read once, when first asked.
+    """Whether a file of the study directory is code the recorded environment already covers, so `[study] code` need
+    not: code of a distribution in the environment record (the core's closure and what `[study] requires` names). An
+    editable one covers every file below its import roots (the directories its `.pth` puts on the path, else its
+    project), which is exactly what the record digests (`environment.source_of`); one installed normally covers the
+    files its RECORD lists. A distribution the record leaves out covers nothing, however its install is laid out, so
+    its files are the study's own code; the distributions are read once, when first asked."""
 
-    A distribution installed normally owns exactly the files its RECORD lists. An editable one owns the files below one
-    of its import roots (the directories its `.pth` puts on the path, else its project) only when that root lies
-    strictly inside the study directory, as a dependency vendored in the study does. A root that is the study directory,
-    or holds it, is the study installed as a project of its own: its files are the study's code, never an install's,
-    whatever names or paths would suggest otherwise."""
+    def __init__(self, recorded: frozenset[str]) -> None:
+        self.recorded = recorded
+        self._dists: list[tuple[metadata.Distribution, list[str] | None]] | None = None
 
-    def __init__(self, root: str) -> None:
-        self.root = root
-        self._dists: list[tuple[metadata.Distribution, list[str]]] | None = None
-
-    def _all(self) -> list[tuple[metadata.Distribution, list[str]]]:
+    def _all(self) -> list[tuple[metadata.Distribution, list[str] | None]]:
         if self._dists is None:
             self._dists = []
-            for dist in installed().values():
-                if not is_editable(dist):
-                    self._dists.append((dist, []))
+            for name, dist in installed().items():
+                if canonical(name) not in self.recorded:
                     continue
-                roots = [os.path.realpath(r) for r in editable_roots(dist)]
-                vendored = [r for r in roots if _inside(r, self.root) and r != self.root]
-                self._dists.append((dist, vendored))
+                roots = [os.path.realpath(r) for r in editable_roots(dist)] if is_editable(dist) else None
+                self._dists.append((dist, roots))
         return self._dists
 
     def owns(self, path: str) -> bool:
-        file = Path(path)
-        for dist, vendored in self._all():
-            if not is_editable(dist):
-                site = os.path.realpath(str(dist.locate_file("")))
-                if _inside(path, site) and owns_file(dist, file, ""):
+        for dist, roots in self._all():
+            if roots is not None:
+                if any(_inside(path, root) for root in roots):
                     return True
-            elif any(_inside(path, root) and path != root for root in vendored):
-                return True
+            else:
+                site = os.path.realpath(str(dist.locate_file("")))
+                if _inside(path, site) and owns_file(dist, Path(path), ""):
+                    return True
         return False
 
 
@@ -193,8 +189,9 @@ class Locator:
     """Which files are the study's own code: inside the study directory, outside the running environment and the
     core, below no directory the code identity skips, and not an installed distribution's."""
 
-    def __init__(self, root: str, skip_dirs: frozenset[str]) -> None:
-        self.root, self.skip_dirs, self._installed = root, skip_dirs, _Installed(root)
+    def __init__(self, root: str, skip_dirs: frozenset[str], recorded: frozenset[str] = frozenset()) -> None:
+        """`recorded`: the canonical names of the distributions the environment record covers."""
+        self.root, self.skip_dirs, self._installed = root, skip_dirs, _Installed(recorded)
 
     def locate(self, file: str, name: str | None = None, *, own: bool = False) -> StudyCode | None:
         """The study code a file is, or None. `own`: a module of the plugin's package, the study's by definition."""
@@ -228,10 +225,10 @@ def in_package(name: str, package: str) -> bool:
     return name == package or name.startswith(f"{package}.")
 
 
-def forget(package: str, root: str, skip_dirs: frozenset[str]) -> None:
+def forget(package: str, root: str, skip_dirs: frozenset[str], recorded: frozenset[str] = frozenset()) -> None:
     """Drop the package's modules and every module whose file is the study's code, whatever it is called; never a
     module of the core or of an installed distribution."""
-    doomed = set(Locator(root, skip_dirs).modules(package))
+    doomed = set(Locator(root, skip_dirs, recorded).modules(package))
     doomed |= {name for name in list(sys.modules) if in_package(name, package)}
     for name in doomed:
         sys.modules.pop(name, None)

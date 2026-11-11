@@ -68,8 +68,9 @@ def test_p02_a_study_directory_that_holds_the_core_loads_and_keeps_the_core_in_t
 
 
 def test_p02_an_editable_dependency_inside_the_study_is_the_environment_s_code(tmp_path, monkeypatch):
-    """P02: adds that a distribution installed editable from a directory inside the study is covered by the recorded
-    environment, not by `[study] code`: the plugin that imports it loads, and the module stays."""
+    """P02: adds that a distribution installed editable from a directory inside the study, and named in `[study]
+    requires`, is covered by the recorded environment, not by `[study] code`: the plugin that imports it loads, and the
+    module stays."""
     study_dir = example_copy(tmp_path)
     vendor = study_dir / "vendor"
     (vendor / "toykit").mkdir(parents=True)
@@ -80,6 +81,7 @@ def test_p02_an_editable_dependency_inside_the_study_is_the_environment_s_code(t
     monkeypatch.syspath_prepend(str(vendor))  # what the install's .pth does at start-up
     monkeypatch.delitem(sys.modules, "toykit", raising=False)
     edit(study_dir / "plugin.py", '"""The plugin of the tiny study', 'import toykit\n\n"""The plugin of the tiny study')
+    edit(study_dir / "study.toml", 'name = "tiny-study"\n', 'name = "tiny-study"\nrequires = ["toykit"]\n')
     try:
         load_plugin(context(study_dir))
         assert sys.modules["toykit"].ANSWER == "deep"
@@ -120,9 +122,9 @@ class _VendorHook:
 
 
 def test_p02_a_vendored_editable_dependency_behind_an_import_hook_is_the_environment_s_code(tmp_path, monkeypatch):
-    """P02: adds that a dependency installed editable from inside the study through an import hook, with no `.pth`
-    entry and no declared top-level names, is recognised by its project's place alone, the same way whether its
-    module or the code it runs is looked at: the plugin that imports it loads."""
+    """P02: adds that an editable dependency behind an import hook, with no `.pth` entry, is the environment's code
+    exactly when the environment record covers it: refused as unlisted study code until `[study] requires` names it,
+    then loaded, the same way whether its module or the code it runs is looked at."""
     study_dir = example_copy(tmp_path)
     vendor = study_dir / "vendor" / "hookkit-src"
     (vendor / "hookkit").mkdir(parents=True)
@@ -137,6 +139,10 @@ def test_p02_a_vendored_editable_dependency_behind_an_import_hook_is_the_environ
         study_dir / "plugin.py", '"""The plugin of the tiny study', 'import hookkit\n\n"""The plugin of the tiny study'
     )
     try:
+        with pytest.raises(ConfigError, match="hookkit"):  # not in the environment record: the study's own code
+            load_plugin(context(study_dir))
+        sys.modules.pop("hookkit", None)
+        edit(study_dir / "study.toml", 'name = "tiny-study"\n', 'name = "tiny-study"\nrequires = ["hookkit"]\n')
         load_plugin(context(study_dir))
         assert sys.modules["hookkit"].ANSWER == "deep"
     finally:

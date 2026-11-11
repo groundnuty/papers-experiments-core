@@ -32,6 +32,7 @@ from expcore.config.loading import ConfigError, Section
 from expcore.config.models import ModelTable, not_built_by_core
 from expcore.plugin import ToolSpec
 from expcore.provenance.codestamp import covered_files
+from expcore.provenance.environment import EnvironmentUnknown, environment
 from expcore.records.build import redactor_for
 from expcore.records.rescore import Scorer, scorer_name, scorer_version
 from expcore.study.config import OUT_DIR, STUDY_FILE, StudyConfig, StudyIdentity
@@ -191,9 +192,14 @@ def import_plugin_module(
     return module
 
 
-def _where(study: StudyConfig | StudyIdentity) -> tuple[str, frozenset[str]]:
-    """The study directory, resolved, and the directories the code identity never enters."""
-    return os.path.realpath(study.root), frozenset(study.scope.skip_dirs)
+def _where(study: StudyConfig | StudyIdentity) -> tuple[str, frozenset[str], frozenset[str]]:
+    """The study directory, resolved, the directories the code identity never enters, and the distributions the
+    environment record covers (none when the environment cannot be recorded, which the pipeline refuses on its own)."""
+    try:
+        recorded = frozenset(environment(getattr(study, "requires", ()))["distributions"])
+    except EnvironmentUnknown:
+        recorded = frozenset()
+    return os.path.realpath(study.root), frozenset(study.scope.skip_dirs), recorded
 
 
 def _forget(study: StudyConfig | StudyIdentity, module_name: str) -> None:
@@ -226,9 +232,9 @@ def check_plugin_modules(study: StudyConfig | StudyIdentity, module: ModuleType,
     code, as they were. Each must also be a module of the plugin's package: one found through the module search path or
     loaded by path is cached under a name another study could be served, or runs from cached bytecode.
     """
-    root, skip_dirs = _where(study)
+    root, skip_dirs, recorded = _where(study)
     package = module.__name__
-    locator = Locator(root, skip_dirs)
+    locator = Locator(root, skip_dirs, recorded)
     modules = locator.modules(package)
     own = {code.path for name, code in modules.items() if in_package(name, package)}
     elsewhere = {code.path: name for name, code in sorted(modules.items()) if not in_package(name, package)}
