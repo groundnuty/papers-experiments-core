@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from expcore.config.key_locations import NO_LOCATIONS, KeyFinders
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term, term_lines
 from expcore.package.identity import FOUND_COMMIT, FOUND_URL, commit_lines, find_identity, url_lines
-from expcore.package.leaks import describe_hit, find_locations, path_holds, scan_tokens
+from expcore.package.leaks import FOUND_COPY, describe_hit, find_locations, path_holds, scan_tokens
 from expcore.package.spec import Opaque, PackageError
 from expcore.package.wheels import Wheel
 from expcore.provenance.environment import CORE_DISTRIBUTION, canonical
@@ -157,6 +157,7 @@ def scan_wheels(
     core = canonical(CORE_DISTRIBUTION)
     for wheel in wheels:
         binaries[wheel.path] = []
+        searched = locations if _is_authors(wheel, exempt, core) else NO_LOCATIONS
         for member, data in members(wheel, redactor):
             label = f"{wheel.path}/{member}"
             seen.add(label)
@@ -175,13 +176,15 @@ def scan_wheels(
             text = as_text(data)
             if text is None:
                 binaries[wheel.path].append({"path": member, "sha256": digest})
+                if searched.is_key_file(data):  # a key that is not text
+                    shown = redactor.name(label, hide=path_holds(label, searched))
+                    findings += [f"{shown}: {FOUND_COPY}", _attest_hint(label, digest, redactor)]
                 continue
             if wheel.path in exempt:
                 found = _plain(label, text, None, terms, hidden, redactor)
             elif wheel.from_index:
                 found = _plain(label, text, tokens, terms, hidden, redactor)
             else:
-                searched = NO_LOCATIONS if canonical(wheel.name) == core else locations
                 found = _deep(label, data, tokens, terms, hidden, redactor, searched)
             if found:
                 findings += found
@@ -190,6 +193,12 @@ def scan_wheels(
         f"{redactor.name(path)}: [[opaque]] attests a member no vendored wheel holds" for path in _stray(attested, seen)
     ]
     return WheelScan(findings, binaries)
+
+
+def _is_authors(wheel: Wheel, exempt: Collection[str], core: str) -> bool:
+    """Whether a wheel can be the author's own code, so that it is searched for key locations: not a release (from an
+    index, or one the lock proves) and not the core (`core`, its canonical name), which has nothing of the author's."""
+    return not (wheel.path in exempt or wheel.from_index or canonical(wheel.name) == core)
 
 
 def _attest_hint(label: str, digest: str, redactor: Redactor) -> str:

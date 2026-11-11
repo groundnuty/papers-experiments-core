@@ -3,6 +3,7 @@
 import dataclasses
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from expcore.study.pipeline import fingerprint_of
 from expcore.study.plugin import StudyContext, load_plugin
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "tiny_study"
+HOME = os.path.expanduser("~")  # a key file declared under this machine's home is also written with `~`
 KEYED = """
 [models.delta-remote]  # a model the plan runs, its key in a file
 backend = "anthropic"
@@ -187,11 +189,27 @@ FOUND = [
     ("/srv/keys/a.key", "[/srv/keys/a.key](notes.md)"),
     ("/srv/keys/a.key", "e.g. /srv/keys/a.key..."),
     ("/srv/keys/a.key", "scp lab:/srv/keys/a.key ."),
+    # other spellings of the path a declared home-relative or ./-relative key file has
+    ("~/prior-study/lab.key", "    - ${HOME}/prior-study/lab.key:/run/key:ro"),
+    ("~/prior-study/lab.key", "cat $HOME/prior-study/lab.key"),
+    ("~/prior-study/lab.key", "error: /home/someone/prior-study/lab.key missing"),  # another host's home
+    (f"{HOME}/prior-study/lab.key", "put it in ~/prior-study/lab.key"),
+    (f"{HOME}/prior-study/lab.key", "- ${HOME}/prior-study/lab.key:/run/key:ro"),
+    ("./keys/lab.key", "cat keys/lab.key"),
+    ("./keys/lab.key", "cat ./keys/lab.key"),
+    # a bare file name with a full stop or a hyphen is a path of one part: found wherever no part continues it
+    ("prior-study.key", "__pycache__/\nprior-study.key\n"),  # a .gitignore line
+    ("prior-study.key", "[k](prior-study.key)"),
+    ("prior-study.key", "KEY_FILE=prior-study.key"),
+    ("lab.key", "x?f=lab.key"),
+    ("prior-study.key", "Put the key in prior-study.key first."),
+    ("key.txt", "copy key.txt here"),
+    ("./prior-study.key", "cat prior-study.key"),
+    ("~/prior-study.key", "cat prior-study.key"),
 ]
 NOT_FOUND = [
     ("key.txt", "my-key.txt"),
     ("key.txt", "/srv/old/my-key.txt"),
-    ("key.txt", "copy key.txt here"),
     ("key.txt", "KEY.TXT"),
     ("secrets", "import secrets"),
     ("secrets", "secrets.token_hex()"),
@@ -202,6 +220,13 @@ NOT_FOUND = [
     ("/srv/keys/a.key", "/SRV/keys/a.key"),
     ("keys/lab.key", "/srv/study/mykeys/lab.key"),
     ("keys/lab.key", "keys/lab.key-old"),
+    ("~/prior-study/lab.key", "/home/someone/old-prior-study/lab.key"),
+    ("~/prior-study/lab.key", "$HOME/prior-study/lab.key.bak"),
+    ("./keys/lab.key", "cat mykeys/lab.key"),
+    ("prior-study.key", "old-prior-study.key"),
+    ("prior-study.key", "prior-study.key.bak"),
+    ("prior-study.key", "prior-study.keys"),
+    ("prior-study.key", "PRIOR-STUDY.KEY"),
 ]
 
 
@@ -212,18 +237,20 @@ def names_key_file(key_file: str, text: str) -> bool:
 
 @pytest.mark.parametrize(("key_file", "text"), FOUND, ids=[text for _, text in FOUND])
 def test_k13_a_key_file_is_found_wherever_no_path_part_continues_it(key_file, text):
-    """K13: a key file's path is found as written wherever no part of a path continues it: after the start, white
-    space, a quote, a bracket, `=`, `:` or `/` (so inside a longer path, and in a file URL), and before the end, white
-    space, a quote, a bracket, `:` (a mount, a line number), `,`, `;`, or a full stop that ends the text there. A bare
-    file name is found as a whole part of a path, or quoted."""
+    """K13: a key file's path is found as written, without a leading `./`, and by its tail after the home directory
+    (`~/`, or this machine's home), wherever no part of a path continues it: after the start, white space, a quote, a
+    bracket, `=`, `:` or `/` (so inside a longer path, in a file URL, after `$HOME` or another host's home), and
+    before the end, white space, a quote, a bracket, `:` (a mount, a line number), `,`, `;`, or a full stop that ends
+    the text there. A bare file name with a full stop or a hyphen is a path of one part and found the same way,
+    prose included; one that is an identifier (`secrets`) is found as a whole part of a path, or quoted."""
     assert names_key_file(key_file, text)
 
 
 @pytest.mark.parametrize(("key_file", "text"), NOT_FOUND, ids=[text for _, text in NOT_FOUND])
 def test_k13_a_key_file_is_not_found_inside_a_longer_name(key_file, text):
-    """K13: a key file's path is found case-sensitively, never continued by a part of a longer name, and a bare file
-    name is an ordinary word unless quoted or a part of a path. So neither `my-key.txt` nor `import secrets` refuses a
-    build whose key file is `key.txt` or `secrets`."""
+    """K13: a key file's path is found case-sensitively, never continued by a part of a longer name, and a bare
+    identifier is an ordinary word unless quoted or a part of a path. So neither `my-key.txt` nor `import secrets`
+    refuses a build whose key file is `key.txt` or `secrets`."""
     assert not names_key_file(key_file, text)
 
 

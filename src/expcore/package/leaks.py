@@ -187,6 +187,7 @@ def findings_in(
 
 
 FOUND_LOCATION = "a key location the study's models.toml declares, which no package holds"
+FOUND_COPY = "its bytes are those of a key file the study's models.toml declares, which no package holds"
 
 
 def path_holds(label: str, locations: KeyFinders) -> bool:
@@ -203,8 +204,10 @@ def find_locations(
 ) -> list[str]:
     """One finding per stream and line that holds a key location (`key_locations.location_finders`), never the value:
     every stream of every file, under every view, as the token check reads it; and the path of each stream
-    (`path_holds`), shown by its hidden name when it holds one. The files in `opaque` were attested by hash
-    and are not read. Empty when there is nothing to look for."""
+    (`path_holds`), shown by its hidden name when it holds one. A file, or a stream inside one (an archive member), that
+    is a copy of a declared key file under any name, by size and SHA-256, is one finding naming its path
+    (`KeyFinders.is_key_file`); a file the checks cannot open is searched as the bytes it is. The files in `opaque`
+    were attested by hash and are not read. Empty when there is nothing to look for."""
     if not locations:
         return []
     redactor = Redactor() if redactor is None else redactor
@@ -212,7 +215,8 @@ def find_locations(
     for name in sorted(files):
         if name in opaque:
             continue
-        for stream in streams(name, files[name])[0]:
+        opened = streams(name, files[name])[0]
+        for stream in opened:
             held = path_holds(stream.label, locations)
             shown = redactor.name(stream.label, hide=held)
             if held:
@@ -221,6 +225,9 @@ def find_locations(
                 found_at = (m.start() for found in locations.patterns for m in found.finditer(text))
                 lines = {text.count("\n", 0, start) + 1 for start in found_at}
                 findings |= {f"{shown}:{line}: {FOUND_LOCATION}" for line in lines}
+        for label, data in [(name, files[name]), *((stream.label, stream.data) for stream in opened)]:
+            if locations.is_key_file(data):
+                findings.add(f"{redactor.name(label, hide=path_holds(label, locations))}: {FOUND_COPY}")
     return sorted(findings)
 
 

@@ -25,6 +25,7 @@ from study_support import EXAMPLE, HEAD, Campaign, clean_environment, cli, copy_
 
 from expcore.campaign.resume import FINGERPRINT_KEY
 from expcore.config.key_locations import location_finders
+from expcore.config.loading import ConfigError
 from expcore.package import build as package_build
 from expcore.package import wheels as wheels_module
 from expcore.package.build import PACKAGE_FILE, build_package, private_hashes, verify_package
@@ -354,6 +355,9 @@ THE_KEY_FILE = [
     ("study/keys/lab.key", "keys/lab.key", KEY_BYTES),  # declared from the directory above the study
     ("/srv/study/lab.key", "lab.key", KEY_BYTES),
     ("lab.key", "bundle.tar", tar_of("lab.key", KEY_BYTES)),  # a member of a packaged archive
+    ("keys/openai.key", "keys/OpenAI.key", KEY_BYTES),  # a label is compared without regard to case
+    ("keys/OpenAI.key", "KEYS/OPENAI.KEY", KEY_BYTES),
+    ("lab.key", "bundle.tar", tar_of("notes/LAB.KEY", KEY_BYTES)),
 ]
 NOT_THE_KEY_FILE = [
     ("lab.key", "my-lab.key"),
@@ -361,13 +365,16 @@ NOT_THE_KEY_FILE = [
     ("keys/lab.key", "mykeys/lab.key"),
     ("keys/lab.key", "lab.key/README.md"),
     ("/srv/study/lab.key", "notes/lab.key"),
+    ("keys/openai.key", "keys/OpenAI.key.md"),
+    ("keys/openai.key", "MYKEYS/OpenAI.key"),
 ]
 
 
 @pytest.mark.parametrize(("key_file", "path", "data"), THE_KEY_FILE, ids=[f"{k} as {p}" for k, p, _ in THE_KEY_FILE])
 def test_k13_a_packaged_file_that_is_the_key_file_is_refused(key_file, path, data):
     """K13: a packaged file, or a member of a packaged archive, whose path and the declared key file's agree on their
-    last parts, the shorter one whole, can be the key itself: it is refused, by its hidden name, never the value."""
+    last parts, the shorter one whole and without regard to case, can be the key itself: it is refused, by its hidden
+    name, never the value."""
     finders = location_finders([SimpleNamespace(key_file=key_file, key_env=None)])
     found = find_locations({path: data}, finders)
     assert any(line.endswith(f": the path holds {FOUND_LOCATION}") for line in found), found
@@ -379,6 +386,93 @@ def test_k13_a_packaged_file_with_a_longer_name_is_not_the_key_file(key_file, pa
     """K13: a packaged file is the key file only by whole parts of its path: `my-lab.key` is not `lab.key`."""
     finders = location_finders([SimpleNamespace(key_file=key_file, key_env=None)])
     assert find_locations({path: KEY_BYTES}, finders) == []
+
+
+OTHER_BYTES = KEY_BYTES.replace(b"0", b"1")  # as long as the key, and not it
+BINARY_KEY = bytes(range(32))  # a key that is not text
+
+
+KEPT = ("vault-of-lanterns", "ember.secret")  # the parts of the path of the key file the tests below keep
+
+
+def kept_key(directory: Path, data: bytes = KEY_BYTES) -> str:
+    """A key file at an absolute path no packaged file's name agrees with, as a model would declare it."""
+    path = directory / "vault-of-lanterns" / "ember.secret"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(data)
+    return str(path)
+
+
+def zip_of(member: str, data: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(member, data)
+    return buffer.getvalue()
+
+
+COPIES = [  # what it is, its path in the package, its bytes, the key file's bytes
+    ("a text file", "notes/readme.txt", KEY_BYTES, KEY_BYTES),
+    ("a file with no extension", "data", KEY_BYTES, KEY_BYTES),
+    ("a binary file", "notes/blob.bin", BINARY_KEY, BINARY_KEY),
+    ("a member of a tar", "bundle.tar", tar_of("misc/plain.txt", KEY_BYTES), KEY_BYTES),
+    ("a member of a zip", "bundle.zip", zip_of("misc/plain.txt", KEY_BYTES), KEY_BYTES),
+]
+
+
+@pytest.mark.parametrize(("path", "data", "key"), [c[1:] for c in COPIES], ids=[c[0] for c in COPIES])
+def test_k13_a_copy_of_the_key_file_is_refused_whatever_it_is_named(tmp_path, path, data, key):
+    """K13: a packaged file, or a member of a packaged archive, whose size and SHA-256 are the declared key file's is
+    the key itself, however it is named: it is refused, naming its path in the package and never the key file's path
+    or the key."""
+    finders = location_finders([SimpleNamespace(key_file=kept_key(tmp_path, key), key_env=None)])
+    found = find_locations({path: data}, finders)
+    assert any(line.startswith(f"{path}") and ": its bytes are those of a key file" in line for line in found), found
+    message = "\n".join(found)
+    assert not any(part in message for part in KEPT)
+    assert KEY_BYTES.decode().strip() not in message
+
+
+def test_k13_a_file_the_size_of_the_key_file_but_not_it_is_not_refused(tmp_path):
+    """K13: the copy is told by the size and the SHA-256 together: a file as long as the key file is not refused."""
+    finders = location_finders([SimpleNamespace(key_file=kept_key(tmp_path), key_env=None)])
+    assert len(OTHER_BYTES) == len(KEY_BYTES)
+    assert find_locations({"notes/readme.txt": OTHER_BYTES}, finders) == []
+
+
+def test_k13_a_key_file_that_is_not_there_or_holds_nothing_adds_no_search_by_content(tmp_path):
+    """K13: a key file that does not exist, is a directory, or is empty gives no refusal and no error at all: an empty
+    key file is not matched by every empty file of the package."""
+    empty = tmp_path / "empty.secret"
+    empty.write_bytes(b"")
+    for declared in (str(tmp_path / "absent" / "x.secret"), str(tmp_path), str(empty)):
+        finders = location_finders([SimpleNamespace(key_file=declared, key_env=None)])
+        assert find_locations({"pkg/__init__.py": b""}, finders) == []
+
+
+def test_k13_a_key_file_over_a_mebibyte_is_refused_by_a_clear_message_that_names_no_path(tmp_path):
+    """K13: a key file is a small secret; one over 1 MiB is implausible and refuses the build, whose message names the
+    model and the key, never the file's path."""
+    big = tmp_path / "vault-of-lanterns" / "ember.secret"
+    big.parent.mkdir()
+    big.write_bytes(b"k" * (2**20 + 1))
+    with pytest.raises(ConfigError, match=r"\[models\.gamma\]: key 'key_file': .*over 1 MiB") as refused:
+        location_finders([SimpleNamespace(key="gamma", key_file=str(big), key_env=None)])
+    assert not any(part in str(refused.value) for part in KEPT)
+    big.write_bytes(b"k" * 2**20)  # exactly 1 MiB is still a key file
+    assert location_finders([SimpleNamespace(key="gamma", key_file=str(big), key_env=None)])
+
+
+def test_k13_a_binary_member_of_a_wheel_that_is_the_key_file_is_refused(tmp_path, hashes):
+    """K13: a member of the author's own wheel that is not text is listed, not read, but if it is the key file, by its
+    size and SHA-256, it is refused, by its path and never the key file's."""
+    filename, data = wheel_of("toy-kit", "1.0", {"toy_kit/blob.bin": BINARY_KEY})
+    wheel = Wheel("toy-kit", "1.0", filename, data, from_index=False, direct=True)
+    finders = location_finders([SimpleNamespace(key_file=kept_key(tmp_path, BINARY_KEY), key_env=None)])
+    found = scan_wheels(
+        [wheel], private_hashes(hashes), terms=None, hidden=(frozenset(), frozenset()), attested={}, locations=finders
+    ).findings
+    assert any("toy_kit/blob.bin: its bytes are those of a key file" in line for line in found), found
+    assert not any(part in line for line in found for part in KEPT), found
 
 
 def test_k13_a_wheel_member_that_is_the_key_file_is_refused_by_its_hidden_name(hashes):
@@ -409,6 +503,23 @@ def test_k13_the_key_file_itself_refuses_the_build(campaign, hashes, tmp_path):
     message = str(refused.value)
     assert f": the path holds {FOUND_LOCATION}" in message
     assert "lab.key" not in message
+
+
+def test_k13_a_renamed_copy_of_the_key_file_refuses_the_build(campaign, hashes, tmp_path):
+    """K13: the key file exists where models.toml says, and a copy of it under any other name that the inclusion list
+    takes would publish the key: the build refuses it by its path in the package, never the key file's path."""
+    copy = copy_campaign(campaign, tmp_path, "copy-of-key")
+    key = kept_key(tmp_path / "home", KEY_BYTES)
+    table = copy.root / "models.toml"
+    table.write_text(table.read_text(encoding="utf-8").replace(KEY_FILE, key), encoding="utf-8")
+    (copy.root / "notes.txt").write_bytes(KEY_BYTES)
+    spec = copy.root / "package.toml"
+    spec.write_text(spec.read_text(encoding="utf-8").replace('"README.md",', '"README.md",\n    "notes.txt",'), "utf-8")
+    with pytest.raises(PackageError) as refused:
+        build_package(copy.root, tmp_path / "dist", hashes=hashes)
+    message = str(refused.value)
+    assert "notes.txt: its bytes are those of a key file" in message
+    assert not any(part in message for part in KEPT)
 
 
 def test_k13_another_file_named_models_toml_refuses_the_build(campaign, hashes, tmp_path):

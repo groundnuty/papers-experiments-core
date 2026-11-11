@@ -15,8 +15,8 @@ package must not show, though: a home directory, an earlier study's folder, an a
 - every replication package ships models.toml in that form, so the identity a reader recomputes from the shipped file
   is the one the records were checked under, with no transformation to take on trust. The build refuses a package
   whose models.toml still holds any other key location (`location_findings`), and one in which any file still names
-  a key location the study's models declare, or is a declared key file (`location_finders`), as safety nets behind
-  the rewrite.
+  a key location the study's models declare, is a declared key file, or is a copy of one under any name
+  (`location_finders`), as safety nets behind the rewrite.
 
 The rewrite is minimal by construction, and checked. It reads the file's bytes once, as UTF-8 with no newline
 translation, which is how the table is loaded too. It marks the lines that begin a statement, outside every string,
@@ -30,8 +30,10 @@ does hashing it, so no such study runs, is checked or ships.
 """
 
 import dataclasses
+import hashlib
 import os
 import re
+import stat
 import tomllib
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -51,6 +53,7 @@ _LINES = re.compile(r"(?<=\n)")  # TOML ends a line at LF (CRLF included) and no
 _NAME_EDGE = r"A-Za-z0-9_"  # a variable's name is found only as a whole identifier
 _PART = r"\w\-~+@%"  # what continues a part of a path written in text, besides a full stop
 _QUOTE = "\"'`"
+MAX_KEY_FILE_BYTES = 2**20  # a key is a small secret: a file over 1 MiB is not one
 
 
 class KeyLocationUnreachable(ConfigError):
@@ -229,12 +232,32 @@ def _path_finder(path: str) -> re.Pattern[str]:
     a bracket, `=`, `,`, `:`, a separator (so a relative path is found inside a longer one, and an absolute one after
     `file://`). On the right it is the end, or any character but those and a separator: white space, a quote, a
     bracket, `:` (a mount, a line number), `,`, `;`; a run of full stops ends it too where nothing that continues a path
-    follows. A bare file name is an ordinary word (`secrets`, `key.txt`), so on the left it is found only after a
-    separator or a quote (`/x/lab.key`, `"lab.key"`); a packaged file named as the key file is found by its path
-    (`KeyFinders.names_file`)."""
-    whole = "/" in path or "\\" in path  # a path with a directory, not a bare file name
+    follows. A bare file name that is an identifier (`secrets`) is an ordinary word, so on the left it is found only
+    after a separator or a quote (`/x/lab.key`, `"lab.key"`); one with a full stop or a hyphen (`prior-study.key`) is
+    a path of one part, found like any other (a `.gitignore` line, `KEY_FILE=prior-study.key`, a sentence). A packaged
+    file named as the key file is found by its path (`KeyFinders.names_file`)."""
+    whole = any(char in path for char in "/\\.-")  # a path with a directory, or a name that is not a plain word
     left = rf"(?<![{_PART}.])" if whole else rf"(?<=[{_QUOTE}/\\])"
     return re.compile(rf"{left}{re.escape(path)}(?![{_PART}/\\]|\.+[{_PART}/\\])")
+
+
+def _spellings(key_file: str) -> set[str]:
+    """The ways a declared key file's path is written elsewhere: as declared, with `~` expanded, without a leading
+    `./`, and the tail after the home directory (after `~/` or `~user/`, or after this machine's home for an absolute
+    path under it), which `$HOME/`, `${HOME}/`, `~/` and another host's home precede. Each is searched as a whole
+    relative path; no tail is empty."""
+    expanded = os.path.expanduser(key_file)
+    spellings = {key_file, expanded}
+    unrooted = key_file
+    while unrooted.startswith("./"):
+        unrooted = unrooted[2:]
+    spellings.add(unrooted)
+    home = os.path.expanduser("~").rstrip("/")
+    if key_file.startswith("~"):
+        spellings.add(key_file.partition("/")[2])
+    if home.startswith("/") and expanded.startswith(f"{home}/"):
+        spellings.add(expanded[len(home) + 1 :])
+    return {spelling for spelling in spellings if spelling.strip("./\\")}
 
 
 def _ends_with(path: str, tail: str) -> bool:
@@ -244,36 +267,70 @@ def _ends_with(path: str, tail: str) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class KeyFinders:
-    """What finds each key location a study's models declare: in text (`patterns`), and as a packaged file (`files`,
-    each key file's path as written and with `~` expanded)."""
+    """What finds each key location a study's models declare: in text (`patterns`), as a packaged file (`files`, each
+    key file's spellings), and as a copy of a key file under any name (`digests`, the size and SHA-256 of each key
+    file that could be read)."""
 
     patterns: tuple[re.Pattern[str], ...] = ()
     files: tuple[str, ...] = ()
+    digests: frozenset[tuple[int, str]] = frozenset()
 
     def __bool__(self) -> bool:
-        return bool(self.patterns or self.files)
+        return bool(self.patterns or self.files or self.digests)
 
     def names_file(self, label: str) -> bool:
         """Whether a packaged file can be a declared key file itself: its path, or the path of the archive member it
-        is (after the last `!` of its label), and the key file's agree on their last parts, the shorter one whole. So
-        `lab.key` and `notes/lab.key` are `lab.key`, and `lab.key` is `/srv/study/lab.key` (a key file declared from
-        another directory); `my-lab.key` is neither."""
-        parts = {label, label.rpartition("!")[2]}
-        return any(_ends_with(part, path) or _ends_with(path, part) for part in parts for path in self.files)
+        is (after the last `!` of its label), and the key file's agree on their last parts, the shorter one whole,
+        without regard to case (a label is a name, which a file system may fold). So `lab.key` and `notes/Lab.key`
+        are `lab.key`, and `lab.key` is `/srv/study/lab.key` (a key file declared from another directory);
+        `my-lab.key` is neither. Text is searched case-sensitively, by `patterns`."""
+        parts = {part.casefold() for part in (label, label.rpartition("!")[2])}
+        folded = [path.casefold() for path in self.files]
+        return any(_ends_with(part, path) or _ends_with(path, part) for part in parts for path in folded)
+
+    def is_key_file(self, data: bytes) -> bool:
+        """Whether the bytes are a declared key file's own, whatever they are named: the same size and SHA-256."""
+        if all(size != len(data) for size, _ in self.digests):
+            return False
+        return (len(data), hashlib.sha256(data).hexdigest()) in self.digests
 
 
 NO_LOCATIONS = KeyFinders()  # nothing to look for
 
 
+def _key_file_digest(spec: Any) -> tuple[int, str] | None:
+    """The size and SHA-256 of a model's key file, read once as the key is read (`ModelSpec.read_key`); None when it
+    is not a readable file or holds nothing a key could. A file over `MAX_KEY_FILE_BYTES` is refused: no key is that
+    large, and a copy of it could not be told by its bytes. The message names the model, never the file."""
+    path = os.path.expanduser(spec.key_file)
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return None
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_KEY_FILE_BYTES + 1)
+    except (OSError, ValueError):
+        return None
+    if len(data) > MAX_KEY_FILE_BYTES:
+        raise KeyLocationUnreachable(
+            f"[models.{getattr(spec, 'key', '?')}]: key 'key_file': the file it names is over 1 MiB, too large to be a "
+            "key, so a copy of it could not be found by its bytes; point key_file at the key itself"
+        )
+    return (len(data), hashlib.sha256(data).hexdigest()) if data.strip() else None
+
+
 def location_finders(specs: Iterable[Any]) -> KeyFinders:
-    """What finds each key location the models declare: a key file's path as written and with `~` expanded, in text
-    (`_path_finder`) and as a packaged file (`KeyFinders.names_file`), and a variable's name as a whole identifier,
-    each case-sensitively. A placeholder is never looked for.
+    """What finds each key location the models declare: a key file's path in the spellings of `_spellings`, in text
+    (`_path_finder`) and as a packaged file (`KeyFinders.names_file`); the key file itself as a copy under any name,
+    when it can be read now (`_key_file_digest`); and a variable's name as a whole identifier. Text is searched
+    case-sensitively. A placeholder is never looked for.
     """
-    paths, names = set(), set()
+    paths, names, digests = set(), set(), set()
     for spec in specs:
         if spec.key_file and spec.key_file != KEY_FILE_WITHHELD:
-            paths |= {spec.key_file, os.path.expanduser(spec.key_file)}
+            paths |= _spellings(spec.key_file)
+            digest = _key_file_digest(spec)
+            if digest is not None:
+                digests.add(digest)
         if spec.key_env and spec.key_env != KEY_ENV_WITHHELD:
             names.add(spec.key_env)
     return KeyFinders(
@@ -282,4 +339,5 @@ def location_finders(specs: Iterable[Any]) -> KeyFinders:
             *(re.compile(rf"(?<![{_NAME_EDGE}]){re.escape(name)}(?![{_NAME_EDGE}])") for name in sorted(names)),
         ),
         files=tuple(sorted(paths)),
+        digests=frozenset(digests),
     )
