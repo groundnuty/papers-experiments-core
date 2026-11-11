@@ -336,3 +336,68 @@ def test_o20_an_unknown_key_of_the_caps_is_refused_so_a_misspelt_cap_cannot_leav
 
     with pytest.raises(ConfigError, match=r"\[sandbox\.served_bytes\]: key 'max_file' is not a known key"):
         load(tmp_path, edit)
+
+
+def caps_campaign(tmp_path):
+    """A campaign store's resume under a platform fingerprint: `resume(fingerprint)` opens it, refusing a change."""
+    from campaign_support import make_fingerprint, make_manifest, make_schema
+    from platform_support import NOW
+
+    from expcore.campaign.resume import open_campaign
+
+    schema, manifest = make_schema(), make_manifest(make_schema())
+
+    def resume(fingerprint):
+        store, _ = open_campaign(
+            tmp_path / "campaign.db", schema, manifest, make_fingerprint(schema, platform=fingerprint), now=NOW,
+            max_attempts=3,
+        )  # fmt: skip
+        store.close()
+
+    return resume
+
+
+def platform_with_caps(tmp_path, name, caps=None):
+    """The loaded platform of a document with the default `[sandbox]`, and `[sandbox.served_bytes]` with caps given."""
+
+    def edit(data):
+        add_sandbox(data)
+        if caps is not None:
+            data["sandbox"]["served_bytes"] = caps
+
+    (tmp_path / name).mkdir()
+    return load_platform(write_platform(tmp_path / name, edit), require_secrets=False)
+
+
+def test_c06_a_campaign_does_not_resume_under_raised_served_bytes_caps(tmp_path):
+    """C06: the caps of the tables of the bytes served decide what a run's evidence can show, and a study scores on it,
+    so a declared `[sandbox.served_bytes]` is in the platform's fingerprint: a resume under raised caps is refused,
+    naming the caps, and the same caps resume."""
+    from expcore.campaign.resume import FingerprintMismatch
+
+    resume = caps_campaign(tmp_path)
+    started = platform_with_caps(tmp_path, "started", {"max_files": 2000}).fingerprint()
+    raised = platform_with_caps(tmp_path, "raised", {"max_files": 4000, "max_ranges_per_file": 128}).fingerprint()
+    assert started["served_bytes"] == {"max_files": 2000, "max_directories": 1000, "max_ranges_per_file": 64}
+    resume(started)
+    with pytest.raises(FingerprintMismatch) as caught:
+        resume(raised)
+    assert caught.value.differences
+    assert all(line.startswith("platform.served_bytes") for line in caught.value.differences)
+    with pytest.raises(FingerprintMismatch):
+        resume(platform_with_caps(tmp_path, "dropped").fingerprint())  # the table taken away: the defaults differ
+    resume(started)
+
+
+def test_c06_a_platform_without_the_caps_table_keeps_the_fingerprint_it_had_and_still_resumes(tmp_path):
+    """C06: a campaign started before the caps could be declared ran under the defaults, and its store holds the
+    fingerprint of that version: the TLS mode and the data paths, nothing of the caps. A platform.toml that still
+    declares no `[sandbox.served_bytes]` gives that same fingerprint, so the campaign resumes; only a declared table
+    enters it."""
+    resume = caps_campaign(tmp_path)
+    config = platform_with_caps(tmp_path, "plain")
+    recorded = {"tls": config.tls.record(), "data_paths": config.sandbox.data_path_record()}  # the earlier version's
+    resume(recorded)
+    assert config.fingerprint() == recorded
+    resume(config.fingerprint())
+    resume(platform_with_caps(tmp_path, "again").fingerprint())

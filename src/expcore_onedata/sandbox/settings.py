@@ -57,7 +57,8 @@ max_files = 1000                # files, the first read; max_directories = 1000;
 and `complete` has the data gate answer every listing with all of the directory's entries (`gatepolicy`). It is refused
 on a mount or no data path, where no gate serves a listing. A study selects it per condition through the level the
 condition gives its `data_path` factor. The run's metadata records it (`listing`), and so does the campaign fingerprint
-(`config.PlatformConfig.fingerprint`, from `data_path_record`), so two modes are never one experiment.
+(`config.PlatformConfig.fingerprint`, from `data_path_record`), so two modes are never one experiment. A declared
+`[sandbox.served_bytes]` is in the fingerprint too (`served_caps_declared`); an absent one leaves it as it was.
 
 The certificate check of the data gate's upstream and of oneclient is not declared here either: it is the platform's one
 `[tls]` setting (`tls.py`), which `load_platform` hands to `load_sandbox` and which every client of the federation
@@ -155,6 +156,7 @@ class SandboxSettings:
     tls: TlsSettings = field(default_factory=TlsSettings)  # the platform's [tls]: the gate's upstream and oneclient
     listings: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))  # rest level -> its listing
     served_caps: Caps = DEFAULT_CAPS  # [sandbox.served_bytes]: the bounds of a run's tables of the bytes served (O20)
+    served_caps_declared: bool = False  # the table is in the file: its caps are in the campaign fingerprint (C06)
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -409,6 +411,7 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
         tls=tls if tls is not None else TlsSettings(),
         listings=listings,
         served_caps=_served_caps(section.section("served_bytes")) if "served_bytes" in section.data else DEFAULT_CAPS,
+        served_caps_declared="served_bytes" in section.data,
     )
 
 
