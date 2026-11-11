@@ -13,7 +13,8 @@ Schema 2 added the model turns the attempt completed and the treatment rule of i
 are still read, since a campaign killed between its marker and the store must resume after an upgrade: they have no
 turn count, so they are read under the version-1 rule (treatment by the declared kind alone) and marked
 `legacy_marker`, which recovery records as an event. A schema-2 marker written before a field was added reads without
-it: `first_turn_rule` as the version-2 rule, `turn_usage` as unknown.
+it: `first_turn_rule` as the version-2 rule, `turn_usage` as unknown, `replies_checked` as False (its usage was judged
+without the check, so an attempt of no turn is charged its bound).
 """
 
 import json
@@ -42,11 +43,12 @@ _RESULT_FIELDS = (
     "recorded_treatment",
     "first_turn_rule",
     "turn_usage",
+    "replies_checked",
 )
 # What a schema-1 marker holds of a result; the rest take their defaults under the version-1 rule.
 _LEGACY_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("model_turns")]
 # Fields added to schema 2 after its first markers were written: a marker without one reads with its default.
-_ADDED_FIELDS = ("first_turn_rule", "turn_usage")
+_ADDED_FIELDS = ("first_turn_rule", "turn_usage", "replies_checked")
 
 
 class MarkerError(RuntimeError):
@@ -80,6 +82,10 @@ class AttemptResult:
     - `turn_usage`: each model turn's counts as its record reported them, in order: input tokens (the whole prompt),
       output tokens, cache writes and cache reads, each `None` when not reported; `None` when unknown (no record). A
       tiered price is applied to each request from these (C24).
+    - `replies_checked`: whether `usage_complete` also says that every reply the backend counted became a turn, so a
+      billed reply it could not read leaves the usage incomplete (C26). Only then does an attempt known to hold no turn
+      cost nothing but its top-ups; a result from before the check (an older marker, a row an upgrade brought forward)
+      may hide such a reply, and is charged its bound.
     """
 
     outcome: Outcome
@@ -97,6 +103,7 @@ class AttemptResult:
     first_turn_rule: bool = True
     legacy_marker: bool = False
     turn_usage: tuple[tuple[int | None, int | None, int | None, int | None], ...] | None = None
+    replies_checked: bool = True
 
     def __post_init__(self) -> None:
         """Refuse a kind outside the closed vocabulary, so a typo never reaches the store; keep the kinds sorted; refuse
@@ -107,8 +114,8 @@ class AttemptResult:
             object.__setattr__(self, "turn_usage", _turn_usage(self.turn_usage))
         if self.recorded_treatment is not None and not isinstance(self.recorded_treatment, bool):
             raise ValueError("recorded_treatment must be True, False or None")
-        if not isinstance(self.first_turn_rule, bool) or not isinstance(self.legacy_marker, bool):
-            raise ValueError("first_turn_rule and legacy_marker must be True or False")
+        if not all(isinstance(flag, bool) for flag in (self.first_turn_rule, self.legacy_marker, self.replies_checked)):
+            raise ValueError("first_turn_rule, legacy_marker and replies_checked must be True or False")
         for kind in (*(() if self.outage_kind is None else (self.outage_kind,)), *self.treatment_kinds):
             if kind not in infra_kinds():
                 raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")
@@ -211,8 +218,9 @@ def read_marker(run_dir: Path, run_key: str, attempt_id: int) -> AttemptResult |
         kept = {f: data[f] for f in fields if f not in _ADDED_FIELDS or f in data}
         if schema == MARKER_SCHEMA:
             kept.setdefault("first_turn_rule", True)
+            kept.setdefault("replies_checked", False)  # written before the check: its usage may hide a billed reply
         if schema == LEGACY_MARKER_SCHEMA:  # no turn count to hold it to: the rule of the time, and a mark for recovery
-            kept.update(first_turn_rule=False, legacy_marker=True)
+            kept.update(first_turn_rule=False, legacy_marker=True, replies_checked=False)
         return AttemptResult(outcome=_outcome_from(data["outcome"]), **kept)
     except (ValueError, KeyError, TypeError) as error:
         raise MarkerError(f"{path}: not a valid marker ({type(error).__name__}: {error})") from None

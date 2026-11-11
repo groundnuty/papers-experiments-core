@@ -187,10 +187,12 @@ def measured_usd(spec: ModelSpec, row: Mapping[str, Any]) -> float | None:
         return 0.0
     if isinstance(spec.price, TieredPrice):
         requests = _requests(row["turn_usage"])
+        if requests == [] and not _no_turn(row):
+            return None  # no turn kept, but a billed reply may have become none: unknown
         return None if requests is None else spec.price.requests_usd(requests)
     if spec.price is None:
         return None
-    if row["input_tokens"] is None and row["output_tokens"] is None and _requests(row["turn_usage"]) == []:
+    if row["input_tokens"] is None and row["output_tokens"] is None and _no_turn(row):
         return 0.0  # no request was answered: no turn, so nothing reported and nothing billed beyond its top-ups
     if row["input_tokens"] is None or row["output_tokens"] is None:
         return None
@@ -200,6 +202,15 @@ def measured_usd(spec: ModelSpec, row: Mapping[str, Any]) -> float | None:
         row["cache_creation_tokens"] or 0,
         row["cache_read_tokens"] or 0,
     )
+
+
+def _no_turn(row: Mapping[str, Any]) -> bool:
+    """Tell whether an attempt is known to have had no request answered: its per-turn usage holds no turn, and its
+    usage was judged with the check that a billed reply the backend could not read leaves it incomplete (C26). A row
+    from before that check (`replies_checked` NULL or 0) may hide such a reply under no turn."""
+    names = row.keys()  # a sqlite3.Row's `in` looks at its values, so its keys are asked for by name
+    checked = row["replies_checked"] if "replies_checked" in names else None
+    return bool(checked) and _requests(row["turn_usage"]) == []
 
 
 def _requests(stored: str | None) -> list[tuple[int, int, int, int]] | None:
@@ -249,10 +260,12 @@ def attempt_costs(
     turn_usage = "a.turn_usage" if "turn_usage" in columns else "NULL AS turn_usage"
     topup_usd = "a.topup_usd" if "topup_usd" in columns else "0 AS topup_usd"
     reserved = "a.reserved_capped" if "reserved_capped" in columns else "NULL AS reserved_capped"
+    checked = "a.replies_checked" if "replies_checked" in columns else "NULL AS replies_checked"
     rows = store.q(
         "SELECT a.id, a.run_key, a.state, r." + column_for("model") + " AS model, a.input_tokens, a.output_tokens, "
         f"a.cache_creation_tokens, a.cache_read_tokens, {turn_usage}, COALESCE(a.usage_complete,1) AS complete, "
-        f"{topup_usd}, {reserved} FROM attempts a JOIN runs r USING(run_key) WHERE a.state IN ({marks}) ORDER BY a.id",
+        f"{topup_usd}, {reserved}, {checked} FROM attempts a JOIN runs r USING(run_key) "
+        f"WHERE a.state IN ({marks}) ORDER BY a.id",
         states,
     )
     costs = []

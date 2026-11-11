@@ -15,7 +15,7 @@ from expcore.campaign.attempt_bounds import attempt_costs, bound_usd, request_bo
 from expcore.campaign.executor import record_run
 from expcore.campaign.export import export_run_state
 from expcore.campaign.gate import Budget, BudgetGate
-from expcore.campaign.markers import write_marker
+from expcore.campaign.markers import MARKER_NAME, write_marker
 from expcore.campaign.recovery import recover
 from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.config.models import Limits
@@ -102,6 +102,28 @@ def test_c26_an_attempt_held_before_any_reply_costs_its_top_ups_alone_and_the_ex
     assert cost.usd == pytest.approx(TOPUP)
     [cell] = export_run_state(store)["discarded_usage"]
     assert (cell["attempts"], cell["usage_incomplete_attempts"]) == (1, 0)
+
+
+def test_c26_a_row_written_before_its_replies_were_checked_holding_no_turn_is_still_charged_its_bound(tmp_path):
+    """C26 and C05: before a billed reply that became no turn left an attempt's usage incomplete, such an attempt was
+    stored complete with no turn, like one held before any reply. A row written then cannot tell the two apart, so it
+    keeps the rule it was written under and is charged its bound: a result recovered from a marker written then, and
+    a row a store migration brought forward."""
+    store, key, begun = running(tmp_path)
+    kinds = store.schema.treatment_kinds[condition_of(store, key)]
+    run_dir = tmp_path / "attempt"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    write_marker(run_dir, key, begun.id, infra("endpoint", model_turns=0, turn_usage=(), treatment_kinds=kinds))
+    marker = run_dir / MARKER_NAME
+    body = json.loads(marker.read_text(encoding="utf-8"))
+    body["result"].pop("replies_checked", None)  # what a marker written before the check holds
+    marker.write_text(json.dumps(body), encoding="utf-8")
+    assert recover(store, NOW, 3).committed == 1
+    [cost] = attempt_costs(store, {MODEL: SPEC}, LIMITS)
+    assert cost.usd == pytest.approx(BOUND)
+    store.db.execute("UPDATE attempts SET replies_checked = NULL")  # a row from before the column
+    [cost] = attempt_costs(store, {MODEL: SPEC}, LIMITS)
+    assert cost.usd == pytest.approx(BOUND)
 
 
 def test_c26_a_top_up_that_does_not_fit_is_refused_with_nothing_charged_and_the_figure_in_an_event(tmp_path):

@@ -82,6 +82,8 @@ _ADDED_COLUMNS = (
     ("attempts", "topup_usd", "REAL NOT NULL DEFAULT 0"),  # what they were charged, each its bound, never refunded
     # the bound the run was reserved at dispatch (C27): 1 by the reply maximum, 0 by the window; NULL: not recorded
     ("attempts", "reserved_capped", "INTEGER"),
+    # 1: usage_complete also says every reply the backend counted became a turn (C26); NULL: a row from before the check
+    ("attempts", "replies_checked", "INTEGER"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -521,7 +523,7 @@ class Store:
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"
                 " detail=?, termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?,"
-                " cache_read_tokens=?, usage_complete=?, turn_usage=? WHERE id=?",
+                " cache_read_tokens=?, usage_complete=?, turn_usage=?, replies_checked=? WHERE id=?",
                 (
                     state,
                     int(charged),
@@ -538,6 +540,7 @@ class Store:
                     result.cache_read_tokens,
                     int(result.usage_complete),
                     None if result.turn_usage is None else json.dumps(result.turn_usage),
+                    int(result.replies_checked),
                     attempt_id,
                 ),
             )
