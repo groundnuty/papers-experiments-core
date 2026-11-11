@@ -185,13 +185,20 @@ def test_onedata_may_import_expcore_but_not_other_third_party_code():
 # -- the testing package is never part of a runtime path --------------------------------------------------------------
 
 
-def _dynamic_module(call: ast.Call) -> str | None:
-    """Return the full dotted name a literal dynamic import names, a relative one resolved against its package."""
+def _dynamic_module(call: ast.Call, here: str = "") -> str | None:
+    """Return the full dotted name a literal dynamic import names, a relative one resolved against its package.
+
+    `here` is the package of the file the call is in. A relative name whose package argument is not a literal
+    (`__package__`, `__spec__.parent`, a variable) is resolved against it: that is what the idiom means, and for a
+    guard it is the side to err on, since a name it cannot resolve would otherwise pass unseen."""
     keywords = {k.arg: k.value for k in call.keywords}
     name = _constant_string(call.args[0] if call.args else keywords.get("name"))
     if name is None or not name.startswith("."):
         return name
-    package = _constant_string(call.args[1] if len(call.args) > 1 else keywords.get("package"))
+    given = call.args[1] if len(call.args) > 1 else keywords.get("package")
+    if given is None:
+        return None  # a relative name with no package raises; it imports nothing
+    package = _constant_string(given) if isinstance(given, ast.Constant) else here
     if not package:
         return None
     try:
@@ -229,7 +236,7 @@ def imported_modules(source: str, package: str) -> set[str]:
                 found.add(base)
                 found.update(f"{base}.{alias.name}" for alias in node.names)
         elif isinstance(node, ast.Call) and _is_importer(node.func, importers):
-            name = _dynamic_module(node)
+            name = _dynamic_module(node, package)
             if name:
                 found.add(name)
                 found.update(f"{name}.{item}" for item in _fromlist(node))  # __import__(m, fromlist=[a]) loads m.a
@@ -311,6 +318,12 @@ def test_importing_every_runtime_module_loads_no_testing_module():
         ("__import__('expcore_onedata.testing')\n", ""),
         ("def load():\n    return __import__('expcore_onedata', fromlist=['testing']).testing\n", ""),
         ("__import__('expcore_onedata', None, None, ('testing',))\n", ""),
+        (
+            "import importlib\ndef fakes():\n    return importlib.import_module('.testing', __package__)\n",
+            "expcore_onedata",
+        ),
+        ("import importlib\nimportlib.import_module('.testing', package=__spec__.parent)\n", "expcore_onedata"),
+        ("import importlib\nimportlib.import_module('..testing', __package__)\n", "expcore_onedata.sandbox"),
         ("from importlib import import_module as load\nload('expcore_onedata.testing')\n", ""),
         ("import importlib as il\nil.import_module(name='expcore_onedata.testing.fake_data')\n", ""),
     ],
@@ -333,6 +346,7 @@ def test_planted_import_of_the_testing_package_is_found(source, package):
         ("import importlib\nimportlib.import_module('.health', 'expcore_onedata')\n", ""),
         ("NAME = 'expcore_onedata.testing'\n", ""),
         ("__import__('expcore_onedata', fromlist=['health'])\n", ""),
+        ("import importlib\nimportlib.import_module('.health', __package__)\n", "expcore_onedata"),
     ],
 )
 def test_other_imports_are_not_taken_for_the_testing_package(source, package):
