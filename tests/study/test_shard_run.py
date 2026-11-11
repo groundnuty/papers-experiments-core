@@ -15,7 +15,7 @@ import pytest
 from record_support import no_secrets_in_the_environment
 
 from expcore.campaign.attempts import ResumeRefused
-from expcore.campaign.manifest import shard_manifest
+from expcore.campaign.manifest import fingerprint_sha256, shard_manifest
 from expcore.campaign.shard import (
     META_ENVIRONMENT,
     META_SHARD,
@@ -25,6 +25,7 @@ from expcore.campaign.shard import (
     assign,
     pair_of,
 )
+from expcore.campaign.shard_run import environment_block
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
 from expcore.study import pipeline
@@ -260,3 +261,49 @@ def test_a_plugins_environment_identity_must_be_a_function(tmp_path):
     declared = dataclasses.replace(plugin, environment_identity={"x": DIGEST})
     with pytest.raises(ConfigError, match="environment_identity must be a function"):
         _check(copy / "plugin.py", study, declared)
+
+
+def test_c29_a_shard_says_the_environment_part_of_its_fingerprint_as_it_starts_and_an_unsharded_start_says_none(
+    study, tmp_path, capsys
+):
+    """C29: one block on stderr with the environment's digest and its distributions, so a host that would not merge
+    shows before it runs; no path of this machine in it, and nothing at all without `--shard`."""
+    run_study(study, shard=FIRST)
+    said = capsys.readouterr().err
+    environment = json.loads(meta_of(study)["fingerprint"])["environment"]
+    block = environment_block(FIRST, environment)
+    assert block in said
+    assert f"environment sha256 {fingerprint_sha256(environment)}" in said
+    assert "papers-experiments-core" in block
+    assert not any(private in block for private in (str(tmp_path), str(Path.home())))
+    run_study(study, shard=FIRST)  # a resume says it again
+    assert capsys.readouterr().err.count("environment sha256") == 1
+    whole = stamped_copy(tmp_path, "whole")
+    run_study(whole)
+    assert "environment sha256" not in capsys.readouterr().err
+
+
+def test_c29_a_host_whose_environment_differs_is_visible_before_its_store_refuses_it(study, monkeypatch, capsys):
+    """C29: a resume under another environment is refused by the store; the shard has already said that environment,
+    so the operator sees which digest this host has."""
+    run_study(study, shard=FIRST)
+    recorded = json.loads(meta_of(study)["fingerprint"])["environment"]
+    capsys.readouterr()
+    other = {**recorded, "distributions": {**recorded["distributions"], "papers-experiments-core": "9.9.9"}}
+    monkeypatch.setattr(pipeline, "study_environment", lambda study: other)
+    with pytest.raises(ResumeRefused):
+        run_study(study, shard=FIRST)
+    said = capsys.readouterr().err
+    assert f"environment sha256 {fingerprint_sha256(other)}" in said
+    assert fingerprint_sha256(other) != fingerprint_sha256(recorded)
+    assert "papers-experiments-core 9.9.9" in said
+
+
+def test_c29_a_shard_refused_before_its_store_opens_says_no_environment(tmp_path, capsys):
+    """C29: the block is the start of a shard that goes on, not of one the command refuses first."""
+    copy = stamped_copy(
+        tmp_path, "small", **{"alpha-stub = 1": "alpha-stub = 2", "max_usd = 0.00001": "max_usd = 0.000001"}
+    )
+    with pytest.raises(Refused):
+        run_study(copy, shard=FIRST)
+    assert "environment sha256" not in capsys.readouterr().err

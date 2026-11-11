@@ -15,15 +15,22 @@ it was before shards existed.
 
 The totals stay in the campaign fingerprint, which every shard shares; the shares are applied to the settings after it
 is computed (`share_settings`), so they never reach it.
+
+The fingerprint also holds the environment of the shard's host: its Python and the installed distributions it
+imports through, and the shards of one campaign must have one fingerprint. A host whose environment differs would be
+refused only when its shard is merged, after it ran, so `environment_block` says it as the shard starts: the
+environment's digest, which every host of the campaign must print alike, and its distributions.
 """
 
 import dataclasses
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.attempts import ResumeRefused
+from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.shard import (
     META_ENVIRONMENT,
     META_SHARD,
@@ -45,6 +52,8 @@ GROWTH_HINT = (
     "start new stores for a new plan)"
 )
 _DIGEST_SHOWN = 12
+LIST_LIMIT = 60
+"""Up to this many distributions the start lists each with its version; more, and each with a short digest."""
 
 
 class ShardMismatch(ResumeRefused):
@@ -86,6 +95,32 @@ def share_settings(settings: "SchedulerConfig", spec: ShardSpec) -> tuple["Sched
     parts = budget_shares(budget.max_usd, budget.per_model_usd, spec)
     shared = dataclasses.replace(budget, max_usd=parts["max_usd"], per_model_usd=parts["per_model_usd"])
     return dataclasses.replace(settings, unit_caps=caps, budget=shared), {"unit_caps": caps, "budget": parts}
+
+
+def environment_block(spec: ShardSpec, environment: Mapping[str, Any]) -> str:
+    """The environment part of the campaign fingerprint, as one block of text a shard prints as it starts.
+
+    The first line gives the whole environment's SHA-256 (the digest `fingerprint_sha256` makes of the section, which
+    holds the sources of the distributions installed from a URL), the Python and the number of distributions; each
+    later line is one distribution. Up to `LIST_LIMIT` of them are listed with their versions. A longer list shows
+    each with the first 12 characters of the SHA-256 of its version and its source instead, so that two hosts' blocks
+    compare line by line, and a distribution that differs only in where it came from still shows. Nothing of a source
+    is printed (no URL, commit or path of this machine), and no path or host name enters the block.
+    """
+    versions = environment["distributions"]
+    sources = environment.get("sources", {})
+    lines = [
+        f"run: shard {spec.index} of {spec.count}: environment sha256 {fingerprint_sha256(environment)}, "
+        f"python {environment['python']}, {len(versions)} distributions "
+        "(every shard of the campaign must print this same digest)"
+    ]
+    for name in sorted(versions):
+        if len(versions) <= LIST_LIMIT:
+            lines.append(f"  {name} {versions[name]}")
+        else:
+            part = hashlib.sha256(canonical([versions[name], sources.get(name)]).encode("utf-8")).hexdigest()
+            lines.append(f"  {name} {part[:_DIGEST_SHOWN]}")
+    return "\n".join(lines)
 
 
 def pin_shard(store: Store, shard: ShardStart | None, started: bool, now: str) -> None:

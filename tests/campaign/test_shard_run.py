@@ -11,7 +11,7 @@ from campaign_support import LATER, NOW, make_fingerprint, make_manifest, make_s
 
 from expcore.campaign.export import ExportError, export_run_state
 from expcore.campaign.gate import Budget
-from expcore.campaign.manifest import plan_problem, shard_manifest
+from expcore.campaign.manifest import fingerprint_sha256, plan_problem, shard_manifest
 from expcore.campaign.resume import FingerprintMismatch, RunSetMismatch, open_campaign
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import (
@@ -25,7 +25,7 @@ from expcore.campaign.shard import (
     assign,
     pair_of,
 )
-from expcore.campaign.shard_run import ShardMismatch, ShardStart, share_settings
+from expcore.campaign.shard_run import LIST_LIMIT, ShardMismatch, ShardStart, environment_block, share_settings
 
 TASKS = ("task-a", "task-b", "task-c", "task-d", "task-e")
 MODELS = ("model-falcon", "model-heron")
@@ -389,3 +389,59 @@ def test_a_store_that_records_a_shard_without_its_other_facts_is_not_exported_as
     store.put_meta(META_SHARD, json.dumps(SPEC.to_json()), NOW)
     with pytest.raises(ExportError, match="records a shard but not"):
         export_run_state(store)
+
+
+# --- the environment a shard says as it starts ---------------------------------------------------------------------
+
+
+def environment_of(count, **sources):
+    """An environment of `count` invented distributions, with the sources given by name."""
+    return {
+        "python": "3.12",
+        "distributions": {f"dist-{n:03d}": f"1.{n}.0" for n in range(count)},
+        "sources": sources,
+    }
+
+
+def test_c29_a_short_environment_is_one_block_of_its_digest_and_its_distributions_with_versions():
+    """C29: the shard says the environment part of the fingerprint as it starts, so a host that would not merge shows
+    before it runs: the digest every host must print alike, the Python and each distribution at its version."""
+    environment = environment_of(3)
+    block = environment_block(SPEC, environment).split("\n")
+    assert block[0] == (
+        f"run: shard 1 of 2: environment sha256 {fingerprint_sha256(environment)}, python 3.12, 3 distributions "
+        "(every shard of the campaign must print this same digest)"
+    )
+    assert block[1:] == ["  dist-000 1.0.0", "  dist-001 1.1.0", "  dist-002 1.2.0"]
+
+
+def differing_lines(one: str, other: str) -> list[int]:
+    """The indexes of the lines two blocks do not share."""
+    return [i for i, (a, b) in enumerate(zip(one.split("\n"), other.split("\n"), strict=True)) if a != b]
+
+
+def test_c29_a_long_environment_shows_a_short_digest_of_each_distribution_instead_of_the_versions():
+    """C29: past the list limit each line is a distribution and 12 characters of the digest of its version and
+    source, so two hosts' blocks compare line by line; a version or a source that differs changes only its line."""
+    block = environment_block(SPEC, environment_of(LIST_LIMIT + 1))
+    lines = block.split("\n")
+    assert len(lines) == LIST_LIMIT + 2
+    assert all(re.fullmatch(r"  dist-\d{3} [0-9a-f]{12}", line) for line in lines[1:])
+    assert not any("1.0.0" in line for line in lines[1:])  # no version is listed
+    bumped = environment_of(LIST_LIMIT + 1)
+    bumped["distributions"]["dist-007"] = "9.9.9"
+    assert differing_lines(block, environment_block(SPEC, bumped)) == [0, 8]  # the digest on top, and its own line
+    moved = environment_of(LIST_LIMIT + 1, **{"dist-003": {"kind": "vcs", "commit": "c" * 40}})
+    assert differing_lines(block, environment_block(SPEC, moved)) == [0, 4]
+
+
+def test_c29_the_environment_block_prints_no_source_url_commit_or_path():
+    """C29: a package is public, and so is a log pasted into an issue: nothing of where a distribution was installed
+    from is printed, in the short form or the long one; only its effect on the digest."""
+    source = {"kind": "vcs", "vcs": "git", "url": "https://git.example.org/team/dist-001.git", "commit": "c" * 40}
+    for count in (3, LIST_LIMIT + 1):
+        block = environment_block(SPEC, environment_of(count, **{"dist-001": source}))
+        assert "example.org" not in block
+        assert "c" * 12 not in block
+        assert "/" not in block.replace("(every shard", "")
+        assert block.split("\n")[0] != environment_block(SPEC, environment_of(count)).split("\n")[0]

@@ -11,7 +11,8 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   is refused (C06). Each hold is said on stderr once, as it begins, changes or ends, with when dispatch resumes, so a
   run waiting out a pause is not silent. With a `shard` (#154) it runs that shard's part of the plan: the fingerprint
   is still computed from the totals, of the whole plan, and only then are the caps and the budget replaced by the
-  shard's shares and the plugin's environment identity read, once.
+  shard's shares and the plugin's environment identity read, once. A shard says its environment on stderr as it
+  starts (`campaign.shard_run.environment_block`), so a host that differs from the others shows before it runs.
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
@@ -59,7 +60,7 @@ from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import ShardError, ShardSpec, check_identity
-from expcore.campaign.shard_run import ShardStart, share_settings
+from expcore.campaign.shard_run import ShardStart, environment_block, share_settings
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
 from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
@@ -219,6 +220,7 @@ def _run_campaign(
     manifest, started = study.manifest, None
     if shard is not None:
         manifest, settings, started = _shard_of(study, plugin, settings, shard)
+        print(environment_block(shard, fingerprint["environment"]), file=sys.stderr)  # before a store can refuse it
     options = {} if crash_hook is None else {"crash_hook": crash_hook}
     with Scheduler(
         out,
