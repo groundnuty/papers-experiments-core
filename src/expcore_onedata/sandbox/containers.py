@@ -34,7 +34,7 @@ ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image'
 ONECLIENT_LOG_DIR = "/tmp/oneclient/0"  # where it writes its log unless told otherwise
 # The published REST client's settings (its environment), not names of any federation.
 ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
-# The client refuses to start without a token, so a REST agent's holds the configured placeholder (O21), never a
+# The client refuses to start without a token, so a REST agent's holds the configured placeholder (O23), never a
 # credential: the gate drops it with any other token the agent sends and adds its own.
 ENV_TOKEN = "ONEDATA_TOKEN"
 ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gate.TOKEN_ENV); the agent's is ENV_TOKEN
@@ -42,7 +42,7 @@ ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
 ENV_CA_BUNDLES = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
 # The published client sends through `requests.Session.send`, which merges no environment setting, so it verifies the
-# gate against the certifi bundle of the agent's image and never reads ENV_CA_BUNDLES (O21). On a REST data path the
+# gate against the certifi bundle of the agent's image and never reads ENV_CA_BUNDLES (O23). On a REST data path the
 # sandbox asks the image's interpreter where that bundle is and extends it with the run's CA, as a trust path.
 CERTIFI_PROBE = (
     "try:\n"
@@ -221,7 +221,7 @@ def agent_run_args(
     In REST mode the agent resolves the zone and the provider to the gate and trusts the run's CA. It holds no token
     and no other credential, in its environment or in a file: the gate adds the token to the requests it forwards, and
     the sidecar owns the mount's (O05). Its `ONEDATA_TOKEN` is the configured placeholder, which only lets the published
-    client start (O21); the gate drops it. In mount mode the read-only mount is bound in with `readonly`. With no data
+    client start (O23); the gate drops it. In mount mode the read-only mount is bound in with `readonly`. With no data
     path it has neither. Each read-only input, the run's own copy and the path the agent sees it at, is bound in with
     `readonly` too, in every data path (O20).
     """
@@ -245,7 +245,7 @@ def agent_run_args(
         for name in gate_hosts:
             args += ["--add-host", f"{name}:{gate_ip}"]
         env = dict.fromkeys(ENV_CA_BUNDLES, CA_PATH) | {ENV_ZONE_HOST: zone_host, ENV_VERIFY_SSL: "true"}
-        env[ENV_TOKEN] = s.placeholder_token  # not a credential: the client's start needs a value (O21)
+        env[ENV_TOKEN] = s.placeholder_token  # not a credential: the client's start needs a value (O23)
     elif mode is DataPathMode.MOUNT:
         if share is None or s.mount is None:
             raise ValueError("a mount data path needs the shared mount point and [sandbox.mount]")

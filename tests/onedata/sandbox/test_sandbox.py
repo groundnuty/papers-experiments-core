@@ -113,7 +113,7 @@ def where_a_credential_is_visible(world, sbx, token: str) -> list[str]:
     found = []
     if token in json.dumps(env):
         found.append("the environment")
-    placeholder = (ENV_TOKEN, world.s.placeholder_token)  # named like a token, holding the placeholder: none (O21)
+    placeholder = (ENV_TOKEN, world.s.placeholder_token)  # named like a token, holding the placeholder: none (O23)
     found += [
         f"environment variable {n}"
         for n, v in env.items()
@@ -143,8 +143,8 @@ def test_o05_no_credential_is_visible_inside_the_agent_on_any_data_path(world, l
     sbx.stop()
 
 
-def test_o21_a_rest_agent_holds_the_placeholder_as_its_token_and_the_gate_the_runs(world):
-    """O21, O05: the REST agent's ONEDATA_TOKEN is the configured placeholder, which is not the run's token; the gate's
+def test_o23_a_rest_agent_holds_the_placeholder_as_its_token_and_the_gate_the_runs(world):
+    """O23, O05: the REST agent's ONEDATA_TOKEN is the configured placeholder, which is not the run's token; the gate's
     environment holds the run's token. Neither container holds the other's value."""
     sbx = start(world, "via-gate")
     agent, gate = (world.host.containers[name].options["_env"] for name in (sbx.names.agent, sbx.names.gate))
@@ -154,8 +154,8 @@ def test_o21_a_rest_agent_holds_the_placeholder_as_its_token_and_the_gate_the_ru
     sbx.stop()
 
 
-def test_o21_o05_a_placeholder_that_is_the_runs_token_refuses_the_start_before_anything_exists(world):
-    """O21, O05: a placeholder configured as the run's own token would put the token in the agent's environment; the
+def test_o23_o05_a_placeholder_that_is_the_runs_token_refuses_the_start_before_anything_exists(world):
+    """O23, O05: a placeholder configured as the run's own token would put the token in the agent's environment; the
     start is refused before anything is created, and the message names the key, never the value."""
     from dataclasses import replace
 
@@ -554,7 +554,7 @@ def rest_start_with_a_bundle(world, lease_key="login-data"):
 
 def test_c19_the_temporary_trust_bundle_container_carries_the_labels_of_every_other_container(world):
     """C19: sandbox, owner and lease key, like the gate and the agent, from the moment it is created: each temporary
-    container, the one that asks the image where its certifi bundle is and the one that reads each bundle (O21)."""
+    container, the one that asks the image where its certifi bundle is and the one that reads each bundle (O23)."""
     sbx = rest_start_with_a_bundle(world)
     probe, *reads = world.host.one_shots
     assert probe.options["--entrypoint"] == world.s.python
@@ -596,8 +596,8 @@ def agent_mounts(world, sbx) -> dict[str, str]:
     return {spec.split(":")[1]: spec.split(":")[0] for spec in specs if spec.endswith(":ro")}
 
 
-def test_o21_a_rest_start_extends_the_images_certifi_bundle_with_the_runs_ca_and_records_it(world):
-    """O21: the published client verifies the gate against the certifi bundle of the agent's image and reads none of
+def test_o23_a_rest_start_extends_the_images_certifi_bundle_with_the_runs_ca_and_records_it(world):
+    """O23: the published client verifies the gate against the certifi bundle of the agent's image and reads none of
     the CA variables, so a REST start asks the image's interpreter where that bundle is, in a container with no network
     and as the agent's user, and mounts the bundle with the run's CA appended over it, read-only, as it does for a
     declared trust path. The metadata says so."""
@@ -614,8 +614,8 @@ def test_o21_a_rest_start_extends_the_images_certifi_bundle_with_the_runs_ca_and
     sbx.stop()
 
 
-def test_o21_an_agent_image_without_certifi_starts_without_it_and_the_metadata_says_so(world):
-    """O21: an image with no certifi has no bundle to extend: the sandbox starts as before, mounts nothing over a
+def test_o23_an_agent_image_without_certifi_starts_without_it_and_the_metadata_says_so(world):
+    """O23: an image with no certifi has no bundle to extend: the sandbox starts as before, mounts nothing over a
     bundle, and records `not_in_image`, so a run whose client could not verify the gate can be told apart."""
     world.host.certifi_probe = CmdResult(0, "certifi:none\n")
     sbx = start(world, "via-gate")
@@ -639,8 +639,8 @@ def test_o21_an_agent_image_without_certifi_starts_without_it_and_the_metadata_s
     ],
     ids=["no-interpreter", "import-error", "extra-output", "relative", "dot-dot", "space", "colon", "silent"],
 )
-def test_o21_a_certifi_question_the_image_cannot_answer_plainly_refuses_the_start_and_leaves_nothing(world, answer):
-    """O21: fail closed. Only `certifi:none` says the image has no certifi; an interpreter that fails, or an answer
+def test_o23_a_certifi_question_the_image_cannot_answer_plainly_refuses_the_start_and_leaves_nothing(world, answer):
+    """O23: fail closed. Only `certifi:none` says the image has no certifi; an interpreter that fails, or an answer
     that is not one absolute path the sandbox can mount over, is no answer, and the start ends with nothing left. The
     message names neither the path nor the interpreter's words."""
     world.host.certifi_probe = answer
@@ -651,8 +651,8 @@ def test_o21_a_certifi_question_the_image_cannot_answer_plainly_refuses_the_star
     assert nothing_left(world)
 
 
-def test_o21_a_declared_trust_path_that_is_the_certifi_bundle_is_extended_once(world):
-    """O21: a study that already declares the certifi bundle in `trust_paths` gets it read and mounted once."""
+def test_o23_a_declared_trust_path_that_is_the_certifi_bundle_is_extended_once(world):
+    """O23: a study that already declares the certifi bundle in `trust_paths` gets it read and mounted once."""
     from dataclasses import replace
 
     settings = replace(world.s, trust_paths=(CERTIFI_BUNDLE,))
@@ -663,8 +663,8 @@ def test_o21_a_declared_trust_path_that_is_the_certifi_bundle_is_extended_once(w
 
 
 @pytest.mark.parametrize("level", ["mounted", "isolated"])
-def test_o21_no_bundle_is_extended_without_a_rest_data_path(world, level):
-    """O21: only a REST agent reaches the gate; a mount or no data path asks the image nothing and records nothing."""
+def test_o23_no_bundle_is_extended_without_a_rest_data_path(world, level):
+    """O23: only a REST agent reaches the gate; a mount or no data path asks the image nothing and records nothing."""
     sbx = start(world, level)
     assert world.host.one_shots == []
     assert sbx.metadata()["certifi"] is None

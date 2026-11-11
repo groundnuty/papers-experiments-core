@@ -403,8 +403,8 @@ def test_c06_a_platform_without_the_caps_table_keeps_the_fingerprint_it_had_and_
     resume(platform_with_caps(tmp_path, "again").fingerprint())
 
 
-def test_o21_the_placeholder_token_defaults_to_a_neutral_word_and_a_file_can_name_another(tmp_path):
-    """O21: on a REST data path the agent's environment holds a placeholder token, so the published client starts; it
+def test_o23_the_placeholder_token_defaults_to_a_neutral_word_and_a_file_can_name_another(tmp_path):
+    """O23: on a REST data path the agent's environment holds a placeholder token, so the published client starts; it
     is `placeholder` unless `[sandbox] placeholder_token` names another, which a study may need to pass its own check of
     the words its agent sees."""
     assert load(tmp_path).placeholder_token == "placeholder"
@@ -420,10 +420,10 @@ def test_o21_the_placeholder_token_defaults_to_a_neutral_word_and_a_file_can_nam
     ["", "two words", "line\nbreak", "tab\there", "café", "x" * 129, 7, True, ["placeholder"]],
     ids=["empty", "space", "line-break", "tab", "not-ascii", "too-long", "number", "boolean", "list"],
 )
-def test_o21_a_placeholder_token_that_could_not_be_a_header_value_is_refused_naming_the_key_never_the_value(
+def test_o23_a_placeholder_token_that_could_not_be_a_header_value_is_refused_naming_the_key_never_the_value(
     tmp_path, value
 ):
-    """O21, O12: the placeholder is sent as a header value by the client and set in the agent's environment, so it
+    """O23, O12: the placeholder is sent as a header value by the client and set in the agent's environment, so it
     must be 1 to 128 printable ASCII characters without white space; the error names the file and the key."""
 
     def edit(data):

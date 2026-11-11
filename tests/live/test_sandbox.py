@@ -21,7 +21,7 @@ The listing and byte-count checks (O21, O22) need a level of `[sandbox.data_path
 the gate the agent's one listing of it must come back whole as the last page, and the collection's count must equal the
 bytes the agent's code received. A mount level's count must be unknown after its collection.
 
-The published-client check (O21) needs a REST level and an agent image with `onedatarestfsspec` installed (it skips
+The published-client check (O23) needs a REST level and an agent image with `onedatarestfsspec` installed (it skips
 without): with only the placeholder token and the default trust, the client must list the directory of
 `[sandbox] content_check_file` and read that file whole through the gate.
 """
@@ -147,7 +147,7 @@ def test_a_write_to_the_agents_root_is_refused_in_a_started_sandbox(config, host
 NO_CREDENTIAL = """
 import os, pathlib
 needle = {needle!r}.encode()
-placeholder = {placeholder!r}  # a REST agent's ONEDATA_TOKEN holds the placeholder, which is no credential (O21)
+placeholder = {placeholder!r}  # a REST agent's ONEDATA_TOKEN holds the placeholder, which is no credential (O23)
 hits = []
 for name, value in os.environ.items():
     if (name, value) == placeholder:
@@ -179,7 +179,7 @@ print("clean" if not hits else sorted(set(hits)))
 @pytest.mark.parametrize("level", LEVELS)
 def test_no_credential_is_visible_inside_the_agent_on_the_data_path_of_this_level(config, host, level):
     """O05: the agent's code cannot read the data-path token: not in its environment, its files or its processes. The
-    one variable named like a token it may hold is a REST agent's ONEDATA_TOKEN, and only with the placeholder (O21)."""
+    one variable named like a token it may hold is a REST agent's ONEDATA_TOKEN, and only with the placeholder (O23)."""
     from expcore_onedata.sandbox.containers import ENV_TOKEN
 
     spec = spec_for(config, level, f"live-cred-{int(time.time())}")
@@ -363,8 +363,8 @@ def test_o21_o22_a_complete_level_serves_a_large_directory_whole_and_counts_the_
 
 
 @needs_platform
-def test_o21_the_published_client_lists_and_reads_through_the_gate_with_the_placeholder(config, host):
-    """O21: in a REST level's agent, the published client (`onedatarestfsspec`, which the agent image must have; the
+def test_o23_the_published_client_lists_and_reads_through_the_gate_with_the_placeholder(config, host):
+    """O23: in a REST level's agent, the published client (`onedatarestfsspec`, which the agent image must have; the
     test skips otherwise) starts with the placeholder token, verifies the gate against the image's certifi bundle that
     the sandbox extended with the run's CA, lists the directory of `[sandbox] content_check_file` and reads that file
     whole, as many bytes as its size. The code it sends is the one the in-process test runs

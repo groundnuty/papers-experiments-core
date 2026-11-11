@@ -12,7 +12,7 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
   * REST data path: the data gate (gate.py, gatepolicy.py, gateboundary.py), whose files are mounted from this package,
     read-only. It holds the token, in its environment, and adds it to the requests it forwards, and no answer it passes
     back holds the token; the agent holds no credential, only the placeholder token the published client needs to
-    start (O21), which the gate drops. The agent trusts the run's CA through the CA variables, each declared trust path
+    start (O23), which the gate drops. The agent trusts the run's CA through the CA variables, each declared trust path
     and its image's certifi bundle, which the published client verifies against: one-shot containers of the agent
     image find that bundle and read each one, and the run's copy with the CA appended is mounted over it read-only;
   * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
@@ -138,7 +138,7 @@ class DockerSandbox:
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,  # the gate's listing mode (O21)
             "images": {},
             "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
-            "certifi": None,  # a REST agent's: `run_ca_added`, or `not_in_image` (O21); never the bundle's path
+            "certifi": None,  # a REST agent's: `run_ca_added`, or `not_in_image` (O23); never the bundle's path
         }
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
@@ -214,7 +214,7 @@ class DockerSandbox:
         if sp.mode is DataPathMode.REST and sp.zone is None:
             raise StartRefused("a REST data path needs the zone")
         if sp.mode is DataPathMode.REST and sp.token is not None and s.placeholder_token == sp.token.reveal():
-            raise StartRefused(  # the agent's environment would hold the run's token (O05, O21)
+            raise StartRefused(  # the agent's environment would hold the run's token (O05, O23)
                 "[sandbox] placeholder_token is the run's data-path token: the agent may hold no credential"
             )
         if sp.mode is DataPathMode.MOUNT and (s.mount is None or s.oneclient is None):
@@ -504,7 +504,7 @@ class DockerSandbox:
         return name
 
     def _certifi(self) -> str | None:
-        """Where the agent image keeps its certifi bundle, which the published client verifies the gate against (O21),
+        """Where the agent image keeps its certifi bundle, which the published client verifies the gate against (O23),
         or None, recorded, when the image has no certifi. An interpreter that fails, or an answer that is not one path
         the sandbox can mount over, refuses the start: no answer is taken for `none`."""
         name = self._one_shot_name()
@@ -523,7 +523,7 @@ class DockerSandbox:
         return found
 
     def _trust_bundles(self) -> dict[str, Path]:
-        """For each configured path of a CA bundle in the agent image, and its certifi bundle when it has one (O21): the
+        """For each configured path of a CA bundle in the agent image, and its certifi bundle when it has one (O23): the
         image's own bundle plus the run's CA."""
         out: dict[str, Path] = {}
         ca = (self.dir / "tls" / "ca.pem").read_text(encoding="utf-8")

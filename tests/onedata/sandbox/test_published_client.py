@@ -1,4 +1,4 @@
-"""O21, O05: the published Onedata client, `onedatarestfsspec`, works through the data gate on a REST data path.
+"""O23, O05: the published Onedata client, `onedatarestfsspec`, works through the data gate on a REST data path.
 
 The sandbox is started as a campaign starts it, on the fake host, whose one-shot containers of the agent image run
 here: the image's interpreter is this one, so the certifi bundle the sandbox finds and extends is this environment's.
@@ -135,10 +135,10 @@ def run_agent_code(env, mounts, routes) -> tuple[dict, dict]:
     return container, client
 
 
-def test_o21_the_published_client_lists_and_reads_through_the_gate_with_the_placeholder_and_the_default_trust(
+def test_o23_the_published_client_lists_and_reads_through_the_gate_with_the_placeholder_and_the_default_trust(
     image_here, platform, tmp_path
 ):
-    """O21, O05: with only the environment the sandbox gives the agent on a REST data path (the zone's host, the
+    """O23, O05: with only the environment the sandbox gives the agent on a REST data path (the zone's host, the
     placeholder token, nothing else of the credential kind) and the trust it sets up by default (the image's certifi
     bundle extended with the run's CA), the published client initialises, lists a directory and reads a file's bytes
     through the gate over verified TLS. Every request the platform received carried the run's token, which the gate

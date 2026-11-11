@@ -490,7 +490,7 @@ _CONTROL = frozenset(range(0x20)) - {0x09} | {0x7F}  # the bytes a header line m
 
 
 def _has_fold(lines: list[bytes], headers) -> bool:
-    """O21: whether a request's header block folds a line or holds a CR or LF inside one. `lines` are the raw lines of the block; `headers` are
+    """O23: whether a request's header block folds a line or holds a CR or LF inside one. `lines` are the raw lines of the block; `headers` are
     its parsed (name, value) pairs. A line that starts with a space or a tab continues the line before it (obs-fold, RFC 7230 3.2.4), and the
     parser joins the two into one value that http.client writes upstream as given, where the line it carries is a header of its own: a token the
     gate drops by name. A CR or LF inside a line is the same fold, or a line end the parser and the upstream read differently. Any other
@@ -856,7 +856,7 @@ class Handler(BaseHTTPRequestHandler):
             "conn_request": self._served,
             "req_headers": {} if folded else _logged_headers(headers),
         }
-        if folded:  # before the body is read or anything is forwarded: the upstream would read a fold as headers of its own (O21)
+        if folded:  # before the body is read or anything is forwarded: the upstream would read a fold as headers of its own (O23)
             rec.update(decision="deny", reason="request header folding not allowed", status=400)
             self._answer(rec, 400, {"error": {"id": "badRequest", "details": "request header folding not allowed"}})
             return

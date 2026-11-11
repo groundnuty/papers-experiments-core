@@ -122,13 +122,13 @@ def test_the_rest_agent_trusts_only_the_runs_ca_and_resolves_the_hosts_to_the_ga
     credential_like = [
         n for n in names_given if any(w in n.upper() for w in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))
     ]
-    assert credential_like == [C.ENV_TOKEN]  # the placeholder alone (O21)
+    assert credential_like == [C.ENV_TOKEN]  # the placeholder alone (O23)
     assert env[C.ENV_TOKEN] == s.placeholder_token
 
 
 @pytest.mark.parametrize("mode", list(DataPathMode))
-def test_o21_only_a_rest_agent_gets_the_placeholder_token_and_only_by_name(s, names, mode):
-    """O21: on a REST data path the agent's ONEDATA_TOKEN is the configured placeholder, so the published client
+def test_o23_only_a_rest_agent_gets_the_placeholder_token_and_only_by_name(s, names, mode):
+    """O23: on a REST data path the agent's ONEDATA_TOKEN is the configured placeholder, so the published client
     starts; it is named with -e, its value in the docker client's environment like every other. A mount or no data path
     gets no token variable at all."""
     extra = {
@@ -187,8 +187,8 @@ def test_the_oneclient_log_directory_is_the_last_one_given():
     assert C.effective_log_dir(["-l", "/c"]) == "/c"
 
 
-def test_o21_the_certifi_question_answers_with_the_interpreters_bundle_or_none_and_is_read_back_exactly():
-    """O21: the probe the sandbox runs in the agent image, run here with this interpreter, prints the path certifi
+def test_o23_the_certifi_question_answers_with_the_interpreters_bundle_or_none_and_is_read_back_exactly():
+    """O23: the probe the sandbox runs in the agent image, run here with this interpreter, prints the path certifi
     gives, which `certifi_bundle` reads back; an interpreter without certifi prints `certifi:none`, read as None."""
     import subprocess
     import sys
@@ -203,8 +203,8 @@ def test_o21_the_certifi_question_answers_with_the_interpreters_bundle_or_none_a
     assert C.certifi_bundle(absent.stdout) is None
 
 
-def test_o21_the_certifi_question_runs_as_the_agent_without_a_network_and_its_bundle_is_extended_once(s):
-    """O21: the one-shot runs the image's interpreter as the agent's code runs, as the agent's user in /work, the first
+def test_o23_the_certifi_question_runs_as_the_agent_without_a_network_and_its_bundle_is_extended_once(s):
+    """O23: the one-shot runs the image's interpreter as the agent's code runs, as the agent's user in /work, the first
     directory of its import path, and with no network; the certifi bundle joins the declared trust paths after them,
     once."""
     args = C.certifi_probe_args(s, "sbx-once-1", LABELS, s.agent.id)

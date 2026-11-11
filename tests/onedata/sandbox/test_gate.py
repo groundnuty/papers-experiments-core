@@ -249,7 +249,7 @@ def test_o05_a_token_scope_inference_carries_the_gates_token_in_its_body(world):
     conn.close()
 
 
-# What an agent may send as a token: the placeholder its environment holds on a REST data path by default (O21), and
+# What an agent may send as a token: the placeholder its environment holds on a REST data path by default (O23), and
 # an invented one shaped like a real token, which the agent could have guessed.
 AGENT_TOKENS = (PLACEHOLDER_TOKEN, "MDAx-guessed-by-the-agent-0123")
 # Every request header in which the platform reads a token (ctool `src/auth/tokens.erl`, `headers.hrl`): the access
@@ -341,8 +341,8 @@ FOLDS = {
 
 @pytest.mark.parametrize("agent_token", AGENT_TOKENS)
 @pytest.mark.parametrize("fold", list(FOLDS))
-def test_o21_a_request_with_a_folded_header_line_is_refused_and_nothing_reaches_the_upstream(world, fold, agent_token):
-    """O21: a header block with a folded line (one that starts with a space or a tab), or a CR or LF inside a line, is
+def test_o23_a_request_with_a_folded_header_line_is_refused_and_nothing_reaches_the_upstream(world, fold, agent_token):
+    """O23: a header block with a folded line (one that starts with a space or a tab), or a CR or LF inside a line, is
     answered 400 before anything is forwarded, the agent's token in it or not: the parser would read the fold into the
     value of the header before it, and the upstream would read the folded line as a header of its own."""
     assert raw_status(world, FOLDS[fold].replace(b"{t}", agent_token.encode())) == 400
@@ -352,8 +352,8 @@ def test_o21_a_request_with_a_folded_header_line_is_refused_and_nothing_reaches_
 
 @pytest.mark.parametrize("agent_token", AGENT_TOKENS)
 @pytest.mark.parametrize("form", sorted(REFUSED_FORMS))
-def test_o21_the_refused_token_forms_get_a_400_and_nothing_reaches_the_upstream(world, form, agent_token):
-    """O21: the forms the gate refuses outright, sent as an ordinary client writes them, are answered 400 and not
+def test_o23_the_refused_token_forms_get_a_400_and_nothing_reaches_the_upstream(world, form, agent_token):
+    """O23: the forms the gate refuses outright, sent as an ordinary client writes them, are answered 400 and not
     forwarded; the agent's token in them is in no line the upstream receives."""
     conn = connect(world)
     assert send_lines(conn, "GET", FILE, TOKEN_FORMS[form](agent_token)) == 400
@@ -363,8 +363,8 @@ def test_o21_the_refused_token_forms_get_a_400_and_nothing_reaches_the_upstream(
 
 
 @pytest.mark.parametrize("agent_token", AGENT_TOKENS)
-def test_o21_the_refusal_of_a_fold_is_logged_with_no_header_value(world, agent_token):
-    """O21: the refusal is a deny line like the gate's others, and holds no value of any header: not the agent's token,
+def test_o23_the_refusal_of_a_fold_is_logged_with_no_header_value(world, agent_token):
+    """O23: the refusal is a deny line like the gate's others, and holds no value of any header: not the agent's token,
     and not a header the log would otherwise show (a folded User-Agent, whose value the line would carry)."""
     head = b"User-Agent: ua-0123\r\n X-Onedata-Consumer-Token: " + agent_token.encode() + b"\r\nRange: bytes=0-1\r\n"
     assert raw_status(world, head) == 400
@@ -378,8 +378,8 @@ def test_o21_the_refusal_of_a_fold_is_logged_with_no_header_value(world, agent_t
     assert "bytes=0-1" not in text
 
 
-def test_o21_white_space_inside_a_header_line_is_no_fold(world):
-    """O21: a value with a tab or spaces inside it, or around it, is no fold: the request is forwarded as before."""
+def test_o23_white_space_inside_a_header_line_is_no_fold(world):
+    """O23: a value with a tab or spaces inside it, or around it, is no fold: the request is forwarded as before."""
     conn = connect(world)
     assert send_lines(conn, "GET", FILE, [("X-Foo", "a \t b"), ("X-Bar", " c ")]) == 200
     conn.close()

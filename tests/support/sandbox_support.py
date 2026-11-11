@@ -168,7 +168,7 @@ def fail_copies(host, stderr: str = "disk full") -> Callable[[], None]:
     return around_run(host, wrapper)
 
 
-# The agent's own use of the published client (O21), as a study's agent uses it: nothing but the environment the
+# The agent's own use of the published client (O23), as a study's agent uses it: nothing but the environment the
 # sandbox gives it, the placeholder token among it, and the trust it sets up by default. It lists the directory of
 # `{space}/{path}` and reads that file through `onedata:///` URLs (the client drops the first name after `onedata://`)
 # and prints what it saw; an image without the client prints `client: None`. Shared by the live test and the in-process
