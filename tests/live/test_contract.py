@@ -28,6 +28,7 @@ from live_support import (  # noqa: E402 -- only once the module is known to run
     require_passed,
 )
 
+from expcore_onedata import consistency  # noqa: E402
 from expcore_onedata.client import (  # noqa: E402
     API_PROVIDER,
     AUTH_HEADER,
@@ -193,6 +194,11 @@ def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_st
     # The platform's one [tls], as every client of the federation takes it: a federation's own CA, or the defaults.
     with httpx.Client(timeout=120, verify=config.tls.client_verify()) as http:
         found = http.post(f"{base}/lookup-file-id/{config.space.name}/{CONTENT_PATH.strip('/')}", headers=headers)
+        if found.status_code == consistency.NOT_FOUND:  # unknown, never a pass or a failure of the platform
+            pytest.skip(
+                "EXPCORE_LIVE_CONTENT_PATH names a file the space does not hold: a space declared baseline = false "
+                "holds none, so set it only where the file was provisioned"
+            )
         assert found.status_code == 200
         content = f"{base}/data/{found.json()['fileId']}/content"
         whole = http.get(content, headers=headers)
@@ -275,7 +281,6 @@ def test_the_space_roots_distribution_gives_each_supporting_providers_physical_s
 
 def test_a_real_block_map_has_the_documented_shape(day0, client, config):
     """The distribution answer parses; a regular file is found by listing the first supporting provider's root."""
-    from expcore_onedata import consistency
     from expcore_onedata.placement import provider_blocks
 
     provider = config.support.providers[0]
@@ -417,8 +422,6 @@ def test_a_running_transfer_is_cancelled_through_the_gate_and_then_reports_an_en
     """O11: a replication of a scratch file is cancelled at once, the gate having read the record's spaceId; the
     cancel answers 204, or 400 when the job ended first, and the record then reports an ended state."""
     # covers: DELETE /transfers/{id}
-    from expcore_onedata import consistency
-
     provisioner, receiver, _, ids = scratch
     tid = provisioner.schedule_transfer("replication", ids[0], receiver)
     statuses = []

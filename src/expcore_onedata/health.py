@@ -46,7 +46,7 @@ from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
-from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
+from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
 from expcore_onedata.tls import WARNING
 from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, data_path_spec
@@ -131,7 +131,18 @@ class PlatformHealth:
         self._service = config.principals.service
         self._token: MintedToken | None = None
         self._lock = threading.Lock()
-        self._gate = PreCampaignHealth(self._space, lambda: content_type_check(config, client))
+        self._content_type: ContentTypeVerdict | None = None
+        self._gate = PreCampaignHealth(self._space, self._measure)
+
+    @property
+    def content_type(self) -> ContentTypeVerdict | None:
+        """What the content-type check found at the first call (None before it), so that a caller can tell a type that
+        was measured and is wrong from one that could not be measured."""
+        return self._content_type
+
+    def _measure(self) -> Health:
+        self._content_type = measure_content_type(self._config, self._client)
+        return self._content_type.health
 
     def _current_token(self) -> MintedToken:
         """Return the cached token, minting a new one when none is left or it is about to expire."""
@@ -151,6 +162,15 @@ class PlatformHealth:
             verdict = self._gate()
         except Exception as error:
             verdict = Health(False, f"health check raised {type(error).__name__}")
+        return self._warned(verdict)
+
+    def space(self) -> Health:
+        """Each space the data path reaches against its declared support set alone (`_space`), without the content type
+        check: what `__call__` answers once that check has passed, and the same warning when TLS is not verified; never
+        raise."""
+        return self._warned(self._space())
+
+    def _warned(self, verdict: Health) -> Health:
         if self._config.tls.insecure:
             return Health(verdict.ok, f"{verdict.detail}; {WARNING}")
         return verdict

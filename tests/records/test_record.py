@@ -7,14 +7,17 @@ import os
 import pytest
 from record_support import hand_made, record_run
 
+from expcore.models.adapters import ModelTurn, ToolCall
 from expcore.records.record import RunRecord, decode, load_record, record_filename
-from expcore.records.schema import RecordError, SchemaVersion
+from expcore.records.schema import CURRENT, RecordError, SchemaVersion
+from expcore.replay.replay import replay_record
 
 V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
     "expcore-record/2",
-    added={"record": ("instruments",), "turn": ("request_sha256",)},
+    added={"record": ("instruments",), "turn": ("request_sha256",), "usage": ("extra", "extra_cut")},
     config_before={"cleanup_deadline_s": 60.0},
+    optional={"usage": ("extra", "extra_cut")},  # the fields of the real table's version 3, here added with this one
 )
 TABLE = (V1, V2)
 
@@ -98,6 +101,80 @@ def test_R01_a_field_a_later_schema_added_is_never_written_into_an_older_record(
     assert "instruments" not in json.loads(text)
     assert "request_sha256" not in text
     assert RunRecord.from_json(decode(text), TABLE).dumps(TABLE) == text
+
+
+def _credit_run(version):
+    """A scripted run whose first reply reports an extra usage field, built as the given record version."""
+    first = ModelTurn(
+        "",
+        [ToolCall("call-1", "echo", {"x": "a"})],
+        10,
+        5,
+        "tool_calls",
+        0.0,
+        usage_extra={"used_credits": 1.5, "details.reasoning_tokens": 7},
+        usage_extra_cut=2,
+    )
+    return record_run([first, "done"], {"echo": lambda a: "x"}, record_options={"schema_version": version})
+
+
+def test_R01_the_extra_usage_fields_are_never_written_into_a_record_of_an_older_version():
+    """R01: the same run written as version 2 holds neither field of version 3 and still validates and reads back to
+    its bytes; written as the current version it holds them, and reads back to its bytes too."""
+    older = _credit_run("expcore-record/2")
+    usage = older.transcript[0]["usage"]
+    assert "extra" not in usage
+    assert "extra_cut" not in usage
+    assert RunRecord.from_json(decode(older.dumps().encode())).dumps() == older.dumps()
+    current = _credit_run(CURRENT)
+    assert current.transcript[0]["usage"]["extra"] == {"used_credits": 1.5, "details.reasoning_tokens": 7}
+    assert current.transcript[0]["usage"]["extra_cut"] == 2
+    assert "extra" not in current.transcript[1]["usage"]  # the reply that reported none stays absent
+    assert RunRecord.from_json(decode(current.dumps().encode())).dumps() == current.dumps()
+
+
+def test_R10_a_backend_that_reports_no_extra_usage_fields_leaves_them_absent_never_null_or_zero():
+    """R10: absent means not recorded. A reply the backend gave no extra fields for has neither field in its usage,
+    in the record, in the file or in the replay, and loading and writing it back adds none."""
+    record = record_run([[("echo", {})], "done"], {"echo": lambda a: "x"})
+    assert record.schema_version == CURRENT
+    assert all("extra" not in t["usage"] and "extra_cut" not in t["usage"] for t in record.transcript)
+    text = record.dumps()
+    assert '"extra' not in text
+    again = RunRecord.from_json(decode(text.encode()))
+    assert again.dumps() == text
+    assert replay_record(again).dumps() == text
+
+
+def test_R10_a_reported_empty_mapping_is_recorded_as_such_and_differs_from_absent():
+    """R10: an adapter that read a usage object with no extra field reports `{}` and a cut of 0; that is recorded, and
+    replays to the same bytes, while another turn of the run without a report stays absent."""
+    reported = ModelTurn(
+        "", [ToolCall("call-1", "echo", {})], 10, 5, "tool_calls", 0.0, usage_extra={}, usage_extra_cut=0
+    )
+    record = record_run([reported, "done"], {"echo": lambda a: "x"})
+    first, second = (t["usage"] for t in record.transcript)
+    assert (first["extra"], first["extra_cut"]) == ({}, 0)
+    assert "extra" not in second
+    assert "extra_cut" not in second
+    text = record.dumps()
+    assert replay_record(RunRecord.from_json(decode(text.encode()))).dumps() == text
+
+
+def test_R01_a_record_of_version_three_without_the_optional_usage_fields_is_valid_and_writes_back_as_it_is():
+    """R01: a record written before an extension of version 3 existed lacks its fields; it loads, and writing it back
+    adds no null and no zero in their place."""
+    record = hand_made()
+    text = record.dumps()
+    assert '"extra' not in text
+    assert RunRecord.from_json(decode(text.encode())).dumps() == text
+    with_one = hand_made()
+    usage = {**with_one.transcript[0]["usage"], "extra_cut": 3}
+    with_one = RunRecord(**{**with_one.__dict__, "transcript": [{**with_one.transcript[0], "usage": usage}]})
+    one_text = with_one.dumps()
+    assert '"extra_cut": 3' in one_text
+    assert '"extra":' not in one_text
+    assert RunRecord.from_json(decode(one_text.encode())).dumps() == one_text
 
 
 def test_R01_a_later_field_that_holds_data_cannot_be_written_into_an_older_record():

@@ -5,8 +5,9 @@ import json
 from pathlib import Path
 
 import pytest
-from sandbox_support import TOKEN, make_spec, start_options
+from sandbox_support import COMPLETE_LEVEL, TOKEN, fail_copies, make_spec, start_options
 
+from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
@@ -415,10 +416,10 @@ def test_a_failed_collection_keeps_the_disks_when_the_sandbox_stops(world, tmp_p
     """A source is never deleted after a failed copy."""
     sbx = start(world, "isolated")
     (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
-    with pytest.raises(SandboxError, match="copying"):
+    undo = fail_copies(world.host)
+    with pytest.raises(InfraError, match="copying"):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
-    world.host.run_handlers.pop("cp")
+    undo()
     sbx.stop()
     kept = world.s.work_root / "_kept_evidence" / sbx.sid
     assert (kept / "work" / "out.txt").read_text() == "x"
@@ -428,6 +429,31 @@ def test_the_data_path_modes_of_a_start_are_recorded_by_name(world):
     sbx = start(world, "mounted")
     assert sbx.metadata()["data_path"] == DataPathMode.MOUNT.value
     sbx.stop()
+
+
+@pytest.mark.parametrize(("level", "listing"), [(COMPLETE_LEVEL, "complete"), ("via-gate", "paged")])
+def test_o21_a_rest_level_tells_its_gate_its_listing_mode_and_the_run_records_it(world, level, listing):
+    """O21: the gate's configuration carries the level's listing mode, and the run's metadata records it beside the
+    data path, so a record says which listings its agent was served."""
+    sbx = start(world, level)
+    assert json.loads((sbx.dir / "gate.json").read_text())["listing"] == listing
+    assert (sbx.metadata()["data_path"], sbx.metadata()["listing"]) == ("rest", listing)
+    sbx.stop()
+    mounted = start(world, "mounted")
+    assert mounted.metadata()["listing"] is None  # no gate lists anything on a mount
+    mounted.stop()
+
+
+@pytest.mark.parametrize(("level", "listing"), [("mounted", "complete"), ("isolated", "complete"), ("via-gate", "all")])
+def test_o21_a_listing_mode_where_no_gate_lists_or_one_it_does_not_know_refuses_the_start(world, level, listing):
+    """O21: a complete listing on a mount or no data path, or a mode the gate does not know, is refused before anything
+    is created."""
+    from dataclasses import replace
+
+    spec = replace(make_spec(world, level), listing=listing)
+    with pytest.raises(StartRefused, match="listing mode"):
+        DockerSandbox.start(world.host, world.s, spec, **start_options(world))
+    assert nothing_left(world)
 
 
 def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_hash(world):
@@ -457,10 +483,10 @@ def test_o12_a_failed_collection_records_where_the_evidence_is_by_id_and_key_not
     """O12: the kept-evidence record names the setting the directory is under and its id, never the path."""
     sbx = start(world, "isolated")
     (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
-    with pytest.raises(SandboxError, match="copying"):
+    undo = fail_copies(world.host)
+    with pytest.raises(InfraError, match="copying"):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
-    world.host.run_handlers.pop("cp")
+    undo()
     sbx.stop()
     kept = sbx.metadata()["evidence_kept"]
     assert kept == {"under": "sandbox.work_root", "directory_id": sbx.sid.rsplit("-", 1)[-1], "relocated": True}
@@ -538,10 +564,10 @@ def test_o15_a_failed_unmount_after_a_failed_collection_leaves_the_directory_whe
 
     sbx = start(world, "isolated", lease_key=KEY)
     (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
-    with pytest.raises(SandboxError, match="copying"):
+    undo = fail_copies(world.host)
+    with pytest.raises(InfraError, match="copying"):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
-    world.host.run_handlers.pop("cp")
+    undo()
     world.host.stuck_mounts.add(str(sbx.dir / "work"))
     with pytest.raises(SandboxError, match="a mount under it may be live"):
         sbx.stop()

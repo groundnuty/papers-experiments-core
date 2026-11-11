@@ -12,10 +12,10 @@ from expcore.errors import BudgetHold, InfraError
 from expcore.models import spend
 from expcore.models.adapters import AnthropicAdapter, ModelTurn, OpenAICompatAdapter
 from expcore.models.retry import Retrier, RetryPolicy
-from expcore.records.build import record_attempt
+from expcore.records.build import _record_attempt, record_attempt
 from expcore.records.record import RunRecord
 from expcore.records.recording import RecordingBackend
-from expcore.records.schema import CURRENT, reply_count_rule
+from expcore.records.schema import CURRENT, REPLY_COUNT_RULE_FROM, SCHEMAS, reply_count_rule
 from expcore.replay.replay import replay_record
 
 POLICY = RetryPolicy(max_retries=3, base_delay_s=1.0, max_delay_s=10.0, jitter=0.0)
@@ -217,8 +217,13 @@ def test_c27_a_billed_reply_the_adapter_cannot_read_still_tells_the_guard_what_i
     assert recording.failure["kind"] == "infra"
 
 
-def billed_unread_record(make_spec, completion, fake_client):
-    """The record of a tool round, then a billed 200 with usage and no choices: one reply more than its turns."""
+# The newest record version before the reply-count rule: a live run never writes it, so only a test builds one.
+BEFORE_THE_RULE = SCHEMAS[[s.name for s in SCHEMAS].index(REPLY_COUNT_RULE_FROM) - 1].name
+
+
+def billed_unread_record(make_spec, completion, fake_client, schema_version=None):
+    """The record of a tool round, then a billed 200 with usage and no choices: one reply more than its turns. Written
+    as the current version, as a live run writes it, unless a test names an older one."""
     config = make_config()
     client = fake_client(
         completion(None, finish="tool_calls", tool_calls=[("look", "{}")]),
@@ -226,9 +231,12 @@ def billed_unread_record(make_spec, completion, fake_client):
     )
     backend = OpenAICompatAdapter(make_spec(), 7, config.limits, client=client, sleep=_no_sleep)
     provider = FakeProvider({"look": lambda arguments: "ok"})
+    options = {"code": dict(CODE), "core_version": "0.1.0"}
+    if schema_version is None:
+        return asyncio.run(record_attempt(backend, [provider], "be brief", "do the task", config, IDENTITY, **options))
     return asyncio.run(
-        record_attempt(
-            backend, [provider], "be brief", "do the task", config, IDENTITY, code=dict(CODE), core_version="0.1.0"
+        _record_attempt(
+            backend, [provider], "be brief", "do the task", config, IDENTITY, schema_version=schema_version, **options
         )
     )
 
@@ -240,8 +248,9 @@ def test_c26_a_record_of_a_version_before_the_reply_count_rule_keeps_its_totals_
     versions from the one that introduced it; a record of an earlier version keeps the totals it was written with and
     replays to the same bytes. The campaign still charges that attempt its bound: its result reads the replies the
     route counted against the turns the record kept, whatever the record's version."""
-    record = billed_unread_record(make_spec, completion, fake_client)
+    record = billed_unread_record(make_spec, completion, fake_client, schema_version=BEFORE_THE_RULE)
     assert record.schema_version == "expcore-record/2"
+    assert not reply_count_rule(record.schema_version)
     assert record.route["usage_seen"]["responses"] == len(record.transcript) + 1
     assert record.totals["usage_incomplete"] is False
     again = RunRecord.from_json(json.loads(json.dumps(record.to_json())))
@@ -249,17 +258,18 @@ def test_c26_a_record_of_a_version_before_the_reply_count_rule_keeps_its_totals_
     assert result_from_record(record, ended_utc="2026-01-01T00:10:00Z").usage_complete is False
 
 
-@pytest.mark.skipif(
-    not reply_count_rule(CURRENT),
-    reason="needs expcore-record/3, which #142 defines: the reply-count rule starts at that version",
-)
 def test_c26_a_record_of_a_version_with_the_reply_count_rule_leaves_its_totals_incomplete_and_round_trips(
     make_spec, completion, fake_client
 ):
-    """C26 and C05: a record written under the reply-count rule keeps, in its own totals, that a billed reply became no
-    turn, and replays to the same bytes."""
+    """C26 and C05: a record written under the reply-count rule, as every new record is from version 3, keeps in its
+    own totals that a billed reply became no turn, and writes back and replays to the same bytes."""
     record = billed_unread_record(make_spec, completion, fake_client)
+    assert record.schema_version == CURRENT == REPLY_COUNT_RULE_FROM == "expcore-record/3"
     assert reply_count_rule(record.schema_version)
+    assert record.route["usage_seen"]["responses"] == len(record.transcript) + 1
     assert record.totals["usage_incomplete"] is True
-    again = RunRecord.from_json(json.loads(json.dumps(record.to_json())))
-    assert replay_record(again).to_json() == record.to_json()
+    stored = record.dumps()
+    again = RunRecord.from_json(json.loads(stored))
+    assert again.dumps() == stored
+    assert replay_record(again).dumps() == stored
+    assert result_from_record(record, ended_utc="2026-01-01T00:10:00Z").usage_complete is False

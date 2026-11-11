@@ -92,7 +92,7 @@ def test_R04_the_check_holds_the_code_identity_and_the_hash_of_every_input_by_re
     """R04: the identity is the code stamp's, and each input is named by its path in the batch."""
     check = stored_check(checked)
     assert check["code"] == CODE
-    assert check["record_schema"] == CURRENT == "expcore-record/2"
+    assert check["record_schema"] == CURRENT == "expcore-record/3"
     paths = sorted(check["inputs"])
     assert len(paths) == 4
     assert any(p.startswith("shard-2/") for p in paths)

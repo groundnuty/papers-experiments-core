@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from federation_support import EXAMPLE
+from federation_support import EXAMPLE, STUDY_BASELINE_OFF, WITH_BASELINE_OFF
 
 
 def file_id(space: str, path: str) -> str:
@@ -140,6 +140,37 @@ def test_a_provider_that_owns_one_space_keeps_it_while_its_mirror_of_another_own
     assert evicted == {fake.ids.providers["alder"]}
     assert all(body["fileId"] != "root-gamma-space" for _, body in fake.transfers)
     assert owners >= evicted  # alder is an owner, yet only its mirror's directory was evicted
+
+
+def baseline_off_spec(fed, tmp_path, text):
+    path = tmp_path / "federation.toml"
+    path.write_text(text, encoding="utf-8")
+    return fed.spec.load_spec(path)
+
+
+def test_a_space_with_no_baseline_files_is_reset_between_runs_like_any_other_and_assumes_none(fed, quick, tmp_path):
+    """The per-run reset walks what a space holds, never what the baseline would: an empty baseline-off space has no
+    file to sweep and nothing to evict, and what a study ingested into one is evicted from its mirror and kept at its
+    owner."""
+    spec = baseline_off_spec(fed, tmp_path, WITH_BASELINE_OFF)
+    fake = FakeProviders(fed, spec, {"alpha-space": {"hello.txt": 64}}, tmp_path / "root")
+    empty = quick.evict_replicas(fake, timeout_s=5)["scratch-space"]
+    assert (empty.files, empty.evicted_from, empty.held_before) == (0, (), {"oak": 0})
+    assert fake.transfers == []
+
+    fake.add(spec.space("scratch-space"), "ingested/part-1.csv", 100)
+    fake.hold("scratch-space", "ingested/part-1.csv", "oak", [[0, 40]])
+    ingested = quick.evict_replicas(fake, timeout_s=5)["scratch-space"]
+    assert (ingested.files, ingested.evicted_from, ingested.held_before) == (1, ("oak",), {"oak": 40})
+    assert fake.held("scratch-space", "ingested/part-1.csv", "oak") == []
+    assert fake.held("scratch-space", "ingested/part-1.csv", "elm") == [[0, 100]]
+
+
+def test_a_baseline_off_study_space_with_nothing_in_it_is_reset_between_runs_without_a_refusal(fed, quick, tmp_path):
+    fake = FakeProviders(fed, baseline_off_spec(fed, tmp_path, STUDY_BASELINE_OFF), {}, tmp_path / "root")
+    done = quick.evict_replicas(fake, timeout_s=5)
+    assert (done["alpha-space"].files, done["alpha-space"].evicted_from) == (0, ())
+    assert fake.transfers == []
 
 
 def test_a_file_not_whole_at_its_owner_refuses_the_reset_before_any_eviction_in_any_space(fed, quick, tmp_path):
