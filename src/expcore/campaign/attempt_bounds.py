@@ -226,6 +226,7 @@ def attempt_costs(
     *,
     reply_capped: Collection[str] = (),
     taken_off: Collection[str] = (),
+    live: Collection[str] | None = None,
 ) -> list[AttemptCost]:
     """Return the cost of every attempt that spent tokens, in attempt order, each charged as the module docstring says.
 
@@ -234,8 +235,12 @@ def attempt_costs(
     dispatch (C27). A row without that record, written before it existed, is bounded by the reply maximum for the
     models in `reply_capped` (the caller's view now) and by the window for any other. Either way an attempt of a model
     in `taken_off`, which the store has taken off the reply maximum, is bounded by the window. Each attempt's top-ups
-    are added to its cost (C26), and a running attempt with top-ups is listed with them alone, since they were charged
-    when they were reserved; an attempt with a top-up is `bounded`, its cost being in part a ceiling.
+    are added to its cost (C26). A running attempt is listed with its top-ups alone, since they were charged when they
+    were reserved and the caller reserves the run itself among the runs in flight; but a running attempt whose run is
+    not in `live`, the run keys a worker is still working on, is charged its bound as well: its worker ended without
+    settling it, a crash in our own bookkeeping (C17), so what it spent is unknown until the next start settles it.
+    `live` None takes every running attempt as live. An attempt with a top-up is `bounded`, its cost being in part a
+    ceiling.
     """
     states = (*BILLED_STATES, "running")
     marks = ",".join("?" * len(states))
@@ -253,11 +258,15 @@ def attempt_costs(
     costs = []
     for row in rows:
         spec, topped = models.get(row["model"]), float(row["topup_usd"] or 0.0)
+        capped = _reserved_capped(row, reply_capped, taken_off)
         if row["state"] == "running":
-            if topped:
-                costs.append(AttemptCost(row["id"], row["run_key"], row["model"], "running", topped, True))
-            continue
-        usd, bounded = _base_cost(spec, row, limits, _reserved_capped(row, reply_capped, taken_off))
+            if live is None or row["run_key"] in live:
+                if topped:
+                    costs.append(AttemptCost(row["id"], row["run_key"], row["model"], "running", topped, True))
+                continue
+            usd, bounded = _bound_cost(spec, limits, capped)  # no worker settles it: its usage is unknown
+        else:
+            usd, bounded = _base_cost(spec, row, limits, capped)
         costs.append(
             AttemptCost(
                 row["id"], row["run_key"], row["model"], row["state"],
@@ -285,6 +294,14 @@ def _base_cost(
     measured = measured_usd(spec, row) if row["complete"] else None
     if measured is not None:
         return measured, False
+    return _bound_cost(spec, limits, reply_capped)
+
+
+def _bound_cost(spec: ModelSpec | None, limits: Limits, reply_capped: bool) -> tuple[float | None, bool]:
+    """An attempt's bound, as the cost of one whose usage is unknown, and whether it is a bound (not for a free
+    model); None for a model the table lacks or whose price is unknown."""
+    if spec is None:
+        return None, False
     bound = bound_usd(spec, limits, reply_capped=reply_capped)
     return bound, bound is not None and not spec.free
 

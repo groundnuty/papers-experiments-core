@@ -194,15 +194,19 @@ class BudgetGate:
 
     # --- the assessment -----------------------------------------------------------------------------------------------
 
-    def assess(self, in_flight: Sequence[str], now: str, exact: str | None = None) -> BudgetState:
+    def assess(
+        self, in_flight: Sequence[str], now: str, exact: str | None = None, *, live: Collection[str] | None = None
+    ) -> BudgetState:
         """Decide which models may start a run, given the models of the runs now in flight.
 
         `in_flight` lists one model key per run being worked on, counted by the dispatcher itself, since an attempt's
-        row exists only a moment after the dispatcher chooses the run. Records the stops that began and ended. `exact` is
-        `now` at full precision (fractional seconds), with which a stop that begins is dated.
+        row exists only a moment after the dispatcher chooses the run. `live` are those runs' keys: a running attempt of
+        any other run has no worker left to settle it and is charged its bound (C17, C26); None takes every running
+        attempt as live. Records the stops that began and ended. `exact` is `now` at full precision (fractional
+        seconds), with which a stop that begins is dated.
         """
         holds, released = self._apply_releases(self._json(HOLDS_KEY), self._json(RELEASED_KEY), now)
-        costs, capped = self._costs()
+        costs, capped = self._costs(live)
         probes = probe_spend.charged(self.store)
         spent = _with_probes(spent_usd(costs), probes)
         reserve = {m: self._reserve(m, capped) for m in self.models}
@@ -225,16 +229,24 @@ class BudgetGate:
             capped,
         )
 
-    def refusal(self, model: str, in_flight: Sequence[str], extra_usd: float, label: str = "this top-up") -> str | None:
+    def refusal(
+        self,
+        model: str,
+        in_flight: Sequence[str],
+        extra_usd: float,
+        label: str = "this top-up",
+        *,
+        live: Collection[str] | None = None,
+    ) -> str | None:
         """Tell why `extra_usd` more for a run of `model` already in flight would not fit, or None when it would (C26).
 
         The figure is the assessment's (what was spent, top-ups included, and the reservations of the runs in flight,
         this one among them), with `extra_usd` in place of a new run's reservation, against both ceilings as released so
-        far. Nothing is recorded: a stop begins at the next assessment, which a request this refused would not pass
-        either. A total that is unknown refuses too.
+        far, `live` as `assess` takes it. Nothing is recorded: a stop begins at the next assessment, which a request this
+        refused would not pass either. A total that is unknown refuses too.
         """
         released = self._json(RELEASED_KEY)
-        costs, capped = self._costs()
+        costs, capped = self._costs(live)
         probes = probe_spend.charged(self.store)
         spent = _with_probes(spent_usd(costs), probes)
         reserve = {m: self._reserve(m, capped) for m in self.models}
@@ -251,14 +263,14 @@ class BudgetGate:
         """The models the store's marks take off the reply maximum for the rest of the campaign (C27)."""
         return frozenset(m for m in {*self.models, *self.shown_capped} if reply_cap.is_unheld(marks, m))
 
-    def _costs(self) -> tuple[list[AttemptCost], frozenset[str]]:
+    def _costs(self, live: Collection[str] | None = None) -> tuple[list[AttemptCost], frozenset[str]]:
         """Every attempt's cost, and the models reserved by the reply maximum now, from one reading of the store's
         marks. An attempt whose usage is unknown is charged the bound its row records it was reserved at dispatch, not
         this gate's view of its model, which before admission holds none to the maximum; by the window once the store
-        has taken its model off it (C05, C27)."""
+        has taken its model off it (C05, C27). A running attempt of a run not in `live` is charged its bound (C17)."""
         taken_off = self._taken_off(reply_cap.unheld(self.store))
         capped = self.shown_capped - taken_off
-        costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped, taken_off=taken_off)
+        costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped, taken_off=taken_off, live=live)
         return costs, capped
 
     def request_bound(self, model: str) -> float | None:

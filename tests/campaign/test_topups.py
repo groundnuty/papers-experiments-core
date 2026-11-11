@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+import time
 
 import pytest
 from campaign_support import NOW, finished, infra, planned_store
@@ -303,3 +304,62 @@ def test_c26_without_a_budget_nothing_is_topped_up_and_nothing_changes(tmp_path)
         rows = attempts(scheduler.store)
         assert [(r["state"], r["topups"], r["topup_usd"]) for r in rows] == [("done", 0, 0.0)] * 3
         assert not {"topup", "topup_refused", "usage_unreported"} & set(event_kinds(scheduler.store))
+
+
+class CrashBesideATopUp:
+    """The study's executor for two runs at once. The first run waits until the second has started, then finishes;
+    the crash hook then fails its bookkeeping before its marker, a crash in our own code that leaves its row running.
+    The second run's first reply leaves its input count out, and its tool returns only once the first run has left the
+    dispatcher's runs in flight, so its next request asks for a top-up while the crashed attempt's row still runs."""
+
+    def __init__(self):
+        self.config, self.started = FakeExecutor().config, []
+        self.second_started = threading.Event()
+        self.scheduler = None  # set once the scheduler is built
+
+    async def __call__(self, request):
+        self.started.append(request.run_key)
+        if len(self.started) == 1:
+            await asyncio.to_thread(self.second_started.wait, 10)
+            script = ["the answer"]
+        else:
+            self.second_started.set()
+            script = [ModelTurn("", [ToolCall("call_first", "look", {})], None, 9, "tool_calls", 0.0), "the answer"]
+        request.backend.use(script)
+        provider = FakeProvider({"look": self.look})
+        return await record_run(
+            request, [provider], "be brief", "do the task", self.config, code=dict(CODE), core_version="0.1.0"
+        )
+
+    def look(self, arguments):
+        deadline = time.monotonic() + 10
+        while self.started[0] in self.scheduler._inflight and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return "ok"
+
+
+def test_c26_a_running_row_whose_worker_crashed_is_counted_at_its_bound_when_a_sibling_asks_for_a_top_up(tmp_path):
+    """C26 and C17: a worker whose bookkeeping crashed after its attempt began leaves the dispatcher's runs in flight,
+    but its row stays running and what it spent is unknown until the next start settles it. A sibling's top-up is
+    then refused against that row's bound: 1.74 for it, 1.74 for the sibling and 0.24 for the top-up are over the
+    ceiling of 3.60, which the two runs' reservations alone fit."""
+    executor = CrashBesideATopUp()
+
+    def crash_after_the_first_run(point, run_key):
+        if point == "before_marker" and run_key == executor.started[0]:
+            raise OSError("no space left on device")
+
+    plan = {"models": (MODEL,), "tasks": ("task-a",), "seeds": (1,)}
+    settings = settings_for(budget=Budget(max_usd=3.60), workers=2)
+    root = tmp_path / "campaign"
+    with build(
+        root, executor=executor, settings=settings, plan=plan, models=TABLE, crash_hook=crash_after_the_first_run
+    ) as scheduler:
+        executor.scheduler = scheduler
+        with pytest.raises(RuntimeError, match="unexpected error"):
+            scheduler.run()
+        rows = {row["run_key"]: row for row in attempts(scheduler.store)}
+        crashed, sibling = (rows[key] for key in executor.started)
+        assert crashed["state"] == "running"
+        assert (sibling["state"], sibling["infra_kind"], sibling["topups"]) == ("infra_fail", "budget_hold", 0)
+        assert "topup_refused" in event_kinds(scheduler.store)

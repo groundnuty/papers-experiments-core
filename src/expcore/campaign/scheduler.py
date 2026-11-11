@@ -251,7 +251,10 @@ class Scheduler:
         def in_flight() -> list[str]:  # read while the locks are held
             return [m for m, _ in self._inflight.values()]
 
-        return Ledger(gate, self.store, self.stamp, (self._cv, self._assess), in_flight)
+        def live() -> frozenset[str]:  # the runs a worker is working on; read while the locks are held (C17)
+            return frozenset(self._inflight)
+
+        return Ledger(gate, self.store, self.stamp, (self._cv, self._assess), in_flight, live)
 
     def reconcile_accounting(self) -> None:
         """Derive the harness-error stops and the units' failures from the stored attempts (C04, C10, C15).
@@ -384,12 +387,14 @@ class Scheduler:
                 counts[unit] = counts.get(unit, 0) + 1
         return counts
 
-    def _assessed(self, flying: list[str], now: str) -> Any:
-        """Assess the budget for the models of the runs in flight (None without a budget)."""
+    def _assessed(self, flying: list[str], now: str, live: frozenset[str]) -> Any:
+        """Assess the budget for the models of the runs in flight (None without a budget). `live` are the keys of the
+        runs a worker is working on, read under `_cv` by the caller: a running attempt of any other run lost its worker
+        to a crash in our own bookkeeping, and is charged its bound (C17)."""
         if self.budget is None:
             return None
         with self._assess:
-            return self.budget.assess(flying, now, exact=self.exact_stamp())
+            return self.budget.assess(flying, now, exact=self.exact_stamp(), live=live)
 
     def recheck(self, row: Any) -> Hold | None:
         """Tell why a run that holds its lease may not start after all, or None: the gates dispatch looked at, again.
@@ -403,8 +408,9 @@ class Scheduler:
         key, model = row["run_key"], row[column_for("model")]
         with self._cv:
             others = [m for k, (m, _) in self._inflight.items() if k != key]
+            live = frozenset(self._inflight)
         stopped, stopped_all = self.stops.stopped()
-        budget = self._assessed(others, self.stamp())
+        budget = self._assessed(others, self.stamp(), live)
         hold = (
             self._all_hold(stopped_all)
             or self._model_hold(model, stopped, budget)
@@ -475,7 +481,7 @@ class Scheduler:
         if self.leases is not None:
             self.leases.settle_quarantines()
         stopped, stopped_all = self.stops.stopped()
-        budget = self._assessed([m for m, _ in self._inflight.values()], now)
+        budget = self._assessed([m for m, _ in self._inflight.values()], now, frozenset(self._inflight))
         in_use = self._in_use()
         held_in_unit = self._live_per_unit()
         waiting = False

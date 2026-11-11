@@ -41,7 +41,7 @@ The ledger's work reads and writes the store, so the guard does it in a thread, 
 
 import asyncio
 import contextlib
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from typing import Any
 
 from expcore.campaign import probe_spend, reply_cap
@@ -61,10 +61,18 @@ class Ledger:
         stamp: Callable[[], str],
         locks: Sequence[Any],
         in_flight: Callable[[], list[str]],
+        live: Callable[[], Collection[str]] | None = None,
     ):
         """Take the budget gate, the store, the clock the store's times come from, the dispatcher's locks in the order
-        it takes them, and what returns the model of each run in flight, read while those locks are held."""
+        it takes them, what returns the model of each run in flight, and what returns those runs' keys (`live`, C17),
+        both read while those locks are held. Without `live` every running attempt is taken as one a worker settles."""
         self.gate, self.store, self.stamp, self.locks, self.in_flight = gate, store, stamp, tuple(locks), in_flight
+        self.live = live
+
+    def _refusal(self, model: str, extra_usd: float, label: str = "this top-up") -> str | None:
+        """The gate's refusal of `extra_usd` more for a run of `model` in flight; call with the locks held."""
+        live = None if self.live is None else self.live()
+        return self.gate.refusal(model, self.in_flight(), extra_usd, label, live=live)
 
     @contextlib.contextmanager
     def _held(self) -> Iterator[None]:
@@ -101,7 +109,7 @@ class Ledger:
         """Tell why a run in flight may not send its next request, or None: the campaign is past a ceiling now that its
         runs are reserved by the window (C27). Nothing is charged."""
         with self._held():
-            refusal = self.gate.refusal(model, self.in_flight(), 0.0, "this request")
+            refusal = self._refusal(model, 0.0, "this request")
             if refusal is not None:
                 self.store.event(self.stamp(), "topup_refused", model, f"{run_key}: {why}: {refusal}")
         return refusal
@@ -119,9 +127,7 @@ class Ledger:
             if usd == 0.0:
                 return 0.0, None
             refusal = (
-                f"model {model} has no price: its request has no bound"
-                if usd is None
-                else self.gate.refusal(model, self.in_flight(), usd)
+                f"model {model} has no price: its request has no bound" if usd is None else self._refusal(model, usd)
             )
             if refusal is not None:
                 self.store.event(self.stamp(), "topup_refused", model, f"{run_key}: {why}: {refusal}")
@@ -148,7 +154,7 @@ class Ledger:
             refusal = (
                 f"model {model} has no price: its request has no bound"
                 if usd is None
-                else self.gate.refusal(model, self.in_flight(), extra, "this resend")
+                else self._refusal(model, extra, "this resend")
             )
             if refusal is not None:
                 self.store.event(self.stamp(), "topup_refused", model, f"{run_key}: {why}: {refusal}")
@@ -180,7 +186,7 @@ class Ledger:
             refusal = (
                 f"model {model} has no price: its probe has no bound"
                 if usd is None
-                else self.gate.refusal(model, self.in_flight(), usd, "this probe")
+                else self._refusal(model, usd, "this probe")
             )
             if refusal is not None:
                 self.store.event(self.stamp(), "probe_refused", model, f"{model}: {what} was not sent: {refusal}")
