@@ -8,6 +8,8 @@ The first checks need only a docker daemon. The ones that start a sandbox need `
 data-path levels mint a read-only token for a fixed user (`[principals.data_path]`). They start a sandbox for each
 configured level, run a line of code in it, prove it refuses a write, stop it, and require that the lease key's
 probe then answers True. Nothing here writes to a space; without the variables nothing is constructed or contacted.
+With a platform file, a read-only input is started too: the agent runs and reads its script, every change to it fails
+with EROFS, and /work stays writable.
 
 The TLS checks need a platform file whose `[tls]` is not the default, because its federation's certificate chains to a
 CA no default trusts (a self-signed one): with each of the three modes in turn, oneclient must fail to mount by default
@@ -16,6 +18,7 @@ either. With `insecure_tls` in the file, the `ca_file` cases skip.
 """
 
 import dataclasses
+import json
 import os
 import time
 
@@ -257,3 +260,61 @@ def test_o05_the_gates_upstream_reaches_the_zone_as_the_tls_setting_says(config,
         assert status == 502
     else:
         assert status < 500
+
+
+# What the agent's code does with a read-only input in a real container: runs its script, then tries every change.
+INPUT_USE = """
+import errno, json, os, subprocess
+script = os.path.join({target!r}, "analyse.sh")
+said = {{"ran": subprocess.run([script], capture_output=True, text=True, check=False).stdout.strip()}}
+
+
+def attempt(what, act):
+    try:
+        act()
+    except OSError as error:
+        said[what] = errno.errorcode.get(error.errno, error.errno)
+    else:
+        said[what] = "done"
+
+
+def create(path):
+    with open(path, "x") as handle:
+        handle.write("written")
+
+
+attempt("read", lambda: open(script, "rb").read())
+attempt("write", lambda: open(script, "w").close())
+attempt("beside", lambda: create(os.path.join({target!r}, "beside.txt")))
+attempt("rename", lambda: os.rename(script, script + ".moved"))
+attempt("chmod", lambda: os.chmod(script, 0o777))
+attempt("delete", lambda: os.unlink(script))
+attempt("work", lambda: create("/work/written-by-the-agent.txt"))
+print(json.dumps(said, sort_keys=True))
+"""
+
+
+@needs_platform
+def test_o20_a_read_only_input_is_read_and_run_but_never_changed_and_work_stays_writable(config, host, tmp_path):
+    """O20: in a real container the agent runs the input's script and reads it, while writing, renaming, chmod-ing and
+    deleting it and creating a file beside it each fail with EROFS, and its own working directory stays writable; the
+    start's own probe proved as much, and the metadata names the input by its hash."""
+    from expcore_onedata.sandbox.api import ReadOnlyInput
+
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    (supplied / "analyse.sh").write_text("#!/bin/sh\necho analysed\n", encoding="utf-8")
+    (supplied / "analyse.sh").chmod(0o755)
+    target = "/opt/supplied"
+    spec = spec_for(config, levels(config)[0], f"live-input-{int(time.time())}")
+    spec = dataclasses.replace(spec, inputs=(ReadOnlyInput(supplied, target),))
+    sandbox = DockerSandbox.start(host, config.sandbox, spec)
+    try:
+        meta = sandbox.metadata()
+        assert meta["read_only_verified"]["inputs"] is True
+        assert [recorded["path"] for recorded in meta["read_only_inputs"]] == [target]
+        said = json.loads(sandbox.exec(INPUT_USE.format(target=target), 60).stdout)
+    finally:
+        sandbox.stop()
+    refused = dict.fromkeys(("write", "beside", "rename", "chmod", "delete"), "EROFS")
+    assert said == {"ran": "analysed", "read": "done", **refused, "work": "done"}

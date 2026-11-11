@@ -5,8 +5,9 @@ import json
 from pathlib import Path
 
 import pytest
-from sandbox_support import TOKEN, make_spec, start_options
+from sandbox_support import TOKEN, fail_copies, make_spec, start_options
 
+from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
@@ -415,10 +416,10 @@ def test_a_failed_collection_keeps_the_disks_when_the_sandbox_stops(world, tmp_p
     """A source is never deleted after a failed copy."""
     sbx = start(world, "isolated")
     (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
-    with pytest.raises(SandboxError, match="copying"):
+    undo = fail_copies(world.host)
+    with pytest.raises(InfraError, match="copying"):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
-    world.host.run_handlers.pop("cp")
+    undo()
     sbx.stop()
     kept = world.s.work_root / "_kept_evidence" / sbx.sid
     assert (kept / "work" / "out.txt").read_text() == "x"
@@ -457,10 +458,10 @@ def test_o12_a_failed_collection_records_where_the_evidence_is_by_id_and_key_not
     """O12: the kept-evidence record names the setting the directory is under and its id, never the path."""
     sbx = start(world, "isolated")
     (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
-    with pytest.raises(SandboxError, match="copying"):
+    undo = fail_copies(world.host)
+    with pytest.raises(InfraError, match="copying"):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
-    world.host.run_handlers.pop("cp")
+    undo()
     sbx.stop()
     kept = sbx.metadata()["evidence_kept"]
     assert kept == {"under": "sandbox.work_root", "directory_id": sbx.sid.rsplit("-", 1)[-1], "relocated": True}
@@ -538,10 +539,10 @@ def test_o15_a_failed_unmount_after_a_failed_collection_leaves_the_directory_whe
 
     sbx = start(world, "isolated", lease_key=KEY)
     (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
-    with pytest.raises(SandboxError, match="copying"):
+    undo = fail_copies(world.host)
+    with pytest.raises(InfraError, match="copying"):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
-    world.host.run_handlers.pop("cp")
+    undo()
     world.host.stuck_mounts.add(str(sbx.dir / "work"))
     with pytest.raises(SandboxError, match="a mount under it may be live"):
         sbx.stop()

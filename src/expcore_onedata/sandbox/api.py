@@ -64,12 +64,29 @@ class Endpoint:
 
 
 @dataclasses.dataclass(frozen=True)
+class ReadOnlyInput:
+    """Files a study supplies to the agent, such as scripts it may run but not change (O20).
+
+    `source` is a directory on the host holding regular files and directories only; `target` is the absolute path the
+    agent sees it at; `sha256` is the hash of its content when it was declared for the campaign (`inputs.declare`), and
+    every start refuses an input whose content no longer has it. The sandbox copies it into the run's own directory,
+    records the copy's hash, mounts the copy read-only in the agent's container and proves from inside the agent that it
+    refuses every change (`expcore_onedata.sandbox.inputs`).
+    """
+
+    source: Path
+    target: str
+    sha256: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class SandboxSpec:
     """What one run asks of a sandbox: its data path and, for a path, the token, the zone and the pinned provider.
 
     The agent is pinned to its local provider (O03): `provider` is that one, and no other host is reachable. A run with
     no data path has no token and no endpoint. `lease_key` names the leased resource the sandbox's containers, network
-    and directories are labelled with, so a probe can prove them gone (C19).
+    and directories are labelled with, so a probe can prove them gone (C19). `inputs` are the run's read-only inputs,
+    in the order they are mounted and recorded (O20).
     """
 
     run_key: str
@@ -78,6 +95,7 @@ class SandboxSpec:
     zone: Endpoint | None = None
     provider: Endpoint | None = None
     lease_key: str | None = None
+    inputs: tuple[ReadOnlyInput, ...] = ()
 
 
 RAN = "ran"  # the cell was started: its exit code, timeout and kill say how it ended

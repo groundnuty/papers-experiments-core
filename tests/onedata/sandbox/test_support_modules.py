@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from fake_host import FakeHost
+from sandbox_support import fail_copies
 
 from expcore_onedata.sandbox import earlyoom, gatelog, netpool, reap
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -150,16 +151,13 @@ def dead_run(world):
 
 
 def run_handlers(host):
-    """The root commands the reaper uses, performed on the test's real temporary directory."""
+    """The root commands the reaper uses, performed on the test's real temporary directory (`find`, `cp` and `chown`
+    run for real in the fake host)."""
 
     def test_e(argv):
         return CmdResult(0 if Path(argv[-1]).exists() else 1)
 
-    def find(argv):
-        files = [p for p in Path(argv[1]).rglob("*") if p.is_file()]
-        return CmdResult(0, "".join(f"{p.stat().st_size}\n" for p in files))
-
-    host.run_handlers.update({"test": test_e, "find": find})
+    host.run_handlers.update({"test": test_e})
 
 
 def test_reaping_a_dead_run_copies_checks_and_only_then_removes_the_directory(world, dead_run, tmp_path):
@@ -233,7 +231,7 @@ def test_a_directory_with_a_container_or_a_young_one_is_left_alone(world, dead_r
 
 def test_a_failed_copy_keeps_the_disks_and_reports_not_gone(world, dead_run, tmp_path):
     run_handlers(world.host)
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
+    fail_copies(world.host)
     assert reap.reap_run(world.host, world.s, "login-data", log_dir=tmp_path, outputs=["out"]) is False
     assert dead_run.exists()
 
