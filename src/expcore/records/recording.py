@@ -101,7 +101,8 @@ class RecordingBackend:
 
         The attempt's spend guard, if the campaign installed one, clears the request first and is told what its reply
         reported (`expcore.models.spend`, C26). A request it refuses is this request's failure, a budget hold, which a
-        replay serves again from the record.
+        replay serves again from the record. A reply the endpoint answered, and so billed, but the backend refused to
+        read (`InfraError.billed`) is told to the guard too, so a reply past the reply maximum is never missed (C27).
         """
         try:
             await spend.before_request()
@@ -111,6 +112,9 @@ class RecordingBackend:
             raise
         except Exception as exc:
             self._fail(exc)
+            billed = getattr(exc, "billed", None)
+            if billed is not None:
+                await spend.after_reply(*billed)
             raise
         conversation = self.inner.transcript()
         native = conversation[-1] if conversation else {}

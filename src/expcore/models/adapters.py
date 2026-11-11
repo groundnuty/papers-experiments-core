@@ -232,7 +232,7 @@ class _SdkBackend:
         """Count a reply's usage the moment it arrives, and refuse a reply that carried none: its tokens are unknown."""
         self.usage.note(input_tokens, output_tokens)
         if input_tokens is None and output_tokens is None:
-            raise InfraError("endpoint", "reply carried no usage: its tokens are unknown")
+            raise InfraError("endpoint", "reply carried no usage: its tokens are unknown", billed=(None, None))
 
 
 class OpenAICompatAdapter(_SdkBackend):
@@ -320,7 +320,11 @@ class OpenAICompatAdapter(_SdkBackend):
         self._count(in_tok, out_tok)
         choices = getattr(resp, "choices", None)
         if not isinstance(choices, (list, tuple)) or not choices:
-            raise InfraError("endpoint", f"reply carried no choices ({type(choices).__name__}); usage already counted")
+            raise InfraError(
+                "endpoint",
+                f"reply carried no choices ({type(choices).__name__}); usage already counted",
+                billed=(in_tok, out_tok),
+            )
         choice = choices[0]
         msg = choice.message
         extra = getattr(msg, "model_extra", None) or {}
@@ -500,7 +504,9 @@ class AnthropicAdapter(_SdkBackend):
         self.served.note(resp)
         self._count(in_tok, out_tok)
         if not isinstance(getattr(resp, "content", None), (list, tuple)):
-            raise InfraError("endpoint", "reply carried no content blocks; usage already counted")
+            raise InfraError(
+                "endpoint", "reply carried no content blocks; usage already counted", billed=(in_tok, out_tok)
+            )
         text, calls, reasoning = [], [], []
         thinking_types = ("thinking", "redacted_thinking")
         self.served.note_thinking(any(getattr(b, "type", None) in thinking_types for b in resp.content))

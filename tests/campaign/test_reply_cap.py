@@ -25,6 +25,7 @@ from expcore.config.prices import Price
 from expcore.errors import BudgetHold
 from expcore.models import spend
 from expcore.models.retry import Retrier, RetryPolicy
+from expcore.replay.replay import replay_record
 
 MODEL = "teasel"
 LIMITS = Limits(
@@ -129,20 +130,24 @@ class Endpoint:
     """Stands in for the OpenAI client the core's adapter builds: answers the one-token completion and the probe of
     the reply maximum, with a reply of `long_reply` output tokens and `finish` as its stop reason."""
 
-    def __init__(self, *, long_reply: int, finish: str):
+    def __init__(self, *, long_reply: int, finish: str, run_unreadable: int | None = None):
         self.long_reply, self.finish, self.requests = long_reply, finish, []
+        self.run_unreadable = run_unreadable  # a run's request gets a billed reply of this many tokens and no choices
         self.chat = type("Chat", (), {"completions": type("Completions", (), {"create": self.create})()})()
 
     async def create(self, **request):
         self.requests.append(request)
         tokens, finish = (1, "length") if request["max_tokens"] == 1 else (self.long_reply, self.finish)
+        choices = [{"index": 0, "finish_reason": finish, "message": {"role": "assistant", "content": "1"}}]
+        if self.run_unreadable is not None and request["max_tokens"] > 16:  # neither probe: a run's request
+            tokens, choices = self.run_unreadable, []
         return ChatCompletion.model_validate(
             {
                 "id": "cmpl-1",
                 "object": "chat.completion",
                 "created": 1,
                 "model": "vendor/teasel-1",
-                "choices": [{"index": 0, "finish_reason": finish, "message": {"role": "assistant", "content": "1"}}],
+                "choices": choices,
                 "usage": {"prompt_tokens": 20, "completion_tokens": tokens, "total_tokens": 20 + tokens},
             }
         )
@@ -423,3 +428,31 @@ def test_c27_an_attempt_recorded_by_the_maximum_is_charged_by_the_window_once_th
     mark_unheld(store, MODEL, NOW, "reply_over_maximum", "a reply of 5000 output tokens")
     assert early.assess([], NOW).spent_usd == pytest.approx(UNHELD)
     assert gate_for(store).assess([], NOW).spent_usd == pytest.approx(UNHELD)
+
+
+def test_c27_a_billed_reply_past_the_maximum_that_cannot_be_read_marks_the_model_and_leaves_the_usage_incomplete(
+    tmp_path, endpoint
+):
+    """C27 and C26: a run's request is answered 200 with 5000 output tokens and no choices. The adapter counts the
+    reply and refuses it before the record keeps a turn, so the record's totals miss it: the attempt's usage is
+    incomplete and it is charged its bound, never the 0 its empty totals would give, and the reply past the reply
+    maximum still takes the model off it, so that bound is the window's. The record replays as it was written."""
+    endpoint.update(run_unreadable=5_000)
+    records = []
+
+    async def keeping(request):
+        record = await through_the_adapter(request)
+        records.append(record)
+        return record
+
+    executor = FakeExecutor(default=keeping)
+    with started(tmp_path, default_backend_factory, executor, Budget(max_usd=100.0)) as scheduler:
+        scheduler.run(max_dispatch=1)
+        [attempt] = scheduler.store.q("SELECT state, infra_kind, usage_complete FROM attempts")
+        assert (attempt["state"], attempt["infra_kind"], attempt["usage_complete"]) == ("infra_fail", "endpoint", 0)
+        assert "reply_over_maximum" in event_kinds(scheduler.store)
+        probes = sum(probe_spend.charged(scheduler.store).values())
+        assert scheduler.budget.assess([], NOW).spent_usd == pytest.approx(UNHELD + probes)
+    [record] = records
+    assert record.totals["usage_incomplete"] is True
+    assert replay_record(record).to_json() == record.to_json()

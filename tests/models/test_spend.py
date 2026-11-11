@@ -7,7 +7,7 @@ from loop_support import ScriptedBackend
 
 from expcore.errors import BudgetHold, InfraError
 from expcore.models import spend
-from expcore.models.adapters import ModelTurn
+from expcore.models.adapters import AnthropicAdapter, ModelTurn, OpenAICompatAdapter
 from expcore.models.retry import Retrier, RetryPolicy
 from expcore.records.recording import RecordingBackend
 
@@ -173,3 +173,38 @@ def test_c26_a_request_the_guard_refuses_is_recorded_as_that_requests_failure_a_
 class _Fixed:
     def uniform(self, a, b):
         return a
+
+
+async def _no_sleep(seconds):
+    return None
+
+
+@pytest.mark.parametrize("sdk", ["openai", "anthropic"])
+def test_c27_a_billed_reply_the_adapter_cannot_read_still_tells_the_guard_what_it_reported(
+    sdk, make_spec, limits, completion, message, fake_client
+):
+    """C27 and C26: a 200 that carries usage but no choices, or content that is not a list of blocks, was billed: the
+    adapter counts it and then refuses it, before the recording keeps a turn. The guard is told its counts all the
+    same, so a reply past the reply maximum still takes the model off it."""
+    if sdk == "openai":
+        client = fake_client(completion(choices=False, usage=(900, 5_000)))
+        backend = OpenAICompatAdapter(make_spec(), 7, limits, client=client, sleep=_no_sleep)
+        counted = 900
+    else:
+        reply = message(usage={"input_tokens": 500, "output_tokens": 5_000})
+        reply.content = None
+        client = fake_client(reply, api="anthropic")
+        backend = AnthropicAdapter(make_spec(backend="anthropic"), 7, limits, client=client, sleep=_no_sleep)
+        counted = 500
+    recording = RecordingBackend(backend)
+    recording.begin("", "go", [])
+    guard = Guard()
+
+    async def go():
+        with spend.watching(guard):
+            await recording.step()
+
+    with pytest.raises(InfraError, match="usage already counted"):
+        asyncio.run(go())
+    assert guard.log == [("request",), ("reply", counted, 5_000)]
+    assert recording.failure["kind"] == "infra"

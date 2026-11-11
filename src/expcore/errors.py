@@ -282,9 +282,14 @@ class ContextOverflow(Exception):
 
 
 class InfraError(RuntimeError):
-    """An infrastructure failure of one of the registered kinds, with a short detail that never holds a secret."""
+    """An infrastructure failure of one of the registered kinds, with a short detail that never holds a secret.
 
-    def __init__(self, kind: str, detail: str):
+    `billed` is the (input, output) counts of a reply the endpoint answered, and so billed, before the failure was found
+    in it (a 200 without choices, say): the recording tells the attempt's spend guard of it (C26, C27). None when no
+    reply came back.
+    """
+
+    def __init__(self, kind: str, detail: str, *, billed: tuple[int | None, int | None] | None = None):
         known = infra_kinds()  # one view, for the test and the message alike
         if kind not in known:
             raise ValueError(
@@ -294,6 +299,7 @@ class InfraError(RuntimeError):
         super().__init__(f"{kind}: {detail}")
         self.kind = kind
         self.detail = detail
+        self.billed = billed
 
 
 class BudgetHold(InfraError):
