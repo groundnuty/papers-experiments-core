@@ -23,7 +23,8 @@ by the client's own timeout.
 
 import asyncio
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -109,6 +110,81 @@ def converge[T](
         sleep(poll_s)
 
 
+def bounded_map[K, V](call: Callable[[K], V], keys: Sequence[K], workers: int) -> list[V]:
+    """Call `call` on every key, at most `workers` at once, and return the results in the keys' order.
+
+    One worker calls them in turn on this thread. The first exception any call raises propagates once every call has
+    ended, so nothing is left running behind a failure."""
+    if workers < 1:
+        raise ValueError("a bounded map needs at least one worker")
+    if workers == 1 or len(keys) < 2:
+        return [call(key) for key in keys]
+    with ThreadPoolExecutor(max_workers=min(workers, len(keys))) as pool:
+        futures = [pool.submit(call, key) for key in keys]
+        wait(futures)
+    return [future.result() for future in futures]
+
+
+@dataclass(frozen=True)
+class EachConvergence:
+    """How a convergence over many items went: whether every item settled, the items that did not, the last value
+    read of each, and how many polls were taken."""
+
+    converged: bool
+    pending: tuple[Any, ...]
+    values: dict[Any, Any]
+    polls: int
+
+
+def converge_each[K, T](
+    keys: Iterable[K],
+    read: Callable[[K], T],
+    matches: Callable[[T], bool],
+    *,
+    timeout_s: float,
+    poll_s: float,
+    consecutive: int = 2,
+    workers: int = 1,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> EachConvergence:
+    """Poll many items together until each matches on `consecutive` polls in a row, or `timeout_s` passes (O07).
+
+    Each poll reads every item not settled yet, at most `workers` at once; an item that matched on `consecutive`
+    polls in a row is settled and not read again. A read that raises `PlatformError` does not match and starts that
+    item's count over; any other exception is a defect and propagates. With items left at the bound the result is
+    `converged=False` with them pending: nothing is guessed."""
+    guard()
+    if consecutive < 1 or timeout_s < 0 or poll_s <= 0:
+        raise ValueError("converge_each needs consecutive >= 1, a non-negative timeout and a positive poll interval")
+    runs = dict.fromkeys(dict.fromkeys(keys), 0)
+    values: dict[Any, Any] = {}
+    began, polls = clock(), 0
+
+    def poll(key: K) -> tuple[bool, Any]:
+        try:
+            value = read(key)
+        except PlatformError:
+            return False, None
+        return matches(value), value
+
+    while True:
+        pending = [key for key, run in runs.items() if run < consecutive]
+        if not pending:
+            return EachConvergence(True, (), values, polls)
+        polls += 1
+        for key, (hit, value) in zip(pending, bounded_map(poll, pending, workers), strict=True):
+            runs[key] = runs[key] + 1 if hit else 0
+            if value is not None:
+                values[key] = value
+        if all(runs[key] >= consecutive for key in pending):
+            return EachConvergence(True, (), values, polls)
+        if clock() - began >= timeout_s:
+            left = tuple(key for key, run in runs.items() if run < consecutive)
+            return EachConvergence(False, left, values, polls)
+        sleep(poll_s)
+
+
 def transfer_state(record: Any) -> str:
     """Return the state a transfer record reports, or "unknown" when it names none of the known fields."""
     if isinstance(record, dict):
@@ -146,27 +222,32 @@ def wait_transfers(
     *,
     timeout_s: float,
     poll_s: float,
+    workers: int = 1,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> TransferReport:
     """Poll each transfer until it has ended, or `timeout_s`. An ended transfer is a report, not evidence of placement.
 
     A transfer the provider does not show yet (`answered_absent`: a 404 or 400 posix enoent) is pending, like a running
-    one. Any other failure, another 400 included, propagates at once.
+    one. Any other failure, another 400 included, propagates at once. Each poll reads the pending transfers at most
+    `workers` at once.
     """
     guard()
     pending = list(dict.fromkeys(transfer_ids))
     ended: dict[str, dict[str, Any]] = {}
     began = clock()
+
+    def read(tid: str) -> Any:
+        try:
+            return client.get(f"/transfers/{tid}", provider=provider)
+        except PlatformError as error:
+            if not answered_absent(error):
+                raise
+            return None
+
     while pending:
-        for tid in list(pending):
-            try:
-                record = client.get(f"/transfers/{tid}", provider=provider)
-            except PlatformError as error:
-                if not answered_absent(error):
-                    raise
-                continue
-            if transfer_state(record) in ENDED_STATES:
+        for tid, record in zip(list(pending), bounded_map(read, list(pending), workers), strict=True):
+            if record is not None and transfer_state(record) in ENDED_STATES:
                 ended[tid] = record
                 pending.remove(tid)
         if not pending or clock() - began >= timeout_s:

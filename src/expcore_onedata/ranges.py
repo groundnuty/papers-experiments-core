@@ -56,14 +56,17 @@ def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_em
     provider the files and bytes asked for, the bytes read, what was held before and after, and the polls it took.
     """
     rows = list(rows)
+    where = provisioner.where
     if not rows:
-        raise ProvisionError("no ranges were declared to place")
+        raise ProvisionError(f"{where}no ranges were declared to place")
+    if any(row.space != provisioner.space.label for row in rows):
+        raise ProvisionError(f"{where}a row lies in another space than the provisioner's; nothing was read")
     provisioner.verify_space()
-    entries = {row.file: provisioner.resolve(row.file) for row in rows}
+    entries = provisioner.resolve_many(row.file for row in rows)  # one listing of each directory, not one per file
     for row in rows:
         size = entries[row.file].size
         if any(offset + length > size for offset, length in row.ranges):
-            raise ProvisionError("a declared range lies beyond the end of its file; nothing was read")
+            raise ProvisionError(f"{where}a declared range lies beyond the end of its file; nothing was read")
     providers = list(dict.fromkeys(row.provider for row in rows))
     record: dict[str, Any] = {"providers": {}}
     for provider in providers:
@@ -73,7 +76,7 @@ def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_em
         provisioner.await_visible(provider, wanted)
         before = provisioner.holds(provider, wanted)
         if start_empty and before:
-            raise NotPlaced(f"the provider already holds {before} B of the files, so it does not start empty")
+            raise NotPlaced(f"{where}the provider already holds {before} B of the files, so it does not start empty")
         read = 0
         for row in mine:
             for offset, length in _chunks(row.ranges, provisioner.settings.chunk_bytes):
@@ -92,7 +95,7 @@ def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_em
         }
         if not confirmation.placed:
             raise NotPlaced(
-                f"the reads returned {read} B but the block map is {confirmation.report.bytes_short} B short",
+                f"{where}the reads returned {read} B but the block map is {confirmation.report.bytes_short} B short",
                 confirmation.report,
             )
     return record

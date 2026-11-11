@@ -37,12 +37,13 @@ Reads and mutations are separate calls:
 
 **The space of a file.** Onedata 25.0 gives a file no path and no space attribute, so the gate walks the file's
 parent links: `GET /data/{id}?attribute=parent_id` through the provider the request is for, from the file up, until it
-meets the root of a space the configuration knows (`[space] id`, whose root is the `fileId` of the provider's
-`GET /spaces/{id}`). The root itself needs no parent read. A walk that reaches the top of a tree (a null parent) without
+meets the root of a space the configuration knows (`[space] id`, or each `[[spaces]]` entry's, whose root is the
+`fileId` of the provider's `GET /spaces/{id}`; a space the provider answers absent is not among them). The root itself
+needs no parent read. A walk that reaches the top of a tree (a null parent) without
 meeting a known root, or that has followed `MAX_SPACE_DEPTH` links without meeting one (a cycle among them), resolves to
 no space (`OutOfScope`). The space is never decoded from the file's id: that encoding is undocumented and may change
 between releases. A file's space does not change, so what a walk read is kept, each fact as the provider that gave it,
-never another's: each provider's root of the space, kept once it answered, and the parent links a walk read, kept only
+never another's: each provider's root of each space, kept once it answered, and the parent links a walk read, kept only
 once the walk reached a known root, at most `MAX_KEPT_LINKS` of them (least recently used dropped first), all dropped
 by `close()`. A walk that failed or was refused keeps no link, so a later request walks again. A file moved within the
 space keeps its space, so a link it left behind still leads to the right root; but a directory moved up keeps its old,
@@ -73,7 +74,8 @@ deployments of record run, on the Compose federation of `deploy/compose-federati
 `day0/2026-11-10-federation-facts.md`, which says which fact a test showed and which a direct read (an eviction's
 record was read directly, since no live test ran one), `day0/2026-11-10-federation-facts-parent-walk.md`, the run
 after the gate's walk by parent links, with the reads that walk rests on and the posix answers of 25.0, and
-`day0/2026-11-11-federation-facts-posix-and-fuse.md`, the run after the core read those answers.
+`day0/2026-11-11-federation-facts-posix-and-fuse.md`, the run after the core read those answers, and
+`day0/2026-11-11-federation-facts.md`, the direct reads of a transfer's record and of a directory's eviction.
 
 - Authentication: the header `X-Auth-Token` with an access token. Confirmed by [S2].
 - `get`: `GET /spaces/{space}/users/{user}/privileges` and `GET /spaces/{space}/effective_users/{user}/privileges`; the
@@ -110,12 +112,22 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   clock), and a record's `type`, provider ids and times (epoch seconds), for a replication and an eviction, are
   confirmed by [L1], which also shows the eviction counter named `filesEvicted` and the state `transferStatus`, as
   [S11] reads them.
+- The reset (`reset.py`, `eviction.py`) sends a `POST /transfers` eviction of a directory, which covers every file
+  under it, confirmed by [L1] (`day0/2026-11-11-federation-facts.md`: the mirror's block map of a file in the directory
+  was empty once the directory's eviction ended). Its other calls no source sends and no live run has made yet, named
+  only by Oneprovider 25.0's REST description, so each is in `UNVERIFIED_ENDPOINTS`: `GET /data/{id}/qos/summary`
+  (answer `requirements`, keyed by requirement id), `GET` and `DELETE /qos_requirements/{qid}` (answer `fileId`), `POST
+  /qos_requirements` (body `fileId`, `expression`; a live test's only) and `DELETE /transfers/{id}` (a cancel: 204, or
+  400 for a job that has ended). A cancel's and a removal's space is read from the record right before the mutation:
+  a transfer's `spaceId`, which [L1] shows in a record, or the space of a requirement's `fileId`, found by its parent
+  links (`_record_space`).
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
 which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
-[L1] confirms; it is empty, since [L1] confirmed every such call the layer still makes. A call [L1] confirmed keeps its
-live contract test (`tests/live/test_contract.py`), which fails if a deployment answers otherwise.
+[L1] confirms: only the reset's QoS calls and its cancel, since [L1] confirmed every other call the layer makes. Each
+entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
+deployment answers otherwise.
 """
 
 import base64
@@ -146,8 +158,34 @@ READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_acc
 # What no source and no live run confirms, or a live run refuted: (method, path, what). Each has a test in
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
-# their live tests stay, so a later release that answers otherwise fails.
-UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = ()
+# their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
+# live run has made yet.
+UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
+    (
+        "DELETE",
+        "/transfers/{id}",
+        "a provider call: the cancel of a transfer that has not ended, answered 204, and 400 for one that has; named "
+        "only by the provider's API description (25.0), which the reset's transfer stage relies on",
+    ),
+    (
+        "GET",
+        "/data/{id}/qos/summary",
+        "a provider call: the requirements on an entry and its ancestors, keyed by requirement id under requirements, "
+        "which the reset's QoS stage lists; named only by the provider's API description (25.0)",
+    ),
+    (
+        "GET",
+        "/qos_requirements/{qid}",
+        "a provider call: a requirement's fileId, which the gate of its removal resolves its space by; named only by "
+        "the provider's API description (25.0)",
+    ),
+    (
+        "DELETE",
+        "/qos_requirements/{qid}",
+        "a provider call: the removal of a requirement, answered 204, after which reading it answers that it is not "
+        "there; named only by the provider's API description (25.0)",
+    ),
+)
 # The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that
 # loop, resolve to no space: the walk is bounded in requests, and a study's tree is far shallower.
 MAX_SPACE_DEPTH = 64
@@ -281,17 +319,29 @@ def _parent_link(answer: Any) -> str | None:
 def _file_target(method: str, path: str, body: Any) -> str | None:
     """Return the file id a request acts on, or None when its path names no file.
 
-    A file is named by `/data/{id}` or what is below it, or, for a transfer job, by the `fileId` in the body of a POST
-    to `/transfers`. Anything else (`/lookup-file-id/..`, `/replicas-id/..`, a transfer cancel) names none and is
-    refused by the caller, since nothing maps it to a space.
+    A file is named by `/data/{id}` or what is below it, or, for a transfer job or a QoS requirement, by the `fileId`
+    in the body of a POST to `/transfers` or `/qos_requirements`. Anything else (`/lookup-file-id/..`,
+    `/replicas-id/..`) names none and is refused by the caller, since nothing maps it to a space; a transfer's cancel
+    and a requirement's removal are resolved through their records (`_record_target`).
     """
     parts = _plain(path)
     if len(parts) >= 3 and parts[1] == "data" and "" not in parts[2:-1]:
         return parts[2] if _FILE_ID.fullmatch(parts[2]) else None
-    if method == "POST" and path == "/transfers" and isinstance(body, dict):
+    if method == "POST" and path in ("/transfers", "/qos_requirements") and isinstance(body, dict):
         file_id = body.get("fileId")
         return file_id if isinstance(file_id, str) and _FILE_ID.fullmatch(file_id) else None
     return None
+
+
+def _record_target(method: str, path: str) -> tuple[str, str] | None:
+    """Return `(kind, id)` for a DELETE of a transfer (its cancel) or of a QoS requirement (its removal), whose space
+    only its record names; None for any other request. An id that is not one plain segment resolves to no space."""
+    parts = _plain(path)
+    if method != "DELETE" or len(parts) != 3 or parts[1] not in ("transfers", "qos_requirements"):
+        return None
+    if not _FILE_ID.fullmatch(parts[2]):
+        raise OutOfScope("the target record's id is not a plain id, so it resolves to no space; nothing was sent")
+    return parts[1], parts[2]
 
 
 class OnezoneClient:
@@ -490,27 +540,39 @@ class OnezoneClient:
     def _space_roots(self, provider: str) -> dict[str, str]:
         """Return root file id -> space id for the spaces the configuration knows, their roots as `provider` gives them.
 
-        A root is the `fileId` of the provider's `GET /spaces/{id}`, read once per provider and kept once it was
-        answered. An absence (`answered_absent`) is a space the provider does not hold, which resolves to no space
-        (OutOfScope); any other failure, or an answer without a plain id, raises PlatformError and keeps nothing."""
-        space_id = self._config.space.id
+        Every declared space is asked for (`[[spaces]]`, or the one `[space]`), so a file resolves to its own space
+        whichever it is, and a caller bound to one space can refuse a file of another (`_require_in_scope`). A root is
+        the `fileId` of the provider's `GET /spaces/{id}`, read once per provider and kept once it was answered. An
+        absence (`answered_absent`) is a space the provider does not hold, left out; when the provider holds none of
+        them, the target resolves to no space (OutOfScope). Any other failure, or an answer without a plain id, raises
+        PlatformError and keeps nothing of that space."""
+        roots: dict[str, str] = {}
+        for space_id in dict.fromkeys(entry.space.id for entry in self._config.spaces):
+            root = self._space_root(provider, space_id)
+            if root is not None:
+                roots[root] = space_id
+        if not roots:
+            raise OutOfScope("the configured space is unknown to that provider, so the target resolves to no space")
+        return roots
+
+    def _space_root(self, provider: str, space_id: str) -> str | None:
+        """Return one declared space's root file id on a provider, kept once answered; None when it answers absent."""
         with self._walk_lock:
             root = self._roots.get((provider, space_id))
-        if root is None:
-            try:
-                answer = self._send("GET", f"/spaces/{space_id}", provider=provider, headers=self._admin)
-            except PlatformError as error:
-                if answered_absent(error):
-                    raise OutOfScope(
-                        "the configured space is unknown to that provider, so the target resolves to no space"
-                    ) from None
-                raise
-            root = answer.get("fileId") if isinstance(answer, dict) else None
-            if not isinstance(root, str) or not _FILE_ID.fullmatch(root):
-                raise PlatformError(f"{self.provider_label(provider)}: the space's answer holds no plain root file id")
-            with self._walk_lock:
-                self._roots[(provider, space_id)] = root
-        return {root: space_id}
+        if root is not None:
+            return root
+        try:
+            answer = self._send("GET", f"/spaces/{space_id}", provider=provider, headers=self._admin)
+        except PlatformError as error:
+            if answered_absent(error):
+                return None
+            raise
+        root = answer.get("fileId") if isinstance(answer, dict) else None
+        if not isinstance(root, str) or not _FILE_ID.fullmatch(root):
+            raise PlatformError(f"{self.provider_label(provider)}: the space's answer holds no plain root file id")
+        with self._walk_lock:
+            self._roots[(provider, space_id)] = root
+        return root
 
     def _kept_parent(self, provider: str, node: str) -> str | None:
         """The parent link this provider gave for a file in an earlier walk, marked as just used; None if not kept."""
@@ -616,8 +678,31 @@ class OnezoneClient:
         space's name, read afresh (`space_name`), so a space renamed since an earlier call changes the answer (O09)."""
         return self.space_name(self.file_space_id(file_id, provider))
 
+    def _record_space_name(self, kind: str, record_id: str, provider: str | None) -> str:
+        """Return the name of the space a transfer or a QoS requirement acts in, read now from its record through the
+        provider the request goes to: a transfer's `spaceId`, resolved by Onezone, or a requirement's `fileId`, whose
+        space its parent links give (`file_space_name`). The record is never kept. A record the provider answers absent
+        (`answered_absent`), or one without the field, raises OutOfScope; any other failure of the read propagates. A
+        transfer's `spaceId` is confirmed by [L1]; a requirement's record is not (`UNVERIFIED_ENDPOINTS`)."""
+        if provider is None:
+            raise OutOfScope(
+                "the mutation names a record but no provider, so it resolves to no space; nothing was sent"
+            )
+        try:
+            record = self._send("GET", f"/{kind}/{record_id}", provider=provider, headers=self._admin)
+        except PlatformError as error:
+            if answered_absent(error):
+                raise OutOfScope("the target record is unknown to its provider, so it resolves to no space") from None
+            raise
+        key = "spaceId" if kind == "transfers" else "fileId"
+        value = record.get(key) if isinstance(record, dict) else None
+        if not isinstance(value, str) or not value:
+            raise OutOfScope(f"the target record holds no {key}, so it resolves to no space; nothing was sent")
+        return self.space_name(value) if kind == "transfers" else self.file_space_name(value, provider)
+
     def _target_name(self, method: str, path: str, provider: str | None, body: Any) -> str:
-        """Return the name of the space a request acts on: the space in its path, or the space of the file it names.
+        """Return the name of the space a request acts on: the space in its path, the space of the file it names, or
+        the space its transfer's or QoS requirement's record names.
 
         A read made for it that fails is refused as not sent (ScopeUnread), keeping that read's status, error id and
         transport flag; a target that resolves to no space stays OutOfScope."""
@@ -625,6 +710,9 @@ class OnezoneClient:
         try:
             if len(parts) >= 3 and parts[1] == "spaces":
                 return self.space_name(_target_space_id(path))
+            record = _record_target(method, path)
+            if record is not None:
+                return self._record_space_name(*record, provider)
             file_id = _file_target(method, path, body)
             if file_id is None or provider is None:
                 raise OutOfScope(
@@ -661,10 +749,11 @@ class OnezoneClient:
     ) -> Any:
         """Send a request that can change state; refuse it, before it is sent, unless it acts on a study space.
 
-        The target is the space id in the path, or the file the path or the body of a transfer job names. The space id
-        is resolved to a name by a read on Onezone made for this mutation alone; the caller names no space and no
-        name, and no earlier answer is reused. The mutation is refused unless that name starts with a configured
-        prefix, and when the request names no space and no file.
+        The target is the space id in the path, the file the path or the body of a transfer job or QoS requirement
+        names, or, for a transfer's cancel or a requirement's removal, the space its record names. The space id is
+        resolved to a name by a read on Onezone made for this mutation alone; the caller names no space and no name,
+        and no earlier answer is reused. The mutation is refused unless that name starts with a prefix of a declared
+        space, and when the request names no space, no file and no such record.
 
         It is sent with the admin credential, or as `token` when one is given: day-0 sends a write as a data-path token
         to see it refused. The gate applies either way, and is resolved with the admin credential. A raw body

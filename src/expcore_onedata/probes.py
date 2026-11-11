@@ -48,7 +48,7 @@ from typing import Any
 
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.placement import Range, held_bytes, merged, uncovered
-from expcore_onedata.provision import Provisioner
+from expcore_onedata.provision import Listings, Provisioner
 from expcore_onedata.transferlog import MAX_LISTED, PAGE_LIMIT, TransferLog
 from expcore_onedata.transferwindow import Window, split_gained
 
@@ -189,6 +189,12 @@ class PlatformProbes:
         transfer listing, and past `max_listed` distinct ids the listing is unknown.
         """
         self._client, self._provisioner = client, provisioner
+        # One instrument per space: with several declared, each has a namespace of its own (`platform_probes_space1`
+        # for spaces[1]) and its snapshot names its space by position; one space keeps the namespace it always had.
+        several = bool(provisioner.where)  # a position starts every message only when several spaces are declared
+        index = provisioner.space.position.removeprefix("spaces[").removesuffix("]")
+        self.namespace = f"{NAMESPACE}_space{index}" if several else NAMESPACE
+        self._space = provisioner.space.position if several else None
         positions: dict[str, int] = {}
         for index, path in enumerate(files.values()):  # one file tracked twice would count its gained bytes twice
             if path in positions:
@@ -215,27 +221,30 @@ class PlatformProbes:
         settings = self._provisioner.settings
         return run_probe(read, attempts=settings.probe_attempts, backoff_s=settings.probe_backoff_s, sleep=self._sleep)
 
-    def _file_id(self, path: str) -> ProbeResult:
+    def _file_id(self, path: str, listings: Listings) -> ProbeResult:
         """Resolve a path to its entry; a path that is no longer there is a failed probe, not an exception.
 
         The read does not wait: the provisioner's wait for a new space root would retry a real 404 inside one attempt,
         out of sight of the probe (O08). The only retry is the probe's own, of a network reset, and it is counted.
+        `listings` is the reading's cache: a directory listed for one tracked file is not listed again for the next,
+        and a listing that failed is not in it, so the next file's probe reads it afresh.
         """
 
         def read() -> Any:
             try:
-                return self._provisioner.resolve(path, wait=False)
+                return self._provisioner.resolve(path, wait=False, listings=listings)
             except KeyError:
                 raise PlatformError("the tracked file is not in the space", status=404) from None
 
         return self._probe(read)
 
     def _read_maps(self) -> tuple[dict[str, ProbeResult], dict[str, dict[str, ProbeResult]]]:
-        """Read every tracked file's entry and each tracked provider's block map of it."""
+        """Read every tracked file's entry, listing each directory once, and each tracked provider's block map of it."""
         entries: dict[str, ProbeResult] = {}
         maps: dict[str, dict[str, ProbeResult]] = {}
+        listings: Listings = {}
         for label, path in self._files.items():
-            entries[label] = entry = self._file_id(path)
+            entries[label] = entry = self._file_id(path, listings)
             maps[label] = {}
             for provider in self._providers:
                 if entry.ok:
@@ -334,6 +343,7 @@ class PlatformProbes:
         gained = {p: row["gained_bytes"] for p, row in pair_totals.items()}
         return {
             "version": VERSION,
+            **({} if self._space is None else {"space": self._space}),  # its position, with several spaces only
             "ok": ok,
             "providers": list(self._providers),
             "seconds": None if self._started is None else round(self._now() - self._started, 3),
