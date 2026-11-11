@@ -168,11 +168,16 @@ are not run against it here.
 measure (`<date>-federation-facts.md`): releases, live test results, the fault test, what listens on the host, the
 commands' timings and what is unknown. A new facts file starts from `day0/federation-facts.template.md`: its
 deployment table is what `describe` prints (the layout, the root's parent, each service's memory limit), and its
-memory table holds each service's peak as `memory` and down read it.
+memory table holds each service's peak as `memory` and down read it. A later run on the same date adds its own facts
+file, named by what it measured again (`<date>-federation-facts-<what>.md`), and leaves the earlier one as it was.
 
-Two scripts measure what the facts file records. `measure_partial_file.py` measures how a file at its final size with
-only a prefix written reads back through each provider. `measure_transfer_shapes.py` records, as field names and types
-with no value, the calls a per-run reset depends on: an eviction's request and answer, an ended transfer's record, the
-space's transfer listing by state with its paging, and whether evicting a directory empties what a mirror holds of
-the files in it. Both take `--layout PATH`, work in the study space through scratch files they remove, and print one
-JSON line per step.
+Scripts beside it measure what the facts files record. `measure_partial_file.py` measures how a file at its final
+size with only a prefix written reads back through each provider. `measure_transfer_shapes.py` records, as field names
+and types with no value, the calls a per-run reset depends on: an eviction's request and answer, an ended transfer's
+record, the space's transfer listing by state with its paging, and whether evicting a directory empties what a mirror
+holds of the files in it. `measure_dir_distribution.py` reads the space root's distribution through each provider,
+compares it with the sum of its files' physical sizes across a placement and an eviction, and times one file's
+distribution read. `measure_granularity_and_eviction.py` records what one range read through the study space's first
+mirror places there, and whether an eviction empties it again; `measure_read_windows.py`, built on it, what a read
+places when it starts inside bytes already held, is longer than 1 MiB, or follows another. Each takes `--layout PATH`,
+works in the study space and leaves it as it found it, and prints one JSON line per step.
