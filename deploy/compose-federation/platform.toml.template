@@ -1,0 +1,18 @@
+# platform.toml of the Compose federation, rendered by federation.py into the federation's root at every up and reset.
+#
+# Written by a fresh tester from docs/study-guide.md, docs/interfaces.md and facts.json alone (U5, #29), then made a
+# template: each @...@ is filled from facts.json, since the ids are new at every up. Every path is relative to the
+# root, where the CA and the secrets are. No tool server and no sandbox images exist here, so neither table is set.
+zone = { name = "zone", url = "@zone_url@" }
+providers.pine = { url = "@provider_url.pine@", id = "@provider_id.pine@" }
+providers.birch = { url = "@provider_url.birch@", id = "@provider_id.birch@" }
+providers.cedar = { url = "@provider_url.cedar@", id = "@provider_id.cedar@" }
+space = { name = "@space_name@", id = "@space_id.alpha-space@", prefixes = ["alpha-"] }
+support = { providers = ["pine", "birch", "cedar"], local = "pine" }
+credentials.admin = { file = "secrets/admin.token" }
+credentials.users = { directory = "secrets/users", pattern = "{user}.pass" }
+principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-reader@" }
+principals.toolserver = { username = "alpha-tools", user_id = "@user_id.alpha-tools@" }
+principals.service = { username = "alpha-health", user_id = "@user_id.alpha-health@" }
+tls = { ca_file = "ca/federation-ca.pem" }
+placement = { holder = "pine" }

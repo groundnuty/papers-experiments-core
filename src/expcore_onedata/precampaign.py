@@ -3,10 +3,10 @@
 
 The data gate streams only a file's content, an answer of 200 or 206 from the content endpoint typed
 `application/octet-stream` (`sandbox/gateboundary.py`); every other answer it buffers whole, up to 4 MiB, and refuses
-above that. That a provider answers a file's content with that type is unconfirmed (`client.UNVERIFIED_ENDPOINTS`): if
-it is wrong, every read over 4 MiB in a REST condition is refused mid-campaign and its run set aside, so the failures
-cluster in one condition. So before the first run the type is measured, and a campaign whose REST reads would be cut is
-refused instead of run.
+above that. Onedata 25.0 answers a file's content with that type (`[L1]` in `client.py`), but a deployment of another
+release may not: if it does not, every read over 4 MiB in a REST condition is refused mid-campaign and its run set
+aside, so the failures cluster in one condition. So before the first run the type is measured, and a campaign whose
+REST reads would be cut is refused instead of run.
 
 `content_type_check` reads the provisioned file `[sandbox] content_check_file` through the agent's local provider, the
 one the gate forwards to: whole, which must be answered 200, and its first byte by range, which must be answered 206,
