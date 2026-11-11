@@ -1,5 +1,5 @@
 # Provenance: new
-"""The platform's instrument of the bytes a run's agent read through its data path (O20).
+"""The platform's instrument of the bytes a run's agent read through its data path (O22).
 
 `ServedBytes(sandbox)` is an `Instrument` (namespace `served_bytes`) a study's executor builds for each run, once
 `SandboxPlatform.launch` has yielded the run's sandbox, and runs with the others: `start_instruments` before

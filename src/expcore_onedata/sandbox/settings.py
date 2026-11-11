@@ -49,11 +49,11 @@ extra_args = []                 # further oneclient arguments, never one that ch
 <level> = "rest"                # the kind alone; a rest level then pages its listings as the server does
 <level> = { kind = "rest", listing = "complete" }  # or a table: a rest level's listing, "paged" or "complete"
 
-[sandbox.served_bytes]          # optional: how much a run's tables of the bytes served list (gatelog.Caps, O20)
+[sandbox.served_bytes]          # optional: how much a run's tables of the bytes served list (gatelog.Caps, O22)
 max_files = 1000                # files, the first read; max_directories = 1000; max_ranges_per_file = 64
 ```
 
-`listing` is a REST data path's option (O19): `paged`, the default, passes the server's page of a listing as it comes,
+`listing` is a REST data path's option (O21): `paged`, the default, passes the server's page of a listing as it comes,
 and `complete` has the data gate answer every listing with all of the directory's entries (`gatepolicy`). It is refused
 on a mount or no data path, where no gate serves a listing. A study selects it per condition through the level the
 condition gives its `data_path` factor. The run's metadata records it (`listing`), and so does the campaign fingerprint
@@ -155,7 +155,7 @@ class SandboxSettings:
     content_check_file: str | None = None  # the file the pre-campaign check reads (`precampaign.py`)
     tls: TlsSettings = field(default_factory=TlsSettings)  # the platform's [tls]: the gate's upstream and oneclient
     listings: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))  # rest level -> its listing
-    served_caps: Caps = DEFAULT_CAPS  # [sandbox.served_bytes]: the bounds of a run's tables of the bytes served (O20)
+    served_caps: Caps = DEFAULT_CAPS  # [sandbox.served_bytes]: the bounds of a run's tables of the bytes served (O22)
     served_caps_declared: bool = False  # the table is in the file: its caps are in the campaign fingerprint (C06)
 
     def mode_of(self, level: str) -> DataPathMode:
@@ -165,7 +165,7 @@ class SandboxSettings:
         return self.data_paths[level]
 
     def listing_of(self, level: str) -> str | None:
-        """The listing mode of a level (O19): `paged` or `complete` for a REST data path, None for any other."""
+        """The listing mode of a level (O21): `paged` or `complete` for a REST data path, None for any other."""
         if self.mode_of(level) is not DataPathMode.REST:
             return None
         return self.listings.get(level, PAGED)
@@ -250,7 +250,7 @@ def _limits(section: Section) -> Limits:
 
 
 def _served_caps(section: Section) -> Caps:
-    """Read [sandbox.served_bytes] (O20): each cap a whole number of at least 1, the default where none is declared."""
+    """Read [sandbox.served_bytes] (O22): each cap a whole number of at least 1, the default where none is declared."""
     keys = tuple(f.name for f in fields(Caps))
     section.reject_unknown(keys)
     return Caps(
@@ -317,7 +317,7 @@ def _data_path(section: Section, level: str, position: int) -> tuple[DataPathMod
 
 def _data_paths(section: Section) -> tuple[Mapping[str, DataPathMode], Mapping[str, str]]:
     """Read [sandbox.data_paths]: level of the study's factor -> mount, rest or none, and each REST level's listing mode
-    (O19), `paged` unless its entry names `complete`."""
+    (O21), `paged` unless its entry names `complete`."""
     modes, listings = {}, {}
     for position, level in enumerate(section.data):  # a level is the study's word: it is named by position, not echoed
         modes[level], listing = _data_path(section, level, position)

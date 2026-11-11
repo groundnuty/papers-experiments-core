@@ -16,7 +16,7 @@ the upstream. Configuration: JSON at the path in argv[1]:
                         "port": 443, "tls": true}},
    "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
 
-`listing` is the data path's listing mode (gatepolicy, O19), `paged` when absent; a gate given another refuses to
+`listing` is the data path's listing mode (gatepolicy, O21), `paged` when absent; a gate given another refuses to
 start. In `complete` the gate answers a listing with all of the directory's entries as one page, which it merges from
 the pages it reads upstream (`Handler._complete_listing`): each page passes the response boundary as any answer that is
 no file's content does, the merged answer is checked once more before any byte of it goes, and a listing it cannot
@@ -54,7 +54,7 @@ TLS context and the log.
 Every line the handler of a client connection logs carries that connection's `conn` (unique in this process), and a request's line carries
 `req_headers`: the few request headers that say what client it was (REQ_HEADERS_LOGGED), never any other. A response's line says what its body was
 (`body`): `content` (the platform's 200 or 206 to a read of a file's content), `listing` (its 200 to a listing, or the merged answer), `other` (any other
-answer of the platform's, passed on) or `gate` (the gate's own answer: a refusal, an error); the per-run count of the bytes served reads it (gatelog, O20). A 206 of a file's content
+answer of the platform's, passed on) or `gate` (the gate's own answer: a refusal, an error); the per-run count of the bytes served reads it (gatelog, O22). A 206 of a file's content
 also carries the platform's `Content-Range` (`content_range`), which says where in the file its bytes begin, for the count per file. A request's `host` is the role the
 gate serves that host in (`onezone`, `oneprovider`), or `not_configured`, never the host's configured name (O12). When a connection ends after a response without a
 request following, one `conn_close` event line says how (see `Handler._peer_gone`), with the kernel's counters of that connection at that moment: a response's
@@ -130,7 +130,7 @@ UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split bet
 # How many answers the gate buffers at once (O05): an answer that is no file content is read whole, up to
 # gateboundary.BUFFER_CAP (4 MiB), and checked before it goes. At most 16 such buffers are held, 64 MiB, and a check
 # holds about four times its buffer at its peak (the raw bytes, a decoded layer, the next, a projection): 256 MiB. A
-# complete listing (O19) reads each page in one of these slots, and one listing at a time is merged (_LISTING_SLOT),
+# complete listing (O21) reads each page in one of these slots, and one listing at a time is merged (_LISTING_SLOT),
 # into at most gatepolicy.COMPLETE_LISTING_BYTES (64 MiB) of entries and tokens: its pieces, the merged answer and the
 # check of it, about 6 x 64 = 384 MiB at the peak, and a 16-byte digest of each entry and token in a set, about 100
 # bytes each with the set's own, 22 MB for the 220,000 entries 64 MiB holds. Together about 660 MiB, under the gate's
@@ -395,14 +395,14 @@ def _checked(resp: http.client.HTTPResponse, seen: dict) -> http.client.HTTPResp
 
 
 TLS_RECORD = 16384  # the most plaintext one TLS record carries: a client reads a record whole or not at all
-# a complete listing's answer (O19): the pages' entries in one list, which is the last page and points to none
+# a complete listing's answer (O21): the pages' entries in one list, which is the last page and points to none
 _MERGED_HEAD, _MERGED_JOIN, _MERGED_TAIL = b'{"children": [', b", ", b'], "isLast": true, "nextPageToken": null}'
 _MERGED_HEADERS = [("Content-Type", "application/json")]
 
 
 def _body_kind(tag: str | None, status: int) -> str:
     """What a body of the platform's that the gate passes on is, for its line (`body`) and the count of the bytes served
-    (gatelog, O20): a file's content, a listing, or anything else."""
+    (gatelog, O22): a file's content, a listing, or anything else."""
     if tag == "content" and status in (200, 206):
         return "content"
     if tag == "children" and status == 200:
@@ -605,7 +605,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_response_only(self, code, message=None) -> None:
         """A response's head begins, the final one after a `100 Continue` included: nothing is body until its headers
-        are all written (`end_headers`), so a head whose write fails is never counted as body bytes (O20)."""
+        are all written (`end_headers`), so a head whose write fails is never counted as body bytes (O22)."""
         self._w.mark = None
         super().send_response_only(code, message)
 
@@ -639,7 +639,7 @@ class Handler(BaseHTTPRequestHandler):
             rec["body_bytes_unconfirmed"] = max(total - body, in_body)
         _log(rec)
         # Only now, with the line written: a teardown that reads this connection between the response and its line
-        # sees the request still outstanding (`in_request`), so the count is unknown rather than a zero (O20).
+        # sees the request still outstanding (`in_request`), so the count is unknown rather than a zero (O22).
         if "conn_request" in rec:
             self._last_logged = rec["conn_request"]
 
@@ -647,7 +647,7 @@ class Handler(BaseHTTPRequestHandler):
         """Count a request this connection is about to answer, before anything is written; False, with the connection
         to close unanswered, once the server's stop has begun. The stop sets its flag before it reads the connections,
         so a request is either counted in time for the teardown to see it outstanding, or answered with nothing at all:
-        no answer can go out unseen between the teardown's reading and its `teardown_complete` line (O20)."""
+        no answer can go out unseen between the teardown's reading and its `teardown_complete` line (O22)."""
         self._served += 1
         stopping = getattr(self.server, "stopping", None)
         if stopping is not None and stopping.is_set():
@@ -819,7 +819,7 @@ class Handler(BaseHTTPRequestHandler):
             rec.update(decision="deny", reason="host not allowed", status=403)
             self._answer(rec, 403, {"error": {"id": "forbidden", "details": "host not allowed"}})
             return
-        listing = CFG.get("listing", gatepolicy.PAGED)  # a listing's limit: O05; its mode: O19
+        listing = CFG.get("listing", gatepolicy.PAGED)  # a listing's limit: O05; its mode: O21
         dec = gatepolicy.decide(hcfg["role"], self.command, url.path, url.query, body, listing=listing)
         rec.update(decision="allow" if dec.allow else "deny", reason=dec.reason, tag=dec.tag)
         if not dec.allow:
@@ -948,7 +948,7 @@ class Handler(BaseHTTPRequestHandler):
         if passed is None:
             return
         token, kind = CFG.get("token"), _body_kind(rec.get("tag"), resp.status)
-        if kind == "content" and resp.status == 206:  # where in the file its bytes begin, as the platform says (O20)
+        if kind == "content" and resp.status == 206:  # where in the file its bytes begin, as the platform says (O22)
             rec["content_range"] = (resp.getheader("Content-Range") or "")[:REQ_HEADER_MAX] or None
         # the length http.client frames the body by (None: chunked, or until EOF), never the raw header; the boundary
         # never rewrites a body, so it stays true
@@ -993,7 +993,7 @@ class Handler(BaseHTTPRequestHandler):
         return declared, sent, failure, failure_origin
 
     def _complete_listing(self, hcfg, url, headers, body, rec) -> None:
-        """A listing in the complete mode (O19): every page of the directory, read upstream in the server's order and
+        """A listing in the complete mode (O21): every page of the directory, read upstream in the server's order and
         answered as one page, or nothing of it.
 
         The gate asks for pages of `gatepolicy.MAX_LIST_LIMIT` with the agent's other options (`complete_listing_request`)
@@ -1207,7 +1207,7 @@ def _teardown_lines() -> None:
         except Exception as e:
             failed += 1
             print("GATE TEARDOWN LINE FAILED", repr(e)[:200], file=sys.stderr, flush=True)
-    if not failed:  # the positive mark the count of the bytes served needs (O20): without it, a line may be missing
+    if not failed:  # the positive mark the count of the bytes served needs (O22): without it, a line may be missing
         _log({"event": TEARDOWN_COMPLETE, "connections": len(live)})
 
 
@@ -1215,7 +1215,7 @@ def teardown() -> None:
     """The gate is stopping: a `conn_close` line (`ended` "teardown") for every client connection still open, before the process exits, and then one
     `teardown_complete` line, written only when every close line was. Never raises, and never waits more than TEARDOWN_BUDGET_S: the lines are written by a
     thread this waits for that long, so a log that is stuck cannot hold the gate up. A gate killed before it gets here (SIGKILL, its memory limit) leaves no
-    `teardown_complete` line, and the count of the bytes it served is then unknown (gatelog, O20)."""
+    `teardown_complete` line, and the count of the bytes it served is then unknown (gatelog, O22)."""
     try:
         t = threading.Thread(target=_teardown_lines, daemon=True)
         t.start()
@@ -1390,7 +1390,7 @@ def main() -> None:
     CFG["token"] = os.environ.pop(TOKEN_ENV, "")  # out of the environment as soon as it is read
     if not CFG["token"]:
         raise SystemExit("the gate has no token to add to the requests it forwards")
-    if CFG.get("listing", gatepolicy.PAGED) not in gatepolicy.LISTINGS:  # O19: never a mode it would guess at
+    if CFG.get("listing", gatepolicy.PAGED) not in gatepolicy.LISTINGS:  # O21: never a mode it would guess at
         raise SystemExit("the gate's listing mode is not one it knows")
     for f in CFG.get("tcp_forwards", []):
         _tcp_forward(f["listen"], f["host"], f["port"])

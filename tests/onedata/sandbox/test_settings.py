@@ -202,8 +202,8 @@ def test_o12_a_level_with_a_bad_value_is_named_by_position_and_never_by_itself(t
     assert key not in str(caught.value)
 
 
-def test_o19_a_rest_level_selects_its_listing_mode_and_one_without_it_pages(tmp_path):
-    """O19: a level's entry is its kind, or a table of its kind and a REST level's listing mode; a REST level that names
+def test_o21_a_rest_level_selects_its_listing_mode_and_one_without_it_pages(tmp_path):
+    """O21: a level's entry is its kind, or a table of its kind and a REST level's listing mode; a REST level that names
     none pages its listings as the server does, and a level of another kind has no listing mode."""
 
     def edit(data):
@@ -239,8 +239,8 @@ def test_o19_a_rest_level_selects_its_listing_mode_and_one_without_it_pages(tmp_
         ({"kind": "elsewhere"}, "must be one of: mount, rest, none"),
     ],
 )
-def test_o19_o12_a_listing_mode_where_it_cannot_apply_is_refused_naming_the_level_by_position(tmp_path, entry, message):
-    """O19, O12: a listing mode on a mount or no data path, one the gate does not know, or a table without a kind is
+def test_o21_o12_a_listing_mode_where_it_cannot_apply_is_refused_naming_the_level_by_position(tmp_path, entry, message):
+    """O21, O12: a listing mode on a mount or no data path, one the gate does not know, or a table without a kind is
     refused at load; the level is named by its position, never by itself."""
 
     def edit(data):
@@ -251,8 +251,8 @@ def test_o19_o12_a_listing_mode_where_it_cannot_apply_is_refused_naming_the_leve
     assert "via-gate" not in str(caught.value)
 
 
-def test_o19_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(tmp_path):
-    """O19, C06: the platform's half of the fingerprint holds each level's kind and a REST level's listing mode, so a
+def test_o21_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(tmp_path):
+    """O21, C06: the platform's half of the fingerprint holds each level's kind and a REST level's listing mode, so a
     campaign started with one listing mode for a level is refused a resume with the other; the same mode resumes."""
     from campaign_support import make_fingerprint, make_manifest, make_schema
     from platform_support import NOW
@@ -292,8 +292,8 @@ def test_o19_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(t
     resume(paged)
 
 
-def test_o20_the_caps_of_the_tables_of_the_bytes_served_are_declared_and_default_to_1000_1000_and_64(tmp_path):
-    """O20: `[sandbox.served_bytes]` declares how many files, directories and ranges a file a run's tables of the bytes
+def test_o22_the_caps_of_the_tables_of_the_bytes_served_are_declared_and_default_to_1000_1000_and_64(tmp_path):
+    """O22: `[sandbox.served_bytes]` declares how many files, directories and ranges a file a run's tables of the bytes
     served may list; a table that declares none, or only some, keeps the defaults for the rest."""
     assert load(tmp_path).served_caps.record() == {
         "max_files": 1000,
@@ -313,10 +313,10 @@ def test_o20_the_caps_of_the_tables_of_the_bytes_served_are_declared_and_default
 
 @pytest.mark.parametrize("key", ["max_files", "max_directories", "max_ranges_per_file"])
 @pytest.mark.parametrize("value", [0, -5, 2.5, True, "2000"], ids=["zero", "negative", "fraction", "boolean", "text"])
-def test_o20_a_cap_that_is_not_a_whole_number_of_at_least_one_is_refused_at_load_naming_the_file_and_key(
+def test_o22_a_cap_that_is_not_a_whole_number_of_at_least_one_is_refused_at_load_naming_the_file_and_key(
     tmp_path, key, value
 ):
-    """O20: a cap must be an integer of at least 1, so a table can always list something and a typo cannot pass as a
+    """O22: a cap must be an integer of at least 1, so a table can always list something and a typo cannot pass as a
     number; the error names the platform file and the key."""
 
     def edit(data):
@@ -328,8 +328,8 @@ def test_o20_a_cap_that_is_not_a_whole_number_of_at_least_one_is_refused_at_load
         load(tmp_path, edit)
 
 
-def test_o20_an_unknown_key_of_the_caps_is_refused_so_a_misspelt_cap_cannot_leave_the_default(tmp_path):
-    """O20: a misspelt cap would silently keep the default and cut the table it was meant to widen; it is refused."""
+def test_o22_an_unknown_key_of_the_caps_is_refused_so_a_misspelt_cap_cannot_leave_the_default(tmp_path):
+    """O22: a misspelt cap would silently keep the default and cut the table it was meant to widen; it is refused."""
 
     def edit(data):
         data["sandbox"]["served_bytes"] = {"max_file": 4000}

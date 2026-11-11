@@ -12,7 +12,7 @@ listing too large to check or serve whole) carries `gate_refusal`, its reason (`
 condition's read, the agent did not read less. A log that cannot be read is unknown, never zero errors, and never no
 refusal (`UNREADABLE`).
 
-**The bytes served in a run (O20, `served`).** The log of a gate that was stopped (the collection's own SIGTERM, after
+**The bytes served in a run (O22, `served`).** The log of a gate that was stopped (the collection's own SIGTERM, after
 the agent's processes were stopped) holds one line per answer, each with the bytes of its body that the gate's socket
 accepted (`body_bytes`), never fewer than the agent received, and what that body was (`body`). `served` adds them up:
 
@@ -37,7 +37,7 @@ output could not be read to show neither went wrong (`gate_output_unreadable`), 
 every connection (`gate_teardown_incomplete`), or a request was still being answered when it stopped
 (`request_in_flight_at_stop`). Unknown is never zero.
 
-**The bytes served per file and per directory (O20, `served`).** The same lines, each answer of a file's content or a
+**The bytes served per file and per directory (O22, `served`).** The same lines, each answer of a file's content or a
 listing put under the file or directory its path names, so a study can check an agent's claimed reads file by file,
 which a run's total cannot (a read log that moves reads between files keeps the total):
 
@@ -174,7 +174,7 @@ def summarize(lines: list[str]) -> dict[str, Any]:
     }
 
 
-# Why the bytes served are unknown (O20): each makes every count None, never a partial sum taken for the whole
+# Why the bytes served are unknown (O22): each makes every count None, never a partial sum taken for the whole
 GATE_NOT_STOPPED = "gate_not_stopped"
 GATE_LOG_MALFORMED = "gate_log_malformed"
 GATE_LOG_WRITE_FAILED = "gate_log_write_failed"
@@ -197,7 +197,7 @@ TABLE_FIELDS = ("files", "files_total", "files_cut", "listings", "listings_total
 
 @dataclasses.dataclass(frozen=True)
 class Caps:
-    """How much a run's tables of the bytes served may list (`[sandbox.served_bytes]` of platform.toml, O20): the
+    """How much a run's tables of the bytes served may list (`[sandbox.served_bytes]` of platform.toml, O22): the
     files, the first read (`files_cut` says when there were more), the directories, the first listed (`listings_cut`),
     and the ranges of one file, the lowest (`ranges_cut`). Each is a whole number of at least 1."""
 
@@ -335,7 +335,7 @@ def _stop_reasons(stop: Mapping[str, Any] | None) -> set[str]:
 
 def served(lines: list[str] | None, stop: Mapping[str, Any] | None, caps: Caps = DEFAULT_CAPS) -> dict[str, Any]:
     """The bytes the gate served the agent in a run, in all and per file and directory, from its log once it was
-    stopped (O20; the module docstring says what each count holds). `lines` are the log's lines, None when it could not
+    stopped (O22; the module docstring says what each count holds). `lines` are the log's lines, None when it could not
     be read; `stop` is what the stop of the gate found (`gate_stop` of the sandbox's metadata, `_stop_reasons`); `caps`
     bound the tables. The log must hold the gate's `teardown_complete` line, whatever its exit code."""
     reasons = _stop_reasons(stop) | (set() if lines is not None else {UNREADABLE})

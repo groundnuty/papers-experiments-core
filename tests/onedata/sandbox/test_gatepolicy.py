@@ -217,8 +217,8 @@ def test_o05_the_nesting_bound_reads_the_body_as_the_parser_decodes_it(encoding)
     assert policy.decide("oneprovider", "GET", CHILDREN, "", deep).status == 400
 
 
-def test_o19_a_listing_in_the_complete_mode_is_merged_and_one_in_the_paged_mode_is_not():
-    """O19: the data path's listing mode decides whether the gate follows a listing's pages; only a listing is merged,
+def test_o21_a_listing_in_the_complete_mode_is_merged_and_one_in_the_paged_mode_is_not():
+    """O21: the data path's listing mode decides whether the gate follows a listing's pages; only a listing is merged,
     and a mode the policy does not know raises rather than being taken for either."""
     complete = policy.decide("oneprovider", "GET", CHILDREN, "limit=1000", listing=policy.COMPLETE)
     assert (complete.allow, complete.merge_pages, complete.tag) == (True, True, "children")
@@ -232,8 +232,8 @@ def test_o19_a_listing_in_the_complete_mode_is_merged_and_one_in_the_paged_mode_
     ("query", "body"),
     [("token=t", None), ("index=a", None), ("offset=2", None), ("", b'{"token": "t"}'), ("", b'{"index": "a"}')],
 )
-def test_o19_a_complete_listing_naming_where_it_starts_is_refused_and_its_limit_is_not_read(query, body):
-    """O19: where a complete listing starts is not the agent's to say, in the query or the body; its limit is the
+def test_o21_a_complete_listing_naming_where_it_starts_is_refused_and_its_limit_is_not_read(query, body):
+    """O21: where a complete listing starts is not the agent's to say, in the query or the body; its limit is the
     gate's, so a limit the paged mode refuses passes, while a malformed body is still refused."""
     refused = policy.decide("oneprovider", "GET", CHILDREN, query, body, listing=policy.COMPLETE)
     assert (refused.allow, refused.status, refused.reason) == (False, 400, policy.START_REFUSED)
@@ -242,8 +242,8 @@ def test_o19_a_complete_listing_naming_where_it_starts_is_refused_and_its_limit_
     assert policy.decide("oneprovider", "GET", CHILDREN, "", b"[1]", listing=policy.COMPLETE).status == 400
 
 
-def test_o19_every_page_goes_with_the_agents_options_but_the_ones_the_gate_sets():
-    """O19: the gate drops the agent's limit and the large-listing hint from the query and the body, keeps the rest,
+def test_o21_every_page_goes_with_the_agents_options_but_the_ones_the_gate_sets():
+    """O21: the gate drops the agent's limit and the large-listing hint from the query and the body, keeps the rest,
     leaves a body without them as it came, and adds its page size and the token of the page before."""
     pairs, body = policy.complete_listing_request(
         "limit=7&attribute=name&tuneForLargeContinuousListing=true", b'{"limit": 9, "attributes": ["size"]}'
@@ -256,8 +256,8 @@ def test_o19_every_page_goes_with_the_agents_options_but_the_ones_the_gate_sets(
     assert policy.page_target("/p", [], "a b") == f"/p?limit={policy.MAX_LIST_LIMIT}&token=a+b"
 
 
-def test_o19_a_page_gives_its_entries_and_the_next_token_or_ends_the_listing():
-    """O19: a page that is not the last gives the token of the next, whatever its length; the last gives none."""
+def test_o21_a_page_gives_its_entries_and_the_next_token_or_ends_the_listing():
+    """O21: a page that is not the last gives the token of the next, whatever its length; the last gives none."""
     walk = policy.ListingWalk()
     assert walk.page(b'{"children": [], "isLast": false, "nextPageToken": "next-a"}') == ([], "next-a")
     entries, after = walk.page(b'{"children": [{"name": "a"}], "isLast": true, "nextPageToken": null}')
@@ -307,16 +307,16 @@ def seeded() -> policy.ListingWalk:
         "entry-twice-in-a-page",
     ],
 )
-def test_o19_a_page_the_listing_cannot_go_on_from_is_refused(data):
-    """O19: no end and no continuation, a token or an entry the listing gave before, a page that is not one, a key
+def test_o21_a_page_the_listing_cannot_go_on_from_is_refused(data):
+    """O21: no end and no continuation, a token or an entry the listing gave before, a page that is not one, a key
     given twice (which of the two a reader takes is not known) or a value JSON does not have: the listing cannot be
     completed from it, so it is never taken for its end."""
     with pytest.raises(ValueError, match="listing page"):
         seeded().page(data)
 
 
-def test_o19_a_walk_keeps_a_fixed_size_digest_of_each_token_and_counts_the_tokens_bytes():
-    """O19: a listing of empty pages with long, distinct tokens keeps 16 bytes of each token, not the token, and counts
+def test_o21_a_walk_keeps_a_fixed_size_digest_of_each_token_and_counts_the_tokens_bytes():
+    """O21: a listing of empty pages with long, distinct tokens keeps 16 bytes of each token, not the token, and counts
     every token's bytes towards the bound of the merged answer, so such pages cannot exhaust the gate's memory before
     the bound refuses the listing."""
     walk = policy.ListingWalk()
@@ -328,8 +328,8 @@ def test_o19_a_walk_keeps_a_fixed_size_digest_of_each_token_and_counts_the_token
     assert len(walk._tokens) == 20
 
 
-def test_o19_entries_that_carry_neither_a_file_id_nor_a_name_are_not_told_apart():
-    """O19: two entries are the same entry by their file id, else by their name; entries with neither (a listing that
+def test_o21_entries_that_carry_neither_a_file_id_nor_a_name_are_not_told_apart():
+    """O21: two entries are the same entry by their file id, else by their name; entries with neither (a listing that
     asks for no such attribute) can be alike without being one, so they are not refused: the check's known limit."""
     walk = policy.ListingWalk()
     assert walk.page(b'{"children": [{"size": 1}, {"size": 1}], "isLast": true}')[0] == [{"size": 1}, {"size": 1}]

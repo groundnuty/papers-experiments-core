@@ -93,7 +93,7 @@ def _gate_log_leaks(root, values: list[str]) -> list[tuple[str, str]]:
     return leaks
 
 
-SERVED_TABLES = ("files", "listings")  # the tables of the bytes served (O20), keyed by ids the agent's requests named
+SERVED_TABLES = ("files", "listings")  # the tables of the bytes served (O22), keyed by ids the agent's requests named
 
 
 def _agent_chosen(meta: dict) -> tuple[dict, list[str]]:

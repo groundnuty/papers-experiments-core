@@ -1,4 +1,4 @@
-"""O20: the bytes a run's agent read through its data path, counted once from the stopped gate's log; unknown, not 0.
+"""O22: the bytes a run's agent read through its data path, counted once from the stopped gate's log; unknown, not 0.
 
 The count is a pure function of the gate's log lines and of what the gate's stop found (`gatelog.served`); the sandbox
 takes it when its collection has stopped the gate, and the platform's instrument records it. Every line here is one
@@ -89,8 +89,8 @@ def log(*records) -> list[str]:
     return [json.dumps(r) for r in records]
 
 
-def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
-    """O20: the platform's file content (a cut transfer's part included), its listings and its other answers make the
+def test_o22_the_bytes_served_add_up_each_answer_by_what_its_body_was():
+    """O22: the platform's file content (a cut transfer's part included), its listings and its other answers make the
     bytes served; the gate's own answers are counted apart, and lines that served nothing count nothing."""
     got = gatelog.served(log(*ANSWERS), STOPPED)
     assert got == {
@@ -180,8 +180,8 @@ def test_o20_the_bytes_served_add_up_each_answer_by_what_its_body_was():
         "output-unknown",
     ],
 )
-def test_o20_a_count_that_may_be_missing_a_line_is_unknown_never_zero(lines, stop, reason):
-    """O20: a log that may lack a line, or holds one that does not say what it served, makes every count None with the
+def test_o22_a_count_that_may_be_missing_a_line_is_unknown_never_zero(lines, stop, reason):
+    """O22: a log that may lack a line, or holds one that does not say what it served, makes every count None with the
     reason, never a partial sum taken for the whole: the tables of the files and directories too, never a part of them
     taken for the whole (an answer of a file's content or a listing must name the file or directory it served)."""
     got = gatelog.served(lines, stop)
@@ -197,8 +197,8 @@ def tables(*records) -> dict:
     return got
 
 
-def test_o20_two_files_read_in_overlapping_ranges_each_keep_their_own_merged_ranges():
-    """O20: each file read through the gate has its own row: the answers of its content, the byte ranges they served
+def test_o22_two_files_read_in_overlapping_ranges_each_keep_their_own_merged_ranges():
+    """O22: each file read through the gate has its own row: the answers of its content, the byte ranges they served
     merged where they overlap or touch, the bytes in those ranges, and the body bytes of every answer; a range of one
     file never merges with another file's. The rows add up to the run's content bytes."""
     got = tables(
@@ -231,8 +231,8 @@ def test_o20_two_files_read_in_overlapping_ranges_each_keep_their_own_merged_ran
     assert sum(row["body_bytes"] for row in got["files"].values()) == got["content_bytes"]
 
 
-def test_o20_a_file_read_again_counts_every_request_and_its_bytes_once_in_its_ranges():
-    """O20: a file read whole twice and then by a range inside it was served its bytes three times: three requests and
+def test_o22_a_file_read_again_counts_every_request_and_its_bytes_once_in_its_ranges():
+    """O22: a file read whole twice and then by a range inside it was served its bytes three times: three requests and
     every body byte, but its unique ranges hold each byte once, which is what a claimed read is checked against."""
     got = tables(read(ALPHA, 500), read(ALPHA, 500), read(ALPHA, 100, first=100))
     row = got["files"][ALPHA]
@@ -240,8 +240,8 @@ def test_o20_a_file_read_again_counts_every_request_and_its_bytes_once_in_its_ra
     assert (row["ranges"], row["range_bytes"]) == ([[0, 500]], 500)
 
 
-def test_o20_a_file_only_looked_at_is_not_in_the_table_and_a_listing_counts_under_its_directory():
-    """O20: a file whose attributes were read, whose content read was refused or answered with the platform's error,
+def test_o22_a_file_only_looked_at_is_not_in_the_table_and_a_listing_counts_under_its_directory():
+    """O22: a file whose attributes were read, whose content read was refused or answered with the platform's error,
     served none of its content, so it has no row. A listing's answers count under the directory listed, keyed by the
     directory's id as its path names it; a listing the platform answered with an error is no listing."""
     attributes = {"method": "GET", "path": f"/api/v3/oneprovider/data/{CHARLIE}", "tag": "attrs", "status": 200}
@@ -270,8 +270,8 @@ def test_o20_a_file_only_looked_at_is_not_in_the_table_and_a_listing_counts_unde
     ],
     ids=["no-content-range", "range-too-short", "several-ranges", "no-platform-status"],
 )
-def test_o20_a_range_the_log_cannot_place_leaves_that_files_ranges_unknown_and_its_bytes_counted(unplaced):
-    """O20: where an answer's bytes began in its file is read from the platform's own answer (a 200 from the start, a
+def test_o22_a_range_the_log_cannot_place_leaves_that_files_ranges_unknown_and_its_bytes_counted(unplaced):
+    """O22: where an answer's bytes began in its file is read from the platform's own answer (a 200 from the start, a
     206 from its Content-Range), never guessed; an answer the log cannot place leaves its file's ranges unknown, never
     a part of them, while its requests and body bytes, and every other file's row, stay known."""
     got = tables(read(ALPHA, 100), unplaced, read(BRAVO, 30, first=5))
@@ -288,8 +288,8 @@ def test_o20_a_range_the_log_cannot_place_leaves_that_files_ranges_unknown_and_i
     assert tables(read(ALPHA, 100), nothing)["files"][ALPHA]["ranges"] == [[0, 100]]
 
 
-def test_o20_the_tables_are_bounded_and_say_when_their_bound_cut_them():
-    """O20: a run lists at most its caps' `max_files` files and `max_directories` directories, the first read, and each
+def test_o22_the_tables_are_bounded_and_say_when_their_bound_cut_them():
+    """O22: a run lists at most its caps' `max_files` files and `max_directories` directories, the first read, and each
     file at most `max_ranges_per_file` ranges, the lowest (1000, 1000 and 64 unless `[sandbox.served_bytes]` declares
     others); a table the bound cut says so, with the number of files or directories read, and a file's unique bytes
     still count every range. The run's own counts are never cut."""
@@ -313,8 +313,8 @@ def test_o20_the_tables_are_bounded_and_say_when_their_bound_cut_them():
     assert tables(*spread[1:])["files"][ALPHA]["ranges_cut"] is False
 
 
-def test_o20_a_byte_range_past_a_files_range_cap_reads_as_cut_and_one_below_it_stays_known():
-    """O20: a file's row keeps its lowest ranges, so every byte below the end of the last one listed is known: inside a
+def test_o22_a_byte_range_past_a_files_range_cap_reads_as_cut_and_one_below_it_stays_known():
+    """O22: a file's row keeps its lowest ranges, so every byte below the end of the last one listed is known: inside a
     range it was served, in a gap it was not. A byte past that end, in a row the cap cut, is unknown, never "not
     served", and a range the log could not place is unknown too. Raised far enough, the cap lists them all."""
     spread = [read(ALPHA, 10, first=0), read(ALPHA, 10, first=100), read(ALPHA, 10, first=200)]
@@ -338,8 +338,8 @@ def test_o20_a_byte_range_past_a_files_range_cap_reads_as_cut_and_one_below_it_s
     )
 
 
-def test_o20_a_lookup_in_an_unknown_run_is_unknown_with_the_runs_reasons_and_a_cut_directory_reads_as_cut():
-    """O20: when the run's count is unknown, so is every file, range and directory a reader looks up, with the run's
+def test_o22_a_lookup_in_an_unknown_run_is_unknown_with_the_runs_reasons_and_a_cut_directory_reads_as_cut():
+    """O22: when the run's count is unknown, so is every file, range and directory a reader looks up, with the run's
     own reasons. A directory left out of a cut listings table is unknown, never "not served"; with no cut, a directory
     without a row was not listed."""
     unknown = gatelog.served(None, STOPPED)
@@ -393,8 +393,8 @@ def collected(world, tmp_path, settings, *records) -> dict:
     return snapshot
 
 
-def test_o20_a_file_past_the_declared_cap_reads_as_cut_never_as_served_zero_or_unread(world, tmp_path):
-    """O20: a run that read more files than `[sandbox.served_bytes] max_files` lists the first it read and says the
+def test_o22_a_file_past_the_declared_cap_reads_as_cut_never_as_served_zero_or_unread(world, tmp_path):
+    """O22: a run that read more files than `[sandbox.served_bytes] max_files` lists the first it read and says the
     table was cut. A file left out has no row, and a lookup of it is unknown ("files_cut"), never served with 0 bytes
     and never "not served": once the table is cut, a file without a row may have been read, so even an unread one
     reads unknown."""
@@ -409,8 +409,8 @@ def test_o20_a_file_past_the_declared_cap_reads_as_cut_never_as_served_zero_or_u
     assert snapshot["content_bytes"] == 220  # the run's own count is never cut
 
 
-def test_o20_the_same_run_with_a_raised_cap_lists_every_file_and_an_unread_one_reads_as_not_served(world, tmp_path):
-    """O20: the run above, with a cap that holds its files, lists all three and is not cut; the third file's row has its
+def test_o22_the_same_run_with_a_raised_cap_lists_every_file_and_an_unread_one_reads_as_not_served(world, tmp_path):
+    """O22: the run above, with a cap that holds its files, lists all three and is not cut; the third file's row has its
     bytes, and a file without a row was not served."""
     snapshot = collected(world, tmp_path, declared(world, max_files=3), *THREE_FILES)
     assert snapshot["caps"] == DEFAULT_CAPS | {"max_files": 3}
@@ -422,8 +422,8 @@ def test_o20_the_same_run_with_a_raised_cap_lists_every_file_and_an_unread_one_r
     assert (found.state, found.reasons, found.row) == ("not_served", (), None)
 
 
-def test_o20_the_caps_in_effect_are_recorded_in_every_snapshot(world, tmp_path):
-    """O20: the snapshot says what its tables were allowed, whatever the data path and whether or not the count is
+def test_o22_the_caps_in_effect_are_recorded_in_every_snapshot(world, tmp_path):
+    """O22: the snapshot says what its tables were allowed, whatever the data path and whether or not the count is
     known: the caps `[sandbox.served_bytes]` declares, or the defaults when it declares none."""
     settings = declared(world, max_files=5, max_directories=7, max_ranges_per_file=9)
     caps = {"max_files": 5, "max_directories": 7, "max_ranges_per_file": 9}
@@ -438,10 +438,10 @@ def test_o20_the_caps_in_effect_are_recorded_in_every_snapshot(world, tmp_path):
 
 
 @pytest.mark.parametrize(("level", "listing"), [(COMPLETE_LEVEL, "complete"), ("via-gate", "paged")])
-def test_o20_a_rest_runs_count_is_taken_once_by_the_collection_and_the_instrument_records_it(
+def test_o22_a_rest_runs_count_is_taken_once_by_the_collection_and_the_instrument_records_it(
     world, tmp_path, level, listing
 ):
-    """O20: before its collection a REST run's count is unknown, since its gate still runs; the collection stops the
+    """O22: before its collection a REST run's count is unknown, since its gate still runs; the collection stops the
     gate and counts its log once, the metadata and the instrument's snapshot carry that count with the data path and
     its listing mode, and it stays the same after the sandbox and its log are gone. So do the tables of the files and
     directories, which replay serves as recorded."""
@@ -465,8 +465,8 @@ def test_o20_a_rest_runs_count_is_taken_once_by_the_collection_and_the_instrumen
     assert NAMESPACE == "served_bytes"
 
 
-def test_o20_a_second_collection_keeps_the_count_the_first_took(world, tmp_path):
-    """O20: the count is taken once. A second collection stops a gate that is already gone (on a real host its stop
+def test_o22_a_second_collection_keeps_the_count_the_first_took(world, tmp_path):
+    """O22: the count is taken once. A second collection stops a gate that is already gone (on a real host its stop
     then fails), so counting again could only lose what the first collection counted; it keeps that count."""
     sbx = start(world, "via-gate")
     write_log(sbx, *ANSWERS)
@@ -479,8 +479,8 @@ def test_o20_a_second_collection_keeps_the_count_the_first_took(world, tmp_path)
     sbx.stop()
 
 
-def test_o20_the_instrument_puts_the_count_in_the_record_where_a_scorer_reads_it(world, tmp_path):
-    """O20: through the core's instrument hooks the count lands in the record under its namespace, as a plain JSON
+def test_o22_the_instrument_puts_the_count_in_the_record_where_a_scorer_reads_it(world, tmp_path):
+    """O22: through the core's instrument hooks the count lands in the record under its namespace, as a plain JSON
     object, so a scorer and replay read the recorded value and nothing measures it again."""
     from record_support import hand_made
 
@@ -495,8 +495,8 @@ def test_o20_the_instrument_puts_the_count_in_the_record_where_a_scorer_reads_it
     sbx.stop()
 
 
-def test_o20_a_mounts_reads_are_unknown_and_no_data_path_read_nothing(world):
-    """O20: a mount's reads go through oneclient, which no gate sees, so its count is unknown and never zero; a run with
+def test_o22_a_mounts_reads_are_unknown_and_no_data_path_read_nothing(world):
+    """O22: a mount's reads go through oneclient, which no gate sees, so its count is unknown and never zero; a run with
     no data path had nothing to read through, so its count is zero."""
     mounted = start(world, "mounted")
     got = mounted.served_bytes()
@@ -520,8 +520,8 @@ def test_o20_a_mounts_reads_are_unknown_and_no_data_path_read_nothing(world):
     isolated.stop()
 
 
-def test_o20_a_gate_whose_stop_left_a_request_unanswered_or_a_close_line_unwritten_is_unknown(world, tmp_path):
-    """O20: the stop of the gate decides whether its log is whole: a request still being answered when it stopped, or a
+def test_o22_a_gate_whose_stop_left_a_request_unanswered_or_a_close_line_unwritten_is_unknown(world, tmp_path):
+    """O22: the stop of the gate decides whether its log is whole: a request still being answered when it stopped, or a
     teardown that says it could not write every close line, makes the count unknown."""
     sbx = start(world, "via-gate")
     write_log(sbx, *ANSWERS, {"event": "conn_close", "conn": "1-9", "ended": "teardown", "in_request": True})
@@ -537,8 +537,8 @@ def test_o20_a_gate_whose_stop_left_a_request_unanswered_or_a_close_line_unwritt
     other.stop()
 
 
-def test_o20_a_gate_log_that_is_not_json_is_unknown_and_the_metadata_still_written(world, tmp_path):
-    """O20: a line cut short (a gate killed mid-write) leaves the count unknown, and the collection still writes the
+def test_o22_a_gate_log_that_is_not_json_is_unknown_and_the_metadata_still_written(world, tmp_path):
+    """O22: a line cut short (a gate killed mid-write) leaves the count unknown, and the collection still writes the
     metadata, with the gate's summary unknown rather than a crash."""
     sbx = start(world, "via-gate")
     (sbx.dir / "gatelog" / "requests.jsonl").write_text('{"method": "GET", "body_by\n', encoding="utf-8")
@@ -549,8 +549,8 @@ def test_o20_a_gate_log_that_is_not_json_is_unknown_and_the_metadata_still_writt
     sbx.stop()
 
 
-def test_o20_a_gate_that_exited_without_its_teardown_mark_is_unknown_whatever_its_exit_code(world, tmp_path):
-    """O20: a gate killed by its memory limit exits too, before it can log an answer still owed or its close lines; an
+def test_o22_a_gate_that_exited_without_its_teardown_mark_is_unknown_whatever_its_exit_code(world, tmp_path):
+    """O22: a gate killed by its memory limit exits too, before it can log an answer still owed or its close lines; an
     exit code shows nothing about that, even a clean one. Only the gate's `teardown_complete` line does, so a log
     without it is unknown."""
     sbx = start(world, "via-gate")
@@ -562,8 +562,8 @@ def test_o20_a_gate_that_exited_without_its_teardown_mark_is_unknown_whatever_it
     sbx.stop()
 
 
-def test_o20_a_gate_output_that_cannot_be_read_leaves_its_log_and_teardown_unknown(world, tmp_path):
-    """O20: the gate reports a failed write of its log and a close line it could not write on its own output; a read of
+def test_o22_a_gate_output_that_cannot_be_read_leaves_its_log_and_teardown_unknown(world, tmp_path):
+    """O22: the gate reports a failed write of its log and a close line it could not write on its own output; a read of
     that output that fails shows neither, so whether the log is whole is unknown, never taken for "no failure"."""
     from expcore_onedata.sandbox.hostops import CmdResult
 
@@ -583,8 +583,8 @@ def test_o20_a_gate_output_that_cannot_be_read_leaves_its_log_and_teardown_unkno
     sbx.stop()
 
 
-def test_o20_the_gate_marks_a_complete_teardown_and_only_a_complete_one(tmp_path, monkeypatch):
-    """O20: the gate's stop writes the close line of every connection still open and then `teardown_complete`; when a
+def test_o22_the_gate_marks_a_complete_teardown_and_only_a_complete_one(tmp_path, monkeypatch):
+    """O22: the gate's stop writes the close line of every connection still open and then `teardown_complete`; when a
     close line cannot be written, it writes no mark, so the count of the bytes it served is unknown."""
     from expcore_onedata.sandbox import gate
 
@@ -611,8 +611,8 @@ def test_o20_the_gate_marks_a_complete_teardown_and_only_a_complete_one(tmp_path
             assert events == ["conn_close", "teardown_complete"]  # the mark comes after every close line
 
 
-def test_o20_a_request_counts_as_logged_only_once_its_line_is_written(monkeypatch):
-    """O20: a teardown that reads a connection between a response and its log line must see that request outstanding
+def test_o22_a_request_counts_as_logged_only_once_its_line_is_written(monkeypatch):
+    """O22: a teardown that reads a connection between a response and its log line must see that request outstanding
     (`in_request`), or it writes `teardown_complete` over a line that may never be written, and the count reads as a
     known zero. So the connection's last logged request moves only after the line is written."""
     from types import SimpleNamespace
@@ -629,8 +629,8 @@ def test_o20_a_request_counts_as_logged_only_once_its_line_is_written(monkeypatc
     assert handler._last_logged == 5
 
 
-def test_o20_a_request_that_starts_once_the_stop_began_answers_nothing(monkeypatch):
-    """O20: a request read before the stop but counted after the teardown read its connection would be answered and
+def test_o22_a_request_that_starts_once_the_stop_began_answers_nothing(monkeypatch):
+    """O22: a request read before the stop but counted after the teardown read its connection would be answered and
     logged after `teardown_complete`; once the stop has begun, a request that starts is closed unanswered instead."""
     from types import SimpleNamespace
 
@@ -650,15 +650,15 @@ def test_o20_a_request_that_starts_once_the_stop_began_answers_nothing(monkeypat
     assert sent == []
 
 
-def test_o20_a_request_line_after_the_teardown_mark_leaves_the_count_unknown():
-    """O20: a line the mark did not cover means the mark proves nothing, so the count is unknown, never a total."""
+def test_o22_a_request_line_after_the_teardown_mark_leaves_the_count_unknown():
+    """O22: a line the mark did not cover means the mark proves nothing, so the count is unknown, never a total."""
     after = read(ALPHA, 5) | {"event": "request", "conn": "1-2"}
     lines = log(*ANSWERS, after)  # ANSWERS ends with the teardown mark
     assert gatelog.served(lines, STOPPED)["unknown"] == [gatelog.GATE_TEARDOWN_UNCONFIRMED]
 
 
-def test_o20_a_final_head_after_a_100_continue_is_never_counted_as_body(monkeypatch):
-    """O20: a `100 Continue` ends its own head, which marks where a body would begin; the final response's head then
+def test_o22_a_final_head_after_a_100_continue_is_never_counted_as_body(monkeypatch):
+    """O22: a `100 Continue` ends its own head, which marks where a body would begin; the final response's head then
     starts again from nothing, so a write of it that fails counts its header bytes as no body at all."""
     from types import SimpleNamespace
 

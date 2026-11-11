@@ -7,7 +7,7 @@
 #   merged: icsa-2027-experiments @ 6fc798cf, icsa/sandbox/gatepolicy.py:14,51,74-75 (a merged listing as a mode)
 #   merged: icsa-2027-experiments @ 6fc798cf, day0/evidence/docs_research.md:24-47 (the listing's paging options)
 #   changes: see the history of this file from its import commit
-"""Request policy of the sandbox gate: which Onedata REST calls pass (O05, O16), and how a listing is paged (O19).
+"""Request policy of the sandbox gate: which Onedata REST calls pass (O05, O16), and how a listing is paged (O21).
 
 Pure functions, no I/O, so the policy is unit-testable. `gate.py` (which runs in the gate container, with the standard
 library only) applies it to every request the sandbox makes.
@@ -53,7 +53,7 @@ more for any further attribute a request names, a path among them. The fake plat
 is about 3.7 MB, and the gate serves it (`tests/onedata/sandbox/test_gate.py`). An answer that still outgrows the cap,
 a listing that names attributes as large as a file's extended attributes, is refused loudly as before, never passed.
 
-**Two listing modes (O19).** A REST data path is `paged` (the default) or `complete`, as `[sandbox.data_paths]` says
+**Two listing modes (O21).** A REST data path is `paged` (the default) or `complete`, as `[sandbox.data_paths]` says
 for the level (`settings.py`), and the gate is told which in its configuration. `paged` is everything above: a listing
 is the server's page, passed on as it came. `complete` answers every listing with all of the directory's entries, in
 the server's order, as one page (`isLast` true, `nextPageToken` null): the gate follows the pages upstream itself, so a
@@ -96,7 +96,7 @@ import re
 from urllib.parse import parse_qs, parse_qsl, urlencode
 
 ONEZONE, ONEPROVIDER = "onezone", "oneprovider"
-PAGED, COMPLETE = "paged", "complete"  # the listing modes of a REST data path (O19)
+PAGED, COMPLETE = "paged", "complete"  # the listing modes of a REST data path (O21)
 LISTINGS = (PAGED, COMPLETE)
 
 _P = "/api/v3/"
@@ -136,7 +136,7 @@ class Decision:
     reason: str
     tag: str = ""
     status: int = 403  # HTTP status of a refusal
-    merge_pages: bool = False  # a complete listing: the gate follows the pages upstream and answers with one (O19)
+    merge_pages: bool = False  # a complete listing: the gate follows the pages upstream and answers with one (O21)
 
 
 def decide(
@@ -284,7 +284,7 @@ def _identity(entry: object) -> tuple[str, object] | None:
 
 
 class ListingWalk:
-    """What a complete listing has read so far, page by page (O19): a fixed-size digest of every token it gave and of
+    """What a complete listing has read so far, page by page (O21): a fixed-size digest of every token it gave and of
     every entry's identity, and the bytes of its tokens, which count towards `COMPLETE_LISTING_BYTES` with its entries.
 
     Onedata gives a listing no snapshot, so a directory another client changes while it is read can be listed wrong: an

@@ -15,37 +15,49 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
   * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
     propagation; the agent has neither the token, nor FUSE, nor a route to any host;
   * no data path: neither;
-  * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids.
+  * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids;
+  * each read-only input of the spec: copied into the run's directory, hashed into the metadata, and mounted read-only
+    in the agent from that copy (inputs.py, O20).
 
 The data path is read-only in every condition (O05). The token is examined by `tokens.py` before it gets here; the gate
 passes only reads; the mount and the root filesystem are read-only, and `start` proves the last two by trying to write
-and requiring the refusal, so a sandbox whose root or mount is writable is never handed out. Images are started by the
+and requiring the refusal, so a sandbox whose root or mount is writable is never handed out; a read-only input is
+proved the same way, every change refused with EROFS, and hashed again. Images are started by the
 resolved id they were pinned to, and a moved tag refuses the start before anything is created (O13). Teardown runs on
 every path that ends a sandbox, in order, and is verified (O15).
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import ipaddress
 import json
 import logging
 import os
 import re
+import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import gatelog, gatepolicy, hostops, netpool
+from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
-from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, SandboxSpec, StartRefused
+from expcore_onedata.sandbox.api import (
+    DataPathMode,
+    ExecResult,
+    ReadOnlyInput,
+    SandboxError,
+    SandboxSpec,
+    StartRefused,
+)
 from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
     ENV_ACCESS_TOKEN,
@@ -72,8 +84,8 @@ GATE_FILES = Path(__file__).resolve().parent  # gate.py and its siblings are mou
 MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
 TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
-MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O20)
-NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O20)
+MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
+NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O22)
 MOUNT_WAIT_S = 60.0
 READ_ONLY_PROBE = (
     "try:\n"
@@ -117,7 +129,7 @@ class DockerSandbox:
         self._meta: dict[str, Any] = {
             "run_key": spec.run_key,
             "data_path": spec.mode.value,
-            "listing": spec.listing if spec.mode is DataPathMode.REST else None,  # the gate's listing mode (O19)
+            "listing": spec.listing if spec.mode is DataPathMode.REST else None,  # the gate's listing mode (O21)
             "images": {},
             "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
         }
@@ -132,6 +144,8 @@ class DockerSandbox:
         self._cells: CellRunner | None = None
         self._ca_bytes: bytes | None = None  # the verified bytes of the platform's CA bundle, when a data path takes it
         self._ca_copy: Path | None = None  # the run's own read-only copy of them, which the containers mount
+        self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
+        self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
         self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
         self._uptime0: float | None = None
@@ -203,6 +217,8 @@ class DockerSandbox:
                 self._ca_bytes = s.tls.bundle()
             except ConfigError as error:
                 raise StartRefused(str(error)) from None
+        # in every data path, so an input never differs by condition; a declared one is hashed again here
+        self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s))
 
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
@@ -240,6 +256,7 @@ class DockerSandbox:
         self.dir.mkdir(parents=True, exist_ok=False)
         if self._ca_bytes is not None:  # written once, from the bytes that were hashed, before any container exists
             self._ca_copy = tls.write_private_copy(self._ca_bytes, self.dir)
+        self._input_copies = self._snapshot_inputs()  # copied and hashed before any container exists
         self._started = time.time()
         self._meta.update(host=self.host.host_facts(), started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         work = self.dir / "work"
@@ -268,6 +285,7 @@ class DockerSandbox:
             roles["sidecar"] = self.names.sidecar
         self._cells = CellRunner(self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started)
         self._verify_read_only()
+        self._verify_inputs()
         self._cells.sample_pids()
         self._start_sampler()
 
@@ -293,7 +311,7 @@ class DockerSandbox:
             "log": "/var/gate/requests.jsonl",
             "tls_dir": "/etc/gate/tls",
             "hosts": hosts,
-            "listing": self.spec.listing,  # paged, or every listing answered complete (O19)
+            "listing": self.spec.listing,  # paged, or every listing answered complete (O21)
         }
         if self._ca_copy is not None:
             config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only
@@ -491,6 +509,7 @@ class DockerSandbox:
             s, self.names, self._label_args(), image_id=s.agent.id, mode=sp.mode, work=work, share=share,
             gate_ip=gate_ip, gate_hosts=gate_hosts, ca=self.dir / "tls" / "ca.pem" if rest else None,
             trust_bundles=self._trust_bundles() if rest else {}, zone_host=sp.zone.host if rest and sp.zone else None,
+            inputs=self._input_copies,
         )  # fmt: skip
         self._register_container(self.names.agent)
         self.host.docker(*args, env=env)
@@ -509,6 +528,81 @@ class DockerSandbox:
                 raise SandboxError(f"the {what} is not read-only for the agent")
             proved[what] = True
         self._meta["read_only_verified"] = proved
+
+    def _snapshot_inputs(self) -> list[tuple[Path, str]]:
+        """Copy each read-only input into the run's directory and record its hash, its files and bytes, and its path in
+        the agent (never the host's) under `read_only_inputs`; the copy is what the agent's container mounts (O20). A
+        copy whose hash is not the one the input was declared with refuses the start; the copy is then given to root and
+        made read-only, on the host as in the agent."""
+        if not self._inputs:
+            return []
+        base = self.dir / "inputs"
+        base.mkdir(mode=0o700)
+        base.chmod(0o700)  # the copies are the driver's, and no other user of the host reaches them
+        copies, recorded = [], []
+        for n, item in enumerate(self._inputs):
+            copy = base / str(n)
+            try:
+                facts = inputs.snapshot(item.source, copy)
+            except (OSError, inputs.InputUnsafe) as error:
+                log.error("read-only input %d could not be copied: %s", n, describe_error(error))
+                raise SandboxError(f"read-only input {n} could not be copied into the run's directory") from None
+            if item.sha256 is not None and facts["sha256"] != item.sha256:
+                raise SandboxError(f"read-only input {n} is no longer the content it was declared with")
+            self._read_only_on_the_host(n, copy)
+            recorded.append({"path": item.target, **facts})
+            copies.append((copy, item.target))
+        self._meta["read_only_inputs"] = recorded
+        return copies
+
+    def _read_only_on_the_host(self, n: int, copy: Path) -> None:
+        """Give an input's copy to root and take every write bit away: 0444 files (0555 executable ones), 0555
+        directories. The modes keep each file's executable bit, so the copy keeps its hash."""
+        for argv in (["chown", "-R", "-P", "-h", "0:0", "--", str(copy)], ["chmod", "-R", "a-w", "--", str(copy)]):
+            done = self.host.run(argv, 60, sudo=True)
+            if done.returncode != 0:
+                log.error("read-only input %d: %s failed: %s", n, argv[0], describe_stderr(done.stderr))
+                raise SandboxError(f"read-only input {n} could not be made root's and read-only on the host")
+
+    @property
+    def read_only_inputs(self) -> list[dict[str, Any]]:
+        """What the start recorded of each read-only input: its path in the agent, its hash, its files and bytes."""
+        return [dict(item) for item in self._meta.get("read_only_inputs", [])]
+
+    def _inputs_unchanged(self) -> None:
+        """At collection, hash each input's copy again: one that no longer has the hash the run recorded was not what
+        the agent was declared to see throughout, which the harness, not the agent, let happen (O20)."""
+        for n, ((copy, _), facts) in enumerate(zip(self._input_copies, self.read_only_inputs, strict=True)):
+            try:
+                same = inputs.digest(copy)["sha256"] == facts["sha256"]
+            except (OSError, inputs.InputUnsafe):
+                same = False
+            if not same:
+                raise kinds.collection_error(
+                    "the read-only inputs", f"input {n}'s copy no longer has the hash the run recorded"
+                )
+
+    def _verify_inputs(self) -> None:
+        """Prove from inside the agent that each read-only input refuses every change as a read-only file system does,
+        while the agent can read it and run its executable file, then show its copy and its source unchanged since they
+        were hashed; refuse to hand out a sandbox where either fails (O20)."""
+        recorded = self._meta.get("read_only_inputs", [])
+        for n, ((copy, target), item, facts) in enumerate(zip(self._input_copies, self._inputs, recorded, strict=True)):
+            name, runnable = inputs.probe_targets(copy)
+            r = self._cells.run(inputs.probe_source(target, name, runnable), 60, record=False)
+            why = inputs.judge(r.stdout, runnable is not None)
+            if why is not None:
+                log.error("read-only input %d: %s (%s)", n, why, describe_stderr(r.stderr))
+                raise SandboxError(f"read-only input {n} is not read-only for the agent: {why}")
+            for what, root in (("copy", copy), ("source", item.source)):
+                try:
+                    same = inputs.digest(root)["sha256"] == facts["sha256"]
+                except (OSError, inputs.InputUnsafe):
+                    same = False
+                if not same:
+                    raise SandboxError(f"read-only input {n} changed between its hash and its mount ({what})")
+        if self._inputs:
+            self._meta["read_only_verified"]["inputs"] = True
 
     # ------------------------------------------------------------------------------------------------ watching
     def watch_container(self, role: str, container: str) -> None:
@@ -590,7 +684,7 @@ class DockerSandbox:
         return res
 
     def served_bytes(self) -> dict[str, Any]:
-        """The bytes the agent read through its data path in this run (O20), as `gatelog.served` counts them, with the
+        """The bytes the agent read through its data path in this run (O22), as `gatelog.served` counts them, with the
         data path and its listing mode. REST: counted once, by the collection, from the log of the gate it stopped;
         before that every count is unknown (`gate_not_collected`). A mount: unknown (`mount_not_through_gate`), since
         its reads go through oneclient and no gate sees them. No data path: zero, since there is nothing to read
@@ -616,10 +710,19 @@ class DockerSandbox:
         if self.spec.mode is not DataPathMode.REST:
             return []
         try:
-            return (self.dir / "gatelog" / "requests.jsonl").read_text(encoding="utf-8").splitlines()
+            return self._read_gate_log().splitlines()
         except (OSError, ValueError) as e:  # UnicodeDecodeError is a ValueError
             log.error("the gate log could not be read for the gate's refusals: %s", describe_error(e))
             return None
+
+    def _read_gate_log(self) -> str:
+        """The gate log's text, read without following a link (O19): a log that is a link or any file but a regular one
+        is unreadable (`OSError`), as one that is missing is."""
+        descriptor = os.open(self.dir / "gatelog" / "requests.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise OSError(errno.EINVAL, "the gate log is not a regular file")
+            return handle.read().decode("utf-8")
 
     @property
     def stopped(self) -> bool:
@@ -632,8 +735,16 @@ class DockerSandbox:
     def collect(self, dest_dir: str | Path, outputs: Sequence[str] = ()) -> dict[str, Any]:
         """Stop whatever of the agent's still runs, then copy out the run's evidence and the named files of /work.
 
-        A copy that fails raises, and the sandbox's disks are then kept when it stops: a source is never deleted after a
-        failed copy. An agent that could not be shown stopped also fails the collection: its outputs may still change."""
+        The copy runs as root and never follows or keeps a link (`copyout.py`, O19), while the agent's container is
+        frozen through its cgroup (`_frozen`). An output that holds a link, a special file, a hard link out of it,
+        another file system, a path too long to copy or more than the working disk holds, or whose way holds one of
+        these, was made so by the agent: nothing of the outputs is copied, and the collection ends normally with each
+        object named by its path and what it is, never a link's target, under `refused_output` in its result and in the
+        metadata, for the study's scorers; the attempt's outcome is the loop's and the scorers'. A collection that fails
+        for the harness's own reasons (a container that cannot be frozen, a copy command or the disk failing, a copy
+        that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash)
+        raises `InfraError` of kind `output_collection`, and the sandbox's disks are then kept when it stops: a source
+        is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection."""
         try:
             state = self._cells.quiesce("before collection")
             if not CellRunner.quiet(state):
@@ -644,37 +755,83 @@ class DockerSandbox:
             self.keep_evidence = True
             raise
 
-    def _copy_out(self, src: Path, dst: Path) -> None:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        r = self.host.run(["cp", "-r", "--no-preserve=ownership", str(src), str(dst)], 600, sudo=True)
-        owner = self.host.run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", str(dst)], 60, sudo=True)
-        if r.returncode != 0 or owner.returncode != 0:
-            log.error("copying out failed: %s", describe_stderr(r.stderr or owner.stderr))
-            raise SandboxError("copying a file out of the sandbox failed")
-
     def _collect(self, dest: Path, outputs: Sequence[str]) -> dict[str, Any]:
         for rel in outputs:
             if rel.startswith("/") or ".." in Path(rel).parts:
                 raise SandboxError("an output to collect must be a relative path inside the working directory")
         dest.mkdir(parents=True, exist_ok=True)
-        got = {}
-        for rel in outputs:
-            src = self.dir / "work" / rel
-            got[rel] = src.exists()
-            if got[rel]:
-                self._copy_out(src, dest / "work" / rel)
+        got = dict.fromkeys(outputs, False)
+        refused: dict[str, Any] | None = None
+        try:
+            copies = [(rel, dest / "work" / rel) for rel in outputs]
+            with self._frozen():  # nothing of the agent's can change the tree while it is listed and copied
+                work = self.dir / "work"
+                copied = copyout.copy_tree(self.host, work, copies, max_bytes=self.s.limits.work_disk_bytes)
+            got = {rel: copied[rel] is not None for rel in outputs}
+        except copyout.UnsafeOutput as unsafe:  # the agent's own doing: for the scorers, never a set-aside
+            refused = self._meta["refused_output"] = copyout.record(unsafe.refused)
+        except SandboxError as failed:  # the copy command, the disk or the copy failed: the harness's own failure
+            raise kinds.collection_error("the run's outputs", str(failed)) from None
+        self._inputs_unchanged()
         self._meta["infra_check"] = check = self.infra_container_check()  # while everything runs
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
+        if refused is not None:
+            result["refused_output"] = refused
         if self.spec.mode is DataPathMode.REST:
             self._stop_gate()
-            if "served_bytes" not in self._meta:  # counted once (O20): a second collection finds the gate already gone
+            if "served_bytes" not in self._meta:  # counted once (O22): a second collection finds the gate already gone
                 lines, caps = self._gate_log_lines(), self.s.served_caps
                 self._meta["served_bytes"] = gatelog.served(lines, self._meta["gate_stop"], caps)
-            log_file = self.dir / "gatelog" / "requests.jsonl"
-            self._copy_out(log_file, dest / "gate-requests.jsonl")
+            log_copy = [("requests.jsonl", dest / "gate-requests.jsonl")]
+            try:  # the gate's own file, in a directory only the gate writes: anything amiss there is not the agent's
+                if not copyout.copy_tree(self.host, self.dir / "gatelog", log_copy, max_bytes=None)["requests.jsonl"]:
+                    raise SandboxError("copying a file out of the sandbox failed: it is missing")  # made at start
+            except SandboxError as failed:
+                raise kinds.collection_error("the gate log", str(failed)) from None
             result["gate_log"] = "gate-requests.jsonl"
         (dest / "metadata.json").write_text(json.dumps(self.metadata(), indent=1, default=str), encoding="utf-8")
         return result
+
+    @contextlib.contextmanager
+    def _frozen(self) -> Iterator[None]:
+        """Freeze every process of the agent's container through its cgroup (`docker pause`) while its outputs are
+        listed and copied, and thaw it after, whatever happened (O19). Whatever of the agent's survived the kills before
+        collection, renamed or hidden among zombies, is frozen with the rest: the freeze is confirmed by the cgroup's
+        own state (`frozen 1` in `cgroup.events`), never by a list of processes, and a freeze that cannot be confirmed
+        stops the collection before anything is listed, as the harness's failure. A container that runs nothing can
+        change nothing and is not frozen."""
+        info = TD._inspect(self.host, self.names.agent, TD.WAITS)
+        if info is not None and info.get("unknown"):
+            raise SandboxError("the agent's container could not be inspected before its outputs were copied")
+        if info is None or not info["running"]:
+            yield
+            return
+        paused = self.host.docker("pause", self.names.agent, check=False, timeout=60)
+        try:
+            if paused.returncode != 0 or not self._cgroup_frozen(info["id"]):
+                log.error(
+                    "the agent's container was not frozen (%s): %s", paused.returncode, describe_stderr(paused.stderr)
+                )
+                raise SandboxError("the agent's container could not be frozen before its outputs were copied")
+            self._meta["frozen_for_collection"] = True
+            yield
+        finally:
+            thawed = self.host.docker("unpause", self.names.agent, check=False, timeout=60)
+            if paused.returncode == 0 and thawed.returncode != 0:
+                log.error("the agent's container could not be thawed: %s", describe_stderr(thawed.stderr))
+
+    def _cgroup_frozen(self, container_id: str) -> bool:
+        """Whether the container's cgroup says it is frozen; False when its state cannot be read."""
+        for directory in (
+            TD.CGROUP_ROOT / "system.slice" / f"docker-{container_id}.scope",
+            TD.CGROUP_ROOT / "docker" / container_id,
+        ):
+            try:
+                events = self.host.read_text(directory / "cgroup.events")
+            except OSError:
+                continue
+            return "frozen 1" in events.splitlines()
+        return False
 
     def _stop_on_purpose(self, role: str) -> None:
         """Note that the harness itself is about to stop a watched container: its state read now, just before, stands as
@@ -707,7 +864,7 @@ class DockerSandbox:
                 self._sleep(0.1)
             logs = self.host.docker("logs", self.names.gate, check=False, timeout=30)
             note["output_read"] = logs.returncode == 0
-            if note["output_read"]:  # only output that was read can show that nothing went wrong (O20)
+            if note["output_read"]:  # only output that was read can show that nothing went wrong (O22)
                 said = logs.stderr + logs.stdout
                 note["log_write_failed"] = "GATE LOG FAILED" in said
                 note["teardown_incomplete"] = any(m in said for m in TEARDOWN_TROUBLE)  # a close line may be missing
@@ -738,9 +895,8 @@ class DockerSandbox:
             check = self.infra_container_check()
             meta["container_deaths"], meta["infra_death"] = check["deaths"], check["death"]
         if self.spec.mode is DataPathMode.REST:
-            file = self.dir / "gatelog" / "requests.jsonl"
             try:
-                meta["gate"] = gatelog.summarize(file.read_text(encoding="utf-8").splitlines())
+                meta["gate"] = gatelog.summarize(self._read_gate_log().splitlines())
             except OSError as e:
                 meta["gate"] = gatelog.unknown(f"the gate log could not be read: {e.strerror}")
             except ValueError:  # bytes that are not UTF-8, or a line that is not JSON: unknown, never a crash

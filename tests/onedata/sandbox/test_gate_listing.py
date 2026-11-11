@@ -1,4 +1,4 @@
-"""O19: in the complete listing mode the data gate answers a listing with every entry of the directory, or with none.
+"""O21: in the complete listing mode the data gate answers a listing with every entry of the directory, or with none.
 
 The gate runs in-process, as in test_gate.py: a TLS listener on a loopback port, a plain HTTP upstream in a thread, and
 clients that speak TLS to the gate with the run's test CA. The upstream is the fake platform, which pages a directory
@@ -149,8 +149,8 @@ def line(world, nth=1, seconds=10.0) -> dict:
     raise AssertionError(f"request line {nth} was not logged")
 
 
-def test_o19_a_complete_listing_merges_every_page_in_the_servers_order_and_a_paged_one_does_not(served):
-    """O19: a directory of 2,500 entries asked for as the official client asks (one page of 1000) comes back whole, in
+def test_o21_a_complete_listing_merges_every_page_in_the_servers_order_and_a_paged_one_does_not(served):
+    """O21: a directory of 2,500 entries asked for as the official client asks (one page of 1000) comes back whole, in
     the server's order, as the last page; the gate read three pages of 1000 upstream, each with the token before. The
     same directory through a gate in the paged mode is the server's first page and its token."""
     tree = {f"file-{n:05d}.bin": b"x" for n in range(2500)}
@@ -176,8 +176,8 @@ def test_o19_a_complete_listing_merges_every_page_in_the_servers_order_and_a_pag
     assert "complete_listing" not in line(paged, nth=2)  # the two gates share the test's log
 
 
-def test_o19_a_short_page_that_is_not_the_last_is_followed(served):
-    """O19: a page may be short and still not the last (the API says `isLast` is the only sign of the end), so the gate
+def test_o21_a_short_page_that_is_not_the_last_is_followed(served):
+    """O21: a page may be short and still not the last (the API says `isLast` is the only sign of the end), so the gate
     goes on from it."""
     upstream = WrittenPages([page(["a", "b", "c"], False, "next-a"), page([], False, "next-b"), page(["d"], True)])
     world = served(upstream)
@@ -213,8 +213,8 @@ def test_o19_a_short_page_that_is_not_the_last_is_followed(served):
         "key-twice",
     ],
 )
-def test_o19_a_page_the_listing_cannot_go_on_from_is_the_platforms_502_and_no_entry_is_passed(served, second):
-    """O19: after a first page that is not the last, a second page that does not end the listing or continue it, or
+def test_o21_a_page_the_listing_cannot_go_on_from_is_the_platforms_502_and_no_entry_is_passed(served, second):
+    """O21: after a first page that is not the last, a second page that does not end the listing or continue it, or
     that is not a 200, is the platform's failure: the agent gets a 502 of origin `upstream` and no entry of the first
     page, never a part of the listing as if it were the whole, and the gate refuses nothing for its own integrity."""
     world = served(WrittenPages([page(["a", "b"], False, "next-a"), second]))
@@ -227,8 +227,8 @@ def test_o19_a_page_the_listing_cannot_go_on_from_is_the_platforms_502_and_no_en
     assert kinds.gate_error(gatelog.refusals(world.log.read_text().splitlines())) is None
 
 
-def test_o19_the_first_pages_answer_that_is_not_a_200_is_passed_on_as_the_paged_mode_passes_it(served):
-    """O19: a listing of a directory that does not exist gets the platform's 404 to it, as it came."""
+def test_o21_the_first_pages_answer_that_is_not_a_200_is_passed_on_as_the_paged_mode_passes_it(served):
+    """O21: a listing of a directory that does not exist gets the platform's 404 to it, as it came."""
     world = served(WrittenPages([(404, {"error": {"id": "posix", "details": "enoent"}})]))
     status, answer = get(world, PAGES)
     assert (status, answer) == (404, {"error": {"id": "posix", "details": "enoent"}})
@@ -237,10 +237,10 @@ def test_o19_the_first_pages_answer_that_is_not_a_200_is_passed_on_as_the_paged_
 
 
 @pytest.mark.parametrize(("bound", "value"), [("bytes", 600), ("pages", 2)])
-def test_o19_a_listing_past_its_bound_is_refused_for_the_gates_integrity_and_its_run_set_aside(
+def test_o21_a_listing_past_its_bound_is_refused_for_the_gates_integrity_and_its_run_set_aside(
     served, monkeypatch, bound, value
 ):
-    """O19: a complete listing larger than the gate serves whole (bytes) or longer (pages) is refused with a 502 and
+    """O21: a complete listing larger than the gate serves whole (bytes) or longer (pages) is refused with a 502 and
     `listing_too_large`, a refusal for the gate's integrity, so the run ends as `data_gate_integrity` and is set
     aside; no entry is passed on."""
     monkeypatch.setattr(
@@ -258,8 +258,8 @@ def test_o19_a_listing_past_its_bound_is_refused_for_the_gates_integrity_and_its
     assert error.kind == kinds.DATA_GATE_INTEGRITY
 
 
-def test_o19_empty_pages_with_long_tokens_count_towards_the_bound_and_are_refused(served, monkeypatch):
-    """O19: the tokens a listing gives count towards the bound of the merged answer, so a platform that answers empty
+def test_o21_empty_pages_with_long_tokens_count_towards_the_bound_and_are_refused(served, monkeypatch):
+    """O21: the tokens a listing gives count towards the bound of the merged answer, so a platform that answers empty
     pages, each with a long token of its own, reaches `listing_too_large` long before it could exhaust the gate's
     memory, rather than being followed for free up to the page bound."""
     monkeypatch.setattr(gate.gatepolicy, "COMPLETE_LISTING_BYTES", 3000)
@@ -273,8 +273,8 @@ def test_o19_empty_pages_with_long_tokens_count_towards_the_bound_and_are_refuse
     assert len(upstream.seen) == 3  # it stopped following the tokens at the bound
 
 
-def test_o19_an_entry_shifted_into_the_next_page_by_an_insertion_refuses_the_listing(served):
-    """O19: a directory changed while it is read (another client adds an entry before `b`, shifting `b` into the next
+def test_o21_an_entry_shifted_into_the_next_page_by_an_insertion_refuses_the_listing(served):
+    """O21: a directory changed while it is read (another client adds an entry before `b`, shifting `b` into the next
     page) gives `b` twice; the gate refuses that listing as the platform's 502 and passes none of it, since a listing
     with an entry twice is no directory's listing."""
     world = served(WrittenPages([page(["a", "b"], False, "next-a"), page(["b", "c"], True)]))
@@ -291,8 +291,8 @@ def test_o19_an_entry_shifted_into_the_next_page_by_an_insertion_refuses_the_lis
     [("?token=t1", None), ("?limit=1000&index=file-1", None), ("", b'{"offset": 3}')],
     ids=["token", "index", "offset-in-body"],
 )
-def test_o19_a_complete_listing_that_names_where_to_start_is_the_agents_400(served, query, body):
-    """O19: a listing that names where it starts could not be the directory's complete listing, so it is refused with a
+def test_o21_a_complete_listing_that_names_where_to_start_is_the_agents_400(served, query, body):
+    """O21: a listing that names where it starts could not be the directory's complete listing, so it is refused with a
     400 the agent reads, a policy refusal, and nothing is forwarded."""
     upstream = WrittenPages([page(["a"], True)])
     world = served(upstream)
@@ -304,8 +304,8 @@ def test_o19_a_complete_listing_that_names_where_to_start_is_the_agents_400(serv
     assert (logged["decision"], logged["status"], logged["body"]) == ("deny", 400, "gate")
 
 
-def test_o19_the_page_size_is_the_gates_and_the_agents_other_options_go_with_every_page(served):
-    """O19: the agent's limit (here above what the paged mode allows) and the large-listing hint are dropped from the
+def test_o21_the_page_size_is_the_gates_and_the_agents_other_options_go_with_every_page(served):
+    """O21: the agent's limit (here above what the paged mode allows) and the large-listing hint are dropped from the
     query and the body; every page goes with the gate's limit, the agent's attributes and its other options."""
     mock = MockOnedata({f"file-{n:05d}.bin": b"x" for n in range(1500)}, space_name="invented-space", token=GATE_TOKEN)
     world = served(mock)
@@ -320,8 +320,8 @@ def test_o19_the_page_size_is_the_gates_and_the_agents_other_options_go_with_eve
     assert all(json.loads(r.body) == {"attributes": ["name", "size"]} for r in asked)
 
 
-def test_o19_a_page_that_holds_the_gates_token_refuses_the_listing_and_passes_no_entry(served):
-    """O19, O05: a page passes the response boundary as any answer that is no file's content does: one that holds the
+def test_o21_a_page_that_holds_the_gates_token_refuses_the_listing_and_passes_no_entry(served):
+    """O21, O05: a page passes the response boundary as any answer that is no file's content does: one that holds the
     gate's token is refused for the gate's integrity, and nothing of the listing goes."""
     world = served(WrittenPages([page(["a"], False, "next-a"), page([f"echo {GATE_TOKEN}"], True)]))
     status, answer = get(world, PAGES)
@@ -330,8 +330,8 @@ def test_o19_a_page_that_holds_the_gates_token_refuses_the_listing_and_passes_no
     assert line(world)["gate_refusal"] == "credential_in_response"
 
 
-def test_o19_a_gate_given_a_listing_mode_it_does_not_know_refuses_to_start(tmp_path, monkeypatch):
-    """O19: the mode comes from the gate's configuration; one it does not know stops it before it serves anything."""
+def test_o21_a_gate_given_a_listing_mode_it_does_not_know_refuses_to_start(tmp_path, monkeypatch):
+    """O21: the mode comes from the gate's configuration; one it does not know stops it before it serves anything."""
     config = tmp_path / "gate.json"
     document = {"log": str(tmp_path / "r.jsonl"), "hosts": {}, "listen_port": 0, "listing": "everything"}
     config.write_text(json.dumps(document), encoding="utf-8")
@@ -344,8 +344,8 @@ def test_o19_a_gate_given_a_listing_mode_it_does_not_know_refuses_to_start(tmp_p
 
 
 @pytest.mark.parametrize("listing", ["complete", "paged"])
-def test_o20_the_bytes_served_are_what_the_client_received_in_either_listing_mode(served, listing):
-    """O20: through a real gate, every answer's line says what its body was, and the count taken from the log is the
+def test_o22_the_bytes_served_are_what_the_client_received_in_either_listing_mode(served, listing):
+    """O22: through a real gate, every answer's line says what its body was, and the count taken from the log is the
     bytes the client received: a file's content whole and by a range, the listing as it was served (the merged answer
     or the server's page), the platform's other answers, and the gate's own refusal apart. Each file read has its row,
     with the ranges the platform's answers say they served, and the listing counts under its directory."""
