@@ -228,7 +228,7 @@ EXPCORE_LIVE_SANDBOX_POOL=<a private IPv4 range> EXPCORE_LIVE_FACTS_OUT=<file> u
 ```
 
 Run it outside any sandbox, after up: it needs Docker, `sudo` for the sandbox's mounts, and `python:3.12-slim` and
-`onedata/oneclient:25.0` on the host (never pulled). It writes three files into `alpha-space` and deletes them again;
+`onedata/oneclient:25.0` on the host (never pulled). It writes seven files into `alpha-space` and deletes them again;
 a reset removes anything an interrupted run leaves there. The test docstring lists what it asserts. It also captures
 what the sidecar can show of the agent's reads, per file (oneclient's options, its logs, the FUSE connection's
 entries); `EXPCORE_LIVE_ONECLIENT_ARGS` passes oneclient further arguments, such as a trace option the first run found.

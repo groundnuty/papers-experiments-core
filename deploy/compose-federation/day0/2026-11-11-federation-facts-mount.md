@@ -60,7 +60,8 @@ by hand during a later run, with the same answer):
 | A token in `docker inspect` | no | no |
 
 The run's token file was gone from the host once oneclient had started. TLS to `pine` was verified against the
-federation's CA (`ca_file`), and the mount answered 1.4 s after the sidecar started, with `--force-proxy-io`.
+federation's CA (`ca_file`), and the FUSE mount appeared on the host 1.4 s after the sidecar's `docker run`, with
+`--force-proxy-io`.
 
 ## Confinement of the agent
 
@@ -122,7 +123,7 @@ file. What the sidecar could show of that, read before the stop:
   `--monitoring-level-basic`, `--monitoring-level-full` and `--monitoring-period` (a Graphite reporter, which needs
   `--graphite-url`), besides `--log-dir`, `--verbose-log-level` (debug builds only) and `--disable-log-buffering`.
 
-With `--io-trace-log`, alone or with `--log-read-write-perf`, oneclient mounted (1.7 and 2.5 s) and then the first read
+With `--io-trace-log`, alone or with `--log-read-write-perf`, the mount appeared (1.7 and 2.5 s) and then the first read
 through the mount answered `ENOTCONN`. The sidecar's own output ended `Oneclient received (11) signal - releasing
 mountpoint`, and the container had exited (code 0) before the accounting step, so no log was left to read; the
 teardown found no mount to unmount, removed both containers and left nothing. So the default log shows nothing per

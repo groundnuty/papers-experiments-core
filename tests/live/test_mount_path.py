@@ -4,7 +4,7 @@
     EXPCORE_LIVE_SANDBOX_POOL=<a private IPv4 range the host routes nowhere> \\
     uv run pytest tests/live/test_mount_path.py
 
-It starts containers (`EXPCORE_LIVE_DOCKER`), and it writes five files into the study space and deletes them again
+It starts containers (`EXPCORE_LIVE_DOCKER`), and it writes seven files into the study space and deletes them again
 (`EXPCORE_LIVE_MUTATE`). `EXPCORE_LIVE_PLATFORM` is the Compose federation's own platform.toml
 (deploy/compose-federation, with `facts.json` beside it). The test writes a copy with a `[sandbox]` table into a
 directory of its own (`mount_live.derive_platform`): images pinned to the ids `EXPCORE_LIVE_AGENT_IMAGE` and
