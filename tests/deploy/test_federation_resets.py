@@ -118,6 +118,7 @@ def test_the_per_run_reset_evicts_every_mirrors_replicas_and_keeps_every_owners_
         assert posted_on in ("birch", "cedar")
         assert body["fileId"] == "root-alpha-space"
     assert "evicted from birch, cedar" in str(alpha)
+    assert "; nothing to evict;" in str(beta)
 
 
 def test_a_provider_that_owns_one_space_keeps_it_while_its_mirror_of_another_owners_space_is_emptied(

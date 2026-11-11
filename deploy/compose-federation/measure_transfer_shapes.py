@@ -27,7 +27,7 @@ from typing import Any
 from fedboot import Bootstrap
 from fedcontent import Content
 from fedlayout import BaselineFile, Layout
-from fedrest import PROVIDER_API, Rest, bearer
+from fedrest import PROVIDER_API, Rest, RestError, bearer
 from fedspec import Service, load_spec
 
 from expcore_onedata.placement import held_bytes, provider_blocks
@@ -112,11 +112,12 @@ class Shapes:
         show(f"{step}: did not end", seconds=WAIT_S)
 
     def mirror_holds(self, file_id: str) -> int | None:
-        """What the mirror holds of the file, in bytes, by its own block map; None when that is unknown."""
-        answer = self.boot.provider(self.mirror, "GET", f"/data/{file_id}/distribution", "distribution")
+        """What the mirror holds of the file, in bytes, by its own block map; None when that is unknown, as it is while
+        the mirror has not seen the file yet (it answers 404)."""
         try:
+            answer = self.boot.provider(self.mirror, "GET", f"/data/{file_id}/distribution", "distribution")
             return held_bytes(provider_blocks(answer, self.boot.ids.providers[self.mirror.name]))
-        except ValueError:
+        except (RestError, ValueError):
             return None
 
     def wait_held(self, file_id: str, wanted: int, step: str) -> None:

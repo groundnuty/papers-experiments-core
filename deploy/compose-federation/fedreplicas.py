@@ -74,10 +74,10 @@ class Evicted:
     seconds: float
 
     def __str__(self) -> str:
-        before = ", ".join(f"{name} {held} B" for name, held in self.held_before.items()) or "no mirror"
-        evicted = ", ".join(self.evicted_from) or "nothing to evict"
+        before = ", ".join(f"{name} {held} B" for name, held in self.held_before.items()) or "nothing (no mirror)"
+        evicted = f"evicted from {', '.join(self.evicted_from)}" if self.evicted_from else "nothing to evict"
         return (
-            f"{self.files} file(s); mirrors held {before}; evicted from {evicted}; "
+            f"{self.files} file(s); mirrors held {before}; {evicted}; "
             f"verified empty on {self.sweeps} sweep(s), {self.seconds:.0f} s"
         )
 
