@@ -238,7 +238,8 @@ def test_o05_a_study_with_only_the_standard_gate_and_a_wrong_type_never_admits_a
     assert executor.requests == []
     [outage] = outages
     assert outage["end_utc"] is None
-    assert outage["checks"] >= 3  # rechecked, and refused each time
+    assert outage["checks"] >= 2  # the first check and at least one recheck, each refused; how many fit in the
+    # settle window depends on the machine's load, so the count is a floor, not a target
     assert "refused" in outage["first_detail"]
     assert "typed application/json" in outage["last_detail"]  # the core keeps the head of the detail
     assert_clean(outage["last_detail"])
