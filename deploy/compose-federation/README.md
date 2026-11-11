@@ -31,7 +31,9 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
   everything in every space, ingested datasets included, and writes the baseline files again. The providers, spaces
   and users keep their ids, so `platform.toml` stays valid. A fault-injection journal left behind is emptied.
 - **reset --replicas** is the reset between runs: it starts what is stopped and checks every step again, then keeps
-  every owner's data and evicts only what the mirrors hold (`fedreplicas.py`). It refuses, evicting nothing in any
+  every owner's data and evicts only what the mirrors hold (`fedreplicas.py`). A space is supported by exactly its
+  owner and its mirrors, so every non-owner that can hold a replica, the agent's local provider included, is a
+  declared mirror, and its replicas go. It refuses, evicting nothing in any
   space, unless every owner's block map holds each of its files whole, since a file only a mirror holds is an original.
   It schedules one eviction of the space's root on each mirror that holds anything, and accepts the result only from
   the block maps, read through the platform layer's own parser: every mirror holding none of each file and the owner
