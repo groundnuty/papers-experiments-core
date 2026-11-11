@@ -995,6 +995,9 @@ class DockerSandbox:
         complete = False
         self._sampler_stop.set()
         try:
+            # first, on every path, a held sandbox's and a kept run's included: a secret is never evidence (O05), and a
+            # step below that raises or hangs must find none left on disk
+            self._step(errors, self._remove_token_files)
             held: set[str] = set()
             if self.names.sidecar in self._containers:
                 # a oneclient sidecar was started (or tried), also after a failed start: the readers stop, the FUSE
@@ -1011,8 +1014,6 @@ class DockerSandbox:
             for c in reversed(self._containers):
                 if c not in held:
                     self._step(errors, hostops.remove_container, self.host, c)
-            # on every path, a held sandbox's and a kept run's included: a secret is never evidence (O05)
-            self._step(errors, self._remove_token_files)
             if held:  # the network and the mounts cannot go while those two live: all of it is left for a retry
                 errors.append("the sidecar and the agent are left running with a FUSE mount that could not be released")
             else:

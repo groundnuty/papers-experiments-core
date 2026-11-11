@@ -278,6 +278,29 @@ def test_o05_the_mounts_token_file_is_removed_even_when_the_fuse_mount_holds_the
     sbx.stop()
 
 
+def test_o05_the_token_files_go_before_the_ordered_teardown_and_whatever_it_does(world, monkeypatch):
+    """O05: the host's copies of the token are the first thing a teardown removes, so that a teardown step that raises
+    or hangs (the ordered unmount of the FUSE mount, the longest) leaves no secret on disk behind it."""
+    from expcore_onedata.sandbox import teardown as TD
+
+    sbx = start(world, "mounted")
+    leftover = sbx.dir / TOKEN_FILE  # as a start cut short before the mount appeared would leave it
+    leftover.write_text(TOKEN, encoding="utf-8")
+    on_disk_when_it_began = []
+
+    def broken(*args, **kwargs):
+        on_disk_when_it_began.append(leftover.exists())
+        raise RuntimeError("the ordered teardown failed")
+
+    monkeypatch.setattr(TD, "ordered_fuse_teardown", broken)
+    with pytest.raises(RuntimeError, match="ordered teardown failed"):
+        sbx.stop()
+    assert on_disk_when_it_began == [False]
+    assert not leftover.exists()
+    monkeypatch.undo()
+    sbx.stop()
+
+
 def plant_token_file(world, run_directory: str, relative: Path, *, age_s: float) -> Path:
     """A file of the data-path token as a run killed outright leaves it: in a run directory of the root, written `age_s`
     seconds ago."""
