@@ -200,7 +200,7 @@ def _check_scheduler_kinds(campaign: CampaignConfig) -> None:
         if kind not in known:
             raise section.fail(
                 key,
-                f"names {kind!r}{close_match(kind, known)}, which is not an infrastructure kind; the kinds known here "
+                f"names a kind that is not an infrastructure kind{close_match(kind, known)}; the kinds known here "
                 f"are: {', '.join(known)}. A platform's kinds are known once its module is listed in [study] "
                 f"platforms of {STUDY_FILE}, and the study's own are the ones it declares in [study.{KINDS_KEY}]",
             )

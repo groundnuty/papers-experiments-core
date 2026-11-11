@@ -242,8 +242,11 @@ def test_c02_a_scheduler_kind_that_names_no_known_kind_is_refused_at_load_naming
     named neither file nor key; it is refused when the study is loaded, with the kinds that are known."""
     toml = set_scheduler(study_dir, key, wrong)
     message = refused(study_dir)
-    assert message.startswith(f"{toml}: [scheduler]: key '{key}' names '{wrong}' (did you mean '{meant}'?)"), message
-    assert "which is not an infrastructure kind" in message
+    expected = (
+        f"{toml}: [scheduler]: key '{key}' names a kind that is not an infrastructure kind (did you mean '{meant}'?)"
+    )
+    assert message.startswith(expected), message
+    assert wrong not in message  # what was typed is never repeated: it may be a name that must not be shown
     assert f"the kinds known here are: {', '.join(errors.CORE_KINDS)}" in message
     assert "[study] platforms" in message
     assert "[study.kinds]" in message
@@ -257,13 +260,13 @@ def test_c02_a_platform_kind_is_a_scheduler_kind_once_its_module_is_listed_and_t
     module = toy_platform(tmp_path, monkeypatch, REGISTER_FLAP)
     set_scheduler(study_dir, "health_kind", "relay_flap")
     alone = refused(study_dir)
-    assert "key 'health_kind' names 'relay_flap'" in alone
+    assert "key 'health_kind' names a kind that is not an infrastructure kind" in alone
     assert "relay_flap" not in alone.split("the kinds known here are:")[1].split(". ")[0]
     list_platforms(study_dir, module)
     assert load_study(study_dir).campaign.scheduler.health_kind == "relay_flap"
     set_scheduler(study_dir, "identity_kind", "relay_flop")
     message = refused(study_dir)
-    assert "key 'identity_kind' names 'relay_flop' (did you mean 'relay_flap'?)" in message
+    assert "key 'identity_kind' names a kind that is not an infrastructure kind (did you mean 'relay_flap'?)" in message
     assert "relay_flap" in message.split("the kinds known here are:")[1].split(". ")[0]
 
 
@@ -272,7 +275,9 @@ def test_c02_a_kind_the_study_declares_is_a_scheduler_kind_while_the_study_loads
     health kind, and it leaves with the load like any of the study's kinds."""
     add_kinds(study_dir, 'relay_flap = { description = "the relay restarted", treatable = true }')
     set_scheduler(study_dir, "health_kind", "relay_flop")
-    assert "key 'health_kind' names 'relay_flop' (did you mean 'relay_flap'?)" in refused(study_dir)
+    assert "key 'health_kind' names a kind that is not an infrastructure kind (did you mean 'relay_flap'?)" in refused(
+        study_dir
+    )
     set_scheduler(study_dir, "health_kind", "relay_flap")
     assert load_study(study_dir).campaign.scheduler.health_kind == "relay_flap"
     assert errors.infra_kinds() == errors.CORE_KINDS
