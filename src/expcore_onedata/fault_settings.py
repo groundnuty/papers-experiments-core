@@ -8,7 +8,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     sanctioned = true                # the configuration's half of the sanction; false or absent refuses
     journal = "fault-journal"        # directory of the injection journal and the targets' lock files
     compose_file = "compose.yaml"    # the Compose file that declares the providers' services
-    project = "..."                  # optional: the Compose project name
+    project = "..."                  # the Compose project name, which with a service names the container
     command = ["docker", "compose"]  # optional: the Compose command
     docker = ["docker"]              # optional: the command that inspects a container
     poll_s = 2                       # optional: between two readings of a service
@@ -36,6 +36,9 @@ from expcore_onedata.compose import CommandRunner, ComposeDriver, run_command
 from expcore_onedata.config import PlatformConfig
 
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+# A Compose project name as Compose accepts it. Required, because Compose would otherwise take the name from the
+# environment, the Compose file or its directory, and a target must name the one container its outage stops.
+PROJECT = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 _KEYS = (
     "sanctioned",
     "journal",
@@ -62,7 +65,7 @@ class FaultSettings:
     journal: Path
     compose_file: Path
     services: Mapping[str, str]
-    project: str | None = None
+    project: str = ""
     command: tuple[str, ...] = ("docker", "compose")
     docker: tuple[str, ...] = ("docker",)
     poll_s: float = 2.0
@@ -97,6 +100,9 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
     services = Section(table.table("services"), file, "[faults.services]")
     if not services.data:
         raise services.fail(None, "must name the service of at least one provider")
+    project = table.string("project")
+    if not PROJECT.fullmatch(project):
+        raise table.fail("project", "must be a Compose project name: lower-case letters, digits, '_' and '-'")
     for index, (name, service) in enumerate(services.data.items()):
         if name not in config.providers:
             raise services.fail(None, f"entry {index} is not a provider declared in [providers]")
@@ -111,7 +117,7 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         journal=(file.parent / table.string("journal")).resolve(),
         compose_file=(file.parent / table.string("compose_file")).resolve(),
         services=dict(services.data),
-        project=table.optional_string("project"),
+        project=project,
         command=words["command"],
         docker=words["docker"],
         poll_s=_number(table, "poll_s", 2.0, 0.001),
@@ -128,15 +134,16 @@ def faults_fingerprint(config: PlatformConfig) -> dict[str, Any] | None:
     """`[faults]`'s half of the platform's fingerprint (`PlatformConfig.fingerprint`); None when the file has none.
 
     What a resume must not change about the fault injector: that it is configured at all (every run is then admitted
-    to the federation, an outage run exclusively), whether it is sanctioned, and which service each target takes down,
-    by the target's label and the SHA-256 of the service's name, never a name or a path (O12). The bounds of its waits
-    and where its journal lies are how it runs, not what the runs measure, so they are left out.
+    to the federation, an outage run exclusively), whether it is sanctioned, and which container each target takes
+    down, by the target's label and the SHA-256 of its Compose project and service names, never a name or a path
+    (O12). The bounds of its waits and where its journal lies are how it runs, not what the runs measure, so they are
+    left out.
     """
     if "faults" not in load_toml(config.file):
         return None
     settings = load_faults(config.file, config)
     targets = {
-        config.provider_label(name): hashlib.sha256(service.encode("utf-8")).hexdigest()
+        config.provider_label(name): hashlib.sha256(f"{settings.project}/{service}".encode()).hexdigest()
         for name, service in settings.services.items()
     }
     return {"sanctioned": settings.sanctioned, "targets": dict(sorted(targets.items()))}

@@ -15,6 +15,7 @@ from fault_support import (
     SERVICES,
     FakeClock,
     FakeServices,
+    faults_table,
     inject_and_die,
     injector_for,
     write_faults,
@@ -337,13 +338,14 @@ def folder(tmp_path, name):
 
 
 def test_c06_the_platform_fingerprint_holds_the_faults_sanction_and_targets_by_label_and_digest_never_a_name(tmp_path):
-    """C06, O12: with `[faults]` the platform's half of the campaign fingerprint gains the sanction and the service of
-    each target, by its label and the SHA-256 of the service's name; no name, path or service appears in it, and a
+    """C06, O12: with `[faults]` the platform's half of the campaign fingerprint gains the sanction and the container
+    of each target, by its label and the SHA-256 of its Compose project and service; no name, path or service appears
+    in it, and a
     platform.toml without `[faults]` keeps the fingerprint it had."""
     platform = write_faults(folder(tmp_path, "faults"))
     fingerprint = load_platform(platform, require_secrets=False).fingerprint()
     services = {LOCAL_TARGET: SERVICES["alpha"], OUTAGE_TARGET: SERVICES["beta"]}
-    digests = {label: hashlib.sha256(service.encode()).hexdigest() for label, service in services.items()}
+    digests = {label: hashlib.sha256(f"stack-a/{service}".encode()).hexdigest() for label, service in services.items()}
     assert fingerprint == {"tls": {"mode": "verify"}, "faults": {"sanctioned": True, "targets": digests}}
     text = json.dumps(fingerprint)
     assert [value for value in [*configured_values(tmp_path / "faults"), *SERVICES.values()] if value in text] == []
@@ -352,13 +354,15 @@ def test_c06_the_platform_fingerprint_holds_the_faults_sanction_and_targets_by_l
 
 
 def test_c06_a_campaign_does_not_resume_under_another_target_service_or_sanction_and_does_under_other_waits(tmp_path):
-    """C06: a resume that takes another service down for a target, changes the sanction, or adds or drops `[faults]`,
+    """C06: a resume that takes another service or project's container down for a target, changes the sanction, or
+    adds or drops `[faults]`,
     is refused naming the platform's faults; one that changes only how long the injector waits resumes."""
     schema, manifest = make_schema(), make_manifest(make_schema())
     configs = {
         "started": write_faults(folder(tmp_path, "a")),
         "other waits": write_faults(folder(tmp_path, "b"), settle_timeout_s=60, admission_timeout_s=10, poll_s=3),
         "other service": write_faults(folder(tmp_path, "c"), services={**SERVICES, "beta": "store-three"}),
+        "other project": write_faults(folder(tmp_path, "f"), project="stack-b"),
         "unsanctioned": write_faults(folder(tmp_path, "d"), sanctioned=False),
         "no faults": write_platform(folder(tmp_path, "e")),
     }
@@ -371,9 +375,25 @@ def test_c06_a_campaign_does_not_resume_under_another_target_service_or_sanction
 
     resume("started")
     resume("other waits")
-    for label in ("other service", "unsanctioned", "no faults"):
+    for label in ("other service", "other project", "unsanctioned", "no faults"):
         with pytest.raises(FingerprintMismatch) as caught:
             resume(label)
         assert all(line.startswith("platform.faults") for line in caught.value.differences), label
         assert "store-three" not in str(caught.value)
     resume("started")
+
+
+@pytest.mark.parametrize("project", [None, "Stack A", "-lead"])
+def test_o10_faults_name_their_compose_project_explicitly(tmp_path, project):
+    """O10: a target must name the one container its outage stops, so `[faults]` names its Compose project, as Compose
+    accepts the name; without it Compose would take one from the environment, the Compose file or its directory."""
+
+    def edit(data):
+        data["faults"] = faults_table(project=project)
+        if project is None:
+            del data["faults"]["project"]
+
+    platform = write_platform(tmp_path, edit)
+    config = load_platform(platform, require_secrets=False)
+    with pytest.raises(ConfigError, match="project"):
+        load_faults(platform, config)

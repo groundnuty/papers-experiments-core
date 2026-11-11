@@ -88,6 +88,7 @@ def faults_table(**changes: Any) -> dict[str, Any]:
         "sanctioned": True,
         "journal": "fault-journal",
         "compose_file": "compose.yaml",
+        "project": "stack-a",
         "poll_s": 1,
         "settle_timeout_s": 5,
         "clear_attempts": 2,
