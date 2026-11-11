@@ -390,6 +390,7 @@ class OpenAICompatAdapter(_SdkBackend):
         if extra := self._extra_body():
             kw["extra_body"] = extra
         resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
+        self.served.note(resp)  # what it says it ran, for info(): admission reads it for a declared set (B18)
         if not getattr(resp, "choices", None):
             raise InfraError("endpoint", "the one-token completion carried no choices")
         usage = getattr(resp, "usage", None)  # reported, never tallied: the probe is no part of a run

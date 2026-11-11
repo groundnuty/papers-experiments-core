@@ -269,9 +269,12 @@ class AttemptRunner:
             if result.outcome.defect is not None:  # the attempt keeps the class and the stack hash; the log the rest
                 defects(error, result.outcome.defect)
         result, moved = self._judge(result, record, model, key)
+        mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
 
         def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
             self._bookkeeping(model, endpoint, key, result, kinds, moved)
+            if mix is not None:
+                p.store.record_deployments(begun.id, mix)
 
         status = self._finish(begun, run_dir, key, result, bookkeeping)
         defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
@@ -294,7 +297,7 @@ class AttemptRunner:
                 p.store.event(p.stamp(), "post_run_check_failed", model, f"{key}: {health.detail}; the outcome stands")
         if record is None:
             return result, False
-        change = p.identities.check(model, record.transcript, p.stamp())
+        change = p.identities.check(model, record.transcript, p.stamp(), run_key=key)
         if change is None:
             return result, False
         p.store.event(p.stamp(), "served_identity_changed", model, f"{key}: {json.dumps(change, sort_keys=True)}")
