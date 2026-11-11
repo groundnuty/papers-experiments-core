@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT = "expcore-fed"  # the Compose project name: every container and network carries it
+ROOT_MARKER = ".expcore-fed-root"  # written by up into a root it made or found empty; holds the project name
 HERE = Path(__file__).resolve().parent
 COMPOSE_FILE = HERE / "compose.yaml"
 TEMPLATE = HERE / "platform.toml.template"
@@ -121,6 +122,11 @@ class Layout:
     @classmethod
     def from_environment(cls) -> "Layout":
         return cls(checked_root(os.environ.get("EXPCORE_FED_ROOT", DEFAULT_ROOT)))
+
+    @property
+    def marker(self) -> Path:
+        """The file that makes the root the federation's own: down's janitor deletes nothing in a root without it."""
+        return self.root / ROOT_MARKER
 
     @property
     def secrets(self) -> Path:

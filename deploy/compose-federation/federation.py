@@ -43,6 +43,7 @@ from fedlayout import (
     PRINCIPALS,
     PROJECT,
     PROVIDERS,
+    ROOT_MARKER,
     SERVICES,
     SPACES,
     STUDY_SPACE,
@@ -167,8 +168,16 @@ def seed(layout: Layout, service: Service, key: Path, cert: Path) -> None:
 
 
 def prepare(layout: Layout) -> None:
-    """Make the root and everything the services read from it; a step whose result exists is left as it is."""
+    """Make the root and everything the services read from it; a step whose result exists is left as it is.
+
+    The root is marked as the federation's own when up makes it or finds it empty. A root that holds anything without
+    the mark is someone else's, and is refused: down would delete what it holds."""
+    owned = layout.marker.is_file() and layout.marker.read_text(encoding="utf-8").strip() == PROJECT
+    if layout.root.exists() and not owned and any(layout.root.iterdir()):
+        raise RuntimeError(f"the root holds files and is not marked as this federation's ({ROOT_MARKER}); refused")
     private_directory(layout.root)
+    if not owned:
+        layout.marker.write_text(PROJECT + "\n", encoding="utf-8")
     private_directory(layout.secrets)
     private_directory(layout.users)
     layout.ca_pem.parent.mkdir(exist_ok=True)
@@ -326,6 +335,8 @@ def down(layout: Layout) -> str:
     compose(layout, "down", "--remove-orphans", "--timeout", "120")
     timer.mark("containers")
     if layout.root.exists():
+        if not (layout.marker.is_file() and layout.marker.read_text(encoding="utf-8").strip() == PROJECT):
+            raise RuntimeError(f"the root is not marked as this federation's ({ROOT_MARKER}); nothing deleted")
         compose(layout, "--profile", "janitor", "run", "--rm", "--no-deps", "janitor")
         layout.root.rmdir()
     timer.mark("data")

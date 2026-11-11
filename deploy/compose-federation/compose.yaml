@@ -299,13 +299,17 @@ services:
         aliases: [cedar.expcore-fed.test]
 
   # Down's helper: removes what the services wrote as root under EXPCORE_FED_ROOT. No network, no published port; it
-  # runs only when down asks for it (profile "janitor") and is removed when it exits.
+  # runs only when down asks for it (profile "janitor") and is removed when it exits. It deletes nothing unless the
+  # root holds the mark up writes there, so a Compose command run by hand against another directory deletes nothing.
   janitor:
     image: *provider-image
     pull_policy: never
     profiles: ["janitor"]
     network_mode: none
-    entrypoint: ["find", "/fed", "-mindepth", "1", "-delete"]
+    entrypoint:
+      - sh
+      - -c
+      - 'test "$$(cat /fed/.expcore-fed-root 2>/dev/null)" = expcore-fed || { echo "not this federation root" >&2; exit 3; }; find /fed -mindepth 1 -delete'
     volumes:
       - type: bind
         source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}

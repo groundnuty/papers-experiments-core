@@ -196,3 +196,31 @@ def test_a_root_through_a_link_is_refused_and_one_below_the_base_is_accepted(fed
     assert fed.layout.checked_root(str(base), base) == base
     with pytest.raises(ValueError, match="symbolic link"):
         fed.layout.checked_root(str(base / "linked" / "data"), base)
+
+
+def test_the_janitor_deletes_nothing_in_a_root_without_the_federations_mark(fed):
+    """A Compose command run by hand, outside the checked entry point, may bind another directory as the root; the
+    janitor deletes only after reading the mark up writes into a root it made or found empty."""
+    janitor = COMPOSE[COMPOSE.index("  janitor:") :]
+    assert f"/fed/{fed.layout.ROOT_MARKER}" in janitor
+    assert janitor.index(fed.layout.ROOT_MARKER) < janitor.index("-delete")
+    assert f"= {fed.layout.PROJECT} ||" in janitor
+
+
+def test_up_refuses_a_root_that_holds_files_without_the_mark_and_down_deletes_nothing_there(fed, tmp_path, monkeypatch):
+    """A directory with someone else's files is not the federation's: up refuses to write into it and down refuses to
+    clear it, before any container runs."""
+    root = tmp_path / "someone-else"
+    root.mkdir()
+    (root / "their-data.txt").write_text("keep me", encoding="utf-8")
+    layout = fed.layout.Layout(root)
+    ran = []
+    monkeypatch.setattr(fed.cli, "compose", lambda *args, **kw: ran.append(args))
+    monkeypatch.setattr(fed.cli, "project_containers", lambda: [])
+    monkeypatch.setattr(fed.cli, "project_networks", lambda: [])
+    with pytest.raises(RuntimeError, match="not marked"):
+        fed.cli.prepare(layout)
+    with pytest.raises(RuntimeError, match="not marked"):
+        fed.cli.down(layout)
+    assert [args for args in ran if "janitor" in args] == []
+    assert (root / "their-data.txt").read_text(encoding="utf-8") == "keep me"
