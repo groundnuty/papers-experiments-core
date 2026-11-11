@@ -1,71 +1,33 @@
-"""What the throwaway federation is: its services, ports, spaces, users, baseline files and where its data lives.
+"""Where the throwaway federation's data lives, what its spaces hold at baseline, and what no layout may change.
 
-Every name here is invented for this test federation. The one place on disk is the root (`EXPCORE_FED_ROOT`): down
-removes it whole, and nothing else outside this directory is written. The root lies in the allowed parent
-(`EXPCORE_FED_ROOT_PARENT`, default /mnt/volume2/expcore-federation), with no link from the parent down to it, or every
-command refuses before it touches a file or a container: down deletes what the root holds. Under the default parent
-the root defaults to the parent itself; under any other parent the root must be named and lie strictly below it, so a
-parent that holds other data is never itself the root.
+What the federation is (its project, services, ports, spaces and users) is declared in a layout file (fedspec.py). The
+one place on disk is the root (`EXPCORE_FED_ROOT`): down removes it whole, and nothing else outside this directory is
+written. The root lies in the allowed parent (`EXPCORE_FED_ROOT_PARENT`, default /mnt/volume2/expcore-federation), with
+no link from the parent down to it, or every command refuses before it touches a file or a container: down deletes what
+the root holds. Under the default parent the root defaults to the parent itself; under any other parent the root must
+be named and lie strictly below it, so a parent that holds other data is never itself the root.
 """
 
 import hashlib
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-PROJECT = "expcore-fed"  # the Compose project name: every container and network carries it
+from fedspec import Spec, load_spec
+
 ROOT_MARKER = ".expcore-fed-root"  # written by up into a root it made or found empty; holds the project name
 HERE = Path(__file__).resolve().parent
-COMPOSE_FILE = HERE / "compose.yaml"
-TEMPLATE = HERE / "platform.toml.template"
+COMPOSE_FILE = HERE / "compose.yaml"  # the default layout's generated Compose file, committed for review
 DEFAULT_ROOT = "/mnt/volume2/expcore-federation"
-LOOPBACK = "127.0.0.1"  # the only address anything is published on
-IMAGES = (
+IMAGES = (  # pinned by the deployment: a layout cannot name another
     "docker.onedata.org/onezone:ID-ba7a778696",
     "docker.onedata.org/oneprovider:ID-765309c84f",
 )
-DOMAIN = "expcore-fed.test"  # a reserved test domain: it resolves only on the project's network
 NODE = "node1"  # each service's one cluster node
 
-
-@dataclass(frozen=True)
-class Service:
-    """One Compose service: its name, its domain on the project's network and its port on the host's loopback."""
-
-    name: str
-    port: int
-
-    @property
-    def domain(self) -> str:
-        return f"{self.name}.{DOMAIN}"
-
-    @property
-    def url(self) -> str:
-        return f"https://{LOOPBACK}:{self.port}"
-
-
-ZONE = Service("zone", 29443)
-PROVIDERS = (Service("pine", 29444), Service("birch", 29445), Service("cedar", 29446))
-SERVICES = (ZONE, *PROVIDERS)
-HOLDER = "pine"  # the data provider: the baseline files are written through it
-
-ADMIN = "admin"  # the zone's admin user, whose password is the zone panel's emergency passphrase
-STUDY_SPACE = "alpha-space"
-SPACES = {  # each space and the providers that support it
-    STUDY_SPACE: ("pine", "birch", "cedar"),
-    "beta-space": ("birch", "cedar"),  # outside the study's prefix: a mutation must never reach it
-}
-SUPPORT_BYTES = 10 << 30
-VIEW_READ = ("space_view", "space_read_data")
-PRINCIPALS = {  # the fixed users of the study space, each holding exactly these privileges in it
-    "alpha-reader": VIEW_READ,  # the data path's user
-    "alpha-tools": VIEW_READ,  # a tool-server user, for a condition with the baseline rights
-    "alpha-health": VIEW_READ,  # the health check's user
-}
-
-CONTENT_FILE = "hello.txt"  # a small file at the space root: the content test reads it
-REPLICATED_FILE = "replicated.bin"  # replicated from the holder to the next provider, so a transfer record exists
+CONTENT_FILE = "hello.txt"  # a small file at the study space's root: the content test reads it
+REPLICATED_FILE = "replicated.bin"  # replicated from the owner to the first mirror, so a transfer record exists
 LISTING_DIR = "listing-1200"  # a directory of more than 1000 small entries, for the complete-listing test
 LISTING_ENTRIES = 1200
 
@@ -87,9 +49,10 @@ class BaselineFile:
         return bytes(out[: self.size])
 
 
-def baseline(space: str) -> tuple[BaselineFile, ...]:
-    """The files a space holds at baseline, directories implied by their paths."""
-    if space == STUDY_SPACE:
+def baseline(space: str, study_space: str) -> tuple[BaselineFile, ...]:
+    """The files a space holds at baseline, directories implied by their paths: the study space's named files and its
+    listing directory, and one small file in every other space, named after it."""
+    if space == study_space:
         named = (
             BaselineFile(CONTENT_FILE, 64),
             BaselineFile(REPLICATED_FILE, 1 << 20),
@@ -98,7 +61,7 @@ def baseline(space: str) -> tuple[BaselineFile, ...]:
         )
         listing = tuple(BaselineFile(f"{LISTING_DIR}/entry-{i:04d}.txt", 16) for i in range(LISTING_ENTRIES))
         return named + listing
-    return (BaselineFile("beta.txt", 64),)
+    return (BaselineFile(f"{space.removesuffix('-space')}.txt", 64),)
 
 
 def checked_parent(value: str) -> Path:
@@ -150,15 +113,22 @@ def root_from_environment(environ: Mapping[str, str]) -> tuple[Path, Path]:
 
 @dataclass(frozen=True)
 class Layout:
-    """The paths below the federation's root, and the allowed parent it was checked against."""
+    """The declared layout, the paths below the federation's root, and the allowed parent the root was checked
+    against."""
 
     root: Path
     parent: Path = Path(DEFAULT_ROOT)
+    spec: Spec = field(default_factory=load_spec)
 
     @classmethod
-    def from_environment(cls, environ: Mapping[str, str] | None = None) -> "Layout":
+    def from_environment(cls, environ: Mapping[str, str] | None = None, spec: Spec | None = None) -> "Layout":
         parent, root = root_from_environment(os.environ if environ is None else environ)
-        return cls(root, parent)
+        return cls(root, parent, load_spec() if spec is None else spec)
+
+    @property
+    def owned(self) -> bool:
+        """Whether the root carries this layout's mark: the file up writes, holding the declared project's name."""
+        return self.marker.is_file() and self.marker.read_text(encoding="utf-8").strip() == self.spec.project
 
     @property
     def parent_is_default(self) -> bool:

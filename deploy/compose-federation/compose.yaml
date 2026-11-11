@@ -1,59 +1,30 @@
-# A throwaway Onedata federation: one Onezone and three Oneproviders, for the live contract tests (#29).
+# The Compose file of the federation layout federation.toml (project expcore-fed), made by fedcompose.py.
 #
-# Bring it up, reset it and take it down with federation.py (see README.md), never with docker compose alone: up
-# generates the CA, the certificates and the secrets these services read, and bootstraps the federation once they run.
-#
-# - Project name: expcore-fed. Every container and the one network carry it; nothing else on the daemon is touched.
-# - Images: exactly the two pinned tags, never pulled (pull_policy: never), never rebuilt.
-# - Ports: each service publishes its 443 on the host's loopback only. Nothing else is published, so the providers'
-#   transfer port and the panels stay on the project's network.
-# - Data: every bind source is below EXPCORE_FED_ROOT (default /mnt/volume2/expcore-federation), made by up and removed
-#   by down. A missing source is an error, never created by the daemon.
-# - Certificates: the federation's own CA signs every service's web certificate (up seeds them into the persistence
-#   directories). start.sh adds the CA to each container's system store before it becomes the stock start script.
-name: expcore-fed
-
-x-zone-image: &zone-image docker.onedata.org/onezone:ID-ba7a778696
-x-provider-image: &provider-image docker.onedata.org/oneprovider:ID-765309c84f
-
-x-service: &service
-  pull_policy: never
-  restart: "no"
-  entrypoint: ["/bin/bash", "/expcore/start.sh"]
-  stop_grace_period: 120s
-  mem_limit: 6g
-  healthcheck:
-    test: ["CMD", "test", "-f", "/root/service-ready.lock"]
-    interval: 10s
-    timeout: 5s
-    retries: 3
-    start_period: 900s
-
-x-ca-mount: &ca-mount
-  type: bind
-  source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/ca/federation-ca.pem
-  target: /expcore/federation-ca.pem
-  read_only: true
-  bind:
-    create_host_path: false
-
-x-start-mount: &start-mount
-  type: bind
-  source: ./start.sh
-  target: /expcore/start.sh
-  read_only: true
-  bind:
-    create_host_path: false
-
+# Never edit it, and never run it with docker compose alone: federation.py generates it from the layout at
+# every command, makes the CA, the certificates and the secrets these services read, and bootstraps the
+# federation. To see what a layout generates: federation.py --layout PATH compose
+name: "expcore-fed"
 services:
   zone:
-    <<: *service
-    image: *zone-image
+    image: "docker.onedata.org/onezone:ID-ba7a778696"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
     command: ["/root/onezone.sh"]
-    hostname: node1
-    domainname: zone.expcore-fed.test
+    hostname: "node1"
+    domainname: "zone.expcore-fed.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
     env_file:
-      - path: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/zone.env
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/zone.env"
         required: false
     environment:
       ONEPANEL_BATCH_MODE: "true"
@@ -78,27 +49,51 @@ services:
           domainName: "zone.expcore-fed.test"
           letsEncryptEnabled: false
     volumes:
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/zone/persistence
-        target: /volumes/persistence
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/zone/persistence"
+        target: "/volumes/persistence"
         bind:
           create_host_path: false
-      - *ca-mount
-      - *start-mount
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
-      - "127.0.0.1:29443:443"
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29443"
+        protocol: "tcp"
     networks:
       fed:
-        aliases: [zone.expcore-fed.test]
-
+        aliases: ["zone.expcore-fed.test"]
   pine:
-    <<: *service
-    image: *provider-image
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
     command: ["/root/oneprovider.sh"]
-    hostname: node1
-    domainname: pine.expcore-fed.test
+    hostname: "node1"
+    domainname: "pine.expcore-fed.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
     env_file:
-      - path: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/pine.env
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/pine.env"
         required: false
     environment:
       ONEPANEL_BATCH_MODE: "true"
@@ -136,38 +131,62 @@ services:
         onezone:
           domainName: "zone.expcore-fed.test"
     volumes:
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/pine/persistence
-        target: /volumes/persistence
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/pine/persistence"
+        target: "/volumes/persistence"
         bind:
           create_host_path: false
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/pine/storage
-        target: /volumes/storage
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/pine/storage"
+        target: "/volumes/storage"
         bind:
           create_host_path: false
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/pine.regtoken
-        target: /expcore/registration-token
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/pine.regtoken"
+        target: "/expcore/registration-token"
         read_only: true
         bind:
           create_host_path: false
-      - *ca-mount
-      - *start-mount
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
-      - "127.0.0.1:29444:443"
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29444"
+        protocol: "tcp"
     networks:
       fed:
-        aliases: [pine.expcore-fed.test]
-
+        aliases: ["pine.expcore-fed.test"]
   birch:
-    <<: *service
-    image: *provider-image
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
     command: ["/root/oneprovider.sh"]
-    hostname: node1
-    domainname: birch.expcore-fed.test
+    hostname: "node1"
+    domainname: "birch.expcore-fed.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
     env_file:
-      - path: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/birch.env
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/birch.env"
         required: false
     environment:
       ONEPANEL_BATCH_MODE: "true"
@@ -205,38 +224,62 @@ services:
         onezone:
           domainName: "zone.expcore-fed.test"
     volumes:
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/birch/persistence
-        target: /volumes/persistence
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/birch/persistence"
+        target: "/volumes/persistence"
         bind:
           create_host_path: false
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/birch/storage
-        target: /volumes/storage
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/birch/storage"
+        target: "/volumes/storage"
         bind:
           create_host_path: false
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/birch.regtoken
-        target: /expcore/registration-token
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/birch.regtoken"
+        target: "/expcore/registration-token"
         read_only: true
         bind:
           create_host_path: false
-      - *ca-mount
-      - *start-mount
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
-      - "127.0.0.1:29445:443"
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29445"
+        protocol: "tcp"
     networks:
       fed:
-        aliases: [birch.expcore-fed.test]
-
+        aliases: ["birch.expcore-fed.test"]
   cedar:
-    <<: *service
-    image: *provider-image
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
     command: ["/root/oneprovider.sh"]
-    hostname: node1
-    domainname: cedar.expcore-fed.test
+    hostname: "node1"
+    domainname: "cedar.expcore-fed.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
     env_file:
-      - path: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/cedar.env
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/cedar.env"
         required: false
     environment:
       ONEPANEL_BATCH_MODE: "true"
@@ -274,49 +317,56 @@ services:
         onezone:
           domainName: "zone.expcore-fed.test"
     volumes:
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/cedar/persistence
-        target: /volumes/persistence
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/cedar/persistence"
+        target: "/volumes/persistence"
         bind:
           create_host_path: false
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/cedar/storage
-        target: /volumes/storage
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/cedar/storage"
+        target: "/volumes/storage"
         bind:
           create_host_path: false
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}/secrets/cedar.regtoken
-        target: /expcore/registration-token
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/cedar.regtoken"
+        target: "/expcore/registration-token"
         read_only: true
         bind:
           create_host_path: false
-      - *ca-mount
-      - *start-mount
-    ports:
-      - "127.0.0.1:29446:443"
-    networks:
-      fed:
-        aliases: [cedar.expcore-fed.test]
-
-  # Down's helper: removes what the services wrote as root under EXPCORE_FED_ROOT. No network, no published port; it
-  # runs only when down asks for it (profile "janitor") and is removed when it exits. It deletes nothing unless the
-  # root holds the mark up writes there, so a Compose command run by hand against another directory deletes nothing.
-  janitor:
-    image: *provider-image
-    pull_policy: never
-    profiles: ["janitor"]
-    network_mode: none
-    entrypoint:
-      - sh
-      - -c
-      - 'test "$$(cat /fed/.expcore-fed-root 2>/dev/null)" = expcore-fed || { echo "not this federation root" >&2; exit 3; }; find /fed -mindepth 1 -delete'
-    volumes:
-      - type: bind
-        source: ${EXPCORE_FED_ROOT:-/mnt/volume2/expcore-federation}
-        target: /fed
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
         bind:
           create_host_path: false
-
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29446"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["cedar.expcore-fed.test"]
+  janitor:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    profiles: ["janitor"]
+    network_mode: "none"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    entrypoint: ["sh", "-c", "test \"$$(cat /fed/.expcore-fed-root 2>/dev/null)\" = expcore-fed || { echo \"not this federation root\" >&2; exit 3; }; find /fed -mindepth 1 -delete"]
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}"
+        target: "/fed"
+        bind:
+          create_host_path: false
 networks:
   fed:
-    driver: bridge
+    driver: "bridge"

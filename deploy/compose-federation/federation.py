@@ -1,57 +1,53 @@
-"""One command each to bring the throwaway federation up, reset it to its baseline, and take it down.
+"""One command each to bring a throwaway federation up, reset it to its baseline, and take it down, as its layout
+declares it.
 
-    uv run python deploy/compose-federation/federation.py up
-    uv run python deploy/compose-federation/federation.py reset
-    uv run python deploy/compose-federation/federation.py down
-    uv run python deploy/compose-federation/federation.py status
+    uv run python deploy/compose-federation/federation.py [--layout PATH] up
+    uv run python deploy/compose-federation/federation.py [--layout PATH] reset
+    uv run python deploy/compose-federation/federation.py [--layout PATH] down
+    uv run python deploy/compose-federation/federation.py [--layout PATH] status | memory | describe | compose
 
 - up: from nothing, make the root, the CA, the certificates and the secrets, start the zone, bootstrap it, start the
   providers, register and support, add the fixed users, write the baseline files, and write facts.json (and
-  platform.toml, from platform.toml.template). On a federation that is already up it starts what is stopped and checks
-  every step again, and leaves the files as they are.
+  platform.toml, from the layout's platform template). On a federation that is already up it starts what is stopped
+  and checks every step again, and leaves the files as they are.
 - reset: start whatever is stopped, check every step again, and bring the spaces' content back to the baseline. The ids
   of the providers, the spaces and the users stay, so platform.toml stays valid.
-- down: remove this project's containers and network, then the root with everything in it, the CA and the secrets
+- down: remove the project's containers and network, then the root with everything in it, the CA and the secrets
   included. Nothing of the federation is left on disk, and the next up makes everything anew.
+- status: the project's containers, the root's allowed parent, and whether facts.json exists.
+- memory: each service's declared limit, and what its cgroup reads now and at its peak since the container started.
+- describe: the declared layout and the root, as the table the day-0 report records.
+- compose: the Compose file the layout generates.
 
-Only the Compose project `expcore-fed` is ever named: no other container, network or image is touched, nothing is
+The layout is `federation.toml` beside this file unless --layout names another (fedspec.py). Only the layout's Compose
+project is ever named, and only over its own root: no other container, network or image is touched, nothing is
 pulled, and nothing is pruned.
 """
 
 import argparse
-import json
-import os
-import re
 import shutil
-import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from fedboot import Bootstrap
+from fedcompose import render as render_compose
 from fedcontent import Content
-from fedlayout import (
-    COMPOSE_FILE,
-    CONTENT_FILE,
-    HOLDER,
-    IMAGES,
-    LISTING_DIR,
-    LISTING_ENTRIES,
-    LOOPBACK,
-    NODE,
-    PRINCIPALS,
-    PROJECT,
-    PROVIDERS,
-    ROOT_MARKER,
-    SERVICES,
-    SPACES,
-    STUDY_SPACE,
-    TEMPLATE,
-    ZONE,
-    Layout,
-    Service,
+from feddocker import (
+    compose,
+    gib,
+    memory_lines,
+    memory_usage,
+    project_containers,
+    project_networks,
+    require_images,
+    require_memory_fits,
+    require_own,
+    require_ports_free,
 )
+from fedfacts import describe, root_parent, write_facts
+from fedlayout import NODE, ROOT_MARKER, Layout
 from fedpki import (
     ensure_secret,
     make_ca,
@@ -62,12 +58,12 @@ from fedpki import (
     write_secret,
 )
 from fedrest import Rest
+from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, load_spec
 
 ZONE_TIMEOUT_S = 1500.0
 PROVIDER_TIMEOUT_S = 1800.0
 SUPPORT_TIMEOUT_S = 600.0
 TRANSFER_TIMEOUT_S = 600.0
-PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9-]+)?)@")
 GUI_CHECK_OFF = """[
     {oz_worker, [
         % the images are development builds: the zone would refuse the providers' GUI packages, which
@@ -95,53 +91,6 @@ class Timer:
         return f"{command}: {time.monotonic() - self.began:.0f} s ({parts})"
 
 
-# -- docker, for this project only ---------------------------------------------------------------------------------
-
-
-def compose(layout: Layout, *args: str, capture: bool = False) -> str:
-    """Run docker compose for this project's file and name; raise on failure."""
-    env = {**os.environ, "EXPCORE_FED_ROOT": str(layout.root)}
-    command = ["docker", "compose", "--file", str(COMPOSE_FILE), "--project-name", PROJECT, *args]
-    done = subprocess.run(command, env=env, check=False, capture_output=capture, text=True)
-    if done.returncode != 0:
-        raise RuntimeError(f"docker compose {args[0]} failed with status {done.returncode}")
-    return done.stdout if capture else ""
-
-
-def docker_lines(*args: str) -> list[str]:
-    """Run a read-only docker command and return its non-empty output lines."""
-    done = subprocess.run(["docker", *args], check=True, capture_output=True, text=True)
-    return [line for line in done.stdout.splitlines() if line.strip()]
-
-
-def project_containers() -> list[str]:
-    """Every container of this project, running or not, as 'name state'."""
-    label = f"label=com.docker.compose.project={PROJECT}"
-    return docker_lines("ps", "--all", "--filter", label, "--format", "{{.Names}} {{.State}}")
-
-
-def project_networks() -> list[str]:
-    return docker_lines(
-        "network", "ls", "--filter", f"label=com.docker.compose.project={PROJECT}", "--format", "{{.Name}}"
-    )
-
-
-def require_images() -> None:
-    """Both pinned images must already be present: nothing is ever pulled."""
-    for image in IMAGES:
-        if subprocess.run(["docker", "image", "inspect", image], capture_output=True, check=False).returncode != 0:
-            raise RuntimeError(f"the image {image} is not present; it is never pulled here")
-
-
-def require_ports_free() -> None:
-    """Before a first start, nothing may listen on the loopback ports the services will publish."""
-    for service in SERVICES:
-        with socket.socket() as probe:
-            probe.settimeout(1)
-            if probe.connect_ex((LOOPBACK, service.port)) == 0:
-                raise RuntimeError(f"something already listens on the loopback port meant for {service.name}")
-
-
 # -- the root, the CA and the secrets --------------------------------------------------------------------------------
 
 
@@ -149,7 +98,7 @@ def seed(layout: Layout, service: Service, key: Path, cert: Path) -> None:
     """Put the service's web certificate and the CA where its panel and worker read them, before its first start.
 
     The image copies its own defaults into the persistence directory only where a file is missing, so these win."""
-    zone = service is ZONE
+    zone = service.name == ZONE
     panel, worker = ("oz_panel", "oz_worker") if zone else ("op_panel", "op_worker")
     etc = layout.persistence(service.name) / "etc"
     certs = etc / panel / "certs"
@@ -170,21 +119,25 @@ def seed(layout: Layout, service: Service, key: Path, cert: Path) -> None:
 def prepare(layout: Layout) -> None:
     """Make the root and everything the services read from it; a step whose result exists is left as it is.
 
-    The root is marked as the federation's own when up makes it or finds it empty. A root that holds anything without
-    the mark is someone else's, and is refused: down would delete what it holds."""
-    owned = layout.marker.is_file() and layout.marker.read_text(encoding="utf-8").strip() == PROJECT
+    The root is marked as the federation's own, with the declared project's name, when up makes it or finds it empty.
+    A root that holds anything without that mark is someone else's, or another layout's, and is refused: down would
+    delete what it holds."""
+    spec, owned = layout.spec, layout.owned
     if layout.root.exists() and not owned and any(layout.root.iterdir()):
-        raise RuntimeError(f"the root holds files and is not marked as this federation's ({ROOT_MARKER}); refused")
+        raise RuntimeError(
+            f"the root holds files and is not marked as this federation's ({ROOT_MARKER} naming {spec.project}); "
+            "refused"
+        )
     private_directory(layout.root)
     if not owned:
-        layout.marker.write_text(PROJECT + "\n", encoding="utf-8")
+        layout.marker.write_text(spec.project + "\n", encoding="utf-8")
     private_directory(layout.secrets)
     private_directory(layout.users)
     layout.ca_pem.parent.mkdir(exist_ok=True)
     layout.journal.mkdir(exist_ok=True)
-    make_ca(layout.ca_pem, layout.ca_key, "expcore-fed test CA")
+    make_ca(layout.ca_pem, layout.ca_key, f"{spec.project} test CA")
     work = private_directory(layout.secrets / "work")
-    for service in SERVICES:
+    for service in spec.services:
         key, cert = layout.secrets / f"{service.name}.key", layout.ca_pem.parent / f"{service.name}.pem"
         make_leaf(
             layout.ca_pem,
@@ -203,7 +156,7 @@ def prepare(layout: Layout) -> None:
         if not layout.persistence(service.name).exists():
             seed(layout, service, key, cert)
         storage = layout.storage(service.name)
-        if service is not ZONE and not storage.exists():
+        if service.name != ZONE and not storage.exists():
             # The provider writes as the users it maps the space's members to, so its storage is open to them; the
             # root above it is 0700, so no other user of the host can reach it.
             storage.mkdir()
@@ -211,100 +164,38 @@ def prepare(layout: Layout) -> None:
     work.rmdir()
 
 
-# -- facts and platform.toml ------------------------------------------------------------------------------------------
-
-
-def facts_of(boot: Bootstrap) -> dict:
-    """What an integrator needs to write platform.toml: addresses, ids, names and where the credentials are.
-
-    It holds no secret: the credentials are named by their files."""
-    ids = boot.ids
-    return {
-        "zone": {"url": ZONE.url, "domain_on_project_network": ZONE.domain},
-        "providers": {
-            p.name: {"url": p.url, "id": ids.providers[p.name], "domain_on_project_network": p.domain}
-            for p in PROVIDERS
-        },
-        "spaces": {name: {"id": ids.spaces[name], "supported_by": list(by)} for name, by in SPACES.items()},
-        "study_space": STUDY_SPACE,
-        "data_provider": HOLDER,
-        "principals": {
-            user: {"user_id": ids.users[user], "privileges": list(rights)} for user, rights in PRINCIPALS.items()
-        },
-        "credentials": {
-            "admin_access_token_file": "secrets/admin.token",
-            "user_password_directory": "secrets/users",
-            "user_password_file_pattern": "{user}.pass",
-        },
-        "ca_file": "ca/federation-ca.pem",
-        "files": {"content": CONTENT_FILE, "listing_directory": LISTING_DIR, "listing_entries": LISTING_ENTRIES},
-        "paths_relative_to": "the directory holding this file",
-        "root_parent": root_parent(boot.layout),
-    }
-
-
-def root_parent(layout: Layout) -> dict:
-    """Where the root was allowed to lie, and which setting said so: the day-0 report records it."""
-    return {
-        "path": str(layout.parent),
-        "set_by": "default" if layout.parent_is_default else "EXPCORE_FED_ROOT_PARENT",
-    }
-
-
-def placeholders(facts: dict) -> dict[str, str]:
-    """The values platform.toml.template names, by placeholder."""
-    values = {"zone_url": facts["zone"]["url"], "space_name": facts["study_space"]}
-    for name, provider in facts["providers"].items():
-        values[f"provider_url.{name}"] = provider["url"]
-        values[f"provider_id.{name}"] = provider["id"]
-    for name, space in facts["spaces"].items():
-        values[f"space_id.{name}"] = space["id"]
-    for user, principal in facts["principals"].items():
-        values[f"user_id.{user}"] = principal["user_id"]
-    return values
-
-
-def render(template: str, values: dict[str, str]) -> str:
-    """Fill every placeholder of the template; refuse one that has no value."""
-    missing = sorted({m for m in PLACEHOLDER.findall(template) if m not in values})
-    if missing:
-        raise RuntimeError(f"platform.toml.template names {len(missing)} placeholder(s) the facts do not hold")
-    return PLACEHOLDER.sub(lambda m: values[m.group(1)], template)
-
-
-def write_facts(layout: Layout, boot: Bootstrap) -> None:
-    facts = facts_of(boot)
-    layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if TEMPLATE.exists():
-        layout.platform.write_text(render(TEMPLATE.read_text(encoding="utf-8"), placeholders(facts)), encoding="utf-8")
-
-
 # -- the commands ----------------------------------------------------------------------------------------------------
 
 
 def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
     """Start the zone, bootstrap it, start the providers, and settle registration, spaces, support and members."""
-    compose(layout, "up", "--detach", ZONE.name)
+    spec = layout.spec
+    compose(layout, "up", "--detach", spec.zone.name)
     boot.wait_zone(ZONE_TIMEOUT_S)
     timer.mark("zone")
     boot.ensure_admin_token()
     boot.ensure_users()
     boot.ensure_registration_tokens()
-    compose(layout, "up", "--detach", *(p.name for p in PROVIDERS))
+    compose(layout, "up", "--detach", *(p.name for p in spec.providers))
     boot.wait_providers(PROVIDER_TIMEOUT_S)
     timer.mark("providers")
     boot.ensure_spaces()
     boot.ensure_support(SUPPORT_TIMEOUT_S)
-    boot.ensure_members(STUDY_SPACE)
+    for space in spec.spaces:
+        if spec.members(space.name):
+            boot.ensure_members(space.name)
     timer.mark("spaces")
 
 
 def up(layout: Layout) -> str:
     timer = Timer()
     require_images()
-    fresh = not project_containers()
+    containers = project_containers(layout.spec.project)
+    require_own(layout, containers)
+    fresh = not containers
     if fresh:
-        require_ports_free()
+        require_ports_free(layout.spec)
+        require_memory_fits(layout.spec)
     prepare(layout)
     timer.mark("prepare")
     rest = Rest(layout.ca_pem)
@@ -314,15 +205,17 @@ def up(layout: Layout) -> str:
         if not layout.facts.exists():
             Content(boot).reset(TRANSFER_TIMEOUT_S)
             timer.mark("baseline")
-        write_facts(layout, boot)
+        written = write_facts(layout, boot)
     finally:
         rest.close()
-    return timer.summary("up" if fresh else "up (already up: checked)")
+    return timer.summary("up" if fresh else "up (already up: checked)") + f"\n{written}"
 
 
 def reset(layout: Layout) -> str:
     timer = Timer()
-    if not project_containers() or not layout.facts.exists():
+    containers = project_containers(layout.spec.project)
+    require_own(layout, containers)
+    if not containers or not layout.facts.exists():
         raise RuntimeError("the federation is not up; run up first")
     rest = Rest(layout.ca_pem)
     try:
@@ -339,42 +232,71 @@ def reset(layout: Layout) -> str:
 
 
 def down(layout: Layout) -> str:
+    """Stop and remove the project, then empty and remove the root; refuse first, touching nothing, when the project's
+    containers bind another root or the root lacks this layout's mark."""
     timer = Timer()
-    had = bool(project_containers()) or layout.root.exists()
+    project = layout.spec.project
+    containers = project_containers(project)
+    require_own(layout, containers)
+    if layout.root.exists() and not layout.owned:
+        raise RuntimeError(
+            f"the root is not marked as this federation's ({ROOT_MARKER} naming {project}); nothing stopped or deleted"
+        )
+    peaks = memory_usage(containers)
+    had = bool(containers) or layout.root.exists()
     compose(layout, "down", "--remove-orphans", "--timeout", "120")
     timer.mark("containers")
     if layout.root.exists():
-        if not (layout.marker.is_file() and layout.marker.read_text(encoding="utf-8").strip() == PROJECT):
-            raise RuntimeError(f"the root is not marked as this federation's ({ROOT_MARKER}); nothing deleted")
         compose(layout, "--profile", "janitor", "run", "--rm", "--no-deps", "janitor")
         layout.root.rmdir()
     timer.mark("data")
-    left = project_containers() + project_networks()
+    left = project_containers(project) + project_networks(project)
     if left or layout.root.exists():
         raise RuntimeError(f"down left {len(left)} container(s) or network(s), or the root, behind")
-    return timer.summary("down" if had else "down (already down)")
+    summary = timer.summary("down" if had else "down (already down)")
+    if peaks:
+        summary += "\npeak memory: " + ", ".join(f"{name} {gib(read['peak'])}" for name, read in peaks.items())
+    return summary
 
 
 def status(layout: Layout) -> str:
-    lines = project_containers() or ["no container of the project"]
+    lines = [str(c) for c in project_containers(layout.spec.project)] or ["no container of the project"]
     parent = root_parent(layout)
+    lines.append(f"layout: {layout.spec.source} (project {layout.spec.project})")
     lines.append(f"root parent: {parent['path']} ({parent['set_by']})")
     lines.append(f"facts: {'present' if layout.facts.exists() else 'absent'}")
     return "\n".join(lines)
 
 
+def memory(layout: Layout) -> str:
+    containers = project_containers(layout.spec.project)
+    require_own(layout, containers)
+    return "\n".join(memory_lines(layout.spec, memory_usage(containers)))
+
+
 def main(argv: list[str] | None = None) -> int:
+    commands = {"up": up, "reset": reset, "down": down, "status": status, "memory": memory, "describe": describe}
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("command", choices=("up", "reset", "down", "status"))
-    command = parser.parse_args(argv).command
+    parser.add_argument("--layout", type=Path, help="the layout file (default: federation.toml beside this script)")
+    parser.add_argument("command", choices=(*commands, "compose"))
+    args = parser.parse_args(argv)
+    command = args.command
     try:
-        layout = Layout.from_environment()  # before anything is touched: a root elsewhere is refused
+        spec: Spec = load_spec(args.layout)
+    except LayoutError as error:
+        print(f"error: {command}: {error}", file=sys.stderr)
+        return 2
+    if command == "compose":
+        print(render_compose(spec), end="")
+        return 0
+    try:
+        layout = Layout.from_environment(spec=spec)  # before anything is touched: a root elsewhere is refused
     except ValueError as error:
         print(f"error: {command}: {error}", file=sys.stderr)
         return 2
     try:
-        print({"up": up, "reset": reset, "down": down, "status": status}[command](layout))
-    except (RuntimeError, TimeoutError, OSError) as error:
+        print(commands[command](layout))
+    except (RuntimeError, TimeoutError, OSError, subprocess.CalledProcessError) as error:
         print(f"error: {command}: {error}", file=sys.stderr)
         return 1
     return 0

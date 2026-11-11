@@ -1,5 +1,5 @@
-"""The baseline content of the spaces: bring each space back to exactly its synthetic files, read every one back, and
-replicate one file so the study space has an ended transfer to read.
+"""The baseline content of the spaces: bring each space back to exactly its synthetic files, written through its owner,
+read every one back, and replicate one file to the study space's first mirror so it has an ended transfer to read.
 
 A provider finishes deleting a directory after the call returns, and with canonical storage paths a new directory of
 the same name has the same path on storage, so the old one's late removal can take the new one's files. Reset
@@ -16,28 +16,15 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from fedboot import Bootstrap
-from fedlayout import (
-    HOLDER,
-    LISTING_DIR,
-    PROVIDERS,
-    REPLICATED_FILE,
-    SPACES,
-    STUDY_SPACE,
-    BaselineFile,
-    Service,
-    baseline,
-)
+from fedlayout import LISTING_DIR, REPLICATED_FILE, BaselineFile, baseline
 from fedrest import PROVIDER_API, RestError, bearer
+from fedspec import Service, Spec
 
 WORKERS = 16
 PAGE = 1000
 WRITE_ROUNDS = 3
 TRANSFER_DONE = {"completed"}
 TRANSFER_FAILED = {"failed", "cancelled", "aborted"}
-
-
-def provider(name: str) -> Service:
-    return next(service for service in PROVIDERS if service.name == name)
 
 
 def parent_of(path: str) -> str:
@@ -53,10 +40,9 @@ def top_directories(files: Iterable[BaselineFile]) -> list[str]:
     return names
 
 
-def writer_of(space: str) -> Service:
-    """The provider a space's baseline is written through: the holder, or the first supporter of a space it lacks."""
-    supporters = SPACES[space]
-    return provider(HOLDER if HOLDER in supporters else supporters[0])
+def writer_of(spec: Spec, space: str) -> Service:
+    """The provider a space's baseline is written through: its owner."""
+    return spec.provider(spec.space(space).owner)
 
 
 def intact(found: dict[str, dict[str, Any]], expected: dict[str, int]) -> bool:
@@ -71,6 +57,7 @@ class Content:
 
     def __init__(self, boot: Bootstrap) -> None:
         self.boot = boot
+        self.spec = boot.layout.spec
 
     def root(self, service: Service, space: str) -> str:
         sid = self.boot.ids.spaces[space]
@@ -148,7 +135,7 @@ class Content:
 
     def settle(self, space: str) -> tuple[int, dict[str, str]]:
         """Bring one space to its baseline; return the count of entries removed and the files' ids by path."""
-        service, files = writer_of(space), baseline(space)
+        service, files = writer_of(self.spec, space), baseline(space, self.spec.study_space)
         removed, directories, ids = self.clear(service, self.root(service, space), files)
         pending = [f for f in files if f.path not in ids]
         for _ in range(WRITE_ROUNDS):
@@ -161,16 +148,15 @@ class Content:
             self.remove(service, [ids.pop(f.path) for f in pending if f.path in ids])
         raise RuntimeError(f"{len(pending)} baseline file(s) of {space} could not be written in {WRITE_ROUNDS} rounds")
 
-    def replicate(self, file_id: str, timeout_s: float) -> None:
-        """Replicate a file from the holder to the next supporter of the study space and wait for the transfer."""
-        target = next(name for name in SPACES[STUDY_SPACE] if name != HOLDER)
+    def replicate(self, file_id: str, target: str, timeout_s: float) -> None:
+        """Replicate a file from the data provider to `target` and wait for the transfer to end."""
         body = {
             "type": "replication",
             "dataSourceType": "file",
             "fileId": file_id,
             "replicatingProviderId": self.boot.ids.providers[target],
         }
-        holder = provider(HOLDER)
+        holder = self.spec.provider(self.spec.holder)
         tid = self.boot.provider(holder, "POST", "/transfers", "transfer", json=body)["transferId"]
         began = time.monotonic()
         while time.monotonic() - began < timeout_s:
@@ -184,10 +170,11 @@ class Content:
         raise TimeoutError("the baseline replication did not end in time")
 
     def reset(self, timeout_s: float) -> dict[str, int]:
-        """Bring every space's content back to its baseline; return how many entries each space lost."""
+        """Bring every space's content back to its baseline; return how many entries each space lost. A study space
+        with no mirror has nothing to replicate to, so it has no transfer record."""
         removed = {}
-        for space in SPACES:
-            removed[space], ids = self.settle(space)
-            if space == STUDY_SPACE:
-                self.replicate(ids[REPLICATED_FILE], timeout_s)
+        for declared in self.spec.spaces:
+            removed[declared.name], ids = self.settle(declared.name)
+            if declared.name == self.spec.study_space and declared.mirrors:
+                self.replicate(ids[REPLICATED_FILE], declared.mirrors[0], timeout_s)
         return removed

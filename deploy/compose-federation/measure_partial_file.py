@@ -1,29 +1,31 @@
 """Measure a file at its final size with only a prefix written, through the providers' REST content endpoint.
 
-    uv run python deploy/compose-federation/measure_partial_file.py
+    uv run python deploy/compose-federation/measure_partial_file.py [--layout PATH]
 
 On the running federation, as its admin, in the study space: create `ingest-partial.bin` through the data provider,
 write its first 64 KiB, set its size to 1 MiB with an empty write at offset 1 MiB, and read it back through the data
-provider and through another provider, by range and whole. Each step prints one JSON line: the status, the headers that
-matter, the lengths, whether the prefix's bytes and the unwritten range's bytes are what they should be, the block map
-per provider, and the seconds; never a token or an id. Whether the data gate would stream an answer is
-`gateboundary.streams` of its status and type. The file is removed at the end, and reset removes anything left.
+provider and through the study space's first mirror, by range and whole. Each step prints one JSON line: the status,
+the headers that matter, the lengths, whether the prefix's bytes and the unwritten range's bytes are what they should
+be, the block map per provider, and the seconds; never a token or an id. Whether the data gate would stream an answer
+is `gateboundary.streams` of its status and type. The file is removed at the end, and reset removes anything left.
 """
 
+import argparse
 import json
 import time
+from pathlib import Path
 
 from fedboot import Bootstrap
-from fedcontent import Content, provider
-from fedlayout import HOLDER, PROVIDERS, STUDY_SPACE, Layout
+from fedcontent import Content
+from fedlayout import Layout
 from fedrest import PROVIDER_API, Rest, bearer
+from fedspec import load_spec
 
 from expcore_onedata.sandbox import gateboundary
 
 NAME = "ingest-partial.bin"
 SIZE = 1 << 20
 PREFIX = 64 << 10
-REMOTE = "birch"
 ANY = tuple(range(200, 600))
 DATA = bytes((i * 7 + 3) % 251 + 1 for i in range(PREFIX))  # no zero byte, so a zero read back is not data
 
@@ -37,6 +39,13 @@ class Probe:
         self.rest, self.boot = rest, boot
         self.token = bearer(boot.admin_token())
         self.names = {pid: name for name, pid in boot.ids.providers.items()}
+        spec = boot.layout.spec
+        self.spec = spec
+        self.holder = spec.provider(spec.holder)
+        mirrors = spec.space(spec.study_space).mirrors
+        if not mirrors:
+            raise RuntimeError("the study space has no mirror to read the file through")
+        self.remote = spec.provider(mirrors[0])
         self.file_id = ""
 
     def call(self, service, method, path, **options):
@@ -49,7 +58,7 @@ class Probe:
 
     def blocks(self, step: str) -> None:
         """The file's size and every provider's blocks and physical size, as the data provider answers."""
-        answer = self.call(provider(HOLDER), "GET", f"/data/{self.file_id}/distribution", headers=self.token)
+        answer = self.call(self.holder, "GET", f"/data/{self.file_id}/distribution", headers=self.token)
         per = {}
         for pid, entry in answer.json().get("distributionPerProvider", {}).items():
             storages = list(entry.get("distributionPerStorageBackend", {}).values())
@@ -58,7 +67,7 @@ class Probe:
                 "blocks": [s.get("blocks") for s in storages],
                 "physicalSize": [s.get("physicalSize") for s in storages],
             }
-        show(step, size=self.size(provider(HOLDER)), distribution_status=answer.status_code, per_provider=per)
+        show(step, size=self.size(self.holder), distribution_status=answer.status_code, per_provider=per)
 
     def read(self, service, step: str, first: int | None = None, last: int | None = None) -> None:
         headers = {**self.token, **({"Range": f"bytes={first}-{last}"} if first is not None else {})}
@@ -89,8 +98,8 @@ class Probe:
         )
 
     def run(self) -> None:
-        holder, remote = provider(HOLDER), provider(REMOTE)
-        root = Content(self.boot).root(holder, STUDY_SPACE)
+        holder, remote = self.holder, self.remote
+        root = Content(self.boot).root(holder, self.spec.study_space)
         made = self.call(
             holder, "POST", f"/data/{root}/children", headers=self.token, params={"name": NAME, "type": "REG"}
         )
@@ -130,12 +139,14 @@ class Probe:
 
 
 def main() -> None:
-    layout = Layout.from_environment()
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--layout", type=Path, help="the layout file (default: federation.toml)")
+    layout = Layout.from_environment(spec=load_spec(parser.parse_args().layout))
     rest = Rest(layout.ca_pem)
     try:
         boot = Bootstrap(rest, layout)
         boot.ensure_spaces()
-        for service in PROVIDERS:
+        for service in layout.spec.providers:
             url = service.url + PROVIDER_API + "/configuration"
             boot.ids.providers[service.name] = rest.json("GET", url, label="configuration")["providerId"]
         Probe(rest, boot).run()
