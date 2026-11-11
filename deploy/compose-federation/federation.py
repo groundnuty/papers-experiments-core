@@ -7,12 +7,12 @@ declares it.
     uv run python deploy/compose-federation/federation.py [--layout PATH] status | memory | describe | compose
 
 - up: from nothing, make the root, the CA, the certificates and the secrets, start the zone, bootstrap it, start the
-  providers, register and support, add the fixed users, write the baseline files, and write facts.json (and
-  platform.toml, from the layout's platform template). On a federation that is already up it starts what is stopped
-  and checks every step again, and leaves the files as they are.
+  providers, register and support, add the fixed users, write the baseline files (into every space but those the layout
+  declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform template). On a
+  federation that is already up it starts what is stopped and checks every step again, and leaves the files as they are.
 - reset --clean: start whatever is stopped, check every step again, and bring every space's content back to the
-  baseline, removing whatever was ingested. The ids of the providers, the spaces and the users stay, so platform.toml
-  stays valid.
+  baseline, removing whatever was ingested; a space declared `baseline = false` is left empty. The ids of the
+  providers, the spaces and the users stay, so platform.toml stays valid.
 - reset --replicas: start whatever is stopped, check every step again, keep every owner's data, and evict only what
   the mirrors hold, verified on the block maps (fedreplicas.py). For between runs. A bare `reset` is refused, naming
   both, so nobody wipes ingested datasets by accident.

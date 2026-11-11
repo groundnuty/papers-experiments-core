@@ -65,6 +65,12 @@ def baseline(space: str, study_space: str) -> tuple[BaselineFile, ...]:
     return (BaselineFile(f"{space.removesuffix('-space')}.txt", 64),)
 
 
+def baseline_plan(spec: Spec) -> dict[str, tuple[BaselineFile, ...]]:
+    """What every declared space holds after up and after reset --clean: its baseline files, or nothing at all for a
+    space declared `baseline = false`, the study space included."""
+    return {space.name: baseline(space.name, spec.study_space) if space.baseline else () for space in spec.spaces}
+
+
 def checked_parent(value: str) -> Path:
     """The allowed parent from a setting, refused unless it is an absolute path other than `/`."""
     if not value or not os.path.isabs(value):

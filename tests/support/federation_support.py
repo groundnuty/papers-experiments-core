@@ -42,3 +42,17 @@ spaces = ["day0-space"]
 agent = false
 """
 )
+
+# The same with a space declared baseline = false: owned by elm, mirrored by oak, and left empty by up and the reset.
+WITH_BASELINE_OFF = (
+    MINIMAL
+    + """
+[spaces.scratch-space]
+owner = "elm"
+mirrors = ["oak"]
+baseline = false
+"""
+)
+
+# The study space itself declared baseline = false: the study ingests everything that is ever in it.
+STUDY_BASELINE_OFF = MINIMAL.replace('mirrors = ["elm"]', 'mirrors = ["elm"]\nbaseline = false', 1)
