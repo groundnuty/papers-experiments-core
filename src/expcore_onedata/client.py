@@ -543,14 +543,20 @@ class OnezoneClient:
     def _space_roots(self, provider: str) -> dict[str, str]:
         """Return root file id -> space id for the spaces the configuration knows, their roots as `provider` gives them.
 
-        Every declared space is asked for (`[[spaces]]`, or the one `[space]`), so a file resolves to its own space
-        whichever it is, and a caller bound to one space can refuse a file of another (`_require_in_scope`). A root is
-        the `fileId` of the provider's `GET /spaces/{id}`, read once per provider and kept once it was answered. An
-        absence (`answered_absent`) is a space the provider does not hold, left out; when the provider holds none of
-        them, the target resolves to no space (OutOfScope). Any other failure, or an answer without a plain id, raises
-        PlatformError and keeps nothing of that space."""
+        The provider is asked for each declared space whose support set names it (`[[spaces]]`, or the one `[space]`
+        with `[support]`): a file a provider can see lies in a space it supports (O04), and how a provider answers for a
+        space it does not support is unmeasured, so the gate does not depend on it where the configuration says which
+        spaces the provider supports. A declared provider that no support set names is asked for every declared space,
+        as the one-space gate always asked for its space. So a file resolves to its own space whichever it is, and a
+        caller bound to one space can refuse a file of another (`_require_in_scope`). A root is the `fileId` of the
+        provider's `GET /spaces/{id}`, read once per space and provider and kept once it was answered. An absence
+        (`answered_absent`) is a space the provider does not hold, left out and asked again next time; when the
+        provider holds none of them, the target resolves to no space (OutOfScope). Any other failure, or an answer
+        without a plain id, raises PlatformError and keeps nothing of that space."""
         roots: dict[str, str] = {}
-        for space_id in dict.fromkeys(entry.space.id for entry in self._config.spaces):
+        declared = self._config.spaces
+        supported = [entry for entry in declared if provider in entry.support.providers] or declared
+        for space_id in dict.fromkeys(entry.space.id for entry in supported):
             root = self._space_root(provider, space_id)
             if root is not None:
                 roots[root] = space_id

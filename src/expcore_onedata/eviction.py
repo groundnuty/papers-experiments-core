@@ -7,7 +7,7 @@ seconds a file, so hundreds of files take minutes. Here the waits are shared:
 - **One call for a directory** (`evict_tree`). An eviction scheduled on a directory applies to every file under it
   (Oneprovider 25.0's REST description of `POST /transfers`: "In case of a directory, the transfer applies to all its
   subfiles and subdirectories (recursively)"), so a subtree leaves a provider in one transfer. The files under it are
-  then listed once, one listing per directory, and verified.
+  listed once beforehand, one listing per directory, and verified once the transfer has ended.
 - **Many files in parallel** (`evict_ids`). A set of files that is not one directory is evicted file by file, at most
   `[placement] concurrency` requests in flight at once (16 by default), and their transfers are waited on together.
 

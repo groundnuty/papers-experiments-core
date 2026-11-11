@@ -108,6 +108,24 @@ def test_o09_a_provisioner_bound_to_one_space_never_mutates_another_under_a_shar
     assert [c for c in fake.provider_calls if c[2] == "/transfers"] == []
 
 
+def test_o09_the_gate_asks_a_provider_only_for_the_roots_of_the_spaces_it_supports(tmp_path, fake, ticker):
+    """O09: the gate walks a file's parent links to the root of a declared space, and asks a provider only for the
+    roots of the spaces whose support set names it: how a provider answers for a space it does not support is
+    unmeasured. Here beta supports only the second space and answers the first's root with a 403, which the gate never
+    reads, so the second space's provisioner writes through beta."""
+
+    def edit(data):
+        two_spaces(data)
+        data["spaces"][0]["providers"] = ["alpha"]
+
+    owned = bound(tmp_path, fake, ticker, edit, SPACE_LABELS[1])
+    fake.statuses = [[f"/spaces/{SPACE_IDS[0]}", 10**6, 403]]
+    owned.put_file("study/mine.bin", DATA)
+    asked = {c[2] for c in fake.provider_calls if c[0] == BETA_ID and c[1] == "GET"}
+    assert f"/spaces/{SPACE_IDS[1]}" in asked
+    assert f"/spaces/{SPACE_IDS[0]}" not in asked
+
+
 def test_o09_a_reset_plan_naming_a_provider_that_does_not_support_its_space_is_refused_before_any_stage(
     tmp_path, fake, ticker
 ):
