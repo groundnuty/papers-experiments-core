@@ -50,6 +50,7 @@ from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.lock import CampaignLocked, DispatchLock
 from expcore.campaign.manifest import Manifest
+from expcore.campaign.probe_spend import MeteredProbes
 from expcore.campaign.recovery import Recovery
 from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
@@ -191,19 +192,17 @@ class Scheduler:
         self.stops = HarnessStops(store, cfg.harness_stop)
         self.reconcile_accounting()
         self.identities = ServedIdentities(store, self.stamp)
-        held = self._admit_models()  # before the gate: which models are held to the reply maximum (C27)
         self.budget, self.ledger = None, None
+        paying = None  # with a budget: the ledger admission's probes are paid from (C26)
         if cfg.budget is not None:
             specs = {m: self.models.resolve(m) for m in self.plan_models}
+            early = BudgetGate(store, specs, cfg.budget, self.agent_config.limits)  # no model is shown held to R yet
+            early.take_releases(self.stamp())  # a release given for a stopped campaign makes room for its probes
+            paying = self._ledger(early)
+        held = self._admit_models(paying)  # before the gate: which models are held to the reply maximum (C27)
+        if cfg.budget is not None:
             self.budget = BudgetGate(store, specs, cfg.budget, self.agent_config.limits, reply_capped=held)
-            # a top-up is decided under the dispatcher's locks, in its order, against the runs in flight (C26)
-            self.ledger = Ledger(
-                self.budget,
-                store,
-                self.stamp,
-                (self._cv, self._assess),
-                lambda: [m for m, _ in self._inflight.values()],
-            )
+            self.ledger = self._ledger(self.budget)
         else:
             store.event(self.stamp(), "budget_gate_off", None, "no budget in this campaign: runs are not held for cost")
         self.gate = None
@@ -242,6 +241,16 @@ class Scheduler:
             )
         )
 
+    def _ledger(self, gate: BudgetGate) -> Ledger:
+        """A ledger over the gate: a top-up is decided under the dispatcher's locks, in its order, against the runs in
+        flight (C26)."""
+        assert self.store
+
+        def in_flight() -> list[str]:  # read while the locks are held
+            return [m for m, _ in self._inflight.values()]
+
+        return Ledger(gate, self.store, self.stamp, (self._cv, self._assess), in_flight)
+
     def reconcile_accounting(self) -> None:
         """Derive the harness-error stops and the units' failures from the stored attempts (C04, C10, C15).
 
@@ -256,29 +265,43 @@ class Scheduler:
             )
         )
 
-    def _admit_models(self) -> frozenset[str]:
+    def _admit_models(self, paying: Ledger | None) -> frozenset[str]:
         """Admit each model's endpoint once (C14). The endpoint checked here is the one every run of the model uses.
 
         With a budget, a model of the core's own factory is also probed for the reply maximum; return the models the
         probe showed held to it, and mark in the store those it did not (C27).
+
+        With a budget (`paying`), every send of a probe is paid from it (C26): reserved one request's bound before it
+        goes out, charged in the store, and settled to what an answered reply's counts cost. A probe that does not fit
+        is not sent, and its model is not admitted, its reason saying the budget is spent. The stub sends nothing an
+        endpoint could bill, so its probes are not paid for; a model without a price is not probed at all, since what
+        a probe of it costs is unknown, and the budget gate holds it (C12).
         """
         assert self.store
         held = set()
         for model in self.plan_models:
             endpoint, spec = self.endpoints[model], self.models.resolve(model)
+            pays = paying if spec.backend != "stub" else None  # the ledger this model's probes are paid from
+            if pays is not None and pays.probe_bound(model) is None:
+                continue
             backend = self.backend_factory(
                 spec, seed=0, limits=self.agent_config.limits, base_url=endpoint.base_url, time_left=None
             )
+            metered = None if pays is None else MeteredProbes(backend, pays, model)
             probed = reply_cap.probed(spec, self.backend_factory, self.settings.budget is not None)
 
-            async def check(backend: Any = backend, probed: bool = probed) -> tuple[str | None, str | None]:
+            async def check(
+                backend: Any = backend, probing: Any = metered or backend, probed: bool = probed
+            ) -> tuple[str | None, str | None]:
                 try:
-                    reason = await admit(backend)
-                    return reason, await reply_cap_unshown(backend) if reason is None and probed else None
+                    reason = await admit(probing)
+                    return reason, await reply_cap_unshown(probing) if reason is None and probed else None
                 finally:
                     await backend.aclose()
 
             reason, unshown = asyncio.run(check())
+            if metered is not None and metered.refusal is not None:  # not sent: no reply says anything of the model
+                reason = f"the campaign's budget is spent: {metered.refusal}"
             if reason is not None:
                 self.not_admitted[model] = reason
                 self.store.event(self.stamp(), "model_not_admitted", model, f"{model}: {reason}")

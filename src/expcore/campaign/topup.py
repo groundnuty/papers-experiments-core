@@ -30,6 +30,10 @@ taken off the maximum during the wait, the rest of its top-up's bound by the win
 refused, and either way the campaign must still be within its ceilings. Marks are made under the ledger's locks, so a
 bound read there and the charge made from it never straddle one.
 
+The ledger also pays for admission's probes (`reserve_probe`, `settle_probe`; `expcore.campaign.probe_spend`): each
+send of a probe is reserved one request's bound by the window before it goes out and charged in the store, and the
+answered one is settled to what its reply's counts cost.
+
 The ledger's work reads and writes the store, so the guard does it in a thread, never on the attempt's event loop
 (L15).
 """
@@ -39,7 +43,8 @@ import contextlib
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
-from expcore.campaign import reply_cap
+from expcore.campaign import probe_spend, reply_cap
+from expcore.campaign.attempt_bounds import probe_usd, request_bound_usd
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.store import Store
 from expcore.errors import BudgetHold
@@ -158,6 +163,41 @@ class Ledger:
             usd = self.bound(model)
             if usd:  # free, or unpriced: a model without a price never runs under a budget (C12)
                 self._add(attempt_id, run_key, model, why, usd)
+
+    def probe_bound(self, model: str) -> float | None:
+        """What one send of an admission probe can cost: one request's bound by the window, whatever the model is held
+        to, since a probe is what would show it held (C26, C27); 0 when free, None when the price is unknown."""
+        return request_bound_usd(self.gate.models[model], self.gate.limits)
+
+    def reserve_probe(self, model: str, what: str) -> tuple[float | None, str | None]:
+        """Reserve one send of an admission probe against the ceilings and charge it in the store (C26); return its
+        bound and None, or why it does not fit, uncharged."""
+        with self._held():
+            usd = self.probe_bound(model)
+            if usd == 0.0:
+                return 0.0, None  # a free model's probe costs nothing
+            refusal = (
+                f"model {model} has no price: its probe has no bound"
+                if usd is None
+                else self.gate.refusal(model, self.in_flight(), usd, "this probe")
+            )
+            if refusal is not None:
+                self.store.event(self.stamp(), "probe_refused", model, f"{model}: {what} was not sent: {refusal}")
+                return usd, refusal
+            assert usd is not None
+            detail = f"{model}: {what}; {usd:.6f} USD reserved before it is sent"
+            probe_spend.add(self.store, model, usd, self.stamp(), ("probe_charged", model, detail))
+        return usd, None
+
+    def settle_probe(self, model: str, what: str, reserved: float, input_tokens: int, output_tokens: int) -> None:
+        """Replace what an answered send of a probe was reserved by what its reply's counts cost (C26)."""
+        cost = probe_usd(self.gate.models[model], self.gate.limits, input_tokens, output_tokens)
+        detail = (
+            f"{model}: {what} reported {input_tokens} input and {output_tokens} output tokens; charged {cost:.6f} USD "
+            f"in place of the {reserved:.6f} reserved"
+        )
+        with self._held():
+            probe_spend.add(self.store, model, cost - reserved, self.stamp(), ("probe_settled", model, detail))
 
     def _add(self, attempt_id: int, run_key: str, model: str, why: str, usd: float) -> None:
         """Charge the attempt one top-up, with its event; call with the locks held."""

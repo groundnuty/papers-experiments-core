@@ -15,7 +15,10 @@ the status and the reports (`BudgetState.estimate_usd`) and decides nothing.
 
 A send of a run in flight that its token cap cannot account for asks for a top-up first (`refusal`, C26; the ledger
 is `expcore.campaign.topup`): the same figure, with the top-up in place of a new run's bound. What was spent includes
-every top-up, of finished attempts and of running ones, from the moment it was reserved.
+every top-up, of finished attempts and of running ones, from the moment it was reserved, and what admission's probes
+were charged (`expcore.campaign.probe_spend`), which each send of a probe asks for the same way before it goes out. A
+start of the campaign takes a release before its probes ask (`take_releases`), so a released campaign is not held
+for want of the room the release gave.
 
 Cost that cannot be known holds like cost that is over: a model whose price is unknown (no price, not free) is held,
 and so is every model once an attempt of an unpriced model has been charged, because the total spent is then unknown.
@@ -35,7 +38,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from expcore.campaign import release, reply_cap
+from expcore.campaign import probe_spend, release, reply_cap
 from expcore.campaign.attempt_bounds import attempt_costs, bound_usd, mean_run_usd, request_bound_usd, spent_usd
 from expcore.campaign.store import Store
 from expcore.config.models import Limits, ModelSpec
@@ -146,6 +149,12 @@ class BudgetGate:
         base = self.budget.max_usd if scope == ALL else self.budget.per_model_usd.get(scope)
         return None if base is None else base + float(released.get(scope, 0.0))
 
+    def take_releases(self, now: str) -> None:
+        """Use up the release file for the stops in force, as each assessment does first. A start of the campaign
+        calls it before admission, whose probes are paid from the budget and must find the room a release gave
+        (C13, C26)."""
+        self._apply_releases(self._json(HOLDS_KEY), self._json(RELEASED_KEY), now)
+
     def _apply_releases(self, holds: dict, released: dict, now: str) -> tuple[dict, dict]:
         """Use up the release file for the stops in force; return the holds and the released amounts that remain."""
         path = self.budget.release_file
@@ -187,14 +196,15 @@ class BudgetGate:
         holds, released = self._apply_releases(self._json(HOLDS_KEY), self._json(RELEASED_KEY), now)
         capped = self.capped()
         costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped)
-        spent = spent_usd(costs)
+        probes = probe_spend.charged(self.store)
+        spent = _with_probes(spent_usd(costs), probes)
         reserve = {m: self._reserve(m, capped) for m in self.models}
         estimate = {m: self._estimate(m, costs, capped) for m in self.models}
         flying = {m: sum(1 for x in in_flight if x == m) for m in self.models}
         found: dict[str, list[Hold]] = {}
         over: dict[str, str] = {}
         for model, spec in self.models.items():
-            for hold in self._holds_of(model, spec, costs, spent, reserve, flying, released):
+            for hold in self._holds_of(model, spec, costs, spent, reserve, flying, released, probes):
                 found.setdefault(model, []).append(hold)
                 if hold.releasable:
                     over.setdefault(hold.scope, hold.reason)
@@ -219,10 +229,12 @@ class BudgetGate:
         released = self._json(RELEASED_KEY)
         capped = self.capped()
         costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped)
-        spent = spent_usd(costs)
+        probes = probe_spend.charged(self.store)
+        spent = _with_probes(spent_usd(costs), probes)
         reserve = {m: self._reserve(m, capped) for m in self.models}
         flying = {m: sum(1 for x in in_flight if x == m) for m in self.models}
-        holds = self._holds_of(model, self.models[model], costs, spent, reserve, flying, released, extra_usd, label)
+        spec = self.models[model]
+        holds = self._holds_of(model, spec, costs, spent, reserve, flying, released, probes, extra_usd, label)
         return "; ".join(h.reason for h in holds) if holds else None
 
     def capped(self) -> frozenset[str]:
@@ -256,13 +268,18 @@ class BudgetGate:
         reserve: Mapping[str, float | None],
         flying: Mapping[str, int],
         released: Mapping[str, float],
+        probes: Mapping[str, float] | None,
         topup: float | None = None,
         label: str = "this top-up",
     ) -> list[Hold]:
         """Return the holds on one model: the unknown ones first, then each ceiling its next run would pass, or, with
-        `topup`, each ceiling that top-up of a run in flight would pass."""
+        `topup`, each ceiling that top-up of a run in flight would pass. `probes` are what admission's probes were
+        charged, per model; None when the store's record of them cannot be read."""
         if not spec.priced:
             return [Hold(model, f"model {model} has no price and is not marked free: its cost is unknown", False)]
+        if probes is None:
+            why = f"the store's {probe_spend.PROBES_KEY}, what admission's probes were charged, cannot be read"
+            return [Hold(ALL, f"the total spent is unknown: {why}", False)]
         if spent is None:
             return [Hold(ALL, "the total spent is unknown: an attempt of a model without a price was charged", False)]
         later = {m: n * reserve[m] for m, n in flying.items() if n and reserve[m] is not None}
@@ -273,7 +290,7 @@ class BudgetGate:
         out = []
         cap = self.ceiling(model, released)
         if cap is not None:
-            used = spent_usd(costs, model) or 0.0
+            used = (spent_usd(costs, model) or 0.0) + probes.get(model, 0.0)
             figure = used + later.get(model, 0.0) + (mine or 0.0)
             if figure > cap:
                 text = _over(f"model {model}", figure, used, later.get(model, 0.0), mine, cap, what)
@@ -298,6 +315,11 @@ class BudgetGate:
         events = [("budget_hold", None if s == ALL else s, f"{s}: {r}") for s, r in sorted(began.items())]
         events += [("budget_hold_over", None if s == ALL else s, f"{s}: no longer over its ceiling") for s in ended]
         self.store.put_meta_many({HOLDS_KEY: json.dumps(kept, sort_keys=True)}, now, events)
+
+
+def _with_probes(spent: float | None, probes: Mapping[str, float] | None) -> float | None:
+    """What was spent on attempts plus what admission's probes were charged; unknown when either is."""
+    return None if spent is None or probes is None else spent + sum(probes.values())
 
 
 def _stop_epoch(hold: Mapping) -> float:

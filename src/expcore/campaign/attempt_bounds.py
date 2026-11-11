@@ -146,6 +146,14 @@ def request_bound_usd(spec: ModelSpec, limits: Limits, *, reply_capped: bool = F
     return overshoot_usd(spec, limits, reply_capped=reply_capped)
 
 
+def probe_usd(spec: ModelSpec, limits: Limits, input_tokens: int, output_tokens: int) -> float:
+    """Return what a reply that reported its counts cost, in dollars, at the dearest rates of any tier: an admission
+    probe's reply says neither how much of its prompt was cached nor which tier priced it, so the dearest rates bound
+    it (C26). The model must be priced."""
+    input_rate, output_rate = _rates(spec, limits)
+    return (input_tokens * input_rate + output_tokens * output_rate) / TOKENS_PER_PRICE_UNIT
+
+
 def bound_usd(spec: ModelSpec, limits: Limits, *, reply_capped: bool = False) -> float | None:
     """Return the bound of one attempt: the requests within its token cap and the one past it at their worst (C25),
     by the reply maximum only for a model held to it (C27); 0 for a free model, None when the price is unknown. A
