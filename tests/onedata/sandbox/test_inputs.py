@@ -63,16 +63,17 @@ def agent_mounts(world, sbx) -> list[str]:
 
 
 def test_o20_the_input_is_copied_and_mounted_read_only_from_the_copy_and_its_hash_is_recorded(world, scripts):
-    """O20: the agent's container mounts the run's own copy of the input at its path with `readonly`; the copy is the
-    driver's, readable by the agent and executable where the source was; the metadata records the path in the agent,
-    the content's SHA-256, its files and bytes, and never the host's path."""
+    """O20: the agent's container mounts the run's own copy of the input at its path with `readonly`; the copy is
+    root's and read-only on the host too (0444 files, 0555 directories), readable by the agent and executable where the
+    source was; the metadata records the path in the agent, the content's SHA-256, its files and bytes, and never the
+    host's path."""
     sbx = start(world, [ReadOnlyInput(scripts, TARGET)])
     copy = sbx.dir / "inputs" / "0"
     assert f"type=bind,src={copy},dst={TARGET},readonly" in agent_mounts(world, sbx)
     assert (copy / "analyse.py").read_text(encoding="utf-8") == "print('analysed')\n"
     modes = {p.relative_to(copy).as_posix(): stat.S_IMODE(p.lstat().st_mode) for p in [copy, *copy.rglob("*")]}
-    assert modes == {".": 0o755, "analyse.py": 0o755, "helpers": 0o755, "helpers/common.py": 0o644}
-    assert all(p.lstat().st_uid == os.getuid() for p in [copy, *copy.rglob("*")])
+    assert modes == {".": 0o555, "analyse.py": 0o555, "helpers": 0o555, "helpers/common.py": 0o444}
+    assert ["chown", "-R", "-P", "-h", "0:0", "--", str(copy)] in world.host.sudo_commands  # the fake cannot chown
     meta = sbx.metadata()
     [recorded] = meta["read_only_inputs"]
     assert set(recorded) == {"path", "sha256", "files", "bytes"}
@@ -282,10 +283,11 @@ def test_o20_two_inputs_are_each_copied_mounted_proved_and_recorded(world, scrip
     sbx.stop()
 
 
-def test_o20_c06_a_campaign_does_not_resume_with_changed_read_only_inputs(scripts, tmp_path):
-    """O20, C06: the plugin declares its read-only inputs in the platform's half of the campaign fingerprint
-    (`inputs.fingerprint`), by their path in the agent and the hash of their content: the same inputs resume, a changed
-    script refuses the resume, and the refusal names neither the host's path nor the script."""
+def test_o20_c06_a_campaign_does_not_resume_with_changed_read_only_inputs(world, scripts, tmp_path):
+    """O20, C06: the plugin declares its read-only inputs (`inputs.declare`) and puts them in the platform's half of
+    the campaign fingerprint (`inputs.fingerprint`), by their path in the agent and the hash of their content: the same
+    inputs resume, a changed script refuses the resume, and the refusal names neither the host's path nor the
+    script."""
     from campaign_support import make_fingerprint, make_manifest, make_schema
     from platform_support import NOW
 
@@ -294,8 +296,8 @@ def test_o20_c06_a_campaign_does_not_resume_with_changed_read_only_inputs(script
     schema, manifest = make_schema(), make_manifest(make_schema())
 
     def resume():
-        declared = inputs.fingerprint({"every-run": [ReadOnlyInput(scripts, TARGET)]})
-        fingerprint = make_fingerprint(schema, platform=declared)
+        declared = inputs.declare(world.s, {"every-run": [ReadOnlyInput(scripts, TARGET)]})
+        fingerprint = make_fingerprint(schema, platform=inputs.fingerprint(declared))
         store, _ = open_campaign(tmp_path / "campaign.db", schema, manifest, fingerprint, now=NOW, max_attempts=3)
         store.close()
 
@@ -307,3 +309,42 @@ def test_o20_c06_a_campaign_does_not_resume_with_changed_read_only_inputs(script
     assert caught.value.differences
     assert all(line.startswith("platform.read_only_inputs") for line in caught.value.differences)
     assert str(scripts) not in str(caught.value)
+
+
+@pytest.mark.parametrize("target", ["/etc/sandbox", "/etc/sandbox/ca.pem", MOUNT_PATH, "/etc/ssl", "/work/x"])
+def test_o20_declaring_inputs_checks_every_path_the_sandbox_reserves(world, scripts, target):
+    """O20: `inputs.declare` refuses the paths the sandbox itself refuses, the run's CA, the data mount, a trust path
+    and the agent's own directories among them, so the fingerprint never names an input no launch can deliver; it
+    gives each input it accepts the hash it declares it with."""
+    settings = dataclasses.replace(world.s, trust_paths=("/etc/ssl/certs/bundle.pem",))
+    with pytest.raises(StartRefused, match="read-only input 0"):
+        inputs.declare(settings, {"every-run": [ReadOnlyInput(scripts, target)]})
+    [item] = inputs.declare(settings, {"every-run": [ReadOnlyInput(scripts, TARGET)]})["every-run"]
+    assert item.sha256 == inputs.digest(scripts)["sha256"]
+
+
+def test_o20_an_input_whose_content_left_its_declared_hash_is_refused_before_anything_exists(world, scripts):
+    """O20: every start hashes each input again and refuses one whose content is no longer the content the campaign
+    declared, so an input edited mid-campaign never runs under the old fingerprint; nothing is created."""
+    [item] = inputs.declare(world.s, {"every-run": [ReadOnlyInput(scripts, TARGET)]})["every-run"]
+    start(world, [item]).stop()  # as declared: it starts
+    (scripts / "analyse.py").write_text("print('edited mid-campaign')\n", encoding="utf-8")
+    with pytest.raises(StartRefused, match="read-only input 0"):
+        start(world, [item])
+    assert nothing_left(world)
+
+
+def test_o20_the_copy_is_hashed_again_when_the_run_is_collected(world, scripts, tmp_path):
+    """O20: the collection hashes each input's copy again: one that no longer has the hash the run recorded was not
+    what the agent was declared to see throughout, and the run is set aside as infrastructure of kind
+    output_collection, never scored."""
+    from expcore.errors import InfraError
+
+    sbx = start(world, [ReadOnlyInput(scripts, TARGET)])
+    script = sbx.dir / "inputs" / "0" / "analyse.py"
+    script.chmod(0o644)
+    script.write_text("print('changed on the host')\n", encoding="utf-8")
+    with pytest.raises(InfraError) as caught:
+        sbx.collect(tmp_path / "evidence")
+    assert caught.value.kind == "output_collection"
+    sbx.stop()

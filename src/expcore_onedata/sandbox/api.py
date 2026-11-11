@@ -68,13 +68,15 @@ class ReadOnlyInput:
     """Files a study supplies to the agent, such as scripts it may run but not change (O20).
 
     `source` is a directory on the host holding regular files and directories only; `target` is the absolute path the
-    agent sees it at. The sandbox copies it into the run's own directory, records the copy's hash, mounts the copy
-    read-only in the agent's container and proves from inside the agent that it refuses every change
-    (`expcore_onedata.sandbox.inputs`).
+    agent sees it at; `sha256` is the hash of its content when it was declared for the campaign (`inputs.declare`), and
+    every start refuses an input whose content no longer has it. The sandbox copies it into the run's own directory,
+    records the copy's hash, mounts the copy read-only in the agent's container and proves from inside the agent that it
+    refuses every change (`expcore_onedata.sandbox.inputs`).
     """
 
     source: Path
     target: str
+    sha256: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)

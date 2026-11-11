@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from fake_host import FakeHost
+from sandbox_support import fail_copies
 
 from expcore_onedata.sandbox import earlyoom, gatelog, netpool, reap
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -230,7 +231,7 @@ def test_a_directory_with_a_container_or_a_young_one_is_left_alone(world, dead_r
 
 def test_a_failed_copy_keeps_the_disks_and_reports_not_gone(world, dead_run, tmp_path):
     run_handlers(world.host)
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
+    fail_copies(world.host)
     assert reap.reap_run(world.host, world.s, "login-data", log_dir=tmp_path, outputs=["out"]) is False
     assert dead_run.exists()
 

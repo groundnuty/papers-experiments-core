@@ -18,8 +18,10 @@ here, when this module is first imported, and neither is treatable:
   the agent's doing nor a condition's manipulation: the run is set aside and counted per condition, and the factor
   schema refuses a condition that declares the kind (O05, O16, C01).
 - `output_collection`: collecting what the run left failed for a reason the agent did not cause (`copyout.py`,
-  `collection_error`): a copy command or the disk failed, a copy did not hold what the listing showed, or the gate's
-  log, in a directory only the gate writes, was not a plain file. The run's evidence is missing, so it says nothing
+  `collection_error`): the agent's container could not be frozen for the copy, a copy command or the disk failed, a
+  copy did not hold what the listing showed (a name swapped after the listing included), the gate's log, in a
+  directory only the gate writes, was not a plain file, or a read-only input's copy no longer had the hash the run
+  recorded. The run's evidence is missing or not what it should be, so it says nothing
   about the agent or the manipulation: set aside and run again within the attempt limit, and no condition may declare
   it (O19). An object the agent made in its outputs (a link, a special file, more than its disk holds) is not this
   kind: it is the agent's own doing, recorded for the study's scorers, and the attempt is not set aside.
@@ -42,9 +44,10 @@ register_infra_kind(
 OUTPUT_COLLECTION = "output_collection"
 register_infra_kind(
     OUTPUT_COLLECTION,
-    "collecting what the run left in its sandbox failed for a reason the agent did not cause (a copy command or the "
-    "disk failed, a copy was not what was listed, or the gate's log was not a plain file): the run's evidence is "
-    "missing, so it says nothing about the agent or the manipulation",
+    "collecting what the run left in its sandbox failed for a reason the agent did not cause (its container could "
+    "not be frozen, a copy command or the disk failed, a copy was not what was listed, the gate's log was not a plain "
+    "file, or a read-only input's copy lost its hash): the run's evidence is missing or not what it should be, so it "
+    "says nothing about the agent or the manipulation",
     treatable=False,
 )
 

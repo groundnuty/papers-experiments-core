@@ -10,10 +10,17 @@ bytes hashed and written to the copy, which is the driver's, mode 0755 where the
 so the bytes hashed are the bytes the agent sees, whatever happens to the source during the run.
 
 The hash covers each entry's path relative to the input, whether it is a directory, and for a file whether it is
-executable, its size and its SHA-256, in path order (`digest`). The run's metadata records it under
-`read_only_inputs`, with the path in the agent and the input's files and bytes, beside the other inputs of the run it
-records by hash (the images, the TLS mode, the platform file), so a changed input changes the record. The plugin
-declares its inputs in the campaign fingerprint too (`fingerprint`), so a resume whose inputs changed is refused.
+executable, its size and its SHA-256, in path order (`digest`). The plugin declares its inputs once (`declare`), which
+checks them against every path the sandbox reserves and gives each the hash of its content, and puts them in the
+campaign fingerprint (`fingerprint`), so a resume whose inputs changed is refused. The platform is built with the
+declared inputs and `launch` refuses any other; every start hashes each input again and refuses one whose content is
+no longer the declared one, so an input edited mid-campaign never runs under the old fingerprint. The run's metadata
+records the hash under `read_only_inputs`, with the path in the agent and the input's files and bytes, beside the other
+inputs of the run it records by hash (the images, the TLS mode, the platform file), and `InputsRecord`, an instrument
+`launch` fills, puts the same in the run's record itself (`RunRecord.instruments["read_only_inputs"]`).
+
+The copy is given to root and made read-only on the host too (0444 files, 0555 directories, or 0555 for an executable
+file), and the collection hashes it again: a copy that no longer has its hash sets the run aside.
 
 Once the agent runs, the start proves the mount read-only from inside it (`probe_source`, `judge`): the agent reads a
 file and may execute an executable one, while writing it, renaming, chmod-ing and deleting it, and creating a file or a
@@ -38,7 +45,9 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox.api import ReadOnlyInput, StartRefused
+from expcore_onedata.sandbox.containers import CA_PATH
 from expcore_onedata.sandbox.hostops import describe_error
+from expcore_onedata.sandbox.settings import SandboxSettings
 
 PART = re.compile(r"[A-Za-z0-9._-]{1,255}")  # a name of a path in the agent: nothing docker's mount syntax splits on
 MAX_TARGET = 1024
@@ -86,9 +95,16 @@ def _overlap(one: str, other: str) -> bool:
     return one == other or one.startswith(other.rstrip("/") + "/") or other.startswith(one.rstrip("/") + "/")
 
 
+def taken_paths(settings: SandboxSettings) -> list[str]:
+    """Every path in the agent an input may not be, hold or lie under: the agent's own directories and the files docker
+    writes, the run's CA, the trust paths of the image and the data mount, in every data path alike."""
+    return [*TAKEN, CA_PATH, *settings.trust_paths, *([settings.mount.path] if settings.mount else [])]
+
+
 def validate(items: Sequence[ReadOnlyInput], taken: Sequence[str]) -> tuple[ReadOnlyInput, ...]:
     """The inputs with their sources resolved, or `StartRefused` naming the first bad one by its position, never a path.
-    `taken` are the paths in the agent that its other mounts take."""
+    `taken` are the paths in the agent that its other mounts take (`taken_paths`). An input with a declared `sha256`
+    whose content no longer has it is refused too."""
     checked: list[ReadOnlyInput] = []
     for n, item in enumerate(items):
         where = f"read-only input {n}"
@@ -114,8 +130,17 @@ def validate(items: Sequence[ReadOnlyInput], taken: Sequence[str]) -> tuple[Read
             raise StartRefused(f"{where}: {error}") from None
         if all(entry.is_dir for entry in entries):
             raise StartRefused(f"{where}: its source holds no file")
-        checked.append(ReadOnlyInput(source, target))
+        if item.sha256 is not None and _hash_of(source, where) != item.sha256:
+            raise StartRefused(f"{where}: its content is no longer the content it was declared with")
+        checked.append(ReadOnlyInput(source, target, item.sha256))
     return tuple(checked)
+
+
+def _hash_of(source: Path, where: str) -> str:
+    try:
+        return digest(source)["sha256"]
+    except (OSError, InputUnsafe) as error:
+        raise StartRefused(f"{where}: its source cannot be read ({describe_error(error)})") from None
 
 
 def _feed(digest: Any, entry: _Entry, size: int = 0, content: str = "") -> None:
@@ -179,22 +204,60 @@ def snapshot(source: Path, copy: Path) -> dict[str, Any]:
     return {"sha256": total.hexdigest(), "files": files, "bytes": size}
 
 
+def declare(
+    settings: SandboxSettings, declared: Mapping[str, Sequence[ReadOnlyInput]]
+) -> dict[str, tuple[ReadOnlyInput, ...]]:
+    """The plugin's read-only inputs, by the name it declares them under (a condition, or one name for every run),
+    each checked against every path the sandbox reserves (`taken_paths`, as a start checks it) and given the hash of
+    its content (`sha256`). Build the platform with them (`SandboxPlatform(..., read_only_inputs=...)`), put them in the
+    campaign fingerprint (`fingerprint`) and pass them to `launch` as declared. An input that cannot be delivered raises
+    `StartRefused`, naming its position, never a path."""
+    out: dict[str, tuple[ReadOnlyInput, ...]] = {}
+    for name, items in declared.items():
+        checked = validate(items, taken_paths(settings))
+        out[str(name)] = tuple(
+            ReadOnlyInput(item.source, item.target, _hash_of(item.source, f"read-only input {n}"))
+            for n, item in enumerate(checked)
+        )
+    return out
+
+
 def fingerprint(declared: Mapping[str, Sequence[ReadOnlyInput]]) -> dict[str, Any]:
     """The read-only inputs' part of the campaign fingerprint, for the plugin to add to its platform half:
-    `StudyPlugin(platform={**config.fingerprint(), **fingerprint(declared)})`. For each name the plugin declares inputs
-    under (a condition, or one name for every run), each input's path in the agent and the hash of its content, in
-    order. The plugin passes the same inputs to `launch`, so a resume whose inputs changed is refused (C06). Inputs
-    that cannot be delivered raise `StartRefused`, naming the position, never a path."""
+    `StudyPlugin(platform={**config.fingerprint(), **fingerprint(declared)})`, from the inputs `declare` returned: for
+    each name, each input's path in the agent and the hash it was declared with, in order, so a resume whose inputs
+    changed is refused (C06)."""
     out: dict[str, list[dict[str, str]]] = {}
     for name, items in declared.items():
-        try:
-            checked = validate(items, TAKEN)
-            out[str(name)] = [{"path": item.target, "sha256": digest(item.source)["sha256"]} for item in checked]
-        except (OSError, InputUnsafe) as error:
-            raise StartRefused(
-                f"the read-only inputs of a declared name cannot be read ({describe_error(error)})"
-            ) from None
+        if any(item.sha256 is None for item in items):
+            raise ValueError("read-only inputs enter the fingerprint as inputs.declare returns them, with their hash")
+        out[str(name)] = [{"path": item.target, "sha256": str(item.sha256)} for item in items]
     return {"read_only_inputs": out}
+
+
+class InputsRecord:
+    """An instrument (`expcore.plugin.Instrument`) that keeps a run's read-only inputs in its record:
+    `RunRecord.instruments["read_only_inputs"]`. The executor makes one per run, starts it with its other instruments
+    and passes it to `launch(..., inputs_record=...)`, which fills it once the sandbox has started; `finish` gives
+    `{"ok": True, "inputs": [{"path", "sha256", "files", "bytes"}, ...]}`, or `{"ok": False, "why": ...}` when no
+    sandbox with these inputs started, never a guess (O08)."""
+
+    namespace = "read_only_inputs"
+
+    def __init__(self) -> None:
+        self._inputs: list[dict[str, Any]] | None = None
+
+    def start(self, identity: Mapping[str, Any]) -> None:
+        self._inputs = None
+
+    def attach(self, recorded: Sequence[Mapping[str, Any]]) -> None:
+        """Keep what the started sandbox recorded of its inputs."""
+        self._inputs = [dict(item) for item in recorded]
+
+    def finish(self) -> Mapping[str, Any]:
+        if self._inputs is None:
+            return {"ok": False, "why": "no sandbox with these read-only inputs was started"}
+        return {"ok": True, "inputs": self._inputs}
 
 
 def probe_targets(copy: Path) -> tuple[str, str | None]:
@@ -291,11 +354,14 @@ def judge(stdout: str, runnable: bool) -> str | None:
 __all__ = [
     "PROBE_MARK",
     "InputUnsafe",
+    "InputsRecord",
+    "declare",
     "digest",
     "fingerprint",
     "judge",
     "probe_source",
     "probe_targets",
     "snapshot",
+    "taken_paths",
     "validate",
 ]

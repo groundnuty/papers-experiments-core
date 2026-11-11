@@ -29,6 +29,7 @@ every path that ends a sandbox, in order, and is verified (O15).
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import ipaddress
 import json
@@ -39,7 +40,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +60,6 @@ from expcore_onedata.sandbox.api import (
 )
 from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
-    CA_PATH,
     ENV_ACCESS_TOKEN,
     ENV_GATE_TOKEN,
     GATE_CA_PATH,
@@ -209,8 +209,8 @@ class DockerSandbox:
                 self._ca_bytes = s.tls.bundle()
             except ConfigError as error:
                 raise StartRefused(str(error)) from None
-        taken = [*inputs.TAKEN, CA_PATH, *s.trust_paths, *([s.mount.path] if s.mount else [])]
-        self._inputs = inputs.validate(sp.inputs, taken)  # in every data path, so an input never differs by condition
+        # in every data path, so an input never differs by condition; a declared one is hashed again here
+        self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s))
 
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
@@ -522,7 +522,9 @@ class DockerSandbox:
 
     def _snapshot_inputs(self) -> list[tuple[Path, str]]:
         """Copy each read-only input into the run's directory and record its hash, its files and bytes, and its path in
-        the agent (never the host's) under `read_only_inputs`; the copy is what the agent's container mounts (O20)."""
+        the agent (never the host's) under `read_only_inputs`; the copy is what the agent's container mounts (O20). A
+        copy whose hash is not the one the input was declared with refuses the start; the copy is then given to root and
+        made read-only, on the host as in the agent."""
         if not self._inputs:
             return []
         base = self.dir / "inputs"
@@ -536,10 +538,40 @@ class DockerSandbox:
             except (OSError, inputs.InputUnsafe) as error:
                 log.error("read-only input %d could not be copied: %s", n, describe_error(error))
                 raise SandboxError(f"read-only input {n} could not be copied into the run's directory") from None
+            if item.sha256 is not None and facts["sha256"] != item.sha256:
+                raise SandboxError(f"read-only input {n} is no longer the content it was declared with")
+            self._read_only_on_the_host(n, copy)
             recorded.append({"path": item.target, **facts})
             copies.append((copy, item.target))
         self._meta["read_only_inputs"] = recorded
         return copies
+
+    def _read_only_on_the_host(self, n: int, copy: Path) -> None:
+        """Give an input's copy to root and take every write bit away: 0444 files (0555 executable ones), 0555
+        directories. The modes keep each file's executable bit, so the copy keeps its hash."""
+        for argv in (["chown", "-R", "-P", "-h", "0:0", "--", str(copy)], ["chmod", "-R", "a-w", "--", str(copy)]):
+            done = self.host.run(argv, 60, sudo=True)
+            if done.returncode != 0:
+                log.error("read-only input %d: %s failed: %s", n, argv[0], describe_stderr(done.stderr))
+                raise SandboxError(f"read-only input {n} could not be made root's and read-only on the host")
+
+    @property
+    def read_only_inputs(self) -> list[dict[str, Any]]:
+        """What the start recorded of each read-only input: its path in the agent, its hash, its files and bytes."""
+        return [dict(item) for item in self._meta.get("read_only_inputs", [])]
+
+    def _inputs_unchanged(self) -> None:
+        """At collection, hash each input's copy again: one that no longer has the hash the run recorded was not what
+        the agent was declared to see throughout, which the harness, not the agent, let happen (O20)."""
+        for n, ((copy, _), facts) in enumerate(zip(self._input_copies, self.read_only_inputs, strict=True)):
+            try:
+                same = inputs.digest(copy)["sha256"] == facts["sha256"]
+            except (OSError, inputs.InputUnsafe):
+                same = False
+            if not same:
+                raise kinds.collection_error(
+                    "the read-only inputs", f"input {n}'s copy no longer has the hash the run recorded"
+                )
 
     def _verify_inputs(self) -> None:
         """Prove from inside the agent that each read-only input refuses every change as a read-only file system does,
@@ -679,15 +711,16 @@ class DockerSandbox:
     def collect(self, dest_dir: str | Path, outputs: Sequence[str] = ()) -> dict[str, Any]:
         """Stop whatever of the agent's still runs, then copy out the run's evidence and the named files of /work.
 
-        The copy runs as root and never follows or keeps a link (`copyout.py`, O19). An output that holds a link, a
-        special file, a hard link out of it, another file system, a path too long to copy or more than the working disk
-        holds was made so by the agent: nothing of the outputs is copied, and the collection ends normally with each
+        The copy runs as root and never follows or keeps a link (`copyout.py`, O19), while the agent's container is
+        frozen through its cgroup (`_frozen`). An output that holds a link, a special file, a hard link out of it,
+        another file system, a path too long to copy or more than the working disk holds, or whose way holds one of
+        these, was made so by the agent: nothing of the outputs is copied, and the collection ends normally with each
         object named by its path and what it is, never a link's target, under `refused_output` in its result and in the
         metadata, for the study's scorers; the attempt's outcome is the loop's and the scorers'. A collection that fails
-        for the harness's own reasons (a copy command or the disk failing, a copy that is not what was listed, a gate
-        log that is not a plain file) raises `InfraError` of kind `output_collection`, and the sandbox's disks are then
-        kept when it stops: a source is never deleted after a failed copy. An agent that could not be shown stopped also
-        fails the collection: its outputs may still change."""
+        for the harness's own reasons (a container that cannot be frozen, a copy command or the disk failing, a copy
+        that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash)
+        raises `InfraError` of kind `output_collection`, and the sandbox's disks are then kept when it stops: a source
+        is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection."""
         try:
             state = self._cells.quiesce("before collection")
             if not CellRunner.quiet(state):
@@ -707,12 +740,15 @@ class DockerSandbox:
         refused: dict[str, Any] | None = None
         try:
             copies = [(rel, dest / "work" / rel) for rel in outputs]
-            copied = copyout.copy_tree(self.host, self.dir / "work", copies, max_bytes=self.s.limits.work_disk_bytes)
+            with self._frozen():  # nothing of the agent's can change the tree while it is listed and copied
+                work = self.dir / "work"
+                copied = copyout.copy_tree(self.host, work, copies, max_bytes=self.s.limits.work_disk_bytes)
             got = {rel: copied[rel] is not None for rel in outputs}
         except copyout.UnsafeOutput as unsafe:  # the agent's own doing: for the scorers, never a set-aside
             refused = self._meta["refused_output"] = copyout.record(unsafe.refused)
         except SandboxError as failed:  # the copy command, the disk or the copy failed: the harness's own failure
             raise kinds.collection_error("the run's outputs", str(failed)) from None
+        self._inputs_unchanged()
         self._meta["infra_check"] = check = self.infra_container_check()  # while everything runs
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
         if refused is not None:
@@ -728,6 +764,47 @@ class DockerSandbox:
             result["gate_log"] = "gate-requests.jsonl"
         (dest / "metadata.json").write_text(json.dumps(self.metadata(), indent=1, default=str), encoding="utf-8")
         return result
+
+    @contextlib.contextmanager
+    def _frozen(self) -> Iterator[None]:
+        """Freeze every process of the agent's container through its cgroup (`docker pause`) while its outputs are
+        listed and copied, and thaw it after, whatever happened (O19). Whatever of the agent's survived the kills before
+        collection, renamed or hidden among zombies, is frozen with the rest: the freeze is confirmed by the cgroup's
+        own state (`frozen 1` in `cgroup.events`), never by a list of processes, and a freeze that cannot be confirmed
+        stops the collection before anything is listed, as the harness's failure. A container that runs nothing can
+        change nothing and is not frozen."""
+        info = TD._inspect(self.host, self.names.agent, TD.WAITS)
+        if info is not None and info.get("unknown"):
+            raise SandboxError("the agent's container could not be inspected before its outputs were copied")
+        if info is None or not info["running"]:
+            yield
+            return
+        paused = self.host.docker("pause", self.names.agent, check=False, timeout=60)
+        try:
+            if paused.returncode != 0 or not self._cgroup_frozen(info["id"]):
+                log.error(
+                    "the agent's container was not frozen (%s): %s", paused.returncode, describe_stderr(paused.stderr)
+                )
+                raise SandboxError("the agent's container could not be frozen before its outputs were copied")
+            self._meta["frozen_for_collection"] = True
+            yield
+        finally:
+            thawed = self.host.docker("unpause", self.names.agent, check=False, timeout=60)
+            if paused.returncode == 0 and thawed.returncode != 0:
+                log.error("the agent's container could not be thawed: %s", describe_stderr(thawed.stderr))
+
+    def _cgroup_frozen(self, container_id: str) -> bool:
+        """Whether the container's cgroup says it is frozen; False when its state cannot be read."""
+        for directory in (
+            TD.CGROUP_ROOT / "system.slice" / f"docker-{container_id}.scope",
+            TD.CGROUP_ROOT / "docker" / container_id,
+        ):
+            try:
+                events = self.host.read_text(directory / "cgroup.events")
+            except OSError:
+                continue
+            return "frozen 1" in events.splitlines()
+        return False
 
     def _stop_on_purpose(self, role: str) -> None:
         """Note that the harness itself is about to stop a watched container: its state read now, just before, stands as

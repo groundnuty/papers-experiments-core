@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 from campaign_support import STUDY_TOML, write_study
-from sandbox_support import make_spec, start_options
+from sandbox_support import after_first, around_run, fail_copies, is_copy, is_listing, make_spec, start_options
 
 from expcore.campaign.attempts import classify
 from expcore.campaign.executor import failure_result
@@ -228,16 +228,37 @@ def test_o19_a_socket_is_refused(world, tmp_path, monkeypatch):
     sbx.stop()
 
 
-def listed_as(host, name: str, kind: str) -> None:
-    """Make the real listing show the entry called `name` as another kind: a device, which a test cannot make. The
-    listing gives each entry's kind first and its name last."""
+def relisted(host, name: str, change) -> None:
+    """Make the real listing show the entry called `name` changed by `change(fields)`: what a test cannot make (a
+    device, a mount). The listing gives each entry as `kind links device:inode size depth name`, NUL-ended."""
 
-    def find(argv):
-        listing = host.real(argv)
-        records = [kind + r[1:] if r.endswith(" " + name) else r for r in listing.stdout.split("\0")]
+    def wrapper(original, argv, timeout_s, **kwargs):
+        listing = original(argv, timeout_s, **kwargs)
+        if not is_listing(argv):
+            return listing
+        records = []
+        for record in listing.stdout.split("\0"):
+            fields = record.split(" ", 5)
+            records.append(" ".join(change(fields)) if len(fields) == 6 and fields[5] == name else record)
         return CmdResult(listing.returncode, "\0".join(records), listing.stderr)
 
-    host.run_handlers["find"] = find
+    around_run(host, wrapper)
+
+
+def listed_as(host, name: str, kind: str) -> None:
+    """Make the real listing show the entry called `name` as another kind: a device, which a test cannot make."""
+    relisted(host, name, lambda fields: [kind, *fields[1:]])
+
+
+def listed_on_another_device(host, name: str) -> None:
+    """Make the real listing show the directory called `name` on another file system: a mount, which a test cannot
+    make."""
+
+    def change(fields):
+        device, inode = fields[2].split(":")
+        return [*fields[:2], f"{int(device) + 1}:{inode}", *fields[3:]]
+
+    relisted(host, name, change)
 
 
 @pytest.mark.parametrize(
@@ -328,7 +349,8 @@ def test_o19_a_sparse_file_bigger_than_the_working_disk_is_refused(world, tmp_pa
 
 def test_o19_a_clean_output_is_the_drivers_own_and_no_command_dereferences(world, tmp_path):
     """O19: a clean output is copied, owned by the driver, every file with one link, and an output named inside it is
-    copied with it; the listing, the copy and the change of owner are each told never to follow a link."""
+    copied with it; the agent's tree is listed and copied as root by the copy helper alone, never by `find`, `cp` or
+    `chown` over paths."""
     sbx = start(world)
     results = sbx.dir / "work" / "results"
     (results / "nested").mkdir(parents=True)
@@ -340,11 +362,11 @@ def test_o19_a_clean_output_is_the_drivers_own_and_no_command_dereferences(world
         info = path.lstat()
         assert (info.st_uid, info.st_gid) == (os.getuid(), os.getgid())
     assert (copied / "nested" / "report.json").lstat().st_nlink == 1
-    commands = {argv[0]: argv for argv in world.host.sudo_commands if argv[0] in ("find", "cp", "chown")}
-    assert "-P" in commands["find"]
-    assert {"-R", "-P"} <= set(commands["cp"])
-    assert {"-R", "-P", "-h"} <= set(commands["chown"])
-    assert "--dereference" not in commands["chown"]
+    commands = [argv for argv in world.host.sudo_commands if str(sbx.dir / "work") in " ".join(argv)]
+    assert not [argv for argv in world.host.sudo_commands if argv[0] in ("find", "cp", "chown")]
+    assert any(is_listing(argv) for argv in world.host.sudo_commands)
+    assert any(is_copy(argv) for argv in world.host.sudo_commands)
+    assert not commands  # the tree's paths travel on stdin, never as arguments a command could take for options
     sbx.stop()
 
 
@@ -357,13 +379,8 @@ def test_o19_a_copy_that_holds_a_link_after_all_is_removed_and_set_aside(world, 
     results.mkdir()
     (results / "report.json").write_text("{}", encoding="utf-8")
 
-    def copies_and_links(argv):
-        done = world.host.real(argv)
-        (Path(argv[-1]) / "planted").symlink_to(outsider)
-        return done
-
-    world.host.run_handlers["cp"] = copies_and_links
     dest = tmp_path / "evidence"
+    after_first(world.host, is_copy, lambda: (dest / "work" / "results" / "planted").symlink_to(outsider))
     with pytest.raises(InfraError) as caught:
         sbx.collect(dest, outputs=["results"])
     assert caught.value.kind == KIND
@@ -400,10 +417,10 @@ def test_o19_c01_a_copy_the_harness_could_not_make_is_set_aside_even_where_sandb
     treatment is still set aside and never scored, and the disks are kept."""
     sbx = start(world)
     (sbx.dir / "work" / "report.json").write_text("{}", encoding="utf-8")
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "No space left on device")
+    undo = fail_copies(world.host, "No space left on device")
     with pytest.raises(InfraError) as caught:
         sbx.collect(tmp_path / "evidence", outputs=["report.json"])
-    world.host.run_handlers.pop("cp")
+    undo()
     assert caught.value.kind == KIND
     assert sbx.keep_evidence is True
     declared = ("sandbox",)
@@ -511,3 +528,91 @@ def test_o19_the_real_hosts_commands_copy_a_clean_tree_and_refuse_a_link(tmp_pat
         copyout.copy_tree(host, root, [("linked", dest / "linked")], max_bytes=1 << 20)
     assert [(r.path, r.what) for r in caught.value.refused] == [("linked/leakage", "symbolic link")]
     assert not (dest / "linked").exists()
+
+
+def run_index(host, matches) -> int:
+    """The position in the host's calls of the first command that `matches`."""
+    return next(i for i, call in enumerate(host.calls) if call[0] == "run" and matches(list(call[1])))
+
+
+def test_o19_the_agents_container_is_frozen_through_its_cgroup_while_its_outputs_are_listed_and_copied(world, tmp_path):
+    """O19: whatever of the agent's survived the collection's kills, renamed or hidden among zombies, can change the
+    tree no more once the container is frozen through its cgroup (docker pause, confirmed by the cgroup's own frozen
+    state, never by a list of processes): the listing and the copy happen between the freeze and the thaw."""
+    sbx = start(world)
+    (sbx.dir / "work" / "report.json").write_text("{}", encoding="utf-8")
+    sbx.collect(tmp_path / "evidence", outputs=["report.json"])
+    calls = world.host.calls
+    paused, thawed = calls.index(("paused", sbx.names.agent)), calls.index(("unpaused", sbx.names.agent))
+    assert paused < run_index(world.host, is_listing) < run_index(world.host, is_copy) < thawed
+    assert world.host.containers[sbx.names.agent].paused is False
+    sbx.stop()
+
+
+def test_o19_a_container_its_cgroup_does_not_show_frozen_is_never_copied_from(world, tmp_path):
+    """O19: a pause the cgroup does not confirm as frozen leaves the tree changeable: nothing is listed or copied, the
+    container is thawed all the same, and the run is set aside as infrastructure of kind output_collection."""
+    sbx = start(world)
+    (sbx.dir / "work" / "report.json").write_text("{}", encoding="utf-8")
+    world.host.pause_without_freezing = True
+    with pytest.raises(InfraError) as caught:
+        sbx.collect(tmp_path / "evidence", outputs=["report.json"])
+    assert caught.value.kind == KIND
+    assert not [call for call in world.host.calls if call[0] == "run" and is_listing(list(call[1]))]
+    assert ("unpaused", sbx.names.agent) in world.host.calls
+    assert not (tmp_path / "evidence" / "work").exists()
+    sbx.stop()
+
+
+@pytest.mark.parametrize("swap", ["symlink", "directory"])
+def test_o19_a_directory_swapped_after_the_listing_is_never_copied_through(world, tmp_path, swap):
+    """O19: the copy opens every name from its parent directory without following a link and checks each object is
+    the one the listing showed, so a directory on the way to an output swapped after the listing, for a link or for
+    another directory holding a file of the same size, is never read through: the copy is refused, removed, and the
+    run set aside as infrastructure of kind output_collection."""
+    sbx = start(world)
+    work = sbx.dir / "work"
+    (work / "results").mkdir()
+    (work / "results" / "report.json").write_text("x" * len(SECRET), encoding="utf-8")
+    planted = tmp_path / "outside" / "planted"
+    planted.mkdir(parents=True)
+    (planted / "report.json").write_text(SECRET, encoding="utf-8")
+
+    def swapped():
+        (work / "results").rename(work / "moved-away")
+        if swap == "symlink":
+            (work / "results").symlink_to(planted, target_is_directory=True)
+        else:
+            planted.rename(work / "results")
+
+    after_first(world.host, is_listing, swapped)
+    dest = tmp_path / "evidence"
+    with pytest.raises(InfraError) as caught:
+        sbx.collect(dest, outputs=["results/report.json"])
+    assert caught.value.kind == KIND
+    assert not secret_readable(dest)
+    assert not (dest / "work" / "results" / "report.json").exists()
+    sbx.stop()
+
+
+@pytest.mark.parametrize(
+    ("make", "what"),
+    [("fifo", "FIFO"), ("device", "character device"), ("mount", "directory of another file system")],
+)
+def test_o19_an_unsafe_object_on_the_way_to_an_output_is_refused_as_the_agents_doing(world, tmp_path, make, what):
+    """O19: on the way to a named output, a FIFO, a device or a directory of another file system is refused as the
+    agent's doing, as a link there is, and never taken for an output the agent did not write."""
+    sbx = start(world)
+    work = sbx.dir / "work"
+    if make == "fifo":
+        os.mkfifo(work / "results")
+    elif make == "device":
+        (work / "results").write_text("", encoding="utf-8")
+        listed_as(world.host, "results", "c")
+    else:
+        (work / "results").mkdir()
+        (work / "results" / "report.json").write_text("{}", encoding="utf-8")
+        listed_on_another_device(world.host, "results")
+    refuse(world, sbx, tmp_path / "evidence", ["results/report.json"])
+    assert refused_paths(sbx) == [("results", what)]
+    sbx.stop()

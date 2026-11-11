@@ -4,34 +4,45 @@
 The agent controls every file under its working directory. A symbolic link it leaves there still points into the host
 after a copy, and the copy's later readers (the study's collector, the record builder, a package build) follow it; a
 hard link to a file outside the output, a device, a FIFO or a socket is as dangerous. The copy has to run as root,
-because the agent's files need not be readable by the driver, so it fails closed, in four steps:
+because the agent's files need not be readable by the driver, so it fails closed, in four steps. The caller makes
+sure nothing of the agent's runs meanwhile: the sandbox freezes the agent's container through its cgroup first.
 
-1. The tree is listed as root, once per collection, without following anything and without leaving its file system
-   (`find -P ROOT -xdev`): each entry's type, link count, device and inode, size, depth and name, the records ended by
+1. The tree is listed as root, once per collection, by the copy helper (`copyhelper.py`, run as root with its request on
+   stdin), which opens every directory from its parent's descriptor without following a link and never leaves the
+   root's file system: each entry's type, link count, device and inode, size, depth and name, the records ended by
    NUL, so a name may hold any byte but NUL and '/'. Names are matched as the listing spells them.
 2. Each output, with the directories on its way to it, is checked against the listing before anything is copied. A
-   symbolic link on the way or in it (dangling or not), a regular file with more links than the output holds (a hard
-   link to a file outside it), a FIFO, socket, device or door, a directory of another file system, a path longer than
-   `MAX_PATH_BYTES`, or more bytes in all than `max_bytes` (the working disk's quota: only a sparse file outgrows the
-   disk it was written on) is refused. `UnsafeOutput` names each by its path relative to the root and what it is, never
-   a link's target, and nothing is copied. An output whose way holds a file or nothing is absent. In the agent's
-   working directory each of these is the agent's own doing: the caller records it for the study's scorers.
-3. Each output is copied with `cp -R -P` (never dereferencing), keeping nothing of the source's modes, owners or times,
-   then given to the driver with `chown -R -P -h` (never following a link).
+   symbolic link, a FIFO, socket, device or door, or a directory of another file system, on the way or in it (a
+   dangling link too), a regular file with more links than the output holds (a hard link to a file outside it), a
+   path longer than `MAX_PATH_BYTES`, or more bytes in all than `max_bytes` (the working disk's quota: only a sparse
+   file outgrows the disk it was written on) is refused. `UnsafeOutput` names each by its path relative to the root
+   and what it is, never a link's target, and nothing is copied. An output whose way holds a regular file or nothing
+   is absent. In the agent's working directory each of these is the agent's own doing: the caller records it for the
+   study's scorers.
+3. Each output is copied by the helper as root, name by name from the parent directory's descriptor with `O_NOFOLLOW`,
+   never through a path: every directory on the way and every object copied must have the device, inode, kind and size
+   the listing showed, so a name swapped for a link or for another object after the listing stops the copy
+   (`CopyMismatch`) rather than being read through. Each object is written anew in the destination and given to the
+   driver with `fchown`, mode 0644 or 0755, nothing of the source's modes, owners or times kept.
 4. The copy is verified as the driver, by lstat: only regular files and directories, every file with one link, every
-   entry the driver's, and the same files, directories and bytes as the listing showed. A copy that is not is removed,
-   and `CopyMismatch` raised: the agent made nothing the listing did not show, so the harness's copy failed.
+   entry the driver's, and the same files, directories and bytes as the listing showed. A copy that is not, or one
+   the helper stopped, is removed and `CopyMismatch` raised: the agent made nothing the listing did not show, so the
+   harness's copy failed.
 
 The listing is held in memory; its size is bounded by the file system it lists (the agent's quota-limited disk, or a
-directory of the harness's own). Every command goes through `HostOps`; the driver reads only its own copy.
+directory of the harness's own), and the helper descends no deeper than a path an output could hold. Every command
+goes through `HostOps`; the driver reads only its own copy.
 """
 
 from __future__ import annotations
 
 import collections
+import functools
+import json
 import logging
 import os
 import stat
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -42,7 +53,7 @@ from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_st
 
 log = logging.getLogger(__name__)
 
-LISTING = "%y %n %D:%i %s %d %f\\0"  # find -printf: type, links, device:inode, size, depth, name; NUL-ended
+HELPER = Path(__file__).with_name("copyhelper.py")  # its source runs as root under this interpreter, `-I -c`
 MAX_PATH_BYTES = 2048  # of a path relative to the root: a deeper copy would near the kernel's PATH_MAX and fail midway
 SHOWN_REFUSALS = 16  # how many refusals a record names; it counts them all
 SHOWN_NAME_CHARS = 256  # how much of a refused path a record shows
@@ -68,6 +79,12 @@ class Entry:
     @property
     def device(self) -> str:
         return self.inode.split(":", 1)[0]
+
+    @property
+    def key(self) -> tuple[int, int]:
+        """The device and inode, as the copy helper compares them."""
+        device, inode = self.inode.split(":", 1)
+        return int(device), int(inode)
 
 
 @dataclass(frozen=True)
@@ -110,6 +127,8 @@ class _Output:
     dirs: int = 0
     bytes: int = 0
     links: dict[str, list[Any]] = field(default_factory=dict)  # inode -> [names in the output, link count, path]
+    ancestors: list[tuple[int, int]] = field(default_factory=list)  # the root and each directory on the way
+    expect: collections.Counter[tuple[int, int, str, int]] = field(default_factory=collections.Counter)
 
 
 def output_parts(rel: str) -> tuple[str, ...]:
@@ -136,9 +155,20 @@ def parse_listing(text: str) -> list[Entry]:
     return entries
 
 
+@functools.cache
+def _helper_source() -> str:
+    return HELPER.read_text(encoding="utf-8")
+
+
+def _helper(host: HostOps, operation: str, request: Mapping[str, Any], timeout_s: float) -> Any:
+    """Run the copy helper as root with `request` on stdin; never a path of the agent's tree as an argument."""
+    argv = [sys.executable, "-I", "-c", _helper_source(), operation]
+    return host.run(argv, timeout_s, sudo=True, input=json.dumps(dict(request)))
+
+
 def list_tree(host: HostOps, root: Path) -> list[Entry]:
     """List `root` as root, never following a link or leaving its file system."""
-    done = host.run(["find", "-P", str(root), "-xdev", "-printf", LISTING], LIST_TIMEOUT_S, sudo=True)
+    done = _helper(host, "list", {"root": str(root), "max_path_bytes": MAX_PATH_BYTES}, LIST_TIMEOUT_S)
     if done.returncode != 0:
         log.error("listing the sandbox's output failed (%s): %s", done.returncode, describe_stderr(done.stderr))
         raise SandboxError(f"listing the sandbox's output failed ({done.returncode})")
@@ -172,8 +202,12 @@ def check(
         for out in outputs.values():
             k = len(out.parts)
             if entry.depth < k:  # on the way to the output, if the names so far are its first ones
-                if names == list(out.parts[: entry.depth]) and entry.kind == "l":
-                    refused.append(Refusal(_shown(names), SPECIAL["l"]))
+                if names == list(out.parts[: entry.depth]):
+                    blocked = _on_the_way(entry, device)
+                    if blocked:
+                        refused.append(Refusal(_shown(names), blocked))
+                    elif entry.kind == "d":
+                        out.ancestors.append(entry.key)
                 continue
             if names[:k] != list(out.parts):
                 continue
@@ -181,7 +215,9 @@ def check(
             problem = _problem(entry, device, lengths[-1])
             if problem:
                 refused.append(Refusal(_shown(names), problem))
-            elif entry.kind == "d":
+                continue
+            out.expect[(*entry.key, entry.kind, entry.size)] += 1
+            if entry.kind == "d":
                 out.dirs += 1
             else:
                 out.files, out.bytes = out.files + 1, out.bytes + entry.size
@@ -195,6 +231,16 @@ def check(
             refused.append(Refusal(_shown(out.parts) or ".", TOO_BIG))
             over = True
     return outputs, list(dict.fromkeys(refused))  # a path on the way to two outputs is one refusal
+
+
+def _on_the_way(entry: Entry, device: str) -> str | None:
+    """What makes a directory on the way to an output unsafe to pass through, or None. A regular file there is not
+    unsafe: the output cannot exist, so it is absent."""
+    if entry.kind == "f":
+        return None
+    if entry.kind != "d":
+        return SPECIAL.get(entry.kind, "file of a type the listing does not know")
+    return "directory of another file system" if entry.device != device else None
 
 
 def _problem(entry: Entry, device: str, length: int) -> str | None:
@@ -215,21 +261,30 @@ def _remove(host: HostOps, path: Path) -> None:
         log.error("a refused copy could not be removed (%s): %s", done.returncode, describe_stderr(done.stderr))
 
 
-def _copy(host: HostOps, src: Path, dst: Path) -> None:
-    """Copy as root with no-dereference semantics, then make the copy the driver's without following a link. The copy
-    goes to a new path: one merged into what is already there could not be verified against the listing."""
+def _copy(host: HostOps, root: Path, out: _Output, dst: Path) -> None:
+    """Copy one output as root through the helper, which opens every name from its parent's descriptor without
+    following a link and checks each object against the listing; the copy is the driver's. It goes to a new path: one
+    merged into what is already there could not be verified against the listing. What a failed copy wrote is removed."""
     if os.path.lexists(dst):
         raise SandboxError("a copy out of the sandbox would be merged into what its destination already holds")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    copied = host.run(
-        ["cp", "-R", "-P", "--no-preserve=all", "--one-file-system", "-T", "--", str(src), str(dst)],
-        COPY_TIMEOUT_S,
-        sudo=True,
-    )
-    owner = host.run(["chown", "-R", "-P", "-h", "--", f"{os.getuid()}:{os.getgid()}", str(dst)], 60, sudo=True)
-    if copied.returncode != 0 or owner.returncode != 0:
-        log.error("copying out failed: %s", describe_stderr(copied.stderr or owner.stderr))
-        raise SandboxError("copying a file out of the sandbox failed")
+    request = {
+        "root": str(root),
+        "parts": list(out.parts),
+        "dest": str(dst),
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "ancestors": [list(key) for key in out.ancestors],
+        "expect": [[*key, count] for key, count in out.expect.items()],
+    }
+    done = _helper(host, "copy", request, COPY_TIMEOUT_S)
+    if done.returncode == 0:
+        return
+    log.error("copying out failed (%s): %s", done.returncode, describe_stderr(done.stderr))
+    _remove(host, dst)
+    if done.returncode == 3:  # the helper found an object the listing did not show, and stopped
+        raise CopyMismatch("a copy out of the sandbox is not what was listed: the tree changed after its listing")
+    raise SandboxError("copying a file out of the sandbox failed")
 
 
 def verify(dst: Path, out: _Output) -> str | None:
@@ -282,7 +337,7 @@ def copy_tree(
         got[rel] = {"files": out.files, "bytes": out.bytes} if out.present else None
         if not out.present or any(out.parts[: len(parts)] == parts for parts in copied):
             continue
-        _copy(host, root.joinpath(*out.parts), dst)
+        _copy(host, root, out, dst)
         why = verify(dst, out)
         if why is not None:
             log.error("a copy out of the sandbox was refused after it was made: %s", why)
