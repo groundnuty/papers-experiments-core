@@ -37,7 +37,7 @@ ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
 # The client refuses to start without a token, so a REST agent's holds the configured placeholder (O21), never a
 # credential: the gate drops it with any other token the agent sends and adds its own.
 ENV_TOKEN = "ONEDATA_TOKEN"
-ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gate.TOKEN_ENV); the agent has no token
+ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gate.TOKEN_ENV); the agent's is ENV_TOKEN
 ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
 ENV_CA_BUNDLES = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
