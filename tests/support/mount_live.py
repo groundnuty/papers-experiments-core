@@ -24,7 +24,7 @@ from typing import Any
 import httpx
 from platform_support import render
 
-from expcore_onedata.client import API_PROVIDER, AUTH_HEADER
+from expcore_onedata.client import API_PROVIDER, AUTH_HEADER, POSIX_ABSENT
 from expcore_onedata.config import PlatformConfig
 
 AGENT_IMAGE = "python:3.12-slim"  # has python, `timeout` and `sleep`, which the agent's container needs
@@ -113,16 +113,20 @@ def derive_platform(source: Path, out_dir: Path, sandbox: Mapping[str, Any]) -> 
 
 def absent(answer: httpx.Response) -> bool:
     """Whether a provider's answer says the entry is not there: a 404, or the 400 `posix` error with errno `enoent`
-    that Onedata 25.0 gives for a file it does not know (seen live on the Compose federation)."""
+    that Onedata 25.0 gives for a file it does not know (the platform layer's `POSIX_ABSENT`). Any other 400, or a body
+    of another shape, is not absence."""
     if answer.status_code == 404:
         return True
-    if answer.status_code != 400:
+    status, code, errno = POSIX_ABSENT
+    if answer.status_code != status:
         return False
     try:
-        error = answer.json().get("error") or {}
+        body = answer.json()
     except ValueError:
         return False
-    return error.get("id") == "posix" and (error.get("details") or {}).get("errno") == "enoent"
+    error = body.get("error") if isinstance(body, dict) else None
+    details = error.get("details") if isinstance(error, dict) else None
+    return isinstance(details, dict) and error.get("id") == code and details.get("errno") == errno
 
 
 class SpaceFiles:
