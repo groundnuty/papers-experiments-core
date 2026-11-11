@@ -32,7 +32,7 @@ from expcore.config.loading import ConfigError, Section
 from expcore.config.models import ModelTable, not_built_by_core
 from expcore.plugin import ToolSpec
 from expcore.provenance.codestamp import covered_files
-from expcore.provenance.environment import EnvironmentUnknown, environment
+from expcore.provenance.environment import EnvironmentUnknown, closure
 from expcore.records.build import redactor_for
 from expcore.records.rescore import Scorer, scorer_name, scorer_version
 from expcore.study.config import OUT_DIR, STUDY_FILE, StudyConfig, StudyIdentity
@@ -194,11 +194,12 @@ def import_plugin_module(
 
 def _where(study: StudyConfig | StudyIdentity) -> tuple[str, frozenset[str], frozenset[str]]:
     """The study directory, resolved, the directories the code identity never enters, and the distributions the
-    environment record covers (none when the environment cannot be recorded, which the pipeline refuses on its own)."""
+    environment record covers (their names only: no source is read). A required distribution that is not installed
+    is refused here, by name, so it is never mistaken for uncovered study code."""
     try:
-        recorded = frozenset(environment(getattr(study, "requires", ()))["distributions"])
-    except EnvironmentUnknown:
-        recorded = frozenset()
+        recorded = frozenset(closure(getattr(study, "requires", ())))
+    except EnvironmentUnknown as error:  # the real cause, before any file is refused as uncovered for want of it
+        raise ConfigError(f"{study.root / 'study.toml'}: [study] requires: {error}") from None
     return os.path.realpath(study.root), frozenset(study.scope.skip_dirs), recorded
 
 

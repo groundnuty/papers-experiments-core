@@ -256,12 +256,31 @@ def source_of(dist: metadata.Distribution) -> dict[str, Any] | None:
     return {"kind": "directory", "editable": True, "python_sha256": python_digest(roots)}
 
 
+def closure(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Distribution] | None = None) -> set[str]:
+    """The canonical names of the distributions the environment record covers: the core, those `requires` names, and
+    what they require here, with extras and markers. Reads metadata only, never a source file.
+
+    Raises EnvironmentUnknown when the core or a required root is not installed.
+    """
+    dists = installed() if found is None else found
+    return set(_closure(requires, dists))
+
+
 def environment(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Distribution] | None = None) -> dict:
     """The environment of the core and the distributions `requires` names, as described above.
 
     Raises EnvironmentUnknown when the core or a required root is not installed.
     """
     dists = installed() if found is None else found
+    asked = _closure(requires, dists)
+    versions = {name: str(dists[name].version) for name in sorted(asked)}
+    sources = {name: source for name in sorted(asked) if (source := source_of(dists[name])) is not None}
+    python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return {"python": python, "distributions": versions, "sources": sources}
+
+
+def _closure(requires: Iterable[str], dists: Mapping[str, metadata.Distribution]) -> dict[str, set[str]]:
+    """Each distribution of the closure with the extras asked of it; see `closure`."""
     queue: list[tuple[str, frozenset[str]]] = []
     for root in (CORE_DISTRIBUTION, *requires):
         parsed = _parse(root, "[study] requires")
@@ -281,10 +300,7 @@ def environment(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Di
             if not applies(parsed, asked[name]) or canonical(parsed.name) not in dists:
                 continue  # its marker is false here, or nothing installed answers it
             queue.append((canonical(parsed.name), frozenset(canonical(e) for e in parsed.extras)))
-    versions = {name: str(dists[name].version) for name in sorted(asked)}
-    sources = {name: source for name in sorted(asked) if (source := source_of(dists[name])) is not None}
-    python = f"{sys.version_info.major}.{sys.version_info.minor}"
-    return {"python": python, "distributions": versions, "sources": sources}
+    return asked
 
 
 def without_sources(env: Mapping[str, Any]) -> dict[str, Any]:

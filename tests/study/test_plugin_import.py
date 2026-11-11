@@ -209,3 +209,24 @@ def test_p02_the_fix_for_a_plugin_in_a_subdirectory_names_the_module_from_the_pl
     assert "'plugins/facts.py' runs from the study directory outside the plugin's package" in str(caught.value)
     assert "(from .facts import ...)" in str(caught.value)
     assert "facts" not in sys.modules
+
+
+def test_p02_a_required_distribution_that_is_not_installed_is_named_not_mistaken_for_study_code(tmp_path):
+    """P02: a `[study] requires` entry that is not installed is the cause to report; the plugin is not refused for an
+    uncovered file it imports for want of that distribution's exemption."""
+    study_dir = example_copy(tmp_path)
+    edit(study_dir / "study.toml", 'name = "tiny-study"\n', 'name = "tiny-study"\nrequires = ["absentkit"]\n')
+    with pytest.raises(ConfigError, match="absentkit"):
+        load_plugin(context(study_dir))
+
+
+def test_p02_finding_what_the_record_covers_reads_no_source_file(tmp_path, monkeypatch):
+    """P02: loading a plugin asks the environment for its distributions' names only; hashing every editable source
+    tree, as the record itself does, would cost a full scan of each one on every load."""
+    from expcore.provenance import environment
+
+    def no_hashing(roots):
+        raise AssertionError("a source tree was hashed while loading a plugin")
+
+    monkeypatch.setattr(environment, "python_digest", no_hashing)
+    load_plugin(context(example_copy(tmp_path)))
