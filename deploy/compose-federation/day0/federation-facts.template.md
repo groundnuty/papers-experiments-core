@@ -55,6 +55,27 @@ After each `reset --replicas`: every mirror's block maps empty of the space's fi
 sweeps in a row (its own verdict), and what the mirrors held before. After each down: no container, network or file of
 the project left, and no listener on its ports.
 
+## Call shapes the core's reset depends on
+
+From `uv run python deploy/compose-federation/measure_transfer_shapes.py`, run once per layout on a federation that is
+up: each call's request and answer as field names and JSON types, never a value. The core's per-run reset (#118) and
+its transfer log rely on these.
+
+| Call | Request (query, body) | Status | Answer |
+|---|---|---|---|
+| `POST /transfers`, an eviction of a file, on the mirror | unknown (not measured) | unknown | unknown (not measured) |
+| `POST /transfers`, an eviction of a directory, on the mirror | unknown (not measured) | unknown | unknown (not measured) |
+| `POST /transfers`, a replication, on the data provider | unknown (not measured) | unknown | unknown (not measured) |
+| `GET /transfers/{transfer}`, an eviction's record once ended | none | unknown | unknown (not measured) |
+| `GET /spaces/{space}/transfers?state=waiting` | unknown (not measured) | unknown | unknown (not measured) |
+| `GET /spaces/{space}/transfers?state=ongoing` | unknown (not measured) | unknown | unknown (not measured) |
+| `GET /spaces/{space}/transfers?state=ended` | unknown (not measured) | unknown | unknown (not measured) |
+| the same with `limit=1`, then its `page_token` | unknown (not measured) | unknown | unknown (not measured) |
+
+Whether the listing answers carry a `Date` header, on the data provider and on the mirror: unknown (not measured).
+Whether evicting a directory empties what the mirror holds of the files in it, as `reset --replicas` assumes, and how
+long its block map took to show it: unknown (not measured).
+
 ## What listens on the host
 
 The layout's loopback ports only, each held by one `docker-proxy` of the project: unknown (not measured).

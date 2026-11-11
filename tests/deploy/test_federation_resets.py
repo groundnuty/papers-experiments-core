@@ -2,6 +2,7 @@
 `reset` refused. The per-run reset runs here against fake provider answers: it keeps every owner's data, evicts only
 what mirrors hold, never schedules an eviction on an owner, and believes only the block maps."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -212,3 +213,41 @@ def test_a_reset_flag_with_another_command_or_both_flags_together_is_refused(fed
         fed.cli.main(["reset", "--clean", "--replicas"])
     assert refused.value.code == 2
     assert dispatched == []
+
+
+# -- the call shapes the live pass records ----------------------------------------------------------------------------
+
+
+def test_a_call_shape_holds_every_field_name_and_type_and_no_value(fed):
+    """The live pass records the eviction's request and answer and the transfer listing by their shapes, for the core's
+    reset to rely on; an id, a token or a name never reaches the record, as a value or as a key."""
+    import measure_transfer_shapes
+
+    provider_id = "f3a9c1e0b7d24c5e8a6f0b1c2d3e4f5a"
+    record = {
+        "type": "eviction",
+        "evictingProviderId": provider_id,
+        "replicatingProviderId": None,
+        "filesEvicted": 3,
+        "transferStatus": "completed",
+        "scheduleTime": 1762800000,
+        "perProvider": {provider_id: {"bytes": 1.5}},
+        "flags": [True],
+    }
+    listing = {"transfers": ["first-transfer-id", "second-transfer-id"], "nextPageToken": None}
+    shape = measure_transfer_shapes.shape
+    assert shape(record) == {
+        "type": "str",
+        "evictingProviderId": "str",
+        "replicatingProviderId": "null",
+        "filesEvicted": "int",
+        "transferStatus": "str",
+        "scheduleTime": "int",
+        "perProvider": {"<id>": {"bytes": "float"}},
+        "flags": {"list_of": 1, "first": "bool"},
+    }
+    assert shape(listing) == {"transfers": {"list_of": 2, "first": "str"}, "nextPageToken": "null"}
+    assert shape({"transfers": []}) == {"transfers": {"list_of": 0, "first": None}}
+    printed = json.dumps([shape(record), shape(listing)])
+    for value in (provider_id, "eviction", "completed", "first-transfer-id"):
+        assert value not in printed
