@@ -9,14 +9,14 @@ may (`config.key_locations`), and what an anonymised package must not hold eithe
 import importlib.resources
 import json
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from pathlib import Path
 
 import expcore
 from expcore.config.key_locations import NO_LOCATIONS, KeyFinders, location_findings
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term
 from expcore.package.identity import find_identity
-from expcore.package.spec import PackageError
+from expcore.package.spec import WHEELS_DIR, PackageError
 from expcore.package.views import JOINED, PARSED, Stream, streams, views
 from expcore.provenance.hashfile import Hashes, parse_hash_file
 from expcore.provenance.redact import Redactor
@@ -187,12 +187,47 @@ def findings_in(
 
 
 FOUND_LOCATION = "a key location the study's models.toml declares, which no package holds"
-FOUND_COPY = "its bytes are those of a key file the study's models.toml declares, which no package holds"
+FOUND_COPY = (
+    "a copy of a key file the study's models.toml declares, which no package holds, was found at this path and must be "
+    "removed"
+)
 
 
 def path_holds(label: str, locations: KeyFinders) -> bool:
     """Whether a stream's path holds a key location, or is a declared key file itself (`KeyFinders.names_file`)."""
     return locations.names_file(label) or any(found.search(label) for found in locations.patterns)
+
+
+def _copies(streams_of: Iterable[tuple[str, bytes]], locations: KeyFinders, redactor: Redactor) -> set[str]:
+    """One finding for each (path, bytes) that is a copy of a declared key file by size and SHA-256 (`FOUND_COPY`),
+    naming the path, hidden when it holds a key location. It never says how to attest the copy and prints no digest."""
+    return {
+        f"{redactor.name(label, hide=path_holds(label, locations))}: {FOUND_COPY}"
+        for label, data in streams_of
+        if locations.is_key_file(data)
+    }
+
+
+def find_copies(
+    files: Mapping[str, bytes],
+    locations: KeyFinders,
+    *,
+    unopened: Collection[str] = frozenset(),
+    redactor: Redactor | None = None,
+) -> list[str]:
+    """One finding per file, and per stream inside it (an archive member, a decoded run), that is a copy of a declared
+    key file under any name (`FOUND_COPY`). A file in `unopened` is compared by its own bytes only. Nothing clears a
+    copy: it is removed, never attested in `[[opaque]]`."""
+    if not locations.digests:
+        return []
+    redactor = Redactor() if redactor is None else redactor
+    findings: set[str] = set()
+    for name in sorted(files):
+        found = [(name, files[name])]
+        if name not in unopened:
+            found += [(stream.label, stream.data) for stream in streams(name, files[name])[0]]
+        findings |= _copies(found, locations, redactor)
+    return sorted(findings)
 
 
 def find_locations(
@@ -201,19 +236,26 @@ def find_locations(
     *,
     opaque: Collection[str] = frozenset(),
     redactor: Redactor | None = None,
+    copies: bool = True,
 ) -> list[str]:
     """One finding per stream and line that holds a key location (`key_locations.location_finders`), never the value:
     every stream of every file, under every view, as the token check reads it; and the path of each stream
     (`path_holds`), shown by its hidden name when it holds one. A file, or a stream inside one (an archive member), that
-    is a copy of a declared key file under any name, by size and SHA-256, is one finding naming its path
-    (`KeyFinders.is_key_file`); a file the checks cannot open is searched as the bytes it is. The files in `opaque`
-    were attested by hash and are not read. Empty when there is nothing to look for."""
+    is a copy of a declared key file under any name, by size and SHA-256, is one finding naming its path (`copies`,
+    `FOUND_COPY`); a file the checks cannot open is searched as the bytes it is. The files in `opaque` were attested by
+    hash and are not read, but a copy of a key file is not attested away: each is opened for one, except a vendored
+    wheel, which is compared by its own bytes (`wheelscan` reads its members). Empty when nothing is looked for."""
     if not locations:
         return []
     redactor = Redactor() if redactor is None else redactor
     findings: set[str] = set()
     for name in sorted(files):
-        if name in opaque:
+        if name in opaque:  # attested: not read, but opened for a copy of a key file, unless a wheel (read by member)
+            if copies:
+                wheel = name.startswith(f"{WHEELS_DIR}/")
+                findings.update(
+                    find_copies({name: files[name]}, locations, unopened={name} if wheel else (), redactor=redactor)
+                )
             continue
         opened = streams(name, files[name])[0]
         for stream in opened:
@@ -225,9 +267,10 @@ def find_locations(
                 found_at = (m.start() for found in locations.patterns for m in found.finditer(text))
                 lines = {text.count("\n", 0, start) + 1 for start in found_at}
                 findings |= {f"{shown}:{line}: {FOUND_LOCATION}" for line in lines}
-        for label, data in [(name, files[name]), *((stream.label, stream.data) for stream in opened)]:
-            if locations.is_key_file(data):
-                findings.add(f"{redactor.name(label, hide=path_holds(label, locations))}: {FOUND_COPY}")
+        if copies:
+            findings |= _copies(
+                [(name, files[name]), *((stream.label, stream.data) for stream in opened)], locations, redactor
+            )
     return sorted(findings)
 
 

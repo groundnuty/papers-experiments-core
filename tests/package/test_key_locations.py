@@ -5,6 +5,7 @@ earlier study, one with its key in a variable named after it. Neither name is in
 withholding keeps them out of the package. The campaign runs once per module.
 """
 
+import base64
 import dataclasses
 import hashlib
 import io
@@ -29,7 +30,7 @@ from expcore.config.loading import ConfigError
 from expcore.package import build as package_build
 from expcore.package import wheels as wheels_module
 from expcore.package.build import PACKAGE_FILE, build_package, private_hashes, verify_package
-from expcore.package.leaks import FOUND_LOCATION, find_locations
+from expcore.package.leaks import FOUND_COPY, FOUND_LOCATION, find_locations
 from expcore.package.spec import Opaque, PackageError
 from expcore.package.wheels import Wheel
 from expcore.package.wheelscan import scan_wheels
@@ -426,7 +427,7 @@ def test_k13_a_copy_of_the_key_file_is_refused_whatever_it_is_named(tmp_path, pa
     or the key."""
     finders = location_finders([SimpleNamespace(key_file=kept_key(tmp_path, key), key_env=None)])
     found = find_locations({path: data}, finders)
-    assert any(line.startswith(f"{path}") and ": its bytes are those of a key file" in line for line in found), found
+    assert any(line.startswith(f"{path}") and ": a copy of a key file" in line for line in found), found
     message = "\n".join(found)
     assert not any(part in message for part in KEPT)
     assert KEY_BYTES.decode().strip() not in message
@@ -471,7 +472,7 @@ def test_k13_a_binary_member_of_a_wheel_that_is_the_key_file_is_refused(tmp_path
     found = scan_wheels(
         [wheel], private_hashes(hashes), terms=None, hidden=(frozenset(), frozenset()), attested={}, locations=finders
     ).findings
-    assert any("toy_kit/blob.bin: its bytes are those of a key file" in line for line in found), found
+    assert any("toy_kit/blob.bin: a copy of a key file" in line for line in found), found
     assert not any(part in line for line in found for part in KEPT), found
 
 
@@ -487,6 +488,80 @@ def test_k13_a_wheel_member_that_is_the_key_file_is_refused_by_its_hidden_name(h
     assert any(line.endswith(f": the path holds {FOUND_LOCATION}") for line in found), found
     assert any("[[opaque]]" in line for line in found), found
     assert not any("lab.key" in line for line in found), found
+
+
+COPY_FOUND = "a copy of a key file the study's models.toml declares, which no package holds, was found at this path"
+WHEEL = "wheels/toy_kit-1.0-py3-none-any.whl"  # where `wheel_of` puts the wheel in a package
+LONG_KEY = b"sk-" + bytes(range(65, 91)) * 3 + b"\n"  # long enough for an encoded run of it to be decoded
+
+
+def scan_one_wheel(hashes, members: dict[str, bytes], finders, attested=None) -> list[str]:
+    filename, data = wheel_of("toy-kit", "1.0", members)
+    wheel = Wheel("toy-kit", "1.0", filename, data, from_index=False, direct=True)
+    return scan_wheels(
+        [wheel],
+        private_hashes(hashes),
+        terms=None,
+        hidden=(frozenset(), frozenset()),
+        attested=attested or {},
+        locations=finders,
+    ).findings
+
+
+WHEEL_COPIES = [  # what it is, the member's path and bytes, the key file's bytes
+    ("a text member", "toy_kit/data/settings.txt", KEY_BYTES, KEY_BYTES),
+    ("a binary member", "toy_kit/blob.bin", BINARY_KEY, BINARY_KEY),
+    (
+        "an encoded run in a text member",
+        "toy_kit/data/blob.txt",
+        b"blob = '" + base64.b64encode(LONG_KEY) + b"'\n",
+        LONG_KEY,
+    ),
+]
+
+
+@pytest.mark.parametrize(("member", "data", "key"), [c[1:] for c in WHEEL_COPIES], ids=[c[0] for c in WHEEL_COPIES])
+def test_k13_a_copy_of_the_key_file_in_a_wheel_is_never_cleared_and_its_digest_never_printed(
+    tmp_path, hashes, member, data, key
+):
+    """K13: a wheel member that is a copy of the key file, or holds one encoded, is refused saying a copy was found at
+    its path and must be removed; no line says how a member is attested, none prints the SHA-256 of the key or of the
+    member, and attesting the member in [[opaque]] by its hash refuses it still."""
+    finders = location_finders([SimpleNamespace(key_file=kept_key(tmp_path, key), key_env=None)])
+    label = f"{WHEEL}/{member}"
+    digests = {hashlib.sha256(key).hexdigest(), hashlib.sha256(data).hexdigest()}
+    for attested in ({}, {label: Opaque(label, hashlib.sha256(data).hexdigest(), "read by hand")}):
+        found = scan_one_wheel(hashes, {member: data}, finders, attested)
+        assert not any("[[opaque]]" in line or "attest" in line or CLEARED in line for line in found), found
+        assert not any(digest in line for line in found for digest in digests), found
+        assert found, "attesting the member cleared it"
+        assert any(line.startswith(f"{label}") and COPY_FOUND in line for line in found), found
+
+
+def test_k13_a_key_location_a_wheel_member_names_by_chance_is_still_cleared_by_attesting_it(tmp_path, hashes):
+    """K13: only a copy of the key file is beyond attesting: a wheel member that merely names a key location is
+    refused with how it is cleared, and attested by its hash it is accepted, a member beside a copy aside."""
+    finders = location_finders([SimpleNamespace(key_file=None, key_env="API_KEY")])
+    members = {"toy_kit/naming.py": GENERIC}
+    label = f"{WHEEL}/toy_kit/naming.py"
+    assert any(CLEARED in line for line in scan_one_wheel(hashes, members, finders))
+    attested = {label: Opaque(label, hashlib.sha256(GENERIC).hexdigest(), "read by hand: a generic name")}
+    assert scan_one_wheel(hashes, members, finders, attested) == []
+
+
+def test_k13_a_copy_of_the_key_file_in_a_packaged_file_is_not_cleared_by_attesting_it(tmp_path):
+    """K13: a packaged file that is a copy of the key file stays refused when package.toml attests it by its hash,
+    whether the checks could read it or not; the finding names its path in the package, saying to remove it, and
+    never prints the digest."""
+    finders = location_finders([SimpleNamespace(key_file=kept_key(tmp_path), key_env=None)])
+    found = find_locations({"notes/readme.txt": KEY_BYTES}, finders, opaque={"notes/readme.txt"})
+    assert len(found) == 1, "attesting the file cleared it"
+    assert found == [f"notes/readme.txt: {FOUND_COPY}"]
+    assert FOUND_COPY.startswith(COPY_FOUND)
+    assert FOUND_COPY.endswith("must be removed")
+    assert not any(hashlib.sha256(KEY_BYTES).hexdigest() in line for line in found)
+    binary = location_finders([SimpleNamespace(key_file=kept_key(tmp_path / "again", BINARY_KEY), key_env=None)])
+    assert find_locations({"blob.bin": BINARY_KEY}, binary, opaque={"blob.bin"}) == [f"blob.bin: {FOUND_COPY}"]
 
 
 def test_k13_the_key_file_itself_refuses_the_build(campaign, hashes, tmp_path):
@@ -518,7 +593,7 @@ def test_k13_a_renamed_copy_of_the_key_file_refuses_the_build(campaign, hashes, 
     with pytest.raises(PackageError) as refused:
         build_package(copy.root, tmp_path / "dist", hashes=hashes)
     message = str(refused.value)
-    assert "notes.txt: its bytes are those of a key file" in message
+    assert "notes.txt: a copy of a key file" in message
     assert not any(part in message for part in KEPT)
 
 

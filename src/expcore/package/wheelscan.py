@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from expcore.config.key_locations import NO_LOCATIONS, KeyFinders
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term, term_lines
 from expcore.package.identity import FOUND_COMMIT, FOUND_URL, commit_lines, find_identity, url_lines
-from expcore.package.leaks import FOUND_COPY, describe_hit, find_locations, path_holds, scan_tokens
+from expcore.package.leaks import describe_hit, find_copies, find_locations, path_holds, scan_tokens
 from expcore.package.spec import Opaque, PackageError
 from expcore.package.wheels import Wheel
 from expcore.provenance.environment import CORE_DISTRIBUTION, canonical
@@ -114,9 +114,10 @@ def _deep(
 ) -> list[str]:
     """Read a member of what can be the author's own code with every view the checks use for a file: the key
     locations the study's models declare (K13), saying how a member that names one by chance, in a distribution the
-    author did not write, is cleared; the study tokens; and in an anonymised package the terms and the identity."""
+    author did not write, is cleared; the study tokens; and in an anonymised package the terms and the identity. A
+    copy of a key file is not looked for here: `scan_wheels` refuses it before, with no way to clear it."""
     one = {label: data}
-    found = find_locations(one, locations, redactor=redactor)
+    found = find_locations(one, locations, redactor=redactor, copies=False)
     if found:
         found.append(f"{redactor.name(label, hide=path_holds(label, locations))}: {CLEARED}")
     found += scan_tokens(one, tokens, redactor=redactor)
@@ -142,7 +143,10 @@ def scan_wheels(
     with every view but the core's: whatever it was installed from, a repository, a local wheel, a URL or a directory,
     it can be the author's own code (K13). A member that names one is refused with how a distribution the author did
     not write, which can name a generic variable a study also uses as its `key_env`, is cleared: attested once read.
-    The core's own code names such variables (its redaction names API_KEY), and holds nothing of the author's.
+    The core's own code names such variables (its redaction names API_KEY), and holds nothing of the author's. A
+    member that is a copy of a declared key file, or a text member that holds one in a stream of its own (decoded, or
+    archived), is refused whether attested or not, naming its path and saying to remove it; it gets no attestation
+    hint, and nothing prints its SHA-256.
 
     A wheel in `exempt` (`lockfile.token_exempt`: a pypi.org release whose bytes the study's lock records) is read as
     a release, without the study-token list; the terms and identity of an anonymised package still apply to it. Every
@@ -162,6 +166,11 @@ def scan_wheels(
             label = f"{wheel.path}/{member}"
             seen.add(label)
             digest = hashlib.sha256(data).hexdigest()
+            text = as_text(data)
+            copies = find_copies({label: data}, searched, unopened={label} if text is None else (), redactor=redactor)
+            if copies:  # removed, never attested: no hint, which would carry its digest, and no clearing
+                findings += copies
+                continue
             if label in attested:
                 if attested[label].sha256 != digest:
                     findings.append(
@@ -173,12 +182,8 @@ def scan_wheels(
                     f"{redactor.name(label)}: names where the distribution came from; an anonymised package refuses it"
                 )
                 continue
-            text = as_text(data)
             if text is None:
                 binaries[wheel.path].append({"path": member, "sha256": digest})
-                if searched.is_key_file(data):  # a key that is not text
-                    shown = redactor.name(label, hide=path_holds(label, searched))
-                    findings += [f"{shown}: {FOUND_COPY}", _attest_hint(label, digest, redactor)]
                 continue
             if wheel.path in exempt:
                 found = _plain(label, text, None, terms, hidden, redactor)
