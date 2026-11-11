@@ -9,7 +9,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   directory and the scope study.toml names, and every record carries it. Its environment (the distributions the
   study's code imports, `provenance.environment`) goes into the campaign fingerprint, so a resume under another one
   is refused (C06). Each hold is said on stderr once, as it begins, changes or ends, with when dispatch resumes, so a
-  run waiting out a pause is not silent.
+  run waiting out a pause is not silent. With a `shard` (#154) it runs that shard's part of the plan: the fingerprint
+  is still computed from the totals, of the whole plan, and only then are the caps and the budget replaced by the
+  shard's shares and the plugin's environment identity read, once.
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
@@ -52,9 +54,12 @@ from expcore.accounting import condition_accounting
 from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.lease import LeasePool
-from expcore.campaign.manifest import build_fingerprint
+from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
 from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
+from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.shard import ShardError, ShardSpec, check_identity
+from expcore.campaign.shard_run import ShardStart, share_settings
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
 from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
@@ -180,6 +185,7 @@ def run_study(
     allow_dirty: bool = False,
     code_root: str | os.PathLike[str] | None = None,
     crash_hook: Callable[[str, str], None] | None = None,
+    shard: ShardSpec | None = None,
 ) -> RunSummary:
     """Open or resume the study's campaign and run the scheduler until nothing more can start.
 
@@ -187,11 +193,13 @@ def run_study(
     no run is in flight and every pending run is held by something that will not end by itself (a budget, a stop):
     a command line has no one to release it. Every backend is built by the plugin's `backend_factory`, or the core's
     when it supplies none. `crash_hook` is the scheduler's own test seam for killing the process at a chosen point of
-    an attempt.
+    an attempt. With `shard` the campaign is that shard of N: its part of the plan, its shares of the caps and the
+    budget, and the environment identity the plugin gives, kept in the store (`campaign.shard_run`); a shard that has
+    no run, or whose share of a total is nothing, is refused before the store is touched.
     """
     study = load_study(path)
     with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
-        return _run_campaign(study, allow_dirty, code_root, crash_hook)
+        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard)
 
 
 def _run_campaign(
@@ -199,6 +207,7 @@ def _run_campaign(
     allow_dirty: bool,
     code_root: str | os.PathLike[str] | None,
     crash_hook: Callable[[str, str], None] | None,
+    shard: ShardSpec | None = None,
 ) -> RunSummary:
     """Run the campaign of a loaded study, with its own infrastructure kinds in scope."""
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
@@ -206,12 +215,16 @@ def _run_campaign(
     out = out_dir(study)
     leases = None if plugin.probe is None else LeasePool(out / "leases", plugin.lease_keys, plugin.probe)
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
+    fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
+    manifest, started = study.manifest, None
+    if shard is not None:
+        manifest, settings, started = _shard_of(study, plugin, settings, shard)
     options = {} if crash_hook is None else {"crash_hook": crash_hook}
     with Scheduler(
         out,
         study.schema,
-        study.manifest,
-        fingerprint_of(study, plugin),
+        manifest,
+        fingerprint,
         plugin.executor,
         agent_config=study.campaign.agent,
         models=study.models,
@@ -222,9 +235,32 @@ def _run_campaign(
         lease_group=plugin.lease_group,
         backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
         on_hold=_say_hold,
+        shard=started,
         **options,
     ) as scheduler:
         return scheduler.run()
+
+
+def _shard_of(
+    study: StudyConfig, plugin: StudyPlugin, settings: SchedulerConfig, spec: ShardSpec
+) -> tuple[Manifest, SchedulerConfig, ShardStart]:
+    """A shard's part of the plan, its shares of the caps and the budget and the identity it runs against.
+
+    Every refusal is made here, before the store is opened: a shard with no run, a total smaller than the number of
+    shards (the message names the key) and an environment identity that is not names mapped to SHA-256 digests.
+    """
+    manifest = shard_manifest(study.manifest, spec)
+    if not manifest.rows:
+        raise Refused(
+            f"shard {spec.index} of {spec.count} gets no run of this plan: there are fewer pairs of task, model and "
+            "seed than shards; run with fewer shards"
+        )
+    try:
+        shared, shares = share_settings(settings, spec)
+        identity = check_identity({} if plugin.environment_identity is None else plugin.environment_identity())
+    except ShardError as error:
+        raise Refused(str(error)) from None
+    return manifest, shared, ShardStart(spec, identity, shares)
 
 
 def _say_hold(line: str) -> None:

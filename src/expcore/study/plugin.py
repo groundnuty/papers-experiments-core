@@ -85,6 +85,12 @@ class StudyPlugin:
       go into the campaign fingerprint, so a resume under another factory or version is refused (C06). Code in the
       study directory is covered by the code identity as well; the version speaks for a factory in an installed package,
       and must then be that package's installed version (`factory_version.check_factory_version`).
+    - `environment_identity`: for a campaign run as shards on several hosts (#154), what the shard ran against: a
+      function that returns names mapped to SHA-256 hex digests (the platform's configuration, the layout of its
+      federation, each space's verified ingest manifest). The core calls it once, when a shard starts, never in an
+      unsharded campaign, checks its form (`campaign.shard.check_identity`) and keeps the result with the shard; a
+      resume of the shard under another identity is refused, and a merge refuses shards whose identities differ (C29).
+      Names and digests only: no host name, path or label that identifies a machine. None: an empty identity.
     """
 
     executor: RunExecutor
@@ -97,6 +103,7 @@ class StudyPlugin:
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
     platform: Mapping[str, Any] = field(default_factory=dict)
     backend_factory: BackendFactory | None = None
+    environment_identity: Callable[[], Mapping[str, str]] | None = None
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
@@ -307,6 +314,11 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
     if not isinstance(plugin.platform, Mapping):
         kind = type(plugin.platform).__name__
         raise ConfigError(f"{file}: the plugin's platform must be a mapping of plain data, not a {kind}")
+    if plugin.environment_identity is not None and not callable(plugin.environment_identity):
+        kind = type(plugin.environment_identity).__name__
+        raise ConfigError(
+            f"{file}: the plugin's environment_identity must be a function returning a mapping, not a {kind}"
+        )
     if plugin.backend_factory is None:
         _check_backends(study)
     else:

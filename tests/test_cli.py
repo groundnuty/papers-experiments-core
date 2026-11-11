@@ -9,6 +9,7 @@ from record_support import no_secrets_in_the_environment
 
 from expcore.campaign.holds import Hold
 from expcore.campaign.scheduler import RunSummary
+from expcore.campaign.shard import ShardSpec
 from expcore.cli import EXIT_PENDING, main
 from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
@@ -121,3 +122,65 @@ def test_l08_a_run_stopped_on_harness_errors_prints_where_their_tracebacks_are(t
     monkeypatch.setattr("expcore.cli.run_study", lambda *args, **kwargs: dataclasses.replace(summary, holds={}))
     assert main(["run", str(tmp_path)]) == EXIT_PENDING  # held by something else: no word of the log
     assert "tracebacks" not in capsys.readouterr().out
+
+
+# --- one campaign on several hosts (#154) -----------------------------------------------------------------------
+
+
+def captured_shard(monkeypatch, tmp_path, *argv):
+    """Run `run` with a stand-in for `run_study`; return the exit status and the keyword `shard` it was given."""
+    given = {}
+
+    def stand_in(*args, **kwargs):
+        given.update(kwargs)
+        return RunSummary(0, {}, {"done": 1})
+
+    monkeypatch.setattr("expcore.cli.run_study", stand_in)
+    return main(["run", str(tmp_path), *argv]), given["shard"] if given else "not called"
+
+
+def test_c28_run_takes_a_shard_and_an_optional_label_and_hands_the_spec_to_the_pipeline(tmp_path, monkeypatch):
+    """C28: `--shard i/N` with the label defaulting to shard-i; without it the campaign is not a shard."""
+    assert captured_shard(monkeypatch, tmp_path) == (0, None)
+    assert captured_shard(monkeypatch, tmp_path, "--shard", "2/3") == (0, ShardSpec(2, 3, "shard-2"))
+    assert captured_shard(monkeypatch, tmp_path, "--shard", "2/3", "--shard-label", "north-2") == (
+        0,
+        ShardSpec(2, 3, "north-2"),
+    )
+
+
+@pytest.mark.parametrize("argv", [["--shard", "two-of-three"], ["--shard", "2"], ["--shard-label", "north"]])
+def test_c28_a_shard_that_is_not_i_over_n_or_a_label_without_a_shard_is_a_usage_error_that_repeats_nothing(
+    argv, tmp_path, capsys
+):
+    """C28: what was typed is not repeated, as for every other usage error of the command."""
+    assert main(["run", str(tmp_path), *argv]) == 2
+    error = capsys.readouterr().err
+    assert "usage:" in error
+    assert not any(word in error for word in ("two-of-three", "north"))
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--shard", "3/2"], "shard index 3 is not between 1 and 2"),
+        (["--shard", "1/1"], "a sharded campaign has at least 2 shards"),
+        (["--shard", "0/2"], "shard index 0 is not between 1 and 2"),
+        (["--shard", "1/2", "--shard-label", "North Rack"], "a shard label is 1 to 64 lower-case letters"),
+    ],
+)
+def test_c28_a_spec_no_shard_can_have_is_refused_saying_why_and_never_quoting_the_label(
+    argv, message, tmp_path, capsys
+):
+    """C28: exit 1 with the reason, as any refusal."""
+    assert main(["run", str(tmp_path), *argv]) == 1
+    error = capsys.readouterr().err
+    assert f"run refused: {message}" in error
+    assert "North Rack" not in error
+
+
+def test_c30_a_total_below_the_number_of_shards_is_refused_by_the_command_naming_the_key(study, capsys):
+    """C30: the example's unit caps are 1, which two shards cannot share."""
+    assert main(["run", str(study), "--shard", "1/2"]) == 1
+    assert "run refused: [scheduler.unit_caps] alpha-stub is 1, less than the 2 shards" in capsys.readouterr().err
+    assert not (study / "out" / "state.sqlite").exists()
