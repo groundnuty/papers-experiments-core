@@ -212,6 +212,16 @@ def test_c28_a_sharded_store_resumed_without_a_shard_is_refused_and_says_how_to_
     assert everything(tmp_path) == before
 
 
+def test_c28_a_store_started_with_a_wide_label_is_told_to_resume_with_the_wide_flag(tmp_path):
+    """C28: the label a store pinned under the wide rule still resumes, with the override, and the refusal of a start
+    without a shard says so."""
+    wide = ShardSpec.parse("1/2", "rack.b_2", wide_label=True)
+    start(tmp_path, shard=shard_start(wide))[0].close()
+    start(tmp_path, shard=shard_start(wide), now=LATER)[0].close()  # the same spec resumes
+    with pytest.raises(ShardMismatch, match=r"--shard 1/2 --shard-label rack\.b_2 --shard-label-wide$"):
+        start(tmp_path, shard=None, now=LATER)
+
+
 def test_c28_an_unsharded_store_resumed_as_a_shard_is_refused(tmp_path):
     """C28: nor is a store that began as the whole campaign continued as one of its shards."""
     start(tmp_path, shard=None)[0].close()

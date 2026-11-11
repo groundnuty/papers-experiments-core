@@ -25,7 +25,7 @@ SHA-256 digests (the platform's configuration, the layout of its federation, eac
 manifest). It is read once when the shard starts and kept with the shard spec. A merge refuses shards whose
 identities differ (C29), so a shard that ran against other data cannot join the batch silently. Names and digests
 only: a package is public and double-blind, so no host name, path or label that identifies a machine is kept, and the
-shard's label is chosen by the operator.
+shard's label is chosen by the operator, from `[a-z0-9-]` unless `--shard-label-wide` allows `.` and `_` too.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
@@ -55,7 +55,8 @@ MERGE_FILE = "merge.json"
 """The file a merge writes at the top of the merged batch, naming its shards (`expcore-merge/1`)."""
 MERGE_SCHEMA = "expcore-merge/1"
 
-_LABEL = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+_LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+_LABEL_WIDE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 _NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _MICRO = Decimal(1_000_000)
@@ -67,35 +68,43 @@ class ShardError(ValueError):
 
 @dataclass(frozen=True)
 class ShardSpec:
-    """Shard `index` of `count` (1-based, count at least 2), with the operator's `label` and the partition rule."""
+    """Shard `index` of `count` (1-based, count at least 2), with the operator's `label` and the partition rule.
+
+    A label is 1 to 64 of `[a-z0-9-]`, starting with a letter or digit: no dot, so a fully qualified host name or an
+    IPv4 address cannot be used by accident. `wide_label` (not kept, not compared) lets it use `.` and `_` as well; it
+    is the one way to name a shard in that wider form, and `from_json` takes it, so a store that pinned such a label
+    still reads back.
+    """
 
     index: int
     count: int
     label: str
     rule: str = RULE
+    wide_label: InitVar[bool] = False
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, wide_label: bool) -> None:
         """Refuse a spec no shard can have."""
         if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 2:
             raise ShardError(f"a sharded campaign has at least 2 shards, not {self.count!r}; run unsharded instead")
         if isinstance(self.index, bool) or not isinstance(self.index, int) or not 1 <= self.index <= self.count:
             raise ShardError(f"shard index {self.index!r} is not between 1 and {self.count}")
-        if not isinstance(self.label, str) or not _LABEL.fullmatch(self.label):
+        if not isinstance(self.label, str) or not (_LABEL_WIDE if wide_label else _LABEL).fullmatch(self.label):
             raise ShardError(
-                "a shard label is 1 to 64 lower-case letters, digits, '.', '_' or '-', starting with a letter or "
-                "digit; choose one that names no machine, since packages are public"
+                "a shard label is 1 to 64 lower-case letters, digits or '-', starting with a letter or digit, with "
+                "no '.', so that a host name or an address is not used by accident; choose one that names no "
+                "machine, since packages are public (--shard-label-wide also allows '.' and '_')"
             )
         if self.rule != RULE:
             raise ShardError(f"the partition rule {self.rule!r} is not this core's ({RULE!r})")
 
     @classmethod
-    def parse(cls, text: str, label: str | None = None) -> ShardSpec:
-        """Read `i/N` from the command line; the label defaults to `shard-i`."""
+    def parse(cls, text: str, label: str | None = None, *, wide_label: bool = False) -> ShardSpec:
+        """Read `i/N` from the command line; the label defaults to `shard-i`, and is wide only if `wide_label`."""
         match = re.fullmatch(r"(\d+)/(\d+)", text.strip())
         if match is None:
             raise ShardError(f"--shard takes i/N, such as 2/4, not {text!r}")
         index, count = int(match.group(1)), int(match.group(2))
-        return cls(index, count, label if label is not None else f"shard-{index}")
+        return cls(index, count, label if label is not None else f"shard-{index}", wide_label=wide_label)
 
     def to_json(self) -> dict[str, Any]:
         """The spec as the store, the export and a merge keep it."""
@@ -103,10 +112,15 @@ class ShardSpec:
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> ShardSpec:
-        """Read a spec back, refusing missing or extra keys."""
+        """Read a spec back, refusing missing or extra keys; a label of the wide form is read too."""
         if not isinstance(data, Mapping) or set(data) != {"rule", "index", "count", "label"}:
             raise ShardError("a shard spec has exactly the keys rule, index, count and label")
-        return cls(data["index"], data["count"], data["label"], data["rule"])
+        return cls(data["index"], data["count"], data["label"], data["rule"], wide_label=True)
+
+
+def is_default_label(label: str) -> bool:
+    """Whether a label is one the default rule allows (no '.' or '_'), so needs no `--shard-label-wide`."""
+    return _LABEL.fullmatch(label) is not None
 
 
 def pair_of(factors: Mapping[str, Any]) -> tuple[str, str, int]:
@@ -206,6 +220,7 @@ __all__ = [
     "caps_shares",
     "check_identity",
     "in_shard",
+    "is_default_label",
     "pair_of",
     "share",
     "share_usd",

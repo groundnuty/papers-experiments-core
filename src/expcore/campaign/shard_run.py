@@ -32,6 +32,7 @@ from expcore.campaign.shard import (
     ShardSpec,
     budget_shares,
     caps_shares,
+    is_default_label,
 )
 from expcore.campaign.store import Store
 
@@ -101,7 +102,7 @@ def pin_shard(store: Store, shard: ShardStart | None, started: bool, now: str) -
             raise ShardMismatch(
                 f"this store belongs to shard {recorded['index']} of {recorded['count']} ({recorded['label']!r}) of a "
                 f"sharded campaign, and this start gives no shard: resume it with --shard "
-                f"{recorded['index']}/{recorded['count']} --shard-label {recorded['label']}"
+                f"{recorded['index']}/{recorded['count']} --shard-label {recorded['label']}{_wide_flag(recorded)}"
             )
         return
     if META_SHARD not in held:
@@ -126,6 +127,11 @@ def pin_shard(store: Store, shard: ShardStart | None, started: bool, now: str) -
     first = next(iter(refused))
     lines = "\n  ".join(line for found in refused.values() for line in found)
     raise ShardMismatch(f"{_REASONS[first].format(**recorded_spec)}:\n  {lines}")
+
+
+def _wide_flag(recorded: Mapping[str, Any]) -> str:
+    """` --shard-label-wide` when the recorded label has a '.' or '_' that only that flag lets a label have."""
+    return "" if is_default_label(str(recorded["label"])) else " --shard-label-wide"
 
 
 _REASONS = {

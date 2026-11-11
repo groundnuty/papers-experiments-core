@@ -16,6 +16,7 @@ from expcore.campaign.shard import (
     caps_shares,
     check_identity,
     in_shard,
+    is_default_label,
     share,
     share_usd,
 )
@@ -90,6 +91,44 @@ def test_c28_a_spec_no_shard_can_have_is_refused(text, label):
     """C28: an index out of range, one shard only, a malformed i/N, or a label that is not a plain lower-case name."""
     with pytest.raises(ShardError):
         ShardSpec.parse(text, label)
+
+
+@pytest.mark.parametrize("label", ["node1.lab.example.org", "10.0.0.5", "node_one", "lab.rack-b"])
+def test_c28_a_label_with_a_dot_or_an_underscore_is_refused_by_default_and_accepted_when_wide(label):
+    """C28: a fully qualified host name or an IPv4 address cannot be used as a label by accident; the wider form, the
+    one that allows '.' and '_', is asked for by name."""
+    with pytest.raises(ShardError, match=r"no '\.'") as refused:
+        ShardSpec.parse("2/4", label)
+    assert label not in str(refused.value)
+    with pytest.raises(ShardError, match=r"no '\.'"):
+        ShardSpec(2, 4, label)
+    spec = ShardSpec.parse("2/4", label, wide_label=True)
+    assert spec.label == label
+    assert spec.to_json() == {"rule": RULE, "index": 2, "count": 4, "label": label}
+
+
+@pytest.mark.parametrize("label", ["north", "rack-b", "shard-2", "a", "9-lab", "x" * 64])
+def test_c28_a_default_label_is_lower_case_letters_digits_and_hyphens(label):
+    """C28: what the default rule keeps: 1 to 64 of `[a-z0-9-]`, starting with a letter or digit."""
+    assert ShardSpec.parse("1/2", label).label == label
+    assert is_default_label(label)
+
+
+@pytest.mark.parametrize("label", ["-north", "North", "", "x" * 65, "node one", ".node"])
+def test_c28_the_wide_form_still_checks_the_start_the_length_and_the_case(label):
+    """C28: the override allows '.' and '_' and nothing more."""
+    with pytest.raises(ShardError, match="lower-case"):
+        ShardSpec.parse("1/2", label, wide_label=True)
+
+
+def test_c28_a_spec_read_back_from_a_store_keeps_the_wide_label_it_pinned():
+    """C28: a store started with a wide label still resumes and merges: `from_json` reads it, equal to the spec made
+    with the override, and its json is the four keys it always had."""
+    spec = ShardSpec.parse("3/5", "rack.b_2", wide_label=True)
+    assert ShardSpec.from_json(spec.to_json()) == spec
+    assert set(spec.to_json()) == {"rule", "index", "count", "label"}
+    with pytest.raises(ShardError, match="lower-case"):
+        ShardSpec.from_json({**spec.to_json(), "label": "Rack.B"})
 
 
 def test_c28_a_spec_round_trips_and_defaults_its_label():

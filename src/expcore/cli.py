@@ -4,7 +4,8 @@
 A thin shell; the logic is in the packages.
 
     run STUDY       load the configuration, open or resume the campaign, run the scheduler; with `--shard i/N
-                    [--shard-label L]` run shard i of N of the campaign on this host (one campaign on several hosts)
+                    [--shard-label L [--shard-label-wide]]` run shard i of N of the campaign on this host (one
+                    campaign on several hosts)
     check BATCH     the replay check over a batch of records (the study is found above the batch), with a copy of
                     the campaign store that the analysis reads instead of the live one
     analyze STUDY   refuse without a current replay check; then export, scores (derived from the records anew each time,
@@ -104,8 +105,15 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument(
                 "--shard-label",
                 metavar="L",
-                help="the shard's name in its export and in a merge: lower-case letters, digits, '.', '_' or '-', "
-                "chosen by you and never a host name (default: shard-i)",
+                help="the shard's name in its export and in a merge: 1 to 64 lower-case letters, digits or '-', "
+                "chosen by you and never a host name or an address (default: shard-i)",
+            )
+            command.add_argument(
+                "--shard-label-wide",
+                action="store_true",
+                help="let the label also use '.' and '_' (a label with a dot is refused otherwise, so that a host "
+                "name or an address is not used by accident); a store that was started with such a label is resumed "
+                "with it",
             )
         else:
             command.add_argument(
@@ -144,7 +152,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None) -> int:
-    shard = None if args.shard is None else ShardSpec.parse(args.shard, args.shard_label)
+    shard = (
+        None if args.shard is None else ShardSpec.parse(args.shard, args.shard_label, wide_label=args.shard_label_wide)
+    )
     summary = run_study(
         args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, crash_hook=crash_hook, shard=shard
     )
@@ -247,8 +257,10 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
-        if args.command == "run" and args.shard is None and args.shard_label is not None:
-            parser.error("--shard-label needs --shard")
+        if args.command == "run" and args.shard is None and (args.shard_label is not None or args.shard_label_wide):
+            parser.error("--shard-label and --shard-label-wide need --shard")
+        if args.command == "run" and args.shard_label_wide and args.shard_label is None:
+            parser.error("--shard-label-wide needs --shard-label")
     except SystemExit as stop:
         return EXIT_USAGE if stop.code else EXIT_OK
     try:

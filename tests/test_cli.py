@@ -149,7 +149,16 @@ def test_c28_run_takes_a_shard_and_an_optional_label_and_hands_the_spec_to_the_p
     )
 
 
-@pytest.mark.parametrize("argv", [["--shard", "two-of-three"], ["--shard", "2"], ["--shard-label", "north"]])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--shard", "two-of-three"],
+        ["--shard", "2"],
+        ["--shard-label", "north"],
+        ["--shard-label-wide"],
+        ["--shard", "2/3", "--shard-label-wide"],
+    ],
+)
 def test_c28_a_shard_that_is_not_i_over_n_or_a_label_without_a_shard_is_a_usage_error_that_repeats_nothing(
     argv, tmp_path, capsys
 ):
@@ -177,6 +186,30 @@ def test_c28_a_spec_no_shard_can_have_is_refused_saying_why_and_never_quoting_th
     error = capsys.readouterr().err
     assert f"run refused: {message}" in error
     assert "North Rack" not in error
+
+
+@pytest.mark.parametrize("label", ["node1.lab.example.org", "10.0.0.5"])
+def test_c28_a_host_name_or_an_address_is_refused_as_a_label_unless_the_wide_form_is_asked_for(
+    label, tmp_path, monkeypatch, capsys
+):
+    """C28: the default label has no '.', so a fully qualified name or an IPv4 address is not used by accident;
+    `--shard-label-wide` allows it, and the spec the pipeline gets is the same one."""
+    assert main(["run", str(tmp_path), "--shard", "1/2", "--shard-label", label]) == 1
+    error = capsys.readouterr().err
+    assert "run refused: a shard label is 1 to 64 lower-case letters, digits or '-'" in error
+    assert "--shard-label-wide" in error
+    assert label not in error
+    assert captured_shard(monkeypatch, tmp_path, "--shard", "1/2", "--shard-label", label, "--shard-label-wide") == (
+        0,
+        ShardSpec(1, 2, label, wide_label=True),
+    )
+
+
+def test_c28_the_wide_form_does_not_let_a_label_have_capitals_or_a_space(tmp_path, capsys):
+    """C28: the override is for '.' and '_' only."""
+    argv = ["run", str(tmp_path), "--shard", "1/2", "--shard-label-wide", "--shard-label", "North Rack"]
+    assert main(argv) == 1
+    assert "a shard label is 1 to 64 lower-case letters" in capsys.readouterr().err
 
 
 def test_c30_a_total_below_the_number_of_shards_is_refused_by_the_command_naming_the_key(study, capsys):
