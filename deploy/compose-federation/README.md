@@ -107,7 +107,8 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
   setting gave it. Down deletes nothing in a root without the mark (`.expcore-fed-root`) naming the layout's project,
   so a root holds one federation at a time. Two federations at once need two roots beside each other below the
   parent (under the default parent, neither may be the parent itself): up refuses a root inside another federation's
-  root or holding one, and down refuses to empty a root that holds one. The root holds:
+  root or holding one, and down refuses to empty a root that holds one. Marks are looked for in every directory above
+  the root up to `/`, and below it to `NESTED_DEPTH` (8) levels, never through a link. The root holds:
 
   | Path | Holds |
   |---|---|

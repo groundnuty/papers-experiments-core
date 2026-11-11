@@ -180,6 +180,47 @@ def test_a_federation_root_inside_another_is_refused_and_the_outer_one_is_not_em
     assert beside.outer_roots == beside.inner_roots == []
 
 
+def marked_outer(fed, tmp_path):
+    outer = fed.layout.Layout(tmp_path / "outer", tmp_path / "outer")
+    fed.pki.private_directory(outer.root)
+    outer.marker.write_text("expcore-fed\n", encoding="utf-8")
+    return outer
+
+
+def test_a_root_two_levels_inside_another_is_refused_and_the_outer_down_does_not_empty_it(
+    fed, minimal_layout, tmp_path, monkeypatch
+):
+    """A look at the root's children alone missed a federation two levels down, and the outer down would have deleted
+    it: up refuses either side, and the outer down refuses a root holding one at any depth to NESTED_DEPTH."""
+    ran = no_docker(fed, monkeypatch)
+    outer = marked_outer(fed, tmp_path)
+    deep = fed.layout.Layout(outer.root / "one" / "two", outer.root, fed.spec.load_spec(minimal_layout))
+    deep.root.mkdir(parents=True)
+    deep.marker.write_text("expcore-test\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="holds another federation's root"):
+        fed.cli.down(outer)
+    with pytest.raises(RuntimeError, match="or holds one"):
+        fed.cli.prepare(outer)
+    with pytest.raises(RuntimeError, match="inside another federation's root"):
+        fed.cli.prepare(deep)
+    assert ran == []
+    assert deep.marker.is_file()
+    assert fed.layout.NESTED_DEPTH >= 2
+
+
+def test_a_root_under_a_parent_inside_another_root_is_refused(fed, minimal_layout, tmp_path, monkeypatch):
+    """A look at the ancestors down to the parent alone missed a root whose configured parent lies inside another
+    federation's root: the marks are looked for all the way up to /."""
+    ran = no_docker(fed, monkeypatch)
+    outer = marked_outer(fed, tmp_path)
+    (outer.root / "study").mkdir()
+    inner = fed.layout.Layout(outer.root / "study" / "fed", outer.root / "study", fed.spec.load_spec(minimal_layout))
+    with pytest.raises(RuntimeError, match="inside another federation's root"):
+        fed.cli.prepare(inner)
+    assert not inner.root.exists()
+    assert ran == []
+
+
 def test_a_root_marked_for_another_project_is_neither_written_nor_emptied(fed, minimal_layout, tmp_path, monkeypatch):
     """The mark holds the declared project's name, so a layout given the root of another layout's federation refuses
     it, and down stops nothing: the containers it would stop are not that root's."""

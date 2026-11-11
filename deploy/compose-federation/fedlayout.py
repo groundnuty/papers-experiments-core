@@ -17,6 +17,7 @@ from pathlib import Path
 from fedspec import Spec, load_spec
 
 ROOT_MARKER = ".expcore-fed-root"  # written by up into a root it made or found empty; holds the project name
+NESTED_DEPTH = 8  # how many levels below a root up and down look for another federation's marked root
 HERE = Path(__file__).resolve().parent
 COMPOSE_FILE = HERE / "compose.yaml"  # the default layout's generated Compose file, committed for review
 DEFAULT_ROOT = "/mnt/volume2/expcore-federation"
@@ -136,17 +137,25 @@ class Layout:
 
     @property
     def outer_roots(self) -> list[Path]:
-        """Other federations' roots this root lies in, from the parent down: their down would delete this one."""
-        above = (p for p in self.root.parents if p == self.parent or self.parent in p.parents)
-        return [p for p in above if os.path.isfile(p / ROOT_MARKER)]
+        """Marked roots this root lies in, at any height up to `/`, the parent's own ancestors included: their down
+        would delete this one."""
+        return [p for p in self.root.parents if os.path.isfile(p / ROOT_MARKER)]
 
     @property
     def inner_roots(self) -> list[Path]:
-        """Other federations' roots directly inside this root: this one's down would delete them."""
-        if not os.path.isdir(self.root):
+        """Marked roots inside this root, down to NESTED_DEPTH levels below it, never through a link: this one's down
+        would delete them. A directory the host user cannot read is one a service wrote as root inside its own data,
+        where no federation's up makes a root, so the search passes it by."""
+        if not os.path.isdir(self.root) or os.path.islink(self.root):
             return []
-        inside = (c for c in self.root.iterdir() if os.path.isdir(c) and not os.path.islink(c))
-        return [c for c in inside if os.path.isfile(c / ROOT_MARKER)]
+        found = []
+        for directory, subdirectories, files in os.walk(self.root, followlinks=False):
+            depth = len(Path(directory).relative_to(self.root).parts)
+            if depth and ROOT_MARKER in files:
+                found.append(Path(directory))
+            if depth >= NESTED_DEPTH:
+                subdirectories.clear()
+        return found
 
     @property
     def marker(self) -> Path:
