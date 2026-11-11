@@ -137,6 +137,7 @@ def completion():
         model="test-model",
         fingerprint=None,
         choices=True,
+        usage_extra=None,
         **message_extra,
     ):
         message = {"role": "assistant", "content": content, **message_extra}
@@ -159,6 +160,7 @@ def completion():
                 "prompt_tokens": prompt or 0,
                 "completion_tokens": out or 0,
                 "total_tokens": (prompt or 0) + (out or 0),
+                **(usage_extra or {}),  # the fields an endpoint adds to the usage object, under its own names
             }
         reply = ChatCompletion.model_validate(body)
         if usage is not None and None in usage:

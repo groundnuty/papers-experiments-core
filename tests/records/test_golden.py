@@ -2,7 +2,8 @@
 
 `tests/data/golden-record-v2.json` is the same for version 2, which adds no field but changes a rule: an infrastructure
 outcome is flagged as treatment only after the model completed a turn. Both files load, write back byte for byte, and
-replay, each under the rule of its own version.
+replay, each under the rule of its own version. Version 3 is still being extended before v0.1.0, so it has no single
+golden: `tests/data/record-v3/` holds one fixture per merge point, and `test_v3_fixtures.py` replays them all.
 
 `tests/data/golden-record-v1.json` is a record of a synthetic run with invented names: tool calls of every outcome, a
 result the data source cut, a call the loop skipped, a secret redacted from the prompt and from a result. It must
@@ -21,6 +22,7 @@ from expcore.replay.replay import replay_record
 
 GOLDEN = Path(__file__).resolve().parents[1] / "data" / "golden-record-v1.json"
 GOLDEN_V2 = Path(__file__).resolve().parents[1] / "data" / "golden-record-v2.json"
+V3_FIXTURES = sorted((Path(__file__).resolve().parents[1] / "data" / "record-v3").glob("*.json"))
 
 
 def test_R01_the_golden_record_of_version_one_loads_and_writes_back_byte_for_byte():
@@ -120,7 +122,7 @@ def test_R12_the_golden_records_check_and_replay_whatever_secrets_the_checking_e
     redacts nothing and the replay redacts nothing, so only a secret the record really holds can stop it."""
     for name, value in SECRET_SHAPED.items():
         monkeypatch.setenv(name, value)
-    for golden in (GOLDEN, GOLDEN_V2):
+    for golden in (GOLDEN, GOLDEN_V2, *V3_FIXTURES):
         assert check_record(golden.read_bytes()) is None
 
 
