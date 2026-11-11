@@ -295,7 +295,7 @@ def _import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
         file=sys.stderr,
     )
     import_platforms(study.study_file, study.platforms)
-    import_plugin_module(study.plugin_file, error_text=False)
+    import_plugin_module(study, error_text=False)
 
 
 def _json_text(data: Any) -> str:
