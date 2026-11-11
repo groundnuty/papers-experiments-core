@@ -55,6 +55,9 @@ def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_em
     for provider in providers:
         mine = [row for row in rows if row.provider == provider]
         wanted = {entries[row.file].file_id: list(row.ranges) for row in mine}
+        provisioner.await_visible(
+            provider, wanted
+        )  # the receiver must see each file before anything is read through it
         before = provisioner.holds(provider, wanted)
         if start_empty and before:
             raise NotPlaced(f"the provider already holds {before} B of the files, so it does not start empty")

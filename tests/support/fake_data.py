@@ -28,6 +28,8 @@ waits. A test bends the fake through plain attributes:
 - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
 - `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement); `readonly_answer` is
   how such a write is refused, 403 by default, `(400, "posix", "eacces")` as Onedata 25.0 answers it;
+- `unseen`, `unseen_after_create`: a provider that sees a new file only after so many reads of it, each answered
+  `unseen_answer` (a 404 by default), as a second provider of 25.0 does for some seconds after a write elsewhere;
 - `missing_answer`: how a file or directory that is not there is answered, a 404 by default; `answer_missing_as_25`
   makes it 400 posix enoent and keeps a deleted entry's `parent_id` readable, as 25.0 does;
 - a content write (`PUT /data/{id}/content`) without `Content-Type: application/octet-stream` is a 415, as in 25.0;
@@ -130,6 +132,11 @@ class FakeData(FakeFederation):
         self.transfer_flip_after = 1
         self.transfer_visible_after = 0
         self.root_enoent_polls = 0
+        # A provider that sees a new file only after some reads: (provider id, file id) -> reads of it answered as
+        # not there; `unseen_after_create` (provider id -> reads) sets that for every file made from then on.
+        self.unseen: dict[tuple[str, str], int] = {}
+        self.unseen_after_create: dict[str, int] = {}
+        self.unseen_answer: tuple[int, str | None, str | None] = (404, "notFound", None)
         self.root_enoent_answer: tuple[int, str | None, str | None] = (404, "posix", "enoent")  # a fresh root's
         self.transfer_unseen_answer: tuple[int, str | None, str | None] = (404, "notFound", None)  # a job not seen yet
         self.page_size = 1000
@@ -244,6 +251,9 @@ class FakeData(FakeFederation):
     def _create(self, parent: str, name: str, kind: str) -> str:
         file_id = f"fid-{next(self._ids):04d}{self.id_suffix}"
         self.nodes[file_id] = Node(file_id, name, kind, parent)
+        if kind == "REG":  # a provider that sees a file sees the directories above it, made before it
+            for provider_id, reads in self.unseen_after_create.items():
+                self.unseen[(provider_id, file_id)] = reads
         return file_id
 
     def _delete(self, file_id: str) -> None:
@@ -353,6 +363,10 @@ class FakeData(FakeFederation):
         found = re.fullmatch(r"/data/([^/]+)(/children|/content|/distribution)?", route)
         if found:
             node = self.nodes.get(found.group(1))
+            lag = (provider, found.group(1))
+            if node is not None and self.unseen.get(lag, 0) > 0:  # this provider does not see the new file yet
+                self.unseen[lag] -= 1
+                return self._answer(self.unseen_answer)
             if node is None:
                 return self._missing(found.group(1), query, method)
             part = found.group(2) or ""

@@ -35,6 +35,55 @@ def test_o02_the_placement_is_confirmed_by_the_block_map_after_it_lags(provision
     assert seeded.held(PATH, BETA_ID) == [[0, 100], [2000, 500]]
 
 
+UNSEEN = [(404, "notFound", None), (400, "posix", "enoent")]
+
+
+@pytest.mark.parametrize("answer", UNSEEN)
+def test_o07_placement_waits_until_the_receiver_sees_a_file_written_through_the_data_provider(
+    provisioner, seeded, ticker, answer
+):
+    """O07: on Onedata 25.0 a second provider sees a file written through the data provider some seconds later, and
+    answers it meanwhile with a 404 or 400 posix enoent. Placement waits, bounded, until the receiver reports the file
+    at its size before any read through it, then places the ranges as usual."""
+    file_id = seeded.id_of(PATH)
+    seeded.unseen[(BETA_ID, file_id)] = 3
+    seeded.unseen_answer = answer
+    record = place_ranges(provisioner, [ROW])
+    assert record["providers"]["beta"]["placement"]["fully_placed"] is True
+    assert seeded.held(PATH, BETA_ID) == [[0, 100], [2000, 500]]
+    assert seeded.unseen[(BETA_ID, file_id)] == 0
+    assert len(ticker.slept) >= 3  # it waited, with pauses, for the three reads that did not see the file
+
+
+def test_o07_a_receiver_that_never_sees_the_file_fails_at_the_bound_naming_it_by_its_label(provisioner, seeded, ticker):
+    """O07: past `VISIBLE_TIMEOUT_S` the wait raises `NotVisible`, a `WaitTimeout`, naming the receiver by its position
+    in platform.toml, and nothing is read through it."""
+    from expcore_onedata.consistency import VISIBLE_TIMEOUT_S, NotVisible, WaitTimeout
+
+    seeded.unseen[(BETA_ID, seeded.id_of(PATH))] = 10**6
+    began = ticker.clock()
+    with pytest.raises(NotVisible, match=r"providers\[1\]") as raised:
+        place_ranges(provisioner, [ROW])
+    assert isinstance(raised.value, WaitTimeout)
+    assert "beta" not in str(raised.value)
+    assert VISIBLE_TIMEOUT_S <= ticker.clock() - began <= VISIBLE_TIMEOUT_S + 2
+    assert [c for c in sent_to(seeded, BETA_ID) if c[2].endswith(("/content", "/distribution"))] == []
+
+
+@pytest.mark.parametrize("answer", [(400, "posix", "eacces"), (400, "badValueNotAllowed", None), (400, None, None)])
+def test_o07_any_other_error_while_waiting_for_the_receiver_fails_closed_at_once(provisioner, seeded, ticker, answer):
+    """O07: only a 404 or 400 posix enoent means "not visible yet"; any other answer raises at once, unwaited."""
+    from expcore_onedata.client import PlatformError
+
+    seeded.unseen[(BETA_ID, seeded.id_of(PATH))] = 3
+    seeded.unseen_answer = answer
+    with pytest.raises(PlatformError) as raised:
+        place_ranges(provisioner, [ROW])
+    assert raised.value.status == 400
+    assert ticker.slept == []
+    assert [c for c in sent_to(seeded, BETA_ID) if c[2].endswith("/content")] == []
+
+
 def test_o02_reads_that_leave_the_block_map_short_are_not_placed(provisioner, seeded):
     """O02 with O01: a provider that answers the reads but never records the blocks has not placed anything."""
     seeded.onthefly_places = False

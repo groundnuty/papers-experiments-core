@@ -319,6 +319,20 @@ def test_o11_the_round_trip_places_confirms_reads_back_evicts_and_cleans_up(cont
     assert not [c for c in fake.provider_calls if c[1] == "POST" and c[2] == "/transfers" and c[0] == "prmock0001"]
 
 
+@pytest.mark.parametrize("answer", [(404, "notFound", None), (400, "posix", "enoent")])
+def test_o07_the_round_trip_waits_for_the_receiver_to_see_its_scratch_file(context, fake, answer):
+    """O07: as on Onedata 25.0, the receiver sees the scratch file written through the data provider only after some
+    reads (404 or 400 posix enoent meanwhile). The round trip waits, bounded, before it reads through the receiver,
+    and passes."""
+    fake.unseen_after_create = {BETA_ID: 3}
+    fake.unseen_answer = answer
+    fake.answer_missing_as_25()
+    entry = by_name(run_checks(context(allow_mutation=True), ["round_trip"]))["round_trip"]
+    assert entry.ok is True, entry.summary
+    assert entry.facts["steps"] == ["created", "placed", "read back", "evicted"]
+    assert entry.facts["cleanup_verified"] is True
+
+
 def test_o11_a_round_trip_that_raises_still_tears_down_and_says_so(context, fake):
     """O11: a trip that fails after creating the scratch file still removes it, in a finally, and verifies it."""
     fake.onthefly_places = False  # the placement fails after the scratch file exists

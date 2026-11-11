@@ -174,6 +174,7 @@ class Provisioner:
         self._clock, self._sleep = clock, sleep
         self._verified_name: str | None = None
         self._root: str | None = None
+        self._visible: set[tuple[str, str]] = set()  # (provider, file id) seen at its size there (`await_visible`)
 
     @property
     def settings(self) -> PlacementSettings:
@@ -346,6 +347,32 @@ class Provisioner:
             raise ProvisionError("the size read back after an upload is not the size uploaded")
         return file_id
 
+    # -- visibility ------------------------------------------------------------
+    def await_visible(self, provider: str, file_ids: Iterable[str]) -> float:
+        """Wait, bounded, until a provider sees each file at its size on the data provider; return the seconds waited.
+
+        A file written through the data provider is not visible through another at once (Onedata 25.0 answers it with
+        a 404 or 400 posix enoent for some seconds), so a read or a transfer through that provider waits here first
+        (`consistency.wait_visible`, bounded by `VISIBLE_TIMEOUT_S`; past it, `NotVisible` names the provider by its
+        label, and any other error fails closed). The data provider, the writer, needs no wait, and a provider and file
+        seen once are not asked again. Instruments never call this: a probe records what it reads (O08)."""
+        if provider == self._settings.holder:
+            return 0.0
+        waited = 0.0
+        for file_id in file_ids:
+            if (provider, file_id) in self._visible:
+                continue
+            size = self._client.get(
+                f"/data/{_segment(file_id)}", provider=self._settings.holder, params={"attribute": "size"}
+            ).get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise PlatformError("the data provider's answer for a file's size holds no size")
+            waited += consistency.wait_visible(
+                self._client, provider, _segment(file_id), size=size, clock=self._clock, sleep=self._sleep
+            )
+            self._visible.add((provider, file_id))
+        return round(waited, 3)
+
     # -- block maps ------------------------------------------------------------
     def blocks(self, file_id: str, provider: str, *, reader: str | None = None) -> list[Range]:
         """Return the blocks a provider holds of a file, read from the block map as the `reader` provider sees it."""
@@ -377,9 +404,10 @@ class Provisioner:
         """Read a range of a file through a provider, which fetches what it lacks; return the bytes.
 
         This is a range read and never a transfer job (O02). It is gated like a mutation, because it changes the
-        provider's block map.
+        provider's block map. The provider must see the file first (`await_visible`).
         """
         self._verified()
+        self.await_visible(provider, [file_id])
         return self._client.read_range(
             f"/data/{_segment(file_id)}/content",
             provider=provider,
@@ -425,8 +453,10 @@ class Provisioner:
 
     # -- transfers -------------------------------------------------------------
     def _schedule(self, kind: str, file_id: str, provider: str) -> str:
+        """Schedule a replication to, or an eviction from, a provider, through it, once it sees the file."""
         field_name = "replicatingProviderId" if kind == "replication" else "evictingProviderId"
         self._verified()
+        self.await_visible(provider, [file_id])
         answer = self._client.mutate(
             "POST",
             "/transfers",

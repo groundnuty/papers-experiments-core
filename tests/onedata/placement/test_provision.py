@@ -158,6 +158,28 @@ def test_o09_every_provisioning_path_is_walked_never_asks_for_a_path_and_uploads
     assert {r.headers.get("Content-Type") for r in uploads} == {"application/octet-stream"}
 
 
+@pytest.mark.parametrize("answer", [(404, "notFound", None), (400, "posix", "enoent")])
+def test_o07_replicate_and_fetch_wait_until_the_provider_sees_a_file_just_written_elsewhere(
+    provisioner, seeded, ticker, answer
+):
+    """O07: a file just written through the data provider is not yet visible through another for some reads. Before a
+    transfer is scheduled through that provider, and before a range is read through it, the provisioner waits until
+    the provider reports the file at its size; it checks each provider and file once, so a second read waits for
+    nothing."""
+    seeded.unseen_after_create = {BETA_ID: 3}
+    seeded.unseen_answer = answer
+    file_id = provisioner.put_file("scratch/a.bin", DATA)
+    assert provisioner.fetch("beta", file_id, 0, 100) == DATA[:100]
+    slept = len(ticker.slept)
+    assert slept >= 3
+    provisioner.fetch("beta", file_id, 100, 100)
+    assert len(ticker.slept) == slept  # no second wait
+    other = provisioner.put_file("scratch/b.bin", DATA)
+    provisioner.replicate("scratch/b.bin", "beta")
+    assert seeded.held("scratch/b.bin", BETA_ID) == [[0, len(DATA)]]
+    assert seeded.unseen[(BETA_ID, other)] == 0
+
+
 OTHER_400S = [(400, "posix", "eacces"), (400, "posix", None), (400, "badValueNotAllowed", None), (400, None, None)]
 
 
