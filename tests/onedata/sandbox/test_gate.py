@@ -332,6 +332,10 @@ FOLDS = {
     "bare-cr": b"X-Foo: bar\rMacaroon: {t}\r\n",  # one line to the reader, two headers to the parser
     "first-line": b" Macaroon: {t}\r\nX-Foo: bar\r\n",  # a continuation of no header, which the parser drops
     "after-bad-line": b"Macaroon : {t}\r\n X-Foo: bar\r\n",  # after a line that ends the parser's block
+    "nul": b"X-Foo: bar\x00X-Auth-Token: {t}\r\n",  # a NUL in a value, which RFC 9110 5.5 says to reject
+    "vertical-tab": b"X-Foo: bar\x0bMacaroon: {t}\r\n",  # a control byte a receiving parser may split on
+    "form-feed": b"X-Foo: bar\x0cMacaroon: {t}\r\n",
+    "delete": b"X-Foo: bar\x7fMacaroon: {t}\r\n",
 }
 
 

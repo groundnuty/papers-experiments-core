@@ -486,17 +486,21 @@ class _HeadLines:
         return getattr(self.raw, name)
 
 
+_CONTROL = frozenset(range(0x20)) - {0x09} | {0x7F}  # the bytes a header line may not hold: every control but the tab
+
+
 def _has_fold(lines: list[bytes], headers) -> bool:
     """O21: whether a request's header block folds a line or holds a CR or LF inside one. `lines` are the raw lines of the block; `headers` are
     its parsed (name, value) pairs. A line that starts with a space or a tab continues the line before it (obs-fold, RFC 7230 3.2.4), and the
     parser joins the two into one value that http.client writes upstream as given, where the line it carries is a header of its own: a token the
-    gate drops by name. A CR or LF inside a line is the same fold, or a line end the parser and the upstream read differently. The line's own
-    end is not one: that is the CRLF, or the LF alone, that closes it."""
+    gate drops by name. A CR or LF inside a line is the same fold, or a line end the parser and the upstream read differently. Any other
+    control byte (below 0x20 but the tab, and DEL) is refused too: RFC 9110 5.5 forbids a NUL in a field, and an upstream may split on what this
+    parser keeps whole. The line's own end is not one: that is the CRLF, or the LF alone, that closes it."""
     for line in lines:
         text = line.removesuffix(b"\n").removesuffix(b"\r")
-        if text[:1] in (b" ", b"\t") or b"\r" in text or b"\n" in text:
+        if text[:1] in (b" ", b"\t") or any(byte in _CONTROL for byte in text):
             return True
-    return any(c in name or c in value for name, value in headers for c in "\r\n")  # the parsed form of the same
+    return any(ord(c) in _CONTROL for name, value in headers for c in name + value)  # the parsed form of the same
 
 
 class Handler(BaseHTTPRequestHandler):
