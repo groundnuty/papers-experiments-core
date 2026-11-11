@@ -27,6 +27,18 @@ are the process's once imported. A study's own last only while it is loaded and 
 (`errors.study_kinds(study.kinds)`), so a study's kinds do not outlast it. Neither key is part of the factor schema;
 study.toml's hash is in the campaign fingerprint, as it always is.
 
+A study whose runs write a file beside each record, and name it by its SHA-256 in that record, declares each such side
+file (`replay.side_files`), so that the replay check, the analysis and a replication package verify it:
+
+    [[study.side_files]]
+    pattern = "extent_ranges.json.gz"               # one file name, looked for beside each record
+    hash_field = "instruments.extent.side_sha256"   # the record field, a dotted path, that holds its SHA-256
+
+A pattern is one literal file name: no directory, no glob character, no leading dot (the check never reads such a
+file), and not a name the campaign or the check writes (a record, an outcome marker, the snapshot, the check). A field
+is record keys joined by dots. Each pattern and each field is declared once. A declaration changes study.toml, whose
+hash is in the campaign fingerprint, so a campaign resumed under another declaration is refused.
+
 Everything is validated when it is loaded, with messages that name the file and the key: the models of the plan are in
 the model table, the `[scheduler]` health and identity kinds are kinds known once the platforms are imported, and the
 cluster each preregistered contrast names is an attribute of every task. Nothing is run.
@@ -35,6 +47,7 @@ cluster each preregistered contrast names is an attribute of every task. Nothing
 import hashlib
 import importlib
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,11 +55,15 @@ from pathlib import Path
 from expcore.campaign.config import CampaignConfig, load_campaign
 from expcore.campaign.factors import FactorSchema, load_factor_schema
 from expcore.campaign.manifest import Manifest, build_manifest
+from expcore.campaign.markers import MARKER_NAME
+from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.config.loading import ConfigError, Section, close_match, load_toml
 from expcore.config.models import ModelTable, load_models
 from expcore.errors import StudyKind, check_study_kind, infra_kinds, study_kinds
 from expcore.provenance.codestamp import CodeScope, CodeScopeError
 from expcore.provenance.environment import is_requirement_name
+from expcore.replay.check import CHECK_FILE, is_record_name
+from expcore.replay.side_files import SideFile
 from expcore.stats import prereg
 from expcore.stats.prereg import Preregistration
 
@@ -56,8 +73,11 @@ CAMPAIGN_FILE = "campaign.toml"
 PREREG_FILE = "preregistration.toml"
 OUT_DIR = "out"  # everything a study produces goes below it (`study.pipeline`)
 CONFIG_FILES = (STUDY_FILE, MODELS_FILE, CAMPAIGN_FILE, PREREG_FILE)
-PLATFORMS_KEY, KINDS_KEY = "platforms", "kinds"
+PLATFORMS_KEY, KINDS_KEY, SIDE_FILES_KEY = "platforms", "kinds", "side_files"
 KIND_KEYS = ("description", "treatable")
+SIDE_FILE_KEYS = ("pattern", "hash_field")
+_FIELD = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*")
+_GLOB = frozenset("*?[]")
 
 
 @dataclass(frozen=True)
@@ -84,6 +104,7 @@ class StudyConfig:
     config_sha256: Mapping[str, str]
     kinds: Mapping[str, StudyKind] = field(default_factory=dict)  # `[study.kinds]`, for `errors.study_kinds`
     requires: tuple[str, ...] = ()  # distributions beyond the core: part of the campaign's environment
+    side_files: tuple[SideFile, ...] = ()  # `[[study.side_files]]`: what the check, analysis and package verify
 
     @property
     def manifest(self) -> Manifest:
@@ -103,6 +124,7 @@ class StudyIdentity:
     platforms: tuple[str, ...]
     kinds: Mapping[str, StudyKind]
     requires: tuple[str, ...]  # distributions beyond the core: what the check compares with the campaign's environment
+    side_files: tuple[SideFile, ...] = ()  # `[[study.side_files]]`: what the check pairs with the records
 
 
 def find_study_root(start: str | os.PathLike[str]) -> Path:
@@ -128,7 +150,7 @@ def _tasks(top: Section, file: Path) -> dict[str, Task]:
 
 def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope, tuple[str, ...]]:
     section = Section(top.section("study").data, top.file, "[study]")
-    section.reject_unknown(["name", "plugin", "code", PLATFORMS_KEY, KINDS_KEY, "requires"])
+    section.reject_unknown(["name", "plugin", "code", PLATFORMS_KEY, KINDS_KEY, "requires", SIDE_FILES_KEY])
     name, plugin = section.string("name"), section.string("plugin")
     plugin_file = (root / plugin).resolve()
     if not plugin_file.is_file() or root.resolve() not in plugin_file.parents:
@@ -206,6 +228,46 @@ def _check_scheduler_kinds(campaign: CampaignConfig) -> None:
             )
 
 
+def _side_files(top: Section) -> tuple[SideFile, ...]:
+    """Read and check the side files the study declares (`[[study.side_files]]`); none when it declares none."""
+    section = Section(top.section("study").data, top.file, "[study]")
+    entries = section.data.get(SIDE_FILES_KEY, [])
+    if not isinstance(entries, list) or not all(isinstance(entry, Mapping) for entry in entries):
+        raise section.fail(SIDE_FILES_KEY, "must be an array of tables, each a [[study.side_files]] table")
+    declared: list[SideFile] = []
+    for number, data in enumerate(entries, start=1):
+        entry = Section(data, top.file, f"[[study.{SIDE_FILES_KEY}]] number {number}")
+        entry.reject_unknown(SIDE_FILE_KEYS)
+        pattern, hash_field = entry.string("pattern"), entry.string("hash_field")
+        problem = _pattern_problem(pattern)
+        if problem is not None:
+            raise entry.fail("pattern", problem)
+        if not _FIELD.fullmatch(hash_field):
+            raise entry.fail(
+                "hash_field", "must be record keys joined by dots, such as 'instruments.extent.side_sha256'"
+            )
+        for earlier in declared:
+            if pattern == earlier.pattern:
+                raise entry.fail("pattern", f"names {pattern!r}, which an earlier [[study.side_files]] names")
+            if hash_field == earlier.hash_field:
+                raise entry.fail("hash_field", f"names {hash_field!r}, which an earlier [[study.side_files]] names")
+        declared.append(SideFile(pattern, hash_field))
+    return tuple(declared)
+
+
+def _pattern_problem(pattern: str) -> str | None:
+    """Why a side file's pattern cannot be declared, or None: it must be one literal name the check can pair."""
+    if "/" in pattern or "\\" in pattern:
+        return "must be a file name, looked for beside each record, not a path"
+    if _GLOB & set(pattern):
+        return "must be one file name, not a glob: each side file is paired with the one record beside it"
+    if pattern.startswith("."):
+        return "may not start with a dot: the replay check takes such a file for a temporary one and never reads it"
+    if pattern in (CHECK_FILE, SNAPSHOT_FILE) or pattern.endswith(MARKER_NAME) or is_record_name(pattern):
+        return f"names {pattern!r}, a file the campaign or the replay check writes"
+    return None
+
+
 def _check_clusters(study: str, tasks: Mapping[str, Task], loaded: Preregistration) -> None:
     """Every contrast clusters by an attribute; a task without it would silently leave the contrast."""
     for contrast in loaded.contrasts.values():
@@ -228,7 +290,8 @@ def read_study_identity(path: str | os.PathLike[str]) -> StudyIdentity:
     study_file = root / STUDY_FILE
     top = Section(load_toml(study_file), study_file, "top level")
     _, plugin_file, scope, requires = _study_table(top, root)
-    return StudyIdentity(root, study_file, plugin_file, scope, _platforms(top), _declared_kinds(top), requires)
+    kinds, side_files = _declared_kinds(top), _side_files(top)
+    return StudyIdentity(root, study_file, plugin_file, scope, _platforms(top), kinds, requires, side_files)
 
 
 def load_study(path: str | os.PathLike[str]) -> StudyConfig:
@@ -237,6 +300,7 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
     study_file = root / STUDY_FILE
     top = Section(load_toml(study_file), study_file, "top level")
     name, plugin_file, scope, requires = _study_table(top, root)
+    side_files = _side_files(top)
     import_platforms(study_file, _platforms(top))  # before anything names a kind: the conditions, the campaign's kinds
     kinds = _declared_kinds(top)
     with study_kinds(kinds):  # held for this load only: a failed load, or the next study, finds none of them
@@ -254,4 +318,6 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
         loaded = prereg.load(root / PREREG_FILE, schema)
         _check_clusters(name, tasks, loaded)
     hashes = {file: hashlib.sha256((root / file).read_bytes()).hexdigest() for file in CONFIG_FILES}
-    return StudyConfig(root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds, requires)
+    return StudyConfig(
+        root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds, requires, side_files
+    )
