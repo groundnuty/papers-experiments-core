@@ -32,7 +32,7 @@ from typing import Any, Protocol
 from expcore.records.digest import plain
 from expcore.records.record import RunRecord, decode
 from expcore.records.schema import SCHEMA_PREFIX, RecordError
-from expcore.replay.side_files import SideFile, SideFileTooLarge, beside, pair, read_side_file
+from expcore.replay.side_files import SideFile, SideFileTooLarge, beside, is_side_file, pair, read_side_file
 
 SIDE_FILES = "side_files"  # the parameter by which a scorer takes the record's verified side files
 _TAKES = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
@@ -196,7 +196,10 @@ def rescore_files(
     """
     scorers = list(scorers)
     target = Path(out_dir) if out_dir is not None else Path(source)
-    loaded = {path.name: found for path in sorted(Path(source).glob("*.json")) if (found := _load_if_record(path))}
+    candidates = sorted(Path(source).glob("*.json"))
+    if side_files is not None:  # a side file named like JSON is read only as a side file, within the cap
+        candidates = [path for path in candidates if not is_side_file(path.name, side_files)]
+    loaded = {path.name: found for path in candidates if (found := _load_if_record(path))}
     held = None
     if side_files is not None:
         held = _side_files_beside(Path(source), {name: data for name, (_, data) in loaded.items()}, side_files)

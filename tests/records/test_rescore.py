@@ -9,6 +9,7 @@ import socket
 import pytest
 from replay_scenarios import SCENARIOS
 
+from expcore.records import rescore as rescore_module
 from expcore.records.record import RunRecord, decode, load_record
 from expcore.records.rescore import rescore, rescore_files, scorer_name, scorer_version
 from expcore.records.schema import RecordError
@@ -343,6 +344,31 @@ def test_R14_rescore_files_refuses_a_side_file_that_does_not_pair_before_any_sco
         rescore_files(attempt, [scorer], side_files=[LOGGED])
     assert scorer.handed == []
     assert written_files(attempt) == before
+
+
+def test_R14_rescore_files_reads_a_side_file_named_like_json_only_as_a_side_file(tmp_path, monkeypatch):
+    """R14: a declared side file whose name ends in `.json` is never loaded as a record, even when its bytes hold one,
+    so it is read only through the bounded reader and handed to the scorer."""
+    named = SideFile("ranges_log.json", "instruments.ranges.side_sha256")
+    content = dataclasses.replace(SCENARIOS["tools"][0](), run_key="run-inside").dumps(environ={}).encode("utf-8")
+    root = tmp_path / "try1"
+    record = dataclasses.replace(SCENARIOS["tools"][0](), run_key="run-sided")
+    instruments = {**record.instruments, "ranges": {"ok": True, "side_sha256": hashlib.sha256(content).hexdigest()}}
+    dataclasses.replace(record, instruments=instruments).write(root, environ={})
+    (root / named.pattern).write_bytes(content)
+    handed: list[dict[str, bytes]] = []
+
+    def logged(record, side_files):
+        handed.append(dict(side_files))
+        return {"outcomes": {"logged": float(len(side_files[named.pattern]))}}
+
+    reads: list[str] = []
+    real = side_module.read_side_file
+    monkeypatch.setattr(rescore_module, "read_side_file", lambda path: reads.append(path.name) or real(path))
+    [written] = rescore_files(root, [logged], side_files=[named])
+    assert load_record(written).run_key == "run-sided"
+    assert handed == [{named.pattern: content}]
+    assert reads == [named.pattern]
 
 
 def test_R14_rescore_files_without_the_declaration_refuses_a_scorer_that_takes_side_files(attempt):
