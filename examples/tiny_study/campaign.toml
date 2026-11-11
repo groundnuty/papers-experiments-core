@@ -20,6 +20,12 @@ poll_interval_s = 0.05
 recheck_s = 1
 health_timeout_s = 5
 lease_timeout_s = 30
+# The kinds the scheduler records its own failures as, written out with their defaults. A failed health check is an
+# infrastructure failure of health_kind, and a run whose model endpoint changed its served identity is one of
+# identity_kind. A platform with a failure of its own names its kind here; no condition may declare either as its
+# treatment, and both must be known kinds.
+health_kind = "sandbox"
+identity_kind = "endpoint"
 
 # Runs in flight at once per unit; a model's unit is its own key unless [endpoints] says otherwise.
 [scheduler.unit_caps]

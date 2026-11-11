@@ -17,15 +17,17 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   table and imports nothing, unless a record needs it, and says so first: a kind still unknown imports the modules
   `[study] platforms` names, and a backend no native parser is registered for also imports the plugin module, so
   what is registered there is known in a new process. `build` is not called, so no model or key is needed.
-  It refuses to run under another environment than the campaign's, and records the one it ran under.
+  It refuses to run under another environment than the campaign's, and records the one it ran under. The side
+  files study.toml declares (`[[study.side_files]]`) are found in the batch it parses, hashed with the records and
+  paired each with the record beside it (`replay.side_files`), and the check records the declaration.
 - `analyse_study` refuses unless the batch has a current passing check (R04, R05), made under the environment in use
-  and the campaign's (the snapshot's fingerprint), and writes nothing. It then uses
-  only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once and compared
-  with the check's hash, cross-validated against each other. It exports from the snapshot, scores the records in
-  memory (a record is never written after its check, since that would change its hash) and runs the preregistered
-  analysis. Every score is
-  derived anew from a record on each call and none is read back: `scores.json` is an output, so `analyze` is how a
-  study is re-scored (R13), offline, after a change to a scorer and a new check (a scorer is code the identity covers).
+  and the campaign's (the snapshot's fingerprint) and under the study's declaration of side files, and writes nothing.
+  It then uses only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once
+  and compared with the check's hash, cross-validated against each other, and each side file paired with its record
+  again. It exports from the snapshot, scores the records in memory (a record is never written after its check, since
+  that would change its hash) and runs the preregistered analysis. Every score is derived anew from a record on each
+  call and none is read back: `scores.json` is an output, so `analyze` is how a study is re-scored (R13), offline,
+  after a change to a scorer and a new check (a scorer is code the identity covers).
 - `output_bytes` is the one place the bytes of `export.json`, `scores.json`, `analysis.json` and `report.md` are made;
   `write_analysis` and `write_report` write them and `regenerate` compares them with the files in `out/`, which is
   what a replication package's `make check` runs. Every time in them comes from the records and the store, every
@@ -65,6 +67,7 @@ from expcore.replay.check import (
     require_current_check,
     verify_batch,
     what_records_need,
+    with_side_files,
     write_check,
 )
 from expcore.replay.native import has_native_parser
@@ -263,7 +266,9 @@ def _check_batch_of(
         running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
         raise Refused(str(error)) from None
-    check = verify_batch(directory, code=code, hashed_only=list(HASHED_ONLY), environment=env)
+    check = verify_batch(
+        directory, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
+    )
     check[SNAPSHOT_KEY] = {"file": SNAPSHOT_FILE, "attempts_running": running, "partial": partial}
     write_check(directory, check)
     return check
@@ -277,7 +282,7 @@ def _import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
     that fails its record. A record that names a backend no parser is registered for also imports the plugin, whose
     code is the study's own. A batch that needs neither imports nothing.
     """
-    needs = what_records_need(batch, HASHED_ONLY)
+    needs = what_records_need(batch, with_side_files(HASHED_ONLY, study.side_files))  # a side file is no record
     if needs.kinds and study.platforms:
         print(
             f"check: importing the study's platforms ({', '.join(study.platforms)}) to read the records of "
@@ -295,7 +300,7 @@ def _import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
         file=sys.stderr,
     )
     import_platforms(study.study_file, study.platforms)
-    import_plugin_module(study.plugin_file, error_text=False)
+    import_plugin_module(study, error_text=False)
 
 
 def _json_text(data: Any) -> str:
@@ -396,8 +401,9 @@ def _analyse_loaded(
             rerun_command=f"python -m expcore check {batch}",
             environment=env,
             compare_sources=not stamped,
+            side_files=study.side_files,
         )
-        verified = load_verified(batch, check, study.schema, partial=partial)
+        verified = load_verified(batch, check, study.schema, partial=partial, side_files=study.side_files)
     except (BatchNotVerified, Unverified) as error:
         raise Refused(str(error)) from None
     rows = verified.snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))

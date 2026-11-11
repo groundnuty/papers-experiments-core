@@ -38,7 +38,7 @@ import re
 import sys
 from collections.abc import Iterable, Mapping
 from importlib import metadata
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import url2pathname
@@ -173,6 +173,48 @@ def top_level_location(top: str, places: Iterable[Path]) -> tuple[list[Path], Pa
     return [], origin if origin is not None and origin.is_file() and _inside(origin, places) else None
 
 
+def is_editable(dist: metadata.Distribution) -> bool:
+    """Whether a distribution is an editable install, by its `direct_url.json` (PEP 660)."""
+    try:
+        data = json.loads(dist.read_text("direct_url.json") or "{}")
+    except ValueError:
+        return False
+    info = data.get("dir_info") if isinstance(data, dict) else None
+    return isinstance(info, dict) and info.get("editable") is True
+
+
+def top_level_names(dist: metadata.Distribution) -> set[str]:
+    """The top-level names a distribution declares in `top_level.txt`, which setuptools writes for an editable install
+    too; none when it declares none."""
+    return set((dist.read_text("top_level.txt") or "").split())
+
+
+def owns_file(dist: metadata.Distribution, file: Path, top: str) -> bool:
+    """Whether an installed distribution's code holds the file of a module under top-level name `top`: listed in its
+    RECORD, or, for an editable install, inside one of its top-level packages where it imports from (directly below a
+    directory its `.pth` puts on the path, else where an import hook loads it inside the project), never merely
+    somewhere below the project."""
+    if is_editable(dist):
+        pth = pth_directories(dist)
+        if pth:
+            homes = [d / top for d in pth if (d / top).is_dir()]
+            return any(h.resolve() in file.parents for h in homes) or any(
+                (d / f"{top}.py").resolve() == file for d in pth
+            )
+        directories, module = top_level_location(top, editable_roots(dist))
+        if any(d.resolve() in file.parents for d in directories):
+            return True
+        # A single top-level module counts only when the distribution names it among its top-level names, so a loose
+        # module of the project on a path added by hand is not taken for the distribution's code.
+        return module is not None and module.resolve() == file and top in top_level_names(dist)
+    site = Path(str(dist.locate_file(""))).resolve()
+    try:
+        relative = PurePosixPath(file.relative_to(site).as_posix())
+    except ValueError:
+        return False
+    return any(PurePosixPath(item.as_posix()) == relative for item in dist.files or [])
+
+
 def python_digest(roots: list[Path]) -> str:
     """A digest of the Python source below the directories, by relative path and content; no path of the machine."""
     digest = hashlib.sha256()
@@ -214,12 +256,31 @@ def source_of(dist: metadata.Distribution) -> dict[str, Any] | None:
     return {"kind": "directory", "editable": True, "python_sha256": python_digest(roots)}
 
 
+def closure(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Distribution] | None = None) -> set[str]:
+    """The canonical names of the distributions the environment record covers: the core, those `requires` names, and
+    what they require here, with extras and markers. Reads metadata only, never a source file.
+
+    Raises EnvironmentUnknown when the core or a required root is not installed.
+    """
+    dists = installed() if found is None else found
+    return set(_closure(requires, dists))
+
+
 def environment(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Distribution] | None = None) -> dict:
     """The environment of the core and the distributions `requires` names, as described above.
 
     Raises EnvironmentUnknown when the core or a required root is not installed.
     """
     dists = installed() if found is None else found
+    asked = _closure(requires, dists)
+    versions = {name: str(dists[name].version) for name in sorted(asked)}
+    sources = {name: source for name in sorted(asked) if (source := source_of(dists[name])) is not None}
+    python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return {"python": python, "distributions": versions, "sources": sources}
+
+
+def _closure(requires: Iterable[str], dists: Mapping[str, metadata.Distribution]) -> dict[str, set[str]]:
+    """Each distribution of the closure with the extras asked of it; see `closure`."""
     queue: list[tuple[str, frozenset[str]]] = []
     for root in (CORE_DISTRIBUTION, *requires):
         parsed = _parse(root, "[study] requires")
@@ -239,10 +300,7 @@ def environment(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Di
             if not applies(parsed, asked[name]) or canonical(parsed.name) not in dists:
                 continue  # its marker is false here, or nothing installed answers it
             queue.append((canonical(parsed.name), frozenset(canonical(e) for e in parsed.extras)))
-    versions = {name: str(dists[name].version) for name in sorted(asked)}
-    sources = {name: source for name in sorted(asked) if (source := source_of(dists[name])) is not None}
-    python = f"{sys.version_info.major}.{sys.version_info.minor}"
-    return {"python": python, "distributions": versions, "sources": sources}
+    return asked
 
 
 def without_sources(env: Mapping[str, Any]) -> dict[str, Any]:

@@ -6,10 +6,10 @@ A complete minimal study for the core. Copy this directory, change the names and
 |---|---|
 | `study.toml` | two factors (`access`, `tools`), three named conditions, four tasks with a `region` attribute. `extended` runs on three of the tasks only. `relay-down` declares the tool server's failure (`knowledge`) as its treatment |
 | `models.toml` | the model table: two priced stub models, each with the context window the budget needs |
-| `campaign.toml` | the plan (models, seeds, run order seed), the loop's caps, the scheduler's caps and a budget |
+| `campaign.toml` | the plan (models, seeds, run order seed), the loop's caps, the scheduler's caps and the kinds it records its own failures as (`health_kind`, `identity_kind`: the defaults, written out), and a budget |
 | `preregistration.toml` | two contrasts in the Holm family (one with an equivalence margin, one declaring that its treatment attempts are scored), one exploratory contrast outside it, the estimator, power settings |
 | `plugin.py` | the tools (two functions, one waits on tool-server start-up), the stub platform's shelf, which serves the lookups and counts the facts it handed out, an instrument (that count, as a snapshot at the run's end), the scorer (which reads the count and returns values for a treatment attempt), the executor, the health check and the resource probe |
-| `prompt.txt` | the prompt template with its named slots |
+| `prompt.txt` | the prompt template with its named slots: the task, its `region` attribute (the executor reads it from `study.tasks`) and the `tools` level's hint |
 | `package.toml` | the inclusion list of the study's replication package |
 
 The interfaces the plugin implements are described in [`docs/interfaces.md`](../../docs/interfaces.md), and how to build a study on them in [`docs/study-guide.md`](../../docs/study-guide.md). In a copy that `python -m expcore example` writes, they point at the documentation of the core that wrote it: links on GitHub at the commit the core was installed from, when it came from a GitHub repository, and otherwise each page's path in the core's repository with the tag or commit to read it at. A link to the core's repository can lead to its authors, so drop or rewrite such links before a double-blind submission; an anonymised build refuses them when the core was installed from that repository.

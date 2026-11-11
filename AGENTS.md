@@ -230,8 +230,11 @@ A versioned Python package (`expcore`, with the Onedata platform layer `expcore_
 - **Codex review before every PR**, with model `gpt-6-astra`:
   - Run it outside the sandbox, because it writes to `~/.codex`.
   - `codex review --base main` refuses custom instructions, so review with `codex exec -m gpt-6-astra -s read-only --output-last-message <out.md> - < <prompt.md>`, and have the prompt start by running `git diff main...HEAD`.
-  - Re-run it on the fix commits until a round finds nothing new.
-- Merging needs the coordinating session's review and the user's go-ahead.
+  - Fix **blocking** findings only: a wrong result, status or number; a security or integrity hole; data loss; a false pass or a guarantee the code doesn't keep; a break for a consumer. Record everything else as a known minor item in the PR body. After a fix round, a delta review asks only whether each blocking item is fixed and whether the fix added a new one; new minor findings don't reopen it.
+  - When Codex is at its usage limit, an independent reviewer stands in: Gemini 4 Argon (high) through `agy` in plan mode, or a fresh-context Opus subagent given only the code and the same blocking-only prompt. A PR merged on such a review is an interim merge: say so in the PR and the merge commit, and give it a Codex pass once Codex is back, with findings fixed in follow-up PRs.
+- Merging needs the coordinating session's review and green CI on the reviewed tip; the user has given a standing go-ahead for PRs that pass both.
+- A pushed branch is never rebased: bring `main` in with a merge commit. Unpushed branches may be rebased.
+- Token-check a PR body or an issue text before publishing it, from a path outside the session scratchpad (whose own path trips the check), and create the PR only if the check passes.
 
 **Subagents**
 - Pin `model: "sonnet"` for coding and mechanical extraction.
