@@ -4,8 +4,9 @@
 `build_package` goes through these steps, and writes nothing to the output directory unless every one passes:
 1. select the files the inclusion list names (`spec`); nothing else goes in;
 2. require what the package's own check needs: the study's configuration and plugin, every file the code identity
-   covers, every input of the replay check (records, outcome markers, the snapshot of the store) with the check itself,
-   and the four outputs (`export.json`, `scores.json`, `analysis.json`, `report.md`);
+   covers, every input of the replay check (records, outcome markers, the snapshot of the store, and the side files
+   study.toml declares) with the check itself, and the four outputs (`export.json`, `scores.json`, `analysis.json`,
+   `report.md`);
 3. refuse a check made under code that is not a clean commit, outputs made by another core version, and a check that
    records no environment or another one than the build's (`provenance.environment`); warn about every other included
    file no commit holds and list it, and refuse one in an anonymised build unless the author allows it (`tracking`);
@@ -16,7 +17,8 @@
    wheel per distribution of the check's environment under `wheels/` with `wheels/requirements.txt` pinning each by
    hash (`wheels`), a `Makefile` whose `check` target installs those wheels into a fresh environment, offline, and
    runs `python -m expcore package-check .` with it, `PACKAGE.json` (what was built from what, under which core and
-   environment, from which wheels) and `SHA256SUMS` (`archive`);
+   environment, from which wheels, and the study's declaration of side files when it has one) and `SHA256SUMS`
+   (`archive`);
 6. refuse the package if a path or content of any file matches a study token, or holds a term of the anonymisation
    list. The token check is `expcore.provenance.study_tokens`' own scanner with the hashes of names that are private
    everywhere (hosts, addresses, users, spaces, providers: the `all` scope): a study's own condition, dataset or model
@@ -27,8 +29,9 @@
    wheel whose bytes the study's `uv.lock` records from pypi.org skips the token list alone (`lockfile`), and
    PACKAGE.json lists it with the lock's hash;
 7. lay the package out in a scratch directory and run its check there, with this interpreter: every file against
-   `SHA256SUMS`, the environment against the check's, then the four outputs derived anew from the records and
-   compared byte for byte (K07);
+   `SHA256SUMS`, the environment against the check's, the declaration of side files in `PACKAGE.json` against
+   study.toml's, then the four outputs derived anew from the records and compared byte for byte (K07), which pairs
+   every side file with its record again (R14);
 8. write the deterministic archive `<out>/<name>.tar.gz` (K06).
 
 Nothing in the package depends on when or where it was built: the only time in it comes from the replay check, and no
@@ -85,11 +88,13 @@ from expcore.provenance.redact import Redactor, stop_message
 from expcore.provenance.study_tokens import count_hashes
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.replay.check import CHECK_FILE, BatchNotVerified
+from expcore.replay.side_files import declared
 from expcore.study.config import CONFIG_FILES, StudyConfig, load_study
 from expcore.study.pipeline import ANALYSIS_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, regenerate
 
 PACKAGE_FILE = "PACKAGE.json"
 PACKAGE_FORMAT = "expcore-package/1"
+SIDE_FILES_KEY = "side_files"  # the key of PACKAGE.json that records the study's declaration of side files
 # The refusals a build's steps raise, whose message is shown as it is (after the redactor); any other exception is
 # shown after its kind.
 _REFUSALS = (PackageError, ConfigError, Refused, BatchNotVerified, EnvironmentUnknown, CodeVersionUnknown)
@@ -215,6 +220,8 @@ def _package_json(
             "SHA256SUMS, the environment against the check's, and each output anew from the records"
         ),
     }
+    if study.side_files:  # recorded only when declared, so the package of a study that declares none is as before
+        data[SIDE_FILES_KEY] = declared(study.side_files)
     return (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -461,12 +468,15 @@ def _verify(root: Path) -> list[str]:
     if problems:
         return problems
     try:
-        changed = differences(recorded, environment(load_study(root).requires), sources=False)
+        study = load_study(root)
+        changed = differences(recorded, environment(study.requires), sources=False)
         if changed:
             return [
                 f"the environment in use is not the one {PACKAGE_FILE} names, which the records were checked under; "
                 "`make -f Makefile check` installs it from wheels/: " + "; ".join(changed)
             ]
+        if package.get(SIDE_FILES_KEY, []) != declared(study.side_files):
+            return [f"{PACKAGE_FILE} records another declaration of side files than the package's study.toml"]
         return regenerate(root, stamped=True)
     except (Refused, BatchNotVerified, ConfigError, EnvironmentUnknown) as error:
         return [str(error)]

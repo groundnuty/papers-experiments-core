@@ -9,14 +9,17 @@ that the check holds:
 - the check lists the records it replayed (`replayed`), and every record the analysis uses is in that list;
 - every record maps to an attempt of the snapshot, by run key, attempt number and the directory of the try;
 - every attempt the analysis would score (state `done`, which includes a scored treatment failure) has such a record,
-  and agrees with it on the run key, the attempt, the outcome and the treatment flag.
+  and agrees with it on the run key, the attempt, the outcome and the treatment flag;
+- every side file the study declares (`replay.side_files`) is read once, compared with the check's hash, and paired
+  again with the hash the record beside it names, so a check file edited to vouch for a side file its record does not
+  name is refused all the same.
 
 Any mismatch is refused, naming it. With `partial`, an attempt that no replayed record covers is left out of the
 analysis instead, and the report says so, and attempts still running at the check are tolerated.
 """
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,7 @@ from expcore.campaign.factors import FactorSchema
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, StoreSnapshot
 from expcore.records.record import RunRecord, decode, record_filename
 from expcore.records.schema import RecordError
+from expcore.replay.side_files import SideFile, is_side_file, pair
 
 UNCOVERED = "no replayed record covers its final attempt"  # why a partial analysis leaves a run out
 
@@ -118,18 +122,42 @@ def _agree(row: Any, record: RunRecord, rel: str) -> None:
             raise Unverified(f"{rel}: the campaign snapshot has {what} {store!r}, the record has {held!r}")
 
 
+def _pair_side_files(
+    batch: Path, check: Mapping[str, Any], raws: Mapping[str, bytes], side_files: Sequence[SideFile]
+) -> None:
+    """Read each declared side file the check hashed once, against the check's hash, and pair it with its record."""
+    side = {}
+    for rel in check["hashed_only"]:
+        if is_side_file(rel, side_files):
+            _read_verified(batch, rel, check["inputs"][rel])
+            side[rel] = check["inputs"][rel]
+    problems = pair({rel: decode(raw) for rel, raw in raws.items()}, side, side_files)
+    if problems:
+        rel, problem = problems[0]
+        raise Unverified(f"{rel}: {problem}")
+
+
 def load_verified(
-    batch: Path, check: Mapping[str, Any], schema: FactorSchema, *, partial: bool = False
+    batch: Path,
+    check: Mapping[str, Any],
+    schema: FactorSchema,
+    *,
+    partial: bool = False,
+    side_files: Sequence[SideFile] = (),
 ) -> VerifiedBatch:
     """Read the snapshot and the replayed records once each, verify them against `check`, and cross-validate them.
 
     `check` is the stored check that `require_current_check` accepted. Raises `Unverified` naming the first thing that
     does not agree. With `partial` an attempt that is still running, or whose final attempt has no replayed record, does
-    not refuse; the second is left out and listed in `excluded`.
+    not refuse; the second is left out and listed in `excluded`. Each of the declared `side_files` is read and paired
+    with its record again.
     """
     replayed = _replayed_set(check)
     snapshot = _load_snapshot(batch, check, schema)
-    records = {rel: _parse(rel, _read_verified(batch, rel, check["inputs"][rel])) for rel in sorted(replayed)}
+    raws = {rel: _read_verified(batch, rel, check["inputs"][rel]) for rel in sorted(replayed)}
+    records = {rel: _parse(rel, raw) for rel, raw in raws.items()}
+    if side_files:
+        _pair_side_files(batch, check, raws, side_files)
     attempts = _attempts(snapshot)
     expected = {record_path(a["digest"], Path(a["run_dir"]).name, a["run_key"], a["attempt"]): a for a in attempts}
     running = sum(1 for a in attempts if a["state"] == "running")
