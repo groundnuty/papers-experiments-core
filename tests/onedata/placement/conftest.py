@@ -23,9 +23,10 @@ def fake(monkeypatch, ticker, request) -> FakeData:
 
     Its clock is the test's ticker, so its jobs' times and its providers' Date headers agree with the probes' clock
     unless a test skews a provider. It answers errors in Onedata 25.0's shape, except for a test marked `legacy_errors`,
-    which gets the older 404 shape: the platform layer reads a 404 as an entry that is gone and uploads without a
-    Content-Type, so those tests fail against 25.0's `posix`/`enoent` and 415 until the core is fixed. Remove the mark
-    from a test when it passes without it."""
+    which gets the older 404 shape. The platform layer has three gaps against 25.0 until the core is fixed: it reads
+    only a 404 as an entry that is gone (25.0 answers 400 `posix`/`enoent`), it uploads without a Content-Type (25.0
+    answers 415), and it counts only a 401 or 403 as a refused write (25.0 answers 400 `posix`/`eacces`). Remove the
+    mark from a test when it passes without it."""
     shape = ERRORS_LEGACY if request.node.get_closest_marker("legacy_errors") else ERRORS_25_0
     federation = make_federation(clock=ticker.clock, error_shape=shape)
     monkeypatch.setenv(ADMIN_ENV, federation.admin_token)

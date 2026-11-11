@@ -232,7 +232,18 @@ def imported_modules(source: str, package: str) -> set[str]:
             name = _dynamic_module(node)
             if name:
                 found.add(name)
+                found.update(f"{name}.{item}" for item in _fromlist(node))  # __import__(m, fromlist=[a]) loads m.a
     return found
+
+
+def _fromlist(call: ast.Call) -> list[str]:
+    """The literal names an `__import__` call's `fromlist` gives (its fourth argument, or the keyword), each of which
+    may be a submodule it loads; none for any other importer or a fromlist that is not a literal list or tuple."""
+    keywords = {k.arg: k.value for k in call.keywords}
+    given = call.args[3] if len(call.args) > 3 else keywords.get("fromlist")
+    if not isinstance(given, (ast.List, ast.Tuple)):
+        return []
+    return [name for item in given.elts if (name := _constant_string(item))]
 
 
 def imports_testing(source: str, package: str) -> bool:
@@ -298,6 +309,8 @@ def test_importing_every_runtime_module_loads_no_testing_module():
         ("import importlib\nimportlib.import_module('.testing', 'expcore_onedata')\n", ""),
         ("import importlib\nimportlib.import_module('..testing', package='expcore_onedata.sandbox')\n", ""),
         ("__import__('expcore_onedata.testing')\n", ""),
+        ("def load():\n    return __import__('expcore_onedata', fromlist=['testing']).testing\n", ""),
+        ("__import__('expcore_onedata', None, None, ('testing',))\n", ""),
         ("from importlib import import_module as load\nload('expcore_onedata.testing')\n", ""),
         ("import importlib as il\nil.import_module(name='expcore_onedata.testing.fake_data')\n", ""),
     ],
@@ -319,6 +332,7 @@ def test_planted_import_of_the_testing_package_is_found(source, package):
         ("import importlib\nimportlib.import_module('expcore_onedata.health')\n", ""),
         ("import importlib\nimportlib.import_module('.health', 'expcore_onedata')\n", ""),
         ("NAME = 'expcore_onedata.testing'\n", ""),
+        ("__import__('expcore_onedata', fromlist=['health'])\n", ""),
     ],
 )
 def test_other_imports_are_not_taken_for_the_testing_package(source, package):
