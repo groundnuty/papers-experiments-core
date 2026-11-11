@@ -332,11 +332,11 @@ def test_o21_a_page_that_holds_the_gates_token_refuses_the_listing_and_passes_no
 
 def test_o21_a_gate_given_a_listing_mode_it_does_not_know_refuses_to_start(tmp_path, monkeypatch):
     """O21: the mode comes from the gate's configuration; one it does not know stops it before it serves anything."""
-    config = tmp_path / "gate.json"
+    config, token_file = tmp_path / "gate.json", tmp_path / "gate-token"
+    token_file.write_text(GATE_TOKEN, encoding="utf-8")  # a token it has, so the mode alone refuses the start
     document = {"log": str(tmp_path / "r.jsonl"), "hosts": {}, "listen_port": 0, "listing": "everything"}
-    config.write_text(json.dumps(document), encoding="utf-8")
+    config.write_text(json.dumps({**document, "token_file": str(token_file)}), encoding="utf-8")
     monkeypatch.setattr("sys.argv", ["gate.py", str(config)])
-    monkeypatch.setenv(gate.TOKEN_ENV, GATE_TOKEN)
     gate.CFG.clear()
     with pytest.raises(SystemExit, match="listing mode"):
         gate.main()

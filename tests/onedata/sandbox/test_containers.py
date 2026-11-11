@@ -14,6 +14,7 @@ from expcore_onedata.tls import TlsSettings
 
 LABELS = ["--label", "org.test.sandbox=1"]
 TOKEN_FILE = Path("/w/secrets/oneclient-token")  # where a run keeps the mount's token for its sidecar
+GATE_TOKEN_FILE = Path("/w/secrets/gate-token")  # and the REST path's for its gate
 
 
 @pytest.fixture
@@ -126,14 +127,14 @@ def test_o05_the_sidecars_shell_hands_the_files_token_to_oneclient_and_refuses_a
     assert run().returncode == 97
 
 
-def test_o05_the_gate_takes_the_token_by_name_and_it_is_the_name_the_gate_reads(s, names):
-    """O05: the gate holds the token: it is named with -e and its value travels in the docker client's environment."""
-    from expcore_onedata.sandbox import gate
-
-    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id)
-    assert ("-e", C.ENV_GATE_TOKEN) in pairs(args)
-    assert C.ENV_GATE_TOKEN == gate.TOKEN_ENV
-    assert not [a for a in args if "=" in a and a.startswith(C.ENV_GATE_TOKEN)]  # never NAME=value
+def test_o05_the_gate_takes_its_token_from_a_read_only_file_and_docker_is_given_no_environment_for_it(s, names):
+    """O05: the gate holds the token, from a file bound into its container alone, read-only, at the path the gate's
+    configuration names; docker is given no environment variable at all (`-e NAME` would keep the value in the
+    container's configuration, where `docker inspect` shows it)."""
+    gate_token = Path("/w/run-secrets/gate-token")
+    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id, token_file=gate_token)
+    assert "-e" not in args
+    assert f"{gate_token}:{C.GATE_TOKEN_PATH}:ro" in [v for f, v in pairs(args) if f == "-v"]
 
 
 def test_the_sidecar_command_sets_tls_from_the_settings_alone(s):
@@ -168,7 +169,7 @@ def test_a_rest_agent_without_a_gate_is_refused(s, names):
 
 def test_o05_the_gate_runs_read_only_with_one_capability_and_its_files_mounted_read_only(s, names):
     """O05: The gate runs read only with one capability and its files mounted read only."""
-    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id)
+    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id, token_file=GATE_TOKEN_FILE)
     assert "--read-only" in args
     assert ("--cap-add", "NET_BIND_SERVICE") in pairs(args)
     assert ("--cap-drop", "ALL") in pairs(args)

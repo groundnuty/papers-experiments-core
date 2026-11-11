@@ -32,8 +32,9 @@ by default, against `upstream_ca_file` alone (the platform's CA bundle, mounted
 read-only), or not at all when `verify_ssl` is false. `tcp_forwards` are plain TCP
 pass-through for the knowledge plane. Every request is logged as one JSON line.
 
-The gate holds the data-path token (from its environment, never from the configuration file or an argument) and adds it
-to every request it forwards; an `X-Auth-Token`, `Authorization` or `Cookie` header the client sent is dropped, and a
+The gate holds the data-path token, read at its start from the file its configuration names (`token_file`, bound into
+its container alone, read-only; never from its environment, the configuration itself or an argument, so docker's
+configuration of the container never holds it), and adds it to every request it forwards; an `X-Auth-Token`, `Authorization` or `Cookie` header the client sent is dropped, and a
 token-scope inference carries the gate's token in its body. So the agent's code holds no credential at all (O05). Every
 answer passes the response boundary (`gateboundary.py`) on its way back, so none hands the token to the agent: a redirect
 or an encoded body becomes a 502 and is never followed or passed on, a header holding the token in any form makes the
@@ -121,9 +122,6 @@ _HOP = {
     "content-length",
 }
 RUN_HEADER = "X-Run-Key"
-TOKEN_ENV = (
-    "GATE_ACCESS_TOKEN"  # the data-path token, in the gate's environment: the agent's code never holds one (O05)
-)
 AUTH_HEADER = "X-Auth-Token"
 CLIENT_CREDENTIALS = {AUTH_HEADER.lower(), "authorization", "cookie"}  # whatever the agent sends of these is dropped
 UPSTREAM_READ_BYTES = 1 << 20  # one read of an upstream body; a token split between two reads is still found
@@ -1384,10 +1382,22 @@ def serve(httpd) -> None:
         httpd.server_close()
 
 
+def _read_token(path: str | None) -> str:
+    """The data-path token from the file the configuration names; empty when there is none or it cannot be read, which
+    refuses the start (O05). The sandbox removes the host's copy once the gate is ready; the gate keeps it in memory."""
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
 def main() -> None:
     with open(sys.argv[1]) as handle:
         CFG.update(json.load(handle))
-    CFG["token"] = os.environ.pop(TOKEN_ENV, "")  # out of the environment as soon as it is read
+    CFG["token"] = _read_token(CFG.get("token_file"))
     if not CFG["token"]:
         raise SystemExit("the gate has no token to add to the requests it forwards")
     if CFG.get("listing", gatepolicy.PAGED) not in gatepolicy.LISTINGS:  # O21: never a mode it would guess at

@@ -182,6 +182,25 @@ def test_no_credential_is_visible_inside_the_agent_on_the_data_path_of_this_leve
         sandbox.stop()
 
 
+@needs_platform
+@pytest.mark.parametrize("level", LEVELS)
+def test_o05_docker_inspect_of_every_container_of_a_running_sandbox_shows_no_token(config, host, level):
+    """O05: anyone with access to the docker daemon reads a container's configuration with `docker inspect`; on every
+    container of a running sandbox of this level (the agent, and the gate or the sidecar its data path starts) it shows
+    no token: each holder takes its token from a file bound into it alone (issue 137)."""
+    spec = spec_for(config, level, f"live-inspect-{int(time.time())}")
+    sandbox = DockerSandbox.start(host, config.sandbox, spec)
+    try:
+        names = (sandbox.names.agent, sandbox.names.gate, sandbox.names.sidecar)
+        shown = {name: host.docker("inspect", name, check=False, timeout=30) for name in names}
+        running = [name for name, answer in shown.items() if answer.returncode == 0]
+        assert sandbox.names.agent in running
+        secret = spec.token.reveal() if spec.token is not None else None
+        assert secret is None or not [name for name in running if secret in shown[name].stdout]
+    finally:
+        sandbox.stop()
+
+
 # The agent's read of the zone through the gate: a call the gate passes, whose answer's status says whether the gate's
 # upstream connection was made (any answer of the federation) or refused (the gate's 502).
 ZONE_CALL = """

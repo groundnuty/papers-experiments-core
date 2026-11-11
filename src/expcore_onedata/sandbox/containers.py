@@ -6,10 +6,11 @@
 The data path is read-only at the mount (O05): the agent's root filesystem is read-only, every capability is dropped,
 no new privilege is possible, and the oneclient mount is bound into the agent read-only. These functions are where those
 flags are written, and a test reads them back. Images are given by resolved id, so a tag that moves after the pin check
-cannot change what runs (O13). A secret never appears in an argument. The mount's token never reaches docker at all:
-it is a file bound into the sidecar alone, read-only, which the sidecar's shell reads into oneclient's environment as it
-starts it (`sidecar_run_args`), so `docker inspect` shows no token. The gate's token is named with `-e NAME` and travels
-in the environment of the docker client (`env`), which docker keeps in the container's configuration.
+cannot change what runs (O13). A secret never appears in an argument, and no token reaches docker at all: each is a
+file bound read-only into the one container that holds it, the sidecar's read by its shell into oneclient's environment
+(`sidecar_run_args`) and the gate's by the gate (`gate_run_args`), so `docker inspect` shows no token. Docker is given
+an environment variable (`-e NAME`, whose value it keeps in the container's configuration) for the agent's settings
+alone.
 """
 
 from __future__ import annotations
@@ -31,12 +32,12 @@ CA_PATH = "/etc/sandbox/ca.pem"  # the run's certificate authority in the agent
 GATE_CA_PATH = "/etc/gate/federation-ca.pem"
 SIDECAR_CA_PATH = "/etc/expcore/federation-ca.pem"
 SIDECAR_TOKEN_PATH = "/run/expcore/oneclient-token"  # the mount's token, bound into the sidecar alone, read-only
+GATE_TOKEN_PATH = "/etc/gate/token"  # the REST path's token, bound into the gate alone, read-only; gate.json names it
 ENV_SSL_CERT_FILE = "SSL_CERT_FILE"  # OpenSSL's setting of the CA file its default verify paths load
 ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image's binary
 ONECLIENT_LOG_DIR = "/tmp/oneclient/0"  # where it writes its log unless told otherwise
 # The published REST client's settings (its environment), not names of any federation.
 ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
-ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gate.TOKEN_ENV); the agent has no token
 ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
 # The sidecar's entrypoint: read the token file into oneclient's variable, refuse an empty one, then become `env` with
@@ -130,20 +131,24 @@ def gate_run_args(
     gate_files: Path,
     image_id: str,
     *,
+    token_file: Path,
     ca_copy: Path | None = None,
 ) -> list[str]:
     """`docker run` for the gate: read-only root, one capability (to bind its port), its files mounted read-only.
 
-    The gate holds the data-path token and adds it to the requests it forwards (O05): it is named with `-e NAME`, and
-    its value travels in the environment of the docker client, as the sidecar's does. With the platform's `ca_file`,
-    `ca_copy`, the run's own copy of the verified bundle, is mounted read-only at `GATE_CA_PATH`, which the gate's
-    configuration names as its upstream CA file."""
+    The gate holds the data-path token and adds it to the requests it forwards (O05). The token never reaches docker:
+    `token_file`, the run's file of it, is bound read-only at `GATE_TOKEN_PATH` in this container alone, and the gate
+    reads it at its start (its configuration names the path). An environment variable given to `docker run` would be
+    kept in the container's configuration, where `docker inspect` shows it. With the platform's `ca_file`, `ca_copy`,
+    the run's own copy of the verified bundle, is mounted read-only at `GATE_CA_PATH`, which the gate's configuration
+    names as its upstream CA file."""
     return [
-        *("run", "-d", "--name", names.gate, "--network", "bridge", *labels, "-e", ENV_GATE_TOKEN),
+        *("run", "-d", "--name", names.gate, "--network", "bridge", *labels),
         *("--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", "--security-opt", "no-new-privileges"),
         *("--read-only", "--user", "0", "--pids-limit", "512", "--memory", str(s.limits.gate_memory_bytes)),
         *("-v", f"{sdir / 'tls'}:/etc/gate/tls:ro", "-v", f"{sdir / 'gate.json'}:/etc/gate/gate.json:ro"),
         *_ca_mount(s, ca_copy, GATE_CA_PATH),
+        *("-v", f"{token_file}:{GATE_TOKEN_PATH}:ro"),
         *("-v", f"{gate_files}:{GATE_DIR}:ro", "-v", f"{sdir / 'gatelog'}:/var/gate"),
         *("--entrypoint", "python", image_id, f"{GATE_DIR}/gate.py", "/etc/gate/gate.json"),
     ]

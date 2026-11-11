@@ -9,9 +9,9 @@ from sandbox_support import COMPLETE_LEVEL, FED_LOCAL, FED_NETWORK, TOKEN, fail_
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
-from expcore_onedata.sandbox.containers import SIDECAR_TOKEN_PATH
+from expcore_onedata.sandbox.containers import GATE_TOKEN_PATH, SIDECAR_TOKEN_PATH
 from expcore_onedata.sandbox.hostops import CmdResult
-from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.sandbox.sandbox import GATE_TOKEN_FILE, DockerSandbox
 
 
 def start(world, level="via-gate", **kw):
@@ -137,16 +137,51 @@ def test_o05_no_credential_is_visible_inside_the_agent_on_any_data_path(world, l
     sbx.stop()
 
 
-def test_o05_the_gate_holds_the_rest_token_in_its_environment_and_nowhere_on_disk_or_in_an_argument(world):
-    """O05: the token is the gate's; it travels in the docker client's environment, as the sidecar's does."""
+def test_o05_the_gate_takes_the_rest_token_from_a_root_owned_file_bound_into_it_alone_and_the_host_keeps_none(world):
+    """O05: the token is the gate's. It reaches the gate as a file bound into the gate's container alone, read-only, at
+    the path the gate's configuration names; the file is made the gate's own user's (root's: the gate has no capability
+    to read another's) and owner-only; and the host's copy is gone once the gate is ready. Docker is given no
+    environment for it, and no argument, record or file of the run holds it."""
     sbx = start(world, "via-gate")
-    gate = world.host.containers[sbx.names.gate]
-    assert gate.options["_env"] == {"GATE_ACCESS_TOKEN": TOKEN}
-    assert "GATE_ACCESS_TOKEN" in gate.options["-e"]
+    gate, agent = world.host.containers[sbx.names.gate], world.host.containers[sbx.names.agent]
+    bound = gate.options["_files"]
+    assert bound[GATE_TOKEN_PATH] == TOKEN
+    assert [path for path, text in bound.items() if TOKEN in text] == [GATE_TOKEN_PATH]
+    assert not [text for text in agent.options["_files"].values() if TOKEN in text]
+    assert json.loads((sbx.dir / "gate.json").read_text())["token_file"] == GATE_TOKEN_PATH
+    assert gate.options["_env"] == {}
+    assert "-e" not in gate.options
+    assert ["chown", "0:0", str(sbx.dir / GATE_TOKEN_FILE)] in world.host.sudo_commands
+    assert not (sbx.dir / GATE_TOKEN_FILE).exists()
     assert TOKEN not in flat(gate)
     assert not [f for f in files_under(sbx.dir) if TOKEN in f.read_text(encoding="utf-8", errors="replace")]
     assert TOKEN not in json.dumps(sbx.metadata())
     sbx.stop()
+
+
+def test_o05_the_gates_token_file_is_gone_after_a_gate_that_never_became_ready_and_after_a_kept_run(world, tmp_path):
+    """O05: the host's copy of the gate's token is removed on every path that ends a sandbox: a gate that exited
+    before it was ready, and a run whose disks are kept as evidence after a failed collection."""
+    original = world.host._run_container
+
+    def exiting(args, env):
+        result = original(args, env)
+        for container in world.host.containers.values():
+            if container.name.endswith("-gate"):
+                container.running, container.logs = False, ""
+        return result
+
+    world.host._run_container = exiting
+    with pytest.raises(SandboxError, match="gate exited"):
+        start(world, "via-gate")
+    leftovers = [p for p in world.s.work_root.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+    assert leftovers == []
+    world.host._run_container = original
+    sbx = start(world, "via-gate")
+    sbx.keep_evidence = True
+    sbx.stop()
+    kept = world.s.work_root / "_kept_evidence"
+    assert not [p for p in kept.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
 
 
 def test_the_mount_path_has_a_read_only_mount_a_sidecar_and_no_gate(world):
@@ -181,13 +216,15 @@ def test_the_mount_token_belongs_to_the_sidecar_and_the_agent_has_none(world):
     sbx.stop()
 
 
-def test_o05_docker_inspect_of_the_running_sidecar_and_agent_shows_no_token(world):
-    """O05: whoever can ask the docker daemon must not read the run's token: `docker inspect` of the running sidecar
-    (its environment, its command, its mounts) and of the agent shows no token, and the host keeps no copy of it once
-    oneclient has started, so a run killed outright leaves none on disk either."""
-    sbx = start(world, "mounted")
-    for name in (sbx.names.sidecar, sbx.names.agent):
-        assert TOKEN not in world.host.docker("inspect", name).stdout
+@pytest.mark.parametrize("level", ["mounted", "via-gate", "isolated"])
+def test_o05_docker_inspect_of_every_running_container_of_the_sandbox_shows_no_token(world, level):
+    """O05: whoever can ask the docker daemon must not read the run's token: `docker inspect` of every container the
+    sandbox runs (its environment, its command, its mounts), the sidecar, the gate and the agent alike, shows no token,
+    and the host keeps no copy of it once its holder has started, so a run killed outright leaves none on disk."""
+    sbx = start(world, level)
+    assert world.host.containers  # every one the sandbox started, whatever the path
+    for name in world.host.containers:
+        assert TOKEN not in world.host.docker("inspect", name).stdout, name
     assert not [p for p in sbx.dir.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
     sbx.stop()
 

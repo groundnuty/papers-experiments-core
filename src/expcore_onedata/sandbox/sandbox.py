@@ -10,10 +10,12 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
   * an INTERNAL docker network from the dedicated pool (no route out) holding the agent container, and in REST mode the
     gate container, the agent's only network peer (O14);
   * REST data path: the data gate (gate.py, gatepolicy.py, gateboundary.py), whose files are mounted from this package,
-    read-only. It holds the token, in its environment, and adds it to the requests it forwards, and no answer it passes
-    back holds the token; the agent holds no credential;
-  * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
-    propagation; the agent has neither the token, nor FUSE, nor a route to any host;
+    read-only. It holds the token, read at its start from a file bound into it alone, and adds it to the requests it
+    forwards, and no answer it passes back holds the token; the agent holds no credential;
+  * mount data path: a oneclient sidecar that owns the mount and the token (from a file bound into it alone), exported
+    read-only to the agent through bind propagation; the agent has neither the token, nor FUSE, nor a route to any host;
+  * no token is ever given to docker, so `docker inspect` shows none, and the host's file of it goes once its holder has
+    started and again at every teardown (`_write_token_file`, `_remove_token_files`);
   * no data path: neither;
   * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids;
   * each read-only input of the spec: copied into the run's directory, hashed into the metadata, and mounted read-only
@@ -60,8 +62,8 @@ from expcore_onedata.sandbox.api import (
 )
 from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
-    ENV_GATE_TOKEN,
     GATE_CA_PATH,
+    GATE_TOKEN_PATH,
     ONECLIENT_LOG_DIR,
     Names,
     agent_run_args,
@@ -82,6 +84,7 @@ RUN_KEY = re.compile(r"[\x21-\x7e]{1,200}")  # it becomes an HTTP header value a
 GATE_FILES = Path(__file__).resolve().parent  # gate.py and its siblings are mounted from here into the gate container
 MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
 TOKEN_FILE = Path("sidecar-secret", "oneclient-token")  # under the run directory, owner-only, while the sidecar starts
+GATE_TOKEN_FILE = Path("gate-secret", "gate-token")  # likewise while the gate starts, owned by the gate's user
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
 TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
 MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
@@ -146,7 +149,7 @@ class DockerSandbox:
         self._ca_copy: Path | None = None  # the run's own read-only copy of them, which the containers mount
         self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
         self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
-        self._token_file: Path | None = None  # the mount's token for the sidecar, on the host only while it starts
+        self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
         self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
         self._uptime0: float | None = None
@@ -327,6 +330,7 @@ class DockerSandbox:
             "tls_dir": "/etc/gate/tls",
             "hosts": hosts,
             "listing": self.spec.listing,  # paged, or every listing answered complete (O21)
+            "token_file": GATE_TOKEN_PATH,  # where `gate_run_args` binds the run's file of the token, read-only
         }
         if self._ca_copy is not None:
             config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only
@@ -443,12 +447,14 @@ class DockerSandbox:
         self._register_container(
             names.gate
         )  # registered before it is created: an interrupt cannot leave one `stop` misses
-        args = gate_run_args(s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id, ca_copy=self._ca_copy)
-        self.host.docker(
-            *args, env={ENV_GATE_TOKEN: self.spec.token.reveal()}
-        )  # the gate holds the token, not the agent
+        token = self._write_token_file(GATE_TOKEN_FILE, gate_owned=True)  # the gate holds the token, not the agent
+        args = gate_run_args(
+            s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id, token_file=token, ca_copy=self._ca_copy
+        )
+        self.host.docker(*args)
         self.host.docker("network", "connect", names.net, names.gate)
         self._wait_gate()
+        self._remove_token_files(token)  # the gate read it before it said ready; its bind outlives the host's copy
         self.watch_container("gate", names.gate)  # its state as the run begins: the baseline the check compares with
         info = hostops.inspect(self.host, names.gate) or {}
         ip = ((info.get("NetworkSettings") or {}).get("Networks") or {}).get(names.net, {}).get("IPAddress", "")
@@ -467,23 +473,32 @@ class DockerSandbox:
             self._sleep(0.1)
         raise SandboxError("the gate did not become ready")
 
-    def _write_token_file(self) -> Path:
-        """The run's file of the mount's token, owner-only, for the sidecar to read at its start (`sidecar_run_args`)."""
-        self._token_file = self.dir / TOKEN_FILE
-        self._token_file.parent.mkdir(mode=0o700)
-        handle = os.open(self._token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    def _write_token_file(self, relative: Path, *, gate_owned: bool = False) -> Path:
+        """The run's file of the data-path token, owner-only (0400), in a directory of its own (0700), for the one
+        container that reads it at its start (`sidecar_run_args`, `gate_run_args`). The gate runs as root with every
+        capability dropped, so it reads only a file root owns: with `gate_owned` the file is made root's."""
+        path = self.dir / relative
+        path.parent.mkdir(mode=0o700)
+        self._token_files.append(path)  # before it exists: every teardown removes it, whatever fails from here
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(self.spec.token.reveal())
-        return self._token_file
+        path.chmod(0o400)
+        if gate_owned and self.host.run(["chown", "0:0", str(path)], 20, sudo=True).returncode != 0:
+            raise SandboxError("the run's token file could not be given to the gate's user")
+        return path
 
-    def _remove_token_file(self) -> None:
-        """Remove the host's copy of the mount's token, verified: once oneclient has started it holds the token itself,
-        so the host keeps none, and a run killed outright leaves none on disk (O05). Run again at every teardown."""
-        if self._token_file is None:
-            return
-        self.host.run(["rm", "-f", str(self._token_file)], 20, sudo=True)
-        if self._token_file.exists():
-            raise SandboxError("the run's copy of the mount's token could not be removed")
+    def _remove_token_files(self, *only: Path) -> None:
+        """Remove the host's copies of the data-path token (`only` these, else all), verified: once its holder has
+        started it keeps the token itself, so the host keeps none, and a run killed outright leaves none on disk (O05).
+        Run for every copy at every teardown."""
+        left = []
+        for path in only or tuple(self._token_files):
+            self.host.run(["rm", "-f", str(path)], 20, sudo=True)
+            if path.exists():
+                left.append(path)
+        if left:
+            raise SandboxError(f"{len(left)} of the run's copies of the data-path token could not be removed")
 
     def _start_mount(self) -> Path:
         """Start the oneclient sidecar on a shared mount point; its token goes in a file bound into it alone, read-only,
@@ -507,7 +522,7 @@ class DockerSandbox:
         t0 = time.monotonic()
         args = sidecar_run_args(
             s, names, self._label_args(), share, s.oneclient.id, host_name,
-            token_file=self._write_token_file(), ca_copy=self._ca_copy,
+            token_file=self._write_token_file(TOKEN_FILE), ca_copy=self._ca_copy,
         )  # fmt: skip
         self.host.docker(*args)
         deadline = time.monotonic() + MOUNT_WAIT_S
@@ -519,7 +534,7 @@ class DockerSandbox:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(0.2)
         self._meta["mount"]["wait_s"] = round(time.monotonic() - t0, 3)
-        self._remove_token_file()  # oneclient read it as it started; its bind in the sidecar outlives the host's copy
+        self._remove_token_files(self.dir / TOKEN_FILE)  # oneclient read it as it started; its bind outlives this copy
         self.watch_container("sidecar", names.sidecar)
         return share
 
@@ -989,7 +1004,7 @@ class DockerSandbox:
                 if c not in held:
                     self._step(errors, hostops.remove_container, self.host, c)
             # on every path, a held sandbox's and a kept run's included: a secret is never evidence (O05)
-            self._step(errors, self._remove_token_file)
+            self._step(errors, self._remove_token_files)
             if held:  # the network and the mounts cannot go while those two live: all of it is left for a retry
                 errors.append("the sidecar and the agent are left running with a FUSE mount that could not be released")
             else:
