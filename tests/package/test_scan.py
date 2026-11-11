@@ -18,6 +18,7 @@ import zlib
 
 import pytest
 
+from expcore.package import views
 from expcore.package.build import scan_tokens
 from expcore.package.leaks import findings_in, without_paths
 from expcore.provenance.candidates import token_hash
@@ -356,14 +357,40 @@ def test_k03_runs_from_16_characters_are_decoded_and_short_ones_refused_for_noth
     assert found({"x.json": f'{{"a": "{weak}", "b": "{no_inflate}"}}\n'.encode()}) == []
 
 
+def staircase(lines: int) -> str:
+    """One wrapped block whose every line has its own width: the shape that makes the run finder give the most."""
+    return "\n".join("A" * (1 + n % 997) for n in range(lines))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        base64.encodebytes(random.Random(1).randbytes(2**20 * 3 // 4)).decode(),  # 1 MB as base64 tools wrap it
+        staircase(4000),  # every line of its own width
+        " ".join("Q" * 20 for _ in range(20000)),  # many short separate runs
+    ],
+    ids=["wrapped", "staircase", "many-runs"],
+)
+def test_k03_the_run_finder_does_work_linear_in_its_input(text):
+    """K03: the run finder is one linear pass: the characters it gives, every joined run and every run it also gives
+    from a later line, total at most MAX_HEADINGS + 1 times the input; what it decodes is at most 3/4 of a run as
+    base64 plus 1/2 as hex. A count of the work done, not a time, so a loaded machine cannot fail it and a quadratic
+    finder always does."""
+    given = (views.MAX_HEADINGS + 1) * len(text)
+    assert sum(len(run) for _, run in views._runs(text)) <= given
+    assert sum(len(decoded) for _, decoded, _ in views.payloads(text)) <= given * 5 // 4
+
+
+@pytest.mark.benchmark
 @pytest.mark.parametrize("size", [17 * 1024, 2**20])
-def test_k03_base64_output_is_scanned_in_linear_time(size):
-    """K03: the run finder is one linear pass: base64 output of 17 KB and of 1 MB, wrapped as base64 tools wrap it,
-    scans in well under two seconds."""
+def test_k03_benchmark_base64_output_scans_in_seconds_not_minutes(size):
+    """K03 benchmark: a whole scan of base64 output, 17 KB and 1 MB wrapped as base64 tools wrap it, ends in
+    seconds. Its bound is generous on purpose: linearity is held by the work count above; this catches only a scan
+    that became pathologically slow, and a machine under load must not fail it (deselect with -m 'not benchmark')."""
     output = base64.encodebytes(random.Random(size).randbytes(size * 3 // 4))
     start = time.perf_counter()
     scan_tokens({"out.b64": output}, HASHES)
-    assert time.perf_counter() - start < 2
+    assert time.perf_counter() - start < 60
 
 
 def test_k03_a_decoded_run_that_is_text_is_read_as_text_and_never_refused_for_a_signature():

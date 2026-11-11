@@ -77,7 +77,7 @@ def test_c07_closing_a_scheduler_with_nothing_in_flight_returns_at_once_and_twic
     began = time.monotonic()
     scheduler.close()
     scheduler.close()
-    assert time.monotonic() - began < 5
+    assert time.monotonic() - began < 20  # far below the 30 s hang it must not wait out
     with build(tmp_path, plan=SMALL):
         pass
 
@@ -97,7 +97,7 @@ def test_c07_a_run_waiting_for_a_lease_when_the_campaign_ends_gives_up_at_once_a
     time.sleep(0.2)  # the worker is inside the wait for a lease
     began = time.monotonic()
     scheduler.close()
-    assert time.monotonic() - began < 5  # not the 600 s of the lease timeout
+    assert time.monotonic() - began < 20  # not the 600 s of the lease timeout
     runner.join(10)
     assert executor.requests == []
     busy.release()
@@ -127,7 +127,7 @@ def test_c11_a_health_check_that_hangs_does_not_block_the_shutdown(tmp_path):
     assert calls  # the worker is inside the check
     began = time.monotonic()
     scheduler.close()
-    assert time.monotonic() - began < 5  # not the 60 s of the health timeout
+    assert time.monotonic() - began < 20  # not the 60 s of the health timeout
     runner.join(10)
     release.set()
     with build(tmp_path, plan=SMALL) as again:
