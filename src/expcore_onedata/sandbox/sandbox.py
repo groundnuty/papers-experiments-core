@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -653,10 +654,19 @@ class DockerSandbox:
         if self.spec.mode is not DataPathMode.REST:
             return []
         try:
-            return (self.dir / "gatelog" / "requests.jsonl").read_text(encoding="utf-8").splitlines()
+            return self._read_gate_log().splitlines()
         except (OSError, ValueError) as e:  # UnicodeDecodeError is a ValueError
             log.error("the gate log could not be read for the gate's refusals: %s", describe_error(e))
             return None
+
+    def _read_gate_log(self) -> str:
+        """The gate log's text, read without following a link (O19): a log that is a link or any file but a regular one
+        is unreadable (`OSError`), as one that is missing is."""
+        descriptor = os.open(self.dir / "gatelog" / "requests.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise OSError(errno.EINVAL, "the gate log is not a regular file")
+            return handle.read().decode("utf-8")
 
     @property
     def stopped(self) -> bool:
@@ -669,12 +679,15 @@ class DockerSandbox:
     def collect(self, dest_dir: str | Path, outputs: Sequence[str] = ()) -> dict[str, Any]:
         """Stop whatever of the agent's still runs, then copy out the run's evidence and the named files of /work.
 
-        The copy runs as root and never follows or keeps a link (`copyout.py`, O19): an output that holds a link, a
-        special file, a hard link out of it or more than the working disk holds is refused before anything of the
-        outputs is copied, named by its path in the metadata's `unsafe_output`, never a link's target, and the
-        collection raises `InfraError` of kind `unsafe_output` once the metadata is written. A copy that fails raises,
-        and the sandbox's disks are then kept when it stops: a source is never deleted after a failed copy, nor after a
-        refused one. An agent that could not be shown stopped also fails the collection: its outputs may still change."""
+        The copy runs as root and never follows or keeps a link (`copyout.py`, O19). An output that holds a link, a
+        special file, a hard link out of it, another file system, a path too long to copy or more than the working disk
+        holds was made so by the agent: nothing of the outputs is copied, and the collection ends normally with each
+        object named by its path and what it is, never a link's target, under `refused_output` in its result and in the
+        metadata, for the study's scorers; the attempt's outcome is the loop's and the scorers'. A collection that fails
+        for the harness's own reasons (a copy command or the disk failing, a copy that is not what was listed, a gate
+        log that is not a plain file) raises `InfraError` of kind `output_collection`, and the sandbox's disks are then
+        kept when it stops: a source is never deleted after a failed copy. An agent that could not be shown stopped also
+        fails the collection: its outputs may still change."""
         try:
             state = self._cells.quiesce("before collection")
             if not CellRunner.quiet(state):
@@ -690,31 +703,30 @@ class DockerSandbox:
             if rel.startswith("/") or ".." in Path(rel).parts:
                 raise SandboxError("an output to collect must be a relative path inside the working directory")
         dest.mkdir(parents=True, exist_ok=True)
-        refused: list[tuple[str, copyout.Refusal]] = []
-        got: dict[str, bool] = {}
+        got = dict.fromkeys(outputs, False)
+        refused: dict[str, Any] | None = None
         try:
             copies = [(rel, dest / "work" / rel) for rel in outputs]
             copied = copyout.copy_tree(self.host, self.dir / "work", copies, max_bytes=self.s.limits.work_disk_bytes)
             got = {rel: copied[rel] is not None for rel in outputs}
-        except copyout.UnsafeOutput as unsafe:
-            refused += [("work", r) for r in unsafe.refused]
+        except copyout.UnsafeOutput as unsafe:  # the agent's own doing: for the scorers, never a set-aside
+            refused = self._meta["refused_output"] = copyout.record(unsafe.refused)
+        except SandboxError as failed:  # the copy command, the disk or the copy failed: the harness's own failure
+            raise kinds.collection_error("the run's outputs", str(failed)) from None
         self._meta["infra_check"] = check = self.infra_container_check()  # while everything runs
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
+        if refused is not None:
+            result["refused_output"] = refused
         if self.spec.mode is DataPathMode.REST:
             self._stop_gate()
-            try:  # the gate's own file, in a directory the gate writes as root: held to the same rule
-                log_copy = [("requests.jsonl", dest / "gate-requests.jsonl")]
-                if copyout.copy_tree(self.host, self.dir / "gatelog", log_copy, max_bytes=None)["requests.jsonl"]:
-                    result["gate_log"] = "gate-requests.jsonl"
-                else:  # `_prepare_gate` made it: a log that is gone is unreadable, as it was to the copy before
-                    raise SandboxError("copying a file out of the sandbox failed: the gate log is missing")
-            except copyout.UnsafeOutput as unsafe:
-                refused += [("gate log", r) for r in unsafe.refused]
-        if refused:
-            self._meta["unsafe_output"] = copyout.record(refused)
+            log_copy = [("requests.jsonl", dest / "gate-requests.jsonl")]
+            try:  # the gate's own file, in a directory only the gate writes: anything amiss there is not the agent's
+                if not copyout.copy_tree(self.host, self.dir / "gatelog", log_copy, max_bytes=None)["requests.jsonl"]:
+                    raise SandboxError("copying a file out of the sandbox failed: it is missing")  # made at start
+            except SandboxError as failed:
+                raise kinds.collection_error("the gate log", str(failed)) from None
+            result["gate_log"] = "gate-requests.jsonl"
         (dest / "metadata.json").write_text(json.dumps(self.metadata(), indent=1, default=str), encoding="utf-8")
-        if refused:
-            raise kinds.output_error(r for _, r in refused)
         return result
 
     def _stop_on_purpose(self, role: str) -> None:
@@ -773,9 +785,8 @@ class DockerSandbox:
             check = self.infra_container_check()
             meta["container_deaths"], meta["infra_death"] = check["deaths"], check["death"]
         if self.spec.mode is DataPathMode.REST:
-            file = self.dir / "gatelog" / "requests.jsonl"
             try:
-                meta["gate"] = gatelog.summarize(file.read_text(encoding="utf-8").splitlines())
+                meta["gate"] = gatelog.summarize(self._read_gate_log().splitlines())
             except OSError as e:
                 meta["gate"] = gatelog.unknown(f"the gate log could not be read: {e.strerror}")
         meta["sidecar_log"] = self.sidecar_errors() if not self._stopped else None

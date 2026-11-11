@@ -14,12 +14,13 @@ because the agent's files need not be readable by the driver, so it fails closed
    link to a file outside it), a FIFO, socket, device or door, a directory of another file system, a path longer than
    `MAX_PATH_BYTES`, or more bytes in all than `max_bytes` (the working disk's quota: only a sparse file outgrows the
    disk it was written on) is refused. `UnsafeOutput` names each by its path relative to the root and what it is, never
-   a link's target, and nothing is copied. An output whose way holds a file or nothing is absent.
+   a link's target, and nothing is copied. An output whose way holds a file or nothing is absent. In the agent's
+   working directory each of these is the agent's own doing: the caller records it for the study's scorers.
 3. Each output is copied with `cp -R -P` (never dereferencing), keeping nothing of the source's modes, owners or times,
    then given to the driver with `chown -R -P -h` (never following a link).
 4. The copy is verified as the driver, by lstat: only regular files and directories, every file with one link, every
-   entry the driver's, and the same files, directories and bytes as the listing showed. A copy that is not is removed
-   and refused.
+   entry the driver's, and the same files, directories and bytes as the listing showed. A copy that is not is removed,
+   and `CopyMismatch` raised: the agent made nothing the listing did not show, so the harness's copy failed.
 
 The listing is held in memory; its size is bounded by the file system it lists (the agent's quota-limited disk, or a
 directory of the harness's own). Every command goes through `HostOps`; the driver reads only its own copy.
@@ -78,13 +79,19 @@ class Refusal:
 
 
 class UnsafeOutput(SandboxError):
-    """What a run left holds something the harness cannot copy safely (`refused`); nothing of it was handed on. The
-    message counts the refusals by what they are and names no path, which is the agent's text."""
+    """What a run left holds something the harness cannot copy safely (`refused`), found in the listing before anything
+    was copied; nothing of it was handed on. The message counts the refusals by what they are and names no path, which
+    is the agent's text."""
 
     def __init__(self, refused: Sequence[Refusal]) -> None:
         self.refused = tuple(refused)
         counts = collections.Counter(r.what for r in self.refused)
         super().__init__("the output holds what cannot be copied safely: " + described(counts))
+
+
+class CopyMismatch(SandboxError):
+    """A copy that does not hold what the listing showed: removed, never handed on. Nothing in the listing explains it,
+    so it is the harness's failure, as a copy command that fails is."""
 
 
 def described(counts: Mapping[str, int]) -> str:
@@ -260,8 +267,8 @@ def copy_tree(
     cannot replace). Each destination is a new path, and an output inside another one is copied with it, so its
     destination must lie at the same place under the other's. Returns, per output, its files and bytes, or None when it
     is absent; raises `UnsafeOutput` when anything in or on the way to an output cannot be copied safely, before any
-    copy is made, or when a copy is not what the listing showed (that copy is removed), and `SandboxError` when a
-    command fails."""
+    copy is made, `CopyMismatch` when a copy is not what the listing showed (that copy is removed), and `SandboxError`
+    when a command fails."""
     rels = [rel for rel, _ in copies]
     if not host.exists(root):
         return dict.fromkeys(rels)
@@ -280,20 +287,29 @@ def copy_tree(
         if why is not None:
             log.error("a copy out of the sandbox was refused after it was made: %s", why)
             _remove(host, dst)
-            raise UnsafeOutput([Refusal(_shown(out.parts) or ".", "copy that is not what was listed")])
+            raise CopyMismatch(f"a copy out of the sandbox is not what was listed: {why}")
         copied.append(out.parts)
     return {rel: got[rel] for rel in rels}
 
 
-def record(refused: Iterable[tuple[str, Refusal]]) -> dict[str, Any]:
-    """What a run's metadata keeps of the refusals, each with what it was found in: at most `SHOWN_REFUSALS` named, by
-    path and what it is, and all of them counted."""
+def record(refused: Iterable[Refusal]) -> dict[str, Any]:
+    """What a run's result and metadata keep of the refusals: at most `SHOWN_REFUSALS` named, by path and what each is,
+    and all of them counted, in all and by what they are."""
     every = list(refused)
     return {
-        "refused": [{"of": of, "path": r.path, "what": r.what} for of, r in every[:SHOWN_REFUSALS]],
+        "refused": [{"path": r.path, "what": r.what} for r in every[:SHOWN_REFUSALS]],
         "count": len(every),
-        "by_what": dict(sorted(collections.Counter(r.what for _, r in every).items())),
+        "by_what": dict(sorted(collections.Counter(r.what for r in every).items())),
     }
 
 
-__all__ = ["MAX_PATH_BYTES", "Refusal", "UnsafeOutput", "copy_tree", "list_tree", "parse_listing", "record"]
+__all__ = [
+    "MAX_PATH_BYTES",
+    "CopyMismatch",
+    "Refusal",
+    "UnsafeOutput",
+    "copy_tree",
+    "list_tree",
+    "parse_listing",
+    "record",
+]

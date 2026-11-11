@@ -3,6 +3,9 @@
 The tests make real links, FIFOs, sockets and odd names in the test's own directories. The fake host runs the real
 `find`, `cp` and `chown` on them, as this user and without sudo, and one test copies with the real host's own commands
 (`DockerHost` with no privilege command). Nothing outside an output may be copied, changed or readable through the copy.
+An object the agent made that cannot be copied safely is the agent's doing: the collection copies none of the outputs,
+names each such object for the study's scorers, and ends normally. Only a copy that fails for the harness's own reasons
+is infrastructure.
 """
 
 import dataclasses
@@ -25,7 +28,7 @@ from expcore_onedata.sandbox import reap
 from expcore_onedata.sandbox.hostops import CmdResult, DockerHost
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 
-KIND = "unsafe_output"
+KIND = "output_collection"
 SECRET = "host-only secret text"
 ENDED = "2026-01-01T00:00:00Z"
 
@@ -67,42 +70,44 @@ def secret_readable(root: Path) -> bool:
 
 
 def refused_paths(sbx) -> list[tuple[str, str]]:
-    return [(r["path"], r["what"]) for r in sbx.metadata()["unsafe_output"]["refused"]]
+    return [(r["path"], r["what"]) for r in sbx.metadata()["refused_output"]["refused"]]
 
 
 def refuse(world, sbx, dest, outputs):
-    """Collect, require the set-aside, and return the error."""
-    with pytest.raises(InfraError) as caught:
-        sbx.collect(dest, outputs=outputs)
-    assert caught.value.kind == KIND
-    assert sbx.keep_evidence is True  # the disks stay, links and all, for an operator
-    return caught.value
+    """Collect what holds an object the agent made and that cannot be copied safely, and return the result: the
+    collection ends normally, copies none of the outputs, and names the refusals for the scorers in its result and in
+    the metadata, written and live alike. The run is the agent's, never set aside, so its disks are not kept."""
+    got = sbx.collect(dest, outputs=outputs)  # no InfraError: what the agent made is its own doing
+    assert got["refused_output"] == sbx.metadata()["refused_output"]
+    written = json.loads((dest / "metadata.json").read_text(encoding="utf-8"))
+    assert written["refused_output"] == got["refused_output"]
+    assert got["outputs"] == dict.fromkeys(outputs, False)
+    assert not (dest / "work").exists()  # nothing of the outputs is copied
+    assert sbx.keep_evidence is False
+    return got
 
 
 def test_o19_a_symbolic_link_to_a_host_file_is_refused_and_named_by_its_path_never_its_target(
     world, outsider, tmp_path
 ):
-    """O19: a symbolic link left in an output and pointing at a host file is refused before anything is copied: the
-    collection raises InfraError of kind unsafe_output, the record names the link by its path in the working directory
-    and what it is, never its target, and nothing of the host file reaches the copy."""
+    """O19: a symbolic link left in an output and pointing at a host file is refused before anything is copied. It is
+    the agent's doing, so the collection ends normally and names the link for the scorers by its path in the working
+    directory and what it is, never its target, and nothing of the host file reaches the copy."""
     sbx = start(world)
     results = sbx.dir / "work" / "results"
     results.mkdir()
     (results / "report.json").write_text("{}", encoding="utf-8")
     (results / "leakage").symlink_to(outsider)
     dest = tmp_path / "evidence"
-    error = refuse(world, sbx, dest, ["results"])
-    assert not (dest / "work").exists()  # nothing of the output was copied
+    got = refuse(world, sbx, dest, ["results"])
     assert not secret_readable(dest)
     assert refused_paths(sbx) == [("results/leakage", "symbolic link")]
-    written = (dest / "metadata.json").read_text(encoding="utf-8")
-    assert json.loads(written)["unsafe_output"] == sbx.metadata()["unsafe_output"]
-    for text in (written, str(error)):
+    for text in ((dest / "metadata.json").read_text(encoding="utf-8"), json.dumps(got)):
         assert str(outsider) not in text
         assert "private.txt" not in text
     assert outsider.read_text(encoding="utf-8") == SECRET
     sbx.stop()
-    assert (world.s.work_root / "_kept_evidence" / sbx.sid).is_dir()
+    assert not sbx.dir.exists()
 
 
 @pytest.mark.parametrize("where", ["inside", "itself"])
@@ -343,9 +348,10 @@ def test_o19_a_clean_output_is_the_drivers_own_and_no_command_dereferences(world
     sbx.stop()
 
 
-def test_o19_a_copy_that_holds_a_link_after_all_is_removed_and_refused(world, outsider, tmp_path):
-    """O19: the copy is verified after it is made: one that holds a link however it came there (here a copy command
-    that leaves one) is removed and refused, never handed on."""
+def test_o19_a_copy_that_holds_a_link_after_all_is_removed_and_set_aside(world, outsider, tmp_path):
+    """O19: the copy is verified after it is made: one that holds what the listing did not show (here a link a copy
+    command left) is removed, never handed on, and the run is set aside as infrastructure of kind output_collection,
+    since the agent did not make it."""
     sbx = start(world)
     results = sbx.dir / "work" / "results"
     results.mkdir()
@@ -358,7 +364,10 @@ def test_o19_a_copy_that_holds_a_link_after_all_is_removed_and_refused(world, ou
 
     world.host.run_handlers["cp"] = copies_and_links
     dest = tmp_path / "evidence"
-    refuse(world, sbx, dest, ["results"])
+    with pytest.raises(InfraError) as caught:
+        sbx.collect(dest, outputs=["results"])
+    assert caught.value.kind == KIND
+    assert sbx.keep_evidence is True
     assert not (dest / "work" / "results").exists()
     assert not secret_readable(dest)
     sbx.stop()
@@ -366,7 +375,8 @@ def test_o19_a_copy_that_holds_a_link_after_all_is_removed_and_refused(world, ou
 
 def test_o19_a_gate_log_replaced_by_a_link_is_refused_too(world, tmp_path):
     """O19: the gate's log, copied out as root like the outputs, is held to the same rule: a link there is refused and
-    the file it points at is not copied."""
+    the file it points at is not copied. The agent cannot reach the gate's directory, so it is infrastructure of kind
+    output_collection, never the agent's doing."""
     elsewhere = tmp_path / "outside" / "elsewhere.jsonl"
     elsewhere.parent.mkdir()
     elsewhere.write_text(json.dumps({"note": SECRET}) + "\n", encoding="utf-8")
@@ -375,31 +385,69 @@ def test_o19_a_gate_log_replaced_by_a_link_is_refused_too(world, tmp_path):
     log.unlink()
     log.symlink_to(elsewhere)
     dest = tmp_path / "evidence"
-    refuse(world, sbx, dest, [])
-    assert sbx.metadata()["unsafe_output"]["refused"] == [
-        {"of": "gate log", "path": "requests.jsonl", "what": "symbolic link"}
-    ]
+    with pytest.raises(InfraError) as caught:
+        sbx.collect(dest)
+    assert caught.value.kind == KIND
+    assert "symbolic link" in caught.value.detail
     assert not (dest / "gate-requests.jsonl").exists()
     assert not secret_readable(dest)
     sbx.stop()
 
 
-def test_o19_c01_a_refused_output_is_set_aside_even_where_sandbox_failures_are_the_treatment(world, outsider, tmp_path):
-    """O19, C01: a refused collection says nothing about the agent or the manipulation: under a condition that declares
-    `sandbox` its treatment the run is still infrastructure, set aside and never scored."""
+def test_o19_c01_a_copy_the_harness_could_not_make_is_set_aside_even_where_sandbox_is_the_treatment(world, tmp_path):
+    """O19, C01: a copy command that fails (a disk that is full) is the harness's failure, not the agent's: the
+    collection raises InfraError of kind output_collection, which under a condition that declares `sandbox` its
+    treatment is still set aside and never scored, and the disks are kept."""
     sbx = start(world)
-    (sbx.dir / "work" / "report.json").symlink_to(outsider)
-    error = refuse(world, sbx, tmp_path / "evidence", ["report.json"])
+    (sbx.dir / "work" / "report.json").write_text("{}", encoding="utf-8")
+    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "No space left on device")
+    with pytest.raises(InfraError) as caught:
+        sbx.collect(tmp_path / "evidence", outputs=["report.json"])
+    world.host.run_handlers.pop("cp")
+    assert caught.value.kind == KIND
+    assert sbx.keep_evidence is True
     declared = ("sandbox",)
     result = dataclasses.replace(
-        failure_result(error, ended_utc=ENDED, wall_s=1.0, treatment_kinds=declared), model_turns=3
+        failure_result(caught.value, ended_utc=ENDED, wall_s=1.0, treatment_kinds=declared), model_turns=3
     )
     assert classify(result, declared) == ("infra_fail", True, False)
     sbx.stop()
 
 
-def test_o19_declaring_unsafe_output_as_treatment_is_refused_at_load(tmp_path):
-    """O19: an agent can leave a link on purpose, so no condition may declare the kind its refusal ends in."""
+def test_o19_c01_an_object_the_agent_made_is_its_own_outcome_never_infrastructure(world, outsider, tmp_path):
+    """O19, C01: a link the agent left is its own doing: the collection raises nothing, so the attempt ends as the loop
+    and the study's scorers make of it, never set aside and run again, which would hide the behaviour and reward it
+    with a fresh attempt."""
+    sbx = start(world)
+    (sbx.dir / "work" / "report.json").symlink_to(outsider)
+    got = refuse(world, sbx, tmp_path / "evidence", ["report.json"])
+    assert got["refused_output"]["by_what"] == {"symbolic link": 1}
+    sbx.stop()
+
+
+def test_o19_the_gate_log_is_read_without_following_a_link(world, tmp_path):
+    """O19: the driver reads the gate's log, for its refusals and its summary, without following a link: a log replaced
+    by a link to another file is unreadable, its refusals unknown, and nothing of that file is read."""
+    from expcore_onedata.sandbox import gatelog
+
+    elsewhere = tmp_path / "outside" / "elsewhere.jsonl"
+    elsewhere.parent.mkdir()
+    planted = {"tag": "content", "decision": "allow", "status": 200, "bytes": 5, "gate_refusal": "planted_reason"}
+    elsewhere.write_text(json.dumps(planted) + "\n", encoding="utf-8")
+    sbx = start(world, "via-gate")
+    log = sbx.dir / "gatelog" / "requests.jsonl"
+    log.unlink()
+    log.symlink_to(elsewhere)
+    assert sbx.gate_refusals() == [gatelog.UNREADABLE]
+    summary = sbx.metadata()["gate"]
+    assert summary["content_requests"] is None
+    assert "planted_reason" not in json.dumps(summary)
+    sbx.stop()
+
+
+def test_o19_declaring_output_collection_as_treatment_is_refused_at_load(tmp_path):
+    """O19: a collection the harness could not make says nothing about the manipulation, so no condition may declare
+    the kind it ends in."""
     import expcore_onedata.sandbox.kinds  # noqa: F401  the platform registers its kinds when it is imported
 
     declared = STUDY_TOML.replace(

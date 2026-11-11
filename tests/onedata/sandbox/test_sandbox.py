@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from sandbox_support import TOKEN, make_spec, start_options
 
+from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
@@ -416,7 +417,7 @@ def test_a_failed_collection_keeps_the_disks_when_the_sandbox_stops(world, tmp_p
     sbx = start(world, "isolated")
     (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
     world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
-    with pytest.raises(SandboxError, match="copying"):
+    with pytest.raises(InfraError, match="copying"):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
     world.host.run_handlers.pop("cp")
     sbx.stop()
@@ -458,7 +459,7 @@ def test_o12_a_failed_collection_records_where_the_evidence_is_by_id_and_key_not
     sbx = start(world, "isolated")
     (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
     world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
-    with pytest.raises(SandboxError, match="copying"):
+    with pytest.raises(InfraError, match="copying"):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
     world.host.run_handlers.pop("cp")
     sbx.stop()
@@ -539,7 +540,7 @@ def test_o15_a_failed_unmount_after_a_failed_collection_leaves_the_directory_whe
     sbx = start(world, "isolated", lease_key=KEY)
     (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
     world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
-    with pytest.raises(SandboxError, match="copying"):
+    with pytest.raises(InfraError, match="copying"):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
     world.host.run_handlers.pop("cp")
     world.host.stuck_mounts.add(str(sbx.dir / "work"))
