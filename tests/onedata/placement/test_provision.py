@@ -111,6 +111,53 @@ def test_o07_a_space_root_failing_for_another_reason_is_not_waited_out(provision
     assert ticker.slept == []
 
 
+def test_o09_every_provisioning_path_is_walked_never_asks_for_a_path_and_uploads_octets(
+    config, placement, seeded, ticker, tmp_path
+):
+    """O09: put, fetch, replicate, evict and teardown each pass the client's gate, which finds a file's space by its
+    parent links. No request of any of them asks a provider for the path attribute 25.0 does not have (every value of
+    every `attribute` parameter is read, not only the last), the walk reads parent links, each mutation and range read
+    comes right after the gate's read of the space's name, and every content upload is marked an octet stream."""
+    import httpx
+
+    from expcore_onedata.client import OnezoneClient
+    from expcore_onedata.provision import Provisioner, resolve_provider_ids
+
+    sent = []
+
+    def recording(request):
+        sent.append(request)
+        return seeded.respond(request)
+
+    client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(recording)))
+    provisioner = Provisioner(
+        client,
+        config,
+        placement.settings,
+        provider_ids=resolve_provider_ids(config),
+        log=tmp_path / "changes.jsonl",
+        clock=ticker.clock,
+        sleep=ticker.sleep,
+    )
+    seeded.evictions_remove_blocks = True
+    file_id = provisioner.put_file("scratch/a.bin", DATA)
+    provisioner.fetch("beta", file_id, 0, 100)
+    provisioner.replicate(PATH, "beta")
+    provisioner.evict(PATH, "beta")
+    assert provisioner.teardown().ok
+    assert not [r for r in sent if "path" in r.url.params.get_list("attribute")]
+    walked = [r.method for r in sent if r.url.params.get("attribute") == "parent_id"]
+    assert walked
+    gated = [r for r in sent if r.method in ("POST", "PUT", "DELETE") or r.headers.get("Range")]
+    assert {r.method for r in gated} >= {"POST", "PUT", "DELETE", "GET"}  # creates, uploads, transfers, deletes, reads
+    for request in gated:  # the gate read the space's name from Onezone right before each one
+        previous = sent[sent.index(request) - 1]
+        assert (previous.method, previous.url.path) == ("GET", f"/api/v3/onezone/spaces/{config.space.id}")
+    uploads = [r for r in sent if r.method == "PUT" and r.url.path.endswith("/content")]
+    assert uploads
+    assert {r.headers.get("Content-Type") for r in uploads} == {"application/octet-stream"}
+
+
 OTHER_400S = [(400, "posix", "eacces"), (400, "posix", None), (400, "badValueNotAllowed", None), (400, None, None)]
 
 
