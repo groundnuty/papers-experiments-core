@@ -148,15 +148,16 @@ def test_a_study_space_with_no_baseline_files_fails_no_check_and_passes_none_tha
     """The baseline-off study space through the whole run: the checks that read no file of the space are as they are
     on any space (the two that change state work on a scratch file of their own and remove it) and the listing is
     unknown. The content type reads the configured check file, which a baseline-off space lacks: it is unknown when a
-    data path is REST (test_o05_the_check_is_a_day0_check_too) and has no file to read when none is. Nothing fails for
-    want of a file and nothing passes on one."""
+    data path is REST (test_o05_the_check_is_a_day0_check_too, and the day-0 health check in test_precampaign.py), and
+    unknown here too, where none is and it measures nothing. Nothing fails for want of a file and nothing passes on
+    one."""
     assert [n for n in fake.nodes.values() if n.parent is not None] == []
     entries = by_name(run_checks(context(allow_mutation=True)))
     assert {n: e.ok for n, e in entries.items()} == {
         "reachability": True,
         "health": True,
         "tokens": None,  # the fixed tool-server user holds the baseline rights only, as in every run here
-        "content_type": True,  # no data path is REST here, so no file is read
+        "content_type": None,  # no data path is REST here, so nothing is measured (O08)
         "listing": None,
         "read_only": True,
         "round_trip": True,

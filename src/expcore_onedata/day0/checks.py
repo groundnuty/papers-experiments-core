@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from expcore_onedata.client import PlatformError
 from expcore_onedata.day0.registry import Context, Result, failed, passed, register, unknown
 from expcore_onedata.health import PlatformHealth
+from expcore_onedata.precampaign import measure_content_type
 from expcore_onedata.probes import run_probe
 from expcore_onedata.tokencheck import PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import Plane, data_path_spec, tool_server_spec
@@ -104,9 +105,18 @@ def health(ctx: Context) -> Result:
     """The platform's own health check: the providers supporting the space equal the declared set."""
     if ctx.config.principals.service is None:
         return unknown("no [principals] service user is declared, so the health check cannot mint its token")
-    verdict = PlatformHealth(ctx.config, ctx.client, ctx.issuer, clock=ctx.now)()
-    detail = verdict.detail
-    return passed(detail) if verdict.ok else failed(detail)
+    platform = PlatformHealth(ctx.config, ctx.client, ctx.issuer, clock=ctx.now)
+    verdict = platform()
+    if verdict.ok:
+        return passed(verdict.detail)
+    content = platform.content_type
+    if content is not None and not content.ok and not content.measured:
+        # The health check composes the content-type check, which refused because it measured nothing (the check file
+        # may not be in the space): unknown, as its own day-0 check says, unless the space is not as declared either.
+        # With no REST data path it measures nothing and refuses nothing, so the verdict above is the space's.
+        space = platform.space()
+        return unknown(verdict.detail) if space.ok else failed(space.detail)
+    return failed(verdict.detail)
 
 
 @register("tokens", "Token minting and examination, per plane")
@@ -201,8 +211,6 @@ def content_type(ctx: Context) -> Result:
     """The pre-campaign check (`precampaign.measure_content_type`): the type the data gate streams on, when a data path
     is REST. A type that differs fails. A check that measured nothing is unknown, which is not a pass: one that could
     not read the type, and one with no REST data path to read it for, which a campaign still admits (O08)."""
-    from expcore_onedata.precampaign import measure_content_type
-
     verdict = measure_content_type(ctx.config, ctx.client)
     if not verdict.measured:
         return unknown(verdict.detail)

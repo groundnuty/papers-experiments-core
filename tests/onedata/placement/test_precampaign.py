@@ -204,6 +204,52 @@ def test_o05_a_day0_content_type_check_whose_file_the_space_does_not_hold_is_unk
     assert provider_reads(fake) == []  # nothing was read: there was no file to ask for
 
 
+def day0_health(platform_file, fake, tmp_path):
+    """The day-0 `health` check, run over a platform with a REST data path (so the pre-campaign check reads a file)."""
+    client = OnezoneClient(load_platform(platform_file), http=fake.client_http())
+    return REGISTRY["health"].run(build_context(platform_file, tmp_path / "out", client=client))
+
+
+def test_o05_the_day0_health_check_is_unknown_not_failed_when_the_check_file_is_not_in_the_space(
+    platform_file, fake, tmp_path
+):
+    """A space declared baseline = false holds no check file. The health check composes the content-type check, which
+    cannot be measured there: that is unknown with its reason (the key, and that the file is not in the space), never
+    a failure of the platform, while the support set is as declared."""
+    found = day0_health(platform_file, fake, tmp_path)
+    assert found.ok is None
+    assert "[sandbox] content_check_file" in found.summary
+    assert "not in the space" in found.summary
+    assert_clean(found.summary)
+    assert provider_reads(fake) == []
+
+
+def test_o05_the_day0_health_check_passes_when_the_file_is_there_and_the_space_is_as_declared(
+    platform_file, fake, tmp_path
+):
+    fake.add_file(CHECK_FILE, DATA)
+    assert day0_health(platform_file, fake, tmp_path).ok is True
+
+
+def test_o05_a_real_health_failure_is_still_failed_with_or_without_the_check_file(platform_file, fake, tmp_path):
+    """Unknown is only for what could not be measured. A provider the platform reports for the space and the layout
+    does not declare fails the check whether or not the file is there."""
+    fake.add_provider("prmock0003", "gamma.test")
+    absent = day0_health(platform_file, fake, tmp_path)
+    assert absent.ok is False
+    assert "differ from the declared set" in absent.summary
+    fake.add_file(CHECK_FILE, DATA)
+    assert day0_health(platform_file, fake, tmp_path).ok is False
+
+
+def test_o05_a_content_type_measured_wrong_fails_the_day0_health_check(platform_file, fake, tmp_path):
+    fake.add_file(CHECK_FILE, DATA)
+    fake.content_type = "application/json"
+    found = day0_health(platform_file, fake, tmp_path)
+    assert found.ok is False
+    assert "typed application/json" in found.summary
+
+
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 
 
