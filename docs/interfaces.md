@@ -9,7 +9,7 @@ All of them are `typing.Protocol`s, so a test double needs no inheritance. Signa
 | Architecture name | In v0.1 |
 |---|---|
 | `Study` | the study directory (`study.toml` and its siblings) plus one plugin module whose `build(context)` returns a `StudyPlugin` ([below](#the-study-plugin)) |
-| `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` (leased platform users), its own `ToolProvider`s and an `Instrument` (the platform probes) through the same `StudyPlugin`; its sandbox is [described below](#the-platform-layers-sandbox) |
+| `Platform`, `Sandbox` | not in the core. The platform layer (`expcore_onedata`, steps 4a and 4b) supplies a `HealthCheck`, a `ResourceProbe` (leased platform users), its own `ToolProvider`s and an `Instrument` (the platform probes) through the same `StudyPlugin`; its sandbox is [described below](#the-platform-layers-sandbox). A platform of another kind is a distribution of its own that plugs in through the same `StudyPlugin` and the same protocols: [the study guide's section 10](study-guide.md#10-a-platform-of-your-own) lists what it needs, and `examples/sparql_platform/` is one |
 | `ToolProvider`, `Scorer`, `Instrument` | protocols: [`ToolProvider`](#toolprovider-and-callcontext), [`Scorer`](#scorer) and [`Instrument`](#instrument) (a protocol since step 4b2) |
 | `ModelBackend`, `RunExecutor`, `HealthCheck`, `ResourceProbe` | protocols, below |
 

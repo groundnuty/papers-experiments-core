@@ -1,6 +1,6 @@
 # SPARQL platform
 
-A second platform for the core, beside the Onedata layer: an in-process RDF store ([pyoxigraph](https://pypi.org/project/pyoxigraph/)) that an agent queries read-only over SPARQL. It needs no Docker, no network and no key. It is built only on the core's documented interfaces, and it is its own distribution, `sparql-platform`, which a study names in `[study] requires` and whose wheel a replication package vendors.
+A second platform for the core, beside the Onedata layer: an in-process RDF store ([pyoxigraph](https://pypi.org/project/pyoxigraph/)) that an agent queries read-only over SPARQL. It needs no Docker, no network and no key. It is built only on the core's documented interfaces, and it is its own distribution, `sparql-platform`, which a study names in `[study] requires` and whose wheel a replication package vendors. What a platform shipped this way needs is listed in [section 10 of the study guide](../../docs/study-guide.md#10-a-platform-of-your-own).
 
 | Part | What it is |
 |---|---|
