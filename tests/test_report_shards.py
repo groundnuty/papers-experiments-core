@@ -92,9 +92,9 @@ def sharded(**changes) -> dict:
     return export(**{**base, **changes})
 
 
-def shard_table(report: str) -> list[list[str]]:
-    """The cells of every row under the shard heading of the report, the header row first."""
-    lines = report.split(SHARD_HEADING, 1)[1].splitlines()
+def shard_table(report: str, heading: str = SHARD_HEADING) -> list[list[str]]:
+    """The cells of every row of the first table under a heading of the report, the header row first."""
+    lines = report.split(heading, 1)[1].splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith("|"))
     rows = []
     for line in lines[start:]:
@@ -108,7 +108,7 @@ def shard_table(report: str) -> list[list[str]]:
 def shard_section(report: str) -> str:
     """The text from the shard heading up to the next `## ` heading, the blank line before that heading included."""
     after = report.split(SHARD_HEADING, 1)[1]
-    return SHARD_HEADING + after.split("## ", 1)[0]
+    return SHARD_HEADING + after.split("\n## ", 1)[0] + "\n"
 
 
 def test_c29_a_merged_batch_has_a_row_per_shard_and_condition_with_its_label_start_and_run_counts():
@@ -209,3 +209,163 @@ def test_c29_a_shards_value_that_is_not_a_list_of_shards_is_refused(shards):
     """C29: `shards` present but empty, not a list, or holding an entry without an index is a malformed export."""
     with pytest.raises(ValueError, match="shards"):
         render(sharded(shards=shards))
+
+
+# --- what the hosts' infrastructure and clocks looked like (descriptive; no test across shards) -------------------
+
+KINDS_HEADING = "### Infrastructure attempts by shard and kind"
+TIME_HEADING = "### Time by shard"
+NOT_RECORDED = "not recorded"
+
+
+def annotate(data: dict, shard: int, field: str, values: list) -> dict:
+    """Set `field` on the analysed entries of one shard, in order, one value each; None leaves the entry without it."""
+    mine = [entry for entry in data["analysed_attempts"] if entry["shard"] == shard]
+    for entry, value in zip(mine, values, strict=True):
+        if value is not None:
+            entry[field] = value
+    return data
+
+
+def retries(shard: int, kind: str, attempts: int, state: str = "infra_fail", charged: bool = True) -> dict:
+    """A row of the export's `retries_by_kind`, with the shard whose store it was counted in."""
+    row = {"condition": "cond-a", "model": "model-a", "kind": kind, "state": state, "charged": charged}
+    return {"shard": shard, **row, "attempts": attempts}
+
+
+def infrastructure() -> dict:
+    """Shard 1: 5 timeout and 1 dns attempts set aside, of which its exhausted run's 3 charged ones (2 timeout, 1
+    dns); shard 2: 4 timeout set aside, none exhausted, and one analysed run that scored a timeout as treatment."""
+    data = sharded(
+        exhausted_runs=entries(1, "cond-a", 1, attempts=3, reasons=["timeout: a", "timeout: b", "dns: c"]),
+        shard_retries_by_kind=[
+            retries(1, "timeout", 3),
+            retries(1, "timeout", 2, "outage_discarded", False),
+            retries(1, "dns", 1),
+            retries(2, "timeout", 4, charged=False),
+        ],
+    )
+    annotate(data, 2, "treatment", [True, None, None, None, None])
+    return annotate(data, 2, "infra_kind", ["timeout", None, None, None, None])
+
+
+def test_c29_each_shard_shows_its_attempts_set_aside_by_kind_beside_what_its_exhausted_and_treatment_runs_show():
+    """C29: per shard and kind, the attempts set aside in all its runs (the export's per-shard retries), the charged
+    attempts of its exhausted runs by their kind, and the attempts scored as treatment; a kind a shard never met is a
+    row of zeros, never a gap."""
+    rows = shard_table(render(infrastructure()), KINDS_HEADING)
+    assert rows[0] == ["Shard", "Kind", "Set aside (all runs)", "Charged in exhausted runs", "Scored as treatment"]
+    assert rows[1:] == [
+        ["shard-1", "dns", "1", "1", "0"],
+        ["shard-1", "timeout", "5", "2", "0"],
+        ["shard-2", "dns", "0", "0", "0"],
+        ["shard-2", "timeout", "4", "0", "1"],
+    ]
+
+
+def test_c29_set_asides_the_export_keeps_only_as_a_sum_over_every_shard_read_not_recorded_never_zero():
+    """C29: an export without per-shard retries has the sum over the shards (`retries_by_kind`) and nothing a shard
+    can be given: the column says not recorded, and the two columns the run entries do carry are still counted."""
+    data = infrastructure()
+    del data["shard_retries_by_kind"]
+    rows = shard_table(render(data), KINDS_HEADING)
+    assert [row[1:] for row in rows[1:]] == [
+        ["dns", NOT_RECORDED, "1", "0"],
+        ["timeout", NOT_RECORDED, "2", "0"],
+        ["dns", NOT_RECORDED, "0", "0"],
+        ["timeout", NOT_RECORDED, "0", "1"],
+    ]
+
+
+def test_c29_a_merged_batch_that_met_no_infrastructure_failure_has_a_row_of_zeros_per_shard():
+    """C29: with no kind in any shard, each shard has a row of kind none: 0 is never mistaken for not reported."""
+    rows = shard_table(render(sharded(shard_retries_by_kind=[])), KINDS_HEADING)
+    assert rows[1:] == [["shard-1", "none", "0", "0", "0"], ["shard-2", "none", "0", "0", "0"]]
+
+
+TIME_HEADER = ["Shard", "Runs timed", "Run wall time median (s)", "Run wall time p90 (s)", "Turns timed"]
+TIME_HEADER += ["Turn latency median (s)", "Turn latency p90 (s)", "Resets timed", "Reset median (s)"]
+
+
+def timed() -> dict:
+    """Shard 1's 7 analysed runs took 10 to 70 s (one each of 10, 20, ..., 70) and had one turn of 1 to 7 s each;
+    shard 2's 5 took 100 to 500 s and had three turns each, of j, 2j and 3j seconds for run j."""
+    data = sharded()
+    annotate(data, 1, "wall_s", [10.0 * k for k in range(1, 8)])
+    annotate(data, 1, "turn_latency_s", [[float(k)] for k in range(1, 8)])
+    annotate(data, 2, "wall_s", [100.0 * j for j in range(1, 6)])
+    return annotate(data, 2, "turn_latency_s", [[float(j), 2.0 * j, 3.0 * j] for j in range(1, 6)])
+
+
+def test_c29_each_shard_shows_the_median_and_p90_of_its_runs_wall_time_and_of_its_turns_latency_with_n():
+    """C29: the analysed runs' wall time and the model turns' latency, per shard, as median and p90 with the number of
+    values each rests on; p90 interpolates between the order statistics, so 7 values of 10 to 70 have a p90 of 64."""
+    rows = shard_table(render(timed()), TIME_HEADING)
+    assert rows[0] == TIME_HEADER
+    assert [row[:7] for row in rows[1:]] == [
+        ["shard-1", "7", "40", "64", "7", "4", "6.4"],
+        ["shard-2", "5", "300", "460", "15", "5", "11.2"],
+    ]
+
+
+def test_c29_a_figure_no_run_carries_reads_not_recorded_and_a_shard_with_no_analysed_run_reads_n_a():
+    """C29: a shard whose analysed runs carry no wall time, turn latency or reset time says not recorded, with N 0;
+    only a shard with no analysed run at all reads n/a, since there was nothing to time."""
+    data = sharded(
+        analysed_attempts=entries(1, "cond-a", 3),
+        exhausted_runs=[],
+        unfinished_runs=[*entries(1, "cond-b", 4, status="pending"), *entries(2, "cond-a", 2, status="pending")],
+        planned_runs=9,
+    )
+    rows = shard_table(render(data), TIME_HEADING)
+    assert rows[1] == ["shard-1", "0", NOT_RECORDED, NOT_RECORDED, "0", NOT_RECORDED, NOT_RECORDED, "0", NOT_RECORDED]
+    assert rows[2] == ["shard-2", "0", "n/a", "n/a", "0", "n/a", "n/a", "0", "n/a"]
+
+
+def test_c29_a_figure_only_some_of_a_shards_runs_carry_is_taken_from_those_and_its_n_says_how_many():
+    """C29: N is the number of values the figure rests on, so a shard whose runs carry it only in part shows fewer
+    than its analysed runs; reset time is read the same way as the other two figures."""
+    data = sharded()
+    annotate(data, 1, "wall_s", [10.0, None, 30.0, None, None, None, None])
+    annotate(data, 2, "reset_s", [3.0, 4.0, None, None, None])
+    rows = shard_table(render(data), TIME_HEADING)
+    assert rows[1][1:4] == ["2", "20", "28"]  # median of 10 and 30; p90 interpolates to 10 + 0.9 * 20
+    assert rows[1][7:] == ["0", NOT_RECORDED]
+    assert rows[2][7:] == ["2", "3.5"]
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"shard_retries_by_kind": [retries(9, "timeout", 1)]}, "shard_retries_by_kind names shard 9"),
+        ({"analysed_attempts": [{"run_key": "x", "condition": "cond-a", "shard": 1, "wall_s": "slow"}]}, "wall_s"),
+        (
+            {"analysed_attempts": [{"run_key": "x", "condition": "cond-a", "shard": 1, "turn_latency_s": [1.0, -2.0]}]},
+            "-2.0",
+        ),
+    ],
+)
+def test_c29_a_per_shard_row_of_an_unlisted_shard_or_a_figure_that_is_not_seconds_is_refused(changes, message):
+    """C29: the section never rests on a guess: a retries row of a shard the export does not list, or a wall time or
+    latency that is not a finite, non-negative number, is refused, naming it."""
+    data = sharded(**{"planned_runs": 1, "exhausted_runs": [], "unfinished_runs": [], **changes})
+    with pytest.raises(ValueError, match=message):
+        render(data)
+
+
+def test_c29_the_per_shard_figures_in_an_export_without_shards_are_not_read_and_change_no_byte_of_the_report():
+    """C29: a batch that was not merged has no section, so the optional per-run figures of a merged export, were an
+    export to carry them without `shards`, change nothing."""
+    plain = {key: value for key, value in sharded().items() if key != "shards"}
+    figures = {key: value for key, value in timed().items() if key != "shards"}
+    figures["shard_retries_by_kind"] = [retries(1, "timeout", 3)]
+    assert render(figures) == render(plain)
+
+
+def test_c29_the_section_gives_no_score_by_shard_and_says_every_figure_is_descriptive():
+    """C29: pairs never cross shards, so a host effect meets both arms alike and a score by shard would show which
+    instances landed where: the section shows completion and infrastructure only, and says no test is made."""
+    text = " ".join(shard_section(render(timed())).split())
+    assert "descriptive" in text
+    assert "no score is shown by shard" in text
+    assert "Estimate" not in text

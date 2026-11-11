@@ -28,10 +28,11 @@ are the same text: no clock, no path and no random number enters it.
   of zeros for each pair the plan runs, so a reader sees whether the budget stopped one model more than another (C26).
   Those come from the export's `budget_holds`, which counts a hold by its own kind even where an outage overlapped it.
 - A batch merged from shards (its export has `shards`, and each run entry its `shard`) gets one more section after the
-  conditions: per shard, with its label and start, and per condition, the runs analysed, exhausted, unfinished and
-  left out and the rates of the first three among the planned runs. The shards are a check that the hosts are
-  interchangeable, not a factor of the design, and no test across shards is made. Without `shards` the report is
-  byte for byte what it was before shards existed (#154).
+  conditions (`expcore.report_shards`): per shard, with its label and start, the runs of each condition by how they
+  ended with their rates, the infrastructure attempts by kind, and the wall time, turn latency and reset time, each
+  figure with its N or `not recorded` (never 0). The shards are a check that the hosts are interchangeable, not a
+  factor of the design: every figure is descriptive, no test across shards is made, and no score is shown by shard.
+  Without `shards` the report is byte for byte what it was before shards existed (#154).
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
@@ -46,7 +47,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from expcore.accounting import condition_accounting, shard_accounting
+from expcore.accounting import condition_accounting
 from expcore.report_notes import (
     BUDGET_HOLD_NOTES,
     CONDITION_NOTES,
@@ -56,16 +57,16 @@ from expcore.report_notes import (
     MISSING_PAIRS,
     NO_CLAIM,
     NO_KIND,
-    SHARD_NOTES,
+    UNKNOWN,
     contrast_notes,
     equivalence_header,
     percent,
 )
+from expcore.report_shards import shard_lines
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
 from expcore.stats.pairing import MISSING_CAUSES
 
 EXPLORATORY = "exploratory"
-UNKNOWN = "n/a"
 NO_MARGIN = "-"  # the margin and the equivalence interval of a contrast that preregistered no margin
 CAUSE_HEADINGS = {
     "treatment_outcome_none": "Treatment outcome None",
@@ -336,35 +337,6 @@ def _infrastructure(export: Mapping[str, Any], conditions: Sequence[str]) -> lis
     return [*lines, *_table(header, rows), "", *COUNT_DEFINITIONS]
 
 
-def _rate(count: int, planned: int) -> str:
-    """A share of the planned runs as a percentage to one decimal; n/a when none were planned (never 0%)."""
-    return f"{100 * count / planned:.1f}%" if planned else UNKNOWN
-
-
-def _shards(export: Mapping[str, Any]) -> list[str]:
-    """The runs of each shard of a merged batch, per condition, with their outcome rates; nothing without shards.
-
-    The shards are a check that the hosts are interchangeable, not a factor of the design: the table is for a reader,
-    and no test across shards is made.
-    """
-    cells = shard_accounting(export)
-    if not cells:
-        return []
-    header = ["Shard", "Started (UTC)", "Condition", "Planned", "Analysed", "Exhausted", "Unfinished", "Left out"]
-    rows = [
-        [
-            cell["label"],
-            cell["started_utc"] or UNKNOWN,
-            cell["condition"],
-            *(cell[field] for field in ("planned", "analysed", "exhausted", "unfinished", "left_out")),
-            *(_rate(cell[field], cell["planned"]) for field in ("analysed", "exhausted", "unfinished")),
-        ]
-        for cell in cells
-    ]
-    header += ["Analysed %", "Exhausted %", "Unfinished %"]
-    return ["## Shards", "", *_table(header, rows), "", *SHARD_NOTES, ""]
-
-
 def _budget_holds(export: Mapping[str, Any]) -> list[str]:
     """The attempts a budget hold set aside, per condition and model, with a row of zeros for each pair the plan runs,
     so a reader sees whether the budget stopped one model's runs more than another's (C26)."""
@@ -508,10 +480,11 @@ def render_report(
     if result.exploratory_only:
         lines.append(f"- **Confirmatory claims**: none; {NO_CLAIM}")
     lines.append("")
+    shards = shard_lines(export, _table)  # only a batch merged from shards has any (#154)
     sections = (
         _contrasts(result, interval_level)
         + _conditions(export)
-        + _shards(export)
+        + shards
         + _deployments(export)
         + _left_out(left_out)
     )
