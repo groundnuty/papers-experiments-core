@@ -19,7 +19,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   store with attempts still running unless `partial`, which the check records. It reads only the study's `[study]`
   table and imports nothing, unless a record needs it, and says so first: a kind still unknown imports the modules
   `[study] platforms` names, and a backend no native parser is registered for also imports the plugin module, so
-  what is registered there is known in a new process. `build` is not called, so no model or key is needed.
+  what is registered there is known in a new process. `build` is not called, so no model or key is needed. A merged
+  batch (`campaign.merge`) is the exception: its merge.json is rebuilt from the shards' snapshots and the study's plan,
+  so its check loads the study's configuration, which imports those platforms.
   It refuses to run under another environment than the campaign's, and records the one it ran under. The side
   files study.toml declares (`[[study.side_files]]`) are found in the batch it parses, hashed with the records and
   paired each with the record beside it (`replay.side_files`), and the check records the declaration.
@@ -27,7 +29,8 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   and the campaign's (the snapshot's fingerprint) and under the study's declaration of side files, and writes nothing.
   It then uses only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once
   and compared with the check's hash, cross-validated against each other, and each side file paired with its record
-  again. It exports from the snapshot, scores the records in memory (a record is never written after its check, since
+  again; a merged batch's merge.json is rebuilt from the snapshots so read and the plan, and refused when it differs.
+  It exports from the snapshot, scores the records in memory (a record is never written after its check, since
   that would change its hash) and runs the preregistered analysis. A scorer that takes `side_files` is handed the
   record's side files as the bytes `load_verified` read and verified, all of them before the plugin is loaded, so
   no scorer runs on a batch that does not verify. Every score is derived anew from a record on each call and none is
@@ -58,7 +61,8 @@ from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
-from expcore.campaign.merge import MergeRefused, read_merge, sha256_of, shard_snapshot_path
+from expcore.campaign.merge import MergeRefused, read_merge
+from expcore.campaign.merged import read_held, verify_merged, verify_queried
 from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.settings import SchedulerConfig
@@ -357,30 +361,31 @@ def _check_merged(
     study: StudyIdentity, directory: Path, code: Mapping[str, Any], env: Mapping[str, Any], partial: bool
 ) -> dict[str, Any]:
     """The replay check of a merged batch: merge.json is bound by its hash, each shard's snapshot is compared with the
-    hash merge.json names and read under the environment in use, and the records are replayed as one batch.
+    hash merge.json names and read under the environment in use, merge.json is rebuilt from the snapshots and the
+    study's plan and must be that document (`campaign.merged`), and the records are replayed as one batch.
 
-    There is no live store to copy: the shards' snapshots were taken at the merge. The check records the SHA-256 of
-    merge.json (`check["merge"]`), and the analysis reads the snapshots against the hashes that file holds."""
+    There is no live store to copy: the shards' snapshots were taken at the merge. Rebuilding merge.json needs the
+    plan, so the check of a merged batch loads the study's configuration, which imports the platforms `[study]` names.
+    The check records the SHA-256 of merge.json (`check["merge"]`), and the analysis reads the snapshots against the
+    hashes that file holds."""
     out = out_dir(study)
     raw = (out / MERGE_FILE).read_bytes()
     try:
         merged = read_merge(raw, out / MERGE_FILE)
+        held = read_held(out, merged)
     except MergeRefused as error:
         raise Refused(str(error)) from None
-    for shard in merged["shards"]:
-        name, path = f"shard {shard['index']} ({shard['label']})", shard_snapshot_path(out, shard["index"])
-        if not path.is_file():
-            raise Refused(f"{name}: its snapshot {path} is missing from the merged batch")
-        if sha256_of(path) != shard["snapshot_sha256"]:
-            raise Refused(
-                f"{name}: its snapshot changed since the merge ({MERGE_FILE} names another SHA-256); merge again"
-            )
-        changed = differences(campaign_environment(read_fingerprint(path)), env)
+    for shard in held.values():
+        changed = differences(campaign_environment(shard.fingerprint), env)
         if changed:
             raise Refused(
-                f"{name}: its campaign ran under another environment than this check would; check under the "
+                f"{shard.name}: its campaign ran under another environment than this check would; check under the "
                 "campaign's environment:\n  " + "\n  ".join(changed)
             )
+    try:
+        verify_merged(merged, held, load_study(study.root).manifest)
+    except MergeRefused as error:
+        raise Refused(str(error)) from None
     import_what_the_records_need(study, directory)
     check = verify_batch(
         directory, code=code, hashed_only=[MARKER_PATTERN], environment=env, side_files=study.side_files
@@ -527,6 +532,13 @@ def _analyse_loaded(
         verified = load_verified(batch, check, study.schema, partial=partial, side_files=study.side_files)
     except (BatchNotVerified, Unverified) as error:
         raise Refused(str(error)) from None
+    if verified.merge is not None:  # what merge.json says must be what its snapshots say, for this plan
+        try:
+            queries = {index: snapshot.q for index, snapshot in verified.snapshots.items() if index is not None}
+            verify_queried(verified.merge, queries, out, study.manifest)
+        except MergeRefused as error:
+            verified.close()
+            raise Refused(str(error)) from None
     for snapshot in verified.snapshots.values():
         rows = snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
         changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])

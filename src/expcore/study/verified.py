@@ -63,6 +63,7 @@ class VerifiedBatch:
     # by record path, each side file beside it by declared pattern: the bytes read once and verified
     side_files: Mapping[str, Mapping[str, bytes]] = field(default_factory=dict)
     shards: tuple[Mapping[str, Any], ...] = ()  # merge.json's list of shards for a merged batch, else empty
+    merge: Mapping[str, Any] | None = None  # merge.json for a merged batch, as read and verified; else None
 
     def close(self) -> None:
         """Close every snapshot."""
@@ -121,8 +122,8 @@ def _load_snapshot(batch: Path, check: Mapping[str, Any], schema: FactorSchema) 
         raise Unverified(f"{SNAPSHOT_FILE}: {error}") from None
 
 
-def _load_shards(batch: Path, merge: Any, schema: FactorSchema) -> tuple[dict[int | None, StoreSnapshot], tuple]:
-    """The snapshots of a merged batch's shards, each verified against the hash merge.json names, and the shard list."""
+def _load_shards(batch: Path, merge: Any, schema: FactorSchema) -> tuple[dict[int | None, StoreSnapshot], dict]:
+    """The snapshots of a merged batch's shards, each verified against the hash merge.json names, and merge.json."""
     out = batch.parent
     expected = merge.get("sha256") if isinstance(merge, dict) else None
     if not isinstance(merge, dict) or merge.get("file") != MERGE_FILE or not isinstance(expected, str):
@@ -145,7 +146,7 @@ def _load_shards(batch: Path, merge: Any, schema: FactorSchema) -> tuple[dict[in
         for opened in snapshots.values():
             opened.close()
         raise
-    return snapshots, tuple(document["shards"])
+    return snapshots, document
 
 
 def _parse(rel: str, raw: bytes) -> RunRecord:
@@ -219,13 +220,13 @@ def load_verified(
     """
     replayed = _replayed_set(check)
     merge = check.get(CHECK_KEY)
-    shards: tuple = ()
+    document: dict | None = None
     if merge is None:
         snapshots: dict[int | None, StoreSnapshot] = {None: _load_snapshot(batch, check, schema)}
     else:
-        snapshots, shards = _load_shards(batch, merge, schema)
+        snapshots, document = _load_shards(batch, merge, schema)
     try:
-        return _cross_validated(batch, check, snapshots, shards, replayed, partial, side_files)
+        return _cross_validated(batch, check, snapshots, document, replayed, partial, side_files)
     except Unverified:
         for snapshot in snapshots.values():
             snapshot.close()
@@ -236,7 +237,7 @@ def _cross_validated(
     batch: Path,
     check: Mapping[str, Any],
     snapshots: Mapping[int | None, StoreSnapshot],
-    shards: tuple,
+    document: dict | None,
     replayed: set[str],
     partial: bool,
     side_files: Sequence[SideFile],
@@ -272,4 +273,5 @@ def _cross_validated(
                     "no replayed record covers it; pass --partial to leave it out"
                 )
             excluded.append(row["run_key"])
-    return VerifiedBatch(dict(snapshots), records, running, tuple(sorted(set(excluded))), held, shards)
+    shards = () if document is None else tuple(document["shards"])
+    return VerifiedBatch(dict(snapshots), records, running, tuple(sorted(set(excluded))), held, shards, document)

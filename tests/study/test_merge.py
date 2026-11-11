@@ -26,7 +26,8 @@ from expcore.campaign.shard import (
     RULE,
     ShardSpec,
 )
-from expcore.study.pipeline import regenerate
+from expcore.campaign.snapshot import take_snapshot
+from expcore.study.pipeline import Refused, regenerate
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
@@ -300,6 +301,149 @@ def test_c29_a_snapshot_changed_after_the_check_is_refused_by_the_analysis(base,
     assert code == 1
     assert f"{SHARDS_DIR}/1/{SNAPSHOT}" in errors
     assert "changed after the replay check read it" in errors
+
+
+# --- merge.json is believed only when the snapshots give it -----------------------------------------------------------
+
+REBUILT = "is not what a merge of the shards' snapshots writes for the study's plan"
+
+
+def edit_merge(campaign: Campaign, change) -> Path:
+    """Rewrite a merged batch's merge.json with `change` applied to its content, as the merge writes the file."""
+    path = campaign.root / "out" / MERGE_FILE
+    document = change(json.loads(path.read_text(encoding="utf-8")))
+    path.write_text(json.dumps(document, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def swap_labels(document: dict) -> dict:
+    first, second = document["shards"]
+    return {**document, "shards": [{**first, "label": second["label"]}, {**second, "label": first["label"]}]}
+
+
+def runs_of_one(document: dict) -> dict:
+    return {**document, "shards": [{**document["shards"][0], "runs": 99}, document["shards"][1]]}
+
+
+def other_identity(document: dict) -> dict:
+    return {**document, "environment_identity": {"layout": "0" * 64}}
+
+
+@pytest.mark.parametrize(
+    ("change", "fields"),
+    [
+        (swap_labels, "shard 1's label, shard 2's label"),
+        (runs_of_one, "shard 1's runs"),
+        (other_identity, "environment_identity"),
+    ],
+    ids=["labels", "runs", "identity"],
+)
+def test_c29_check_rebuilds_merge_json_from_the_snapshots_and_refuses_a_file_that_differs(
+    base, clean_environment, merged, change, fields
+):
+    """C29: the check does not take merge.json's word: it rebuilds the document from the snapshots and the plan, so
+    labels swapped, a shard's runs changed, or another environment identity are refused, naming the fields."""
+    copy = copy_campaign(merged, base, f"rebuilt-{change.__name__}")
+    edit_merge(copy, change)
+    code, errors = cli(clean_environment, "check", str(copy.runs))
+    assert code == 1, errors
+    assert REBUILT in errors
+    assert f"it differs in {fields};" in errors
+
+
+def test_c29_analyze_rebuilds_merge_json_too_so_a_check_made_to_vouch_for_an_edit_is_refused(
+    base, clean_environment, merged
+):
+    """C29: the analysis rebuilds merge.json from the snapshots it verified as well, so an edited file is refused even
+    when the replay check was altered to name its hash; report and regenerate refuse with it."""
+    copy = copy_campaign(merged, base, "rebuilt-vouched")
+    path = edit_merge(copy, swap_labels)
+    check_file = copy.runs / "replay-check.json"
+    check = json.loads(check_file.read_text(encoding="utf-8"))
+    check["merge"]["sha256"] = sha(path)
+    check_file.write_text(json.dumps(check, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    for command in ("analyze", "report"):
+        code, errors = cli(clean_environment, command, str(copy.root))
+        assert code == 1, errors
+        assert REBUILT in errors
+        assert "shard 1's label" in errors
+    with pytest.raises(Refused, match=REBUILT):
+        regenerate(copy.root)
+
+
+def test_c29_a_shard_removed_after_the_merge_is_refused_by_the_check(base, clean_environment, merged):
+    """C29: a merged batch is at least 2 shards, each index once: dropping a shard's snapshot, its records and its
+    entry, and lowering the count to 1, is refused rather than checked as a smaller campaign."""
+    copy = copy_campaign(merged, base, "shard-dropped")
+    out = copy.root / "out"
+    connection = sqlite3.connect(out / SHARDS_DIR / "2" / SNAPSHOT)
+    digests = {row[0] for row in connection.execute("SELECT digest FROM runs")}
+    connection.close()
+    for digest in digests:
+        shutil.rmtree(out / "runs" / digest, ignore_errors=True)
+    shutil.rmtree(out / SHARDS_DIR / "2")
+    edit_merge(copy, lambda document: {**document, "count": 1, "shards": document["shards"][:1]})
+    code, errors = cli(clean_environment, "check", str(copy.runs))
+    assert code == 1, errors
+    assert "is not the shards 1 to 1, at least 2" in errors
+
+
+def test_c29_a_snapshot_whose_runs_leave_part_of_the_plan_out_is_refused_by_the_check(
+    base, clean_environment, merged, foreign, shard2_without_foreign
+):
+    """C29: the union of the snapshots' runs is the plan at the check as at the merge: a shard's snapshot replaced by
+    one that lacks a run, with merge.json made to match it, is refused, naming the run."""
+    copy = copy_campaign(merged, base, "snapshot-short")
+    target = copy.root / "out" / SHARDS_DIR / "2" / SNAPSHOT
+    target.unlink()
+    take_snapshot(shard2_without_foreign.root / "out" / "state.sqlite", target)
+    edit_merge(
+        copy,
+        lambda document: {
+            **document,
+            "shards": [
+                document["shards"][0],
+                {**document["shards"][1], "snapshot_sha256": sha(target), "runs": document["shards"][1]["runs"] - 1},
+            ],
+        },
+    )
+    code, errors = cli(clean_environment, "check", str(copy.runs))
+    assert code == 1, errors
+    assert f"run {foreign}, which belongs to shard 2 (shard-2), is in no shard" in errors
+
+
+def test_c29_a_snapshot_under_another_shards_index_is_refused_by_the_check(base, clean_environment, merged):
+    """C29: each snapshot lies under its own shard's index: two snapshots swapped, with merge.json's hashes swapped to
+    match, are refused."""
+    copy = copy_campaign(merged, base, "snapshots-swapped")
+    one, two = (copy.root / "out" / SHARDS_DIR / index / SNAPSHOT for index in ("1", "2"))
+    first, second = one.read_bytes(), two.read_bytes()
+    one.write_bytes(second)
+    two.write_bytes(first)
+    edit_merge(
+        copy,
+        lambda document: {
+            **document,
+            "shards": [
+                {**document["shards"][0], "snapshot_sha256": sha(one)},
+                {**document["shards"][1], "snapshot_sha256": sha(two)},
+            ],
+        },
+    )
+    code, errors = cli(clean_environment, "check", str(copy.runs))
+    assert code == 1, errors
+    assert f"{SHARDS_DIR}/1/{SNAPSHOT}: is the snapshot of shard 2 (shard-2), not of shard 1" in errors
+
+
+def test_c29_a_snapshot_merge_json_does_not_list_is_refused_by_the_check(base, clean_environment, merged):
+    """C29: everything under shards/ is a shard merge.json lists; a third snapshot added beside the two is refused."""
+    copy = copy_campaign(merged, base, "snapshot-stray")
+    shards = copy.root / "out" / SHARDS_DIR
+    (shards / "3").mkdir()
+    shutil.copyfile(shards / "2" / SNAPSHOT, shards / "3" / SNAPSHOT)
+    code, errors = cli(clean_environment, "check", str(copy.runs))
+    assert code == 1, errors
+    assert f"{SHARDS_DIR}/3: in the merged batch, but {MERGE_FILE} lists no such shard" in errors
 
 
 # --- what a merge refuses -------------------------------------------------------------------------------------------

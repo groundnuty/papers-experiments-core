@@ -60,12 +60,17 @@ SHARDS = [
 SEQ = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5}
 
 
+def plan(*keys: str) -> dict[str, int]:
+    """The place in the whole plan of each of `keys`: a plan of exactly those runs."""
+    return {key: SEQ[key] for key in keys}
+
+
 def test_c29_run_lists_join_in_plan_order_each_entry_tagged_with_its_shard():
     """C29: the run lists are concatenated in the order of the whole plan, whatever the shard, every entry says which
     shard ran it, and the planned runs add up."""
     one = export(analysed=[entry("c"), entry("a")], exhausted=[entry("e")])
     two = export(analysed=[entry("d")], unfinished=[entry("b", status="pending")])
-    joined = join_exports({2: two, 1: one}, SEQ, SHARDS)
+    joined = join_exports({2: two, 1: one}, plan("a", "b", "c", "d", "e"), SHARDS)
     assert [(e["run_key"], e["shard"]) for e in joined["analysed_attempts"]] == [("a", 1), ("c", 1), ("d", 2)]
     assert [(e["run_key"], e["shard"]) for e in joined["exhausted_runs"]] == [("e", 1)]
     assert [(e["run_key"], e["shard"]) for e in joined["unfinished_runs"]] == [("b", 2)]
@@ -77,7 +82,7 @@ def test_c29_left_out_runs_are_tagged_and_ordered_like_the_others():
     """C29: an entry of `excluded_attempts` carries its shard too, and `partial` holds when any shard's does."""
     one = export(analysed=[entry("a")], excluded=[entry("e", attempt=1, reason="uncovered")])
     two = export(excluded=[entry("b", attempt=1, reason="uncovered")])
-    joined = join_exports({1: one, 2: two}, SEQ, SHARDS)
+    joined = join_exports({1: one, 2: two}, plan("a", "b", "e"), SHARDS)
     assert [(e["run_key"], e["shard"]) for e in joined["excluded_attempts"]] == [("b", 2), ("e", 1)]
     assert joined["partial"] is True
     assert joined["running_attempts"] == 0
@@ -87,7 +92,7 @@ def test_c29_a_shards_own_shard_key_does_not_reach_the_merged_export():
     """C29: a shard's export may carry its own spec under `shard`; the merged export has `shards` instead."""
     one = {**export(analysed=[entry("a")]), EXPORT_KEY: {"spec": {"index": 1}}}
     two = export(analysed=[entry("b")])
-    joined = join_exports({1: one, 2: two}, SEQ, SHARDS)
+    joined = join_exports({1: one, 2: two}, plan("a", "b"), SHARDS)
     assert EXPORT_KEY not in joined
     assert "shards" in joined
 
@@ -142,7 +147,7 @@ def test_c29_accounting_figures_that_are_sums_are_summed_row_by_row():
         infrastructure_by_condition=[infra("endpoint", 4, 1)],
         budget_holds=holds(2),
     )
-    joined = join_exports({1: one, 2: two}, SEQ, SHARDS)
+    joined = join_exports({1: one, 2: two}, plan("a", "b"), SHARDS)
     assert [(r["condition"], r["attempts"], r["input_tokens"], r["wall_s"]) for r in joined["discarded_usage"]] == [
         ("base", 5, 50, 3.5),
         ("mid", 1, 10, 1.0),
@@ -158,7 +163,7 @@ def test_c29_the_kinds_are_the_cores_then_every_other_kind_sorted():
     """C29: the vocabulary of kinds is what the unsharded export gives: the core's, then the others, sorted."""
     one = export(analysed=[entry("a")], kinds=[*CORE_KINDS, "zeta"])
     two = export(analysed=[entry("b")], kinds=[*CORE_KINDS, "alpha"])
-    assert join_exports({1: one, 2: two}, SEQ, SHARDS)["kinds"] == [*CORE_KINDS, "alpha", "zeta"]
+    assert join_exports({1: one, 2: two}, plan("a", "b"), SHARDS)["kinds"] == [*CORE_KINDS, "alpha", "zeta"]
 
 
 def test_c29_exports_that_are_not_of_one_campaign_are_refused():
@@ -167,11 +172,11 @@ def test_c29_exports_that_are_not_of_one_campaign_are_refused():
     other = copy.deepcopy(two)
     other["factors"] = ["task"]
     with pytest.raises(ExportError, match="disagree on 'factors'"):
-        join_exports({1: one, 2: other}, SEQ, SHARDS)
+        join_exports({1: one, 2: other}, plan("a", "b"), SHARDS)
     short = copy.deepcopy(two)
     del short["budget_holds"]
     with pytest.raises(ExportError, match="budget_holds"):
-        join_exports({1: one, 2: short}, SEQ, SHARDS)
+        join_exports({1: one, 2: short}, plan("a", "b"), SHARDS)
     with pytest.raises(ExportError, match="run b of the shards' exports is not in the plan"):
         join_exports({1: one, 2: two}, {"a": 0}, SHARDS)
     with pytest.raises(ExportError, match="disagree on 'declared_treatment'"):
@@ -180,13 +185,28 @@ def test_c29_exports_that_are_not_of_one_campaign_are_refused():
                 1: export(infrastructure_by_condition=[infra("endpoint", 0, 0, declared=True)]),
                 2: export(infrastructure_by_condition=[infra("endpoint", 0, 0, declared=False)]),
             },
-            SEQ,
+            plan(),
             SHARDS,
         )
 
 
+def test_c29_a_join_that_does_not_cover_the_plan_is_refused():
+    """C29: the joined run lists hold every run of the whole plan exactly once, and the planned runs add up to it, so
+    a merged batch with a shard left out is refused here too, whatever its merge.json says."""
+    one, two = export(analysed=[entry("a")]), export(analysed=[entry("b")])
+    with pytest.raises(ExportError, match=r"run c of the plan is in no shard's export \(1 of the plan's 3 runs"):
+        join_exports({1: one, 2: two}, plan("a", "b", "c"), SHARDS)
+    with pytest.raises(ExportError, match="run b of the plan is in no shard's export"):
+        join_exports({1: one}, plan("a", "b"), SHARDS[:1])
+    with pytest.raises(ExportError, match="run a is listed more than once"):
+        join_exports({1: one, 2: export(exhausted=[entry("a")])}, plan("a"), SHARDS)
+    with pytest.raises(ExportError, match="the shards' exports plan 3 runs, but the plan has 2"):
+        join_exports({1: {**one, "planned_runs": 2}, 2: two}, plan("a", "b"), SHARDS)
+
+
 def test_c29_a_merge_file_that_is_not_the_shards_one_to_n_is_refused():
-    """C29: merge.json is read back strictly: its schema, its keys, and shards 1..N each with a snapshot hash."""
+    """C29: merge.json is read back strictly: its schema, its keys, and shards 1..N of N at least 2, each with a
+    snapshot hash; a batch of one shard is no merge."""
     good = {
         "schema": MERGE_SCHEMA,
         "fingerprint": "f" * 64,
@@ -200,6 +220,8 @@ def test_c29_a_merge_file_that_is_not_the_shards_one_to_n_is_refused():
         {**good, "schema": "expcore-merge/0"},
         {**good, "extra": 1},
         {**good, "shards": good["shards"][:1]},
+        {**good, "count": 1, "shards": good["shards"][:1]},
+        {**good, "count": True, "shards": good["shards"][:1]},
         {**good, "shards": [good["shards"][1], good["shards"][0]]},
         {**good, "shards": [good["shards"][0], {**good["shards"][1], "snapshot_sha256": "short"}]},
         {**good, "shards": [good["shards"][0], {k: v for k, v in good["shards"][1].items() if k != "label"}]},

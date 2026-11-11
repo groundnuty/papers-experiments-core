@@ -48,7 +48,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
-from expcore.campaign.merge import SHARDS_DIR, MergeRefused, merge_text, read_merge
+from expcore.campaign.merge import MergeRefused, ShardFacts, facts_of_bytes, merge_document, merge_text, read_merge
+from expcore.campaign.merged import snapshot_rel
 from expcore.campaign.resume import FINGERPRINT_KEY
 from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
@@ -174,21 +175,26 @@ def _anonymised_snapshot(data: bytes, scratch: Path) -> bytes:
 
 def _anonymised_shards(files: dict[str, bytes], scratch: Path) -> dict[str, str]:
     """Rewrite, in `files` (mutated in place: the caller's copy of the package), the snapshot of every shard of a merged
-    batch without its environment's sources, and merge.json with the SHA-256 of each rewritten snapshot, which the
-    replay check and the analysis compare the snapshots with. Returns each snapshot's old hash and its new one: the
-    export lists the hashes, so the author's export is compared with them swapped (`_outputs`)."""
+    batch without its environment's sources, and merge.json as the merge writes it from the rewritten snapshots
+    (`merge_document`): each snapshot's SHA-256 changes, and so does the campaign fingerprint's, which hashes the
+    environment with its sources. The check and the analysis rebuild merge.json from the snapshots and refuse one that
+    differs. Returns each snapshot's old hash and its new one: the export lists the hashes, so the author's export is
+    compared with them swapped (`_outputs`)."""
     try:
         document = read_merge(files[MERGE_PATH], MERGE_PATH)
     except (KeyError, MergeRefused) as error:
         raise PackageError(f"{MERGE_PATH}: {error}") from None
     swaps: dict[str, str] = {}
+    rewritten: list[ShardFacts] = []
     for shard in document["shards"]:
-        path = f"{OUT_DIR}/{SHARDS_DIR}/{shard['index']}/{SNAPSHOT_FILE}"
+        path = f"{OUT_DIR}/{snapshot_rel(shard['index'])}"
         files[path] = _anonymised_snapshot(files[path], scratch)
-        rewritten = hashlib.sha256(files[path]).hexdigest()
-        swaps[shard["snapshot_sha256"]] = rewritten
-        shard["snapshot_sha256"] = rewritten
-    files[MERGE_PATH] = merge_text(document).encode("utf-8")
+        try:
+            rewritten.append(facts_of_bytes(files[path], path, out=scratch, snapshot=scratch / SNAPSHOT_FILE))
+        except MergeRefused as error:
+            raise PackageError(str(error)) from None
+        swaps[shard["snapshot_sha256"]] = rewritten[-1].snapshot_sha256
+    files[MERGE_PATH] = merge_text(merge_document(rewritten)).encode("utf-8")
     return swaps
 
 

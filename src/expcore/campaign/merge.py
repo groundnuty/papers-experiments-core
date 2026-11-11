@@ -24,7 +24,9 @@ replay check (`study.merge`) last:
 which every shard shares), `rule`, `count`, `environment_identity` and `shards`, each `{index, label, started_utc,
 shares, runs, snapshot_sha256}` in index order, `runs` being how many runs the shard planned. It names no host or path:
 a batch is published in a package. `check` binds the file by its SHA-256 and checks each snapshot against it, and the
-analysis reads each snapshot once, compared with the same hash (`study.verified`).
+analysis reads each snapshot once, compared with the same hash (`study.verified`). Neither trusts what the file says:
+each rebuilds it from the snapshots and the study's plan, through the checks above, and refuses a file that differs
+(`campaign.merged`).
 
 The merge writes into a staging directory beside `OUT` and renames it into place, so a refused or killed merge leaves
 `OUT` as it was, and `OUT` must not exist or must be empty.
@@ -35,11 +37,10 @@ import json
 import os
 import shutil
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from expcore.campaign.manifest import Manifest, compare_fingerprints, fingerprint_sha256
 from expcore.campaign.resume import FINGERPRINT_KEY, recorded_fingerprint
@@ -66,6 +67,7 @@ CHECK_KEY = "merge"  # the key of the replay check that says which merge.json it
 _SKIPPED = frozenset({"replay-check.json", SNAPSHOT_FILE})  # a shard's own check of its batch: not part of the union
 _SHARD_KEYS = {"index", "label", "started_utc", "shares", "runs", "snapshot_sha256"}
 _DOCUMENT_KEYS = {"schema", "fingerprint", "rule", "count", "environment_identity", "shards"}
+Query = Callable[[str], Iterable[Sequence[Any]]]  # runs SQL on a store, or a snapshot of one, and returns the rows
 
 
 class MergeRefused(RuntimeError):
@@ -102,14 +104,14 @@ def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _meta(db: sqlite3.Connection, where: Path) -> dict[str, str]:
+def _meta(query: Query, where: object) -> dict[str, str]:
     try:
-        return {row[0]: row[1] for row in db.execute("SELECT key, value FROM meta")}
+        return {row[0]: row[1] for row in query("SELECT key, value FROM meta")}
     except sqlite3.Error as error:
         raise MergeRefused(f"{where}: its store has no meta table ({type(error).__name__}: {error})") from None
 
 
-def _json(meta: Mapping[str, str], key: str, where: Path) -> Any:
+def _json(meta: Mapping[str, str], key: str, where: object) -> Any:
     """A meta value that is JSON; refused, naming the key, when the store lacks it or it is not JSON."""
     if key not in meta:
         raise MergeRefused(f"{where}: its store records no {key!r}, so it did not run as a shard of this core")
@@ -122,8 +124,7 @@ def _json(meta: Mapping[str, str], key: str, where: Path) -> Any:
 def read_shard(out: Path, scratch: Path) -> ShardFacts:
     """Copy the store of the shard whose `out/` is `out` to `scratch` and read what the merge needs from the copy.
 
-    Refuses a store with attempts still running, and a store that is not a shard's: no spec, start, environment
-    identity or shares, or a fingerprint it does not record.
+    Refuses a store with attempts still running, and a store that is not a shard's (`facts_of`).
     """
     store = out / STATE_FILE
     try:
@@ -132,32 +133,53 @@ def read_shard(out: Path, scratch: Path) -> ShardFacts:
         raise MergeRefused(f"{out}: {error}; a shard is merged when it has finished") from None
     except SnapshotError as error:
         raise MergeRefused(str(error)) from None
-    db = sqlite3.connect(f"file:{quote(str(scratch))}?mode=ro", uri=True)
+    return facts_of_bytes(scratch.read_bytes(), out, out=out, snapshot=scratch)
+
+
+def facts_of_bytes(data: bytes, where: object, *, out: Path, snapshot: Path) -> ShardFacts:
+    """What the shard store whose bytes are `data` says of itself (`facts_of`), with the SHA-256 of those bytes."""
+    db = sqlite3.connect(":memory:")
     try:
-        meta = _meta(db, out)
-        if META_SHARD not in meta:
-            raise MergeRefused(f"{out}: not a shard: its store records no {META_SHARD!r}, so it ran unsharded")
         try:
-            spec = ShardSpec.from_json(_json(meta, META_SHARD, out))
-        except ShardError as error:
-            raise MergeRefused(f"{out}: the shard spec in its store is unusable: {error}") from None
-        started = meta.get(META_STARTED)
-        if not isinstance(started, str) or not started:
-            raise MergeRefused(f"{out}: its store records no {META_STARTED!r}")
-        try:
-            environment = check_identity(_json(meta, META_ENVIRONMENT, out))
-        except ShardError as error:
-            raise MergeRefused(f"{out}: the environment identity in its store is unusable: {error}") from None
-        shares = _json(meta, META_SHARES, out)
-        fingerprint = recorded_fingerprint([(meta[FINGERPRINT_KEY],)] if FINGERPRINT_KEY in meta else [])
-        if fingerprint is None:
-            raise MergeRefused(f"{out}: its store records no campaign fingerprint")
-        runs = {row[0]: json.loads(row[1]) for row in db.execute("SELECT run_key, factors FROM runs")}
-    except sqlite3.Error as error:
-        raise MergeRefused(f"{out}: cannot read its store ({type(error).__name__}: {error})") from None
+            db.deserialize(data)
+        except sqlite3.Error as error:
+            raise MergeRefused(f"{where}: not a campaign store ({type(error).__name__}: {error})") from None
+        query: Query = lambda sql: db.execute(sql).fetchall()  # noqa: E731
+        return facts_of(query, where, out=out, snapshot=snapshot, sha256=hashlib.sha256(data).hexdigest())
     finally:
         db.close()
-    return ShardFacts(out, scratch, sha256_of(scratch), spec, started, environment, shares, fingerprint, runs)
+
+
+def facts_of(query: Query, where: object, *, out: Path, snapshot: Path, sha256: str) -> ShardFacts:
+    """What a shard's store says of itself, read through `query` (SQL in, rows out); `where` names it in a message.
+
+    The merge reads a shard's store this way, and so do the check and the analysis of a merged batch, each from the
+    snapshot it verified, to rebuild merge.json (`campaign.merged`). Refuses a store that is not a shard's: no spec,
+    start, environment identity or shares, or a fingerprint it does not record.
+    """
+    try:
+        meta = _meta(query, where)
+        if META_SHARD not in meta:
+            raise MergeRefused(f"{where}: not a shard: its store records no {META_SHARD!r}, so it ran unsharded")
+        try:
+            spec = ShardSpec.from_json(_json(meta, META_SHARD, where))
+        except ShardError as error:
+            raise MergeRefused(f"{where}: the shard spec in its store is unusable: {error}") from None
+        started = meta.get(META_STARTED)
+        if not isinstance(started, str) or not started:
+            raise MergeRefused(f"{where}: its store records no {META_STARTED!r}")
+        try:
+            environment = check_identity(_json(meta, META_ENVIRONMENT, where))
+        except ShardError as error:
+            raise MergeRefused(f"{where}: the environment identity in its store is unusable: {error}") from None
+        shares = _json(meta, META_SHARES, where)
+        fingerprint = recorded_fingerprint([(meta[FINGERPRINT_KEY],)] if FINGERPRINT_KEY in meta else [])
+        if fingerprint is None:
+            raise MergeRefused(f"{where}: its store records no campaign fingerprint")
+        runs = {row[0]: json.loads(row[1]) for row in query("SELECT run_key, factors FROM runs")}
+    except sqlite3.Error as error:
+        raise MergeRefused(f"{where}: cannot read its store ({type(error).__name__}: {error})") from None
+    return ShardFacts(out, snapshot, sha256, spec, started, environment, shares, fingerprint, runs)
 
 
 # --- the checks that need only what the snapshots say --------------------------------------------------------------
@@ -338,12 +360,14 @@ def read_merge(raw: bytes, where: object = MERGE_FILE) -> dict[str, Any]:
         raise MergeRefused(f"{where}: not an {MERGE_SCHEMA} merge file")
     shards = document["shards"]
     count = document["count"]
-    ok = isinstance(shards, list) and isinstance(count, int) and not isinstance(count, bool)
+    ok = isinstance(shards, list) and isinstance(count, int) and not isinstance(count, bool) and count >= 2
     ok = ok and all(isinstance(s, dict) and set(s) == _SHARD_KEYS for s in shards)
     ok = ok and [s["index"] for s in shards] == list(range(1, count + 1))
     ok = ok and all(isinstance(s["snapshot_sha256"], str) and len(s["snapshot_sha256"]) == 64 for s in shards)
     if not ok:
-        raise MergeRefused(f"{where}: its list of shards is not the shards 1 to {count}, each with its snapshot hash")
+        raise MergeRefused(
+            f"{where}: its list of shards is not the shards 1 to {count!r}, at least 2, each with its snapshot hash"
+        )
     return document
 
 

@@ -13,11 +13,15 @@ snapshot and this module joins the results:
   every other kind any shard used, sorted;
 - `shards` is merge.json's list of shards, as it is.
 
+The joined run lists must hold every run of the whole plan exactly once, and the planned runs must add up to it: a
+merged batch with a shard left out is refused here too, whatever its merge.json says.
+
 What stays the shard's own is when and how an attempt began: `dispatch_seq`, `started_at` and `lease_wait_s` come from
 the shard's store, where each shard counts its own dispatches, so they say nothing about the order across shards.
 An unmerged batch's export has neither `shard` nor `shards`: nothing here runs for it.
 """
 
+import collections
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -72,8 +76,26 @@ def join_exports(
             if any(part != value for part in parts):
                 raise ExportError(f"the shards' exports disagree on {key!r}")
             joined[key] = value
+    _require_the_plan(joined, seq_of)
     joined[SHARDS_KEY] = [dict(shard) for shard in shards]
     return joined
+
+
+def _require_the_plan(joined: Mapping[str, Any], seq_of: Mapping[str, int]) -> None:
+    """Refuse a joined export whose run lists do not hold every run of the plan exactly once: a shard left out of a
+    merged batch would otherwise be analysed as a smaller campaign."""
+    held = collections.Counter(entry["run_key"] for name in LISTS for entry in joined.get(name, ()))
+    twice = sorted((key for key, n in held.items() if n > 1), key=seq_of.__getitem__)
+    if twice:
+        raise ExportError(f"run {twice[0]} is listed more than once in the shards' exports")
+    missing = sorted(set(seq_of) - set(held), key=seq_of.__getitem__)
+    if missing:
+        raise ExportError(
+            f"run {missing[0]} of the plan is in no shard's export ({len(missing)} of the plan's {len(seq_of)} runs "
+            "are missing); a merged batch holds every shard"
+        )
+    if joined["planned_runs"] != len(seq_of):
+        raise ExportError(f"the shards' exports plan {joined['planned_runs']} runs, but the plan has {len(seq_of)}")
 
 
 def _same_shape(first: Mapping[str, Any], other: Mapping[str, Any], at: int, index: int) -> None:
