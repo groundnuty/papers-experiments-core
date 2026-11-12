@@ -26,17 +26,18 @@ its tools called through MCP (`outage_tools`: `get_file_distribution`, `list_spa
 server are started for the space's scenario (`outage_agent`), and each is measured with everything up first: a
 baseline that does not serve stops nothing. Every cell has an outcome (`served`, `partial`, `differs`, `refused`, `no
 answer`, `blocked`) and its seconds against `Context.outage_bound_s`; a mount read also its errno and whether it
-blocked, a tool call its wording, timeout and attempts.
+blocked, a tool call whether it timed out, its attempts and its wording as a digest with the error terms it holds.
 
-**After it**: the restore, by the fault injector, verified by the identity of the service having changed, and the target
-answering again, then the reads again, which must return what was written. The restore runs in a `finally`; the
-scratch is torn down after it, since teardown deletes through the target, and its absence is verified (O11).
+**After it**: the restore, by the fault injector, verified by the identity of the service having changed and the
+provider serving, and the target answering again, then the reads again, which must return what was written. The
+restore runs in a `finally`; the scratch is torn down after it, since teardown deletes through the target, and its
+absence is verified (O11).
 
 **The injector (O10, O11).** The provider is taken down and brought back by the platform's fault injector
 (`outage_fault`, over `expcore_onedata.faults.FaultInjector`): journalled before the stop, recovered if an earlier
-process left it open, restored only with a changed identity, a stop of unknown outcome waited out. The check holds the
-federation's lock exclusively (`admission.FederationLock`) for a whole space's scenario, the scratch's teardown
-included, and the injector takes that admission as its own.
+process left it open, restored only with a changed identity and once the provider serves, a stop of unknown outcome
+waited out. The check holds the federation's lock exclusively (`admission.FederationLock`) for a whole space's
+scenario, the scratch's teardown included, and the injector takes that admission as its own.
 
 **Verdict.** Passed: the target was seen down and restored, every cell measured, the re-reads right, the scratch gone.
 Failed: the target answered while it was down, it could not be restored or did not answer or read back after the
@@ -49,8 +50,11 @@ cell answered is a fact, never a failure.
 
 **Consent (O10).** Nothing is stopped without `EXPCORE_LIVE_MUTATE=1`, `EXPCORE_LIVE_FAULTS=1` and `sanctioned = true`
 in `[faults]` of platform.toml. **Names (O12).** Providers are `providers[i]` in every key and message, spaces
-`spaces[i]`, files the pair and kind they are, a tool's wording is scrubbed of every name and id the check knows, and
-nothing identifying is recorded.
+`spaces[i]`, files the pair and kind they are, and nothing identifying is recorded. Only structured fields are kept
+(outcomes, statuses, error ids and errnos of a plain word's shape, counts, seconds, tool names, held bytes by label, a
+transfer's state from a known set); a tool's answer or wording, which can name what the check does not know, is kept
+only as a digest of it with every known name and id-like token replaced, its length and its error terms
+(`outage_tools.Scrubber`).
 """
 
 import asyncio

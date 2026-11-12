@@ -21,6 +21,7 @@ by an id or a name (O12).
 
 import errno as errnos
 import hashlib
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -31,6 +32,7 @@ from expcore_onedata.provision import LISTING_ATTRIBUTES, LISTING_LIMIT, Provisi
 
 BLOCKED_FRACTION = 0.9  # an unanswered call that took this much of its bound was blocked, not refused
 ROLES = ("target", "mirror", "local")
+WORD = re.compile(r"[A-Za-z][A-Za-z_]{0,63}")  # an error id or a class name: letters, never an id, host or address
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,14 @@ class ScratchFile:
         return hashlib.sha256(self.data).hexdigest()
 
 
+def word(value: Any, pattern: re.Pattern[str] = WORD) -> str | None:
+    """A word an answer names (an error id, an errno's name, an exception's class) as it may be recorded (O12): the
+    word when it is one of the shape `pattern` allows, else `other`; None stays None."""
+    if value is None:
+        return None
+    return value if isinstance(value, str) and pattern.fullmatch(value) else "other"
+
+
 def unanswered(seconds: float, bound_s: float) -> str:
     """The outcome of a call that got no answer: `blocked` when it took the bound's blocked fraction, else `no
     answer`. A timeout is one, whether a transport's or a mount's ETIMEDOUT (Python's `TimeoutError`)."""
@@ -100,7 +110,7 @@ def failure_facts(error: BaseException, seconds: float, bound_s: float) -> dict[
         facts.update(status=None, transport=False, os_errno=errnos.errorcode.get(error.errno or 0, "unknown"))
         answered = True
     elif isinstance(error, PlatformError):
-        facts.update(status=error.status, code=error.code, errno=error.errno, transport=error.transport)
+        facts.update(status=error.status, code=word(error.code), errno=word(error.errno), transport=error.transport)
         answered = error.status is not None
     else:
         raise error

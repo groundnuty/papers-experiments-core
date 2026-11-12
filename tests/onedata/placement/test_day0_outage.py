@@ -381,18 +381,48 @@ def test_o28_a_knowledge_tool_whose_schema_cannot_be_filled_is_unmeasured_and_th
     assert entry.facts["restore"]["verified"] is True
 
 
-def test_o28_a_tool_that_answers_an_error_keeps_its_wording_scrubbed_and_its_attempts(context, agent):
+def test_o28_a_tool_that_answers_an_error_keeps_its_wordings_digest_and_its_attempts(context, agent):
     """O28: a read-only tool that answers an error while the provider is down is called again, at most three times,
-    and each error's wording is recorded with every name and id the check knows replaced by its label."""
-    agent.tool_errors = {"get_file_distribution": f"cannot reach https://alpha.test ({ALPHA_ID}) for {SPACE_NAME}"}
+    and each error's wording is recorded as a digest (the SHA-256 prefix of the text with every known name and id-like
+    token replaced), its length and the error terms it holds, never as text."""
+    agent.tool_errors = {"get_file_distribution": f"https://alpha.test ({ALPHA_ID}) is unreachable for {SPACE_NAME}"}
     entry = outage_check(context)
     cell = entry.facts["during"]["knowledge"]["get_file_distribution"]["owner_only"]
     assert (cell["outcome"], cell["attempts"], len(cell["errors"])) == ("refused", 3, 3)
-    assert "providers[0]" in cell["error"]
-    assert "spaces[0]" in cell["error"]
+    assert set(cell["error"]) == {"sha256", "chars", "terms"}
+    assert len(cell["error"]["sha256"]) == 16
+    assert cell["errors"] == [cell["error"]["sha256"]] * 3  # the same wording each time
+    assert cell["error"]["terms"] == ["unreachable"]
     for needle in ("alpha.test", ALPHA_ID, SPACE_NAME):
         assert needle not in json.dumps(entry.facts), needle
     assert entry.ok is True  # what a tool answered is a fact, not a failure
+
+
+def test_o28_no_name_in_a_tools_answer_reaches_the_facts_whether_the_check_knows_it_or_not(context, agent):
+    """O28: a tool's answers and errors are free text holding names the check cannot know: a slot user's id in a
+    transfer record, a provider's registered name that is not its key in platform.toml, an address. None of them
+    reaches the facts: only structured fields are kept (outcome, seconds, attempts, the providers' held bytes by
+    label, a transfer's state from a known set), and a text only as its digest, length and error terms."""
+    user_id = "u-slot-a-tools"  # the leased slot's tool-server user
+    foreign, address = "Northwind Archive", "192.0.2.17"
+    agent.answer_extra = {
+        "get_transfer": {"userId": user_id, "replicatingProviderName": foreign, "source": address},
+        "get_file_distribution": {"note": f"{foreign} at {address}"},
+    }
+    agent.tool_errors = {"list_space_providers": f"{foreign} at {address} refused user {user_id}: timed out"}
+    entry = outage_check(context)
+    assert entry.ok is True, entry.summary
+    text = json.dumps({"summary": entry.summary, "facts": entry.facts})
+    for needle in (user_id, foreign, "Northwind", address):
+        assert needle not in text, needle
+    providers = entry.facts["during"]["knowledge"]["list_space_providers"]
+    assert providers["outcome"] == "refused"
+    assert providers["error"]["terms"] == ["timed out", "refused"]
+    follow = entry.facts["during"]["knowledge"]["schedule_file_replication"]["replicated"]["get_transfer"]
+    assert follow["states"][-1][1] == "completed"
+    assert set(follow["last_call"]["answer"]) == {"sha256", "chars", "terms"}
+    owner_only = entry.facts["during"]["knowledge"]["get_file_distribution"]["owner_only"]
+    assert owner_only["providers"][entry.facts["roles"]["target"]]["held_bytes"] == outage_run.FILE_BYTES
 
 
 def test_o28_a_tool_that_never_answers_is_blocked_at_the_bound(context, agent):

@@ -20,14 +20,16 @@ records as a gap, never as an outcome.
 """
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from expcore_onedata.day0.outage_cells import unanswered
+from expcore_onedata.day0.outage_cells import unanswered, word
 from expcore_onedata.sandbox.api import ExecResult
 
 KILL_WAIT_S = 10.0  # how long the cell waits for a killed child that is stuck in the kernel
 CELL_MARGIN_S = 30.0  # what a cell's own limit adds to its reads' deadlines
+ERRNO_NAME = re.compile(r"E[A-Z0-9]{1,15}|unknown")  # errno.errorcode's names, and the cell's word for none
 
 CHILD = r"""
 import errno, hashlib, json, os, sys
@@ -129,7 +131,13 @@ def _base(row: Mapping[str, Any], bound_s: float) -> dict[str, Any]:
 
 
 def _error(row: Mapping[str, Any]) -> dict[str, Any]:
-    return {"errno": row.get("error"), "errno_number": row.get("errno"), "error_kind": row.get("kind")}
+    """A row's error as it may be recorded: an errno's name and number and a class name, each of its shape (O12)."""
+    number = row.get("errno")
+    return {
+        "errno": word(row.get("error"), ERRNO_NAME),
+        "errno_number": number if isinstance(number, int) and not isinstance(number, bool) else None,
+        "error_kind": word(row.get("kind")),
+    }
 
 
 def _timed_out(row: Mapping[str, Any]) -> bool:

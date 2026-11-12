@@ -223,6 +223,7 @@ class AgentWorld:
         self.tool_broken: dict[str, str] = {}  # answers an error with this wording whether or not anything is down
         self.tool_hangs: set[str] = set()
         self.hang_s = 0.0
+        self.answer_extra: dict[str, dict] = {}  # fields a tool's served answer carries besides the REST record
         self.tool_calls: list[tuple[str, dict]] = []
         self.mount_ops: list[tuple[str, str]] = []
 
@@ -288,7 +289,7 @@ class AgentWorld:
                     {"providerId": pid, "online": provider["domain"] not in self.world.down}
                     for pid, provider in fake.providers.items()
                 ]
-                return {"result": {"providers": rows}}
+                return {"result": {"providers": rows, **self.answer_extra.get(name, {})}}
             if name == "get_file_distribution":
                 answer = self._call("GET", f"/data/{arguments['file_id']}/distribution")
             elif name == "schedule_file_replication":
@@ -301,7 +302,7 @@ class AgentWorld:
             return {"error": f"{type(error).__name__} talking to https://{self.local_host}"}
         if answer.status_code >= 300:
             return {"error": f"HTTP {answer.status_code} from https://{self.local_host}"}
-        return {"result": answer.json()}
+        return {"result": {**answer.json(), **self.answer_extra.get(name, {})}}
 
 
 class ToolRelay:

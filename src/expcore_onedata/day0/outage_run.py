@@ -51,7 +51,8 @@ def payload(label: str) -> bytes:
 
 
 def scrubber(ctx: Context, entry: StudySpace) -> Scrubber:
-    """Every name and id of the configuration a tool's text may hold, with what the report calls it (O12)."""
+    """Every name and id of the configuration a tool's text may hold, with what the report calls it, replaced before
+    the text's digest is taken (O12)."""
     config, pairs = ctx.config, {}
     for name, provider in config.providers.items():
         label = config.provider_label(name)
