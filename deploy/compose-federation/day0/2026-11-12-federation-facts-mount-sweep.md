@@ -54,7 +54,7 @@ uv run python deploy/compose-federation/federation.py down
 
 The input's SHA-256 was `7271303c37cd9156cc019a96f3408b5ed3feae2b37f3e6cb67602ce6fff685f9`. `up` took 219 s. The
 oneclient image is on the host only by digest now, untagged; its id, `sha256:aff60c5f…`, is the one the 11 Nov run
-used as `onedata/oneclient:25.0`. The agent's image is `python:3.12-slim`, `sha256:423ed6ab…`, as on 11 Nov. Three
+used as `onedata/oneclient:25.0`. The agent's image is `python:3.12-slim`, `sha256:423ed6ab…`, as on 11 Nov. Four
 smoke runs of up to six reads per file came first, to check the script; their numbers are not used below.
 
 ## The launch, per setting
@@ -110,10 +110,12 @@ Every read's offset, length, bytes, seconds and gained ranges are in
   (146 B and 268 B). B's first read, 8 B at 0, placed the whole file.
 - **`most`** placed exactly what `defaults` placed, read for read: the thresholds of 0 and the whole-file cluster
   window changed nothing measured here.
-- **`least`** and **`min-block-4k`** placed the same bytes as each other, read for read, so the read-buffer options
-  changed nothing measured here. The first read (8 B at 0) placed 4096 B. Later gains were 4096 B blocks from a
-  read's own offset, the unheld tail of a read, short fills between held ranges, and fetches past a read's end: by
-  pread, seven per setting ended exactly 8192 B past the read's end; buffered, they ended up to 8071 B past it. Then,
+- **`least`** and **`min-block-4k`** placed the same totals, and the same gains read for read for A and for B by
+  pread. B buffered differed only in how two reads split the same 7220 B: one gain of 7220 B under `least`, gains of
+  4096 B and 3124 B under `min-block-4k`. So the read-buffer options changed nothing measured here. The first read
+  (8 B at 0) placed 4096 B. Later gains were 4096 B blocks from a read's own offset, the unheld tail of a read, short
+  fills between held ranges, and fetches past a read's end: by pread, seven per setting ended exactly 8192 B past the
+  read's end; buffered, they ended up to 8314 B past it. Then,
   after 13 (buffered) or 12 (pread) reads had gained bytes, the next read, 512 B, placed every byte of A still
   missing, 8247458 B and 8251185 B, in 5 ranges at once. B by pread ended without the 512 B at 311944.
 - **`more`:** A's first read placed 4194304 B from 0, and a later read inside those bytes (the buffered replay's 28th
@@ -149,8 +151,8 @@ oneclient's own fetching accounts for the bytes placed beyond the reads, and the
   4096 B under the 4 KiB settings, 4 MiB under `more`.
 - A pread of bytes `pine` held took a median 2.7 ms (2.3 ms to 4.3 ms, tenth to ninetieth percentile, over 520
   reads of up to 4 KiB that gained nothing), a 48 B pread at 0 straight after an 8 B pread at 0 included: each went
-  to oneclient, and the kernel's page cache did not answer it. Buffered reads that Python's buffer could answer took
-  a median 20 µs.
+  to oneclient, and the kernel's page cache did not answer it. Buffered reads of up to 4 KiB that gained nothing took
+  a median 20 µs (ninetieth percentile 3.4 ms, over 521 reads).
 - The refused shared mapping and the page cache that never answered are what FUSE's direct-I/O mode would show, a
   mode that bypasses the page cache and its read-ahead. The open flags themselves were not read.
 - Buffered and pread placed the same bytes under `defaults`, `more` and `most`. They differ only under the 4 KiB
