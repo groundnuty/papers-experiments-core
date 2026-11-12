@@ -10,7 +10,6 @@ import json
 
 import pytest
 from campaign_support import make_fingerprint, make_manifest, make_schema
-from platform_support import NOW, write_platform
 from sandbox_support import add_sandbox
 from tls_support import ANSWER, HAS_OPENSSL, TlsServer, make_federation_ca, swap_after_check
 
@@ -20,6 +19,7 @@ from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import load_platform
 from expcore_onedata.health import PlatformHealth
+from expcore_onedata.testing import NOW, write_platform
 from expcore_onedata.tls import WARNING
 from expcore_onedata.tokens import TokenIssuer
 

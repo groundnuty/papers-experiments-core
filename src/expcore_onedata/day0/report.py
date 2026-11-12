@@ -7,8 +7,8 @@ day-0 report did; unknown is listed in a table of its own and is never counted a
 into a directory the caller names and never over an earlier report.
 
 Nothing identifying a deployment is written. Every string is scrubbed of the configured URLs, hosts, identifiers and
-the space's name before it is written, and of any token the process has registered as a secret; providers are named by
-the label platform.toml gives them.
+the name and id of every declared space before it is written, and of any token the process has registered as a secret;
+providers are named by the label platform.toml gives them, and with several spaces a space by its position, `spaces[i]`.
 """
 
 import hashlib
@@ -46,8 +46,11 @@ def status(ok: bool | None) -> str:
 
 
 def sensitive_strings(config: PlatformConfig) -> list[str]:
-    """Return every string of the configuration that identifies the deployment, longest first."""
-    found = {config.zone.url, config.space.name, config.space.id}
+    """Return every string of the configuration that identifies the deployment, longest first: the zone's URL and host,
+    each provider's URL, host and id, and the name and id of every declared space, one or several."""
+    found = {config.zone.url}
+    for entry in config.spaces:
+        found.update({entry.space.name, entry.space.id})
     for provider in config.providers.values():
         found.update({provider.url, provider.host, provider.id or ""})
     found.add(config.zone.url.split("://")[-1])

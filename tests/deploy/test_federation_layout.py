@@ -95,6 +95,16 @@ REFUSED = [
         ('study_space = "alpha-space"', 'study_space = "alpha-space"\nplatform_template = "none.t"'),
         "platform_template",
     ),
+    (
+        "baseline not a boolean",
+        ('mirrors = ["elm"]', 'mirrors = ["elm"]\nbaseline = "no"'),
+        "spaces.alpha-space.baseline: must be true or false",
+    ),
+    (
+        "baseline a number",
+        ('mirrors = ["elm"]', 'mirrors = ["elm"]\nbaseline = 0'),
+        "spaces.alpha-space.baseline: must be true or false",
+    ),
     ("provider declared twice", ("[providers.elm]\nport = 29645", "[providers.oak]\nport = 29645"), "not a TOML file"),
 ]
 

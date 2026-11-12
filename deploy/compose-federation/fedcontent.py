@@ -7,6 +7,9 @@ therefore never deletes and makes again a directory of the same name: a baseline
 file (the large listing directory is kept whole when it is intact), and any other entry is removed, a directory of
 another name included. Every baseline file is then read back through the writer, and a file whose bytes differ is
 written again, for a bounded number of rounds.
+
+A space declared `baseline = false` has no baseline files: it is brought back to empty, everything in it removed, and
+nothing is written into it. A study space with none has no replicated file either, so it gets no transfer record.
 """
 
 import time
@@ -16,7 +19,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from fedboot import Bootstrap
-from fedlayout import LISTING_DIR, REPLICATED_FILE, BaselineFile, baseline
+from fedlayout import LISTING_DIR, REPLICATED_FILE, BaselineFile, baseline_plan
 from fedrest import PROVIDER_API, RestError, bearer
 from fedspec import Service, Spec
 
@@ -58,6 +61,7 @@ class Content:
     def __init__(self, boot: Bootstrap) -> None:
         self.boot = boot
         self.spec = boot.layout.spec
+        self.plan = baseline_plan(self.spec)
 
     def root(self, service: Service, space: str) -> str:
         sid = self.boot.ids.spaces[space]
@@ -135,8 +139,10 @@ class Content:
 
     def settle(self, space: str) -> tuple[int, dict[str, str]]:
         """Bring one space to its baseline; return the count of entries removed and the files' ids by path."""
-        service, files = writer_of(self.spec, space), baseline(space, self.spec.study_space)
+        service, files = writer_of(self.spec, space), self.plan[space]
         removed, directories, ids = self.clear(service, self.root(service, space), files)
+        if not files:
+            return removed, ids
         pending = [f for f in files if f.path not in ids]
         for _ in range(WRITE_ROUNDS):
             with ThreadPoolExecutor(WORKERS) as pool:
@@ -171,10 +177,11 @@ class Content:
 
     def reset(self, timeout_s: float) -> dict[str, int]:
         """Bring every space's content back to its baseline; return how many entries each space lost. A study space
-        with no mirror has nothing to replicate to, so it has no transfer record."""
+        with no mirror has nothing to replicate to, and one declared `baseline = false` has no file to replicate, so
+        neither has a transfer record."""
         removed = {}
         for declared in self.spec.spaces:
             removed[declared.name], ids = self.settle(declared.name)
-            if declared.name == self.spec.study_space and declared.mirrors:
+            if declared.name == self.spec.study_space and declared.mirrors and declared.baseline:
                 self.replicate(ids[REPLICATED_FILE], declared.mirrors[0], timeout_s)
         return removed

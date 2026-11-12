@@ -47,12 +47,13 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.sandbox import gatelog, kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
+from expcore_onedata.sandbox.gatepolicy import PAGED
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, mount_identity, parse_mountinfo
 from expcore_onedata.sandbox.inputs import InputsRecord
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
 from expcore_onedata.sandbox.settings import SandboxSettings
-from expcore_onedata.tokens import MintedToken, RunTokens, TokenIssuer, data_path_spec
+from expcore_onedata.tokens import MintedToken, Plane, RunTokens, TokenIssuer, data_path_spec
 from expcore_onedata.users import GROUP, SlotProbe, Slots, SlotTokens, TokenJournal
 
 if TYPE_CHECKING:
@@ -291,11 +292,12 @@ class SandboxPlatform:
     def _spec(
         self,
         run_key: str,
-        mode: DataPathMode,
+        level: str,
         token: MintedToken | None,
         lease: Lease | None,
         inputs: Sequence[ReadOnlyInput] = (),
     ) -> SandboxSpec:
+        mode = self._s.mode_of(level)
         lease_key, given = (lease.key if lease else None), tuple(inputs)
         if mode is DataPathMode.NONE:
             return SandboxSpec(run_key=run_key, mode=mode, lease_key=lease_key, inputs=given)
@@ -306,6 +308,7 @@ class SandboxPlatform:
             zone=Endpoint.from_url(self._config.zone.url),
             provider=Endpoint.from_url(self._config.local_provider.url),  # the agent is pinned to its local provider
             lease_key=lease_key,
+            listing=self._s.listing_of(level) or PAGED,  # the level's listing mode (O21)
             inputs=given,
         )
 
@@ -320,7 +323,7 @@ class SandboxPlatform:
                 raise ValueError("a run with a tool server needs a leased slot: its tool-server user is the slot's")
             if mode is DataPathMode.NONE:
                 return None
-            spec = data_path_spec(self._config.space.id, mode.interface or "rest")
+            spec = data_path_spec(self._config.space_ids(Plane.DATA_PATH), mode.interface or "rest")
             return RunTokens(self._issuer.mint(spec, self._fixed(), ceiling_s=ceiling_s), None)
         if mode is DataPathMode.NONE and condition is None:
             return None  # a run that needs neither plane mints nothing, whatever it holds
@@ -343,7 +346,7 @@ class SandboxPlatform:
     def _prepare(
         self,
         run_key: str,
-        mode: DataPathMode,
+        level: str,
         lease: Lease | None,
         tokens: RunTokens | None,
         condition: str | None,
@@ -355,7 +358,7 @@ class SandboxPlatform:
         sandbox = DockerSandbox(
             self._host,
             self._s,
-            self._spec(run_key, mode, data, lease, inputs),
+            self._spec(run_key, level, data, lease, inputs),
             registry=self._registry,
             config_sha256=self._config.sha256,
             **self._options,
@@ -433,7 +436,7 @@ class SandboxPlatform:
                 )
                 minting.add_done_callback(lambda _: minted())  # a task that never got to run has no thread to end
                 tokens = await asyncio.shield(minting)
-                sandbox = self._prepare(run_key, mode, lease, tokens, condition, inputs)
+                sandbox = self._prepare(run_key, level, lease, tokens, condition, inputs)
                 ended = self._threads.began(lease.key if lease is not None else None)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end

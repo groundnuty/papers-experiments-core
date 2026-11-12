@@ -1,10 +1,10 @@
 """The pinned tool-server checkout: the commit it holds, and that it is clean."""
 
 import pytest
-from platform_support import write_platform
 
 from expcore_onedata.config import load_platform
 from expcore_onedata.pin import PinError, verify_configured, verify_pin
+from expcore_onedata.testing import write_platform
 
 
 @pytest.fixture

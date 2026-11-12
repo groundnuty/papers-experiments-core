@@ -3,7 +3,6 @@
 import dataclasses
 
 import pytest
-from platform_support import ALPHA_ID, NOW, write_platform
 
 from expcore.campaign.healthgate import Health, read_health
 from expcore.config.loading import ConfigError
@@ -11,6 +10,7 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.federation import ReportedProvider, SpaceView
 from expcore_onedata.health import REFRESH_BEFORE_S, TOKEN_CAP_S, PlatformHealth, compare
+from expcore_onedata.testing import ALPHA_ID, NOW, write_platform
 from expcore_onedata.tokens import TokenIssuer
 
 

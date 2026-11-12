@@ -2,13 +2,12 @@
 
 import json
 import sys
-from pathlib import Path
 
 import pytest
 
 from expcore.tools.manifest import FrozenManifest, ManifestError, diff, digest, main, mismatches
 
-SERVER = str(Path(__file__).resolve().parents[1] / "support" / "fake_mcp_server.py")
+SERVER = ["-m", "expcore_onedata.testing.fake_mcp_server"]  # the stand-in MCP server: its module, run with -m
 
 
 def tool(name, description="d", schema=None):
@@ -91,12 +90,12 @@ def test_a_missing_file_is_refused_with_its_name(tmp_path):
 
 def test_the_command_line_freezes_a_server_and_checks_it_later(tmp_path, capsys):
     out = tmp_path / "tools.json"
-    server = [sys.executable, SERVER, "--tools", "echo,add"]
+    server = [sys.executable, *SERVER, "--tools", "echo,add"]
     assert main(["freeze", str(out), "--", *server]) == 0
     assert FrozenManifest.load(out).tools[0]["name"] == "add"
     assert main(["check", str(out), "--", *server]) == 0
     assert "equals the frozen one" in capsys.readouterr().out
-    assert main(["check", str(out), "--", sys.executable, SERVER, "--tools", "echo"]) == 1
+    assert main(["check", str(out), "--", sys.executable, *SERVER, "--tools", "echo"]) == 1
     assert "missing from the server: add" in capsys.readouterr().err
 
 
@@ -104,7 +103,7 @@ def test_l13_the_command_line_takes_its_options_after_the_file_as_its_usage_show
     """L13: `freeze OUT --pass-env NAME -- COMMAND`, the documented form, freezes the server; the options are not
     taken for the server's command."""
     out = tmp_path / "tools.json"
-    server = [sys.executable, SERVER, "--tools", "echo,add"]
+    server = [sys.executable, *SERVER, "--tools", "echo,add"]
     assert main(["freeze", str(out), "--pass-env", "TOYLAB_HOME", "--timeout", "60", "--", *server]) == 0
     assert [t["name"] for t in FrozenManifest.load(out).tools] == ["add", "echo"]
     assert main(["check", str(out), "--timeout", "60", "--pass-env", "TOYLAB_HOME", "--", *server]) == 0

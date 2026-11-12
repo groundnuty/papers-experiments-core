@@ -13,6 +13,7 @@ from pathlib import Path
 from fedboot import Bootstrap
 from feddocker import gib
 from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout
+from fedspec import Spec
 
 PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")
 
@@ -23,6 +24,32 @@ def root_parent(layout: Layout) -> dict:
         "path": str(layout.parent),
         "set_by": "default" if layout.parent_is_default else "EXPCORE_FED_ROOT_PARENT",
     }
+
+
+def baseline_files(spec: Spec) -> dict | None:
+    """The study space's baseline files a check may read, or None when the study space is declared `baseline = false`:
+    it holds none, so a check that reads one has nothing to read there. `spaces.<name>.baseline` says which other
+    spaces keep theirs."""
+    if not spec.space(spec.study_space).baseline:
+        return None
+    return {"content": CONTENT_FILE, "listing_directory": LISTING_DIR, "listing_entries": LISTING_ENTRIES}
+
+
+def baseline_left_behind(layout: Layout) -> list[str]:
+    """The spaces the recorded facts show were brought up with baseline files and the layout now declares
+    `baseline = false`: up on a federation that is up writes and removes none, so those files would stay where an agent
+    can read them. Facts from before the flag was recorded count as having had the files; a space the facts do not list
+    had none; no facts.json (a first up) means nothing was written."""
+    if not layout.facts.is_file():
+        return []
+    try:
+        recorded = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]
+        had_files = {name: space.get("baseline", True) for name, space in recorded.items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RuntimeError(
+            f"{layout.facts.name} cannot be read as the facts up writes ({type(error).__name__})"
+        ) from None
+    return [s.name for s in layout.spec.spaces if not s.baseline and had_files.get(s.name, False)]
 
 
 def facts_of(boot: Bootstrap) -> dict:
@@ -49,6 +76,7 @@ def facts_of(boot: Bootstrap) -> dict:
                 "mirrors": list(s.mirrors),
                 "supported_by": list(s.supporters),
                 "agent_visible": s.agent_visible,
+                "baseline": s.baseline,
             }
             for s in spec.spaces
         },
@@ -69,7 +97,7 @@ def facts_of(boot: Bootstrap) -> dict:
             "user_password_file_pattern": "{user}.pass",
         },
         "ca_file": "ca/federation-ca.pem",
-        "files": {"content": CONTENT_FILE, "listing_directory": LISTING_DIR, "listing_entries": LISTING_ENTRIES},
+        "files": baseline_files(spec),
         "paths_relative_to": "the directory holding this file",
         "root_parent": root_parent(boot.layout),
     }
@@ -131,7 +159,9 @@ def describe(layout: Layout) -> str:
             (
                 f"Space `{s.name}`" + (" (study space)" if s.name == spec.study_space else ""),
                 f"owner `{s.owner}`, mirrors {', '.join(f'`{m}`' for m in s.mirrors) or 'none'}, "
-                f"support {gib(s.support_bytes)} each" + ("" if s.agent_visible else "; day-0 only, no agent user"),
+                f"support {gib(s.support_bytes)} each"
+                + ("" if s.agent_visible else "; day-0 only, no agent user")
+                + ("" if s.baseline else "; no baseline files"),
             )
             for s in spec.spaces
         ),

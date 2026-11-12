@@ -1,9 +1,9 @@
 """The probes record every transfer of the space that started in the run's window, whoever started it (O08)."""
 
 import pytest
-from placement_support import ALPHA_ID, BETA_ID, DATA, tool_plane_replicates
 
 from expcore_onedata.probes import PlatformProbes
+from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA, tool_plane_replicates
 
 PATH = "study/data.bin"
 

@@ -9,8 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from platform_support import NOW
-from sandbox_support import FAST
+from sandbox_support import COMPLETE_LEVEL, FAST
 
 from expcore.campaign.lease import LeasePool
 from expcore.errors import InfraError
@@ -18,6 +17,7 @@ from expcore_onedata.sandbox.api import DataPathMode, SandboxError
 from expcore_onedata.sandbox.hostops import CmdResult, MountTableError, fuse_mounts, parse_mountinfo
 from expcore_onedata.sandbox.provider import SandboxPlatform, SandboxProbe
 from expcore_onedata.sandbox.registry import Registry
+from expcore_onedata.testing import NOW
 from expcore_onedata.tokens import TokenRefused
 from expcore_onedata.users import GROUP, JOURNAL, SAFETY_MARGIN_S, TokenJournal
 
@@ -162,6 +162,15 @@ def test_o05_each_data_path_gets_a_read_only_token_of_its_own_interface_minted_b
     assert sandbox.metadata()["data_path_token"]["slot"] == 0  # the first of [slots], by position
     assert sandbox.spec.token.subject == stage.slots.get(KEY).data_path.user_id
     assert "token" not in json.dumps(sandbox.metadata()["data_path_token"]).lower().replace("data_path_token", "")
+
+
+@pytest.mark.parametrize(("level", "listing"), [(COMPLETE_LEVEL, "complete"), ("via-gate", "paged"), ("mounted", None)])
+def test_o21_the_launch_gives_a_run_the_listing_mode_its_level_selects(stage, level, listing):
+    """O21: a study selects the listing mode per condition through the level of its data path; the launch gives the
+    run's sandbox that level's mode, and the run's metadata records it."""
+    sandbox, _ = run_launch(stage, level)
+    assert sandbox.spec.listing == (listing or "paged")
+    assert sandbox.metadata()["listing"] == listing
 
 
 def test_o12_the_platform_launch_records_the_hash_of_the_platform_file(stage):

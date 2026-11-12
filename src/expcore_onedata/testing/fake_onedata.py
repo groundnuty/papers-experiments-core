@@ -40,10 +40,21 @@ class Request:
     range: str | None
     token: str | None
     body: bytes = b""
-    run_headers: tuple = ()  # every X-dataset-192 header value received
 
 
 class MockOnedata:
+    """The REST surface above, served over a real local HTTP socket (`start`, `stop`, `.port`) from a fixed file set.
+
+    Models: the five calls listed in the module docstring, with the paging rule measured on the real federation, byte
+    ranges (206 with `Content-Range`, 416 past the end), file ids made from paths, the single token it accepts, and a
+    space whose providers (`providers`) and the ones that support it (`supports`) a test changes. Every request is in
+    `.requests`.
+
+    Does not model: writes, deletes, transfers or block maps (`FakeData` has them), tokens other than the one it was
+    given (a subclass adds the ones it issues), file times (always 0) and permissions (always 644), more than one
+    space, and symbolic links. The file set is fixed when the mock is made.
+    """
+
     SPACE_ID = "spmock0001"
     PROVIDER_ID = "prmock0001"
 
@@ -51,7 +62,7 @@ class MockOnedata:
         self,
         files: Mapping[str, bytes | pathlib.Path],
         *,
-        space_name: str = "dataset-176",
+        space_name: str = "test-space",
         zone_host: str = "onezone.mock",
         provider_host: str = "provider.mock",
         max_limit: int | None = 10000,
@@ -159,7 +170,6 @@ class MockOnedata:
                             self.headers.get("Range"),
                             tok,
                             body,
-                            tuple(self.headers.get_all("X-dataset-192") or ()),
                         )
                     )
                 if self.command == "POST" and u.path.endswith("/onezone/tokens/infer_access_token_scope"):

@@ -11,7 +11,10 @@ service principal, on the host and outside every run, and compares the providers
 declared set (`[support] providers`), matching them by provider id. The declared set is the only expectation: a
 multi-provider federation passes when it reports exactly its declared providers, and a provider that is reported but not
 declared fails the check as surely as a declared one that is missing. The check also fails when the space's name differs from the declared one or a declared
-provider is reported offline.
+provider is reported offline. With several spaces (`[[spaces]]`) the token is a data path's, scoped to the spaces the
+data path reaches (`space_ids("data_path")`) and no others, and each of those is checked against its own support set;
+the first that fails is named by its position (`spaces[i]`). A space only the tool server's token reaches is not in the
+token's scope, so this check cannot read it.
 
 An answer that cannot be read is unhealthy, never a crash and never a pass: any failure, including an unexpected
 exception, becomes `Health(False, reason)`. The reason names positions in the file (`providers[i]`), counts and the
@@ -41,12 +44,12 @@ from collections.abc import Callable
 from expcore.campaign.healthgate import Health
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
-from expcore_onedata.config import PlatformConfig
-from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, read_space
-from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
+from expcore_onedata.config import PlatformConfig, StudySpace
+from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
+from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
 from expcore_onedata.tls import WARNING
 from expcore_onedata.tokencheck import TokenRefused
-from expcore_onedata.tokens import MintedToken, TokenIssuer, data_path_spec
+from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, data_path_spec
 
 TOKEN_CAP_S = 300.0  # the check's own budget; its token outlives it by the configured margin
 REFRESH_BEFORE_S = 120.0  # a cached token is replaced this long before it expires
@@ -64,17 +67,20 @@ def _reported_ids(reported: list[ReportedProvider]) -> str:
     return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
 
 
-def compare(view: SpaceView, config: PlatformConfig) -> Health:
-    """Compare the providers the federation reports for the space with the declared set; any difference fails.
+def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = None) -> Health:
+    """Compare the providers the federation reports for a space with its declared set; any difference fails.
 
-    Reported providers are matched to declared ones by provider id. A reported provider no declaration fits, and a
-    declared provider that more than one reported provider fits (or a reported provider that fits several declarations),
-    fail the check: the first match is never taken, so a second provider cannot hide behind the declared one.
+    `entry` is the declared space (`[[spaces]]`); without one it is the only space. Reported providers are matched to
+    declared ones by provider id. A reported provider no declaration fits, and a declared provider that more than one
+    reported provider fits (or a reported provider that fits several declarations), fail the check: the first match is
+    never taken, so a second provider cannot hide behind the declared one.
 
     The detail holds no configured name, host, URL or id (O12). A declared provider is `providers[i]`, its position in
     platform.toml; a provider no declaration fits is shown by the id the federation reports for it.
     """
-    if view.name != config.space.name:
+    entry = entry or config.space_named()
+    space, support = entry.space, entry.support
+    if view.name != space.name:
         return Health(False, "the study space is reported under another name than the declared one")
     matched: dict[str, list[bool]] = {}
     strangers: list[ReportedProvider] = []
@@ -88,8 +94,8 @@ def compare(view: SpaceView, config: PlatformConfig) -> Health:
         else:
             matched.setdefault(names[0], []).append(reported.online)
     ambiguous.update(name for name, online in matched.items() if len(online) > 1)
-    missing = set(config.support.providers) - set(matched)
-    unexpected = set(matched) - set(config.support.providers)
+    missing = set(support.providers) - set(matched)
+    unexpected = set(matched) - set(support.providers)
     if missing or strangers or unexpected or ambiguous:
         parts = []
         if missing:
@@ -125,14 +131,25 @@ class PlatformHealth:
         self._service = config.principals.service
         self._token: MintedToken | None = None
         self._lock = threading.Lock()
-        self._gate = PreCampaignHealth(self._space, lambda: content_type_check(config, client))
+        self._content_type: ContentTypeVerdict | None = None
+        self._gate = PreCampaignHealth(self._space, self._measure)
+
+    @property
+    def content_type(self) -> ContentTypeVerdict | None:
+        """What the content-type check found at the first call (None before it), so that a caller can tell a type that
+        was measured and is wrong from one that could not be measured."""
+        return self._content_type
+
+    def _measure(self) -> Health:
+        self._content_type = measure_content_type(self._config, self._client)
+        return self._content_type.health
 
     def _current_token(self) -> MintedToken:
         """Return the cached token, minting a new one when none is left or it is about to expire."""
         with self._lock:
             token = self._token
             if token is None or self._clock() > token.expires_at - REFRESH_BEFORE_S:
-                spec = data_path_spec(self._config.space.id)
+                spec = data_path_spec(self._config.space_ids(Plane.DATA_PATH))  # the data path's spaces, no other
                 token = self._token = self._issuer.mint(spec, self._service, ceiling_s=TOKEN_CAP_S)
             return token
 
@@ -145,15 +162,34 @@ class PlatformHealth:
             verdict = self._gate()
         except Exception as error:
             verdict = Health(False, f"health check raised {type(error).__name__}")
+        return self._warned(verdict)
+
+    def space(self) -> Health:
+        """Each space the data path reaches against its declared support set alone (`_space`), without the content type
+        check: what `__call__` answers once that check has passed, and the same warning when TLS is not verified; never
+        raise."""
+        return self._warned(self._space())
+
+    def _warned(self, verdict: Health) -> Health:
         if self._config.tls.insecure:
             return Health(verdict.ok, f"{verdict.detail}; {WARNING}")
         return verdict
 
     def _space(self) -> Health:
-        """The space as Onezone reports it, against the declared support set; never raise."""
+        """Each declared space as Onezone reports it, against its declared support set; never raise.
+
+        The scope is read once, with a data-path token, and every space the data path reaches is checked. With several
+        spaces the first that fails is named by its position (`spaces[i]`), and a pass names how many were checked."""
         try:
-            view = read_space(self._client, self._current_token().reveal(), self._config.space.id)
-            return compare(view, self._config)
+            answer = self._client.query("/tokens/infer_access_token_scope", {"token": self._current_token().reveal()})
+            if len(self._config.spaces) == 1:
+                return compare(parse_scope(answer, self._config.space.id), self._config)
+            checked = [entry for entry in self._config.spaces if Plane.DATA_PATH in entry.tokens]
+            for entry in checked:
+                verdict = compare(parse_scope(answer, entry.space.id), self._config, entry)
+                if not verdict.ok:
+                    return Health(False, f"{entry.position}: {verdict.detail}")
+            return Health(True, f"ok: each of the {len(checked)} spaces is supported by its declared set")
         except _SAFE as error:
             return Health(False, f"health check failed: {error}")
         except Exception as error:

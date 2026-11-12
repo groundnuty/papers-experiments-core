@@ -1,9 +1,15 @@
-"""A tiny real MCP stdio server for the client tests, built with the SDK's server API.
+# Provenance: new
+"""A tiny real MCP stdio server for tests of a tool client, built with the SDK's server API.
 
-    python fake_mcp_server.py --tools echo,add [--suffix TEXT] [--hang]
+    python -m expcore_onedata.testing.fake_mcp_server --tools echo,add [--suffix TEXT] [--hang]
 
 `--tools` is the server-side allow-list: only the named tools of the catalogue are registered. `--suffix` changes
 every description. `--hang` makes the server never speak.
+
+Models: an MCP server over stdio that lists and calls tools, with a small catalogue (`CATALOGUE`: `echo`, `add`, `fail`
+that raises, `crash` that kills the process, and `extra`, a tool nobody froze), the allow-list, and a server that
+hangs. Does not model: any real server's tools, its settings or its behaviour under load; the Onedata server is
+`fake_onedata_mcp`, which is configured from this one.
 """
 
 import argparse

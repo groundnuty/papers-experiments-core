@@ -5,7 +5,6 @@ import asyncio
 import os
 import sys
 import time
-from pathlib import Path
 
 import anyio
 import pytest
@@ -21,12 +20,12 @@ from expcore.models.adapters import StubAdapter
 from expcore.tools.manifest import FrozenManifest, ManifestError, live_manifest
 from expcore.tools.mcp_client import McpToolProvider
 
-SERVER = str(Path(__file__).resolve().parents[1] / "support" / "fake_mcp_server.py")
+SERVER = ["-m", "expcore_onedata.testing.fake_mcp_server"]  # the stand-in MCP server: its module, run with -m
 
 
 def launch(tools="echo,add", *, suffix="", hang=False):
     """The command and arguments of the fake server, with its server-side allow-list."""
-    args = [SERVER, "--tools", tools]
+    args = [*SERVER, "--tools", tools]
     if suffix:
         args += ["--suffix", suffix]
     if hang:

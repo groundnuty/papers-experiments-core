@@ -11,7 +11,10 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
     gate container, the agent's only network peer (O14);
   * REST data path: the data gate (gate.py, gatepolicy.py, gateboundary.py), whose files are mounted from this package,
     read-only. It holds the token, in its environment, and adds it to the requests it forwards, and no answer it passes
-    back holds the token; the agent holds no credential;
+    back holds the token; the agent holds no credential, only the placeholder token the published client needs to
+    start (O23), which the gate drops. The agent trusts the run's CA through the CA variables, each declared trust path
+    and its image's certifi bundle, which the published client verifies against: one-shot containers of the agent
+    image find that bundle and read each one, and the run's copy with the CA appended is mounted over it read-only;
   * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
     propagation; the agent has neither the token, nor FUSE, nor a route to any host;
   * no data path: neither;
@@ -46,7 +49,7 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import copyout, gatelog, hostops, inputs, kinds, netpool
+from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
@@ -66,10 +69,13 @@ from expcore_onedata.sandbox.containers import (
     ONECLIENT_LOG_DIR,
     Names,
     agent_run_args,
+    certifi_bundle,
+    certifi_probe_args,
     effective_log_dir,
     gate_run_args,
     sidecar_command,
     sidecar_run_args,
+    trust_targets,
 )
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr, stderr_digest
 from expcore_onedata.sandbox.observe import Observer
@@ -83,6 +89,9 @@ RUN_KEY = re.compile(r"[\x21-\x7e]{1,200}")  # it becomes an HTTP header value a
 GATE_FILES = Path(__file__).resolve().parent  # gate.py and its siblings are mounted from here into the gate container
 MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
+TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
+MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
+NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O22)
 MOUNT_WAIT_S = 60.0
 READ_ONLY_PROBE = (
     "try:\n"
@@ -126,8 +135,10 @@ class DockerSandbox:
         self._meta: dict[str, Any] = {
             "run_key": spec.run_key,
             "data_path": spec.mode.value,
+            "listing": spec.listing if spec.mode is DataPathMode.REST else None,  # the gate's listing mode (O21)
             "images": {},
             "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
+            "certifi": None,  # a REST agent's: `run_ca_added`, or `not_in_image` (O23); never the bundle's path
         }
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
@@ -202,8 +213,16 @@ class DockerSandbox:
             raise StartRefused("a data path needs the agent's local provider")
         if sp.mode is DataPathMode.REST and sp.zone is None:
             raise StartRefused("a REST data path needs the zone")
+        if sp.mode is DataPathMode.REST and sp.token is not None and s.placeholder_token == sp.token.reveal():
+            raise StartRefused(  # the agent's environment would hold the run's token (O05, O23)
+                "[sandbox] placeholder_token is the run's data-path token: the agent may hold no credential"
+            )
         if sp.mode is DataPathMode.MOUNT and (s.mount is None or s.oneclient is None):
             raise StartRefused("a mount data path needs [sandbox.mount] and the oneclient image")
+        if sp.listing not in gatepolicy.LISTINGS or (
+            sp.mode is not DataPathMode.REST and sp.listing != gatepolicy.PAGED
+        ):
+            raise StartRefused("the listing mode must be paged or complete, and complete is for a REST data path only")
         if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
             try:  # the bytes the record names by their hash, read once: the containers get these and never the path
                 self._ca_bytes = s.tls.bundle()
@@ -303,6 +322,7 @@ class DockerSandbox:
             "log": "/var/gate/requests.jsonl",
             "tls_dir": "/etc/gate/tls",
             "hosts": hosts,
+            "listing": self.spec.listing,  # paged, or every listing answered complete (O21)
         }
         if self._ca_copy is not None:
             config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only
@@ -475,14 +495,40 @@ class DockerSandbox:
         self.watch_container("sidecar", names.sidecar)
         return share
 
+    def _one_shot_name(self) -> str:
+        """The name of a one-shot container of the agent image, registered before it is created, so a `stop` that runs
+        meanwhile looks for it."""
+        name = f"{self.names.agent}-once-{uuid.uuid4().hex[:6]}"
+        self._checkpoint()
+        self._register_container(name)
+        return name
+
+    def _certifi(self) -> str | None:
+        """Where the agent image keeps its certifi bundle, which the published client verifies the gate against (O23),
+        or None, recorded, when the image has no certifi. An interpreter that fails, or an answer that is not one path
+        the sandbox can mount over, refuses the start: no answer is taken for `none`."""
+        name = self._one_shot_name()
+        result = self.host.docker(*certifi_probe_args(self.s, name, self._label_args(), self.s.agent.id), check=False)
+        if result.returncode != 0:
+            raise SandboxError(
+                f"the agent image did not say where its certifi bundle is ({describe_stderr(result.stderr)})"
+            )
+        try:
+            found = certifi_bundle(result.stdout)
+        except ValueError:
+            raise SandboxError(
+                "the agent image's answer about its certifi bundle is not one path to mount over"
+            ) from None
+        self._meta["certifi"] = "not_in_image" if found is None else "run_ca_added"
+        return found
+
     def _trust_bundles(self) -> dict[str, Path]:
-        """For each configured path of a CA bundle in the agent image: the image's own bundle plus the run's CA."""
+        """For each configured path of a CA bundle in the agent image, and its certifi bundle when it has one (O23): the
+        image's own bundle plus the run's CA."""
         out: dict[str, Path] = {}
         ca = (self.dir / "tls" / "ca.pem").read_text(encoding="utf-8")
-        for n, path in enumerate(self.s.trust_paths):
-            name = f"{self.names.agent}-once-{uuid.uuid4().hex[:6]}"
-            self._checkpoint()
-            self._register_container(name)  # registered before it is created
+        for n, path in enumerate(trust_targets(self.s.trust_paths, self._certifi())):
+            name = self._one_shot_name()
             # labelled like every other container of the sandbox, so that the probe and the orphan reaper find it if the
             # docker call is cut off before `--rm` has removed it (C19)
             base = self.host.docker(
@@ -674,6 +720,21 @@ class DockerSandbox:
             res.gate_refusals, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
         return res
 
+    def served_bytes(self) -> dict[str, Any]:
+        """The bytes the agent read through its data path in this run (O22), as `gatelog.served` counts them, with the
+        data path and its listing mode. REST: counted once, by the collection, from the log of the gate it stopped;
+        before that every count is unknown (`gate_not_collected`). A mount: unknown (`mount_not_through_gate`), since
+        its reads go through oneclient and no gate sees them. No data path: zero, since there is nothing to read
+        through. The tables of the files and directories served follow the counts: None when they are unknown, empty
+        when they are zero. Every answer records the caps of the tables, `[sandbox.served_bytes]`. Unknown is never
+        zero."""
+        path, caps = {"data_path": self.spec.mode.value, "listing": self._meta.get("listing")}, self.s.served_caps
+        if self.spec.mode is DataPathMode.MOUNT:
+            return path | gatelog.served_unknown(MOUNT_NOT_THROUGH_GATE, caps=caps)
+        if self.spec.mode is DataPathMode.NONE:
+            return path | gatelog.served_nothing(caps)
+        return path | self._meta.get("served_bytes", gatelog.served_unknown(NOT_COLLECTED, caps=caps))
+
     def gate_refusals(self) -> list[str]:
         """The reasons of the answers the data gate refused for its own integrity so far (O05), from its log; empty
         without a gate. A log that cannot be read stands for `gatelog.UNREADABLE`: its refusals are unknown (O16)."""
@@ -755,6 +816,9 @@ class DockerSandbox:
             result["refused_output"] = refused
         if self.spec.mode is DataPathMode.REST:
             self._stop_gate()
+            if "served_bytes" not in self._meta:  # counted once (O22): a second collection finds the gate already gone
+                lines, caps = self._gate_log_lines(), self.s.served_caps
+                self._meta["served_bytes"] = gatelog.served(lines, self._meta["gate_stop"], caps)
             log_copy = [("requests.jsonl", dest / "gate-requests.jsonl")]
             try:  # the gate's own file, in a directory only the gate writes: anything amiss there is not the agent's
                 if not copyout.copy_tree(self.host, self.dir / "gatelog", log_copy, max_bytes=None)["requests.jsonl"]:
@@ -836,7 +900,13 @@ class DockerSandbox:
                     break
                 self._sleep(0.1)
             logs = self.host.docker("logs", self.names.gate, check=False, timeout=30)
-            note["log_write_failed"] = "GATE LOG FAILED" in logs.stderr + logs.stdout
+            note["output_read"] = logs.returncode == 0
+            if note["output_read"]:  # only output that was read can show that nothing went wrong (O22)
+                said = logs.stderr + logs.stdout
+                note["log_write_failed"] = "GATE LOG FAILED" in said
+                note["teardown_incomplete"] = any(m in said for m in TEARDOWN_TROUBLE)  # a close line may be missing
+            else:  # unknown, never "no failure": the count of the bytes served is then unknown too
+                note["log_write_failed"] = note["teardown_incomplete"] = None
         except Exception as e:
             note["error"] = describe_error(e)
 
@@ -866,6 +936,9 @@ class DockerSandbox:
                 meta["gate"] = gatelog.summarize(self._read_gate_log().splitlines())
             except OSError as e:
                 meta["gate"] = gatelog.unknown(f"the gate log could not be read: {e.strerror}")
+            except ValueError:  # bytes that are not UTF-8, or a line that is not JSON: unknown, never a crash
+                meta["gate"] = gatelog.unknown("the gate log could not be parsed")
+        meta["served_bytes"] = self.served_bytes()
         meta["sidecar_log"] = self.sidecar_errors() if not self._stopped else None
         return meta
 

@@ -12,6 +12,7 @@ environment of the docker client (`env`).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,10 +34,57 @@ ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image'
 ONECLIENT_LOG_DIR = "/tmp/oneclient/0"  # where it writes its log unless told otherwise
 # The published REST client's settings (its environment), not names of any federation.
 ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
-ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gate.TOKEN_ENV); the agent has no token
+# The client refuses to start without a token, so a REST agent's holds the configured placeholder (O23), never a
+# credential: the gate drops it with any other token the agent sends and adds its own.
+ENV_TOKEN = "ONEDATA_TOKEN"
+ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gate.TOKEN_ENV); the agent's is ENV_TOKEN
 ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
 ENV_CA_BUNDLES = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+# The published client sends through `requests.Session.send`, which merges no environment setting, so it verifies the
+# gate against the certifi bundle of the agent's image and never reads ENV_CA_BUNDLES (O23). On a REST data path the
+# sandbox asks the image's interpreter where that bundle is and extends it with the run's CA, as a trust path.
+CERTIFI_PROBE = (
+    "try:\n"
+    "    import certifi\n"
+    "except ImportError:\n"
+    "    print('certifi:none')\n"
+    "else:\n"
+    "    print('certifi:' + certifi.where())\n"
+)
+CERTIFI_NONE = "none"
+CERTIFI_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,4095}")  # an absolute path `-v SOURCE:PATH:ro` can mount over
+
+
+def certifi_probe_args(s: SandboxSettings, name: str, labels: Sequence[str], image_id: str) -> list[str]:
+    """`docker run` of the one-shot container that asks the agent image's interpreter where its certifi bundle is: as
+    the agent's code runs (`cells.py`), the same interpreter as the agent's user in /work, the first directory of its
+    import path; with no network, removed when it ends, and labelled like every container of the sandbox."""
+    uid = s.agent_uid
+    return [
+        *("run", "--rm", "--name", name, *labels, "--network", "none", "--user", f"{uid}:{uid}", "--workdir", "/work"),
+        *("--entrypoint", s.python, image_id, "-c", CERTIFI_PROBE),
+    ]
+
+
+def certifi_bundle(stdout: str) -> str | None:
+    """The path of the image's certifi bundle from the probe's output, or None when the image has no certifi. Any other
+    output, more than the one line or a path the agent's mount could not be put on, raises `ValueError`: no answer."""
+    lines = stdout.splitlines()
+    if len(lines) != 1 or not lines[0].startswith("certifi:"):
+        raise ValueError("the probe did not answer with one line")
+    found = lines[0].removeprefix("certifi:")
+    if found == CERTIFI_NONE:
+        return None
+    if not CERTIFI_PATH.fullmatch(found) or {".", ".."} & set(found.split("/")):
+        raise ValueError("the probe's path is not one absolute path without dot segments")
+    return found
+
+
+def trust_targets(declared: Sequence[str], certifi: str | None) -> tuple[str, ...]:
+    """The paths in the agent image whose CA bundles get the run's CA: the declared `trust_paths`, then the certifi
+    bundle, once, when the image has one."""
+    return (*declared, *([certifi] if certifi is not None and certifi not in declared else []))
 
 
 @dataclass(frozen=True)
@@ -172,8 +220,9 @@ def agent_run_args(
 
     In REST mode the agent resolves the zone and the provider to the gate and trusts the run's CA. It holds no token
     and no other credential, in its environment or in a file: the gate adds the token to the requests it forwards, and
-    the sidecar owns the mount's (O05). In mount mode the read-only mount is bound in with `readonly`. With no data path
-    it has neither. Each read-only input, the run's own copy and the path the agent sees it at, is bound in with
+    the sidecar owns the mount's (O05). Its `ONEDATA_TOKEN` is the configured placeholder, which only lets the published
+    client start (O23); the gate drops it. In mount mode the read-only mount is bound in with `readonly`. With no data
+    path it has neither. Each read-only input, the run's own copy and the path the agent sees it at, is bound in with
     `readonly` too, in every data path (O20).
     """
     lim, uid = s.limits, s.agent_uid
@@ -196,12 +245,14 @@ def agent_run_args(
         for name in gate_hosts:
             args += ["--add-host", f"{name}:{gate_ip}"]
         env = dict.fromkeys(ENV_CA_BUNDLES, CA_PATH) | {ENV_ZONE_HOST: zone_host, ENV_VERIFY_SSL: "true"}
+        env[ENV_TOKEN] = s.placeholder_token  # not a credential: the client's start needs a value (O23)
     elif mode is DataPathMode.MOUNT:
         if share is None or s.mount is None:
             raise ValueError("a mount data path needs the shared mount point and [sandbox.mount]")
         args += ["--mount", f"type=bind,src={share},dst={s.mount.path},readonly,bind-propagation=rslave"]
     for copy, target in inputs:
         args += ["--mount", f"type=bind,src={copy},dst={target},readonly"]
-    for name in env:  # settings only, never a credential; their values travel in the docker client's environment
+    # settings and the placeholder, never a credential; their values travel in the docker client's environment
+    for name in env:
         args += ["-e", name]
     return [*args, image_id, "sleep", "infinity"], env

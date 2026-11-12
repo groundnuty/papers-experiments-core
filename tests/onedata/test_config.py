@@ -1,11 +1,11 @@
 """O12: the federation's names live in platform.toml and are validated when it is loaded."""
 
 import pytest
-from platform_support import ADMIN_ENV, BASELINE, MANAGE, SPACE_NAME, write_platform
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import SecretSource, load_platform
 from expcore_onedata.rights import declares_write
+from expcore_onedata.testing import ADMIN_ENV, BASELINE, MANAGE, SPACE_NAME, write_platform
 
 SENTINEL = "sentinel-value-0042"  # a stand-in for a secret or a name that must never be echoed
 

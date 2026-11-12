@@ -5,13 +5,15 @@ import dataclasses
 import json
 
 import pytest
-from platform_support import BASELINE, CEILING_S, DATA, MANAGE, NOW, TOOLS
 from record_support import record_run
 
 from expcore.records.redact import REDACTED
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import TokenSettings
 from expcore_onedata.credentials import Principal
+from expcore_onedata.testing import BASELINE, CEILING_S, MANAGE, NOW
+from expcore_onedata.testing import DATA_PATH_USER as DATA
+from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
 from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import (
     ExpiryMismatch,

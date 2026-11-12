@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 import zipfile
 from importlib import metadata
 from pathlib import Path
@@ -212,6 +213,29 @@ def test_k10_the_cores_own_wheel_built_from_this_checkout_matches_its_editable_i
     packages with what they import from, the example and the hash file through the mapping pyproject.toml declares."""
     name, data = wheel_of("papers-experiments-core", "0.1.0", core_wheel_files())
     assert compare_supplied(metadata.distribution("papers-experiments-core"), True, name, data) == ()
+
+
+def test_k10_the_cores_wheel_holds_the_testing_package_because_the_build_includes_the_whole_platform_layer():
+    """K10: the platform layer's testing package ships in the core's wheel, its two runnable servers included, since the
+    build includes all of `src/expcore_onedata`; nothing of it is a test tree, and the core's runtime never loads it
+    (the import boundary test), so a distribution without the `onedata` extra still imports without it."""
+    root = Path(__file__).resolve().parents[2]
+    wheel = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["hatch"]["build"]["targets"][
+        "wheel"
+    ]
+    assert "src/expcore_onedata" in wheel["only-include"]
+    shipped = core_wheel_files()
+    for module in (
+        "__init__",
+        "fake_data",
+        "fake_federation",
+        "fake_onedata",
+        "fake_mcp_server",
+        "fake_onedata_mcp",
+        "world",
+    ):
+        assert f"expcore_onedata/testing/{module}.py" in shipped, module
+    assert not [name for name in shipped if name.startswith("expcore_onedata/testing/") and "conftest" in name]
 
 
 @pytest.mark.parametrize("member", ["expcore/examples/tiny_study/plugin.py", "expcore/examples/tiny_study/prompt.txt"])
