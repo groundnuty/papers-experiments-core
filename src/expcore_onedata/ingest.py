@@ -186,15 +186,19 @@ class ProgressiveIngest:
 
     def _perform(self, step: Step) -> None:
         planned, ids = self._plan.file(step.label), self._files[step.label]
-        done = self._p.upload(planned.path, planned.source, stop=step.stop)
+        old = self._base.last_id.get(step.label)
+        try:
+            done = self._base.upload(planned, "run", old, stop=step.stop)
+        except FAILURES:
+            if self._base.last_id.get(step.label) != old:  # the upload made a file before it failed, now recorded
+                ids["arrived_id"] = self._base.last_id[step.label]
+            raise
         written = self._base.stamp()
+        if ids["arrived_id"] != done.file_id:  # the first part, or a file made again under the label: recorded at once
+            self._base.record_id(step.label, "created", "run", old, done.file_id, action=done.action)
+            ids["arrived_id"] = done.file_id
         if done.digest != Digest(step.stop, step.sha256):
             raise ProvisionError(f"{self._p.where}{step.label}: a written part does not have the plan's hash")
-        if ids["arrived_id"] != done.file_id:  # the first part, or a file made again under the label
-            self._base.record_id(
-                step.label, "created", "run", self._base.last_id.get(step.label), done.file_id, action=done.action
-            )
-            ids["arrived_id"] = done.file_id
         late = round(written["clock"] - (self._t0 or 0.0) - step.due_s, 3)
         self._reading(
             "written", step, **written, late_s=late, bytes=step.stop, action=done.action, file_id=done.file_id

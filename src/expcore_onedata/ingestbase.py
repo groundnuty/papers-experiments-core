@@ -35,7 +35,7 @@ from expcore_onedata.client import PlatformError, answered_absent
 from expcore_onedata.ingestplan import IngestPlan, PlannedFile
 from expcore_onedata.provision import Entry, NotPlaced, Provisioner, ProvisionError
 from expcore_onedata.rangemap import safe_path
-from expcore_onedata.streamed import Digest, chunks
+from expcore_onedata.streamed import Digest, Upload, chunks
 
 FAILURES = (PlatformError, ProvisionError, consistency.WaitTimeout, KeyError, OSError)  # an ingest failure's causes
 _PLAIN_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")
@@ -255,17 +255,36 @@ class Baseline:
         self.remove(planned.label, before, phase)
         return {"action": "removed", "file_id": None}
 
+    def upload(self, planned: PlannedFile, phase: str, old: str | None, *, stop: int | None = None) -> Upload:
+        """Upload a planned file (up to `stop`) through the provisioner. When the upload fails after it made the file,
+        the file it made is recorded as `created` before the failure is raised, so no id the ingest made goes
+        unrecorded: the change log, the ingest's own, names each file the upload created at the planned path."""
+        made_before = self._made_at(planned.path)
+        try:
+            return self._p.upload(planned.path, planned.source, stop=stop)
+        except FAILURES:
+            for new in self._made_at(planned.path):
+                if new not in made_before:
+                    self.record_id(planned.label, "created", phase, old, new, action="created")
+                    old = new
+            raise
+
+    def _made_at(self, path: str) -> list[str]:
+        """The ids of the regular files the provisioner's change log says it created at a path, oldest first."""
+        return [line["id"] for line in self._p.logged() if line.get("kind") == "REG" and line.get("path") == path]
+
     def _write_back(self, planned: PlannedFile, phase: str, before: Entry | None) -> dict[str, Any]:
-        """Write a "complete" file back from its staged source, checked first, into its existing directory."""
+        """Write a "complete" file back from its staged source, checked first, into its existing directory. Its id is
+        recorded as soon as the upload returns, before its hash is checked and its arrival confirmed."""
         self.check_source(planned)
         if before is None:
             self.check_directory(planned)  # the upload would create a missing one
-        done = self._p.upload(planned.path, planned.source)
+        old = before.file_id if before is not None else self.last_id.get(planned.label)
+        done = self.upload(planned, phase, old)
+        self.record_id(planned.label, "restored", phase, old, done.file_id, action=done.action)
         if done.digest != Digest(planned.size, planned.sha256):
             raise ProvisionError(f"{self._p.where}{planned.label}: the restored file is not its staged source")
         self.confirm(done.file_id, planned.size)
-        old = before.file_id if before is not None else self.last_id.get(planned.label)
-        self.record_id(planned.label, "restored", phase, old, done.file_id, action=done.action)
         return {"action": done.action, "file_id": done.file_id}
 
     def restore_all(self, phase: str) -> dict[str, Any]:

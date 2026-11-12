@@ -431,6 +431,76 @@ def test_o27_every_file_id_the_ingest_removes_creates_or_restores_is_recorded_wi
     assert in_journal == events
 
 
+def id_events(snapshot, tmp_path):
+    """The (event, phase, old id, new id) of every id change, from the snapshot and from the journal."""
+    shown = [(e["event"], e["phase"], e["old_id"], e["new_id"]) for e in snapshot["ids"]]
+    lines = [json.loads(line) for line in (tmp_path / "journal.jsonl").read_text().splitlines()]
+    kept = [(j["event"], j["phase"], j["old_id"], j["new_id"]) for j in lines if j["entry"] == "id"]
+    return shown, kept
+
+
+def test_o27_a_restore_whose_confirmation_fails_still_records_the_id_it_made(make, fake, ticker, tmp_path):
+    """O27: the restore writes the day back into a new file, and the second provider never shows it, so the restore
+    fails. The new file's id is recorded all the same, in the snapshot and the journal, with its clock label: an id is
+    recorded as soon as it exists, before its hash is checked and its arrival confirmed."""
+    baseline = fake.id_of(DAY_PATH)
+    ingest = make(DAY_ROW)
+    ingest.start({})
+    ticker.now += 50
+    fake.visibility_delay_by_provider[BETA_ID] = 10**9
+    snapshot = ingest.finish()
+    made = fake.id_of(DAY_PATH)
+    assert snapshot["restore"]["ok"] is False
+    shown, kept = id_events(snapshot, tmp_path)
+    assert shown[-1] == ("restored", "restore", baseline, made)
+    assert kept == shown
+    assert {"clock", "t_rel_s", "utc"} <= set(snapshot["ids"][-1])
+
+
+def test_o27_a_restore_whose_upload_fails_after_making_the_file_records_it_as_created(make, fake, ticker, tmp_path):
+    """O27: the restore's upload creates the day's file and its first write is answered 500. The file it made is
+    recorded as created, with the old id and its clock label, before the failure is raised; the next restore writes
+    the day back into that same file and records it as restored."""
+    baseline = fake.id_of(DAY_PATH)
+    ingest = make(DAY_ROW)
+    ingest.start({})
+    ticker.now += 50
+    fake.statuses = [["/content", 1, 500]]
+    snapshot = ingest.finish()
+    made = fake.id_of(DAY_PATH)
+    assert made != baseline
+    assert snapshot["restore"]["ok"] is False
+    shown, kept = id_events(snapshot, tmp_path)
+    assert shown[-1] == ("created", "restore", baseline, made)
+    assert kept == shown
+    assert {"clock", "t_rel_s", "utc"} <= set(snapshot["ids"][-1])
+    assert ingest.restore()["ok"] is True  # the executor's finally
+    shown, _ = id_events(ingest.finish(), tmp_path)
+    assert shown[-1] == ("restored", "restore", made, made)
+    assert content(fake, DAY_PATH) == DAY
+
+
+def test_o27_an_arrival_whose_write_fails_after_making_the_file_records_it_as_created(make, fake, ticker, tmp_path):
+    """O27: the arrival's upload creates the day's file and its first write is answered 500. The file it made is
+    recorded as created in the run, with the removed baseline's id as the old one and its clock label, and the
+    snapshot's arrived id is that file's."""
+    baseline = fake.id_of(DAY_PATH)
+    ingest = make(DAY_ROW)
+    ingest.start({})
+    t0 = ticker.now
+    fake.statuses = [["/content", 1, 500]]
+    ticker.now = t0 + 300
+    until(lambda: ingest.failure is not None)
+    made = fake.id_of(DAY_PATH)
+    snapshot = ingest.finish()
+    shown, kept = id_events(snapshot, tmp_path)
+    assert ("created", "run", baseline, made) in shown
+    assert kept == shown
+    created = next(e for e in snapshot["ids"] if e["event"] == "created")
+    assert {"clock", "t_rel_s", "utc"} <= set(created)
+    assert snapshot["files"]["day-13"]["arrived_id"] == made
+
+
 def test_o27_the_record_names_providers_by_position_and_files_by_label(make, fake, ticker, tmp_path):
     """O27 with O12: nothing in the snapshot names a provider, the space, a path or the staging directory."""
     ingest = make(DAY_ROW, NOTE_ROW)
