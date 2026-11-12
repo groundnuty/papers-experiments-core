@@ -36,10 +36,14 @@ from expcore.campaign.shard import (
     META_SHARD,
     META_SHARES,
     META_STARTED,
+    RULE_BY_MODEL,
+    ModelShards,
+    ShardError,
     ShardSpec,
     budget_shares,
     caps_shares,
     is_default_label,
+    part,
 )
 from expcore.campaign.store import Store
 
@@ -95,6 +99,61 @@ def share_settings(settings: "SchedulerConfig", spec: ShardSpec) -> tuple["Sched
     parts = budget_shares(budget.max_usd, budget.per_model_usd, spec)
     shared = dataclasses.replace(budget, max_usd=parts["max_usd"], per_model_usd=parts["per_model_usd"])
     return dataclasses.replace(settings, unit_caps=caps, budget=shared), {"unit_caps": caps, "budget": parts}
+
+
+def share_settings_by_model(
+    settings: "SchedulerConfig", spec: ShardSpec, layout: ModelShards, unit: str, budget: Mapping[str, Any] | None
+) -> tuple["SchedulerConfig", dict[str, Any]]:
+    """Shard `spec`'s settings under `expcore-shard/3` (C31), with the shares as the store and the export keep them.
+
+    The shard runs one run at a time: its cap is 1 on `unit`, its model's, and it runs nothing of any other unit.
+    `budget` is its part of the budget (`shard_budget.shard_budgets`), None without one. A shard whose part of
+    `max_usd` is 0 runs a model that costs nothing, which no gate can hold for cost, so it runs without one: a `Budget`
+    of 0 dollars holds every run.
+    """
+    if spec.rule != RULE_BY_MODEL or layout.count != spec.count:
+        raise ShardError(f"shard {spec.index} of {spec.count} is not a shard by model of this layout ({spec.rule!r})")
+    caps = {unit: 1}
+    if settings.budget is None or budget is None:
+        return dataclasses.replace(settings, unit_caps=caps, budget=None), {"unit_caps": caps, "budget": None}
+    parts = {"max_usd": budget["max_usd"], "per_model_usd": dict(budget["per_model_usd"])}
+    shared = None
+    if parts["max_usd"] > 0:
+        shared = dataclasses.replace(settings.budget, max_usd=parts["max_usd"], per_model_usd=parts["per_model_usd"])
+    return dataclasses.replace(settings, unit_caps=caps, budget=shared), {"unit_caps": caps, "budget": parts}
+
+
+def refuse_unrunnable(
+    spec: ShardSpec,
+    pairs: Mapping[str, int],
+    unit_of: Mapping[str, str],
+    unit_caps: Mapping[str, int],
+    layout: ModelShards | None = None,
+) -> None:
+    """Refuse a shard that holds pairs of a model whose concurrency share is 0 (C31): it could never run them.
+
+    `pairs` counts the shard's pairs by model, `unit_of` gives each model's unit and `unit_caps` the campaign's totals.
+    Under `expcore-shard/2` a model's share is the shard's part of its unit's cap, which is 0 for the shards past the
+    cap when the cap is below N (an uncapped unit has no share to lack); under `expcore-shard/3`, with the campaign's
+    `layout`, it is 1 for the shard's own model and 0 for every other. Raises ShardError naming the model.
+    """
+    for model, held in sorted(pairs.items()):
+        if spec.rule == RULE_BY_MODEL:
+            serves = layout.at(spec.index)[0] if layout is not None else None
+            if model == serves:
+                continue
+            why = f"shard {spec.index} serves model {serves} only (expcore-shard/3)"
+        else:
+            unit = unit_of[model]
+            cap = unit_caps.get(unit)
+            if cap is None or part(cap, spec.index, spec.count, what=unit, allow_zero=True) > 0:
+                continue
+            why = f"[scheduler.unit_caps] {unit} = {cap} over {spec.count} shards"
+        raise ShardError(
+            f"shard {spec.index} of {spec.count} holds {held} pair(s) of model {model}, and its share of that model's "
+            f"concurrency is 0 ({why}), so it could never run them; shard by model with [shards] per_model "
+            "(expcore-shard/3), or use fewer shards"
+        )
 
 
 def environment_block(spec: ShardSpec, environment: Mapping[str, Any]) -> str:

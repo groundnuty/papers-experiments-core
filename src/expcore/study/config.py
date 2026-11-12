@@ -51,11 +51,14 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from expcore.campaign.config import CampaignConfig, load_campaign
 from expcore.campaign.factors import FactorSchema, load_factor_schema
 from expcore.campaign.manifest import Manifest, build_manifest
 from expcore.campaign.markers import MARKER_NAME
+from expcore.campaign.shard import ShardError
+from expcore.campaign.shard_budget import shard_budgets
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.config.key_locations import KeyLocationUnreachable, withhold_key_locations
 from expcore.config.loading import ConfigError, Section, close_match, load_toml
@@ -334,6 +337,24 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
         loaded = prereg.load(root / PREREG_FILE, schema)
         _check_clusters(name, tasks, loaded)
     hashes = {file: hashlib.sha256(_hashed_bytes(root, file)).hexdigest() for file in CONFIG_FILES}
-    return StudyConfig(
+    study = StudyConfig(
         root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds, requires, side_files
     )
+    if campaign.shards is not None and campaign.scheduler.budget is not None:
+        try:
+            shard_budgets_of(study)
+        except ShardError as error:
+            raise ConfigError(f"{campaign.source}: [shards] per_model with [budget]: {error}") from None
+    return study
+
+
+def shard_budgets_of(study: StudyConfig) -> dict[int, dict[str, Any]]:
+    """Every shard's part of the budget of a study that shards by model and has a budget (C31), by shard index.
+
+    `load_study` refuses a study for which this raises ShardError, so a start finds the same parts.
+    """
+    layout, budget = study.campaign.shards, study.campaign.scheduler.budget
+    if layout is None or budget is None:
+        raise ShardError("only a campaign with both [shards] per_model and [budget] shares its budget by model")
+    models = {model: study.models.resolve(model) for model in study.campaign.models}
+    return shard_budgets(budget, layout, study.manifest, models, study.campaign.agent.limits)

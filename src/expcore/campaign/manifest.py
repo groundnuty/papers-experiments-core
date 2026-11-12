@@ -30,7 +30,7 @@ from functools import cached_property
 from typing import Any
 
 from expcore.campaign.factors import FactorSchema, PlanError, RunKey
-from expcore.campaign.shard import ShardSpec, assign, in_shard, pair_of
+from expcore.campaign.shard import ModelShards, ShardError, ShardSpec, in_shard, layout_of, pair_of, partition
 
 ORDER_RULE = "sha256(order_seed|run_key)"
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -76,13 +76,14 @@ def _sha256_lines(lines: Iterable[str]) -> str:
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
-def shard_manifest(manifest: Manifest, spec: ShardSpec) -> Manifest:
+def shard_manifest(manifest: Manifest, spec: ShardSpec, layout: ModelShards | None = None) -> Manifest:
     """Return the runs of shard `spec`, each keeping its place in the whole plan and the plan's order (C28, C08).
 
-    The partition is assigned from the whole plan, pair by pair, and then each run is kept or dropped: no run is
-    renumbered, so a merge can take the union of the shards' runs in the one order the full plan has.
+    The partition is assigned from the whole plan, pair by pair, under the spec's rule (by model with the campaign's
+    `[shards]` `layout`, C31), and then each run is kept or dropped: no run is renumbered, so a merge can take the union
+    of the shards' runs in the one order the full plan has.
     """
-    assignment = assign({pair_of(row.key.factors) for row in manifest.rows}, spec.count)
+    assignment = partition({pair_of(row.key.factors) for row in manifest.rows}, spec, layout)
     return Manifest(
         manifest.order_seed, tuple(row for row in manifest.rows if in_shard(row.key.factors, spec, assignment))
     )
@@ -215,11 +216,15 @@ def plan_problem(
 
     The plan is every condition x task x model x seed of the fingerprint. A manifest that lists other runs would be a
     different experiment whatever the fingerprint says, so a start whose two disagree is refused. A shard's plan is the
-    part of that one its pairs are assigned to, with the assignment made from the whole declared plan (C28).
+    part of that one its pairs are assigned to, with the assignment made from the whole declared plan (C28) under the
+    shard's rule, by model with the `[shards]` layout the fingerprint declares (C31).
     """
     keys = schema.expand(fingerprint["tasks"], fingerprint["models"], [int(seed) for seed in fingerprint["seeds"]])
     if shard is not None:
-        assignment = assign({pair_of(key.factors) for key in keys}, shard.count)
+        try:
+            assignment = partition({pair_of(key.factors) for key in keys}, shard, layout_of(fingerprint))
+        except ShardError as error:
+            return str(error)
         keys = [key for key in keys if in_shard(key.factors, shard, assignment)]
     declared = {key.text for key in keys}
     planned = {row.key.text for row in manifest.rows}

@@ -15,7 +15,8 @@ replay check (`study.merge`) last:
 
 1. every shard is sharded, under the same rule and count, with indices exactly 1..N and distinct labels;
 2. every shard has the same campaign fingerprint, which a start pins whole, so the same experiment;
-3. the shards' run sets are disjoint, and every run belongs to its shard under `assign()` over the whole plan;
+3. the shards' run sets are disjoint, and every run belongs to its shard under their rule's assignment of the whole
+   plan (`assign()`, or by model with the `[shards]` layout of their fingerprint, C31);
 4. the union of the run sets is exactly the plan, so no run is missing and none is extra;
 5. each shard passes the replay check `python -m expcore check` performs on a batch;
 6. every shard records the same environment identity.
@@ -54,10 +55,11 @@ from expcore.campaign.shard import (
     META_STARTED,
     ShardError,
     ShardSpec,
-    assign,
     check_identity,
     in_shard,
+    layout_of,
     pair_of,
+    partition,
 )
 from expcore.campaign.snapshot import SNAPSHOT_FILE, AttemptsRunning, SnapshotError, take_snapshot
 
@@ -246,14 +248,17 @@ def _check_fingerprints(shards: Sequence[ShardFacts]) -> None:
 
 def _check_runs(shards: Sequence[ShardFacts], plan: Manifest) -> None:
     """3 and 4: disjoint run sets, each run in its own shard, and together exactly the plan."""
-    count = shards[0].spec.count
+    fingerprint = shards[0].fingerprint  # every shard's, after check 2
     holder: dict[str, ShardFacts] = {}
     for shard in shards:
         for key in sorted(shard.runs):
             if key in holder:
                 raise MergeRefused(f"run {key} is in both {holder[key].name} and {shard.name}: the shards overlap")
             holder[key] = shard
-    assignment = assign({pair_of(row.key.factors) for row in plan.rows}, count)
+    try:  # the rule the shards ran under (check 1 made it one), by model with the layout their fingerprint declares
+        assignment = partition({pair_of(row.key.factors) for row in plan.rows}, shards[0].spec, layout_of(fingerprint))
+    except ShardError as error:
+        raise MergeRefused(f"{shards[0].name}: its shards cannot be assigned the plan's pairs: {error}") from None
     for shard in shards:
         for key, factors in sorted(shard.runs.items()):
             if pair_of(factors) not in assignment:

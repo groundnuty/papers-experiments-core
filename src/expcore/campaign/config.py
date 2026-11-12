@@ -30,6 +30,14 @@ The file is validated when it is loaded, with messages that name the file and th
     [endpoints.model-a]           # optional: the unit a model's runs count in (default: the model's own key)
     unit = "pool-a"
     base_url = "https://llm.example.test/v1"
+
+    [shards]                      # optional: shard by model first, `expcore-shard/3` (C31)
+    per_model = { model-a = 2, model-b = 1 }
+
+`[shards] per_model` gives every model of the plan, in the order its shards take, how many shards serve it; N is the
+sum, at least 2, and `run --shard i/N` must give that N. Each such shard runs one run at a time, so the counts of the
+models on one unit are that unit's concurrent runs: a sum above the unit's `[scheduler.unit_caps]` cap is refused. The
+layout is in the campaign's caps, so in the fingerprint every shard shares; without the table nothing changes.
 """
 
 import dataclasses
@@ -41,11 +49,12 @@ from typing import Any
 from expcore.campaign.executor import Endpoint
 from expcore.campaign.gate import Budget
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.shard import SHARDS_CAP, ModelShards
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.models import Limits
 from expcore.loop.config import MALFORMED_POLICIES, AgentConfig
 
-_TOP_KEYS = ("order_seed", "seeds", "models", "agent", "scheduler", "budget", "endpoints")
+_TOP_KEYS = ("order_seed", "seeds", "models", "agent", "scheduler", "budget", "endpoints", "shards")
 _AGENT_KEYS = ("max_tool_rounds", "time_cap_s", "token_budget", "output_cap_chars", "max_output_tokens")
 _SCHEDULER_KINDS: dict[str, type] = {
     "max_attempts": int,
@@ -76,15 +85,20 @@ class CampaignConfig:
     agent: AgentConfig
     scheduler: SchedulerConfig
     endpoints: Mapping[str, Endpoint] = field(default_factory=dict)
+    shards: ModelShards | None = None  # `[shards] per_model`: shard by model first (C31)
 
     def caps(self) -> dict[str, Any]:
-        """The campaign-wide caps as plain data, for the fingerprint: the loop's, the attempt limit and the budget."""
+        """The campaign-wide caps as plain data, for the fingerprint: the loop's, the attempt limit and the budget, and
+        the `[shards]` layout only when the campaign declares one."""
         budget = self.scheduler.budget
-        return {
+        caps = {
             "agent": self.agent.as_dict(),
             "max_attempts": self.scheduler.max_attempts,
             "budget": None if budget is None else dataclasses.asdict(budget) | {"release_file": None},
         }
+        if self.shards is not None:
+            caps[SHARDS_CAP] = self.shards.to_json()
+        return caps
 
 
 def _typed(section: Section, key: str, kind: type) -> Any:
@@ -169,6 +183,55 @@ def _endpoints(root: Section, models: tuple[str, ...]) -> dict[str, Endpoint]:
     return endpoints
 
 
+def _shards(
+    root: Section, models: tuple[str, ...], scheduler: SchedulerConfig, endpoints: Mapping[str, Endpoint]
+) -> ModelShards | None:
+    """`[shards] per_model`, in declared order; every model of the plan once, and no unit past its cap (C31)."""
+    if "shards" not in root.data:
+        return None
+    section = _table(root, "shards")
+    section.reject_unknown(["per_model"])
+    if "per_model" not in section.data:
+        raise section.fail("per_model", "is required: each model of the plan with how many shards serve it")
+    table = Section(section.table("per_model"), root.file, "[shards.per_model]")
+    counts = []
+    for model in table.data:
+        if model not in models:
+            raise table.fail(model, f"is not one of the plan's models: {', '.join(models)}")
+        count = _typed(table, model, int)
+        if count < 1:
+            raise table.fail(model, f"is {count}: a model with no shard has pairs that no shard runs")
+        counts.append((model, count))
+    missing = [model for model in models if model not in table.data]
+    if missing:
+        raise section.fail("per_model", f"gives no count for model {missing[0]}: every model of the plan needs one")
+    total = sum(count for _, count in counts)
+    if total < 2:
+        raise section.fail("per_model", f"sums to {total}: a sharded campaign has at least 2 shards")
+    _refuse_past_caps(table, counts, scheduler.unit_caps, endpoints)
+    return ModelShards(tuple(counts))
+
+
+def _refuse_past_caps(
+    table: Section, counts: list[tuple[str, int]], caps: Mapping[str, int], endpoints: Mapping[str, Endpoint]
+) -> None:
+    """Refuse shard counts above a concurrency cap: each shard runs one run at a time, so the shards of the models on
+    one unit are that many of its runs at once."""
+    by_unit: dict[str, list[tuple[str, int]]] = {}
+    for model, count in counts:
+        by_unit.setdefault(endpoints[model].unit, []).append((model, count))
+    for unit, held in by_unit.items():
+        cap, total = caps.get(unit), sum(count for _, count in held)
+        if cap is None or total <= cap:
+            continue
+        cause = f"[scheduler.unit_caps] {unit} = {cap}: each shard runs one run at a time, so its shards would run more"
+        if len(held) == 1:
+            raise table.fail(held[0][0], f"is {total}, above the concurrency cap of its unit, {cause}")
+        names = " + ".join(f"{model} {count}" for model, count in held)
+        message = f"with the other models of unit {unit} gives {names} = {total} shards, above {cause}"
+        raise table.fail(held[0][0], message)
+
+
 def load_campaign(path: str | os.PathLike[str]) -> CampaignConfig:
     """Read and validate campaign.toml; raise ConfigError naming the file and the key of the first problem."""
     root = Section(load_toml(path), path, "top level")
@@ -185,12 +248,14 @@ def load_campaign(path: str | os.PathLike[str]) -> CampaignConfig:
     if len(set(models)) != len(models):
         raise root.fail("models", "names a model more than once")
     budget = _budget(root)
+    agent, scheduler, endpoints = _agent(root), _scheduler(root, budget), _endpoints(root, models)
     return CampaignConfig(
         source=str(path),
         order_seed=order_seed,
         seeds=tuple(seeds),
         models=models,
-        agent=_agent(root),
-        scheduler=_scheduler(root, budget),
-        endpoints=_endpoints(root, models),
+        agent=agent,
+        scheduler=scheduler,
+        endpoints=endpoints,
+        shards=_shards(root, models, scheduler, endpoints),
     )
