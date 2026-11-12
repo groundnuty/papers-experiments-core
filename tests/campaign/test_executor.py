@@ -9,8 +9,15 @@ from record_support import CODE, hand_made, make_config
 from scheduler_support import ReportingBackend
 
 from expcore.campaign.attempts import classify
-from expcore.campaign.executor import Endpoint, RunRequest, failure_result, record_run, result_from_record
-from expcore.errors import InfraError
+from expcore.campaign.executor import (
+    Endpoint,
+    RunRequest,
+    failure_result,
+    record_run,
+    result_from_record,
+    sent_no_request,
+)
+from expcore.errors import FirstTurnRefusal, InfraError
 from expcore.records.build import RunIdentity
 
 ENDED = "2026-01-01T00:10:00Z"
@@ -46,6 +53,32 @@ def test_an_infra_error_raised_outside_the_loop_is_infrastructure_of_its_kind_wi
     assert result.outcome.infra_kind == "sandbox"
     assert (result.input_tokens, result.usage_complete) == (None, False)
     assert classify(result).state == "infra_fail"
+
+
+def test_c31_a_failure_known_to_have_sent_no_request_has_a_usage_of_none_not_an_unknown_one():
+    """C31 and C24: with `sent_nothing` the result holds zero tokens and no turn, complete, so the store charges it
+    nothing at any price; without it the usage stays unknown and the attempt is charged its bound."""
+    refusal = FirstTurnRefusal("tool_plane_integrity", "instrument 'm' refused at the first turn: not realised")
+    known = failure_result(refusal, ended_utc=ENDED, wall_s=0.1, sent_nothing=True)
+    assert (known.input_tokens, known.output_tokens, known.turn_usage, known.usage_complete) == (0, 0, (), True)
+    assert (known.outcome.infra_kind, classify(known).state) == ("tool_plane_integrity", "infra_fail")
+    unknown = failure_result(refusal, ended_utc=ENDED, wall_s=0.1)
+    assert (unknown.input_tokens, unknown.turn_usage, unknown.usage_complete) == (None, None, False)
+
+
+def test_c31_only_a_first_turn_refusal_from_a_backend_that_sent_nothing_is_known_to_have_sent_no_request():
+    """C31: a first-turn refusal is raised before the loop's first request, so it sent none unless the backend counted
+    one; a backend that keeps no count is taken at the refusal's word, and any other failure may have sent requests."""
+    refusal = FirstTurnRefusal("tool_plane_integrity", "refused")
+    idle, busy = ReportingBackend("m1", 1, None), ReportingBackend("m1", 1, None)
+    busy.begin("sys", "user", [])
+    asyncio.run(busy.step())
+    assert (idle.requests_sent, busy.requests_sent) == (0, 1)
+    assert sent_no_request(refusal, idle) is True
+    assert sent_no_request(refusal, busy) is False
+    assert sent_no_request(refusal, object()) is True  # a backend of a study's own that keeps no count
+    assert sent_no_request(InfraError("tool_plane_integrity", "refused"), idle) is False
+    assert sent_no_request(ValueError("a crash"), idle) is False
 
 
 def test_c10_any_other_exception_is_a_harness_defect_named_by_its_class_and_never_by_its_text():

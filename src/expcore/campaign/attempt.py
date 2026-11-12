@@ -48,6 +48,7 @@ from expcore.campaign.executor import (
     RunRequest,
     failure_result,
     result_from_record,
+    sent_no_request,
 )
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.harness_stop import HarnessStops, kind_of
@@ -266,7 +267,13 @@ class AttemptRunner:
             record = asyncio.run(go())
             result = result_from_record(record, ended_utc=p.stamp())
         except Exception as error:  # the executor's: infrastructure or a defect of ours, classified by what it is
-            result = failure_result(error, ended_utc=p.stamp(), wall_s=p.monotonic() - started, treatment_kinds=kinds)
+            result = failure_result(
+                error,
+                ended_utc=p.stamp(),
+                wall_s=p.monotonic() - started,
+                treatment_kinds=kinds,
+                sent_nothing=sent_no_request(error, backend),
+            )
             if result.outcome.defect is not None:  # the attempt keeps the class and the stack hash; the log the rest
                 defects(error, result.outcome.defect)
         result, moved = self._judge(result, record, model, key)

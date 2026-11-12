@@ -7,7 +7,9 @@ from loop_support import FakeProvider
 from record_support import CODE, make_config
 from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, key_of, settings_for
 
+from expcore.campaign.attempt_bounds import attempt_costs
 from expcore.campaign.executor import record_run
+from expcore.campaign.gate import Budget
 from expcore.campaign.healthgate import Health
 from expcore.errors import InfraError
 from expcore.records.instruments import finish_instruments, first_turn_instruments
@@ -239,3 +241,48 @@ def test_c31_a_refused_treatment_attempt_is_not_scored_when_the_health_gate_repo
         assert (second["state"], second["treatment"], second["infra_kind"]) == ("done", 1, "knowledge")
         assert executor.calls_of(key) == 2
         assert "instrument_refused" in event_kinds(store)
+
+
+def refused_at_the_first_turn_after(requests):
+    """An executor behaviour: `requests` replies are asked of the backend, then the first-turn hook refuses."""
+    refuser = Refuser(hook=InfraError(REFUSED, "the files were not in their start state"))
+
+    async def behave(request):
+        request.backend.begin("be brief", "do the task", [])
+        for _ in range(requests):
+            await request.backend.step()
+        first_turn_instruments([refuser], request.timer)
+        raise AssertionError("the hook refused, so the executor does not get here")
+
+    return behave
+
+
+def first_attempt_cost(tmp_path, requests):
+    """The state and cost of the first attempt of a run whose first-turn hook refused after `requests` requests."""
+    schema = make_schema()
+    key = key_of(schema, "api-none")
+    executor = FakeExecutor({key: [refused_at_the_first_turn_after(requests)]})
+    settings = settings_for(budget=Budget(max_usd=1_000.0))
+    with build(tmp_path, schema=schema, executor=executor, plan=SMALL, settings=settings) as scheduler:
+        scheduler.run()
+        costs = attempt_costs(scheduler.store, scheduler.models.models, scheduler.agent_config.limits)
+        first = next(cost for cost in costs if cost.run_key == key)
+        return attempt_rows(scheduler.store, key)[0]["infra_kind"], first
+
+
+def test_c31_an_attempt_refused_at_the_first_turn_sent_no_request_and_costs_nothing(tmp_path):
+    """C31 and C24: the hook runs before the loop sends its first request, so the refused attempt is known to have
+    cost nothing; like an attempt that found an outage before it began it is charged 0, never the bound of an attempt
+    whose usage is unknown."""
+    kind, cost = first_attempt_cost(tmp_path, requests=0)
+    assert kind == REFUSED
+    assert (cost.usd, cost.bounded) == (0.0, False)
+
+
+def test_c31_an_attempt_refused_at_the_first_turn_after_a_request_was_sent_keeps_the_bound(tmp_path):
+    """C31 and C26: an executor that sent a request before the hook ran spent something nobody counted, so the
+    refused attempt is charged the bound of an attempt whose usage is unknown, as before."""
+    kind, cost = first_attempt_cost(tmp_path, requests=1)
+    assert kind == REFUSED
+    assert cost.usd > 0.0
+    assert cost.bounded

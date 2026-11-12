@@ -28,7 +28,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from expcore.errors import InfraError, is_treatable
+from expcore.errors import FirstTurnRefusal, InfraError, is_treatable
 from expcore.loop.outcomes import DETAIL_LIMIT
 from expcore.loop.timer import AgentTimer
 from expcore.plugin import FIRST_TURN_LABEL, Instrument
@@ -81,10 +81,10 @@ def _require_untreatable(instrument: Instrument, error: InfraError, when: str) -
         ) from error
 
 
-def _refusal(instrument: Instrument, error: InfraError, when: str) -> InfraError:
-    """The error to raise for an instrument's refusal: the same kind, naming the instrument."""
+def _refusal(instrument: Instrument, error: InfraError, when: str) -> FirstTurnRefusal:
+    """The error to raise for an instrument's refusal at the first turn: the same kind, naming the instrument."""
     _require_untreatable(instrument, error, when)
-    return InfraError(error.kind, f"instrument {instrument.namespace!r} refused {when}: {error.detail}")
+    return FirstTurnRefusal(error.kind, f"instrument {instrument.namespace!r} refused {when}: {error.detail}")
 
 
 def first_turn_instruments(instruments: Sequence[Instrument], timer: AgentTimer) -> None:
@@ -96,9 +96,10 @@ def first_turn_instruments(instruments: Sequence[Instrument], timer: AgentTimer)
     no instrument that has the hook no reading is taken, so a run without one is unchanged.
 
     An `InfraError` of a kind no condition can declare as its treatment is the instrument's refusal: it is raised again
-    naming the instrument, and the executor lets it reach its caller, which sets the attempt aside as infrastructure of
-    that kind (no request was sent, so no turn was completed and the kind is never treatment, whatever a condition
-    declares). Any other exception is a defect of the instrument.
+    as a `FirstTurnRefusal` naming the instrument, and the executor lets it reach its caller, which sets the attempt
+    aside as infrastructure of that kind (no request was sent, so no turn was completed and the kind is never
+    treatment, whatever a condition declares) and, as no request was sent, charges it no tokens. Any other exception
+    is a defect of the instrument.
     """
     check_instruments(instruments)
     hooked = [(i, hook) for i in instruments if (hook := _method(i, "at_first_turn")) is not None]
