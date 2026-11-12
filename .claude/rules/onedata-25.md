@@ -8,6 +8,8 @@ paths:
 
 # Onedata 25.0 as measured, and the live federation
 
+The images are a 25.0 development build (op-worker `f118ed9`), not the released 25.0 tag: a dated facts file names it as "25.0 development build (op-worker f118ed9)", never just "25.0" (`day0/2026-11-12-federation-facts-build.md`).
+
 Behaviours measured live on 25.0 (dated facts in `deploy/compose-federation/day0/`), which the platform layer must handle:
 - A deleted or not-yet-visible entry answers 400 with error id `posix`/`enoent`, not 404. Treat exactly that id, or 404, as absent; any other 400 fails closed.
 - A write with a read-only token answers 400 `posix`/`eacces`: a refusal, like 401 and 403.
