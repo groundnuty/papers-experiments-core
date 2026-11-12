@@ -475,9 +475,12 @@ class Provisioner:
             raise ProvisionError(f"{self._where}the size read back after an upload is not the size uploaded")
         return file_id
 
-    def upload(self, path: str, source: Path | str, *, content_type: str = OCTET_STREAM) -> Upload:
+    def upload(
+        self, path: str, source: Path | str, *, content_type: str = OCTET_STREAM, stop: int | None = None
+    ) -> Upload:
         """Upload a local file to a path of the space on the data provider, never holding it whole; return what was
-        done (O25).
+        done (O25). With `stop`, only the local file's first `stop` bytes are its content here: the target ends as
+        that prefix, verified by its hash, and a later upload with a larger stop, or none, resumes from it.
 
         The file is read and sent `chunk_bytes` at a time, each chunk a PUT at its offset through the client's mutation
         gate (the space's name is checked first, and the file's space before every write), carrying `content_type`.
@@ -498,6 +501,10 @@ class Provisioner:
         """
         media, source = media_type(content_type), Path(source)
         size = source.stat().st_size  # a local file that is not there is refused before anything is asked
+        if stop is not None:
+            if isinstance(stop, bool) or not isinstance(stop, int) or not 1 <= stop <= size:
+                raise ProvisionError(f"{self._where}an upload's stop is a whole number of bytes within the local file")
+            size = stop
         self._verified()
         *directory, name = safe_path(path)
         parent = self.make_dir("/".join(directory)) if directory else self.root()
@@ -510,7 +517,7 @@ class Provisioner:
             file_id = existing.file_id
             if action == "skipped":
                 return Upload(file_id, Digest(size, hasher.hexdigest()), action, 0)
-        blocks = _hashing(chunks(source, self._settings.chunk_bytes, start=start), hasher)
+        blocks = _hashing(chunks(source, self._settings.chunk_bytes, start=start, stop=size), hasher)
         sent = self._write_chunks(file_id, blocks, media, truncate=action == "restarted")
         expected = Digest(start + sent, hasher.hexdigest())
         if expected.size != size:
