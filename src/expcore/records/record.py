@@ -5,7 +5,7 @@
 """The run record: one JSON file per attempt, written atomically and read back byte for byte (R01).
 
 A record holds what is needed to audit, re-score and replay an attempt offline: who it was (run key, factor values,
-attempt, and the infrastructure kinds its condition declares as treatment), the route and the settings each request carried, the prompts and tools the model was given, the agent
+attempt, and the infrastructure kinds, and from version 3 the targets, its condition declares as treatment), the route and the settings each request carried, the prompts and tools the model was given, the agent
 configuration as resolved for the run, the code stamp, the transcript turn by turn with the neutral and the native
 message, every tool call with the exact text shown and the raw result, the clock readings, the outcome, the instrument
 outputs under their namespaces, and the scores, kept apart. The sections and their fields are in `schema.py`.
@@ -36,6 +36,7 @@ from expcore.records.schema import (
     RecordError,
     SchemaVersion,
     added_after,
+    derived_treatment,
     optional_in,
     validate,
 )
@@ -75,6 +76,7 @@ class RunRecord:
     instruments: dict[str, Any] = field(default_factory=dict)
     scores: dict[str, Any] = field(default_factory=dict)
     redacted_paths: list[str] = field(default_factory=list)
+    treatment_targets: dict[str, str] = field(default_factory=dict)
     # Version 3, optional: the instrument that refused the attempt after the run, `{"namespace", "infra_kind",
     # "detail"}` (C31). None when none did; it is then left out of the file, never written as a null.
     instrument_refusal: dict[str, Any] | None = None
@@ -98,31 +100,47 @@ class RunRecord:
         return self.outcome["name"] in SET_ASIDE_OUTCOMES and not self.outcome["treatment"]
 
     def with_instrument(self, namespace: str, data: dict[str, Any]) -> "RunRecord":
-        """Return a copy that also holds an instrument's output under its namespace."""
-        return dataclasses.replace(self, instruments={**self.instruments, namespace: data})
+        """Return a copy that also holds an instrument's output under its namespace, its treatment flag derived again.
+
+        The fault injector is an instrument, and under version 3 its reading decides whether a declared target was held
+        down in this attempt, so the flag the loop's record carried before the snapshot arrived is taken anew from the
+        record's own parts (`derived_treatment`), the rule its validation holds it to.
+        """
+        record = dataclasses.replace(self, instruments={**self.instruments, namespace: data})
+        flag = derived_treatment(vars(record), record.schema_version)
+        if flag is record.outcome["treatment"]:
+            return record
+        return dataclasses.replace(record, outcome={**record.outcome, "treatment": flag})
 
     def with_instrument_refusal(self, refusal: dict[str, Any]) -> "RunRecord":
         """Return a copy that records the instrument that refused the attempt: `namespace`, `infra_kind`, `detail` (C31)."""
         return dataclasses.replace(self, instrument_refusal=dict(refusal))
 
     def to_json(self, schemas: tuple[SchemaVersion, ...] = SCHEMAS) -> dict[str, Any]:
-        """Return the record as a dictionary in file order, without the fields a later schema added.
+        """Return the record as a dictionary in file order, without the fields a later schema added, and without an
+        optional field that holds its default.
 
         A later-added field is dropped when it holds its default; one that holds data cannot be written into a record
-        of an earlier version, and raises.
+        of an earlier version, and raises. A field the record's own version marks optional (`treatment_targets` and
+        `instrument_refusal`, from version 3) is absent when it holds its default, "not recorded", never written as an
+        empty value or a null.
         """
         data = dataclasses.asdict(self)
-        ordered = {"schema_version": data.pop("schema_version"), **data}
-        for name in sorted(added_after(ordered["schema_version"], "record", schemas)):
-            default = next(f for f in dataclasses.fields(self) if f.name == name)
-            empty = default.default_factory() if default.default_factory is not dataclasses.MISSING else default.default
-            if ordered[name] != empty:
-                raise RecordError(f"{name} holds data but {ordered['schema_version']} predates the field")
+        version = data.pop("schema_version")
+        ordered = {"schema_version": version, **data}
+        for name in sorted(added_after(version, "record", schemas)):
+            if ordered[name] != self._empty(name):
+                raise RecordError(f"{name} holds data but {version} predates the field")
             del ordered[name]
-        for name in optional_in("record", ordered["schema_version"], schemas):
-            if ordered.get(name) is None:  # an optional field the run did not supply is absent, never null
-                ordered.pop(name, None)
+        for name in sorted(optional_in("record", version, schemas)):
+            if ordered[name] == self._empty(name):
+                del ordered[name]
         return ordered
+
+    def _empty(self, name: str) -> Any:
+        """The default of one of the record's fields, the value it holds when the record says nothing of it."""
+        held = next(f for f in dataclasses.fields(self) if f.name == name)
+        return held.default_factory() if held.default_factory is not dataclasses.MISSING else held.default
 
     @classmethod
     def from_json(cls, data: Any, schemas: tuple[SchemaVersion, ...] = SCHEMAS) -> "RunRecord":

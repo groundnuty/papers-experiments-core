@@ -123,7 +123,8 @@ def test_o04_health_checks_each_space_against_its_own_support_set(tmp_path, fake
     config, client, issuer = configure(tmp_path, fake, edit=lambda d: d["spaces"][0].update(providers=["alpha"]))
     fake.supports.pop(BETA_ID)  # the study space: alpha alone, as its entry declares
     health = PlatformHealth(config, client, issuer, clock=lambda: NOW)
-    assert health()._asdict() == {"ok": True, "detail": "ok: each of the 2 spaces is supported by its declared set"}
+    passed = {"ok": True, "detail": "ok: each of the 2 spaces is supported by its declared set", "deferred": False}
+    assert health()._asdict() == passed
     fake.space_supports[SPACE_IDS[1]].pop(BETA_ID)
     verdict = health()
     assert verdict.ok is False

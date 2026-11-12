@@ -174,7 +174,9 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
             instruments=rec.instruments,
             instrument_refusal=rec.instrument_refusal,  # carried over like the instruments; absent when absent
             treatment_kinds=rec.treatment_kinds,
+            treatment_targets=rec.treatment_targets,
             schema_version=rec.schema_version,  # the rule of the record's own version decides its treatment flag
+            schemas=schemas,
             redactor=Redactor.none(),  # the record is redacted already; what the loop derives from it is too
         )
     except RecordError as exc:

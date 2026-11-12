@@ -59,7 +59,9 @@ def check_instruments(instruments: Sequence[Instrument]) -> None:
 
 
 def start_instruments(instruments: Sequence[Instrument], identity: Mapping[str, Any]) -> None:
-    """Check the instruments, then let each take its first reading. An instrument that raises here is a defect."""
+    """Check the instruments, then let each take its first reading. What one raises here reaches the executor's caller:
+    an `InfraError` (a fault injector that could not take its target down) is infrastructure of its kind, anything
+    else a defect."""
     check_instruments(instruments)
     for instrument in instruments:
         instrument.start(identity)
@@ -131,6 +133,9 @@ def _refused_by(instruments: Sequence[Instrument]) -> dict[str, Any] | None:
 
 def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> RunRecord:
     """Return the record with each instrument's snapshot under its namespace; a failed one is recorded as failed.
+
+    Each snapshot is added through `RunRecord.with_instrument`, which derives the treatment flag again: a fault
+    injector's snapshot decides whether a declared target was held down in this attempt (record version 3).
 
     Then each instrument that has `check` is asked, in order, once every snapshot is in; the first to refuse stops the
     rest, and its refusal is in the returned record (`RunRecord.instrument_refusal`), snapshots and all, so the attempt

@@ -240,7 +240,7 @@ On the Onedata platform four clients talk to the federation: the platform layer'
 - **`ca_file`**, preferred: `ca_file = "federation-ca.pem"` names a CA bundle the federation's certificate chains to, relative to `platform.toml`. Verification stays on, against that bundle. The bundle must hold certificates and no private key. No client reads the file you named: its bytes are hashed when `platform.toml` is loaded, read once more for each run and refused unless they have that hash, and every client gets those bytes, the REST client in memory and the gate, the sidecar and the tool server as the run's own read-only copy. A bundle replaced after the load is never trusted; a run started after it is refused until `platform.toml` is loaded again.
 - **`insecure_tls`**: `insecure_tls = true` turns verification off for all four clients. It is for disposable test federations only: anyone on the path to the federation can then read and alter the data and the tokens. While it is on, every health reading ends with a warning.
 
-The two keys never go together, and the per-client keys of earlier versions (`insecure_tls` under `[toolserver]`, `tls` under `[sandbox.mount]`) are refused at load. Each run's sandbox metadata records the mode, `verify`, `ca_file` with the bundle's SHA-256, or `insecure`, and never the bundle's path or contents. To make the mode part of the campaign's fingerprint, the plugin passes the platform's half of it, `StudyPlugin(..., platform=config.fingerprint())` with `config` the loaded `platform.toml`; a resume under another mode or another bundle is then refused.
+The two keys never go together, and the per-client keys of earlier versions (`insecure_tls` under `[toolserver]`, `tls` under `[sandbox.mount]`) are refused at load. Each run's sandbox metadata records the mode, `verify`, `ca_file` with the bundle's SHA-256, or `insecure`, and never the bundle's path or contents. To make the mode part of the campaign's fingerprint, the plugin passes the platform's half of it, `StudyPlugin(..., platform=config.fingerprint())` with `config` the loaded `platform.toml`; a resume under another mode or another bundle is then refused. With `[faults]` the same call also carries the fault injector's sanction and, for each provider it may take down, the provider's label with the SHA-256 of its service's name, so a resume that adds or drops `[faults]`, changes the sanction or takes another service down is refused too; the injector's waits and its journal's place are not part of it.
 
 ### Data paths on the Onedata platform
 
@@ -366,7 +366,7 @@ except ConfigError as error:
 shutil.rmtree(tampered)
 ```
 
-A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run. A kind named nowhere is refused as unknown, and the error lists the treatable kinds. The `health_kind` and `identity_kind` of `[scheduler]` are checked against the same vocabulary when the study is loaded ([section 2](#the-schedulers-kinds)).
+A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`, which registers every kind the layer raises, the fault injector's included. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run. A kind named nowhere is refused as unknown, and the error lists the treatable kinds. The `health_kind` and `identity_kind` of `[scheduler]` are checked against the same vocabulary when the study is loaded ([section 2](#the-schedulers-kinds)).
 
 ```python
 from expcore.errors import infra_kinds
@@ -626,6 +626,49 @@ for (condition, provider, reason), n in sorted(counts.items(), key=str):
 records = [p for p in Path("my-study/out/runs").glob("*/try*/*.json") if p.name.count(".") == 2]
 assert records and all(load_record(p).run_key for p in records)  # every attempt's record is read
 assert counts == Counter()  # the example study runs without the platform
+```
+
+### Fault injection: compare like isolation with like
+
+On the Onedata platform a condition whose manipulation is a provider outage (`infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]`, with `[faults]` in platform.toml and `platforms = ["expcore_onedata.sandbox.kinds"]` in `[study]`, the module that registers `provider_outage` and the injector's own failure, `injector_failure`, which no condition may declare) runs alone on the federation: its run admission is exclusive, so no other run shares the federation while the provider is down. The injector hands the federation back only when the restored provider serves, not merely when its container runs with a new identity: a restarted provider can refuse connections for the better part of a minute, and a control run that started on it would meet outage-like refusals that its agent may absorb without any recorded infrastructure error. It waits, at most `ready_timeout_s` of `[faults]` (180 s by default), until the provider's container is healthy and the platform's authenticated read through it answers, records the wait as `ready_after_s` in its snapshot, and otherwise leaves the restore unverified, the injection open and the health gate failing. A control that shares the federation with concurrent runs differs from it in load as well as in the fault, and a contrast between the two confounds them. Either give the control the same isolation, a condition with no fault that declares `exclusive = true`, or restrict the contrast to measures that do not depend on the federation's load. `exclusive = true` needs a run admission to hold: on a platform without `[faults]` it is refused at the start, naming the file and the key. Before analysing, check what each compared attempt actually held: the export's `admission` is `shared`, `exclusive`, or `none` for a study without admission, as stored when the attempt was admitted, never inferred from its condition.
+
+```python
+import expcore_onedata.sandbox.kinds  # what [study] platforms imports before study.toml's conditions are validated
+from expcore.campaign.factors import load_factor_schema
+
+design = Path("isolated-design.toml")
+design.write_text(
+    """
+[factors.fault]
+levels = ["outage", "none"]
+
+[identity]
+order = ["task", "fault", "model", "seed"]
+
+[conditions.outage]
+fault = "outage"
+infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]
+
+[conditions.matched-control]
+fault = "none"
+exclusive = true
+"""
+)
+isolated = load_factor_schema(design)
+assert isolated.exclusive == {"outage": False, "matched-control": True}
+
+
+def admission_by_condition(export):
+    """The admission modes each condition's analysed attempts held."""
+    held = {}
+    for entry in export["analysed_attempts"]:
+        held.setdefault(entry["condition"], set()).add(entry["admission"])
+    return held
+
+
+held = admission_by_condition(export)
+assert all(len(modes) == 1 for modes in held.values())  # each condition ran under one isolation
+assert held == dict.fromkeys(held, {"none"})  # the example study has no run admission
 ```
 
 ### Testing a study's instruments and scorers

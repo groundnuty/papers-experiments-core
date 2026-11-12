@@ -113,6 +113,19 @@ def finished(**fields) -> AttemptResult:
     return AttemptResult(Outcome("finished"), LATER, fields.pop("wall_s", 12.5), **fields)
 
 
+MARKER_SCHEMA_3_FIELDS = ("target_rule", "treatment_targets", "injected_targets")
+
+
+def as_schema_two(body: dict) -> dict:
+    """Turn the JSON of a marker written now into what schema 2 wrote: no target of a fault, declared, injected or the
+    outcome's, and no target rule. Every marker written before a field of schema 2 was added is a schema-2 marker."""
+    body["schema"] = 2
+    for name in MARKER_SCHEMA_3_FIELDS:
+        del body["result"][name]
+    del body["result"]["outcome"]["infra_target"]
+    return body
+
+
 def infra(kind: str = "endpoint", detail: str = "HTTP 503 after 5 retries", **fields) -> AttemptResult:
     """Return the result of an attempt that ended on an infrastructure failure of a kind, after one completed turn.
 

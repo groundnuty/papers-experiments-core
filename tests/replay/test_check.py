@@ -33,7 +33,7 @@ from expcore.replay.check import (
 from expcore.replay.divergence import ReplayDivergence
 
 NAMES = ("tools", "malformed", "infra_turn_three", "tool_crash")
-REFUSAL_FIXTURE = Path(__file__).parent.parent / "data" / "record-v3" / "03-instrument-refusal.json"
+REFUSAL_FIXTURE = Path(__file__).parent.parent / "data" / "record-v3" / "04-instrument-refusal.json"
 
 
 @pytest.fixture

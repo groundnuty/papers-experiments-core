@@ -15,6 +15,8 @@ import subprocess
 import pytest
 from federation_support import DEPLOY, EXAMPLE
 
+from expcore_onedata.fault_settings import FaultSettings
+
 FORBIDDEN_SERVICE_KEYS = {"privileged", "cap_add", "devices", "pid", "ipc", "build", "expose", "security_opt"}
 
 
@@ -41,6 +43,19 @@ def test_every_published_port_is_bound_to_the_loopback_and_nothing_else_is_publi
             published[name] = int(port["published"])
         assert service.get("network_mode") in (None, "none")  # never the host's network
     assert published == {s.name: s.port for s in any_spec.services}
+
+
+def test_o11_the_fault_injectors_default_settle_timeout_covers_every_stop_grace_period_with_a_margin(fed, any_spec):
+    """O11: a stop that hits the command timeout leaves the daemon stopping the container for up to the provider's
+    grace period; the restore waits that long for it to show down, so the default settle timeout (the bound of that
+    wait) exceeds the grace of every service the generator emits by at least 30 s."""
+    graces = [
+        float(s["stop_grace_period"].removesuffix("s"))
+        for s in services(fed, any_spec).values()
+        if "stop_grace_period" in s  # the janitor keeps Compose's default, and is no provider
+    ]
+    assert graces
+    assert max(graces) + 30 <= FaultSettings.settle_timeout_s
 
 
 def test_only_the_two_pinned_images_are_named_and_none_is_ever_pulled_or_built(fed, any_spec):
