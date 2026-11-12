@@ -108,6 +108,17 @@ def test_o09_a_provisioner_bound_to_one_space_never_mutates_another_under_a_shar
     assert [c for c in fake.provider_calls if c[2] == "/transfers"] == []
 
 
+def test_o25_a_provisioner_bound_to_one_space_never_reads_another_spaces_file_by_range(tmp_path, fake, ticker):
+    """O25 with O09: a range read through a provider can make it fetch bytes, so `read_file` is bound to the
+    provisioner's space as its writes are. The second space's provisioner asked to read a file of the first, under the
+    same prefix, is refused by the gate before any range is sent."""
+    owned = bound(tmp_path, fake, ticker, two_spaces, SPACE_LABELS[1])
+    foreign = fake.add_file("study/theirs.bin", DATA)
+    with pytest.raises(OutOfScope, match="another space than the one the request is bound to"):
+        owned.read_file(foreign)
+    assert [r for r in fake.requests if r.range] == []
+
+
 def test_o09_the_gate_asks_a_provider_only_for_the_roots_of_the_spaces_it_supports(tmp_path, fake, ticker):
     """O09: the gate walks a file's parent links to the root of a declared space, and asks a provider only for the
     roots of the spaces whose support set names it: how a provider answers for a space it does not support is

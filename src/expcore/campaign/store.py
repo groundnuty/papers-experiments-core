@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.attempts import (
+    ADMISSION_MODES,
     LEASE_OUTCOMES,
     AttemptRefused,
     BegunAttempt,
@@ -86,6 +87,8 @@ _ADDED_COLUMNS = (
     ("attempts", "replies_checked", "INTEGER"),
     # JSON [[fingerprint or null, turns], ...] of a model that declares accepted fingerprints (B18); NULL: none kept
     ("attempts", "deployments", "TEXT"),
+    # what of the run admission the attempt held (attempts.ADMISSION_MODES); NULL: unknown
+    ("attempts", "admission", "TEXT"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -415,6 +418,7 @@ class Store:
         lease_wait_s: float | None = None,
         lease_outcome: str = "none",
         reserved_capped: bool | None = None,
+        admission: str = "none",
     ) -> BegunAttempt:
         """Insert the 'running' row before the run starts; refuse in the transaction a run that is not pending.
 
@@ -422,14 +426,17 @@ class Store:
         run again under the number it had. The row also takes the next place in the campaign's dispatch sequence (one
         more than the largest so far, in the same write transaction, so it grows with every attempt and a restart
         carries on from where the dead process stopped), the lease it runs under: how long it waited for it and
-        how it was obtained (`LEASE_OUTCOMES`), and the bound the budget gate reserved the run when it let it start:
-        by the reply maximum or by the window (`reserved_capped`, C27; None when no gate decided it). An attempt whose
-        usage turns out unknown is charged that bound, at this start or any later one (`attempt_bounds`).
+        how it was obtained (`LEASE_OUTCOMES`), the bound the budget gate reserved the run when it let it start:
+        by the reply maximum or by the window (`reserved_capped`, C27; None when no gate decided it), and what it held
+        of the platform's run admission (`ADMISSION_MODES`). An attempt whose usage turns out unknown is charged that
+        bound, at this start or any later one (`attempt_bounds`).
         """
         if lease_outcome not in LEASE_OUTCOMES:
             raise ValueError(f"lease_outcome {lease_outcome!r} must be one of: {', '.join(LEASE_OUTCOMES)}")
         if reserved_capped is not None and not isinstance(reserved_capped, bool):
             raise ValueError(f"reserved_capped is True, False or None, not {reserved_capped!r}")
+        if admission not in ADMISSION_MODES:
+            raise ValueError(f"admission {admission!r} must be one of: {', '.join(ADMISSION_MODES)}")
 
         def go() -> BegunAttempt:
             run = self.db.execute("SELECT status FROM runs WHERE run_key=?", (run_key,)).fetchone()
@@ -446,8 +453,20 @@ class Store:
             capped = None if reserved_capped is None else int(reserved_capped)
             cursor = self.db.execute(
                 "INSERT INTO attempts(run_key,attempt,state,started_utc,pid,run_dir,dispatch_seq,lease_wait_s,"
-                "lease_outcome,reserved_capped) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (run_key, number, "running", started, pid, run_dir, sequence, lease_wait_s, lease_outcome, capped),
+                "lease_outcome,reserved_capped,admission) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    run_key,
+                    number,
+                    "running",
+                    started,
+                    pid,
+                    run_dir,
+                    sequence,
+                    lease_wait_s,
+                    lease_outcome,
+                    capped,
+                    admission,
+                ),
             )
             return BegunAttempt(int(cursor.lastrowid), number, int(sequence))
 
@@ -494,10 +513,10 @@ class Store:
         The state, the charge and the treatment mark follow from the cause and the run's condition (`classify`). A run is
         done on an agent outcome or a treatment fault, exhausted when its charged attempts reach `max_attempts`, set
         aside as a harness error when our own code crashed, and otherwise pending again. An attempt that is not running is refused: its result would be recorded twice. So is a
-        result whose `treatment_kinds` differ from the condition's declaration, or whose record's treatment flag differs
-        from the store's own decision from the outcome, the declared kinds and the completed turns, taken with the
-        first-turn rule of the record's schema version (both are TreatmentKindsMismatch), and the attempt then stays
-        running.
+        result whose `treatment_kinds` or `treatment_targets` differ from the condition's declaration, or whose record's
+        treatment flag differs from the store's own decision from the outcome, the declared kinds and targets, the
+        completed turns and the injected targets, taken with the rules of the record's schema version (both are
+        TreatmentKindsMismatch), and the attempt then stays running.
         """
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
@@ -515,17 +534,23 @@ class Store:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so its result is not recorded")
             condition = self.schema.condition_named(json.loads(row["factors"]), row["run_key"])
             declared = self.schema.treatment_kinds[condition]
+            targets = self.schema.treatment_targets[condition]
             if result.treatment_kinds != declared:
                 raise TreatmentKindsMismatch(
                     f"{row['run_key']}: the record carries treatment kinds {list(result.treatment_kinds)} but "
                     f"condition {condition!r} declares {list(declared)}; the attempt stays running"
                 )
-            state, charged, treatment = classify(result, declared)
+            if dict(result.treatment_targets) != targets:
+                raise TreatmentKindsMismatch(
+                    f"{row['run_key']}: the record carries treatment targets {dict(result.treatment_targets)} but "
+                    f"condition {condition!r} declares {targets}; the attempt stays running"
+                )
+            state, charged, treatment = classify(result, declared, targets)
             if result.recorded_treatment is not None and result.recorded_treatment != treatment:
                 raise TreatmentKindsMismatch(
                     f"{row['run_key']}: the record says treatment={result.recorded_treatment} but the store decides "
-                    f"{treatment} for the outcome, the declared kinds and the {result.model_turns} completed turn(s); "
-                    "the attempt stays running"
+                    f"{treatment} for the outcome, the declared kinds and targets, the injected targets and the "
+                    f"{result.model_turns} completed turn(s); the attempt stays running"
                 )
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"

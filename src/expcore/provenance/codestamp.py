@@ -23,7 +23,7 @@ import datetime as dt
 import hashlib
 import json
 import subprocess
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -50,11 +50,16 @@ class CodeScope:
     `roots` are files and directories relative to the tree root: the code, and the data files and configuration the
     code reads or is configured by. `not_hashed` are files under the roots that a run never reads, such as a dated
     log of amendments, so that adding a row to one does not change the identity. `skip_dirs` are never entered.
+    `canonical` pairs a covered file, by its path relative to the tree root, with the function that gives the bytes
+    hashed for it: a canonical form that leaves out what never reaches a run, such as where a model's key lives
+    (`expcore.config.key_locations`). The file is still covered, and every other byte of it still counts. A function
+    that cannot make the form refuses the file, and hashing raises its error: such a file is never vouched for.
     """
 
     roots: tuple[str, ...]
     not_hashed: frozenset[str] = frozenset()
     skip_dirs: frozenset[str] = SKIP_DIRS
+    canonical: tuple[tuple[str, Callable[[bytes], bytes]], ...] = ()
 
     def __post_init__(self) -> None:
         """Refuse an empty scope and any root that is absolute or climbs out of the tree."""
@@ -66,9 +71,16 @@ class CodeScope:
                 raise CodeScopeError(f"root {root!r} must be a relative path inside the tree")
 
     @classmethod
-    def of(cls, roots: Iterable[str], not_hashed: Collection[str] = (), skip_dirs: Collection[str] = SKIP_DIRS):
+    def of(
+        cls,
+        roots: Iterable[str],
+        not_hashed: Collection[str] = (),
+        skip_dirs: Collection[str] = SKIP_DIRS,
+        canonical: Mapping[str, Callable[[bytes], bytes]] | None = None,
+    ):
         """Build a scope from any iterables."""
-        return cls(tuple(roots), frozenset(not_hashed), frozenset(skip_dirs))
+        forms = tuple(sorted((canonical or {}).items()))
+        return cls(tuple(roots), frozenset(not_hashed), frozenset(skip_dirs), forms)
 
 
 def _files(root: Path, scope: CodeScope) -> list[Path]:
@@ -97,7 +109,8 @@ def covered_files(root: Path | str, scope: CodeScope) -> list[str]:
 
 
 def tree_hash(root: Path | str, scope: CodeScope) -> str:
-    """Return the sha256 over (relative path, sha256 of content) of every covered file, in path order.
+    """Return the sha256 over (relative path, sha256 of content) of every covered file, in path order; a file the
+    scope gives a canonical form is hashed in that form.
 
     Independent of modification times and of git (P03). Raises CodeScopeError when no file is covered, because an
     identity over nothing would pass for any code.
@@ -106,9 +119,13 @@ def tree_hash(root: Path | str, scope: CodeScope) -> str:
     files = _files(root, scope)
     if not files:
         raise CodeScopeError(f"no file under {', '.join(scope.roots)} in {root}: the identity would cover no code")
+    forms = dict(scope.canonical)
     digest = hashlib.sha256()
     for f in files:
-        digest.update(f.relative_to(root).as_posix().encode() + b"\0" + hashlib.sha256(f.read_bytes()).digest())
+        name = f.relative_to(root).as_posix()
+        data = f.read_bytes()
+        data = forms[name](data) if name in forms else data
+        digest.update(name.encode() + b"\0" + hashlib.sha256(data).digest())
     return digest.hexdigest()
 
 

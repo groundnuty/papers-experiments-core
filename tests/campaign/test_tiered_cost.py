@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 import pytest
-from campaign_support import finished, planned_store, run_one
+from campaign_support import as_schema_two, finished, planned_store, run_one
 from loop_support import ScriptedBackend
 from record_support import make_config, no_secrets_in_the_environment, record_run
 from scheduler_support import build, settings_for
@@ -131,7 +131,7 @@ def test_c24_the_marker_keeps_the_per_turn_usage_and_an_older_marker_without_it_
     write_marker(tmp_path, "k", 1, result)
     assert read_marker(tmp_path, "k", 1) == result
     path = tmp_path / MARKER_NAME
-    body = json.loads(path.read_text(encoding="utf-8"))
+    body = as_schema_two(json.loads(path.read_text(encoding="utf-8")))  # a marker of before the field is schema 2
     del body["result"]["turn_usage"]
     path.write_text(json.dumps(body), encoding="utf-8")
     assert read_marker(tmp_path, "k", 1).turn_usage is None

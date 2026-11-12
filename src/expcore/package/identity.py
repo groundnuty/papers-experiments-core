@@ -7,7 +7,8 @@ hash of the same code, which a reader can recompute, and drops every source:
 
 - first, every file of the batch must be exactly the bytes the original replay check hashed, and no other input may
   have appeared: a record changed after the check would otherwise be given a pseudo-commit and pass under the
-  original check's time;
+  original check's time. A merged batch's merge.json must be the bytes the check names, and each shard's snapshot the
+  bytes merge.json names (`verify_merged_inputs`, which every build makes, plain or anonymised);
 - each record's `code.commit`, and the head of the commit in `code.why`, become that record's pseudo-commit. The
   field is free text under the format and no seal covers it (`records.seal` pins prompts, configuration, tools and
   settings), so no record format changes, and every digest a record holds stays valid;
@@ -47,7 +48,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
+from expcore.campaign.merge import MergeRefused, ShardFacts, facts_of_bytes, merge_document, merge_text, read_merge
+from expcore.campaign.merged import snapshot_rel
 from expcore.campaign.resume import FINGERPRINT_KEY
+from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.package.spec import PackageError
 from expcore.package.views import streams, views
@@ -65,6 +70,7 @@ _HEX_RUN = re.compile(rf"[0-9a-fA-F]{{{SHORTEST_ID},}}")
 FOUND_COMMIT = "a commit id of the study's repository or its environment"
 FOUND_URL = "a source URL or repository name of the study, its environment or the vendored code"
 BATCH = f"{OUT_DIR}/{RUNS_DIR}"
+MERGE_PATH = f"{OUT_DIR}/{MERGE_FILE}"
 
 
 def pseudo_commit(tree_sha256: str) -> str:
@@ -113,6 +119,32 @@ def verify_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -> None:
             raise PackageError(
                 f"{BATCH}/{rel} {state} what the replay check hashed; run `python -m expcore check` again"
             )
+
+
+def verify_merged_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -> None:
+    """Refuse a merged batch whose merge.json is not the bytes the replay check hashed, or one of whose shard snapshots
+    is not the bytes merge.json names, naming the first; nothing to do for a batch that is not merged.
+
+    The check hashes neither as an input of the batch, so this is what binds them before a build reads or rewrites them:
+    an anonymised build rewrites both and makes the check again, which would otherwise vouch for edited bytes."""
+    if MERGE_KEY not in check:
+        return
+    merge = check[MERGE_KEY]
+    expected = merge.get("sha256") if isinstance(merge, dict) else None
+    raw = files.get(MERGE_PATH)
+    if raw is None or not isinstance(expected, str) or hashlib.sha256(raw).hexdigest() != expected:
+        state = "is missing, though" if raw is None else "differs from"
+        raise PackageError(f"{MERGE_PATH} {state} what the replay check hashed; run `python -m expcore check` again")
+    try:
+        document = read_merge(raw, MERGE_PATH)
+    except MergeRefused as error:
+        raise PackageError(str(error)) from None
+    for shard in document["shards"]:
+        path = f"{OUT_DIR}/{snapshot_rel(shard['index'])}"
+        data = files.get(path)
+        if data is None or hashlib.sha256(data).hexdigest() != shard["snapshot_sha256"]:
+            state = "is missing, though" if data is None else "differs from"
+            raise PackageError(f"{path} {state} the snapshot {MERGE_PATH} names; merge the shards again")
 
 
 def replayed_records(check: Mapping[str, Any]) -> list[str]:
@@ -168,6 +200,31 @@ def _anonymised_snapshot(data: bytes, scratch: Path) -> bytes:
     return path.read_bytes()
 
 
+def _anonymised_shards(files: dict[str, bytes], scratch: Path) -> dict[str, str]:
+    """Rewrite, in `files` (mutated in place: the caller's copy of the package), the snapshot of every shard of a merged
+    batch without its environment's sources, and merge.json as the merge writes it from the rewritten snapshots
+    (`merge_document`): each snapshot's SHA-256 changes, and so does the campaign fingerprint's, which hashes the
+    environment with its sources. The check and the analysis rebuild merge.json from the snapshots and refuse one that
+    differs. Returns each snapshot's old hash and its new one: the export lists the hashes, so the author's export is
+    compared with them swapped (`_outputs`)."""
+    try:
+        document = read_merge(files[MERGE_PATH], MERGE_PATH)
+    except (KeyError, MergeRefused) as error:
+        raise PackageError(f"{MERGE_PATH}: {error}") from None
+    swaps: dict[str, str] = {}
+    rewritten: list[ShardFacts] = []
+    for shard in document["shards"]:
+        path = f"{OUT_DIR}/{snapshot_rel(shard['index'])}"
+        files[path] = _anonymised_snapshot(files[path], scratch)
+        try:
+            rewritten.append(facts_of_bytes(files[path], path, out=scratch, snapshot=scratch / SNAPSHOT_FILE))
+        except MergeRefused as error:
+            raise PackageError(str(error)) from None
+        swaps[shard["snapshot_sha256"]] = rewritten[-1].snapshot_sha256
+    files[MERGE_PATH] = merge_text(merge_document(rewritten)).encode("utf-8")
+    return swaps
+
+
 def _anonymised_check(
     files: Mapping[str, bytes], check: Mapping[str, Any], code: Mapping[str, Any], env: Mapping[str, Any], parent: Path
 ) -> bytes:
@@ -187,12 +244,15 @@ def _anonymised_check(
     made["checked_at"] = check.get("checked_at")
     if "snapshot" in check:
         made["snapshot"] = check["snapshot"]
+    if MERGE_KEY in check:  # a merged batch: the check names merge.json by hash, and anonymising rewrote the file
+        made[MERGE_KEY] = {**check[MERGE_KEY], "sha256": hashlib.sha256(files[MERGE_PATH]).hexdigest()}
     write_check(batch, made)
     return (batch / CHECK_FILE).read_bytes()
 
 
-def _outputs(files: dict[str, bytes], commit: str, pseudo: str, stage: Path) -> None:
-    """Derive the outputs from the rewritten batch; refuse any that is not the author's with the commit replaced."""
+def _outputs(files: dict[str, bytes], commit: str, pseudo: str, stage: Path, swaps: Mapping[str, str]) -> None:
+    """Derive the outputs from the rewritten batch; refuse any that is not the author's with the commit replaced,
+    and each old snapshot hash of `swaps` (a merged batch's export lists them) with its new one."""
     lay_out(stage, files)
     try:
         made = output_bytes(analyse_study(stage, stamped=True))
@@ -200,7 +260,10 @@ def _outputs(files: dict[str, bytes], commit: str, pseudo: str, stage: Path) -> 
         raise PackageError(f"the anonymised records cannot be analysed: {error}") from None
     for name in OUTPUT_FILES:
         path = f"{OUT_DIR}/{name}"
-        if files[path].replace(commit.encode(), pseudo.encode()) != made[name]:
+        expected = files[path].replace(commit.encode(), pseudo.encode())
+        for old, new in swaps.items():
+            expected = expected.replace(old.encode(), new.encode())
+        if expected != made[name]:
             raise PackageError(f"{path}: differs from what the records give")
         files[path] = made[name]
 
@@ -227,6 +290,7 @@ def anonymise_identity(
     """Return the files with a tree-hash identity and no source, the new code identity and the environment kept."""
     refuse_labelled_versions(env)
     verify_inputs(files, check)
+    verify_merged_inputs(files, check)
     original = dict(check["code"])
     code = {**original, "commit": pseudo_commit(original["tree_sha256"])}
     kept = without_sources(env)
@@ -235,11 +299,15 @@ def anonymise_identity(
         result[f"{BATCH}/{rel}"] = _anonymised_record(files[f"{BATCH}/{rel}"])
     with tempfile.TemporaryDirectory(prefix=".anonymise-", dir=parent) as scratch:
         where = Path(scratch)
-        snapshot = f"{BATCH}/{SNAPSHOT_FILE}"
-        result[snapshot] = _anonymised_snapshot(files[snapshot], where)
+        swaps: dict[str, str] = {}
+        if MERGE_KEY in check:
+            swaps = _anonymised_shards(result, where)
+        else:
+            snapshot = f"{BATCH}/{SNAPSHOT_FILE}"
+            result[snapshot] = _anonymised_snapshot(files[snapshot], where)
         result[f"{BATCH}/{CHECK_FILE}"] = _anonymised_check(result, check, code, kept, where)
         result[STAMP] = stamp_bytes(result, root, scope, code["commit"], str(check.get("checked_at")), where)
-        _outputs(result, str(original["commit"]), code["commit"], where / "stage")
+        _outputs(result, str(original["commit"]), code["commit"], where / "stage", swaps)
     del result[STAMP]  # written with every package's generated files
     return result, code, kept
 

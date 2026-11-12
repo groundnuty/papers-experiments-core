@@ -10,19 +10,23 @@
 3. refuse a check made under code that is not a clean commit, outputs made by another core version, and a check that
    records no environment or another one than the build's (`provenance.environment`); warn about every other included
    file no commit holds and list it, and refuse one in an anonymised build unless the author allows it (`tracking`);
-4. with an anonymisation list (`anonymise`), rewrite the prose and metadata files it names, give the package a code
-   identity by tree hash alone: no commit id and no source URL anywhere (`identity`), and withhold the provenance
-   headers of the vendored code (`withhold`);
+4. in every build, write each key location of models.toml (`key_file`, `key_env`) as its fixed placeholder: where a key
+   lives is outside the code identity and the campaign fingerprint, so the file still verifies (`config.key_locations`,
+   K13). With an anonymisation list (`anonymise`), also rewrite the prose and metadata files it names, give the
+   package a code identity by tree hash alone: no commit id and no source URL anywhere (`identity`), and withhold the
+   provenance headers of the vendored code (`withhold`);
 5. add the generated files: `.code-stamp.json` (the commit and tree hash the check names, dated by the check), one
    wheel per distribution of the check's environment under `wheels/` with `wheels/requirements.txt` pinning each by
    hash (`wheels`), a `Makefile` whose `check` target installs those wheels into a fresh environment, offline, and
    runs `python -m expcore package-check .` with it, `PACKAGE.json` (what was built from what, under which core and
    environment, from which wheels, and the study's declaration of side files when it has one) and `SHA256SUMS`
    (`archive`);
-6. refuse the package if a path or content of any file matches a study token, or holds a term of the anonymisation
-   list. The token check is `expcore.provenance.study_tokens`' own scanner with the hashes of names that are private
-   everywhere (hosts, addresses, users, spaces, providers: the `all` scope): a study's own condition, dataset or model
-   names belong in its own package. Both checks fail closed: a file goes in only if they can read all of it (text,
+6. refuse the package if a path or content of any file matches a study token, holds a term of the anonymisation
+   list, or names a key location the study's models declare, or if its models.toml still holds a key location other
+   than the placeholder; another file named models.toml is refused before that. The token check is
+   `expcore.provenance.study_tokens`' own scanner with the hashes of names that are private everywhere (hosts,
+   addresses, users, spaces, providers: the `all` scope): a study's own condition, dataset or model names belong in
+   its own package. Both checks fail closed: a file goes in only if they can read all of it (text,
    SQLite databases and archives of them, `views`); anything else is refused, unless package.toml attests that exact
    file by its SHA-256 with a reason (`[[opaque]]`), and then it goes in unread. Every text member of every wheel is
    read too, and every member that is not text is attested by its hash and listed in PACKAGE.json (`wheelscan`); a
@@ -47,10 +51,14 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
+from expcore.campaign.merge import SHARDS_DIR, MergeRefused, read_merge
+from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
+from expcore.config.key_locations import location_finders, withhold_key_locations
 from expcore.config.loading import ConfigError
 from expcore.models.route import sdk_version
 from expcore.package.anonymise import Anonymisation, holds_term, load_anonymisation, refuse_models, rewrite
@@ -64,6 +72,7 @@ from expcore.package.identity import (
     replayed_records,
     stamp_bytes,
     verify_inputs,
+    verify_merged_inputs,
 )
 from expcore.package.leaks import default_hashes, findings_in, private_hashes, scan_tokens
 from expcore.package.lockfile import PYPI, lock_hashes, token_exempt
@@ -89,7 +98,7 @@ from expcore.provenance.study_tokens import count_hashes
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.replay.check import CHECK_FILE, BatchNotVerified
 from expcore.replay.side_files import declared
-from expcore.study.config import CONFIG_FILES, StudyConfig, load_study
+from expcore.study.config import CONFIG_FILES, MODELS_FILE, StudyConfig, load_study
 from expcore.study.pipeline import ANALYSIS_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, regenerate
 
 PACKAGE_FILE = "PACKAGE.json"
@@ -114,7 +123,22 @@ def _read_json(files: Mapping[str, bytes], path: str, what: str) -> dict:
     return data
 
 
-def _required(study: StudyConfig, check: Mapping[str, object]) -> list[str]:
+def _snapshot_files(check: Mapping[str, object], files: Mapping[str, bytes]) -> set[str]:
+    """The snapshot of the campaign store the analysis reads: one in the batch, or, for a merged batch (the check
+    names a merge), merge.json and the snapshot of each shard it lists, which the package must hold as well."""
+    if MERGE_KEY not in check:
+        return {f"{OUT_DIR}/{RUNS_DIR}/{SNAPSHOT_FILE}"}
+    merge = f"{OUT_DIR}/{MERGE_FILE}"
+    if merge not in files:
+        return {merge}
+    try:
+        shards = read_merge(files[merge], merge)["shards"]
+    except MergeRefused as error:
+        raise PackageError(str(error)) from None
+    return {merge, *(f"{OUT_DIR}/{SHARDS_DIR}/{shard['index']}/{SNAPSHOT_FILE}" for shard in shards)}
+
+
+def _required(study: StudyConfig, check: Mapping[str, object], files: Mapping[str, bytes]) -> list[str]:
     """Every file the package's check needs: configuration, plugin, code, the check's inputs and the outputs."""
     root = study.root.resolve()
     try:
@@ -126,7 +150,8 @@ def _required(study: StudyConfig, check: Mapping[str, object]) -> list[str]:
     if not isinstance(inputs, dict) or not inputs:
         raise PackageError(f"{batch}/{CHECK_FILE}: names no input; run `python -m expcore check {batch}` first")
     return sorted(
-        {*CONFIG_FILES, plugin, *covered_files(root, study.scope), f"{batch}/{CHECK_FILE}", f"{batch}/{SNAPSHOT_FILE}"}
+        {*CONFIG_FILES, plugin, *covered_files(root, study.scope), f"{batch}/{CHECK_FILE}"}
+        | _snapshot_files(check, files)
         | {f"{batch}/{name}" for name in inputs}
         | {f"{OUT_DIR}/{name}" for name in OUTPUT_FILES}
     )
@@ -195,6 +220,10 @@ def _package_json(
             "tree hash only: every commit id is the first 40 hexadecimal digits of its tree hash, and no source is kept"
             if rewritten_identity
             else "commit and tree hash"
+        ),
+        "key_locations": (
+            f"withheld: every key_file and key_env of {MODELS_FILE} is a fixed placeholder; where a key lives is not "
+            "part of the code identity or the campaign fingerprint, so the file verifies as it is"
         ),
         "checked_at": check.get("checked_at"),
         "environment": env,
@@ -332,6 +361,15 @@ def _collect(
     warn: Callable[[str], None],
 ) -> tuple[PackageSpec, dict[str, bytes]]:
     study, spec, files, check = _selection(study_root)
+    verify_merged_inputs(files, check)  # before merge.json or a snapshot is read or rewritten, in every build
+    files[MODELS_FILE] = withhold_key_locations(files[MODELS_FILE])  # in every build; the identity agrees (K13)
+    other = sorted(path for path in files if PurePosixPath(path).name == MODELS_FILE and path != MODELS_FILE)
+    if other:
+        raise PackageError(
+            f"{other[0]}: a file named {MODELS_FILE} beside the study's own; a package withholds the key locations of "
+            f"the study's {MODELS_FILE} only, so leave this one out of [package] include (K13)"
+        )
+    locations = location_finders(study.models.models.values())  # the values the rewrite withheld, looked for anywhere
     if terms is not None:
         refuse_models(terms, _model_names(study))
     where = f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}"
@@ -373,6 +411,7 @@ def _collect(
         attested=attested,
         exempt=exempt,
         redactor=redactor,
+        locations=locations,
     )
     files["Makefile"] = makefile(env)
     files[PACKAGE_FILE] = _package_json(
@@ -396,7 +435,15 @@ def _collect(
     files[SUMS_FILE] = render_sums(files)
     generated = {*GENERATED, REQUIREMENTS}
     findings = read.findings + findings_in(
-        files, tokens, terms, hidden_commits, hidden_urls, opaque, generated=generated, redactor=redactor
+        files,
+        tokens,
+        terms,
+        hidden_commits,
+        hidden_urls,
+        opaque,
+        generated=generated,
+        redactor=redactor,
+        locations=locations,
     )
     if findings:
         raise PackageError("refusing to build the package:" + "".join(f"\n  {finding}" for finding in findings))
@@ -412,7 +459,7 @@ def _selection(study_root: Path) -> tuple[StudyConfig, PackageSpec, dict[str, by
     spec = load_spec(study.root)
     files = {path: (study.root / path).read_bytes() for path in select(study.root, spec)}
     check = _read_json(files, f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}", "the replay check")
-    missing = [path for path in _required(study, check) if path not in files]
+    missing = [path for path in _required(study, check, files) if path not in files]
     if missing:
         more = f" and {len(missing) - 1} more" if len(missing) > 1 else ""
         raise PackageError(f"{SPEC_FILE}: the package's check needs {missing[0]}{more}; add it to [package] include")

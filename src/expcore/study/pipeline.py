@@ -19,7 +19,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   store with attempts still running unless `partial`, which the check records. It reads only the study's `[study]`
   table and imports nothing, unless a record needs it, and says so first: a kind still unknown imports the modules
   `[study] platforms` names, and a backend no native parser is registered for also imports the plugin module, so
-  what is registered there is known in a new process. `build` is not called, so no model or key is needed.
+  what is registered there is known in a new process. `build` is not called, so no model or key is needed. A merged
+  batch (`campaign.merge`) is the exception: its merge.json is rebuilt from the shards' snapshots and the study's plan,
+  so its check loads the study's configuration, which imports those platforms.
   It refuses to run under another environment than the campaign's, and records the one it ran under. The side
   files study.toml declares (`[[study.side_files]]`) are found in the batch it parses, hashed with the records and
   paired each with the record beside it (`replay.side_files`), and the check records the declaration.
@@ -27,7 +29,8 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   and the campaign's (the snapshot's fingerprint) and under the study's declaration of side files, and writes nothing.
   It then uses only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once
   and compared with the check's hash, cross-validated against each other, and each side file paired with its record
-  again. It exports from the snapshot, scores the records in memory (a record is never written after its check, since
+  again; a merged batch's merge.json is rebuilt from the snapshots so read and the plan, and refused when it differs.
+  It exports from the snapshot, scores the records in memory (a record is never written after its check, since
   that would change its hash) and runs the preregistered analysis. A scorer that takes `side_files` is handed the
   record's side files as the bytes `load_verified` read and verified, all of them before the plugin is loaded, so
   no scorer runs on a batch that does not verify. Every score is derived anew from a record on each call and none is
@@ -54,14 +57,19 @@ from typing import Any
 from expcore.accounting import condition_accounting
 from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
+from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
-from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_fingerprint
+from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
+from expcore.campaign.merge import MergeRefused, read_merge
+from expcore.campaign.merged import read_held, verify_merged, verify_queried
+from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.settings import SchedulerConfig
-from expcore.campaign.shard import ShardError, ShardSpec, check_identity
+from expcore.campaign.shard import MERGE_FILE, ShardError, ShardSpec, check_identity
 from expcore.campaign.shard_run import ShardStart, environment_block, share_settings
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
@@ -84,6 +92,7 @@ from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
+    MODELS_FILE,
     OUT_DIR,
     StudyConfig,
     StudyIdentity,
@@ -94,7 +103,7 @@ from expcore.study.config import (
 )
 from expcore.study.factory_version import check_factory_version
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
-from expcore.study.verified import UNCOVERED, Unverified, load_verified
+from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
 
 RUNS_DIR = "runs"
 MARKER_PATTERN = "*attempt-marker.json"
@@ -135,12 +144,20 @@ def _digest(value: Any) -> str:
 
 
 def model_digest(spec: ModelSpec) -> str:
-    """The digest of a model entry in the campaign fingerprint: every field of it, its declared set of accepted
-    fingerprints only when it declares one (B18), so an entry without one keeps the digest it had before the key."""
-    entry = dataclasses.asdict(spec)
-    if not entry["accepted_fingerprints"]:
-        del entry["accepted_fingerprints"]
-    return _digest(entry)
+    """The digest of a model entry in the campaign fingerprint: every field of it, each key location as its placeholder
+    (K13), and its declared set of accepted fingerprints only when it declares one (B18). An entry that names no key
+    location and declares no set keeps the digest it had before either."""
+    return _digest(_fingerprinted(withheld_entry(spec)))
+
+
+def _counted_digest(spec: ModelSpec) -> str:
+    """The digest a core before K13 gave a model entry, where each key lives counted; for a refused resume's hint."""
+    return _digest(_fingerprinted(dataclasses.asdict(spec)))
+
+
+def _fingerprinted(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """A model entry as its digest takes it: without `accepted_fingerprints` when it declares none (B18)."""
+    return {k: v for k, v in entry.items() if k != "accepted_fingerprints" or v}
 
 
 def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:
@@ -162,6 +179,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
     A plugin's `backend_factory` enters as its name and its `version`. Code that lives in the study directory is
     already covered by the code identity every record carries; the version is what speaks for a factory that lives
     in an installed package, and it is refused unless it is that package's installed version (`factory_version`).
+    Where a model's key lives is left out, of each model's digest and of models.toml's hash (K13).
     """
     check_factory_version(plugin, study)
     return build_fingerprint(
@@ -222,25 +240,53 @@ def _run_campaign(
         manifest, settings, started = _shard_of(study, plugin, settings, shard)
         print(environment_block(shard, fingerprint["environment"]), file=sys.stderr)  # before a store can refuse it
     options = {} if crash_hook is None else {"crash_hook": crash_hook}
-    with Scheduler(
-        out,
-        study.schema,
-        manifest,
-        fingerprint,
-        plugin.executor,
-        agent_config=study.campaign.agent,
-        models=study.models,
-        endpoints=study.campaign.endpoints,
-        settings=settings,
-        health=plugin.health,
-        leases=leases,
-        lease_group=plugin.lease_group,
-        backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
-        on_hold=_say_hold,
-        shard=started,
-        **options,
-    ) as scheduler:
-        return scheduler.run()
+    try:
+        with Scheduler(
+            out,
+            study.schema,
+            manifest,
+            fingerprint,
+            plugin.executor,
+            agent_config=study.campaign.agent,
+            models=study.models,
+            endpoints=study.campaign.endpoints,
+            settings=settings,
+            health=plugin.health,
+            leases=leases,
+            lease_group=plugin.lease_group,
+            admission=plugin.admission,
+            backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
+            on_hold=_say_hold,
+            shard=started,
+            **options,
+        ) as scheduler:
+            return scheduler.run()
+    except FingerprintMismatch as refused:
+        hint = _counted_key_locations(study, read_fingerprint(out / STATE_FILE))
+        if not hint:
+            raise
+        raise FingerprintMismatch(refused.differences, hint=hint) from None
+
+
+def _counted_key_locations(study: StudyConfig, recorded: Mapping[str, Any] | None) -> str:
+    """Name the leaves of a recorded fingerprint that hold exactly what an earlier core gave by counting where each key
+    lives, which this one leaves out (K13), so a refused resume says why they differ; empty when none does."""
+    configs = recorded.get("configs") if isinstance(recorded, Mapping) else None
+    models = recorded.get("models") if isinstance(recorded, Mapping) else None
+    raw = (study.root / MODELS_FILE).read_bytes()
+    leaves = []
+    if isinstance(configs, Mapping) and raw != withhold_key_locations(raw):
+        leaves += [f"configs.{MODELS_FILE}"] if configs.get(MODELS_FILE) == hashlib.sha256(raw).hexdigest() else []
+    for key in study.campaign.models if isinstance(models, Mapping) else ():
+        spec = study.models.resolve(key)
+        counted = _counted_digest(spec)
+        leaves += [f"models.{key}"] if counted != model_digest(spec) and models.get(key) == counted else []
+    if not leaves:
+        return ""
+    return (
+        f" ({', '.join(leaves)}: recorded with where each key lives, which the core that started the campaign counted "
+        "and this one leaves out (K13); finish the campaign with that core, or start a new store)"
+    )
 
 
 def _shard_of(
@@ -324,6 +370,12 @@ def _check_batch_of(
         raise Refused(f"{directory}: no batch of records here; run the study first")
     env = study_environment(study)
     store = out_dir(study) / STATE_FILE
+    if (out_dir(study) / MERGE_FILE).is_file():
+        if store.is_file():
+            raise Refused(
+                f"{out_dir(study)}: holds a merged batch ({MERGE_FILE}) and a campaign store; use one or the other"
+            )
+        return _check_merged(study, directory, code, env, partial)
     if store.is_file():  # without a store, take_snapshot refuses below
         changed = differences(campaign_environment(read_fingerprint(store)), env)
         if changed:
@@ -331,7 +383,7 @@ def _check_batch_of(
                 f"{store}: the campaign ran under another environment than this check would; check under the "
                 "campaign's environment:\n  " + "\n  ".join(changed)
             )
-    _import_what_the_records_need(study, directory)
+    import_what_the_records_need(study, directory)
     try:
         running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
@@ -344,7 +396,45 @@ def _check_batch_of(
     return check
 
 
-def _import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
+def _check_merged(
+    study: StudyIdentity, directory: Path, code: Mapping[str, Any], env: Mapping[str, Any], partial: bool
+) -> dict[str, Any]:
+    """The replay check of a merged batch: merge.json is bound by its hash, each shard's snapshot is compared with the
+    hash merge.json names and read under the environment in use, merge.json is rebuilt from the snapshots and the
+    study's plan and must be that document (`campaign.merged`), and the records are replayed as one batch.
+
+    There is no live store to copy: the shards' snapshots were taken at the merge. Rebuilding merge.json needs the
+    plan, so the check of a merged batch loads the study's configuration, which imports the platforms `[study]` names.
+    The check records the SHA-256 of merge.json (`check["merge"]`), and the analysis reads the snapshots against the
+    hashes that file holds."""
+    out = out_dir(study)
+    raw = (out / MERGE_FILE).read_bytes()
+    try:
+        merged = read_merge(raw, out / MERGE_FILE)
+        held = read_held(out, merged)
+    except MergeRefused as error:
+        raise Refused(str(error)) from None
+    for shard in held.values():
+        changed = differences(campaign_environment(shard.fingerprint), env)
+        if changed:
+            raise Refused(
+                f"{shard.name}: its campaign ran under another environment than this check would; check under the "
+                "campaign's environment:\n  " + "\n  ".join(changed)
+            )
+    try:
+        verify_merged(merged, held, load_study(study.root).manifest)
+    except MergeRefused as error:
+        raise Refused(str(error)) from None
+    import_what_the_records_need(study, directory)
+    check = verify_batch(
+        directory, code=code, hashed_only=[MARKER_PATTERN], environment=env, side_files=study.side_files
+    )
+    check[MERGE_KEY] = {"file": MERGE_FILE, "sha256": hashlib.sha256(raw).hexdigest(), "partial": partial}
+    write_check(directory, check)
+    return check
+
+
+def import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
     """Import only what a record of the batch cannot be read without, and say so first.
 
     The study's own kinds are in scope already, read as data. A record that names a kind still unknown imports the
@@ -473,19 +563,34 @@ def _analyse_loaded(
             compare_sources=not stamped,
             side_files=study.side_files,
         )
+        if (out / MERGE_FILE).is_file() and MERGE_KEY not in check:
+            raise BatchNotVerified(
+                f"{batch}: the replay check was made without {MERGE_FILE}, which is here now; "
+                f"run `python -m expcore check {batch}` again"
+            )
         verified = load_verified(batch, check, study.schema, partial=partial, side_files=study.side_files)
     except (BatchNotVerified, Unverified) as error:
         raise Refused(str(error)) from None
-    rows = verified.snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
-    changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])
-    if changed:
-        verified.snapshot.close()
-        raise Refused("the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed))
+    if verified.merge is not None:  # what merge.json says must be what its snapshots say, for this plan
+        try:
+            queries = {index: snapshot.q for index, snapshot in verified.snapshots.items() if index is not None}
+            verify_queried(verified.merge, queries, out, study.manifest)
+        except MergeRefused as error:
+            verified.close()
+            raise Refused(str(error)) from None
+    for snapshot in verified.snapshots.values():
+        rows = snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
+        changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])
+        if changed:
+            verified.close()
+            raise Refused(
+                "the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed)
+            )
     plugin = load_plugin(StudyContext(study, code))
     try:
-        export = export_run_state(verified.snapshot, excluded=dict.fromkeys(verified.excluded, UNCOVERED))
+        export = _export_of(verified, study.manifest)
     finally:
-        verified.snapshot.close()
+        verified.close()
     rows, scores = [], {}
     for entry in export["analysed_attempts"]:
         where = (entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
@@ -502,6 +607,19 @@ def _analyse_loaded(
         raise Refused(str(error)) from None
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)
+
+
+def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
+    """The export the analysis reads: the campaign's from its snapshot, or, for a merged batch, the shards' exports
+    joined in the order of the whole plan (`campaign.export_join`)."""
+    left_out = dict.fromkeys(verified.excluded, UNCOVERED)
+    if None in verified.snapshots:
+        return export_run_state(verified.snapshots[None], excluded=left_out)
+    parts = {}
+    for index, snapshot in verified.snapshots.items():
+        held = {row["run_key"] for row in snapshot.q("SELECT run_key FROM runs")}
+        parts[index] = export_run_state(snapshot, excluded={key: why for key, why in left_out.items() if key in held})
+    return join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
 
 
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:

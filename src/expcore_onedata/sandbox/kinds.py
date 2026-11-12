@@ -10,8 +10,8 @@ never from an exit code. Their categories map to the core's vocabulary of infras
 - `unknown`: counters unreadable, evidence conflicting, or a kill nothing attributes. Infrastructure kind
   `unattributed_kill`, retried within the attempt limit.
 
-Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). Two kinds are the platform's own, registered
-here, when this module is first imported, and neither is treatable:
+Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). The platform's own kinds are registered here,
+when this module is first imported. Two are the sandbox's, and neither is treatable:
 
 - `data_gate_integrity`: the data gate's refusal of an answer it cannot pass to the agent (a redirect, an encoded body,
   its token in a header or a body, an answer larger than it checks whole, a complete listing larger than it serves
@@ -26,6 +26,13 @@ here, when this module is first imported, and neither is treatable:
   about the agent or the manipulation: set aside and run again within the attempt limit, and no condition may declare
   it (O19). An object the agent made in its outputs (a link, a special file, more than its disk holds) is not this
   kind: it is the agent's own doing, recorded for the study's scorers, and the attempt is not set aside.
+
+This is the one module of the platform layer that registers kinds, so a study names it alone in `[study] platforms` to
+make every kind the layer raises known before its conditions are validated, and `check` imports it alone for a record
+that names one. The fault injector's two kinds are registered here too (`expcore_onedata.faults`):
+`provider_outage`, a provider of the federation that was unavailable, which a condition may declare with the target
+it takes down; and `injector_failure`, the injector's own failure to inject, clear or verify, which is not treatable,
+so a run whose fault was never verified is set aside and never scored as the outage (O10, O11, C01).
 """
 
 from collections.abc import Iterable, Mapping
@@ -51,6 +58,10 @@ register_infra_kind(
     "says nothing about the agent or the manipulation",
     treatable=False,
 )
+PROVIDER_OUTAGE = "provider_outage"
+INJECTOR_FAILURE = "injector_failure"
+register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable")
+register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
 
 KIND_OF_CATEGORY: Mapping[str, str | None] = {
     "agent": None,
@@ -117,8 +128,10 @@ def collection_error(what: str, reason: str) -> InfraError:
 
 __all__ = [
     "DATA_GATE_INTEGRITY",
+    "INJECTOR_FAILURE",
     "KIND_OF_CATEGORY",
     "OUTPUT_COLLECTION",
+    "PROVIDER_OUTAGE",
     "collection_error",
     "death_error",
     "gate_error",
