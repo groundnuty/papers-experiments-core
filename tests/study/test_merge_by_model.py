@@ -10,9 +10,19 @@ import json
 from pathlib import Path
 
 import pytest
-from shard_support import json_meta, keys_of_shard, make_study, merge_into, plant_run, run_shard, without_run
+from shard_support import (
+    json_meta,
+    keys_of_shard,
+    make_study,
+    merge_into,
+    meta_of,
+    plant_run,
+    run_shard,
+    without_run,
+)
 from study_support import Campaign, clean_environment, cli, finish
 
+from expcore.campaign.deployments import ACCEPTED_META
 from expcore.campaign.shard import MERGE_FILE, META_SHARD, META_SHARES, RULE_BY_MODEL
 from expcore.study.config import load_study
 
@@ -108,3 +118,60 @@ def test_c32_the_merge_names_the_rule_by_model_and_checks_each_run_by_its_assign
     code, errors = merge_into(clean_environment, target, moved, shards[2], lacking)
     assert code == 1, errors
     assert f"shard 1 (shard-1): run {foreign} belongs to shard 3 (shard-3), not to this shard" in errors
+
+
+# --- only some models declare accepted fingerprints (B18): the shards' exports differ in `deployment_shares` ----------
+
+
+@pytest.fixture(scope="module")
+def declared_whole(base, clean_environment) -> Campaign:
+    """One driver of the campaign in which alpha-stub declares a set of accepted fingerprints and beta-stub does not."""
+    campaign = Campaign(make_study(base, "declared-whole", EXTRA, declare=["alpha-stub"]))
+    campaign.codes["run"], _ = cli(clean_environment, "run", str(campaign.root))
+    finish(clean_environment, campaign)
+    assert campaign.codes == {"run": 0, "check": 0, "analyze": 0, "report": 0}
+    return campaign
+
+
+@pytest.fixture(scope="module")
+def declared_shards(base, clean_environment) -> dict[int, Campaign]:
+    return {
+        i: run_shard(base, f"declared-shard-{i}", clean_environment, i, count=3, extra=EXTRA, declare=["alpha-stub"])
+        for i in SERVES
+    }
+
+
+@pytest.fixture(scope="module")
+def declared_merged(base, clean_environment, declared_shards) -> tuple[Campaign, dict[str, str]]:
+    """The shards merged and the batch checked, analysed and reported, with each command's stderr: a refusal is
+    for the test to name, so no step here is asserted."""
+    campaign = Campaign(make_study(base, "declared-merged", EXTRA, declare=["alpha-stub"]))
+    errors = {}
+    campaign.codes["merge"], errors["merge"] = merge_into(clean_environment, campaign, *declared_shards.values())
+    for name, target in {
+        "check": str(campaign.runs),
+        "analyze": str(campaign.root),
+        "report": str(campaign.root),
+    }.items():
+        campaign.codes[name], errors[name] = cli(clean_environment, name, target)
+    return campaign, errors
+
+
+def test_c32_shards_by_model_where_only_some_models_declare_accepted_fingerprints_merge_and_analyse(
+    declared_whole, declared_shards, declared_merged
+):
+    """C32: a shard of a model without a set of accepted fingerprints (B18) keeps no record of one, so its export has
+    no `deployment_shares`, and a shard of a model with one does; yet the batch merges, the analysis and the report
+    are made, and the deployment shares are one driver's."""
+    declares = {index: ACCEPTED_META in meta_of(shard) for index, shard in declared_shards.items()}
+    assert declares == {1: True, 2: True, 3: False}  # so shard 3's export has no `deployment_shares`
+    merged_campaign, errors = declared_merged
+    assert merged_campaign.codes == {"merge": 0, "check": 0, "analyze": 0, "report": 0}, errors
+    one, many = read(declared_whole, "export.json"), read(merged_campaign, "export.json")
+    assert [share["model"] for share in one["deployment_shares"]] == ["alpha-stub"]
+    assert many["deployment_shares"] == one["deployment_shares"]
+    assert json.dumps(many["deployment_shares"]) == json.dumps(one["deployment_shares"])
+    assert list(many) == [*one, "shards"]  # the export's bytes: the place of the key too
+    assert (merged_campaign.root / "out" / "analysis.json").read_bytes() == (
+        declared_whole.root / "out" / "analysis.json"
+    ).read_bytes()
