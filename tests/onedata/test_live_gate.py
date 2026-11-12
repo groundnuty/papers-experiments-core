@@ -27,16 +27,34 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
     assert "3 skipped" in done.stdout
 
 
-def test_o09_no_call_is_left_unconfirmed_and_the_refuted_path_read_is_gone():
-    """O09: the live contract tests against Onedata 25.0 confirmed every call the layer makes that no source did, the
-    gate's walk by `parent_id` among them, and refuted the file's `path` attribute the gate read before, which no
-    release at hand answers. The gate no longer asks for it, so nothing is left unconfirmed; the client's docstring
-    records what refuted it."""
+def test_o09_only_the_resets_qos_calls_and_cancel_are_left_unconfirmed_and_the_refuted_path_read_is_gone():
+    """O09, O11: the live contract tests against Onedata 25.0 confirmed every call the layer makes that no source did,
+    the gate's walk by `parent_id` among them, the reset's eviction of a directory and a transfer record's `spaceId`,
+    and refuted the file's `path` attribute the gate read before, which no release at hand answers. The gate no longer
+    asks for it; the client's docstring records what refuted it. What is left unconfirmed are the reset's calls no live
+    run has made: a transfer's cancel, a QoS summary, a requirement's record and its removal."""
     from expcore_onedata import client
 
-    assert client.UNVERIFIED_ENDPOINTS == ()
+    assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {
+        ("DELETE", "/transfers/{id}"),
+        ("GET", "/data/{id}/qos/summary"),
+        ("GET", "/qos_requirements/{qid}"),
+        ("DELETE", "/qos_requirements/{qid}"),
+    }
+    what = " ".join(w for _, _, w in client.UNVERIFIED_ENDPOINTS)
+    assert all(field in what for field in ("fileId", "requirements", "400"))
     assert "badValueNotAllowed" in client.__doc__
     assert '"attribute": "path"' not in Path(client.__file__).read_text(encoding="utf-8")
+
+
+def test_every_unverified_endpoint_has_a_live_contract_test():
+    """Each (method, path) neither a source nor a live run confirms is named by a `covers:` line of a live test, so
+    none goes unchecked."""
+    from expcore_onedata.client import UNVERIFIED_ENDPOINTS
+
+    live = (ROOT / "tests" / "live" / "test_contract.py").read_text(encoding="utf-8")
+    missing = [f"{m} {p}" for m, p, _ in UNVERIFIED_ENDPOINTS if f"# covers: {m} {p}\n" not in live]
+    assert not missing, f"no live test covers: {missing}"
 
 
 def test_every_endpoint_the_live_federation_confirmed_keeps_its_live_test():
@@ -51,6 +69,8 @@ def test_every_endpoint_the_live_federation_confirmed_keeps_its_live_test():
         ("GET", "/data/{file}/content"),
         ("GET", "/spaces/{space}/transfers"),
         ("GET", "/transfers/{id}"),
+        ("POST", "/transfers"),
+        ("GET", "/data/{id}/distribution"),
     ):
         assert f"# covers: {method} {path}\n" in live
 

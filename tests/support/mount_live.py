@@ -22,10 +22,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from platform_support import render
 
 from expcore_onedata.client import API_PROVIDER, AUTH_HEADER, POSIX_ABSENT
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.testing.world import render
 
 AGENT_IMAGE = "python:3.12-slim"  # has python, `timeout` and `sleep`, which the agent's container needs
 ONECLIENT_IMAGE = "onedata/oneclient:25.0"  # the client of the federation's release

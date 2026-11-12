@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from platform_support import BASELINE, CREDENTIALS_DIR, configured_values, write_platform
+from platform_support import configured_values
 from sandbox_support import (
     FED_NETWORK,
     FED_SUBNET,
@@ -24,6 +24,7 @@ from expcore_onedata.sandbox import reap, teardown
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.testing import BASELINE, CREDENTIALS_DIR, write_platform
 from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.users import Slots, load_slots
 

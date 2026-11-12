@@ -157,7 +157,36 @@ def test_the_rest_agent_trusts_only_the_runs_ca_and_resolves_the_hosts_to_the_ga
     assert env["SSL_CERT_FILE"] == C.CA_PATH
     names_given = {v for f, v in pairs(args) if f == "-e"}
     assert names_given == set(env)
-    assert not [n for n in names_given if any(w in n.upper() for w in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))]
+    credential_like = [
+        n for n in names_given if any(w in n.upper() for w in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))
+    ]
+    assert credential_like == [C.ENV_TOKEN]  # the placeholder alone (O23)
+    assert env[C.ENV_TOKEN] == s.placeholder_token
+
+
+@pytest.mark.parametrize("mode", list(DataPathMode))
+def test_o23_only_a_rest_agent_gets_the_placeholder_token_and_only_by_name(s, names, mode):
+    """O23: on a REST data path the agent's ONEDATA_TOKEN is the configured placeholder, so the published client
+    starts; it is named with -e, its value in the docker client's environment like every other. A mount or no data path
+    gets no token variable at all."""
+    extra = {
+        DataPathMode.REST: {
+            "gate_ip": "10.1.0.2",
+            "gate_hosts": ["z.test"],
+            "ca": Path("/w/ca.pem"),
+            "zone_host": "z.test",
+        },
+        DataPathMode.MOUNT: {"share": Path("/w/mount")},
+        DataPathMode.NONE: {},
+    }[mode]
+    args, env = agent(s, names, mode, **extra)
+    if mode is DataPathMode.REST:
+        assert C.ENV_TOKEN == "ONEDATA_TOKEN"  # the name the published client reads
+        assert env[C.ENV_TOKEN] == s.placeholder_token == "placeholder"
+        assert ("-e", C.ENV_TOKEN) in pairs(args)
+    else:
+        assert C.ENV_TOKEN not in env
+    assert not [a for a in args if a.startswith(f"{C.ENV_TOKEN}=")]  # never NAME=value
 
 
 def test_a_rest_agent_without_a_gate_is_refused(s, names):
@@ -233,3 +262,35 @@ def test_the_oneclient_log_directory_is_the_last_one_given():
     assert C.effective_log_dir(["-f"]) == C.ONECLIENT_LOG_DIR
     assert C.effective_log_dir(["--log-dir", "/a", "--log-dir=/b"]) == "/b"
     assert C.effective_log_dir(["-l", "/c"]) == "/c"
+
+
+def test_o23_the_certifi_question_answers_with_the_interpreters_bundle_or_none_and_is_read_back_exactly():
+    """O23: the probe the sandbox runs in the agent image, run here with this interpreter, prints the path certifi
+    gives, which `certifi_bundle` reads back; an interpreter without certifi prints `certifi:none`, read as None."""
+    import subprocess
+    import sys
+
+    import certifi
+
+    found = subprocess.run([sys.executable, "-c", C.CERTIFI_PROBE], capture_output=True, text=True, check=True)
+    assert C.certifi_bundle(found.stdout) == certifi.where()
+    hidden = "import sys\nsys.modules['certifi'] = None\n" + C.CERTIFI_PROBE  # an import of it raises ImportError
+    absent = subprocess.run([sys.executable, "-c", hidden], capture_output=True, text=True, check=True)
+    assert absent.stdout == "certifi:none\n"
+    assert C.certifi_bundle(absent.stdout) is None
+
+
+def test_o23_the_certifi_question_runs_as_the_agent_without_a_network_and_its_bundle_is_extended_once(s):
+    """O23: the one-shot runs the image's interpreter as the agent's code runs, as the agent's user in /work, the first
+    directory of its import path, and with no network; the certifi bundle joins the declared trust paths after them,
+    once."""
+    args = C.certifi_probe_args(s, "sbx-once-1", LABELS, s.agent.id)
+    assert ("--network", "none") in pairs(args)
+    assert ("--user", f"{s.agent_uid}:{s.agent_uid}") in pairs(args)
+    assert ("--workdir", "/work") in pairs(args)
+    assert ("--entrypoint", s.python) in pairs(args)
+    assert args[:2] == ["run", "--rm"]
+    assert args[-3:] == [s.agent.id, "-c", C.CERTIFI_PROBE]
+    assert C.trust_targets(("/etc/a.pem",), "/lib/cacert.pem") == ("/etc/a.pem", "/lib/cacert.pem")
+    assert C.trust_targets(("/lib/cacert.pem",), "/lib/cacert.pem") == ("/lib/cacert.pem",)
+    assert C.trust_targets(("/etc/a.pem",), None) == ("/etc/a.pem",)

@@ -23,6 +23,7 @@ prefixes = ["..."]              # a mutation may only name a space whose name st
 [support]
 providers = ["<name>", ...]     # the declared supporting set; health fails on any difference (O04)
 local = "<name>"                # the agent's own provider; the agent is pinned to it (O03)
+                                # or, for several spaces, [[spaces]] in place of both tables (spaces.py)
 
 [credentials.admin]             # the admin access token that examines tokens and reads privileges: exactly one of
 env = "VARIABLE_NAME"           #   the name of an environment variable, or
@@ -67,6 +68,13 @@ manifest = "path.json"          # the frozen manifest the client checks the serv
 Two more tables are accepted here and read by the modules that use them, each validated against this file's providers:
 `[placement]` (the data provider, the bounds of placement and the declared range map; `rangemap.load_placement`) and
 `[slots.<name>]` (the leased platform users, one per token plane; `users.load_slots`).
+
+**Several spaces** (`spaces.py`). The one-space form's single space is `spaces[0]`, labelled `space`, and its
+fingerprint is unchanged. With several spaces, `space` and `support` refuse (there is no one space to give), and each
+consumer names the space it acts on by its label: provisioning, placement, eviction and the probes are bound to one
+(`provision.Provisioner`), a token plane's caveats and privilege checks reach every space it is scoped to
+(`space_ids`), a mutation passes the gate when its target lies under any declared prefix (`prefixes`), and the spaces
+enter the campaign fingerprint, so a resume under another set is refused.
 """
 
 import hashlib
@@ -84,6 +92,7 @@ from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.rights import BASELINE_RIGHTS, KNOWN_RIGHTS, declares_write
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
+from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
 
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
@@ -115,23 +124,6 @@ class Provider:
     def host(self) -> str:
         """The URL's host, lower case, which Onezone reports as the provider's domain."""
         return (urlsplit(self.url).hostname or "").lower()
-
-
-@dataclass(frozen=True)
-class Space:
-    """The study space and the name prefixes a mutation may act on."""
-
-    name: str
-    id: str
-    prefixes: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class Support:
-    """The providers declared to support the space, and the agent's own."""
-
-    providers: tuple[str, ...]
-    local: str
 
 
 @dataclass(frozen=True)
@@ -187,8 +179,7 @@ class PlatformConfig:
     file: Path
     zone: Zone
     providers: Mapping[str, Provider]
-    space: Space
-    support: Support
+    spaces: tuple[StudySpace, ...]  # the one-space form's single space, or the entries of [[spaces]]
     admin: SecretSource
     users: UserCredentials | None
     tokens: TokenSettings
@@ -197,11 +188,45 @@ class PlatformConfig:
     sandbox: SandboxSettings | None = None
     sha256: str = ""  # of the file as loaded: a record names the configuration by this, never by a value in it
     tls: TlsSettings = field(default_factory=TlsSettings)  # every client's one certificate check (`[tls]`)
+    spaces_table: bool = False  # the spaces came from [[spaces]], one entry or several, not from [space]/[support]
+
+    def space_named(self, label: str | None = None) -> StudySpace:
+        """Return the space a label names, or, with none, the only one; refuse, naming no label, when there is none
+        such, or when several are declared and none is named."""
+        if label is None:
+            if len(self.spaces) != 1:
+                raise ConfigError(f"{self.file}: [[spaces]]: several spaces are declared, so name one by its label")
+            return self.spaces[0]
+        found = [entry for entry in self.spaces if entry.label == label]
+        if not found:
+            raise ConfigError(f"{self.file}: [[spaces]]: the space asked for is not declared")
+        return found[0]
+
+    @property
+    def space(self) -> Space:
+        """The only space; refused when several are declared, since then a caller must name one (`space_named`)."""
+        return self.space_named().space
+
+    @property
+    def support(self) -> Support:
+        """The only space's support set; refused when several are declared (`space_named(label).support`)."""
+        return self.space_named().support
+
+    @property
+    def prefixes(self) -> tuple[str, ...]:
+        """Every declared space's prefixes, each once: a mutation's target must start with one of them (O09)."""
+        return tuple(dict.fromkeys(p for entry in self.spaces for p in entry.space.prefixes))
+
+    def space_ids(self, plane: str) -> tuple[str, ...]:
+        """The ids of the spaces a token plane is scoped to, in the file's order."""
+        if plane not in PLANES:
+            raise ValueError(f"unknown token plane; known: {', '.join(PLANES)}")
+        return tuple(entry.space.id for entry in self.spaces if plane in entry.tokens)
 
     @property
     def local_provider(self) -> Provider:
-        """The agent's own provider."""
-        return self.providers[self.support.local]
+        """The agent's own provider, the same in every declared space."""
+        return self.providers[self.spaces[0].support.local]
 
     def provider_label(self, name: str) -> str:
         """Name a declared provider for a message by its position in the file, `providers[i]`, never by its name."""
@@ -216,12 +241,19 @@ class PlatformConfig:
         """The platform's half of the campaign fingerprint (`StudyPlugin.platform`): what a resume must not change.
 
         It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12), and,
-        with a `[sandbox]`, every level of the data path with its kind and a REST level's listing mode (O21), so a
-        resume after a level changed its data path or its listing is refused. A declared `[sandbox.served_bytes]` puts
-        the caps of the tables of the bytes served there too (O22), since they decide what a run's evidence can show;
-        without the table the fingerprint keeps the shape it had before the caps could be declared, so a campaign that
-        ran under the defaults still resumes."""
+        whenever the `[[spaces]]` form is used (one entry or several), each entry's SHA-256 in the file's order
+        (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
+        The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was.
+
+        With a `[sandbox]`, it also holds every level of the data path with its kind and a REST level's listing mode
+        (O21), so a resume after a level changed its data path or its listing is refused. A declared
+        `[sandbox.served_bytes]` puts the caps of the tables of the bytes served there too (O22), since they decide what
+        a run's evidence can show; without the table the fingerprint keeps the shape it had before the caps could be
+        declared, so a campaign that ran under the defaults still resumes.
+        """
         out: dict[str, Any] = {"tls": self.tls.record()}
+        if self.spaces_table:
+            out["spaces"] = [entry.digest() for entry in self.spaces]
         if self.sandbox is not None:
             out["data_paths"] = self.sandbox.data_path_record()
             if self.sandbox.served_caps_declared:
@@ -318,33 +350,6 @@ def _providers(root: Section) -> dict[str, Provider]:
     if len(set(ids)) != len(ids):
         raise table.fail(None, "must give each provider its own id")
     return out
-
-
-def _space(section: Section) -> Space:
-    """Read [space]: the name, the id and the prefixes the name must start with."""
-    section.reject_unknown(("name", "id", "prefixes"))
-    prefixes = section.strings("prefixes")
-    if not prefixes or len(set(prefixes)) != len(prefixes):
-        raise section.fail("prefixes", "must list at least one prefix, each once")
-    name = section.string("name")
-    if not name.startswith(prefixes):
-        raise section.fail("name", "must start with one of the prefixes")
-    return Space(name, section.string("id"), prefixes)
-
-
-def _support(section: Section, providers: Mapping[str, Provider]) -> Support:
-    """Read [support] and check it against the declared providers."""
-    section.reject_unknown(("providers", "local"))
-    names = section.strings("providers")
-    if not names or len(set(names)) != len(names):
-        raise section.fail("providers", "must list at least one provider, each once")
-    for name in names:
-        if name not in providers:
-            raise section.fail("providers", "names a provider that is not in [providers]")
-    local = section.string("local")
-    if local not in names:
-        raise section.fail("local", "must be one of the supporting providers")
-    return Support(names, local)
 
 
 def _tokens(section: Section) -> TokenSettings:
@@ -481,6 +486,7 @@ def load_platform(
             "providers",
             "space",
             "support",
+            "spaces",
             "credentials",
             "tokens",
             "principals",
@@ -501,15 +507,13 @@ def load_platform(
     tls = load_tls(Section(root.table("tls"), file, "[tls]"), file.parent)
     if require_secrets:
         _check_fixed_users(users, principals, file, environ)
-    zone_entry = Zone(_name(zone, "name", zone.string("name"), "the zone name"), _url(zone, "url"))
-    space = _space(root.section("space"))
-    support = _support(root.section("support"), providers)
+    spaces = load_spaces(root, providers)
     return PlatformConfig(
         file=file,
-        zone=zone_entry,
+        zone=Zone(_name(zone, "name", zone.string("name"), "the zone name"), _url(zone, "url")),
         providers=MappingProxyType(providers),
-        space=space,
-        support=support,
+        spaces=spaces,
+        spaces_table="spaces" in root.data,
         admin=_secret_source(credentials.section("admin"), file.parent, require=require_secrets, environ=environ),
         users=users,
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),
@@ -520,7 +524,7 @@ def load_platform(
             file.parent,
             tls=tls,
             providers=tuple(providers),
-            local=support.local,
+            local=spaces[0].support.local,  # the same in every entry (load_spaces, O03)
         )
         if "sandbox" in root.data
         else None,

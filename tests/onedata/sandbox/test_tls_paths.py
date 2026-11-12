@@ -21,7 +21,6 @@ from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from platform_support import write_platform
 from sandbox_support import TOKEN, add_sandbox, fail_copies, make_spec, start_options
 from tls_support import HAS_OPENSSL, TlsServer, make_federation_ca, swap_after_check
 
@@ -32,6 +31,7 @@ from expcore_onedata.sandbox.api import StartRefused
 from expcore_onedata.sandbox.hostops import DockerHost
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.testing import write_platform
 
 pytestmark = pytest.mark.skipif(not HAS_OPENSSL, reason="the openssl command makes the test CAs")
 
