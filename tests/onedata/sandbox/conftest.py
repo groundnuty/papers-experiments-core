@@ -8,7 +8,14 @@ from types import SimpleNamespace
 import pytest
 from fake_host import FakeHost
 from platform_support import configured_values
-from sandbox_support import SLOT_USERS, add_sandbox, configured_sandbox_values
+from sandbox_support import (
+    FED_NETWORK,
+    FED_SUBNET,
+    SLOT_USERS,
+    add_federation,
+    add_sandbox,
+    configured_sandbox_values,
+)
 
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
@@ -51,6 +58,20 @@ def world(tmp_path):
     for ref in (s.agent, s.gate, s.oneclient):
         host.add_image(ref.name, ref.id)
     host.oneclient_images.add(s.oneclient.id)
+    return SimpleNamespace(host=host, config=config, s=s, registry=Registry(), tmp_path=tmp_path)
+
+
+@pytest.fixture
+def fed_world(tmp_path):
+    """The `world`, with `[sandbox.federation]` in the platform document and the federation's own network on the host:
+    a network the federation's deployment made, which carries no label of the sandbox's."""
+    config = load_platform(write_platform(tmp_path, add_federation), require_secrets=False)
+    s = config.sandbox
+    host = FakeHost()
+    for ref in (s.agent, s.gate, s.oneclient):
+        host.add_image(ref.name, ref.id)
+    host.oneclient_images.add(s.oneclient.id)
+    host.networks[FED_NETWORK] = {"id": "f" * 12, "subnet": FED_SUBNET, "labels": {}, "args": []}
     return SimpleNamespace(host=host, config=config, s=s, registry=Registry(), tmp_path=tmp_path)
 
 

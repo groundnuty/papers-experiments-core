@@ -415,16 +415,18 @@ def test_o05_a_token_scope_inference_that_is_not_a_json_object_is_refused_and_no
     conn.close()
 
 
-def test_o05_the_gate_takes_its_token_from_its_environment_and_removes_it(tmp_path, monkeypatch):
-    """O05: the token is read from the environment, never from the configuration file, and removed from it."""
+def test_o05_the_gate_takes_its_token_from_the_file_its_configuration_names_and_never_from_its_environment(
+    tmp_path, monkeypatch
+):
+    """O05: the gate reads its token from the file its configuration names (bound into its container read-only), so
+    the token is never in docker's configuration of the container; a token in its environment is not used, and a
+    missing or empty file refuses the start."""
+    token_file = tmp_path / "gate-token"
     config = tmp_path / "gate.json"
-    config.write_text(
-        json.dumps({"log": str(tmp_path / "r.jsonl"), "hosts": {}, "listen_host": "127.0.0.1", "listen_port": 0}),
-        encoding="utf-8",
-    )
+    document = {"log": str(tmp_path / "r.jsonl"), "hosts": {}, "listen_host": "127.0.0.1", "listen_port": 0}
+    config.write_text(json.dumps({**document, "token_file": str(token_file)}), encoding="utf-8")
     monkeypatch.setattr("sys.argv", ["gate.py", str(config)])
-    monkeypatch.setenv(gate.TOKEN_ENV, GATE_TOKEN)
-    gate.CFG.clear()
+    monkeypatch.setenv("GATE_ACCESS_TOKEN", "tok-from-the-environment")
     monkeypatch.setattr(gate, "_tls_context", lambda: type("Plain", (), {"wrap_socket": lambda self, s, **k: s})())
 
     def stop_serving(httpd):
@@ -432,14 +434,17 @@ def test_o05_the_gate_takes_its_token_from_its_environment_and_removes_it(tmp_pa
         raise SystemExit("stop here")
 
     monkeypatch.setattr(gate, "serve", stop_serving)
+    for absent in (None, ""):  # no file, then an empty one
+        if absent is not None:
+            token_file.write_text(absent, encoding="utf-8")
+        gate.CFG.clear()
+        with pytest.raises(SystemExit, match="no token"):
+            gate.main()
+    token_file.write_text(GATE_TOKEN, encoding="utf-8")
+    gate.CFG.clear()
     with pytest.raises(SystemExit, match="stop here"):
         gate.main()
     assert gate.CFG["token"] == GATE_TOKEN
-    assert gate.TOKEN_ENV not in __import__("os").environ
-    monkeypatch.delenv(gate.TOKEN_ENV, raising=False)
-    gate.CFG.clear()
-    with pytest.raises(SystemExit, match="no token"):
-        gate.main()
     gate.CFG.clear()
 
 

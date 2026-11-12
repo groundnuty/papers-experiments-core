@@ -2,17 +2,19 @@
 
 import ipaddress
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
 from fake_host import CERTIFI_BUNDLE
-from sandbox_support import COMPLETE_LEVEL, TOKEN, fail_copies, make_spec, start_options
+from sandbox_support import COMPLETE_LEVEL, FED_LOCAL, FED_NETWORK, TOKEN, fail_copies, make_spec, start_options
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
-from expcore_onedata.sandbox.containers import ENV_TOKEN
+from expcore_onedata.sandbox.containers import ENV_TOKEN, GATE_TOKEN_PATH, SIDECAR_TOKEN_PATH
 from expcore_onedata.sandbox.hostops import CmdResult
-from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.sandbox.sandbox import GATE_TOKEN_FILE, TOKEN_FILE, DockerSandbox
 
 
 def start(world, level="via-gate", **kw):
@@ -21,8 +23,8 @@ def start(world, level="via-gate", **kw):
 
 
 def flat(container) -> str:
-    """Every argument docker was given for a container, as text (its environment is separate)."""
-    arguments = {k: v for k, v in container.options.items() if k != "_env"}
+    """Every argument docker was given for a container, as text (the fake's own records, `_env` and `_files`, apart)."""
+    arguments = {k: v for k, v in container.options.items() if not k.startswith("_")}
     return json.dumps(arguments, default=str) + " ".join(container.command)
 
 
@@ -144,8 +146,8 @@ def test_o05_no_credential_is_visible_inside_the_agent_on_any_data_path(world, l
 
 
 def test_o23_a_rest_agent_holds_the_placeholder_as_its_token_and_the_gate_the_runs(world):
-    """O23, O05: the REST agent's ONEDATA_TOKEN is the configured placeholder, which is not the run's token; the gate's
-    environment holds the run's token. Neither container holds the other's value."""
+    """O23, O05: the REST agent's ONEDATA_TOKEN is the configured placeholder, which is not the run's token; the gate
+    holds the run's token, from its file. Neither container's environment holds the other's value."""
     sbx = start(world, "via-gate")
     agent, gate = (world.host.containers[name].options["_env"] for name in (sbx.names.agent, sbx.names.gate))
     assert agent[ENV_TOKEN] == world.s.placeholder_token != TOKEN
@@ -167,16 +169,51 @@ def test_o23_o05_a_placeholder_that_is_the_runs_token_refuses_the_start_before_a
     assert not [call for call in world.host.calls if call[:2] == ("docker", "run")]
 
 
-def test_o05_the_gate_holds_the_rest_token_in_its_environment_and_nowhere_on_disk_or_in_an_argument(world):
-    """O05: the token is the gate's; it travels in the docker client's environment, as the sidecar's does."""
+def test_o05_the_gate_takes_the_rest_token_from_a_root_owned_file_bound_into_it_alone_and_the_host_keeps_none(world):
+    """O05: the token is the gate's. It reaches the gate as a file bound into the gate's container alone, read-only, at
+    the path the gate's configuration names; the file is made the gate's own user's (root's: the gate has no capability
+    to read another's) and owner-only; and the host's copy is gone once the gate is ready. Docker is given no
+    environment for it, and no argument, record or file of the run holds it."""
     sbx = start(world, "via-gate")
-    gate = world.host.containers[sbx.names.gate]
-    assert gate.options["_env"] == {"GATE_ACCESS_TOKEN": TOKEN}
-    assert "GATE_ACCESS_TOKEN" in gate.options["-e"]
+    gate, agent = world.host.containers[sbx.names.gate], world.host.containers[sbx.names.agent]
+    bound = gate.options["_files"]
+    assert bound[GATE_TOKEN_PATH] == TOKEN
+    assert [path for path, text in bound.items() if TOKEN in text] == [GATE_TOKEN_PATH]
+    assert not [text for text in agent.options["_files"].values() if TOKEN in text]
+    assert json.loads((sbx.dir / "gate.json").read_text())["token_file"] == GATE_TOKEN_PATH
+    assert gate.options["_env"] == {}
+    assert "-e" not in gate.options
+    assert ["chown", "0:0", str(sbx.dir / GATE_TOKEN_FILE)] in world.host.sudo_commands
+    assert not (sbx.dir / GATE_TOKEN_FILE).exists()
     assert TOKEN not in flat(gate)
     assert not [f for f in files_under(sbx.dir) if TOKEN in f.read_text(encoding="utf-8", errors="replace")]
     assert TOKEN not in json.dumps(sbx.metadata())
     sbx.stop()
+
+
+def test_o05_the_gates_token_file_is_gone_after_a_gate_that_never_became_ready_and_after_a_kept_run(world, tmp_path):
+    """O05: the host's copy of the gate's token is removed on every path that ends a sandbox: a gate that exited
+    before it was ready, and a run whose disks are kept as evidence after a failed collection."""
+    original = world.host._run_container
+
+    def exiting(args, env):
+        result = original(args, env)
+        for container in world.host.containers.values():
+            if container.name.endswith("-gate"):
+                container.running, container.logs = False, ""
+        return result
+
+    world.host._run_container = exiting
+    with pytest.raises(SandboxError, match="gate exited"):
+        start(world, "via-gate")
+    leftovers = [p for p in world.s.work_root.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+    assert leftovers == []
+    world.host._run_container = original
+    sbx = start(world, "via-gate")
+    sbx.keep_evidence = True
+    sbx.stop()
+    kept = world.s.work_root / "_kept_evidence"
+    assert not [p for p in kept.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
 
 
 def test_the_mount_path_has_a_read_only_mount_a_sidecar_and_no_gate(world):
@@ -195,15 +232,205 @@ def test_the_mount_path_has_a_read_only_mount_a_sidecar_and_no_gate(world):
 
 
 def test_the_mount_token_belongs_to_the_sidecar_and_the_agent_has_none(world):
-    """O05: the agent has neither the token nor FUSE nor a route; the sidecar takes the token from its environment."""
+    """O05: the agent has neither the token nor FUSE nor a route; the sidecar takes the token from a file bound into it
+    read-only, and from nowhere else: not an argument, not its environment as docker keeps it."""
     sbx = start(world, "mounted")
     agent, sidecar = (world.host.containers[n] for n in (sbx.names.agent, sbx.names.sidecar))
-    assert sidecar.options["_env"]["ONECLIENT_ACCESS_TOKEN"] == TOKEN
+    assert sidecar.options["_files"] == {SIDECAR_TOKEN_PATH: TOKEN}
+    assert any(spec.endswith(f":{SIDECAR_TOKEN_PATH}:ro") for spec in sidecar.options["-v"])
     assert TOKEN not in flat(sidecar)
+    assert TOKEN not in json.dumps(sidecar.options["_env"])
     assert TOKEN not in json.dumps(agent.options["_env"])
+    assert not agent.options["_files"]
     assert "--device" not in agent.options
     assert sbx.names.net in agent.networks
     assert "bridge" not in agent.networks
+    sbx.stop()
+
+
+@pytest.mark.parametrize("level", ["mounted", "via-gate", "isolated"])
+def test_o05_docker_inspect_of_every_running_container_of_the_sandbox_shows_no_token(world, level):
+    """O05: whoever can ask the docker daemon must not read the run's token: `docker inspect` of every container the
+    sandbox runs (its environment, its command, its mounts), the sidecar, the gate and the agent alike, shows no token,
+    and the host keeps no copy of it once its holder has started (a run killed before then leaves one, which the next
+    start on the root removes)."""
+    sbx = start(world, level)
+    assert world.host.containers  # every one the sandbox started, whatever the path
+    for name in world.host.containers:
+        assert TOKEN not in world.host.docker("inspect", name).stdout, name
+    assert not [p for p in sbx.dir.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+    sbx.stop()
+
+
+def test_o05_the_mounts_token_file_is_gone_after_a_failed_start_and_after_a_kept_run(world, tmp_path):
+    """O05: the host's copy of the token is removed on every path that ends a sandbox: a start whose sidecar exited
+    before the mount appeared, and a run whose disks are kept as evidence after a failed collection."""
+    original = world.host._run_container
+
+    def exiting(args, env):
+        result = original(args, env)
+        for container in world.host.containers.values():
+            if container.name.endswith("-oneclient"):
+                container.running = False
+        return result
+
+    world.host._run_container = exiting
+    world.host.oneclient_images.clear()  # the sidecar exits and no mount appears
+    with pytest.raises(SandboxError, match="sidecar exited"):
+        start(world, "mounted")
+    leftovers = [p for p in world.s.work_root.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+    assert leftovers == []
+    world.host._run_container = original
+    world.host.oneclient_images.add(world.s.oneclient.id)
+    sbx = start(world, "mounted")
+    sbx.keep_evidence = True
+    sbx.stop()
+    kept = world.s.work_root / "_kept_evidence"
+    assert kept.exists()
+    assert not [p for p in kept.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+
+
+def test_o05_the_mounts_token_file_is_removed_even_when_the_fuse_mount_holds_the_containers(world, monkeypatch):
+    """O05: when the FUSE mount can be neither unmounted nor aborted, the teardown leaves the sidecar and the agent
+    running (O15) and keeps the run's directory; the host's copy of the token goes all the same."""
+    from expcore_onedata.sandbox import teardown as TD
+
+    sbx = start(world, "mounted")
+    leftover = sbx.dir / TOKEN_FILE  # as a start cut short before the mount appeared would leave it
+    leftover.write_text(TOKEN, encoding="utf-8")
+    held = TD.TeardownResult(fuse_safe=False, removed=[], errors=["the mount is held"], log=[])
+    monkeypatch.setattr(TD, "ordered_fuse_teardown", lambda *a, **k: held)
+    with pytest.raises(SandboxError, match="left running"):
+        sbx.stop()
+    assert not leftover.exists()
+    assert sbx.dir.exists()  # everything else is left for a retry
+    monkeypatch.undo()
+    sbx.stop()
+
+
+def test_o05_the_token_files_go_before_the_ordered_teardown_and_whatever_it_does(world, monkeypatch):
+    """O05: the host's copies of the token are the first thing a teardown removes, so that a teardown step that raises
+    or hangs (the ordered unmount of the FUSE mount, the longest) leaves no secret on disk behind it."""
+    from expcore_onedata.sandbox import teardown as TD
+
+    sbx = start(world, "mounted")
+    leftover = sbx.dir / TOKEN_FILE  # as a start cut short before the mount appeared would leave it
+    leftover.write_text(TOKEN, encoding="utf-8")
+    on_disk_when_it_began = []
+
+    def broken(*args, **kwargs):
+        on_disk_when_it_began.append(leftover.exists())
+        raise RuntimeError("the ordered teardown failed")
+
+    monkeypatch.setattr(TD, "ordered_fuse_teardown", broken)
+    with pytest.raises(RuntimeError, match="ordered teardown failed"):
+        sbx.stop()
+    assert on_disk_when_it_began == [False]
+    assert not leftover.exists()
+    monkeypatch.undo()
+    sbx.stop()
+
+
+def test_o05_a_run_whose_token_file_cannot_be_removed_is_not_moved_into_the_kept_evidence(world):
+    """O05: a secret is never evidence. When the host's copy of the token cannot be removed, the run directory that
+    holds it is left where it is and the teardown says why, rather than moving the file into the evidence; once the
+    file can go, the next teardown keeps the evidence."""
+    sbx = start(world, "mounted")
+    sbx.keep_evidence = True
+    leftover = sbx.dir / TOKEN_FILE  # as a start cut short before the mount appeared would leave it
+    leftover.write_text(TOKEN, encoding="utf-8")
+
+    def busy(argv):
+        if "-f" in argv and argv[-1] == str(leftover):
+            return CmdResult(1, "", "busy")
+        return world.host._run_default(argv)
+
+    world.host.run_handlers["rm"] = busy
+    with pytest.raises(SandboxError, match="token"):
+        sbx.stop()
+    kept = world.s.work_root / "_kept_evidence" / sbx.sid
+    assert leftover.exists()
+    assert not kept.exists()
+    assert sbx.metadata()["evidence_kept"]["relocated"] is False
+    world.host.run_handlers.clear()
+    sbx.stop()
+    assert kept.is_dir()
+    assert not [p for p in kept.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+
+
+def plant_token_file(world, run_directory: str, relative: Path, *, age_s: float) -> Path:
+    """A file of the data-path token as a run killed outright leaves it: in a run directory of the root, written `age_s`
+    seconds ago."""
+    path = world.s.work_root / run_directory / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(TOKEN, encoding="utf-8")
+    then = time.time() - age_s
+    os.utime(path, (then, then))
+    return path
+
+
+def test_o05_a_start_removes_the_token_files_a_killed_run_left_on_the_root(world):
+    """O05: a run killed between writing a token file and removing it leaves the file on disk; the next start on the
+    same root removes it, the mount sidecar's and the gate's alike."""
+    left_by_a_mount_start = plant_token_file(world, "dead-key-1a2b3c4d", TOKEN_FILE, age_s=3600)
+    left_by_a_gate_start = plant_token_file(world, "other-key-5e6f7a8b", GATE_TOKEN_FILE, age_s=3600)
+    sbx = start(world, "isolated")
+    assert not left_by_a_mount_start.exists()
+    assert not left_by_a_gate_start.exists()
+    assert sbx.metadata()["reaped_token_files"] == {"removed": 2, "left": 0}
+    sbx.stop()
+
+
+def test_o05_a_start_leaves_a_token_file_that_may_be_another_starts_and_what_no_sandbox_names(world):
+    """O05: only the files a sandbox writes, by its own naming, and only once much older than a start keeps one: a file
+    written a moment ago is a start in another process that has not yet run its container, and a file elsewhere on the
+    root, or one a link points at, is not the sandbox's to remove."""
+    under_way = plant_token_file(world, "live-key-1a2b3c4d", TOKEN_FILE, age_s=5)
+    not_a_run_directory = plant_token_file(world, "notes", TOKEN_FILE, age_s=3600)
+    not_the_name = plant_token_file(world, "dead-key-5e6f7a8b", Path("sidecar-secret", "other-file"), age_s=3600)
+    target = plant_token_file(world, "elsewhere", Path("target"), age_s=3600)
+    linked = world.s.work_root / "dead-key-9c0d1e2f" / TOKEN_FILE
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(target)
+    sbx = start(world, "isolated")
+    assert [p.exists() for p in (under_way, not_a_run_directory, not_the_name, target)] == [True] * 4
+    assert linked.is_symlink()
+    assert sbx.metadata()["reaped_token_files"] == {"removed": 0, "left": 0}
+    sbx.stop()
+
+
+def test_o05_a_token_file_reached_through_a_linked_directory_is_not_removed(world):
+    """O05: the reaping follows no link anywhere on the way to a token file: a run directory whose secret directory is a
+    link to a directory elsewhere, holding a file of a token file's name, leaves that file alone."""
+    elsewhere = world.s.work_root.parent / "outside-root"
+    outside = elsewhere / TOKEN_FILE.name
+    outside.parent.mkdir(parents=True)
+    outside.write_text(TOKEN, encoding="utf-8")
+    then = time.time() - 3600
+    os.utime(outside, (then, then))
+    run_directory = world.s.work_root / "dead-key-3e4f5a6b"
+    run_directory.mkdir(parents=True)
+    (run_directory / TOKEN_FILE.parent).symlink_to(elsewhere, target_is_directory=True)
+    sbx = start(world, "isolated")
+    assert outside.exists()
+    assert sbx.metadata()["reaped_token_files"] == {"removed": 0, "left": 0}
+    sbx.stop()
+
+
+def test_o05_a_token_file_the_start_cannot_remove_is_counted_and_does_not_refuse_the_start(world):
+    """O05: reaping what a killed run left never fails the start that does it; the count of what stayed is recorded."""
+    stuck = plant_token_file(world, "dead-key-1a2b3c4d", TOKEN_FILE, age_s=3600)
+
+    def busy(argv):
+        if argv[-1] == str(stuck):
+            return CmdResult(1, "", "busy")
+        return world.host._run_default(argv)
+
+    world.host.run_handlers["rm"] = busy
+    sbx = start(world, "isolated")
+    assert stuck.exists()
+    assert sbx.metadata()["reaped_token_files"] == {"removed": 0, "left": 1}
+    world.host.run_handlers.clear()
     sbx.stop()
 
 
@@ -211,7 +438,8 @@ def test_the_tls_mode_of_the_mount_comes_from_the_settings_alone(world):
     sbx = start(world, "mounted")
     command = world.host.containers[sbx.names.sidecar].command
     assert "--insecure" not in command
-    assert command[:2] == ["-u", "ONECLIENT_INSECURE"]
+    oneclient = command[command.index("-u") :]  # after the shell that reads the token file
+    assert oneclient[:2] == ["-u", "ONECLIENT_INSECURE"]
     sbx.stop()
 
 
@@ -492,8 +720,9 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     sbx = start(world, "mounted")
     meta = sbx.metadata()
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
-    assert set(meta["mount"]) == {"io_mode", "log_dir_from", "wait_s"}
+    assert set(meta["mount"]) == {"io_mode", "log_dir_from", "network", "wait_s"}
     assert meta["mount"]["log_dir_from"] == "default"
+    assert meta["mount"]["network"] in ("default bridge", "federation")  # the kind of network, never its name
     text = json.dumps(meta, default=str)
     assert world.s.network.pools[0] not in text
     assert str(world.s.work_root) not in text
@@ -851,3 +1080,60 @@ def test_o15_a_stop_that_ran_during_the_start_is_not_the_last_word_on_the_sandbo
     sbx.stop(force=True)
     assert sbx.stopped
     assert nothing_left(world)
+
+
+# -- [sandbox.federation]: the sidecar on the federation's own network ------------------------------------------------
+
+
+def test_o03_a_mount_sidecar_reaches_the_federation_on_its_network_and_the_agent_stays_on_its_own(fed_world):
+    """O03: with `[sandbox.federation]` the sidecar is started on the federation's own network, and on no other, and
+    mounts through the local provider's name there; the agent is on the sandbox's internal network alone. The record
+    says which kind of network the sidecar was on, never its name (O12)."""
+    sbx = start(fed_world, "mounted")
+    sidecar, agent = (fed_world.host.containers[n] for n in (sbx.names.sidecar, sbx.names.agent))
+    assert set(sidecar.networks) == {FED_NETWORK}
+    assert sidecar.command[sidecar.command.index("-H") + 1] == FED_LOCAL
+    assert set(agent.networks) == {sbx.names.net}
+    assert sbx.metadata()["mount"]["network"] == "federation"
+    sbx.stop()
+
+
+def test_o03_without_the_table_the_record_says_the_sidecar_was_on_the_default_bridge(world):
+    """O03: a sandbox without `[sandbox.federation]` records that its sidecar was on docker's default bridge."""
+    sbx = start(world, "mounted")
+    assert sbx.metadata()["mount"]["network"] == "default bridge"
+    sbx.stop()
+
+
+def test_o15_a_federation_network_that_is_not_there_refuses_the_start_before_anything_is_created(fed_world):
+    """O15: the federation's network is the federation deployment's, never the sandbox's to make; one that is not on
+    the host refuses a mount sandbox's start before any container, network, mount or directory exists, so there is
+    nothing to tear down, and the message names the table and not the network. A run with another data path never
+    asks for that network, and starts."""
+    del fed_world.host.networks[FED_NETWORK]
+    with pytest.raises(StartRefused, match=r"\[sandbox\.federation\]") as caught:
+        start(fed_world, "mounted")
+    assert FED_NETWORK not in str(caught.value)
+    assert nothing_left(fed_world)
+    assert not fed_world.s.work_root.exists() or not list(fed_world.s.work_root.iterdir())
+    start(fed_world, "isolated").stop()
+    assert nothing_left(fed_world)
+
+
+def test_o15_the_teardown_takes_the_sidecar_off_the_federation_network_and_leaves_the_network_as_it_was(fed_world):
+    """O15: the sidecar is on the federation's network while the sandbox runs; the ordered teardown removes it, which
+    takes it off that network, and the network itself is never disconnected, removed or reaped. The probe then shows
+    the sandbox gone (C19)."""
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    before = dict(fed_world.host.networks[FED_NETWORK])
+    sbx = start(fed_world, "mounted", lease_key=KEY)
+    assert set(fed_world.host.containers[sbx.names.sidecar].networks) == {FED_NETWORK}
+    sbx.stop()
+    assert set(fed_world.host.networks) == {FED_NETWORK}
+    assert fed_world.host.networks[FED_NETWORK] == before
+    assert not fed_world.host.containers
+    assert not fed_world.host.mounts
+    touched = [c for c in fed_world.host.calls if c[0] == "docker" and c[1] == "network" and FED_NETWORK in c[2][1:]]
+    assert touched == [], "only a lookup of the federation network by name is allowed"
+    assert SandboxProbe(fed_world.host, fed_world.s).resource_gone(KEY, {}) is True

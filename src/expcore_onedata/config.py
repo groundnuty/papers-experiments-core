@@ -507,18 +507,25 @@ def load_platform(
     tls = load_tls(Section(root.table("tls"), file, "[tls]"), file.parent)
     if require_secrets:
         _check_fixed_users(users, principals, file, environ)
+    spaces = load_spaces(root, providers)
     return PlatformConfig(
         file=file,
         zone=Zone(_name(zone, "name", zone.string("name"), "the zone name"), _url(zone, "url")),
         providers=MappingProxyType(providers),
-        spaces=load_spaces(root, providers),
+        spaces=spaces,
         spaces_table="spaces" in root.data,
         admin=_secret_source(credentials.section("admin"), file.parent, require=require_secrets, environ=environ),
         users=users,
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),
         principals=principals,
         toolserver=_toolserver(root.section("toolserver"), file.parent) if "toolserver" in root.data else None,
-        sandbox=load_sandbox(Section(root.table("sandbox"), file, "[sandbox]"), file.parent, tls=tls)
+        sandbox=load_sandbox(
+            Section(root.table("sandbox"), file, "[sandbox]"),
+            file.parent,
+            tls=tls,
+            providers=tuple(providers),
+            local=spaces[0].support.local,  # the same in every entry (load_spaces, O03)
+        )
         if "sandbox" in root.data
         else None,
         sha256=digest,

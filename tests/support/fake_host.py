@@ -80,12 +80,25 @@ def writable(path: str) -> None:
                 os.chmod(full, 0o700)
 
 
+def _config_env(c: FakeContainer) -> list[str]:
+    """The container's environment as docker keeps it in its configuration, which `docker inspect` shows: each `-e
+    NAME=value`, and each `-e NAME` with the value the docker client's environment held for it."""
+    client = c.options.get("_env") or {}
+    named = c.options.get("-e", [])
+    return [e if "=" in e else f"{e}={client[e]}" for e in named if "=" in e or e in client]
+
+
 def _inspect_json(c: FakeContainer) -> dict[str, Any]:
     return {
         "Id": c.id,
         "Name": "/" + c.name,
         "Image": c.image,
-        "Config": {"Labels": c.labels},
+        "Config": {
+            "Labels": c.labels,
+            "Env": _config_env(c),
+            "Entrypoint": [c.options["--entrypoint"]] if "--entrypoint" in c.options else None,
+            "Cmd": c.command,
+        },
         "State": {
             "Status": ("paused" if c.paused else "running") if c.running else "exited",
             "Running": c.running,
@@ -416,6 +429,11 @@ class FakeHost:
         self.add_stat(container.pid, "tini", 1)
         self.add_cgroup(container, [container.pid], events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
         container.options["_env"] = dict(env or {})
+        container.options["_files"] = {  # what each file bound in held when the container started, by destination
+            spec.split(":")[1]: Path(spec.split(":")[0]).read_text(encoding="utf-8")
+            for spec in options.get("-v", [])
+            if Path(spec.split(":")[0]).is_file()
+        }
         return CmdResult(0, container.id + "\n")
 
     def _mount_oneclient(self, container: FakeContainer) -> None:

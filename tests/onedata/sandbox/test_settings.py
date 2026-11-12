@@ -1,11 +1,22 @@
 """The [sandbox] table: every image, pool, limit, mount option and data path is read from platform.toml (O12-O14)."""
 
 import pytest
-from sandbox_support import AGENT_IMAGE_ID, COMPLETE_LEVEL, GATE_IMAGE_ID, LEVELS, POOL, add_sandbox
+from sandbox_support import (
+    AGENT_IMAGE_ID,
+    COMPLETE_LEVEL,
+    FED_LOCAL,
+    FED_NETWORK,
+    GATE_IMAGE_ID,
+    LEVELS,
+    POOL,
+    add_federation,
+    add_sandbox,
+)
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.sandbox.settings import FederationNetwork
 from expcore_onedata.testing import NOW, write_platform
 
 
@@ -399,6 +410,100 @@ def test_c06_a_platform_without_the_caps_table_keeps_the_fingerprint_it_had_and_
     assert config.fingerprint() == recorded
     resume(config.fingerprint())
     resume(platform_with_caps(tmp_path, "again").fingerprint())
+
+
+# -- [sandbox.federation]: the network the sidecar reaches the federation on -------------------------------------------
+
+
+def federated(tmp_path, edit=None):
+    """Load the default document with the `[sandbox.federation]` table of `add_federation`, after an optional edit."""
+
+    def both(data):
+        add_federation(data)
+        if edit is not None:
+            edit(data["sandbox"]["federation"])
+
+    return load_platform(write_platform(tmp_path, both), require_secrets=False).sandbox
+
+
+def test_o03_the_federation_table_gives_the_sidecar_a_network_and_the_local_providers_name_on_it(tmp_path):
+    """O03: a federation whose providers the host reaches at addresses no container can use (a Compose project's
+    loopback ports) is reached on its own docker network, where the local provider has a name of its own; the table
+    names that network and the local provider's name there, and nothing else."""
+    sandbox = federated(tmp_path)
+    assert sandbox.federation == FederationNetwork(network=FED_NETWORK, local_provider=FED_LOCAL)
+    (tmp_path / "plain").mkdir()
+    assert load(tmp_path / "plain").federation is None  # optional: without it the sidecar starts as it always has
+
+
+@pytest.mark.parametrize(
+    ("change", "named"),
+    [
+        (lambda t: t["providers"].clear(), "the local provider"),  # the provider the agent is pinned to is missing
+        (lambda t: t["providers"].update(beta="beta.fed-net.test"), "entry 1"),  # a declared provider, not the local
+        (lambda t: t["providers"].update(gamma="gamma.fed-net.test"), "entry 1"),  # a provider nobody declared
+    ],
+)
+def test_o03_the_federation_table_names_the_local_provider_and_no_other(tmp_path, change, named):
+    """O03: the agent is pinned to its local provider, so the sidecar dials the local provider's name and no other.
+    The table keys the name by the provider it belongs to, so a `[support] local` changed without it is refused at
+    load instead of mounting through another provider; an entry for any other provider is refused rather than read
+    by nothing. A provider's name is configured, so it is named by its position."""
+    with pytest.raises(ConfigError, match=named) as caught:
+        federated(tmp_path, change)
+    for value in ("beta", "gamma", "alpha"):
+        assert value not in str(caught.value)
+
+
+@pytest.mark.parametrize("network", ["bridge", "host", "none", "default", "container:other", "a b", ""])
+def test_o05_the_federation_network_is_a_named_network_of_its_own_never_the_host_or_none(tmp_path, network):
+    """O05: the sidecar joins the federation's own network instead of docker's default bridge. The host's network
+    (no isolation at all), none (no federation), the default bridge (where no name resolves), a container's network
+    and a malformed name are refused at load, naming the key and never the value."""
+
+    def change(table):
+        table["network"] = network
+
+    with pytest.raises(ConfigError, match="'network'") as caught:
+        federated(tmp_path, change)
+    if network:
+        assert f"'{network}'" not in str(caught.value)
+
+
+@pytest.mark.parametrize("address", ["alpha.fed-net.test:443", "https://alpha.fed-net.test", "a b", "-x", ""])
+def test_o03_the_local_providers_name_on_the_network_is_a_host_name(tmp_path, address):
+    """O03: the sidecar dials the name as oneclient's provider host on its default port, so it is a plain host name:
+    no scheme, no port, no space. It is a configured value, named by its position."""
+
+    def change(table):
+        table["providers"]["alpha"] = address
+
+    with pytest.raises(ConfigError, match="entry 0") as caught:
+        federated(tmp_path, change)
+    if address:
+        assert address not in str(caught.value)
+
+
+def test_o05_a_federation_table_without_a_mount_data_path_is_refused(tmp_path):
+    """O05: only the mount sidecar reads the table, so with no data path a mount it would change nothing: refused, as
+    a misspelt key is, so a configuration never seems to do what it does not."""
+
+    def edit(data):
+        add_federation(data)
+        data["sandbox"]["data_paths"] = {"via-gate": "rest", "isolated": "none"}
+
+    with pytest.raises(ConfigError, match=r"\[sandbox\]: key 'federation' is read by the mount sidecar alone"):
+        load_platform(write_platform(tmp_path, edit), require_secrets=False)
+
+
+def test_o05_an_unknown_key_of_the_federation_table_is_refused(tmp_path):
+    """O05: a misspelt key cannot do nothing: the table holds the network and the local provider's name only."""
+
+    def change(table):
+        table["zone"] = "zone.fed-net.test"
+
+    with pytest.raises(ConfigError, match=r"\[sandbox\.federation\]: key 'zone' is not a known key"):
+        federated(tmp_path, change)
 
 
 def test_o23_the_placeholder_token_defaults_to_a_neutral_word_and_a_file_can_name_another(tmp_path):

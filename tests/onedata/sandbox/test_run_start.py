@@ -415,10 +415,11 @@ def test_o24_the_gate_takes_its_mark_signal_before_it_says_it_is_ready(tmp_path,
         def __init__(self, address, handler):
             self.socket = None
 
-    config = tmp_path / "gate.json"
-    config.write_text(json.dumps({"log": str(tmp_path / "r.jsonl"), "hosts": {}, "listen_port": 0}), encoding="utf-8")
+    config, token_file = tmp_path / "gate.json", tmp_path / "gate-token"
+    token_file.write_text("tok-invented-0123456789", encoding="utf-8")  # the gate reads its token from a file
+    document = {"log": str(tmp_path / "r.jsonl"), "hosts": {}, "listen_port": 0, "token_file": str(token_file)}
+    config.write_text(json.dumps(document), encoding="utf-8")
     monkeypatch.setattr("sys.argv", ["gate.py", str(config)])
-    monkeypatch.setenv(gate.TOKEN_ENV, "tok-invented-0123456789")
     monkeypatch.setattr(gate, "CFG", {})
     monkeypatch.setattr(gate, "GateServer", Server)
     monkeypatch.setattr(gate, "_tls_context", lambda: SimpleNamespace(wrap_socket=lambda sock, **options: sock))

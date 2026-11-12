@@ -6,8 +6,11 @@
 The data path is read-only at the mount (O05): the agent's root filesystem is read-only, every capability is dropped,
 no new privilege is possible, and the oneclient mount is bound into the agent read-only. These functions are where those
 flags are written, and a test reads them back. Images are given by resolved id, so a tag that moves after the pin check
-cannot change what runs (O13). A secret never appears in an argument: it is named with `-e NAME` and travels in the
-environment of the docker client (`env`).
+cannot change what runs (O13). A secret never appears in an argument, and no token reaches docker at all: each is a
+file bound read-only into the one container that holds it, the sidecar's read by its shell into oneclient's environment
+(`sidecar_run_args`) and the gate's by the gate (`gate_run_args`), so `docker inspect` shows no token. Docker is given
+an environment variable (`-e NAME`, whose value it keeps in the container's configuration) for the agent's settings
+alone.
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ CA_PATH = "/etc/sandbox/ca.pem"  # the run's certificate authority in the agent
 # oneclient. The agent never gets it: it trusts the run's CA, the gate's, alone.
 GATE_CA_PATH = "/etc/gate/federation-ca.pem"
 SIDECAR_CA_PATH = "/etc/expcore/federation-ca.pem"
+SIDECAR_TOKEN_PATH = "/run/expcore/oneclient-token"  # the mount's token, bound into the sidecar alone, read-only
+GATE_TOKEN_PATH = "/etc/gate/token"  # the REST path's token, bound into the gate alone, read-only; gate.json names it
 ENV_SSL_CERT_FILE = "SSL_CERT_FILE"  # OpenSSL's setting of the CA file its default verify paths load
 ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image's binary
 ONECLIENT_LOG_DIR = "/tmp/oneclient/0"  # where it writes its log unless told otherwise
@@ -37,10 +42,17 @@ ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
 # The client refuses to start without a token, so a REST agent's holds the configured placeholder (O23), never a
 # credential: the gate drops it with any other token the agent sends and adds its own.
 ENV_TOKEN = "ONEDATA_TOKEN"
-ENV_GATE_TOKEN = "GATE_ACCESS_TOKEN"  # the gate's: the name the gate reads (gate.TOKEN_ENV); the agent's is ENV_TOKEN
 ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
+# The sidecar's entrypoint: read the token file into oneclient's variable, refuse an empty one, then become `env` with
+# the arguments of `sidecar_command`. The value lives in oneclient's own environment, never in docker's configuration.
+SIDECAR_START = (
+    f'{ENV_ACCESS_TOKEN}="$(cat {SIDECAR_TOKEN_PATH})" && [ -n "${ENV_ACCESS_TOKEN}" ] || exit 97; '
+    f'export {ENV_ACCESS_TOKEN}; exec env "$@"'
+)
+SIDECAR_SHELL_NAME = "oneclient-sidecar"  # the shell's $0, before the arguments it hands to `env`
 ENV_CA_BUNDLES = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+DEFAULT_BRIDGE = "bridge"  # docker's default network: the sidecar's without [sandbox.federation]
 # The published client sends through `requests.Session.send`, which merges no environment setting, so it verifies the
 # gate against the certifi bundle of the agent's image and never reads ENV_CA_BUNDLES (O23). On a REST data path the
 # sandbox asks the image's interpreter where that bundle is and extends it with the run's CA, as a trust path.
@@ -104,7 +116,7 @@ class Names:
 
 
 def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
-    """The arguments after the sidecar's image name, run with `--entrypoint env`.
+    """The arguments the sidecar's shell hands to `env` once it has read the token file (`sidecar_run_args`).
 
     The published image sets an environment flag that makes the client skip TLS verification, so the default entrypoint
     would run unverified whatever is passed. `env -u` removes the flag, and the platform's `[tls]` alone decides the
@@ -125,6 +137,18 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
         *mount.extra_args,
         SIDECAR_MOUNT,
     ]
+
+
+def sidecar_route(settings: SandboxSettings, provider_host: str) -> tuple[str, str]:
+    """The network the sidecar starts on and the provider host it dials there (O03).
+
+    With `[sandbox.federation]`, the federation's own network and the local provider's name on it: a federation whose
+    providers the host reaches at addresses no container can use (a Compose project's ports on the host's loopback) is
+    reached there, by the name its certificate holds. Without it, docker's default bridge and the host of the local
+    provider's URL, which a federation with public addresses needs. The agent joins neither (`agent_run_args`)."""
+    if settings.federation is None:
+        return DEFAULT_BRIDGE, provider_host
+    return settings.federation.network, settings.federation.local_provider
 
 
 def effective_log_dir(args: Sequence[str], default: str = ONECLIENT_LOG_DIR) -> str:
@@ -155,20 +179,24 @@ def gate_run_args(
     gate_files: Path,
     image_id: str,
     *,
+    token_file: Path,
     ca_copy: Path | None = None,
 ) -> list[str]:
     """`docker run` for the gate: read-only root, one capability (to bind its port), its files mounted read-only.
 
-    The gate holds the data-path token and adds it to the requests it forwards (O05): it is named with `-e NAME`, and
-    its value travels in the environment of the docker client, as the sidecar's does. With the platform's `ca_file`,
-    `ca_copy`, the run's own copy of the verified bundle, is mounted read-only at `GATE_CA_PATH`, which the gate's
-    configuration names as its upstream CA file."""
+    The gate holds the data-path token and adds it to the requests it forwards (O05). The token never reaches docker:
+    `token_file`, the run's file of it, is bound read-only at `GATE_TOKEN_PATH` in this container alone, and the gate
+    reads it at its start (its configuration names the path). An environment variable given to `docker run` would be
+    kept in the container's configuration, where `docker inspect` shows it. With the platform's `ca_file`, `ca_copy`,
+    the run's own copy of the verified bundle, is mounted read-only at `GATE_CA_PATH`, which the gate's configuration
+    names as its upstream CA file."""
     return [
-        *("run", "-d", "--name", names.gate, "--network", "bridge", *labels, "-e", ENV_GATE_TOKEN),
+        *("run", "-d", "--name", names.gate, "--network", "bridge", *labels),
         *("--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", "--security-opt", "no-new-privileges"),
         *("--read-only", "--user", "0", "--pids-limit", "512", "--memory", str(s.limits.gate_memory_bytes)),
         *("-v", f"{sdir / 'tls'}:/etc/gate/tls:ro", "-v", f"{sdir / 'gate.json'}:/etc/gate/gate.json:ro"),
         *_ca_mount(s, ca_copy, GATE_CA_PATH),
+        *("-v", f"{token_file}:{GATE_TOKEN_PATH}:ro"),
         *("-v", f"{gate_files}:{GATE_DIR}:ro", "-v", f"{sdir / 'gatelog'}:/var/gate"),
         *("--entrypoint", "python", image_id, f"{GATE_DIR}/gate.py", "/etc/gate/gate.json"),
     ]
@@ -182,21 +210,29 @@ def sidecar_run_args(
     image_id: str,
     provider_host: str,
     *,
+    token_file: Path,
     ca_copy: Path | None = None,
 ) -> list[str]:
     """`docker run` for the mount sidecar: it owns the mount and the token; the agent gets neither, nor FUSE. With the
     platform's `ca_file`, `ca_copy`, the run's own copy of the verified bundle, is mounted read-only at
-    `SIDECAR_CA_PATH` (see `sidecar_command`)."""
+    `SIDECAR_CA_PATH` (see `sidecar_command`). Its network and the host it dials are `sidecar_route`'s: the
+    federation's own network when `[sandbox.federation]` names one, and never a second network beside it.
+
+    The token never reaches docker (O05): `token_file`, the run's file of it, is bound read-only at
+    `SIDECAR_TOKEN_PATH` in this container alone, and the entrypoint, `sh -c SIDECAR_START`, reads it into oneclient's
+    environment before it becomes `env` with `sidecar_command`'s arguments. An environment variable given to `docker
+    run` (`-e NAME`) would be kept in the container's configuration, where `docker inspect` shows it."""
     lim = s.limits
+    network, dialled = sidecar_route(s, provider_host)
     return [
-        *("run", "-d", "--name", names.sidecar, "--network", "bridge", *labels),
+        *("run", "-d", "--name", names.sidecar, "--network", network, *labels),
         *("--cpus", str(lim.cpus), "--memory", str(lim.memory_bytes), "--memory-swap", str(lim.memory_bytes)),
         *("--pids-limit", str(lim.pids), "--cap-add", "SYS_ADMIN", "--device", "/dev/fuse"),
         *("--security-opt", "apparmor:unconfined", "--tmpfs", "/root/.local:size=1g"),
         *_ca_mount(s, ca_copy, SIDECAR_CA_PATH),
-        *("-e", ENV_ACCESS_TOKEN),
+        *("-v", f"{token_file}:{SIDECAR_TOKEN_PATH}:ro"),
         *("--mount", f"type=bind,src={share},dst={SIDECAR_MOUNT},bind-propagation=rshared"),
-        *("--entrypoint", "env", image_id, *sidecar_command(provider_host, s)),
+        *("--entrypoint", "sh", image_id, "-c", SIDECAR_START, SIDECAR_SHELL_NAME, *sidecar_command(dialled, s)),
     ]
 
 
