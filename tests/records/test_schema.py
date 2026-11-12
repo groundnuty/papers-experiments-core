@@ -116,8 +116,10 @@ def test_R02_version_three_marks_the_extra_usage_fields_optional_and_no_older_ve
     written before the field existed lacks it, and is valid."""
     from expcore.records import schema as rules
 
-    assert SCHEMAS[-1].optional == {"usage": ("extra", "extra_cut")}
+    assert SCHEMAS[-1].optional == {"usage": ("extra", "extra_cut"), "record": ("instrument_refusal",)}
     assert rules.optional_in("usage", "expcore-record/3") == {"extra", "extra_cut"}
+    assert rules.optional_in("record", "expcore-record/3") == {"instrument_refusal"}
+    assert rules.optional_in("record", "expcore-record/2") == frozenset()
     assert rules.optional_in("usage", "expcore-record/2") == frozenset()
     assert rules.optional_in("turn", "expcore-record/3") == frozenset()
 
@@ -280,8 +282,9 @@ def test_instruments_and_scores_are_objects_under_lower_case_namespaces():
 V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
     "expcore-record/2",
-    added={"record": ("instruments",), "turn": ("request_sha256",)},
+    added={"record": ("instruments", "instrument_refusal"), "turn": ("request_sha256",)},
     config_before={"cleanup_deadline_s": 60.0},
+    optional={"record": ("instrument_refusal",)},  # the field of the real table's version 3, here added with this one
 )
 TABLE = (V1, V2)
 

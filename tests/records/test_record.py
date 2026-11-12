@@ -15,9 +15,14 @@ from expcore.replay.replay import replay_record
 V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
     "expcore-record/2",
-    added={"record": ("instruments",), "turn": ("request_sha256",), "usage": ("extra", "extra_cut")},
+    added={
+        "record": ("instruments", "instrument_refusal"),
+        "turn": ("request_sha256",),
+        "usage": ("extra", "extra_cut"),
+    },
     config_before={"cleanup_deadline_s": 60.0},
-    optional={"usage": ("extra", "extra_cut")},  # the fields of the real table's version 3, here added with this one
+    # the fields of the real table's version 3, here added with this one
+    optional={"record": ("instrument_refusal",), "usage": ("extra", "extra_cut")},
 )
 TABLE = (V1, V2)
 

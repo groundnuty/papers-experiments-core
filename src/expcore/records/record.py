@@ -36,6 +36,7 @@ from expcore.records.schema import (
     RecordError,
     SchemaVersion,
     added_after,
+    optional_in,
     validate,
 )
 from expcore.records.seal import mark_unverified, seal
@@ -74,6 +75,9 @@ class RunRecord:
     instruments: dict[str, Any] = field(default_factory=dict)
     scores: dict[str, Any] = field(default_factory=dict)
     redacted_paths: list[str] = field(default_factory=list)
+    # Version 3, optional: the instrument that refused the attempt after the run, `{"namespace", "infra_kind",
+    # "detail"}` (C31). None when none did; it is then left out of the file, never written as a null.
+    instrument_refusal: dict[str, Any] | None = None
     schema_version: str = CURRENT
 
     @property
@@ -86,13 +90,20 @@ class RunRecord:
         """Tell whether the attempt is set aside and re-run instead of scored: a partial record (R09).
 
         An infrastructure outcome of a kind the attempt's condition declares as its treatment is a scored final
-        attempt, so it is not set aside: the record carries the declared kinds and the flag, and the store agrees.
+        attempt, so it is not set aside: the record carries the declared kinds and the flag, and the store agrees. An
+        attempt an instrument refused after the run is set aside whatever its outcome was (C31).
         """
+        if self.instrument_refusal is not None:
+            return True
         return self.outcome["name"] in SET_ASIDE_OUTCOMES and not self.outcome["treatment"]
 
     def with_instrument(self, namespace: str, data: dict[str, Any]) -> "RunRecord":
         """Return a copy that also holds an instrument's output under its namespace."""
         return dataclasses.replace(self, instruments={**self.instruments, namespace: data})
+
+    def with_instrument_refusal(self, refusal: dict[str, Any]) -> "RunRecord":
+        """Return a copy that records the instrument that refused the attempt: `namespace`, `infra_kind`, `detail` (C31)."""
+        return dataclasses.replace(self, instrument_refusal=dict(refusal))
 
     def to_json(self, schemas: tuple[SchemaVersion, ...] = SCHEMAS) -> dict[str, Any]:
         """Return the record as a dictionary in file order, without the fields a later schema added.
@@ -108,6 +119,9 @@ class RunRecord:
             if ordered[name] != empty:
                 raise RecordError(f"{name} holds data but {ordered['schema_version']} predates the field")
             del ordered[name]
+        for name in optional_in("record", ordered["schema_version"], schemas):
+            if ordered.get(name) is None:  # an optional field the run did not supply is absent, never null
+                ordered.pop(name, None)
         return ordered
 
     @classmethod

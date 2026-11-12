@@ -216,6 +216,26 @@ def test_C26_the_second_fixture_pins_a_billed_reply_that_became_no_turn_as_incom
     assert record.totals["usage_incomplete"] is True
 
 
+def test_c31_the_third_fixture_pins_an_instruments_refusal_after_the_run_and_the_first_turn_reading_in_the_clock():
+    """C31 and R03: the third merge point added the optional `instrument_refusal` of a record, and a clock reading the
+    executor takes for an instrument's first-turn hook before the loop starts its clock. The fixture was written by the
+    code of that merge: a finished attempt whose instrument then refused it with a kind no condition can declare. It
+    replays to its own bytes, with the executor's reading and the refusal served back as recorded."""
+    third = [p for p in FIXTURES if p.name.startswith("03-")]
+    assert [p.name for p in third] == ["03-instrument-refusal.json"]
+    record = load_record(third[0])
+    assert record.outcome["name"] == "finished"  # what the loop saw; the refusal came after the run
+    assert record.instrument_refusal == {
+        "namespace": "manipulation",
+        "infra_kind": "tool_plane_integrity",
+        "detail": "the arriving files were not in their declared start state",
+    }
+    assert record.set_aside is True
+    assert [label for label, _ in record.clock][:2] == ["instrument_first_turn", "start"]
+    assert record.instruments["manipulation"]["start_state_clock_s"] == record.clock[0][1]
+    assert "instrument_refusal" not in json.loads(load_record(FIXTURES[0]).dumps())  # earlier records stay without it
+
+
 @pytest.mark.parametrize(
     "entry",
     [{}, dict.fromkeys(RETRY_FIELDS)],
