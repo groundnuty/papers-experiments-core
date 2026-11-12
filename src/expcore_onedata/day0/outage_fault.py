@@ -49,8 +49,12 @@ class Outage:
             self._injector.start(self._identity)
         except InfraError as error:
             return {"started": False, "reason": error.detail, **self._injected()}
-        except ConfigError as error:  # refused before anything was stopped: the sanction, the admission, the target
-            return {"started": False, "reason": str(error), **self._injected()}
+        except ConfigError as error:  # refused before anything was stopped; its message names the file, so not kept
+            return {
+                "started": False,
+                "reason": f"the injector refused to start ({type(error).__name__})",
+                **self._injected(),
+            }
         return {"started": True, "seen_down": True, **self._injected()}
 
     def _injected(self) -> dict[str, Any]:

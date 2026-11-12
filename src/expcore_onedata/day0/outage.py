@@ -61,7 +61,8 @@ from expcore.errors import InfraError
 from expcore_onedata.admission import OUTAGE_RUN, FederationLock
 from expcore_onedata.config import StudySpace
 from expcore_onedata.day0.mutating import clean_up
-from expcore_onedata.day0.outage_agent import AgentPlane
+from expcore_onedata.day0.outage_agent import AgentPlane, unallowed_tools
+from expcore_onedata.day0.outage_agent import refusal as agent_refusal
 from expcore_onedata.day0.outage_cells import Roles
 from expcore_onedata.day0.outage_run import Run
 from expcore_onedata.day0.registry import Context, Result, holder_of, per_space, register, unknown
@@ -83,13 +84,19 @@ def _refusal(ctx: Context) -> str | None:
 
 
 def prerequisite(ctx: Context) -> str | None:
-    """What a platform.toml and a run still lack for the check to start, or None: the refusals the check makes, and
-    for each space the three providers it needs. A live test skips with this reason, which names no value."""
+    """What a platform.toml and a run still lack for the check to start and measure everything, or None: the
+    refusals the check makes, for each space the three providers it needs, and what starting the sandbox and the tool
+    server needs (`outage_agent.refusal`). A live test skips with this reason, which names no value."""
     refusal = _refusal(ctx)
     if refusal is not None:
         return refusal
     reasons = [roles for entry in ctx.config.spaces if isinstance(roles := _roles(ctx, entry), str)]
-    return reasons[0] if reasons else None
+    if reasons:
+        return reasons[0]
+    refused = agent_refusal(ctx)
+    if refused is None and unallowed_tools(ctx):
+        return f"the tool-server condition does not allow {len(unallowed_tools(ctx))} of the four knowledge tools"
+    return refused
 
 
 @register("provider_outage", "Reads and the knowledge plane while a provider is down", mutates=True)

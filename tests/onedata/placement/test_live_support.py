@@ -4,6 +4,7 @@ platform is contacted here)."""
 from pathlib import Path
 
 import pytest
+from fake_host import FakeHost
 from fault_support import faults_table
 from live_support import (
     prerequisite_missing,
@@ -13,7 +14,7 @@ from live_support import (
     require_passed,
     require_restored,
 )
-from outage_support import GAMMA_ID, SERVICE
+from outage_support import GAMMA_ID, KNOWLEDGE_MANIFEST, SERVICE, with_agent
 
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
@@ -22,6 +23,7 @@ from expcore_onedata.day0.runner import build_context
 from expcore_onedata.testing import with_placement, write_platform
 
 LIVE = Path(__file__).resolve().parents[2] / "live" / "test_contract.py"
+RELAY = "http://127.0.0.1:9"  # never called: these tests only read what the platform file declares
 
 
 def entry(ok, **facts):
@@ -30,6 +32,7 @@ def entry(ok, **facts):
 
 def context(tmp_path, fake, edit):
     tmp_path.mkdir(exist_ok=True)
+    (tmp_path / KNOWLEDGE_MANIFEST).write_text("{}", encoding="utf-8")  # a condition's manifest must exist to load
     path = write_platform(tmp_path, edit)
     client = OnezoneClient(load_platform(path), http=fake.client_http())
     return build_context(path, tmp_path / "out", client=client, allow_mutation=True)
@@ -116,21 +119,45 @@ def with_outage(data):
     data["faults"] = faults_table(services={"alpha": SERVICE})
 
 
-def test_o28_the_outage_check_names_what_the_platform_file_lacks(tmp_path, fake):
-    """O28: no sanctioned [faults] table and a data provider that is the local one are each named; a platform with
-    three providers, a sanction and a data provider apart from the local one has nothing missing."""
+def test_o28_the_outage_check_names_what_the_platform_file_lacks(tmp_path, fake, monkeypatch):
+    """O28: no sanctioned [faults] table, a data provider that is the local one, no consent to start containers, no
+    knowledge condition, no [slots] and no mount level are each named, so the live test skips before it takes a
+    provider down; a platform with all of them and a host has nothing missing."""
+    monkeypatch.delenv("EXPCORE_LIVE_DOCKER", raising=False)
     fake.add_provider(GAMMA_ID, "gamma.test")
     ctx = context(tmp_path / "one", fake, both_supporting)
     ctx.allow_faults = True
     assert "sanctioned = true" in prerequisite_missing("provider_outage", ctx)
-    ctx = context(tmp_path / "two", fake, with_outage)
-    ctx.allow_faults = True
+    ctx = context(tmp_path / "two", fake, lambda data: (with_outage(data), with_agent(data, RELAY)))
+    ctx.allow_faults, ctx.agent_host = True, FakeHost()
     assert prerequisite_missing("provider_outage", ctx) is None
     ctx.allow_faults = False
     assert "EXPCORE_LIVE_FAULTS=1" in prerequisite_missing("provider_outage", ctx)
+    ctx.allow_faults, ctx.agent_host = True, None
+    assert "EXPCORE_LIVE_DOCKER=1" in prerequisite_missing("provider_outage", ctx)
+    ctx.agent_host, ctx.tool_condition = FakeHost(), "read"
+    assert "4 of the four knowledge tools" in prerequisite_missing("provider_outage", ctx)
     ctx = context(tmp_path / "three", fake, lambda data: (with_outage(data), data["support"].update(local="alpha")))
     ctx.allow_faults = True
     assert "local provider" in prerequisite_missing("provider_outage", ctx)
+
+    def without(table):
+        def edit(data):
+            with_outage(data)
+            with_agent(data, RELAY)
+            if table == "slots":
+                del data["slots"]
+            else:
+                data["sandbox"]["data_paths"] = {"isolated": "none"}
+
+        return edit
+
+    ctx = context(tmp_path / "four", fake, without("slots"))
+    ctx.allow_faults, ctx.agent_host = True, FakeHost()
+    assert "[slots]" in prerequisite_missing("provider_outage", ctx)
+    ctx = context(tmp_path / "five", fake, without("mount"))
+    ctx.allow_faults, ctx.agent_host = True, FakeHost()
+    assert "maps to the mount" in prerequisite_missing("provider_outage", ctx)
 
 
 def test_a_read_only_check_that_ran_on_no_provider_or_left_something_behind_does_not_pass():

@@ -25,7 +25,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from expcore.campaign.lease import LeasePool, LeaseRefused
-from expcore.config.loading import ConfigError
+from expcore.config.loading import ConfigError, load_toml
 from expcore.errors import InfraError
 from expcore.plugin import NO_WAITS
 from expcore_onedata.config import StudySpace
@@ -55,6 +55,31 @@ def knowledge_condition(ctx: Context) -> str | None:
     return next((name for name, cond in server.conditions.items() if set(KNOWLEDGE_TOOLS) <= set(cond.allow)), None)
 
 
+def refusal(ctx: Context) -> str | None:
+    """What stands between the check and starting the sandbox and the tool server, or None. A platform without a
+    `[sandbox]` table is named as such, whether or not containers were allowed."""
+    config = ctx.config
+    if config.sandbox is None:
+        return "platform.toml has no [sandbox] table, so no sandbox or tool server was started"
+    if ctx.agent_host is None:
+        return "EXPCORE_LIVE_DOCKER=1 is not set, so no sandbox or tool server was started"
+    if "slots" not in load_toml(config.file):
+        return "platform.toml has no [slots] table, so no user could be leased for the sandbox and the tool server"
+    if config.toolserver is None:
+        return "platform.toml has no [toolserver] table, so the agent's tools cannot be started"
+    if knowledge_condition(ctx) is None:
+        return "no [toolserver] condition allows the four knowledge tools (or the named one is not declared)"
+    return None
+
+
+def unallowed_tools(ctx: Context) -> list[str]:
+    """The knowledge tools the chosen condition does not allow (all of them when no condition is chosen)."""
+    server, condition = ctx.config.toolserver, knowledge_condition(ctx)
+    if server is None or condition is None:
+        return list(KNOWLEDGE_TOOLS)
+    return [name for name in KNOWLEDGE_TOOLS if name not in server.conditions[condition].allow]
+
+
 def _level(ctx: Context) -> str:
     sandbox = ctx.config.sandbox
     assert sandbox is not None
@@ -79,18 +104,6 @@ class AgentPlane:
     def _event(self, kind: str, detail: str) -> None:
         self.events.append((kind, detail))
 
-    def _refusal(self) -> str | None:
-        ctx = self._ctx
-        if ctx.agent_host is None:
-            return "EXPCORE_LIVE_DOCKER=1 is not set, so no sandbox or tool server was started"
-        if ctx.config.sandbox is None:
-            return "platform.toml has no [sandbox] table, so no sandbox or tool server was started"
-        if ctx.config.toolserver is None:
-            return "platform.toml has no [toolserver] table, so the agent's tools cannot be started"
-        if knowledge_condition(ctx) is None:
-            return "no [toolserver] condition allows the four knowledge tools (or the named one is not declared)"
-        return None
-
     def _platform(self) -> SandboxPlatform:
         ctx = self._ctx
         slots = load_slots(ctx.config.file, ctx.config)
@@ -112,10 +125,10 @@ class AgentPlane:
     @contextlib.asynccontextmanager
     async def opened(self) -> AsyncIterator["AgentPlane"]:
         """Lease a slot, start the sandbox and then the tool server, yield, and stop them in reverse order."""
-        refusal = self._refusal()
-        if refusal is not None:
-            self.facts = {"sandbox": {"started": False, "reason": refusal}, "tool_server": {"started": False}}
-            self.facts["tool_server"]["reason"] = refusal
+        refused = refusal(self._ctx)
+        if refused is not None:
+            self.facts = {"sandbox": {"started": False, "reason": refused}, "tool_server": {"started": False}}
+            self.facts["tool_server"]["reason"] = refused
             yield self
             return
         ctx, condition = self._ctx, knowledge_condition(self._ctx)
@@ -195,4 +208,4 @@ def _why(error: BaseException) -> str:
     return error.kind if isinstance(error, InfraError) else type(error).__name__
 
 
-__all__ = ["LEASES", "AgentPlane", "knowledge_condition", "mount_levels"]
+__all__ = ["LEASES", "AgentPlane", "knowledge_condition", "mount_levels", "refusal", "unallowed_tools"]

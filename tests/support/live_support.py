@@ -7,6 +7,7 @@ import pytest
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.day0.outage import prerequisite as outage_prerequisite
+from expcore_onedata.day0.outage_agent import mount_levels
 from expcore_onedata.day0.registry import Context
 from expcore_onedata.day0.report import Entry
 from expcore_onedata.tokencheck import PrivilegesMismatch
@@ -54,7 +55,10 @@ def prerequisite_missing(name: str, ctx: Context) -> str | None:
             return "the round_trip check needs the id of the data provider and of the receiving provider"
         return None
     if name == "provider_outage":
-        return outage_prerequisite(ctx)
+        missing = outage_prerequisite(ctx)
+        if missing is None and not mount_levels(ctx):  # the issue asks for the mount's answers: a live run needs one
+            return "the provider_outage check's live run needs a [sandbox.data_paths] level that maps to the mount"
+        return missing
     raise ValueError("this helper knows the read_only, round_trip and provider_outage checks only")
 
 

@@ -9,6 +9,7 @@ import json
 import shutil
 
 import pytest
+from fake_host import FakeHost
 from fake_reset import FakeReset
 from fault_support import faults_table
 from outage_support import (
@@ -60,6 +61,12 @@ def edit(data):
     data["providers"]["gamma"] = {"url": f"https://{GAMMA_HOST}", "id": GAMMA_ID}
     data["support"] = {"providers": ["alpha", "beta", "gamma"], "local": "beta"}
     data["faults"] = faults_table(services={"alpha": SERVICE}, settle_timeout_s=30)
+
+
+@pytest.fixture(autouse=True)
+def no_container_consent(monkeypatch):
+    """No test here may start a real container: the consent a live run exports is taken away."""
+    monkeypatch.delenv("EXPCORE_LIVE_DOCKER", raising=False)
 
 
 @pytest.fixture(scope="module")
@@ -131,9 +138,10 @@ def context(platform, world, agent, services, ticker, tmp_path):
             "sleep": ticker.sleep,
             "now": lambda: NOW,
             "tcp": None,
-            "agent_host": agent_host(path, agent),
             "agent_options": agent_options(),
         }
+        if "agent_host" not in options:
+            settings["agent_host"] = agent_host(path, agent)
         return build_context(path, tmp_path / "out", **{**settings, **options})
 
     return make
@@ -730,6 +738,18 @@ def test_o28_a_sandbox_that_does_not_start_leaves_the_mount_unmeasured_and_the_c
     assert entry.ok is None
     assert entry.facts["agent"]["sandbox"]["reason"].startswith("the sandbox did not start")
     assert entry.facts["mount"]["measured"] is False
+
+
+def test_o28_a_platform_without_a_sandbox_table_is_named_as_such_whatever_the_consent(
+    tmp_path, fake, relay, tools_manifest, context
+):
+    """O28: with a host to start containers on (the consent given) and no [sandbox] table, the reason the mount and the
+    tools were not measured names the table, never the consent."""
+    target = write_target(tmp_path / "bare", fake, relay, tools_manifest, lambda data: data.pop("sandbox"))
+    entry = outage_check(context, target=target, agent_host=FakeHost())
+    assert entry.ok is None
+    assert entry.facts["agent"]["sandbox"]["reason"].startswith("platform.toml has no [sandbox] table")
+    assert "EXPCORE_LIVE_DOCKER" not in entry.summary
 
 
 def test_o28_without_a_declared_mount_the_mount_is_absent_not_unknown(tmp_path, fake, relay, tools_manifest, context):
