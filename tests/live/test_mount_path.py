@@ -595,6 +595,7 @@ def attempt(tmp_path_factory):
             text = json.dumps(redacted(facts, local, owner), indent=1, sort_keys=True, default=str)
             Path(out).write_text(text + "\n", encoding="utf-8")
     facts["names"] = {"local": local, "owner": owner}
+    facts["labels"] = {role: config.provider_label(name) for role, name in facts["names"].items()}  # the probes' keys
     return facts
 
 
@@ -683,8 +684,8 @@ def test_o01_the_probes_attribute_the_bytes_fetched_on_demand_to_the_owner(attem
     """O01: before the read the local provider held nothing of the file; after it, its block map holds the whole file,
     and the probes attribute every one of those bytes to the owner, the one provider that held them, with no transfer
     in the window, so the lower bound on what came on demand is the whole file."""
-    names, probes = attempt["names"], attempt["probes"]
-    local, owner = names["local"], names["owner"]
+    labels, probes = attempt["labels"], attempt["probes"]
+    local, owner = labels["local"], labels["owner"]  # the probes key a provider by its position, never its name
     assert attempt["local_block_map_settled"] is True
     assert probes["ok"] is True
     readings = probes["files"]["whole"]["providers"]
