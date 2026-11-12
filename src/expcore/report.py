@@ -482,10 +482,6 @@ def render_report(
     lines.append("")
     shards = shard_lines(export, _table)  # only a batch merged from shards has any (#154)
     sections = (
-        _contrasts(result, interval_level)
-        + _conditions(export)
-        + shards
-        + _deployments(export)
-        + _left_out(left_out)
+        _contrasts(result, interval_level) + _conditions(export) + shards + _deployments(export) + _left_out(left_out)
     )
     return "\n".join(lines + sections)

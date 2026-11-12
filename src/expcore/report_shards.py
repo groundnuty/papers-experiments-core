@@ -12,19 +12,19 @@ a score by shard would mostly show which instances landed where. The section sho
 - the wall time of its analysed runs, the latency of its model turns and the time of its resets, as median and 90th
   percentile with N.
 
-**What the export carries, and what a merged export has to carry for the rest.** The run lists carry `shard` on each
-entry, so the first table and the last two columns of the second are counted from them: the reasons of an exhausted run
-name the kind of each charged attempt, and an analysed attempt scored as treatment names its `infra_kind`. Two things
-are optional, and a figure without its source reads `not recorded` (never 0):
+**What the export carries.** The run lists carry `shard` on each entry, so the first table and the last two columns of
+the second are counted from them: the reasons of an exhausted run name the kind of each charged attempt, and an
+analysed attempt scored as treatment names its `infra_kind`. A merged export the core makes also carries:
 
-- `shard_retries_by_kind`: the rows of each shard's own `retries_by_kind` with a `shard` added, one set per shard.
-  `retries_by_kind` itself is summed over the shards by a merge, so a shard's set-asides cannot be read from it. They
-  live in each shard's store (`attempts`: state, `infra_kind`, `outage_kind`, `charged`) and in each shard's export.
-  A merged export that carries the key (an empty list among them) has recorded them, zero included.
-- In each `analysed_attempts` entry, `wall_s` (the attempt's wall time; the store's `attempts.wall_s`, which the export
-  keeps only as sums in `discarded_usage`), `turn_latency_s` (each model turn's latency, in turn order; it lives in the
-  run's record, `TurnRecord.latency_s`, which the store does not hold: it keeps only each turn's token counts) and
-  `reset_s` (the seconds the run's environment reset took; no store column or export field holds it today).
+- `shard_retries_by_kind`: the rows of each shard's own `retries_by_kind` with a `shard` added, one set per shard
+  (`retries_by_kind` itself is summed over the shards by the merge). An empty list has recorded them, zero included.
+- In each `analysed_attempts` entry, `wall_s` (the attempt's wall time, from its shard's snapshot) and
+  `turn_latency_s` (each model turn's latency in turn order, from the run's record), both added by
+  `study.merged_times`.
+
+The section is still read from an export that lacks any of them, and a figure without its source reads `not recorded`
+(never 0). `reset_s` (the seconds the run's environment reset took) is the one the core does not record: no store
+column, record field or export key holds it, so it reads `not recorded` in every merged export the core makes.
 
 N is the number of values a figure rests on. A shard whose analysed runs carry only some of them shows the smaller N.
 """

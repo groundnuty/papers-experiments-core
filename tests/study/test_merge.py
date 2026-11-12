@@ -27,8 +27,9 @@ from shard_support import (
     without_run,
     write_meta,
 )
-from study_support import Campaign, clean_environment, cli, copy_campaign, finish
+from study_support import Campaign, clean_environment, cli, copy_campaign, finish, table
 
+from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.merge import SHARDS_DIR
 from expcore.campaign.shard import (
     MERGE_FILE,
@@ -38,7 +39,9 @@ from expcore.campaign.shard import (
     META_STARTED,
     RULE,
 )
-from expcore.campaign.snapshot import take_snapshot
+from expcore.campaign.snapshot import SNAPSHOT_FILE, StoreSnapshot, take_snapshot
+from expcore.records.record import record_filename
+from expcore.study.config import load_study
 from expcore.study.pipeline import Refused, regenerate
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
@@ -225,21 +228,83 @@ def test_c29_the_merged_export_tags_every_run_with_its_shard_and_lists_the_shard
     assert export["planned_runs"] == sum(shard["runs"] for shard in export["shards"])
 
 
+def test_c29_the_merged_export_carries_each_runs_wall_time_and_turn_latency_and_each_shards_set_asides(
+    merged, shard1, shard2, tmp_path
+):
+    """C29: each analysed entry of the merged export has the wall time its shard's store holds for the attempt and
+    the latency of each turn of the attempt's record, in turn order, after the keys every entry has and before its
+    shard; `shard_retries_by_kind` is each shard's own `retries_by_kind` rows, tagged with the shard."""
+    export = read(merged, "export.json")
+    shards = {1: shard1, 2: shard2}
+    assert export["analysed_attempts"]
+    for entry in export["analysed_attempts"]:
+        assert list(entry) == [*ENTRY_KEYS, "wall_s", "turn_latency_s", "shard"]
+        (row,) = shards[entry["shard"]].sql(
+            "SELECT wall_s FROM attempts WHERE run_key = ? AND attempt = ? AND state = 'done'",
+            entry["run_key"],
+            entry["attempt"],
+        )
+        assert entry["wall_s"] == row["wall_s"]
+        record = json.loads(
+            (merged.runs / entry["run_dir"] / record_filename(entry["run_key"], entry["attempt"])).read_text()
+        )
+        assert entry["turn_latency_s"] == [turn["latency_s"] for turn in record["transcript"]]
+    assert any(e["turn_latency_s"] for e in export["analysed_attempts"]), "no run had a turn: the check proves nothing"
+    expected = []
+    for index, campaign in shards.items():
+        snapshot = tmp_path / f"shard-{index}.sqlite"
+        take_snapshot(campaign.root / "out" / "state.sqlite", snapshot)
+        own = export_run_state(StoreSnapshot(snapshot.read_bytes(), load_study(campaign.root).schema), excluded={})
+        expected += [{**row, "shard": index} for row in own["retries_by_kind"]]
+    assert export["shard_retries_by_kind"] == expected
+    assert list(export)[-2:] == ["shard_retries_by_kind", "shards"]
+
+
+def test_c29_the_report_of_a_merged_batch_shows_each_shards_run_and_turn_times_and_set_asides_but_not_its_reset_time(
+    merged,
+):
+    """C29: the `## Shards` section of a merged batch gives every shard's wall time per run and latency per turn
+    (median, p90 and N), and its attempts set aside per kind; only the reset time, which nothing in the core records,
+    reads `not recorded`."""
+    export = read(merged, "export.json")
+    rows = {label: cells[1:] for label, cells in table(merged.report, "### Time by shard").items()}
+    assert sorted(rows) == ["shard-1", "shard-2"]
+    for index in (1, 2):
+        mine = [e for e in export["analysed_attempts"] if e["shard"] == index]
+        runs_n, wall_median, wall_p90, turns_n, turn_median, turn_p90, resets_n, reset_median = rows[f"shard-{index}"]
+        assert int(runs_n) == len(mine) > 0
+        assert int(turns_n) == sum(len(e["turn_latency_s"]) for e in mine) > 0
+        for cell in (wall_median, wall_p90, turn_median, turn_p90):
+            assert float(cell) >= 0, cell
+        assert (resets_n, reset_median) == ("0", "not recorded")
+    block = merged.report.split("### Infrastructure attempts by shard and kind\n", 1)[1].split("###", 1)[0]
+    kinds = [line for line in block.splitlines() if line.startswith("| ")]  # the table, not the notes below it
+    assert len(kinds) > 2
+    assert not any("not recorded" in line for line in kinds)
+
+
 def test_c29_the_merged_batch_gives_the_scores_of_one_unsharded_driver(whole, merged):
     """C29: scores, analysis and report of the merged batch equal those of one driver of the same campaign; only
-    the fields of a shard's own sequence (dispatch positions, start times, lease waits) and the shard tags differ."""
+    the fields of a shard's own sequence (dispatch positions, start times, lease waits), the shard tags, the run times
+    only a merged export carries and the report's `## Shards` section differ."""
     assert (merged.root / "out" / "scores.json").read_bytes() == (whole.root / "out" / "scores.json").read_bytes()
     assert (merged.root / "out" / "analysis.json").read_bytes() == (whole.root / "out" / "analysis.json").read_bytes()
     one, many = read(whole, "export.json"), read(merged, "export.json")
-    own = {"shard", "dispatch_seq", "started_at", "lease_wait_s"}
+    own = {"shard", "dispatch_seq", "started_at", "lease_wait_s", "wall_s", "turn_latency_s"}
     for key in one:
         if key == "analysed_attempts":
             continue
         assert many[key] == one[key], key
     plain = lambda entries: [{k: v for k, v in e.items() if k not in own} for e in entries]  # noqa: E731
     assert plain(many["analysed_attempts"]) == plain(one["analysed_attempts"])  # the same rows, in the same order
-    assert set(many) - set(one) == {"shards"}
-    assert _report_differs_only_in_positions(merged.report, whole.report)
+    assert set(many) - set(one) == {"shards", "shard_retries_by_kind"}
+    assert _report_differs_only_in_positions(without_shard_section(merged.report), whole.report)
+
+
+def without_shard_section(report: str) -> str:
+    """The report without its `## Shards` section: from that heading up to the next `## ` one."""
+    head, rest = report.split("## Shards\n", 1)
+    return head + "## " + rest.split("\n## ", 1)[1]
 
 
 def _report_differs_only_in_positions(merged: str, whole: str) -> bool:
@@ -259,13 +324,54 @@ def test_c29_regenerate_derives_the_outputs_of_a_merged_batch_anew(merged):
     assert regenerate(merged.root) == []
 
 
-def test_c29_the_export_of_an_unmerged_batch_has_neither_key(whole):
-    """C29: an unsharded campaign's export and its run entries carry no shard, and its check no merge."""
+ENTRY_KEYS = [  # what every export's analysed entry holds, in order: nothing of a merged batch's
+    "run_key",
+    "digest",
+    "condition",
+    "factors",
+    "attempt",
+    "run_dir",
+    "treatment",
+    "infra_kind",
+    "dispatch_seq",
+    "started_at",
+    "lease_wait_s",
+    "lease_outcome",
+]
+MERGED_ONLY = {"shards", "shard_retries_by_kind"}  # top-level keys only a merged batch's export has
+
+
+def test_c29_the_export_of_an_unmerged_batch_has_none_of_a_merged_batchs_keys_and_is_byte_for_byte_its_own(whole):
+    """C29: an unsharded campaign's export and its run entries carry no shard, no shard's set-asides and no run time,
+    its check no merge; its bytes are exactly what the export of its snapshot gives, as before shards existed."""
     export = read(whole, "export.json")
-    assert "shards" not in export
+    assert not MERGED_ONLY & set(export)
     assert "shard" not in export
-    assert all("shard" not in e for name in LISTS for e in export.get(name, []))
+    for name in LISTS:
+        assert all("shard" not in e for e in export.get(name, [])), name
+    assert all(list(e) == ENTRY_KEYS for e in export["analysed_attempts"])
     assert "merge" not in read(whole, "runs/replay-check.json")
+    snapshot = StoreSnapshot((whole.runs / SNAPSHOT_FILE).read_bytes(), load_study(whole.root).schema)
+    assert (whole.root / "out" / "export.json").read_text(encoding="utf-8") == export_text(
+        export_run_state(snapshot, excluded={})
+    )
+
+
+def test_c29_a_shards_own_export_has_its_shard_key_and_none_of_a_merged_batchs_keys(base, clean_environment, shard1):
+    """C29: the export of a shard on its own (its own check and analyze) has a `shard` object last, entries of the
+    plain shape, no run time and no per-shard set-asides, and the bytes the export of its snapshot gives."""
+    alone = copy_campaign(shard1, base, "shard-one-alone")
+    finish(clean_environment, alone)
+    assert alone.codes == {"check": 0, "analyze": 0, "report": 0}
+    text = (alone.root / "out" / "export.json").read_text(encoding="utf-8")
+    export = json.loads(text)
+    assert not MERGED_ONLY & set(export)
+    assert list(export)[-1] == "shard"
+    assert export["analysed_attempts"]
+    assert all(list(e) == ENTRY_KEYS for e in export["analysed_attempts"])
+    snapshot = StoreSnapshot((alone.runs / SNAPSHOT_FILE).read_bytes(), load_study(alone.root).schema)
+    assert text == export_text(export_run_state(snapshot, excluded={}))
+    assert "## Shards" not in alone.report
 
 
 def test_c29_a_partial_analysis_of_a_merged_batch_tags_the_runs_it_leaves_out(base, clean_environment, merged):
