@@ -101,7 +101,9 @@ def make_federation(
     shape (`ERRORS_25_0`, or `ERRORS_LEGACY` for the older 404 shape, which no live version is known to give).
     `delete_delay_s` keeps a delete under way for that many seconds of `clock` after it is answered (`FakeData`,
     "Pending deletes"); 0, the default, finishes it at once, and above 0 it needs a `clock` that moves (a `Ticker`'s):
-    the first delete that would pend without one raises `ValueError`. The platform layer reads the admin credential
+    the first delete that would pend without one raises `ValueError`. `lose_recreated` makes the landing of a
+    directory's delete take the files of a directory made again under its name; off by default, since the 12 Nov live
+    check reproduced no loss, and kept for testing defensive waits. The platform layer reads the admin credential
     from the environment variable `ADMIN_ENV`: a test sets it to `fake.admin_token`.
     """
     federation = FakeData(

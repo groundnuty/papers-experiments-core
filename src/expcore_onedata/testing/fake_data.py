@@ -38,12 +38,15 @@ _LAST_PAGE_TOKEN = "end-"  # how this fake marks the token a last children page 
 
 # Where what `FakeData` answers while a delete is under way (`delete_delay_s`) was recorded on Onedata 25.0: a deleted
 # entry reading as 400 posix/enoent with its parent link kept (the first), another provider's directory sizes following
-# a delete about 5 s later (the second), and a directory delete finishing after the call returns, taking the files of a
-# directory made again under its name (the third, a module docstring and not a dated fact; #29).
+# a delete about 5 s later (the second), a directory delete finishing after the call returns and, it said, taking the
+# files of a directory made again under its name (the third, a module docstring and not a dated fact; #29), and the
+# 12 Nov check of the whole model (the fourth), which held, failed or left untested each claim: it reproduced no
+# loss, so the third now backs only the opt-in `lose_recreated`.
 DELETE_FACTS = (
     "deploy/compose-federation/day0/2026-11-10-federation-facts-parent-walk.md",
     "deploy/compose-federation/day0/2026-11-11-federation-facts-posix-and-fuse.md",
     "deploy/compose-federation/fedcontent.py",
+    "deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md",
 )
 
 # What each shape sets: how an entry that is not there, one a reader does not show yet, a space root not there yet and
@@ -181,25 +184,38 @@ class FakeData(FakeFederation):
     **Pending deletes** (`delete_delay_s`; the default 0 finishes every delete at once, everywhere, so nothing changes
     for a test that does not set it). With a delay, a DELETE of a file or a directory is answered 204 and takes that
     many seconds of `clock` to land (`land_deletes()` lands them without waiting), so a study can test that its code
-    waits before it uses the name again. In between, by what is recorded (`DELETE_FACTS`):
+    waits before it uses the name again. In between, by what was recorded (`DELETE_FACTS`; the 12 Nov check, on a 25.0
+    development build, is `deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md`):
 
-    - Recorded. The provider the DELETE went to answers the entry as a deleted one at once (`missing_answer`), with a
-      deleted file's `parent_id` still reading (`keep_deleted_parents`). A provider finishes deleting a directory after
-      the call returns, and a directory made again under the same name before then loses its files when it does (the
-      reason a federation reset never deletes a directory and makes it again). So the create of the name is accepted
-      there, and when the delete lands the files under the directory made again go with it. Other providers' directory
-      sizes were seen to follow a delete about 5 s late.
-    - Assumed, not recorded; a live check can confirm or correct each. (a) The providers the DELETE did not go to keep
-      showing the entry, in reads and listings, until it lands, and refuse its name (409, as for any taken name);
-      a second DELETE through them changes nothing. (b) Every provider lands it at once, after the one delay. (c) A
-      file's delete is late in the same way (a directory's is what was recorded), and a file's name made again loses
-      nothing. (d) The late removal of a directory takes files at any depth of the directory made again and no
-      directory. (e) A listing through the DELETE's provider already leaves out a directory still going (a deleted
-      file was seen gone from one). (f) A provider that still shows the old entry shows one made again beside it,
-      once the visibility delay lets it. (g) What is under a directory deleted through a provider answers as deleted
-      there at once too: the facts cited have rows for the deleted file and the deleted directory themselves, none
-      for what is under it. (h) A transfer scheduled through that provider for an entry it answers as deleted is
-      refused as one of an entry that is not there (400, as with no delay).
+    - Recorded. The provider the DELETE went to answers a deleted file, and what is under a deleted directory, as a
+      deleted entry at once (`missing_answer`), with its `parent_id` still reading when asked alone
+      (`keep_deleted_parents`). The providers the DELETE did not go to keep showing the entry, its files and its
+      listing entry until it lands, and all of them stop in the same second. A listing through the DELETE's provider
+      already leaves out a directory still going. A delete finishes after the call returns, a file's like a
+      directory's. The create of a name made again meanwhile is accepted there, and it **loses nothing**: no file of
+      a directory made again was lost or changed when the old delete landed (0 of 21, in four trials watched for
+      120 s on every provider, by hash, and on the owner's storage in one), nor was a file made again. A transfer
+      scheduled through the DELETE's provider for a file it answers as deleted is accepted, a transfer id and no
+      error, and completes at once with 0 files processed, replicated or failed (a replication was tried; the fake
+      does the same for an eviction and a migration, an assumption, and places or removes no block). The earlier
+      assumptions (a) in reads and listings, (b) at once, (c), (e) and (g) held.
+    - Corrected by that check; the fake had them wrong, from an earlier record and an assumption. A directory made
+      again under the same name did not lose its files when the old delete landed: `lose_recreated=True` keeps that
+      loss, for testing code that waits defensively, and it was not reproduced live. The check did not cover a file
+      over 64 KiB, or a delete still working through many files when the name is made again, so a loss there is not
+      ruled out. (h) A transfer for a deleted file was accepted, where the fake answered 400.
+    - Assumed, not seen live; a live check can confirm or correct each. (a) The providers the DELETE did not go to
+      refuse the entry's name (409, as for any taken name), and a second DELETE through them changes nothing: no
+      mutation was sent through them. (d) With `lose_recreated`, the loss takes files at any depth and no directory:
+      nothing was lost live. (f) A provider that still shows the old entry shows one made again beside it, once the
+      visibility delay lets it: no tick live held both, and no suffixed name appeared; the mirrors switched from the
+      old entry to the new one, or showed neither for some seconds between, so a test should not rely on seeing both.
+    - Simplified. One `delete_delay_s` serves every provider; live, the mirrors stopped showing an entry after 3 s in
+      four trials and 8 s in two. The owner answered a deleted directory's files as gone at once and the
+      directory's own attributes for up to a second, under another parent and partly emptied, where the fake
+      answers the directory gone at once. A new file showed on a mirror late, at size 0 or with only
+      some of its directory's files, before about 8 s (lag, not loss): not modelled, since `visibility_delay_s` hides
+      a new entry whole. Directory sizes followed a delete, and an addition, 5 s to 13 s late: not modelled.
 
     A delay needs a `clock` that moves. The default never does, so a delete would never land and a test of a name used
     again would pass for no reason: the first DELETE that would pend with it raises `ValueError` naming
@@ -243,9 +259,10 @@ class FakeData(FakeFederation):
     metadata other than the id, name, type, size and parent, storage backends beyond one per provider, concurrent
     writers, quotas, symbolic links, a token's space or interface caveats (only the read-only caveat is enforced, and
     `enforce_readonly=False` turns that off), a delete that other providers show late (unless `delete_delay_s` is set),
-    the visibility delay for scheduling a transfer of a file the provider does not show yet (the job is accepted),
-    eviction of part of a file (it removes all of a provider's blocks), other errors than those above, and any
-    provider call that is not listed above.
+    a new file's lag on a mirror at size 0 or with only some of its siblings, directory sizes, the visibility delay for
+    scheduling a transfer of a file the provider does not show yet (the job is accepted), eviction of part of a file
+    (it removes all of a provider's blocks), other errors than those above, and any provider call that is not listed
+    above.
 
     A test bends the fake through plain attributes:
 
@@ -267,6 +284,9 @@ class FakeData(FakeFederation):
     - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
     - `delete_delay_s` (also a constructor argument): seconds of `clock` a delete stays under way after it is answered
       (0: none); `land_deletes()` ends every one now (see "Pending deletes");
+    - `lose_recreated` (also a constructor argument): True makes the landing of a directory's delete take the files of a
+      directory made again under its name meanwhile; off by default, since it was not reproduced live (12 Nov facts)
+      and is kept for testing defensive waits (see "Pending deletes");
     - `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
       `readonly_answer` is how such a write is refused;
     - `unseen` (`(provider id, file id)` to reads) and `unseen_after_create` (provider id to reads, for every file made
