@@ -99,8 +99,9 @@ def make_federation(
     the provider it was not made on after `visibility_delay_s` seconds of it. `error_shape` is the data API's error
     shape (`ERRORS_25_0`, or `ERRORS_LEGACY` for the older 404 shape, which no live version is known to give).
     `delete_delay_s` keeps a delete under way for that many seconds of `clock` after it is answered (`FakeData`,
-    "Pending deletes"); 0, the default, finishes it at once. The platform layer reads the admin credential from the
-    environment variable `ADMIN_ENV`: a test sets it to `fake.admin_token`.
+    "Pending deletes"); 0, the default, finishes it at once, and above 0 it needs a `clock` that moves (a `Ticker`'s):
+    the first delete that would pend without one raises `ValueError`. The platform layer reads the admin credential
+    from the environment variable `ADMIN_ENV`: a test sets it to `fake.admin_token`.
     """
     federation = FakeData(
         space_name=SPACE_NAME,

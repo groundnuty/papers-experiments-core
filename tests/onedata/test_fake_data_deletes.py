@@ -6,6 +6,8 @@ binds to a `Ticker`, so none of them waits. The answers a test pins as recorded 
 that disproves one has a test to change.
 """
 
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -269,3 +271,90 @@ def test_a_test_can_land_every_delete_under_way_without_moving_the_clock():
         assert absent(fake, ALPHA_ID, gone)
         assert absent(fake, BETA_ID, gone)
     assert names(fake, BETA_ID) == []
+
+
+def test_threads_reading_at_once_while_deletes_land_never_see_the_tree_change_under_them():
+    """The core's bulk reads run many at once; the first read after a delete is due lands it, in the tree the others
+    iterate, so landing and the reads of the tree must be made under the fake's lock."""
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads as often as the interpreter allows, so an unlocked tree shows it
+    try:
+        results = []
+        for _ in range(6):
+            fake, ticker = delayed()
+            for k in range(8):
+                for i in range(25):
+                    fake.add_file(f"d{k}/f{i}.bin", b"x")
+            for k in range(8):
+                delete(fake, ALPHA_ID, fake.id_of(f"d{k}"))
+            ticker.sleep(DELAY_S + 1)
+
+            def read(_: int, fake: FakeData = fake) -> list[str] | str:
+                try:
+                    return names(fake, BETA_ID)
+                except Exception as error:  # the failure under test: whatever the fake raised to a reader
+                    return f"{type(error).__name__}: {error}"
+
+            with ThreadPoolExecutor(16) as pool:
+                results.extend(pool.map(read, range(48)))
+    finally:
+        sys.setswitchinterval(interval)
+    assert results == [[]] * 6 * 48  # every read saw the directories gone, none raised
+
+
+@pytest.mark.parametrize("delay", [0.0, DELAY_S])
+def test_a_transfer_of_a_file_whose_delete_is_under_way_is_refused_through_its_provider_as_with_no_delay(delay):
+    fake = make_federation(clock=Ticker().clock, delete_delay_s=delay)
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    body = {"type": "replication", "fileId": file_id, "replicatingProviderId": BETA_ID}
+    refused = call(fake, ALPHA_ID, "POST", "/transfers", json=body)
+    assert (refused.status_code, refused.json()["error"]["id"]) == (400, "badValueNotAllowed")
+    assert fake.transfers == {}
+
+
+def test_a_transfer_of_a_file_under_a_directory_whose_delete_is_under_way_is_refused_through_the_deleting_provider():
+    fake, ticker = delayed()
+    inner = fake.add_file("study/b.bin", DATA)
+    delete(fake, ALPHA_ID, fake.id_of("study"))
+    body = {"type": "eviction", "fileId": inner, "evictingProviderId": ALPHA_ID}
+    assert call(fake, ALPHA_ID, "POST", "/transfers", json=body).status_code == 400
+    assert fake.transfers == {}
+    # the providers the DELETE did not go to still show the file, so they accept the job until the delete lands
+    assert call(fake, BETA_ID, "POST", "/transfers", json=body).status_code == 201
+    ticker.sleep(DELAY_S)
+    assert call(fake, BETA_ID, "POST", "/transfers", json=body).status_code == 400
+
+
+def test_a_delay_with_the_clock_a_fake_starts_with_is_refused_at_the_first_delete_that_would_pend():
+    fake = make_federation(delete_delay_s=DELAY_S)  # no clock bound: it would never move, and no delete would land
+    file_id = fake.add_file("a.bin", DATA)
+    with pytest.raises(ValueError, match=r"delete_delay_s.*never moves.*make_federation\(clock=ticker\.clock\)"):
+        delete(fake, ALPHA_ID, file_id)
+    assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}").status_code == 200  # nothing was left pending
+    ticker = Ticker()
+    fake.clock = ticker.clock  # the delay and the clock may be set in either order
+    delete(fake, ALPHA_ID, file_id)
+    assert absent(fake, ALPHA_ID, file_id)
+    assert not absent(fake, BETA_ID, file_id)
+    ticker.sleep(DELAY_S)
+    assert absent(fake, BETA_ID, file_id)
+
+
+def test_no_delay_needs_no_clock():
+    fake = make_federation()
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    assert absent(fake, ALPHA_ID, file_id)
+    assert absent(fake, BETA_ID, file_id)
+
+
+def test_the_nodes_of_a_fake_still_hold_an_entry_whose_delete_is_under_way_though_its_helpers_find_it_gone():
+    fake, ticker = delayed()
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    assert file_id in fake.nodes
+    assert not fake.exists("a.bin")
+    ticker.sleep(DELAY_S)
+    fake.exists("a.bin")  # a read of the tree lands what is due
+    assert file_id not in fake.nodes

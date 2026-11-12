@@ -6,6 +6,7 @@ from __future__ import annotations
 import itertools
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from email.utils import formatdate
 
@@ -21,6 +22,13 @@ ROOT_ID = "root-0001"
 ERRORS_25_0 = "25.0"  # as seen live on Onedata 25.0: an entry that is gone answers 400 posix/enoent, and so on
 ERRORS_LEGACY = "legacy"  # this fake's first shape: 404 notFound, 403 forbidden, no Content-Type check; not seen live
 ERROR_SHAPES = (ERRORS_25_0, ERRORS_LEGACY)
+
+
+def _frozen_clock() -> float:
+    """The clock a `FakeData` has until a test binds one: it never moves, which `delete_delay_s` refuses (a delete under
+    way could never land)."""
+    return 0.0
+
 
 Answer = tuple[int, str | None, str | None]  # (status, error id, errno); an error id of None: a body no error object
 
@@ -174,12 +182,12 @@ class FakeData(FakeFederation):
     many seconds of `clock` to land (`land_deletes()` lands them without waiting), so a study can test that its code
     waits before it uses the name again. In between, by what is recorded (`DELETE_FACTS`):
 
-    - Recorded. The provider the DELETE went to answers the entry, and what is under a directory, as a deleted one at
-      once (`missing_answer`), with a deleted file's `parent_id` still reading (`keep_deleted_parents`). A provider
-      finishes deleting a directory after the call returns, and a directory made again under the same name before then
-      loses its files when it does (the reason a federation reset never deletes a directory and makes it again). So
-      the create of the name is accepted there, and when the delete lands the files under the directory made again
-      go with it. Other providers' directory sizes were seen to follow a delete about 5 s late.
+    - Recorded. The provider the DELETE went to answers the entry as a deleted one at once (`missing_answer`), with a
+      deleted file's `parent_id` still reading (`keep_deleted_parents`). A provider finishes deleting a directory after
+      the call returns, and a directory made again under the same name before then loses its files when it does (the
+      reason a federation reset never deletes a directory and makes it again). So the create of the name is accepted
+      there, and when the delete lands the files under the directory made again go with it. Other providers' directory
+      sizes were seen to follow a delete about 5 s late.
     - Assumed, not recorded; a live check can confirm or correct each. (a) The providers the DELETE did not go to keep
       showing the entry, in reads and listings, until it lands, and refuse its name (409, as for any taken name);
       a second DELETE through them changes nothing. (b) Every provider lands it at once, after the one delay. (c) A
@@ -187,7 +195,22 @@ class FakeData(FakeFederation):
       nothing. (d) The late removal of a directory takes files at any depth of the directory made again and no
       directory. (e) A listing through the DELETE's provider already leaves out a directory still going (a deleted
       file was seen gone from one). (f) A provider that still shows the old entry shows one made again beside it,
-      once the visibility delay lets it.
+      once the visibility delay lets it. (g) What is under a directory deleted through a provider answers as deleted
+      there at once too: the facts cited have rows for the deleted file and the deleted directory themselves, none
+      for what is under it. (h) A transfer scheduled through that provider for an entry it answers as deleted is
+      refused as one of an entry that is not there (400, as with no delay).
+
+    A delay needs a `clock` that moves. The default never does, so a delete would never land and a test of a name used
+    again would pass for no reason: the first DELETE that would pend with it raises `ValueError` naming
+    `delete_delay_s` and how to bind one (`make_federation(clock=ticker.clock)` or `fake.clock = ticker.clock`, a
+    `Ticker`'s). The delay and the clock are plain attributes a test sets in either order, so the check is made at that
+    DELETE and not when the delay is set. A delay of 0 needs no clock.
+
+    `fake.nodes` still holds an entry whose delete is under way, until it lands, though `id_of` and `exists` already
+    treat it as gone: a test that reads `nodes` directly sees it there.
+
+    Provider calls are answered one at a time, under the fake's lock, so threads may call it at once (a core's bulk
+    reads do); a delete that is due lands under that lock, as the first call after its time.
 
     **Error shapes**, chosen with `error_shape` and documented by the version each belongs to:
 
@@ -283,6 +306,8 @@ class FakeData(FakeFederation):
         self, *, error_shape: str = ERRORS_25_0, visibility_delay_s: float = 0.0, delete_delay_s: float = 0.0, **kwargs
     ) -> None:
         super().__init__(**kwargs)
+        # Re-entrant: `respond` holds it for a whole provider route, and the helpers the route calls take it again.
+        self._lock = threading.RLock()
         self.error_shape = error_shape  # which version's error answers the data API gives: see ERROR_SHAPES
         self.visibility_delay_s = visibility_delay_s  # seconds of `clock` before a new entry shows on another provider
         self.visibility_delay_by_provider: dict[str, float] = {}  # provider id -> its own delay, over the one above
@@ -329,7 +354,7 @@ class FakeData(FakeFederation):
         self.writes_before_reset: int | None = None  # writes of content that succeed before the rest are reset
         self.children_omit: set[str] = set()  # keys every children page leaves out
         self.children_fields: dict = {}  # keys every children page answers with this value instead
-        self.clock = lambda: 0.0  # epoch seconds of a job's schedule, start and finish times
+        self.clock = _frozen_clock  # epoch seconds of a job's schedule, start and finish times; a test binds its own
         self.transfer_omit: set[str] = set()  # fields a job's record leaves out
         self.transfer_list_body: dict | None = None  # replaces every answer of the listing
         self.provider_view: dict[tuple[str, str], dict] = {}  # (job, provider id) -> its listed state, record fields
@@ -366,22 +391,24 @@ class FakeData(FakeFederation):
         holder = holder or self.PROVIDER_ID
         parent = ROOT_ID
         *dirs, name = path.strip("/").split("/")
-        for part in dirs:
-            parent = self._child(parent, part) or self._create(parent, part, "DIR", holder)
-        file_id = self._create(parent, name, "REG", holder)
-        self.nodes[file_id].content = bytearray(content)
-        if content:
-            self.blocks[(file_id, holder)] = [[0, len(content)]]
+        with self._lock:
+            for part in dirs:
+                parent = self._child(parent, part) or self._create(parent, part, "DIR", holder)
+            file_id = self._create(parent, name, "REG", holder)
+            self.nodes[file_id].content = bytearray(content)
+            if content:
+                self.blocks[(file_id, holder)] = [[0, len(content)]]
         return file_id
 
     def id_of(self, path: str) -> str:
         """Return the id of a path of the space; raise KeyError when there is none."""
         node = ROOT_ID
-        for part in path.strip("/").split("/"):
-            child = self._child(node, part)
-            if child is None:
-                raise KeyError(path)
-            node = child
+        with self._lock:
+            for part in path.strip("/").split("/"):
+                child = self._child(node, part)
+                if child is None:
+                    raise KeyError(path)
+                node = child
         return node
 
     def held(self, path: str, provider_id: str) -> list[list[int]]:
@@ -443,11 +470,12 @@ class FakeData(FakeFederation):
         """The id of the entry of that name under a parent, after the deletes that are due have landed. An entry whose
         delete is under way is not found by the provider it was deleted through (nor by `None`, which is how a test's
         helpers ask), and is found by the others, which still show it."""
-        self._settle_deletes()
-        found = (
-            n for n in self.nodes.values() if n.parent == parent and n.name == name and not self._left(n, provider)
-        )
-        return next((n.file_id for n in found), None)
+        with self._lock:
+            self._settle_deletes()
+            found = (
+                n for n in self.nodes.values() if n.parent == parent and n.name == name and not self._left(n, provider)
+            )
+            return next((n.file_id for n in found), None)
 
     def _left(self, node: Node, provider: str | None) -> bool:
         """Tell whether an entry's delete is under way and `provider`, the one it was sent through, answers it gone."""
@@ -479,6 +507,13 @@ class FakeData(FakeFederation):
         if self.delete_delay_s <= 0:
             self._delete(node.file_id)
             return
+        if self.clock is _frozen_clock:
+            raise ValueError(
+                f"delete_delay_s is {self.delete_delay_s}, but this fake's clock never moves, so the delete would "
+                "never land and a test of a name used again would pass for no reason: bind a clock that moves, "
+                "make_federation(clock=ticker.clock) or fake.clock = ticker.clock for a Ticker, and advance it with "
+                "ticker.sleep(...)"
+            )
         current: Node | None = node
         while current is not None:
             if current.file_id in self._deleting:
@@ -491,15 +526,18 @@ class FakeData(FakeFederation):
 
     def land_deletes(self) -> None:
         """Land every delete that is under way now, without waiting for its time, as `end_transfer` ends a job."""
-        for pending in sorted(self._deleting.values(), key=lambda p: p.lands):
-            self._land(pending)
+        with self._lock:
+            for pending in sorted(self._deleting.values(), key=lambda p: p.lands):
+                self._land(pending)
 
     def _settle_deletes(self) -> None:
-        """Land the deletes whose time has come, in the order they fell due."""
-        if self._deleting:
-            now = self.clock()
-            for pending in sorted((p for p in self._deleting.values() if p.lands <= now), key=lambda p: p.lands):
-                self._land(pending)
+        """Land the deletes whose time has come, in the order they fell due. Landing changes the tree, so it is done
+        under the lock that every read of the tree is made under."""
+        with self._lock:
+            if self._deleting:
+                now = self.clock()
+                for pending in sorted((p for p in self._deleting.values() if p.lands <= now), key=lambda p: p.lands):
+                    self._land(pending)
 
     def _land(self, pending: _Deleting) -> None:
         """Finish a delete. A directory's late removal takes the files of a directory made again under its name since
@@ -613,7 +651,9 @@ class FakeData(FakeFederation):
         token = request.headers.get("X-Auth-Token")
         if token != self.admin_token and not self._accepts(token):
             return self._error(401, "unauthorized")
-        return self._dated(self._provider_route(request, provider, route), provider)
+        with self._lock:  # a route reads the tree and may land deletes in it: one at a time, whatever threads call
+            answer = self._provider_route(request, provider, route)
+        return self._dated(answer, provider)
 
     def _dated(self, response: httpx.Response, provider: str) -> httpx.Response:
         """Give an answer the Date header of the provider's clock: the fake's clock moved by the provider's skew, in
@@ -678,7 +718,7 @@ class FakeData(FakeFederation):
             if part == "/distribution" and method == "GET":
                 return httpx.Response(200, json=self._distribution(node))
         if route == "/transfers" and method == "POST":
-            return self._schedule(request)
+            return self._schedule(request, provider)
         found = re.fullmatch(r"/spaces/([^/]+)/transfers", route)
         if found and method == "GET":
             return self._list_transfers(found.group(1), query, provider)
@@ -841,14 +881,18 @@ class FakeData(FakeFederation):
                 }
         return {"type": node.kind, "distributionPerProvider": per}
 
-    def _schedule(self, request: httpx.Request) -> httpx.Response:
+    def _schedule(self, request: httpx.Request, via: str) -> httpx.Response:
+        """Schedule a job through the provider `via`: an entry that provider answers as deleted, one whose delete is
+        under way included, is refused as an entry that is not there is, as it is with no delay."""
         sent = json.loads(request.content or b"{}")
         kind = sent.get("type")
         provider = sent.get("evictingProviderId" if kind == "eviction" else "replicatingProviderId")
         source = sent.get("evictingProviderId") if kind == "migration" else None
+        node = self.nodes.get(sent.get("fileId"))
         if (
             kind not in ("replication", "eviction", "migration")
-            or sent.get("fileId") not in self.nodes
+            or node is None
+            or self._hidden(node, via)
             or provider is None
             or (kind == "migration" and source is None)
         ):
