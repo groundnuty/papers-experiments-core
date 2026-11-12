@@ -71,16 +71,20 @@ def _method(instrument: Instrument, name: str) -> Any:
     return method if callable(method) else None
 
 
-def _refusal(instrument: Instrument, error: InfraError, when: str) -> InfraError:
-    """The error to raise for an instrument's refusal: the same kind, naming the instrument. A kind a condition may
-    declare as its treatment is no refusal but a defect of the instrument (`InstrumentRefusalError`)."""
-    namespace = instrument.namespace
+def _require_untreatable(instrument: Instrument, error: InfraError, when: str) -> None:
+    """Raise `InstrumentRefusalError` when the kind of a refusal is one a condition may declare as its treatment: that
+    is no refusal but a defect of the instrument, as the refused attempt could be scored as the manipulation."""
     if is_treatable(error.kind):
         raise InstrumentRefusalError(
-            f"instrument {namespace!r} refused {when} with {error.kind!r}, a kind a condition may declare as its "
-            "treatment: a refusal must be of a kind that none can, or the refused attempt could be scored"
+            f"instrument {instrument.namespace!r} refused {when} with {error.kind!r}, a kind a condition may declare "
+            "as its treatment: a refusal must be of a kind that none can, or the refused attempt could be scored"
         ) from error
-    return InfraError(error.kind, f"instrument {namespace!r} refused {when}: {error.detail}")
+
+
+def _refusal(instrument: Instrument, error: InfraError, when: str) -> InfraError:
+    """The error to raise for an instrument's refusal: the same kind, naming the instrument."""
+    _require_untreatable(instrument, error, when)
+    return InfraError(error.kind, f"instrument {instrument.namespace!r} refused {when}: {error.detail}")
 
 
 def first_turn_instruments(instruments: Sequence[Instrument], timer: AgentTimer) -> None:
@@ -119,7 +123,7 @@ def _refused_by(instruments: Sequence[Instrument]) -> dict[str, Any] | None:
         try:
             check()
         except InfraError as error:
-            _refusal(instrument, error, "after the run")  # raises for a kind a condition may declare
+            _require_untreatable(instrument, error, "after the run")
             return {"namespace": instrument.namespace, "infra_kind": error.kind, "detail": error.detail[:DETAIL_LIMIT]}
     return None
 
