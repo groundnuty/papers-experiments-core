@@ -302,3 +302,24 @@ def test_b18_shards_that_declare_other_accepted_fingerprints_are_refused():
     other = deployment_shares({**declared({}), "model-b": {"accepted": ["fp-else"], "confirmed": {}}}, TWO)
     with pytest.raises(ExportError, match="model-b"):
         join_exports({1: with_shares("a", one), 2: with_shares("b", other)}, plan("a", "b"), SHARDS)
+
+
+def test_b18_c32_a_shard_that_exports_no_deployment_shares_adds_none_to_those_of_the_others():
+    """B18, C32: a shard whose plan has no model with a set exports no `deployment_shares`; in either order it counts
+    as no entries, the shares are those of the shards that have them, and the joined export has the key where
+    `export_run_state` puts it (after `kinds`) when the first shard lacks it."""
+    shares = deployment_shares(declared({"fp-east": PROBE}), ONE)
+    with_key, without = with_shares("a", shares), export(analysed=[entry("b")])
+    assert "deployment_shares" not in without
+    for exports in ({1: with_key, 2: without}, {1: without, 2: with_key}):
+        joined = join_exports(exports, plan("a", "b"), SHARDS)
+        assert joined["deployment_shares"] == shares
+        assert json.dumps(joined["deployment_shares"]) == json.dumps(shares)
+    keys = list(join_exports({1: without, 2: with_key}, plan("a", "b"), SHARDS))  # the first shard lacks the key
+    assert keys.index("deployment_shares") == keys.index("kinds") + 1
+
+
+def test_b18_c32_shards_none_of_which_export_deployment_shares_join_into_an_export_without_them():
+    """B18, C32: a campaign whose models declare no set has no `deployment_shares`, merged or not."""
+    joined = join_exports({1: export(analysed=[entry("a")]), 2: export(analysed=[entry("b")])}, plan("a", "b"), SHARDS)
+    assert "deployment_shares" not in joined

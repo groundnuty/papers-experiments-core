@@ -39,6 +39,14 @@ read and every check is made on each provider that supports the space, since eac
 **Before any stage** the plan is checked (no provider to evict from or allowed to hold bytes is the data provider, by
 name or id, or one that does not support the space) and the space's live name is verified (`verify_space`).
 
+**Reads that time out are tried again, boundedly and in the log** (O29, `readretry.py`): the reset's own reads (the
+walks' listings, the summaries, the transfer listings, records and waits, the eviction stage's waits for its transfers,
+the occupancy, a space's root and the gate's reads before each cancel and removal) go under the provisioner's policy,
+three attempts with pauses of 2 s and 5 s, and the record says how many were retried (`reads_retried`). A read inside
+a poll that counts a failed read as one that did not match (the requirements' removal check) is one attempt: the poll is
+the retry. Nothing but a read that timed out is tried again: an error answer, a connection error and every mutation
+stand as before.
+
 **Fail closed.** A stage that cannot verify what it did, a read that fails, an answer in another shape, a bound
 reached, leaves the reset failed: `run` raises `ResetFailed` naming the stage, with the record of the stages so far
 (each with its seconds), and runs no later stage. The caller must not start the next run then. Nothing is assumed:
@@ -57,6 +65,7 @@ from expcore_onedata.client import NotSent, PlatformError, answered_absent
 from expcore_onedata.eviction import evict_ids, evict_tree
 from expcore_onedata.occupancy import physical_sizes
 from expcore_onedata.provision import Provisioner, ProvisionError
+from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferlog import PAGE_LIMIT
 from expcore_onedata.transferrecord import Unreadable, page_of
 
@@ -123,8 +132,14 @@ class SpaceReset:
             "occupancy": lambda: self._occupancy(bounds),
             "history": self._history,
         }
-        record: dict[str, Any] = {"space": self._p.space.position, "ok": False, "stages": {}, "seconds": None}
-        began = self._p.clock()
+        record: dict[str, Any] = {
+            "space": self._p.space.position,
+            "ok": False,
+            "stages": {},
+            "seconds": None,
+            "reads_retried": 0,
+        }
+        began, retried = self._p.clock(), self._p.reads_retried
         for stage in STAGES:
             started = self._p.clock()
             try:
@@ -134,6 +149,7 @@ class SpaceReset:
                 record["stages"][stage] = {"ok": False, "seconds": round(self._p.clock() - started, 3)}
                 record["stages"][stage]["error"] = detail
                 record["seconds"] = round(self._p.clock() - began, 3)
+                record["reads_retried"] = self._p.reads_retried - retried
                 raise ResetFailed(
                     f"{self._p.where}the reset failed at its {stage} stage ({type(error).__name__}): {detail}; "
                     "the next run must not start",
@@ -141,13 +157,13 @@ class SpaceReset:
                     record,
                 ) from None
             record["stages"][stage] = {"ok": True, "seconds": round(self._p.clock() - started, 3), **facts}
-        record.update(ok=True, seconds=round(self._p.clock() - began, 3))
+        record.update(ok=True, seconds=round(self._p.clock() - began, 3), reads_retried=self._p.reads_retried - retried)
         return record
 
     # -- 1. QoS requirements --------------------------------------------------------
     def _summary(self, file_id: str, provider: str) -> set[str]:
         """The ids of the QoS requirements on an entry and its ancestors, from its summary on one provider."""
-        answer = self._p.client.get(f"/data/{file_id}/qos/summary", provider=provider)
+        answer = self._p.client.get(f"/data/{file_id}/qos/summary", provider=provider, retry=self._p.retry)
         requirements = answer.get("requirements") if isinstance(answer, dict) else None
         if not isinstance(requirements, Mapping) or not all(isinstance(q, str) for q in requirements):
             raise Unreadable("a QoS summary holds no table of requirements keyed by id")
@@ -161,7 +177,9 @@ class SpaceReset:
         found: dict[str, str] = {}
         read = 0
         for provider in self._providers:
-            root = consistency.space_root(self._p.client, provider, self._p.space_id, sleep=self._p.sleep)
+            root = consistency.space_root(
+                self._p.client, provider, self._p.space_id, sleep=self._p.sleep, retry=self._p.retry
+            )
             entries = [root, *(entry.file_id for entry, leaf in self._p.walk(root, provider) if leaf)]
             summaries = consistency.bounded_map(
                 lambda f, p=provider: self._summary(f, p), entries, self._p.settings.concurrency
@@ -176,7 +194,7 @@ class SpaceReset:
         25.0's 400 posix enoent); any other failure, another 400 included, propagates and does not count."""
         provider, qid = key
         try:
-            self._p.client.get(f"/qos_requirements/{qid}", provider=provider)
+            self._p.client.get(f"/qos_requirements/{qid}", provider=provider, retry=ONE_ATTEMPT)
         except PlatformError as error:
             if answered_absent(error):
                 return True
@@ -216,7 +234,7 @@ class SpaceReset:
         path, ids, token = f"/spaces/{self._p.space_id}/transfers", [], None
         for _ in range(self._listed_max // PAGE_LIMIT + 1):
             params = {"state": state, "limit": PAGE_LIMIT, **({"page_token": token} if token else {})}
-            page, token = page_of(self._p.client.get(path, provider=provider, params=params))
+            page, token = page_of(self._p.client.get(path, provider=provider, params=params, retry=self._p.retry))
             ids += page
             if len(ids) > self._listed_max:
                 break
@@ -254,6 +272,7 @@ class SpaceReset:
                     workers=settings.concurrency,
                     clock=self._p.clock,
                     sleep=self._p.sleep,
+                    retry=self._p.retry,
                 ),
                 f"{self._label(provider)}: {what}",
             )
@@ -332,7 +351,7 @@ class SpaceReset:
         """With no transfer running, read each provider's physical size of the space and refuse a provider other
         than the data provider that holds more than it is allowed."""
         self._require_quiet()
-        sizes = physical_sizes(self._p, self._providers)
+        sizes = physical_sizes(self._p, self._providers, retry=self._p.retry)
         over = [p for p, held in sizes.items() if p != self._p.settings.holder and held > allowed.get(p, 0)]
         if over:
             where = ", ".join(self._label(p) for p in over)
@@ -342,7 +361,7 @@ class SpaceReset:
     # -- 5. ended-transfer history ------------------------------------------------------
     def _finish(self, provider: str, tid: str) -> float:
         """An ended job's finish time, from its record; one without a number there is unreadable."""
-        record = self._p.client.get(f"/transfers/{tid}", provider=provider)
+        record = self._p.client.get(f"/transfers/{tid}", provider=provider, retry=self._p.retry)
         value = record.get("finishTime") if isinstance(record, dict) else None
         if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
             raise Unreadable("an ended transfer's record has no finishTime that is a number")

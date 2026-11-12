@@ -39,6 +39,7 @@ from expcore_onedata.client import PlatformError, answered_absent
 from expcore_onedata.ingestplan import IngestPlan, PlannedFile
 from expcore_onedata.provision import Entry, NotPlaced, Provisioner, ProvisionError
 from expcore_onedata.rangemap import safe_path
+from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.streamed import Digest, Upload, chunks
 
 FAILURES = (PlatformError, ProvisionError, consistency.WaitTimeout, KeyError, OSError)  # an ingest failure's causes
@@ -124,7 +125,7 @@ class Baseline:
 
     def _times(self, file_id: str) -> dict[str, Any]:
         try:
-            answer = self._p.client.get(f"/data/{plain(file_id)}", provider=self.holder)
+            answer = self._p.client.get(f"/data/{plain(file_id)}", provider=self.holder, retry=self._p.retry)
         except PlatformError:
             return {"mtime": None, "ctime": None, "attributes_ok": False}
         shown = answer if isinstance(answer, dict) else {}
@@ -174,7 +175,7 @@ class Baseline:
     def _absent_everywhere(self, file_id: str) -> bool:
         for provider in self.providers:
             try:
-                self._p.client.get(f"/data/{plain(file_id)}", provider=provider)
+                self._p.client.get(f"/data/{plain(file_id)}", provider=provider, retry=ONE_ATTEMPT)
             except PlatformError as error:
                 if answered_absent(error):
                     continue
@@ -234,7 +235,13 @@ class Baseline:
         for provider in self.visible_on:
             if provider != self.holder:
                 waited[self._p.client.provider_label(provider)] = consistency.wait_visible(
-                    self._p.client, provider, plain(file_id), size=size, clock=self._p.clock, sleep=self._p.sleep
+                    self._p.client,
+                    provider,
+                    plain(file_id),
+                    size=size,
+                    clock=self._p.clock,
+                    sleep=self._p.sleep,
+                    retry=self._p.retry,
                 )
         return {"holder_covered": True, "visible_s": waited}
 

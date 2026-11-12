@@ -24,6 +24,7 @@ from expcore_onedata.day0.registry import Context, Result, failed, passed, per_s
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.rangemap import RangeRow
 from expcore_onedata.ranges import place_ranges
+from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.tokens import Plane, data_path_spec
 
@@ -55,7 +56,7 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
     Any other outcome is `cleaned` False with a `cleanup_reason`. The absence is that provider's (#114).
     """
     try:
-        ctx.client.mutate("DELETE", f"/data/{entry_id}", provider=provider)
+        ctx.client.mutate("DELETE", f"/data/{entry_id}", provider=provider, gate_retry=ctx.plumbing_retry())
     except PlatformError as error:
         if not answered_absent(error):  # already gone is confirmed by the reads below
             return {"cleaned": False, "cleanup_reason": "the delete was refused or failed"}
@@ -64,7 +65,7 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
         if poll:
             ctx.sleep(ABSENCE_POLL_S)
         try:
-            ctx.client.get(f"/data/{entry_id}", provider=provider)
+            ctx.client.get(f"/data/{entry_id}", provider=provider, retry=ONE_ATTEMPT)
             absent, reason = 0, "the entry was still there after the delete"
         except PlatformError as error:
             if not answered_absent(error):
@@ -91,7 +92,9 @@ def _attempt_write(ctx: Context, name: str, space_id: str, token: str) -> dict[s
     as `code` and its errno as `errno`)."""
     created: str | None = None
     try:
-        root = consistency.space_root(ctx.client, name, space_id, tries=3, wait_s=1.0, sleep=ctx.sleep)
+        root = consistency.space_root(
+            ctx.client, name, space_id, tries=3, wait_s=1.0, sleep=ctx.sleep, retry=ctx.plumbing_retry()
+        )
     except PlatformError as error:
         return {"enforced": None, "sent": False, "error": "the space root could not be read", "status": error.status}
     try:
@@ -101,6 +104,7 @@ def _attempt_write(ctx: Context, name: str, space_id: str, token: str) -> dict[s
             provider=name,
             params={"name": _scratch_name(), "type": "DIR"},
             token=token,
+            gate_retry=ctx.plumbing_retry(),
         )
         created = answer.get("fileId") if isinstance(answer, dict) else None
         row: dict[str, Any] = {"enforced": False, "sent": True, "status": "accepted"}

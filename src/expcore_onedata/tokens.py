@@ -45,6 +45,7 @@ from urllib.parse import quote
 from expcore_onedata.client import MintNotSent, OnezoneClient, PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, TokenSettings
 from expcore_onedata.credentials import Principal
+from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.rights import BASELINE_RIGHTS
 from expcore_onedata.tokencheck import (
     CaveatSpec,
@@ -225,7 +226,8 @@ class TokenIssuer:
         """
         space, user = quote(space_id, safe=""), quote(user_id, safe="")
         answers = [
-            self._client.get(f"/spaces/{space}/{kind}/{user}/privileges") for kind in ("users", "effective_users")
+            self._client.get(f"/spaces/{space}/{kind}/{user}/privileges", retry=ONE_ATTEMPT)
+            for kind in ("users", "effective_users")
         ]
         try:
             return answers[0]["privileges"], answers[1]["privileges"]

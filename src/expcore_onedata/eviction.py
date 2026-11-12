@@ -25,6 +25,10 @@ nothing). While a file's block map still shows bytes `EVICTION_CHECK_S` after th
 scheduled again after `EVICTION_RETRY_PAUSE_S`, the directory's as a whole for a tree and each such file's for a set,
 up to `EVICTION_ATTEMPTS` in all; after the last the whole settle bound is waited before `NotPlaced` refuses it. Only
 the block map judges, never a transfer's counters, and the record says how many attempts it took.
+
+The wait for the transfers to end polls each one's record, and a poll that times out ends the eviction, so those polls
+are tried again under the provisioner's policy (O29, `readretry.py`), within the wait's own bound. The block-map reads
+of the verification are inside a poll that counts a failed read as one that did not match, and stay one attempt.
 """
 
 from collections.abc import Callable, Iterable, Sequence
@@ -96,6 +100,7 @@ def _wait_ended(provisioner: Provisioner, provider: str, transfer_ids: list[str]
             workers=settings.concurrency,
             clock=provisioner.clock,
             sleep=provisioner.sleep,
+            retry=provisioner.retry,
         ),
         f"{provisioner.where}eviction",
     )

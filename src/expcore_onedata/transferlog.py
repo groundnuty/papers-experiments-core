@@ -42,6 +42,7 @@ from typing import Any, Protocol
 
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.provision import Provisioner
+from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferrecord import STATES, UNDECLARED, Job, Unreadable, job_of, page_of, record_of
 from expcore_onedata.transferwindow import (
     CARRIED_OVER,
@@ -161,7 +162,9 @@ class TransferLog:
         for provider in self._providers:
             jobs: dict[str, Job] = {}
             for tid, state in self._listed_on(provider).items():
-                found = self._probe(lambda t=tid, p=provider: self._client.get(f"/transfers/{t}", provider=p))
+                found = self._probe(
+                    lambda t=tid, p=provider: self._client.get(f"/transfers/{t}", provider=p, retry=ONE_ATTEMPT)
+                )
                 if not found.ok:
                     raise Unreadable(f"a transfer's record could not be read: {found.error}")
                 jobs[tid] = job_of(tid, state, found.value)

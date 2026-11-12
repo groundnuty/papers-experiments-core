@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore_onedata.provision import Provisioner, ProvisionError
+from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
 from expcore_onedata.transferrecord import Unreadable
 
 
@@ -36,12 +37,15 @@ def _physical(entry: Any) -> int:
     return total
 
 
-def physical_sizes(provisioner: Provisioner, providers: Sequence[str]) -> dict[str, int]:
+def physical_sizes(
+    provisioner: Provisioner, providers: Sequence[str], *, retry: ReadRetry = ONE_ATTEMPT
+) -> dict[str, int]:
     """Return each declared provider's physical bytes of the provisioner's space, from one read of its root's
     distribution on the data provider; `providers` must all be in the answer. Raise Unreadable for anything unknown,
-    and ProvisionError when an undeclared provider holds bytes."""
+    and ProvisionError when an undeclared provider holds bytes. The read that timed out is tried again under `retry`,
+    the policy of a caller that reads it as plumbing (the reset); by default it is one attempt (O29)."""
     root = provisioner.root()
-    answer = provisioner.client.get(f"/data/{root}/distribution", provider=provisioner.settings.holder)
+    answer = provisioner.client.get(f"/data/{root}/distribution", provider=provisioner.settings.holder, retry=retry)
     per = answer.get("distributionPerProvider") if isinstance(answer, Mapping) else None
     if not isinstance(per, Mapping):
         raise Unreadable("the space root's distribution answer has no 'distributionPerProvider' table")

@@ -46,6 +46,7 @@ from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.provision import LISTING_ATTRIBUTES, LISTING_LIMIT, listing_entry, next_page_token
 from expcore_onedata.rangemap import safe_path
+from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.gateboundary import DATA_CONTENT_TYPE, streams
 
@@ -67,7 +68,7 @@ def _child(client: OnezoneClient, provider: str, directory: str, name: str) -> s
     """The file id of an entry of a directory, following its pages; LookupError when it is not there."""
     params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
     while True:
-        page = client.get(f"/data/{directory}/children", provider=provider, params=params)
+        page = client.get(f"/data/{directory}/children", provider=provider, params=params, retry=ONE_ATTEMPT)
         token = next_page_token(page)  # a page without its last-page marker is refused, never the end (O26)
         for item in page["children"]:
             entry = listing_entry(item)
@@ -110,7 +111,7 @@ def measure_content_type(config: PlatformConfig, client: OnezoneClient) -> Conte
     local, space_id = config.local_provider.name, config.space_ids("data_path")[0]
     label = client.provider_label(local)
     try:
-        node = consistency.space_root(client, local, space_id, tries=1)
+        node = consistency.space_root(client, local, space_id, tries=1, retry=ONE_ATTEMPT)
         for part in safe_path(sandbox.content_check_file):
             node = _child(client, local, node, part)
         whole = client.content_answer(f"/data/{node}/content", provider=local, first_byte=False)
