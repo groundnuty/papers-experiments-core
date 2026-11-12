@@ -130,6 +130,18 @@ replay held only the baseline's earlier, ended record. oneclient's log directory
 start-up settings) under every setting, and no line named a fixture file by id or uuid. So what oneclient pulled per
 read is known only as `pine`'s block-map gain, a lower bound, in every setting.
 
+**Reads that start inside held bytes: this sweep and the 11 Nov facts agree.** Under `defaults`, a read lying entirely
+inside bytes `pine` already held gained nothing (83 of A's 90 reads). The 11 Nov mount facts
+(`2026-11-11-federation-facts-mount.md`, "Placement through the mount") say "a read starting inside held bytes gained
+1 MiB from the first byte not held". Both of the reads behind that sentence **reached past the held end**: a 1 MiB read
+whose first 93 B were held, and a 1 MiB read whose first 4096 B were held. Neither probe read entirely inside held
+bytes. So the two results cover different cases:
+- a read wholly inside held bytes gains 0;
+- a read that starts inside and reaches past gains 1 MiB from the first byte not held, clipped to the file's end.
+
+Two cases are not measured by either file: a read reaching past the held end by much less than the window (for example
+4 KiB or 64 KiB past), and a held-out sequence from another file.
+
 ## Read-ahead
 
 As the agent's container saw it, in every setting:
