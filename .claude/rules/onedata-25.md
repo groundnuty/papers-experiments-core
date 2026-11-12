@@ -20,6 +20,7 @@ Behaviours measured live on 25.0 (dated facts in `deploy/compose-federation/day0
 - A dated facts file in `deploy/compose-federation/day0/` is **sealed once its PR merges**: studies pin their evidence by each file's SHA-256. A later finding or correction goes in a new dated file that names the file it amends; never edit a merged one.
 - A children listing ends only on `isLast: true` (a JSON boolean, false on every earlier page); `nextPageToken` is a string on every page, the last included, and an exactly full last page is followed by an empty one. A transfers listing has no `isLast`: it ends on `nextPageToken: null`. Never treat a missing marker as the end (facts: `2026-11-12-federation-facts-listing-end.md`).
 - Through the mount, oneclient 25.0 names no file in its logs, and `--io-trace-log` crashes it on the first read: per-file served bytes exist only on the REST path (the gate).
+- A token with any data-access caveat (`data.path`, `data.objectid`, `data.readonly`, or interface `oneclient`) is usable for data access alone: `POST /transfers` and its own `POST /tokens/examine` answer `tokenCaveatUnverified` (#177). A token that must write carries none.
 
 The live federation (`deploy/compose-federation/`, Docker Compose):
 - One live federation session at a time on this host. Stay within the project's own containers and networks, never prune, publish ports on 127.0.0.1 only, keep data under the federation's root, never print a secret, and leave everything down and verified at the end.

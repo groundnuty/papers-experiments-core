@@ -127,7 +127,10 @@ def health(ctx: Context) -> Result:
 
 
 def _reach(ctx: Context, spec: PlaneSpec) -> dict[str, Any]:
-    """With several spaces, the positions of the spaces a token reaches, as a fact; with one, nothing."""
+    """With several spaces, the positions of the plane's spaces, as a fact; with one, nothing.
+
+    For a read-only token they are its `data.path` whitelist. A writing token has no data-access caveat, so they are
+    the spaces its principal's rights are read in and that Onezone's scope of the token must equal (`tokenscope`)."""
     if len(ctx.config.spaces) == 1:
         return {}
     ids = spec.caveats.space_ids
@@ -140,7 +143,9 @@ def tokens(ctx: Context) -> Result:
 
     Each token is the one a run mints (`TokenIssuer.mint_run_tokens`): scoped to every space its plane reaches
     (`space_ids`), with its principal's rights checked in each of them, so with several spaces a refusal names the
-    space by its position and each plane's facts list the positions it reaches."""
+    space by its position and each plane's facts list the positions it reaches. A writing condition's token is minted
+    as a run mints it too: its user must hold no Onezone admin privilege, and Onezone's scope of the token must be
+    exactly the plane's spaces, so a fixed tool-server user who is a member of another space fails the check."""
     principals = ctx.config.principals
     data_spaces, tool_spaces = (ctx.config.space_ids(plane) for plane in (Plane.DATA_PATH, Plane.TOOL_SERVER))
     planes: dict[str, Any] = {}

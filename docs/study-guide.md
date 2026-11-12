@@ -425,7 +425,7 @@ A side file may hold at most 64 MiB (`expcore.replay.side_files.MAX_SIDE_FILE_BY
 
 ### Running one campaign on several hosts
 
-A main study can be too long for one host. Run it as N shards, one driver per host, each with its own copy of the study, its own `out/`, store and platform: `python -m expcore run my-study --shard 2/4 --shard-label rack-b` is shard 2 of 4. N is at least 2. Every shard host needs the same commit and the same locked environment (`uv sync --frozen`), with equivalent platform settings: the campaign fingerprint holds the study's configuration, the installed distributions and the platform's settings, and shards with different fingerprints are refused when they are merged. As it starts, each shard prints the environment part of its fingerprint on stderr: one digest, which every host must print alike, and the installed distributions with their versions (a short digest each when the list is long), so a host that differs shows before it runs. The shard is given on the command line only, never in `campaign.toml`, so every shard has the fingerprint of the whole plan, and a campaign run without `--shard` is exactly the campaign it was before shards existed: its store, records, export and report are byte for byte the same.
+A main study can be too long for one host. Run it as N shards, one driver per host, each with its own copy of the study, its own `out/`, store and platform: `python -m expcore run my-study --shard 2/4 --shard-label rack-b` is shard 2 of 4. N is at least 2. Every shard host needs the same commit and the same locked environment (`uv sync --frozen`), with equivalent platform settings: the campaign fingerprint holds the study's configuration, the installed distributions and the platform's settings, and shards with different fingerprints are refused when they are merged. As it starts, each shard prints the environment part of its fingerprint on stderr: one digest, which every host must print alike, and the installed distributions with their versions (a short digest each when the list is long), so a host that differs shows before it runs. Which shard a host runs is given on the command line only, never in `campaign.toml`, so every shard has the fingerprint of the whole plan, and a campaign run without `--shard`, and without the `[shards]` table below, is exactly the campaign it was before shards existed: its store, records, export and report are byte for byte the same.
 
 **The label** names the shard in its export and in a merge. It is 1 to 64 lower-case letters, digits or `-`, starting with a letter or digit, chosen by you, and defaults to `shard-i`. It has no dot, so a fully qualified host name or an IPv4 address is refused instead of used by accident. Never use a host name, an address or anything else that identifies a machine: a replication package is public and may be double-blind, and the label travels with the export. A name for the part of the work (`north`, `rack-b`, `shard-2`) is enough. A label that needs `.` or `_` is allowed only with `--shard-label-wide`, given with `--shard-label` at every start of that shard, since a resume must give the label it started with.
 
@@ -447,6 +447,21 @@ The assignment depends on the whole plan, so the plan of a sharded campaign cann
 
 The shares are fixed, never pooled. A shard whose pairs run longer, or cost more, than the others can hit its own ceiling while another has capacity or budget left over, and nothing moves between them. Uneven shards therefore may leave part of a cap or a budget unused. To lose less, choose N so that each shard gets many pairs per model, and keep a margin in the budget. A resume with other totals is refused: the shares are pinned at the first start, so change the totals only by starting every shard on a new store.
 
+**A shard never holds pairs it cannot run.** When N is above a unit's cap, the shards past the cap get none of that unit's sessions while the deal above still gives them its model's pairs. Such a shard is refused at start, naming the model (`shard 2 of 2 holds 2 pair(s) of model alpha-stub, and its share of that model's concurrency is 0`).
+
+**Sharding by model.** When every concurrent run needs a platform of its own (one federation per run, say), N is the number of runs in flight, far above a model's concurrent sessions, so shard by model instead. Declare in `campaign.toml` how many shards serve each model, as a table `[shards]` with one key, `per_model = { alpha-stub = 20, beta-stub = 6 }`. N is then the sum, 26, and `--shard i/N` must give it. Shard i serves one model: the models in the order the table declares them, each taking as many shards as its count, so shards 1 to 20 serve `alpha-stub` and 21 to 26 serve `beta-stub`. A model's pairs are dealt among its own shards as above, so a pair stays whole, and its shards differ by at most one pair. Each shard runs one run at a time, so a model's count is its concurrent sessions: a count above its unit's `[scheduler.unit_caps]` cap is refused when the study loads, and so are counts of models that share a unit summing past its cap. The table is in the campaign fingerprint, so every shard and a driver of the whole campaign from the same file share one, and the stores pin the rule `expcore-shard/3`; a store made under the rule above keeps it and still resumes and merges.
+
+```python
+from expcore.campaign.shard import ModelShards, assign_by_model
+
+layout = ModelShards((("model-a", 2), ("model-b", 1)))  # per_model = { model-a = 2, model-b = 1 }
+assert [layout.at(i)[0] for i in (1, 2, 3)] == ["model-a", "model-a", "model-b"]
+by_model = assign_by_model(pairs, layout)  # the pairs of the example above
+assert {pair[1] for pair, shard in by_model.items() if shard == 3} == {"model-b"}
+```
+
+The money follows each model's price. A model's `per_model_usd` ceiling is split equally over its shards. `max_usd` is split over the shards of the priced models only, in proportion to each shard's reserved bound (its planned runs times what the budget gate reserves for one run of its model, the larger of the bounds with and without the reply maximum), in whole micro-dollars rounded down; the shards of a free model get nothing and run without a budget gate, since there is nothing to hold. The study is refused when it loads if `max_usd` cannot pay one run's reservation for every priced shard together, or if a priced shard's part of `max_usd`, or of a ceiling above 0, is below one run's reservation; a model with no price that is not free is refused too.
+
 **Declaring an environment identity.** A shard that ran against other data than its siblings must not join their batch unseen. Declare what a shard runs against with `StudyPlugin.environment_identity`, a function that returns names mapped to SHA-256 hex digests: the platform's configuration, the layout of its federation, the verified ingest manifest of each space. The core calls it once when the shard starts, refuses anything but such names and digests (and a function that raises) with a message that names the plugin file, and keeps the result in the store and the export. A resume of the shard against another identity is refused, naming what changed, and a merge refuses shards whose identities differ. Names and digests only, for the same reason as the label: a name names a role (`data.study`, `layout`), never a private space, provider or host, since a package is public and its identity names travel with the export. A study without a platform, or one that declares nothing, has an empty identity.
 
 A shard's own `check`, `analyze` and `report` work as for any campaign, over its own runs. Its store pins four facts at the first start, with the order seed: the spec, when the shard first started, the identity and the shares. A resume is refused when it gives another spec, label or rule, when a sharded store is resumed without `--shard` or an unsharded one with it, or when the identity or the shares differ. The export of a shard has one more top-level key, `shard`, holding those facts; its run entries are the ones any export has.
@@ -455,7 +470,7 @@ A shard's own `check`, `analyze` and `report` work as for any campaign, over its
 
 A campaign run as shards (one `out/` per host) is merged into one batch before anything is analysed. Copy the study, at the commit the shards ran, to the machine that merges, and run `python -m expcore merge STUDY/out SHARD_OUT...` with the `out/` of every shard, each given once. The merge reads the shards and writes only `STUDY/out`, which must not exist or must be empty: `STUDY/out/runs` holds the union of their runs, `STUDY/out/shards/<index>/campaign-snapshot.sqlite` each shard's snapshot of its store, and `STUDY/out/merge.json` the shards (label, start time, shares, number of runs) with the SHA-256 of each snapshot.
 
-It refuses, naming the shard by its index and label and saying why, shards that are not one campaign run against one environment: a different partition rule or count, a missing or repeated index, one label twice, a different campaign fingerprint, runs in two shards, a run in a shard it does not belong to under the partition of the whole plan, a run of the plan that no shard holds, a record that fails the replay check (the same one `check` makes, under the code and environment in use), a shard with attempts still running, and shards whose environment identities differ. Nothing is written when it refuses.
+It refuses, naming the shard by its index and label and saying why, shards that are not one campaign run against one environment: a different partition rule or count, a missing or repeated index, one label twice, a different campaign fingerprint, runs in two shards, a run in a shard it does not belong to under the partition of the whole plan (by model when the campaign declares `[shards]`), a run of the plan that no shard holds, a record that fails the replay check (the same one `check` makes, under the code and environment in use), a shard with attempts still running, and shards whose environment identities differ. Nothing is written when it refuses.
 
 `check STUDY/out/runs`, `analyze STUDY` and `report STUDY` then work as on any batch. `check` records merge.json's hash and compares each snapshot with the hash merge.json names; `analyze` reads each snapshot once against it. Neither takes merge.json's word for what it says: both rebuild it from the snapshots and the study's plan with the merge's own checks, and refuse a merge.json that differs, so a batch edited after the merge (a shard removed, labels swapped) is refused. The check of a merged batch therefore loads the study's configuration. The batch's export joins the shards': its run lists are in plan order with each entry tagged `"shard": <index>`, a top-level `"shards"` repeats merge.json's list, and the figures that are sums (planned runs, discarded usage, retries, budget holds, the runs and turns of each deployment) are summed, with each deployment's shares computed again from the sums. The scores, the analysis and the report equal those of one driver of the whole campaign. What differs is what belongs to a shard's own sequence: `dispatch_seq`, `started_at` and `lease_wait_s` of an attempt, and so the report's median dispatch position, which pools every shard's own positions. A deployment fingerprint two shards both confirmed is named confirmed by the first shard's witness, where one driver names the earliest. To package a merged study, list `out/merge.json` and `out/shards` in `package.toml` beside `out/runs`. The build refuses a merge.json or a snapshot changed since the check.
 
@@ -819,6 +834,74 @@ else:
 ```
 
 [`interfaces.md`](interfaces.md#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check) says when each runs, what it may do and how a failure is classified.
+
+### Data that arrives during a run
+
+To test whether an agent notices that its data are incomplete before it computes, a condition can make part of a dataset arrive while the agent works, as if its owner were still ingesting it. The Onedata layer's `ProgressiveIngest` (from `expcore_onedata.ingest`, namespace `progressive_ingest`) is the instrument that does it. Declare the plan in a TOML file of your own, one per condition, and load it with `load_ingest_plan(path, config)` from `expcore_onedata.ingestplan`. The plan names a staging directory of sources you keep and, for each file, a label (how the record names it, never by its path), its path in the space, its source, when it arrives (`at_s`, seconds after the instrument's start), whether it is written whole or in `parts` over `over_s` seconds, and its `baseline`. Use `"complete"` for a file your other conditions read: it is removed before the run and written back from its staged source after. Use `"absent"` for new data: it is removed again after the run. Put `ingestplan.fingerprint({condition: plan})` into the platform half of the campaign fingerprint, so a resume after the schedule or a staged source changed is refused.
+
+Give the instrument a provisioner of its own, whose change log is the ingest's and never goes to a teardown, and a journal file that lasts across runs. The instrument claims the log when you build it: a log another provisioner already wrote to is refused, and so is a teardown over the ingest's log. Start it with your other instruments and finish it with them through `finish_instruments`, which runs its post-run check ([An instrument that refuses an attempt](#an-instrument-that-refuses-an-attempt)). A part that could not be written or confirmed, or a baseline that could not be restored, makes the check refuse with `InfraError("ingest_failure")`, a kind no condition may declare, so the attempt is set aside, charged and run again, never scored; `raise_if_failed()` makes the same check, as a second guard once the record is written. Each file is restored on its own, so one that cannot be restored leaves no other file missing. In your executor's `finally`, call `restore()` through `asyncio.to_thread`, since it blocks. A file that has not arrived when the run ends is the manipulation, never a failure. A start that cannot set the start state raises the same kind before the agent runs. The snapshot gives each part's planned, written and confirmed times on the loop's clock (`steps`) and every file id the ingest removed, created or restored, with the old and new id (`ids`), so a scorer can compare the agent's reads with the arrivals from the record alone, and you can map a data gate's errors to files after the run. Until the core admits such conditions exclusively (#27), keep the runs that use an ingest apart from any other run on the same owner's space.
+
+The block runs a plan of one file in two parts against the fakes. The run ends after the first part, so the day is half there, and the finish writes it back whole from the staged copy.
+
+```python
+import time
+
+from expcore_onedata.ingest import ProgressiveIngest
+from expcore_onedata.ingestplan import load_ingest_plan
+from expcore_onedata.testing import ALPHA_ID, with_placement, write_platform
+
+DAY = b"13,ok\n" * 100
+ticker = Ticker()
+fake = make_federation(clock=ticker.clock)
+fake.add_provider(BETA_ID, "beta.test")  # beta supports the space too, so each arrival is confirmed there
+fake.add_file("records/day-12.csv", b"12,ok\n" * 100)
+fake.add_file("records/day-13.csv", DAY)
+
+
+def both_providers(document):
+    with_placement(document)
+    document["support"]["providers"] = ["alpha", "beta"]
+
+
+workdir = Path(tempfile.mkdtemp())
+os.environ[ADMIN_ENV] = fake.admin_token
+platform = write_platform(workdir, both_providers)
+config = load_platform(platform)
+client = OnezoneClient(config, http=fake.client_http())
+own = Provisioner(  # the ingest's own provisioner and change log
+    client,
+    config,
+    load_placement(platform, config).settings,
+    provider_ids=resolve_provider_ids(config),
+    log=workdir / "ingest-changes.jsonl",
+    clock=ticker.clock,
+    sleep=ticker.sleep,
+)
+(workdir / "staged").mkdir()
+(workdir / "staged" / "day-13.csv").write_bytes(DAY)  # the copy the study keeps
+(workdir / "ingest.toml").write_text(
+    '[ingest]\nstaging = "staged"\n\n[[ingest.files]]\nlabel = "day-13"\npath = "records/day-13.csv"\n'
+    'source = "day-13.csv"\nat_s = 60\nbaseline = "complete"\nparts = 2\nover_s = 60\n',
+    encoding="utf-8",
+)
+plan = load_ingest_plan(workdir / "ingest.toml", config)
+ingest = ProgressiveIngest(own, plan, journal=workdir / "ingest-journal.jsonl", max_wait_s=0.001)
+
+ingest.start({})  # the day is removed: the agent starts without it
+assert not fake.exists("records/day-13.csv")
+ticker.sleep(60)  # a Ticker moves only when told; on the real clock the schedule runs by itself
+while ingest.progress < 1:
+    time.sleep(0.001)
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 300]]  # half of the day has arrived
+snapshot = ingest.finish()  # the run ended before the second half
+ingest.check()  # what finish_instruments asks after the snapshots: nothing to refuse
+assert [s["step"] for s in snapshot["steps"] if s["step"] != "planned"] == ["written", "confirmed", "not_due"]
+assert [e["event"] for e in snapshot["ids"]] == ["restored", "removed", "created", "restored"]
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, len(DAY)]]  # whole again, from the staged copy
+
+del os.environ[ADMIN_ENV]
+shutil.rmtree(workdir)
+```
 
 ## 6. What a conclusion may say
 
