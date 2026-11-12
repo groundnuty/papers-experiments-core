@@ -9,7 +9,7 @@ onedatarestfsspec 25.0.0 / onedatafilerestclient 25.0.0 call:
   POST /api/v3/onezone/tokens/infer_access_token_scope
   POST /api/v3/oneprovider/lookup-file-id/{space}@{id}[/{path}]
   GET  /api/v3/oneprovider/data/{id}                 (attributes; JSON body lists them)
-  GET  /api/v3/oneprovider/data/{id}/children        (limit, token; nextPageToken, isLast)
+  GET  /api/v3/oneprovider/data/{id}/children        (limit, token; nextPageToken, isLast, ending as 25.0's do)
   GET  /api/v3/oneprovider/data/{id}/content         (Range -> 206 + Content-Range)
 
 Page size as measured on the real federation (#10): default 1000, `max_limit` 10000, and a larger
@@ -199,21 +199,28 @@ class MockOnedata:
                 self._err(404, "notFound", u.path)
 
             def _children(self, path, q, keys):
+                # A page ends as 25.0's were measured to: a token on every page, the last included; `isLast` true only
+                # on a page shorter than its limit, so a full page of the last entries is followed by an empty one; the
+                # page after a last page is a 400 posix eagain (fake_data.LISTING_END_FACTS).
                 names = outer._children(path)
                 limit = int(q.get("limit", 1000))
                 if outer.max_limit is not None and limit > outer.max_limit:
                     return self._err(400, "badValueNotInRange", f"limit must be <= {outer.max_limit}")
+                if limit < 1:
+                    return self._err(400, "badValueNotInRange", "limit must be >= 1")
+                if q.get("token", "").startswith("end-"):
+                    return self._err(400, "posix", {"errno": "eagain"})
                 start = int(q["token"]) if q.get("token") else 0
                 page = names[start : start + limit]
                 nxt = start + len(page)
-                last = nxt >= len(names)
+                last = len(page) < limit
                 pre = path + "/" if path else ""
                 self._json(
                     200,
                     {
-                        "children": [outer._attrs(pre + n, keys) for n in page],
+                        "nextPageToken": f"end-{nxt}" if last else str(nxt),
                         "isLast": last,
-                        "nextPageToken": None if last else str(nxt),
+                        "children": [outer._attrs(pre + n, keys) for n in page],
                     },
                 )
 

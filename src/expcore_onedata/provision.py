@@ -182,9 +182,14 @@ def next_page_token(page: Any) -> str | None:
     """Read a children page's paging (O26): None when it is the listing's last page, else the next page's token.
 
     Onedata's API says a page may be shorter than its limit and still not be the last, and that `isLast` is the only
-    valid sign that every entry has been listed. A page without `children`, without a boolean `isLast`, or not the last
-    and without a token, is refused (PlatformError), never taken for the end of the listing: a listing cut there would
-    pass for a whole directory, and a file on a later page for a missing one.
+    valid sign that every entry has been listed. On 25.0 that was measured, in
+    `deploy/compose-federation/day0/2026-11-12-federation-facts-listing-end.md`: every page carries `nextPageToken`,
+    `isLast` and `children`; `isLast` is a boolean, false before the last page and true on it; the token is a non-empty
+    string on every page, the last included; a page the directory's last entries fill is followed by an empty page with
+    `isLast` true; and the page after a last page answers 400 `posix` `eagain`. So the end is `isLast` true alone,
+    whatever the token, and an empty last page is no error. A page without `children`, without a boolean `isLast`, or not the last and without a token,
+    is refused (PlatformError), never taken for the end of the listing: a listing cut there would pass for a whole
+    directory, and a file on a later page for a missing one.
     """
     if not isinstance(page, dict) or not isinstance(page.get("children"), list):
         raise PlatformError("a listing answer holds no 'children'")

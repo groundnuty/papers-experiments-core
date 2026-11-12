@@ -75,7 +75,8 @@ deployments of record run, on the Compose federation of `deploy/compose-federati
 record was read directly, since no live test ran one), `day0/2026-11-10-federation-facts-parent-walk.md`, the run
 after the gate's walk by parent links, with the reads that walk rests on and the posix answers of 25.0, and
 `day0/2026-11-11-federation-facts-posix-and-fuse.md`, the run after the core read those answers, and
-`day0/2026-11-11-federation-facts.md`, the direct reads of a transfer's record and of a directory's eviction.
+`day0/2026-11-11-federation-facts.md`, the direct reads of a transfer's record and of a directory's eviction, and
+`day0/2026-11-12-federation-facts-listing-end.md`, how a children listing and a transfer listing end (O26).
 
 - Authentication: the header `X-Auth-Token` with an access token. Confirmed by [S2].
 - `get`: `GET /spaces/{space}/users/{user}/privileges` and `GET /spaces/{space}/effective_users/{user}/privileges`; the
