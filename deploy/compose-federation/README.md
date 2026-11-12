@@ -110,8 +110,9 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
   bind, and a command refuses, before it touches anything, a project whose containers or networks bind another root or
   name none: that is another federation of the same name. A federation brought up before both carried that label is
   refused, so take it down with the code that brought it up. The two images are exactly `docker.onedata.org/onezone:ID-ba7a778696` and
-  `docker.onedata.org/oneprovider:ID-765309c84f`, never pulled (`pull_policy: never`) and never rebuilt. Nothing is
-  pruned.
+  `docker.onedata.org/oneprovider:ID-765309c84f`, never pulled (`pull_policy: never`) and never rebuilt. They are a
+  25.0 development build, not the released 25.0 tag: `day0/2026-11-12-federation-facts-build.md` gives each component's
+  commit and names the earlier dated files whose "25.0" means it. Nothing is pruned.
 - **Ports:** each service publishes its 443 on `127.0.0.1` only, on the port the layout gives it (the default: the
   zone on 29443, `pine` on 29444, `birch` on 29445, `cedar` on 29446). Nothing else is published. On the project's
   network the services reach one another by their domains (`zone.<domain>`, `<provider>.<domain>`), which resolve
