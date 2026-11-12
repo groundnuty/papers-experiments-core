@@ -3,7 +3,8 @@
 #   import: sanitised with study-token map 60f68a1c2af4b0fc87651bf88bc2e52f8aed546687dd3099f912a69a027ddf59
 #   changes: see the history of this file from its import commit
 """Reap what a dead process left of one run's sandbox: containers and networks (netpool.reap_orphans), then what only
-this does, its loop mounts and directory.
+this does, its loop mounts and directory. The one part a start runs for itself is `reap_token_files`: the files of the
+data-path token that a killed run left, which nothing else removes until its directory is reaped.
 
 Called by an operator tool, or by whatever frees a lease key whose last holder died without releasing it, so that a dead
 run's cell never keeps reading under a user that is now another run's. No run output is deleted without the operator's
@@ -23,6 +24,7 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -36,6 +38,8 @@ log = logging.getLogger(__name__)
 
 REAPED = "reaped.jsonl"  # what was removed, written before it is removed
 YOUNG_S = 120.0  # a directory this new, with no container, may be a live start's: not touched yet
+TOKEN_FILE_GRACE_S = 600.0  # several times what a healthy start holds its file for: a docker call and the mount's wait
+SID_DIRECTORY = re.compile(r".+-[0-9a-f]{8}")  # the name of a run's directory: its key, a dash, the eight hex of its id
 
 
 class CollectFailed(SandboxError):
@@ -145,6 +149,64 @@ def _reap_one(host: HostOps, log_dir: Path, x: Path, outputs: Sequence[str], max
         log.error("reap: a run directory could not be handled: %s", describe_error(e))
         return False
     return not x.exists()  # verified, not assumed: a mount left behind keeps the directory
+
+
+def _real_directories(base: Path, relative: Path) -> bool:
+    """Whether every directory from `base` down through `relative` is a directory itself and not a link to one."""
+    here = base
+    for part in relative.parts:
+        here = here / part
+        try:
+            if not stat.S_ISDIR(here.lstat().st_mode):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def reap_token_files(
+    host: HostOps, root: Path, relatives: Sequence[Path], *, grace_s: float = TOKEN_FILE_GRACE_S
+) -> dict[str, int]:
+    """Remove the files of the data-path token that a run killed outright left on the host: it wrote one and died before
+    it removed it (`DockerSandbox._write_token_file`), and nothing else removes it until `reap_run` reaches its directory.
+
+    Only a regular file at one of `relatives` inside a directory of `root` that is named as a sandbox names its own
+    (key, dash, eight hex digits), and only once it is `grace_s` old, several times what a healthy start keeps its
+    file for (one docker call and the mount's or the gate's wait): a younger one may be a start in another process
+    that has not yet run its container, and removing the file of a start that did stall past the grace makes that
+    start fail, never pass on a missing token. A link is never followed, at the file or at any directory on the way to it (`lstat` each), so a file anywhere else is not touched. Returns the
+    count removed and the count found and not removed, which is all a record may say of them (O12)."""
+    removed = left = 0
+    if not Path(root).is_dir():  # a root nothing has run on yet
+        return {"removed": 0, "left": 0}
+    cutoff = time.time() - grace_s
+    for run_dir in sorted(Path(root).iterdir()):
+        if not SID_DIRECTORY.fullmatch(run_dir.name) or run_dir.is_symlink() or not run_dir.is_dir():
+            continue
+        for relative in relatives:
+            path = run_dir / relative
+            if not _real_directories(run_dir, Path(relative).parent):  # a link on the way leads off the root
+                continue
+            try:
+                facts = path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as e:  # one that cannot be examined is not shown gone
+                log.error("reap: a token file could not be examined: %s", describe_error(e))
+                left += 1
+                continue
+            if not stat.S_ISREG(facts.st_mode) or facts.st_mtime > cutoff:
+                continue
+            _sudo(host, "rm", "-f", str(path), timeout_s=20.0)
+            if os.path.lexists(path):  # verified, not assumed
+                named = _named(run_dir)
+                log.error(
+                    "reap: a token file of directory %s (sha256 %s) could not be removed", named["id"], named["sha256"]
+                )
+                left += 1
+            else:
+                removed += 1
+    return {"removed": removed, "left": left}
 
 
 def reap_run(

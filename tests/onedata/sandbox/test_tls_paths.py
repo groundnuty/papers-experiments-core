@@ -242,7 +242,7 @@ def test_o05_oneclient_is_given_the_tls_setting_and_the_bundle_read_only(tmp_pat
     sidecar = world.host.containers[sbx.names.sidecar]
     command, mounts = sidecar.command, mounts_of(sidecar)
     binary = command.index(C.ONECLIENT_BIN)
-    settings = command[:binary]  # what `env` sets and unsets before it runs oneclient
+    settings = command[command.index(C.SIDECAR_SHELL_NAME) + 1 : binary]  # what `env` sets and unsets for oneclient
     copy = the_run_copy(sbx, mounts[C.SIDECAR_CA_PATH][0]) if C.SIDECAR_CA_PATH in mounts else None
     sbx.stop()
     assert settings[:2] == ["-u", "ONECLIENT_INSECURE"]  # the image's own skip-verification flag is always removed

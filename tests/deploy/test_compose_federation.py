@@ -251,6 +251,50 @@ def test_platform_toml_is_written_private_even_over_an_open_one(fed, tmp_path):
     assert "stale-content-sentinel" not in layout.platform.read_text(encoding="utf-8")
 
 
+@needs_openssl
+def test_o03_the_mount_live_test_puts_the_sidecar_on_the_federation_network_dialling_the_data_providers_domain(
+    fed, tmp_path
+):
+    """O03: the live mount-path test runs with a copy of the federation's platform.toml and a `[sandbox]` table: the
+    sidecar joins the project's network and dials the local provider by its domain there, the one its certificate
+    names, never the loopback address the host reaches it at. The copy lives in a directory of its own, with every path
+    of the original made absolute, and loads with its secrets and its CA where the federation keeps them."""
+    from mount_live import LEVEL, derive_platform, federation_network, sandbox_table
+
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.sandbox.api import DataPathMode
+
+    root, own = tmp_path / "root", tmp_path / "own"
+    root.mkdir()
+    own.mkdir()
+    layout = fed.layout.Layout(root)
+    fed.facts.write_facts(layout, fake_boot(fed, layout))
+    (root / "ca").mkdir()
+    fed.pki.make_ca(root / "ca" / "federation-ca.pem", tmp_path / "ca.key", "test CA")
+    facts = json.loads(layout.facts.read_text(encoding="utf-8"))
+    local = layout.spec.holder
+    table = sandbox_table(
+        work_root=own / "work",
+        images={"agent": ("agent:1", "sha256:" + "a" * 64), "oneclient": ("mounter:1", "sha256:" + "c" * 64)},
+        pool="10.77.0.0/24",
+        network=federation_network(facts),
+        local=local,
+        local_address=facts["providers"][local]["domain_on_project_network"],
+    )
+    before = sorted(p.name for p in root.iterdir())
+    config = load_platform(derive_platform(layout.platform, own, table), require_secrets=False)
+    assert "fed" in fed.compose.model(layout.spec)["networks"]  # the project's one network
+    assert config.sandbox.federation.network == f"{layout.spec.project}_fed"
+    assert config.sandbox.federation.local_provider == layout.spec.provider(local).domain
+    assert config.sandbox.mode_of(LEVEL) is DataPathMode.MOUNT
+    assert config.tls.ca_file == (root / "ca" / "federation-ca.pem").resolve()
+    assert config.admin.ref == str((root / "secrets" / "admin.token").resolve())
+    assert list(own.iterdir()) == [own / "platform.toml"]
+    assert sorted(p.name for p in root.iterdir()) == before  # nothing written beside the original
+    with pytest.raises(ValueError, match="already has a"):
+        derive_platform(own / "platform.toml", tmp_path, table)
+
+
 def test_a_layout_without_a_template_writes_facts_and_says_there_is_no_platform_file(fed, minimal_layout, tmp_path):
     layout = fed.layout.Layout(tmp_path, spec=fed.spec.load_spec(minimal_layout))
     assert "no platform.toml" in fed.facts.write_facts(layout, fake_boot(fed, layout))

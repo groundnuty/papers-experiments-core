@@ -55,6 +55,7 @@ from expcore.campaign.recovery import Recovery
 from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.shard_run import ShardStart
 from expcore.campaign.store import Store, column_for
 from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
@@ -114,8 +115,10 @@ class Scheduler:
         monotonic: Callable[[], float] = time.monotonic,
         crash_hook: Callable[[str, str], None] = lambda point, run_key: None,
         on_hold: Callable[[str], None] | None = None,
+        shard: ShardStart | None = None,
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
+        self.shard = shard  # a shard's start: `manifest` is then its part of the plan, `settings` its shares (#154)
         self.on_hold = on_hold  # takes one line per hold that begins, changes or ends; never one per pass
         self.executor, self.agent_config, self.models = executor, agent_config, models
         self.endpoints, self.settings = dict(endpoints), settings or SchedulerConfig()
@@ -179,6 +182,7 @@ class Scheduler:
             now=self.stamp(),
             max_attempts=cfg.max_attempts,
             allow_growth=cfg.allow_growth,
+            shard=self.shard,
         )
         store = self.store
         self.holds = HoldRegistry(store, self.stamp, None if self.on_hold is None else self._announce)

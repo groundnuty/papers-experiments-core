@@ -80,12 +80,25 @@ def writable(path: str) -> None:
                 os.chmod(full, 0o700)
 
 
+def _config_env(c: FakeContainer) -> list[str]:
+    """The container's environment as docker keeps it in its configuration, which `docker inspect` shows: each `-e
+    NAME=value`, and each `-e NAME` with the value the docker client's environment held for it."""
+    client = c.options.get("_env") or {}
+    named = c.options.get("-e", [])
+    return [e if "=" in e else f"{e}={client[e]}" for e in named if "=" in e or e in client]
+
+
 def _inspect_json(c: FakeContainer) -> dict[str, Any]:
     return {
         "Id": c.id,
         "Name": "/" + c.name,
         "Image": c.image,
-        "Config": {"Labels": c.labels},
+        "Config": {
+            "Labels": c.labels,
+            "Env": _config_env(c),
+            "Entrypoint": [c.options["--entrypoint"]] if "--entrypoint" in c.options else None,
+            "Cmd": c.command,
+        },
         "State": {
             "Status": ("paused" if c.paused else "running") if c.running else "exited",
             "Running": c.running,
@@ -154,6 +167,7 @@ class FakeHost:
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
         self.pause_without_freezing = False  # a `docker pause` that answers 0 but leaves the cgroup unfrozen
+        self.signal_handlers: dict[str, Callable[[FakeContainer], None]] = {}  # a signal the process handles and lives
         self.base_bundle = "BASE BUNDLE\n"
         # what the agent image's interpreter answers the sandbox's question of where its certifi bundle is
         self.certifi_probe = CmdResult(0, f"certifi:{CERTIFI_BUNDLE}\n")
@@ -415,6 +429,11 @@ class FakeHost:
         self.add_stat(container.pid, "tini", 1)
         self.add_cgroup(container, [container.pid], events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
         container.options["_env"] = dict(env or {})
+        container.options["_files"] = {  # what each file bound in held when the container started, by destination
+            spec.split(":")[1]: Path(spec.split(":")[0]).read_text(encoding="utf-8")
+            for spec in options.get("-v", [])
+            if Path(spec.split(":")[0]).is_file()
+        }
         return CmdResult(0, container.id + "\n")
 
     def _mount_oneclient(self, container: FakeContainer) -> None:
@@ -486,9 +505,14 @@ class FakeHost:
         container = self._find(args[-1])
         if container is None:
             return CmdResult(1, "", "No such container")
+        sig = args[args.index("-s") + 1] if "-s" in args else "KILL"
+        self.calls.append(("signalled", container.name, sig))
+        handled = self.signal_handlers.get(sig)
+        if handled is not None:  # the process handles this signal: it acts on it and goes on running
+            handled(container)
+            return CmdResult(0, container.name + "\n")
         container.running, container.exit_code = False, 0
         self.alive.discard(container.pid)
-        self.calls.append(("signalled", container.name, args[args.index("-s") + 1] if "-s" in args else "KILL"))
         return CmdResult(0, container.name + "\n")
 
     def _inspect(self, args: list[str]) -> CmdResult:

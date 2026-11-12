@@ -1,0 +1,267 @@
+"""The code the live mount-path test runs inside the agent, run here against local files, so its classification is known
+before the one live run that cannot be repeated cheaply: what it reports is what happened, never a guess (O08)."""
+
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import httpx
+from mount_live import (
+    SpaceFiles,
+    accounting_cell,
+    candidate_options,
+    confinement_cell,
+    file_guid,
+    mentions,
+    pattern,
+    read_cell,
+    reader_cell,
+    reads_cell,
+    unwritten_cell,
+)
+
+PREFIX, SIZE = 4096, 65536
+
+
+def run(code: str, timeout: float = 60) -> dict:
+    """Run a cell's code as the agent would, in a fresh interpreter, and return the JSON line it printed."""
+    done = subprocess.run(
+        [sys.executable, "-"], input=code, capture_output=True, text=True, timeout=timeout, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def partial(path, label, *, size=SIZE, tail=None):
+    """A file at `size` with only its prefix written (sparse), or with `tail` written after the prefix."""
+    with open(path, "wb") as handle:
+        handle.write(pattern(label, PREFIX))
+        if tail is not None:
+            handle.write(tail)
+        handle.truncate(size)
+
+
+def test_o08_an_unwritten_range_that_reads_as_zeros_is_reported_as_zeros_with_the_prefix_intact(tmp_path):
+    """O08: a sparse file at its final size reads its unwritten range as zeros: each read is `zeros`, at its full
+    length, the prefix's bytes it returned are the ones written, and the size is the final size."""
+    partial(tmp_path / "f", "label-zeros")
+    found = run(unwritten_cell({"f": (str(tmp_path / "f"), "label-zeros")}, PREFIX, SIZE, 5))["f"]
+    assert found["size"] == SIZE
+    for name, length in (("unwritten", 4096), ("across_prefix_end", 32), ("whole", SIZE)):
+        assert found[name]["outcome"] == "zeros", name
+        assert found[name]["bytes"] == length
+        assert found[name]["prefix_matches"] is True
+        assert found[name]["seconds"] >= 0
+
+
+def test_o08_short_nonzero_and_error_reads_are_each_named_and_never_taken_for_zeros(tmp_path):
+    """O08: a file that ends at its prefix reads short, one whose unwritten range holds bytes reads `nonzero`, and a
+    missing one is an error named by its errno; none of them is reported as zeros."""
+    partial(tmp_path / "short", "label-short", size=PREFIX)
+    partial(tmp_path / "dirty", "label-dirty", tail=b"\x07" * 100)
+    files = {
+        "short": (str(tmp_path / "short"), "label-short"),
+        "dirty": (str(tmp_path / "dirty"), "label-dirty"),
+        "missing": (str(tmp_path / "missing"), "label-missing"),
+    }
+    found = run(unwritten_cell(files, PREFIX, SIZE, 5))
+    assert found["short"]["unwritten"] == {**found["short"]["unwritten"], "outcome": "short", "bytes": 0}
+    assert found["short"]["whole"]["outcome"] == "short"
+    assert found["short"]["whole"]["prefix_matches"] is True
+    assert found["dirty"]["across_prefix_end"]["outcome"] == "nonzero"
+    assert found["dirty"]["unwritten"]["outcome"] == "nonzero"
+    assert found["missing"]["stat_error"] == "ENOENT"
+    assert found["missing"]["unwritten"]["outcome"] == "error"
+    assert found["missing"]["unwritten"]["error"] == "ENOENT"
+
+
+def test_o08_a_read_that_does_not_return_by_its_deadline_is_blocked_and_the_files_later_reads_are_not_tried(tmp_path):
+    """O08: a read that has not returned by its deadline (here: opening a pipe nobody writes to) is `blocked`, its
+    reader is killed, and the file's later reads are `not_tried`, never guessed."""
+    os.mkfifo(tmp_path / "pipe")
+    found = run(unwritten_cell({"pipe": (str(tmp_path / "pipe"), "label-pipe")}, PREFIX, SIZE, 1))["pipe"]
+    assert found["unwritten"]["outcome"] == "blocked"
+    assert found["unwritten"]["killed"] is True
+    assert found["unwritten"]["seconds"] >= 1
+    assert found["across_prefix_end"]["outcome"] == "not_tried"
+    assert found["whole"]["outcome"] == "not_tried"
+
+
+def test_o08_the_read_cell_reports_the_size_the_bytes_and_their_digest_or_the_errno(tmp_path):
+    """O08: a whole-file read reports its size, the bytes it read and their SHA-256, never the bytes; a file that does
+    not appear within the wait is an error named by its errno."""
+    data = pattern("whole", 300_001)
+    (tmp_path / "w").write_bytes(data)
+    found = run(read_cell(str(tmp_path / "w"), wait_s=0))
+    assert found["size"] == found["read"] == len(data)
+    assert found["sha256"] == hashlib.sha256(data).hexdigest()
+    assert "error" not in found
+    assert run(read_cell(str(tmp_path / "absent"), wait_s=0))["error"] == "ENOENT"
+
+
+def test_o05_the_confinement_cell_tells_a_writable_or_crowded_mount_and_a_refused_connection(tmp_path):
+    """O05: the cell that checks the agent's view reports a mount holding more than the space, a space it can write
+    to, and every way to the federation it tried by a word (never `connected` for a closed port or a name that does
+    not resolve), so a confinement that does not hold shows in its output."""
+    mount = tmp_path / "mount"
+    (mount / "only-space").mkdir(parents=True)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed = probe.getsockname()[1]  # free once the socket closes: nothing listens there
+    found = run(confinement_cell(str(mount), "only-space", ["name.invalid"], [], [closed]))
+    assert found["only_the_space"] is True
+    assert found["write_in_the_space"] == "WRITABLE"
+    assert found["by_name"] == ["unresolved"]
+    assert found["by_address"] == []
+    assert found["loopback_ports"] != ["connected"]
+    assert found["mount_lines"] == 0  # not a mount here: the live test requires one, read-only
+    assert found["mount_read_only"] is False
+    (mount / "another").mkdir()
+    assert run(confinement_cell(str(mount), "only-space", [], [], []))["only_the_space"] is False
+
+
+def test_o08_the_accounting_cell_stats_one_file_reads_a_range_of_another_twice_and_prints_no_bytes(tmp_path):
+    """O08: the agent's side of the accounting check is a known pattern: one file only stat'd, one range of another
+    read twice through two opens, each read's length and seconds; it prints no byte it read, and a missing file is an
+    error named by its errno."""
+    (tmp_path / "untouched").write_bytes(pattern("untouched", 1000))
+    data = pattern("repeat", 20_000)
+    (tmp_path / "repeat").write_bytes(data)
+    code = accounting_cell(str(tmp_path / "untouched"), str(tmp_path / "repeat"), 5000, 4096)
+    done = subprocess.run([sys.executable, "-"], input=code.encode(), capture_output=True, timeout=60, check=False)
+    found = json.loads(done.stdout)
+    assert found["untouched_size"] == 1000
+    assert [r["bytes"] for r in found["reads"]] == [4096, 4096]
+    assert found["same_bytes_twice"] is True
+    assert data[5000:5100] not in done.stdout  # the bytes themselves never leave the agent
+    missing = run(accounting_cell(str(tmp_path / "gone"), str(tmp_path / "gone-too"), 0, 10))
+    assert missing["untouched_error"] == "ENOENT"
+    assert [r["error"] for r in missing["reads"]] == ["ENOENT", "ENOENT"]
+    assert missing["same_bytes_twice"] is False
+
+
+def test_o08_the_sidecars_evidence_is_read_by_name_and_counted_per_file_never_judged():
+    """O08: from oneclient's help only the options whose names say they may record reads are kept; a file's REST id
+    gives its uuid only when it decodes as one (else None, never a guess); and each form of a file is counted per line
+    of a log, so the verdict is left to whoever reads the counts."""
+    help_text = "  --io-trace-log  Enable a trace\n  --monitoring-type arg\n  --force-proxy-io\n  -H [ --host ] arg\n"
+    assert candidate_options(help_text) == ["io-trace-log", "monitoring-type"]
+    invented = "0000000000ABCDEF" + b"guid#u-invented-1#s-invented".hex()
+    assert file_guid(invented) == "u-invented-1"
+    assert file_guid("not-hex-at-all-x") is None
+    assert file_guid("0000000000ABCDEF" + b"other#thing".hex()) is None
+    log = "read u-invented-1 off 0\nopen whole.bin\nread u-invented-1 off 4096\n"
+    found = mentions(
+        log, {"whole": {"id": invented, "uuid": "u-invented-1", "name": "whole.bin"}, "other": {"uuid": None}}
+    )
+    assert found == {"whole": {"id": 0, "uuid": 2, "name": 1}, "other": {}}
+
+
+def test_o08_the_reads_cell_reports_each_reads_bytes_by_pread_or_in_order_and_never_the_bytes(tmp_path):
+    """O08: each requested range is read and reported with its length and seconds, by `pread` at its offset or, in
+    order, by `read` from the first offset; a read past the end is short, never padded; no byte read is printed."""
+    data = pattern("granular", 100_000)
+    (tmp_path / "g").write_bytes(data)
+    reads = [(0, 1), (4096, 4096), (99_000, 4096)]
+    done = subprocess.run(
+        [sys.executable, "-"], input=reads_cell(str(tmp_path / "g"), reads).encode(), capture_output=True, check=False
+    )
+    found = json.loads(done.stdout)
+    assert [r["bytes"] for r in found] == [1, 4096, 1000]
+    assert data[4096:4196] not in done.stdout
+    in_order = run(reads_cell(str(tmp_path / "g"), [(10, 100), (110, 100), (210, 100)], sequential=True))
+    assert [r["bytes"] for r in in_order] == [100, 100, 100]
+    assert run(reads_cell(str(tmp_path / "g"), [(0, 1)]))[0]["seconds"] >= 0
+
+
+def test_o08_the_background_reader_outlives_its_cell_and_counts_its_reads(tmp_path):
+    """O08: the reader the freeze check runs keeps reading after the cell that started it has ended, and writes how
+    many reads it has done, so a host that sees the count stop knows the reader stopped."""
+    import time
+
+    (tmp_path / "big").write_bytes(pattern("big", 3 << 20))
+    counter = tmp_path / "count"
+    pid = run(reader_cell(str(tmp_path / "big"), 3 << 20, str(counter)))["pid"]
+    try:
+        deadline = time.monotonic() + 30
+        while True:  # one read per look: the reader truncates the file before each write
+            text = counter.read_text().strip() if counter.exists() else ""
+            if text.isdigit() and int(text) >= 2:
+                break
+            assert time.monotonic() < deadline, "the reader did not count two reads"
+            time.sleep(0.1)
+    finally:
+        os.kill(pid, 9)
+
+
+ENOENT = "enoent"
+ENOENT_BODY = {"error": {"id": "posix", "details": {"errno": "enoent"}, "description": "invented"}}
+
+
+def fake_space(answers):
+    """SpaceFiles over a scripted provider: `answers` maps (method, file id) to what it gives, in turn: a status, or
+    `ENOENT`, Onedata 25.0's answer for a file it does not know."""
+    calls = []
+
+    def handler(request):
+        file_id = request.url.path.rsplit("/", 1)[-1]
+        calls.append((request.method, file_id))
+        queue = answers.get((request.method, file_id), [404])
+        given = queue.pop(0) if len(queue) > 1 else queue[0]
+        return httpx.Response(400, json=ENOENT_BODY) if given == ENOENT else httpx.Response(given)
+
+    config = SimpleNamespace(
+        tls=SimpleNamespace(client_verify=lambda: True),
+        admin=SimpleNamespace(read=lambda: "tok-invented"),
+        providers={"near": SimpleNamespace(url="https://near.test"), "far": SimpleNamespace(url="https://far.test")},
+        space=SimpleNamespace(id="space-invented"),
+    )
+    return SpaceFiles(config, transport=httpx.MockTransport(handler)), calls
+
+
+def test_o11_the_fixture_files_are_deleted_newest_first_and_each_is_shown_gone_or_reported():
+    """O11: the files the live test wrote are deleted in `finally`, newest first, each through the provider that made
+    it, and the deletion is verified: a directory the provider still refuses to delete (its files' deletion has not
+    reached it yet) is tried again within the window, an entry still listed after its delete is deleted again, and
+    one never shown gone is reported by position."""
+    space, calls = fake_space(
+        {
+            ("DELETE", "dir-1"): [409, 409, 204],  # refused while its files' deletion propagates, then deleted
+            ("GET", "dir-1"): [404],
+            ("DELETE", "file-2"): [204],
+            ("GET", "file-2"): [200, 404],  # still listed once after its delete
+            ("DELETE", "file-3"): [500],  # never deleted
+            ("GET", "file-3"): [200],
+        }
+    )
+    space.created = [("near", "dir-1"), ("far", "file-2"), ("far", "file-3")]
+    failed = space.remove_all(window_s=10, poll_s=1, sleep=lambda s: None, clock=iter(range(100)).__next__)
+    assert failed == ["entry 2: not shown gone (its last delete answered 500)"]
+    deletes = [file_id for method, file_id in calls if method == "DELETE"]
+    assert deletes[0] == "file-3"  # newest first
+    assert deletes[-3:] == ["dir-1", "dir-1", "dir-1"]  # the directory last, tried until it went
+    assert deletes.count("file-2") == 2
+    assert space.created == []
+
+
+def test_o11_an_entry_the_provider_answers_400_enoent_for_is_gone_as_onedata_25_answers_a_deleted_file():
+    """O11: Onedata 25.0 answers a read of a file it no longer has, and a second delete of it, with 400 `posix` and
+    errno `enoent` rather than 404 (seen live on the Compose federation); that is the entry shown gone. Any other
+    400 is not."""
+    space, _ = fake_space(
+        {
+            ("DELETE", "file-1"): [204],
+            ("GET", "file-1"): [ENOENT],
+            ("DELETE", "file-2"): [ENOENT],  # already gone when the delete came
+            ("GET", "file-2"): [ENOENT],
+            ("DELETE", "file-3"): [204],
+            ("GET", "file-3"): [400],  # a 400 of another kind says nothing of the entry
+        }
+    )
+    space.created = [("near", "file-1"), ("near", "file-2"), ("near", "file-3")]
+    failed = space.remove_all(window_s=3, poll_s=1, sleep=lambda s: None, clock=iter(range(100)).__next__)
+    assert failed == ["entry 2: not shown gone (its last delete answered 204)"]

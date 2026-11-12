@@ -16,6 +16,7 @@ from expcore.campaign.shard import (
     caps_shares,
     check_identity,
     in_shard,
+    is_default_label,
     share,
     share_usd,
 )
@@ -92,6 +93,44 @@ def test_c28_a_spec_no_shard_can_have_is_refused(text, label):
         ShardSpec.parse(text, label)
 
 
+@pytest.mark.parametrize("label", ["node1.lab.example.org", "10.0.0.5", "node_one", "lab.rack-b"])
+def test_c28_a_label_with_a_dot_or_an_underscore_is_refused_by_default_and_accepted_when_wide(label):
+    """C28: a fully qualified host name or an IPv4 address cannot be used as a label by accident; the wider form, the
+    one that allows '.' and '_', is asked for by name."""
+    with pytest.raises(ShardError, match=r"no '\.'") as refused:
+        ShardSpec.parse("2/4", label)
+    assert label not in str(refused.value)
+    with pytest.raises(ShardError, match=r"no '\.'"):
+        ShardSpec(2, 4, label)
+    spec = ShardSpec.parse("2/4", label, wide_label=True)
+    assert spec.label == label
+    assert spec.to_json() == {"rule": RULE, "index": 2, "count": 4, "label": label}
+
+
+@pytest.mark.parametrize("label", ["north", "rack-b", "shard-2", "a", "9-lab", "x" * 64])
+def test_c28_a_default_label_is_lower_case_letters_digits_and_hyphens(label):
+    """C28: what the default rule keeps: 1 to 64 of `[a-z0-9-]`, starting with a letter or digit."""
+    assert ShardSpec.parse("1/2", label).label == label
+    assert is_default_label(label)
+
+
+@pytest.mark.parametrize("label", ["-north", "North", "", "x" * 65, "node one", ".node"])
+def test_c28_the_wide_form_still_checks_the_start_the_length_and_the_case(label):
+    """C28: the override allows '.' and '_' and nothing more."""
+    with pytest.raises(ShardError, match="lower-case"):
+        ShardSpec.parse("1/2", label, wide_label=True)
+
+
+def test_c28_a_spec_read_back_from_a_store_keeps_the_wide_label_it_pinned():
+    """C28: a store started with a wide label still resumes and merges: `from_json` reads it, equal to the spec made
+    with the override, and its json is the four keys it always had."""
+    spec = ShardSpec.parse("3/5", "rack.b_2", wide_label=True)
+    assert ShardSpec.from_json(spec.to_json()) == spec
+    assert set(spec.to_json()) == {"rule", "index", "count", "label"}
+    with pytest.raises(ShardError, match="lower-case"):
+        ShardSpec.from_json({**spec.to_json(), "label": "Rack.B"})
+
+
 def test_c28_a_spec_round_trips_and_defaults_its_label():
     """C28: the spec the store keeps reads back equal, and the label defaults to shard-i."""
     spec = ShardSpec.parse("2/4")
@@ -135,6 +174,35 @@ def test_c29_an_environment_identity_is_names_to_digests_only():
         with pytest.raises(ShardError):
             check_identity(bad)
     assert check_identity({}) == {}
+
+
+def test_c29_names_of_two_types_are_a_refusal_and_not_a_type_error():
+    """C29: sorting names of different types raised a TypeError that came out as a traceback."""
+    digest = "a" * 64
+    for bad in ({1: digest, "layout": digest}, {"layout": digest, None: digest}, {3: digest}):
+        with pytest.raises(ShardError, match="identity name"):
+            check_identity(bad)
+
+
+@pytest.mark.parametrize("count", [2, 3, 7])
+def test_c30_a_model_ceiling_of_zero_holds_it_entirely_so_every_shard_shares_zero(count):
+    """C30: a `per_model_usd` ceiling of 0 is not "less than the N shards": it is zero for every shard, beside the
+    shares of the other ceilings."""
+    for spec in (ShardSpec(i, count, f"shard-{i}") for i in range(1, count + 1)):
+        parts = budget_shares(15.0, {"model-falcon": 0, "model-heron": 5.0}, spec)
+        assert parts["per_model_usd"]["model-falcon"] == 0.0
+        assert 0.0 < parts["per_model_usd"]["model-heron"] <= 5.0 / count + 0.000001
+        assert parts["max_usd"] > 0.0
+
+
+def test_c30_a_zero_total_is_refused_everywhere_but_a_model_ceiling():
+    """C30: a zero `max_usd` or a zero whole-number cap still leaves a shard nothing, and the message says the total."""
+    spec = ShardSpec(1, 2, "shard-1")
+    with pytest.raises(ShardError, match=r"\[budget\] max_usd is 0, less than the 2 shards"):
+        budget_shares(0.0, {}, spec)
+    with pytest.raises(ShardError, match="less than the 2 shards"):
+        share(0, spec, what="cap")
+    assert share_usd(0, spec, what="ceiling", allow_zero=True) == 0.0
 
 
 def test_c30_caps_and_budget_shares_over_all_shards_sum_within_the_totals():

@@ -10,13 +10,17 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
   * an INTERNAL docker network from the dedicated pool (no route out) holding the agent container, and in REST mode the
     gate container, the agent's only network peer (O14);
   * REST data path: the data gate (gate.py, gatepolicy.py, gateboundary.py), whose files are mounted from this package,
-    read-only. It holds the token, in its environment, and adds it to the requests it forwards, and no answer it passes
-    back holds the token; the agent holds no credential, only the placeholder token the published client needs to
-    start (O23), which the gate drops. The agent trusts the run's CA through the CA variables, each declared trust path
-    and its image's certifi bundle, which the published client verifies against: one-shot containers of the agent
-    image find that bundle and read each one, and the run's copy with the CA appended is mounted over it read-only;
-  * mount data path: a oneclient sidecar that owns the mount and the token, exported read-only to the agent through bind
-    propagation; the agent has neither the token, nor FUSE, nor a route to any host;
+    read-only. It holds the token, read at its start from a file bound into it alone, and adds it to the requests it
+    forwards, and no answer it passes back holds the token; the agent holds no credential, only the placeholder token
+    the published client needs to start (O23), which the gate drops. The agent trusts the run's CA through the CA
+    variables, each declared trust path and its image's certifi bundle, which the published client verifies against:
+    one-shot containers of the agent image find that bundle and read each one, and the run's copy with the CA appended
+    is mounted over it read-only;
+  * mount data path: a oneclient sidecar that owns the mount and the token (from a file bound into it alone), exported
+    read-only to the agent through bind propagation; the agent has neither the token, nor FUSE, nor a route to any host;
+  * no token is ever given to docker, so `docker inspect` shows none, and the host's file of it goes once its holder has
+    started and again at every teardown (`_write_token_file`, `_remove_token_files`); a run killed outright before that
+    leaves it until the next start on the root removes it (`reap.reap_token_files`);
   * no data path: neither;
   * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids;
   * each read-only input of the spec: copied into the run's directory, hashed into the metadata, and mounted read-only
@@ -49,11 +53,12 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool
+from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool, reap
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
+    RAN,
     DataPathMode,
     ExecResult,
     ReadOnlyInput,
@@ -63,9 +68,8 @@ from expcore_onedata.sandbox.api import (
 )
 from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
-    ENV_ACCESS_TOKEN,
-    ENV_GATE_TOKEN,
     GATE_CA_PATH,
+    GATE_TOKEN_PATH,
     ONECLIENT_LOG_DIR,
     Names,
     agent_run_args,
@@ -88,7 +92,10 @@ log = logging.getLogger(__name__)
 RUN_KEY = re.compile(r"[\x21-\x7e]{1,200}")  # it becomes an HTTP header value at the gate
 GATE_FILES = Path(__file__).resolve().parent  # gate.py and its siblings are mounted from here into the gate container
 MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
+TOKEN_FILE = Path("sidecar-secret", "oneclient-token")  # under the run directory, owner-only, while the sidecar starts
+GATE_TOKEN_FILE = Path("gate-secret", "gate-token")  # likewise while the gate starts, owned by the gate's user
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
+RUN_START_POLLS = 50  # reads of the gate's log, 0.1 s apart, for the mark of the run's start it was signalled to write
 TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
 MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
 NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O22)
@@ -129,6 +136,9 @@ class DockerSandbox:
         self._mounts: list[Path] = []
         self._mount_log: list[dict[str, Any]] = []  # what the record file holds: each mount's path and identity
         self._refusals_seen = 0  # the data gate's refusals already handed back with a cell
+        self._phase = threading.Lock()  # orders the agent's first cell, the harness's steps and the mark (O24)
+        self._agent_began = False  # an agent's cell has been entered: no harness step or mark from then on
+        self._steps_running = 0  # harness steps under way: no mark meanwhile
         self._containers: list[str] = []
         self._net: str | None = None
         self._watched: dict[str, dict[str, Any]] = {}
@@ -153,6 +163,7 @@ class DockerSandbox:
         self._ca_copy: Path | None = None  # the run's own read-only copy of them, which the containers mount
         self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
         self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
+        self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
         self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
         self._uptime0: float | None = None
@@ -187,6 +198,7 @@ class DockerSandbox:
         TERM.raise_if_requested()  # a SIGTERM reached this process: nothing new starts
         self._validate()
         self._pin_images()  # a moved tag refuses the start (O13), before anything exists
+        self._require_federation_network()  # likewise a network the sidecar would join and that is not there
         self._checkpoint()
         self._stopped = False  # from here, `stop` has something to verify
         self._meta["pending_cleanups_left"] = self.registry.drain()
@@ -194,6 +206,12 @@ class DockerSandbox:
             self._meta["reaped_orphans"] = netpool.reap_orphans(self.host, self.labels)  # never fails the start
         except Exception as e:
             self._meta["reaped_orphans"] = {"error": describe_error(e)}
+        try:  # the files of the token that a run killed outright left on this root, which `reap_orphans` never touches
+            self._meta["reaped_token_files"] = reap.reap_token_files(
+                self.host, self.s.work_root, (TOKEN_FILE, GATE_TOKEN_FILE)
+            )  # never fails the start
+        except Exception as e:
+            self._meta["reaped_token_files"] = {"error": describe_error(e)}
         try:
             self._build()
             self._checkpoint()
@@ -247,6 +265,19 @@ class DockerSandbox:
             if resolved != ref.id:
                 raise StartRefused(f"the {role} image no longer resolves to the id it is pinned to")
             self._meta["images"][role] = resolved
+
+    def _require_federation_network(self) -> None:
+        """A mount sidecar that joins `[sandbox.federation]`'s network needs it on this host: it is the federation's own
+        deployment's, never the sandbox's to make, so one docker does not show refuses the start before anything
+        exists (O15). Only a lookup by name: the network is never inspected for more, changed or removed."""
+        federation = self.s.federation
+        if self.spec.mode is not DataPathMode.MOUNT or federation is None:
+            return
+        found = hostops.network_exists(self.host, federation.network)
+        if found is None:
+            raise StartRefused("docker could not say whether the network [sandbox.federation] names is on this host")
+        if not found:
+            raise StartRefused("the network [sandbox.federation] names is not on this host: bring the federation up")
 
     def _cleanup_after(self, exc: BaseException) -> None:
         """Stop what a failed start left. A cleanup that fails too is registered for the next start, and reachable on the
@@ -323,6 +354,7 @@ class DockerSandbox:
             "tls_dir": "/etc/gate/tls",
             "hosts": hosts,
             "listing": self.spec.listing,  # paged, or every listing answered complete (O21)
+            "token_file": GATE_TOKEN_PATH,  # where `gate_run_args` binds the run's file of the token, read-only
         }
         if self._ca_copy is not None:
             config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only
@@ -439,12 +471,14 @@ class DockerSandbox:
         self._register_container(
             names.gate
         )  # registered before it is created: an interrupt cannot leave one `stop` misses
-        args = gate_run_args(s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id, ca_copy=self._ca_copy)
-        self.host.docker(
-            *args, env={ENV_GATE_TOKEN: self.spec.token.reveal()}
-        )  # the gate holds the token, not the agent
+        token = self._write_token_file(GATE_TOKEN_FILE, gate_owned=True)  # the gate holds the token, not the agent
+        args = gate_run_args(
+            s, names, self._label_args(), self.dir, GATE_FILES, s.gate.id, token_file=token, ca_copy=self._ca_copy
+        )
+        self.host.docker(*args)
         self.host.docker("network", "connect", names.net, names.gate)
         self._wait_gate()
+        self._remove_token_files(token)  # the gate read it before it said ready; its bind outlives the host's copy
         self.watch_container("gate", names.gate)  # its state as the run begins: the baseline the check compares with
         info = hostops.inspect(self.host, names.gate) or {}
         ip = ((info.get("NetworkSettings") or {}).get("Networks") or {}).get(names.net, {}).get("IPAddress", "")
@@ -463,8 +497,41 @@ class DockerSandbox:
             self._sleep(0.1)
         raise SandboxError("the gate did not become ready")
 
+    def _write_token_file(self, relative: Path, *, gate_owned: bool = False) -> Path:
+        """The run's file of the data-path token, owner-only (0400), in a directory of its own (0700), for the one
+        container that reads it at its start (`sidecar_run_args`, `gate_run_args`). The gate runs as root with every
+        capability dropped, so it reads only a file root owns: with `gate_owned` the file is made root's."""
+        path = self.dir / relative
+        path.parent.mkdir(mode=0o700)
+        self._token_files.append(path)  # before it exists: every teardown removes it, whatever fails from here
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(self.spec.token.reveal())
+        path.chmod(0o400)
+        if gate_owned and self.host.run(["chown", "0:0", str(path)], 20, sudo=True).returncode != 0:
+            raise SandboxError("the run's token file could not be given to the gate's user")
+        return path
+
+    def _remove_token_files(self, *only: Path) -> None:
+        """Remove the host's copies of the data-path token (`only` these, else all), verified: once its holder has
+        started it keeps the token itself, so the host keeps none (O05). Run for every copy at every teardown. A run
+        killed outright between writing a file and removing it (a healthy start's docker call and wait) leaves it, and
+        the next start on this root removes it once it is several times older than that (`reap.reap_token_files`)."""
+        left = []
+        for path in only or tuple(self._token_files):
+            self.host.run(["rm", "-f", str(path)], 20, sudo=True)
+            if os.path.lexists(path):
+                left.append(path)
+        if left:
+            raise SandboxError(f"{len(left)} of the run's copies of the data-path token could not be removed")
+
+    def _token_files_left(self) -> bool:
+        """Whether any of the run's copies of the token is still on the host: looked at, never assumed from a step."""
+        return any(os.path.lexists(path) for path in self._token_files)
+
     def _start_mount(self) -> Path:
-        """Start the oneclient sidecar on a shared mount point; the token goes in its environment, never an argument."""
+        """Start the oneclient sidecar on a shared mount point; its token goes in a file bound into it alone, read-only,
+        never in an argument or in docker's configuration of the container (O05)."""
         s, sp, names = self.s, self.spec, self.names
         share = self.dir / "mount"
         share.mkdir()
@@ -475,14 +542,18 @@ class DockerSandbox:
         host_name = sp.provider.host
         command = sidecar_command(host_name, s)
         self._log_dir = effective_log_dir(command)
-        self._meta["mount"] = {  # the keys that set it, never a path (O12); its TLS is the run's `tls`
+        self._meta["mount"] = {  # the keys that set it, never a path or a name (O12); its TLS is the run's `tls`
             "io_mode": s.mount.io_mode,
             "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != ONECLIENT_LOG_DIR else "default",
+            "network": "federation" if s.federation is not None else "default bridge",  # `sidecar_route`'s, by kind
         }
         self._register_container(names.sidecar)
         t0 = time.monotonic()
-        args = sidecar_run_args(s, names, self._label_args(), share, s.oneclient.id, host_name, ca_copy=self._ca_copy)
-        self.host.docker(*args, env={ENV_ACCESS_TOKEN: sp.token.reveal()})
+        args = sidecar_run_args(
+            s, names, self._label_args(), share, s.oneclient.id, host_name,
+            token_file=self._write_token_file(TOKEN_FILE), ca_copy=self._ca_copy,
+        )  # fmt: skip
+        self.host.docker(*args)
         deadline = time.monotonic() + MOUNT_WAIT_S
         while not hostops.is_fuse_mounted(self.host.read_text("/proc/self/mountinfo"), str(share)):
             if (hostops.inspect(self.host, names.sidecar) or {}).get("State", {}).get("Running") is not True:
@@ -492,6 +563,7 @@ class DockerSandbox:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(0.2)
         self._meta["mount"]["wait_s"] = round(time.monotonic() - t0, 3)
+        self._remove_token_files(self.dir / TOKEN_FILE)  # oneclient read it as it started; its bind outlives this copy
         self.watch_container("sidecar", names.sidecar)
         return share
 
@@ -706,19 +778,111 @@ class DockerSandbox:
         threading.Thread(target=loop, daemon=True, name=f"sample-{self.names.agent}").start()
 
     # ------------------------------------------------------------------------------------------------ the API
-    def exec(self, code: str, timeout_s: float) -> ExecResult:
+    def exec(self, code: str, timeout_s: float, *, record: bool = True) -> ExecResult:
         """Run Python source as the unprivileged user (see `CellRunner.run`), with the data gate's refusals that came
-        while it ran (`gate_refusals`)."""
+        while it ran (`gate_refusals`).
+
+        `record=False` makes it a step of the harness's own, a check before the agent's loop starts (O24), and it runs
+        only before the agent's run: it is refused once the run's start is marked or one of the agent's cells has begun,
+        since after the mark its requests would count as the agent's, and between cells it would take a cell's refusals
+        and kills. It runs the same way, as the agent's user in the agent's container, and is no cell of the agent's: it
+        is recorded under `harness_steps` with its exit status, its refusals and the host killer's kills it met, none
+        of which the agent's first cell takes. Its only time limit is the backstop `timeout` in the container
+        (`CAP_MARGIN_S` after `timeout_s`): the harness's timer, which would stop the agent's processes, is not started,
+        and no kill cause is read."""
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
-        res = self._cells.run(code, timeout_s)
-        lines = self._gate_log_lines()
-        if lines is None:  # unknown is never none
-            res.gate_refusals = (gatelog.UNREADABLE,)
-        else:
-            seen = gatelog.refusals(lines)
-            res.gate_refusals, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
+        self._enter(record)
+        try:
+            res = self._cells.run(code, timeout_s, record=record)
+            res.gate_refusals = self._new_refusals()
+            if not record:
+                self._record_step(res)
+        finally:
+            if not record:
+                with self._phase:
+                    self._steps_running -= 1
         return res
+
+    def _enter(self, record: bool) -> None:
+        """Say whose the code about to run is (O24): an agent's cell has begun once its `exec` is entered, and a harness
+        step runs only before that and before the mark. Both wait while a mark is being set."""
+        with self._phase:
+            if record:
+                self._agent_began = True
+                return
+            if "run_start" in self._meta or self._agent_began:
+                raise SandboxError(
+                    "a harness step runs only before the agent's run: its start is marked or a cell began"
+                )
+            self._steps_running += 1
+
+    def _new_refusals(self) -> tuple[str, ...]:
+        """The data gate's refusals since the last cell or step; an unreadable log stands for them, unknown never none."""
+        lines = self._gate_log_lines()
+        if lines is None:
+            return (gatelog.UNREADABLE,)
+        seen = gatelog.refusals(lines)
+        new, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
+        return new
+
+    def _record_step(self, res: ExecResult) -> None:
+        """A harness step's record (O24), with the host killer's kills it met, read now so no cell of the agent's takes
+        them (None when its journal could not be read)."""
+        steps = self._meta.setdefault("harness_steps", [])
+        steps.append(
+            {
+                "step": len(steps) + 1,
+                "status": res.status,
+                "exit_code": res.exit_code if res.status == RAN else None,
+                "duration_s": res.duration_s,
+                "timed_out": res.timed_out,
+                "gate_refusals": list(res.gate_refusals),
+                "earlyoom_kills": self._cells.step_earlyoom(),
+            }
+        )
+
+    def mark_run_start(self) -> dict[str, Any]:
+        """Mark where the agent's run begins (O24): the executor calls this once, after its own steps (`exec(...,
+        record=False)`) have returned and before the agent's loop starts. A REST data path's gate is signalled (SIGUSR1)
+        and writes the mark in its own log, naming each request it had begun and not yet logged; the mark is read back
+        before this returns, and an agent's cell entered meanwhile waits until it has, so no request of the agent's can
+        come before it. The count of the bytes served then takes only the answers after it, and counts those before it
+        apart (`served_bytes`). Without a gate nothing is signalled. Returns what the mark found, kept as
+        `metadata()["run_start"]`: `gate`, and with a gate `signalled` and `confirmed`. A mark not confirmed leaves the
+        count unknown (`run_start_unconfirmed`); the executor decides whether its run goes on. Refused once an agent's
+        cell has begun (its `exec` entered, not ended), while a harness step runs, once the gate was stopped, and a
+        second time."""
+        with self._phase:  # held to the end: a cell entered meanwhile starts after the mark is in the log
+            if self._cells is None or self._stopped:
+                raise SandboxError("the sandbox is not running")
+            if "run_start" in self._meta:
+                raise SandboxError("the run's start is already marked")
+            if self._agent_began:
+                raise SandboxError("the run's start must be marked before the agent's first cell begins")
+            if self._steps_running:
+                raise SandboxError("the run's start cannot be marked while a harness step runs")
+            if "gate_stop" in self._meta:
+                raise SandboxError("the run's start cannot be marked after the collection stopped the gate")
+            return self._mark()
+
+    def _mark(self) -> dict[str, Any]:
+        """Set the mark (`mark_run_start`, whose lock the caller holds)."""
+        if self.spec.mode is not DataPathMode.REST:
+            self._meta["run_start"] = {"gate": False}
+            return dict(self._meta["run_start"])
+        note = self._meta["run_start"] = {"gate": True, "signalled": False, "confirmed": False}
+        r = self.host.docker("kill", "-s", "USR1", self.names.gate, check=False, timeout=30)
+        note["signalled"] = r.returncode == 0
+        for _ in range(RUN_START_POLLS if note["signalled"] else 0):
+            lines = self._gate_log_lines()
+            if lines is not None and gatelog.run_start_marks(lines):
+                note["confirmed"] = True
+                break
+            self._sleep(0.1)
+        if not note["confirmed"]:
+            log.error("the gate's mark of the run's start was not read back (signalled: %s)", note["signalled"])
+        return dict(note)
 
     def served_bytes(self) -> dict[str, Any]:
         """The bytes the agent read through its data path in this run (O22), as `gatelog.served` counts them, with the
@@ -727,8 +891,14 @@ class DockerSandbox:
         its reads go through oneclient and no gate sees them. No data path: zero, since there is nothing to read
         through. The tables of the files and directories served follow the counts: None when they are unknown, empty
         when they are zero. Every answer records the caps of the tables, `[sandbox.served_bytes]`. Unknown is never
-        zero."""
-        path, caps = {"data_path": self.spec.mode.value, "listing": self._meta.get("listing")}, self.s.served_caps
+        zero. `run_start_marked` says whether `mark_run_start` was called: with it, a REST count holds only the answers
+        after the mark, and those before it are `before_run_start` (O24)."""
+        path = {
+            "data_path": self.spec.mode.value,
+            "listing": self._meta.get("listing"),
+            "run_start_marked": "run_start" in self._meta,
+        }
+        caps = self.s.served_caps
         if self.spec.mode is DataPathMode.MOUNT:
             return path | gatelog.served_unknown(MOUNT_NOT_THROUGH_GATE, caps=caps)
         if self.spec.mode is DataPathMode.NONE:
@@ -817,8 +987,8 @@ class DockerSandbox:
         if self.spec.mode is DataPathMode.REST:
             self._stop_gate()
             if "served_bytes" not in self._meta:  # counted once (O22): a second collection finds the gate already gone
-                lines, caps = self._gate_log_lines(), self.s.served_caps
-                self._meta["served_bytes"] = gatelog.served(lines, self._meta["gate_stop"], caps)
+                lines, caps, mark = self._gate_log_lines(), self.s.served_caps, self._meta.get("run_start")
+                self._meta["served_bytes"] = gatelog.served(lines, self._meta["gate_stop"], caps, run_start=mark)
             log_copy = [("requests.jsonl", dest / "gate-requests.jsonl")]
             try:  # the gate's own file, in a directory only the gate writes: anything amiss there is not the agent's
                 if not copyout.copy_tree(self.host, self.dir / "gatelog", log_copy, max_bytes=None)["requests.jsonl"]:
@@ -970,6 +1140,9 @@ class DockerSandbox:
         complete = False
         self._sampler_stop.set()
         try:
+            # first, on every path, a held sandbox's and a kept run's included: a secret is never evidence (O05), and a
+            # step below that raises or hangs must find none left on disk
+            self._step(errors, self._remove_token_files)
             held: set[str] = set()
             if self.names.sidecar in self._containers:
                 # a oneclient sidecar was started (or tried), also after a failed start: the readers stop, the FUSE
@@ -1033,6 +1206,13 @@ class DockerSandbox:
             # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)
             errors.append(
                 "the run directory is left where it is: a mount under it may be live, or one of its own elsewhere"
+            )
+            return
+        if self.keep_evidence and self._token_files_left():  # a secret is never evidence: the run stays where it is
+            self._meta["evidence_kept"]["left_in_place"] = "a copy of the data-path token could not be removed"
+            errors.append(
+                "the run directory is left where it is: a copy of the data-path token in it could not be removed, "
+                "so it is not kept as evidence"
             )
             return
         if self.keep_evidence:  # the copy failed: the disks hold the only record of the run

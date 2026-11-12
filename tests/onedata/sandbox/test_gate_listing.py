@@ -332,11 +332,11 @@ def test_o21_a_page_that_holds_the_gates_token_refuses_the_listing_and_passes_no
 
 def test_o21_a_gate_given_a_listing_mode_it_does_not_know_refuses_to_start(tmp_path, monkeypatch):
     """O21: the mode comes from the gate's configuration; one it does not know stops it before it serves anything."""
-    config = tmp_path / "gate.json"
+    config, token_file = tmp_path / "gate.json", tmp_path / "gate-token"
+    token_file.write_text(GATE_TOKEN, encoding="utf-8")  # a token it has, so the mode alone refuses the start
     document = {"log": str(tmp_path / "r.jsonl"), "hosts": {}, "listen_port": 0, "listing": "everything"}
-    config.write_text(json.dumps(document), encoding="utf-8")
+    config.write_text(json.dumps({**document, "token_file": str(token_file)}), encoding="utf-8")
     monkeypatch.setattr("sys.argv", ["gate.py", str(config)])
-    monkeypatch.setenv(gate.TOKEN_ENV, GATE_TOKEN)
     gate.CFG.clear()
     with pytest.raises(SystemExit, match="listing mode"):
         gate.main()
@@ -422,5 +422,47 @@ def test_o22_the_bytes_served_are_what_the_client_received_in_either_listing_mod
         "listings_total": 1,
         "listings_cut": False,
         "caps": {"max_files": 1000, "max_directories": 1000, "max_ranges_per_file": 64},
+        "before_run_start": None,
         "unknown": [],
     }
+
+
+def test_o24_through_a_real_gate_the_count_takes_only_the_answers_after_its_run_start_mark(served):
+    """O24: the harness's lookup is answered and the gate marks the run's start at once, whether or not the lookup's
+    line is written yet: the mark names it when it is not. The count of the log then holds the agent's answers alone,
+    the lookup's apart, and only the agent's file has a row."""
+    data = bytes(range(256)) * 4
+    tree = {"data.bin": data, "seen.bin": bytes(50)}
+    world = served(MockOnedata(tree, space_name="invented-space", token=GATE_TOKEN), listing="paged")
+    file_id, seen_id = "f" + b"data.bin".hex(), "f" + b"seen.bin".hex()
+    status, looked = request(world, f"/api/v3/oneprovider/data/{seen_id}")  # the harness's check of the data path
+    assert status == 200
+    gate.mark_run_start()  # the executor's mark, as soon as its check returned
+    assert request(world, f"/api/v3/oneprovider/data/{file_id}/content") == (200, data)  # the agent's read
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:  # every answer's line, and no handler between its line and its count
+        lines = world.log.read_text().splitlines()
+        if sum('"method"' in x for x in lines) == 2 and not gate._LIVE:
+            break
+        time.sleep(0.05)
+    gate.teardown()
+    stopped = {
+        "signalled": True,
+        "exit_code": 0,
+        "output_read": True,
+        "log_write_failed": False,
+        "teardown_incomplete": False,
+    }
+    marked = {"gate": True, "signalled": True, "confirmed": True}
+    got = gatelog.served(world.log.read_text().splitlines(), stopped, run_start=marked)
+    assert got["unknown"] == []
+    assert (got["served_bytes"], got["content_bytes"], got["other_bytes"]) == (len(data), len(data), 0)
+    assert got["before_run_start"] == {
+        "requests": 1,
+        "served_bytes": len(looked),
+        "content_bytes": 0,
+        "listing_bytes": 0,
+        "other_bytes": len(looked),
+        "gate_answer_bytes": 0,
+    }
+    assert set(got["files"]) == {file_id}

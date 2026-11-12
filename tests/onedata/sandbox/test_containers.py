@@ -1,14 +1,20 @@
 """The docker arguments of each container: read-only everywhere, images by id, no secret in an argument (O05, O13)."""
 
+import dataclasses
+import subprocess
 from pathlib import Path
 
 import pytest
+from sandbox_support import FED_LOCAL, FED_NETWORK
 
 from expcore_onedata.sandbox import containers as C
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.sandbox.settings import FederationNetwork
 from expcore_onedata.tls import TlsSettings
 
 LABELS = ["--label", "org.test.sandbox=1"]
+TOKEN_FILE = Path("/w/secrets/oneclient-token")  # where a run keeps the mount's token for its sidecar
+GATE_TOKEN_FILE = Path("/w/secrets/gate-token")  # and the REST path's for its gate
 
 
 @pytest.fixture
@@ -79,24 +85,56 @@ def test_o05_the_mount_is_bound_into_the_agent_read_only(s, names):
     assert env == {}
 
 
-def test_o05_the_sidecar_is_the_only_container_with_fuse_and_the_token_goes_by_name(s, names):
-    """O05: The sidecar is the only container with fuse and the token goes by name."""
-    args = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test")
+def test_o05_the_sidecar_is_the_only_container_with_fuse_and_takes_its_token_from_a_read_only_file(s, names):
+    """O05: the sidecar is the only container with FUSE. Its token is never given to docker: not as an argument and
+    not as an environment variable (`-e NAME`, whose value docker keeps in the container's configuration, where
+    `docker inspect` shows it to anyone with access to the daemon). It is a file bound into the sidecar read-only,
+    which the sidecar's shell reads into oneclient's environment as it starts oneclient."""
+    token_file = Path("/w/secrets/oneclient-token")
+    args = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=token_file)
     assert ("--device", "/dev/fuse") in pairs(args)
-    assert ("-e", C.ENV_ACCESS_TOKEN) in pairs(args)  # the name only: the value travels in the environment
+    assert C.ENV_ACCESS_TOKEN not in [v for f, v in pairs(args) if f == "-e"]
+    assert [a for a in args if C.ENV_ACCESS_TOKEN in a] == [C.SIDECAR_START]  # named only where the file is read
+    assert f"{token_file}:{C.SIDECAR_TOKEN_PATH}:ro" in [v for f, v in pairs(args) if f == "-v"]
+    assert dict(pairs(args))["--entrypoint"] == "sh"
+    script = args[args.index("-c") + 1]
+    assert f'{C.ENV_ACCESS_TOKEN}="$(cat {C.SIDECAR_TOKEN_PATH})"' in script  # read from the file, in the container
+    assert script.endswith('exec env "$@"')  # then oneclient, as `sidecar_command` says
     assert "ro,allow_other" in args
     assert s.oneclient.id in args
     assert "type=bind,src=/w/mount,dst=/mnt/oneclient,bind-propagation=rshared" in args
 
 
-def test_o05_the_gate_takes_the_token_by_name_and_it_is_the_name_the_gate_reads(s, names):
-    """O05: the gate holds the token: it is named with -e and its value travels in the docker client's environment."""
-    from expcore_onedata.sandbox import gate
+def test_o05_the_sidecars_shell_hands_the_files_token_to_oneclient_and_refuses_an_empty_one(tmp_path):
+    """O05: run by a real shell, the sidecar's start script puts the token file's value, and nothing else, into the
+    environment of the program `env` starts, with every argument passed through as given (spaces included), and
+    exits without starting it when the file is empty or missing."""
+    token = tmp_path / "token"
+    script = C.SIDECAR_START.replace(C.SIDECAR_TOKEN_PATH, str(token))
+    show = ["sh", "-c", f'printf "%s|%s|%s" "${C.ENV_ACCESS_TOKEN}" "$1" "$2"', "show", "a b", "-u"]
 
-    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id)
-    assert ("-e", C.ENV_GATE_TOKEN) in pairs(args)
-    assert C.ENV_GATE_TOKEN == gate.TOKEN_ENV
-    assert not [a for a in args if "=" in a and a.startswith(C.ENV_GATE_TOKEN)]  # never NAME=value
+    def run():
+        return subprocess.run(
+            ["sh", "-c", script, C.SIDECAR_SHELL_NAME, *show], capture_output=True, text=True, check=False, timeout=30
+        )
+
+    token.write_text("tok-invented-0123", encoding="utf-8")
+    done = run()
+    assert (done.returncode, done.stdout) == (0, "tok-invented-0123|a b|-u")
+    token.write_text("", encoding="utf-8")
+    assert run().returncode == 97
+    token.unlink()
+    assert run().returncode == 97
+
+
+def test_o05_the_gate_takes_its_token_from_a_read_only_file_and_docker_is_given_no_environment_for_it(s, names):
+    """O05: the gate holds the token, from a file bound into its container alone, read-only, at the path the gate's
+    configuration names; docker is given no environment variable at all (`-e NAME` would keep the value in the
+    container's configuration, where `docker inspect` shows it)."""
+    gate_token = Path("/w/run-secrets/gate-token")
+    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id, token_file=gate_token)
+    assert "-e" not in args
+    assert f"{gate_token}:{C.GATE_TOKEN_PATH}:ro" in [v for f, v in pairs(args) if f == "-v"]
 
 
 def test_the_sidecar_command_sets_tls_from_the_settings_alone(s):
@@ -160,7 +198,7 @@ def test_a_rest_agent_without_a_gate_is_refused(s, names):
 
 def test_o05_the_gate_runs_read_only_with_one_capability_and_its_files_mounted_read_only(s, names):
     """O05: The gate runs read only with one capability and its files mounted read only."""
-    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id)
+    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id, token_file=GATE_TOKEN_FILE)
     assert "--read-only" in args
     assert ("--cap-add", "NET_BIND_SERVICE") in pairs(args)
     assert ("--cap-drop", "ALL") in pairs(args)
@@ -179,6 +217,45 @@ def test_the_limits_come_from_the_settings(s, names):
     assert flags["--pids-limit"] == str(s.limits.pids)
     assert flags["--ulimit"] == f"nofile={s.limits.nofile}:{s.limits.nofile}"
     assert flags["--user"] == f"{s.agent_uid}:{s.agent_uid}"
+
+
+def test_o03_with_a_federation_network_the_sidecar_starts_on_it_and_dials_the_local_providers_name(s, names):
+    """O03: with `[sandbox.federation]` the sidecar starts on the federation's own network, never also on the
+    default bridge, and dials the local provider by its name there, not the host of the URL the host reaches.
+    Without the table it starts as it always has: on the default bridge, dialling the URL's host."""
+    federated = dataclasses.replace(s, federation=FederationNetwork(FED_NETWORK, FED_LOCAL))
+    args = C.sidecar_run_args(
+        federated, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE
+    )
+    assert [v for f, v in pairs(args) if f == "--network"] == [FED_NETWORK]
+    assert args[args.index("-H") + 1] == FED_LOCAL
+    assert "p.test" not in args
+    plain = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE)
+    assert [v for f, v in pairs(plain) if f == "--network"] == ["bridge"]
+    assert plain[plain.index("-H") + 1] == "p.test"
+
+
+@pytest.mark.parametrize("mode", list(DataPathMode))
+def test_o05_the_federation_network_is_the_sidecars_alone_and_the_agent_never_joins_it(s, names, mode):
+    """O05: the sidecar is on the federation network and the agent is not: it stays on its own internal network in
+    every data path, so it reaches the federation through the mount and nothing else."""
+    federated = dataclasses.replace(s, federation=FederationNetwork(FED_NETWORK, FED_LOCAL))
+    sidecar = C.sidecar_run_args(
+        federated, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE
+    )
+    assert dict(pairs(sidecar))["--network"] == FED_NETWORK
+    extra = {
+        DataPathMode.REST: {"gate_ip": "10.1.0.2", "gate_hosts": ["h.test"], "ca": Path("/w/ca.pem"), "zone_host": "z"},
+        DataPathMode.MOUNT: {"share": Path("/w/mount")},
+        DataPathMode.NONE: {},
+    }[mode]
+    args, _ = C.agent_run_args(
+        federated, names, LABELS, image_id=s.agent.id, mode=mode, work=Path("/w/work"),
+        **({"share": None, "gate_ip": None, "gate_hosts": [], "ca": None, "trust_bundles": {}, "zone_host": None}
+           | extra),
+    )  # fmt: skip
+    assert [v for f, v in pairs(args) if f == "--network"] == [names.net]
+    assert not [a for a in args if FED_NETWORK in a]
 
 
 def test_the_oneclient_log_directory_is_the_last_one_given():
