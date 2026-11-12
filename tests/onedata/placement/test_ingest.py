@@ -476,17 +476,65 @@ def test_o27_an_absent_baseline_file_with_the_plans_bytes_is_kept_when_its_stage
     assert not [call for call in fake.provider_calls if call[1] == "DELETE"]
 
 
-def test_o27_an_arrival_the_ingest_made_is_removed_though_its_staged_copy_is_damaged(make, fake, ticker, tmp_path):
-    """O27: the note the ingest wrote is its own, whatever became of the copy it came from, so the finish removes it and
-    the dataset is back at its baseline; only the plan's bytes found at a path need the copy to be sound first."""
+def test_o27_an_arrival_the_ingest_made_is_kept_when_its_staged_copy_is_damaged_and_the_restore_fails(
+    make, fake, ticker, tmp_path
+):
+    """O27 with O09: the note the ingest wrote is its own, but the copy it came from is damaged during the run, so the
+    finish cannot show that nothing the study keeps is lost by removing it. The file stays, the restore of it fails, and
+    no delete is sent: a failed restore is infrastructure, which is recoverable, where a removal would lose data."""
     ingest = make(NOTE_ROW)
     ingest.start({})
     run_to(ingest, ticker, ticker.now, 100, 1)
     assert content(fake, NOTE_PATH) == NOTE
     (tmp_path / "staged" / "note.txt").write_bytes(NOTE[:-1] + b"?")
     snapshot = ingest.finish()
-    assert content(fake, NOTE_PATH) is None
-    assert snapshot["restore"]["ok"] is True
+    assert content(fake, NOTE_PATH) == NOTE
+    assert snapshot["restore"]["ok"] is False
+    assert not [call for call in fake.provider_calls if call[1] == "DELETE"]
+
+
+def test_o27_a_damaged_copy_fails_the_restore_of_its_arrival_alone_and_the_attempt_becomes_infrastructure(
+    make, fake, ticker, tmp_path
+):
+    """O27 with C31: the note arrived during the run and its staged copy is damaged before the finish. Its restore
+    fails and the note stays, the day, listed after it, is still written back from its sound copy, and the post-run
+    check refuses the attempt as `ingest_failure` naming the restore and the note, as for any failed restore."""
+    ingest = make(NOTE_ROW, DAY_ROW)
+    ingest.start({})
+    run_to(ingest, ticker, ticker.now, 300, 2)
+    (tmp_path / "staged" / "note.txt").write_bytes(NOTE[:-1] + b"?")
+    snapshot = ingest.finish()
+    restore = snapshot["restore"]
+    assert (restore["files"]["note"]["ok"], restore["files"]["day-13"]["ok"]) == (False, True)
+    assert "staged source" in restore["files"]["note"]["detail"]
+    assert (content(fake, NOTE_PATH), content(fake, DAY_PATH)) == (NOTE, DAY)
+    with pytest.raises(InfraError, match="restore") as raised:
+        ingest.check()
+    assert raised.value.kind == INGEST_FAILURE
+    assert "note" in raised.value.detail
+    assert not is_treatable(raised.value.kind)
+
+
+def test_o27_a_complete_file_whose_copy_is_damaged_after_the_start_restored_it_is_kept_by_the_start(
+    make, fake, tmp_path, monkeypatch
+):
+    """O27 with O09: the start's removal of a complete file checks its staged copy itself, not only the restore before
+    it. The copy is damaged between the two, so the file the restore just wrote back stays, nothing is deleted, and the
+    start refuses as an ingest failure."""
+    ingest = make(DAY_ROW)
+    restore_all = ingest._base.restore_all
+
+    def restore_then_damage(phase):
+        restored = restore_all(phase)
+        (tmp_path / "staged" / "day-13.csv").write_bytes(DAY[:-1] + b"?")
+        return restored
+
+    monkeypatch.setattr(ingest._base, "restore_all", restore_then_damage)
+    with pytest.raises(InfraError, match="staged source") as raised:
+        ingest.start({})
+    assert raised.value.kind == INGEST_FAILURE
+    assert content(fake, DAY_PATH) == DAY
+    assert not [call for call in fake.provider_calls if call[1] == "DELETE"]
 
 
 KEPT_ROW = {"label": "day-12", "path": KEPT_PATH, "source": "day-12.csv", "at_s": 300, "baseline": "complete"}

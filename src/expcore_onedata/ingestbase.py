@@ -3,10 +3,14 @@
 it, and confirming each change on every provider, every file id recorded (O27). `ingest.py` drives it.
 
 **What may be removed** (the data a study keeps is never lost): a file at a planned path is removed only when the
-provisioner's change log says the ingest made it, or when its bytes read back are those of its staged source, which has
-just been checked against the plan's hash. Anything else at a planned path is refused, before anything is sent. A
-"complete" file is written back from its staged source by `Provisioner.upload`, which resumes or rewrites only a file
-the ingest made. No directory is created or removed: a planned file's directory must exist.
+provisioner's change log says the ingest made it, or when its bytes read back are those of its staged source. Either
+way its staged source is checked against the plan's hash first, in every removal, the ingest's own files included
+(`remove`): the copy the baseline is restored from may be the last good one of the bytes, whatever made the file. A
+damaged copy leaves the file in place and fails the restore of that file alone, an infrastructure failure, which is
+recoverable, where the removal could lose data without a trace. Anything else at a planned path is refused, before
+anything is sent. A "complete" file is written back from its staged source, checked first, by `Provisioner.upload`,
+which resumes or rewrites only a file the ingest made. No directory is created or removed: a planned file's directory
+must exist.
 
 **Every removal is confirmed on every provider of the space** (`answered_absent` on consecutive polls, bounded by
 `settle_timeout_s`), and a name removed earlier, by this run or a crashed one, is written again only once every
@@ -193,9 +197,12 @@ class Baseline:
         if not gone.converged:
             raise ProvisionError(f"{self._p.where}{label}: a removed file still answered on a provider after the bound")
 
-    def remove(self, label: str, entry: Entry, phase: str) -> None:
-        """Delete a file through the gate, the intent journalled first, and wait until every provider answers it
-        absent."""
+    def remove(self, planned: PlannedFile, entry: Entry, phase: str) -> None:
+        """Delete a planned file's entry through the gate and wait until every provider answers it absent. Its staged
+        copy is checked first, whoever made the entry, so a damaged copy leaves the file in place (a ProvisionError);
+        then the intent is journalled."""
+        self.check_source(planned)
+        label = planned.label
         self.journal(entry="intent", label=label, action="remove", file_id=entry.file_id, phase=phase)
         try:
             self._p.mutate("DELETE", f"/data/{plain(entry.file_id)}", provider=self.holder)
@@ -211,7 +218,7 @@ class Baseline:
         for planned in self._plan.files:
             if planned.baseline == "complete":
                 found = self._p.resolve(planned.path)
-                self.remove(planned.label, found, "start")
+                self.remove(planned, found, "start")
                 removed[planned.label] = found.file_id
         return removed
 
@@ -243,7 +250,9 @@ class Baseline:
         return self._p.read_file(found.file_id, size=planned.size).sha256 == planned.sha256
 
     def restore_file(self, planned: PlannedFile, phase: str) -> dict[str, Any]:
-        """Bring one file to its baseline and verify it; return what was done and the id it ends with."""
+        """Bring one file to its baseline and verify it; return what was done and the id it ends with. Nothing is
+        removed or rewritten before the file's staged copy is checked, the ingest's own file included (`remove`,
+        `_write_back`): a damaged copy fails this file's restore, which leaves the file in place."""
         before = self.entry(planned.path)
         if before is None and planned.label in self.last_id:  # a name removed earlier, perhaps by a crashed run
             self.await_absent(planned.label, self.last_id[planned.label])
@@ -251,14 +260,12 @@ class Baseline:
             return self._write_back(planned, phase, before)
         if before is None:
             return {"action": "absent", "file_id": None}
-        if not self._made_by_ingest(before):  # found by its bytes, it may be the last good copy of them
-            self.check_source(planned)
         if not self._removable(planned, before):
             raise ProvisionError(
                 f"{self._p.where}{planned.label}: a file at its path is neither the ingest's nor its staged source; "
                 "nothing was removed"
             )
-        self.remove(planned.label, before, phase)
+        self.remove(planned, before, phase)
         return {"action": "removed", "file_id": None}
 
     def upload(self, planned: PlannedFile, phase: str, old: str | None, *, stop: int | None = None) -> Upload:
