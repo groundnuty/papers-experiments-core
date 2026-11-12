@@ -28,7 +28,7 @@ from expcore.tools.manifest import FrozenManifest, ManifestError, live_manifest
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.pin import PinError
-from expcore_onedata.testing import BASELINE, CEILING_S, MANAGE, NOW, TOOL_SERVER_ARGS, write_platform
+from expcore_onedata.testing import ALPHA_ID, BASELINE, CEILING_S, MANAGE, NOW, TOOL_SERVER_ARGS, write_platform
 from expcore_onedata.testing import DATA_PATH_USER as DATA
 from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
 from expcore_onedata.tls import CA_BUNDLE_ENV
@@ -531,6 +531,149 @@ def test_c01_a_rights_change_at_teardown_is_set_aside_and_never_scored_under_a_c
     assert finish(caught.value, turns=3) == ("pending", ("infra_fail", 1, 0, "tool_plane_integrity"))
     server_down = InfraError("knowledge", "the tool server went down")
     assert finish(server_down, turns=3) == ("done", ("done", 0, 1, "knowledge"))  # the server failing is still scored
+
+
+OUTSIDE = "sp-outside-0009"  # a space Onezone knows that the configuration does not declare
+JOINED = "the token's scope differs from the plane's spaces: has also 1 space the configuration does not declare"
+ADMIN = "the principal holds Onezone admin privileges: oz_spaces_add_relationships"
+CLUSTER = "the principal is an effective member of 1 cluster"
+PROVIDER_CLUSTER = "cl-provider-0001"  # the id of a provider's cluster, which no message may hold
+CLUSTERS = "/api/v3/onezone/user/effective_clusters"
+
+
+def manage_token(issuer, config, fake):
+    """A writing condition's token, minted while its user is a member of the plane's space alone and no admin."""
+    fake.grant(TOOLS.user_id, MANAGE)
+    return issuer.mint(tool_server_spec(config.space.id, config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+
+
+def joins_outside(fake):
+    return lambda: fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
+
+
+def becomes_admin(fake):
+    return lambda: fake.admin_privileges.update({TOOLS.user_id: ["oz_spaces_add_relationships"]})
+
+
+def joins_a_cluster(fake):
+    return lambda: fake.clusters.update({TOOLS.user_id: [PROVIDER_CLUSTER]})
+
+
+BOUNDARY_CHANGES = [(joins_outside, JOINED), (becomes_admin, ADMIN), (joins_a_cluster, CLUSTER)]
+BOUNDARY_IDS = ["joined an outside space", "became an admin", "joined a cluster"]
+
+
+@pytest.mark.parametrize(("change", "reason"), BOUNDARY_CHANGES, ids=BOUNDARY_IDS)
+def test_o09_a_writing_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_starts_no_server(
+    change, reason, world, fake, tmp_path
+):
+    """O09: a writing token is bounded by its user alone, so the launch reads its scope, the user's admin privileges and
+    the clusters the token acts in again: a user who became a member of a space outside the plane, or of a provider's
+    cluster, or an admin of Onezone, after the mint starts nothing, and the refusal names no space and no cluster."""
+    config, issuer, launcher = world
+    token = manage_token(issuer, config, fake)
+    change(fake)()
+    with pytest.raises(InfraError, match=re.escape(f"failed its check before the start: {reason}")) as caught:
+        start(launcher, RecordingContext(), "manage", token, tmp_path)
+    assert caught.value.kind == "tool_plane_integrity"
+    assert OUTSIDE not in str(caught.value)
+    assert PROVIDER_CLUSTER not in str(caught.value)
+    assert token.reveal() not in str(caught.value)
+    assert not (tmp_path / "seen.json").exists()
+
+
+@pytest.mark.parametrize(("change", "reason"), BOUNDARY_CHANGES, ids=BOUNDARY_IDS)
+def test_o09_a_writing_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_during_the_run_is_set_aside(
+    change, reason, world, fake, events
+):
+    """O09: the same reads at teardown find a boundary that changed while the server ran; the run is set aside as
+    infrastructure of the tool-plane kind. Its declared space rights did not change, so no rights event is recorded."""
+    config, issuer, launcher = world
+    token = manage_token(issuer, config, fake)
+    with pytest.raises(InfraError, match=re.escape(f"failed its check at teardown: {reason}")) as caught:
+        run_with(launcher, RecordingContext(), "manage", token, change(fake))
+    assert caught.value.kind == "tool_plane_integrity"
+    assert OUTSIDE not in str(caught.value)
+    assert PROVIDER_CLUSTER not in str(caught.value)
+    assert events == []
+
+
+def test_o09_a_writing_plane_is_read_for_its_scope_admin_privileges_and_clusters_before_the_spawn_and_after_the_stop(
+    world, fake, tmp_path
+):
+    """O09: a writing condition's launch adds three reads to the read-only plane's three: the user's admin privileges,
+    as an admin read, the token's scope, which Onezone answers to the token in the body and no header, and the clusters
+    the token acts in, which the token reads itself, so it is the credential of that request and the admin is not."""
+    config, issuer, launcher = world
+    token = manage_token(issuer, config, fake)
+    before = len(fake.requests)
+    start(launcher, RecordingContext(), "manage", token, tmp_path)
+    one_check = [
+        ("POST", "/api/v3/onezone/tokens/examine", fake.ADMIN),
+        ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/users/{TOOLS.user_id}/privileges", fake.ADMIN),
+        ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/effective_users/{TOOLS.user_id}/privileges", fake.ADMIN),
+        ("GET", f"/api/v3/onezone/users/{TOOLS.user_id}/effective_privileges", fake.ADMIN),
+        ("POST", "/api/v3/onezone/tokens/infer_access_token_scope", None),
+        ("GET", CLUSTERS, token.reveal()),
+    ]
+    assert [(r.method, r.path, r.token) for r in fake.requests[before:]] == one_check * 2
+
+
+def test_o09_a_read_only_plane_is_read_for_neither_its_scope_nor_admin_privileges_nor_clusters(world, fake, tmp_path):
+    """O09: a read-only condition's token is kept to the plane by its data.path caveat, so its launch and teardown make
+    none of the three reads, with an outside space, an admin privilege and a cluster all present."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
+    fake.admin_privileges[TOOLS.user_id] = ["oz_spaces_add_relationships"]
+    fake.clusters[TOOLS.user_id] = [PROVIDER_CLUSTER]
+    before = len(fake.requests)
+    start(launcher, RecordingContext(), "read", token, tmp_path)
+    after = [r.path for r in fake.requests[before:]]
+    assert after
+    assert not [
+        p for p in after if p.endswith(("/effective_privileges", "/infer_access_token_scope", "/effective_clusters"))
+    ]
+
+
+def admin_read_fails(fake, monkeypatch):
+    reads = fake._admin_route
+
+    def failing(method, route, sent):
+        return fake._error(503, "x") if route.endswith("/effective_privileges") else reads(method, route, sent)
+
+    return lambda: monkeypatch.setattr(fake, "_admin_route", failing)
+
+
+@pytest.mark.parametrize(
+    ("bend", "words"),
+    [
+        (lambda fake, monkeypatch: lambda: setattr(fake, "scope_status", 503), "could not be reached"),
+        (admin_read_fails, "could not be reached"),
+        (lambda fake, monkeypatch: lambda: setattr(fake, "scope_hook", lambda a: {}), "failed its check"),
+        (lambda fake, monkeypatch: lambda: setattr(fake, "clusters_status", 503), "could not be reached"),
+        (lambda fake, monkeypatch: lambda: setattr(fake, "clusters_hook", lambda a: {}), "failed its check"),
+    ],
+    ids=["scope outage", "admin read outage", "scope unreadable", "clusters outage", "clusters unreadable"],
+)
+@pytest.mark.parametrize("when", ["before the start", "at teardown"])
+def test_o05_a_writing_planes_scope_admin_or_clusters_read_that_fails_is_an_outage_never_a_pass(
+    bend, words, when, world, fake, tmp_path, monkeypatch, events
+):
+    """O05: unknown is not a pass. An outage of Onezone while the scope, the admin privileges or the clusters are
+    read, at launch or at teardown, sets the run aside in the outage's words; an unreadable answer fails the check."""
+    config, issuer, launcher = world
+    token = manage_token(issuer, config, fake)
+    if when == "before the start":
+        bend(fake, monkeypatch)()
+        run = lambda: start(launcher, RecordingContext(), "manage", token, tmp_path)  # noqa: E731
+    else:
+        run = lambda: run_with(launcher, RecordingContext(), "manage", token, bend(fake, monkeypatch))  # noqa: E731
+    with pytest.raises(InfraError, match=re.escape(f"{words} {when}")) as caught:
+        run()
+    assert caught.value.kind == "tool_plane_integrity"
+    assert token.reveal() not in str(caught.value)
+    assert events == []
 
 
 def test_a_federation_that_cannot_examine_the_token_is_infrastructure_of_kind_tool_plane_integrity(

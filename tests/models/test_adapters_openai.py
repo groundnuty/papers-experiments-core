@@ -362,6 +362,23 @@ def test_b01_transient_errors_are_retried_and_each_retry_is_recorded_on_the_turn
     assert [e["retry"] for e in info["retry_events"]] == [1, 2]
 
 
+def test_c31_the_backend_counts_every_request_it_started_resends_included(
+    make_spec, limits, completion, fake_client, make_error
+):
+    """C31: `requests_sent` is what the scheduler reads to tell an attempt that sent nothing: none before a step, and a
+    resend after a failure counts as another request."""
+
+    async def sleep(seconds):
+        pass
+
+    client = fake_client(make_error(429, headers={"retry-after": "1"}), completion("finally"))
+    backend = adapter(make_spec(), limits, client, sleep=sleep)
+    backend.begin("", "go", [])
+    assert backend.requests_sent == 0
+    step(backend)
+    assert backend.requests_sent == 2
+
+
 def test_b02_retries_that_run_out_end_as_infrastructure_endpoint(make_spec, limits, fake_client, make_error):
     """B02: N+1 transient errors raise InfraError endpoint, which the loop records unscored."""
     from expcore.config.models import ClientSettings

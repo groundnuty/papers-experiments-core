@@ -346,3 +346,12 @@ class BudgetHold(InfraError):
 
     def __init__(self, detail: str):
         super().__init__(BUDGET_HOLD, detail)
+
+
+class FirstTurnRefusal(InfraError):
+    """An instrument refused the attempt at the agent's first turn (C31), before the loop sent its first request.
+
+    An infrastructure failure of the kind the instrument refused with, which is never one a condition can declare as
+    its treatment. Raised by `first_turn_instruments`; the scheduler reads it as the sign that the attempt sent
+    nothing, so it costs no tokens, unless its backend says it sent a request after all.
+    """

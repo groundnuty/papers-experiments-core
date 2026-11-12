@@ -77,6 +77,9 @@ class RunRecord:
     scores: dict[str, Any] = field(default_factory=dict)
     redacted_paths: list[str] = field(default_factory=list)
     treatment_targets: dict[str, str] = field(default_factory=dict)
+    # Version 3, optional: the instrument that refused the attempt after the run, `{"namespace", "infra_kind",
+    # "detail"}` (C31). None when none did; it is then left out of the file, never written as a null.
+    instrument_refusal: dict[str, Any] | None = None
     schema_version: str = CURRENT
 
     @property
@@ -89,8 +92,11 @@ class RunRecord:
         """Tell whether the attempt is set aside and re-run instead of scored: a partial record (R09).
 
         An infrastructure outcome of a kind the attempt's condition declares as its treatment is a scored final
-        attempt, so it is not set aside: the record carries the declared kinds and the flag, and the store agrees.
+        attempt, so it is not set aside: the record carries the declared kinds and the flag, and the store agrees. An
+        attempt an instrument refused after the run is set aside whatever its outcome was (C31).
         """
+        if self.instrument_refusal is not None:
+            return True
         return self.outcome["name"] in SET_ASIDE_OUTCOMES and not self.outcome["treatment"]
 
     def with_instrument(self, namespace: str, data: dict[str, Any]) -> "RunRecord":
@@ -106,13 +112,18 @@ class RunRecord:
             return record
         return dataclasses.replace(record, outcome={**record.outcome, "treatment": flag})
 
+    def with_instrument_refusal(self, refusal: dict[str, Any]) -> "RunRecord":
+        """Return a copy that records the instrument that refused the attempt: `namespace`, `infra_kind`, `detail` (C31)."""
+        return dataclasses.replace(self, instrument_refusal=dict(refusal))
+
     def to_json(self, schemas: tuple[SchemaVersion, ...] = SCHEMAS) -> dict[str, Any]:
         """Return the record as a dictionary in file order, without the fields a later schema added, and without an
         optional field that holds its default.
 
         A later-added field is dropped when it holds its default; one that holds data cannot be written into a record
-        of an earlier version, and raises. A field the record's own version marks optional (`treatment_targets`, from
-        version 3) is absent when it holds its default, "not recorded", never written as an empty value.
+        of an earlier version, and raises. A field the record's own version marks optional (`treatment_targets` and
+        `instrument_refusal`, from version 3) is absent when it holds its default, "not recorded", never written as an
+        empty value or a null.
         """
         data = dataclasses.asdict(self)
         version = data.pop("schema_version")

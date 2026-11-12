@@ -11,7 +11,7 @@ never from an exit code. Their categories map to the core's vocabulary of infras
   `unattributed_kill`, retried within the attempt limit.
 
 Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). The platform's own kinds are registered here,
-when this module is first imported. Two are the sandbox's, and neither is treatable:
+when this module is first imported. Three are the sandbox's and the ingest's, and none is treatable:
 
 - `data_gate_integrity`: the data gate's refusal of an answer it cannot pass to the agent (a redirect, an encoded body,
   its token in a header or a body, an answer larger than it checks whole, a complete listing larger than it serves
@@ -26,6 +26,10 @@ when this module is first imported. Two are the sandbox's, and neither is treata
   about the agent or the manipulation: set aside and run again within the attempt limit, and no condition may declare
   it (O19). An object the agent made in its outputs (a link, a special file, more than its disk holds) is not this
   kind: it is the agent's own doing, recorded for the study's scorers, and the attempt is not set aside.
+- `ingest_failure`: a progressive ingest (`expcore_onedata.ingest`) could not do what its plan declares: set the start
+  state, write or confirm an arrival, or restore the dataset's baseline after the run (O27). Data missing or partial
+  because the plan has not finished is the condition's manipulation and the agent's outcome, never this kind; an
+  ingest that fails on its own says nothing about the agent, so the run is set aside and no condition may declare it.
 
 This is the one module of the platform layer that registers kinds, so a study names it alone in `[study] platforms` to
 make every kind the layer raises known before its conditions are validated, and `check` imports it alone for a record
@@ -62,6 +66,15 @@ PROVIDER_OUTAGE = "provider_outage"
 INJECTOR_FAILURE = "injector_failure"
 register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable")
 register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
+
+INGEST_FAILURE = "ingest_failure"
+register_infra_kind(
+    INGEST_FAILURE,
+    "a progressive ingest failed on its own (its start state, a write or confirmation of an arrival, or the restore "
+    "of the dataset's baseline): data the plan had not delivered yet is the manipulation, but a plan the harness could "
+    "not carry out says nothing about the agent",
+    treatable=False,
+)
 
 KIND_OF_CATEGORY: Mapping[str, str | None] = {
     "agent": None,
@@ -128,6 +141,7 @@ def collection_error(what: str, reason: str) -> InfraError:
 
 __all__ = [
     "DATA_GATE_INTEGRITY",
+    "INGEST_FAILURE",
     "INJECTOR_FAILURE",
     "KIND_OF_CATEGORY",
     "OUTPUT_COLLECTION",

@@ -19,7 +19,8 @@ The order is fixed, and each step is decided by what a kill at that point must l
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`; with a budget,
    under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26);
-6. the post-run health check and the served-identity check, which can turn the result into infrastructure (C11, C16);
+6. the post-run health check, an instrument's refusal and the served-identity check, which can turn the result into
+   infrastructure (C11, C31, C16);
 7. the **outcome marker**, then the **store's record** of the result, in this order, with the unit's and the
    harness-error bookkeeping in the same transaction as the result (C04, C15, C10), so a kill cannot keep the result and
    lose the stop or the failure it caused; the lease ends after it. A result committed from its marker at the next
@@ -53,6 +54,7 @@ from expcore.campaign.executor import (
     RunRequest,
     failure_result,
     result_from_record,
+    sent_no_request,
 )
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.harness_stop import HarnessStops, kind_of
@@ -334,6 +336,7 @@ class AttemptRunner:
                 wall_s=p.monotonic() - started,
                 treatment_kinds=kinds,
                 treatment_targets=targets,
+                sent_nothing=sent_no_request(error, backend),
             )
             if result.outcome.defect is not None:  # the attempt keeps the class and the stack hash; the log the rest
                 defects(error, result.outcome.defect)
@@ -370,6 +373,7 @@ class AttemptRunner:
                 p.store.event(p.stamp(), "post_run_check_failed", model, f"{key}: {health.detail}; the outcome stands")
         if record is None:
             return result, False
+        result = self._judge_instruments(result, record, model, key)
         change = p.identities.check(model, record.transcript, p.stamp(), run_key=key)
         if change is None:
             return result, False
@@ -379,6 +383,36 @@ class AttemptRunner:
         text = "the endpoint's served identity changed during the run"
         outcome = Outcome("infrastructure", text, infra_kind=p.settings.identity_kind)
         return dataclasses.replace(result, outcome=outcome), True
+
+    def _judge_instruments(self, result: AttemptResult, record: Any, model: str, key: str) -> AttemptResult:
+        """Apply the refusal an instrument's post-run check put in the record (C31): the third way a finished attempt is
+        set aside here, after the health check, which decides first, and before the endpoint's identity.
+
+        The refusal applies to an attempt the store would score, which is what `classify` says: a cap or an answer, or
+        a fault the condition declares as its treatment, whether or not an outage flag is on it (the treatment rule is
+        checked first, C01). Such an attempt becomes infrastructure of the instrument's kind, a kind no condition can
+        have as its treatment, so it is never scored: it is run again like any infrastructure failure. The record keeps
+        what the loop saw; the result is what the store decides on, so it no longer claims the treatment the record
+        flagged. A result that still carries an `outage_kind` is then classified as an attempt an outage overlapped,
+        `outage_discarded` and not charged, as the health check's outcome would be; any other is `infra_fail` and
+        charged. Either way it is not scored and its run is tried again.
+
+        An attempt the store would not score, one set aside by the health check, an outage, or its own infrastructure
+        failure or defect, keeps its outcome and the refusal is noted.
+        """
+        p, refusal = self.p, record.instrument_refusal
+        if refusal is None:
+            return result
+        who = f"instrument {refusal['namespace']!r} refused the attempt"
+        text = f"{key}: {who}: {refusal['infra_kind']}: {refusal['detail']}"
+        scored = classify(result, result.treatment_kinds, result.treatment_targets).state == "done"
+        if not scored and (result.outage_kind is not None or result.outcome.set_aside):
+            p.store.event(p.stamp(), "instrument_refused", model, f"{text}; the outcome stands")
+            return result
+        p.store.event(p.stamp(), "instrument_refused", model, text)
+        detail = f"{who} after the run: {refusal['detail']}"
+        outcome = Outcome("infrastructure", detail, infra_kind=refusal["infra_kind"])
+        return dataclasses.replace(result, outcome=outcome, recorded_treatment=False)
 
     def _finish(
         self, begun: Any, run_dir: Path, key: str, result: AttemptResult, also: Callable[[], None] | None = None

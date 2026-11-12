@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import json
 import tarfile
+from pathlib import Path
 
 import pytest
 from read_support import counting_open, whole_reads
@@ -32,6 +33,7 @@ from expcore.replay.check import (
 from expcore.replay.divergence import ReplayDivergence
 
 NAMES = ("tools", "malformed", "infra_turn_three", "tool_crash")
+REFUSAL_FIXTURE = Path(__file__).parent.parent / "data" / "record-v3" / "04-instrument-refusal.json"
 
 
 @pytest.fixture
@@ -562,3 +564,13 @@ def test_R04_the_command_accepts_a_stored_check_that_ran_the_required_recompute(
     write_check(batch, verify_batch(batch, code=code, recompute=[decisions()]))
     assert run_cli(batch, code_repo, "--require", "--require-recompute", "decisions") == 0
     assert run_cli(batch, code_repo, "--require", "--require-recompute", "other") == 1
+
+
+def test_c31_a_record_names_the_kind_its_instrument_refused_with_so_the_platform_that_registers_it_is_imported():
+    """C31 and R03: the kinds a record names are what the check imports a platform for. A batch whose only platform
+    kind is the one an instrument's check refused with must name it, or the record fails validation as an unknown kind
+    before anything imports the platform."""
+    data = json.loads(REFUSAL_FIXTURE.read_text(encoding="utf-8"))
+    assert check_module._kinds_named(data) == {"tool_plane_integrity"}
+    data["instrument_refusal"]["infra_kind"] = "data_gate_integrity"  # a kind a platform registers
+    assert check_module._kinds_named(data) == {"data_gate_integrity"}

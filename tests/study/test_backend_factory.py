@@ -519,6 +519,25 @@ def test_r03_only_what_this_process_cannot_read_asks_for_the_study_s_code(tmp_pa
     assert what_records_need(batch, HASHED_ONLY) == (["toy_unread"], ["toy_ended", "toy_failed", "toy_treated"])
 
 
+def test_r03_a_kind_only_an_instrument_refusal_names_asks_for_the_study_s_platforms(tmp_path):
+    """R03 and C31: a record whose only platform kind is the one an instrument's check refused with cannot be validated
+    until the platform that registers the kind is imported, so the scan reads it from `instrument_refusal` as it does
+    from the outcome; a refusal that is not an object, or names no string, asks for nothing."""
+    batch = tmp_path / "batch"
+    batch.mkdir()
+    refusal = {"namespace": "manipulation", "infra_kind": "toy_refused", "detail": "not realised"}
+    files = {
+        "refused.json": json.dumps({"route": {"backend": "stub"}, "outcome": {}, "instrument_refusal": refusal}),
+        "core.json": json.dumps({"instrument_refusal": {**refusal, "infra_kind": "tool_plane_integrity"}}),
+        "no-kind.json": '{"instrument_refusal": {"namespace": "manipulation"}}',
+        "odd-kind.json": '{"instrument_refusal": {"infra_kind": 3}}',
+        "odd-refusal.json": '{"instrument_refusal": "toy_not_an_object"}',
+    }
+    for name, body in files.items():
+        (batch / name).write_text(body, encoding="utf-8")
+    assert what_records_need(batch, HASHED_ONLY) == ([], ["toy_refused"])
+
+
 @pytest.mark.parametrize("gated", ["plugin", "platform"])
 def test_r03_a_custom_backend_batch_whose_study_code_cannot_be_imported_is_refused_by_module_and_exception_type_only(
     tmp_path, clean_environment, monkeypatch, gated
