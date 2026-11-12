@@ -20,13 +20,13 @@ from urllib.parse import urlsplit
 
 import pytest
 from fake_host import FakeHost, _parse_run
-from fake_onedata import MockOnedata
 from sandbox_support import PUBLISHED_CLIENT, TOKEN, make_spec, start_options
 
 from expcore_onedata.sandbox import gate
 from expcore_onedata.sandbox.containers import ENV_ZONE_HOST
 from expcore_onedata.sandbox.hostops import CmdResult, DockerHost
 from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.testing import MockOnedata
 
 pytestmark = pytest.mark.skipif(shutil.which("openssl") is None, reason="the openssl command makes the run CA")
 
