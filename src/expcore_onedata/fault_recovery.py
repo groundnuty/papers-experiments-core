@@ -33,7 +33,9 @@ provider's REST endpoint refusing connections right after the restart and its he
 then. A service that does not serve within the bound is `not_serving`: unverified, the injection open, its identity
 not asked for again (it is already verified), and the next `settle` finds it restored and waits again. The seconds
 waited, counted from the verified identity change, are returned (`ready_after_s`) for the injector's snapshot and the
-`recovered` reading. A service the stop never took down (`never_down`) kept running and is not waited for.
+`recovered` reading. A service the stop never took down (`never_down`) kept running and is not waited for. A probe
+that refuses the service (`ConfigError`: no provider is declared for it, which no wait changes) is not serving, at once:
+the settling ends `serves_unconfigured`, unverified and open, and the failure says why.
 
 `recover` settles every open injection whose target's lock it can take (its holder is gone),
 reports a lock held while its journalled holder is gone as stuck, and returns the targets live injectors hold.
@@ -46,6 +48,7 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple, Protocol
 
+from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore_onedata.compose import DriverError, Observation
 from expcore_onedata.fault_journal import InjectionJournal, holder_alive
@@ -72,6 +75,11 @@ class FaultDriver(Protocol):
         """Whether the running service serves now: its API answers an authenticated read and its container, when it has
         a health check, is healthy. False when it does not (yet); raise DriverError only when it cannot be read."""
         ...
+
+
+_WHY = {  # how a settling failed, in words, where the bare word would not say it
+    "serves_unconfigured": "its service has no provider declared in [faults.services], so no read can show it serving",
+}
 
 
 class Settled(NamedTuple):
@@ -143,7 +151,8 @@ class Recovery:
                 lock.close()
             step("recovered", done, target=target, how=how, identity_after_sha256=after, ready_after_s=ready_after_s)
             if not done:
-                raise failure(f"an injection of {target} that an earlier run left open was not cleared", target)
+                why = _WHY.get(how, how)
+                raise failure(f"an injection of {target} that an earlier run left open was not cleared ({why})", target)
         return sorted(set(held))
 
     def settle(self, entry: Mapping[str, Any]) -> Settled:
@@ -199,7 +208,10 @@ class Recovery:
                 return Settled(False, reason)
         ready_after_s = None
         if how != "never_down":  # it was restarted: its identity changed, which is not yet that it serves
-            ready_after_s = self._await_serving(entry["service"])
+            try:
+                ready_after_s = self._await_serving(entry["service"])
+            except ConfigError:  # no provider is declared for the service: waiting cannot change that
+                return Settled(False, "serves_unconfigured", after)
             if ready_after_s is None:
                 return Settled(False, "not_serving", after)  # fail closed: the injection stays open, the identity known
         self.journal.append({"event": "cleared", "id": entry["id"], "how": how})
@@ -208,7 +220,8 @@ class Recovery:
     def _await_serving(self, service: str) -> float | None:
         """Ask the driver whether the service serves, now and then every `poll_s`, until it does or `ready_timeout_s`
         is over; return the seconds waited (0 when it served at the first reading), None when it never did. A service
-        that cannot be read is no answer yet, so it is asked again; the bound is checked between two readings."""
+        that cannot be read is no answer yet, so it is asked again; the bound is checked between two readings. A
+        ConfigError of the probe (no provider is declared for the service) is not caught: no wait changes it."""
         timeout_s, poll_s = self._settings.ready_timeout_s, self._settings.poll_s
         polls = max(1, math.ceil(timeout_s / poll_s)) + 1
         started = self._clock()

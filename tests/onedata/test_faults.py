@@ -305,6 +305,17 @@ def test_o12_a_service_entry_is_named_by_its_position_in_messages(tmp_path):
     assert "store one!" not in str(caught.value)
 
 
+def test_o12_two_providers_cannot_name_the_same_service(tmp_path):
+    """O12: one container is one target. Two providers on one service would take both down with a single stop and
+    leave the readiness probe, which maps a service back to its provider, asking the wrong one; the load refuses it,
+    by the entries' positions and never by the service."""
+    platform = write_faults(tmp_path, services={"alpha": "store-one", "beta": "store-one"})
+    config = load_platform(platform, require_secrets=False)
+    with pytest.raises(ConfigError, match=r"entry 1 names the same service as entry 0") as caught:
+        load_faults(platform, config)
+    assert "store-one" not in str(caught.value)
+
+
 def test_c01_the_injector_writes_under_the_namespace_the_core_reads(tmp_path):
     """C01: the treatment rule finds the injector's reading where the injector puts it."""
     assert injector_for(write_faults(tmp_path), FakeServices()).namespace == FAULT_NAMESPACE

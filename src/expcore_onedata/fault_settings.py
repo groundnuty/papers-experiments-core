@@ -20,7 +20,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     health_wait_s = 30               # optional: the longest the health check waits for it; below health_timeout_s
 
     [faults.services]
-    <provider name> = "<service>"    # each provider that may be taken down, by its name in [providers]
+    <provider name> = "<service>"    # each provider that may be taken down, by its name; no two share a service
 
 `settle_timeout_s` must exceed the providers' `stop_grace_period` (the Compose file's, 120 s in the federation of
 deploy/compose-federation) by a margin. A stop that hits `command_timeout_s` kills the CLI, not the Docker daemon's
@@ -126,11 +126,15 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
     project = table.string("project")
     if not PROJECT.fullmatch(project):
         raise table.fail("project", "must be a Compose project name: lower-case letters, digits, '_' and '-'")
+    named: dict[str, int] = {}  # each service by the position of the entry that names it
     for index, (name, service) in enumerate(services.data.items()):
         if name not in config.providers:
             raise services.fail(None, f"entry {index} is not a provider declared in [providers]")
         if not isinstance(service, str) or not SERVICE.fullmatch(service):
             raise services.fail(None, f"entry {index} must be a service name: letters, digits, '_', '.' and '-'")
+        if service in named:  # one container is one target: the probe maps a service back to exactly one provider
+            raise services.fail(None, f"entry {index} names the same service as entry {named[service]}")
+        named[service] = index
     words = {}
     for key, default in (("command", ("docker", "compose")), ("docker", ("docker",))):
         words[key] = tuple(table.strings(key)) or default

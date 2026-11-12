@@ -19,6 +19,7 @@ from fault_support import (
     write_faults,
 )
 
+from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore_onedata.admission import FederationLock
 from expcore_onedata.config import load_platform
@@ -191,6 +192,25 @@ def test_o11_the_gate_fails_for_a_restore_whose_provider_never_served(tmp_path):
     assert "not_serving" in health.detail
 
 
+def test_o11_a_probe_that_refuses_the_service_is_not_serving_and_is_not_polled_again(tmp_path):
+    """O11: the probe raises ConfigError when no provider is declared for the service, which no wait can change: the
+    restore fails closed at once, as `serves_unconfigured`, and the injection stays open and pending."""
+    services = FakeServices()
+    injector = injector_for(write_faults(tmp_path), services)
+    injector.start(RUN)
+
+    def refuse(service):
+        raise ConfigError("platform.toml: [faults.services]: the service is not one a provider is declared for")
+
+    services.on_serves = refuse
+    assert injector.clear() is False
+    assert step(injector, "cleared")["how"] == "serves_unconfigured"
+    assert step(injector, "verified")["ok"] is False
+    assert [call for call in services.calls if call[0] == "serves"] == [("serves", SERVICE)]
+    assert len(open_injections(tmp_path)) == 1
+    assert injector.snapshot()["ok"] is False
+
+
 # --- recovery -----------------------------------------------------------------------------------------------------
 
 
@@ -248,4 +268,22 @@ def test_o11_the_health_check_fails_while_a_recovered_provider_does_not_serve(tm
     health = FaultGate(settings_of(platform), FakeServices(path=state, never_serves=True))()
     assert health.ok is False
     assert OUTAGE_TARGET in health.detail
+    assert len(open_injections(tmp_path)) == 1
+
+
+def test_o11_the_gate_fails_closed_with_a_message_when_the_probe_refuses_the_service(tmp_path):
+    """O11: a ConfigError from the probe used to escape the health check. The gate answers not ok instead, naming the
+    target by its label and saying why nothing can show the provider serving; the injection stays open."""
+    platform, state = crashed(tmp_path, poll_s=0.01)
+    services = FakeServices(path=state)
+
+    def refuse(service):
+        raise ConfigError("platform.toml: [faults.services]: the service is not one a provider is declared for")
+
+    services.on_serves = refuse
+    health = FaultGate(settings_of(platform), services)()
+    assert (health.ok, health.deferred) == (False, False)
+    assert OUTAGE_TARGET in health.detail
+    assert "no provider declared in [faults.services]" in health.detail
+    assert SERVICE not in health.detail
     assert len(open_injections(tmp_path)) == 1
