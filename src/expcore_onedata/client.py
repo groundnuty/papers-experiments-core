@@ -96,6 +96,15 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   admin privileges, its own and its groups': named by Onezone's REST description, onedata/onezone-swagger, release/25.0
   at 58c697695fd73ff480f4a6e5fdbf733036465398, paths/users/id/effective_privileges.yaml, which says its reader needs
   `oz_view_privileges`. No source sends it and no live run has made it, so it is in `UNVERIFIED_ENDPOINTS`.
+- `get` as the token: `GET /user/effective_clusters` with the token being checked (`token=`), the answer key `clusters`,
+  a list of cluster ids: the clusters the token's user is an effective member of. Onezone's REST description has no
+  such read of another user, so it is the current user's, sent as that user's token: onedata/onezone-swagger,
+  release/25.0 at 58c697695fd73ff480f4a6e5fdbf733036465398, paths/user/effective_clusters.yaml (operation
+  `list_user_effective_clusters`, "on behalf of the current user only", the `Clusters` definition with its required
+  `clusters`), and the route `/user/effective_clusters` of onedata/oz-worker, release/25.0 at
+  03af698e5759f9db97a003047eb4e29e4ba7507f, src/http/rest/routes/user_routes.erl, which needs no specific privilege.
+  A writing tool-server token's user must be a member of none (`tokenscope.py`). No source sends it and no live run
+  has made it, so it is in `UNVERIFIED_ENDPOINTS`.
 - `mint_own_token`: `POST /user/tokens/temporary` with `Authorization: Basic` of the user itself, body
   `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
 - Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
@@ -142,7 +151,8 @@ after the gate's walk by parent links, with the reads that walk rests on and the
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
 which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
 [L1] confirms: only the reset's QoS calls and its cancel, the truncation by a write of content without an offset, and
-the read of a user's Onezone admin privileges, since [L1] confirmed every other call and detail the layer relies on.
+the reads of a user's Onezone admin privileges and of the clusters a token's user is a member of, since [L1] confirmed
+every other call and detail the layer relies on.
 Each entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
 deployment answers otherwise.
 """
@@ -178,8 +188,8 @@ READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_acc
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
 # their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
-# live run has made yet, the truncating write of content an upload's restart relies on, and the read of a writing
-# tool-server user's Onezone admin privileges.
+# live run has made yet, the truncating write of content an upload's restart relies on, and the reads of a writing
+# tool-server user's Onezone admin privileges and of the clusters its token's user is a member of.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     (
         "PUT",
@@ -218,6 +228,13 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "a Onezone call with the admin token: a user's effective admin privileges in Onezone under privileges, which "
         "a writing tool-server user must have none of; named only by Onezone's REST description (25.0), which says "
         "the reader needs oz_view_privileges",
+    ),
+    (
+        "GET",
+        "/user/effective_clusters",
+        "a Onezone call sent as the token being checked: the clusters its user is an effective member of under "
+        "clusters, which a writing tool-server user must have none of; named only by Onezone's REST description "
+        "(25.0), which says it is for the current user, and by oz-worker's route of that path",
     ),
 )
 # The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that

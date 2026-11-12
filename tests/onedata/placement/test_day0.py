@@ -115,13 +115,17 @@ def test_every_condition_passes_when_the_fixed_user_matches_its_rights(context, 
             lambda fake: fake.admin_privileges.update({"u-tools": ["oz_groups_view"]}),
             "the principal holds Onezone admin privileges: oz_groups_view",
         ),
+        (
+            lambda fake: fake.clusters.update({"u-tools": ["cl-provider-0001"]}),
+            "the principal is an effective member of 1 cluster",
+        ),
     ],
-    ids=["a member of an outside space", "an admin"],
+    ids=["a member of an outside space", "an admin", "a member of a cluster"],
 )
 def test_o09_a_writing_conditions_user_beyond_its_plane_fails_the_tokens_check(change, reason, context, fake):
     """O09: the day-0 tokens check mints what a run mints, so a writing condition's fixed user who is a member of a
-    space outside the plane, or holds an admin privilege of Onezone, is refused: the check fails, naming no space,
-    and the read-only planes it has still pass."""
+    space outside the plane or of a provider's cluster, or holds an admin privilege of Onezone, is refused: the check
+    fails, naming no space and no cluster, and the read-only planes it has still pass."""
     from expcore_onedata.testing import MANAGE
 
     fake.grant("u-tools", MANAGE)
@@ -133,6 +137,7 @@ def test_o09_a_writing_conditions_user_beyond_its_plane_fails_the_tokens_check(c
     assert planes["tool_server:manage"]["refusal"] == reason
     assert planes["data_path"]["examined"] is True
     assert "sp-outside-0009" not in json.dumps(entries["tokens"].facts)
+    assert "cl-provider-0001" not in json.dumps(entries["tokens"].facts)
 
 
 def test_a_provider_that_does_not_answer_fails_reachability_without_naming_its_host(context, fake):

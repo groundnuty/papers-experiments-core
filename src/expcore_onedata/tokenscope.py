@@ -1,10 +1,12 @@
 # Provenance: new
-"""What a token without a data-access caveat reaches, read back from Onezone: its scope and its user's admin privileges.
+"""What a token without a data-access caveat reaches, read back from Onezone: its scope, its user's admin privileges
+and its user's clusters.
 
 A writing condition's tool-server token carries no data-access caveat (`tokens.tool_server_spec`, #177), so nothing in
 the token keeps it to the tool-server plane's spaces. Its reach is its user's: every space the user is an effective
-member of, directly or through a group, and every Onezone operation an admin privilege of the user allows. Two reads
-bound that reach, and each refuses what it cannot read (unknown is not a pass):
+member of, directly or through a group; every Onezone operation an admin privilege of the user allows; and every
+provider a cluster of the user lets it act through. Three reads bound that reach, and each refuses what it cannot read
+(unknown is not a pass):
 
 1. **The scope equals the plane's spaces.** Onezone's `POST /tokens/infer_access_token_scope` answers, for a user's
    token, `dataAccessScope.spaces` keyed by space id: the user's effective spaces narrowed by the token's data-access
@@ -18,11 +20,26 @@ bound that reach, and each refuses what it cannot read (unknown is not a pass):
    release/25.0 at 58c697695fd73ff480f4a6e5fdbf733036465398, paths/users/id/effective_privileges.yaml; the reader needs
    `oz_view_privileges`). The list must be empty. No source sends this call and no live run has made it yet, so it is
    in `client.UNVERIFIED_ENDPOINTS`.
+3. **The user is an effective member of no cluster.** A provider's cluster holds its members' privileges over the
+   provider. In onedata/oz-worker, release/25.0 at 03af698e5759f9db97a003047eb4e29e4ba7507f, a user with
+   `cluster_update` on a provider's cluster may manage and mint that provider's tokens
+   (src/logic/token_logic_plugin.erl, `authorize/2`, the `provider_temporary_token` clauses) and update the provider's
+   instance, domain configuration and DNS records, and one with `cluster_delete` may delete the provider
+   (src/logic/provider_logic_plugin.erl, `authorize/2`). A member of any provider's cluster therefore acts through
+   that provider beyond the plane's spaces, whatever the scope and the admin privileges say.
+   Onezone's REST description has no read of another user's effective clusters: onedata/onezone-swagger, release/25.0
+   at 58c697695fd73ff480f4a6e5fdbf733036465398, has no `effective_clusters` under paths/users/id/, and the oz-worker
+   commit above routes none under `/users/:id` (src/http/rest/routes/user_routes.erl). What both have is the current
+   user's, `GET /user/effective_clusters`, answering `clusters`, a list of ids, with no specific privilege needed
+   (paths/user/effective_clusters.yaml, whose description says it is for the current user only, and the route of
+   that path in user_routes.erl). So it is sent as the token being checked, not as the admin: it answers which clusters
+   that token acts in, which is what the check is for. The list must be empty. No source sends this call and no live
+   run has made it yet, so it is in `client.UNVERIFIED_ENDPOINTS`.
 
 A read that gets no answer raises `ExaminationFailed` with the `PlatformError`, so a caller tells an outage from a
 refusal; an answer that cannot be read, and one that differs, raise a `TokenRefused`. A message names a space by its
-position (`spaces[i]`), counts the spaces the configuration does not declare, names admin privileges, and never holds
-an id, a name or the token.
+position (`spaces[i]`), counts the spaces the configuration does not declare, names admin privileges, counts clusters,
+and never holds an id, a name or the token.
 """
 
 from collections.abc import Mapping, Sequence
@@ -34,6 +51,7 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.tokencheck import ExaminationFailed, TokenRefused
 
 SCOPE_PATH = "/tokens/infer_access_token_scope"
+CLUSTERS_PATH = "/user/effective_clusters"  # the current user's, so it is sent as the token being checked
 _SHOWN_PRIVILEGES = 8  # the most admin privileges a refusal names
 
 
@@ -43,6 +61,10 @@ class ScopeMismatch(TokenRefused):
 
 class AdminPrivileged(TokenRefused):
     """A principal whose token has no data-access caveat holds an admin privilege of Onezone."""
+
+
+class ClusterMember(TokenRefused):
+    """A principal whose token has no data-access caveat is an effective member of a cluster."""
 
 
 def scope_spaces(client: OnezoneClient, token: str) -> set[str]:
@@ -102,3 +124,22 @@ def require_no_admin(privileges: Sequence[Any]) -> None:
     more = len(held) - _SHOWN_PRIVILEGES
     shown = ", ".join(held[:_SHOWN_PRIVILEGES]) + (f" and {more} more" if more > 0 else "")
     raise AdminPrivileged(f"the principal holds Onezone admin privileges: {shown}")
+
+
+def effective_clusters(client: OnezoneClient, token: str) -> list[str]:
+    """Return the clusters the token's user is an effective member of, read as that token; raise as the module says."""
+    try:
+        answer = client.get(CLUSTERS_PATH, token=token)
+    except PlatformError as error:
+        raise ExaminationFailed(f"the token's clusters could not be read ({error})", error) from None
+    clusters = answer.get("clusters") if isinstance(answer, Mapping) else None
+    if not isinstance(clusters, list) or not all(isinstance(c, str) for c in clusters):
+        raise TokenRefused("the token's clusters could not be read: 'clusters' is not a list of strings")
+    return clusters
+
+
+def require_no_clusters(clusters: Sequence[Any]) -> None:
+    """Refuse a principal that is an effective member of any cluster, counting them and never naming one."""
+    if clusters:
+        count = len(clusters)
+        raise ClusterMember(f"the principal is an effective member of {count} cluster{'' if count == 1 else 's'}")

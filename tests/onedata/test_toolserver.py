@@ -536,6 +536,9 @@ def test_c01_a_rights_change_at_teardown_is_set_aside_and_never_scored_under_a_c
 OUTSIDE = "sp-outside-0009"  # a space Onezone knows that the configuration does not declare
 JOINED = "the token's scope differs from the plane's spaces: has also 1 space the configuration does not declare"
 ADMIN = "the principal holds Onezone admin privileges: oz_spaces_add_relationships"
+CLUSTER = "the principal is an effective member of 1 cluster"
+PROVIDER_CLUSTER = "cl-provider-0001"  # the id of a provider's cluster, which no message may hold
+CLUSTERS = "/api/v3/onezone/user/effective_clusters"
 
 
 def manage_token(issuer, config, fake):
@@ -552,16 +555,21 @@ def becomes_admin(fake):
     return lambda: fake.admin_privileges.update({TOOLS.user_id: ["oz_spaces_add_relationships"]})
 
 
-BOUNDARY_CHANGES = [(joins_outside, JOINED), (becomes_admin, ADMIN)]
+def joins_a_cluster(fake):
+    return lambda: fake.clusters.update({TOOLS.user_id: [PROVIDER_CLUSTER]})
 
 
-@pytest.mark.parametrize(("change", "reason"), BOUNDARY_CHANGES, ids=["joined an outside space", "became an admin"])
-def test_o09_a_writing_planes_user_who_joined_a_space_outside_it_or_became_an_admin_starts_no_server(
+BOUNDARY_CHANGES = [(joins_outside, JOINED), (becomes_admin, ADMIN), (joins_a_cluster, CLUSTER)]
+BOUNDARY_IDS = ["joined an outside space", "became an admin", "joined a cluster"]
+
+
+@pytest.mark.parametrize(("change", "reason"), BOUNDARY_CHANGES, ids=BOUNDARY_IDS)
+def test_o09_a_writing_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_starts_no_server(
     change, reason, world, fake, tmp_path
 ):
-    """O09: a writing token is bounded by its user alone, so the launch reads its scope and the user's admin privileges
-    again: a user who became a member of a space outside the plane, or an admin of Onezone, after the mint starts
-    nothing, and the refusal names no space."""
+    """O09: a writing token is bounded by its user alone, so the launch reads its scope, the user's admin privileges and
+    the clusters the token acts in again: a user who became a member of a space outside the plane, or of a provider's
+    cluster, or an admin of Onezone, after the mint starts nothing, and the refusal names no space and no cluster."""
     config, issuer, launcher = world
     token = manage_token(issuer, config, fake)
     change(fake)()
@@ -569,12 +577,13 @@ def test_o09_a_writing_planes_user_who_joined_a_space_outside_it_or_became_an_ad
         start(launcher, RecordingContext(), "manage", token, tmp_path)
     assert caught.value.kind == "tool_plane_integrity"
     assert OUTSIDE not in str(caught.value)
+    assert PROVIDER_CLUSTER not in str(caught.value)
     assert token.reveal() not in str(caught.value)
     assert not (tmp_path / "seen.json").exists()
 
 
-@pytest.mark.parametrize(("change", "reason"), BOUNDARY_CHANGES, ids=["joined an outside space", "became an admin"])
-def test_o09_a_writing_planes_user_who_joined_a_space_outside_it_or_became_an_admin_during_the_run_is_set_aside(
+@pytest.mark.parametrize(("change", "reason"), BOUNDARY_CHANGES, ids=BOUNDARY_IDS)
+def test_o09_a_writing_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_during_the_run_is_set_aside(
     change, reason, world, fake, events
 ):
     """O09: the same reads at teardown find a boundary that changed while the server ran; the run is set aside as
@@ -585,14 +594,16 @@ def test_o09_a_writing_planes_user_who_joined_a_space_outside_it_or_became_an_ad
         run_with(launcher, RecordingContext(), "manage", token, change(fake))
     assert caught.value.kind == "tool_plane_integrity"
     assert OUTSIDE not in str(caught.value)
+    assert PROVIDER_CLUSTER not in str(caught.value)
     assert events == []
 
 
-def test_o09_a_writing_plane_is_read_for_its_scope_and_admin_privileges_before_the_spawn_and_after_the_stop(
+def test_o09_a_writing_plane_is_read_for_its_scope_admin_privileges_and_clusters_before_the_spawn_and_after_the_stop(
     world, fake, tmp_path
 ):
-    """O09: a writing condition's launch adds two reads to the read-only plane's three: the user's admin privileges, as
-    an admin read, and the token's scope, which Onezone answers to the token in the body and no header."""
+    """O09: a writing condition's launch adds three reads to the read-only plane's three: the user's admin privileges,
+    as an admin read, the token's scope, which Onezone answers to the token in the body and no header, and the clusters
+    the token acts in, which the token reads itself, so it is the credential of that request and the admin is not."""
     config, issuer, launcher = world
     token = manage_token(issuer, config, fake)
     before = len(fake.requests)
@@ -603,8 +614,26 @@ def test_o09_a_writing_plane_is_read_for_its_scope_and_admin_privileges_before_t
         ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/effective_users/{TOOLS.user_id}/privileges", fake.ADMIN),
         ("GET", f"/api/v3/onezone/users/{TOOLS.user_id}/effective_privileges", fake.ADMIN),
         ("POST", "/api/v3/onezone/tokens/infer_access_token_scope", None),
+        ("GET", CLUSTERS, token.reveal()),
     ]
     assert [(r.method, r.path, r.token) for r in fake.requests[before:]] == one_check * 2
+
+
+def test_o09_a_read_only_plane_is_read_for_neither_its_scope_nor_admin_privileges_nor_clusters(world, fake, tmp_path):
+    """O09: a read-only condition's token is kept to the plane by its data.path caveat, so its launch and teardown make
+    none of the three reads, with an outside space, an admin privilege and a cluster all present."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
+    fake.admin_privileges[TOOLS.user_id] = ["oz_spaces_add_relationships"]
+    fake.clusters[TOOLS.user_id] = [PROVIDER_CLUSTER]
+    before = len(fake.requests)
+    start(launcher, RecordingContext(), "read", token, tmp_path)
+    after = [r.path for r in fake.requests[before:]]
+    assert after
+    assert not [
+        p for p in after if p.endswith(("/effective_privileges", "/infer_access_token_scope", "/effective_clusters"))
+    ]
 
 
 def admin_read_fails(fake, monkeypatch):
@@ -622,15 +651,17 @@ def admin_read_fails(fake, monkeypatch):
         (lambda fake, monkeypatch: lambda: setattr(fake, "scope_status", 503), "could not be reached"),
         (admin_read_fails, "could not be reached"),
         (lambda fake, monkeypatch: lambda: setattr(fake, "scope_hook", lambda a: {}), "failed its check"),
+        (lambda fake, monkeypatch: lambda: setattr(fake, "clusters_status", 503), "could not be reached"),
+        (lambda fake, monkeypatch: lambda: setattr(fake, "clusters_hook", lambda a: {}), "failed its check"),
     ],
-    ids=["scope outage", "admin read outage", "scope unreadable"],
+    ids=["scope outage", "admin read outage", "scope unreadable", "clusters outage", "clusters unreadable"],
 )
 @pytest.mark.parametrize("when", ["before the start", "at teardown"])
-def test_o05_a_writing_planes_scope_or_admin_read_that_fails_is_an_outage_never_a_pass(
+def test_o05_a_writing_planes_scope_admin_or_clusters_read_that_fails_is_an_outage_never_a_pass(
     bend, words, when, world, fake, tmp_path, monkeypatch, events
 ):
-    """O05: unknown is not a pass. An outage of Onezone while the scope or the admin privileges are read, at launch or
-    at teardown, sets the run aside in the outage's words; an answer that cannot be read fails the check."""
+    """O05: unknown is not a pass. An outage of Onezone while the scope, the admin privileges or the clusters are
+    read, at launch or at teardown, sets the run aside in the outage's words; an unreadable answer fails the check."""
     config, issuer, launcher = world
     token = manage_token(issuer, config, fake)
     if when == "before the start":

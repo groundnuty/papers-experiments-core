@@ -19,8 +19,8 @@ What `TokenIssuer.mint` does, in this order, and refuses at the first failure:
    token without a data-access caveat, no Onezone admin privilege (`tokenscope`);
 3. mints with the plane's exact caveats (`CaveatSpec`, shared with the examination);
 4. examines the token fail-closed, against that exact set and the lifetime window, and, for a token without a
-   data-access caveat, requires Onezone's scope of it to be exactly the plane's spaces (`tokenscope`). A token that
-   fails is dropped.
+   data-access caveat, requires Onezone's scope of it to be exactly the plane's spaces and the clusters it acts in to
+   be none (`tokenscope`). A token that fails is dropped.
 
 A principal mints its own token with its own credential (`OnezoneClient.mint_own_token`). Tokens are never revoked: no
 source revokes one, so each ends with its lifetime, which derives from the whole-time ceiling (O06).
@@ -55,7 +55,14 @@ from expcore_onedata.tokencheck import (
     require_examined,
     require_privileges,
 )
-from expcore_onedata.tokenscope import admin_privileges, require_no_admin, require_scope, scope_spaces
+from expcore_onedata.tokenscope import (
+    admin_privileges,
+    effective_clusters,
+    require_no_admin,
+    require_no_clusters,
+    require_scope,
+    scope_spaces,
+)
 
 
 class Plane(StrEnum):
@@ -165,11 +172,12 @@ def tool_server_spec(space_id: str | Sequence[str], condition: Condition) -> Pla
     /transfers` answered `tokenCaveatUnverified`).
 
     **The boundary of a writing token is therefore its principal**, the slot's leased tool-server user (C19, O09), and
-    three reads hold it, before the token is minted (the scope just after) and again at the tool server's launch and
-    teardown: the user's rights, direct and effective, in each of the plane's spaces must be exactly the condition's;
-    Onezone's scope of the token, which lists every space the user is an effective member of, must be exactly the
-    plane's spaces, so a space of another study or one declared for the data path alone is refused; and the user must
-    hold no Onezone admin privilege (`tokenscope`).
+    four reads hold it, before the token is minted (the scope and the clusters just after) and again at the tool
+    server's launch and teardown: the user's rights, direct and effective, in each of the plane's spaces must be
+    exactly the condition's; Onezone's scope of the token, which lists every space the user is an effective member of,
+    must be exactly the plane's spaces, so a space of another study or one declared for the data path alone is
+    refused; the user must hold no Onezone admin privilege; and the clusters the token acts in, read as the token, must
+    be none, since a member of a provider's cluster can act through that provider (`tokenscope`).
 
     Onedata's `api` caveat is not a data-access caveat and could narrow the token to named operations, but which
     operations the tool server's calls map to is not in the source its format was read from, and one missing entry
@@ -258,6 +266,18 @@ class TokenIssuer:
             return
         require_scope(scope_spaces(self._client, value), spec.caveats.space_ids, self._config)
 
+    def check_clusters(self, spec: PlaneSpec, value: str) -> None:
+        """For a token without a data-access caveat, require its user to be an effective member of no cluster, read as
+        the token itself (`GET /user/effective_clusters` answers for the user it is sent as); a read-only token's
+        boundary is its `data.path` caveat, so it is not read.
+
+        A read that gets no answer raises `ExaminationFailed`; an answer that cannot be read raises `TokenRefused`; a
+        member of a cluster raises `tokenscope.ClusterMember`, counting the clusters and never naming one.
+        """
+        if spec.caveats.data_access:
+            return
+        require_no_clusters(effective_clusters(self._client, value))
+
     def _check_in(self, spec: PlaneSpec, user_id: str, space_id: str) -> None:
         """Require the plane's exact rights of the user in one space; raise as `check_user` says."""
         try:
@@ -318,6 +338,7 @@ class TokenIssuer:
             raise ExpiryMismatch("the token's expiry is not the one it was minted with", examined.valid_until)
         try:
             self.check_scope(spec, value)
+            self.check_clusters(spec, value)
         except TokenRefused as refused:
             raise DroppedToken(str(refused), examined.valid_until) from refused
         return MintedToken(spec.plane, principal.user_id, examined.token_id, examined.valid_until, Secret(value))

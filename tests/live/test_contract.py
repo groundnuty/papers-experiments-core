@@ -46,7 +46,7 @@ from expcore_onedata.health import PlatformHealth  # noqa: E402
 from expcore_onedata.sandbox import gateboundary  # noqa: E402
 from expcore_onedata.tokencheck import CaveatSpec  # noqa: E402
 from expcore_onedata.tokens import TokenIssuer, data_path_spec  # noqa: E402
-from expcore_onedata.tokenscope import admin_privileges  # noqa: E402
+from expcore_onedata.tokenscope import admin_privileges, effective_clusters  # noqa: E402
 
 CEILING_S = 300.0
 CONTENT_PATH = os.environ.get("EXPCORE_LIVE_CONTENT_PATH")  # a provisioned, non-empty file: its path in the space
@@ -240,6 +240,21 @@ def test_the_tool_server_user_holds_no_onezone_admin_privilege(config, client):
     if config.principals.toolserver is None:
         pytest.skip("platform.toml declares no [principals.toolserver] user")
     assert admin_privileges(client, config.principals.toolserver.user_id) == []
+
+
+def test_a_writing_tool_server_token_acts_in_no_cluster(config, client, issuer):
+    """O09: a member of a provider's cluster can act through that provider whatever its spaces, so a writing token's
+    user must be a member of none. Onezone's read of another user's clusters does not exist, so the call is the current
+    user's, sent as the token itself: it answers 200 with a list of cluster ids (`tokenscope.effective_clusters`), and
+    the tool-server user's is empty. The token has no data-access caveat, as a data-access one would refuse the read."""
+    # covers: GET /user/effective_clusters
+    if config.toolserver is None or config.principals.toolserver is None:
+        pytest.skip("platform.toml declares no tool server or no [principals.toolserver] user")
+    writing = next((n for n, c in config.toolserver.conditions.items() if c.writes), None)
+    if writing is None:
+        pytest.skip("platform.toml declares no condition with a write right")
+    token = mint_for_condition(issuer, config, writing, config.principals.toolserver, CEILING_S)
+    assert effective_clusters(client, token.reveal()) == []
 
 
 @SLOW

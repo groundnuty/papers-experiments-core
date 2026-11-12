@@ -169,6 +169,8 @@ def test_o05_a_writing_token_that_comes_back_with_a_data_access_caveat_is_droppe
 OUTSIDE = "sp-outside-0009"  # a space Onezone knows that the configuration does not declare
 SCOPE = "/api/v3/onezone/tokens/infer_access_token_scope"
 ADMIN_READ = f"/api/v3/onezone/users/{TOOLS.user_id}/effective_privileges"
+CLUSTERS = "/api/v3/onezone/user/effective_clusters"
+PROVIDER_CLUSTER = "cl-provider-0001"  # the id of a provider's cluster, which no message may hold
 
 
 def test_o09_a_writing_token_whose_user_is_a_member_of_a_space_outside_the_plane_is_dropped(issuer, fake, config):
@@ -197,14 +199,61 @@ def test_o09_a_writing_conditions_user_with_a_onezone_admin_privilege_gets_no_to
     assert [r.token for r in fake.requests if r.path == ADMIN_READ] == [fake.ADMIN]
 
 
-def test_o05_the_data_path_and_a_read_only_condition_read_neither_the_scope_nor_admin_privileges(issuer, fake, config):
-    """O05: a read-only token's boundary is its data.path caveat, so its mint is what it was: no scope is read for it
-    and no admin privilege of its user, even with a space outside the plane and an admin privilege present."""
+@pytest.mark.parametrize(
+    ("clusters", "count"),
+    [([PROVIDER_CLUSTER], "1 cluster"), ([PROVIDER_CLUSTER, "cl-provider-0002"], "2 clusters")],
+    ids=["one cluster", "two clusters"],
+)
+def test_o09_a_writing_tokens_user_who_is_a_member_of_a_cluster_is_dropped(clusters, count, issuer, fake, config):
+    """O09: a member of a provider's cluster (cluster_update, cluster_delete) can mint that provider's tokens and change
+    or delete the provider, so it acts through it beyond the plane's spaces whatever its scope is. Onezone answers the
+    current user's clusters only, so the read is sent as the minted token itself, never as the admin, and a member of
+    any is refused: the token is dropped with the expiry it is known to have, and the message counts the clusters
+    without naming one."""
+    fake.grant(TOOLS.user_id, MANAGE)
+    fake.clusters[TOOLS.user_id] = clusters
+    with pytest.raises(DroppedToken, match=f"the principal is an effective member of {count}$") as refused:
+        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    assert refused.value.expires_at == int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s
+    assert PROVIDER_CLUSTER not in str(refused.value)
+    (minted,) = fake.issued  # it was minted, and dropped once the clusters it acts in were read
+    reads = [r for r in fake.requests if r.path == CLUSTERS]
+    assert [(r.method, r.token) for r in reads] == [("GET", minted)]
+    assert fake.ADMIN not in [r.token for r in reads]
+
+
+def test_o09_a_writing_token_without_a_cluster_is_minted_after_its_scope_and_before_it_is_returned(
+    issuer, fake, config
+):
+    """O09: a user who is a member of no cluster gets its token; the clusters are read once, after the scope."""
+    fake.grant(TOOLS.user_id, MANAGE)
+    token = issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    paths = [r.path for r in fake.requests if r.path in (SCOPE, CLUSTERS)]
+    assert paths == [SCOPE, CLUSTERS]
+    assert [r.token for r in fake.requests if r.path == CLUSTERS] == [token.reveal()]
+
+
+def test_o09_a_scope_that_is_refused_is_refused_before_the_clusters_are_read(issuer, fake, config):
+    """O09: the clusters are read after the scope, so a user who fails both is refused for its scope alone and no
+    request for its clusters is sent."""
+    fake.grant(TOOLS.user_id, MANAGE)
+    fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
+    fake.clusters[TOOLS.user_id] = [PROVIDER_CLUSTER]
+    with pytest.raises(DroppedToken, match="the token's scope differs"):
+        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    assert not [r for r in fake.requests if r.path == CLUSTERS]
+
+
+def test_o05_the_data_path_and_a_read_only_condition_read_no_scope_admin_privileges_or_clusters(issuer, fake, config):
+    """O05: a read-only token's boundary is its data.path caveat, so its mint is what it was: no scope is read for it,
+    no admin privilege of its user and no cluster, even with a space outside the plane, an admin privilege and a
+    cluster present. A data-access caveat would refuse a clusters read anyway."""
     fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
     fake.admin_privileges[TOOLS.user_id] = ["oz_groups_view"]
+    fake.clusters[TOOLS.user_id] = fake.clusters[DATA.user_id] = [PROVIDER_CLUSTER]
     issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)
     issuer.mint(tool_server_spec("spmock0001", config.condition("read")), TOOLS, ceiling_s=CEILING_S)
-    assert not [r for r in fake.requests if r.path in (SCOPE, ADMIN_READ)]
+    assert not [r for r in fake.requests if r.path in (SCOPE, ADMIN_READ, CLUSTERS)]
 
 
 def scope_without_spaces(answer):
@@ -217,14 +266,24 @@ def scope_without_spaces(answer):
         (lambda fake: setattr(fake, "scope_status", 503), True, "token's scope could not be read"),
         (lambda fake: setattr(fake, "scope_hook", scope_without_spaces), False, "scope answer lists no spaces"),
         (lambda fake: fake.admin_privileges.update({TOOLS.user_id: "oz_groups_view"}), False, "not a list of strings"),
+        (lambda fake: setattr(fake, "clusters_status", 503), True, "token's clusters could not be read"),
+        (lambda fake: setattr(fake, "clusters_hook", lambda answer: {}), False, "'clusters' is not a list of strings"),
+        (lambda fake: setattr(fake, "clusters_hook", lambda a: {"clusters": [7]}), False, "not a list of strings"),
     ],
-    ids=["scope outage", "scope unreadable", "admin privileges unreadable"],
+    ids=[
+        "scope outage",
+        "scope unreadable",
+        "admin privileges unreadable",
+        "clusters outage",
+        "clusters answer without the key",
+        "clusters that are no ids",
+    ],
 )
-def test_o05_a_writing_tokens_scope_or_admin_privileges_that_cannot_be_read_give_no_token(
+def test_o05_a_writing_tokens_scope_admin_privileges_or_clusters_that_cannot_be_read_give_no_token(
     bend, outage, reason, issuer, fake, config
 ):
-    """O05: unknown is not a pass. A scope read that fails is an `ExaminationFailed` carrying the outage, so a caller
-    can tell one apart; an answer that cannot be read is a refusal; neither gives a token."""
+    """O05: unknown is not a pass. A scope, admin or clusters read that fails is an `ExaminationFailed` carrying the
+    outage, so a caller can tell one apart; an answer that cannot be read is a refusal; neither gives a token."""
     fake.grant(TOOLS.user_id, MANAGE)
     bend(fake)
     with pytest.raises(TokenRefused, match=reason) as refused:
