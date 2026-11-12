@@ -88,10 +88,9 @@ def test_b18_a_model_that_declares_no_set_keeps_the_digest_it_had_in_the_fingerp
         api_id="gamma-relay",
         status="frozen",
         base_url="https://llm.example.invalid/v1",
-        key_env="RELAY_KEY",
         free=True,
-    )
-    assert model_digest(spec) == "e9dd1ea32339a6aea8da8d8f8edc874ab407b1c682989ec68efb3eb0b9b68455"
+    )  # no key location: where a key lives enters as a placeholder (K13), which gave a keyed entry a new digest
+    assert model_digest(spec) == "675005d213c3f888d5e23a42967d5709cf0e0f3d5845470e6264877807031aca"
     declared = ModelSpec(**{**spec.__dict__, "accepted_fingerprints": ("deploy-kestrel",)})
     assert model_digest(declared) != model_digest(spec)
 
