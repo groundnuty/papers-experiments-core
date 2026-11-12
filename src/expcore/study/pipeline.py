@@ -56,12 +56,13 @@ from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
-from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_fingerprint
+from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import ShardError, ShardSpec, check_identity
 from expcore.campaign.shard_run import ShardStart, environment_block, share_settings
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
@@ -84,6 +85,7 @@ from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
+    MODELS_FILE,
     OUT_DIR,
     StudyConfig,
     StudyIdentity,
@@ -135,12 +137,20 @@ def _digest(value: Any) -> str:
 
 
 def model_digest(spec: ModelSpec) -> str:
-    """The digest of a model entry in the campaign fingerprint: every field of it, its declared set of accepted
-    fingerprints only when it declares one (B18), so an entry without one keeps the digest it had before the key."""
-    entry = dataclasses.asdict(spec)
-    if not entry["accepted_fingerprints"]:
-        del entry["accepted_fingerprints"]
-    return _digest(entry)
+    """The digest of a model entry in the campaign fingerprint: every field of it, each key location as its placeholder
+    (K13), and its declared set of accepted fingerprints only when it declares one (B18). An entry that names no key
+    location and declares no set keeps the digest it had before either."""
+    return _digest(_fingerprinted(withheld_entry(spec)))
+
+
+def _counted_digest(spec: ModelSpec) -> str:
+    """The digest a core before K13 gave a model entry, where each key lives counted; for a refused resume's hint."""
+    return _digest(_fingerprinted(dataclasses.asdict(spec)))
+
+
+def _fingerprinted(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """A model entry as its digest takes it: without `accepted_fingerprints` when it declares none (B18)."""
+    return {k: v for k, v in entry.items() if k != "accepted_fingerprints" or v}
 
 
 def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:
@@ -162,6 +172,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
     A plugin's `backend_factory` enters as its name and its `version`. Code that lives in the study directory is
     already covered by the code identity every record carries; the version is what speaks for a factory that lives
     in an installed package, and it is refused unless it is that package's installed version (`factory_version`).
+    Where a model's key lives is left out, of each model's digest and of models.toml's hash (K13).
     """
     check_factory_version(plugin, study)
     return build_fingerprint(
@@ -222,25 +233,52 @@ def _run_campaign(
         manifest, settings, started = _shard_of(study, plugin, settings, shard)
         print(environment_block(shard, fingerprint["environment"]), file=sys.stderr)  # before a store can refuse it
     options = {} if crash_hook is None else {"crash_hook": crash_hook}
-    with Scheduler(
-        out,
-        study.schema,
-        manifest,
-        fingerprint,
-        plugin.executor,
-        agent_config=study.campaign.agent,
-        models=study.models,
-        endpoints=study.campaign.endpoints,
-        settings=settings,
-        health=plugin.health,
-        leases=leases,
-        lease_group=plugin.lease_group,
-        backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
-        on_hold=_say_hold,
-        shard=started,
-        **options,
-    ) as scheduler:
-        return scheduler.run()
+    try:
+        with Scheduler(
+            out,
+            study.schema,
+            manifest,
+            fingerprint,
+            plugin.executor,
+            agent_config=study.campaign.agent,
+            models=study.models,
+            endpoints=study.campaign.endpoints,
+            settings=settings,
+            health=plugin.health,
+            leases=leases,
+            lease_group=plugin.lease_group,
+            backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
+            on_hold=_say_hold,
+            shard=started,
+            **options,
+        ) as scheduler:
+            return scheduler.run()
+    except FingerprintMismatch as refused:
+        hint = _counted_key_locations(study, read_fingerprint(out / STATE_FILE))
+        if not hint:
+            raise
+        raise FingerprintMismatch(refused.differences, hint=hint) from None
+
+
+def _counted_key_locations(study: StudyConfig, recorded: Mapping[str, Any] | None) -> str:
+    """Name the leaves of a recorded fingerprint that hold exactly what an earlier core gave by counting where each key
+    lives, which this one leaves out (K13), so a refused resume says why they differ; empty when none does."""
+    configs = recorded.get("configs") if isinstance(recorded, Mapping) else None
+    models = recorded.get("models") if isinstance(recorded, Mapping) else None
+    raw = (study.root / MODELS_FILE).read_bytes()
+    leaves = []
+    if isinstance(configs, Mapping) and raw != withhold_key_locations(raw):
+        leaves += [f"configs.{MODELS_FILE}"] if configs.get(MODELS_FILE) == hashlib.sha256(raw).hexdigest() else []
+    for key in study.campaign.models if isinstance(models, Mapping) else ():
+        spec = study.models.resolve(key)
+        counted = _counted_digest(spec)
+        leaves += [f"models.{key}"] if counted != model_digest(spec) and models.get(key) == counted else []
+    if not leaves:
+        return ""
+    return (
+        f" ({', '.join(leaves)}: recorded with where each key lives, which the core that started the campaign counted "
+        "and this one leaves out (K13); finish the campaign with that core, or start a new store)"
+    )
 
 
 def _shard_of(
