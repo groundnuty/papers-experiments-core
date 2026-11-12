@@ -52,6 +52,9 @@ PLUMBING = {
     ("day0/mutating.py", "_attempt_write", "consistency.space_root"): ["ctx.plumbing_retry()"],
     ("day0/mutating.py", "_attempt_write", "client.mutate"): ["ctx.plumbing_retry()"],
     ("day0/mutating.py", "_remove_and_verify", "client.mutate"): ["ctx.plumbing_retry()"],
+    # day-0's outage check, before anything is taken down: the proof of who holds what is part of setting the scenario
+    # up, and a stall there ends the preparation (the helpers it calls, below, read under the provisioner's own policy)
+    ("day0/outage_run.py", "Run.prove_holdings", "provisioner.blocks"): ["self.provisioner.retry"],
 }
 
 # A read whose policy is its caller's: a parameter that the caller names, so each caller is a row above or below.
@@ -91,6 +94,11 @@ ONE_ATTEMPT_SITES = {
     ("day0/checks.py", "_names", "client.get"): ["ONE_ATTEMPT"],
     ("day0/checks.py", "_space_listing", "consistency.space_root"): ["ONE_ATTEMPT"],
     ("day0/mutating.py", "_remove_and_verify", "client.get"): ["ONE_ATTEMPT"],
+    # the outage check's cells: the reads and listings during the outage and in the all-up baseline, whose outcome,
+    # errno and latency are the record, and the target's direct answer. A retry there would hide what is measured.
+    ("day0/outage_cells.py", "Cells.read", "client.read_content"): ["ONE_ATTEMPT"],
+    ("day0/outage_cells.py", "Cells._names", "client.get"): ["ONE_ATTEMPT"],
+    ("day0/outage_cells.py", "Cells.target_answers", "client.get"): ["ONE_ATTEMPT"],
     # a read inside a poll that counts a failed read as one that did not match: the poll is the retry
     ("provision.py", "Provisioner._gone", "client.get"): ["ONE_ATTEMPT"],
     ("provision.py", "Provisioner.placement_report", "provisioner.blocks"): ["<default>"],
@@ -155,6 +163,13 @@ HELPER_USERS = {
         "provisioner.resolve",
         "provisioner.walk",
     },
+    "day0/outage_run.py": {  # the outage check's setup, which writes and places its scratch files before the outage
+        "provisioner.verify_space",
+        "provisioner.put_file",
+        "provisioner.resolve",
+        "provisioner.await_visible",
+        "provisioner.replicate",
+    },
     "ingest.py": {"provisioner.verify_space"},
     "ingestbase.py": {
         "provisioner.resolve",
@@ -198,6 +213,9 @@ NOT_THE_PROVISIONERS = {
     ("ingestbase.py", "Baseline._write_back", "self"),
     ("transferlog.py", "_placement", "edges"),  # a window of transfer edges, not a block map
     ("transferwindow.py", "Edges.bears_on", "self"),
+    # the agent's tool `schedule_file_replication` through the tool server (MCP), which reaches no Onezone read of ours
+    ("day0/outage_run.py", "Run.agent_baseline", "self.tools"),
+    ("day0/outage_run.py", "Run.during", "tools"),
 }
 
 # Modules whose every read measures: no site in them may ever name another policy, or call a helper that retries.
@@ -210,6 +228,7 @@ MEASURING_MODULES = {
     "tokenscope.py",
     "health.py",
     "day0/checks.py",
+    "day0/outage_cells.py",  # every cell it makes is a measurement; the run's setup is in outage_run.py
 }
 
 
@@ -284,9 +303,9 @@ def test_o29_the_provisioner_helpers_that_retry_are_called_by_the_modules_the_ta
 
 
 def test_o29_the_measuring_modules_keep_one_attempt_in_every_read_and_every_helper():
-    """O29: the health gate's checks, the placement probes, the transfer log, the fault gate's probe and day-0's checks
-    never name a policy other than one attempt and never call a provisioner helper in its retrying form, so a timeout
-    there is the recorded timeout."""
+    """O29: the health gate's checks, the placement probes, the transfer log, the fault gate's probe, day-0's checks and
+    the outage check's cells never name a policy other than one attempt and never call a provisioner helper in its
+    retrying form, so a timeout there is the recorded timeout."""
     scans = every_scan()
     assert set(scans) >= MEASURING_MODULES
     assert {module: measuring_breaches(scans[module]) for module in MEASURING_MODULES} == {

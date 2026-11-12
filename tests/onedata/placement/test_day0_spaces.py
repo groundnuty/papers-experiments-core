@@ -90,6 +90,7 @@ def test_a_two_space_platform_runs_every_check_and_writes_a_report(platform, fak
         "listing": "pass",
         "read_only": "pass",
         "round_trip": "pass",
+        "provider_outage": "unknown",  # taking a provider down needs EXPCORE_LIVE_FAULTS and a sanctioned [faults]
     }
     assert code == EXIT_UNKNOWN
     assert not [check["name"] for check in checks.values() if "raised" in check["summary"]]
