@@ -167,17 +167,18 @@ class Run(AfterRestore):
     # -- before ---------------------------------------------------------------------------------------------------
     def prepare(self) -> None:
         """Make the files, place the replicas, prove who holds what and read the REST baseline."""
-        roles, prov = self.roles, self.provisioner
-        prov.verify_space()
+        roles, provisioner = self.roles, self.provisioner
+        # The setup is plumbing: each helper reads under the provisioner's own policy, three attempts on a timeout (O29)
+        provisioner.verify_space()
         for pair in self.pairs:
             for kind in KINDS:
                 path = f"{self.directory}/{pair}-{kind}.bin"
                 data = payload(f"{pair}:{kind}")
-                self.files[(pair, kind)] = ScratchFile(pair, kind, path, prov.put_file(path, data), data)
-        self.directory_id = prov.resolve(self.directory).file_id
-        prov.await_visible(roles.local, [f.file_id for f in self.files.values()])
+                self.files[(pair, kind)] = ScratchFile(pair, kind, path, provisioner.put_file(path, data), data)
+        self.directory_id = provisioner.resolve(self.directory).file_id
+        provisioner.await_visible(roles.local, [f.file_id for f in self.files.values()])
         for pair in self.pairs:
-            prov.replicate(self.files[(pair, "replicated")].path, roles.mirror)
+            provisioner.replicate(self.files[(pair, "replicated")].path, roles.mirror)
         for file in self.files.values():
             self.scrub.add(file.file_id, f"file:{file.key}")
         self.scrub.add(self.directory, "scratch")
@@ -194,7 +195,12 @@ class Run(AfterRestore):
         roles, rows, wrong = self.roles, {}, []
         for file in self.files.values():
             held = {
-                role: held_bytes(self.provisioner.blocks(file.file_id, roles.name(role), reader=roles.local))
+                role: held_bytes(
+                    # setup, read before anything is taken down: a stall ends the preparation, so it is retried (O29)
+                    self.provisioner.blocks(
+                        file.file_id, roles.name(role), reader=roles.local, retry=self.provisioner.retry
+                    )
+                )
                 for role in ROLES
             }
             size = len(file.data)

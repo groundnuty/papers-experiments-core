@@ -29,6 +29,7 @@ from typing import Any
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.provision import LISTING_ATTRIBUTES, LISTING_LIMIT, Provisioner, listing_entry, next_page_token
+from expcore_onedata.readretry import ONE_ATTEMPT
 
 BLOCKED_FRACTION = 0.9  # an unanswered call that took this much of its bound was blocked, not refused
 ROLES = ("target", "mirror", "local")
@@ -168,6 +169,7 @@ class Cells:
                 sink=sink,
                 clock=self._clock,
                 space=self._entry.space,
+                gate_retry=ONE_ATTEMPT,  # a measurement: a stalled gate read is the cell's recorded outcome (O29)
             )
         )
         facts = {**self._base(seconds), "bytes": received, "expected_bytes": len(file.data)}
@@ -192,7 +194,11 @@ class Cells:
         params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
         while True:
             page = self._client.get(
-                f"/data/{directory_id}/children", provider=self._roles.local, params=params, timeout_s=self.bound_s
+                f"/data/{directory_id}/children",
+                provider=self._roles.local,
+                params=params,
+                timeout_s=self.bound_s,
+                retry=ONE_ATTEMPT,  # a measurement: a page that stalls is what the cell records (O29)
             )
             token = next_page_token(page)
             for item in page["children"]:
@@ -225,7 +231,9 @@ class Cells:
     def target_answers(self, timeout_s: float) -> dict[str, Any]:
         """Ask the target for its configuration directly: whether it answers, as a down provider must not."""
         _, error, seconds = self._timed(
-            lambda: self._client.get("/configuration", provider=self._roles.target, timeout_s=timeout_s)
+            lambda: self._client.get(
+                "/configuration", provider=self._roles.target, timeout_s=timeout_s, retry=ONE_ATTEMPT
+            )  # the answer, or the lack of one, is the measurement (O29)
         )
         if error is None:
             return {"answers": True, "seconds": seconds}

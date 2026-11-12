@@ -763,8 +763,8 @@ def test_o28_a_file_that_the_local_provider_already_holds_is_not_one_held_only_b
     def local_holds_one(self):
         real_blocks = self.provisioner.blocks
 
-        def blocks(file_id, provider, *, reader=None):
-            found = real_blocks(file_id, provider, reader=reader)
+        def blocks(file_id, provider, *, reader=None, **options):
+            found = real_blocks(file_id, provider, reader=reader, **options)  # the setup passes its `retry` (O29)
             if provider == self.roles.local and file_id == self.files[("rest", "owner_only")].file_id:
                 return [(0, outage_run.FILE_BYTES)]
             return found
