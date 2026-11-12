@@ -13,14 +13,17 @@ its errno), and whether it blocked: still running at its deadline, so it was kil
 
 **The request** is one JSON document on one line of the cell (`REQUEST = json.loads(...)`), so a test's fake host can
 read what a cell asks without parsing Python. **The facts** (`read_facts`, `listing_facts`) have the outcome vocabulary
-of `outage_cells`: `served`, `partial`, `differs`, `refused` (with `errno`), `blocked` (with `blocked: true`); a cell
-whose output cannot be read measured nothing, which `outage_run` records as a gap, never as an outcome.
+of `outage_cells`: `served`, `partial`, `differs`, `refused` (an errno other than a timeout's), `no answer` or
+`blocked` (a timeout, by its seconds against the bound as a REST timeout is, the errno kept), `blocked` with `blocked:
+true` (still running at its deadline, killed); a cell whose output cannot be read measured nothing, which `outage_run`
+records as a gap, never as an outcome.
 """
 
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from expcore_onedata.day0.outage_cells import unanswered
 from expcore_onedata.sandbox.api import ExecResult
 
 KILL_WAIT_S = 10.0  # how long the cell waits for a killed child that is stuck in the kernel
@@ -129,6 +132,19 @@ def _error(row: Mapping[str, Any]) -> dict[str, Any]:
     return {"errno": row.get("error"), "errno_number": row.get("errno"), "error_kind": row.get("kind")}
 
 
+def _timed_out(row: Mapping[str, Any]) -> bool:
+    """Whether an error is a timeout: Python reports a mount's ETIMEDOUT as `TimeoutError`, keeping the errno."""
+    return row.get("kind") == "TimeoutError" or row.get("error") == "ETIMEDOUT"
+
+
+def _failed(row: Mapping[str, Any], bound_s: float, *, received: int = 0) -> str:
+    """A failed op's outcome, by the rule of `outage_cells.failure_facts`: a timeout got no answer (`no answer`, or
+    `blocked` by its seconds), any other errno is a refusal, and bytes before an error that did not block are
+    `partial`."""
+    outcome = unanswered(row.get("seconds") or 0.0, bound_s) if _timed_out(row) else "refused"
+    return "partial" if received and outcome != "blocked" else outcome
+
+
 def read_facts(row: Mapping[str, Any] | None, size: int, sha256: str, bound_s: float) -> dict[str, Any] | None:
     """A read's facts from its row; None when the row says nothing (the cell could not read its child)."""
     if row is None or row.get("unreadable"):
@@ -137,7 +153,7 @@ def read_facts(row: Mapping[str, Any] | None, size: int, sha256: str, bound_s: f
     if row.get("blocked"):
         return {**facts, "outcome": "blocked", "killed": row.get("killed")}
     if "error" in row:
-        return {**facts, **_error(row), "outcome": "partial" if facts["bytes"] else "refused"}
+        return {**facts, **_error(row), "outcome": _failed(row, bound_s, received=facts["bytes"])}
     matches = row.get("sha256") == sha256 and row.get("bytes") == size
     return {**facts, "hash_matches": matches, "outcome": "served" if matches else "differs"}
 
@@ -150,7 +166,7 @@ def listing_facts(row: Mapping[str, Any] | None, expected: Sequence[str], bound_
     if row.get("blocked"):
         return {**facts, "outcome": "blocked", "killed": row.get("killed")}
     if "error" in row:
-        return {**facts, **_error(row), "outcome": "refused"}
+        return {**facts, **_error(row), "outcome": _failed(row, bound_s)}
     names = list(row.get("names") or [])
     missing = [name for name in expected if name not in names]
     unexpected = [name for name in names if name not in expected]

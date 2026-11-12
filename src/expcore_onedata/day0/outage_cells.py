@@ -84,6 +84,12 @@ class ScratchFile:
         return hashlib.sha256(self.data).hexdigest()
 
 
+def unanswered(seconds: float, bound_s: float) -> str:
+    """The outcome of a call that got no answer: `blocked` when it took the bound's blocked fraction, else `no
+    answer`. A timeout is one, whether a transport's or a mount's ETIMEDOUT (Python's `TimeoutError`)."""
+    return "blocked" if seconds >= BLOCKED_FRACTION * bound_s else "no answer"
+
+
 def failure_facts(error: BaseException, seconds: float, bound_s: float) -> dict[str, Any]:
     """What a failed call shows: the answer's status, error id and errno, or the mount's errno, and its outcome."""
     facts: dict[str, Any] = {}
@@ -98,10 +104,7 @@ def failure_facts(error: BaseException, seconds: float, bound_s: float) -> dict[
         answered = error.status is not None
     else:
         raise error
-    if answered:
-        facts["outcome"] = "refused"
-    else:
-        facts["outcome"] = "blocked" if seconds >= BLOCKED_FRACTION * bound_s else "no answer"
+    facts["outcome"] = "refused" if answered else unanswered(seconds, bound_s)
     return facts
 
 

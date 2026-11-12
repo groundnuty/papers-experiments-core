@@ -51,6 +51,30 @@ def test_o28_the_mount_cell_reads_whole_files_names_an_errno_and_kills_a_read_th
     assert (listing["outcome"], listing["missing"]) == ("partial", 1)
 
 
+def test_o28_a_mount_timeout_is_no_answer_or_blocked_by_its_seconds_never_a_refusal():
+    """O28: a mount's ETIMEDOUT, which Python reports as TimeoutError, is a call that got no answer: `no answer` when
+    it came early, `blocked` when it took the bound's blocked fraction, `partial` when bytes came first and it did not
+    block, as a REST timeout is (`outage_cells.failure_facts`); its errno is kept. Any other errno is a refusal."""
+    timeout = {"key": "a", "error": "ETIMEDOUT", "errno": 110, "kind": "TimeoutError", "blocked": False}
+    early = outage_mount.read_facts({**timeout, "seconds": 1.0, "bytes": 0}, 10, "0" * 64, 20.0)
+    assert (early["outcome"], early["errno"], early["errno_number"], early["error_kind"]) == (
+        "no answer",
+        "ETIMEDOUT",
+        110,
+        "TimeoutError",
+    )
+    late = outage_mount.read_facts({**timeout, "seconds": 19.0, "bytes": 0}, 10, "0" * 64, 20.0)
+    assert (late["outcome"], late["blocked"]) == ("blocked", False)  # it waited its bound; the child was not killed
+    cut = outage_mount.read_facts({**timeout, "seconds": 2.0, "bytes": 4}, 10, "0" * 64, 20.0)
+    assert cut["outcome"] == "partial"
+    listed = outage_mount.listing_facts({**timeout, "seconds": 19.0}, ["x"], 20.0)
+    assert (listed["outcome"], listed["errno"]) == ("blocked", "ETIMEDOUT")
+    assert outage_mount.listing_facts({**timeout, "seconds": 1.0}, ["x"], 20.0)["outcome"] == "no answer"
+    refused = {"key": "a", "error": "EIO", "errno": 5, "kind": "OSError", "seconds": 19.0, "bytes": 0}
+    assert outage_mount.read_facts(refused, 10, "0" * 64, 20.0)["outcome"] == "refused"
+    assert outage_mount.listing_facts(refused, ["x"], 20.0)["outcome"] == "refused"
+
+
 def test_o28_a_cell_that_prints_no_result_measured_nothing():
     """O28: a cell whose output is not its result (it was killed, or the sandbox failed it) is a reason, not facts."""
     said = outage_mount.results(ExecResult("Traceback ...\n", "", 1, 0.0, timed_out=True))

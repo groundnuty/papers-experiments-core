@@ -728,15 +728,24 @@ def test_o28_the_mount_is_read_through_a_real_sandbox_in_mount_mode_all_up_and_d
     assert ("read", "owner_only") in agent.mount_ops
 
 
-def test_o28_a_mount_read_that_fails_records_its_errno_by_name_and_number(context, agent):
-    """O28: a read through the mount that fails is refused with its errno: Python reports a mount's ETIMEDOUT as
-    TimeoutError, and the cell keeps the errno's name and number and the exception's class."""
+def test_o28_a_mount_read_that_times_out_at_the_bound_is_blocked_with_its_errno(context, agent):
+    """O28: a mount's ETIMEDOUT, which Python reports as TimeoutError, after the read waited its bound got no answer:
+    it is `blocked`, never a refusal, and the cell keeps the errno's name and number and the exception's class (the
+    child was not killed, so its own `blocked` flag stays false)."""
     agent.mount_down = ("ETIMEDOUT", 110, "TimeoutError")
     entry = outage_check(context)
     owner_only = entry.facts["during"]["mount"]["owner_only"]
-    assert (owner_only["outcome"], owner_only["errno"], owner_only["errno_number"]) == ("refused", "ETIMEDOUT", 110)
+    assert (owner_only["outcome"], owner_only["errno"], owner_only["errno_number"]) == ("blocked", "ETIMEDOUT", 110)
     assert (owner_only["error_kind"], owner_only["blocked"]) == ("TimeoutError", False)
     assert entry.ok is True
+
+
+def test_o28_a_mount_read_that_fails_with_another_errno_is_refused_with_it(context, agent):
+    """O28: a read through the mount that fails with an errno other than a timeout's is refused, with that errno."""
+    agent.mount_down = ("EIO", 5, "OSError")
+    entry = outage_check(context)
+    owner_only = entry.facts["during"]["mount"]["owner_only"]
+    assert (owner_only["outcome"], owner_only["errno"], owner_only["errno_number"]) == ("refused", "EIO", 5)
 
 
 def test_o28_a_declared_mount_left_unmeasured_makes_the_check_unknown_never_passed(context):
