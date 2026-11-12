@@ -319,6 +319,26 @@ def test_o28_the_knowledge_plane_is_the_agents_own_tools_called_through_mcp_all_
     assert entry.facts["after"]["transfers"]["owner_only"]["outcome"] == "served"
 
 
+def test_o28_from_where_is_measured_on_the_files_actually_read_during_the_outage(context, agent):
+    """O28: where each file read during the outage is held is asked of the agent's own tool, `get_file_distribution`
+    of the very files read over REST and through the mount, while the provider is down: a replicated file read
+    through the local provider is held there afterwards, as the mirror holds it, and the file only the downed
+    provider holds is not."""
+    entry = outage_check(context)
+    assert entry.ok is True, entry.summary
+    where, labels, size = entry.facts["during"]["knowledge"]["from_where"], entry.facts["roles"], outage_run.FILE_BYTES
+    assert set(where) == {"rest/replicated", "rest/owner_only", "mount/replicated", "mount/owner_only"}
+    for pair in ("rest", "mount"):
+        replicated, owner_only = where[f"{pair}/replicated"], where[f"{pair}/owner_only"]
+        assert (replicated["outcome"], replicated["file"]) == ("served", f"{pair}/replicated")
+        assert replicated["providers"][labels["local"]]["held_bytes"] == size
+        assert replicated["providers"][labels["mirror"]]["held_bytes"] == size
+        assert owner_only["providers"][labels["local"]]["held_bytes"] == 0
+        assert owner_only["providers"][labels["target"]]["held_bytes"] == size
+    asked = [arguments["file_id"] for name, arguments in agent.tool_calls if name == "get_file_distribution"]
+    assert len(asked) == len(set(asked)) == 1 + 2 + 4  # the baseline's, the knowledge pair's, the four files read
+
+
 def test_o28_the_stand_in_tools_refuse_a_replication_elsewhere_and_a_space_not_under_test(agent, world):
     """O28: the stand-in tools check the agent's arguments: a replication to the provider taken down or to the mirror,
     and the providers of a space not under test, are answered errors and kept as misuses; the right ones serve."""

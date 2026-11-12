@@ -272,7 +272,9 @@ class Run:
         return not probe["answers"]
 
     async def during(self) -> None:
-        """Measure, through the local provider, the REST path, the mount and the agent's tools."""
+        """Measure, through the local provider, the REST path, the mount and the agent's tools: the knowledge pair's
+        distribution, the providers and the replications, and then `get_file_distribution` of every file the REST
+        path and the mount read, which shows where its bytes are held now (`from_where`)."""
         cells, files = self.cells, self.files
 
         def rest() -> dict[str, Any]:
@@ -296,6 +298,11 @@ class Run:
             for kind in KINDS:
                 file = files[("knowledge", kind)]
                 knowledge["schedule_file_replication"][kind] = await tools.replicate(file.key, file.file_id)
+            knowledge["from_where"] = {}  # where each file read above is held now, by the agent's own tool
+            for pair in ("rest", "mount") if "mount" in during else ("rest",):
+                for kind in KINDS:
+                    file = files[(pair, kind)]
+                    knowledge["from_where"][file.key] = await tools.distribution(file.key, file.file_id)
             during["knowledge"] = knowledge
             self.note_unmeasured("the outage", knowledge)
 

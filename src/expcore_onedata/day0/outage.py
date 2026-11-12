@@ -22,11 +22,13 @@ listing of the scratch directory, over REST (`outage_cells`) and, when the platf
 through the mount of a real sandbox in mount mode, inside the agent's container (`outage_mount`); and the knowledge
 plane as the agent meets it: the condition's tool server, started with the leased slot's tool-server user and token,
 its tools called through MCP (`outage_tools`: `get_file_distribution`, `list_space_providers`,
-`schedule_file_replication` to the local provider, `get_transfer` until it ends or the bound). The sandbox and the tool
-server are started for the space's scenario (`outage_agent`), and each is measured with everything up first: a
-baseline that does not serve stops nothing. Every cell has an outcome (`served`, `partial`, `differs`, `refused`, `no
-answer`, `blocked`) and its seconds against `Context.outage_bound_s`; a mount read also its errno and whether it
-blocked, a tool call whether it timed out, its attempts and its wording as a digest with the error terms it holds.
+`schedule_file_replication` to the local provider, `get_transfer` until it ends or the bound, and
+`get_file_distribution` of each file the REST path and the mount read, which shows where its bytes came to be held).
+The sandbox and the tool server are started for the space's scenario (`outage_agent`), and each is measured with
+everything up first: a baseline that does not serve stops nothing. Every cell has an outcome (`served`, `partial`,
+`differs`, `refused`, `no answer`, `blocked`) and its seconds against `Context.outage_bound_s`; a mount read also its
+errno and whether it blocked, a tool call whether it timed out, its attempts and its wording as a digest with the
+error terms it holds.
 
 **After it**: the restore, by the fault injector, verified by the identity of the service having changed and the
 provider serving, and the target answering again, then the reads again, which must return what was written. The
