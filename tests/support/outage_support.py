@@ -219,6 +219,7 @@ class AgentWorld:
         self.space_ids = space_ids or (world.fake.SPACE_ID,)
         self.misused: list[tuple[str, str]] = []  # (tool, what was wrong) of each call with a wrong argument
         self.mount_down: Any = "blocked"
+        self.mount_broken: tuple[str, int, str] | None = None  # every mount read fails so, whatever is down
         self.tool_errors: dict[str, str] = {}
         self.tool_broken: dict[str, str] = {}  # answers an error with this wording whether or not anything is down
         self.tool_hangs: set[str] = set()
@@ -244,6 +245,9 @@ class AgentWorld:
         node = fake.id_of(op["path"][len(self.space_root) :])
         if op["op"] == "list":
             return {**row, "names": sorted(n.name for n in fake.nodes.values() if n.parent == node)}
+        if self.mount_broken is not None:
+            name, number, kind = self.mount_broken
+            return {**row, "error": name, "errno": number, "kind": kind, "bytes": 0}
         local = fake.provider_of(self.local_host)
         if not fake.blocks.get((node, local)) and not self.world.holders_up(node):
             if self.mount_down == "blocked":

@@ -33,7 +33,7 @@ from sandbox_support import MOUNT_PATH
 from expcore_onedata.admission import OUTAGE_RUN
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
-from expcore_onedata.day0 import outage_budget, outage_cells, outage_run, outage_tools
+from expcore_onedata.day0 import outage_agent, outage_budget, outage_cells, outage_run, outage_tools
 from expcore_onedata.day0.outage_cells import Cells
 from expcore_onedata.day0.outage_tools import KNOWLEDGE_TOOLS
 from expcore_onedata.day0.runner import EXIT_FAIL, EXIT_UNKNOWN, build_context, run, run_checks
@@ -917,6 +917,60 @@ def test_o28_tokens_that_ended_before_a_reread_are_the_checks_own_failure_never_
     assert after["owner_only"]["outcome"] == "served"
     assert "transfers" not in after
     assert entry.facts["restore"]["verified"] is True
+
+
+def test_o28_a_mount_baseline_that_does_not_serve_stops_nothing_and_the_check_is_unknown(context, agent, services):
+    """O28: a mount whose reads fail with every provider up says nothing about an outage: the scenario stops no
+    provider, the check is unknown with the reason, and the scratch is still torn down."""
+    agent.mount_broken = ("EIO", 5, "OSError")
+    entry = outage_check(context)
+    assert entry.ok is None
+    assert "the baseline did not read back through the mount" in entry.summary
+    assert services.verbs() == []
+    assert entry.facts["baseline"]["mount"]["owner_only"]["outcome"] == "refused"
+    assert entry.facts["cleanup_verified"] is True
+
+
+def test_o28_the_sandbox_and_the_tool_plane_are_stopped_when_a_measurement_raises(context, world, monkeypatch):
+    """O28: a measurement that raises while the provider is down fails the check, and the sandbox's teardown and the
+    tool plane's check at its stop still run, after the restore."""
+    real = Cells.listing
+
+    def broken(self, directory_id, expected):
+        if world.down:
+            raise ValueError("a defect in a measurement")
+        return real(self, directory_id, expected)
+
+    monkeypatch.setattr(Cells, "listing", broken)
+    entry = outage_check(context)
+    assert entry.ok is False
+    assert (entry.facts["agent"]["sandbox"]["stopped"], entry.facts["agent"]["tool_server"]["stopped"]) == (True, True)
+
+
+def test_o28_the_sandbox_and_the_tool_plane_are_stopped_when_the_run_itself_raises(
+    context, platform, agent, world, monkeypatch
+):
+    """O28: an error that escapes the run (here, from the checks after the restore) fails the check, and on its way out
+    the tool plane's check at its stop and the sandbox's teardown run, in that order, and leave no container."""
+    left = []
+    real_leave = outage_agent.AgentPlane._leave
+
+    async def leave(self, manager, what):
+        left.append(what)
+        return await real_leave(self, manager, what)
+
+    async def raising(self, went_down):
+        raise RuntimeError("a defect after the restore")
+
+    monkeypatch.setattr(outage_agent.AgentPlane, "_leave", leave)
+    monkeypatch.setattr(outage_run.Run, "after_restore", raising)
+    host = agent_host(platform, agent)
+    entry = outage_check(context, agent_host=host)
+    assert entry.ok is False
+    assert "the check raised RuntimeError" in entry.summary
+    assert left == ["the tool plane's check at its stop", "the sandbox's teardown"]
+    assert host.containers == {}
+    assert world.down == set()
 
 
 def test_o28_a_declared_mount_left_unmeasured_makes_the_check_unknown_never_passed(context):
