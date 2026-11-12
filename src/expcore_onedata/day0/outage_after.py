@@ -16,7 +16,7 @@ from typing import Any
 from expcore_onedata.day0.outage_agent import AgentPlane
 from expcore_onedata.day0.outage_budget import DOWN_PROBE_S
 from expcore_onedata.day0.outage_cells import KINDS, Cells, ScratchFile
-from expcore_onedata.day0.outage_fault import RESTORED
+from expcore_onedata.day0.outage_fault import LEFT_OPEN, RESTORED
 from expcore_onedata.day0.outage_tools import Tools
 from expcore_onedata.day0.registry import Context
 
@@ -39,9 +39,20 @@ class AfterRestore:
 
     async def after_restore(self, went_down: bool) -> None:
         """Check the restore: cleared and verified by the injector, the target answering, and the reads returning
-        what was written. A provider never seen down needs only to be found as it was (`never_down`)."""
+        what was written. A provider never seen down needs only to be found as it was (`never_down`). A start whose
+        recovery of an earlier injection failed or left it open (`earlier_injection_open`) is a failure that names
+        the provider by its position, and `outage.provider_outage` runs no later space after it."""
         restore = self.facts["restore"]
         if restore["how"] == "not_injected":
+            return
+        if restore["how"] == LEFT_OPEN:  # nothing of this space was stopped, but a provider may still be down
+            left = ", ".join(
+                f"{row['target'] or 'the injection journal'} ({row['how']})" for row in restore["left_open"]
+            )
+            self.problems.append(
+                "the injector's start could not settle an injection an earlier run left open, so no provider was "
+                f"taken down and one may still be down: {left}"
+            )
             return
         if not restore["cleared"]:
             self.problems.append(f"the provider could not be brought back ({restore['how']})")

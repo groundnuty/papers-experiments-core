@@ -28,6 +28,7 @@ from expcore_onedata.day0.outage_cells import KINDS, ROLES, Cells, Roles, Scratc
 from expcore_onedata.day0.outage_fault import Outage
 from expcore_onedata.day0.outage_tools import Scrubber, Tools, baseline_gaps
 from expcore_onedata.day0.registry import Context, Result, failed, passed, unknown
+from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.faults import FaultInjector
 from expcore_onedata.placement import held_bytes
 from expcore_onedata.provision import ProvisionError
@@ -137,7 +138,7 @@ class Run(AfterRestore):
             sanctioned=ctx.allow_faults and ctx.allow_mutation,  # the caller's half of the sanction (O10)
             driver=ctx.fault_driver, clock=ctx.clock, sleep=ctx.sleep,
         )  # fmt: skip
-        outage = Outage(injector, self.directory)
+        outage = Outage(injector, self.directory, InjectionJournal(ctx.fault_settings.journal))
         went_down = False
         try:
             async with outage.down() as down:  # the injector's `running`: never its start in a bare thread (#27)

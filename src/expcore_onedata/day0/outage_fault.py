@@ -7,7 +7,9 @@ reads what the injector did from its snapshot, so the check has the injector's g
 - **Sanction (O10).** The injector needs `sanctioned = true` in `[faults]` and `sanctioned=True` from its caller; the
   check gives the caller's half only once `EXPCORE_LIVE_MUTATE=1` and `EXPCORE_LIVE_FAULTS=1` are both set.
 - **Journal and recovery (O11).** The injection is journalled before the stop; an injection an earlier process left open
-  is cleared and verified before this one starts, and one that cannot be fails the start.
+  is cleared and verified before this one starts, and one that cannot be fails the start. Such a start took nothing down
+  and still leaves a provider that may be down, so `restored` tells it from a start that failed cleanly
+  (`earlier_injection_open`, not cleared, naming each provider left open by its label).
 - **Verified restore (O11).** A restore counts only when the service runs with an identity other than the one read
   before the stop and the provider then serves (its driver's `serves`, within `ready_timeout_s` of `[faults]`; the
   wait is `ready_after_s`); readiness alone is not one, and a provider that does not serve in time is `not_serving`,
@@ -25,19 +27,26 @@ in `finally`, shielded. The check never awaits the injector's start or clear in 
 `down` and `restored` turn the injector's outcome into the check's facts: whether the provider was seen down, and
 whether it is back (`cleared`: nothing is left down) and restored (`verified`: back with a changed identity, and
 serving), with the injector's own word for how (`restored`, `found_restored`, `never_down`, `identity_unchanged`,
-`not_running`, `not_serving`, `start_failed`, `restore_unverified`, `stop_unsettled`). The provider is named by its
-label and an identity by its digest, as the injector names them (O12).
+`not_running`, `not_serving`, `start_failed`, `restore_unverified`, `stop_unsettled`), or `earlier_injection_open`: the
+start failed in settling an injection an earlier run left open (the injector's `recovered` step, not `ok`), or with no
+such step and an injection open in the journal, or a journal that cannot be read. `not_injected` is only a start that
+failed before anything was journalled, with nothing open. The provider is named by its label and an identity by its
+digest, as the injector names them (O12).
 """
 
 import contextlib
+import re
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
+from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.faults import FaultInjector
 
 RESTORED = ("restored", "found_restored")  # the injector's ways of a verified restore
+LEFT_OPEN = "earlier_injection_open"  # a start's recovery of an earlier injection failed or left it open
+_WORD = re.compile(r"[A-Za-z_]{1,40}")  # how a settling ended, as the injector or its journal words it
 
 
 def _last(steps: list[Mapping[str, Any]], name: str) -> Mapping[str, Any] | None:
@@ -45,11 +54,18 @@ def _last(steps: list[Mapping[str, Any]], name: str) -> Mapping[str, Any] | None
     return found[-1] if found else None
 
 
+def _word(how: Any, otherwise: str) -> str:
+    """How a settling ended when it is a plain word, else `otherwise`: the journal is a file, nothing else is kept."""
+    return how if isinstance(how, str) and _WORD.fullmatch(how) else otherwise
+
+
 class Outage:
     """One provider taken down through the injector for the body of `down` and brought back as it ends."""
 
-    def __init__(self, injector: FaultInjector, run_key: str) -> None:
-        self._injector, self._identity = injector, {"run_key": run_key, "attempt": 1}
+    def __init__(self, injector: FaultInjector, run_key: str, journal: InjectionJournal) -> None:
+        """`journal` is the injector's own (`[faults] journal`), read only after a start that failed with nothing
+        taken down, to see whether it left an injection open (`left_open`)."""
+        self._injector, self._identity, self._journal = injector, {"run_key": run_key, "attempt": 1}, journal
 
     @contextlib.asynccontextmanager
     async def down(self) -> AsyncIterator[dict[str, Any]]:
@@ -84,10 +100,20 @@ class Outage:
     def restored(self) -> dict[str, Any]:
         """How the restore went, read from the injector's snapshot once `down` has ended (its clear settled the
         injection and verified the identity and the serving). With nothing stopped, nothing needed restoring:
-        `not_injected`."""
+        `not_injected`, unless the start failed in settling an injection an earlier run left open, or left one open
+        (`earlier_injection_open`, with `left_open`): a provider may still be down, so it is not cleared."""
         snapshot = self._injector.snapshot()
         cleared, verified = _last(snapshot["steps"], "cleared"), _last(snapshot["steps"], "verified")
         if cleared is None:
+            left = self.left_open(snapshot["steps"])
+            if left:
+                return {
+                    "cleared": False,
+                    "verified": False,
+                    "how": LEFT_OPEN,
+                    "left_open": left,
+                    "journal_steps": [step["step"] for step in snapshot["steps"]],
+                }
             return {"cleared": True, "verified": False, "how": "not_injected"}
         facts: dict[str, Any] = {
             "cleared": bool(cleared.get("ok")),
@@ -102,5 +128,23 @@ class Outage:
         facts["journal_steps"] = [step["step"] for step in snapshot["steps"]]
         return facts
 
+    def left_open(self, steps: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """The injections a start that took nothing down left open, each as `{"target": label, "how": word}`.
 
-__all__ = ["RESTORED", "Outage"]
+        The injector's own word comes first: its recovery of an injection an earlier run left open records each one it
+        failed to settle (`recovered`, not `ok`, with the label and how it ended). A start can also fail with no such
+        step and leave one open all the same (an injection a live injector holds down, a journal that cannot be read),
+        so without one the journal is read: each open injection there is left open (`how` is its `clear_failed`, else
+        `left_open`), and a journal that cannot be read cannot show that nothing is open, so it is told as one
+        (`target` None, `journal_unreadable`). A start that failed cleanly leaves the journal with nothing open."""
+        failed = [step for step in steps if step.get("step") == "recovered" and not step.get("ok")]
+        if failed:
+            return [{"target": step.get("target"), "how": _word(step.get("how"), "left_open")} for step in failed]
+        try:
+            entries = self._journal.open_entries()
+        except (ValueError, OSError):  # a line number or an OS error's path is not kept (O12)
+            return [{"target": None, "how": "journal_unreadable"}]
+        return [{"target": entry["target"], "how": _word(entry.get("clear_failed"), "left_open")} for entry in entries]
+
+
+__all__ = ["LEFT_OPEN", "RESTORED", "Outage"]

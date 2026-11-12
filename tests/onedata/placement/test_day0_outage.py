@@ -38,7 +38,8 @@ from expcore_onedata.day0 import outage_agent, outage_budget, outage_cells, outa
 from expcore_onedata.day0.outage_cells import Cells
 from expcore_onedata.day0.outage_tools import KNOWLEDGE_TOOLS
 from expcore_onedata.day0.runner import EXIT_FAIL, EXIT_UNKNOWN, build_context, run, run_checks
-from expcore_onedata.fault_journal import InjectionJournal
+from expcore_onedata.fault_journal import InjectionJournal, holder
+from expcore_onedata.fault_recovery import digest
 from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import compose_driver, load_faults
 from expcore_onedata.sandbox.provider import SandboxPlatform
@@ -1165,6 +1166,96 @@ def test_o28_a_provider_whose_rest_never_answers_the_checks_own_read_halts_the_s
     assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("fail", "unknown")
     assert spaces["spaces[0]"]["restore"]["rest_answers_again"] is False
     assert services.verbs() == ["stop", "start"]
+
+
+def leave_open(ctx, services, *later, alive=False):
+    """What a run that died mid-injection left in the journal for the first space's data provider: `injecting`, then
+    the events `later` names. `alive` names this process as its holder, whose lock the test then takes, as a live
+    injector's. Return the lock, to be closed by the test."""
+    journal = InjectionJournal(ctx.fault_settings.journal)
+    line = {
+        "target": "providers[0]",
+        "service": SERVICE,
+        "identity_sha256": digest(services.observe(SERVICE).identity),
+        "holder": holder() if alive else {"pid": 999999, "boot_id": "x"},
+    }
+    journal.append({"event": "injecting", "id": "left-open", **line})
+    for event in later:
+        journal.append({"event": event, "id": "left-open"})
+    return journal.try_lock("providers[0]") if alive else None
+
+
+def test_o28_a_start_that_cannot_settle_an_injection_an_earlier_run_left_open_halts_the_spaces_after_it(two_spaces):
+    """O28: the injector settles an injection an earlier run left open before it takes anything down. When that fails
+    (its stop was asked for and the service never shows down, so `stop_unsettled`), nothing was stopped by this start
+    but a provider may still be down: the space fails, naming the provider by its position and the injector's word, and
+    the spaces after it are not run, as for a provider that could not be restored."""
+    ctx, services, _, _ = two_spaces
+    leave_open(ctx, services, "stopping")
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    assert entry.ok is False
+    spaces = entry.facts["spaces"]
+    assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("fail", "unknown")
+    restore = spaces["spaces[0]"]["restore"]
+    assert (restore["cleared"], restore["verified"], restore["how"]) == (False, False, "earlier_injection_open")
+    assert restore["left_open"] == [{"target": "providers[0]", "how": "stop_unsettled"}]
+    assert "providers[0]" in spaces["spaces[0]"]["summary"]
+    assert "stop_unsettled" in spaces["spaces[0]"]["summary"]
+    assert "spaces[0] left a provider" in spaces["spaces[1]"]["summary"]
+    assert services.verbs() == []  # the leftover was never restarted, and no space took the provider down
+
+
+def test_o28_an_injection_a_live_injector_holds_down_is_left_open_by_the_start_and_halts_the_spaces_after_it(
+    two_spaces,
+):
+    """O28: a start refused because an injection is held down by a live injector records no recovery step, so the
+    check reads the journal after the failed start: an injection still open there leaves the space failed and the
+    spaces after it not run."""
+    ctx, services, _, _ = two_spaces
+    lock = leave_open(ctx, services, "stopping", "injected", alive=True)
+    try:
+        entry = run_checks(ctx, ["provider_outage"])[0]
+    finally:
+        lock.close()
+    spaces = entry.facts["spaces"]
+    assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("fail", "unknown")
+    restore = spaces["spaces[0]"]["restore"]
+    assert (restore["cleared"], restore["how"]) == (False, "earlier_injection_open")
+    assert restore["left_open"] == [{"target": "providers[0]", "how": "left_open"}]
+    assert "providers[0]" in spaces["spaces[0]"]["summary"]
+    assert services.verbs() == []
+
+
+def test_o28_a_journal_that_cannot_be_read_after_a_failed_start_is_not_shown_to_hold_nothing_open(
+    two_spaces,
+):
+    """O28: when the journal cannot be read, the injector's start fails with no recovery step and the check cannot show
+    that nothing is open: it fails closed, as for an injection left open, naming no provider."""
+    ctx, services, _, _ = two_spaces
+    journal = InjectionJournal(ctx.fault_settings.journal)
+    journal.append({"event": "unheard-of", "id": "x"})
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    spaces = entry.facts["spaces"]
+    assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("fail", "unknown")
+    assert spaces["spaces[0]"]["restore"]["left_open"] == [{"target": None, "how": "journal_unreadable"}]
+    assert "the injection journal" in spaces["spaces[0]"]["summary"]
+    assert services.verbs() == []
+
+
+def test_o28_a_start_that_fails_before_anything_is_journalled_or_stopped_leaves_the_spaces_after_it_to_run(two_spaces):
+    """O28: a start that fails cleanly (the service cannot be read before the stop, so nothing is journalled or
+    stopped and nothing is open) is no provider left down: each space is unknown for what it could not do, with
+    `not_injected`, and none halts the other."""
+    ctx, services, _, _ = two_spaces
+    services.unreadable = True
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    assert entry.ok is None
+    spaces = entry.facts["spaces"]
+    assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("unknown", "unknown")
+    assert [spaces[name]["restore"]["how"] for name in ("spaces[0]", "spaces[1]")] == ["not_injected"] * 2
+    assert all("left a provider" not in row["summary"] for row in spaces.values())
+    assert services.verbs() == []
+    assert InjectionJournal(ctx.fault_settings.journal).open_entries() == []
 
 
 def test_o28_an_unknown_run_exits_with_the_unknown_status(platform, world, services, tmp_path, ticker):

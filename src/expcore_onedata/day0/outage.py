@@ -45,7 +45,10 @@ scenario, the scratch's teardown included, and the injector takes that admission
 Failed: the target answered while it was down, it could not be restored or did not answer or read back after the
 restore, the scratch was not shown gone, a measurement raised, or the sandbox's teardown or the tool plane's check at
 its stop failed. A space whose provider is not shown back (not
-cleared, or not answering REST again) halts the spaces after it. Unknown: anything the check could not do or measure,
+cleared, or not answering REST again) halts the spaces after it, and so does a space whose start could not settle an
+injection an earlier run left open, or left one open: nothing of that space was stopped, but a provider may still be
+down, so the check fails naming it by its position. A start that fails with nothing open (a service that cannot be read
+before the stop) only leaves that space unknown. Unknown: anything the check could not do or measure,
 with the reason: a mount the platform declares and that was not read, a tool not called, or the sandbox or the tool
 server not started (starting them needs `Context.agent_host`, which `EXPCORE_LIVE_DOCKER=1` gives the runner). What a
 cell answered is a fact, never a failure.
@@ -111,8 +114,8 @@ def provider_outage(ctx: Context) -> Result:
 
     The spaces run one after the other, each with its provider brought back before the next starts; if a space's
     provider is not shown back (the injector could not clear the injection, or the provider does not answer REST
-    again), no later space is run, since a provider may still be down. The verdict is the worst over the spaces
-    (`per_space`)."""
+    again), or its start left an injection of an earlier run open (`outage_fault.LEFT_OPEN`), no later space is run,
+    since a provider may still be down. The verdict is the worst over the spaces (`per_space`)."""
     refusal = _refusal(ctx)
     if refusal is not None:
         return unknown(refusal)
