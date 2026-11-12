@@ -15,7 +15,7 @@ package must not show, though: a home directory, an earlier study's folder, an a
 - every replication package ships models.toml in that form, so the identity a reader recomputes from the shipped file
   is the one the records were checked under, with no transformation to take on trust. The build refuses a package
   whose models.toml still holds any other key location (`location_findings`), and one in which any file still names
-  a key location the study's models declare, is a declared key file, or is a copy of one under any name
+  a key location the study's models declare, is a declared key file, or is or holds a copy of one under any name
   (`location_finders`), as safety nets behind the rewrite.
 
 The rewrite is minimal by construction, and checked. It reads the file's bytes once, as UTF-8 with no newline
@@ -59,6 +59,8 @@ _HOMES = (  # what a tail is written behind: `~`, `~name`, a variable, a home di
     rf"(?:~[{_PART}.]*|\$HOME|\$\{{HOME\}}|%(?:USERPROFILE|HOME)%|/home/[{_PART}.]+|/Users/[{_PART}.]+|/root)"
 )
 MAX_KEY_FILE_BYTES = 2**20  # a key is a small secret: a file over 1 MiB is not one
+MIN_NEEDLE_BYTES = 16  # a key file's content is searched for inside other bytes from this length: a shorter run of
+# bytes occurs by chance in a large package, a random 16 bytes (128 bits) never does
 
 
 class KeyLocationUnreachable(ConfigError):
@@ -298,12 +300,16 @@ def _ends_with(path: str, tail: str) -> bool:
 @dataclasses.dataclass(frozen=True)
 class KeyFinders:
     """What finds each key location a study's models declare: in text (`patterns`), as a packaged file (`files`, each
-    key file's spellings), and as a copy of a key file under any name (`digests`, the size and SHA-256 of each key
-    file that could be read)."""
+    key file's spellings), as a copy of a key file under any name (`digests`, the size and SHA-256 of each key file
+    that could be read), and as the content of one inside other bytes of any format (`needles`, each key file's bytes
+    as they are and with the white space around them stripped, those of at least `MIN_NEEDLE_BYTES` only: a shorter key
+    is found as a whole stream, by `digests`, and not inside other bytes). `needles` hold the key itself: they are
+    kept out of the repr, and nothing may print them."""
 
     patterns: tuple[re.Pattern[str], ...] = ()
     files: tuple[str, ...] = ()
     digests: frozenset[tuple[int, str]] = frozenset()
+    needles: tuple[bytes, ...] = dataclasses.field(default=(), repr=False)
 
     def __bool__(self) -> bool:
         return bool(self.patterns or self.files or self.digests)
@@ -324,14 +330,21 @@ class KeyFinders:
             return False
         return (len(data), hashlib.sha256(data).hexdigest()) in self.digests
 
+    def holds_key_file(self, data: bytes) -> bool:
+        """Whether the bytes hold a declared key file's content anywhere in them, in a container of any format, a
+        text or a binary: a substring search (linear in the bytes), for the key file's exact bytes and for its bytes
+        with the white space around them stripped, since a copy in a script or a note usually lacks the key file's
+        trailing newline. A key shorter than `MIN_NEEDLE_BYTES` has no needle: `is_key_file` alone finds that one."""
+        return any(needle in data for needle in self.needles)
+
 
 NO_LOCATIONS = KeyFinders()  # nothing to look for
 
 
-def _key_file_digest(spec: Any) -> tuple[int, str] | None:
-    """The size and SHA-256 of a model's key file, read once as the key is read (`ModelSpec.read_key`); None when it
-    is not a readable file or holds nothing a key could. A file over `MAX_KEY_FILE_BYTES` is refused: no key is that
-    large, and a copy of it could not be told by its bytes. The message names the model, never the file."""
+def _key_file(spec: Any) -> bytes | None:
+    """The bytes of a model's key file, read once as the key is read (`ModelSpec.read_key`); None when it is not a
+    readable file or holds nothing a key could. A file over `MAX_KEY_FILE_BYTES` is refused: no key is that large, and
+    a copy of it could not be told by its bytes. The message names the model, never the file."""
     path = os.path.expanduser(spec.key_file)
     try:
         if not stat.S_ISREG(os.stat(path).st_mode):
@@ -345,24 +358,32 @@ def _key_file_digest(spec: Any) -> tuple[int, str] | None:
             f"[models.{getattr(spec, 'key', '?')}]: key 'key_file': the file it names is over 1 MiB, too large to be a "
             "key, so a copy of it could not be found by its bytes; point key_file at the key itself"
         )
-    return (len(data), hashlib.sha256(data).hexdigest()) if data.strip() else None
+    return data if data.strip() else None
+
+
+def _needles(key: bytes) -> set[bytes]:
+    """What is searched for inside other bytes of a key file's content: the bytes, and the bytes with the white space
+    around them stripped, when long enough to be told from chance (`MIN_NEEDLE_BYTES`)."""
+    return {needle for needle in (key, key.strip()) if len(needle) >= MIN_NEEDLE_BYTES}
 
 
 def location_finders(specs: Iterable[Any]) -> KeyFinders:
     """What finds each key location the models declare: a key file's path in the spellings of `_spellings`, in text
     (`_path_finder`, `_home_finder`) and as a packaged file (`KeyFinders.names_file`); the key file itself as a copy
-    under any name, when it can be read now (`_key_file_digest`); and a variable's name as a whole identifier. Text is
-    searched case-sensitively. A placeholder is never looked for.
+    under any name, and its content inside other bytes when it is long enough (`_key_file`, `_needles`), when it can be
+    read now; and a variable's name as a whole identifier. Text is searched case-sensitively. A placeholder is never
+    looked for.
     """
-    paths, bare, names, digests = set(), set(), set(), set()
+    paths, bare, names, digests, needles = set(), set(), set(), set(), set()
     for spec in specs:
         if spec.key_file and spec.key_file != KEY_FILE_WITHHELD:
             whole, words = _spellings(spec.key_file)
             paths |= whole
             bare |= words
-            digest = _key_file_digest(spec)
-            if digest is not None:
-                digests.add(digest)
+            key = _key_file(spec)
+            if key is not None:
+                digests.add((len(key), hashlib.sha256(key).hexdigest()))
+                needles |= _needles(key)
         if spec.key_env and spec.key_env != KEY_ENV_WITHHELD:
             names.add(spec.key_env)
     return KeyFinders(
@@ -373,4 +394,5 @@ def location_finders(specs: Iterable[Any]) -> KeyFinders:
         ),
         files=tuple(sorted(paths)),
         digests=frozenset(digests),
+        needles=tuple(sorted(needles)),
     )

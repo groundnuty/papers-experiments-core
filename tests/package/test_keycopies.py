@@ -15,7 +15,7 @@ from package_support import wheel_of
 
 from expcore.config.key_locations import location_finders
 from expcore.package import views
-from expcore.package.leaks import FOUND_COPY, UNCHECKED, find_locations
+from expcore.package.leaks import FOUND_COPY, UNCHECKED, find_copies, find_locations
 from expcore.package.spec import Opaque
 from expcore.package.wheels import Wheel
 from expcore.package.wheelscan import scan_wheels
@@ -61,6 +61,24 @@ def tarred(*members: tuple[str, bytes], kind: bytes = tarfile.REGTYPE) -> bytes:
     return buffer.getvalue()
 
 
+def tar_in_v7_format() -> bytes:
+    """A tar in the old v7 format: no "ustar" magic in its header (the checksum is made again), which the tar reader
+    and GNU tar both read all the same."""
+    data = bytearray(tarred(("k.bin", KEY)))
+    data[257:265] = bytes(8)
+    data[148:156] = b" " * 8
+    data[148:156] = b"%06o\0 " % sum(data[:512])
+    assert not views._is_tar(bytes(data))
+    with tarfile.open(fileobj=io.BytesIO(bytes(data))) as archive:
+        assert archive.extractfile("k.bin").read() == KEY
+    return bytes(data)
+
+
+def tar_after_a_junk_block() -> bytes:
+    """A tar with a block of junk before its first header, which GNU tar skips to extract the member after it."""
+    return b"G" * 512 + tarred(("k.bin", KEY))
+
+
 def tar_with_bad_header() -> bytes:
     """A tar whose second header's checksum is wrong: the tar reader stops there, as it does at the end of an archive,
     while GNU tar skips to the next header and extracts the key file."""
@@ -99,6 +117,21 @@ def sqlite_of(directory, *blobs: bytes, wal: bool = False) -> bytes:
     connection.commit()
     connection.close()
     return path.read_bytes()
+
+
+def wal_of(directory, *blobs: bytes) -> bytes:
+    """The write-ahead log of a database in WAL mode, read while a connection to it is open (closing it would
+    checkpoint the log into the database and delete it)."""
+    connection = sqlite3.connect(directory / "runs.db")
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA wal_autocheckpoint = 0")
+        connection.execute("CREATE TABLE runs (id INTEGER, blob BLOB)")
+        connection.executemany("INSERT INTO runs VALUES (?, ?)", list(enumerate(blobs, 1)))
+        connection.commit()
+        return (directory / "runs.db-wal").read_bytes()
+    finally:
+        connection.close()
 
 
 def nested(levels: int) -> bytes:
@@ -213,7 +246,7 @@ def test_k13_a_tar_of_directories_and_links_passes_the_walk(finders):
 def test_k13_a_wal_mode_sqlite_database_is_read_for_a_copy_of_the_key_file(finders, tmp_path):
     """K13: a database in WAL mode (which SQLite will not deserialise as it is) with no copy of the key file passes,
     attested; one with the key file in a BLOB is refused by the BLOB's path."""
-    clean = sqlite_of(tmp_path, b"\0" + KEY, wal=True)
+    clean = sqlite_of(tmp_path, KEY[1:], wal=True)
     assert clean[18:20] == b"\x02\x02"
     assert find_locations({"out/runs.db": clean}, finders, opaque={"out/runs.db"}) == []
     (tmp_path / "runs.db").unlink()
@@ -231,10 +264,108 @@ def test_k13_nothing_is_walked_for_a_copy_when_no_key_file_can_be_read(tmp_path)
 
 def test_k13_an_attested_archive_with_no_copy_in_it_passes(finders):
     """K13: an attested archive the content scanner would refuse (a PNG, a compressed tar inside), which holds no copy
-    of the key file, passes the walk; so do bytes that hold the key among others."""
+    of the key file, passes the walk; so do bytes that hold all but the key's first byte."""
     inner = gzip.compress(tarred(("notes.txt", b"plain notes\n"), ("plot.png", PNG)))
-    bundle = zipped(("figures/plot.png", PNG), ("inner.tar.gz", inner), ("near.bin", b"\0" + KEY))
+    bundle = zipped(("figures/plot.png", PNG), ("inner.tar.gz", inner), ("near.bin", b"\0" + KEY[1:]))
     assert find_locations({"data/bundle.zip": bundle}, finders, opaque={"data/bundle.zip"}) == []
+
+
+def copy_found(finders, path: str, data: bytes) -> list[str]:
+    """The findings for one file, attested and not, each of which must name the path alone and no digest."""
+    for opaque in (frozenset({path}), frozenset()):
+        found = find_locations({path: data}, finders, opaque=opaque)
+        assert f"{path}: {FOUND_COPY}" in found, found
+        assert not digests_printed(found)
+        assert not any(part in line for line in found for part in KEPT)
+    return found
+
+
+def test_k13_a_copy_of_the_key_file_in_a_tar_in_v7_format_is_found_attested_or_not(finders):
+    """K13: a tar with no "ustar" magic (the v7 format) is not recognised as a tar, but GNU tar extracts the key file
+    from it: the bytes are searched for the key file's content, whatever their format, so it is refused by its path."""
+    copy_found(finders, "data/old.tar", tar_in_v7_format())
+
+
+def test_k13_a_copy_of_the_key_file_in_a_tar_after_a_junk_block_is_found_attested_or_not(finders):
+    """K13: a tar behind a block of junk is no tar to the reader, and GNU tar extracts the key file from it all the
+    same: the bytes are searched for the key file's content, so it is refused by its path."""
+    copy_found(finders, "data/junk.tar", tar_after_a_junk_block())
+
+
+def test_k13_a_copy_of_the_key_file_in_a_wal_sidecar_is_found_attested_or_not(finders, tmp_path):
+    """K13: the -wal file of a database in WAL mode holds the pages not yet in the database, with no SQLite header of
+    its own; a key file written to one is found by searching its bytes for the key file's content."""
+    wal = wal_of(tmp_path, KEY)
+    assert KEY in wal
+    copy_found(finders, "out/runs.db-wal", wal)
+
+
+def test_k13_a_database_page_the_key_file_was_deleted_from_is_found_by_its_bytes(finders, tmp_path):
+    """K13: a value deleted from an SQLite database stays in its file until the space is reused, and no row holds it:
+    the walk of values cannot see it, but the search of the file's bytes does."""
+    path = tmp_path / "runs.db"
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA secure_delete = OFF")
+    connection.execute("CREATE TABLE runs (id INTEGER, blob BLOB)")
+    connection.executemany("INSERT INTO runs VALUES (?, ?)", [(1, KEY), (2, b"kept")])
+    connection.commit()
+    connection.execute("DELETE FROM runs WHERE id = 1")
+    connection.commit()
+    connection.close()
+    data = path.read_bytes()
+    assert KEY in data
+    copy_found(finders, "out/runs.db", data)
+
+
+EMBEDDED = [  # what it is, the packaged path, the bytes with the key file's content in them
+    ("without its trailing newline", "src/t.py", b"TOKEN = '" + KEY.rstrip() + b"'\n"),
+    ("with its trailing newline", "notes/log.txt", b"before\n" + KEY + b"after\n"),
+    ("in bytes that are not text", "data/blob.bin", b"\xff\xfe\x00" + KEY.rstrip() + b"\x00\x80"),
+]
+
+
+@pytest.mark.parametrize(("path", "data"), [c[1:] for c in EMBEDDED], ids=[c[0] for c in EMBEDDED])
+def test_k13_the_key_files_content_is_found_inside_other_bytes_with_or_without_its_newline(finders, path, data):
+    """K13: a key file usually ends with a newline that its copy in a script, a note or a binary lacks, and the stream
+    is then not the key file by size and SHA-256: the content, stripped of the white space around it, is searched
+    for too, so the stream is refused by its path."""
+    assert not finders.is_key_file(data)
+    copy_found(finders, path, data)
+
+
+def test_k13_a_copy_nested_in_a_container_is_named_by_its_member_not_by_the_container_holding_it(finders):
+    """K13: a stored zip holds the key file's bytes as they are, so the zip's own bytes hold them too; only the member
+    is named, once, not the zip as well."""
+    found = find_locations({"data/a.zip": zipped(("k.bin", KEY), stored=True)}, finders, opaque={"data/a.zip"})
+    assert found == [f"data/a.zip!k.bin: {FOUND_COPY}"], found
+
+
+SHORT = [  # the key, how long it is, whether a copy of it inside other bytes is found
+    ("16 bytes", b"0123456789abcdef", True),
+    ("15 bytes", b"0123456789abcde", False),
+    ("a short key and a trailing newline", b"abcdefghijkl\n", False),
+]
+
+
+@pytest.mark.parametrize(("key", "found_inside"), [c[1:] for c in SHORT], ids=[c[0] for c in SHORT])
+def test_k13_a_key_shorter_than_16_bytes_is_not_searched_for_inside_other_bytes(tmp_path, key, found_inside):
+    """K13: a short key would occur by chance in other bytes, so it is searched for from 16 bytes up; a shorter one is
+    compared by whole stream, size and SHA-256, as before, and nothing prints it."""
+    finders = finders_of(tmp_path, key)
+    inside = {"src/t.py": b"x = '" + key.strip() + b"'\n", "data/blob.bin": b"\xff\0" + key.strip() + b"\0\x80"}
+    found = find_locations(inside, finders, opaque=set(inside))
+    assert bool(found) == found_inside, found
+    whole = find_locations({"data/k.txt": key}, finders, opaque={"data/k.txt"})
+    assert whole == [f"data/k.txt: {FOUND_COPY}"], whole
+    assert not any(key.strip().decode() in line for line in [*found, *whole])
+
+
+def test_k13_a_vendored_wheel_holding_the_key_files_content_is_found_by_its_own_bytes(finders):
+    """K13: a wheel in `unopened` (its members are walked by `scan_wheels`) is compared by its own bytes, and now
+    searched for the key file's content too: one the zip reader does not open, but which holds the key, is refused."""
+    holding = b"PK\x03\x04 not a wheel the zip reader opens " + KEY.rstrip() + b" ..."
+    found = find_copies({"vendor/x.whl": holding}, finders, unopened={"vendor/x.whl"})
+    assert found == [f"vendor/x.whl: {FOUND_COPY}"], found
 
 
 def scan(wheel: Wheel, finders, *, attested=None, exempt=()):
@@ -252,6 +383,7 @@ def scan(wheel: Wheel, finders, *, attested=None, exempt=()):
 ARCHIVED = [  # what it is, the member's path and bytes, the copy's label under it
     ("a zip member", "toy_kit/data.zip", zipped(("k.bin", KEY)), "toy_kit/data.zip!k.bin"),
     ("a tar member", "toy_kit/data.tar", tarred(("k.bin", KEY)), "toy_kit/data.tar!k.bin"),
+    ("a v7 tar", "toy_kit/old.tar", tar_in_v7_format(), "toy_kit/old.tar"),
 ]
 
 

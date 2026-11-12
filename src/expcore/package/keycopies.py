@@ -6,14 +6,20 @@ A package must never hold a copy of a key file its study's models.toml declares 
 that decodes to one), and an attested file is not given to it at all. This walk is its own, and nothing cuts it short
 but its limits: no kind of content is refused, and an attestation changes nothing.
 
-Each stream is compared by size and then SHA-256 with each key file (`KeyFinders.is_key_file`), and what it holds is
-walked in turn, read as the scanner reads it (its classifiers are shared): the members of a zip (at offset 0, or
-wherever the zip reader finds one) or a tar, and their comments; what a gzip, bzip2, xz or zlib stream decompresses
-to; each value of an SQLite database, in WAL mode or not; and in text, every base64 and hex run, decoded as the scanner
-decodes it (`views.payloads`). A tar member is read whenever the reader gives a stream for it, whatever its type,
-links aside (GNU tar extracts one of an unknown type as a file); a tar with bytes after its last member that are not
-the zero blocks ending it is unchecked, because the reader stops at a header it cannot read where GNU tar goes on to
-the next. A stream of any other kind (a PNG, a PDF, a compiled binary) is compared as the bytes it is.
+Each stream is compared by size and then SHA-256 with each key file (`KeyFinders.is_key_file`) and its bytes are
+searched for each key file's content as a substring (`KeyFinders.holds_key_file`: the key as it is, and with the white
+space around it stripped, since a copy in a note usually lacks a key file's trailing newline), so a key embedded
+uncompressed is found in a container of any format the walk does not open (a tar in the v7 format, a tar behind junk, a
+write-ahead log, a page deleted from a database). That search is made on a key of at least 16 bytes only; a shorter key
+would occur by chance, and is compared by whole stream alone. What a stream holds is walked in turn, read as the scanner
+reads it (its classifiers are shared): the members of a zip (at offset 0, or wherever the zip reader finds one) or a
+tar, and their comments; what a gzip, bzip2, xz or zlib stream decompresses to; each value of an SQLite database, in WAL
+mode or not; and in text, every base64 and hex run, decoded as the scanner decodes it (`views.payloads`). A tar member
+is read whenever the reader gives a stream for it, whatever its type, links aside (GNU tar extracts one of an unknown
+type as a file); a tar with bytes after its last member that are not the zero blocks ending it is unchecked, because the
+reader stops at a header it cannot read where GNU tar goes on to the next. A stream of any other kind (a PNG, a PDF, a
+compiled binary) is compared and searched as the bytes it is. A stream that holds the key but contains a stream that is
+a copy too (a stored zip and its member) is named by the inner one only.
 
 The limits are the scanner's, for each packaged file and each wheel member alone: containers nested `MAX_DEPTH` deep
 (a decoded run is not a level of its own: each one is shorter than the text it is in, so runs inside runs end on their
@@ -92,9 +98,23 @@ class _State:
 
     def visit(self, label: str, data: bytes, depth: int, *, strict: bool) -> None:
         """Compare one stream, then walk what it holds. `strict` is False for a decoded run, which fails to open as
-        an archive only by chance, so it is then compared and let be."""
-        if self.locations.is_key_file(data):
+        an archive only by chance, so it is then compared and let be.
+
+        A stream is a copy when it is a key file by size and SHA-256, or, failing that, when it holds a key file's
+        content anywhere (`KeyFinders.holds_key_file`): the one search of its bytes, whatever they are, finds the key
+        in a container the walk does not open (a tar with no "ustar" magic, a write-ahead log, a deleted database
+        page). A stored zip holds its members' bytes as they are, so what holds a copy that a member of it was named
+        for is named by the member alone: the stream is the copy only when no stream inside it was."""
+        copy = self.locations.is_key_file(data)
+        if copy:
             self.found.copies.append(label)
+        before = len(self.found.copies)
+        self._walk(label, data, depth, strict=strict)
+        if not copy and len(self.found.copies) == before and self.locations.holds_key_file(data):
+            self.found.copies.append(label)
+
+    def _walk(self, label: str, data: bytes, depth: int, *, strict: bool) -> None:
+        """Walk what one stream holds, as `visit` does."""
         text = _text(data)
         if text is not None:
             self._runs(label, text, depth)

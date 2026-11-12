@@ -223,7 +223,8 @@ def find_copies(
     findings: set[str] = set()
     for name in sorted(files):
         if name in unopened:
-            found = Walk(copies=[name] if locations.is_key_file(files[name]) else [])
+            held = locations.is_key_file(files[name]) or locations.holds_key_file(files[name])
+            found = Walk(copies=[name] if held else [])
         else:
             found = walk(name, files[name], locations)
         shown = {label: redactor.name(label, hide=path_holds(label, locations)) for label in found.labels()}

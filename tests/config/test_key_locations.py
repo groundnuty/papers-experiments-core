@@ -353,3 +353,29 @@ def test_k13_a_models_toml_that_is_not_toml_as_its_bytes_are_is_refused_at_load_
     assert "/srv/hidden" not in str(loading.value) + str(hashing.value)
     with pytest.raises(ConfigError, match="cannot be read as a TOML table"):
         withhold_key_locations(b"not = [toml")
+
+
+@pytest.mark.parametrize(
+    ("key", "searched"),
+    [
+        (b"0123456789abcdef", [b"0123456789abcdef"]),
+        (b"0123456789abcdef\n", [b"0123456789abcdef", b"0123456789abcdef\n"]),
+        (b"  0123456789abcdef  \n", [b"  0123456789abcdef  \n", b"0123456789abcdef"]),
+        (b"0123456789abcde", []),
+        (b"0123456789abcde\n", [b"0123456789abcde\n"]),  # 16 bytes as it stands, 15 stripped
+        (b"abcdefghijkl\n", []),
+    ],
+    ids=["16 bytes", "newline-ended", "padded", "15 bytes", "15 and a newline", "short"],
+)
+def test_k13_a_key_file_is_searched_for_inside_other_bytes_from_16_bytes_up_and_never_printed(tmp_path, key, searched):
+    """K13: a key file's content is looked for inside other bytes as it is and with the white space around it
+    stripped, each only from 16 bytes up (a shorter run occurs by chance); no representation of the finders holds the
+    key."""
+    path = tmp_path / "vault" / "lab.secret"
+    path.parent.mkdir()
+    path.write_bytes(key)
+    finders = location_finders([SimpleNamespace(key_file=str(path), key_env=None, key="gamma")])
+    assert sorted(finders.needles) == sorted(searched)
+    assert finders.holds_key_file(b"\0" + key + b"\0") == bool(searched)
+    assert key.strip().decode() not in repr(finders)
+    assert "needles" not in repr(finders)

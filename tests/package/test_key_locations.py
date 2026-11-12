@@ -616,7 +616,7 @@ def test_k13_with_the_key_file_there_the_example_and_an_attested_archive_without
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("figures/plot.png", PNG)
         archive.writestr("figures/inner.tar.gz", gzip.compress(inner))
-        archive.writestr("figures/near.bin", b"\0" + KEY_BYTES)  # holds the key among other bytes: not a copy
+        archive.writestr("figures/near.bin", b"\0" + KEY_BYTES[1:])  # all but the key's first byte: not a copy
     (copy.root / "figures.zip").write_bytes(buffer.getvalue())
     digest = hashlib.sha256(buffer.getvalue()).hexdigest()
     spec = copy.root / "package.toml"
