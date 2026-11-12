@@ -48,6 +48,7 @@ from urllib.parse import quote
 
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.tokencheck import ExaminationFailed, TokenRefused
 
 SCOPE_PATH = "/tokens/infer_access_token_scope"
@@ -104,7 +105,7 @@ def _order(position: str) -> tuple[int, str]:
 def admin_privileges(client: OnezoneClient, user_id: str) -> list[str]:
     """Return a user's effective Onezone admin privileges, read with the admin credential; raise as the module says."""
     try:
-        answer = client.get(f"/users/{quote(user_id, safe='')}/effective_privileges")
+        answer = client.get(f"/users/{quote(user_id, safe='')}/effective_privileges", retry=ONE_ATTEMPT)
     except PlatformError as error:
         what = "the principal's Onezone admin privileges"
         raise ExaminationFailed(f"{what} could not be read ({error})", error) from None
@@ -129,7 +130,7 @@ def require_no_admin(privileges: Sequence[Any]) -> None:
 def effective_clusters(client: OnezoneClient, token: str) -> list[str]:
     """Return the clusters the token's user is an effective member of, read as that token; raise as the module says."""
     try:
-        answer = client.get(CLUSTERS_PATH, token=token)
+        answer = client.get(CLUSTERS_PATH, token=token, retry=ONE_ATTEMPT)
     except PlatformError as error:
         raise ExaminationFailed(f"the token's clusters could not be read ({error})", error) from None
     clusters = answer.get("clusters") if isinstance(answer, Mapping) else None

@@ -91,6 +91,7 @@ class ProgressiveIngest:
         self._halt = threading.Event()
         self._thread: threading.Thread | None = None
         self._started = self._closed = False
+        self._retried_before = provisioner.reads_retried  # the count the snapshot's `reads_retried` is taken from
         self._t0: float | None = None
         self._readings: list[dict[str, Any]] = []
         self._files = {f.label: {"baseline_id": None, "arrived_id": None, "restored_id": None} for f in plan.files}
@@ -132,6 +133,7 @@ class ProgressiveIngest:
         if self._started:
             raise RuntimeError("a ProgressiveIngest instruments one run: make a new one for each")
         self._started = True
+        self._retried_before = self._p.reads_retried  # the provisioner serves one run's ingest after another (O29)
         began = self._p.clock()
         try:
             self._p.verify_space()
@@ -344,6 +346,7 @@ class ProgressiveIngest:
             "failure": self._failure,
             "defect": self._defect,
             "restore": self._restore,
+            "reads_retried": self._p.reads_retried - self._retried_before,
         }
 
 

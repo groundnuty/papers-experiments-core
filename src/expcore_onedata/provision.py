@@ -25,6 +25,11 @@ configured name or lies outside the prefixes. On top of that gate:
   a directory only when nothing but logged, already deleted entries was in it; anything else is reported as left, and
   the report's `ok` is False. Nothing outside the log is touched, and no token or user is revoked.
 - **The waits are bounded** (O07, `consistency.py`) and happen before or after a run, never in the agent's time.
+- **A plumbing read that timed out is tried again, boundedly and in the log** (O29, `readretry.py`): the listings, the
+  size and attribute reads, `read_file`'s metadata read and the visibility wait, three attempts with pauses of 2 s and
+  5 s. `reads_retried` counts the retries. Never retried: a mutation, a streamed or range read, a block map (what the
+  probes record and the placement polls judge), a transfer's record, and what is read inside a poll that already counts
+  a failed read as a poll that did not match. An instrument's own read (`resolve(wait=False)`) is one attempt.
 
 The change log is a JSON-lines file: one line per creation and per deletion with the path, the id and the time. It holds
 no token and no credential.
@@ -48,6 +53,7 @@ from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, ans
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncovered
 from expcore_onedata.rangemap import PlacementSettings, safe_path
+from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
 from expcore_onedata.streamed import OCTET_STREAM, Digest, Upload, chunks, media_type
 
 LISTING_LIMIT = 1000
@@ -241,6 +247,7 @@ class Provisioner:
         self._log_lock = threading.Lock()
         self._role: str | None = None  # the role that claimed the log through this provisioner (`claim_log`)
         self._clock, self._sleep = clock, sleep
+        self._retry = ReadRetry(clock=clock, sleep=sleep)  # this provisioner's plumbing reads, and their count (O29)
         self._verified_name: str | None = None
         self._root: str | None = None
         self._visible: set[tuple[str, str]] = set()  # (provider, file id) seen at its size there (`await_visible`)
@@ -269,6 +276,17 @@ class Provisioner:
         """Send a mutation through the client's gate, bound to this provisioner's space: one whose target lies in any
         other declared space is refused before it is sent, even under a shared prefix (O09)."""
         return self._client.mutate(method, path, space=self._entry.space, **options)
+
+    @property
+    def retry(self) -> ReadRetry:
+        """The policy for this provisioner's plumbing reads (three attempts, 2 s and 5 s apart), which the reset and
+        the ingest that work through it pass to their own reads too, so one count says how many were retried (O29)."""
+        return self._retry
+
+    @property
+    def reads_retried(self) -> int:
+        """How many reads that timed out were tried again under `retry`, for the record of what this provisioner did."""
+        return self._retry.retries
 
     def clock(self) -> float:
         """The provisioner's clock (monotonic seconds, or a test's)."""
@@ -334,6 +352,7 @@ class Provisioner:
                 self._entry.space.id,
                 **({} if wait else {"tries": 1}),
                 sleep=self._sleep,
+                retry=self._retry if wait else ONE_ATTEMPT,
             )
         return self._root
 
@@ -386,26 +405,30 @@ class Provisioner:
 
     # -- listing and creation --------------------------------------------------
     def children(
-        self, directory_id: str, provider: str | None = None, *, listings: Listings | None = None
+        self, directory_id: str, provider: str | None = None, *, listings: Listings | None = None, retry: bool = True
     ) -> dict[str, Entry]:
         """Return every entry of a directory by name, following the pages to the end.
 
         `listings` is one operation's cache: a directory it holds is not listed again, and one listed whole is added to
-        it, so an operation over many files lists each directory once. A listing that fails adds nothing."""
+        it, so an operation over many files lists each directory once. A listing that fails adds nothing. A page read
+        that timed out is tried again under the provisioner's policy (O29), unless `retry` is False, an instrument's
+        read."""
         provider = provider or self._settings.holder
         if listings is not None and (provider, directory_id) in listings:
             return listings[(provider, directory_id)]
-        entries = self._list_pages(directory_id, provider)
+        entries = self._list_pages(directory_id, provider, self._retry if retry else ONE_ATTEMPT)
         if listings is not None:
             listings[(provider, directory_id)] = entries
         return entries
 
-    def _list_pages(self, directory_id: str, provider: str) -> dict[str, Entry]:
-        """List one directory on a provider, following the pages to the end."""
+    def _list_pages(self, directory_id: str, provider: str, reads: ReadRetry) -> dict[str, Entry]:
+        """List one directory on a provider, following the pages to the end, each page read under `reads`."""
         entries: dict[str, Entry] = {}
         params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
         while True:
-            page = self._client.get(f"/data/{_segment(directory_id)}/children", provider=provider, params=params)
+            page = self._client.get(
+                f"/data/{_segment(directory_id)}/children", provider=provider, params=params, retry=reads
+            )
             token = next_page_token(page)
             for item in page["children"]:
                 entry = listing_entry(item)
@@ -419,12 +442,13 @@ class Provisioner:
     ) -> Entry:
         """Walk a space-relative path down from the root and return its entry; raise KeyError naming the part missing.
 
-        `wait` is as for `root`: an instrument passes False so that no real answer is retried inside its read.
+        `wait` is as for `root`: an instrument passes False so that no real answer is retried inside its read, and no
+        read that timed out either (O29): its listings are one attempt each.
         `listings` is the operation's cache of directory listings (`children`), shared by every path it resolves.
         """
         node = Entry(self.root(wait=wait), "", 0, "DIR")
         for part in safe_path(path):
-            found = self.children(node.file_id, provider, listings=listings).get(part)
+            found = self.children(node.file_id, provider, listings=listings, retry=wait).get(part)
             if found is None:
                 raise KeyError(f"no entry {part!r} on the way down the path")
             node = found
@@ -614,7 +638,7 @@ class Provisioner:
 
     def _size_of(self, file_id: str) -> Any:
         """The size a file's attributes on the data provider give now."""
-        answer = self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder)
+        answer = self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder, retry=self._retry)
         return answer.get("size") if isinstance(answer, dict) else None
 
     def read_file(
@@ -639,9 +663,12 @@ class Provisioner:
         """
         self._verified()
         provider = provider or self._settings.holder
+        deadline = self._settings.transfer_timeout_s if deadline_s is None else deadline_s
         self.await_visible(provider, [file_id])
         if size is None:
-            answer = self._client.get(f"/data/{_segment(file_id)}", provider=provider)
+            answer = self._client.get(
+                f"/data/{_segment(file_id)}", provider=provider, retry=self._retry, deadline_s=deadline
+            )
             size = answer.get("size") if isinstance(answer, dict) else None
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                 raise PlatformError("a file's attributes hold no size, so its read has no bound")
@@ -651,7 +678,7 @@ class Provisioner:
             provider=provider,
             size=size,
             chunk_bytes=self._settings.chunk_bytes,
-            deadline_s=self._settings.transfer_timeout_s if deadline_s is None else deadline_s,
+            deadline_s=deadline,
             timeout_s=self._settings.request_timeout_s,
             space=self._entry.space,
         )
@@ -684,12 +711,21 @@ class Provisioner:
             if (provider, file_id) in self._visible:
                 continue
             size = self._client.get(
-                f"/data/{_segment(file_id)}", provider=self._settings.holder, params={"attribute": "size"}
+                f"/data/{_segment(file_id)}",
+                provider=self._settings.holder,
+                params={"attribute": "size"},
+                retry=self._retry,
             ).get("size")
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                 raise PlatformError("the data provider's answer for a file's size holds no size")
             waited += consistency.wait_visible(
-                self._client, provider, _segment(file_id), size=size, clock=self._clock, sleep=self._sleep
+                self._client,
+                provider,
+                _segment(file_id),
+                size=size,
+                clock=self._clock,
+                sleep=self._sleep,
+                retry=self._retry,
             )
             self._visible.add((provider, file_id))
         return round(waited, 3)
@@ -697,7 +733,9 @@ class Provisioner:
     # -- block maps ------------------------------------------------------------
     def blocks(self, file_id: str, provider: str, *, reader: str | None = None) -> list[Range]:
         """Return the blocks a provider holds of a file, read from the block map as the `reader` provider sees it."""
-        answer = self._client.get(f"/data/{_segment(file_id)}/distribution", provider=reader or provider)
+        answer = self._client.get(
+            f"/data/{_segment(file_id)}/distribution", provider=reader or provider, retry=ONE_ATTEMPT
+        )
         try:
             return provider_blocks(answer, self.provider_id(provider))
         except ValueError as error:
@@ -827,6 +865,7 @@ class Provisioner:
                 poll_s=self._settings.poll_s,
                 clock=self._clock,
                 sleep=self._sleep,
+                retry=ONE_ATTEMPT,
             ),
             "replication",
         )
@@ -887,6 +926,7 @@ class Provisioner:
                     poll_s=self._settings.poll_s,
                     clock=self._clock,
                     sleep=self._sleep,
+                    retry=ONE_ATTEMPT,
                 ),
                 "eviction",
             )
@@ -906,7 +946,7 @@ class Provisioner:
         (`answered_absent`). A read that worked is "no"; any other failure, another 400 or an unreadable body among
         them, raises, so the poll never counts as absence."""
         try:
-            self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder)
+            self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder, retry=ONE_ATTEMPT)
         except PlatformError as error:
             if answered_absent(error):
                 return True

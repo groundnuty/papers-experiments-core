@@ -42,6 +42,7 @@ from expcore_onedata.provision import (
     Provisioner,
     ProvisionError,
 )
+from expcore_onedata.readretry import ONE_ATTEMPT
 
 
 def _converge_empty(
@@ -96,6 +97,7 @@ def _wait_ended(provisioner: Provisioner, provider: str, transfer_ids: list[str]
             workers=settings.concurrency,
             clock=provisioner.clock,
             sleep=provisioner.sleep,
+            retry=ONE_ATTEMPT,
         ),
         f"{provisioner.where}eviction",
     )

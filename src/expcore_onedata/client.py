@@ -173,6 +173,7 @@ from expcore.config.loading import ConfigError
 from expcore.records.redact import register_secret
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
+from expcore_onedata.readretry import ONE_ATTEMPT, Exhausted, ReadRetry, Trace, run_attempts
 from expcore_onedata.streamed import Digest, media_type
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
@@ -251,7 +252,20 @@ _CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 _FILE_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a file's object id: one plain path segment
 _SPACE_ID = re.compile(r"[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}")  # one plain path segment, never "." or ".."
 DEFAULT_TIMEOUT_S = 15.0
+# The only failures a read is retried on (`readretry.py`): a wait that ran out for the answer, the connection or a slot
+# of the pool. A write timeout, an error answer and every other transport failure are final.
+RETRIED_TIMEOUTS = (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout)
 ERROR_BODY_BYTES = 64 * 1024  # the most of a streamed answer's error body read to find Onedata's error id
+
+
+_REQUEST_COUNT = re.compile(r"Request Count: (\d+)$")  # the end of httpcore's `ConnectionInterface.info()`
+
+
+def _build_http(config: PlatformConfig, timeout_s: float) -> httpx.Client:
+    """The HTTP client the layer sends through when none is injected, checking certificates as `[tls]` says. A retried
+    read is sent through one more of them, made for that read alone, so it has a connection of its own
+    (`readretry.py`)."""
+    return httpx.Client(timeout=timeout_s, verify=config.tls.client_verify())
 
 
 class PlatformError(RuntimeError):
@@ -428,7 +442,7 @@ class OnezoneClient:
         if kept_links < 1:
             raise ValueError("the client keeps at least one parent link")
         self._config = config
-        self._http = http if http is not None else httpx.Client(timeout=timeout_s, verify=config.tls.client_verify())
+        self._http = http if http is not None else _build_http(config, timeout_s)
         self._owns_http = http is None
         self._timeout_s = timeout_s
         self._environ = environ
@@ -475,6 +489,21 @@ class OnezoneClient:
         """Name a declared provider for a message by its position in the file, `providers[i]`, never by its name."""
         return self._base(provider)[1]
 
+    def _served_before(self) -> int | None:
+        """How many requests the connection carrying the request just sent had served before it, from the pool's request
+        count; None when the pool cannot be seen (an injected transport that has none) or when more than one connection
+        is active, so that this request's own cannot be told (`readretry.py`).
+
+        httpx keeps its pool private; the connections it lists and their `info()` ("..., ACTIVE, Request Count: N") are
+        httpcore's documented view of it, and the count includes the request itself, so one less is what it served."""
+        pool = getattr(getattr(self._http, "_transport", None), "_pool", None)
+        connections = getattr(pool, "connections", None)
+        if connections is None:
+            return None
+        active = [info for info in (c.info() for c in connections) if ", ACTIVE, " in info]
+        found = _REQUEST_COUNT.search(active[0]) if len(active) == 1 else None
+        return int(found.group(1)) - 1 if found else None
+
     def _request(
         self,
         method: str,
@@ -486,24 +515,51 @@ class OnezoneClient:
         params: Mapping[str, Any] | None = None,
         content: bytes | None = None,
         timeout_s: float | None = None,
+        retry: ReadRetry = ONE_ATTEMPT,
+        deadline_s: float | None = None,
     ) -> httpx.Response:
         """Send one request and return the answer; a transport failure or a status of 400 or more is a PlatformError.
 
         A transport failure (a reset, a refusal, a timeout) has `transport` set and a real answer has its status, so
-        a caller that retries can tell the two apart (O08).
+        a caller that retries can tell the two apart (O08). Only a GET under a policy of more than one attempt is
+        retried, and only when it timed out (`readretry.py`); anything else is sent once.
         """
         base, label = self._base(provider)
         url = base + _check_path(path)
+        wait = timeout_s if timeout_s is not None else self._timeout_s
+
+        def send(timeout: float, trace: Trace, fresh: bool) -> httpx.Response:
+            options: dict[str, Any] = {
+                "headers": dict(headers),
+                "json": json,
+                "params": dict(params) if params else None,
+                "content": content,
+                "timeout": timeout,
+                "extensions": {"trace": trace} if retry.attempts > 1 else None,
+            }
+            if fresh and self._owns_http:  # a retry gets a connection of its own, never one of the pool's idle ones
+                with _build_http(self._config, self._timeout_s) as one_shot:
+                    return one_shot.request(method, url, **options)
+            return self._http.request(method, url, **options)
+
         try:
-            response = self._http.request(
-                method,
-                url,
-                headers=dict(headers),
-                json=json,
-                params=dict(params) if params else None,
-                content=content,
-                timeout=timeout_s if timeout_s is not None else self._timeout_s,
-            )
+            if method == "GET" and retry.attempts > 1:
+                response = run_attempts(
+                    send,
+                    retry=retry,
+                    label=label,
+                    timeout_s=wait,
+                    timeouts=RETRIED_TIMEOUTS,
+                    deadline_s=deadline_s,
+                    served=self._served_before,
+                )
+            else:
+                response = send(wait, lambda name, info: None, False)
+        except Exhausted as spent:
+            raise PlatformError(
+                f"{label}: {method} failed ({type(spent.error).__name__}) after {spent.attempts} attempts",
+                transport=True,
+            ) from None
         except httpx.HTTPError as error:
             raise PlatformError(f"{label}: {method} failed ({type(error).__name__})", transport=True) from None
         if response.status_code >= 400:
@@ -527,6 +583,8 @@ class OnezoneClient:
         params: Mapping[str, Any] | None = None,
         content: bytes | None = None,
         timeout_s: float | None = None,
+        retry: ReadRetry = ONE_ATTEMPT,
+        deadline_s: float | None = None,
     ) -> Any:
         """Send one request and return the decoded JSON; map every failure to a PlatformError without detail."""
         response = self._request(
@@ -538,6 +596,8 @@ class OnezoneClient:
             params=params,
             content=content,
             timeout_s=timeout_s,
+            retry=retry,
+            deadline_s=deadline_s,
         )
         return self._decoded(response, method, provider)
 
@@ -566,13 +626,29 @@ class OnezoneClient:
         token: str | None = None,
         params: Mapping[str, Any] | None = None,
         timeout_s: float | None = None,
+        retry: ReadRetry = ONE_ATTEMPT,
+        deadline_s: float | None = None,
     ) -> Any:
         """GET a path of Onezone or of a declared provider, with the admin credential or as the token given.
 
         The privilege reads of tokens.py and the listings, block maps and transfer records of step 4b2 are its callers.
+
+        `retry` is the call site's choice, named by every caller: a `ReadRetry` for the harness's own plumbing, which
+        tries a read that timed out again, boundedly and in the log, and `ONE_ATTEMPT` (the default) for whatever
+        measures the platform, so that a timeout stays the recorded timeout it is. It is on `get` alone: no other call
+        of the client takes one. `deadline_s` bounds the whole call, its retries and pauses included (`readretry.py`).
         """
         headers = {AUTH_HEADER: token} if token is not None else self._admin
-        return self._send("GET", path, provider=provider, headers=headers, params=params, timeout_s=timeout_s)
+        return self._send(
+            "GET",
+            path,
+            provider=provider,
+            headers=headers,
+            params=params,
+            timeout_s=timeout_s,
+            retry=retry,
+            deadline_s=deadline_s,
+        )
 
     def query(self, path: str, body: Mapping[str, Any]) -> Any:
         """POST to one of the endpoints that only read (`READING_POSTS`); any other path is refused."""

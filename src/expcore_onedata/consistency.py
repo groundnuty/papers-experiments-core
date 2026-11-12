@@ -19,6 +19,12 @@ executor that must place data does so before it starts the loop, or after it end
 
 Every wait takes an injectable `clock` and `sleep`, so a test never really waits. A request inside a poll is bounded
 by the client's own timeout.
+
+A wait whose reads propagate a failure (`wait_transfers`, `space_root`, `wait_visible`) takes the caller's `retry`, the
+policy for a read that timed out (`readretry.py`): the harness's plumbing passes its own, whatever measures the platform
+passes `ONE_ATTEMPT`, and the default is one attempt. A read inside a poll that counts a failure as a poll that did not
+match (`converge`, `converge_each`) is never retried: the poll is the retry. A wait's own bound also bounds the retries
+of its reads.
 """
 
 import asyncio
@@ -29,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore_onedata.client import OnezoneClient, PlatformError, answered_absent
+from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
 
 # The states in which a transfer has ended: the earlier study's working code stopped polling at these four.
 ENDED_STATES = ("completed", "failed", "cancelled", "skipped")
@@ -225,6 +232,7 @@ def wait_transfers(
     workers: int = 1,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    retry: ReadRetry = ONE_ATTEMPT,
 ) -> TransferReport:
     """Poll each transfer until it has ended, or `timeout_s`. An ended transfer is a report, not evidence of placement.
 
@@ -239,7 +247,9 @@ def wait_transfers(
 
     def read(tid: str) -> Any:
         try:
-            return client.get(f"/transfers/{tid}", provider=provider)
+            return client.get(
+                f"/transfers/{tid}", provider=provider, retry=retry, deadline_s=timeout_s - (clock() - began)
+            )
         except PlatformError as error:
             if not answered_absent(error):
                 raise
@@ -274,6 +284,7 @@ def space_root(
     tries: int = 30,
     wait_s: float = 2.0,
     sleep: Callable[[float], None] = time.sleep,
+    retry: ReadRetry = ONE_ATTEMPT,
 ) -> str:
     """Return the id of the space's root directory on a provider, waiting out "no such file" on a fresh space.
 
@@ -284,7 +295,7 @@ def space_root(
     guard()
     for attempt in range(1, tries + 1):
         try:
-            answer = client.get(f"/spaces/{space_id}", provider=provider)
+            answer = client.get(f"/spaces/{space_id}", provider=provider, retry=retry)
         except PlatformError as error:
             if not answered_absent(error) or attempt == tries:
                 raise
@@ -307,6 +318,7 @@ def wait_visible(
     poll_s: float = VISIBLE_POLL_S,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    retry: ReadRetry = ONE_ATTEMPT,
 ) -> float:
     """Wait until a provider sees a file written through another, at its size; return the seconds it took.
 
@@ -320,7 +332,13 @@ def wait_visible(
     began = clock()
     while True:
         try:
-            answer = client.get(f"/data/{file_id}", provider=provider, params={"attribute": "size"})
+            answer = client.get(
+                f"/data/{file_id}",
+                provider=provider,
+                params={"attribute": "size"},
+                retry=retry,
+                deadline_s=timeout_s - (clock() - began),
+            )
             if isinstance(answer, dict) and answer.get("size") == size:
                 return round(clock() - began, 3)
         except PlatformError as error:
