@@ -44,7 +44,8 @@ both halves. The driver handed to every construction counted its calls: 0, so no
 
 ## One measured injection of `birch` (O11)
 
-Started 34.7 s after the live test's restore, once `birch` was healthy again.
+Started once `birch` was healthy again, 48 s after the live test's restart (its `StartedAt`), after a health wait of
+34.7 s.
 
 - **Journal before the stop:** when the driver's `stop` was called, the journal held exactly one open `injecting`
   entry for the service. The journal ended with `injecting`, `injected`, `cleared` for it and 0 open entries.
@@ -120,8 +121,9 @@ with `cedar` stopped. `down`'s cgroup peaks: `pine` 1.15 GiB, `zone` 1.09 GiB, `
   (the crashing child's, `cedar`'s) put `injected` about 30 to 31 s after the step before it, so "seen down" comes about
   31 s into `start`.
 - **A verified restore is not a ready provider.** Within about a second of the restore, `birch`'s REST endpoint still
-  refused the connection. The Compose health check was healthy about 49 s (`birch`) and 52 s (`cedar`) after the
-  restarted container's `StartedAt`, polled every 3 s. The injector verifies the container's identity, not readiness,
+  refused the connection. The Compose health check was healthy about 48 s (`birch`, after the live test), 49 s
+  (`birch`, after the measured injection) and 52 s (`cedar`) after the restarted container's `StartedAt`, polled every
+  3 s. The injector verifies the container's identity, not readiness,
   so a run that follows an outage run at once meets a provider still starting.
 - **The sampler barely saw an outage.** A container counted stopped only from its exit to the start, about 1 to 2 s
   here, and `docker stats` omits a stopped container: one sample of 114 held 3 containers.
