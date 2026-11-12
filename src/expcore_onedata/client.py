@@ -100,7 +100,7 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   answered with a 206 and a `Content-Range`. `content_answer` is the same call whole or with `Range: bytes=0-0`, of
   which only the status and the `Content-Type` are read: the type it measures (`precampaign.py`),
   `application/octet-stream` for both, is confirmed by [L1]. `read_content` is a run of range reads, each streamed and
-  hashed as it comes (O21).
+  hashed as it comes (O25).
 - A write of content without the `offset` query, which truncates the file first and which a restarted upload relies
   on: only the provider's API description states it, and no source sends it; see `UNVERIFIED_ENDPOINTS`.
 - `file_space_id`: `GET /data/{id}` with the query `attribute=parent_id`, answered `{"parent_id": <id>}`, and
@@ -884,7 +884,7 @@ class OnezoneClient:
         space: Space | None = None,
     ) -> Digest:
         """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
-        size and the SHA-256 of what was read (O21).
+        size and the SHA-256 of what was read (O25).
 
         Nothing holds the file: each range of at most `chunk_bytes` is a streamed GET whose pieces, as the connection
         delivers them, are hashed, handed to `sink` when one is given, and dropped. Each range passes the gate of

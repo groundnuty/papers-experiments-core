@@ -84,7 +84,7 @@ def page_of(answer: Any) -> tuple[list[str], str | None]:
 
     The last page says so with `nextPageToken` null (the provider's API description: "When end of list is reached, the
     token is returned with a null value"). A page without the key, or with one that is neither null nor a token, may
-    be cut, so it is refused, never read as the end of the listing (O22).
+    be cut, so it is refused, never read as the end of the listing (O26).
     """
     if not isinstance(answer, dict) or not isinstance(answer.get("transfers"), list):
         raise Unreadable("a page of the listing has no list of transfers")

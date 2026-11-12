@@ -68,7 +68,7 @@ def _child(client: OnezoneClient, provider: str, directory: str, name: str) -> s
     params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
     while True:
         page = client.get(f"/data/{directory}/children", provider=provider, params=params)
-        token = next_page_token(page)  # a page without its last-page marker is refused, never the end (O22)
+        token = next_page_token(page)  # a page without its last-page marker is refused, never the end (O26)
         for item in page["children"]:
             entry = listing_entry(item)
             if entry.name == name:

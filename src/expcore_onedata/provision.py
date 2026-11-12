@@ -11,10 +11,10 @@
 before it first acts the provisioner reads the space's live name from Onezone and refuses one that differs from the
 configured name or lies outside the prefixes. On top of that gate:
 
-- **A large file is never held whole** (O21). `upload` sends a local file a chunk at a time, skips a target that
+- **A large file is never held whole** (O25). `upload` sends a local file a chunk at a time, skips a target that
   already holds its bytes, resumes one that holds a prefix, and reports success only once the size and SHA-256 read
   back match; `read_file` reads a file back by streamed ranges, hashing as it goes. Every write carries a content type.
-- **A listing ends only on its last-page marker** (O22, `next_page_token`): a page without one is refused.
+- **A listing ends only on its last-page marker** (O26, `next_page_token`): a page without one is refused.
 - **Placement is what the block map says** (O01). A replication job that reports `completed` is a report; `replicate`
   returns only when `GET /data/{id}/distribution` on the receiving provider covers the whole file on consecutive polls,
   and raises `NotPlaced` with the shortfall otherwise. An eviction is confirmed the same way, by the block map showing
@@ -179,7 +179,7 @@ def _hashing(blocks: Iterable[tuple[int, bytes]], hasher: Any) -> Iterator[tuple
 
 
 def next_page_token(page: Any) -> str | None:
-    """Read a children page's paging (O22): None when it is the listing's last page, else the next page's token.
+    """Read a children page's paging (O26): None when it is the listing's last page, else the next page's token.
 
     Onedata's API says a page may be shorter than its limit and still not be the last, and that `isLast` is the only
     valid sign that every entry has been listed. A page without `children`, without a boolean `isLast`, or not the last
@@ -472,7 +472,7 @@ class Provisioner:
 
     def upload(self, path: str, source: Path | str, *, content_type: str = OCTET_STREAM) -> Upload:
         """Upload a local file to a path of the space on the data provider, never holding it whole; return what was
-        done (O21).
+        done (O25).
 
         The file is read and sent `chunk_bytes` at a time, each chunk a PUT at its offset through the client's mutation
         gate (the space's name is checked first, and the file's space before every write), carrying `content_type`.
@@ -589,7 +589,7 @@ class Provisioner:
         deadline_s: float | None = None,
     ) -> Digest:
         """Read a file's whole content through a provider (the data provider unless named), hashing it as it comes,
-        and write it to `dest` when one is given; return its size and SHA-256 (O21).
+        and write it to `dest` when one is given; return its size and SHA-256 (O25).
 
         The read is the client's `read_content`: by ranges of `chunk_bytes`, each gated as a range read and streamed,
         so the file is never held. It is bounded in bytes by `size`, or else by the size the file's attributes give,

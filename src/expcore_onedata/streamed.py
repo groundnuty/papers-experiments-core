@@ -1,5 +1,5 @@
 # Provenance: new
-"""Large files in and out of the platform (O21): what a streamed upload or read reports, and the local half of it.
+"""Large files in and out of the platform (O25): what a streamed upload or read reports, and the local half of it.
 
 A file is never held whole: the upload reads the local file a chunk at a time (`chunks`) and the read hands each piece
 of a provider's answer on as it comes (`OnezoneClient.read_content`), both hashing as they go. What either reports is a

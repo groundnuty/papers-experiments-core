@@ -1,5 +1,5 @@
 """Large files in and out of the space: a streamed upload that skips, resumes or restarts and is verified by its hash,
-and a streamed read that hashes as it goes (O21)."""
+and a streamed read that hashes as it goes (O25)."""
 
 import builtins
 import hashlib
@@ -101,8 +101,8 @@ def watch_local_reads(monkeypatch, source):
 # -- the upload --------------------------------------------------------------------------------------------------------
 
 
-def test_o21_a_large_file_goes_in_a_chunk_at_a_time_and_is_never_read_whole(provisioner, fake, tmp_path, monkeypatch):
-    """O21: memory follows the chunk size, not the file's. No read of the local file asks for more than a chunk and
+def test_o25_a_large_file_goes_in_a_chunk_at_a_time_and_is_never_read_whole(provisioner, fake, tmp_path, monkeypatch):
+    """O25: memory follows the chunk size, not the file's. No read of the local file asks for more than a chunk and
     none reads it whole; every write carries at most a chunk, at its own offset, and the result is the file."""
     source = local_file(tmp_path, BULKY)
     sizes = watch_local_reads(monkeypatch, source)
@@ -120,8 +120,8 @@ def test_o21_a_large_file_goes_in_a_chunk_at_a_time_and_is_never_read_whole(prov
     assert result.file_id in [line["id"] for line in provisioner.logged()]  # a creation, so teardown removes it
 
 
-def test_o21_a_write_carries_the_content_type_its_caller_names_and_octets_by_default(provisioner, fake, tmp_path):
-    """O21: every write of `put_file` and of an upload carries a Content-Type, application/octet-stream, the one
+def test_o25_a_write_carries_the_content_type_its_caller_names_and_octets_by_default(provisioner, fake, tmp_path):
+    """O25: every write of `put_file` and of an upload carries a Content-Type, application/octet-stream, the one
     Onedata 25.0 is known to take, unless the caller names another. The fake refuses any other type, as its 25.0 shape
     does; with that rule off, a named type is sent as named."""
     provisioner.put_file("ingest/small.bin", DATA)
@@ -136,17 +136,17 @@ def test_o21_a_write_carries_the_content_type_its_caller_names_and_octets_by_def
 
 
 @pytest.mark.parametrize("named", ["", "octet", "text/csv\r\nX-Other: 1", "a/b/c", None])
-def test_o21_a_content_type_that_is_not_a_plain_media_type_is_refused_before_anything_is_sent(
+def test_o25_a_content_type_that_is_not_a_plain_media_type_is_refused_before_anything_is_sent(
     provisioner, fake, tmp_path, named
 ):
-    """O21: the type goes into a header, so one that is empty, has no subtype or holds a line break is refused."""
+    """O25: the type goes into a header, so one that is empty, has no subtype or holds a line break is refused."""
     with pytest.raises(ValueError, match="content type"):
         provisioner.upload(TARGET, local_file(tmp_path, DATA), content_type=named)
     assert changes(fake) == []
 
 
-def test_o21_a_file_already_there_with_the_same_bytes_is_skipped_and_nothing_is_sent(provisioner, fake, tmp_path):
-    """O21: an upload run again finds the target holding the same size and SHA-256 and sends nothing."""
+def test_o25_a_file_already_there_with_the_same_bytes_is_skipped_and_nothing_is_sent(provisioner, fake, tmp_path):
+    """O25: an upload run again finds the target holding the same size and SHA-256 and sends nothing."""
     source = local_file(tmp_path, BULKY)
     first = provisioner.upload(TARGET, source)
     before = list(changes(fake))
@@ -156,8 +156,8 @@ def test_o21_a_file_already_there_with_the_same_bytes_is_skipped_and_nothing_is_
     assert changes(fake) == before
 
 
-def test_o21_a_file_another_made_with_the_same_bytes_is_skipped_and_stays_out_of_the_log(provisioner, seeded, tmp_path):
-    """O21 with O09: skipping writes nothing, so a file this provisioner did not create can be skipped; it is not
+def test_o25_a_file_another_made_with_the_same_bytes_is_skipped_and_stays_out_of_the_log(provisioner, seeded, tmp_path):
+    """O25 with O09: skipping writes nothing, so a file this provisioner did not create can be skipped; it is not
     adopted into the log, and teardown leaves it."""
     result = provisioner.upload(SEEDED, local_file(tmp_path, DATA))
     assert (result.action, result.file_id) == ("skipped", seeded.id_of(SEEDED))
@@ -165,8 +165,8 @@ def test_o21_a_file_another_made_with_the_same_bytes_is_skipped_and_stays_out_of
     assert provisioner.logged() == []
 
 
-def test_o21_an_upload_cut_by_a_reset_resumes_from_where_the_target_ends(provisioner, fake, tmp_path):
-    """O21: the connection drops after five writes. The upload run again finds a strict prefix and sends the rest by
+def test_o25_an_upload_cut_by_a_reset_resumes_from_where_the_target_ends(provisioner, fake, tmp_path):
+    """O25: the connection drops after five writes. The upload run again finds a strict prefix and sends the rest by
     offset writes from its end; no byte of the prefix is sent twice, and the whole is verified."""
     source = local_file(tmp_path, BULKY)
     fake.writes_before_reset = 5
@@ -183,8 +183,8 @@ def test_o21_an_upload_cut_by_a_reset_resumes_from_where_the_target_ends(provisi
     assert stored(fake, result.file_id) == BULKY
 
 
-def test_o21_a_prefix_that_ends_inside_a_chunk_is_resumed_from_its_last_byte(provisioner, fake, tmp_path):
-    """O21: a write cut part way leaves a prefix that is not a whole number of chunks; the rest starts at its end."""
+def test_o25_a_prefix_that_ends_inside_a_chunk_is_resumed_from_its_last_byte(provisioner, fake, tmp_path):
+    """O25: a write cut part way leaves a prefix that is not a whole number of chunks; the rest starts at its end."""
     source = local_file(tmp_path, BULKY)
     first = provisioner.upload(TARGET, source)
     cut = 7 * CHUNK + 300
@@ -196,10 +196,10 @@ def test_o21_a_prefix_that_ends_inside_a_chunk_is_resumed_from_its_last_byte(pro
     assert stored(fake, first.file_id) == BULKY
 
 
-def test_o21_a_target_this_provisioner_made_that_differs_is_written_again_from_a_truncating_first_write(
+def test_o25_a_target_this_provisioner_made_that_differs_is_written_again_from_a_truncating_first_write(
     provisioner, fake, tmp_path
 ):
-    """O21: a target that holds more bytes than the local file, or as many but other ones, is no prefix. The first
+    """O25: a target that holds more bytes than the local file, or as many but other ones, is no prefix. The first
     write goes without an offset, which truncates the file (the API's rule), and the rest follow at their offsets."""
     made = provisioner.upload(TARGET, local_file(tmp_path, BULKY + b"tail"))
 
@@ -217,18 +217,18 @@ def test_o21_a_target_this_provisioner_made_that_differs_is_written_again_from_a
     restarted()
 
 
-def test_o21_an_empty_file_over_a_longer_target_truncates_it(provisioner, fake, tmp_path):
-    """O21: an empty local file has no chunk to send, so the truncating write goes with an empty body."""
+def test_o25_an_empty_file_over_a_longer_target_truncates_it(provisioner, fake, tmp_path):
+    """O25: an empty local file has no chunk to send, so the truncating write goes with an empty body."""
     made = provisioner.upload(TARGET, local_file(tmp_path, DATA))
     result = provisioner.upload(TARGET, local_file(tmp_path, b"", name="empty.bin"))
     assert (result.action, result.digest) == ("restarted", digest(b""))
     assert stored(fake, made.file_id) == b""
 
 
-def test_o21_a_differing_file_this_provisioner_did_not_create_is_refused_and_nothing_is_sent(
+def test_o25_a_differing_file_this_provisioner_did_not_create_is_refused_and_nothing_is_sent(
     provisioner, seeded, tmp_path
 ):
-    """O21 with O09: resuming or restarting writes into the file, which would adopt it; a file the log does not hold
+    """O25 with O09: resuming or restarting writes into the file, which would adopt it; a file the log does not hold
     is refused whether it is a prefix of the local file or not, and nothing is written."""
     for content in (DATA + b"more", DATA[:-1] + b"?"):
         with pytest.raises(ProvisionError, match="did not create"):
@@ -237,23 +237,23 @@ def test_o21_a_differing_file_this_provisioner_did_not_create_is_refused_and_not
     assert stored(seeded, seeded.id_of(SEEDED)) == DATA
 
 
-def test_o21_an_upload_whose_bytes_come_back_otherwise_is_not_a_success(provisioner, fake, tmp_path):
-    """O21: the platform stores something other than what was sent (same size, other bytes). The hash read back
+def test_o25_an_upload_whose_bytes_come_back_otherwise_is_not_a_success(provisioner, fake, tmp_path):
+    """O25: the platform stores something other than what was sent (same size, other bytes). The hash read back
     differs and the upload fails; it is never reported as done."""
     fake.corrupt_writes = True
     with pytest.raises(ProvisionError, match="SHA-256"):
         provisioner.upload(TARGET, local_file(tmp_path, BULKY))
 
 
-def test_o21_a_path_that_is_a_directory_is_refused(provisioner, fake, tmp_path):
+def test_o25_a_path_that_is_a_directory_is_refused(provisioner, fake, tmp_path):
     fake.add_file("ingest/table.bin/inner.bin", b"x")
     with pytest.raises(ProvisionError, match="not a regular file"):
         provisioner.upload(TARGET, local_file(tmp_path, DATA))
     assert changes(fake) == []
 
 
-def test_o21_an_upload_into_a_space_outside_the_prefixes_sends_nothing(provisioner, seeded, tmp_path):
-    """O21 with O09: the upload goes through the same gate as every write; the space's live name is checked first."""
+def test_o25_an_upload_into_a_space_outside_the_prefixes_sends_nothing(provisioner, seeded, tmp_path):
+    """O25 with O09: the upload goes through the same gate as every write; the space's live name is checked first."""
     seeded.space_name = "unrelated-space"
     with pytest.raises(ProvisionError, match="outside the configured prefixes"):
         provisioner.upload(TARGET, local_file(tmp_path, BULKY))
@@ -263,8 +263,8 @@ def test_o21_an_upload_into_a_space_outside_the_prefixes_sends_nothing(provision
 # -- the streamed, hashed read -----------------------------------------------------------------------------------------
 
 
-def test_o21_a_file_is_read_to_a_local_path_by_ranges_and_hashed_as_it_comes(provisioner, seeded, tmp_path):
-    """O21: the read goes range by range, each of at most a chunk, and the local file appears only once it is whole."""
+def test_o25_a_file_is_read_to_a_local_path_by_ranges_and_hashed_as_it_comes(provisioner, seeded, tmp_path):
+    """O25: the read goes range by range, each of at most a chunk, and the local file appears only once it is whole."""
     file_id = provisioner.put_file("ingest/table.bin", BULKY)
     destination = tmp_path / "back" / "table.bin"
     destination.parent.mkdir()
@@ -277,12 +277,12 @@ def test_o21_a_file_is_read_to_a_local_path_by_ranges_and_hashed_as_it_comes(pro
     assert ranged[0] == f"bytes=0-{CHUNK - 1}"
 
 
-def test_o21_a_read_without_a_destination_only_hashes(provisioner, seeded):
+def test_o25_a_read_without_a_destination_only_hashes(provisioner, seeded):
     assert provisioner.read_file(seeded.id_of(SEEDED)) == digest(DATA)
 
 
-def test_o21_a_read_of_a_file_outside_the_prefixes_sends_no_range(provisioner, seeded, client, tmp_path):
-    """O21 with O09: each range is gated as a range read is, by the file's space read afresh, so a file outside the
+def test_o25_a_read_of_a_file_outside_the_prefixes_sends_no_range(provisioner, seeded, client, tmp_path):
+    """O25 with O09: each range is gated as a range read is, by the file's space read afresh, so a file outside the
     study's prefixes is refused before any of its content is asked for. An empty file needs no range, and is refused
     all the same, so a read outside the study never succeeds."""
     file_id = seeded.id_of(SEEDED)
@@ -294,8 +294,8 @@ def test_o21_a_read_of_a_file_outside_the_prefixes_sends_no_range(provisioner, s
     assert [r for r in seeded.requests if r.range] == []
 
 
-def test_o21_a_read_that_fails_part_way_leaves_no_file_at_its_destination(config, placement, seeded, tmp_path, ticker):
-    """O21: the connection drops on the third range, after two have been written. The partial bytes are removed, so
+def test_o25_a_read_that_fails_part_way_leaves_no_file_at_its_destination(config, placement, seeded, tmp_path, ticker):
+    """O25: the connection drops on the third range, after two have been written. The partial bytes are removed, so
     nothing at the destination can be taken for the file."""
     from expcore_onedata.provision import Provisioner, resolve_provider_ids
 
@@ -364,8 +364,8 @@ def ranged_pieces(request):
     )
 
 
-def test_o21_the_read_keeps_its_memory_flat_whatever_the_size(config, monkeypatch):
-    """O21: 32 MiB come back in ranges of 8 MiB, made as they are read. No answer of content is read whole, and the
+def test_o25_the_read_keeps_its_memory_flat_whatever_the_size(config, monkeypatch):
+    """O25: 32 MiB come back in ranges of 8 MiB, made as they are read. No answer of content is read whole, and the
     peak of memory the read allocates stays far below one range, let alone the file."""
     real = httpx.Response.read
 
@@ -406,8 +406,8 @@ def test_o21_the_read_keeps_its_memory_flat_whatever_the_size(config, monkeypatc
         (206, b"abc", "bytes 0-3/8"),  # fewer bytes than the range
     ],
 )
-def test_o21_a_range_answered_with_other_bytes_than_asked_for_is_refused(config, status, body, content_range):
-    """O21: the read is bounded by the range: every answer must be a 206 for exactly the bytes asked for, of a file of
+def test_o25_a_range_answered_with_other_bytes_than_asked_for_is_refused(config, status, body, content_range):
+    """O25: the read is bounded by the range: every answer must be a 206 for exactly the bytes asked for, of a file of
     the size it was read at, and must carry neither more nor fewer bytes."""
     headers = {"Content-Range": content_range} if content_range else {}
     client = answering(config, lambda request: httpx.Response(status, content=body, headers=headers))
@@ -415,8 +415,8 @@ def test_o21_a_range_answered_with_other_bytes_than_asked_for_is_refused(config,
         client.read_content("/data/fid/content", provider="alpha", size=8, chunk_bytes=4, deadline_s=5)
 
 
-def test_o21_a_read_that_passes_its_deadline_stops(config):
-    """O21: the deadline is checked as the bytes arrive, so a slow file ends the read instead of holding it open."""
+def test_o25_a_read_that_passes_its_deadline_stops(config):
+    """O25: the deadline is checked as the bytes arrive, so a slow file ends the read instead of holding it open."""
     ticks = iter(range(0, 1000, 3))
     client = answering(config, ranged_pieces)
     with pytest.raises(PlatformError, match="deadline"):
@@ -430,7 +430,7 @@ def test_o21_a_read_that_passes_its_deadline_stops(config):
         )
 
 
-def test_o21_a_read_names_only_content_paths_and_a_declared_provider(config, seeded, client):
+def test_o25_a_read_names_only_content_paths_and_a_declared_provider(config, seeded, client):
     with pytest.raises(OutOfScope, match="content only"):
         client.read_content("/data/fid", provider="alpha", size=4, chunk_bytes=4, deadline_s=5)
     with pytest.raises(OutOfScope, match="not declared"):

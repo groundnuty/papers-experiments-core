@@ -33,7 +33,7 @@ def test_o09_only_the_resets_qos_calls_cancel_and_the_truncating_write_are_uncon
     and refuted the file's `path` attribute the gate read before, which no release at hand answers. The gate no longer
     asks for it; the client's docstring records what refuted it. What is left unconfirmed are the reset's calls no live
     run has made (a transfer's cancel, a QoS summary, a requirement's record and its removal) and the write of content
-    without an offset, which truncates the file and which a restarted upload relies on (O21)."""
+    without an offset, which truncates the file and which a restarted upload relies on (O25)."""
     from expcore_onedata import client
 
     assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {

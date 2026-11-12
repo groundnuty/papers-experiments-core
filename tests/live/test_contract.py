@@ -528,7 +528,7 @@ def copy_prefix(source, dest, size):
 def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_back_by_its_hash(
     config, client, tmp_path
 ):
-    """O21: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
+    """O25: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
     nothing, a shorter file over the longer target is written again from a write without an offset (which must
     truncate it), and the streamed read gives each file's SHA-256. Everything is under a fresh scratch directory and
     torn down; skipped without a [placement] table."""

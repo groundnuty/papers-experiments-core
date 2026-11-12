@@ -217,7 +217,7 @@ def _names(ctx: Context, provider: str, root: str, limit: int) -> tuple[list[str
         if token:
             params["token"] = token
         page = ctx.client.get(f"/data/{root}/children", provider=provider, params=params)
-        token = next_page_token(page)  # a page without its last-page marker is refused, never the end (O22)
+        token = next_page_token(page)  # a page without its last-page marker is refused, never the end (O26)
         names += [c["name"] for c in page["children"]]
         pages += 1
         if len(names) > WALK_CAP:
