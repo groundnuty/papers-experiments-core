@@ -8,8 +8,9 @@
 
 The data path and the tool server are separate planes (architecture.md, "Tokens and permissions"): each has its own
 platform user and its own token, and nothing is shared. The data path is read-only on the study space and its user holds
-exactly view and read. The tool server's token and user match the condition's declared rights, no more and no less, and
-its token is read-only only when the condition declares no write right.
+exactly view and read. The tool server's user holds the condition's declared rights, no more and no less; its token is
+read-only and path-scoped, as the data path's is, when the condition declares no write right, and carries no
+data-access caveat when it declares one (`tool_server_spec`).
 
 What `TokenIssuer.mint` does, in this order, and refuses at the first failure:
 1. derives the lifetime from the run's whole-time ceiling and checks it against the platform's limit, before anything is minted
@@ -151,8 +152,24 @@ def data_path_spec(space_id: str | Sequence[str], interface: str = "rest") -> Pl
 
 
 def tool_server_spec(space_id: str | Sequence[str], condition: Condition) -> PlaneSpec:
-    """The tool server of a condition, scoped to its spaces: its declared rights in each, read-only exactly when none
-    of them writes."""
+    """The tool server of a condition, reaching its spaces with its declared rights in each.
+
+    A condition that declares no write right gets the data path's caveats: read-only, and scoped by `data.path` to its
+    spaces. A writing condition's token carries no data-access caveat, only its expiry and the `rest` interface. On
+    Onedata 25.0 a token with any data-access caveat (`data.path`, `data.objectid`, `data.readonly`) is a data-access
+    token, usable for data access alone, so it can neither schedule a transfer nor add a QoS requirement (#177: `POST
+    /transfers` answered `tokenCaveatUnverified`).
+
+    **The boundary of a writing token is therefore its principal**, the slot's leased tool-server user (C19, O09). Its
+    rights are read back, direct and effective, in each of the plane's spaces and must be exactly the condition's,
+    before the token is minted and again at the tool server's launch and teardown. Those reads cover the plane's
+    spaces only: that the user is a member of no other space is the operator's setup of the slot, which nothing here
+    reads, so a writing token reaches whatever that membership gives.
+
+    Onedata's `api` caveat is not a data-access caveat and could narrow the token to named operations, but which
+    operations the tool server's calls map to is not in the source its format was read from, and one missing entry
+    would refuse a tool as #177 did, so this token has none.
+    """
     return PlaneSpec(
         Plane.TOOL_SERVER,
         condition.rights,

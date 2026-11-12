@@ -117,12 +117,51 @@ def test_o05_a_principal_that_cannot_be_read_gets_no_token(issuer, fake):
 
 
 def test_o05_the_tool_server_token_has_the_conditions_caveats_no_more_and_no_less(issuer, fake, config):
-    """O05: read-only when the condition declares no write right, without the read-only caveat when it does."""
+    """O05: read-only and path-scoped when the condition declares no write right; with no data-access caveat at all
+    when it does, since on Onedata 25.0 one would make the token usable for data access alone (#177)."""
     reading = issuer.mint(tool_server_spec("spmock0001", config.condition("read")), TOOLS, ceiling_s=CEILING_S)
     assert types(fake, reading) == ["time", "data.readonly", "interface", "data.path"]
     fake.grant(TOOLS.user_id, MANAGE)
     managing = issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
-    assert types(fake, managing) == ["time", "interface", "data.path"]
+    assert types(fake, managing) == ["time", "interface"]
+
+
+def test_o05_each_plane_and_condition_kind_mints_exactly_its_caveat_list(issuer, fake, config):
+    """O05: the data path and a read-only condition mint the same list they did before writing tokens changed, byte
+    for byte; a writing condition mints its expiry and the rest interface alone."""
+    expiry = int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s
+    read_only = (
+        f'[{{"type": "time", "validUntil": {expiry}}}, {{"type": "data.readonly"}}, '
+        '{"type": "interface", "interface": "rest"}, {"type": "data.path", "whitelist": ["L3NwbW9jazAwMDE="]}]'
+    )
+    data = issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)
+    reading = issuer.mint(tool_server_spec("spmock0001", config.condition("read")), TOOLS, ceiling_s=CEILING_S)
+    fake.grant(TOOLS.user_id, MANAGE)
+    writing = issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    minted = {name: json.dumps(fake.issued[t.reveal()]["caveats"]) for name, t in (("data", data), ("read", reading))}
+    assert minted == {"data": read_only, "read": read_only}
+    assert fake.issued[writing.reveal()]["caveats"] == [
+        {"type": "time", "validUntil": expiry},
+        {"type": "interface", "interface": "rest"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "added",
+    [
+        {"type": "data.path", "whitelist": [base64.b64encode(b"/spmock0001").decode()]},
+        {"type": "data.readonly"},
+        {"type": "data.objectid", "whitelist": ["000000000000"]},
+    ],
+    ids=lambda caveat: caveat["type"],
+)
+def test_o05_a_writing_token_that_comes_back_with_a_data_access_caveat_is_dropped(added, issuer, fake, config):
+    """O05: a server that adds a data-access caveat to a writing condition's token hands out a token whose transfers
+    and QoS requirements Onedata 25.0 refuses; it is dropped, not returned."""
+    fake.grant(TOOLS.user_id, MANAGE)
+    fake.mint_hook = lambda user, caveats: [*caveats, added]
+    with pytest.raises(TokenRefused, match="data-access caveat"):
+        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
 
 
 def test_o05_the_tool_server_principal_must_hold_exactly_the_conditions_rights(issuer, fake, config):

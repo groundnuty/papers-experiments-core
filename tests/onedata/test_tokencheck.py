@@ -1,6 +1,8 @@
 """O05, O06: a token is examined fail-closed against the exact caveat set of its plane before it is used."""
 
 import base64
+import json
+import re
 
 import pytest
 
@@ -125,18 +127,83 @@ def test_o05_an_examination_that_raises_or_is_empty_refuses_without_echoing_the_
         require_examined("", DATA, subject="u", examine=lambda t: info(), min_ttl_s=1, max_ttl_s=2, now=NOW)
 
 
-def test_o05_a_token_that_would_write_has_no_readonly_caveat_and_one_that_may_not_is_refused_for_having_it():
-    """O05: the tool-server plane's set differs by read-only alone, and each plane refuses the other's."""
-    assert examine(info(WRITING), WRITING)
-    with pytest.raises(TokenRefused, match="not asked for"):
+def test_o05_a_token_that_would_write_carries_no_data_access_caveat_and_each_plane_refuses_the_others():
+    """O05: a writable token is not a data-access token, and a read-only one is; each spec refuses the other's token."""
+    assert examine(info(WRITING), WRITING) == Examined("tid-1", "u-data", NOW + 1800, ("interface", "time"))
+    with pytest.raises(TokenRefused, match="data-access caveat"):
         examine(info(DATA), WRITING)
-    with pytest.raises(TokenRefused, match=r"no data\.readonly"):
+    with pytest.raises(TokenRefused, match=r"no data\.path"):
         examine(info(WRITING), DATA)
+
+
+def writing_with(*extra):
+    return info(WRITING, caveats=[*WRITING.caveats(NOW + 1800), *extra])
+
+
+WRITING_REFUSED = {
+    "a path whitelist": (writing_with(path_caveat(f"/{SPACE}")), r"data-access caveat \('data\.path'\)"),
+    "read-only": (writing_with({"type": "data.readonly"}), r"data-access caveat \('data\.readonly'\)"),
+    "an object id whitelist": (
+        writing_with({"type": "data.objectid", "whitelist": ["000000000000"]}),
+        r"data-access caveat \('data\.objectid'\)",
+    ),
+    "the oneclient interface": (
+        info(
+            WRITING,
+            caveats=[
+                {"type": "interface", "interface": "oneclient"} if c["type"] == "interface" else c
+                for c in WRITING.caveats(NOW + 1800)
+            ],
+        ),
+        "interface caveat is not the one",
+    ),
+    "an api caveat": (writing_with({"type": "api", "whitelist": ["opw/create/op_transfer.*.instance:*"]}), "not asked"),
+    "no interface": (info(WRITING, caveats=WRITING.caveats(NOW + 1800)[:1]), "no interface"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(WRITING_REFUSED))
+def test_o05_a_writing_token_that_carries_a_data_access_caveat_or_anything_else_is_refused(name):
+    """O05: on Onedata 25.0 any of data.path, data.objectid and data.readonly, and the oneclient interface, makes a
+    token usable for data access alone, so it could not schedule a transfer; a writing token carrying one is refused,
+    as is one with any caveat its spec did not ask for or without one it did."""
+    answer, reason = WRITING_REFUSED[name]
+    with pytest.raises(TokenRefused, match=reason):
+        examine(answer, WRITING)
+
+
+@pytest.mark.parametrize("missing", ["data.path", "data.readonly"])
+def test_o05_a_read_only_token_that_lacks_one_of_its_data_access_caveats_is_refused(missing):
+    """O05: the read-only set keeps both data caveats; a token without either is refused, naming the one it lacks."""
+    with pytest.raises(TokenRefused, match=f"no {re.escape(missing)} caveat"):
+        examine(info(caveats=without(missing)))
+
+
+def test_o05_a_read_only_token_has_byte_for_byte_the_caveats_it_had_before_writing_tokens_changed():
+    """O05: the data path's and a read-only tool server's caveat list is unchanged, in content and in order."""
+    assert json.dumps(DATA.caveats(5)) == (
+        '[{"type": "time", "validUntil": 5}, {"type": "data.readonly"}, {"type": "interface", "interface": "rest"}, '
+        '{"type": "data.path", "whitelist": ["L3NwbW9jazAwMDE="]}]'
+    )
+    several = CaveatSpec(("spmock0001", "spmock0002"), readonly=True, interface="oneclient")
+    assert json.dumps(several.caveats(5)) == (
+        '[{"type": "time", "validUntil": 5}, {"type": "data.readonly"}, {"type": "interface", "interface": '
+        '"oneclient"}, {"type": "data.path", "whitelist": ["L3NwbW9jazAwMDE=", "L3NwbW9jazAwMDI="]}]'
+    )
+
+
+def test_o05_a_writing_spec_mints_only_its_expiry_and_its_interface_and_is_never_a_oneclient_one():
+    """O05: a writable token's caveats are the time and the rest interface, nothing that limits it to data access; a
+    writable spec with the oneclient interface, itself a data-access caveat on 25.0, is refused when it is built."""
+    assert WRITING.caveats(5) == [{"type": "time", "validUntil": 5}, {"type": "interface", "interface": "rest"}]
+    assert (DATA.data_access, WRITING.data_access) == (True, False)
+    with pytest.raises(ValueError, match="oneclient"):
+        CaveatSpec(SPACE, readonly=False, interface="oneclient")
 
 
 def test_the_spec_builds_the_caveats_the_examination_accepts():
     assert [c["type"] for c in DATA.caveats(5)] == ["time", "data.readonly", "interface", "data.path"]
-    assert [c["type"] for c in WRITING.caveats(5)] == ["time", "interface", "data.path"]
+    assert [c["type"] for c in WRITING.caveats(5)] == ["time", "interface"]
     with pytest.raises(ValueError, match="interface"):
         CaveatSpec(SPACE, readonly=True, interface="ftp")
 

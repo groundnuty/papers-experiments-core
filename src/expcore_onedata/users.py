@@ -64,6 +64,10 @@ launcher.
 
 Users are created by the operator, not by this layer: there is no unscoped user creation or deletion here. The privileges
 a slot's users hold are checked, direct and effective, before every token is minted (`tokens.py`).
+
+**A slot's tool-server user must be a member of no space outside the tool-server plane's.** A writing condition's token
+carries no data-access caveat (`tokens.tool_server_spec`), so what it can reach is what its user's memberships give, and
+the privilege checks read the plane's spaces only. Setting the user up so is the operator's part of the slot.
 """
 
 import json
