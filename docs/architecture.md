@@ -44,6 +44,11 @@ src/expcore_onedata/
   probes.py      the platform instrument: file distribution, transfer records, bytes per provider pair
   users.py       leased platform users (a slot gives a run one user per token plane) and the token journal
   health.py      pre- and post-run checks against the declared support set
+  faults.py      the fault injector: one provider taken down per run under a double sanction, journalled first,
+                 cleared in finally and verified by a changed identity and by the provider serving;
+                 compose.py, fault_journal.py, fault_recovery.py, fault_serves.py and fault_settings.py serve it
+  admission.py   the federation's reader-writer lock: outage runs exclusive with every other run, and its holder record
+  fault_gate.py  the fault half of the health check: recovery, the shared lock around the check, a timed-out wait told apart
   day0/          registry of checks (reachability, health, tokens, listing, read-only, round trip) and a dated report
   testing/       fakes of the platform for a study's own tests: the REST mock, a federation with every provider's data API, a clock,
                  the default platform.toml, two stand-in MCP servers; installed with the layer, imported by no runtime module
@@ -114,7 +119,7 @@ tools = "read"
 - transcript: per turn the neutral message, the native provider message, stop reason, usage (`None` when unreported, R10; from record schema version 3 also the provider's other numeric usage fields under their own names, capped, recorded only, `docs/interfaces.md`), served model and fingerprint (B06), retries with their errors, the echoed-request digest (R06);
 - tool calls: arguments, raw arguments when malformed (L01), the exact text the model saw, the raw result, status, timings, and two truncation flags kept apart: the harness cap's (L06) and the data source's own row or size limit, as the provider reports it (L07);
 - clock readings at every point the loop reads the clock, the boundaries of waits on infrastructure (measured live through the call context, L04) and the loop's looks at a running call included; the agent's time, the waits and `cleanup_s` (harness time spent stopping a cut call, never charged to the agent) add up to the elapsed time;
-- outcome from a closed vocabulary, and infrastructure kind when it applies (C02); an infrastructure outcome is flagged as treatment only if its condition declares the kind, the kind is treatable, and the model completed at least one turn, because a failure before the agent's first turn says nothing about the manipulation (C01). That first-turn rule is record schema version 2 (`expcore-record/2`, no field added); a version-1 record is read and replayed under the version-1 rule, the declared kind alone, and an outcome marker of schema 1 is committed under it too, with a `legacy_marker` event;
+- outcome from a closed vocabulary, and infrastructure kind when it applies (C02); an infrastructure outcome is flagged as treatment only if its condition declares the kind, the kind is treatable, and the model completed at least one turn, because a failure before the agent's first turn says nothing about the manipulation (C01). That first-turn rule is record schema version 2 (`expcore-record/2`, no field added); a version-1 record is read and replayed under the version-1 rule, the declared kind alone, and an outcome marker of schema 1 is committed under it too, with a `legacy_marker` event. Version 3 (`expcore-record/3`) adds the target of a fault: an infrastructure failure may name what failed by a position label (`providers[1]`, never a configured name), a condition may declare a kind with the target it manipulates (`{kind, target}` in `infrastructure_is_treatment`), and then only a failure of that target, while the run's fault injector held it down in this attempt (its instrument reading, `expcore.records.injections`), is treatment; another target's failure, the agent's own provider's included, a failure naming none and an injection that did not happen are set aside. One method decides for the record, the store, `classify` and the replay (`Outcome.is_treatment`), and the store refuses a result whose flag it does not reproduce;
 - instrument outputs, each under its own namespace;
 - scores, kept apart and recomputable.
 
@@ -228,7 +233,7 @@ v0.1 holds what a study needs to run end to end; the rest follows in v0.2. Each 
 | statistics kernel: named contrasts, the first estimator, Holm, cluster bootstrap, power simulation | further estimators |
 | provenance headers, code stamp, study-token test | |
 | replication packages: inclusion list, checksums, study-token check, anonymisation lists (whole words, prose and metadata only), deterministic archive, `make check` (needed by #5's release) | replication packages: scanner, canaries |
-| platform: federation configuration, tokens on both planes, sandbox and data paths, tool-server launch, provisioning, probes, health, day-0 checks (#4) | fault injection |
+| platform: federation configuration, tokens on both planes, sandbox and data paths, tool-server launch, provisioning, probes, health, day-0 checks (#4); fault injection with target-matched treatment (#17) | |
 
 ## Decisions on review
 
