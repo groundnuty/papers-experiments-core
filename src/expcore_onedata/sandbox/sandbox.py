@@ -58,6 +58,7 @@ from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
+    RAN,
     DataPathMode,
     ExecResult,
     ReadOnlyInput,
@@ -94,6 +95,7 @@ MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, th
 TOKEN_FILE = Path("sidecar-secret", "oneclient-token")  # under the run directory, owner-only, while the sidecar starts
 GATE_TOKEN_FILE = Path("gate-secret", "gate-token")  # likewise while the gate starts, owned by the gate's user
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
+RUN_START_POLLS = 50  # reads of the gate's log, 0.1 s apart, for the mark of the run's start it was signalled to write
 TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
 MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
 NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O22)
@@ -134,6 +136,9 @@ class DockerSandbox:
         self._mounts: list[Path] = []
         self._mount_log: list[dict[str, Any]] = []  # what the record file holds: each mount's path and identity
         self._refusals_seen = 0  # the data gate's refusals already handed back with a cell
+        self._phase = threading.Lock()  # orders the agent's first cell, the harness's steps and the mark (O24)
+        self._agent_began = False  # an agent's cell has been entered: no harness step or mark from then on
+        self._steps_running = 0  # harness steps under way: no mark meanwhile
         self._containers: list[str] = []
         self._net: str | None = None
         self._watched: dict[str, dict[str, Any]] = {}
@@ -773,19 +778,111 @@ class DockerSandbox:
         threading.Thread(target=loop, daemon=True, name=f"sample-{self.names.agent}").start()
 
     # ------------------------------------------------------------------------------------------------ the API
-    def exec(self, code: str, timeout_s: float) -> ExecResult:
+    def exec(self, code: str, timeout_s: float, *, record: bool = True) -> ExecResult:
         """Run Python source as the unprivileged user (see `CellRunner.run`), with the data gate's refusals that came
-        while it ran (`gate_refusals`)."""
+        while it ran (`gate_refusals`).
+
+        `record=False` makes it a step of the harness's own, a check before the agent's loop starts (O24), and it runs
+        only before the agent's run: it is refused once the run's start is marked or one of the agent's cells has begun,
+        since after the mark its requests would count as the agent's, and between cells it would take a cell's refusals
+        and kills. It runs the same way, as the agent's user in the agent's container, and is no cell of the agent's: it
+        is recorded under `harness_steps` with its exit status, its refusals and the host killer's kills it met, none
+        of which the agent's first cell takes. Its only time limit is the backstop `timeout` in the container
+        (`CAP_MARGIN_S` after `timeout_s`): the harness's timer, which would stop the agent's processes, is not started,
+        and no kill cause is read."""
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
-        res = self._cells.run(code, timeout_s)
-        lines = self._gate_log_lines()
-        if lines is None:  # unknown is never none
-            res.gate_refusals = (gatelog.UNREADABLE,)
-        else:
-            seen = gatelog.refusals(lines)
-            res.gate_refusals, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
+        self._enter(record)
+        try:
+            res = self._cells.run(code, timeout_s, record=record)
+            res.gate_refusals = self._new_refusals()
+            if not record:
+                self._record_step(res)
+        finally:
+            if not record:
+                with self._phase:
+                    self._steps_running -= 1
         return res
+
+    def _enter(self, record: bool) -> None:
+        """Say whose the code about to run is (O24): an agent's cell has begun once its `exec` is entered, and a harness
+        step runs only before that and before the mark. Both wait while a mark is being set."""
+        with self._phase:
+            if record:
+                self._agent_began = True
+                return
+            if "run_start" in self._meta or self._agent_began:
+                raise SandboxError(
+                    "a harness step runs only before the agent's run: its start is marked or a cell began"
+                )
+            self._steps_running += 1
+
+    def _new_refusals(self) -> tuple[str, ...]:
+        """The data gate's refusals since the last cell or step; an unreadable log stands for them, unknown never none."""
+        lines = self._gate_log_lines()
+        if lines is None:
+            return (gatelog.UNREADABLE,)
+        seen = gatelog.refusals(lines)
+        new, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
+        return new
+
+    def _record_step(self, res: ExecResult) -> None:
+        """A harness step's record (O24), with the host killer's kills it met, read now so no cell of the agent's takes
+        them (None when its journal could not be read)."""
+        steps = self._meta.setdefault("harness_steps", [])
+        steps.append(
+            {
+                "step": len(steps) + 1,
+                "status": res.status,
+                "exit_code": res.exit_code if res.status == RAN else None,
+                "duration_s": res.duration_s,
+                "timed_out": res.timed_out,
+                "gate_refusals": list(res.gate_refusals),
+                "earlyoom_kills": self._cells.step_earlyoom(),
+            }
+        )
+
+    def mark_run_start(self) -> dict[str, Any]:
+        """Mark where the agent's run begins (O24): the executor calls this once, after its own steps (`exec(...,
+        record=False)`) have returned and before the agent's loop starts. A REST data path's gate is signalled (SIGUSR1)
+        and writes the mark in its own log, naming each request it had begun and not yet logged; the mark is read back
+        before this returns, and an agent's cell entered meanwhile waits until it has, so no request of the agent's can
+        come before it. The count of the bytes served then takes only the answers after it, and counts those before it
+        apart (`served_bytes`). Without a gate nothing is signalled. Returns what the mark found, kept as
+        `metadata()["run_start"]`: `gate`, and with a gate `signalled` and `confirmed`. A mark not confirmed leaves the
+        count unknown (`run_start_unconfirmed`); the executor decides whether its run goes on. Refused once an agent's
+        cell has begun (its `exec` entered, not ended), while a harness step runs, once the gate was stopped, and a
+        second time."""
+        with self._phase:  # held to the end: a cell entered meanwhile starts after the mark is in the log
+            if self._cells is None or self._stopped:
+                raise SandboxError("the sandbox is not running")
+            if "run_start" in self._meta:
+                raise SandboxError("the run's start is already marked")
+            if self._agent_began:
+                raise SandboxError("the run's start must be marked before the agent's first cell begins")
+            if self._steps_running:
+                raise SandboxError("the run's start cannot be marked while a harness step runs")
+            if "gate_stop" in self._meta:
+                raise SandboxError("the run's start cannot be marked after the collection stopped the gate")
+            return self._mark()
+
+    def _mark(self) -> dict[str, Any]:
+        """Set the mark (`mark_run_start`, whose lock the caller holds)."""
+        if self.spec.mode is not DataPathMode.REST:
+            self._meta["run_start"] = {"gate": False}
+            return dict(self._meta["run_start"])
+        note = self._meta["run_start"] = {"gate": True, "signalled": False, "confirmed": False}
+        r = self.host.docker("kill", "-s", "USR1", self.names.gate, check=False, timeout=30)
+        note["signalled"] = r.returncode == 0
+        for _ in range(RUN_START_POLLS if note["signalled"] else 0):
+            lines = self._gate_log_lines()
+            if lines is not None and gatelog.run_start_marks(lines):
+                note["confirmed"] = True
+                break
+            self._sleep(0.1)
+        if not note["confirmed"]:
+            log.error("the gate's mark of the run's start was not read back (signalled: %s)", note["signalled"])
+        return dict(note)
 
     def served_bytes(self) -> dict[str, Any]:
         """The bytes the agent read through its data path in this run (O22), as `gatelog.served` counts them, with the
@@ -794,8 +891,14 @@ class DockerSandbox:
         its reads go through oneclient and no gate sees them. No data path: zero, since there is nothing to read
         through. The tables of the files and directories served follow the counts: None when they are unknown, empty
         when they are zero. Every answer records the caps of the tables, `[sandbox.served_bytes]`. Unknown is never
-        zero."""
-        path, caps = {"data_path": self.spec.mode.value, "listing": self._meta.get("listing")}, self.s.served_caps
+        zero. `run_start_marked` says whether `mark_run_start` was called: with it, a REST count holds only the answers
+        after the mark, and those before it are `before_run_start` (O24)."""
+        path = {
+            "data_path": self.spec.mode.value,
+            "listing": self._meta.get("listing"),
+            "run_start_marked": "run_start" in self._meta,
+        }
+        caps = self.s.served_caps
         if self.spec.mode is DataPathMode.MOUNT:
             return path | gatelog.served_unknown(MOUNT_NOT_THROUGH_GATE, caps=caps)
         if self.spec.mode is DataPathMode.NONE:
@@ -884,8 +987,8 @@ class DockerSandbox:
         if self.spec.mode is DataPathMode.REST:
             self._stop_gate()
             if "served_bytes" not in self._meta:  # counted once (O22): a second collection finds the gate already gone
-                lines, caps = self._gate_log_lines(), self.s.served_caps
-                self._meta["served_bytes"] = gatelog.served(lines, self._meta["gate_stop"], caps)
+                lines, caps, mark = self._gate_log_lines(), self.s.served_caps, self._meta.get("run_start")
+                self._meta["served_bytes"] = gatelog.served(lines, self._meta["gate_stop"], caps, run_start=mark)
             log_copy = [("requests.jsonl", dest / "gate-requests.jsonl")]
             try:  # the gate's own file, in a directory only the gate writes: anything amiss there is not the agent's
                 if not copyout.copy_tree(self.host, self.dir / "gatelog", log_copy, max_bytes=None)["requests.jsonl"]:

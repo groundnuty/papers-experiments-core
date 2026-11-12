@@ -61,6 +61,15 @@ file's `ranges_cut` say a bound cut the list, and `range_bytes` counts every ran
 effect are in the result (`caps`), whatever else is known. Whenever the run's count is unknown, so is every table
 (None, with the same reasons), and an answer of a file's content or a listing whose path names no file or directory
 makes the log malformed. How a reader tells a row the cap left out from a file never served is `served.lookup_file`.
+
+**The run's start (O24).** A harness that reads through the gate before the agent's loop (a check of the data path as
+the agent's user) marks where the agent's run begins: the gate writes one `run_start` line, naming each request it had
+begun and not yet logged (`before`, by `conn` and `conn_request`). Given what the sandbox's mark found, `served` counts
+and tables only the answers after that line, and counts those before it, or named in it, apart (`before_run_start`:
+`requests` and the five counts), never in a table, so nothing is hidden. A mark the sandbox did not read back before
+the loop started (`confirmed`), or one the log does not show once and before its teardown mark, leaves every count
+unknown (`run_start_unconfirmed`), never "everything after"; a mark in the log of a run that set none, or one that does
+not name its requests, is a malformed log. Without a mark every answer is the run's, and `before_run_start` is None.
 """
 
 import dataclasses
@@ -146,6 +155,19 @@ def refusals(lines: list[str]) -> list[str]:
     return out
 
 
+def run_start_marks(lines: list[str]) -> int:
+    """How many marks of the run's start (`RUN_START`) the log holds so far. A line still being written when the log is
+    read (the last, cut short) is no mark yet."""
+    found = 0
+    for line in lines:
+        try:
+            record = json.loads(line) if line.strip() else {}
+        except ValueError:
+            continue
+        found += isinstance(record, dict) and record.get("event") == RUN_START
+    return found
+
+
 def _counted(values: list[str]) -> dict[str, int]:
     return {v: values.count(v) for v in sorted(set(values))}
 
@@ -182,7 +204,9 @@ GATE_TEARDOWN_INCOMPLETE = "gate_teardown_incomplete"
 GATE_TEARDOWN_UNCONFIRMED = "gate_teardown_unconfirmed"
 GATE_OUTPUT_UNREADABLE = "gate_output_unreadable"
 REQUEST_IN_FLIGHT = "request_in_flight_at_stop"
+RUN_START_UNCONFIRMED = "run_start_unconfirmed"
 TEARDOWN_COMPLETE = "teardown_complete"  # the event the gate logs last, once every close line is written (gate.py)
+RUN_START = "run_start"  # the harness's mark: the agent's run begins after it (gate.py, O24)
 SERVED_FIELDS = ("served_bytes", "content_bytes", "listing_bytes", "other_bytes", "gate_answer_bytes")
 _BODY_FIELD = {
     "content": "content_bytes",
@@ -190,6 +214,7 @@ _BODY_FIELD = {
     "other": "other_bytes",
     "gate": "gate_answer_bytes",
 }
+_SERVED_KINDS = ("content_bytes", "listing_bytes", "other_bytes")  # what `served_bytes` adds up: the platform's answers
 
 
 TABLE_FIELDS = ("files", "files_total", "files_cut", "listings", "listings_total", "listings_cut")
@@ -220,12 +245,40 @@ _CONTENT_RANGE = re.compile(r"bytes ([0-9]{1,18})-([0-9]{1,18})/(?:[0-9]{1,18}|\
 def served_unknown(*reasons: str, caps: Caps = DEFAULT_CAPS) -> dict[str, Any]:
     """The bytes served, unknown for these reasons: every count None, and every table; the caps are still the run's."""
     tables = dict.fromkeys(TABLE_FIELDS)
-    return {**dict.fromkeys(SERVED_FIELDS), **tables, "caps": caps.record(), "unknown": sorted(set(reasons))}
+    unknown = {"before_run_start": None, "caps": caps.record(), "unknown": sorted(set(reasons))}
+    return {**dict.fromkeys(SERVED_FIELDS), **tables, **unknown}
 
 
 def served_nothing(caps: Caps = DEFAULT_CAPS) -> dict[str, Any]:
-    """The bytes served through no data path: every count zero, and every table empty."""
-    return {**dict.fromkeys(SERVED_FIELDS, 0), **_Tables(caps).snapshot(), "unknown": []}
+    """The bytes served through no data path: every count zero, before the run's start as after it, and every table
+    empty."""
+    nothing = dict.fromkeys(SERVED_FIELDS, 0)
+    before = {"requests": 0, **nothing}
+    return {**nothing, **_Tables(caps).snapshot(), "before_run_start": before, "unknown": []}
+
+
+def _begun_before(record: Mapping[str, Any]) -> set[tuple[str, int]] | None:
+    """The requests a `run_start` line names as begun before it, as (`conn`, `conn_request`); None when it names them
+    in no form the gate writes."""
+    named = record.get("before")
+    if not isinstance(named, list):
+        return None
+    out = set()
+    for item in named:
+        if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+            return None
+        if isinstance(item[1], bool) or not isinstance(item[1], int):
+            return None
+        out.add((item[0], item[1]))
+    return out
+
+
+def _request_of(record: Mapping[str, Any]) -> tuple[str, int] | None:
+    """The request a line answers, as a `run_start` line names one; None for a line that names none."""
+    conn, number = record.get("conn"), record.get("conn_request")
+    if isinstance(conn, str) and isinstance(number, int) and not isinstance(number, bool):
+        return conn, number
+    return None
 
 
 def _span(record: Mapping[str, Any], size: int) -> tuple[int, int] | None:
@@ -333,14 +386,35 @@ def _stop_reasons(stop: Mapping[str, Any] | None) -> set[str]:
     return reasons
 
 
-def served(lines: list[str] | None, stop: Mapping[str, Any] | None, caps: Caps = DEFAULT_CAPS) -> dict[str, Any]:
+def _run_start_reasons(run_start: Mapping[str, Any] | None, marks: int, late: bool) -> set[str]:
+    """Why the mark of the run's start leaves the count unknown (O24): a mark the sandbox set must have been read back
+    before the agent's loop started (`confirmed`) and stand in the log once, before the gate's teardown mark; a mark in
+    the log of a run that set none is a malformed log."""
+    if run_start is None:
+        return {GATE_LOG_MALFORMED} if marks else set()
+    if not isinstance(run_start, Mapping) or run_start.get("confirmed") is not True or marks != 1 or late:
+        return {RUN_START_UNCONFIRMED}
+    return set()
+
+
+def served(
+    lines: list[str] | None,
+    stop: Mapping[str, Any] | None,
+    caps: Caps = DEFAULT_CAPS,
+    run_start: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """The bytes the gate served the agent in a run, in all and per file and directory, from its log once it was
     stopped (O22; the module docstring says what each count holds). `lines` are the log's lines, None when it could not
     be read; `stop` is what the stop of the gate found (`gate_stop` of the sandbox's metadata, `_stop_reasons`); `caps`
-    bound the tables. The log must hold the gate's `teardown_complete` line, whatever its exit code."""
+    bound the tables. The log must hold the gate's `teardown_complete` line, whatever its exit code. `run_start` is what
+    the sandbox's mark of the run's start found (`run_start` of its metadata), None when none was set, and then every
+    answer is the run's; with one, the run's are the answers after the mark's line, except those it names as begun
+    before it, which are counted apart (`before_run_start`) and never in the tables (O24)."""
     reasons = _stop_reasons(stop) | (set() if lines is not None else {UNREADABLE})
     counts, tables = dict.fromkeys(_BODY_FIELD.values(), 0), _Tables(caps)
-    confirmed = False
+    before, held = {"requests": 0, **counts}, _Tables(caps)  # the answers before the mark, checked as the run's are
+    confirmed, marks, late, begun = False, 0, False, set()
+    run = run_start is None  # unmarked: every answer is the run's
     for text in lines or ():
         if not text.strip():
             continue
@@ -351,6 +425,14 @@ def served(lines: list[str] | None, stop: Mapping[str, Any] | None, caps: Caps =
             continue
         if not isinstance(record, dict):
             reasons.add(GATE_LOG_MALFORMED)
+            continue
+        if record.get("event") == RUN_START:
+            marks, late, run = marks + 1, late or confirmed, True
+            named = _begun_before(record)
+            if named is None:
+                reasons.add(GATE_LOG_MALFORMED)  # a mark that does not say which requests it found begun
+            else:
+                begun |= named
             continue
         if record.get("event") == "conn_close" and record.get("in_request") is True:
             reasons.add(REQUEST_IN_FLIGHT)  # its answer may have begun, and has no line
@@ -365,12 +447,17 @@ def served(lines: list[str] | None, stop: Mapping[str, Any] | None, caps: Caps =
         if isinstance(size, bool) or not isinstance(size, int) or size < 0 or field is None:
             reasons.add(GATE_LOG_MALFORMED)  # a line that does not say what it served is no count
             continue
-        counts[field] += size
-        if not tables.add(record, field, size):
+        mine = run and _request_of(record) not in begun
+        into, rows = (counts, tables) if mine else (before, held)
+        into[field] += size
+        before["requests"] += 0 if mine else 1
+        if not rows.add(record, field, size):
             reasons.add(GATE_LOG_MALFORMED)  # content or a listing of no file or directory the log can name
+    reasons |= _run_start_reasons(run_start, marks, late)
     if lines is not None and not confirmed:  # an exit is no proof: a gate killed by its memory limit exits as well
         reasons.add(GATE_TEARDOWN_UNCONFIRMED)
     if reasons:
         return served_unknown(*reasons, caps=caps)
-    total = counts["content_bytes"] + counts["listing_bytes"] + counts["other_bytes"]
-    return {"served_bytes": total, **counts, **tables.snapshot(), "unknown": []}
+    total = sum(counts[f] for f in _SERVED_KINDS)
+    apart = None if run_start is None else {**before, "served_bytes": sum(before[f] for f in _SERVED_KINDS)}
+    return {"served_bytes": total, **counts, **tables.snapshot(), "before_run_start": apart, "unknown": []}
