@@ -22,16 +22,36 @@ it opens, so a restart in the outage restores it (`restarts` counts those) and t
      "last_detail"}
 
 **A gate state that cannot be read at a restart opens closed**: whether the platform is up is then unknown, and the
-first passing check ends it. Nothing is charged for a restart.
+first passing check ends it. Nothing is charged for a restart. A restored outage that was blocking does not block
+until the restored gate's first check has answered (bounded by its timeout), so a platform that is healthy again
+reopens a campaign that exits when blocked.
 
 Post-run checks. A run whose post-run check fails **while the gate is closed at the instant the check returns** (it
 began after the gate closed, or was in flight as it closed) is retried without the attempt counting: it is kept with its
 tokens as an outage-discarded attempt, and the outage's record counts it (`discarded`, `discarded_input_tokens`,
 `discarded_output_tokens`, `discarded_usage_unknown`). The definition is by order, with no clock window. A failed
 post-run check that returns while the gate is still open does not close it; the next pre-run check that fails does.
+
+**A deferred check is a wait, not a failure.** A platform answers `Health(False, detail, deferred=True)` when it could
+not look now for a reason that is no fault: a run holds the platform on purpose (an outage run of the study holds the
+federation, and the check's bounded wait for it ran out). A deferral is never a pass and never an outage: a deferred
+pre-run check holds its run (`defer`) without closing the gate, recording an outage or charging an attempt, and the
+run is tried again after `recheck_s`; a deferred post-run check verified nothing, so no finished result, treatment
+included, is scored on it: the attempt is set aside as `post_check_unverified`, a kind no condition may declare; and the
+dispatcher's own check keeps a closed gate closed while it is deferred, since only a pass opens it. **A deferral is
+bounded.** Its start is kept in the store (`expcore.campaign.deferral`), so a restart keeps its age, and it is in the
+status; a pass, before or after a run, ends it. A pre-run check deferred longer than `max_defer_s` fails: it closes the gate as any failure
+does, charging the run that found it, and the outage is `blocking`, a hold that does not end by itself, so a campaign
+that exits when blocked stops instead of waiting on a holder that may never let go. A gate already closed is checked
+by the dispatcher alone, and its deferred checks count the same way: past the bound its outage becomes blocking too.
+
+**Every check runs in its caller's context** (`contextvars`), so a post-run check, which runs inside the run's
+admission (`expcore.campaign.attempt`: a platform's hook that holds a resource from before the attempt until after
+its post-run check), can see that the run still holds it.
 """
 
 import contextlib
+import contextvars
 import json
 import threading
 import time
@@ -39,20 +59,23 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
+from expcore.campaign.deferral import Deferral, deferral_alarms, parse_deferral
 from expcore.campaign.store import Store
 
 META = "health_outages"
 HOW_PASSED = "check_passed"  # the dispatcher's own health check passed: dispatch resumed by itself
 KEEP = 200  # the newest this many outages are kept
-GO, HOLD, FOUND = "go", "hold", "found"  # what a pre-run check lets a run do
+GO, HOLD, FOUND, DEFER = "go", "hold", "found", "defer"  # what a pre-run check lets a run do
 UNREADABLE_DETAIL = "the stored outage record was unreadable"
 
 
 class Health(NamedTuple):
-    """One reading of the platform: whether it is healthy, and in what words."""
+    """One reading of the platform: whether it is healthy, in what words, and whether the reading was deferred (the
+    platform is held on purpose and could not be looked at now; never ok, see the module docstring)."""
 
     ok: bool
     detail: str
+    deferred: bool = False
 
 
 class HealthCheck(Protocol):
@@ -65,11 +88,14 @@ class HealthCheck(Protocol):
 
 def read_health(check: Callable[[], Any]) -> Health:
     """Run a check and return what it said. One that raises, or answers something other than a `Health` or an
-    (ok, detail) pair with a real boolean, is a failed check, never a crash and never a pass."""
+    (ok, detail) pair with a real boolean, is a failed check, never a crash and never a pass. A deferred `Health` stays
+    deferred and is never ok, whatever its `ok` says."""
     try:
         answer = check()
     except Exception as error:
         return Health(False, f"health check raised {type(error).__name__}")
+    if isinstance(answer, Health) and isinstance(answer.ok, bool) and isinstance(answer.deferred, bool):
+        return Health(answer.ok and not answer.deferred, str(answer.detail), answer.deferred)
     if isinstance(answer, tuple | list) and len(answer) == 2 and isinstance(answer[0], bool):
         return Health(answer[0], str(answer[1]))
     return Health(False, f"health check answered {str(answer)[:80]!r}, not (ok, detail)")
@@ -97,15 +123,21 @@ def dump(outages: list[dict[str, Any]]) -> str:
     return json.dumps({"outages": outages[-KEEP:]}, sort_keys=True)
 
 
-def fact(raw: str | None) -> dict[str, Any]:
-    """Return the status fact: readable, the outages, and the open one. An unreadable record lists none, never []."""
+def fact(raw: str | None, deferral_raw: str | None = None) -> dict[str, Any]:
+    """Return the status fact: readable, the outages, the open one, and the current deferral (`deferral_raw` is the
+    store's `health_deferral`). An unreadable record lists none, never []."""
+    try:
+        deferral = parse_deferral(deferral_raw)
+    except (ValueError, TypeError):
+        deferral = None
     outages = parse(raw)
     if outages is None:
-        return {"readable": False, "outages": None, "open": None}
+        return {"readable": False, "outages": None, "open": None, "deferral": deferral}
     return {
         "readable": True,
         "outages": outages,
         "open": next((o for o in reversed(outages) if o.get("end_utc") is None), None),
+        "deferral": deferral,
     }
 
 
@@ -118,7 +150,7 @@ def alarms(state: dict[str, Any], every_s: float) -> list[str]:
         ]
     outage = state["open"]
     if outage is None:
-        return []
+        return deferral_alarms(state.get("deferral"))
     last = outage.get("last_detail") or outage.get("first_detail") or "no detail"
     return [
         f"HEALTH GATE CLOSED since {outage['start_utc']}: no run starts; the dispatcher re-checks every {every_s:g} s "
@@ -130,7 +162,8 @@ def alarms(state: dict[str, Any], every_s: float) -> list[str]:
 
 @dataclass(frozen=True)
 class PreRun:
-    """What a pre-run check lets the run do: `go`, `hold` (stay pending, charge nothing) or `found` (this run found a
+    """What a pre-run check lets the run do: `go`, `hold` (stay pending, charge nothing), `defer` (the check was
+    deferred: stay pending, charge nothing, try again after `recheck_s`, the gate left open) or `found` (this run found a
     new outage and is charged its one attempt)."""
 
     verdict: str
@@ -148,11 +181,13 @@ class HealthGate:
         *,
         recheck_s: float = 30.0,
         timeout_s: float = 60.0,
+        max_defer_s: float = 3600.0,
     ):
-        if recheck_s <= 0 or timeout_s <= 0:
-            raise ValueError("recheck_s and timeout_s must be positive")
+        if recheck_s <= 0 or timeout_s <= 0 or max_defer_s <= 0:
+            raise ValueError("recheck_s, timeout_s and max_defer_s must be positive")
         self.store, self.check, self.clock = store, check, clock
-        self.recheck_s, self.timeout_s = recheck_s, timeout_s
+        self.recheck_s, self.timeout_s, self.max_defer_s = recheck_s, timeout_s, max_defer_s
+        self.deferral = Deferral(store, clock)
         self._open: dict[str, Any] | None = None  # the open outage's record; None: the gate is open
         self._outages: list[dict[str, Any]] = []
         self._lock = threading.Lock()  # "who found it" and the record's writes are one step each
@@ -162,6 +197,7 @@ class HealthGate:
         self._stop: threading.Event | None = None  # the campaign's end, set by `start`
         self._thread: threading.Thread | None = None
         self.check_now = False  # a gate restored by a restart is checked at once, not after a period
+        self._restored = threading.Event()  # set while a restored gate's first check has not answered
 
     # --- state ----------------------------------------------------------------------------------------------------
 
@@ -170,9 +206,18 @@ class HealthGate:
         """Tell whether the gate is closed now."""
         return self._open is not None
 
+    @property
+    def blocking(self) -> bool:
+        """Tell whether the gate is closed by a failure that does not end by itself: a deferral past its bound. A gate a
+        restart restored is not, until its first check has answered (bounded by its timeout): the platform may be
+        healthy again, and that answer must not be thrown away by a campaign that exits as blocked."""
+        outage = self._open
+        return outage is not None and bool(outage.get("blocking")) and not self._restored.is_set()
+
     def load(self) -> None:
         """Restore the outage list at a start. A gate closed when the last process ended is closed again and checked at
         once; a record that cannot be read reads as closed too, until a check passes. Nothing is charged for it."""
+        self.deferral.load()
         now = self.clock()
         raw = self.store.get_meta(META)
         outages = parse(raw)
@@ -195,6 +240,7 @@ class HealthGate:
         if open_one is not None:
             open_one["restarts"] = int(open_one.get("restarts", 0)) + 1
             self._open, self.check_now = open_one, True
+            self._restored.set()
             self.store.put_meta(META, dump(self._outages), now)
             self.store.event(
                 now,
@@ -204,8 +250,9 @@ class HealthGate:
                 "checked at once; no attempt is charged for the restart",
             )
 
-    def _close(self, run_key: str, detail: str) -> bool:
-        """Close the gate for a failed check. True: this run found the outage and is its one attempt."""
+    def _close(self, run_key: str, detail: str, *, blocking: bool = False) -> bool:
+        """Close the gate for a failed check. True: this run found the outage and is its one attempt. A `blocking`
+        outage, a deferral past its bound, is a hold that does not end by itself."""
         with self._lock:
             if self._open is not None:
                 return False
@@ -220,6 +267,8 @@ class HealthGate:
                 "first_detail": detail[:200],
                 "last_detail": detail[:200],
             }
+            if blocking:
+                record["blocking"] = True
             self._open = record
             self._outages.append(record)
             self.store.put_meta(META, dump(self._outages), now)
@@ -257,7 +306,8 @@ class HealthGate:
             finally:
                 box["done"].set()
 
-        threading.Thread(target=go, daemon=True, name="health-check").start()
+        context = contextvars.copy_context()  # the caller's: a post-run check sees what the run still holds
+        threading.Thread(target=context.run, args=(go,), daemon=True, name="health-check").start()
         while not box["done"].wait(0.02):  # in slices, so the end of the run is seen at once
             if stop is not None and stop.is_set():
                 return None
@@ -280,8 +330,8 @@ class HealthGate:
 
     def before_run(self, run_key: str) -> PreRun:
         """Check before an attempt. A closed gate holds the run without a check; a passing check lets it go unless the
-        gate closed while the check was out; a failing check closes the gate and charges this run, or, if another run
-        closed it first, holds this one."""
+        gate closed while the check was out; a deferred check defers the run and leaves the gate as it is; a failing
+        check closes the gate and charges this run, or, if another run closed it first, holds this one."""
         if self._open is not None:
             return PreRun(HOLD, "the gate is closed")
         if self._stop is not None and self._stop.is_set():
@@ -294,14 +344,26 @@ class HealthGate:
         if closed is not None:
             return PreRun(HOLD, "the gate closed while this check was out")
         if health.ok:
+            self.deferral.end()
             return PreRun(GO, health.detail)
-        if not self._close(run_key, health.detail):
+        blocking, detail = False, health.detail
+        if health.deferred:
+            age = self.deferral.note(health.detail)
+            if age <= self.max_defer_s:
+                return PreRun(DEFER, health.detail)  # a wait, not a failure: nothing is closed or charged
+            blocking = True  # a wait past its bound: the holder may never let go
+            detail = f"{detail} (deferred for {age:.0f} s, past max_defer_s of {self.max_defer_s:g} s)"
+        if not self._close(run_key, detail, blocking=blocking):
             return PreRun(HOLD, "another run's failed check closed the gate first")
-        return PreRun(FOUND, health.detail)
+        return PreRun(FOUND, detail)
 
     def after_run(self) -> tuple[Health, dict[str, Any] | None]:
-        """Check after an attempt: the health, and the outage record if the gate was closed when the check returned."""
-        return self._read_at_gate()
+        """Check after an attempt: the health, and the outage record if the gate was closed when the check returned. A
+        check that passes ends the current deferral, as a pre-run pass does, so a later one counts from its own start."""
+        health, outage = self._read_at_gate()
+        if health.ok:
+            self.deferral.end()
+        return health, outage
 
     def note_discard(self, outage: dict[str, Any], input_tokens: int | None, output_tokens: int | None) -> None:
         """Count a post-run attempt the outage discarded, and its tokens (counted apart where unknown, never as zero)."""
@@ -327,7 +389,12 @@ class HealthGate:
             if health.ok:
                 record["end_utc"], record["how"] = now, HOW_PASSED
                 self._open = None
+                self.deferral.end()
+            blocked = health.deferred and self._past_bound(record, health.detail)
             self.store.put_meta(META, dump(self._outages), now)
+            if blocked:
+                text = f"the dispatcher's own check stayed deferred past max_defer_s ({health.detail[:200]}): blocking"
+                self.store.event(now, "health_gate_blocking", None, text)
             if health.ok:
                 survived = f" and survived {record['restarts']} restart(s)" if record.get("restarts") else ""
                 self.store.event(
@@ -338,6 +405,14 @@ class HealthGate:
                     f"check(s); the outage began {record['start_utc']}{survived}: dispatch resumes",
                 )
         return health.ok
+
+    def _past_bound(self, record: dict[str, Any], detail: str) -> bool:
+        """Count a deferred check of the dispatcher's own; once the deferral is past `max_defer_s`, the open outage
+        becomes blocking. Return whether it just did."""
+        if self.deferral.note(detail) <= self.max_defer_s or record.get("blocking"):
+            return False
+        record["blocking"] = True
+        return True
 
     def _timed(self, stop: threading.Event | None) -> Health:
         """One check of the dispatcher's own, with a timeout: see `_ask`. The end of the campaign reads as down."""
@@ -366,7 +441,11 @@ class HealthGate:
                 self.check_now = False
                 if stop.wait(wait):
                     break
-                if self.poll(stop):
+                try:
+                    opened = self.poll(stop)
+                finally:
+                    self._restored.clear()  # answered, or timed out: a blocking outage blocks again
+                if opened:
                     on_open()
             except Exception as error:
                 with contextlib.suppress(Exception):  # the store may be gone: the campaign is ending

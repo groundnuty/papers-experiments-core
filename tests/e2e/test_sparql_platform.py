@@ -22,6 +22,7 @@ import pytest
 from sparql_platform import STORE_KIND, GraphStore, QueryLog, SparqlPlatform, SparqlTools, StoreHealth, StoreSnapshot
 from study_support import HEAD, ROOT, clean_environment
 
+from expcore.campaign.healthgate import Health
 from expcore.errors import InfraError
 from expcore.provenance.codestamp import write_stamp
 from expcore.records.record import load_record
@@ -293,7 +294,7 @@ def test_a_store_that_cannot_be_read_is_infrastructure_of_the_platforms_kind_nev
     assert caught.value.kind == STORE_KIND == "rdf_store"
     health = StoreHealth(GraphStore.load(graph))
     health.store = FailingStore()
-    assert health() == (False, "rdf_store: the store could not be read (OSError)")
+    assert health() == Health(False, "rdf_store: the store could not be read (OSError)")
     with pytest.raises(InfraError):
         StoreSnapshot(FailingStore(), QueryLog()).start({})
 
@@ -319,6 +320,6 @@ def test_the_platform_refuses_a_graph_with_blank_nodes_and_its_health_and_finger
     with pytest.raises(ValueError, match="not a graph file"):
         GraphStore.load(tmp_path / "graph.json")
     platform = SparqlPlatform(graph, max_rows=3)
-    assert platform.health()() == (True, "the store answers and holds its 4 triples")
+    assert platform.health()() == Health(True, "the store answers and holds its 4 triples")
     assert platform.fingerprint() == {"platform": "sparql-platform", "max_rows": 3, "graph": platform.loaded}
     assert platform.loaded == GraphStore.load(graph).snapshot()  # the same file gives the same snapshot

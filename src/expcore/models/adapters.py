@@ -197,6 +197,12 @@ class _SdkBackend:
         self.served.expect(requested_from_sent(self._sent))
 
     @property
+    def requests_sent(self) -> int:
+        """How many requests this backend has started, each resend after a failure counted (an optional attribute of a
+        backend: the scheduler reads it to tell an attempt that sent nothing)."""
+        return self.retrier.stats.requests
+
+    @property
     def output_limit(self) -> int:
         """The max_tokens a request carries (B11)."""
         return self.spec.output_tokens(self.limits.max_output_tokens)
@@ -642,6 +648,7 @@ class StubAdapter:
         self.output_limit, self.context_tokens, self._probe_error = output_limit, context_tokens, probe_error
         self._messages: list[dict] = []
         self._ctx_tokens = 0
+        self.requests_sent = 0  # replies asked of the script, kept across `use`
 
     def use(self, script: list) -> None:
         """Replace the script and start it from its first item; the conversation so far is not touched."""
@@ -670,6 +677,7 @@ class StubAdapter:
         """Return the next scripted reply; "done" once the script is used up."""
         item = self._script[self._i] if self._i < len(self._script) else "done"
         self._i += 1
+        self.requests_sent += 1
         if isinstance(item, BaseException):
             raise item
         if isinstance(item, ModelTurn):

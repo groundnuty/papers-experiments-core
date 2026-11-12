@@ -17,6 +17,7 @@ Behaviours measured live on 25.0 (dated facts in `deploy/compose-federation/day0
 - An eviction scheduled within about a second of a placement settling can complete with `filesEvicted` 0: judge eviction only by the block map, and retry, bounded.
 - A range read places a 1 MiB window from the read's own offset, clipped to the file's end, aligned to nothing. Record held bytes from the block map, never the request.
 - Deleting a directory is asynchronous: never reuse a name at once.
+- A token with any data-access caveat (`data.path`, `data.objectid`, `data.readonly`, or interface `oneclient`) is usable for data access alone: `POST /transfers` and its own `POST /tokens/examine` answer `tokenCaveatUnverified` (#177). A token that must write carries none.
 
 The live federation (`deploy/compose-federation/`, Docker Compose):
 - One live federation session at a time on this host. Stay within the project's own containers and networks, never prune, publish ports on 127.0.0.1 only, keep data under the federation's root, never print a secret, and leave everything down and verified at the end.

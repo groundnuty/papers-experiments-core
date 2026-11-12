@@ -27,13 +27,16 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
     assert "3 skipped" in done.stdout
 
 
-def test_o09_only_the_resets_qos_calls_cancel_and_the_truncating_write_are_unconfirmed_and_the_path_read_is_gone():
+def test_o09_only_the_resets_calls_the_truncating_write_and_the_tool_server_user_reads_are_unconfirmed():
     """O09, O11: the live contract tests against Onedata 25.0 confirmed every call the layer makes that no source did,
     the gate's walk by `parent_id` among them, the reset's eviction of a directory and a transfer record's `spaceId`,
     and refuted the file's `path` attribute the gate read before, which no release at hand answers. The gate no longer
     asks for it; the client's docstring records what refuted it. What is left unconfirmed are the reset's calls no live
-    run has made (a transfer's cancel, a QoS summary, a requirement's record and its removal) and the write of content
-    without an offset, which truncates the file and which a restarted upload relies on (O25)."""
+    run has made (a transfer's cancel, a QoS summary, a requirement's record and its removal), the write of content
+    without an offset, which truncates the file and which a restarted upload relies on (O25), and the two reads that
+    bound a writing tool-server user (#177): its Onezone admin privileges, named by Onezone's REST description alone,
+    and the clusters its token acts in, the current user's read sent as the token, named by that description and the
+    route of oz-worker."""
     from expcore_onedata import client
 
     assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {
@@ -42,9 +45,16 @@ def test_o09_only_the_resets_qos_calls_cancel_and_the_truncating_write_are_uncon
         ("GET", "/data/{id}/qos/summary"),
         ("GET", "/qos_requirements/{qid}"),
         ("DELETE", "/qos_requirements/{qid}"),
+        ("GET", "/users/{id}/effective_privileges"),
+        ("GET", "/user/effective_clusters"),
     }
     what = " ".join(w for _, _, w in client.UNVERIFIED_ENDPOINTS)
-    assert all(field in what for field in ("fileId", "requirements", "400", "truncates"))
+    assert all(
+        field in what for field in ("fileId", "requirements", "400", "truncates", "oz_view_privileges", "clusters")
+    )
+    assert "58c697695fd73ff480f4a6e5fdbf733036465398" in client.__doc__  # the REST description they are named by
+    assert "paths/user/effective_clusters.yaml" in client.__doc__
+    assert "03af698e5759f9db97a003047eb4e29e4ba7507f" in client.__doc__  # oz-worker's route of the clusters read
     assert "badValueNotAllowed" in client.__doc__
     assert '"attribute": "path"' not in Path(client.__file__).read_text(encoding="utf-8")
 

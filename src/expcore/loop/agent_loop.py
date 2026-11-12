@@ -205,7 +205,7 @@ class _Run:
                 Outcome("time_cap", "the request went out and was not answered in time; it was not resent")
             ) from None
         except InfraError as exc:  # the kind goes through unchanged (C02)
-            raise _End(Outcome("infrastructure", exc.detail, infra_kind=exc.kind)) from None
+            raise _End(Outcome("infrastructure", exc.detail, infra_kind=exc.kind, infra_target=exc.target)) from None
         except (
             ContextOverflow
         ) as exc:  # the conversation outgrew the window: the attempt's own ending, not infrastructure
@@ -309,7 +309,7 @@ class _Run:
             return cut_run, cut_ending(f"tool {call.name!r}", cut.tick, self.config)
         except InfraError as exc:
             return self._failed(index, call, tick, f"infrastructure: {exc.kind}", waited0), Outcome(
-                "infrastructure", exc.detail, infra_kind=exc.kind
+                "infrastructure", exc.detail, infra_kind=exc.kind, infra_target=exc.target
             )
         except Exception as exc:
             return self._failed(index, call, tick, f"{type(exc).__name__}: {exc}", waited0), self._defect(

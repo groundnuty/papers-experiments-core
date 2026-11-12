@@ -2,12 +2,14 @@
 
     EXPCORE_LIVE_PLATFORM=/path/to/platform.toml uv run pytest tests/live
     EXPCORE_LIVE_SLOW=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live   # also the test that waits out a lifetime
+    EXPCORE_LIVE_FAULTS=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live  # also the test that takes a provider down
 
 They check what the fake can only assume: that the endpoints the layer calls answer in the shape it parses. They read
 (health, discovery, the examination of a token, and, with EXPCORE_LIVE_CONTENT_PATH naming a provisioned file by its
 path in the space, that file's content) and mint a short-lived token per plane for the configured fixed users.
 Tokens are never revoked, so each one ends with its lifetime. Nothing here changes a space, a file or a privilege, and
-without the variable nothing is constructed or contacted.
+without the variable nothing is constructed or contacted. Only with EXPCORE_LIVE_FAULTS=1 as well does the fault test
+take a provider declared in `[faults]` down and bring it back.
 """
 
 import os
@@ -44,6 +46,7 @@ from expcore_onedata.health import PlatformHealth  # noqa: E402
 from expcore_onedata.sandbox import gateboundary  # noqa: E402
 from expcore_onedata.tokencheck import CaveatSpec  # noqa: E402
 from expcore_onedata.tokens import TokenIssuer, data_path_spec  # noqa: E402
+from expcore_onedata.tokenscope import admin_privileges, effective_clusters  # noqa: E402
 
 CEILING_S = 300.0
 CONTENT_PATH = os.environ.get("EXPCORE_LIVE_CONTENT_PATH")  # a provisioned, non-empty file: its path in the space
@@ -227,6 +230,31 @@ def test_each_condition_mints_and_examines_its_tool_server_token(index, config, 
     name = list(config.toolserver.conditions)[index]
     token = mint_for_condition(issuer, config, name, config.principals.toolserver, CEILING_S)
     assert token.subject == config.principals.toolserver.user_id
+
+
+def test_the_tool_server_user_holds_no_onezone_admin_privilege(config, client):
+    """O09: a writing condition's token carries no data-access caveat, so its user's Onezone admin privileges are live
+    on it. The admin credential reads them in the shape the layer parses (`tokenscope.admin_privileges`), and the
+    tool-server user holds none."""
+    # covers: GET /users/{id}/effective_privileges
+    if config.principals.toolserver is None:
+        pytest.skip("platform.toml declares no [principals.toolserver] user")
+    assert admin_privileges(client, config.principals.toolserver.user_id) == []
+
+
+def test_a_writing_tool_server_token_acts_in_no_cluster(config, client, issuer):
+    """O09: a member of a provider's cluster can act through that provider whatever its spaces, so a writing token's
+    user must be a member of none. Onezone's read of another user's clusters does not exist, so the call is the current
+    user's, sent as the token itself: it answers 200 with a list of cluster ids (`tokenscope.effective_clusters`), and
+    the tool-server user's is empty. The token has no data-access caveat, as a data-access one would refuse the read."""
+    # covers: GET /user/effective_clusters
+    if config.toolserver is None or config.principals.toolserver is None:
+        pytest.skip("platform.toml declares no tool server or no [principals.toolserver] user")
+    writing = next((n for n, c in config.toolserver.conditions.items() if c.writes), None)
+    if writing is None:
+        pytest.skip("platform.toml declares no condition with a write right")
+    token = mint_for_condition(issuer, config, writing, config.principals.toolserver, CEILING_S)
+    assert effective_clusters(client, token.reveal()) == []
 
 
 @SLOW
@@ -568,3 +596,34 @@ def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_
     finally:
         report = provisioner.teardown()
     assert report.ok, report.left
+
+
+# -- the fault injector (issue #17) -----------------------------------------------------------------------------------
+
+FAULTS = pytest.mark.skipif(
+    os.environ.get("EXPCORE_LIVE_FAULTS") != "1",
+    reason="EXPCORE_LIVE_FAULTS=1 is not set; this test takes a provider of the deployment down",
+)
+
+
+@FAULTS
+def test_a_provider_taken_down_is_seen_down_and_comes_back_with_a_new_identity(config, client):
+    """O11: the injector takes a provider of `[faults.services]` down (EXPCORE_LIVE_FAULT_TARGET, a label such as
+    providers[1], or the first that is not the agent's own), sees it down, brings it back with a changed identity and
+    waits until it serves (its container healthy, its REST read answered), leaving no injection open in the journal."""
+    from expcore_onedata.faults import FaultInjector, compose_driver, load_faults, provider_serves
+
+    settings = load_faults(PLATFORM, config)
+    remote = [name for name in settings.services if name != config.support.local] or list(settings.services)
+    target = os.environ.get("EXPCORE_LIVE_FAULT_TARGET") or config.provider_label(remote[0])
+    driver = compose_driver(settings, probe=provider_serves(config, settings, client))
+    injector = FaultInjector(config, settings, target, sanctioned=True, driver=driver)
+    with injector.session({"run_key": "live-fault-check", "attempt": 1}):
+        steps = [s["step"] for s in injector.snapshot()["steps"]]
+        assert "injected" in steps
+    snapshot = injector.finish()
+    assert snapshot["ok"] is True, snapshot["steps"]
+    (injection,) = snapshot["injections"]
+    ready_after_s = injection.pop("ready_after_s")  # the seconds the restored provider took to serve, on this clock
+    assert injection == {"target": target, "injected": True, "cleared": True, "verified": True}
+    assert 0 <= ready_after_s <= settings.ready_timeout_s

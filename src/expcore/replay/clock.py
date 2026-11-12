@@ -16,7 +16,9 @@ cancelled work did not stop in time. The replay follows them:
 - the replay's cleanup waiter answers from the recorded label of the reading that ends the cleanup.
 
 Readings labelled `time_left` are not served: the live backend's retry policy took them inside a request, and a
-recorded backend never retries.
+recorded backend never retries. Nor is the reading labelled `instrument_first_turn`: the executor took it before the
+loop started the clock, for an instrument's first-turn hook (C31), and the replay runs no instrument. That one is put
+back at the start of the replayed record's clock, as recorded, so the two clocks are compared whole.
 """
 
 import asyncio
@@ -24,11 +26,14 @@ from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from typing import Any
 
-from expcore.plugin import check_wait_kind
+from expcore.plugin import FIRST_TURN_LABEL, check_wait_kind
 from expcore.replay.divergence import stop
 
 # The label under which `AgentTimer.time_left` logs its readings.
 BACKEND_CLOCK_LABELS = frozenset({"time_left"})
+# The readings an executor took before the loop started the clock. The replay does not serve them, and puts them back,
+# as recorded, at the start of the clock it builds, so the replayed record keeps them where they were (C31).
+EXECUTOR_CLOCK_LABELS = frozenset({FIRST_TURN_LABEL})
 WAIT_START, WAIT_END, WATCH = "wait_start:", "wait_end:", "watch"
 CLEANUP_LABELS = ("cleanup_end", "cleanup_end_timed_out")
 _YIELDS_FOR_A_READING = 100  # loop iterations the watch is given to take a reading that is due before the replay stops
@@ -41,7 +46,8 @@ class ReplayClock:
     """
 
     def __init__(self, readings: Sequence[Sequence[Any]]):
-        kept = [(label, float(value)) for label, value in readings if label not in BACKEND_CLOCK_LABELS]
+        unserved = BACKEND_CLOCK_LABELS | EXECUTOR_CLOCK_LABELS
+        kept = [(label, float(value)) for label, value in readings if label not in unserved]
         self._labels = [label for label, _ in kept]
         self._values = [value for _, value in kept]
         self._read = 0

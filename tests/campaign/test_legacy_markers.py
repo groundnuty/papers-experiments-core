@@ -3,7 +3,17 @@
 import json
 
 import pytest
-from campaign_support import LATER, NOW, finished, infra, keys_under, make_manifest, open_store, treatment_schema
+from campaign_support import (
+    LATER,
+    NOW,
+    as_schema_two,
+    finished,
+    infra,
+    keys_under,
+    make_manifest,
+    open_store,
+    treatment_schema,
+)
 
 from expcore.campaign.markers import MARKER_NAME, MarkerError, read_marker, write_marker
 from expcore.campaign.recovery import recover
@@ -14,7 +24,7 @@ NEW_FIELDS = ("model_turns", "recorded_treatment", "first_turn_rule", "turn_usag
 def legacy_marker(run_dir, key, attempt_id, result):
     """Write the marker of a result as schema 1 wrote it: no model-turn count, no record flag, no rule."""
     path = write_marker(run_dir, key, attempt_id, result)
-    body = json.loads(path.read_text())
+    body = as_schema_two(json.loads(path.read_text()))
     body["schema"] = 1
     for name in NEW_FIELDS:
         del body["result"][name]
@@ -42,7 +52,7 @@ def test_c04_a_schema_one_marker_reads_under_the_version_one_rule_and_is_marked_
     assert result.replies_checked is False  # written before the check: an attempt of no turn is charged its bound
     assert result.outcome.infra_kind == "endpoint"
     assert json.loads(path.read_text())["schema"] == 1
-    write_marker(tmp_path, "k", 1, infra("endpoint"))  # a marker written now is schema 2 and is not legacy
+    write_marker(tmp_path, "k", 1, infra("endpoint"))  # a marker written now is schema 3 and is not legacy
     assert read_marker(tmp_path, "k", 1).legacy_marker is False
 
 
@@ -91,7 +101,7 @@ def test_c04_a_new_marker_commits_without_a_legacy_event(tmp_path):
     assert [r["kind"] for r in store.q("SELECT kind FROM events")] == ["recovered_committed"]
 
 
-@pytest.mark.parametrize("schema", [0, 3, "1", True, None])
+@pytest.mark.parametrize("schema", [0, 4, "1", True, None])
 def test_c04_any_other_marker_schema_is_still_refused(schema, tmp_path):
     """C04: only schemas 1 and 2 are readable."""
     path = write_marker(tmp_path, "k", 1, finished())
@@ -106,7 +116,7 @@ def test_c04_any_other_marker_schema_is_still_refused(schema, tmp_path):
 def test_c04_a_schema_one_marker_with_a_field_of_schema_two_is_not_trusted(tmp_path):
     """C04: a schema-1 marker holds exactly the schema-1 fields; one that also holds the new ones is not a marker."""
     path = write_marker(tmp_path, "k", 1, finished())
-    body = json.loads(path.read_text())
+    body = as_schema_two(json.loads(path.read_text()))
     body["schema"] = 1
     path.write_text(json.dumps(body))
     unknown = "unknown result fields: first_turn_rule, model_turns, recorded_treatment, replies_checked, turn_usage"
@@ -118,7 +128,7 @@ def test_c04_a_schema_two_marker_without_the_rule_field_reads_under_the_version_
     """C04: a schema-2 marker written before the rule field existed holds a version-2 record, so recovery reads it
     with the first-turn rule rather than refusing it."""
     path = write_marker(tmp_path, "k", 1, infra("endpoint"))
-    body = json.loads(path.read_text())
+    body = as_schema_two(json.loads(path.read_text()))
     del body["result"]["first_turn_rule"]
     path.write_text(json.dumps(body, sort_keys=True))
     result = read_marker(tmp_path, "k", 1)

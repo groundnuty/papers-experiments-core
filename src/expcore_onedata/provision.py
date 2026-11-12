@@ -239,6 +239,7 @@ class Provisioner:
         self._ids = dict(provider_ids)
         self._log = Path(log)
         self._log_lock = threading.Lock()
+        self._role: str | None = None  # the role that claimed the log through this provisioner (`claim_log`)
         self._clock, self._sleep = clock, sleep
         self._verified_name: str | None = None
         self._root: str | None = None
@@ -345,20 +346,43 @@ class Provisioner:
             handle.write(json.dumps(line, sort_keys=True) + "\n")
             handle.flush()
 
-    def logged(self) -> list[dict[str, Any]]:
-        """Return the creations the log holds that no later deletion line cancels, oldest first."""
+    def _lines(self) -> list[dict[str, Any]]:
         if not self._log.exists():
             return []
+        return [json.loads(text) for text in self._log.read_text(encoding="utf-8").splitlines() if text.strip()]
+
+    def logged(self) -> list[dict[str, Any]]:
+        """Return the creations the log holds that no later deletion line cancels, oldest first."""
         created: dict[str, dict[str, Any]] = {}
-        for text in self._log.read_text(encoding="utf-8").splitlines():
-            if not text.strip():
-                continue
-            line = json.loads(text)
+        for line in self._lines():
             if line.get("action") == "create":
                 created[line["id"]] = line
             elif line.get("action") == "delete":
                 created.pop(line["id"], None)
         return list(created.values())
+
+    def claim_log(self, role: str) -> None:
+        """Reserve the change log for one role that needs a log of its own, such as a progressive ingest, whose restore
+        takes what the log says was created for its own and whose restored files a teardown over the log would delete.
+
+        The claim is a line of the log, so another provisioner on the same file, or a later process, sees it too, and
+        `teardown` refuses a claimed log; each creation this provisioner logs after it carries the role. Claiming again
+        for the same role is harmless (one study's runs, one after another). ProvisionError, with nothing written, when
+        the log holds another role's claim or a creation without the role, which another user made."""
+        lines = self._lines()
+        claims = {line.get("role") for line in lines if line.get("action") == "claim"}
+        foreign = [line for line in lines if line.get("action") == "create" and line.get("role") != role]
+        if claims - {role} or foreign:
+            raise ProvisionError(
+                f"{self._where}the change log is shared with another user; a {role} needs a provisioner and a change "
+                "log of its own"
+            )
+        if not claims:
+            self._write("claim", role=role)
+        self._role = role
+
+    def _claimed_by(self) -> str | None:
+        return next((line.get("role") for line in self._lines() if line.get("action") == "claim"), None)
 
     # -- listing and creation --------------------------------------------------
     def children(
@@ -451,7 +475,7 @@ class Provisioner:
         file_id = answer.get("fileId") if isinstance(answer, dict) else None
         if not isinstance(file_id, str) or not file_id:
             raise PlatformError("a creation answer holds no file id")
-        self._write("create", id=file_id, kind=kind, path=path)
+        self._write("create", id=file_id, kind=kind, path=path, **({} if self._role is None else {"role": self._role}))
         return file_id
 
     def put_file(self, path: str, data: bytes, *, content_type: str = OCTET_STREAM) -> str:
@@ -475,9 +499,12 @@ class Provisioner:
             raise ProvisionError(f"{self._where}the size read back after an upload is not the size uploaded")
         return file_id
 
-    def upload(self, path: str, source: Path | str, *, content_type: str = OCTET_STREAM) -> Upload:
+    def upload(
+        self, path: str, source: Path | str, *, content_type: str = OCTET_STREAM, stop: int | None = None
+    ) -> Upload:
         """Upload a local file to a path of the space on the data provider, never holding it whole; return what was
-        done (O25).
+        done (O25). With `stop`, only the local file's first `stop` bytes are its content here: the target ends as
+        that prefix, verified by its hash, and a later upload with a larger stop, or none, resumes from it.
 
         The file is read and sent `chunk_bytes` at a time, each chunk a PUT at its offset through the client's mutation
         gate (the space's name is checked first, and the file's space before every write), carrying `content_type`.
@@ -498,6 +525,10 @@ class Provisioner:
         """
         media, source = media_type(content_type), Path(source)
         size = source.stat().st_size  # a local file that is not there is refused before anything is asked
+        if stop is not None:
+            if isinstance(stop, bool) or not isinstance(stop, int) or not 1 <= stop <= size:
+                raise ProvisionError(f"{self._where}an upload's stop is a whole number of bytes within the local file")
+            size = stop
         self._verified()
         *directory, name = safe_path(path)
         parent = self.make_dir("/".join(directory)) if directory else self.root()
@@ -510,7 +541,9 @@ class Provisioner:
             file_id = existing.file_id
             if action == "skipped":
                 return Upload(file_id, Digest(size, hasher.hexdigest()), action, 0)
-        blocks = _hashing(chunks(source, self._settings.chunk_bytes, start=start), hasher)
+        # The caller's stop, never the size taken above: without one, a local file appended to meanwhile is read to its
+        # new end and fails the size check below instead of being cut to its first bytes and reported done.
+        blocks = _hashing(chunks(source, self._settings.chunk_bytes, start=start, stop=stop), hasher)
         sent = self._write_chunks(file_id, blocks, media, truncate=action == "restarted")
         expected = Digest(start + sent, hasher.hexdigest())
         if expected.size != size:
@@ -901,8 +934,15 @@ class Provisioner:
 
         A deletion is logged only once the entry's absence is confirmed, so an entry whose DELETE answered success and
         that is still there keeps its creation record and a later teardown deletes and checks it again. A directory
-        is deleted only when everything in it is an entry this teardown has confirmed gone.
+        is deleted only when everything in it is an entry this teardown has confirmed gone. A change log a role has
+        claimed (`claim_log`) is refused with nothing sent: it holds files that role restores, not files to remove.
         """
+        claimed = self._claimed_by()
+        if claimed is not None:
+            raise ProvisionError(
+                f"{self._where}the change log is a {claimed}'s; a teardown over it would delete the files it restores, "
+                "so nothing was deleted"
+            )
         self._verified()
         deleted: list[str] = []
         left: list[dict[str, Any]] = []

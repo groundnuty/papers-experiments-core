@@ -67,6 +67,7 @@ _SCHEDULER_KINDS: dict[str, type] = {
     "identity_kind": str,
     "recheck_s": float,
     "health_timeout_s": float,
+    "max_defer_s": float,
     "lease_timeout_s": float,
     "exit_when_blocked": bool,
     "allow_growth": bool,

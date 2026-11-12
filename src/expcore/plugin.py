@@ -146,6 +146,12 @@ class ToolProvider(Protocol):
         ...
 
 
+# The label of the one reading of the run's clock that `first_turn_instruments` takes, before the loop starts the
+# agent's clock. The record's clock holds it, so a first-turn reading of an instrument can be put against the loop's own
+# readings; the replay does not serve it, as it is not the loop's (C31).
+FIRST_TURN_LABEL = "instrument_first_turn"
+
+
 @runtime_checkable
 class Instrument(Protocol):
     """A measurement taken around a run, written into the record under its own namespace.
@@ -158,6 +164,19 @@ class Instrument(Protocol):
     and records what it read: replay then serves the snapshot and never asks the platform again. An instrument whose
     reading fails records the failure (`"ok": False`) and never a guessed value (O08). It runs outside the agent's
     time, before the loop starts and after it ends, so none of its waits is a wait kind.
+
+    Two more methods are optional, and an instrument that has neither is called as it always was (C31):
+
+    - `at_first_turn(moment: Mapping[str, Any]) -> None`, called once by the executor after its last step of its own
+      and just before the loop starts the agent's clock, so before the first request is sent. `moment["clock_s"]` is the
+      reading of the run's clock that the record logs under `FIRST_TURN_LABEL`; an instrument labels what it reads
+      with it and keeps the reading for `finish` to record.
+    - `check() -> None`, called after every instrument's `finish`, while the executor still has what the run left. It
+      returns when the manipulation held. To refuse the attempt, because the manipulation was not realised or a plan
+      failed mid-run, it raises `InfraError` of a declared kind that no condition can have as its treatment; the
+      attempt is then set aside and run again like any other infrastructure failure. The same holds for
+      `at_first_turn`. Any other exception, and an `InfraError` of a kind a condition may declare, is a defect of the
+      instrument.
     """
 
     namespace: str

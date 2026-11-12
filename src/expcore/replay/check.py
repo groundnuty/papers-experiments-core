@@ -230,10 +230,11 @@ class RecordNeeds(NamedTuple):
 
 
 def _kinds_named(data: Mapping[str, Any]) -> set[str]:
-    """The infrastructure kinds a record names: what its condition declared, and what its outcome and request ended in."""
+    """The infrastructure kinds a record names: what its condition declared, and what its outcome, its request and an
+    instrument's refusal ended in."""
     declared = data.get("treatment_kinds")
     named = list(declared) if isinstance(declared, list) else []
-    for section in ("outcome", "failed_request"):
+    for section in ("outcome", "failed_request", "instrument_refusal"):
         part = data.get(section)
         if isinstance(part, Mapping):
             named.append(part.get("infra_kind"))

@@ -20,12 +20,24 @@ An answer that cannot be read is unhealthy, never a crash and never a pass: any 
 exception, becomes `Health(False, reason)`. The reason names positions in the file (`providers[i]`), counts and the
 ids the federation reports, never a token, URL, host or configured name.
 
+When platform.toml has a `[faults]` table the fault gate (`expcore_onedata.fault_gate.FaultGate`) runs around the whole
+check, before it asks Onezone anything or measures the content type: it recovers what a crashed run left open whenever
+no run is on the federation, then holds the federation shared until the check has answered, so no injection starts in
+the middle of it, and fails while an injection stays open, because a provider taken down for one condition's run, and
+not verifiably back, leaves the federation out of its baseline state for every other run, including runs of conditions
+that use no injector. A check whose bounded wait for the federation runs out, because an outage run holds it, reads
+nothing and answers deferred, a wait that charges no run (`expcore.campaign.healthgate`). The gate is built in and
+cannot be left out; `fault_driver` replaces the Compose driver that `[faults]` describes, for tests. The gate's recovery
+verifies a restore only when the provider serves, as the injector's clear does (`faults.py`, "A restore is verified
+only when the provider serves"): the Compose driver it builds reads through the check's own client.
+
 The check of the earlier study also read one known file back through its provider and compared its checksum with a study manifest. That
 belongs to the study (its data) and not to the platform, so a study adds it with its own check.
 
 **The content type the data gate streams on is part of this check (O05, O11), with no opt-out.** When any level of
 `[sandbox.data_paths]` is REST, the first call measures it (`precampaign.content_type_check`: the provisioned
-`[sandbox] content_check_file`, read whole and by range through the local provider) before anything else, and the
+`[sandbox] content_check_file`, read whole and by range through the local provider) before anything but the fault gate,
+so it never measures through a provider an outage run holds down, and the
 check keeps that verdict for the campaign, since a type once answered does not change: a refusal, or a type that could
 not be measured, answers every call after it with its detail, so the gate stays closed and no run is admitted; a pass
 lets every call answer as the space check does. With no REST data path nothing is read. The composition is
@@ -41,10 +53,15 @@ import threading
 import time
 from collections.abc import Callable
 
-from expcore.campaign.healthgate import Health
+from expcore.campaign.healthgate import Health, HealthCheck
 from expcore.config.loading import ConfigError
+from expcore_onedata.admission import fault_settings_of
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
+from expcore_onedata.fault_gate import FaultGate
+from expcore_onedata.fault_recovery import FaultDriver
+from expcore_onedata.fault_serves import provider_serves
+from expcore_onedata.fault_settings import compose_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
 from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
 from expcore_onedata.tls import WARNING
@@ -113,6 +130,20 @@ def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = 
     return Health(True, f"ok: the space is supported by exactly the {len(matched)} declared provider(s)")
 
 
+def _fault_gate(
+    config: PlatformConfig, client: OnezoneClient, driver: FaultDriver | None, inner: HealthCheck
+) -> FaultGate | None:
+    """The fault gate around `inner` when platform.toml has a `[faults]` table, None when it has none; a table that is
+    not valid raises ConfigError here, so a platform with an injector never runs without the gate. The Compose driver
+    it recovers through finds a restored provider serving by reading through the check's own client."""
+    settings = fault_settings_of(config)
+    if settings is None:
+        return None
+    if driver is None:
+        driver = compose_driver(settings, probe=provider_serves(config, settings, client))
+    return FaultGate(settings, driver, inner)
+
+
 class PlatformHealth:
     """The platform's `HealthCheck`; keep one for the campaign so that its token is reused until it nears its end, and
     the content type it measured at its first call is kept for the campaign."""
@@ -124,6 +155,7 @@ class PlatformHealth:
         issuer: TokenIssuer,
         *,
         clock: Callable[[], float] = time.time,
+        fault_driver: FaultDriver | None = None,
     ) -> None:
         if config.principals.service is None:
             raise ConfigError(f"{config.file}: [principals]: key 'service' is required for the health check")
@@ -133,6 +165,7 @@ class PlatformHealth:
         self._lock = threading.Lock()
         self._content_type: ContentTypeVerdict | None = None
         self._gate = PreCampaignHealth(self._space, self._measure)
+        self._faults = _fault_gate(config, client, fault_driver, self._gate)  # outermost: it holds the federation
 
     @property
     def content_type(self) -> ContentTypeVerdict | None:
@@ -154,12 +187,13 @@ class PlatformHealth:
             return token
 
     def __call__(self) -> Health:
-        """Return the platform's health: the content type kept from the first call, then the space; never raise.
+        """Return the platform's health: with `[faults]`, the fault gate holding the federation around the rest; the
+        content type kept from the first call; then the space. Never raise.
 
-        While `[tls] insecure_tls` is on, every reading, healthy or not, ends with a warning that no client of the
-        federation checks its certificate (`tls.WARNING`); the verdict is unchanged."""
+        While `[tls] insecure_tls` is on, every reading, healthy, failed or deferred, ends with a warning that no client
+        of the federation checks its certificate (`tls.WARNING`); the verdict, a deferral included, is unchanged."""
         try:
-            verdict = self._gate()
+            verdict = self._faults() if self._faults is not None else self._gate()
         except Exception as error:
             verdict = Health(False, f"health check raised {type(error).__name__}")
         return self._warned(verdict)
@@ -172,7 +206,7 @@ class PlatformHealth:
 
     def _warned(self, verdict: Health) -> Health:
         if self._config.tls.insecure:
-            return Health(verdict.ok, f"{verdict.detail}; {WARNING}")
+            return verdict._replace(detail=f"{verdict.detail}; {WARNING}")
         return verdict
 
     def _space(self) -> Health:
