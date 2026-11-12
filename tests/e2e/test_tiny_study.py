@@ -156,6 +156,24 @@ def test_every_record_holds_the_instruments_snapshot_and_the_scorer_reads_its_co
         assert scores[entry["run_key"]]["tiny"]["result"]["outcomes"]["served"] == float(served)
 
 
+def test_c31_the_example_declares_no_instrument_hook_so_no_record_of_it_has_a_trace_of_one(resumed):
+    """C31: a study that declares no hook behaves as it did. No record on disk, the attempts that were set aside and
+    the one the kill cut short included, has the first-turn reading in its clock or a refusal in it, and every
+    instrument of the example is the one that only starts and finishes."""
+    from expcore.plugin import FIRST_TURN_LABEL
+
+    plugin = import_plugin_module(load_study(resumed.root))
+    assert not hasattr(plugin.FactsServed, "at_first_turn")
+    assert not hasattr(plugin.FactsServed, "check")
+    paths = [p for p in resumed.runs.rglob("*.json") if p.name not in ("attempt-marker.json", "replay-check.json")]
+    assert len(paths) == 23
+    for path in paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert "instrument_refusal" not in data
+        assert FIRST_TURN_LABEL not in [label for label, _ in data["clock"]]
+        assert data["clock"][0][0] == "start"
+
+
 def test_b15_each_record_holds_the_prompt_filled_from_its_tasks_own_attributes(resumed):
     """B15: adds that the user prompt a record keeps is the one the model was sent, filled per task: the example's
     executor reads the task's `region` from `study.tasks`, and the record holds the slot values and the template's

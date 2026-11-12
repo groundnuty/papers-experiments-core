@@ -42,6 +42,7 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   list has a defined order, and no path of the machine appears, so the same records give the same bytes anywhere.
 """
 
+import collections
 import dataclasses
 import hashlib
 import json
@@ -66,8 +67,14 @@ from expcore.campaign.merged import read_held, verify_merged, verify_queried
 from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.settings import SchedulerConfig
-from expcore.campaign.shard import MERGE_FILE, ShardError, ShardSpec, check_identity
-from expcore.campaign.shard_run import ShardStart, environment_block, share_settings
+from expcore.campaign.shard import MERGE_FILE, ModelShards, ShardError, ShardSpec, by_model, check_identity, pair_of
+from expcore.campaign.shard_run import (
+    ShardStart,
+    environment_block,
+    refuse_unrunnable,
+    share_settings,
+    share_settings_by_model,
+)
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
 from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
@@ -100,6 +107,7 @@ from expcore.study.config import (
     import_platforms,
     load_study,
     read_study_identity,
+    shard_budgets_of,
 )
 from expcore.study.factory_version import check_factory_version
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
@@ -238,7 +246,7 @@ def _run_campaign(
     manifest, started = study.manifest, None
     if shard is not None:
         manifest, settings, started = _shard_of(study, plugin, settings, shard)
-        print(environment_block(shard, fingerprint["environment"]), file=sys.stderr)  # before a store can refuse it
+        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
     options = {} if crash_hook is None else {"crash_hook": crash_hook}
     try:
         with Scheduler(
@@ -254,6 +262,7 @@ def _run_campaign(
             health=plugin.health,
             leases=leases,
             lease_group=plugin.lease_group,
+            admission=plugin.admission,
             backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
             on_hold=_say_hold,
             shard=started,
@@ -293,21 +302,48 @@ def _shard_of(
 ) -> tuple[Manifest, SchedulerConfig, ShardStart]:
     """A shard's part of the plan, its shares of the caps and the budget and the identity it runs against.
 
-    Every refusal is made here, before the store is opened: a shard with no run, a total smaller than the number of
-    shards (the message names the key) and an environment identity that the plugin cannot give or that is not names
-    mapped to SHA-256 digests (the message names the plugin).
+    A campaign that declares `[shards] per_model` shards by model (`expcore-shard/3`, C32): the command line's spec
+    takes that rule, and its N must be the layout's sum. Every refusal is made here, before the store is opened: an N
+    that is not the sum, a shard with no run, a shard holding pairs of a model whose concurrency share is 0 (the
+    message names the model), a total smaller than the number of shards (the message names the key), a budget that
+    cannot pay for a run of every priced shard, and an environment identity that the plugin cannot give or that is
+    not names mapped to SHA-256 digests (the message names the plugin).
     """
-    manifest = shard_manifest(study.manifest, spec)
-    if not manifest.rows:
-        raise Refused(
-            f"shard {spec.index} of {spec.count} gets no run of this plan: there are fewer pairs of task, model and "
-            "seed than shards; run with fewer shards"
-        )
+    layout = study.campaign.shards
     try:
-        shared, shares = share_settings(settings, spec)
+        spec = spec if layout is None else by_model(spec, layout)
+        manifest = shard_manifest(study.manifest, spec, layout)
+    except ShardError as error:
+        raise Refused(str(error)) from None
+    if not manifest.rows:
+        raise Refused(_no_run(spec, layout))
+    unit_of = {model: endpoint.unit for model, endpoint in study.campaign.endpoints.items()}
+    pairs = collections.Counter(model for _, model, _ in {pair_of(row.key.factors) for row in manifest.rows})
+    try:
+        refuse_unrunnable(spec, pairs, unit_of, settings.unit_caps, layout)
+        if layout is None:
+            shared, shares = share_settings(settings, spec)
+        else:
+            model = layout.at(spec.index)[0]
+            budget = None if settings.budget is None else shard_budgets_of(study)[spec.index]
+            shared, shares = share_settings_by_model(settings, spec, layout, unit_of[model], budget)
     except ShardError as error:
         raise Refused(str(error)) from None
     return manifest, shared, ShardStart(spec, _identity_of(study, plugin), shares)
+
+
+def _no_run(spec: ShardSpec, layout: ModelShards | None) -> str:
+    """Why a shard with no run of the plan is refused, and what to change."""
+    if layout is None:
+        return (
+            f"shard {spec.index} of {spec.count} gets no run of this plan: there are fewer pairs of task, model and "
+            "seed than shards; run with fewer shards"
+        )
+    model, k, count = layout.at(spec.index)
+    return (
+        f"shard {spec.index} of {spec.count} (model {model}, its shard {k} of {count}) gets no run of this plan: the "
+        f"model has fewer pairs of task, model and seed than shards; give it fewer in [shards] per_model"
+    )
 
 
 def _identity_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, str]:

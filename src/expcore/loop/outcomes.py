@@ -12,8 +12,10 @@ The vocabulary is closed so a typo never reaches a record and the analysis can e
   call was not executed (L10). The agent's own ending, scored like any other.
 - `error`: the model or endpoint failed in a way that is the attempt's own (a context overflow, a plain 400).
 - `infrastructure`: the endpoint, the sandbox or a tool server failed; carries the kind from `expcore.errors`
-  unchanged (C02). The attempt is set aside and re-run, never scored, unless its condition declares the kind as its
-  treatment, the kind can be one, and the model completed at least one turn (`Outcome.is_treatment`).
+  unchanged (C02), and the target the failure names, if any (a position label such as `providers[1]`). The attempt
+  is set aside and re-run, never scored, unless its condition declares the kind as its treatment, the kind can be one,
+  the model completed at least one turn and, where the declaration names a target, the failure is of that target and
+  the run's fault injector held it down (`Outcome.is_treatment`).
 - `harness_defect`: a crash in harness or tool code on valid input (L08); carries a line-free stack hash. Set aside
   and re-run after the fix, never scored as the agent's failure.
 """
@@ -21,11 +23,11 @@ The vocabulary is closed so a typo never reaches a record and the analysis can e
 import hashlib
 import json
 import traceback
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from expcore.errors import infra_kinds, is_treatable
+from expcore.errors import check_target, infra_kinds, is_treatable
 
 OUTCOMES = (
     "finished",
@@ -64,9 +66,10 @@ class Outcome:
     infra_kind: str | None = None
     error_type: str | None = None
     defect: HarnessDefect | None = None
+    infra_target: str | None = None
 
     def __post_init__(self) -> None:
-        """Refuse an unknown name, a missing or stray kind, error type or defect, and shorten the detail line."""
+        """Refuse an unknown name, a missing or stray kind, error type, defect or target, and shorten the detail."""
         if self.name not in OUTCOMES:
             raise ValueError(f"unknown outcome {self.name!r}; the outcomes are: {', '.join(OUTCOMES)}")
         if (self.name == "infrastructure") != (self.infra_kind is not None):
@@ -79,6 +82,9 @@ class Outcome:
             raise ValueError("an error outcome carries an error_type, and no other outcome does")
         if (self.name == "harness_defect") != (self.defect is not None):
             raise ValueError("a harness_defect outcome carries its defect, and no other outcome does")
+        if self.infra_target is not None and self.name != "infrastructure":
+            raise ValueError("only an infrastructure outcome names a target")
+        check_target(self.infra_target)
         object.__setattr__(self, "detail", self.detail[:DETAIL_LIMIT])
 
     @property
@@ -92,24 +98,41 @@ class Outcome:
         return self.name in SET_ASIDE_OUTCOMES
 
     def is_treatment(
-        self, treatment_kinds: Collection[str], completed_turns: int, *, first_turn_rule: bool = True
+        self,
+        treatment_kinds: Collection[str],
+        completed_turns: int,
+        *,
+        first_turn_rule: bool = True,
+        target_rule: bool = True,
+        treatment_targets: Mapping[str, str] | None = None,
+        injected: Collection[str] = (),
     ) -> bool:
         """Tell whether the attempt is a scored final attempt because its condition's manipulation is this fault.
 
-        True only for an infrastructure outcome of a kind the condition declares as its treatment and that can be one
-        (`expcore.errors.is_treatable`), and, under the first-turn rule, only if the model completed at least one turn.
-        A failure before the agent's first turn happened to the harness before the agent met the condition, so it says
-        nothing about the manipulation and is set aside whatever the condition declares. Records of the first schema
-        version, and markers written before the rule, were made without it (`first_turn_rule=False`): for them the
-        declared kind alone decides. The store, the record and the replay all derive the flag through this method, each
-        with the rule of the record's version, so they cannot disagree.
+        The one decision the record, the store, `classify` and the replay all take, each with the rule of the record's
+        own version. True only when every one of these holds:
+        - the outcome is infrastructure of a kind the condition declares as its treatment and that can be one
+          (`expcore.errors.is_treatable`);
+        - under the first-turn rule (record version 2 on), the model completed at least one turn: a failure before
+          the agent's first turn happened before the agent met the condition, so it says nothing about the manipulation;
+        - under the target rule (version 3 on), where the declaration names a target for the kind
+          (`treatment_targets`), the failure names that same target and the run's fault injector recorded an injection
+          of it in this attempt (`injected`, from `expcore.records.injections.injected_targets`). Another target's
+          failure, a failure that names none, and a target the injector did not take down are set aside.
+
+        A kind declared without a target is decided by the first two alone, whatever target the failure names. Records
+        of the first version, and markers written before the first-turn rule, were made without it
+        (`first_turn_rule=False`): for them the declared kind alone decides. Versions before 3 declare no target.
         """
-        return (
+        if not (
             self.name == "infrastructure"
             and (completed_turns >= 1 or not first_turn_rule)
             and self.infra_kind in treatment_kinds
             and is_treatable(self.infra_kind)
-        )
+        ):
+            return False
+        target = (treatment_targets or {}).get(self.infra_kind) if target_rule else None
+        return target is None or (self.infra_target == target and target in injected)
 
 
 def harness_defect_of(exc: BaseException) -> HarnessDefect:

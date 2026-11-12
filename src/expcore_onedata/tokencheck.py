@@ -11,8 +11,9 @@ parsed ("unknown is not a pass"). The same `CaveatSpec` builds the caveats at mi
 and what is accepted have one source.
 
 The two planes differ only in their spec: the data path is read-only on the space and its principal holds exactly view
-and read; the tool-server plane's caveats and principal privileges equal the condition's declared rights, and it is
-read-only only when the condition declares no write right.
+and read; the tool-server plane's principal privileges equal the condition's declared rights, its token is read-only
+with the data path's caveats when the condition declares no write right, and otherwise it carries no data-access caveat
+at all (`CaveatSpec`).
 
 A message names the caveat type or the right that was wrong and never a path, an id or a token value.
 """
@@ -26,6 +27,10 @@ from dataclasses import dataclass
 from typing import Any
 
 INTERFACES = ("rest", "oneclient")
+# The caveats that make a token a data-access token on Onedata 25.0, usable for data access alone; the interface caveat
+# is one too, but only as `oneclient` (onedata/ctool, release/25.0 at 019fee12a1638ca516da97a931a2d6138fa25279,
+# src/auth/data_access_caveats.erl, `?DATA_ACCESS_CAVEATS` and `filter/1`).
+DATA_ACCESS_CAVEATS = ("data.path", "data.objectid", "data.readonly")
 _TYPE_LIMIT = 40
 
 
@@ -59,36 +64,57 @@ def _shown(name: Any) -> str:
 
 @dataclass(frozen=True)
 class CaveatSpec:
-    """The exact caveat set of one plane's token for its spaces: one space's id, or the ids of several (`[[spaces]]`),
-    each of whose subtrees is one entry of the `data.path` whitelist."""
+    """The exact caveat set of one plane's token for the spaces its plane reaches: one space's id, or the ids of
+    several (`[[spaces]]`).
+
+    A read-only token is a data-access token: its caveats are the expiry, `data.readonly`, the interface and a
+    `data.path` whitelist with each space's subtree as one entry. A writable token carries no data-access caveat, only
+    the expiry and the interface: on Onedata 25.0 a token with any of `DATA_ACCESS_CAVEATS` is usable for data access
+    alone, and its request to schedule a transfer is refused (`tokenCaveatUnverified`, #177). Its spaces are then not a
+    caveat but the scope its principal's rights are read in (`tokens.TokenIssuer.check_user`).
+    """
 
     space_id: str | tuple[str, ...]
     readonly: bool
     interface: str
 
     def __post_init__(self) -> None:
-        """Refuse an interface the platform does not have, and a set of spaces that is empty or names one twice."""
+        """Refuse an interface the platform does not have, a set of spaces that is empty or names one twice, and a
+        writable token on the oneclient interface, which 25.0 counts as a data-access caveat."""
         if self.interface not in INTERFACES:
             raise ValueError(f"unknown interface {self.interface!r}; known: {', '.join(INTERFACES)}")
         if not self.space_ids or len(set(self.space_ids)) != len(self.space_ids):
             raise ValueError("a token's caveats reach at least one space, each once")
+        if not self.readonly and self.interface == "oneclient":
+            raise ValueError("a writable token cannot have the oneclient interface, a data-access caveat on 25.0")
+
+    @property
+    def data_access(self) -> bool:
+        """Whether the token carries the data-access caveats, `data.readonly` and `data.path`: exactly when it is
+        read-only."""
+        return self.readonly
 
     @property
     def space_ids(self) -> tuple[str, ...]:
-        """The ids of the spaces the token reaches, in the order given."""
+        """The ids of the spaces the plane reaches, in the order given."""
         return (self.space_id,) if isinstance(self.space_id, str) else tuple(self.space_id)
 
     def paths(self) -> list[str]:
-        """The `data.path` whitelist, decoded: each space's subtree, `/{space id}`."""
+        """The `data.path` whitelist of a read-only token, decoded: each space's subtree, `/{space id}`."""
         return [f"/{space_id}" for space_id in self.space_ids]
 
     def caveats(self, valid_until: int) -> list[dict[str, Any]]:
-        """Return the caveats to mint: the expiry, read-only when the plane is, the interface, the spaces' subtrees."""
+        """Return the caveats to mint: the expiry, read-only when the plane is, the interface, and the spaces' subtrees
+        when the token is read-only."""
         return [
             {"type": "time", "validUntil": valid_until},
-            *([{"type": "data.readonly"}] if self.readonly else []),
+            *([{"type": "data.readonly"}] if self.data_access else []),
             {"type": "interface", "interface": self.interface},
-            {"type": "data.path", "whitelist": [base64.b64encode(p.encode()).decode() for p in self.paths()]},
+            *(
+                [{"type": "data.path", "whitelist": [base64.b64encode(p.encode()).decode() for p in self.paths()]}]
+                if self.data_access
+                else []
+            ),
         ]
 
     def shape(self) -> Counter[str]:
@@ -134,11 +160,18 @@ def _parse(info: Any) -> tuple[str, str, list[Mapping[str, Any]]]:
 
 
 def _check_shape(caveats: list[Mapping[str, Any]], spec: CaveatSpec) -> None:
-    """Require exactly the caveat types of the spec, each once, and no field a caveat should not have."""
+    """Require exactly the caveat types of the spec, each once, and no field a caveat should not have; a writable
+    token with a data-access caveat is refused as such, since that caveat would leave it unable to write."""
     found, wanted = Counter(c["type"] for c in caveats), spec.shape()
     for name in sorted(wanted):
         if found[name] == 0:
             raise TokenRefused(f"the token has no {name} caveat")
+    if not spec.data_access:
+        carried = sorted(name for name in found if name in DATA_ACCESS_CAVEATS)
+        if carried:
+            raise TokenRefused(
+                f"the writable token carries a data-access caveat ({_shown(carried[0])}), which limits it to data access"
+            )
     for name in sorted(found):
         if name not in wanted:
             raise TokenRefused(f"the token has a caveat that was not asked for: {_shown(name)}")
@@ -151,9 +184,22 @@ def _check_shape(caveats: list[Mapping[str, Any]], spec: CaveatSpec) -> None:
 
 
 def _check_values(caveats: list[Mapping[str, Any]], spec: CaveatSpec) -> float:
-    """Check the path and the interface against the spec; return the expiry the time caveat sets."""
+    """Check the path, when the spec has one, and the interface against the spec; return the expiry the time caveat
+    sets."""
     by_type = {c["type"]: c for c in caveats}
-    whitelist = by_type["data.path"]["whitelist"]
+    if spec.data_access:
+        _check_paths(by_type["data.path"], spec)
+    if by_type["interface"]["interface"] != spec.interface:
+        raise TokenRefused("the interface caveat is not the one the plane uses")
+    expiry = by_type["time"]["validUntil"]
+    if isinstance(expiry, bool) or not isinstance(expiry, int | float) or not math.isfinite(expiry):
+        raise TokenRefused("the time caveat is malformed")
+    return float(expiry)
+
+
+def _check_paths(caveat: Mapping[str, Any], spec: CaveatSpec) -> None:
+    """Require the `data.path` whitelist to be each of the spec's spaces once, in canonical base64."""
+    whitelist = caveat["whitelist"]
     if not isinstance(whitelist, list) or not all(isinstance(w, str) for w in whitelist):
         raise TokenRefused("the data.path caveat is malformed")
     try:
@@ -167,12 +213,6 @@ def _check_values(caveats: list[Mapping[str, Any]], spec: CaveatSpec) -> float:
         raise TokenRefused("the data.path caveat is not canonical base64")
     if sorted(paths) != sorted(spec.paths()):  # each declared space once, in any order, and nothing else
         raise TokenRefused("the data.path caveat is not the study space(s) alone")
-    if by_type["interface"]["interface"] != spec.interface:
-        raise TokenRefused("the interface caveat is not the one the plane uses")
-    expiry = by_type["time"]["validUntil"]
-    if isinstance(expiry, bool) or not isinstance(expiry, int | float) or not math.isfinite(expiry):
-        raise TokenRefused("the time caveat is malformed")
-    return float(expiry)
 
 
 def require_examined(

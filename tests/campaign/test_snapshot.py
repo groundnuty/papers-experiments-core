@@ -121,3 +121,18 @@ def test_bytes_that_are_not_a_store_for_this_schema_are_refused(settled, tmp_pat
     other = make_schema().__class__({"gate": ["open"]}, ["task", "gate", "model", "seed"], {"only": {"gate": "open"}})
     with pytest.raises(SnapshotError, match="factor columns"):
         StoreSnapshot((tmp_path / SNAPSHOT_FILE).read_bytes(), other)
+
+
+def test_r04_a_snapshot_from_before_the_admission_column_exports_it_as_unknown(settled, tmp_path):
+    """R04: a campaign recorded before attempts kept their admission mode is still analysed: a snapshot is read as it
+    was written, never migrated, so its attempts' admission is None (unknown) in the export, never a mode."""
+    store, _ = settled
+    destination = tmp_path / SNAPSHOT_FILE
+    take_snapshot(store.path, destination)
+    old = sqlite3.connect(destination)
+    old.execute("ALTER TABLE attempts DROP COLUMN admission")
+    old.commit()
+    old.close()
+    data = export_run_state(StoreSnapshot(destination.read_bytes(), make_schema()))
+    assert data["analysed_attempts"]
+    assert all(entry["admission"] is None for entry in data["analysed_attempts"])

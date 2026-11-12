@@ -6,7 +6,7 @@ import threading
 import time
 
 import pytest
-from campaign_support import NOW, finished, infra, planned_store
+from campaign_support import NOW, as_schema_two, finished, infra, planned_store
 from loop_support import FakeProvider
 from record_support import CODE
 from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, models_for, settings_for
@@ -115,7 +115,7 @@ def test_c26_a_row_written_before_its_replies_were_checked_holding_no_turn_is_st
     run_dir.mkdir(parents=True, exist_ok=True)
     write_marker(run_dir, key, begun.id, infra("endpoint", model_turns=0, turn_usage=(), treatment_kinds=kinds))
     marker = run_dir / MARKER_NAME
-    body = json.loads(marker.read_text(encoding="utf-8"))
+    body = as_schema_two(json.loads(marker.read_text(encoding="utf-8")))
     body["result"].pop("replies_checked", None)  # what a marker written before the check holds
     marker.write_text(json.dumps(body), encoding="utf-8")
     assert recover(store, NOW, 3).committed == 1

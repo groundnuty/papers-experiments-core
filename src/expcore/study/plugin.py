@@ -24,6 +24,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from expcore.campaign.attempt import RunAdmission
 from expcore.campaign.defect_log import write_failure
 from expcore.campaign.executor import BackendFactory, RunExecutor
 from expcore.campaign.healthgate import HealthCheck
@@ -75,10 +76,12 @@ class StudyPlugin:
     - `probe`, `lease_group`, `lease_keys`: the platform's resources. `lease_group` maps a run's factor values to the
       group of leases it needs (None: no lease) and `lease_keys` the keys of a group; `probe` answers for holders and
       resources. Leave them out for a study that shares nothing.
+    - `admission`: the platform's hold on a resource every run shares (`campaign.attempt.RunAdmission`): entered before
+      an attempt starts and left after its post-run check, so the check sees what the run left; None when it has none.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
-      Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, and each level's data path and
-      listing mode). They go into the campaign fingerprint, so a resume under another is refused. Leave it empty for a
-      study without a platform.
+      Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, each level's data path and
+      listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign
+      fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
     - `backend_factory`: builds the backend of every model, for admission and for each run, in place of the core's
       `default_backend_factory`; None keeps the core's. A model whose backend the core does not build
       (`config.models.BACKENDS`) needs one, and the factory decides which models it serves: it hands the others to
@@ -102,6 +105,7 @@ class StudyPlugin:
     probe: ResourceProbe | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
+    admission: RunAdmission | None = None
     platform: Mapping[str, Any] = field(default_factory=dict)
     backend_factory: BackendFactory | None = None
     environment_identity: Callable[[], Mapping[str, str]] | None = None
