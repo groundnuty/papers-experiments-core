@@ -16,9 +16,14 @@ else: every write goes through the provisioner, so through the mutation gate bou
   failure: the schedule stops, and the parts after it are recorded as abandoned, never dropped.
 - **`finish`** stops the schedule (a part not yet due is recorded as not due: the run ended first, which is the
   manipulation, not a failure), restores the baseline and returns the snapshot. **`restore`** is the same, for an
-  executor's `finally` when `finish` was not reached; calling it again is harmless.
-- **`raise_if_failed`**, which the executor calls once the record is written, raises `InfraError("ingest_failure")`
-  when a part, the stop or the restore failed, so the attempt is set aside (a kind no condition may declare).
+  executor's `finally` when `finish` was not reached; calling it again is harmless. Each file is restored on its own,
+  so one that fails leaves no other missing. Both block, so an executor on an event loop calls them through
+  `asyncio.to_thread`, as it calls `finish_instruments`.
+- **`check`**, the post-run check that `finish_instruments` calls once every snapshot is in (C31), raises
+  `InfraError("ingest_failure")`, a kind no condition may declare, naming the step, when the start, an arrival, the
+  stop or the restore failed: the core records the refusal and sets the attempt aside as charged infrastructure, run
+  again, whatever the executor does. **`raise_if_failed`** is the same check, a second guard for the executor to call
+  once the record is written.
 
 The snapshot (version 1) is clock-labelled: a reading carries `clock`, the provisioner's monotonic clock, which the
 loop's clock readings use too, `t_rel_s` from the schedule's start (`anchor`: `instrument_start`) and `utc`. `steps`
@@ -273,19 +278,34 @@ class ProgressiveIngest:
             self.restore()
         return self._snapshot()
 
-    def raise_if_failed(self) -> None:
-        """Raise `InfraError("ingest_failure")` when a part, the stop or the restore failed, so the executor sets the
-        attempt aside; a defect of the schedule is raised as one (RuntimeError)."""
+    def check(self) -> None:
+        """The post-run check (`expcore.records.instruments.finish_instruments` calls it once every snapshot is in,
+        C31): return when the start state was set, every due part arrived and the baseline came back; otherwise raise
+        `InfraError("ingest_failure")`, a kind no condition may declare, naming the step that failed. The core then puts
+        the refusal in the record and sets the attempt aside as charged infrastructure, run again, whatever the
+        executor does after; an ingest that failed is never scored as the agent's outcome. A start, a finish or a
+        restore that never ran refuses too, since unknown is not a pass. A defect of the schedule is raised as one
+        (RuntimeError), so the attempt is a harness defect."""
         if self._defect is not None:
             raise RuntimeError(f"the progressive ingest's schedule failed with a defect ({self._defect})")
+        if self._start is None or not self._start["ok"]:
+            why = f": {self._start['detail']}" if self._start is not None else ": it never ran"
+            self._refuse(f"at the start, which did not set the start state{why}")
         if self._failure is not None:
+            step = "an arrival" if self._failure["phase"] == "arrival" else "the stop of its schedule"
             part = f" ({self._failure['label']}, part {self._failure['part']})" if "label" in self._failure else ""
-            text = f"{self._p.where}the progressive ingest failed{part}: {self._failure['detail']}"
-            raise InfraError(INGEST_FAILURE, text[:600])
+            self._refuse(f"at {step}{part}: {self._failure['detail']}")
         if self._restore is None or not self._restore["ok"]:
-            why = f": {self._restore['detail']}" if self._restore is not None else ""
-            text = f"{self._p.where}the progressive ingest did not restore the baseline{why}"
-            raise InfraError(INGEST_FAILURE, text[:600])
+            why = f": {self._restore['detail']}" if self._restore is not None else ": it never ran"
+            self._refuse(f"at the restore, which did not bring the baseline back{why}")
+
+    def _refuse(self, what: str) -> None:
+        raise InfraError(INGEST_FAILURE, f"{self._p.where}the progressive ingest failed {what}"[:600])
+
+    def raise_if_failed(self) -> None:
+        """The same as `check`, for an executor to call once the record is written: a second guard, since the core
+        already sets the attempt aside on the check's refusal."""
+        self.check()
 
     def _snapshot(self) -> dict[str, Any]:
         def relative(reading: dict[str, Any]) -> dict[str, Any]:

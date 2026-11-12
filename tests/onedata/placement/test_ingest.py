@@ -1,13 +1,20 @@
 """Progressive ingest: files of a dataset arrive during a run on their schedule, each verified, every id recorded, and
 the dataset restored to its declared baseline afterwards without losing what the study keeps (O27)."""
 
+import asyncio
 import json
 import threading
 import time
 
 import pytest
+from campaign_support import make_schema
+from loop_support import FakeProvider
+from record_support import CODE, make_config
+from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, key_of
 
+from expcore.campaign.executor import record_run
 from expcore.errors import InfraError, is_treatable
+from expcore.records.instruments import finish_instruments, start_instruments
 from expcore_onedata.ingest import NAMESPACE, ProgressiveIngest
 from expcore_onedata.ingestplan import load_ingest_plan
 from expcore_onedata.sandbox.kinds import INGEST_FAILURE
@@ -205,6 +212,95 @@ def test_o27_a_refused_write_is_an_ingest_failure_and_the_kind_is_never_a_treatm
         ingest.raise_if_failed()
     assert is_treatable(INGEST_FAILURE) is False
     assert snapshot["restore"]["ok"] is True
+    assert content(fake, DAY_PATH) == DAY
+
+
+PRIVATE = ("alpha", "beta", SPACE_NAME, "records/", ".csv", "staged", PROVIDER)
+
+
+def test_o27_the_post_run_check_refuses_a_failed_arrival_naming_the_step_and_passes_a_clean_run(make, fake, ticker):
+    """O27 with C31: `check`, which `finish_instruments` calls after every snapshot is in, returns after a run whose
+    arrivals and restore held, and refuses a run whose arrival failed with `ingest_failure`, a kind no condition may
+    declare, naming the step and the label and nothing private."""
+    clean = make(NOTE_ROW)
+    clean.start({})
+    run_to(clean, ticker, ticker.now, 100, 1)
+    clean.finish()
+    clean.check()
+    failing = make(DAY_ROW)
+    failing.start({})
+    fake.statuses = [["/content", 1, 500]]
+    ticker.now += 300
+    until(lambda: failing.failure is not None)
+    failing.finish()
+    with pytest.raises(InfraError) as raised:
+        failing.check()
+    assert raised.value.kind == INGEST_FAILURE
+    assert "arrival" in raised.value.detail and "day-13" in raised.value.detail
+    assert not [word for word in PRIVATE if word in raised.value.detail]
+
+
+def test_o27_the_post_run_check_refuses_a_failed_restore_and_a_run_it_cannot_vouch_for(make, fake, ticker, tmp_path):
+    """O27 with C31: a restore that could not bring a file back refuses the attempt naming the restore; an instrument
+    whose start never ran, or whose finish never restored, refuses too, since unknown is not a pass."""
+    stage_kept_day(tmp_path)
+    ingest = make(KEPT_ROW, DAY_ROW)
+    ingest.start({})
+    stage_kept_day(tmp_path, KEPT[:-1] + b"?")
+    ingest.finish()
+    with pytest.raises(InfraError, match="restore") as raised:
+        ingest.check()
+    assert raised.value.kind == INGEST_FAILURE and "day-12" in raised.value.detail
+    never_started = make(DAY_ROW)
+    with pytest.raises(InfraError, match="start") as raised:
+        never_started.check()
+    assert raised.value.kind == INGEST_FAILURE
+    not_finished = make(NOTE_ROW)
+    not_finished.start({})
+    with pytest.raises(InfraError, match="restore") as raised:
+        not_finished.check()
+    assert raised.value.kind == INGEST_FAILURE
+
+
+def test_o27_a_failed_arrival_is_charged_infrastructure_and_rerun_though_the_executor_never_asks(
+    make, fake, ticker, tmp_path
+):
+    """O27 with C31, end to end through the scheduler: the executor starts the ingest with its instruments, the
+    arrival's write is answered 500, the agent's run ends and the executor finishes the instruments, writes nothing
+    else and never calls `raise_if_failed`. The ingest's post-run check refuses, so the attempt is set aside as charged
+    infrastructure of `ingest_failure` and run again, never scored as the agent's outcome; the dataset is restored."""
+    ingest = make(DAY_ROW)
+
+    async def run_with_a_failing_arrival(request):
+        identity = {"run_key": request.run_key, "factors": dict(request.identity.factors), "attempt": 1}
+        await asyncio.to_thread(start_instruments, [ingest], identity)
+        fake.statuses = [["/content", 1, 500]]
+        ticker.now += 300
+        await asyncio.to_thread(until, lambda: ingest.failure is not None)
+        request.backend.use([])
+        record = await record_run(
+            request,
+            [FakeProvider({"look": lambda arguments: "ok"})],
+            "be brief",
+            "do the task",
+            make_config(),
+            code=dict(CODE),
+            core_version="0.1.0",
+        )
+        return await asyncio.to_thread(finish_instruments, record, [ingest])  # and no raise_if_failed
+
+    schema = make_schema()
+    key = key_of(schema, "api-none")
+    executor = FakeExecutor({key: [run_with_a_failing_arrival]})
+    plan = {"tasks": ("task-a",), "seeds": (1,)}
+    with build(tmp_path / "campaign", schema=schema, executor=executor, plan=plan) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+        store = scheduler.store
+        assert attempts_of(store, key) == [("infra_fail", 1, 1), ("done", 0, 2)]
+        (first, _) = store.q("SELECT infra_kind, detail FROM attempts WHERE run_key=? ORDER BY id", (key,))
+        assert first["infra_kind"] == INGEST_FAILURE
+        assert NAMESPACE in first["detail"] and "arrival" in first["detail"]
+        assert "instrument_refused" in event_kinds(store)
     assert content(fake, DAY_PATH) == DAY
 
 
