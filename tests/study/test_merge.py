@@ -1,9 +1,10 @@
 """Merging the shards of one campaign (#154, C29): the six refusals, the merged layout, and check, analyze, report and
 regenerate on the merged batch, which give the scores of one driver of the whole campaign.
 
-The shards are the example study run for real, each over its own part of the plan (`shard_support.run_shard`), so the
-records, stores and dispatch sequences are a shard's own. Each refusal plants one fault in a copy of a finished shard
-and expects the merge to name the shard and the reason and to leave nothing behind.
+The shards are the example study run for real with `run --shard i/N --shard-label L` (`shard_support.run_shard`), so
+the records, stores, store meta and dispatch sequences are what the run side writes. Each refusal plants one fault in
+a copy of a finished shard, or runs a shard against another environment, and expects the merge to name the shard and
+the reason and to leave nothing behind.
 """
 
 import hashlib
@@ -14,17 +15,28 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from shard_support import IDENTITY, keys_of_shard, merge_into, run_shard, shard_meta, write_meta
-from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
+from shard_support import (
+    IDENTITY,
+    json_meta,
+    keys_of_shard,
+    make_study,
+    merge_into,
+    meta_of,
+    plant_run,
+    run_shard,
+    without_run,
+    write_meta,
+)
+from study_support import Campaign, clean_environment, cli, copy_campaign, finish
 
 from expcore.campaign.merge import SHARDS_DIR
 from expcore.campaign.shard import (
     MERGE_FILE,
     MERGE_SCHEMA,
-    META_ENVIRONMENT,
     META_SHARD,
+    META_SHARES,
+    META_STARTED,
     RULE,
-    ShardSpec,
 )
 from expcore.campaign.snapshot import take_snapshot
 from expcore.study.pipeline import Refused, regenerate
@@ -43,7 +55,7 @@ def base(tmp_path_factory) -> Path:
 @pytest.fixture(scope="module")
 def whole(base, clean_environment) -> Campaign:
     """One driver of the whole campaign: the reference the merged batch must agree with."""
-    campaign = Campaign(make_copy(base, "whole"))
+    campaign = Campaign(make_study(base, "whole"))
     campaign.codes["run"], _ = cli(clean_environment, "run", str(campaign.root))
     finish(clean_environment, campaign)
     assert campaign.codes == {"run": 0, "check": 0, "analyze": 0, "report": 0}
@@ -61,27 +73,34 @@ def shard2(base, clean_environment) -> Campaign:
 
 
 @pytest.fixture(scope="module")
+def shard2_elsewhere(base, clean_environment) -> Campaign:
+    """Shard 2 run against another environment: its platform configuration has another digest."""
+    changed = {**IDENTITY, "platform": hashlib.sha256(b"another platform configuration").hexdigest()}
+    return run_shard(base, "shard-two-elsewhere", clean_environment, 2, identity=changed)
+
+
+@pytest.fixture(scope="module")
 def foreign(shard2) -> str:
     """A run of shard 2, which shard 1 may be made to hold by mistake."""
     return keys_of_shard(shard2.root, 2)[0]
 
 
 @pytest.fixture(scope="module")
-def shard1_with_foreign(base, clean_environment, foreign) -> Campaign:
-    """Shard 1 whose plan also holds a run that belongs to shard 2."""
-    return run_shard(base, "shard-one-plus", clean_environment, 1, add=[foreign])
+def shard1_with_foreign(base, foreign, shard1, shard2) -> Campaign:
+    """A copy of shard 1 whose store also holds a run that belongs to shard 2."""
+    return plant_run(shard1, shard2, foreign, base, "shard-one-plus")
 
 
 @pytest.fixture(scope="module")
-def shard2_without_foreign(base, clean_environment, foreign) -> Campaign:
-    """Shard 2 whose plan leaves out one of its own runs."""
-    return run_shard(base, "shard-two-minus", clean_environment, 2, drop=[foreign])
+def shard2_without_foreign(base, foreign, shard2) -> Campaign:
+    """A copy of shard 2 whose store leaves out one of its own runs."""
+    return without_run(shard2, foreign, base, "shard-two-minus")
 
 
 @pytest.fixture(scope="module")
 def merged(base, clean_environment, shard1, shard2) -> Campaign:
     """The two shards merged into a copy of the study, checked, analysed and reported."""
-    campaign = Campaign(make_copy(base, "merged"))
+    campaign = Campaign(make_study(base, "merged"))
     campaign.codes["merge"], errors = merge_into(clean_environment, campaign, shard1, shard2)
     assert campaign.codes["merge"] == 0, errors
     finish(clean_environment, campaign)
@@ -149,8 +168,12 @@ def test_c29_a_good_merge_writes_the_batch_the_snapshots_and_the_merge_file(merg
         snapshot = out / SHARDS_DIR / str(shard["index"]) / SNAPSHOT
         assert shard["snapshot_sha256"] == sha(snapshot)
         assert shard["runs"] == len(keys_of_shard(campaign.root, shard["index"]))
-        assert shard["started_utc"].startswith(f"2026-03-0{shard['index']}")
-        assert shard["shares"] == json.loads(shard_meta(shard["index"], 2, "x")["shard_shares"])
+        assert shard["started_utc"] == meta_of(campaign)[META_STARTED]  # when the shard first started, as it pinned it
+        assert shard["shares"] == json_meta(campaign, META_SHARES)
+        assert shard["shares"] == {  # a half of each cap of 2 and of the budget of 5.0, as the run side shares them
+            "unit_caps": {"alpha-stub": 1, "beta-stub": 1},
+            "budget": {"max_usd": 2.5, "per_model_usd": {}},
+        }
     expected = {p.name for c in (shard1, shard2) for p in (c.root / "out" / "runs").iterdir() if p.is_dir()}
     assert {p.name for p in (out / "runs").iterdir() if p.is_dir()} == expected
     assert not (out / "runs" / SNAPSHOT).exists()  # the merged batch holds no snapshot of its own
@@ -162,7 +185,7 @@ def test_c29_a_good_merge_writes_the_batch_the_snapshots_and_the_merge_file(merg
 def test_c29_a_merge_only_reads_the_shards(base, clean_environment, shard1, shard2):
     """C29: the merge never changes a shard's out/: its records and its store stay as they were."""
     before = {p: sha(p) for c in (shard1, shard2) for p in (c.root / "out" / "runs").rglob("*") if p.is_file()}
-    campaign = Campaign(make_copy(base, "reads-only"))
+    campaign = Campaign(make_study(base, "reads-only"))
     code, errors = merge_into(clean_environment, campaign, shard1, shard2)
     assert code == 0, errors
     after = {p: sha(p) for c in (shard1, shard2) for p in (c.root / "out" / "runs").rglob("*") if p.is_file()}
@@ -468,7 +491,7 @@ def test_c29_a_merge_needs_every_shard_exactly_once(base, clean_environment, who
 def test_c29_shards_of_another_count_are_refused(base, clean_environment, whole, shard1, shard2):
     """C29: a shard of a campaign split into another number of shards is refused, naming both."""
     other = copy_out(shard2, base / "count-three")
-    write_meta(store_of(other), shard_meta(2, 3, "shard-2"))
+    edit_json_meta(other, META_SHARD, lambda spec: {**spec, "count": 3})
     refused(
         clean_environment,
         whole,
@@ -496,7 +519,7 @@ def test_c29_a_shard_under_another_partition_rule_is_refused(base, clean_environ
 def test_c29_two_shards_with_one_label_are_refused(base, clean_environment, whole, shard1, shard2):
     """C29: labels are distinct, so a merge never takes two shards for one host."""
     other = copy_out(shard2, base / "label-same")
-    write_meta(store_of(other), {META_SHARD: json.dumps(ShardSpec(2, 2, "shard-1").to_json())})
+    edit_json_meta(other, META_SHARD, lambda spec: {**spec, "label": "shard-1"})
     refused(
         clean_environment,
         whole,
@@ -590,18 +613,17 @@ def test_c29_a_shard_whose_replay_check_fails_is_refused_naming_the_record(
     )
 
 
-def test_c29_shards_run_against_different_environments_are_refused(base, clean_environment, whole, shard1, shard2):
+def test_c29_shards_run_against_different_environments_are_refused(
+    base, clean_environment, whole, shard1, shard2_elsewhere
+):
     """C29: every shard records the same environment identity; a shard that ran against other data is refused,
     naming what differs."""
-    other = copy_out(shard2, base / "identity-other")
-    changed = {**IDENTITY, "platform": hashlib.sha256(b"another platform configuration").hexdigest()}
-    write_meta(store_of(other), {META_ENVIRONMENT: json.dumps(changed, sort_keys=True)})
     refused(
         clean_environment,
         whole,
         base / "refused-identity" / "out",
         shard1.root / "out",
-        other,
+        shard2_elsewhere.root / "out",
         fragments=("shard 2 (shard-2): ran against another environment than shard 1 (shard-1)", "differs in platform"),
     )
 

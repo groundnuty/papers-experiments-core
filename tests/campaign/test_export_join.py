@@ -9,7 +9,7 @@ from expcore.campaign.deployments import deployment_shares
 from expcore.campaign.export import FORMAT, ExportError
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.merge import MergeRefused, read_merge
-from expcore.campaign.shard import EXPORT_KEY, MERGE_SCHEMA
+from expcore.campaign.shard import EXPORT_KEY, MERGE_SCHEMA, RULE
 from expcore.errors import CORE_KINDS
 
 
@@ -91,7 +91,13 @@ def test_c29_left_out_runs_are_tagged_and_ordered_like_the_others():
 
 def test_c29_a_shards_own_shard_key_does_not_reach_the_merged_export():
     """C29: a shard's export may carry its own spec under `shard`; the merged export has `shards` instead."""
-    one = {**export(analysed=[entry("a")]), EXPORT_KEY: {"spec": {"index": 1}}}
+    own = {  # the object the run side puts last in a shard's export
+        "spec": {"rule": RULE, "index": 1, "count": 2, "label": "shard-1"},
+        "started_utc": "2026-03-01T10:00:00Z",
+        "environment_identity": {},
+        "shares": {"unit_caps": {"alpha": 1}, "budget": {"max_usd": 2.5, "per_model_usd": {}}},
+    }
+    one = {**export(analysed=[entry("a")]), EXPORT_KEY: own}
     two = export(analysed=[entry("b")])
     joined = join_exports({1: one, 2: two}, plan("a", "b"), SHARDS)
     assert EXPORT_KEY not in joined

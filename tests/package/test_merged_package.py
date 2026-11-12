@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 from package_support import stand_in_vendor
-from shard_support import run_shard
-from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
+from shard_support import make_study, run_shard
+from study_support import Campaign, clean_environment, cli, copy_campaign, finish
 
 from expcore.campaign.shard import MERGE_FILE, META_ENVIRONMENT
 from expcore.package import build as package_build
@@ -71,7 +71,7 @@ def campaign(tmp_path_factory, clean_environment, core_from_a_repository) -> Cam
     home.mkdir()
     one = run_shard(home, "one", clean_environment, 1)
     two = run_shard(home, "two", clean_environment, 2)
-    merged = Campaign(make_copy(home, "study"))
+    merged = Campaign(make_study(home, "study"))
     spec = merged.root / "package.toml"
     listed = '    "out/runs",\n    "out/merge.json",\n    "out/shards",\n'
     spec.write_text(spec.read_text(encoding="utf-8").replace('    "out/runs",\n', listed), encoding="utf-8")
