@@ -269,10 +269,19 @@ ERROR_BODY_BYTES = 64 * 1024  # the most of a streamed answer's error body read 
 @dataclass(frozen=True)
 class _GateReads:
     """How the gate's own reads are made: the policy for a read that timed out, and the `deadline_s` that bounds each
-    read's retries (`readretry.py`). Every internal call of the gate names it, so none can be made without a choice."""
+    read's retries (`readretry.py`). Every internal call of the gate names it, so none can be made without a choice.
+
+    `bound` is the caller's `deadline_s`, the seconds each read may have, or, for a call with one deadline over a gate
+    of several reads, a function that says how many are left now. `deadline_s` is read when a read begins, so each read
+    of the gate has the time left at its own start and not a share worked out once for them all."""
 
     retry: ReadRetry = ONE_ATTEMPT
-    deadline_s: float | None = None
+    bound: float | Callable[[], float] | None = None
+
+    @property
+    def deadline_s(self) -> float | None:
+        """The seconds a read that begins now may spend, its retries and pauses included; None for no deadline."""
+        return self.bound() if callable(self.bound) else self.bound
 
 
 _ONE_ATTEMPT = _GateReads()  # the choice of whatever measures the platform, and the default of every caller
@@ -1090,8 +1099,10 @@ class OnezoneClient:
         anything is sent); what `sink` received by then is not the file. A file of no bytes needs no range, and its
         space is still checked, so a read of a file outside the study never succeeds.
 
-        `gate_retry` is the policy of the gate's reads alone, as for `mutate`, and the retries of each stay within what
-        remains of the deadline when the range's gate began; a range is streamed once, whatever the policy.
+        `gate_retry` is the policy of the gate's reads alone, as for `mutate`. A range's gate makes several reads, and
+        each is given what remains of the deadline when that read begins: its retries and pauses stay within it, so
+        they never carry the gate past the deadline, and a read that begins after it was passed is made once. A range
+        is streamed once, whatever the policy.
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
@@ -1102,6 +1113,9 @@ class OnezoneClient:
         base, label = self._base(provider)
         hasher, began = hashlib.sha256(), clock()
         late = f"{label}: a streamed read passed its deadline of {deadline_s:g} s"
+        # Every read of every gate is asked what is left as it begins: one number worked out for the gate would give
+        # each of its several reads the whole of it, and a gate of k reads could spend k times the deadline.
+        gate = _GateReads(gate_retry, lambda: deadline_s - (clock() - began))
 
         def consume(piece: bytes) -> None:
             hasher.update(piece)
@@ -1111,10 +1125,8 @@ class OnezoneClient:
                 raise PlatformError(late)
 
         if size == 0:
-            gate = _GateReads(gate_retry, deadline_s - (clock() - began))
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
         for first in range(0, size, chunk_bytes):
-            gate = _GateReads(gate_retry, deadline_s - (clock() - began))
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
             remaining = deadline_s - (clock() - began)
             if remaining <= 0:

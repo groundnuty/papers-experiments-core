@@ -6,6 +6,7 @@ mock transport whose timeouts move a ticker by the seconds the request was allow
 and nothing really waits.
 """
 
+import contextlib
 import inspect
 import logging
 import threading
@@ -24,7 +25,8 @@ from expcore_onedata.readretry import (
     ReadRetry,
     connection_state,
 )
-from expcore_onedata.testing import SPACE_PREFIX, Ticker, write_platform
+from expcore_onedata.testing import PROVIDER, SPACE_PREFIX, Ticker, write_platform
+from expcore_onedata.testing.fake_federation import ZONE
 
 LOG = "expcore_onedata.readretry"
 PHASE = {httpx.ReadTimeout: "read", httpx.ConnectTimeout: "connect", httpx.PoolTimeout: "pool"}
@@ -391,6 +393,91 @@ def test_o29_a_deadline_that_leaves_room_lets_the_first_retry_through_at_the_ful
     assert client.get("/spaces", retry=policy, deadline_s=100.0) == {"size": 7}
     assert [r.extensions["timeout"]["read"] for r in script.seen] == [6.0, 6.0, 6.0]
     assert ticker.slept == [2.0, 5.0]
+
+
+DEADLINE = 100.0  # a content read's deadline, and the request timeout below it: 30 s
+
+
+def content_gate(config, ticker, stalls, *, answer_s=0.0):
+    """A client whose `read_content` of an empty file passes a gate of three reads, in this order: the space's root
+    from the provider, the file's parent link, the space's name from Onezone. Read `i` times out `stalls[i]` times (the
+    ticker moves by the timeout each request carried) and then answers after `answer_s` seconds. Returns the client and
+    the read timeout of every request, in order."""
+    timeouts: list[float] = []
+    tried = [0, 0, 0]
+
+    def handler(request):
+        path = request.url.path
+        if request.url.params.get("attribute") == "parent_id":
+            which, answer = 1, {"parent_id": "root-s"}
+        elif path == f"{PROVIDER}/spaces/{config.space.id}":
+            which, answer = 0, {"fileId": "root-s"}
+        elif path == f"{ZONE}/spaces/{config.space.id}":
+            which, answer = 2, {"name": config.space.name}
+        else:
+            raise AssertionError("a request that is no read of the gate")
+        timeouts.append(request.extensions["timeout"]["read"])
+        tried[which] += 1
+        if tried[which] <= stalls[which]:
+            ticker.now += request.extensions["timeout"]["read"]
+            raise httpx.ReadTimeout("simulated", request=request)
+        ticker.now += answer_s
+        return httpx.Response(200, json=answer)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    return OnezoneClient(config, http=http, timeout_s=30.0), timeouts
+
+
+def read_empty(client, ticker, policy, deadline_s=DEADLINE):
+    return client.read_content(
+        "/data/fid/content",
+        provider="alpha",
+        size=0,
+        chunk_bytes=4,
+        deadline_s=deadline_s,
+        clock=ticker.clock,
+        gate_retry=policy,
+    )
+
+
+def test_o29_each_gate_read_of_a_content_read_gets_the_time_actually_left(config, ticker, policy):
+    """O29: a 100 s deadline, a 30 s timeout, and gate reads that each stall once before they answer. The first read
+    ends at 32 s and the second at 64 s, so the third has 36 s: its first attempt stalls to 94 s, 6 s remain, the pause
+    of 2 s leaves 4 s, and the retry's timeout is cut to that 4 s, ending the read, and the gate, at the deadline. A
+    third read that was given the 100 s the first had would retry at the full 30 s, pause again and end near 131 s."""
+    client, timeouts = content_gate(config, ticker, [1, 1, 2])
+    began = ticker.now
+    with pytest.raises(ScopeUnread, match=r"after 2 attempts"):
+        read_empty(client, ticker, policy)
+    assert timeouts == [30.0, 30.0, 30.0, 30.0, 30.0, 4.0]
+    assert ticker.now - began == DEADLINE
+    assert ticker.slept == [2.0, 2.0, 2.0]
+
+
+def test_o29_a_gate_that_stalls_twice_in_each_read_stays_within_twice_the_deadline(config, ticker, policy):
+    """O29: every gate read stalls twice and answers just under the timeout, 29 s after its third attempt began: one
+    read alone takes 96 s, so three such reads, each given the deadline afresh, took 288 s, beyond the twice the
+    deadline `read_content` documents. Each read now has what is left: the second has 4 s, retries nothing, and ends the
+    gate at 126 s."""
+    client, _ = content_gate(config, ticker, [2, 2, 2], answer_s=29.0)
+    began = ticker.now
+    with contextlib.suppress(ScopeUnread):  # answered or refused is not what is held here: the time is
+        read_empty(client, ticker, policy)
+    assert ticker.now - began <= 2 * DEADLINE
+
+
+def test_o29_a_roomy_deadline_leaves_each_gate_read_its_full_retries(config, ticker, policy):
+    """O29: with time to spare nothing is cut: three gate reads that stall once each take 32 s each, 96 s in all, every
+    retry has the full 30 s, and the read is answered. With the 100 s deadline the same stalls leave the last read's
+    retry 4 s, which is enough for it to be answered, so it is."""
+    client, timeouts = content_gate(config, ticker, [1, 1, 1])
+    began = ticker.now
+    assert read_empty(client, ticker, policy, deadline_s=200.0).size == 0
+    assert timeouts == [30.0] * 6
+    assert ticker.now - began == 96.0
+    again, cut = content_gate(config, ticker, [1, 1, 1])
+    assert read_empty(again, ticker, policy).size == 0
+    assert cut == [30.0] * 5 + [4.0]
 
 
 def test_o29_how_a_connection_began_is_read_from_httpcores_trace_events():
