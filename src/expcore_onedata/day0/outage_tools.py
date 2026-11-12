@@ -245,6 +245,8 @@ class Tools:
         facts["calls"] = len(calls)
         if ended or last["outcome"] == "served":
             return {**facts, "outcome": "served" if ended else "blocked", "last_call": last}
+        if last["outcome"] is None:  # not called: unmeasured, named by its tool and why
+            facts.update(tool="get_transfer", reason=last.get("reason"))
         return {**facts, "outcome": last["outcome"], "last_call": last}
 
     async def transfer_now(self, key: str) -> dict[str, Any] | None:

@@ -359,6 +359,28 @@ def test_o28_a_tool_called_with_a_wrong_id_is_never_a_pass(context, agent, servi
     assert services.verbs() == []
 
 
+@pytest.mark.parametrize("tool", ["get_file_distribution", "get_transfer"])
+def test_o28_a_knowledge_tool_whose_schema_cannot_be_filled_is_unmeasured_and_the_check_unknown(
+    context, agent, monkeypatch, tool
+):
+    """O28: a knowledge tool whose input schema the check cannot fill is not called: it is unmeasured, named by its
+    tool and the reason, and the check is unknown, never passed. Only that gap keeps it from passing: the baseline's
+    own test skips a cell that was not measured."""
+    real = outage_tools.arguments
+    reason = "its input schema requires 1 argument(s) the check cannot fill"
+
+    def unfillable(name, schema, values):
+        return reason if name == tool else real(name, schema, values)
+
+    monkeypatch.setattr(outage_tools, "arguments", unfillable)
+    entry = outage_check(context)
+    assert entry.ok is None
+    assert f"during the outage, {tool}: {reason}" in entry.summary
+    assert "None: None" not in entry.summary
+    assert tool not in {name for name, _ in agent.tool_calls}
+    assert entry.facts["restore"]["verified"] is True
+
+
 def test_o28_a_tool_that_answers_an_error_keeps_its_wording_scrubbed_and_its_attempts(context, agent):
     """O28: a read-only tool that answers an error while the provider is down is called again, at most three times,
     and each error's wording is recorded with every name and id the check knows replaced by its label."""
