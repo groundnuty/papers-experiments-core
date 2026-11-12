@@ -21,8 +21,9 @@ from typing import Any, Protocol
 
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import PlatformConfig, StudySpace
-from expcore_onedata.day0.outage_driver import OutageSettings, ServiceDriver
 from expcore_onedata.day0.report import status
+from expcore_onedata.fault_recovery import FaultDriver
+from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.rangemap import Placement
 from expcore_onedata.tokens import TokenIssuer
@@ -73,9 +74,9 @@ class Context:
     """Everything a check may use: the loaded configuration, the client, and the permission to change state.
 
     Taking a provider down is a second permission, `allow_faults` (`EXPCORE_LIVE_FAULTS=1`), beside `allow_mutation`
-    and beside `sanctioned = true` in `[faults]` of platform.toml (`outage_settings`). `outage_driver` is the
-    deployment's driver for it (Compose by default), `mount` a reader of the mount when a run has one, and
-    `outage_bound_s` the longest a read or a call of the outage check waits for an answer.
+    and beside `sanctioned = true` in `[faults]` of platform.toml (`fault_settings`, `fault_settings.load_faults`).
+    `fault_driver` is the fault injector's driver (`compose.ComposeDriver` by default), `mount` a reader of the mount
+    when a run has one, and `outage_bound_s` the longest a read or a call of the outage check waits for an answer.
     """
 
     config: PlatformConfig
@@ -92,8 +93,8 @@ class Context:
     now: Callable[[], float] = lambda: 0.0
     provider_ids: dict[str, str] = field(default_factory=dict)
     allow_faults: bool = False
-    outage_settings: OutageSettings | None = None
-    outage_driver: ServiceDriver | None = None
+    fault_settings: FaultSettings | None = None
+    fault_driver: FaultDriver | None = None
     mount: MountAccess | None = None
     outage_bound_s: float = 60.0
     _provisioners: dict[str, Provisioner] = field(default_factory=dict, repr=False)  # by the label of their space

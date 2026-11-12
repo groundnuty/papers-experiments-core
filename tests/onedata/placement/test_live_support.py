@@ -4,6 +4,7 @@ platform is contacted here)."""
 from pathlib import Path
 
 import pytest
+from fault_support import faults_table
 from live_support import (
     prerequisite_missing,
     require_cleaned,
@@ -57,27 +58,47 @@ def test_a_cleanup_result_that_is_absent_or_not_true_is_not_a_cleanup():
 
 
 def test_o28_a_provider_that_was_not_shown_restored_does_not_pass_the_live_outage_test():
-    """O28: the outage check's pass must carry a restore verified by a changed identity and by REST answering again."""
-    good = {"verified": True, "how": "restored", "rest_answers_again": True}
+    """O28: the outage check's pass must carry a restore cleared and verified by the injector, by a changed identity,
+    and the provider's REST answering again."""
+    good = {"cleared": True, "verified": True, "how": "restored", "rest_answers_again": True}
     require_restored(entry(True, restore=good))
     with pytest.raises(AssertionError, match="no restore"):
         require_restored(entry(True))
     for bad in (
+        {**good, "cleared": False},
         {**good, "verified": False},
         {**good, "verified": None},
-        {**good, "how": "never_seen_down"},
+        {**good, "how": "never_down"},
         {**good, "rest_answers_again": False},
         {key: value for key, value in good.items() if key != "rest_answers_again"},
     ):
-        with pytest.raises(AssertionError, match=r"restore|never down|answer again"):
+        with pytest.raises(AssertionError, match=r"back|restore|never down|answer again"):
             require_restored(entry(True, restore=bad))
+
+
+def test_o28_with_several_spaces_the_restore_and_the_cleanup_are_read_in_every_space():
+    """O28: with several spaces the facts sit under `spaces`, so the live helpers read each space's: a run whose spaces
+    were all restored and cleaned passes them, and one space without either fails them, never a false failure from
+    reading the top level."""
+    good = {"restore": {"cleared": True, "verified": True, "how": "restored", "rest_answers_again": True}}
+    both = {"spaces[0]": {**good, "cleanup_verified": True}, "spaces[1]": {**good, "cleanup_verified": True}}
+    require_restored(entry(True, spaces=both))
+    require_cleaned(entry(True, spaces=both))
+    unrestored = {**both, "spaces[1]": {"restore": {**good["restore"], "verified": False}, "cleanup_verified": True}}
+    with pytest.raises(AssertionError, match="did not verify the restore"):
+        require_restored(entry(True, spaces=unrestored))
+    uncleaned = {**both, "spaces[1]": {**good, "cleanup_verified": False}}
+    with pytest.raises(AssertionError, match="scratch entry gone"):
+        require_cleaned(entry(True, spaces=uncleaned))
+    with pytest.raises(AssertionError, match="no space"):
+        require_restored(entry(True, spaces={}))
 
 
 def with_outage(data):
     with_placement(data)
     data["providers"]["gamma"] = {"url": "https://gamma.test", "id": GAMMA_ID}
     data["support"] = {"providers": ["alpha", "beta", "gamma"], "local": "beta"}
-    data["faults"] = {"sanctioned": True, "compose_file": "compose.yaml", "services": {"alpha": SERVICE}}
+    data["faults"] = faults_table(services={"alpha": SERVICE})
 
 
 def test_o28_the_outage_check_names_what_the_platform_file_lacks(tmp_path, fake):

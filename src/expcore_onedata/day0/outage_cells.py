@@ -189,9 +189,9 @@ class Cells:
         return facts
 
     # -- listings -------------------------------------------------------------------------------------------------
-    def _names(self, directory_id: str) -> dict[str, int]:
-        """Every entry of a directory through the local provider, name -> size, to the last page's marker (O26)."""
-        entries: dict[str, int] = {}
+    def _names(self, directory_id: str, found: dict[str, int]) -> None:
+        """Every entry of a directory through the local provider, name -> size, to the last page's marker (O26), put
+        into `found` as each page comes (it is the point: a page that fails leaves what came before it there)."""
         params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
         while True:
             page = self._client.get(
@@ -199,17 +199,19 @@ class Cells:
             )
             token = next_page_token(page)
             for item in page["children"]:
-                found = listing_entry(item)
-                entries[found.name] = found.size
+                entry = listing_entry(item)
+                found[entry.name] = entry.size
             if token is None:
-                return entries
+                return
             params = {**params, "token": token}
 
     def listing(self, directory_id: str, expected: Mapping[str, int]) -> dict[str, Any]:
-        """List a directory through the local provider and compare it with the entries it must hold."""
-        found, error, seconds = self._timed(lambda: self._names(directory_id))
+        """List a directory through the local provider and compare it with the entries it must hold. A listing that
+        fails after some pages is `partial`, with the entries it got and the error that cut it."""
+        found: dict[str, int] = {}
+        _, error, seconds = self._timed(lambda: self._names(directory_id, found))
         facts = {**self._base(seconds), "expected_entries": len(expected)}
-        if error is not None:
+        if error is not None and not found:
             return {**facts, **failure_facts(error, seconds, self.bound_s)}
         missing = [name for name in expected if name not in found]
         unexpected = [name for name in found if name not in expected]
@@ -217,14 +219,10 @@ class Cells:
         outcome = "served" if not (missing or unexpected or resized) else "differs"
         if missing and not (unexpected or resized):
             outcome = "partial"
-        return {
-            **facts,
-            "outcome": outcome,
-            "entries": len(found),
-            "missing": len(missing),
-            "unexpected": len(unexpected),
-            "size_differs": len(resized),
-        }
+        counts = {"entries": len(found), "missing": len(missing), "unexpected": len(unexpected)}
+        if error is not None:  # cut partway: what came is kept, with the error, and is never the whole listing
+            return {**facts, **failure_facts(error, seconds, self.bound_s), **counts, "outcome": "partial"}
+        return {**facts, "outcome": outcome, **counts, "size_differs": len(resized)}
 
     def listing_mount(self, directory: str, expected: Mapping[str, int]) -> dict[str, Any]:
         """List a directory through the mount (names only: a mount's listing has no sizes here)."""

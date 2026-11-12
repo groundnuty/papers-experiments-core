@@ -1,6 +1,8 @@
 """Day-0 checks as code: a registry, a dated report, unknown that is not a pass, and clean-up that is verified (O11)."""
 
 import json
+import subprocess
+import sys
 
 import httpx
 import pytest
@@ -65,6 +67,19 @@ def by_name(entries):
 
 def mutating_calls(fake):
     return [c for c in fake.provider_calls if c[1] in ("POST", "PUT", "DELETE")]
+
+
+@pytest.mark.parametrize("first", ["outage", "mutating", "registry", "runner"])
+def test_the_registry_order_is_the_same_whichever_module_of_the_package_is_imported_first(first):
+    """The report lists the checks in one order, whatever a test session or a study imports first: in a fresh
+    interpreter, importing the outage check's module (or another) before the runner gives the runner's order."""
+    code = (
+        f"import expcore_onedata.day0.{first}\n"
+        "from expcore_onedata.day0.runner import REGISTRY\n"
+        "print(','.join(REGISTRY))\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=True)
+    assert done.stdout.strip().split(",") == list(NAMES)
 
 
 def test_the_registry_holds_the_checks_the_brief_names_and_marks_those_that_change_state():

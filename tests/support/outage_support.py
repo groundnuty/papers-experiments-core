@@ -7,8 +7,10 @@ provider that is down, so this module adds one outside the fakes, as a transport
   provider that lacks a file's bytes, when every provider that holds them is down, wait out its timeout (the clock is
   the test's `Ticker`, so nothing waits) and then time out. A transfer of such a file stays active. What each of
   these does is a stand-in's choice, not a fact about Onedata: the live day-0 run is what measures them.
-- `FakeServices` is the Compose driver's stand-in: `stop` takes the host down, `start` brings it up, and a service's
-  identity is its generation, which a start changes (or not, to model a restore that did not take effect).
+- `FakeServices` is the fault injector's driver's stand-in (`expcore_onedata.faults.FaultDriver`): `stop` takes the host
+  down, `start` brings it up, and a service's identity is its generation, which a start changes (or not, to model a
+  restore that did not take effect). `WorldDaemon` is `fault_support.FakeDaemon` (the Docker daemon behind the real
+  Compose driver, on the test's clock) with the world's hosts following its containers, for a stop that times out.
 - `FakeMount` reads and lists through "the mount" from the same world.
 
 Every name is invented, as in `expcore_onedata.testing`.
@@ -19,8 +21,9 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
+from fault_support import FakeDaemon
 
-from expcore_onedata.day0.outage_driver import DriverError, Observation
+from expcore_onedata.compose import DriverError, Observation
 from expcore_onedata.testing import FakeData, Ticker
 
 GAMMA_ID, GAMMA_HOST = "pr-gamma", "gamma.test"
@@ -37,6 +40,7 @@ class OutageWorld:
         self.onezone_notices = True  # Onezone marks a provider whose service is down offline at once
         self.listing_loses = 0  # while a provider is down, a children listing leaves out this many entries
         self.listing_resizes = False  # ... or shows every entry with another size
+        self.listing_cut = False  # ... or answers a page after the first with a 500
         self.calls: list[tuple[str, str]] = []  # (host, route) of every provider call, in order
 
     def holders_up(self, file_id: str) -> bool:
@@ -52,6 +56,8 @@ class OutageWorld:
         read = re.fullmatch(r".*/oneprovider/data/([^/]+)/content", path)
         if read and self.down and not self.holds_here(host, read.group(1)) and not self.holders_up(read.group(1)):
             return self.cannot_fetch(request)
+        if self.down and self.listing_cut and path.endswith("/children") and "token" in request.url.params:
+            return httpx.Response(500, json={"error": {"id": "internalServerError", "details": {}}})
         record = re.fullmatch(r".*/oneprovider/transfers/([^/]+)", path)
         if record and self.down and request.method == "GET" and self.stalled(record.group(1)):
             return httpx.Response(200, json={"replicationStatus": "active", "type": "replication", "scheduleTime": 1})
@@ -93,7 +99,7 @@ class OutageWorld:
 
 
 class FakeServices:
-    """A `ServiceDriver` over the world: `services` maps a Compose service to the host it serves."""
+    """A `FaultDriver` over the world: `services` maps a Compose service to the host it serves."""
 
     def __init__(
         self, world: OutageWorld, services: dict[str, str], on_stop: Callable[[str], None] | None = None
@@ -164,3 +170,25 @@ class FakeMount:
         fake = self.world.fake
         directory = fake.id_of(path)
         return [node.name for node in fake.nodes.values() if node.parent == directory]
+
+
+class WorldDaemon(FakeDaemon):
+    """The fake Docker daemon behind the real Compose driver, whose providers' hosts are down while their containers do
+    not run: `services` maps a Compose service to the host it serves. The daemon's clock is the test's `Ticker`."""
+
+    def __init__(self, world: OutageWorld, services: dict[str, str]) -> None:
+        super().__init__(world.ticker, tuple(services))
+        self.world, self.hosts = world, services
+
+    def sync(self) -> None:
+        for service, host in self.hosts.items():
+            if self.running(service):
+                self.world.down.discard(host)
+            else:
+                self.world.down.add(host)
+
+    def __call__(self, argv, *, timeout_s):
+        try:
+            return super().__call__(argv, timeout_s=timeout_s)
+        finally:
+            self.sync()

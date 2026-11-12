@@ -74,17 +74,34 @@ def require_every_provider_refused(entry: Entry) -> None:
     assert all(row.get("cleaned") is not False for row in rows.values()), f"the {entry.name} check left a scratch entry"
 
 
+def per_space_facts(entry: Entry) -> list[Mapping]:
+    """A check's facts for each space it ran in: under `spaces` with several spaces (`per_space`), else its own."""
+    spaces = entry.facts.get("spaces")
+    if isinstance(spaces, Mapping):
+        assert spaces, f"the {entry.name} check reports no space it ran in"
+        return list(spaces.values())
+    return [entry.facts]
+
+
 def require_restored(entry: Entry) -> None:
-    """Fail unless the check shows the provider back: its restore verified by a changed identity and by its REST
-    answering again. A pass that does not say so is no pass."""
-    restore = entry.facts.get("restore")
-    assert isinstance(restore, Mapping), f"the {entry.name} check reports no restore"
-    assert restore.get("verified") is True, f"the {entry.name} check did not verify the restore"
-    assert restore.get("how") == "restored", f"the {entry.name} check found the provider never down"
-    assert restore.get("rest_answers_again") is True, f"the {entry.name} check did not see the provider answer again"
+    """Fail unless the check shows the provider back in every space it ran in: the injector's restore cleared and
+    verified by a changed identity, and its REST answering again. A pass that does not say so is no pass."""
+    for facts in per_space_facts(entry):
+        restore = facts.get("restore")
+        assert isinstance(restore, Mapping), f"the {entry.name} check reports no restore"
+        assert restore.get("cleared") is True, f"the {entry.name} check did not bring the provider back"
+        assert restore.get("verified") is True, f"the {entry.name} check did not verify the restore"
+        assert restore.get("how") in ("restored", "found_restored"), (
+            f"the {entry.name} check found the provider never down"
+        )
+        assert restore.get("rest_answers_again") is True, (
+            f"the {entry.name} check did not see the provider answer again"
+        )
 
 
 def require_cleaned(entry: Entry) -> None:
-    """Fail unless the check reports, explicitly, that what it created is gone: an absent result is not a true one."""
-    assert "cleanup_verified" in entry.facts, f"the {entry.name} check reports no cleanup result"
-    assert entry.facts["cleanup_verified"] is True, f"the {entry.name} check did not show its scratch entry gone"
+    """Fail unless the check reports, explicitly, in every space it ran in, that what it created is gone: an absent
+    result is not a true one."""
+    for facts in per_space_facts(entry):
+        assert "cleanup_verified" in facts, f"the {entry.name} check reports no cleanup result"
+        assert facts["cleanup_verified"] is True, f"the {entry.name} check did not show its scratch entry gone"

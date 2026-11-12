@@ -25,13 +25,20 @@ the bound). The tool server itself is not launched: its wording of an error is n
 shape of `outage_cells`: status and error id, seconds against the bound, and an outcome (`served`, `partial`,
 `differs`, `refused`, `no answer`, `blocked`). Blocking is bounded by `Context.outage_bound_s`.
 
-**After it**: the restore, verified by the identity of the service having changed and by the target answering again
-(`outage_driver`), then the reads again, which must return what was written. The restore runs in a `finally`; the
+**After it**: the restore, by the fault injector, verified by the identity of the service having changed, and the target
+answering again, then the reads again, which must return what was written. The restore runs in a `finally`; the
 scratch is torn down after it, since teardown deletes through the target, and its absence is verified (O11).
+
+**The injector (O10, O11).** The provider is taken down and brought back by the platform's fault injector
+(`outage_fault`, over `expcore_onedata.faults.FaultInjector`): journalled before the stop, recovered if an earlier
+process left it open, restored only with a changed identity, a stop of unknown outcome waited out. The check holds the
+federation's lock exclusively (`admission.FederationLock`) for a whole space's scenario, the scratch's teardown
+included, and the injector takes that admission as its own.
 
 **Verdict.** Passed: the target was seen down and restored, every cell measured, the re-reads right, the scratch gone.
 Failed: the target answered while it was down, it could not be restored or did not answer or read back after the
-restore, the scratch was not shown gone, or a measurement raised. Unknown: anything the check could not do or measure,
+restore, the scratch was not shown gone, or a measurement raised. A space whose provider is not shown back (not
+cleared, or not answering REST again) halts the spaces after it. Unknown: anything the check could not do or measure,
 with the reason. What a cell answered is a fact, never a failure.
 
 **Consent (O10).** Nothing is stopped without `EXPCORE_LIVE_MUTATE=1`, `EXPCORE_LIVE_FAULTS=1` and `sanctioned = true`
@@ -43,13 +50,17 @@ import hashlib
 import secrets
 from typing import Any
 
+from expcore.config.loading import ConfigError
+from expcore.errors import InfraError
 from expcore_onedata import consistency
+from expcore_onedata.admission import OUTAGE_RUN, FederationLock
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import StudySpace
 from expcore_onedata.day0.mutating import clean_up
 from expcore_onedata.day0.outage_cells import ROLES, Cells, Roles, ScratchFile
-from expcore_onedata.day0.outage_driver import Outage, OutageError
+from expcore_onedata.day0.outage_fault import RESTORED, Outage
 from expcore_onedata.day0.registry import Context, Result, failed, holder_of, passed, per_space, register, unknown
+from expcore_onedata.faults import FaultInjector
 from expcore_onedata.placement import held_bytes
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.sandbox.settings import DataPathMode
@@ -87,9 +98,9 @@ def _refusal(ctx: Context) -> str | None:
         return "the outage check needs mutation consent (EXPCORE_LIVE_MUTATE=1), so nothing was sent"
     if not ctx.allow_faults:
         return "the outage check takes a provider down and needs EXPCORE_LIVE_FAULTS=1, so nothing was sent"
-    if ctx.outage_settings is None or ctx.outage_settings.sanctioned is not True:
+    if ctx.fault_settings is None or ctx.fault_settings.sanctioned is not True:
         return "the outage check needs 'sanctioned = true' in [faults] of platform.toml, so nothing was sent"
-    if ctx.outage_driver is None:
+    if ctx.fault_driver is None:
         return "no driver for the deployment's services was given to this run, so no provider can be taken down"
     if ctx.placement is None:
         return "platform.toml has no [placement] table, so the data provider is not declared"
@@ -110,9 +121,10 @@ def prerequisite(ctx: Context) -> str | None:
 def provider_outage(ctx: Context) -> Result:
     """Take the data provider of each space down, record the answers, restore it and show it restored (see above).
 
-    The spaces run one after the other, each with its provider restored and verified before the next starts; if a
-    restore cannot be verified, no later space is run, since a provider may still be down. The verdict is the worst
-    over the spaces (`per_space`)."""
+    The spaces run one after the other, each with its provider brought back before the next starts; if a space's
+    provider is not shown back (the injector could not clear the injection, or the provider does not answer REST
+    again), no later space is run, since a provider may still be down. The verdict is the worst over the spaces
+    (`per_space`)."""
     refusal = _refusal(ctx)
     if refusal is not None:
         return unknown(refusal)
@@ -120,9 +132,10 @@ def provider_outage(ctx: Context) -> Result:
 
     def one(entry: StudySpace) -> Result:
         if stuck:
-            return unknown(f"not run: {stuck[0]} left a provider that could not be shown restored")
+            return unknown(f"not run: {stuck[0]} left a provider that could not be shown back")
         result = _outage_in(ctx, entry)
-        if result.facts.get("restore", {}).get("verified") is False:
+        restore = result.facts.get("restore", {})
+        if restore.get("cleared") is False or restore.get("rest_answers_again") is False:
             stuck.append(entry.position)
         return result
 
@@ -142,7 +155,7 @@ def _roles(ctx: Context, entry: StudySpace) -> Roles | str:
     mirror = next((name for name in entry.support.providers if name not in (target, local)), None)
     if mirror is None:
         return "the support set has no provider besides the data provider and the local one to hold a replica"
-    if ctx.outage_settings is None or target not in ctx.outage_settings.services:
+    if ctx.fault_settings is None or target not in ctx.fault_settings.services:
         return f"[faults.services] names no service for the data provider ({shown})"
     if any(name not in ctx.provider_ids for name in (target, mirror, local)):
         return "a provider's id is neither declared in platform.toml nor read from the space"
@@ -150,16 +163,30 @@ def _roles(ctx: Context, entry: StudySpace) -> Roles | str:
 
 
 def _outage_in(ctx: Context, entry: StudySpace) -> Result:
-    """The outage check in one declared space."""
+    """The outage check in one declared space, with the federation held exclusively for the whole of it."""
     roles = _roles(ctx, entry)
     if isinstance(roles, str):
         return unknown(roles)
-    run = Run(ctx, entry, roles)
+    settings = ctx.fault_settings
+    assert settings is not None
+    entered = False
     try:
-        run.execute()
-    finally:
-        run.facts["cleanup_verified"] = clean_up(run.provisioner, run.directory)
-    return run.verdict()
+        with FederationLock(settings).held(
+            exclusive=True, timeout_s=settings.admission_timeout_s, target=roles.labels["target"], purpose=OUTAGE_RUN
+        ) as admission:
+            entered = True
+            run = Run(ctx, entry, roles)
+            try:
+                run.execute()
+            finally:
+                run.facts["cleanup_verified"] = clean_up(run.provisioner, run.directory)
+            run.facts["admission"] = {"exclusive": admission.exclusive}
+            return run.verdict()
+    except (InfraError, ConfigError) as error:
+        if entered:
+            raise
+        reason = error.detail if isinstance(error, InfraError) else str(error)
+        return unknown(f"the federation could not be held exclusively, so nothing was stopped ({reason})")
 
 
 class Run:
@@ -198,19 +225,19 @@ class Run:
             reason = str(error) if isinstance(error, Unprepared) else type(error).__name__
             self.gaps.append(f"nothing was taken down: the scenario could not be set up or proved ({reason})")
             return
-        settings = self.ctx.outage_settings
-        driver = self.ctx.outage_driver
-        assert settings is not None
-        assert driver is not None
-        outage = Outage(
-            driver,
-            settings.services[self.roles.target],
-            settle_timeout_s=settings.settle_timeout_s,
-            poll_s=settings.poll_s,
-            clear_attempts=settings.clear_attempts,
-            clock=self.ctx.clock,
-            sleep=self.ctx.sleep,
+        ctx = self.ctx
+        assert ctx.fault_settings is not None
+        assert ctx.fault_driver is not None
+        injector = FaultInjector(
+            ctx.config,
+            ctx.fault_settings,
+            self.roles.labels["target"],
+            sanctioned=ctx.allow_faults and ctx.allow_mutation,  # the caller's half of the sanction (O10)
+            driver=ctx.fault_driver,
+            clock=ctx.clock,
+            sleep=ctx.sleep,
         )
+        outage = Outage(injector, self.directory)
         went_down = False
         try:
             went_down = self.take_down(outage)
@@ -298,15 +325,15 @@ class Run:
 
     # -- during ------------------------------------------------------------------------------------
     def take_down(self, outage: Outage) -> bool:
-        """Stop the target and see it down; True when it was seen down. The target must not answer REST either."""
-        try:
-            down = outage.take_down()
-        except OutageError as error:
-            self.facts["outage"] = {"started": False, "reason": str(error)}
-            self.gaps.append(f"the provider could not be taken down and seen down ({error})")
+        """Stop the target through the injector and see it down; True when it was seen down. The target must not
+        answer REST either."""
+        down = outage.take_down()
+        if not down["started"]:
+            self.facts["outage"] = down
+            self.gaps.append(f"the provider could not be taken down and seen down ({down['reason']})")
             return False
         probe = self.cells.target_answers(min(self.bound_s, DOWN_PROBE_S))
-        self.facts["outage"] = {"started": True, **down, "rest_answers_while_down": probe["answers"], "rest": probe}
+        self.facts["outage"] = {**down, "rest_answers_while_down": probe["answers"], "rest": probe}
         if probe["answers"]:
             self.problems.append(
                 "the provider answered REST while its service was seen down, so no outage was observed"
@@ -347,12 +374,16 @@ class Run:
 
     # -- after -------------------------------------------------------------------------------------
     def after_restore(self, went_down: bool) -> None:
-        """Check the restore: verified by the driver, the target answering, and the reads returning what was written."""
+        """Check the restore: cleared and verified by the injector, the target answering, and the reads returning what
+        was written. A provider never seen down needs only to be found as it was (`never_down`)."""
         restore = self.facts["restore"]
-        if not restore["verified"]:
-            self.problems.append(f"the provider could not be restored and verified ({restore['how']})")
-            return
         if restore["how"] == "not_injected":
+            return
+        if not restore["cleared"]:
+            self.problems.append(f"the provider could not be brought back ({restore['how']})")
+            return
+        if went_down and restore["how"] not in RESTORED:
+            self.problems.append(f"the provider could not be restored and verified ({restore['how']})")
             return
         if not self.wait_for_target():
             self.problems.append("the provider ran again but did not answer REST within the settle timeout")
@@ -374,7 +405,7 @@ class Run:
 
     def wait_for_target(self) -> bool:
         """Poll the target's REST until it answers, within the settle timeout; record how long it took."""
-        settings = self.ctx.outage_settings
+        settings = self.ctx.fault_settings
         assert settings is not None
         began, tries = self.ctx.clock(), 0
         while True:
@@ -391,7 +422,7 @@ class Run:
 
     def reread(self, read: Any) -> dict[str, Any]:
         """Read again until the read is served, within the settle timeout (a provider is slow to take up its peers)."""
-        settings = self.ctx.outage_settings
+        settings = self.ctx.fault_settings
         assert settings is not None
         began, tries = self.ctx.clock(), 0
         while True:

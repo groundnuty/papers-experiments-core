@@ -9,13 +9,17 @@ import json
 
 import pytest
 from fake_reset import FakeReset
-from outage_support import GAMMA_HOST, GAMMA_ID, SERVICE, FakeMount, FakeServices, OutageWorld
+from fault_support import faults_table
+from outage_support import GAMMA_HOST, GAMMA_ID, SERVICE, FakeMount, FakeServices, OutageWorld, WorldDaemon
 
+from expcore_onedata.admission import OUTAGE_RUN
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
-from expcore_onedata.day0 import outage
+from expcore_onedata.day0 import outage, outage_cells
 from expcore_onedata.day0.outage_cells import Cells
 from expcore_onedata.day0.runner import EXIT_FAIL, EXIT_UNKNOWN, build_context, run, run_checks
+from expcore_onedata.fault_journal import InjectionJournal
+from expcore_onedata.fault_settings import compose_driver, load_faults
 from expcore_onedata.testing import (
     ADMIN_ENV,
     ALPHA_ID,
@@ -35,13 +39,7 @@ def edit(data):
     with_placement(data)
     data["providers"]["gamma"] = {"url": f"https://{GAMMA_HOST}", "id": GAMMA_ID}
     data["support"] = {"providers": ["alpha", "beta", "gamma"], "local": "beta"}
-    data["faults"] = {
-        "sanctioned": True,
-        "compose_file": "compose.yaml",
-        "settle_timeout_s": 30,
-        "poll_s": 1,
-        "services": {"alpha": SERVICE},
-    }
+    data["faults"] = faults_table(services={"alpha": SERVICE}, settle_timeout_s=30)
 
 
 @pytest.fixture
@@ -116,10 +114,58 @@ def test_o28_the_provider_is_taken_down_seen_down_and_restored_and_nothing_is_le
     assert entry.facts["outage"]["seen_down"] is True
     assert entry.facts["outage"]["rest_answers_while_down"] is False
     assert entry.facts["outage"]["rest"]["transport"] is True
+    assert entry.facts["restore"]["cleared"] is True
     assert entry.facts["restore"]["verified"] is True
     assert entry.facts["restore"]["how"] == "restored"
     assert entry.facts["restore"]["rest_answers_again"] is True
     assert entry.facts["cleanup_verified"] is True
+
+
+def test_o28_the_outage_is_the_fault_injectors_journalled_held_exclusively_and_settled(context, platform, services):
+    """O28: the provider is taken down by the fault injector of #27, not a copy of it: the injection is journalled
+    before the stop and cleared after the restore, and while it is down the federation is held exclusively by an
+    outage run whose holder record names the target by its label."""
+    settings = load_faults(platform, load_platform(platform))
+    journal = InjectionJournal(settings.journal)
+    seen = {}
+
+    def while_stopping(service):
+        seen["open"] = [entry["target"] for entry in journal.open_entries()]
+        seen["holder"] = journal.read_holder()
+
+    services.on_stop = while_stopping
+    entry = outage_check(context)
+    assert entry.ok is True, entry.summary
+    assert seen["open"] == ["providers[0]"]  # journalled before the stop
+    assert (seen["holder"]["purpose"], seen["holder"]["target"]) == (OUTAGE_RUN, "providers[0]")
+    assert journal.open_entries() == []  # settled once restored
+    assert journal.read_holder() is None  # and the federation let go
+    assert entry.facts["admission"] == {"exclusive": True}
+    assert entry.facts["restore"]["journal_steps"][-2:] == ["cleared", "verified"]
+
+
+def test_o28_a_stop_whose_outcome_is_unknown_is_waited_out_and_restored_by_the_injector(
+    platform, world, ticker, tmp_path
+):
+    """O28: a stop command that times out (the CLI killed, the daemon still stopping) is settled the injector's way:
+    the restore waits for the service to show down, then starts it and verifies the changed identity; the check is
+    unknown, never passed, and leaves nothing down."""
+    daemon = WorldDaemon(world, {SERVICE: "alpha.test"})
+    daemon.stop_hangs = True
+    settings = load_faults(platform, load_platform(platform))
+    client = OnezoneClient(load_platform(platform), http=world.client_http())
+    ctx = build_context(
+        platform, tmp_path / "o", client=client, driver=compose_driver(settings, runner=daemon), allow_mutation=True,
+        allow_faults=True, clock=ticker.clock, sleep=ticker.sleep, outage_bound_s=BOUND_S,
+    )  # fmt: skip
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    assert entry.ok is None
+    assert entry.facts["outage"]["started"] is False
+    assert (entry.facts["restore"]["cleared"], entry.facts["restore"]["how"]) == (True, "restored")
+    assert daemon.starts(SERVICE) == 2
+    assert daemon.running(SERVICE)
+    assert world.down == set()
+    assert InjectionJournal(settings.journal).open_entries() == []
 
 
 def test_o28_a_provider_that_still_answers_while_its_service_is_stopped_is_no_observed_outage(context, services):
@@ -130,7 +176,7 @@ def test_o28_a_provider_that_still_answers_while_its_service_is_stopped_is_no_ob
     assert "could not be taken down" in entry.summary
     assert entry.facts["outage"]["started"] is False
     assert "during" not in entry.facts
-    assert entry.facts["restore"]["how"] == "never_seen_down"
+    assert (entry.facts["restore"]["cleared"], entry.facts["restore"]["how"]) == (True, "never_down")
 
 
 def test_o28_a_service_seen_down_whose_rest_still_answers_fails_the_check(context, world, services):
@@ -148,6 +194,7 @@ def test_o28_a_service_seen_down_whose_rest_still_answers_fails_the_check(contex
     assert entry.facts["outage"]["rest_answers_while_down"] is True
     assert "during" not in entry.facts
     assert entry.facts["restore"]["verified"] is True
+    assert entry.facts["restore"]["rest_answers_again"] is True
 
 
 # -- the answers are recorded ------------------------------------------------------------------------------------------
@@ -228,6 +275,18 @@ def test_o28_a_listing_that_lost_entries_while_the_provider_was_down_is_partial(
     assert entry.ok is True
 
 
+def test_o28_a_listing_that_fails_partway_is_partial_with_what_it_listed_and_the_error(context, world, monkeypatch):
+    """O28: a listing whose second page fails while the provider is down reports the entries it got as partial, with
+    the error's status, never as nothing listed."""
+    monkeypatch.setattr(outage_cells, "LISTING_LIMIT", 2)
+    world.listing_cut = True
+    entry = outage_check(context)
+    listing = entry.facts["during"]["rest"]["listing"]
+    assert (listing["outcome"], listing["entries"], listing["status"]) == ("partial", 2, 500)
+    assert listing["missing"] == listing["expected_entries"] - 2
+    assert entry.facts["baseline"]["rest"]["listing"]["outcome"] == "served"
+
+
 def test_o28_a_listing_whose_sizes_changed_while_the_provider_was_down_differs(context, world):
     """O28: a listing whose sizes changed while the provider was down differs."""
     world.listing_resizes = True
@@ -254,9 +313,10 @@ def test_o28_a_restore_that_leaves_the_identity_unchanged_fails_the_check(contex
     services.keeps_identity = True
     entry = outage_check(context)
     assert entry.ok is False
-    assert "could not be restored" in entry.summary
+    assert "could not be brought back (identity_unchanged)" in entry.summary
     assert entry.facts["restore"] == {
         **entry.facts["restore"],
+        "cleared": False,
         "verified": False,
         "how": "identity_unchanged",
         "identity_changed": False,
@@ -271,10 +331,9 @@ def test_o28_a_provider_that_does_not_run_again_fails_the_check_after_trying_to_
     services.stays_down = True
     entry = outage_check(context)
     assert entry.ok is False
-    assert entry.facts["restore"]["verified"] is False
-    assert entry.facts["restore"]["how"] == "not_running_again"
-    assert entry.facts["restore"]["attempts"] == 3
-    assert services.verbs() == ["stop", "start", "start", "start"]
+    assert (entry.facts["restore"]["cleared"], entry.facts["restore"]["verified"]) == (False, False)
+    assert entry.facts["restore"]["how"] == "not_running"
+    assert services.verbs() == ["stop", "start", "start"]  # clear_attempts = 2 in the fixture's [faults]
     assert "cleanup_verified" in entry.facts  # the teardown ran, and could not reach the provider it deletes through
 
 
@@ -312,14 +371,15 @@ def test_o28_the_restore_runs_when_a_measurement_raises(context, services, world
     assert entry.facts["restore"]["verified"] is True
 
 
-def test_o28_a_service_that_cannot_be_stopped_is_unknown_and_is_found_as_it_was(context, services, world):
-    """O28: a service that cannot be stopped is unknown and is found as it was."""
+def test_o28_a_stop_command_that_fails_leaves_the_injection_unsettled_and_fails_the_check(context, services, world):
+    """O28: a stop command that fails has an outcome the injector cannot know; the service never shows down within the
+    settle timeout, so the injection stays open, unverified, and the check fails instead of calling it as it was."""
     services.fail_stop = True
     entry = outage_check(context)
-    assert entry.ok is None
-    assert "could not be taken down" in entry.summary
-    assert entry.facts["restore"]["verified"] is True
-    assert entry.facts["restore"]["how"] == "never_seen_down"
+    assert entry.ok is False
+    assert entry.facts["outage"]["started"] is False
+    assert (entry.facts["restore"]["cleared"], entry.facts["restore"]["how"]) == (False, "stop_unsettled")
+    assert "could not be brought back" in entry.summary
     assert world.down == set()
 
 
@@ -491,6 +551,8 @@ def test_o28_providers_and_spaces_are_named_by_position_and_nothing_identifying_
         SERVICE,
         "compose.yaml",
         "container-",
+        "stack-a",
+        "fault-journal",
     ):
         assert needle not in text, needle
     assert entry.facts["roles"] == {"target": "providers[0]", "mirror": "providers[2]", "local": "providers[1]"}
@@ -602,7 +664,7 @@ def two_spaces(tmp_path, ticker, monkeypatch):
         with_placement(data)
         data["providers"]["gamma"] = {"url": f"https://{GAMMA_HOST}", "id": GAMMA_ID}
         with_spaces(data, 2, providers=["alpha", "beta", "gamma"], local="beta", holder="alpha")
-        data["faults"] = {"sanctioned": True, "compose_file": "compose.yaml", "services": {"alpha": SERVICE}}
+        data["faults"] = faults_table(services={"alpha": SERVICE})
 
     directory = tmp_path / "several"
     directory.mkdir()
@@ -643,6 +705,25 @@ def test_o28_a_space_whose_provider_could_not_be_shown_restored_stops_the_spaces
     assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("fail", "unknown")
     assert "spaces[0] left a provider" in spaces["spaces[1]"]["summary"]
     assert services.verbs() == ["stop", "start"]  # the second space never stopped it again
+
+
+def test_o28_a_provider_that_never_answers_rest_again_halts_the_spaces_after_it(two_spaces):
+    """O28: a provider back with a changed identity that never answers REST again is not shown back either: the
+    space fails and the spaces after it are not run."""
+    ctx, services, world = two_spaces
+    real_start = services.start
+
+    def start_but_stay_unreachable(service: str) -> None:
+        real_start(service)
+        world.down.add("alpha.test")
+
+    services.start = start_but_stay_unreachable  # type: ignore[method-assign]
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    spaces = entry.facts["spaces"]
+    assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("fail", "unknown")
+    assert spaces["spaces[0]"]["restore"]["rest_answers_again"] is False
+    assert "spaces[0] left a provider" in spaces["spaces[1]"]["summary"]
+    assert services.verbs() == ["stop", "start"]
 
 
 def test_o28_an_unknown_run_exits_with_the_unknown_status(platform, world, services, tmp_path, ticker):
