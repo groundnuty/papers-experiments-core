@@ -349,7 +349,7 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
 
 
 def shard_budgets_of(study: StudyConfig) -> dict[int, dict[str, Any]]:
-    """Every shard's part of the budget of a study that shards by model and has a budget (C31), by shard index.
+    """Every shard's part of the budget of a study that shards by model and has a budget (C32), by shard index.
 
     `load_study` refuses a study for which this raises ShardError, so a start finds the same parts.
     """

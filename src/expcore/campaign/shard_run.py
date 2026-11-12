@@ -14,7 +14,7 @@ changed shares. A start without a shard reads one meta row and writes nothing, s
 it was before shards existed.
 
 The totals stay in the campaign fingerprint, which every shard shares; the shares are applied to the settings after it
-is computed (`share_settings`, or `share_settings_by_model` for a campaign that shards by model, C31), so they never
+is computed (`share_settings`, or `share_settings_by_model` for a campaign that shards by model, C32), so they never
 reach it. Before any share is taken, a shard holding pairs of a model whose concurrency share is 0 is refused, naming
 the model (`refuse_unrunnable`).
 
@@ -106,7 +106,7 @@ def share_settings(settings: "SchedulerConfig", spec: ShardSpec) -> tuple["Sched
 def share_settings_by_model(
     settings: "SchedulerConfig", spec: ShardSpec, layout: ModelShards, unit: str, budget: Mapping[str, Any] | None
 ) -> tuple["SchedulerConfig", dict[str, Any]]:
-    """Shard `spec`'s settings under `expcore-shard/3` (C31), with the shares as the store and the export keep them.
+    """Shard `spec`'s settings under `expcore-shard/3` (C32), with the shares as the store and the export keep them.
 
     The shard runs one run at a time: its cap is 1 on `unit`, its model's, and it runs nothing of any other unit.
     `budget` is its part of the budget (`shard_budget.shard_budgets`), None without one. A shard whose part of
@@ -132,7 +132,7 @@ def refuse_unrunnable(
     unit_caps: Mapping[str, int],
     layout: ModelShards | None = None,
 ) -> None:
-    """Refuse a shard that holds pairs of a model whose concurrency share is 0 (C31): it could never run them.
+    """Refuse a shard that holds pairs of a model whose concurrency share is 0 (C32): it could never run them.
 
     `pairs` counts the shard's pairs by model, `unit_of` gives each model's unit and `unit_caps` the campaign's totals.
     Under `expcore-shard/2` a model's share is the shard's part of its unit's cap, which is 0 for the shards past the

@@ -471,8 +471,8 @@ def plan_by_model():
     return schema, manifest, make_fingerprint(schema, task_ids=TASKS, model_keys=MODELS, seed_ids=SEEDS, caps=caps)
 
 
-def test_c31_a_shard_by_model_plans_its_models_pairs_only_and_a_start_is_checked_against_that_part():
-    """C31: the shards' plans are disjoint and together the whole plan; each holds one model's runs, at their places in
+def test_c32_a_shard_by_model_plans_its_models_pairs_only_and_a_start_is_checked_against_that_part():
+    """C32: the shards' plans are disjoint and together the whole plan; each holds one model's runs, at their places in
     the whole plan; `plan_problem` reads the layout from the fingerprint, and a /3 shard of a fingerprint with none
     is refused."""
     schema, manifest, fingerprint = plan_by_model()
@@ -490,8 +490,8 @@ def test_c31_a_shard_by_model_plans_its_models_pairs_only_and_a_start_is_checked
     assert "declares no [shards] per_model" in plan_problem(schema, parts[0], without, BY_MODEL[0])
 
 
-def test_c31_a_store_of_a_shard_by_model_pins_its_rule_and_resumes_as_itself(tmp_path):
-    """C31: the spec's rule is kept with the shard, so a store started by model resumes by model; a start under
+def test_c32_a_store_of_a_shard_by_model_pins_its_rule_and_resumes_as_itself(tmp_path):
+    """C32: the spec's rule is kept with the shard, so a store started by model resumes by model; a start under
     expcore-shard/2 in a campaign that declares a layout is refused before the store is touched."""
     schema, manifest, fingerprint = plan_by_model()
     shard = shard_start(BY_MODEL[2], shares={"unit_caps": {"unit-f": 1}, "budget": None})
@@ -511,8 +511,8 @@ def test_c31_a_store_of_a_shard_by_model_pins_its_rule_and_resumes_as_itself(tmp
     assert everything(tmp_path) == before
 
 
-def test_c31_a_shard_by_model_runs_one_run_at_a_time_on_its_models_unit_and_on_its_part_of_the_budget():
-    """C31: its cap is 1 on its model's unit and it has no other; its budget is the part `shard_budget` gave it."""
+def test_c32_a_shard_by_model_runs_one_run_at_a_time_on_its_models_unit_and_on_its_part_of_the_budget():
+    """C32: its cap is 1 on its model's unit and it has no other; its budget is the part `shard_budget` gave it."""
     part = {"max_usd": 1.25, "per_model_usd": {"model-falcon": 0.5}}
     shared, recorded = share_settings_by_model(settings(), BY_MODEL[2], LAYOUT, "unit-f", part)
     assert shared.unit_caps == recorded["unit_caps"] == {"unit-f": 1}
@@ -525,16 +525,16 @@ def test_c31_a_shard_by_model_runs_one_run_at_a_time_on_its_models_unit_and_on_i
         share_settings_by_model(settings(), SPEC, LAYOUT, "unit-h", part)
 
 
-def test_c31_a_shard_of_a_model_that_costs_nothing_runs_without_a_gate_and_records_its_zero_dollars():
-    """C31: a part of 0 dollars cannot be a `Budget`, which would hold every run; the model costs nothing anyway."""
+def test_c32_a_shard_of_a_model_that_costs_nothing_runs_without_a_gate_and_records_its_zero_dollars():
+    """C32: a part of 0 dollars cannot be a `Budget`, which would hold every run; the model costs nothing anyway."""
     part = {"max_usd": 0.0, "per_model_usd": {}}
     shared, recorded = share_settings_by_model(settings(), BY_MODEL[0], LAYOUT, "unit-h", part)
     assert shared.budget is None
     assert recorded == {"unit_caps": {"unit-h": 1}, "budget": part}
 
 
-def test_c31_a_shard_holding_pairs_of_a_model_whose_concurrency_share_is_0_is_refused_naming_the_model():
-    """C31: under expcore-shard/2 a cap of 3 over 4 shards leaves shard 4 none of its unit; holding that model's pairs
+def test_c32_a_shard_holding_pairs_of_a_model_whose_concurrency_share_is_0_is_refused_naming_the_model():
+    """C32: under expcore-shard/2 a cap of 3 over 4 shards leaves shard 4 none of its unit; holding that model's pairs
     it could never run them. Shard 3 gets one, and an uncapped unit has no share to lack."""
     units = {"model-falcon": "unit-f", "model-heron": "unit-h"}
     with pytest.raises(ShardError, match=r"shard 4 of 4 holds 5 pair\(s\) of model model-falcon.*is 0") as refused:
@@ -544,8 +544,8 @@ def test_c31_a_shard_holding_pairs_of_a_model_whose_concurrency_share_is_0_is_re
     refuse_unrunnable(ShardSpec(4, 4, "shard-4"), {"model-heron": 5}, units, {"unit-f": 3})
 
 
-def test_c31_a_shard_by_model_holding_pairs_of_another_model_is_refused():
-    """C31: under expcore-shard/3 a shard's share of every model but its own is 0."""
+def test_c32_a_shard_by_model_holding_pairs_of_another_model_is_refused():
+    """C32: under expcore-shard/3 a shard's share of every model but its own is 0."""
     units = {"model-falcon": "unit-f", "model-heron": "unit-h"}
     refuse_unrunnable(BY_MODEL[2], {"model-falcon": 10}, units, {}, LAYOUT)
     with pytest.raises(ShardError, match=r"model model-heron.*serves model model-falcon only"):

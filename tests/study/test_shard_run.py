@@ -374,8 +374,8 @@ def by_model_copy(base: Path, name: str, **replaced: str) -> Path:
     return copy
 
 
-def test_c31_a_shard_holding_pairs_of_a_model_whose_concurrency_share_is_0_is_refused_at_start(tmp_path):
-    """C31: under expcore-shard/2 a unit cap of 1 over 2 shards gives shard 2 none of alpha-stub's sessions, while the
+def test_c32_a_shard_holding_pairs_of_a_model_whose_concurrency_share_is_0_is_refused_at_start(tmp_path):
+    """C32: under expcore-shard/2 a unit cap of 1 over 2 shards gives shard 2 none of alpha-stub's sessions, while the
     balanced deal still gives it alpha-stub's pairs; it is refused, naming the model, before the store is opened."""
     copy = stamped_copy(tmp_path, "starved", **{"beta-stub = 1": "beta-stub = 2"})
     assert "alpha-stub" in {pair[1] for pair in (pair_of(r.key.factors) for r in shard_manifest(
@@ -385,8 +385,8 @@ def test_c31_a_shard_holding_pairs_of_a_model_whose_concurrency_share_is_0_is_re
     assert not (copy / "out" / "state.sqlite").exists()
 
 
-def test_c31_a_shard_by_model_runs_its_models_pairs_one_at_a_time_on_its_part_of_the_budget(tmp_path):
-    """C31: shard 2 of 3 is alpha-stub's first: its runs are alpha-stub's pairs dealt to it, its cap is 1 on
+def test_c32_a_shard_by_model_runs_its_models_pairs_one_at_a_time_on_its_part_of_the_budget(tmp_path):
+    """C32: shard 2 of 3 is alpha-stub's first: its runs are alpha-stub's pairs dealt to it, its cap is 1 on
     alpha-stub's unit, its part of the budget follows the reserved bounds, and its store pins expcore-shard/3."""
     copy = by_model_copy(tmp_path, "by-model")
     study = load_study(copy)
@@ -408,23 +408,23 @@ def test_c31_a_shard_by_model_runs_its_models_pairs_one_at_a_time_on_its_part_of
     assert caps["budget"]["max_usd"] == 5.0  # the total, not the part
 
 
-def test_c31_a_shard_whose_n_is_not_the_layouts_sum_is_refused_before_the_store_is_opened(tmp_path):
-    """C31: `--shard i/N` must give the N that [shards] per_model declares."""
+def test_c32_a_shard_whose_n_is_not_the_layouts_sum_is_refused_before_the_store_is_opened(tmp_path):
+    """C32: `--shard i/N` must give the N that [shards] per_model declares."""
     copy = by_model_copy(tmp_path, "wrong-n")
     with pytest.raises(Refused, match=r"--shard 1/2 does not fit .*declares 3 shards: give --shard i/3"):
         run_study(copy, shard=FIRST)
     assert not (copy / "out" / "state.sqlite").exists()
 
 
-def test_c31_a_budget_that_cannot_pay_one_run_of_every_priced_shard_is_refused_when_the_study_loads(tmp_path):
-    """C31: the parts of max_usd are fixed by the plan, the prices and the caps, so a study whose shards could not
+def test_c32_a_budget_that_cannot_pay_one_run_of_every_priced_shard_is_refused_when_the_study_loads(tmp_path):
+    """C32: the parts of max_usd are fixed by the plan, the prices and the caps, so a study whose shards could not
     each run once is refused at load, naming campaign.toml."""
     with pytest.raises(ConfigError, match=r"campaign\.toml: \[shards\] per_model with \[budget\]: .*reservation"):
         by_model_copy(tmp_path, "poor", **{"max_usd = 0.00001": "max_usd = 0.0001"})
 
 
-def test_c31_a_shard_by_model_resumes_and_a_store_made_under_expcore_shard_2_still_resumes(tmp_path, study):
-    """C31: each store resumes under the rule it pinned; a campaign without [shards] keeps expcore-shard/2."""
+def test_c32_a_shard_by_model_resumes_and_a_store_made_under_expcore_shard_2_still_resumes(tmp_path, study):
+    """C32: each store resumes under the rule it pinned; a campaign without [shards] keeps expcore-shard/2."""
     run_study(study, shard=FIRST)
     run_study(study, shard=FIRST)
     assert json.loads(meta_of(study)[META_SHARD])["rule"] == RULE

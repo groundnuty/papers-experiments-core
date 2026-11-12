@@ -104,8 +104,8 @@ SHARDED = (
 )
 
 
-def test_c31_shards_per_model_is_read_in_declared_order_and_enters_the_caps_only_when_declared(tmp_path):
-    """C31: the layout keeps the order the file declares (m-b's shards come first), as a list the fingerprint's
+def test_c32_shards_per_model_is_read_in_declared_order_and_enters_the_caps_only_when_declared(tmp_path):
+    """C32: the layout keeps the order the file declares (m-b's shards come first), as a list the fingerprint's
     canonical text cannot sort; a campaign without [shards] has the caps it always had."""
     campaign = load(tmp_path, SHARDED)
     assert campaign.shards == ModelShards((("m-b", 2), ("m-a", 3)))
@@ -128,20 +128,20 @@ def test_c31_shards_per_model_is_read_in_declared_order_and_enters_the_caps_only
     ],
     ids=["above its unit's cap", "above its own cap", "zero", "not a number", "one left out", "unknown", "misspelt"],
 )
-def test_c31_a_shard_count_that_cannot_work_is_refused_at_load_naming_the_key(tmp_path, old, new, fragments):
-    """C31: each shard runs one run at a time, so a model's count is its concurrent sessions: above its unit's cap it
+def test_c32_a_shard_count_that_cannot_work_is_refused_at_load_naming_the_key(tmp_path, old, new, fragments):
+    """C32: each shard runs one run at a time, so a model's count is its concurrent sessions: above its unit's cap it
     is refused; every model of the plan needs a count of at least 1."""
     refused(tmp_path, SHARDED.replace(old, new, 1), *fragments)
 
 
-def test_c31_the_models_of_one_unit_are_held_to_its_cap_together(tmp_path):
-    """C31: two models on one unit share its cap, so their shard counts are summed against it."""
+def test_c32_the_models_of_one_unit_are_held_to_its_cap_together(tmp_path):
+    """C32: two models on one unit share its cap, so their shard counts are summed against it."""
     text = SHARDED + '\n[endpoints.m-b]\nunit = "pool"\n'  # m-b counts in pool too
     refused(tmp_path, text, "'m-b'", "with the other models of unit pool gives m-b 2 + m-a 3 = 5 shards", "pool = 3")
 
 
-def test_c31_a_unit_without_a_cap_takes_any_count_but_a_layout_needs_two_shards(tmp_path):
-    """C31: an uncapped unit has nothing to exceed; one shard in all is not a sharded campaign."""
+def test_c32_a_unit_without_a_cap_takes_any_count_but_a_layout_needs_two_shards(tmp_path):
+    """C32: an uncapped unit has nothing to exceed; one shard in all is not a sharded campaign."""
     assert load(tmp_path, SHARDED.replace("pool = 3\n", "").replace("m-a = 3 }", "m-a = 40 }")).shards.count == 42
     one = SHARDED.replace('models = ["m-a", "m-b"]', 'models = ["m-a"]').replace("m-b = 2, m-a = 3", "m-a = 1")
     refused(tmp_path, one.replace("per_model_usd = { m-a = 2.5 }", ""), "'per_model'", "sums to 1", "at least 2")

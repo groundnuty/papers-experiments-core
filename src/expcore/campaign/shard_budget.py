@@ -1,5 +1,5 @@
 # Provenance: new
-"""The budget of a campaign that shards by model (`expcore-shard/3`, #154, C30, C31): who gets which dollars.
+"""The budget of a campaign that shards by model (`expcore-shard/3`, #154, C30, C32): who gets which dollars.
 
 Under `expcore-shard/2` every shard runs every model, so an equal share of each ceiling is fair. Under
 `expcore-shard/3` a shard runs one model, and the models cost very different amounts, so:

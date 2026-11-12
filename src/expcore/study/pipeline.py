@@ -301,7 +301,7 @@ def _shard_of(
 ) -> tuple[Manifest, SchedulerConfig, ShardStart]:
     """A shard's part of the plan, its shares of the caps and the budget and the identity it runs against.
 
-    A campaign that declares `[shards] per_model` shards by model (`expcore-shard/3`, C31): the command line's spec
+    A campaign that declares `[shards] per_model` shards by model (`expcore-shard/3`, C32): the command line's spec
     takes that rule, and its N must be the layout's sum. Every refusal is made here, before the store is opened: an N
     that is not the sum, a shard with no run, a shard holding pairs of a model whose concurrency share is 0 (the
     message names the model), a total smaller than the number of shards (the message names the key), a budget that

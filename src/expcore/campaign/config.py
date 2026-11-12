@@ -31,7 +31,7 @@ The file is validated when it is loaded, with messages that name the file and th
     unit = "pool-a"
     base_url = "https://llm.example.test/v1"
 
-    [shards]                      # optional: shard by model first, `expcore-shard/3` (C31)
+    [shards]                      # optional: shard by model first, `expcore-shard/3` (C32)
     per_model = { model-a = 2, model-b = 1 }
 
 `[shards] per_model` gives every model of the plan, in the order its shards take, how many shards serve it; N is the
@@ -85,7 +85,7 @@ class CampaignConfig:
     agent: AgentConfig
     scheduler: SchedulerConfig
     endpoints: Mapping[str, Endpoint] = field(default_factory=dict)
-    shards: ModelShards | None = None  # `[shards] per_model`: shard by model first (C31)
+    shards: ModelShards | None = None  # `[shards] per_model`: shard by model first (C32)
 
     def caps(self) -> dict[str, Any]:
         """The campaign-wide caps as plain data, for the fingerprint: the loop's, the attempt limit and the budget, and
@@ -186,7 +186,7 @@ def _endpoints(root: Section, models: tuple[str, ...]) -> dict[str, Endpoint]:
 def _shards(
     root: Section, models: tuple[str, ...], scheduler: SchedulerConfig, endpoints: Mapping[str, Endpoint]
 ) -> ModelShards | None:
-    """`[shards] per_model`, in declared order; every model of the plan once, and no unit past its cap (C31)."""
+    """`[shards] per_model`, in declared order; every model of the plan once, and no unit past its cap (C32)."""
     if "shards" not in root.data:
         return None
     section = _table(root, "shards")

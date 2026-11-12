@@ -16,7 +16,7 @@ replay check (`study.merge`) last:
 1. every shard is sharded, under the same rule and count, with indices exactly 1..N and distinct labels;
 2. every shard has the same campaign fingerprint, which a start pins whole, so the same experiment;
 3. the shards' run sets are disjoint, and every run belongs to its shard under their rule's assignment of the whole
-   plan (`assign()`, or by model with the `[shards]` layout of their fingerprint, C31);
+   plan (`assign()`, or by model with the `[shards]` layout of their fingerprint, C32);
 4. the union of the run sets is exactly the plan, so no run is missing and none is extra;
 5. each shard passes the replay check `python -m expcore check` performs on a batch;
 6. every shard records the same environment identity.

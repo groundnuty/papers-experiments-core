@@ -1,4 +1,4 @@
-"""The budget of a campaign that shards by model (`expcore-shard/3`, #154): who gets which dollars (C30, C31)."""
+"""The budget of a campaign that shards by model (`expcore-shard/3`, #154): who gets which dollars (C30, C32)."""
 
 from decimal import Decimal
 from fractions import Fraction
@@ -46,8 +46,8 @@ def total_micro(parts) -> int:
     return sum(micro_usd(part["max_usd"]) for part in parts.values())
 
 
-def test_c31_a_runs_reservation_is_the_larger_of_its_bounds_with_and_without_the_reply_maximum():
-    """C31: which bound the gate uses is known only after admission, so a share is held to the larger one."""
+def test_c32_a_runs_reservation_is_the_larger_of_its_bounds_with_and_without_the_reply_maximum():
+    """C32: which bound the gate uses is known only after admission, so a share is held to the larger one."""
     spec = MODELS["model-falcon"]
     both = [bound_usd(spec, LIMITS, reply_capped=capped) for capped in (False, True)]
     assert reservation_usd(spec, LIMITS) == max(both) > 0
@@ -55,8 +55,8 @@ def test_c31_a_runs_reservation_is_the_larger_of_its_bounds_with_and_without_the
     assert reservation_usd(model("model-plover", None), LIMITS) is None
 
 
-def test_c31_max_usd_is_split_over_the_priced_shards_by_their_reserved_bound_and_free_shards_get_nothing():
-    """C31: each priced shard's part of `max_usd` follows its planned runs times its model's reservation, in whole
+def test_c32_max_usd_is_split_over_the_priced_shards_by_their_reserved_bound_and_free_shards_get_nothing():
+    """C32: each priced shard's part of `max_usd` follows its planned runs times its model's reservation, in whole
     micro-dollars rounded down, so the parts sum to at most the total; the free model's shards get 0."""
     parts = shard_budgets(Budget(50.0), LAYOUT, plan(), MODELS, LIMITS)
     runs = planned_runs(plan(), LAYOUT)
@@ -72,8 +72,8 @@ def test_c31_max_usd_is_split_over_the_priced_shards_by_their_reserved_bound_and
 
 
 @pytest.mark.parametrize("max_usd", [3.0, 7.25, 50.0, 1234.567891])
-def test_c31_the_parts_of_max_usd_never_sum_past_it_and_no_priced_shard_is_below_one_run(max_usd):
-    """C31: whatever the total, the parts are within it, and each priced shard can pay for at least one run."""
+def test_c32_the_parts_of_max_usd_never_sum_past_it_and_no_priced_shard_is_below_one_run(max_usd):
+    """C32: whatever the total, the parts are within it, and each priced shard can pay for at least one run."""
     parts = shard_budgets(Budget(max_usd), LAYOUT, plan(), MODELS, LIMITS)
     assert sum(Decimal(str(part["max_usd"])) for part in parts.values()) <= Decimal(str(max_usd))
     for index, part in parts.items():
@@ -81,15 +81,15 @@ def test_c31_the_parts_of_max_usd_never_sum_past_it_and_no_priced_shard_is_below
         assert part["max_usd"] == 0.0 if name == "model-osprey" else part["max_usd"] >= reserve(name)
 
 
-def test_c31_a_max_usd_too_small_for_every_priced_shard_to_run_once_is_refused():
-    """C31: the five priced shards together need one run's reservation each."""
+def test_c32_a_max_usd_too_small_for_every_priced_shard_to_run_once_is_refused():
+    """C32: the five priced shards together need one run's reservation each."""
     need = 3 * reserve("model-falcon") + 2 * reserve("model-heron")
     with pytest.raises(ShardError, match=r"less than one run's reservation for each of the 5 shards of priced models"):
         shard_budgets(Budget(need * 0.99), LAYOUT, plan(), MODELS, LIMITS)
 
 
-def test_c31_a_priced_shard_below_one_runs_reservation_is_refused_even_when_the_total_would_cover_every_shard():
-    """C31: a model of 20 shards of one pair each beside a model of one shard of 20 pairs: a total of exactly one run
+def test_c32_a_priced_shard_below_one_runs_reservation_is_refused_even_when_the_total_would_cover_every_shard():
+    """C32: a model of 20 shards of one pair each beside a model of one shard of 20 pairs: a total of exactly one run
     per shard goes mostly to the large shard, by its reserved bound, and leaves each small one less than a run."""
     layout = ModelShards((("model-falcon", 20), ("model-heron", 1)))
     models = {name: MODELS[name] for name in ("model-falcon", "model-heron")}
@@ -98,15 +98,15 @@ def test_c31_a_priced_shard_below_one_runs_reservation_is_refused_even_when_the_
         shard_budgets(Budget(need + 0.001), layout, plan(tuple(models)), models, LIMITS)
 
 
-def test_c31_a_model_whose_price_is_unknown_is_refused_naming_it():
-    """C31: what its runs reserve is unknown, so no part of the money can be set for its shards."""
+def test_c32_a_model_whose_price_is_unknown_is_refused_naming_it():
+    """C32: what its runs reserve is unknown, so no part of the money can be set for its shards."""
     models = {**MODELS, "model-osprey": model("model-osprey", None)}
     with pytest.raises(ShardError, match="model model-osprey has no price and is not marked free"):
         shard_budgets(Budget(50.0), LAYOUT, plan(), models, LIMITS)
 
 
-def test_c31_a_models_ceiling_is_split_over_its_own_shards_and_a_ceiling_of_zero_holds_each_of_them():
-    """C31: a shard keeps only its own model's ceiling, its part of it; 0 holds the model in every one of its shards."""
+def test_c32_a_models_ceiling_is_split_over_its_own_shards_and_a_ceiling_of_zero_holds_each_of_them():
+    """C32: a shard keeps only its own model's ceiling, its part of it; 0 holds the model in every one of its shards."""
     budget = Budget(50.0, {"model-falcon": 20.0, "model-heron": 0})
     parts = shard_budgets(budget, LAYOUT, plan(), MODELS, LIMITS)
     falcon = [parts[i]["per_model_usd"] for i in (1, 2, 3)]
@@ -116,15 +116,15 @@ def test_c31_a_models_ceiling_is_split_over_its_own_shards_and_a_ceiling_of_zero
     assert [parts[i]["per_model_usd"] for i in (6, 7)] == [{}, {}]
 
 
-def test_c31_a_models_ceiling_whose_part_cannot_pay_for_one_run_is_refused():
-    """C31: a ceiling above 0 whose part is below one run would hold that shard before its first run."""
+def test_c32_a_models_ceiling_whose_part_cannot_pay_for_one_run_is_refused():
+    """C32: a ceiling above 0 whose part is below one run would hold that shard before its first run."""
     budget = Budget(50.0, {"model-heron": reserve("model-heron") * 1.5})
     with pytest.raises(ShardError, match=r"\(model model-heron\) gets .* of \[budget.per_model_usd\] model-heron"):
         shard_budgets(budget, LAYOUT, plan(), MODELS, LIMITS)
 
 
-def test_c31_a_campaign_of_free_models_only_gives_every_shard_nothing_and_is_not_refused():
-    """C31: no shard is priced, so none needs a reservation and none gets dollars."""
+def test_c32_a_campaign_of_free_models_only_gives_every_shard_nothing_and_is_not_refused():
+    """C32: no shard is priced, so none needs a reservation and none gets dollars."""
     models = {"model-osprey": MODELS["model-osprey"], "model-plover": model("model-plover", None, free=True)}
     layout = ModelShards((("model-osprey", 1), ("model-plover", 1)))
     parts = shard_budgets(Budget(1.0), layout, plan(tuple(models)), models, LIMITS)

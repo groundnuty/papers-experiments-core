@@ -16,7 +16,7 @@ only on the plan and N, so every host computes the same one; it depends on the w
 cannot grow on resume. Inside a shard the runs keep their plan order (C08) and their place in the whole plan, so a
 merge can take the union.
 
-**A campaign may shard by model first (C31, `RULE_BY_MODEL`, `expcore-shard/3`).** When one federation serves one
+**A campaign may shard by model first (C32, `RULE_BY_MODEL`, `expcore-shard/3`).** When one federation serves one
 concurrent run, N is the number of concurrent runs, far above a model's concurrent sessions, and the rule above would
 deal every model's pairs to shards that get none of its sessions. `[shards] per_model = { model-a = 20, model-b = 6 }`
 in `campaign.toml` (`ModelShards`, in the campaign fingerprint every shard shares) fixes N as the sum and maps shard i
@@ -57,7 +57,7 @@ RULE_BY_MODEL = (
     "expcore-shard/3: shards by model in the declared order of [shards] per_model; per model, pairs ranked by "
     "sha256(json [task, model, seed]), dealt round its own shards"
 )
-"""The rule of a campaign that declares `[shards] per_model` (C31): every shard serves one model."""
+"""The rule of a campaign that declares `[shards] per_model` (C32): every shard serves one model."""
 RULES = (RULE, RULE_BY_MODEL)
 """The rules this core partitions by and reads back."""
 SHARDS_CAP = "shards"
@@ -187,7 +187,7 @@ def in_shard(factors: Mapping[str, Any], spec: ShardSpec, assignment: Mapping[tu
 
 @dataclass(frozen=True)
 class ModelShards:
-    """`[shards] per_model`: the plan's models in declared order, each with how many shards serve it (C31).
+    """`[shards] per_model`: the plan's models in declared order, each with how many shards serve it (C32).
 
     The order is kept as a sequence, never as a mapping whose keys a canonical text would sort, so every host maps
     shard i to the same model. N is the sum, at least 2; each count is at least 1.
@@ -242,7 +242,7 @@ def layout_of(fingerprint: Mapping[str, Any]) -> ModelShards | None:
 
 
 def assign_by_model(pairs: Iterable[tuple[str, str, int]], layout: ModelShards) -> dict[tuple[str, str, int], int]:
-    """The 1-based shard of every pair of the whole plan under `expcore-shard/3` (C31).
+    """The 1-based shard of every pair of the whole plan under `expcore-shard/3` (C32).
 
     Each model's pairs are dealt among that model's own shards as `assign` deals pairs among all shards (ranked by
     SHA-256, from a start the model's hash picks), offset by the model's first shard. A model of the plan without a

@@ -80,7 +80,7 @@ def shard_manifest(manifest: Manifest, spec: ShardSpec, layout: ModelShards | No
     """Return the runs of shard `spec`, each keeping its place in the whole plan and the plan's order (C28, C08).
 
     The partition is assigned from the whole plan, pair by pair, under the spec's rule (by model with the campaign's
-    `[shards]` `layout`, C31), and then each run is kept or dropped: no run is renumbered, so a merge can take the union
+    `[shards]` `layout`, C32), and then each run is kept or dropped: no run is renumbered, so a merge can take the union
     of the shards' runs in the one order the full plan has.
     """
     assignment = partition({pair_of(row.key.factors) for row in manifest.rows}, spec, layout)
@@ -217,7 +217,7 @@ def plan_problem(
     The plan is every condition x task x model x seed of the fingerprint. A manifest that lists other runs would be a
     different experiment whatever the fingerprint says, so a start whose two disagree is refused. A shard's plan is the
     part of that one its pairs are assigned to, with the assignment made from the whole declared plan (C28) under the
-    shard's rule, by model with the `[shards]` layout the fingerprint declares (C31).
+    shard's rule, by model with the `[shards]` layout the fingerprint declares (C32).
     """
     keys = schema.expand(fingerprint["tasks"], fingerprint["models"], [int(seed) for seed in fingerprint["seeds"]])
     if shard is not None:

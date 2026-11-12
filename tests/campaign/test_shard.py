@@ -229,8 +229,8 @@ def test_c30_caps_and_budget_shares_over_all_shards_sum_within_the_totals():
 LAYOUT = ModelShards((("model-osprey", 3), ("model-falcon", 1), ("model-heron", 2)))
 
 
-def test_c31_shard_i_maps_to_a_model_and_its_place_among_that_models_shards_in_declared_order():
-    """C31: the models in declared order, never sorted, each taking as many shards as its count."""
+def test_c32_shard_i_maps_to_a_model_and_its_place_among_that_models_shards_in_declared_order():
+    """C32: the models in declared order, never sorted, each taking as many shards as its count."""
     assert LAYOUT.count == 6
     assert [LAYOUT.at(i) for i in range(1, 7)] == [
         ("model-osprey", 1, 3),
@@ -251,14 +251,14 @@ def test_c31_shard_i_maps_to_a_model_and_its_place_among_that_models_shards_in_d
     [(), (("model-falcon", 1),), (("model-falcon", 0), ("model-heron", 2)), (("model-falcon", 1), ("model-falcon", 1))],
     ids=["empty", "one shard", "a zero count", "a model twice"],
 )
-def test_c31_a_layout_no_campaign_can_shard_by_is_refused(per_model):
-    """C31: at least 2 shards, each model once with at least one shard."""
+def test_c32_a_layout_no_campaign_can_shard_by_is_refused(per_model):
+    """C32: at least 2 shards, each model once with at least one shard."""
     with pytest.raises(ShardError, match="per_model"):
         ModelShards(per_model)
 
 
-def test_c31_a_shard_serves_its_own_model_only_and_a_models_shards_differ_by_at_most_one_pair():
-    """C31: every pair of a model lands in one of that model's shards, balanced as expcore-shard/2 balances them."""
+def test_c32_a_shard_serves_its_own_model_only_and_a_models_shards_differ_by_at_most_one_pair():
+    """C32: every pair of a model lands in one of that model's shards, balanced as expcore-shard/2 balances them."""
     assignment = assign_by_model(PAIRS, LAYOUT)
     assert set(assignment) == set(PAIRS)
     for index in range(1, LAYOUT.count + 1):
@@ -275,8 +275,8 @@ def test_c31_a_shard_serves_its_own_model_only_and_a_models_shards_differ_by_at_
         assert {p: assignment[p] - first + 1 for p in mine} == assign(mine, count)  # the deal of expcore-shard/2
 
 
-def test_c31_a_pair_never_crosses_shards_under_the_rule_by_model():
-    """C31: every condition of one task, model and seed lands in one shard, each run in exactly one."""
+def test_c32_a_pair_never_crosses_shards_under_the_rule_by_model():
+    """C32: every condition of one task, model and seed lands in one shard, each run in exactly one."""
     assignment = assign_by_model(PAIRS, LAYOUT)
     specs = [ShardSpec(i, LAYOUT.count, f"shard-{i}", RULE_BY_MODEL) for i in range(1, LAYOUT.count + 1)]
     for task, model, seed, condition in itertools.product(TASKS, MODELS, SEEDS, ["cond-plain", "cond-other"]):
@@ -285,14 +285,14 @@ def test_c31_a_pair_never_crosses_shards_under_the_rule_by_model():
     assert assign_by_model(list(reversed(PAIRS)), LAYOUT) == assignment  # the same on every host, in any order
 
 
-def test_c31_a_model_of_the_plan_without_a_count_is_refused():
-    """C31: its pairs would be in no shard."""
+def test_c32_a_model_of_the_plan_without_a_count_is_refused():
+    """C32: its pairs would be in no shard."""
     with pytest.raises(ShardError, match=r"model-heron.*no count"):
         assign_by_model(PAIRS, ModelShards((("model-osprey", 1), ("model-falcon", 1))))
 
 
-def test_c31_the_partition_follows_the_specs_rule_and_refuses_a_spec_that_does_not_fit_the_layout():
-    """C31: expcore-shard/2 assigns as it did; /3 needs the layout, with N its sum; /2 is refused beside a layout."""
+def test_c32_the_partition_follows_the_specs_rule_and_refuses_a_spec_that_does_not_fit_the_layout():
+    """C32: expcore-shard/2 assigns as it did; /3 needs the layout, with N its sum; /2 is refused beside a layout."""
     two, three = ShardSpec(1, 6, "shard-1"), ShardSpec(1, 6, "shard-1", RULE_BY_MODEL)
     assert partition(PAIRS, two, None) == assign(PAIRS, 6)
     assert partition(PAIRS, three, LAYOUT) == assign_by_model(PAIRS, LAYOUT)
@@ -304,8 +304,8 @@ def test_c31_the_partition_follows_the_specs_rule_and_refuses_a_spec_that_does_n
         partition(PAIRS, ShardSpec(1, 5, "shard-1", RULE_BY_MODEL), LAYOUT)
 
 
-def test_c31_a_spec_of_either_rule_round_trips_and_the_command_lines_spec_takes_the_rule_by_model():
-    """C31: a store pinned under expcore-shard/2 still reads back; `by_model` keeps the index, the count and the label,
+def test_c32_a_spec_of_either_rule_round_trips_and_the_command_lines_spec_takes_the_rule_by_model():
+    """C32: a store pinned under expcore-shard/2 still reads back; `by_model` keeps the index, the count and the label,
     a wide one included, and refuses an N that is not the layout's sum."""
     for rule in RULES:
         spec = ShardSpec(2, 6, "rack.b", rule, wide_label=True)
@@ -316,8 +316,8 @@ def test_c31_a_spec_of_either_rule_round_trips_and_the_command_lines_spec_takes_
         by_model(ShardSpec.parse("2/4"), LAYOUT)
 
 
-def test_c31_a_fingerprint_without_a_layout_declares_none():
-    """C31: the layout is read from the fingerprint's caps, where a campaign without [shards] has none."""
+def test_c32_a_fingerprint_without_a_layout_declares_none():
+    """C32: the layout is read from the fingerprint's caps, where a campaign without [shards] has none."""
     assert layout_of({"caps": {"max_attempts": 3}}) is None
     assert layout_of({"caps": {"max_attempts": 3, "shards": LAYOUT.to_json()}}) == LAYOUT
     with pytest.raises(ShardError):
