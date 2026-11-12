@@ -85,7 +85,11 @@ def add_users(federation: FakeFederation) -> None:
 
 
 def make_federation(
-    *, clock: Callable[[], float] | None = None, error_shape: str = ERRORS_25_0, visibility_delay_s: float = 0.0
+    *,
+    clock: Callable[[], float] | None = None,
+    error_shape: str = ERRORS_25_0,
+    visibility_delay_s: float = 0.0,
+    delete_delay_s: float = 0.0,
 ) -> FakeData:
     """Return the federation the default `platform.toml` describes, as a `FakeData`.
 
@@ -93,11 +97,17 @@ def make_federation(
     and that does not support it yet, and the three users, who can log in and read. Its jobs' times and its providers'
     `Date` headers come from `clock` (a `Ticker`'s `clock`, say), and so does the visibility delay: a new file shows on
     the provider it was not made on after `visibility_delay_s` seconds of it. `error_shape` is the data API's error
-    shape (`ERRORS_25_0`, or `ERRORS_LEGACY` for the older 404 shape, which no live version is known to give). The
-    platform layer reads the admin credential from the environment variable `ADMIN_ENV`: a test sets it to
-    `fake.admin_token`.
+    shape (`ERRORS_25_0`, or `ERRORS_LEGACY` for the older 404 shape, which no live version is known to give).
+    `delete_delay_s` keeps a delete under way for that many seconds of `clock` after it is answered (`FakeData`,
+    "Pending deletes"); 0, the default, finishes it at once. The platform layer reads the admin credential from the
+    environment variable `ADMIN_ENV`: a test sets it to `fake.admin_token`.
     """
-    federation = FakeData(space_name=SPACE_NAME, error_shape=error_shape, visibility_delay_s=visibility_delay_s)
+    federation = FakeData(
+        space_name=SPACE_NAME,
+        error_shape=error_shape,
+        visibility_delay_s=visibility_delay_s,
+        delete_delay_s=delete_delay_s,
+    )
     if clock is not None:
         federation.clock = clock
     federation.add_provider(BETA_ID, "beta.test", supports=False)

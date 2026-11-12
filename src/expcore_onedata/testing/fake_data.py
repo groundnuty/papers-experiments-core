@@ -28,6 +28,16 @@ Answer = tuple[int, str | None, str | None]  # (status, error id, errno); an err
 LISTING_END_FACTS = "deploy/compose-federation/day0/2026-11-12-federation-facts-listing-end.md"
 _LAST_PAGE_TOKEN = "end-"  # how this fake marks the token a last children page carries, to refuse the page after it
 
+# Where what `FakeData` answers while a delete is under way (`delete_delay_s`) was recorded on Onedata 25.0: a deleted
+# entry reading as 400 posix/enoent with its parent link kept (the first), another provider's directory sizes following
+# a delete about 5 s later (the second), and a directory delete finishing after the call returns, taking the files of a
+# directory made again under its name (the third, a module docstring and not a dated fact; #29).
+DELETE_FACTS = (
+    "deploy/compose-federation/day0/2026-11-10-federation-facts-parent-walk.md",
+    "deploy/compose-federation/day0/2026-11-11-federation-facts-posix-and-fuse.md",
+    "deploy/compose-federation/fedcontent.py",
+)
+
 # What each shape sets: how an entry that is not there, one a reader does not show yet, a space root not there yet and
 # a read-only write are answered, whether a deleted entry's parent link still reads, and whether an upload must say it
 # is an octet stream. A test may set any of these attributes after the shape, to bend one answer.
@@ -92,6 +102,19 @@ class Transfer:
         return "ended" if self.ended else "waiting" if self.waiting else "ongoing"
 
 
+@dataclass
+class _Deleting:
+    """A delete that was answered and has not landed: the entry, where it stood, the provider the DELETE went to and
+    when it lands (on `clock`)."""
+
+    file_id: str
+    parent: str | None
+    name: str
+    kind: str
+    via: str
+    lands: float
+
+
 def _merge(blocks: list[list[int]]) -> list[list[int]]:
     """Merge overlapping or adjacent [offset, length] blocks."""
     merged: list[list[int]] = []
@@ -146,6 +169,26 @@ class FakeData(FakeFederation):
     each read of the file through that provider answers `unseen_answer` until they are used up; the listing is not
     counted and shows the file.
 
+    **Pending deletes** (`delete_delay_s`; the default 0 finishes every delete at once, everywhere, so nothing changes
+    for a test that does not set it). With a delay, a DELETE of a file or a directory is answered 204 and takes that
+    many seconds of `clock` to land (`land_deletes()` lands them without waiting), so a study can test that its code
+    waits before it uses the name again. In between, by what is recorded (`DELETE_FACTS`):
+
+    - Recorded. The provider the DELETE went to answers the entry, and what is under a directory, as a deleted one at
+      once (`missing_answer`), with a deleted file's `parent_id` still reading (`keep_deleted_parents`). A provider
+      finishes deleting a directory after the call returns, and a directory made again under the same name before then
+      loses its files when it does (the reason a federation reset never deletes a directory and makes it again). So
+      the create of the name is accepted there, and when the delete lands the files under the directory made again
+      go with it. Other providers' directory sizes were seen to follow a delete about 5 s late.
+    - Assumed, not recorded; a live check can confirm or correct each. (a) The providers the DELETE did not go to keep
+      showing the entry, in reads and listings, until it lands, and refuse its name (409, as for any taken name);
+      a second DELETE through them changes nothing. (b) Every provider lands it at once, after the one delay. (c) A
+      file's delete is late in the same way (a directory's is what was recorded), and a file's name made again loses
+      nothing. (d) The late removal of a directory takes files at any depth of the directory made again and no
+      directory. (e) A listing through the DELETE's provider already leaves out a directory still going (a deleted
+      file was seen gone from one). (f) A provider that still shows the old entry shows one made again beside it,
+      once the visibility delay lets it.
+
     **Error shapes**, chosen with `error_shape` and documented by the version each belongs to:
 
     - `ERRORS_25_0` (the default), as measured live on Onedata 25.0 (the dated facts in
@@ -175,7 +218,7 @@ class FakeData(FakeFederation):
     it), partial replication (a replication places the whole file, as Onedata's does), QoS requirements, file
     metadata other than the id, name, type, size and parent, storage backends beyond one per provider, concurrent
     writers, quotas, symbolic links, a token's space or interface caveats (only the read-only caveat is enforced, and
-    `enforce_readonly=False` turns that off), a delete that other providers show late (it shows everywhere at once),
+    `enforce_readonly=False` turns that off), a delete that other providers show late (unless `delete_delay_s` is set),
     the visibility delay for scheduling a transfer of a file the provider does not show yet (the job is accepted),
     eviction of part of a file (it removes all of a provider's blocks), other errors than those above, and any
     provider call that is not listed above.
@@ -198,6 +241,8 @@ class FakeData(FakeFederation):
       whose route contains the substring (to that provider, when named) fail with a connection reset;
     - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status;
     - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
+    - `delete_delay_s` (also a constructor argument): seconds of `clock` a delete stays under way after it is answered
+      (0: none); `land_deletes()` ends every one now (see "Pending deletes");
     - `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
       `readonly_answer` is how such a write is refused;
     - `unseen` (`(provider id, file id)` to reads) and `unseen_after_create` (provider id to reads, for every file made
@@ -234,11 +279,17 @@ class FakeData(FakeFederation):
     keep_deleted_parents: bool
     require_octet_stream: bool
 
-    def __init__(self, *, error_shape: str = ERRORS_25_0, visibility_delay_s: float = 0.0, **kwargs) -> None:
+    def __init__(
+        self, *, error_shape: str = ERRORS_25_0, visibility_delay_s: float = 0.0, delete_delay_s: float = 0.0, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self.error_shape = error_shape  # which version's error answers the data API gives: see ERROR_SHAPES
         self.visibility_delay_s = visibility_delay_s  # seconds of `clock` before a new entry shows on another provider
         self.visibility_delay_by_provider: dict[str, float] = {}  # provider id -> its own delay, over the one above
+        self.delete_delay_s = (
+            delete_delay_s  # seconds of `clock` a DELETE stays under way after it is answered (0: none)
+        )
+        self._deleting: dict[str, _Deleting] = {}  # entry id -> the delete of it that has not landed
         self.nodes: dict[str, Node] = {ROOT_ID: Node(ROOT_ID, "", "DIR", None)}
         self.blocks: dict[tuple[str, str], list[list[int]]] = {}
         self.pending: dict[tuple[str, str], list[list[int]]] = {}  # [offset, length, polls left]
@@ -388,8 +439,88 @@ class FakeData(FakeFederation):
         self._finish(transfer)
 
     # -- tree ------------------------------------------------------------------
-    def _child(self, parent: str, name: str) -> str | None:
-        return next((n.file_id for n in self.nodes.values() if n.parent == parent and n.name == name), None)
+    def _child(self, parent: str, name: str, provider: str | None = None) -> str | None:
+        """The id of the entry of that name under a parent, after the deletes that are due have landed. An entry whose
+        delete is under way is not found by the provider it was deleted through (nor by `None`, which is how a test's
+        helpers ask), and is found by the others, which still show it."""
+        self._settle_deletes()
+        found = (
+            n for n in self.nodes.values() if n.parent == parent and n.name == name and not self._left(n, provider)
+        )
+        return next((n.file_id for n in found), None)
+
+    def _left(self, node: Node, provider: str | None) -> bool:
+        """Tell whether an entry's delete is under way and `provider`, the one it was sent through, answers it gone."""
+        pending = self._deleting.get(node.file_id)
+        return pending is not None and (provider is None or pending.via == provider)
+
+    def _hidden(self, node: Node, provider: str) -> bool:
+        """Tell whether an entry, or a directory above it, was deleted through `provider` and is still going."""
+        if not self._deleting:
+            return False
+        current: Node | None = node
+        while current is not None:
+            if self._left(current, provider):
+                return True
+            current = self.nodes.get(current.parent) if current.parent is not None else None
+        return False
+
+    def _under(self, file_id: str) -> list[str]:
+        """The ids of an entry and of everything under it."""
+        ids = [file_id]
+        for child in [n.file_id for n in self.nodes.values() if n.parent == file_id]:
+            ids.extend(self._under(child))
+        return ids
+
+    def _remove(self, node: Node, provider: str) -> None:
+        """Delete an entry with what is under it: now, or, with a `delete_delay_s`, by answering it deleted through
+        `provider` at once and leaving it to the others until `delete_delay_s` has passed. A delete of an entry whose
+        own delete, or a directory above it, is already under way changes nothing."""
+        if self.delete_delay_s <= 0:
+            self._delete(node.file_id)
+            return
+        current: Node | None = node
+        while current is not None:
+            if current.file_id in self._deleting:
+                return
+            current = self.nodes.get(current.parent) if current.parent is not None else None
+        for member in self._under(node.file_id):  # a gone entry's parent link reads, as it does once the delete lands
+            self.deleted_parents[member] = self.nodes[member].parent
+        lands = self.clock() + self.delete_delay_s
+        self._deleting[node.file_id] = _Deleting(node.file_id, node.parent, node.name, node.kind, provider, lands)
+
+    def land_deletes(self) -> None:
+        """Land every delete that is under way now, without waiting for its time, as `end_transfer` ends a job."""
+        for pending in sorted(self._deleting.values(), key=lambda p: p.lands):
+            self._land(pending)
+
+    def _settle_deletes(self) -> None:
+        """Land the deletes whose time has come, in the order they fell due."""
+        if self._deleting:
+            now = self.clock()
+            for pending in sorted((p for p in self._deleting.values() if p.lands <= now), key=lambda p: p.lands):
+                self._land(pending)
+
+    def _land(self, pending: _Deleting) -> None:
+        """Finish a delete. A directory's late removal takes the files of a directory made again under its name since
+        (`FakeData`, "Pending deletes"); a file's, and a name made again that is a file, lose nothing."""
+        if pending.file_id not in self._deleting:  # taken with a directory above it that landed first
+            return
+        del self._deleting[pending.file_id]
+        if pending.kind == "DIR":
+            again = next(
+                (
+                    n.file_id
+                    for n in self.nodes.values()
+                    if (n.parent, n.name, n.kind) == (pending.parent, pending.name, "DIR")
+                    and n.file_id != pending.file_id
+                    and n.file_id not in self._deleting
+                ),
+                None,
+            )
+            for file_id in [i for i in self._under(again) if self.nodes[i].kind == "REG"] if again else []:
+                self._delete(file_id)
+        self._delete(pending.file_id)
 
     def _create(self, parent: str, name: str, kind: str, origin: str | None = None) -> str:
         file_id = f"fid-{next(self._ids):04d}{self.id_suffix}"
@@ -417,6 +548,7 @@ class FakeData(FakeFederation):
         for child in [n.file_id for n in self.nodes.values() if n.parent == file_id]:
             self._delete(child)
         self.deleted_parents[file_id] = self.nodes[file_id].parent
+        self._deleting.pop(file_id, None)
         del self.nodes[file_id]
         for table in (self.blocks, self.pending):
             for key in [k for k in table if k[0] == file_id]:
@@ -513,13 +645,14 @@ class FakeData(FakeFederation):
             and any(c.get("type") == "data.readonly" for c in issued["caveats"])
         ):
             return self._answer(self.readonly_answer)
+        self._settle_deletes()
         found = re.fullmatch(r"/spaces/([^/]+)", route)
         if found and method == "GET":
             return self._space_root(found.group(1))
         found = re.fullmatch(r"/data/([^/]+)(/children|/content|/distribution)?", route)
         if found:
             node = self.nodes.get(found.group(1))
-            if node is None:
+            if node is None or self._hidden(node, provider):  # a delete through this provider that is under way: gone
                 return self._missing(found.group(1), query, method)
             if not self._shown(node, provider):  # this provider does not see the new entry yet
                 return self._answer(self.unseen_answer)
@@ -532,7 +665,7 @@ class FakeData(FakeFederation):
                 if self.fail_deletes:
                     return self._error(500, "internalServerError")
                 if not self.ignore_deletes:
-                    self._delete(node.file_id)
+                    self._remove(node, provider)
                 return httpx.Response(204)
             if part == "/children" and method == "GET":
                 return self._list(node, query, provider)
@@ -595,7 +728,11 @@ class FakeData(FakeFederation):
         limit = min(int(query.get("limit", self.page_size)), self.page_size)
         if limit < 1:
             return self._error(400, "badValueNotInRange")
-        shown = (n for n in self.nodes.values() if n.parent == node.file_id and self._visible(n, provider))
+        shown = (
+            n
+            for n in self.nodes.values()
+            if n.parent == node.file_id and self._visible(n, provider) and not self._left(n, provider)
+        )
         children = sorted(shown, key=lambda n: n.name)
         start = int(token or "0")
         page = children[start : start + limit]
@@ -612,7 +749,7 @@ class FakeData(FakeFederation):
         name, kind = query.get("name"), query.get("type")
         if parent.kind != "DIR" or not name or kind not in ("REG", "DIR"):
             return self._error(400, "badValueNotAllowed")
-        if self._child(parent.file_id, name) is not None:
+        if self._child(parent.file_id, name, provider) is not None:
             return self._error(409, "posix")
         return httpx.Response(201, json={"fileId": self._create(parent.file_id, name, kind, provider)})
 
