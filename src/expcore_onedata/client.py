@@ -75,7 +75,8 @@ deployments of record run, on the Compose federation of `deploy/compose-federati
 record was read directly, since no live test ran one), `day0/2026-11-10-federation-facts-parent-walk.md`, the run
 after the gate's walk by parent links, with the reads that walk rests on and the posix answers of 25.0, and
 `day0/2026-11-11-federation-facts-posix-and-fuse.md`, the run after the core read those answers, and
-`day0/2026-11-11-federation-facts.md`, the direct reads of a transfer's record and of a directory's eviction.
+`day0/2026-11-11-federation-facts.md`, the direct reads of a transfer's record and of a directory's eviction, and
+`day0/2026-11-12-federation-facts-listing-end.md`, how a children listing and a transfer listing end (O26).
 
 - Authentication: the header `X-Auth-Token` with an access token. Confirmed by [S2].
 - `get`: `GET /spaces/{space}/users/{user}/privileges` and `GET /spaces/{space}/effective_users/{user}/privileges`; the
@@ -99,14 +100,17 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   or `evictingProviderId`) and `GET /transfers/{id}`. `read_range` is `GET /data/{id}/content` with a `Range` header,
   answered with a 206 and a `Content-Range`. `content_answer` is the same call whole or with `Range: bytes=0-0`, of
   which only the status and the `Content-Type` are read: the type it measures (`precampaign.py`),
-  `application/octet-stream` for both, is confirmed by [L1].
+  `application/octet-stream` for both, is confirmed by [L1]. `read_content` is a run of range reads, each streamed and
+  hashed as it comes (O25).
+- A write of content without the `offset` query, which truncates the file first and which a restarted upload relies
+  on: only the provider's API description states it, and no source sends it; see `UNVERIFIED_ENDPOINTS`.
 - `file_space_id`: `GET /data/{id}` with the query `attribute=parent_id`, answered `{"parent_id": <id>}`, and
   `{"parent_id": null}` for a space's root. Confirmed by [L1] (a file two levels down, its directory and the root, on
   each of the three providers), which also refuted the `path` attribute the gate read before: [S9], the earlier
   study's mock of what the official client calls, answered it as `/{space name}/...`, and Onedata 25.0 answers
   `attribute=path` with 400 `badValueNotAllowed`. No release at hand answers it, so the gate no longer asks for it.
 - The probes' transfer log (`transferlog.py`) reads `GET /spaces/{space}/transfers` on a provider (query `state`,
-  `limit`, `page_token`; answer `transfers`, a list of ids, and `nextPageToken`, followed until empty), confirmed by
+  `limit`, `page_token`; answer `transfers`, a list of ids, and `nextPageToken`, followed until null), confirmed by
   [S10] for the states `ongoing` and `ended`, and each id's `GET /transfers/{id}`, whose `fileId` [S10] and state and
   counters [S11] are confirmed. The state `waiting`, the listing answer's `Date` header (`get_dated`, the provider's
   clock), and a record's `type`, provider ids and times (epoch seconds), for a replication and an eviction, are
@@ -128,18 +132,20 @@ after the gate's walk by parent links, with the reads that walk rests on and the
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
 which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
-[L1] confirms: only the reset's QoS calls and its cancel, since [L1] confirmed every other call the layer makes. Each
+[L1] confirms: only the reset's QoS calls and its cancel, and the truncation by a write of content without an offset,
+since [L1] confirmed every other call and detail the layer relies on. Each
 entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
 deployment answers otherwise.
 """
 
 import base64
+import hashlib
 import re
 import socket
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -148,6 +154,7 @@ from expcore.config.loading import ConfigError
 from expcore.records.redact import register_secret
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
+from expcore_onedata.streamed import Digest, media_type
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
 API_PROVIDER = "/api/v3/oneprovider"  # [S7]
@@ -162,8 +169,15 @@ READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_acc
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
 # their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
-# live run has made yet.
+# live run has made yet, and the truncating write of content an upload's restart relies on.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
+    (
+        "PUT",
+        "/data/{id}/content",
+        "a provider call: a write without the offset query truncates the file to the bytes it sends, which a "
+        "restarted upload relies on; named only by the provider's API description (25.0), and every source sends an "
+        "offset [S8]",
+    ),
     (
         "DELETE",
         "/transfers/{id}",
@@ -203,6 +217,7 @@ _CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 _FILE_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a file's object id: one plain path segment
 _SPACE_ID = re.compile(r"[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}")  # one plain path segment, never "." or ".."
 DEFAULT_TIMEOUT_S = 15.0
+ERROR_BODY_BYTES = 64 * 1024  # the most of a streamed answer's error body read to find Onedata's error id
 
 
 class PlatformError(RuntimeError):
@@ -274,6 +289,17 @@ def answered_absent(error: PlatformError) -> bool:
     if isinstance(error, NotSent):
         return False
     return error.status == 404 or (error.status, error.code, error.errno) == POSIX_ABSENT
+
+
+def _streamed_error_fields(response: httpx.Response) -> tuple[str | None, str | None]:
+    """Return Onedata's error id and its POSIX errno from a streamed error answer, as `_error_fields` does, reading at
+    most `ERROR_BODY_BYTES` of it."""
+    body = b""
+    for piece in response.iter_bytes():
+        body += piece
+        if len(body) > ERROR_BODY_BYTES:
+            return None, None
+    return _error_fields(httpx.Response(response.status_code, content=body))
 
 
 def _check_path(path: str) -> str:
@@ -765,6 +791,7 @@ class OnezoneClient:
         timeout_s: float | None = None,
         token: str | None = None,
         space: Space | None = None,
+        content_type: str | None = None,
     ) -> Any:
         """Send a request that can change state; refuse it, before it is sent, unless it acts on a study space.
 
@@ -776,18 +803,19 @@ class OnezoneClient:
 
         It is sent with the admin credential, or as `token` when one is given: day-0 sends a write as a data-path token
         to see it refused. The gate applies either way, and is resolved with the admin credential. A raw body
-        (`content`) is sent as `UPLOAD_CONTENT_TYPE`, which Onedata 25.0 requires of a content write ([L1]: 415
-        without it). With `space` (a provisioner's, or its reset's, own space) the target must be that space alone: its
-        id, its name, and its own prefixes.
+        (`content`) is sent as `content_type`, a plain `type/subtype`, or as `UPLOAD_CONTENT_TYPE` when none is named,
+        since Onedata 25.0 requires one of a content write ([L1]: 415 without it). With `space` (a provisioner's, or its
+        reset's, own space) the target must be that space alone: its id, its name, and its own prefixes.
         """
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
+        media = UPLOAD_CONTENT_TYPE if content_type is None else media_type(content_type)
         self._base(provider)  # an undeclared provider is refused before anything is read
         self._require_in_scope(self._target(method, path, provider, json), space)
         headers = {AUTH_HEADER: token} if token is not None else dict(self._admin)
         if content is not None:
-            headers["Content-Type"] = UPLOAD_CONTENT_TYPE
+            headers["Content-Type"] = media
         return self._send(
             method,
             path,
@@ -842,6 +870,96 @@ class OnezoneClient:
         ):
             raise PlatformError(f"{label}: a range read was answered with another range than the one asked for")
         return body
+
+    def read_content(
+        self,
+        path: str,
+        *,
+        provider: str,
+        size: int,
+        chunk_bytes: int,
+        deadline_s: float,
+        sink: Callable[[bytes], None] | None = None,
+        timeout_s: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        space: Space | None = None,
+    ) -> Digest:
+        """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
+        size and the SHA-256 of what was read (O25).
+
+        Nothing holds the file: each range of at most `chunk_bytes` is a streamed GET whose pieces, as the connection
+        delivers them, are hashed, handed to `sink` when one is given, and dropped. Each range passes the gate of
+        `read_range`, the file's space read afresh before it, since a read through a provider that lacks the bytes
+        makes it fetch them; with `space`, that space alone, as for `mutate`.
+
+        Bounds. On bytes: every answer must be a 206 whose `Content-Range` is exactly the range asked for, of a file of
+        `size` bytes, carrying exactly that range's bytes; a byte more is refused as soon as it arrives. On time: the
+        deadline, `deadline_s` from the start, is checked before every range and after every piece, and no single wait
+        for the platform lasts longer than the smaller of `timeout_s` and what remains of the deadline, so the read
+        ends within twice the deadline whatever the platform does. A refusal raises PlatformError (OutOfScope before
+        anything is sent); what `sink` received by then is not the file. A file of no bytes needs no range, and its
+        space is still checked, so a read of a file outside the study never succeeds.
+        """
+        parts = _plain(path)
+        if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
+            raise OutOfScope("a content read is of /data/{id}/content only")
+        if size < 0 or chunk_bytes < 1 or not deadline_s > 0:
+            raise OutOfScope("a streamed read needs its bounds: a size of zero or more, a positive chunk and deadline")
+        path = _check_path(path)
+        base, label = self._base(provider)
+        hasher, began = hashlib.sha256(), clock()
+        late = f"{label}: a streamed read passed its deadline of {deadline_s:g} s"
+
+        def consume(piece: bytes) -> None:
+            hasher.update(piece)
+            if sink is not None:
+                sink(piece)
+            if clock() - began > deadline_s:
+                raise PlatformError(late)
+
+        if size == 0:
+            self._require_in_scope(self._target("GET", path, provider, None), space)
+        for first in range(0, size, chunk_bytes):
+            self._require_in_scope(self._target("GET", path, provider, None), space)
+            remaining = deadline_s - (clock() - began)
+            if remaining <= 0:
+                raise PlatformError(late)
+            wait = min(timeout_s if timeout_s is not None else self._timeout_s, remaining)
+            self._stream_range(base + path, label, (first, min(chunk_bytes, size - first), size), wait, consume)
+        return Digest(size, hasher.hexdigest())
+
+    def _stream_range(
+        self, url: str, label: str, span: tuple[int, int, int], wait: float, consume: Callable[[bytes], None]
+    ) -> None:
+        """Stream one range, `span` = (first byte, length, the file's size), to `consume` piece by piece; refuse an
+        answer that is not exactly that range of a file of that size."""
+        first, length, total = span
+        last = first + length - 1
+        got = 0
+        try:
+            with self._http.stream(
+                "GET", url, headers={**self._admin, "Range": f"bytes={first}-{last}"}, timeout=wait
+            ) as response:
+                status = response.status_code
+                if status >= 400:
+                    code, errno = _streamed_error_fields(response)
+                    raise PlatformError(
+                        _answered(label, "GET", status, code, errno), status=status, code=code, errno=errno
+                    )
+                found = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+                if status != 206 or found is None:
+                    raise PlatformError(f"{label}: a streamed read's range was not answered with a 206 and a range")
+                if tuple(int(found.group(i)) for i in (1, 2, 3)) != (first, last, total):
+                    raise PlatformError(f"{label}: a streamed read's range was answered with another range or size")
+                for piece in response.iter_bytes():
+                    got += len(piece)
+                    if got > length:
+                        raise PlatformError(f"{label}: a streamed read's range carried more bytes than it asked for")
+                    consume(piece)
+        except httpx.HTTPError as error:
+            raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
+        if got != length:
+            raise PlatformError(f"{label}: a streamed read's range carried fewer bytes than it asked for")
 
     def content_answer(
         self, path: str, *, provider: str, first_byte: bool, timeout_s: float | None = None

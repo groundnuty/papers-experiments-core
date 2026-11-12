@@ -486,3 +486,85 @@ def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_th
     assert record["stages"]["qos"]["removed"] >= 1
     assert record["stages"]["history"]["removable"] is False
     assert all(isinstance(stage["seconds"], float) for stage in record["stages"].values())
+
+
+# -- large files (issue #127) -----------------------------------------------------------------------------------------
+
+LARGE_FILE_BYTES = 40 << 20  # tens of MB: ten chunks of the size below, quick to move
+LARGE_FILE_CHUNK = 4 << 20
+
+
+def write_random(path, size, seed):
+    """Write `size` pseudo-random bytes, a MiB at a time, and return their SHA-256."""
+    import hashlib
+    import random
+
+    stream, hasher = random.Random(seed), hashlib.sha256()
+    with open(path, "wb") as handle:
+        for start in range(0, size, 1 << 20):
+            piece = stream.randbytes(min(1 << 20, size - start))
+            hasher.update(piece)
+            handle.write(piece)
+    return hasher.hexdigest()
+
+
+def copy_prefix(source, dest, size):
+    """Copy the first `size` bytes of `source` to `dest`, a MiB at a time, and return their SHA-256. A stream drawn
+    again with the same seed is no prefix: `randbytes` of a length that is not a multiple of four ends otherwise."""
+    import hashlib
+
+    hasher = hashlib.sha256()
+    with open(source, "rb") as reader, open(dest, "wb") as writer:
+        while size > 0:
+            piece = reader.read(min(1 << 20, size))
+            assert piece, "the source ended before the prefix"
+            hasher.update(piece)
+            writer.write(piece)
+            size -= len(piece)
+    return hasher.hexdigest()
+
+
+@MUTATE
+def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_back_by_its_hash(
+    config, client, tmp_path
+):
+    """O25: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
+    nothing, a shorter file over the longer target is written again from a write without an offset (which must
+    truncate it), and the streamed read gives each file's SHA-256. Everything is under a fresh scratch directory and
+    torn down; skipped without a [placement] table."""
+    # covers: PUT /data/{id}/content
+    import dataclasses
+    import secrets
+
+    from expcore.config.loading import ConfigError
+    from expcore_onedata.provision import Provisioner, resolve_provider_ids
+    from expcore_onedata.rangemap import load_placement
+
+    try:
+        placement = load_placement(PLATFORM, config)
+    except ConfigError:
+        pytest.skip("the large-file test needs a [placement] table, which platform.toml does not have")
+    settings = dataclasses.replace(placement.settings, chunk_bytes=LARGE_FILE_CHUNK)
+    provisioner = Provisioner(
+        client, config, settings, provider_ids=resolve_provider_ids(config), log=tmp_path / "changes.jsonl"
+    )
+    whole, prefix = tmp_path / "whole.bin", tmp_path / "prefix.bin"
+    whole_sha = write_random(whole, LARGE_FILE_BYTES, seed=127)
+    cut = 2 * LARGE_FILE_CHUNK + 4321  # ends inside a chunk, as a write cut part way leaves it
+    prefix_sha = copy_prefix(whole, prefix, cut)
+    path = f"expcore-live-{secrets.token_hex(6)}/large.bin"
+    try:
+        assert provisioner.upload(path, prefix).action == "created"
+        resumed = provisioner.upload(path, whole)
+        assert (resumed.action, resumed.sent_bytes) == ("resumed", LARGE_FILE_BYTES - cut)
+        assert (resumed.digest.size, resumed.digest.sha256) == (LARGE_FILE_BYTES, whole_sha)
+        assert provisioner.upload(path, whole).action == "skipped"
+        restarted = provisioner.upload(path, prefix)  # the target is longer, so only a truncating write fits it
+        assert (restarted.action, restarted.digest.sha256) == ("restarted", prefix_sha)
+        back = tmp_path / "back.bin"
+        found = provisioner.read_file(restarted.file_id, dest=back)
+        assert (found.size, found.sha256) == (cut, prefix_sha)
+        assert back.stat().st_size == cut
+    finally:
+        report = provisioner.teardown()
+    assert report.ok, report.left

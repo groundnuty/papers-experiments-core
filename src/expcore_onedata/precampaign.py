@@ -44,7 +44,7 @@ from expcore.campaign.healthgate import Health, HealthCheck, read_health
 from expcore_onedata import consistency
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
-from expcore_onedata.provision import LISTING_ATTRIBUTES, LISTING_LIMIT, listing_entry
+from expcore_onedata.provision import LISTING_ATTRIBUTES, LISTING_LIMIT, listing_entry, next_page_token
 from expcore_onedata.rangemap import safe_path
 from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.gateboundary import DATA_CONTENT_TYPE, streams
@@ -68,17 +68,14 @@ def _child(client: OnezoneClient, provider: str, directory: str, name: str) -> s
     params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
     while True:
         page = client.get(f"/data/{directory}/children", provider=provider, params=params)
-        if not isinstance(page, dict) or not isinstance(page.get("children"), list):
-            raise PlatformError("a listing answer holds no 'children'")
+        token = next_page_token(page)  # a page without its last-page marker is refused, never the end (O26)
         for item in page["children"]:
             entry = listing_entry(item)
             if entry.name == name:
                 return entry.file_id
-        if page.get("isLast", True):
+        if token is None:
             raise LookupError("the check file is not in the space")
-        if not page.get("nextPageToken"):
-            raise PlatformError("a listing is not on its last page but names no next page")
-        params = {**params, "token": page["nextPageToken"]}
+        params = {**params, "token": token}
 
 
 @dataclass(frozen=True)

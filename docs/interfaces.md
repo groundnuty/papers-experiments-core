@@ -619,6 +619,41 @@ Implementer (the platform layer) guarantees:
 
 Not carried over from the earlier study: the gate's whole-file mode, the tracer and its checks, the capacity probes tied to two data layouts, and the replication branch of its fourth condition. Its merged-listing mode is the complete listing above, written anew against this gate with bounds and checks the earlier one lacked.
 
+## The platform layer's files in and out
+
+`expcore_onedata.provision.Provisioner` puts a study's data into its space and reads it back; every write and every range read goes through `expcore_onedata.client.OnezoneClient`'s mutation gate, bound to the provisioner's space (`space`): the target file's space is found by its parent links and its live name read right before each request, and a target in any other space is refused unsent (O09). `Digest` and `Upload` are in `expcore_onedata.streamed`.
+
+```python
+class Provisioner:
+    def put_file(self, path: str, data: bytes, *, content_type: str = "application/octet-stream") -> str
+    def upload(self, path: str, source: Path | str, *, content_type: str = "application/octet-stream") -> Upload
+    def read_file(self, file_id: str, *, provider: str | None = None, dest: Path | str | None = None,
+                  size: int | None = None, deadline_s: float | None = None) -> Digest
+    def children(self, directory_id: str, provider: str | None = None, *, listings: Listings | None = None
+                 ) -> dict[str, Entry]
+
+class OnezoneClient:
+    def mutate(self, method: str, path: str, *, provider: str | None = None, json: Any = None,
+               params: Mapping[str, Any] | None = None, content: bytes | None = None, timeout_s: float | None = None,
+               token: str | None = None, space: Space | None = None, content_type: str | None = None) -> Any
+    def read_content(self, path: str, *, provider: str, size: int, chunk_bytes: int, deadline_s: float,
+                     sink: Callable[[bytes], None] | None = None, timeout_s: float | None = None,
+                     clock: Callable[[], float] = time.monotonic, space: Space | None = None) -> Digest
+
+@dataclass(frozen=True)
+class Digest:      # size: int, sha256: str (hex)
+@dataclass(frozen=True)
+class Upload:      # file_id: str, digest: Digest, action: "created" | "skipped" | "resumed" | "restarted", sent_bytes: int
+```
+
+`path` is relative to the space root; the provisioner works on its space's data provider (`holder` of its `[[spaces]]` entry, or `[placement] holder`).
+
+- **`put_file`** takes the content in memory, refuses a file already at the path, and verifies the size read back. It is for small files, a day-0 scratch file for one.
+- **`upload`** never holds the file: it reads and sends it `[placement] chunk_bytes` at a time, each chunk a PUT at its offset. A target that already holds the same size and SHA-256 is skipped with nothing sent, whoever created it, and stays out of the change log. One this provisioner created (the change log says so) that holds a strict prefix is resumed from where it ends by offset writes; any other it created is restarted from a write without an offset, which truncates it. A differing file it did not create is refused before anything is written (O09). The upload succeeds only when the size and the SHA-256 read back equal those of the bytes it read and sent; otherwise `ProvisionError`. Skipping or resuming reads the target back first, and verifying reads it again, so expect the bytes to cross the network about twice (O25).
+- **Every write of content carries `content_type`**, a plain `type/subtype`, `application/octet-stream` (`client.UPLOAD_CONTENT_TYPE`) unless named: Onedata 25.0 answers 415 to a write without one. Only `application/octet-stream` is confirmed on 25.0, and the fake federation refuses any other type.
+- **`read_file`** reads a file through `provider` (the data provider unless named; another provider is first waited on until it shows the file, `await_visible`) by ranges of `chunk_bytes`, each gated as a range read bound to the space (a read through a provider that lacks the bytes fetches them), streamed and hashed as it comes, and writes it to `dest` when one is given: to `<dest>.part`, moved into place only when the read is whole and removed when it fails. It is bounded in bytes by `size`, or by the size the file's attributes give, which every answer must match: each must be a 206 for exactly the range asked for, of a file of that size, with exactly its bytes. It is bounded in time by `deadline_s` (`[placement] transfer_timeout_s` unless given), checked before every range and after every piece, with no wait for the platform longer than `request_timeout_s` or what remains of the deadline. `OnezoneClient.read_content` is the same read for a caller with its own `sink`.
+- **A listing ends only on its last-page marker** (O26). A children page ends it only with a boolean `isLast` that is true, whatever its `nextPageToken`, and a page of the transfer listing only with `nextPageToken` null, with no `isLast` asked for; a page without the marker is refused (`PlatformError`, or `Unreadable` in the probes), never taken as the whole directory. These are the shapes measured on 25.0 (`deploy/compose-federation/day0/2026-11-12-federation-facts-listing-end.md`): a children page carries a token on the last page too, a full last page of either listing is followed by an empty one, and the page after a last children page answers 400 `posix` `eagain`. `provision.next_page_token(page)` reads a children page for any caller, and the testing module's fakes answer both listings so (`fake_data.LISTING_END_FACTS`).
+
 ## Estimator
 
 `expcore.stats.estimators`. A contrast names its estimator in `preregistration.toml` (`estimator = "..."`), with the estimator's parameters in `[estimators.<name>]`. The core registers one, `wilcoxon_cluster_bootstrap`.
@@ -758,6 +793,8 @@ def tool_plane_replicates(fake: FakeData, client: OnezoneClient, path: str, targ
 The names the default document and the federation share are `ADMIN_ENV` (the variable that holds the admin credential, which a test sets to `fake.admin_token`), `ALPHA_ID` and `BETA_ID` (the providers' ids), `SPACE_NAME` and `SPACE_PREFIX`, `USERS` (login to password and user id), `DATA_PATH_USER`, `TOOL_SERVER_USER` and `SERVICE_USER` (the three principals), `CREDENTIALS_DIR`, `BASELINE` and `MANAGE` (privilege sets), `NOW` and `CEILING_S` (the issuer's clock and a run's ceiling), `SETTINGS` (the `[placement]` table), `DATA` (4096 bytes whose every offset has its own value) and `TOOL_SERVER_ARGS` (the stand-in tool server's arguments after the interpreter).
 
 Two stand-in MCP servers are run, not imported, so importing the package does not load the MCP SDK: `python -m expcore_onedata.testing.fake_mcp_server --tools echo,add` is a real MCP stdio server with a small catalogue and a tool allow-list, and `python -m expcore_onedata.testing.fake_onedata_mcp` is the Onedata tool server's stand-in, configured by environment as the real one is (`TOOL_SERVER_ARGS` is its command line). Neither models the real server's tools.
+
+**Listings.** `FakeData` and `MockOnedata` end a children listing as Onedata 25.0 was measured to (`fake_data.LISTING_END_FACTS`, `deploy/compose-federation/day0/2026-11-12-federation-facts-listing-end.md`): every page has `nextPageToken`, `isLast` and `children`, in that order, with a token on the last page too; `isLast` is true only on a page shorter than its limit, so a page the last entries fill is followed by an empty last page; and the page after a last page answers 400 `posix` `eagain`. `FakeData`'s transfer listing gives a full page a token and the last page a null one, with no `isLast`, so a full page is followed by an empty one. A reader that stops on a missing or null token, or treats an empty last page as an error, fails against them as it would against 25.0.
 
 **Per-reader views.** A file or directory is made on one provider (`add_file`'s holder, or the provider a `POST` of children was sent to), and every other provider shows it only after `visibility_delay_s` seconds of the fake's `clock` (`visibility_delay_by_provider` gives one reader its own delay; the default is none). Until then that reader's reads of it answer as a deleted entry does, and its parent's listing leaves it out. The delay is counted on the fake's clock, which a test binds to a `Ticker`, so a test of a six-second delay takes no time. About 6 s was seen live on Onedata 25.0.
 

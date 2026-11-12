@@ -24,6 +24,10 @@ ERROR_SHAPES = (ERRORS_25_0, ERRORS_LEGACY)
 
 Answer = tuple[int, str | None, str | None]  # (status, error id, errno); an error id of None: a body no error object
 
+# Where the shapes of a complete listing were measured on Onedata 25.0: how a children page and a transfer page end.
+LISTING_END_FACTS = "deploy/compose-federation/day0/2026-11-12-federation-facts-listing-end.md"
+_LAST_PAGE_TOKEN = "end-"  # how this fake marks the token a last children page carries, to refuse the page after it
+
 # What each shape sets: how an entry that is not there, one a reader does not show yet, a space root not there yet and
 # a read-only write are answered, whether a deleted entry's parent link still reads, and whether an upload must say it
 # is an octet stream. A test may set any of these attributes after the shape, to bend one answer.
@@ -107,14 +111,16 @@ class FakeData(FakeFederation):
 
       GET    /spaces/{space}                        the space's root directory (ENOENT for `root_enoent_polls` calls)
       GET    /data/{id}                             attributes, `parent_id` among them; asked for a path, 400 as in 25.0
-      GET    /data/{id}/children                    paged by `limit` and `token`
+      GET    /data/{id}/children                    paged by `limit` and `token`, ending as 25.0's do
       POST   /data/{id}/children?name&type          create a file or a directory
-      PUT    /data/{id}/content?offset              write bytes; the writing provider holds them
+      PUT    /data/{id}/content?offset              write bytes; the writing provider holds them. Without `offset`
+                                                    the file is truncated first, as the API describes
       GET    /data/{id}/content  (Range)            206; a provider lacking the bytes fetches them on the fly
       GET    /data/{id}/distribution                the block map of every provider
       DELETE /data/{id}                             remove a file or a directory with what is under it
       POST   /transfers, GET /transfers/{id}        replication, eviction and migration jobs
-      GET    /spaces/{space}/transfers              the ids of the space's jobs in one state (`limit`, `page_token`)
+      GET    /spaces/{space}/transfers              the ids of the space's jobs in one state (`limit`, `page_token`),
+                                                    ending as 25.0's do
 
     and, from Onezone, `GET /spaces/{space}` (the live name). Time is counted in calls, and where a delay is in
     seconds it is seconds of the fake's own `clock`, never of the wall, so a test never waits.
@@ -124,6 +130,13 @@ class FakeData(FakeFederation):
     the bytes fetches them there, on the fly, and they show in its map after `fetch_lag` polls of the map. A
     replication places the whole file on its target, and an eviction removes all of the evicting provider's blocks of
     the file (a migration does both); no provider's map changes another's.
+
+    **Listings** end as Onedata 25.0's were measured to (`LISTING_END_FACTS`). A children page has the keys
+    `nextPageToken`, `isLast` and `children`, in that order: `isLast` is true only on a page shorter than its limit,
+    the token is a non-empty string on every page, the last included, so a page the directory's last entries fill is
+    followed by an empty page with `isLast` true, and the page after a last page answers 400 `posix` `eagain`. A
+    transfer page has `transfers` and `nextPageToken`, no `isLast`: the token is a string on a full page and null on
+    the last, so a full page is followed by an empty one with a null token.
 
     **Per-reader views.** A file or a directory is made on one provider, and every other provider shows it only
     after `visibility_delay_s` seconds of `clock` (`visibility_delay_by_provider` gives a reader its own; the default is
@@ -192,7 +205,11 @@ class FakeData(FakeFederation):
     - `missing_answer`: how a file or directory that is not there is answered; `keep_deleted_parents`: a deleted
       entry's `parent_id` still answers its old parent; `answer_missing_as_25(answer)` sets both, as 25.0 has them;
     - `require_octet_stream`: a content write (`PUT /data/{id}/content`) without `Content-Type:
-      application/octet-stream` is a 415;
+      application/octet-stream` is a 415; `content_types` lists the Content-Type of every content write, in order;
+    - `corrupt_writes`: True stores every write with its first byte inverted, so the content differs from what was sent;
+    - `writes_before_reset`: the content writes that succeed before the next one fails with a connection reset, and
+      every later one with it (None: never);
+    - `children_omit`, `children_fields`: keys every children page leaves out, and keys it answers with another value;
     - `content_type`: the Content-Type of a file's content, read whole or by range (None: the header is left out);
     - `clock`: the epoch seconds a job's schedule, start and finish times are taken from (a test binds its own);
     - `transfer_omit`: field names a job's record leaves out; `transfer_list_body`: an answer that replaces the
@@ -256,6 +273,11 @@ class FakeData(FakeFederation):
         self.resets: list[list] = []
         self.statuses: list[list] = []
         self.content_type: str | None = "application/octet-stream"  # of a file's content, whole or by range
+        self.content_types: list[str | None] = []  # the Content-Type of every write of content, in order
+        self.corrupt_writes = False  # every write is stored with its first byte inverted
+        self.writes_before_reset: int | None = None  # writes of content that succeed before the rest are reset
+        self.children_omit: set[str] = set()  # keys every children page leaves out
+        self.children_fields: dict = {}  # keys every children page answers with this value instead
         self.clock = lambda: 0.0  # epoch seconds of a job's schedule, start and finish times
         self.transfer_omit: set[str] = set()  # fields a job's record leaves out
         self.transfer_list_body: dict | None = None  # replaces every answer of the listing
@@ -517,9 +539,7 @@ class FakeData(FakeFederation):
             if part == "/children" and method == "POST":
                 return self._make(node, query, provider)
             if part == "/content" and method == "PUT":
-                if self.require_octet_stream and request.headers.get("Content-Type") != "application/octet-stream":
-                    return self._error(415, "unsupportedMediaType")  # 25.0 refuses a raw body that does not say so
-                return self._write(node, provider, int(query.get("offset", "0")), request.content)
+                return self._put_content(request, node, provider)
             if part == "/content" and method == "GET":
                 return self._read(node, provider, request.headers.get("Range"))
             if part == "/distribution" and method == "GET":
@@ -563,17 +583,29 @@ class FakeData(FakeFederation):
         return parent
 
     def _list(self, node: Node, query: httpx.QueryParams, provider: str) -> httpx.Response:
+        """A page of a directory's children, shaped as Onedata 25.0's (`LISTING_END_FACTS`): the keys `nextPageToken`,
+        `isLast` and `children`, in that order; a token on every page, the last included; `isLast` true only on a page
+        shorter than its limit, so a page the directory's last entries fill is followed by an empty last page; and a
+        400 `posix` `eagain` for the page after a last page."""
         if node.kind != "DIR":
             return self._error(400, "posix")
+        token = query.get("token")
+        if token is not None and token.startswith(_LAST_PAGE_TOKEN):
+            return self._error(400, "posix", "eagain")
+        limit = min(int(query.get("limit", self.page_size)), self.page_size)
+        if limit < 1:
+            return self._error(400, "badValueNotInRange")
         shown = (n for n in self.nodes.values() if n.parent == node.file_id and self._visible(n, provider))
         children = sorted(shown, key=lambda n: n.name)
-        start = int(query.get("token", "0"))
-        limit = min(int(query.get("limit", self.page_size)), self.page_size)
+        start = int(token or "0")
         page = children[start : start + limit]
-        last = start + limit >= len(children)
-        body: dict = {"children": [self._attributes(c) for c in page], "isLast": last}
-        if not last:
-            body["nextPageToken"] = str(start + limit)
+        last = len(page) < limit
+        body: dict = {
+            "nextPageToken": f"{_LAST_PAGE_TOKEN if last else ''}{start + len(page)}",
+            "isLast": last,
+            "children": [self._attributes(c) for c in page],
+        }
+        body = {key: value for key, value in {**body, **self.children_fields}.items() if key not in self.children_omit}
         return httpx.Response(200, json=body)
 
     def _make(self, parent: Node, query: httpx.QueryParams, provider: str) -> httpx.Response:
@@ -583,6 +615,28 @@ class FakeData(FakeFederation):
         if self._child(parent.file_id, name) is not None:
             return self._error(409, "posix")
         return httpx.Response(201, json={"fileId": self._create(parent.file_id, name, kind, provider)})
+
+    def _put_content(self, request: httpx.Request, node: Node, provider: str) -> httpx.Response:
+        """A write of content: 415 unless it says it is an octet stream when the shape requires that, a reset once the
+        writes run out, and without `offset` a truncation before the bytes are written, as the API describes."""
+        sent_type = request.headers.get("Content-Type")
+        self.content_types.append(sent_type)
+        if self.require_octet_stream and sent_type != "application/octet-stream":
+            return self._error(415, "unsupportedMediaType")  # 25.0 refuses a raw body that does not say so
+        if self.writes_before_reset is not None:
+            if self.writes_before_reset <= 0:
+                raise httpx.ConnectError("connection reset")
+            self.writes_before_reset -= 1
+        offset = request.url.params.get("offset")
+        if offset is None:
+            node.content = bytearray()
+            for table in (self.blocks, self.pending):
+                for key in [k for k in table if k[0] == node.file_id]:
+                    del table[key]
+        body = request.content
+        if self.corrupt_writes and body:
+            body = bytes([body[0] ^ 0xFF]) + body[1:]
+        return self._write(node, provider, int(offset or "0"), body)
 
     def _write(self, node: Node, provider: str, offset: int, body: bytes) -> httpx.Response:
         end = offset + len(body)
@@ -683,7 +737,7 @@ class FakeData(FakeFederation):
         ]
         start = int(query.get("page_token") or "0")
         end = start + int(query.get("limit", "100"))
-        token = str(end) if end < len(ids) else None
+        token = str(end) if end <= len(ids) else None  # a full page gets a token, so an empty last page can follow
         return httpx.Response(200, json={"transfers": ids[start:end], "nextPageToken": token})
 
     def _transfer(self, tid: str, provider: str) -> httpx.Response:

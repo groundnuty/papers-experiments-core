@@ -27,22 +27,24 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
     assert "3 skipped" in done.stdout
 
 
-def test_o09_only_the_resets_qos_calls_and_cancel_are_left_unconfirmed_and_the_refuted_path_read_is_gone():
+def test_o09_only_the_resets_qos_calls_cancel_and_the_truncating_write_are_unconfirmed_and_the_path_read_is_gone():
     """O09, O11: the live contract tests against Onedata 25.0 confirmed every call the layer makes that no source did,
     the gate's walk by `parent_id` among them, the reset's eviction of a directory and a transfer record's `spaceId`,
     and refuted the file's `path` attribute the gate read before, which no release at hand answers. The gate no longer
     asks for it; the client's docstring records what refuted it. What is left unconfirmed are the reset's calls no live
-    run has made: a transfer's cancel, a QoS summary, a requirement's record and its removal."""
+    run has made (a transfer's cancel, a QoS summary, a requirement's record and its removal) and the write of content
+    without an offset, which truncates the file and which a restarted upload relies on (O25)."""
     from expcore_onedata import client
 
     assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {
+        ("PUT", "/data/{id}/content"),
         ("DELETE", "/transfers/{id}"),
         ("GET", "/data/{id}/qos/summary"),
         ("GET", "/qos_requirements/{qid}"),
         ("DELETE", "/qos_requirements/{qid}"),
     }
     what = " ".join(w for _, _, w in client.UNVERIFIED_ENDPOINTS)
-    assert all(field in what for field in ("fileId", "requirements", "400"))
+    assert all(field in what for field in ("fileId", "requirements", "400", "truncates"))
     assert "badValueNotAllowed" in client.__doc__
     assert '"attribute": "path"' not in Path(client.__file__).read_text(encoding="utf-8")
 
