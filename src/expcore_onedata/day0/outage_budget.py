@@ -15,13 +15,13 @@ start and its clear are each bounded as `FaultInjector.cancel_wait_s` bounds a s
 and command timeouts, and two waits for a provider to serve).
 """
 
+from expcore_onedata.day0.outage_cells import KINDS
 from expcore_onedata.day0.outage_mount import cell_timeout_s
 from expcore_onedata.day0.outage_tools import READ_ATTEMPTS
 from expcore_onedata.day0.registry import Context
 
 MARGIN_S = 600.0
 DOWN_PROBE_S = 10.0  # the longest the check waits to see that the target does not answer
-KINDS = 2  # the files of a pair: replicated and owner-only
 REST_READS = 3  # the reads of the outage over REST, and again after it: two files and the listing
 
 
@@ -45,14 +45,14 @@ def scenario_s(ctx: Context, *, mount: bool) -> float:
     injector = (settle + faults.command_timeout_s) * (faults.clear_attempts + 2) + 2 * faults.ready_timeout_s
     knowledge = (
         (2 * call + replicate)  # with everything up: a distribution, the providers, a replication
-        + (KINDS * call + call + KINDS * replicate)  # during the outage, for the knowledge pair
-        + 2 * KINDS * call  # where each file read during the outage is held (REST and the mount)
-        + KINDS * call  # the transfers after the restore
+        + (len(KINDS) * call + call + len(KINDS) * replicate)  # during the outage, for the knowledge pair
+        + 2 * len(KINDS) * call  # where each file read during the outage is held (REST and the mount)
+        + len(KINDS) * call  # the transfers after the restore
     )
-    mount = (2 * cell_timeout_s(3, bound) + settle + cell_timeout_s(KINDS, bound) + poll) if mount else 0.0
+    reads = (2 * cell_timeout_s(3, bound) + settle + cell_timeout_s(len(KINDS), bound) + poll) if mount else 0.0
     rest = REST_READS * 2 * bound + DOWN_PROBE_S  # during the outage (a listing may take two pages), and the probe
     after = (settle + DOWN_PROBE_S + poll) + REST_READS * (settle + 2 * bound + poll)  # the wait, and the re-reads
-    return 2 * injector + knowledge + mount + rest + after + MARGIN_S
+    return 2 * injector + knowledge + reads + rest + after + MARGIN_S
 
 
 __all__ = ["DOWN_PROBE_S", "MARGIN_S", "scenario_s"]

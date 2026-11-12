@@ -3,7 +3,8 @@
 
 `outage.py` decides whether a space can be run and holds the federation for it; this module is what runs. See
 `outage.py` for the scenario, `outage_cells` (REST), `outage_mount` (the mount, through a real sandbox),
-`outage_tools` (the agent's tools, through MCP), `outage_agent` (starting those two) and `outage_fault` (the injector).
+`outage_tools` (the agent's tools, through MCP), `outage_agent` (starting those two), `outage_fault` (the injector),
+`outage_after` (the steps after the restore) and `outage_budget` (the lifetime of the agent's tokens).
 
 The run is a coroutine because the tool server's client is one; every blocking step (the platform's REST calls and
 bounded waits, the injector, the sandbox's cells) runs in a worker thread (`asyncio.to_thread`, which carries the
@@ -13,17 +14,18 @@ federation's admission with it), since the platform layer refuses to wait on the
 import asyncio
 import hashlib
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 from expcore_onedata import consistency
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import StudySpace
 from expcore_onedata.day0 import outage_mount
+from expcore_onedata.day0.outage_after import AfterRestore
 from expcore_onedata.day0.outage_agent import AgentPlane, mount_levels
 from expcore_onedata.day0.outage_budget import DOWN_PROBE_S
-from expcore_onedata.day0.outage_cells import ROLES, Cells, Roles, ScratchFile
-from expcore_onedata.day0.outage_fault import RESTORED, Outage
+from expcore_onedata.day0.outage_cells import KINDS, ROLES, Cells, Roles, ScratchFile
+from expcore_onedata.day0.outage_fault import Outage
 from expcore_onedata.day0.outage_tools import Scrubber, Tools, baseline_gaps
 from expcore_onedata.day0.registry import Context, Result, failed, passed, unknown
 from expcore_onedata.faults import FaultInjector
@@ -32,7 +34,6 @@ from expcore_onedata.provision import ProvisionError
 from expcore_onedata.sandbox.api import SandboxError
 
 FILE_BYTES = 16384
-KINDS = ("replicated", "owner_only")
 BASE_PAIRS = ("baseline", "rest", "knowledge")
 MOUNT_PAIRS = ("baseline_mount", "mount")
 
@@ -64,8 +65,9 @@ def scrubber(ctx: Context, entry: StudySpace) -> Scrubber:
     return Scrubber(pairs)
 
 
-class Run:
-    """One space's outage: the scenario's files, the facts gathered, and what went wrong or could not be measured."""
+class Run(AfterRestore):
+    """One space's outage: the scenario's files, the facts gathered, and what went wrong or could not be measured. The
+    steps after the restore are `outage_after.AfterRestore`'s."""
 
     def __init__(self, ctx: Context, entry: StudySpace, roles: Roles, plane: AgentPlane) -> None:
         self.ctx, self.entry, self.roles, self.plane = ctx, entry, roles, plane
@@ -336,95 +338,6 @@ class Run:
 
         walk(knowledge)
         self.gaps += [f"during {when}, {reason}" for reason in sorted(reasons)]
-
-    # -- after ----------------------------------------------------------------------------------------------------
-    async def after_restore(self, went_down: bool) -> None:
-        """Check the restore: cleared and verified by the injector, the target answering, and the reads returning
-        what was written. A provider never seen down needs only to be found as it was (`never_down`)."""
-        restore = self.facts["restore"]
-        if restore["how"] == "not_injected":
-            return
-        if not restore["cleared"]:
-            self.problems.append(f"the provider could not be brought back ({restore['how']})")
-            return
-        if went_down and restore["how"] not in RESTORED:
-            self.problems.append(f"the provider could not be restored and verified ({restore['how']})")
-            return
-        if not await asyncio.to_thread(self.wait_for_target):
-            self.problems.append("the provider ran again but did not answer REST within the settle timeout")
-            return
-        if not went_down:
-            return
-        after = await asyncio.to_thread(self.rereads)
-        if self.tools is not None and self.tokens_hold("the transfers' reading after the restore"):
-            after["transfers"] = {kind: await self.tools.transfer_now(f"knowledge/{kind}") for kind in KINDS}
-        self.facts["after"] = after
-        reads = {name: row for name, row in after.items() if name != "transfers" and not row.get("tokens_ended")}
-        wrong = [name for name, row in reads.items() if row["outcome"] != "served"]
-        if wrong:
-            self.problems.append(f"after the restore {len(wrong)} read(s) did not return what was written")
-
-    def rereads(self) -> dict[str, Any]:
-        """The reads again after the restore, each until it is served or the settle timeout."""
-        files = self.files
-        after: dict[str, Any] = {
-            "owner_only": self.reread(lambda: self.cells.read(files[("rest", "owner_only")])),
-            "replicated": self.reread(lambda: self.cells.read(files[("rest", "replicated")])),
-            "listing": self.reread(lambda: self.cells.listing(self.directory_id, self.expected)),
-        }
-        if self.plane.mount_path is not None:
-            after["mount_owner_only"] = self.reread(
-                lambda: self.mount_cells("mount", listing=False)["owner_only"] or {"outcome": None},
-                tokens="the re-read through the mount",
-            )
-        return after
-
-    def wait_for_target(self) -> bool:
-        """Poll the target's REST until it answers, within the settle timeout; record how long it took."""
-        settings = self.ctx.fault_settings
-        assert settings is not None
-        began, tries = self.ctx.clock(), 0
-        while True:
-            tries += 1
-            if self.cells.target_answers(min(self.bound_s, DOWN_PROBE_S))["answers"]:
-                elapsed = round(self.ctx.clock() - began, 3)
-                self.facts["restore"].update(rest_answers_again=True, rest_answered_after_s=elapsed, polls=tries)
-                return True
-            if self.ctx.clock() - began >= settings.settle_timeout_s:
-                self.facts["restore"].update(rest_answers_again=False, polls=tries)
-                return False
-            self.ctx.sleep(settings.poll_s)
-
-    def reread(self, read: Callable[[], dict[str, Any]], *, tokens: str | None = None) -> dict[str, Any]:
-        """Read again until the read is served, within the settle timeout (a provider is slow to take up its peers).
-        A read made with the agent's tokens (`tokens` names it) is not made once they have ended: it is then
-        `tokens_ended`, the check's own failure, never the provider's."""
-        settings = self.ctx.fault_settings
-        assert settings is not None
-        began, tries = self.ctx.clock(), 0
-        while True:
-            if tokens is not None and not self.tokens_hold(tokens):
-                return {"outcome": None, "tokens_ended": True, "attempts": tries}
-            tries += 1
-            row = read()
-            if row["outcome"] == "served" or self.ctx.clock() - began >= settings.settle_timeout_s:
-                return {**row, "attempts": tries}
-            self.ctx.sleep(settings.poll_s)
-
-    def tokens_hold(self, step: str) -> bool:
-        """Whether the agent's tokens surely still hold for a step that uses them (`AgentPlane.tokens_until`). When
-        they have ended the step is not made, and the first such step is the check's own failure, named: a step the
-        tokens could not make says nothing about the provider."""
-        until = self.plane.tokens_until
-        if until is None or self.ctx.clock() < until:
-            return True
-        if self.tokens_ended is None:
-            self.tokens_ended = step
-            self.problems.append(
-                f"the agent's tokens had ended before {step}, so it was not made (the check's own failure: the "
-                "lifetime they were minted for did not cover the scenario)"
-            )
-        return False
 
     # -- the verdict ----------------------------------------------------------------------------------------------
     def verdict(self) -> Result:

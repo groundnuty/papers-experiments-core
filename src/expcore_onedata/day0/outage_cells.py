@@ -32,6 +32,7 @@ from expcore_onedata.provision import LISTING_ATTRIBUTES, LISTING_LIMIT, Provisi
 
 BLOCKED_FRACTION = 0.9  # an unanswered call that took this much of its bound was blocked, not refused
 ROLES = ("target", "mirror", "local")
+KINDS = ("replicated", "owner_only")  # the files of a pair: held by the target and the mirror, or by the target alone
 WORD = re.compile(r"[A-Za-z][A-Za-z_]{0,63}")  # an error id or a class name: letters, never an id, host or address
 
 
