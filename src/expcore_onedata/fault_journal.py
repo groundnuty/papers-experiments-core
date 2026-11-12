@@ -26,9 +26,12 @@ skipping a provider nobody will bring back. A pid reused by an unrelated process
 lock is then skipped as a live one; the boot id rules out a holder from before a reboot.
 
 A restore that failed is journalled too (`clear_failed`, with how it failed), so an injection that is still open after
-a failed clear can be told from one in progress. Beside the journal, whoever holds the federation exclusively keeps a
-holder record (`federation.holder`, written whole and fsynced by `write_holder`; `expcore_onedata.admission`): its pid
-and boot id, its purpose, the target's label and the time it took the lock.
+a failed clear can be told from one in progress. A stop command that raised (it timed out, so its CLI was killed while
+the Docker daemon goes on stopping the container) is journalled as `stop_unknown`: whoever settles that injection,
+this process or a later one, waits for the container to show down before it judges the restore. Beside the journal,
+whoever holds the federation exclusively keeps a holder record (`federation.holder`, written whole and fsynced by
+`write_holder`; `expcore_onedata.admission`): its pid and boot id, its purpose, the target's label and the time it took
+the lock.
 """
 
 import contextlib
@@ -149,8 +152,9 @@ class InjectionJournal:
     """Append-only record of every injection and its clear: the target's label, its service, its identity's digest and
     its holder.
 
-    Lines: `injecting` (before the stop command), `injected` (once the target was seen down) and `cleared` (once a
-    restore was verified, or recovery found the target up). An `injecting` line no `cleared` line settles is open.
+    Lines: `injecting` (before the stop command), `stop_unknown` (once the stop command raised, so what it did is not
+    known), `injected` (once the target was seen down) and `cleared` (once a restore was verified, or recovery found
+    the target up). An `injecting` line no `cleared` line settles is open.
     """
 
     def __init__(self, directory: Path) -> None:
@@ -200,8 +204,9 @@ class InjectionJournal:
             os.fsync(handle.fileno())
 
     def open_entries(self) -> list[dict[str, Any]]:
-        """Return the open injections, each with `injected` set when it was seen down; raise ValueError when a complete
-        line is not an injection event. Only an incomplete final line is ignored: it was never acted on."""
+        """Return the open injections, each with `injected` set when it was seen down and `stop_unknown` when its stop
+        command raised; raise ValueError when a complete line is not an injection event. Only an incomplete final line
+        is ignored: it was never acted on."""
         if not self.path.exists():
             return []
         with self._section(fcntl.LOCK_SH):
@@ -222,6 +227,8 @@ class InjectionJournal:
                 entries[key] = {**line, "injected": False}
             elif event == "injected" and key in entries:
                 entries[key]["injected"] = True
+            elif event == "stop_unknown" and key in entries:
+                entries[key]["stop_unknown"] = True  # the stop raised: the daemon may still be stopping the target
             elif event == "clear_failed" and key in entries:
                 entries[key]["clear_failed"] = str(line.get("how"))  # still open: its restore failed
             elif event == "cleared":

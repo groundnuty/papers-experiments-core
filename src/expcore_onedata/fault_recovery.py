@@ -7,7 +7,17 @@ a study lists in `[study] platforms`), the driver protocol, and the steps that l
 restore counts only when the service runs with an identity other than the one journalled before the injection;
 readiness alone is not one, and a service back with the same identity is a failed restore. A service that cannot be
 read is started all the same (starting a running service changes nothing), and its restore is then
-`restore_unverified`. `recover` settles every open injection whose target's lock it can take (its holder is gone),
+`restore_unverified`.
+
+A stop whose outcome is unknown (its command timed out, so the CLI was killed while the Docker daemon goes on stopping
+the container for up to the provider's `stop_grace_period`) is not judged by a reading taken at once: a `start` of a
+container that is still running does nothing, and the old identity read then is the container on its way down, not
+one that never went down. The entry says so (`stop_unknown`); `settle` first waits, bounded by the settle timeout, for
+the service to show not running, and only then restores it and judges the restore by the changed identity. A service
+that never shows down within the bound is `stop_unsettled`, not cleared, never verified. The settle timeout must
+therefore exceed the providers' `stop_grace_period` with a margin (180 s against the federation's 120 s, by default).
+
+`recover` settles every open injection whose target's lock it can take (its holder is gone),
 reports a lock held while its journalled holder is gone as stuck, and returns the targets live injectors hold.
 """
 
@@ -119,29 +129,46 @@ class Recovery:
             self.journal.append({"event": "clear_failed", "id": entry["id"], "how": how})
 
     def _settle(self, entry: Mapping[str, Any]) -> tuple[bool, str, str | None]:
-        before = entry["identity_sha256"]
-        try:
-            seen: Observation | None = self._driver.observe(entry["service"])
-        except DriverError:
-            seen = None
+        before, injected = entry["identity_sha256"], entry["injected"]
+        seen: Observation | None
+        if entry.get("stop_unknown"):  # the daemon may still be stopping it: a reading now proves nothing
+            seen = self._await_down(entry["service"], before)
+            if seen is None:
+                return False, "stop_unsettled", None  # never seen down within the bound: fail closed
+            injected = True  # it was seen not running (or running anew): it did go down
+        else:
+            try:
+                seen = self._driver.observe(entry["service"])
+            except DriverError:
+                seen = None
         same = seen is not None and seen.identity is not None and digest(seen.identity) == before
         after = None
         if seen is not None and seen.running and seen.identity is not None and not same:
             how, after = "found_restored", digest(seen.identity)
         elif seen is not None and seen.running and same:
-            if entry["injected"]:  # it was seen down, so it must have started anew: its identity cannot be trusted
+            if injected:  # it was seen down, so it must have started anew: its identity cannot be trusted
                 return False, "identity_unchanged", None
             how = "never_down"  # the stop never took effect
         else:
             restored, after, reason = self._restore(entry["service"], before)
             if restored:
                 how = "restored"
-            elif reason == "identity_unchanged" and not entry["injected"]:
+            elif reason == "identity_unchanged" and not injected:
                 how = "never_down"  # unreadable at first, then running as it was: it never went down
             else:
                 return False, reason, None
         self.journal.append({"event": "cleared", "id": entry["id"], "how": how})
         return True, how, after
+
+    def _await_down(self, service: str, before: str) -> Observation | None:
+        """After a stop of unknown outcome: read the service until it shows not running, or running with another
+        identity (which only a restart gives), bounded by the settle timeout. A reading that fails is no answer, so it
+        is read again. None when it never showed either."""
+
+        def down(seen: Observation) -> bool:
+            return not seen.running or (seen.identity is not None and digest(seen.identity) != before)
+
+        return self.wait(down, service, unreadable_ok=True)
 
     def _restore(self, service: str, before: str) -> tuple[bool, str | None, str]:
         """Start the service and wait for it to run with an identity whose digest is not `before`, a bounded number of
@@ -169,17 +196,28 @@ class Recovery:
                 return False, None, "identity_unchanged"  # back with the identity it had: not a restore (O11)
         return False, None, reason
 
-    def wait(self, done: Callable[[Observation], bool], service: str) -> Observation | None:
-        """Read the service until `done` holds, bounded by the settle timeout and by a count; None when it never did."""
+    def wait(
+        self, done: Callable[[Observation], bool], service: str, *, unreadable_ok: bool = False
+    ) -> Observation | None:
+        """Read the service until `done` holds, bounded by the settle timeout and by a count; None when it never did.
+
+        A reading that fails raises DriverError, unless `unreadable_ok`: then it counts as a reading that shows nothing.
+        """
         polls = max(1, math.ceil(self._settings.settle_timeout_s / self._settings.poll_s)) + 1
         started = self._clock()
         self.last = None
         for poll in range(polls):
             if poll:
                 self._sleep(self._settings.poll_s)
-            self.last = self._driver.observe(service)
-            if done(self.last):
-                return self.last
+            try:
+                self.last = self._driver.observe(service)
+            except DriverError:
+                if not unreadable_ok:
+                    raise
+                self.last = None
+            else:
+                if done(self.last):
+                    return self.last
             if self._clock() - started >= self._settings.settle_timeout_s:
                 break
         return None

@@ -12,7 +12,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     command = ["docker", "compose"]  # optional: the Compose command
     docker = ["docker"]              # optional: the command that inspects a container
     poll_s = 2                       # optional: between two readings of a service
-    settle_timeout_s = 180           # optional: the longest a service may take to go down or to come back
+    settle_timeout_s = 180           # optional: the longest a service may take to go down or to come back; see below
     command_timeout_s = 120          # optional: the longest one command may take
     clear_attempts = 3               # optional: how many times a restore is tried
     admission_timeout_s = 3600       # optional: the longest a run waits for the federation's lock
@@ -20,6 +20,14 @@ service entry, its position, never by a provider's or a service's name. The serv
 
     [faults.services]
     <provider name> = "<service>"    # each provider that may be taken down, by its name in [providers]
+
+`settle_timeout_s` must exceed the providers' `stop_grace_period` (the Compose file's, 120 s in the federation of
+deploy/compose-federation) by a margin. A stop that hits `command_timeout_s` kills the CLI, not the Docker daemon's
+stop, which runs on for up to the grace period; the restore then waits, for at most `settle_timeout_s`, for the service
+to show not running, and a service not seen down in that time is an unverified restore (`faults.py`, "A stop of unknown
+outcome"). The grace period is in the Compose file, which platform.toml does not read, so nothing here can refuse a
+value below it: whoever raises the grace, or lowers `settle_timeout_s`, keeps this bound. The default is the grace
+period plus `SETTLE_MARGIN_S`.
 """
 
 import hashlib
@@ -39,6 +47,9 @@ SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # A Compose project name as Compose accepts it. Required, because Compose would otherwise take the name from the
 # environment, the Compose file or its directory, and a target must name the one container its outage stops.
 PROJECT = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
+STOP_GRACE_S = 120.0  # the federation's `stop_grace_period` for a provider (deploy/compose-federation/fedcompose.py)
+SETTLE_MARGIN_S = 60.0  # what the default settle timeout adds to it, for the daemon's kill and the readings' lag
+DEFAULT_SETTLE_TIMEOUT_S = STOP_GRACE_S + SETTLE_MARGIN_S
 _KEYS = (
     "sanctioned",
     "journal",
@@ -69,7 +80,7 @@ class FaultSettings:
     command: tuple[str, ...] = ("docker", "compose")
     docker: tuple[str, ...] = ("docker",)
     poll_s: float = 2.0
-    settle_timeout_s: float = 180.0
+    settle_timeout_s: float = DEFAULT_SETTLE_TIMEOUT_S
     command_timeout_s: float = 120.0
     clear_attempts: int = 3
     admission_timeout_s: float = 3600.0
@@ -121,7 +132,7 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         command=words["command"],
         docker=words["docker"],
         poll_s=_number(table, "poll_s", 2.0, 0.001),
-        settle_timeout_s=_number(table, "settle_timeout_s", 180.0, 0),
+        settle_timeout_s=_number(table, "settle_timeout_s", DEFAULT_SETTLE_TIMEOUT_S, 0),
         command_timeout_s=_number(table, "command_timeout_s", 120.0, 1),
         clear_attempts=_number(table, "clear_attempts", 3, 1, integer=True),
         admission_timeout_s=_number(table, "admission_timeout_s", 3600.0, 0),

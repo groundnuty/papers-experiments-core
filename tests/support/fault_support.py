@@ -2,11 +2,13 @@
 
 import json
 import os
+import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from expcore_onedata.compose import DriverError, Observation
+from expcore_onedata.compose import CommandResult, DriverError, Observation
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import FaultInjector, load_faults
 from expcore_onedata.testing import write_platform
@@ -118,6 +120,64 @@ class FakeClock:
 
     def sleep(self, seconds: float) -> None:
         self.now += seconds
+
+
+class FakeDaemon:
+    """A Docker daemon behind the command runner, on the injector's fake clock: each service has one container.
+
+    `docker compose stop` asks the daemon to stop the container, which exits `exit_after_s` seconds later (never, when
+    that is None). With `stop_hangs` the CLI does not return: it is killed at the runner's timeout, as a real one is,
+    and the daemon goes on stopping the container all the same. `start` of a running container does nothing, and does
+    not cancel a stop in progress; of an exited one it starts it anew (another start time, so another identity).
+    """
+
+    def __init__(self, clock: FakeClock, services: Sequence[str] = SERVICE_NAMES) -> None:
+        self.clock = clock
+        self.exit_after_s: float | None = 0.0
+        self.stop_hangs = False
+        self.commands: list[tuple[str, str]] = []
+        self._containers = {
+            name: {"id": f"cid-{index}", "starts": 1, "running": True, "exit_at": None}
+            for index, name in enumerate(services)
+        }
+
+    def _container(self, service: str) -> dict[str, Any]:
+        container = self._containers[service]
+        if container["exit_at"] is not None and self.clock.now >= container["exit_at"]:
+            container["running"], container["exit_at"] = False, None
+        return container
+
+    def running(self, service: str) -> bool:
+        return self._container(service)["running"]
+
+    def starts(self, service: str) -> int:
+        return self._container(service)["starts"]
+
+    def __call__(self, argv: Sequence[str], *, timeout_s: float) -> CommandResult:
+        if argv[-2] in ("stop", "start"):
+            return self._act(argv[-2], argv[-1], argv, timeout_s)
+        if argv[-4:-1] == ["ps", "--all", "--quiet"]:
+            self.commands.append(("ps", argv[-1]))
+            return CommandResult(0, self._container(argv[-1])["id"] + "\n")
+        service = next(name for name, c in self._containers.items() if c["id"] == argv[-1])
+        self.commands.append(("inspect", service))
+        container = self._container(service)
+        started = f"start-{container['starts']}"
+        return CommandResult(0, f"{container['id']}|{started}|{str(container['running']).lower()}\n")
+
+    def _act(self, verb: str, service: str, argv: Sequence[str], timeout_s: float) -> CommandResult:
+        self.commands.append((verb, service))
+        container = self._container(service)
+        if verb == "start":
+            if not container["running"]:
+                container["running"], container["starts"] = True, container["starts"] + 1
+            return CommandResult(0, "")
+        if self.exit_after_s is not None and container["running"]:
+            container["exit_at"] = self.clock.now + self.exit_after_s
+        if self.stop_hangs:
+            self.clock.sleep(timeout_s)  # the CLI is killed here; the daemon is not
+            raise subprocess.TimeoutExpired(list(argv), timeout_s)
+        return CommandResult(0, "")
 
 
 def injector_for(platform: Path, driver: Any, target: str = OUTAGE_TARGET, clock: FakeClock | None = None, **kw: Any):

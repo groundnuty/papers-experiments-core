@@ -30,7 +30,18 @@ set aside and run again; the reading shows the failed injection and the clear th
 **Clear (O11).** `clear` brings the provider back and counts a restore only when the provider runs with an identity
 other than the one read before the injection (`ComposeDriver`: the container's id and start time). Readiness alone is
 not a restore, and a provider back with the same identity is a failed restore. The start is tried a bounded number of
-times; a service that cannot be read is started all the same, and its restore is `restore_unverified`. `clear`
+times; a service that cannot be read is started all the same, and its restore is `restore_unverified`.
+
+**A stop of unknown outcome (O11).** When the stop command raises, typically at its timeout (`command_timeout_s`), the
+CLI is killed but the Docker daemon goes on stopping the container for up to the provider's `stop_grace_period`; the
+federation's is 120 s, the default command timeout. The injection is then journalled `stop_unknown`, and the clear
+does not start the service or read its identity at once, because a `start` of a container still running does nothing
+and the old identity then read is the container on its way down, not one that never went down. It waits, for at most
+`settle_timeout_s`, for the service to show not running, and only then starts it and judges the restore by the changed
+identity. A service not seen down within that bound leaves the restore `stop_unsettled`: unverified, the injection
+open and pending, never cleared. `settle_timeout_s` must therefore exceed the providers' `stop_grace_period` with a
+margin; its default, 180 s, does for the federation's 120 s, and platform.toml does not know the grace, so a federation
+that raises it raises this too (`expcore_onedata.fault_settings`). `clear`
 never raises: a failed restore is in the snapshot (`verified: false`), stays open in the journal and stays pending,
 with the target's lock held, so a later `clear`, `finish` or `start` tries again. `finish` calls it, `session` calls it
 in a `finally` around both `start` and the agent's run, and `start` calls it before failing.
@@ -181,6 +192,7 @@ class FaultInjector:
         self._steps: list[dict[str, Any]] = []
         self._injection: dict[str, Any] | None = None
         self._went_down = False  # the target was seen down during the open injection
+        self._stop_unknown = False  # the open injection's stop command raised: what it did is not known
         self._origin = clock()
 
     # --- the sanction and the readings ------------------------------------------------------------------------
@@ -240,7 +252,9 @@ class FaultInjector:
         self._pending, self._went_down = (entry, digest), False
         self._injection = {"target": self.target, "injected": False, "cleared": False, "verified": False}
         try:
+            self._stop_unknown = True  # until the command returns, the daemon may be stopping the target all the same
             self._driver.stop(self._service)
+            self._stop_unknown = False
             self._went_down = self._recovery.wait(lambda seen: not seen.running, self._service) is not None
             if not self._went_down:
                 raise _NotSeenDown()
@@ -248,12 +262,21 @@ class FaultInjector:
         except BaseException as error:  # whatever broke after the stop, the target is brought back before it is raised
             why = type(error).__name__
             self._step("injected", False, identity_before_sha256=digest, seen_down=self._went_down, error=why)
+            if self._stop_unknown:
+                self._journal_stop_unknown(entry)
             self._clear()
             if not isinstance(error, Exception):
                 raise
             raise self._fail(f"{self.target} could not be taken down, seen down and journalled ({why})") from None
         self._injection["injected"] = True
         self._step("injected", True, identity_before_sha256=digest)
+
+    def _journal_stop_unknown(self, entry: str) -> None:
+        """Journal that the stop command raised, so that a later process settling the injection waits for the target
+        to show down too. The journal may be what failed: the injection stays open all the same, and this injector's
+        own clear still knows."""
+        with contextlib.suppress(OSError):
+            self._journal.append({"event": "stop_unknown", "id": entry})
 
     def _admit(self) -> None:
         """Hold the federation exclusively for the whole injection: the run's own admission, which must then be
@@ -370,8 +393,9 @@ class FaultInjector:
 
         Returns True when this injector leaves nothing down. Until a restore is verified the injection stays pending,
         with the target's lock held, so a later `clear`, `finish` or `start` tries again; a verified one makes calling
-        it again harmless. A target the injection never took down is found running with its old identity. An injector
-        discarded with its restore still unverified lets the lock go when it is collected, so recovery can settle it.
+        it again harmless. A target the injection never took down is found running with its old identity, unless the
+        stop's outcome is unknown: then the clear first waits for the target to show not running. An injector discarded
+        with its restore still unverified lets the lock go when it is collected, so recovery can settle it.
         """
         with self._mutex:
             return self._clear()
@@ -383,7 +407,13 @@ class FaultInjector:
         injection = self._injection if self._injection is not None else {"target": self.target, "injected": False}
         try:
             done, how, after = self._recovery.settle(
-                {"id": entry, "service": self._service, "identity_sha256": digest, "injected": self._went_down}
+                {
+                    "id": entry,
+                    "service": self._service,
+                    "identity_sha256": digest,
+                    "injected": self._went_down,
+                    "stop_unknown": self._stop_unknown,
+                }
             )
         except Exception as error:  # never lose the reading: a clear that failed stays pending and open
             done, how, after = False, type(error).__name__, None
@@ -392,7 +422,7 @@ class FaultInjector:
         self._step("cleared", done, how=how)
         self._step("verified", verified, identity_changed=after is not None, identity_after_sha256=after)
         if done:
-            self._pending = None
+            self._pending, self._stop_unknown = None, False
             self._unlock()
             self._release_admission()
         return done
