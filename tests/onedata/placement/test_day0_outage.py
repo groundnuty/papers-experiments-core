@@ -38,6 +38,7 @@ from expcore_onedata.day0.outage_cells import Cells
 from expcore_onedata.day0.outage_tools import KNOWLEDGE_TOOLS
 from expcore_onedata.day0.runner import EXIT_FAIL, EXIT_UNKNOWN, build_context, run, run_checks
 from expcore_onedata.fault_journal import InjectionJournal
+from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import compose_driver, load_faults
 from expcore_onedata.testing import (
     ADMIN_ENV,
@@ -167,6 +168,7 @@ def test_o28_the_provider_is_taken_down_seen_down_and_restored_and_nothing_is_le
     assert entry.facts["restore"]["cleared"] is True
     assert entry.facts["restore"]["verified"] is True
     assert entry.facts["restore"]["how"] == "restored"
+    assert entry.facts["restore"]["ready_after_s"] == 0  # the injector found it serving at its first reading
     assert entry.facts["restore"]["rest_answers_again"] is True
     assert entry.facts["cleanup_verified"] is True
 
@@ -202,10 +204,12 @@ def test_o28_a_stop_whose_outcome_is_unknown_is_waited_out_and_restored_by_the_i
     unknown, never passed, and leaves nothing down."""
     daemon = WorldDaemon(world, {SERVICE: "alpha.test"})
     daemon.stop_hangs = True
-    settings = load_faults(platform, load_platform(platform))
-    client = OnezoneClient(load_platform(platform), http=world.client_http())
+    config = load_platform(platform)
+    settings = load_faults(platform, config)
+    client = OnezoneClient(config, http=world.client_http())
+    driver = compose_driver(settings, runner=daemon, probe=provider_serves(config, settings, client))
     ctx = build_context(
-        platform, tmp_path / "o", client=client, driver=compose_driver(settings, runner=daemon), allow_mutation=True,
+        platform, tmp_path / "o", client=client, driver=driver, allow_mutation=True,
         allow_faults=True, clock=ticker.clock, sleep=ticker.sleep, outage_bound_s=BOUND_S,
     )  # fmt: skip
     entry = run_checks(ctx, ["provider_outage"])[0]
@@ -423,8 +427,8 @@ def test_o28_a_provider_that_does_not_run_again_fails_the_check_after_trying_to_
     assert "cleanup_verified" in entry.facts  # the teardown ran, and could not reach the provider it deletes through
 
 
-def test_o28_a_provider_that_runs_but_does_not_answer_rest_after_the_restore_fails_the_check(context, world, services):
-    """O28: a provider that runs but does not answer rest after the restore fails the check."""
+def stay_unreachable(services, world):
+    """Make the provider's service start with a new identity and its host answer nothing."""
     real_start = services.start
 
     def start_but_stay_unreachable(service: str) -> None:
@@ -432,9 +436,29 @@ def test_o28_a_provider_that_runs_but_does_not_answer_rest_after_the_restore_fai
         world.down.add("alpha.test")
 
     services.start = start_but_stay_unreachable  # type: ignore[method-assign]
+
+
+def test_o28_a_provider_that_runs_but_does_not_serve_after_the_restore_fails_the_check(context, world, services):
+    """O28: a provider back with a changed identity whose REST does not answer does not serve, so the injector of #27
+    leaves its restore unverified (`not_serving`), the injection open, and the check fails."""
+    stay_unreachable(services, world)
     entry = outage_check(context)
     assert entry.ok is False
-    assert entry.facts["restore"]["verified"] is True  # the identity changed
+    restore = entry.facts["restore"]
+    assert (restore["cleared"], restore["verified"], restore["how"]) == (False, False, "not_serving")
+    assert "could not be brought back (not_serving)" in entry.summary
+
+
+def test_o28_a_provider_whose_driver_finds_it_serving_and_whose_rest_does_not_answer_fails_the_check(
+    context, world, services
+):
+    """O28: the check asks the target's REST itself after the injector's restore: a driver that finds the provider
+    serving while the target does not answer the check's own read still fails the check, by the settle timeout."""
+    stay_unreachable(services, world)
+    services.serves = lambda service: True  # type: ignore[method-assign]
+    entry = outage_check(context)
+    assert entry.ok is False
+    assert entry.facts["restore"]["verified"] is True  # the identity changed and the driver found it serving
     assert entry.facts["restore"]["rest_answers_again"] is False
     assert "did not answer REST" in entry.summary
 
@@ -841,21 +865,28 @@ def test_o28_a_space_whose_provider_could_not_be_shown_restored_stops_the_spaces
 
 
 def test_o28_a_provider_that_never_answers_rest_again_halts_the_spaces_after_it(two_spaces):
-    """O28: a provider back with a changed identity that never answers REST again is not shown back either: the
-    space fails and the spaces after it are not run."""
+    """O28: a provider back with a changed identity that never answers REST again does not serve, so it is not shown
+    back: the space fails and the spaces after it are not run."""
     ctx, services, world = two_spaces
-    real_start = services.start
+    stay_unreachable(services, world)
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    spaces = entry.facts["spaces"]
+    assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("fail", "unknown")
+    assert spaces["spaces[0]"]["restore"]["how"] == "not_serving"
+    assert "spaces[0] left a provider" in spaces["spaces[1]"]["summary"]
+    assert services.verbs() == ["stop", "start"]
 
-    def start_but_stay_unreachable(service: str) -> None:
-        real_start(service)
-        world.down.add("alpha.test")
 
-    services.start = start_but_stay_unreachable  # type: ignore[method-assign]
+def test_o28_a_provider_whose_rest_never_answers_the_checks_own_read_halts_the_spaces_after_it(two_spaces):
+    """O28: a provider the driver finds serving that never answers the check's own REST read is not shown back
+    either: the space fails and the spaces after it are not run."""
+    ctx, services, world = two_spaces
+    stay_unreachable(services, world)
+    services.serves = lambda service: True  # type: ignore[method-assign]
     entry = run_checks(ctx, ["provider_outage"])[0]
     spaces = entry.facts["spaces"]
     assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("fail", "unknown")
     assert spaces["spaces[0]"]["restore"]["rest_answers_again"] is False
-    assert "spaces[0] left a provider" in spaces["spaces[1]"]["summary"]
     assert services.verbs() == ["stop", "start"]
 
 

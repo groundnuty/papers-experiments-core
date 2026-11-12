@@ -158,9 +158,14 @@ class FakeServices:
             raise DriverError("the container's inspection could not be read")
         return Observation(self.running[service], f"container-{service}@{self.generation[service]}")
 
+    def serves(self, service: str) -> bool:
+        """Whether the provider serves, as the real probe finds it: its service runs and its host answers."""
+        self.calls.append(("serves", service))
+        return self.running[service] and self.services[service] not in self.world.down
+
     def verbs(self) -> list[str]:
         """The stops and starts, in order."""
-        return [verb for verb, _ in self.calls if verb != "observe"]
+        return [verb for verb, _ in self.calls if verb in ("stop", "start")]
 
 
 class WorldDaemon(FakeDaemon):

@@ -9,16 +9,19 @@ reads what the injector did from its snapshot, so the check has the injector's g
 - **Journal and recovery (O11).** The injection is journalled before the stop; an injection an earlier process left open
   is cleared and verified before this one starts, and one that cannot be fails the start.
 - **Verified restore (O11).** A restore counts only when the service runs with an identity other than the one read
-  before the stop; readiness alone is not one. A stop whose outcome is unknown (its command timed out) is settled by
-  waiting for the service to show down before it is started again, and one never seen down stays unverified.
+  before the stop and the provider then serves (its driver's `serves`, within `ready_timeout_s` of `[faults]`; the
+  wait is `ready_after_s`); readiness alone is not one, and a provider that does not serve in time is `not_serving`,
+  unverified. A stop whose outcome is unknown (its command timed out, or the process died with the journal saying
+  `stopping`) is settled by waiting for the service to show down before it is started again, and one never seen down
+  stays unverified.
 - **The federation held (O11).** The check holds the federation's lock exclusively around a whole space's scenario
   (`outage.py`); the injector takes that admission as its own and names its target in the holder record.
 
 `take_down` and `restore` turn the injector's outcome into the check's facts: whether the provider was seen down, and
-whether it is back (`cleared`: nothing is left down) and restored (`verified`: back with a changed identity), with the
-injector's own word for how (`restored`, `found_restored`, `never_down`, `identity_unchanged`, `not_running`,
-`start_failed`, `restore_unverified`, `stop_unsettled`). The provider is named by its label and an identity by its
-digest, as the injector names them (O12).
+whether it is back (`cleared`: nothing is left down) and restored (`verified`: back with a changed identity, and
+serving), with the injector's own word for how (`restored`, `found_restored`, `never_down`, `identity_unchanged`,
+`not_running`, `not_serving`, `start_failed`, `restore_unverified`, `stop_unsettled`). The provider is named by its
+label and an identity by its digest, as the injector names them (O12).
 """
 
 from collections.abc import Mapping
@@ -82,6 +85,8 @@ class Outage:
         }
         if verified and verified.get("identity_after_sha256"):
             facts["identity_after_sha256"] = verified["identity_after_sha256"]
+        if verified and verified.get("ready_after_s") is not None:
+            facts["ready_after_s"] = verified["ready_after_s"]  # from the identity change to serving
         facts["journal_steps"] = [step["step"] for step in snapshot["steps"]]
         return facts
 

@@ -14,6 +14,7 @@ from expcore_onedata.config import PlatformConfig, load_platform
 from expcore_onedata.day0.registry import REGISTRY, Context, Result, failed
 from expcore_onedata.day0.report import Entry, build_report, stamp, write_report
 from expcore_onedata.fault_recovery import FaultDriver
+from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import compose_driver
 from expcore_onedata.provision import resolve_provider_ids
 from expcore_onedata.rangemap import load_placement
@@ -67,7 +68,8 @@ def build_context(
     handed in (a test's fake); otherwise one is built that talks to the configured federation.
 
     A platform.toml with a `[faults]` table gives the outage check the fault injector's settings
-    (`fault_settings.load_faults`) and its Compose driver (`compose_driver`), unless a `driver` is handed in. Taking a
+    (`fault_settings.load_faults`) and its Compose driver (`compose_driver`), which finds a restored provider serving by
+    reading through the run's client (`fault_serves.provider_serves`), unless a `driver` is handed in. Taking a
     provider down also needs `allow_faults` (`EXPCORE_LIVE_FAULTS=1` by default). The outage check starts a sandbox
     and the tool server on `agent_host`, by default a `DockerHost` when `EXPCORE_LIVE_DOCKER=1` and platform.toml has
     a `[sandbox]` table, and on none otherwise.
@@ -77,6 +79,8 @@ def build_context(
     placement = load_placement(path, config) if "placement" in load_toml(path) else None
     client = client or OnezoneClient(config, environ=environ)
     settings = fault_settings_of(config)
+    if driver is None and settings is not None:
+        driver = compose_driver(settings, probe=provider_serves(config, settings, client))
     ctx = Context(
         config=config,
         client=client,
@@ -92,7 +96,7 @@ def build_context(
         now=now,
         allow_faults=faults_allowed(environ) if allow_faults is None else allow_faults,
         fault_settings=settings,
-        fault_driver=driver or (compose_driver(settings) if settings else None),
+        fault_driver=driver,
         outage_bound_s=outage_bound_s,
         agent_host=agent_host or _default_host(config, environ),
         agent_options=dict(agent_options or {}),
