@@ -124,7 +124,7 @@ print(json.dumps(out))
 """
 
 REPLAYER = r"""
-import errno, io, json, os, sys, time
+import ctypes, errno, io, json, os, sys, time
 mode, path, prog, ack, reads = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], json.loads(sys.argv[5])
 def emit(rec):
     with open(prog, "a") as h:
@@ -133,8 +133,21 @@ t0 = time.perf_counter()
 handle = open(path, "rb") if mode == "buffered" else None
 fd = handle.fileno() if handle is not None else os.open(path, os.O_RDONLY)
 st = os.fstat(fd)
-emit({"i": -1, "open_s": round(time.perf_counter() - t0, 5), "st_blksize": st.st_blksize, "size": st.st_size,
-      "handle": type(handle).__name__ if handle is not None else "fd", "default_buffer_size": io.DEFAULT_BUFFER_SIZE})
+opened = {"i": -1, "open_s": round(time.perf_counter() - t0, 5), "st_blksize": st.st_blksize, "size": st.st_size,
+          "handle": type(handle).__name__ if handle is not None else "fd",
+          "default_buffer_size": io.DEFAULT_BUFFER_SIZE}
+# Whether the file maps shared (FUSE refuses that, ENODEV, for a file opened in direct-I/O mode); nothing is touched.
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.restype, libc.mmap.argtypes = ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                                                          ctypes.c_int, ctypes.c_int, ctypes.c_long]
+libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+got = libc.mmap(None, st.st_size, 1, 1, fd, 0)  # PROT_READ, MAP_SHARED
+if got in (None, ctypes.c_void_p(-1).value):
+    opened["mmap_shared"] = errno.errorcode.get(ctypes.get_errno(), "error")
+else:
+    opened["mmap_shared"] = "mapped"
+    libc.munmap(ctypes.c_void_p(got), st.st_size)
+emit(opened)
 for i, (offset, length) in enumerate(reads):
     if i:
         while not os.path.exists("%s.%d" % (ack, i - 1)):
