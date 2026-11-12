@@ -2,8 +2,9 @@
 
 These are tests of the fake, not of the platform layer. The delay is counted on the fake's own `clock`, which every test
 binds to a `Ticker`, so none of them waits. The answers a test pins as recorded are those the fake's docstring and
-`docs/interfaces.md` mark so (`DELETE_FACTS`); the ones they mark as assumptions are pinned here too, so a live check
-that disproves one has a test to change.
+`docs/interfaces.md` mark so (`DELETE_FACTS`, the 12 Nov check among them); the ones they mark as assumptions are
+pinned here too, so a live check that disproves one has a test to change. The loss of a directory made again under the
+name of one whose delete lands was not reproduced live: it is an opt-in (`lose_recreated`), and its tests say so.
 """
 
 import sys
@@ -127,19 +128,54 @@ def test_a_deleted_directory_pends_with_what_is_under_it():
     assert fake.deleted_parents[inner] == deep  # and each keeps the parent it had
 
 
-def test_a_directory_name_reused_during_its_delete_loses_the_files_made_in_it_when_the_delete_lands():
+def test_a_directory_name_reused_during_its_delete_loses_nothing_by_default():
+    """Recorded live (12 Nov): files made under a directory re-created within 0.1 s of the old one's delete, which
+    landed after that, were all there on every provider afterwards. The create is accepted, as recorded before."""
     fake, ticker = delayed()
     fake.add_file("study/old.bin", DATA)
     old = fake.id_of("study")
     delete(fake, ALPHA_ID, old)
-    fresh = make(fake, ALPHA_ID, ROOT_ID, "study", "DIR")  # recorded: the create is accepted, not refused
+    fresh = make(fake, ALPHA_ID, ROOT_ID, "study", "DIR")
+    assert fresh != old
+    kept = make(fake, ALPHA_ID, fresh, "new.bin", "REG")
+    write(fake, ALPHA_ID, kept, b"fresh")
+    sub = make(fake, ALPHA_ID, fresh, "sub", "DIR")
+    deep = make(fake, ALPHA_ID, sub, "deep.bin", "REG")
+    write(fake, ALPHA_ID, deep, b"deeper")
+    ticker.sleep(DELAY_S)
+    for provider in (ALPHA_ID, BETA_ID):
+        assert absent(fake, provider, old)
+        assert call(fake, provider, "GET", f"/data/{kept}/content").content == b"fresh"
+        assert call(fake, provider, "GET", f"/data/{deep}/content").content == b"deeper"
+        assert names(fake, provider) == ["study"]
+        assert names(fake, provider, fresh) == ["new.bin", "sub"]
+        assert names(fake, provider, sub) == ["deep.bin"]
+    assert fake.exists("study/new.bin")
+    ticker.sleep(1000)
+    assert call(fake, ALPHA_ID, "GET", f"/data/{kept}/content").content == b"fresh"
+
+
+def test_the_loss_is_an_opt_in_and_it_is_off_by_default():
+    assert FakeData().lose_recreated is False
+    assert FakeData(lose_recreated=True).lose_recreated is True
+    assert make_federation().lose_recreated is False
+    assert make_federation(lose_recreated=True).lose_recreated is True
+
+
+def test_with_lose_recreated_a_directory_name_reused_during_its_delete_loses_its_files_when_the_delete_lands():
+    """Not reproduced live (12 Nov facts); kept to test code that waits defensively before it reuses a name."""
+    fake, ticker = delayed(lose_recreated=True)
+    fake.add_file("study/old.bin", DATA)
+    old = fake.id_of("study")
+    delete(fake, ALPHA_ID, old)
+    fresh = make(fake, ALPHA_ID, ROOT_ID, "study", "DIR")  # the create is accepted, not refused
     assert fresh != old
     kept = make(fake, ALPHA_ID, fresh, "new.bin", "REG")
     write(fake, ALPHA_ID, kept, b"fresh")
     assert call(fake, ALPHA_ID, "GET", f"/data/{kept}/content").content == b"fresh"
     assert names(fake, ALPHA_ID, fresh) == ["new.bin"]
     ticker.sleep(5)
-    assert absent(fake, ALPHA_ID, kept)  # recorded: the old delete's late removal takes the new directory's files
+    assert absent(fake, ALPHA_ID, kept)  # the old delete's late removal takes the new directory's files
     assert absent(fake, BETA_ID, old)
     assert call(fake, ALPHA_ID, "GET", f"/data/{fresh}").status_code == 200  # assumed: the directory itself stays
     assert names(fake, ALPHA_ID, fresh) == []
@@ -148,8 +184,8 @@ def test_a_directory_name_reused_during_its_delete_loses_the_files_made_in_it_wh
     assert not fake.exists("study/new.bin")
 
 
-def test_a_directory_that_loses_files_loses_the_files_at_any_depth_and_keeps_the_directories():
-    fake, ticker = delayed()
+def test_with_lose_recreated_the_loss_takes_the_files_at_any_depth_and_keeps_the_directories():
+    fake, ticker = delayed(lose_recreated=True)
     fake.add_file("study/x.bin", DATA)
     delete(fake, ALPHA_ID, fake.id_of("study"))
     fresh = make(fake, ALPHA_ID, ROOT_ID, "study", "DIR")
@@ -160,8 +196,9 @@ def test_a_directory_that_loses_files_loses_the_files_at_any_depth_and_keeps_the
     assert names(fake, ALPHA_ID, sub) == []
 
 
-def test_code_that_waits_until_every_provider_answers_absent_keeps_what_it_writes_next():
-    fake, ticker = delayed()
+@pytest.mark.parametrize("lose_recreated", [False, True])
+def test_code_that_waits_until_every_provider_answers_absent_keeps_what_it_writes_next(lose_recreated):
+    fake, ticker = delayed(lose_recreated=lose_recreated)
     fake.add_file("study/old.bin", DATA)
     old = fake.id_of("study")
     delete(fake, ALPHA_ID, old)
@@ -178,9 +215,11 @@ def test_code_that_waits_until_every_provider_answers_absent_keeps_what_it_write
     assert call(fake, ALPHA_ID, "GET", f"/data/{kept}/content").content == b"fresh"
 
 
-def test_a_file_name_reused_during_its_delete_keeps_the_new_file():
-    """The facts record the loss for a directory's name only, so the fake loses nothing of a file's (an assumption)."""
-    fake, ticker = delayed()
+@pytest.mark.parametrize("lose_recreated", [False, True])
+def test_a_file_name_reused_during_its_delete_keeps_the_new_file(lose_recreated):
+    """Recorded live (12 Nov): a single file deleted and made again at once lost nothing, whatever `lose_recreated`
+    does to a directory's."""
+    fake, ticker = delayed(lose_recreated=lose_recreated)
     old = fake.add_file("a.bin", DATA)
     delete(fake, ALPHA_ID, old)
     fresh = make(fake, ALPHA_ID, ROOT_ID, "a.bin", "REG")
@@ -302,28 +341,84 @@ def test_threads_reading_at_once_while_deletes_land_never_see_the_tree_change_un
     assert results == [[]] * 6 * 48  # every read saw the directories gone, none raised
 
 
+def schedule(fake: FakeData, provider: str, kind: str, file_id: str) -> httpx.Response:
+    """Schedule a job of that kind for a file through a provider: a replication to `BETA_ID`, an eviction from
+    `ALPHA_ID`, and a migration from the one to the other."""
+    body: dict = {"type": kind, "fileId": file_id}
+    if kind in ("replication", "migration"):
+        body["replicatingProviderId"] = BETA_ID
+    if kind in ("eviction", "migration"):
+        body["evictingProviderId"] = ALPHA_ID
+    return call(fake, provider, "POST", "/transfers", json=body)
+
+
+def record(fake: FakeData, provider: str, transfer_id: str) -> dict:
+    return call(fake, provider, "GET", f"/transfers/{transfer_id}").json()
+
+
+def listed(fake: FakeData, provider: str, state: str) -> list[str]:
+    route = f"/spaces/{fake.SPACE_ID}/transfers"
+    return call(fake, provider, "GET", route, params={"state": state, "limit": 100}).json()["transfers"]
+
+
 @pytest.mark.parametrize("delay", [0.0, DELAY_S])
-def test_a_transfer_of_a_file_whose_delete_is_under_way_is_refused_through_its_provider_as_with_no_delay(delay):
+@pytest.mark.parametrize("kind", ["replication", "eviction", "migration"])
+def test_a_transfer_of_a_deleted_file_is_accepted_through_its_provider_and_ends_at_once_with_no_file(delay, kind):
+    """Recorded live (12 Nov): the transfer of a file the deleting provider already answered as deleted was accepted,
+    with a transfer id and no error, and completed at once with 0 files processed, 0 replicated and 0 failed; none
+    was left waiting or ongoing. The earlier assumption, that it is refused 400 as an entry that is gone, failed."""
     fake = make_federation(clock=Ticker().clock, delete_delay_s=delay)
     file_id = fake.add_file("a.bin", DATA)
     delete(fake, ALPHA_ID, file_id)
-    body = {"type": "replication", "fileId": file_id, "replicatingProviderId": BETA_ID}
-    refused = call(fake, ALPHA_ID, "POST", "/transfers", json=body)
+    accepted = schedule(fake, ALPHA_ID, kind, file_id)
+    assert accepted.status_code == 201
+    transfer_id = accepted.json()["transferId"]
+    done = record(fake, ALPHA_ID, transfer_id)  # the first read already finds it ended, not active
+    status = "evictionStatus" if kind == "eviction" else "replicationStatus"
+    assert done[status] == "completed"
+    assert (done["filesReplicated"], done["filesEvicted"], done["filesFailed"], done["bytesReplicated"]) == (0, 0, 0, 0)
+    assert done["finishTime"] == done["startTime"] == done["scheduleTime"]
+    assert listed(fake, ALPHA_ID, "ended") == [transfer_id]
+    assert listed(fake, ALPHA_ID, "waiting") == listed(fake, ALPHA_ID, "ongoing") == []
+
+
+def test_a_transfer_of_a_deleted_file_places_and_removes_nothing_while_its_delete_is_under_way():
+    """The file is still in the fake's tree until the delete lands; a job for it must not move a block."""
+    fake, _ = delayed()
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    held = [list(b) for b in fake.blocks[(file_id, ALPHA_ID)]]
+    for kind in ("replication", "migration", "eviction"):
+        assert schedule(fake, ALPHA_ID, kind, file_id).status_code == 201
+    assert fake.blocks[(file_id, ALPHA_ID)] == held  # not evicted
+    assert (file_id, BETA_ID) not in fake.blocks  # not replicated
+
+
+def test_a_transfer_of_a_file_that_never_was_is_still_refused_as_an_entry_that_is_not_there():
+    """Not recorded: the live job was for a file that existed and was deleted, so an id the fake never made keeps the
+    refusal it had."""
+    fake = make_federation(clock=Ticker().clock)
+    refused = schedule(fake, ALPHA_ID, "replication", "fid-never")
     assert (refused.status_code, refused.json()["error"]["id"]) == (400, "badValueNotAllowed")
     assert fake.transfers == {}
 
 
-def test_a_transfer_of_a_file_under_a_directory_whose_delete_is_under_way_is_refused_through_the_deleting_provider():
+def test_a_transfer_of_a_file_under_a_directory_whose_delete_is_under_way_follows_the_deleting_provider():
     fake, ticker = delayed()
     inner = fake.add_file("study/b.bin", DATA)
     delete(fake, ALPHA_ID, fake.id_of("study"))
-    body = {"type": "eviction", "fileId": inner, "evictingProviderId": ALPHA_ID}
-    assert call(fake, ALPHA_ID, "POST", "/transfers", json=body).status_code == 400
-    assert fake.transfers == {}
-    # the providers the DELETE did not go to still show the file, so they accept the job until the delete lands
-    assert call(fake, BETA_ID, "POST", "/transfers", json=body).status_code == 201
+    deleted = schedule(fake, ALPHA_ID, "eviction", inner)  # recorded: accepted, and it ends at once with no file
+    assert deleted.status_code == 201
+    assert record(fake, ALPHA_ID, deleted.json()["transferId"])["filesEvicted"] == 0
+    assert fake.blocks[(inner, ALPHA_ID)]  # nothing was evicted
+    # an assumption: the providers the DELETE did not go to still show the file, so their job is a real one
+    shown = schedule(fake, BETA_ID, "eviction", inner)
+    assert shown.status_code == 201
+    assert record(fake, BETA_ID, shown.json()["transferId"])["evictionStatus"] == "active"
     ticker.sleep(DELAY_S)
-    assert call(fake, BETA_ID, "POST", "/transfers", json=body).status_code == 400
+    landed = schedule(fake, BETA_ID, "eviction", inner)  # landed: it is a deleted file's job on every provider
+    assert landed.status_code == 201
+    assert record(fake, BETA_ID, landed.json()["transferId"])["filesEvicted"] == 0
 
 
 def test_a_delay_with_the_clock_a_fake_starts_with_is_refused_at_the_first_delete_that_would_pend():

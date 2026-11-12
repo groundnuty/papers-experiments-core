@@ -100,6 +100,7 @@ class Transfer:
     waiting: bool = False
     bytes_replicated: int | None = None  # the counter the record reports, when a test scripts it
     noop: bool = False  # an eviction that completed and evicted nothing (`evictions_noop_first`)
+    deleted: bool = False  # the file was deleted when the job was scheduled: it ended at once, with no file processed
 
     @property
     def replicates(self) -> bool:
@@ -303,7 +304,13 @@ class FakeData(FakeFederation):
     require_octet_stream: bool
 
     def __init__(
-        self, *, error_shape: str = ERRORS_25_0, visibility_delay_s: float = 0.0, delete_delay_s: float = 0.0, **kwargs
+        self,
+        *,
+        error_shape: str = ERRORS_25_0,
+        visibility_delay_s: float = 0.0,
+        delete_delay_s: float = 0.0,
+        lose_recreated: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         # Re-entrant: `respond` holds it for a whole provider route, and the helpers the route calls take it again.
@@ -314,6 +321,9 @@ class FakeData(FakeFederation):
         self.delete_delay_s = (
             delete_delay_s  # seconds of `clock` a DELETE stays under way after it is answered (0: none)
         )
+        # A directory made again under the name of one whose delete is under way loses its files when that delete lands.
+        # Not reproduced live (12 Nov facts), so off: an opt-in for testing defensive waits.
+        self.lose_recreated = lose_recreated
         self._deleting: dict[str, _Deleting] = {}  # entry id -> the delete of it that has not landed
         self.nodes: dict[str, Node] = {ROOT_ID: Node(ROOT_ID, "", "DIR", None)}
         self.blocks: dict[tuple[str, str], list[list[int]]] = {}
@@ -540,12 +550,14 @@ class FakeData(FakeFederation):
                     self._land(pending)
 
     def _land(self, pending: _Deleting) -> None:
-        """Finish a delete. A directory's late removal takes the files of a directory made again under its name since
-        (`FakeData`, "Pending deletes"); a file's, and a name made again that is a file, lose nothing."""
+        """Finish a delete. It removes the entry and what is under it, and nothing made again under its name since:
+        that was seen live (`FakeData`, "Pending deletes"). With `lose_recreated`, a directory's late removal also takes
+        the files of a directory made again under its name; a file's, and a name made again that is a file, lose
+        nothing either way."""
         if pending.file_id not in self._deleting:  # taken with a directory above it that landed first
             return
         del self._deleting[pending.file_id]
-        if pending.kind == "DIR":
+        if pending.kind == "DIR" and self.lose_recreated:
             again = next(
                 (
                     n.file_id
@@ -882,24 +894,31 @@ class FakeData(FakeFederation):
         return {"type": node.kind, "distributionPerProvider": per}
 
     def _schedule(self, request: httpx.Request, via: str) -> httpx.Response:
-        """Schedule a job through the provider `via`: an entry that provider answers as deleted, one whose delete is
-        under way included, is refused as an entry that is not there is, as it is with no delay."""
+        """Schedule a job through the provider `via`. A file that provider answers as deleted, one whose delete is under
+        way or that landed, is accepted, as seen live (`DELETE_FACTS`): the job ends at once with no file processed and
+        places or removes nothing. A file id the fake never made is refused as an entry that is not there."""
         sent = json.loads(request.content or b"{}")
         kind = sent.get("type")
         provider = sent.get("evictingProviderId" if kind == "eviction" else "replicatingProviderId")
         source = sent.get("evictingProviderId") if kind == "migration" else None
         node = self.nodes.get(sent.get("fileId"))
+        gone = (node is None and sent.get("fileId") in self.deleted_parents) or (
+            node is not None and self._hidden(node, via)
+        )
         if (
             kind not in ("replication", "eviction", "migration")
-            or node is None
-            or self._hidden(node, via)
+            or (node is None and not gone)
             or provider is None
             or (kind == "migration" and source is None)
         ):
             return self._error(400, "badValueNotAllowed")
         tid = f"tid-{next(self._ids):04d}"
         now = int(self.clock())
-        self.transfers[tid] = Transfer(kind, sent["fileId"], provider, source_id=source, scheduled=now, started=now)
+        self.transfers[tid] = Transfer(
+            kind, sent["fileId"], provider, source_id=source, scheduled=now, started=now, deleted=gone
+        )
+        if gone:
+            self.end_transfer(tid)
         return httpx.Response(201, json={"transferId": tid})
 
     def _list_transfers(self, space: str, query: httpx.QueryParams, provider: str) -> httpx.Response:
@@ -933,6 +952,7 @@ class FakeData(FakeFederation):
         state = "completed" if transfer.ended else "scheduled" if transfer.waiting else "active"
         size = len(self.nodes[transfer.file_id].content) if transfer.file_id in self.nodes else 0
         moved = transfer.bytes_replicated if transfer.bytes_replicated is not None else size
+        files = 0 if transfer.deleted else 1  # a job for a file that was deleted processed none
         answer = {
             "evictionStatus" if transfer.kind == "eviction" else "replicationStatus": state,
             "type": transfer.kind,
@@ -942,9 +962,9 @@ class FakeData(FakeFederation):
             "scheduleTime": transfer.scheduled,
             "startTime": transfer.started,
             "finishTime": transfer.finished,
-            "bytesReplicated": moved if transfer.ended and transfer.replicates else 0,
-            "filesReplicated": 1 if transfer.ended and transfer.replicates else 0,
-            "filesEvicted": 1 if transfer.ended and transfer.kind != "replication" and not transfer.noop else 0,
+            "bytesReplicated": moved if transfer.ended and transfer.replicates and files else 0,
+            "filesReplicated": files if transfer.ended and transfer.replicates else 0,
+            "filesEvicted": files if transfer.ended and transfer.kind != "replication" and not transfer.noop else 0,
             "filesFailed": 0,
         }
         view = self._view(tid, provider)
@@ -959,6 +979,8 @@ class FakeData(FakeFederation):
         return self.provider_view.get((tid, provider), {})
 
     def _finish(self, transfer: Transfer) -> None:
+        if transfer.deleted:  # nothing to place or remove, and no eviction counted as a no-op
+            return
         key = (transfer.file_id, transfer.provider_id)
         if transfer.replicates and self.transfers_place_blocks and transfer.file_id in self.nodes:
             size = len(self.nodes[transfer.file_id].content)

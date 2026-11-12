@@ -90,6 +90,7 @@ def make_federation(
     error_shape: str = ERRORS_25_0,
     visibility_delay_s: float = 0.0,
     delete_delay_s: float = 0.0,
+    lose_recreated: bool = False,
 ) -> FakeData:
     """Return the federation the default `platform.toml` describes, as a `FakeData`.
 
@@ -108,6 +109,7 @@ def make_federation(
         error_shape=error_shape,
         visibility_delay_s=visibility_delay_s,
         delete_delay_s=delete_delay_s,
+        lose_recreated=lose_recreated,
     )
     if clock is not None:
         federation.clock = clock
