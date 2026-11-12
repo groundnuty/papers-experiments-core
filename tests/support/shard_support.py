@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from study_support import HEAD, Campaign, cli, copy_campaign, make_copy
 
-from expcore.campaign.shard import ShardSpec, assign, in_shard, pair_of
+from expcore.campaign.shard import RULE, RULE_BY_MODEL, ShardSpec, in_shard, pair_of, partition
 from expcore.provenance.codestamp import write_stamp
 from expcore.study import pipeline
 from expcore.study.config import load_study
@@ -35,8 +35,9 @@ IDENTITY = {
 UNIT_CAPS = ("alpha-stub = 1", "beta-stub = 1")
 
 
-def make_study(base: Path, name: str) -> Path:
-    """A stamped copy of the example whose unit caps (1 each) are 2, which two shards can share one of each.
+def make_study(base: Path, name: str, extra: str = "") -> Path:
+    """A stamped copy of the example whose unit caps (1 each) are 2, which two shards can share one of each, with
+    `extra` appended to its campaign.toml (a `[shards]` table, say).
 
     Every copy of a test (the shards, the whole campaign they are compared with, the study they merge into) is made
     here, so they plan the same campaign: the caps are in the campaign's fingerprint.
@@ -46,7 +47,7 @@ def make_study(base: Path, name: str) -> Path:
     for cap in UNIT_CAPS:
         assert cap in text, f"the example no longer caps {cap.split(' ')[0]} at 1"
         text = text.replace(cap, cap.replace("= 1", "= 2"))
-    (root / "campaign.toml").write_text(text, encoding="utf-8")
+    (root / "campaign.toml").write_text(text + extra, encoding="utf-8")
     write_stamp(root, HEAD, load_study(root).scope)  # campaign.toml changed: stamp the copy again
     return root
 
@@ -70,13 +71,14 @@ def run_shard(
     count: int = 2,
     label: str | None = None,
     identity: Mapping[str, str] = IDENTITY,
+    extra: str = "",
 ) -> Campaign:
     """Run shard `index` of `count` of the example study in a copy named `name` under `base`, and return it.
 
     It is run by the command line, `run --shard index/count --shard-label label`, to the end. It is not checked: the
-    merge does that.
+    merge does that. `extra` is appended to the copy's campaign.toml, as `make_study` takes it.
     """
-    root = make_study(base, name)
+    root = make_study(base, name, extra)
     with pytest.MonkeyPatch.context() as patch:
         declaring(patch, identity)
         code, errors = cli(
@@ -87,11 +89,12 @@ def run_shard(
 
 
 def keys_of_shard(root: Path, index: int, count: int = 2) -> list[str]:
-    """The run keys of shard `index`, in plan order."""
-    manifest = load_study(root).manifest
-    assignment = assign({pair_of(row.key.factors) for row in manifest.rows}, count)
-    spec = ShardSpec(index, count, f"shard-{index}")
-    return [row.key.text for row in manifest.rows if in_shard(row.key.factors, spec, assignment)]
+    """The run keys of shard `index`, in plan order, under the study's rule: by model when it declares `[shards]`."""
+    study = load_study(root)
+    layout = study.campaign.shards
+    spec = ShardSpec(index, count, f"shard-{index}", RULE if layout is None else RULE_BY_MODEL)
+    assignment = partition({pair_of(row.key.factors) for row in study.manifest.rows}, spec, layout)
+    return [row.key.text for row in study.manifest.rows if in_shard(row.key.factors, spec, assignment)]
 
 
 def meta_of(campaign: Campaign) -> dict[str, str]:
