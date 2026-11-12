@@ -252,11 +252,19 @@ def test_a_reset_that_leaves_the_dataset_fails_the_rehearsal_naming_the_files(st
 
 
 def test_a_merge_that_refuses_the_first_pair_fails_the_rehearsal(stand_ins, monkeypatch):
-    monkeypatch.setattr(
-        stand_ins.rehearsal, "expcore", lambda *argv, identity_file=None: (1, "", "merge refused: nothing\n")
-    )
-    with pytest.raises(RuntimeError, match="ended with status 1"):
+    real = stand_ins.core
+    calls = []
+
+    def merge_refuses(*argv, identity_file=None):  # every step as the stand-in runs it, but the merge refuses
+        calls.append(argv[0])
+        if argv[0] == "merge":
+            return 1, "", "merge refused: nothing\n"
+        return real(*argv, identity_file=identity_file)
+
+    monkeypatch.setattr(stand_ins.rehearsal, "expcore", merge_refuses)
+    with pytest.raises(RuntimeError, match="the merge of two shards of one environment was refused"):
         stand_ins.rehearsal.run()
+    assert calls.count("run") == 2  # both shards ran, so the failure is step 5's own guard
 
 
 # --- the steps, against the real core ---------------------------------------------------------------------------------
