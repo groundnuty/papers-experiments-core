@@ -335,6 +335,7 @@ def _build_record(
     secret_env: Iterable[str] = (),
     models: ModelTable | None = None,
     environ: Mapping[str, str] | None = None,
+    instrument_refusal: Mapping[str, Any] | None = None,
 ) -> RunRecord:
     """Build the record of a finished attempt from the loop's result and the recording wrapper it ran through.
 
@@ -434,6 +435,8 @@ def _build_record(
         "scores": {},
         "treatment_targets": targets,
     }
+    if instrument_refusal is not None:  # optional: written only when there is one, served back by a replay
+        fields["instrument_refusal"] = plain(dict(instrument_refusal))
     if redactor is None:
         redactor = redactor_for(recording.inner, environ=environ, secrets=secrets, secret_env=secret_env, models=models)
     redacted, paths = redactor.structure(fields)
@@ -452,8 +455,8 @@ def build_record(result: LoopResult, recording: RecordingBackend, **options: Any
 
     A live run cannot choose an older record version: that would apply an older treatment rule to a new run. The
     keyword options are those of `_build_record` (`identity`, `system`, `user`, `specs`, `code`, `core_version`,
-    `instruments`, `treatment_kinds`, `treatment_targets`, `redactor`, `secrets`, `secret_env`, `models`, `environ`);
-    `schema_version` is refused.
+    `instruments`, `instrument_refusal`, `treatment_kinds`, `treatment_targets`, `redactor`, `secrets`, `secret_env`,
+    `models`, `environ`); `schema_version` is refused.
     """
     if "schema_version" in options:
         raise TypeError("build_record writes the current record version; a live run cannot choose another")

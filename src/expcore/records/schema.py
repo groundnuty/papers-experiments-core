@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore.config.models import Limits
-from expcore.errors import TARGET_LABEL, infra_kinds
+from expcore.errors import TARGET_LABEL, infra_kinds, is_treatable
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
@@ -89,6 +89,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "scores": (dict,),
         "redacted_paths": (list,),
         "treatment_targets": (dict,),
+        "instrument_refusal": (dict,),
     },
     "prompt": {"system": (dict,), "user": (dict,), "tools_sha256": (str,)},
     "prompt_part": {"text": (str,), "sha256": (str,), "template_sha256": (str, NONE), "slots": (dict, NONE)},
@@ -190,6 +191,8 @@ FAILURE_KINDS = ("infra", "context_overflow", "abandoned", "error", "cut")
 # The fields of a retry event (`expcore.models.retry.Retrier`) and of a code identity (`codestamp.version`).
 RETRY_FIELDS = ("retry", "kind", "error", "status", "retry_after_s", "wait_s", "message")
 CODE_FIELDS = ("commit", "dirty", "source", "stale", "why", "tree_sha256")
+# The fields of the refusal an instrument's post-run check records (C31); `_check_refusal` checks the object.
+REFUSAL_FIELDS = ("namespace", "infra_kind", "detail")
 
 
 class RecordError(ValueError):
@@ -244,8 +247,16 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
     SchemaVersion(f"{SCHEMA_PREFIX}2", first_turn_rule=True),
     SchemaVersion(
         f"{SCHEMA_PREFIX}3",
-        added={"usage": ("extra", "extra_cut"), "record": ("treatment_targets",), "outcome": ("infra_target",)},
-        optional={"usage": ("extra", "extra_cut"), "record": ("treatment_targets",), "outcome": ("infra_target",)},
+        added={
+            "usage": ("extra", "extra_cut"),
+            "record": ("treatment_targets", "instrument_refusal"),
+            "outcome": ("infra_target",),
+        },
+        optional={
+            "usage": ("extra", "extra_cut"),
+            "record": ("treatment_targets", "instrument_refusal"),
+            "outcome": ("infra_target",),
+        },
         first_turn_rule=True,
         target_rule=True,
     ),
@@ -515,6 +526,24 @@ def _check_treatment_targets(targets: Any, kinds: list[str]) -> None:
         raise RecordError("treatment_targets: the kinds are written sorted")
 
 
+def _check_refusal(refusal: Any) -> None:
+    """Check the refusal an instrument's post-run check recorded: its keys, a namespace as plain as an instrument's, a
+    kind of the registry that no condition can declare as its treatment, and a detail that is text (C31)."""
+    where = "instrument_refusal"
+    _check_keys(where, refusal, REFUSAL_FIELDS)
+    if not isinstance(refusal["namespace"], str) or not _NAMESPACE.fullmatch(refusal["namespace"]):
+        raise RecordError(f"{where}.namespace: a lower-case instrument namespace, not {refusal['namespace']!r}")
+    kind = refusal["infra_kind"]
+    if not isinstance(kind, str) or kind not in infra_kinds():
+        raise RecordError(
+            f"{where}.infra_kind: {kind!r} is not an infrastructure kind; known: {', '.join(infra_kinds())}"
+        )
+    if is_treatable(kind):
+        raise RecordError(f"{where}.infra_kind: {kind!r} is treatable, so no instrument can refuse an attempt with it")
+    if not isinstance(refusal["detail"], str):
+        raise RecordError(f"{where}.detail: expected str, got {type(refusal['detail']).__name__}")
+
+
 def _check_configuration(config: Any, version: str, schemas: Sequence[SchemaVersion]) -> None:
     """Check the agent configuration against the loop's own fields, less the settings a later version added."""
     later = set(config_defaults(version, schemas))
@@ -591,4 +620,6 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
     _check_route(body["route"])
     if any(not isinstance(p, str) for p in body.get("redacted_paths", ())):
         raise RecordError("redacted_paths: a list of field paths")
+    if "instrument_refusal" in body:  # optional, from version 3
+        _check_refusal(body["instrument_refusal"])
     return version

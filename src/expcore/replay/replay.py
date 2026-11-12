@@ -51,7 +51,7 @@ from expcore.records.record import RunRecord
 from expcore.records.recording import RecordingBackend
 from expcore.records.redact import Redactor
 from expcore.records.schema import SCHEMAS, RecordError, SchemaVersion, config_defaults
-from expcore.replay.clock import ReplayClock
+from expcore.replay.clock import EXECUTOR_CLOCK_LABELS, ReplayClock
 from expcore.replay.compare import compare
 from expcore.replay.divergence import Halt, ReplayDivergence
 from expcore.replay.recorded import RecordedBackend, RecordedToolProvider, ReplayToolBox
@@ -159,6 +159,8 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
     except Halt as halt:
         raise halt.divergence from None
     _check_used(backend, provider, clock)
+    # the readings an executor took before the loop started the clock are not the loop's: serve them back as recorded
+    result.clock_readings[:0] = [(label, value) for label, value in rec.clock if label in EXECUTOR_CLOCK_LABELS]
     try:
         replayed = _build_record(
             result,
@@ -170,6 +172,7 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
             code=rec.code,
             core_version=rec.core_version,
             instruments=rec.instruments,
+            instrument_refusal=rec.instrument_refusal,  # carried over like the instruments; absent when absent
             treatment_kinds=rec.treatment_kinds,
             treatment_targets=rec.treatment_targets,
             schema_version=rec.schema_version,  # the rule of the record's own version decides its treatment flag
