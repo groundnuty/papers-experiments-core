@@ -205,10 +205,19 @@ class AgentWorld:
     fails with an errno (`mount_down = ("ETIMEDOUT", 110, "TimeoutError")`, as Python reports a mount's ETIMEDOUT). The
     tools answer from the providers' REST surface through the same transport, so a downed host is refused; while a host
     is down `tool_errors` makes a tool answer an error with that wording, and `tool_hangs` makes one never answer (the
-    ticker moved by `hang_s` first). What each does is a stand-in's choice, not a fact about Onedata."""
+    ticker moved by `hang_s` first). What each does is a stand-in's choice, not a fact about Onedata.
 
-    def __init__(self, world: OutageWorld, local_host: str, space_root: str) -> None:
+    The tools check the arguments the agent's side would pass, as a real server's caller must get them right: a
+    replication's target must be the agent's local provider (never the provider taken down, nor the mirror), and
+    `list_space_providers` must be asked about a space under test (`space_ids`, the fake's study space by default). A
+    call that is not is answered an error and kept in `misused`, so a check that sends a wrong id cannot pass."""
+
+    def __init__(
+        self, world: OutageWorld, local_host: str, space_root: str, space_ids: tuple[str, ...] | None = None
+    ) -> None:
         self.world, self.local_host, self.space_root = world, local_host, space_root.rstrip("/") + "/"
+        self.space_ids = space_ids or (world.fake.SPACE_ID,)
+        self.misused: list[tuple[str, str]] = []  # (tool, what was wrong) of each call with a wrong argument
         self.mount_down: Any = "blocked"
         self.tool_errors: dict[str, str] = {}
         self.tool_broken: dict[str, str] = {}  # answers an error with this wording whether or not anything is down
@@ -250,8 +259,21 @@ class AgentWorld:
         request = httpx.Request(method, f"https://{self.local_host}{PROVIDER_API}{path}", headers=headers, **options)
         return self.world.respond(request)
 
+    def wrong_argument(self, name: str, arguments: dict) -> str | None:
+        """What is wrong with a call's arguments, or None: the checks of the class docstring."""
+        local = self.world.fake.provider_of(self.local_host)
+        if name == "schedule_file_replication" and arguments.get("provider_id") != local:
+            return "the replication's target is not the agent's local provider"
+        if name == "list_space_providers" and arguments.get("space_id") not in self.space_ids:
+            return "the space is not one under test"
+        return None
+
     def tool(self, name: str, arguments: dict) -> dict:
         self.tool_calls.append((name, arguments))
+        wrong = self.wrong_argument(name, arguments)
+        if wrong is not None:
+            self.misused.append((name, wrong))
+            return {"error": f"invalid argument: {wrong}"}
         if self.world.down and name in self.tool_hangs:
             self.world.ticker.sleep(self.hang_s)
             return {"hang": True}

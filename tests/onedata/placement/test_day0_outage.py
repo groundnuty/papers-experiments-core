@@ -33,7 +33,7 @@ from sandbox_support import MOUNT_PATH
 from expcore_onedata.admission import OUTAGE_RUN
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
-from expcore_onedata.day0 import outage_cells, outage_run
+from expcore_onedata.day0 import outage_cells, outage_run, outage_tools
 from expcore_onedata.day0.outage_cells import Cells
 from expcore_onedata.day0.outage_tools import KNOWLEDGE_TOOLS
 from expcore_onedata.day0.runner import EXIT_FAIL, EXIT_UNKNOWN, build_context, run, run_checks
@@ -316,6 +316,47 @@ def test_o28_the_knowledge_plane_is_the_agents_own_tools_called_through_mcp_all_
     assert scheduled["owner_only"]["get_transfer"]["outcome"] == "blocked"
     assert scheduled["owner_only"]["get_transfer"]["calls"] > 1
     assert entry.facts["after"]["transfers"]["owner_only"]["outcome"] == "served"
+
+
+def test_o28_the_stand_in_tools_refuse_a_replication_elsewhere_and_a_space_not_under_test(agent, world):
+    """O28: the stand-in tools check the agent's arguments: a replication to the provider taken down or to the mirror,
+    and the providers of a space not under test, are answered errors and kept as misuses; the right ones serve."""
+    file_id = world.fake.add_file("probe.bin", b"x", holder=ALPHA_ID)
+    for provider in (ALPHA_ID, GAMMA_ID):
+        assert "error" in agent.tool("schedule_file_replication", {"file_id": file_id, "provider_id": provider})
+    assert "error" in agent.tool("list_space_providers", {"space_id": SPACE_IDS[1]})
+    assert [name for name, _ in agent.misused] == ["schedule_file_replication"] * 2 + ["list_space_providers"]
+    assert "result" in agent.tool("schedule_file_replication", {"file_id": file_id, "provider_id": BETA_ID})
+    assert "result" in agent.tool("list_space_providers", {"space_id": SPACE_IDS[0]})
+    assert len(agent.misused) == 3
+
+
+@pytest.mark.parametrize(
+    ("tool", "kind", "role"),
+    [
+        ("schedule_file_replication", "provider", "target"),
+        ("schedule_file_replication", "provider", "mirror"),
+        ("list_space_providers", "space", "local"),
+    ],
+)
+def test_o28_a_tool_called_with_a_wrong_id_is_never_a_pass(context, agent, services, monkeypatch, tool, kind, role):
+    """O28: a check that schedules the replication to the provider taken down or to the mirror, or asks for the
+    providers of anything but the space under test, is answered an error with everything up: the baseline does not
+    serve, nothing is stopped and the check is unknown, never passed."""
+    real = outage_tools.Tools.call
+
+    async def wrong(self, name, values):
+        if name == tool:
+            values = {**values, kind: self._roles.ids[role]}
+        return await real(self, name, values)
+
+    monkeypatch.setattr(outage_tools.Tools, "call", wrong)
+    entry = outage_check(context)
+    assert entry.ok is None
+    assert f"knowledge tools did not serve with everything up ({tool})" in entry.summary
+    assert agent.misused
+    assert {name for name, _ in agent.misused} == {tool}
+    assert services.verbs() == []
 
 
 def test_o28_a_tool_that_answers_an_error_keeps_its_wording_scrubbed_and_its_attempts(context, agent):
@@ -827,7 +868,7 @@ def two_spaces(tmp_path, ticker, monkeypatch, tools_manifest):
         data["sandbox"]["data_paths"] = {"isolated": "none"}
 
     world = OutageWorld(federation, ticker)
-    agent = AgentWorld(world, "beta.test", SPACE_ROOT)
+    agent = AgentWorld(world, "beta.test", SPACE_ROOT, space_ids=SPACE_IDS[:2])
     relay = ToolRelay(agent)
     directory = tmp_path / "several"
     directory.mkdir()
@@ -841,20 +882,23 @@ def two_spaces(tmp_path, ticker, monkeypatch, tools_manifest):
         clock=ticker.clock, sleep=ticker.sleep, outage_bound_s=BOUND_S, now=lambda: NOW,
         agent_host=agent_host(platform, agent), agent_options=agent_options(),
     )  # fmt: skip
-    yield ctx, services, world
+    yield ctx, services, world, agent
     relay.close()
 
 
 def test_o28_in_each_of_several_spaces_the_provider_is_taken_down_and_restored_and_spaces_are_named_by_position(
     two_spaces,
 ):
-    """O28: in each of several spaces the provider is taken down and restored and spaces are named by position."""
-    ctx, services, world = two_spaces
+    """O28: in each of several spaces the provider is taken down and restored and spaces are named by position; each
+    space's tools are asked about that space, the one under test, with everything up and while it is down."""
+    ctx, services, world, agent = two_spaces
     entry = run_checks(ctx, ["provider_outage"])[0]
     assert entry.ok is True, entry.summary
     assert list(entry.facts["spaces"]) == ["spaces[0]", "spaces[1]"]
     assert {row["result"] for row in entry.facts["spaces"].values()} == {"pass"}
     assert services.verbs() == ["stop", "start", "stop", "start"]  # restored and verified before the next space
+    asked = [arguments["space_id"] for name, arguments in agent.tool_calls if name == "list_space_providers"]
+    assert asked == [SPACE_IDS[0]] * 2 + [SPACE_IDS[1]] * 2
     text = json.dumps({"summary": entry.summary, "facts": entry.facts})
     for needle in (*SPACE_NAMES[:2], *SPACE_IDS[:2], *SPACE_LABELS[:2], "alpha.test"):
         assert needle not in text, needle
@@ -863,7 +907,7 @@ def test_o28_in_each_of_several_spaces_the_provider_is_taken_down_and_restored_a
 
 def test_o28_a_space_whose_provider_could_not_be_shown_restored_stops_the_spaces_after_it(two_spaces):
     """O28: a space whose provider could not be shown restored stops the spaces after it."""
-    ctx, services, _ = two_spaces
+    ctx, services, _, _ = two_spaces
     services.keeps_identity = True
     entry = run_checks(ctx, ["provider_outage"])[0]
     assert entry.ok is False
@@ -876,7 +920,7 @@ def test_o28_a_space_whose_provider_could_not_be_shown_restored_stops_the_spaces
 def test_o28_a_provider_that_never_answers_rest_again_halts_the_spaces_after_it(two_spaces):
     """O28: a provider back with a changed identity that never answers REST again does not serve, so it is not shown
     back: the space fails and the spaces after it are not run."""
-    ctx, services, world = two_spaces
+    ctx, services, world, _ = two_spaces
     stay_unreachable(services, world)
     entry = run_checks(ctx, ["provider_outage"])[0]
     spaces = entry.facts["spaces"]
@@ -889,7 +933,7 @@ def test_o28_a_provider_that_never_answers_rest_again_halts_the_spaces_after_it(
 def test_o28_a_provider_whose_rest_never_answers_the_checks_own_read_halts_the_spaces_after_it(two_spaces):
     """O28: a provider the driver finds serving that never answers the check's own REST read is not shown back
     either: the space fails and the spaces after it are not run."""
-    ctx, services, world = two_spaces
+    ctx, services, world, _ = two_spaces
     stay_unreachable(services, world)
     services.serves = lambda service: True  # type: ignore[method-assign]
     entry = run_checks(ctx, ["provider_outage"])[0]
