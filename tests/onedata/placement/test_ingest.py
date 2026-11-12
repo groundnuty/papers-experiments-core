@@ -260,6 +260,7 @@ def test_o27_a_part_still_being_written_past_the_bound_is_an_ingest_failure_and_
     with pytest.raises(InfraError, match="ingest_failure"):
         ingest.raise_if_failed()
     release.set()
+    until(lambda: ingest.progress >= 1)  # the held part finishes; the next join finds the thread ended
     assert ingest.stop() is True
 
 

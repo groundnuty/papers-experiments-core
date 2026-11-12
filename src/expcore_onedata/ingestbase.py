@@ -10,7 +10,8 @@ the ingest made. No directory is created or removed: a planned file's directory 
 
 **Every removal is confirmed on every provider of the space** (`answered_absent` on consecutive polls, bounded by
 `settle_timeout_s`), and a name removed earlier, by this run or a crashed one, is written again only once every
-provider answers its old entry absent: 25.0 deletes asynchronously, and a name reused at once can lose the new file.
+provider answers its old entry absent. 25.0 was measured to delete a directory asynchronously and to lose files
+when a name is deleted and recreated at once (#29); the wait is applied to every removed file as a precaution.
 
 **Every id change is recorded** (`Baseline.ids`) and journalled: a JSON-lines file kept across runs, each line pushed to
 disk before the next step, so the ids of a run whose record was lost can still be mapped to files. An id event holds
