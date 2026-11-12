@@ -64,6 +64,15 @@ def plain(file_id: str) -> str:
     return file_id
 
 
+class RestoreFailed(ProvisionError):
+    """Some planned files could not be brought back to their baseline; every other one was. `files` holds each file's
+    result by label, a failed one as `{"ok": False, "error", "detail"}`."""
+
+    def __init__(self, message: str, files: dict[str, dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.files = files
+
+
 class Baseline:
     """The planned files of one space: their removal for the start state and their restore, verified and recorded."""
 
@@ -139,12 +148,16 @@ class Baseline:
         if Digest(size, hasher.hexdigest()) != Digest(planned.size, planned.sha256):
             raise ProvisionError(f"{self._p.where}{planned.label}: its staged source no longer has the plan's hash")
 
+    def check_directory(self, planned: PlannedFile) -> None:
+        """A planned file's directory exists: the ingest creates none, so the namespace stays the baseline's."""
+        *directory, _ = safe_path(planned.path)
+        if directory and self._p.resolve("/".join(directory)).kind != "DIR":
+            raise ProvisionError(f"{self._p.where}{planned.label}: its directory is not a directory")
+
     def check_directories(self) -> None:
-        """Every planned file's directory exists: the ingest creates none, so the namespace stays the baseline's."""
+        """Every planned file's directory exists, so no arrival creates one."""
         for planned in self._plan.files:
-            *directory, _ = safe_path(planned.path)
-            if directory and self._p.resolve("/".join(directory)).kind != "DIR":
-                raise ProvisionError(f"{self._p.where}{planned.label}: its directory is not a directory")
+            self.check_directory(planned)
 
     def entry(self, path: str) -> Entry | None:
         """The entry at a path on the data provider, or None when there is none."""
@@ -231,14 +244,7 @@ class Baseline:
         if before is None and planned.label in self.last_id:  # a name removed earlier, perhaps by a crashed run
             self.await_absent(planned.label, self.last_id[planned.label])
         if planned.baseline == "complete":
-            self.check_source(planned)
-            done = self._p.upload(planned.path, planned.source)
-            if done.digest != Digest(planned.size, planned.sha256):
-                raise ProvisionError(f"{self._p.where}{planned.label}: the restored file is not its staged source")
-            self.confirm(done.file_id, planned.size)
-            old = before.file_id if before is not None else self.last_id.get(planned.label)
-            self.record_id(planned.label, "restored", phase, old, done.file_id, action=done.action)
-            return {"action": done.action, "file_id": done.file_id}
+            return self._write_back(planned, phase, before)
         if before is None:
             return {"action": "absent", "file_id": None}
         if not self._removable(planned, before):
@@ -249,9 +255,37 @@ class Baseline:
         self.remove(planned.label, before, phase)
         return {"action": "removed", "file_id": None}
 
+    def _write_back(self, planned: PlannedFile, phase: str, before: Entry | None) -> dict[str, Any]:
+        """Write a "complete" file back from its staged source, checked first, into its existing directory."""
+        self.check_source(planned)
+        if before is None:
+            self.check_directory(planned)  # the upload would create a missing one
+        done = self._p.upload(planned.path, planned.source)
+        if done.digest != Digest(planned.size, planned.sha256):
+            raise ProvisionError(f"{self._p.where}{planned.label}: the restored file is not its staged source")
+        self.confirm(done.file_id, planned.size)
+        old = before.file_id if before is not None else self.last_id.get(planned.label)
+        self.record_id(planned.label, "restored", phase, old, done.file_id, action=done.action)
+        return {"action": done.action, "file_id": done.file_id}
+
     def restore_all(self, phase: str) -> dict[str, Any]:
-        """Restore every planned file, in the plan's order."""
-        return {f.label: self.restore_file(f, phase) for f in self._plan.files}
+        """Restore every planned file, in the plan's order, each on its own: a file that fails stops none of the others,
+        so one bad staged copy never leaves the files after it missing. Return each file's result by label, or raise
+        `RestoreFailed` after the loop, naming every file that failed and holding every result."""
+        files: dict[str, dict[str, Any]] = {}
+        for planned in self._plan.files:
+            try:
+                files[planned.label] = {"ok": True, **self.restore_file(planned, phase)}
+            except FAILURES as error:
+                files[planned.label] = {"ok": False, "error": type(error).__name__, "detail": detail(error)}
+        failed = [label for label, done in files.items() if not done["ok"]]
+        if failed:
+            raise RestoreFailed(
+                f"{self._p.where}not brought back to the baseline: {', '.join(failed)}, every other file was; "
+                f"{failed[0]}: {files[failed[0]]['detail']}",
+                files,
+            )
+        return files
 
 
-__all__ = ["FAILURES", "Baseline", "detail", "plain", "utc"]
+__all__ = ["FAILURES", "Baseline", "RestoreFailed", "detail", "plain", "utc"]

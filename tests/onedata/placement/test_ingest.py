@@ -288,6 +288,61 @@ def test_o27_the_restore_leaves_the_declared_baseline_and_deletes_nothing_the_st
     ]
 
 
+def stage_kept_day(tmp_path, content=KEPT):
+    """Put the earlier day's staged copy beside the others, so a plan can list it as a complete file."""
+    (tmp_path / "staged").mkdir(exist_ok=True)
+    (tmp_path / "staged" / "day-12.csv").write_bytes(content)
+
+
+KEPT_ROW = {"label": "day-12", "path": KEPT_PATH, "source": "day-12.csv", "at_s": 300, "baseline": "complete"}
+
+
+def test_o27_a_file_that_cannot_be_restored_never_keeps_the_files_after_it_missing(make, fake, ticker, tmp_path):
+    """O27: day-12's staged copy changes during the run, so day-12 cannot be written back. Day-13, listed after it,
+    has a sound copy: the finish restores it all the same, the restore names day-12 alone as failed, and the snapshot
+    holds day-13's restored id. Each file is restored on its own; the first failure stops none of the others."""
+    stage_kept_day(tmp_path)
+    ingest = make(KEPT_ROW, DAY_ROW)
+    ingest.start({})
+    assert (content(fake, KEPT_PATH), content(fake, DAY_PATH)) == (None, None)
+    stage_kept_day(tmp_path, KEPT[:-1] + b"?")  # the copy the study keeps is damaged during the run
+    ticker.now += 50
+    snapshot = ingest.finish()
+    assert content(fake, DAY_PATH) == DAY
+    restore = snapshot["restore"]
+    assert restore["ok"] is False
+    assert "day-12" in restore["detail"] and "day-13" not in restore["detail"]
+    assert (restore["files"]["day-12"]["ok"], restore["files"]["day-13"]["ok"]) == (False, True)
+    assert "staged source" in restore["files"]["day-12"]["detail"]
+    assert snapshot["files"]["day-13"]["restored_id"] == fake.id_of(DAY_PATH)
+    with pytest.raises(InfraError, match="day-12"):
+        ingest.raise_if_failed()
+    with pytest.raises(InfraError):  # the executor's finally tries again, and day-13 stays restored
+        ingest.restore()
+    assert content(fake, DAY_PATH) == DAY
+
+
+def test_o27_a_staged_copy_that_changed_refuses_the_start_only_after_every_other_file_is_restored(
+    make, fake, ticker, tmp_path
+):
+    """O27: a run stops right after its start removed both days, and nothing restores them; then day-12's staged copy
+    changes. The next start cannot write day-12 back and refuses as an ingest failure, but it restores day-13 first:
+    one bad copy never leaves the other files of the plan missing."""
+    stage_kept_day(tmp_path)
+    crashed, following = make(KEPT_ROW, DAY_ROW), make(KEPT_ROW, DAY_ROW)  # both plans hash the sound copies
+    crashed.start({})
+    assert crashed.stop() is True  # no restore runs, as after a crash
+    stage_kept_day(tmp_path, KEPT[:-1] + b"?")
+    with pytest.raises(InfraError, match="day-12") as raised:
+        following.start({})
+    assert raised.value.kind == INGEST_FAILURE
+    assert content(fake, DAY_PATH) == DAY
+    assert content(fake, KEPT_PATH) is None  # nothing sound to write it back from
+    start = following.finish()["start"]
+    assert start["ok"] is False
+    assert (start["restore"]["day-12"]["ok"], start["restore"]["day-13"]["ok"]) == (False, True)
+
+
 def test_o27_a_run_that_ends_before_an_arrival_restores_the_file_from_its_staged_copy(make, fake, ticker):
     """O27: the run ends at 50 s, before either file was due. That is the manipulation, not a failure: both are
     recorded as not due, and the day, removed for the run, is written back from the copy the study keeps."""

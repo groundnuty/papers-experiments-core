@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.errors import InfraError
-from expcore_onedata.ingestbase import FAILURES, Baseline, detail
+from expcore_onedata.ingestbase import FAILURES, Baseline, RestoreFailed, detail
 from expcore_onedata.ingestplan import IngestPlan, Step
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.sandbox.kinds import INGEST_FAILURE
@@ -127,18 +127,19 @@ class ProgressiveIngest:
         try:
             self._p.verify_space()
             self._base.read_journal()
-            for planned in self._plan.files:
-                self._base.check_source(planned)
+            restored = self._base.restore_all("start")  # each file on its own, its staged source checked first
             self._base.check_directories()
-            restored = self._base.restore_all("start")
+            for planned in self._plan.files:
+                if planned.baseline == "absent":  # a "complete" one was checked by its restore
+                    self._base.check_source(planned)
             for label, file_id in self._base.remove_for_start().items():
                 self._files[label]["baseline_id"] = file_id
+        except RestoreFailed as error:  # every file was tried, and every other one restored
+            self._start = {**self._failed("start", error, began), "restore": error.files}
+            raise self._start_refused(error) from None
         except FAILURES as error:
             self._start = {**self._failed("start", error, began), "recovered": self._recover()}
-            raise InfraError(
-                INGEST_FAILURE,
-                f"{self._p.where}the progressive ingest could not set its start state: {detail(error)}"[:600],
-            ) from None
+            raise self._start_refused(error) from None
         self._start = {"ok": True, "seconds": round(self._p.clock() - began, 3), "restore": restored}
         self._t0 = self._p.clock()
         for step in self._steps:
@@ -146,12 +147,17 @@ class ProgressiveIngest:
         self._thread = threading.Thread(target=self._drive, name="progressive-ingest", daemon=True)
         self._thread.start()
 
+    def _start_refused(self, error: BaseException) -> InfraError:
+        text = f"{self._p.where}the progressive ingest could not set its start state: {detail(error)}"
+        return InfraError(INGEST_FAILURE, text[:600])
+
     def _recover(self) -> dict[str, Any]:
         """After a failed start, restore the baseline as far as it goes; the result is recorded, never raised."""
         try:
             return {"ok": True, "files": self._base.restore_all("start")}
         except FAILURES as error:
-            return {"ok": False, "error": type(error).__name__, "detail": detail(error)}
+            files = error.files if isinstance(error, RestoreFailed) else None
+            return {"ok": False, "error": type(error).__name__, "detail": detail(error), "files": files}
 
     # -- the schedule --------------------------------------------------------------------------------------------------
     def _drive(self) -> None:
@@ -240,14 +246,21 @@ class ProgressiveIngest:
             files = self._base.restore_all("restore")
         except FAILURES as error:
             self._restore = self._failed("restore", error, began)
+            if isinstance(error, RestoreFailed):  # every other file came back: say which, and with which id
+                self._restore["files"] = self._restored(error.files)
             raise InfraError(
                 INGEST_FAILURE,
                 f"{self._p.where}the progressive ingest could not restore the baseline: {detail(error)}"[:600],
             ) from None
-        for label, done in files.items():
-            self._files[label]["restored_id"] = done["file_id"]
-        self._restore = {"ok": True, "seconds": round(self._p.clock() - began, 3), "files": files}
+        self._restore = {"ok": True, "seconds": round(self._p.clock() - began, 3), "files": self._restored(files)}
         return self._restore
+
+    def _restored(self, files: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Note the id each restored file ends with; return the restore's results."""
+        for label, done in files.items():
+            if done["ok"]:
+                self._files[label]["restored_id"] = done["file_id"]
+        return files
 
     def finish(self) -> dict[str, Any]:
         """Stop the schedule, restore the baseline and return the snapshot. A restore that fails is in the snapshot
@@ -266,7 +279,9 @@ class ProgressiveIngest:
             text = f"{self._p.where}the progressive ingest failed{part}: {self._failure['detail']}"
             raise InfraError(INGEST_FAILURE, text[:600])
         if self._restore is None or not self._restore["ok"]:
-            raise InfraError(INGEST_FAILURE, f"{self._p.where}the progressive ingest did not restore the baseline")
+            why = f": {self._restore['detail']}" if self._restore is not None else ""
+            text = f"{self._p.where}the progressive ingest did not restore the baseline{why}"
+            raise InfraError(INGEST_FAILURE, text[:600])
 
     def _snapshot(self) -> dict[str, Any]:
         def relative(reading: dict[str, Any]) -> dict[str, Any]:
