@@ -395,6 +395,34 @@ An attempt killed between writing its side file and writing its record leaves a 
 
 A side file may hold at most 64 MiB (`expcore.replay.side_files.MAX_SIDE_FILE_BYTES`), since the analysis reads each one whole into memory to hand it to the scorers ([section 5](#5-score-and-analyse)). `check` fails a larger one at stage `side_file`, and `analyze` refuses one that grew past the cap after the check, having read no more than one byte beyond it. Keep a larger log compressed, or split it into side files of their own names.
 
+### Running one campaign on several hosts
+
+A main study can be too long for one host. Run it as N shards, one driver per host, each with its own copy of the study, its own `out/`, store and platform: `python -m expcore run my-study --shard 2/4 --shard-label rack-b` is shard 2 of 4. N is at least 2. Every shard host needs the same commit and the same locked environment (`uv sync --frozen`), with equivalent platform settings: the campaign fingerprint holds the study's configuration, the installed distributions and the platform's settings, and shards with different fingerprints are refused when they are merged. As it starts, each shard prints the environment part of its fingerprint on stderr: one digest, which every host must print alike, and the installed distributions with their versions (a short digest each when the list is long), so a host that differs shows before it runs. The shard is given on the command line only, never in `campaign.toml`, so every shard has the fingerprint of the whole plan, and a campaign run without `--shard` is exactly the campaign it was before shards existed: its store, records, export and report are byte for byte the same.
+
+**The label** names the shard in its export and in a merge. It is 1 to 64 lower-case letters, digits or `-`, starting with a letter or digit, chosen by you, and defaults to `shard-i`. It has no dot, so a fully qualified host name or an IPv4 address is refused instead of used by accident. Never use a host name, an address or anything else that identifies a machine: a replication package is public and may be double-blind, and the label travels with the export. A name for the part of the work (`north`, `rack-b`, `shard-2`) is enough. A label that needs `.` or `_` is allowed only with `--shard-label-wide`, given with `--shard-label` at every start of that shard, since a resume must give the label it started with.
+
+**The partition is by pair.** A pair is one task, one model and one seed. Every condition of a pair runs in the same shard, so no contrast's pair is split across hosts, and no host holds half of a comparison. Within a model, the pairs are ranked by a SHA-256 of their text and dealt round the shards from a starting shard the model's own hash picks. Each shard so gets the floor or the ceiling of n/N of every model's pairs, and the shards that get the ceiling differ from model to model, so no shard collects every remainder. Every host computes the same assignment from the same plan, and a run keeps its place in the whole plan and the run order of the seed:
+
+```python
+from expcore.campaign.shard import assign
+
+pairs = [(f"task-{n}", model, seed) for n in range(10) for model in ("model-a", "model-b") for seed in (1, 2)]
+assignment = assign(pairs, 3)
+for model in ("model-a", "model-b"):
+    sizes = [sum(1 for pair, shard in assignment.items() if pair[1] == model and shard == i) for i in (1, 2, 3)]
+    assert max(sizes) - min(sizes) <= 1  # the floor or the ceiling of 20 / 3, for every model
+```
+
+The assignment depends on the whole plan, so the plan of a sharded campaign cannot grow on resume: a resume that adds tasks, models, seeds or conditions is refused, whatever `allow_growth` says. A shard that would get no run (more shards than pairs) is refused at start.
+
+**The shares.** `[scheduler.unit_caps]`, `max_usd` and `per_model_usd` in `campaign.toml` are totals of the whole campaign: a model's concurrent sessions and the money are limits of the study, not of one host. Shard i of N runs on an equal part of each: the remainder of a cap goes to the first shards, so the shares of a cap sum to the total, and dollars are shared in whole micro-dollars, rounded down, so they sum to at most the total. The fingerprint holds the totals; the shares are applied after it is computed, and each is recorded in the store and the export. A total below N is refused at start, naming its key (`[scheduler.unit_caps] alpha-stub is 1, less than the 2 shards`); the one exception is a `per_model_usd` ceiling of 0, which holds that model entirely and is 0 for every shard. `workers`, the release step and the release file are the host's own and are not shared.
+
+The shares are fixed, never pooled. A shard whose pairs run longer, or cost more, than the others can hit its own ceiling while another has capacity or budget left over, and nothing moves between them. Uneven shards therefore may leave part of a cap or a budget unused. To lose less, choose N so that each shard gets many pairs per model, and keep a margin in the budget. A resume with other totals is refused: the shares are pinned at the first start, so change the totals only by starting every shard on a new store.
+
+**Declaring an environment identity.** A shard that ran against other data than its siblings must not join their batch unseen. Declare what a shard runs against with `StudyPlugin.environment_identity`, a function that returns names mapped to SHA-256 hex digests: the platform's configuration, the layout of its federation, the verified ingest manifest of each space. The core calls it once when the shard starts, refuses anything but such names and digests (and a function that raises) with a message that names the plugin file, and keeps the result in the store and the export. A resume of the shard against another identity is refused, naming what changed, and a merge refuses shards whose identities differ. Names and digests only, for the same reason as the label: a name names a role (`data.study`, `layout`), never a private space, provider or host, since a package is public and its identity names travel with the export. A study without a platform, or one that declares nothing, has an empty identity.
+
+A shard's own `check`, `analyze` and `report` work as for any campaign, over its own runs. Its store pins four facts at the first start, with the order seed: the spec, when the shard first started, the identity and the shares. A resume is refused when it gives another spec, label or rule, when a sharded store is resumed without `--shard` or an unsharded one with it, or when the identity or the shares differ. The export of a shard has one more top-level key, `shard`, holding those facts; its run entries are the ones any export has.
+
 ## 5. Score and analyse
 
 ```sh

@@ -3,7 +3,9 @@
 
 A thin shell; the logic is in the packages.
 
-    run STUDY       load the configuration, open or resume the campaign, run the scheduler
+    run STUDY       load the configuration, open or resume the campaign, run the scheduler; with `--shard i/N
+                    [--shard-label L [--shard-label-wide]]` run shard i of N of the campaign on this host (one
+                    campaign on several hosts)
     check BATCH     the replay check over a batch of records (the study is found above the batch), with a copy of
                     the campaign store that the analysis reads instead of the live one
     analyze STUDY   refuse without a current replay check; then export, scores (derived from the records anew each time,
@@ -24,6 +26,7 @@ no lease began none.
 
 import argparse
 import hashlib
+import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -31,6 +34,7 @@ from pathlib import Path
 from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.factors import PlanError
 from expcore.campaign.scheduler import CampaignLocked
+from expcore.campaign.shard import ShardError, ShardSpec
 from expcore.config.loading import ConfigError
 from expcore.package.build import build_package, default_hashes, private_hashes, verify_package
 from expcore.package.spec import PackageError
@@ -61,8 +65,19 @@ _REFUSALS = (
     BatchNotVerified,
     PackageError,
     ExampleError,
+    ShardError,
 )
 _GUARDED = frozenset({"package", "package-check"})  # commands whose every message goes through the redactor
+
+
+_SHARD_TEXT = re.compile(r"\d+/\d+")
+
+
+def _shard_text(text: str) -> str:
+    """An `i/N` for `--shard`; anything else is a usage error that does not repeat what was typed."""
+    if _SHARD_TEXT.fullmatch(text.strip()) is None:
+        raise argparse.ArgumentTypeError("--shard takes i/N, such as 2/4")
+    return text
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,7 +94,28 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(target, type=Path, help=text)
         command.add_argument("--allow-dirty", action="store_true", help="accept code with uncommitted changes")
         command.add_argument("--code-root", type=Path, help="where the code identity is read from (default: STUDY)")
-        if name != "run":
+        if name == "run":
+            command.add_argument(
+                "--shard",
+                type=_shard_text,
+                metavar="i/N",
+                help="run shard i of N of the campaign on this host: its own store and out/, a fixed part of the plan "
+                "chosen by pair, and its share of the caps and the budget (N at least 2)",
+            )
+            command.add_argument(
+                "--shard-label",
+                metavar="L",
+                help="the shard's name in its export and in a merge: 1 to 64 lower-case letters, digits or '-', "
+                "chosen by you and never a host name or an address (default: shard-i)",
+            )
+            command.add_argument(
+                "--shard-label-wide",
+                action="store_true",
+                help="let the label also use '.' and '_' (a label with a dot is refused otherwise, so that a host "
+                "name or an address is not used by accident); a store that was started with such a label is resumed "
+                "with it",
+            )
+        else:
             command.add_argument(
                 "--partial",
                 action="store_true",
@@ -116,7 +152,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None) -> int:
-    summary = run_study(args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, crash_hook=crash_hook)
+    shard = (
+        None if args.shard is None else ShardSpec.parse(args.shard, args.shard_label, wide_label=args.shard_label_wide)
+    )
+    summary = run_study(
+        args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, crash_hook=crash_hook, shard=shard
+    )
     runs = sum(summary.statuses.values())
     statuses = dict(sorted(summary.statuses.items()))
     print(f"dispatched {summary.attempts} attempts of {runs} runs; runs by status: {statuses}")
@@ -213,8 +254,13 @@ def _example(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], None] | None = None) -> int:
     """Run one command; return its exit status. `crash_hook` is for tests that kill `run` at a chosen point."""
+    parser = build_parser()
     try:
-        args = build_parser().parse_args(argv)
+        args = parser.parse_args(argv)
+        if args.command == "run" and args.shard is None and (args.shard_label is not None or args.shard_label_wide):
+            parser.error("--shard-label and --shard-label-wide need --shard")
+        if args.command == "run" and args.shard_label_wide and args.shard_label is None:
+            parser.error("--shard-label-wide needs --shard-label")
     except SystemExit as stop:
         return EXIT_USAGE if stop.code else EXIT_OK
     try:

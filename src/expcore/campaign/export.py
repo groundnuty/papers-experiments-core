@@ -50,6 +50,11 @@ those runs, and a run served by two deployments counts for both, so they can add
 counts the runs served by more than one, and `runs_without_mix` the analysed runs whose attempt recorded none (one
 recovery committed from its marker). A campaign without such a model has no `deployment_shares`, so its export is
 the one it had before the key.
+
+A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campaign.shard.EXPORT_KEY`), last: the
+`spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
+budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
+export has no such key, and every byte of it is what it was before shards existed.
 """
 
 import collections
@@ -64,6 +69,7 @@ from typing import Any, Protocol
 
 from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, deployment_shares
 from expcore.campaign.factors import FactorSchema, RunKey
+from expcore.campaign.shard import EXPORT_KEY, META_ENVIRONMENT, META_SHARD, META_SHARES, META_STARTED
 from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
 FORMAT = "campaign-export-1"
@@ -126,6 +132,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
             attempts[attempt["run_key"]].append(attempt)
         identities = {run["run_key"]: _identity(store, run) for run in runs}
         declared = store.q("SELECT value FROM meta WHERE key=?", (ACCEPTED_META,))
+        shard = _shard_facts(store)
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
     scored: list[tuple[str, Any]] = []  # the model and the analysed attempt of each analysed run
@@ -184,7 +191,35 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
+    if shard is not None:
+        data[EXPORT_KEY] = shard
     return data
+
+
+def _shard_facts(store: RunState) -> dict[str, Any] | None:
+    """What the store pinned when its campaign started as a shard, for the export; None for an unsharded campaign.
+
+    The campaign's meta table holds the facts as JSON text (`campaign.shard_run`). A store that holds the spec but not
+    every other fact was not written by a shard's start, and the export says so rather than guess.
+    """
+    held = {
+        row["key"]: row["value"]
+        for row in store.q(
+            "SELECT key, value FROM meta WHERE key IN (?,?,?,?)",
+            (META_SHARD, META_STARTED, META_ENVIRONMENT, META_SHARES),
+        )
+    }
+    if META_SHARD not in held:
+        return None
+    missing = [key for key in (META_STARTED, META_ENVIRONMENT, META_SHARES) if key not in held]
+    if missing:
+        raise ExportError(f"the store records a shard but not {', '.join(missing)}")
+    return {
+        "spec": json.loads(held[META_SHARD]),
+        "started_utc": held[META_STARTED],
+        "environment_identity": json.loads(held[META_ENVIRONMENT]),
+        "shares": json.loads(held[META_SHARES]),
+    }
 
 
 def batch_relative(run_dir: str | None) -> str | None:
