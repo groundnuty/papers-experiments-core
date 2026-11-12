@@ -15,9 +15,12 @@ data-access caveat when it declares one (`tool_server_spec`).
 What `TokenIssuer.mint` does, in this order, and refuses at the first failure:
 1. derives the lifetime from the run's whole-time ceiling and checks it against the platform's limit, before anything is minted
    (O06: `token_window`);
-2. reads the principal's privileges back, direct and effective, and requires exactly the plane's set (O05);
+2. reads the principal's privileges back, direct and effective, and requires exactly the plane's set (O05), and, for a
+   token without a data-access caveat, no Onezone admin privilege (`tokenscope`);
 3. mints with the plane's exact caveats (`CaveatSpec`, shared with the examination);
-4. examines the token fail-closed, against that exact set and the lifetime window. A token that fails is dropped.
+4. examines the token fail-closed, against that exact set and the lifetime window, and, for a token without a
+   data-access caveat, requires Onezone's scope of it to be exactly the plane's spaces (`tokenscope`). A token that
+   fails is dropped.
 
 A principal mints its own token with its own credential (`OnezoneClient.mint_own_token`). Tokens are never revoked: no
 source revokes one, so each ends with its lifetime, which derives from the whole-time ceiling (O06).
@@ -52,6 +55,7 @@ from expcore_onedata.tokencheck import (
     require_examined,
     require_privileges,
 )
+from expcore_onedata.tokenscope import admin_privileges, require_no_admin, require_scope, scope_spaces
 
 
 class Plane(StrEnum):
@@ -160,15 +164,17 @@ def tool_server_spec(space_id: str | Sequence[str], condition: Condition) -> Pla
     token, usable for data access alone, so it can neither schedule a transfer nor add a QoS requirement (#177: `POST
     /transfers` answered `tokenCaveatUnverified`).
 
-    **The boundary of a writing token is therefore its principal**, the slot's leased tool-server user (C19, O09). Its
-    rights are read back, direct and effective, in each of the plane's spaces and must be exactly the condition's,
-    before the token is minted and again at the tool server's launch and teardown. Those reads cover the plane's
-    spaces only: that the user is a member of no other space is the operator's setup of the slot, which nothing here
-    reads, so a writing token reaches whatever that membership gives.
+    **The boundary of a writing token is therefore its principal**, the slot's leased tool-server user (C19, O09), and
+    three reads hold it, before the token is minted (the scope just after) and again at the tool server's launch and
+    teardown: the user's rights, direct and effective, in each of the plane's spaces must be exactly the condition's;
+    Onezone's scope of the token, which lists every space the user is an effective member of, must be exactly the
+    plane's spaces, so a space of another study or one declared for the data path alone is refused; and the user must
+    hold no Onezone admin privilege (`tokenscope`).
 
     Onedata's `api` caveat is not a data-access caveat and could narrow the token to named operations, but which
     operations the tool server's calls map to is not in the source its format was read from, and one missing entry
-    would refuse a tool as #177 did, so this token has none.
+    would refuse a tool as #177 did, so this token has none. Within those spaces it is a full REST session for every
+    call the tool server makes, and what the agent can ask for is the condition's tool allow-list (its frozen manifest).
     """
     return PlaneSpec(
         Plane.TOOL_SERVER,
@@ -220,7 +226,9 @@ class TokenIssuer:
 
     def check_user(self, spec: PlaneSpec, user_id: str) -> None:
         """Require the user to hold exactly the plane's rights, direct and effective, in every space the plane's token
-        reaches, as Onezone reports them now; with several spaces a refusal names the space by its position.
+        reaches, as Onezone reports them now; with several spaces a refusal names the space by its position. For a
+        token without a data-access caveat, also require the user to hold no Onezone admin privilege
+        (`tokenscope.AdminPrivileged`), which such a token would carry whatever its spaces.
 
         An answer that cannot be had raises `ExaminationFailed` (a `TokenRefused` that keeps the cause, so a caller can
         tell an outage from a refusal); one that differs from the plane's set raises `TokenRefused`.
@@ -228,14 +236,27 @@ class TokenIssuer:
         space_ids = spec.caveats.space_ids
         if len(space_ids) == 1:
             self._check_in(spec, user_id, space_ids[0])
+        else:
+            for space_id in space_ids:
+                try:
+                    self._check_in(spec, user_id, space_id)
+                except ExaminationFailed as failed:
+                    raise ExaminationFailed(f"{self._position(space_id)}: {failed}", failed.error) from None
+                except TokenRefused as refused:  # PrivilegesMismatch or TokenRefused, each with a message alone
+                    raise type(refused)(f"{self._position(space_id)}: {refused}") from None
+        if not spec.caveats.data_access:
+            require_no_admin(admin_privileges(self._client, user_id))
+
+    def check_scope(self, spec: PlaneSpec, value: str) -> None:
+        """For a token without a data-access caveat, require Onezone's scope of it to be exactly the plane's spaces
+        (`tokenscope.require_scope`); a read-only token's scope is its `data.path` caveat, so it is not read.
+
+        A scope read that gets no answer raises `ExaminationFailed`; an answer that cannot be read raises `TokenRefused`;
+        a scope with another space, or without one of the plane's, raises `tokenscope.ScopeMismatch`.
+        """
+        if spec.caveats.data_access:
             return
-        for space_id in space_ids:
-            try:
-                self._check_in(spec, user_id, space_id)
-            except ExaminationFailed as failed:
-                raise ExaminationFailed(f"{self._position(space_id)}: {failed}", failed.error) from None
-            except TokenRefused as refused:  # PrivilegesMismatch or TokenRefused, each with a message alone
-                raise type(refused)(f"{self._position(space_id)}: {refused}") from None
+        require_scope(scope_spaces(self._client, value), spec.caveats.space_ids, self._config)
 
     def _check_in(self, spec: PlaneSpec, user_id: str, space_id: str) -> None:
         """Require the plane's exact rights of the user in one space; raise as `check_user` says."""
@@ -295,6 +316,10 @@ class TokenIssuer:
             raise DroppedToken(f"the token could not be examined ({type(error).__name__})", None) from None
         if valid_until is not None and examined.valid_until != valid_until:
             raise ExpiryMismatch("the token's expiry is not the one it was minted with", examined.valid_until)
+        try:
+            self.check_scope(spec, value)
+        except TokenRefused as refused:
+            raise DroppedToken(str(refused), examined.valid_until) from refused
         return MintedToken(spec.plane, principal.user_id, examined.token_id, examined.valid_until, Secret(value))
 
     def mint_run_tokens(

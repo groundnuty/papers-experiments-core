@@ -87,6 +87,15 @@ after the gate's walk by parent links, with the reads that walk rests on and the
 - `query`: `POST /tokens/infer_access_token_scope`, body `{"token"}`, no header; the answer's
   `dataAccessScope.spaces[*].name` and `.supports` and `.providers[*].domain` are read. Confirmed by [S6]; the
   providers' `name` and `online` by [L1]. A token past its time caveat is answered 400 `tokenCaveatUnverified` [L1].
+  For a user's token, `dataAccessScope.spaces` is keyed by space id and holds the user's effective spaces narrowed by
+  the token's data-access caveats, every one of them for a token with none: onedata/oz-worker, release/25.0 at
+  03af698e5759f9db97a003047eb4e29e4ba7507f, src/logic/token_logic_plugin.erl, `infer_access_token_scope/2`, and
+  onedata/ctool, release/25.0 at 019fee12a1638ca516da97a931a2d6138fa25279, src/auth/data_access_caveats.erl,
+  `match_available_spaces/2`. The tool server's writing token is checked by its keys (`tokenscope.py`).
+- `get`: `GET /users/{id}/effective_privileges` with the admin token, the answer key `privileges`, a user's Onezone
+  admin privileges, its own and its groups': named by Onezone's REST description, onedata/onezone-swagger, release/25.0
+  at 58c697695fd73ff480f4a6e5fdbf733036465398, paths/users/id/effective_privileges.yaml, which says its reader needs
+  `oz_view_privileges`. No source sends it and no live run has made it, so it is in `UNVERIFIED_ENDPOINTS`.
 - `mint_own_token`: `POST /user/tokens/temporary` with `Authorization: Basic` of the user itself, body
   `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
 - Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
@@ -132,9 +141,9 @@ after the gate's walk by parent links, with the reads that walk rests on and the
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
 which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
-[L1] confirms: only the reset's QoS calls and its cancel, and the truncation by a write of content without an offset,
-since [L1] confirmed every other call and detail the layer relies on. Each
-entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
+[L1] confirms: only the reset's QoS calls and its cancel, the truncation by a write of content without an offset, and
+the read of a user's Onezone admin privileges, since [L1] confirmed every other call and detail the layer relies on.
+Each entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
 deployment answers otherwise.
 """
 
@@ -169,7 +178,8 @@ READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_acc
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
 # their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
-# live run has made yet, and the truncating write of content an upload's restart relies on.
+# live run has made yet, the truncating write of content an upload's restart relies on, and the read of a writing
+# tool-server user's Onezone admin privileges.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     (
         "PUT",
@@ -201,6 +211,13 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "/qos_requirements/{qid}",
         "a provider call: the removal of a requirement, answered 204, after which reading it answers that it is not "
         "there; named only by the provider's API description (25.0)",
+    ),
+    (
+        "GET",
+        "/users/{id}/effective_privileges",
+        "a Onezone call with the admin token: a user's effective admin privileges in Onezone under privileges, which "
+        "a writing tool-server user must have none of; named only by Onezone's REST description (25.0), which says "
+        "the reader needs oz_view_privileges",
     ),
 )
 # The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that

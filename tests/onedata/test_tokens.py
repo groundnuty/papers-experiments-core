@@ -11,11 +11,12 @@ from expcore.records.redact import REDACTED
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import TokenSettings
 from expcore_onedata.credentials import Principal
-from expcore_onedata.testing import BASELINE, CEILING_S, MANAGE, NOW
+from expcore_onedata.testing import ALPHA_ID, BASELINE, CEILING_S, MANAGE, NOW
 from expcore_onedata.testing import DATA_PATH_USER as DATA
 from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
-from expcore_onedata.tokencheck import TokenRefused
+from expcore_onedata.tokencheck import ExaminationFailed, TokenRefused
 from expcore_onedata.tokens import (
+    DroppedToken,
     ExpiryMismatch,
     Plane,
     Secret,
@@ -24,6 +25,7 @@ from expcore_onedata.tokens import (
     token_window,
     tool_server_spec,
 )
+from expcore_onedata.tokenscope import AdminPrivileged
 
 SETTINGS = TokenSettings()  # margin 900, excess 600, headroom 300
 
@@ -162,6 +164,76 @@ def test_o05_a_writing_token_that_comes_back_with_a_data_access_caveat_is_droppe
     fake.mint_hook = lambda user, caveats: [*caveats, added]
     with pytest.raises(TokenRefused, match="data-access caveat"):
         issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+
+
+OUTSIDE = "sp-outside-0009"  # a space Onezone knows that the configuration does not declare
+SCOPE = "/api/v3/onezone/tokens/infer_access_token_scope"
+ADMIN_READ = f"/api/v3/onezone/users/{TOOLS.user_id}/effective_privileges"
+
+
+def test_o09_a_writing_token_whose_user_is_a_member_of_a_space_outside_the_plane_is_dropped(issuer, fake, config):
+    """O09: a writing token carries no data-access caveat, so Onezone's scope of it is every space its user is a member
+    of. After minting, a scope with one space more than the plane's is refused: the token is dropped with the expiry it
+    is known to have, and the message counts the space without naming it or giving its id."""
+    fake.grant(TOOLS.user_id, MANAGE)
+    fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
+    with pytest.raises(DroppedToken, match="has also 1 space the configuration does not declare") as refused:
+        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    assert refused.value.expires_at == int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s
+    assert OUTSIDE not in str(refused.value)
+    assert "unrelated" not in str(refused.value)
+    assert len(fake.issued) == 1  # it was minted, and dropped once its scope was read
+
+
+def test_o09_a_writing_conditions_user_with_a_onezone_admin_privilege_gets_no_token(issuer, fake, config):
+    """O09: an admin privilege of Onezone is live on a token without a data-access caveat, whatever the plane's spaces,
+    so the writing condition's user must hold none. It is read, with the admin credential, before anything is minted,
+    and the refusal names the privileges, which are no value of the federation."""
+    fake.grant(TOOLS.user_id, MANAGE)
+    fake.admin_privileges[TOOLS.user_id] = ["oz_spaces_add_relationships", "oz_groups_view"]
+    with pytest.raises(AdminPrivileged, match="holds Onezone admin privileges: oz_groups_view, oz_spaces_add_rel"):
+        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    assert fake.issued == {}
+    assert [r.token for r in fake.requests if r.path == ADMIN_READ] == [fake.ADMIN]
+
+
+def test_o05_the_data_path_and_a_read_only_condition_read_neither_the_scope_nor_admin_privileges(issuer, fake, config):
+    """O05: a read-only token's boundary is its data.path caveat, so its mint is what it was: no scope is read for it
+    and no admin privilege of its user, even with a space outside the plane and an admin privilege present."""
+    fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
+    fake.admin_privileges[TOOLS.user_id] = ["oz_groups_view"]
+    issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)
+    issuer.mint(tool_server_spec("spmock0001", config.condition("read")), TOOLS, ceiling_s=CEILING_S)
+    assert not [r for r in fake.requests if r.path in (SCOPE, ADMIN_READ)]
+
+
+def scope_without_spaces(answer):
+    return {**answer, "dataAccessScope": None}
+
+
+@pytest.mark.parametrize(
+    ("bend", "outage", "reason"),
+    [
+        (lambda fake: setattr(fake, "scope_status", 503), True, "token's scope could not be read"),
+        (lambda fake: setattr(fake, "scope_hook", scope_without_spaces), False, "scope answer lists no spaces"),
+        (lambda fake: fake.admin_privileges.update({TOOLS.user_id: "oz_groups_view"}), False, "not a list of strings"),
+    ],
+    ids=["scope outage", "scope unreadable", "admin privileges unreadable"],
+)
+def test_o05_a_writing_tokens_scope_or_admin_privileges_that_cannot_be_read_give_no_token(
+    bend, outage, reason, issuer, fake, config
+):
+    """O05: unknown is not a pass. A scope read that fails is an `ExaminationFailed` carrying the outage, so a caller
+    can tell one apart; an answer that cannot be read is a refusal; neither gives a token."""
+    fake.grant(TOOLS.user_id, MANAGE)
+    bend(fake)
+    with pytest.raises(TokenRefused, match=reason) as refused:
+        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    cause = refused.value.__cause__ if isinstance(refused.value, DroppedToken) else refused.value
+    assert isinstance(cause, ExaminationFailed) is outage
+    if outage:
+        assert isinstance(cause.error, PlatformError)
+        assert cause.error.status == 503
 
 
 def test_o05_the_tool_server_principal_must_hold_exactly_the_conditions_rights(issuer, fake, config):

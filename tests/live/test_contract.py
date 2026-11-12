@@ -46,6 +46,7 @@ from expcore_onedata.health import PlatformHealth  # noqa: E402
 from expcore_onedata.sandbox import gateboundary  # noqa: E402
 from expcore_onedata.tokencheck import CaveatSpec  # noqa: E402
 from expcore_onedata.tokens import TokenIssuer, data_path_spec  # noqa: E402
+from expcore_onedata.tokenscope import admin_privileges  # noqa: E402
 
 CEILING_S = 300.0
 CONTENT_PATH = os.environ.get("EXPCORE_LIVE_CONTENT_PATH")  # a provisioned, non-empty file: its path in the space
@@ -229,6 +230,16 @@ def test_each_condition_mints_and_examines_its_tool_server_token(index, config, 
     name = list(config.toolserver.conditions)[index]
     token = mint_for_condition(issuer, config, name, config.principals.toolserver, CEILING_S)
     assert token.subject == config.principals.toolserver.user_id
+
+
+def test_the_tool_server_user_holds_no_onezone_admin_privilege(config, client):
+    """O09: a writing condition's token carries no data-access caveat, so its user's Onezone admin privileges are live
+    on it. The admin credential reads them in the shape the layer parses (`tokenscope.admin_privileges`), and the
+    tool-server user holds none."""
+    # covers: GET /users/{id}/effective_privileges
+    if config.principals.toolserver is None:
+        pytest.skip("platform.toml declares no [principals.toolserver] user")
+    assert admin_privileges(client, config.principals.toolserver.user_id) == []
 
 
 @SLOW
