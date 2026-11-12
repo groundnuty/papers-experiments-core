@@ -67,7 +67,8 @@ manifest = "path.json"          # the frozen manifest the client checks the serv
 
 Two more tables are accepted here and read by the modules that use them, each validated against this file's providers:
 `[placement]` (the data provider, the bounds of placement and the declared range map; `rangemap.load_placement`) and
-`[slots.<name>]` (the leased platform users, one per token plane; `users.load_slots`).
+`[slots.<name>]` (the leased platform users, one per token plane; `users.load_slots`). `[faults]` (the sanction, journal
+and services of the fault injector; `faults.load_faults`) is read the same way.
 
 **Several spaces** (`spaces.py`). The one-space form's single space is `spaces[0]`, labelled `space`, and its
 fingerprint is unchanged. With several spaces, `space` and `support` refuse (there is no one space to give), and each
@@ -250,7 +251,13 @@ class PlatformConfig:
         `[sandbox.served_bytes]` puts the caps of the tables of the bytes served there too (O22), since they decide what
         a run's evidence can show; without the table the fingerprint keeps the shape it had before the caps could be
         declared, so a campaign that ran under the defaults still resumes.
+
+        When the file has `[faults]`, it holds the fault injector's sanction and targets too
+        (`fault_settings.faults_fingerprint`), never a path, a name or a value (O12). A file without `[faults]` keeps
+        the fingerprint it had before the fault injector existed.
         """
+        from expcore_onedata.fault_settings import faults_fingerprint  # it reads this module's config: import when used
+
         out: dict[str, Any] = {"tls": self.tls.record()}
         if self.spaces_table:
             out["spaces"] = [entry.digest() for entry in self.spaces]
@@ -258,6 +265,9 @@ class PlatformConfig:
             out["data_paths"] = self.sandbox.data_path_record()
             if self.sandbox.served_caps_declared:
                 out["served_bytes"] = self.sandbox.served_caps.record()
+        faults = faults_fingerprint(self)
+        if faults is not None:
+            out["faults"] = faults
         return out
 
     def condition_label(self, name: str) -> str:
@@ -495,6 +505,7 @@ def load_platform(
             "sandbox",
             "placement",  # read by rangemap.load_placement
             "slots",  # read by users.load_slots
+            "faults",  # read by faults.load_faults
         )
     )
     zone = root.section("zone")

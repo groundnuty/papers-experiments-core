@@ -296,8 +296,9 @@ def test_c02_the_kinds_an_unknown_kind_error_offers_are_the_treatable_ones(tmp_p
     with pytest.raises(ConfigError) as caught:
         load_factor_schema(path)
     offered = str(caught.value).split("treatable kinds: ", 1)[1].split(";", 1)[0].split(", ")
-    untreatable = ("tool_plane_integrity", "budget_hold", "provider_tampered")
+    untreatable = ("tool_plane_integrity", "budget_hold", "post_check_unverified", "provider_tampered")
     assert offered == [k for k in errors.infra_kinds() if k not in untreatable]
+    assert "post_check_unverified" not in offered  # the core's kind for a post-run check that verified nothing
     assert "[study] platforms" in str(caught.value)
     assert "[study.kinds]" in str(caught.value)
 
@@ -315,8 +316,11 @@ def test_c02_a_kind_a_platform_registered_is_accepted_and_refused_before_it_is(t
     ("declaration", "message"),
     [
         ('["endpoint", "endpoint"]', "key 'infrastructure_is_treatment' repeats 'endpoint'"),
-        ('"endpoint"', "key 'infrastructure_is_treatment' must be an array of non-empty strings"),
-        ("[1]", "key 'infrastructure_is_treatment' must be an array of non-empty strings"),
+        (
+            '"endpoint"',
+            "key 'infrastructure_is_treatment' must be an array of infrastructure kinds, each a name or a table",
+        ),
+        ("[1]", "key 'infrastructure_is_treatment' must be an array of infrastructure kinds, each a name or a table"),
     ],
 )
 def test_c02_a_malformed_treatment_declaration_is_refused(tmp_path, registry, declaration, message):

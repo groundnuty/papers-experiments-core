@@ -22,6 +22,7 @@ and never edits an earlier one: a change that is not additive makes the earlier 
 hold.
 """
 
+import copy
 import dataclasses
 import json
 import re
@@ -29,15 +30,18 @@ from pathlib import Path
 
 import pytest
 
+from expcore.records.injections import FAULT_NAMESPACE, injected_targets
 from expcore.records.record import RunRecord, decode, load_record
 from expcore.records.schema import (
     RETRY_FIELDS,
     SCHEMAS,
     SECTIONS,
+    RecordError,
     SchemaVersion,
     fields_of,
     optional_in,
     reply_count_rule,
+    target_rule,
     validate,
 )
 from expcore.replay.check import check_record
@@ -214,6 +218,55 @@ def test_C26_the_second_fixture_pins_a_billed_reply_that_became_no_turn_as_incom
     assert record.route["usage_seen"]["responses"] == len(record.transcript) + 1 == 2
     assert record.failed_request["kind"] == "infra"
     assert record.totals["usage_incomplete"] is True
+
+
+def test_C01_the_third_fixture_pins_a_targeted_fault_with_the_injectors_reading_and_its_verified_restore():
+    """C01 and R02: the third merge point added the target of a fault, `outcome.infra_target` and `treatment_targets`,
+    both optional, with version 3's target rule. Its fixture, written by that code on the record tests' fake clock, is
+    a run whose tool server failed naming the declared target after one completed turn, with the fault injector's
+    reading of that target injected, cleared and verified in this attempt: it is treatment, not set aside, and both
+    fields come last in their sections. The earlier fixtures hold neither field."""
+    third = [p for p in FIXTURES if p.name.startswith("03-")]
+    assert [p.name for p in third] == ["03-fault-target.json"]
+    record = load_record(third[0])
+    assert target_rule(record.schema_version)
+    assert len(record.transcript) == 1
+    assert record.treatment_kinds == ["knowledge"]
+    assert record.treatment_targets == {"knowledge": "servers[1]"}
+    assert (record.outcome["infra_kind"], record.outcome["infra_target"]) == ("knowledge", "servers[1]")
+    assert (record.outcome["treatment"], record.set_aside) == (True, False)
+    reading = record.instruments[FAULT_NAMESPACE]
+    assert injected_targets(record.instruments, record.run_key, record.attempt) == {"servers[1]"}
+    assert reading["injections"] == [{"target": "servers[1]", "injected": True, "cleared": True, "verified": True}]
+    assert [step["step"] for step in reading["steps"]] == ["sanctioned", "injected", "cleared", "verified"]
+    assert reading["steps"][-1]["identity_changed"] is True
+    data = decode(third[0].read_bytes())
+    assert list(data)[-1] == "treatment_targets"
+    assert list(data["outcome"])[-1] == "infra_target"
+    for earlier in FIXTURES[:2]:
+        held = decode(earlier.read_bytes())
+        assert "treatment_targets" not in held
+        assert "infra_target" not in held["outcome"]
+
+
+def test_R02_the_target_fields_are_absent_when_there_is_none_never_null_or_empty():
+    """R02 and R10: a version-3 record that holds `treatment_targets` as an empty table, or `infra_target` as null,
+    would not write back to its own bytes, since the writer leaves both out when there is nothing to say, so both are
+    refused. The third fixture with both fields taken out is a record of a condition that declares the kind with no
+    target, which the kind and the first turn alone decide: still valid, still treatment."""
+    data = decode(FIXTURES[0].read_bytes())
+    empty = {**copy.deepcopy(data), "treatment_targets": {}}
+    with pytest.raises(RecordError, match="treatment_targets: a condition that declares no target"):
+        validate(empty)
+    null = copy.deepcopy(data)
+    null["outcome"]["infra_target"] = None
+    with pytest.raises(RecordError, match=r"outcome\.infra_target: expected str"):
+        validate(null)
+    third = decode(next(p for p in FIXTURES if p.name.startswith("03-")).read_bytes())
+    untargeted = {k: v for k, v in copy.deepcopy(third).items() if k != "treatment_targets"}
+    del untargeted["outcome"]["infra_target"]
+    assert validate(untargeted) == V3
+    assert untargeted["outcome"]["treatment"] is True
 
 
 @pytest.mark.parametrize(
