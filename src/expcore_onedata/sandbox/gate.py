@@ -63,7 +63,8 @@ request following, one `conn_close` event line says how (see `Handler._peer_gone
 `body_bytes` counts what the gate's socket accepted, which says nothing of what the client read, and the close is what shows it. When the gate itself is stopped
 (SIGTERM or SIGINT: `serve`; or the server closed: `GateServer.server_close`), every connection still open gets that line with `ended` "teardown", before the process
 exits (`teardown`), and then one `teardown_complete` line once every such line is written; a gate that is killed (SIGKILL, `docker rm -f`) cannot write
-either, and a log without `teardown_complete` says so.
+either, and a log without `teardown_complete` says so. SIGUSR1 is the harness's mark of where the agent's run begins: one `run_start` line naming every request
+begun and not yet logged (`mark_run_start`), so the count of the bytes served keeps the harness's own requests apart (O24).
 
 Errors and retries, identical on every path: an upstream attempt that fails before any byte of
 an answer arrives (connect, handshake, send, or the peer closing first) is retried once, on a new connection, before
@@ -1290,6 +1291,29 @@ def teardown() -> None:
         print("GATE TEARDOWN FAILED", repr(e)[:200], file=sys.stderr, flush=True)
 
 
+RUN_START = "run_start"  # the harness's mark: the agent's run begins after it (gatelog, O24)
+
+
+def mark_run_start() -> None:
+    """The harness has ended its own steps and the agent's loop is about to start (SIGUSR1, `_on_run_start`): one
+    `run_start` line. Every open connection is read first, and a request one has begun and not yet logged is named in
+    `before` by its `conn` and `conn_request`, so its line, which comes after the mark, still counts as before it; a
+    request begun after that reading is the run's. Never raises: a mark that could not be written is missing from the
+    log, and the run's count of the bytes served is then unknown (gatelog, O24)."""
+    try:
+        with _LIVE_LOCK:
+            live = list(_LIVE.values())
+        before = [[h._conn, n] for h in live for n in range(h._last_logged + 1, h._served + 1)]
+        _log({"event": RUN_START, "connections": len(live), "before": before})
+    except Exception as e:
+        print("GATE RUN START FAILED", repr(e)[:200], file=sys.stderr, flush=True)
+
+
+def _on_run_start(signum, frame) -> None:
+    """SIGUSR1. The mark is written by a thread of its own: the main thread may hold the log's lock when it comes."""
+    threading.Thread(target=mark_run_start, daemon=True).start()
+
+
 class GateServer(ThreadingHTTPServer):
     """One thread per client connection; a deep accept queue for bursts of new connections (the default is 5; gate
     config `listen_backlog` overrides). Closing it is the gate's stop: the connections still open get their teardown lines first (`teardown`)."""
@@ -1464,6 +1488,8 @@ def main() -> None:
     # a gate that cannot log does not start, and one that started leaves a log, so a missing log is lost evidence, not zero errors
     with open(CFG["log"], "a"):
         pass
+    # before "ready": unhandled, SIGUSR1 ends a process, and the container's PID 1 ignores it, so no mark is written (O24)
+    signal.signal(signal.SIGUSR1, _on_run_start)
     print("gate ready", flush=True)
     serve(httpd)
 

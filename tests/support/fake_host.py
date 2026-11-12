@@ -154,6 +154,7 @@ class FakeHost:
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
         self.pause_without_freezing = False  # a `docker pause` that answers 0 but leaves the cgroup unfrozen
+        self.signal_handlers: dict[str, Callable[[FakeContainer], None]] = {}  # a signal the process handles and lives
         self.base_bundle = "BASE BUNDLE\n"
         # what the agent image's interpreter answers the sandbox's question of where its certifi bundle is
         self.certifi_probe = CmdResult(0, f"certifi:{CERTIFI_BUNDLE}\n")
@@ -486,9 +487,14 @@ class FakeHost:
         container = self._find(args[-1])
         if container is None:
             return CmdResult(1, "", "No such container")
+        sig = args[args.index("-s") + 1] if "-s" in args else "KILL"
+        self.calls.append(("signalled", container.name, sig))
+        handled = self.signal_handlers.get(sig)
+        if handled is not None:  # the process handles this signal: it acts on it and goes on running
+            handled(container)
+            return CmdResult(0, container.name + "\n")
         container.running, container.exit_code = False, 0
         self.alive.discard(container.pid)
-        self.calls.append(("signalled", container.name, args[args.index("-s") + 1] if "-s" in args else "KILL"))
         return CmdResult(0, container.name + "\n")
 
     def _inspect(self, args: list[str]) -> CmdResult:
