@@ -24,6 +24,7 @@ from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.day0.report import status
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.rangemap import Placement
+from expcore_onedata.readretry import ReadRetry
 from expcore_onedata.tokens import TokenIssuer
 
 
@@ -69,6 +70,14 @@ class Context:
     now: Callable[[], float] = lambda: 0.0
     provider_ids: dict[str, str] = field(default_factory=dict)
     _provisioners: dict[str, Provisioner] = field(default_factory=dict, repr=False)  # by the label of their space
+    _retry: ReadRetry | None = field(default=None, repr=False)
+
+    def plumbing_retry(self) -> ReadRetry:
+        """The policy of the reads a check makes to set itself up (the root it writes under), never of a read it
+        measures: three attempts, 2 s and 5 s apart, on this context's clock and sleep (O29)."""
+        if self._retry is None:
+            self._retry = ReadRetry(clock=self.clock, sleep=self.sleep)
+        return self._retry
 
     def provisioner(self, space: str | None = None) -> Provisioner:
         """Return this run's provisioner in a space, named by its label (the only space by default), with its change

@@ -20,12 +20,23 @@ from expcore.campaign.shard import (
     META_SHARD,
     META_SHARES,
     META_STARTED,
+    RULE,
+    RULE_BY_MODEL,
+    ModelShards,
     ShardError,
     ShardSpec,
     assign,
     pair_of,
 )
-from expcore.campaign.shard_run import LIST_LIMIT, ShardMismatch, ShardStart, environment_block, share_settings
+from expcore.campaign.shard_run import (
+    LIST_LIMIT,
+    ShardMismatch,
+    ShardStart,
+    environment_block,
+    refuse_unrunnable,
+    share_settings,
+    share_settings_by_model,
+)
 
 TASKS = ("task-a", "task-b", "task-c", "task-d", "task-e")
 MODELS = ("model-falcon", "model-heron")
@@ -445,3 +456,97 @@ def test_c29_the_environment_block_prints_no_source_url_commit_or_path():
         assert "c" * 12 not in block
         assert "/" not in block.replace("(every shard", "")
         assert block.split("\n")[0] != environment_block(SPEC, environment_of(count)).split("\n")[0]
+
+
+# --- shards by model (expcore-shard/3) -----------------------------------------------------------------------------
+
+LAYOUT = ModelShards((("model-heron", 2), ("model-falcon", 1)))
+BY_MODEL = [ShardSpec(i, 3, f"shard-{i}", RULE_BY_MODEL) for i in (1, 2, 3)]
+
+
+def plan_by_model():
+    """The whole plan, with a fingerprint whose caps declare the layout, as a campaign with [shards] has."""
+    schema, manifest, _ = plan()
+    caps = {"attempt_limit": 3, "time_cap_s": 600, "shards": LAYOUT.to_json()}
+    return schema, manifest, make_fingerprint(schema, task_ids=TASKS, model_keys=MODELS, seed_ids=SEEDS, caps=caps)
+
+
+def test_c32_a_shard_by_model_plans_its_models_pairs_only_and_a_start_is_checked_against_that_part():
+    """C32: the shards' plans are disjoint and together the whole plan; each holds one model's runs, at their places in
+    the whole plan; `plan_problem` reads the layout from the fingerprint, and a /3 shard of a fingerprint with none
+    is refused."""
+    schema, manifest, fingerprint = plan_by_model()
+    parts = [shard_manifest(manifest, spec, LAYOUT) for spec in BY_MODEL]
+    assert sorted(row.key.text for part in parts for row in part.rows) == sorted(row.key.text for row in manifest.rows)
+    assert [{row.key.factors["model"] for row in part.rows} for part in parts] == [
+        {"model-heron"},
+        {"model-heron"},
+        {"model-falcon"},
+    ]
+    for spec, part in zip(BY_MODEL, parts, strict=True):
+        assert plan_problem(schema, part, fingerprint, spec) is None
+    assert "omits" in plan_problem(schema, parts[0], fingerprint, BY_MODEL[1])
+    _, _, without = plan()
+    assert "declares no [shards] per_model" in plan_problem(schema, parts[0], without, BY_MODEL[0])
+
+
+def test_c32_a_store_of_a_shard_by_model_pins_its_rule_and_resumes_as_itself(tmp_path):
+    """C32: the spec's rule is kept with the shard, so a store started by model resumes by model; a start under
+    expcore-shard/2 in a campaign that declares a layout is refused before the store is touched."""
+    schema, manifest, fingerprint = plan_by_model()
+    shard = shard_start(BY_MODEL[2], shares={"unit_caps": {"unit-f": 1}, "budget": None})
+    part = shard_manifest(manifest, BY_MODEL[2], LAYOUT)
+    for now in (NOW, LATER):
+        store, _ = open_campaign(
+            tmp_path / "campaign.db", schema, part, fingerprint, now=now, max_attempts=3, shard=shard
+        )
+        assert json.loads(store.get_meta(META_SHARD))["rule"] == RULE_BY_MODEL
+        store.close()
+    before = everything(tmp_path)
+    with pytest.raises(RunSetMismatch, match="made under expcore-shard/2"):
+        open_campaign(
+            tmp_path / "campaign.db", schema, part, fingerprint, now=LATER, max_attempts=3,
+            shard=shard_start(BY_MODEL[2].under(RULE), shares=shard.shares),
+        )  # fmt: skip
+    assert everything(tmp_path) == before
+
+
+def test_c32_a_shard_by_model_runs_one_run_at_a_time_on_its_models_unit_and_on_its_part_of_the_budget():
+    """C32: its cap is 1 on its model's unit and it has no other; its budget is the part `shard_budget` gave it."""
+    part = {"max_usd": 1.25, "per_model_usd": {"model-falcon": 0.5}}
+    shared, recorded = share_settings_by_model(settings(), BY_MODEL[2], LAYOUT, "unit-f", part)
+    assert shared.unit_caps == recorded["unit_caps"] == {"unit-f": 1}
+    assert (shared.budget.max_usd, shared.budget.per_model_usd) == (1.25, {"model-falcon": 0.5})
+    assert shared.budget.release_step_usd == 1.0  # the host's own
+    assert recorded["budget"] == part
+    unbudgeted, recorded = share_settings_by_model(settings(budget=None), BY_MODEL[0], LAYOUT, "unit-h", None)
+    assert (unbudgeted.budget, recorded) == (None, {"unit_caps": {"unit-h": 1}, "budget": None})
+    with pytest.raises(ShardError, match="not a shard by model"):
+        share_settings_by_model(settings(), SPEC, LAYOUT, "unit-h", part)
+
+
+def test_c32_a_shard_of_a_model_that_costs_nothing_runs_without_a_gate_and_records_its_zero_dollars():
+    """C32: a part of 0 dollars cannot be a `Budget`, which would hold every run; the model costs nothing anyway."""
+    part = {"max_usd": 0.0, "per_model_usd": {}}
+    shared, recorded = share_settings_by_model(settings(), BY_MODEL[0], LAYOUT, "unit-h", part)
+    assert shared.budget is None
+    assert recorded == {"unit_caps": {"unit-h": 1}, "budget": part}
+
+
+def test_c32_a_shard_holding_pairs_of_a_model_whose_concurrency_share_is_0_is_refused_naming_the_model():
+    """C32: under expcore-shard/2 a cap of 3 over 4 shards leaves shard 4 none of its unit; holding that model's pairs
+    it could never run them. Shard 3 gets one, and an uncapped unit has no share to lack."""
+    units = {"model-falcon": "unit-f", "model-heron": "unit-h"}
+    with pytest.raises(ShardError, match=r"shard 4 of 4 holds 5 pair\(s\) of model model-falcon.*is 0") as refused:
+        refuse_unrunnable(ShardSpec(4, 4, "shard-4"), {"model-falcon": 5, "model-heron": 5}, units, {"unit-f": 3})
+    assert "[scheduler.unit_caps] unit-f = 3 over 4 shards" in str(refused.value)
+    refuse_unrunnable(ShardSpec(3, 4, "shard-3"), {"model-falcon": 5}, units, {"unit-f": 3})
+    refuse_unrunnable(ShardSpec(4, 4, "shard-4"), {"model-heron": 5}, units, {"unit-f": 3})
+
+
+def test_c32_a_shard_by_model_holding_pairs_of_another_model_is_refused():
+    """C32: under expcore-shard/3 a shard's share of every model but its own is 0."""
+    units = {"model-falcon": "unit-f", "model-heron": "unit-h"}
+    refuse_unrunnable(BY_MODEL[2], {"model-falcon": 10}, units, {}, LAYOUT)
+    with pytest.raises(ShardError, match=r"model model-heron.*serves model model-falcon only"):
+        refuse_unrunnable(BY_MODEL[2], {"model-falcon": 10, "model-heron": 1}, units, {}, LAYOUT)
