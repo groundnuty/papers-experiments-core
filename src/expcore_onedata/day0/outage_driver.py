@@ -1,5 +1,5 @@
 # Provenance: new
-"""Taking one provider's service down and bringing it back, for the day-0 outage check (O27, O11).
+"""Taking one provider's service down and bringing it back, for the day-0 outage check (O28, O11).
 
 This is the mechanism of the fault injector of the open pull request #27 (`expcore_onedata.faults`), without its
 journal, its federation lock and its sanction hook, none of which is on `main`: the service is stopped and started

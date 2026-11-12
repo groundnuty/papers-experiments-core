@@ -205,7 +205,7 @@ uv run python -m expcore_onedata.day0 /mnt/volume2/expcore-federation/platform.t
 
 ## The day-0 outage check against it
 
-`provider_outage` (#108, O27) takes a provider down, so it runs against a platform file the root's is not: one whose
+`provider_outage` (#108, O28) takes a provider down, so it runs against a platform file the root's is not: one whose
 space has a data provider that is not the agent's local provider, with a third provider beside them, and a sanctioned
 `[faults]` table. In the default layout `pine` owns the study space and is the local provider, so the root's file makes
 the check unknown, saying so. Derive a file as the mount test derives its own, with `birch` local, `pine` taken down and

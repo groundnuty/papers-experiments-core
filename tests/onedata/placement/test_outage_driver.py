@@ -1,4 +1,4 @@
-"""O27, O11: the outage driver stops and starts a service through Docker Compose and counts a restore only when the
+"""O28, O11: the outage driver stops and starts a service through Docker Compose and counts a restore only when the
 service's identity changed; its settings are read from `[faults]` with the keys the fault injector of #27 uses, and a
 mistake in them names its position, never a name."""
 
@@ -47,8 +47,8 @@ def compose(runner, **options):
     return ComposeServices("/srv/compose.yaml", runner=runner, timeout_s=7.0, **options)
 
 
-def test_o27_stop_and_start_are_compose_commands_without_a_shell_and_bounded():
-    """O27: stop and start are compose commands without a shell and bounded."""
+def test_o28_stop_and_start_are_compose_commands_without_a_shell_and_bounded():
+    """O28: stop and start are compose commands without a shell and bounded."""
     runner = Runner()
     driver = compose(runner, project="proj")
     driver.stop("svc")
@@ -58,8 +58,8 @@ def test_o27_stop_and_start_are_compose_commands_without_a_shell_and_bounded():
     assert set(runner.timeouts) == {7.0}
 
 
-def test_o27_an_observation_is_the_containers_id_and_start_time_and_whether_it_runs():
-    """O27: an observation is the containers id and start time and whether it runs."""
+def test_o28_an_observation_is_the_containers_id_and_start_time_and_whether_it_runs():
+    """O28: an observation is the containers id and start time and whether it runs."""
     runner = Runner(
         {"ps": CommandResult(0, "cid-1\n"), "inspect": CommandResult(0, "cid-1|2026-11-12T10:00:00Z|true\n")}
     )
@@ -68,8 +68,8 @@ def test_o27_an_observation_is_the_containers_id_and_start_time_and_whether_it_r
     assert ["docker", "inspect", "--format", INSPECT, "cid-1"] in runner.argvs
 
 
-def test_o27_a_service_with_no_container_runs_not_and_has_no_identity():
-    """O27: a service with no container runs not and has no identity."""
+def test_o28_a_service_with_no_container_runs_not_and_has_no_identity():
+    """O28: a service with no container runs not and has no identity."""
     assert compose(Runner({"ps": CommandResult(0, "")})).observe("svc") == Observation(False, None)
 
 
@@ -84,16 +84,16 @@ def test_o27_a_service_with_no_container_runs_not_and_has_no_identity():
         {"ps": FileNotFoundError("docker")},
     ],
 )
-def test_o27_an_unreadable_service_is_a_driver_error_that_names_the_step_and_no_service(answers):
-    """O27: an unreadable service is a driver error that names the step and no service."""
+def test_o28_an_unreadable_service_is_a_driver_error_that_names_the_step_and_no_service(answers):
+    """O28: an unreadable service is a driver error that names the step and no service."""
     with pytest.raises(DriverError) as caught:
         compose(Runner(answers)).observe("svc-secret-name")
     assert "svc-secret-name" not in str(caught.value)
     assert "/srv" not in str(caught.value)
 
 
-def test_o27_a_failed_stop_says_the_step_and_the_exit_code_and_nothing_the_command_printed():
-    """O27: a failed stop says the step and the exit code and nothing the command printed."""
+def test_o28_a_failed_stop_says_the_step_and_the_exit_code_and_nothing_the_command_printed():
+    """O28: a failed stop says the step and the exit code and nothing the command printed."""
     runner = Runner({"stop": CommandResult(2, "out containing svc-secret", "err containing svc-secret")})
     with pytest.raises(DriverError, match="stop the service failed with exit code 2") as caught:
         compose(runner).stop("svc-secret")
@@ -119,8 +119,8 @@ def settings_for(tmp_path, **faults):
     return load_outage_settings(path, load_platform(path))
 
 
-def test_o27_the_faults_table_is_read_with_the_injectors_keys_and_defaults(tmp_path):
-    """O27: the faults table is read with the injectors keys and defaults."""
+def test_o28_the_faults_table_is_read_with_the_injectors_keys_and_defaults(tmp_path):
+    """O28: the faults table is read with the injectors keys and defaults."""
     settings = settings_for(tmp_path, project="proj", journal="j", admission_timeout_s=5, health_wait_s=3)
     assert settings.sanctioned is True
     assert settings.services == {"alpha": SERVICE}
@@ -135,8 +135,8 @@ def test_o27_the_faults_table_is_read_with_the_injectors_keys_and_defaults(tmp_p
     assert compose_services(settings, Runner()) is not None
 
 
-def test_o27_a_table_that_does_not_say_true_is_not_a_sanction(tmp_path):
-    """O27: a table that does not say true is not a sanction."""
+def test_o28_a_table_that_does_not_say_true_is_not_a_sanction(tmp_path):
+    """O28: a table that does not say true is not a sanction."""
     assert settings_for(tmp_path, sanctioned=False).sanctioned is False
 
 
@@ -152,10 +152,10 @@ def test_o27_a_table_that_does_not_say_true_is_not_a_sanction(tmp_path):
         ({"surprise": 1}, "is not a known key"),
     ],
 )
-def test_o27_a_mistake_in_the_faults_table_names_the_key_or_the_entrys_position_and_never_a_name(
+def test_o28_a_mistake_in_the_faults_table_names_the_key_or_the_entrys_position_and_never_a_name(
     tmp_path, faults, message
 ):
-    """O27: a mistake in the faults table names the key or the entrys position and never a name."""
+    """O28: a mistake in the faults table names the key or the entrys position and never a name."""
     with pytest.raises(ConfigError, match=message) as caught:
         settings_for(tmp_path, **faults)
     assert "unknown-provider" not in str(caught.value)
@@ -200,8 +200,8 @@ def outage_of(service, ticker, **options):
     return Outage(service, "svc", **{**settings, **options})
 
 
-def test_o27_taking_down_reads_the_identity_stops_and_sees_the_service_down():
-    """O27: taking down reads the identity stops and sees the service down."""
+def test_o28_taking_down_reads_the_identity_stops_and_sees_the_service_down():
+    """O28: taking down reads the identity stops and sees the service down."""
     ticker, service = Ticker(), Service()
     facts = outage_of(service, ticker).take_down()
     assert facts["seen_down"] is True
@@ -210,8 +210,8 @@ def test_o27_taking_down_reads_the_identity_stops_and_sees_the_service_down():
     assert service.calls == ["stop"]
 
 
-def test_o27_a_service_that_is_not_running_is_not_stopped():
-    """O27: a service that is not running is not stopped."""
+def test_o28_a_service_that_is_not_running_is_not_stopped():
+    """O28: a service that is not running is not stopped."""
     ticker, service = Ticker(), Service()
     service.running = False
     with pytest.raises(OutageError, match="not running before the stop") as caught:
@@ -220,8 +220,8 @@ def test_o27_a_service_that_is_not_running_is_not_stopped():
     assert service.calls == []
 
 
-def test_o27_a_stop_that_never_shows_in_the_service_is_not_an_outage_and_its_restore_finds_it_as_it_was():
-    """O27: a stop that never shows in the service is not an outage and its restore finds it as it was."""
+def test_o28_a_stop_that_never_shows_in_the_service_is_not_an_outage_and_its_restore_finds_it_as_it_was():
+    """O28: a stop that never shows in the service is not an outage and its restore finds it as it was."""
     ticker, service = Ticker(), Service()
     service.stop = lambda name: service.calls.append("stop")  # type: ignore[method-assign]  (returns, does nothing)
     outage = outage_of(service, ticker)
@@ -232,8 +232,8 @@ def test_o27_a_stop_that_never_shows_in_the_service_is_not_an_outage_and_its_res
     assert outage.restore()["verified"] is True
 
 
-def test_o27_a_restore_is_verified_by_a_changed_identity_and_repeating_it_changes_nothing():
-    """O27: a restore is verified by a changed identity and repeating it changes nothing."""
+def test_o28_a_restore_is_verified_by_a_changed_identity_and_repeating_it_changes_nothing():
+    """O28: a restore is verified by a changed identity and repeating it changes nothing."""
     ticker, service = Ticker(), Service()
     outage = outage_of(service, ticker)
     outage.take_down()
@@ -244,8 +244,8 @@ def test_o27_a_restore_is_verified_by_a_changed_identity_and_repeating_it_change
     assert service.generation == 2
 
 
-def test_o27_readiness_alone_is_not_a_restore():
-    """O27: readiness alone is not a restore."""
+def test_o28_readiness_alone_is_not_a_restore():
+    """O28: readiness alone is not a restore."""
     ticker, service = Ticker(), Service()
     service.new_identity = False
     outage = outage_of(service, ticker)
@@ -254,8 +254,8 @@ def test_o27_readiness_alone_is_not_a_restore():
     assert (result["verified"], result["how"], result["identity_changed"]) == (False, "identity_unchanged", False)
 
 
-def test_o27_a_start_that_fails_is_tried_again_up_to_the_attempts_and_then_is_not_a_restore():
-    """O27: a start that fails is tried again up to the attempts and then is not a restore."""
+def test_o28_a_start_that_fails_is_tried_again_up_to_the_attempts_and_then_is_not_a_restore():
+    """O28: a start that fails is tried again up to the attempts and then is not a restore."""
     ticker, service = Ticker(), Service()
     service.starts_up = False
     outage = outage_of(service, ticker, clear_attempts=2)
@@ -265,15 +265,15 @@ def test_o27_a_start_that_fails_is_tried_again_up_to_the_attempts_and_then_is_no
     assert service.calls == ["stop", "start", "start"]
 
 
-def test_o27_nothing_to_restore_when_nothing_was_stopped():
-    """O27: nothing to restore when nothing was stopped."""
+def test_o28_nothing_to_restore_when_nothing_was_stopped():
+    """O28: nothing to restore when nothing was stopped."""
     ticker, service = Ticker(), Service()
     assert outage_of(service, ticker).restore() == {"verified": True, "how": "not_injected", "attempts": 0}
     assert service.calls == []
 
 
-def test_o27_the_waits_are_bounded_by_the_settle_timeout_on_the_given_clock():
-    """O27: the waits are bounded by the settle timeout on the given clock."""
+def test_o28_the_waits_are_bounded_by_the_settle_timeout_on_the_given_clock():
+    """O28: the waits are bounded by the settle timeout on the given clock."""
     ticker, service = Ticker(), Service()
     service.starts_up = False
     outage = outage_of(service, ticker, settle_timeout_s=4.0, clear_attempts=1)

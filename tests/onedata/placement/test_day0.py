@@ -180,8 +180,8 @@ def test_the_consent_is_the_variable_set_to_exactly_one():
     assert not mutation_allowed({})
 
 
-def test_o27_the_consent_to_take_a_provider_down_is_its_own_variable_set_to_exactly_one():
-    """O27: EXPCORE_LIVE_FAULTS is a second consent beside EXPCORE_LIVE_MUTATE; neither stands for the other."""
+def test_o28_the_consent_to_take_a_provider_down_is_its_own_variable_set_to_exactly_one():
+    """O28: EXPCORE_LIVE_FAULTS is a second consent beside EXPCORE_LIVE_MUTATE; neither stands for the other."""
     assert faults_allowed({"EXPCORE_LIVE_FAULTS": "1"})
     assert not faults_allowed({"EXPCORE_LIVE_FAULTS": "true"})
     assert not faults_allowed({"EXPCORE_LIVE_MUTATE": "1"})

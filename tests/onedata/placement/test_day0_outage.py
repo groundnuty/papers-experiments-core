@@ -1,4 +1,4 @@
-"""O27: the day-0 outage check takes a declared provider down, records what each way of reaching the data and the
+"""O28: the day-0 outage check takes a declared provider down, records what each way of reaching the data and the
 knowledge plane answers, restores the provider and shows it restored, and fails if it cannot (issue #108).
 
 The fakes model no provider that is down, so `outage_support.OutageWorld` puts one in front of them; what it does
@@ -106,8 +106,8 @@ def outage_check(context, **options):
 # -- the outage is observed --------------------------------------------------------------------------------------------
 
 
-def test_o27_the_provider_is_taken_down_seen_down_and_restored_and_nothing_is_left_down(context, world, services):
-    """O27: the provider is taken down seen down and restored and nothing is left down."""
+def test_o28_the_provider_is_taken_down_seen_down_and_restored_and_nothing_is_left_down(context, world, services):
+    """O28: the provider is taken down seen down and restored and nothing is left down."""
     entry = outage_check(context)
     assert entry.ok is True, entry.summary
     assert services.verbs() == ["stop", "start"]
@@ -122,8 +122,8 @@ def test_o27_the_provider_is_taken_down_seen_down_and_restored_and_nothing_is_le
     assert entry.facts["cleanup_verified"] is True
 
 
-def test_o27_a_provider_that_still_answers_while_its_service_is_stopped_is_no_observed_outage(context, services):
-    """O27: a provider that still answers while its service is stopped is no observed outage."""
+def test_o28_a_provider_that_still_answers_while_its_service_is_stopped_is_no_observed_outage(context, services):
+    """O28: a provider that still answers while its service is stopped is no observed outage."""
     services.stop_has_no_effect = True  # the stop command returns, nothing goes down
     entry = outage_check(context)
     assert entry.ok is None  # never seen down: nothing to measure, and nothing to restore
@@ -133,8 +133,8 @@ def test_o27_a_provider_that_still_answers_while_its_service_is_stopped_is_no_ob
     assert entry.facts["restore"]["how"] == "never_seen_down"
 
 
-def test_o27_a_service_seen_down_whose_rest_still_answers_fails_the_check(context, world, services):
-    """O27: a service seen down whose rest still answers fails the check."""
+def test_o28_a_service_seen_down_whose_rest_still_answers_fails_the_check(context, world, services):
+    """O28: a service seen down whose rest still answers fails the check."""
     real_stop = services.stop
 
     def stop_only_the_container(service: str) -> None:
@@ -153,8 +153,8 @@ def test_o27_a_service_seen_down_whose_rest_still_answers_fails_the_check(contex
 # -- the answers are recorded ------------------------------------------------------------------------------------------
 
 
-def test_o27_the_answers_of_each_path_are_recorded_with_status_latency_and_outcome(context):
-    """O27: the answers of each path are recorded with status latency and outcome."""
+def test_o28_the_answers_of_each_path_are_recorded_with_status_latency_and_outcome(context):
+    """O28: the answers of each path are recorded with status latency and outcome."""
     entry = outage_check(context)
     assert entry.ok is True, entry.summary
     rest = entry.facts["during"]["rest"]
@@ -171,8 +171,8 @@ def test_o27_the_answers_of_each_path_are_recorded_with_status_latency_and_outco
     assert entry.facts["during"]["knowledge"]["get_file_distribution"]["rest/replicated"]["outcome"] == "served"
 
 
-def test_o27_a_read_the_platform_refuses_records_its_status_and_error_id(context, world):
-    """O27: a read the platform refuses records its status and error id."""
+def test_o28_a_read_the_platform_refuses_records_its_status_and_error_id(context, world):
+    """O28: a read the platform refuses records its status and error id."""
     world.reads_while_down = "refuse"
     entry = outage_check(context)
     refused = entry.facts["during"]["rest"]["owner_only"]
@@ -186,8 +186,8 @@ def test_o27_a_read_the_platform_refuses_records_its_status_and_error_id(context
     assert entry.ok is True  # what a read answered is a fact, not a failure
 
 
-def test_o27_the_knowledge_plane_is_recorded_per_tool_and_the_blocked_transfer_is_told_from_the_finished_one(context):
-    """O27: the knowledge plane is recorded per tool and the blocked transfer is told from the finished one."""
+def test_o28_the_knowledge_plane_is_recorded_per_tool_and_the_blocked_transfer_is_told_from_the_finished_one(context):
+    """O28: the knowledge plane is recorded per tool and the blocked transfer is told from the finished one."""
     entry = outage_check(context)
     knowledge = entry.facts["during"]["knowledge"]
     labels = entry.facts["roles"]
@@ -207,8 +207,8 @@ def test_o27_the_knowledge_plane_is_recorded_per_tool_and_the_blocked_transfer_i
     assert scheduled["owner_only"]["local_held_bytes"] == 0
 
 
-def test_o27_the_wait_for_onezone_to_call_the_provider_offline_is_bounded_and_unknown_is_not_a_time(context, world):
-    """O27: the wait for onezone to call the provider offline is bounded and unknown is not a time."""
+def test_o28_the_wait_for_onezone_to_call_the_provider_offline_is_bounded_and_unknown_is_not_a_time(context, world):
+    """O28: the wait for onezone to call the provider offline is bounded and unknown is not a time."""
     world.onezone_notices = False
     entry = outage_check(context)
     later = entry.facts["during"]["knowledge"]["list_space_providers"]["until_target_offline"]
@@ -217,8 +217,8 @@ def test_o27_the_wait_for_onezone_to_call_the_provider_offline_is_bounded_and_un
     assert entry.ok is True
 
 
-def test_o27_a_listing_that_lost_entries_while_the_provider_was_down_is_partial(context, world):
-    """O27: a listing that lost entries while the provider was down is partial."""
+def test_o28_a_listing_that_lost_entries_while_the_provider_was_down_is_partial(context, world):
+    """O28: a listing that lost entries while the provider was down is partial."""
     world.listing_loses = 2
     entry = outage_check(context)
     listing = entry.facts["during"]["rest"]["listing"]
@@ -228,16 +228,16 @@ def test_o27_a_listing_that_lost_entries_while_the_provider_was_down_is_partial(
     assert entry.ok is True
 
 
-def test_o27_a_listing_whose_sizes_changed_while_the_provider_was_down_differs(context, world):
-    """O27: a listing whose sizes changed while the provider was down differs."""
+def test_o28_a_listing_whose_sizes_changed_while_the_provider_was_down_differs(context, world):
+    """O28: a listing whose sizes changed while the provider was down differs."""
     world.listing_resizes = True
     entry = outage_check(context)
     listing = entry.facts["during"]["rest"]["listing"]
     assert (listing["outcome"], listing["size_differs"], listing["missing"]) == ("differs", listing["entries"], 0)
 
 
-def test_o27_a_failed_baseline_means_no_attributable_difference_so_nothing_is_stopped(context, world, services):
-    """O27: a failed baseline means no attributable difference so nothing is stopped."""
+def test_o28_a_failed_baseline_means_no_attributable_difference_so_nothing_is_stopped(context, world, services):
+    """O28: a failed baseline means no attributable difference so nothing is stopped."""
     world.fake.statuses.append(["/content", 10**6, 500])  # every read of content fails, with everything up
     entry = outage_check(context)
     assert entry.ok is None
@@ -249,8 +249,8 @@ def test_o27_a_failed_baseline_means_no_attributable_difference_so_nothing_is_st
 # -- the restore is verified, and a failed restore fails the check ---------------------------------
 
 
-def test_o27_a_restore_that_leaves_the_identity_unchanged_fails_the_check(context, services, world):
-    """O27: a restore that leaves the identity unchanged fails the check."""
+def test_o28_a_restore_that_leaves_the_identity_unchanged_fails_the_check(context, services, world):
+    """O28: a restore that leaves the identity unchanged fails the check."""
     services.keeps_identity = True
     entry = outage_check(context)
     assert entry.ok is False
@@ -264,10 +264,10 @@ def test_o27_a_restore_that_leaves_the_identity_unchanged_fails_the_check(contex
     assert world.down == set()  # it answers again, and that is not a restore
 
 
-def test_o27_a_provider_that_does_not_run_again_fails_the_check_after_trying_to_start_it_again(
+def test_o28_a_provider_that_does_not_run_again_fails_the_check_after_trying_to_start_it_again(
     context, services, world
 ):
-    """O27: a provider that does not run again fails the check after trying to start it again."""
+    """O28: a provider that does not run again fails the check after trying to start it again."""
     services.stays_down = True
     entry = outage_check(context)
     assert entry.ok is False
@@ -278,8 +278,8 @@ def test_o27_a_provider_that_does_not_run_again_fails_the_check_after_trying_to_
     assert "cleanup_verified" in entry.facts  # the teardown ran, and could not reach the provider it deletes through
 
 
-def test_o27_a_provider_that_runs_but_does_not_answer_rest_after_the_restore_fails_the_check(context, world, services):
-    """O27: a provider that runs but does not answer rest after the restore fails the check."""
+def test_o28_a_provider_that_runs_but_does_not_answer_rest_after_the_restore_fails_the_check(context, world, services):
+    """O28: a provider that runs but does not answer rest after the restore fails the check."""
     real_start = services.start
 
     def start_but_stay_unreachable(service: str) -> None:
@@ -294,8 +294,8 @@ def test_o27_a_provider_that_runs_but_does_not_answer_rest_after_the_restore_fai
     assert "did not answer REST" in entry.summary
 
 
-def test_o27_the_restore_runs_when_a_measurement_raises(context, services, world, monkeypatch):
-    """O27: the restore runs when a measurement raises."""
+def test_o28_the_restore_runs_when_a_measurement_raises(context, services, world, monkeypatch):
+    """O28: the restore runs when a measurement raises."""
     real = Cells.listing
 
     def broken(self, directory_id, expected):
@@ -312,8 +312,8 @@ def test_o27_the_restore_runs_when_a_measurement_raises(context, services, world
     assert entry.facts["restore"]["verified"] is True
 
 
-def test_o27_a_service_that_cannot_be_stopped_is_unknown_and_is_found_as_it_was(context, services, world):
-    """O27: a service that cannot be stopped is unknown and is found as it was."""
+def test_o28_a_service_that_cannot_be_stopped_is_unknown_and_is_found_as_it_was(context, services, world):
+    """O28: a service that cannot be stopped is unknown and is found as it was."""
     services.fail_stop = True
     entry = outage_check(context)
     assert entry.ok is None
@@ -323,8 +323,8 @@ def test_o27_a_service_that_cannot_be_stopped_is_unknown_and_is_found_as_it_was(
     assert world.down == set()
 
 
-def test_o27_a_service_that_cannot_be_read_before_the_stop_is_not_stopped(context, services):
-    """O27: a service that cannot be read before the stop is not stopped."""
+def test_o28_a_service_that_cannot_be_read_before_the_stop_is_not_stopped(context, services):
+    """O28: a service that cannot be read before the stop is not stopped."""
     services.unreadable = True
     entry = outage_check(context)
     assert entry.ok is None
@@ -342,8 +342,8 @@ def test_o27_a_service_that_cannot_be_read_before_the_stop_is_not_stopped(contex
         ({"allow_faults": False}, "EXPCORE_LIVE_FAULTS=1"),
     ],
 )
-def test_o27_without_both_consents_nothing_is_stopped_or_sent(context, services, world, options, needs):
-    """O27: without both consents nothing is stopped or sent."""
+def test_o28_without_both_consents_nothing_is_stopped_or_sent(context, services, world, options, needs):
+    """O28: without both consents nothing is stopped or sent."""
     entry = outage_check(context, **options)
     assert entry.ok is None
     assert needs in entry.summary
@@ -351,8 +351,8 @@ def test_o27_without_both_consents_nothing_is_stopped_or_sent(context, services,
     assert [c for c in world.fake.provider_calls if c[1] in ("POST", "PUT", "DELETE")] == []
 
 
-def test_o27_without_the_sanction_in_platform_toml_nothing_is_stopped(tmp_path, world, services, ticker):
-    """O27: without the sanction in platform toml nothing is stopped."""
+def test_o28_without_the_sanction_in_platform_toml_nothing_is_stopped(tmp_path, world, services, ticker):
+    """O28: without the sanction in platform toml nothing is stopped."""
     directory = tmp_path / "unsanctioned"
     directory.mkdir()
 
@@ -372,8 +372,8 @@ def test_o27_without_the_sanction_in_platform_toml_nothing_is_stopped(tmp_path, 
     assert services.calls == []
 
 
-def test_o27_a_platform_without_a_faults_table_gives_no_driver_and_stops_nothing(tmp_path, world, ticker):
-    """O27: a platform without a faults table gives no driver and stops nothing."""
+def test_o28_a_platform_without_a_faults_table_gives_no_driver_and_stops_nothing(tmp_path, world, ticker):
+    """O28: a platform without a faults table gives no driver and stops nothing."""
     directory = tmp_path / "plain"
     directory.mkdir()
 
@@ -389,10 +389,10 @@ def test_o27_a_platform_without_a_faults_table_gives_no_driver_and_stops_nothing
     assert "sanctioned = true" in entry.summary
 
 
-def test_o27_a_space_whose_data_provider_is_the_agents_local_provider_has_no_outage_to_read_through(
+def test_o28_a_space_whose_data_provider_is_the_agents_local_provider_has_no_outage_to_read_through(
     tmp_path, world, services, ticker
 ):
-    """O27: a space whose data provider is the agents local provider has no outage to read through."""
+    """O28: a space whose data provider is the agents local provider has no outage to read through."""
     directory = tmp_path / "same"
     directory.mkdir()
 
@@ -413,8 +413,8 @@ def test_o27_a_space_whose_data_provider_is_the_agents_local_provider_has_no_out
     assert services.calls == []
 
 
-def test_o27_a_support_set_without_a_third_provider_has_no_replica_to_hold(tmp_path, world, services, ticker):
-    """O27: a support set without a third provider has no replica to hold."""
+def test_o28_a_support_set_without_a_third_provider_has_no_replica_to_hold(tmp_path, world, services, ticker):
+    """O28: a support set without a third provider has no replica to hold."""
     directory = tmp_path / "two"
     directory.mkdir()
 
@@ -434,8 +434,8 @@ def test_o27_a_support_set_without_a_third_provider_has_no_replica_to_hold(tmp_p
     assert services.calls == []
 
 
-def test_o27_the_scenario_is_proved_by_the_local_providers_own_block_map_before_anything_is_stopped(context, world):
-    """O27: the scenario is proved by the local providers own block map before anything is stopped."""
+def test_o28_the_scenario_is_proved_by_the_local_providers_own_block_map_before_anything_is_stopped(context, world):
+    """O28: the scenario is proved by the local providers own block map before anything is stopped."""
     entry = outage_check(context)
     held = entry.facts["held_before"]
     labels = entry.facts["roles"]
@@ -445,10 +445,10 @@ def test_o27_the_scenario_is_proved_by_the_local_providers_own_block_map_before_
     assert set(held) == {f"{pair}/{kind}" for pair in outage.BASE_PAIRS for kind in outage.KINDS}
 
 
-def test_o27_a_file_that_the_local_provider_already_holds_is_not_one_held_only_by_the_target(
+def test_o28_a_file_that_the_local_provider_already_holds_is_not_one_held_only_by_the_target(
     context, world, services, monkeypatch
 ):
-    """O27: a file that the local provider already holds is not one held only by the target."""
+    """O28: a file that the local provider already holds is not one held only by the target."""
     real = outage.Run.prepare
 
     def local_holds_one(self):
@@ -473,10 +473,10 @@ def test_o27_a_file_that_the_local_provider_already_holds_is_not_one_held_only_b
 # -- names -----------------------------------------------------------------------------------------
 
 
-def test_o27_providers_and_spaces_are_named_by_position_and_nothing_identifying_is_recorded(
+def test_o28_providers_and_spaces_are_named_by_position_and_nothing_identifying_is_recorded(
     context, platform, world, services, tmp_path, ticker
 ):
-    """O27: providers and spaces are named by position and nothing identifying is recorded."""
+    """O28: providers and spaces are named by position and nothing identifying is recorded."""
     entry = outage_check(context)
     assert entry.ok is True
     text = json.dumps({"summary": entry.summary, "facts": entry.facts})
@@ -499,10 +499,10 @@ def test_o27_providers_and_spaces_are_named_by_position_and_nothing_identifying_
     assert len(entry.facts["outage"]["identity_before_sha256"]) == 64
 
 
-def test_o27_the_report_of_a_whole_run_holds_the_check_and_none_of_the_names(
+def test_o28_the_report_of_a_whole_run_holds_the_check_and_none_of_the_names(
     platform, world, services, tmp_path, ticker
 ):
-    """O27: the report of a whole run holds the check and none of the names."""
+    """O28: the report of a whole run holds the check and none of the names."""
     client = OnezoneClient(load_platform(platform), http=world.client_http())
     code, json_path, md_path = run(
         platform, tmp_path / "reports", client=client, driver=services, allow_mutation=True, allow_faults=True,
@@ -517,8 +517,8 @@ def test_o27_the_report_of_a_whole_run_holds_the_check_and_none_of_the_names(
         assert needle not in text, needle
 
 
-def test_o27_a_failed_restore_gives_the_failing_exit_status(platform, world, services, tmp_path, ticker):
-    """O27: a failed restore gives the failing exit status."""
+def test_o28_a_failed_restore_gives_the_failing_exit_status(platform, world, services, tmp_path, ticker):
+    """O28: a failed restore gives the failing exit status."""
     services.keeps_identity = True
     client = OnezoneClient(load_platform(platform), http=world.client_http())
     code, _, _ = run(
@@ -532,8 +532,8 @@ def test_o27_a_failed_restore_gives_the_failing_exit_status(platform, world, ser
 # -- the mount -------------------------------------------------------------------------------------
 
 
-def test_o27_a_mount_the_platform_declares_but_the_run_lacks_is_unknown_not_skipped(context, monkeypatch):
-    """O27: a mount the platform declares but the run lacks is unknown not skipped."""
+def test_o28_a_mount_the_platform_declares_but_the_run_lacks_is_unknown_not_skipped(context, monkeypatch):
+    """O28: a mount the platform declares but the run lacks is unknown not skipped."""
     monkeypatch.setattr(outage, "mount_declared", lambda ctx: True)
     entry = outage_check(context)
     assert entry.ok is None
@@ -546,16 +546,16 @@ def test_o27_a_mount_the_platform_declares_but_the_run_lacks_is_unknown_not_skip
     assert entry.facts["during"]["rest"]["replicated"]["outcome"] == "served"
 
 
-def test_o27_without_a_declared_mount_the_mount_is_absent_not_unknown(context):
-    """O27: without a declared mount the mount is absent not unknown."""
+def test_o28_without_a_declared_mount_the_mount_is_absent_not_unknown(context):
+    """O28: without a declared mount the mount is absent not unknown."""
     entry = outage_check(context)
     assert entry.facts["mount"] == {"declared": False}
     assert "mount" not in entry.facts["during"]
     assert entry.ok is True
 
 
-def test_o27_the_mount_is_read_when_the_run_has_one_and_its_answers_are_recorded(context, world, monkeypatch):
-    """O27: the mount is read when the run has one and its answers are recorded."""
+def test_o28_the_mount_is_read_when_the_run_has_one_and_its_answers_are_recorded(context, world, monkeypatch):
+    """O28: the mount is read when the run has one and its answers are recorded."""
     monkeypatch.setattr(outage, "mount_declared", lambda ctx: True)
     mount = FakeMount(world, BETA_ID)
     entry = outage_check(context, mount=mount)
@@ -569,8 +569,8 @@ def test_o27_the_mount_is_read_when_the_run_has_one_and_its_answers_are_recorded
     assert entry.facts["after"]["mount_owner_only"]["outcome"] == "served"
 
 
-def test_o27_a_mount_that_answers_with_an_errno_is_recorded_with_it(context, world, monkeypatch):
-    """O27: a mount that answers with an errno is recorded with it."""
+def test_o28_a_mount_that_answers_with_an_errno_is_recorded_with_it(context, world, monkeypatch):
+    """O28: a mount that answers with an errno is recorded with it."""
     monkeypatch.setattr(outage, "mount_declared", lambda ctx: True)
     mount = FakeMount(world, BETA_ID)
     entry = outage_check(context, mount=mount)  # first, a run on which it works, so the baseline can hold
@@ -617,10 +617,10 @@ def two_spaces(tmp_path, ticker, monkeypatch):
     return ctx, services, world
 
 
-def test_o27_in_each_of_several_spaces_the_provider_is_taken_down_and_restored_and_spaces_are_named_by_position(
+def test_o28_in_each_of_several_spaces_the_provider_is_taken_down_and_restored_and_spaces_are_named_by_position(
     two_spaces,
 ):
-    """O27: in each of several spaces the provider is taken down and restored and spaces are named by position."""
+    """O28: in each of several spaces the provider is taken down and restored and spaces are named by position."""
     ctx, services, world = two_spaces
     entry = run_checks(ctx, ["provider_outage"])[0]
     assert entry.ok is True, entry.summary
@@ -633,8 +633,8 @@ def test_o27_in_each_of_several_spaces_the_provider_is_taken_down_and_restored_a
     assert world.down == set()
 
 
-def test_o27_a_space_whose_provider_could_not_be_shown_restored_stops_the_spaces_after_it(two_spaces):
-    """O27: a space whose provider could not be shown restored stops the spaces after it."""
+def test_o28_a_space_whose_provider_could_not_be_shown_restored_stops_the_spaces_after_it(two_spaces):
+    """O28: a space whose provider could not be shown restored stops the spaces after it."""
     ctx, services, _ = two_spaces
     services.keeps_identity = True
     entry = run_checks(ctx, ["provider_outage"])[0]
@@ -645,8 +645,8 @@ def test_o27_a_space_whose_provider_could_not_be_shown_restored_stops_the_spaces
     assert services.verbs() == ["stop", "start"]  # the second space never stopped it again
 
 
-def test_o27_an_unknown_run_exits_with_the_unknown_status(platform, world, services, tmp_path, ticker):
-    """O27: an unknown run exits with the unknown status."""
+def test_o28_an_unknown_run_exits_with_the_unknown_status(platform, world, services, tmp_path, ticker):
+    """O28: an unknown run exits with the unknown status."""
     client = OnezoneClient(load_platform(platform), http=world.client_http())
     code, _, _ = run(
         platform, tmp_path / "reports", client=client, driver=services, allow_mutation=True, allow_faults=False,

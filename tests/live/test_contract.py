@@ -393,7 +393,7 @@ FAULTS = pytest.mark.skipif(
 @MUTATE
 @FAULTS
 def test_a_provider_outage_is_measured_and_the_provider_is_restored(day0):
-    """O27: the check takes the data provider down, records the answers of the REST path and the knowledge plane,
+    """O28: the check takes the data provider down, records the answers of the REST path and the knowledge plane,
     restores the provider and shows it answering again with another identity, and removes its scratch. It is skipped
     only when platform.toml lacks what it needs, and the skip names that."""
     from expcore_onedata.day0.runner import run_checks

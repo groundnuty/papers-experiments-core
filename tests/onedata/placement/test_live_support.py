@@ -56,8 +56,8 @@ def test_a_cleanup_result_that_is_absent_or_not_true_is_not_a_cleanup():
             require_cleaned(entry(True, cleanup_verified=value))
 
 
-def test_o27_a_provider_that_was_not_shown_restored_does_not_pass_the_live_outage_test():
-    """O27: the outage check's pass must carry a restore verified by a changed identity and by REST answering again."""
+def test_o28_a_provider_that_was_not_shown_restored_does_not_pass_the_live_outage_test():
+    """O28: the outage check's pass must carry a restore verified by a changed identity and by REST answering again."""
     good = {"verified": True, "how": "restored", "rest_answers_again": True}
     require_restored(entry(True, restore=good))
     with pytest.raises(AssertionError, match="no restore"):
@@ -80,8 +80,8 @@ def with_outage(data):
     data["faults"] = {"sanctioned": True, "compose_file": "compose.yaml", "services": {"alpha": SERVICE}}
 
 
-def test_o27_the_outage_check_names_what_the_platform_file_lacks(tmp_path, fake):
-    """O27: no sanctioned [faults] table and a data provider that is the local one are each named; a platform with
+def test_o28_the_outage_check_names_what_the_platform_file_lacks(tmp_path, fake):
+    """O28: no sanctioned [faults] table and a data provider that is the local one are each named; a platform with
     three providers, a sanction and a data provider apart from the local one has nothing missing."""
     fake.add_provider(GAMMA_ID, "gamma.test")
     ctx = context(tmp_path / "one", fake, both_supporting)

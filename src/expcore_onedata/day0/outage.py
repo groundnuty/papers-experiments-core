@@ -1,5 +1,5 @@
 # Provenance: new
-"""The day-0 check of what reads and the knowledge plane do while a provider is down (O27, issue #108).
+"""The day-0 check of what reads and the knowledge plane do while a provider is down (O28, issue #108).
 
 A study's outage condition cannot be designed without these facts, so the check takes a declared provider down, records
 what each way of reaching the data answers, brings the provider back, and fails if it cannot show that it did.
