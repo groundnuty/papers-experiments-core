@@ -29,6 +29,7 @@ from expcore_onedata.health import PlatformHealth
 from expcore_onedata.precampaign import measure_content_type
 from expcore_onedata.probes import run_probe
 from expcore_onedata.provision import next_page_token
+from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.tokencheck import PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import Plane, PlaneSpec, data_path_spec, tool_server_spec
 
@@ -79,12 +80,12 @@ def reachability(ctx: Context) -> Result:
     hard, soft = [], []
     for name, provider in ctx.config.providers.items():
         tcp = _tcp(ctx, name)
-        found = _probe(ctx, lambda n=name: ctx.client.get("/configuration", provider=n))
+        found = _probe(ctx, lambda n=name: ctx.client.get("/configuration", provider=n, retry=ONE_ATTEMPT))
         configuration = found.value if found.ok and isinstance(found.value, dict) else {}
         online = None
         if provider.id or name in ctx.provider_ids:
             pid = provider.id or ctx.provider_ids[name]
-            seen = _probe(ctx, lambda p=pid: ctx.client.get(f"/providers/{p}"))
+            seen = _probe(ctx, lambda p=pid: ctx.client.get(f"/providers/{p}", retry=ONE_ATTEMPT))
             online = seen.value.get("online") if seen.ok and isinstance(seen.value, dict) else None
             online = online if isinstance(online, bool) else None
         rows[name] = {
@@ -127,7 +128,10 @@ def health(ctx: Context) -> Result:
 
 
 def _reach(ctx: Context, spec: PlaneSpec) -> dict[str, Any]:
-    """With several spaces, the positions of the spaces a token reaches, as a fact; with one, nothing."""
+    """With several spaces, the positions of the plane's spaces, as a fact; with one, nothing.
+
+    For a read-only token they are its `data.path` whitelist. A writing token has no data-access caveat, so they are
+    the spaces its principal's rights are read in and that Onezone's scope of the token must equal (`tokenscope`)."""
     if len(ctx.config.spaces) == 1:
         return {}
     ids = spec.caveats.space_ids
@@ -140,7 +144,9 @@ def tokens(ctx: Context) -> Result:
 
     Each token is the one a run mints (`TokenIssuer.mint_run_tokens`): scoped to every space its plane reaches
     (`space_ids`), with its principal's rights checked in each of them, so with several spaces a refusal names the
-    space by its position and each plane's facts list the positions it reaches."""
+    space by its position and each plane's facts list the positions it reaches. A writing condition's token is minted
+    as a run mints it too: its user must hold no Onezone admin privilege, and Onezone's scope of the token must be
+    exactly the plane's spaces, so a fixed tool-server user who is a member of another space fails the check."""
     principals = ctx.config.principals
     data_spaces, tool_spaces = (ctx.config.space_ids(plane) for plane in (Plane.DATA_PATH, Plane.TOOL_SERVER))
     planes: dict[str, Any] = {}
@@ -216,7 +222,7 @@ def _names(ctx: Context, provider: str, root: str, limit: int) -> tuple[list[str
         params: dict[str, Any] = {"limit": limit, "attribute": ["name", "type"]}
         if token:
             params["token"] = token
-        page = ctx.client.get(f"/data/{root}/children", provider=provider, params=params)
+        page = ctx.client.get(f"/data/{root}/children", provider=provider, params=params, retry=ONE_ATTEMPT)
         token = next_page_token(page)  # a page without its last-page marker is refused, never the end (O26)
         names += [c["name"] for c in page["children"]]
         pages += 1
@@ -253,7 +259,9 @@ def _space_listing(ctx: Context, entry: StudySpace) -> Result:
     bad = []
     for name in entry.support.providers:
         try:
-            root = consistency.space_root(ctx.client, name, entry.space.id, tries=3, wait_s=1.0, sleep=ctx.sleep)
+            root = consistency.space_root(
+                ctx.client, name, entry.space.id, tries=3, wait_s=1.0, sleep=ctx.sleep, retry=ONE_ATTEMPT
+            )
             rows[name] = _listing(ctx, name, root)
         except (PlatformError, KeyError, TypeError) as error:
             rows[name] = {"error": type(error).__name__, "status": getattr(error, "status", None)}

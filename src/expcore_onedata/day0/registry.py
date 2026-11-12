@@ -26,6 +26,7 @@ from expcore_onedata.fault_recovery import FaultDriver
 from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.rangemap import Placement
+from expcore_onedata.readretry import ReadRetry
 from expcore_onedata.sandbox.hostops import HostOps
 from expcore_onedata.tokens import TokenIssuer
 
@@ -91,6 +92,14 @@ class Context:
     tool_condition: str | None = None
     outage_ceiling_s: float | None = None
     _provisioners: dict[str, Provisioner] = field(default_factory=dict, repr=False)  # by the label of their space
+    _retry: ReadRetry | None = field(default=None, repr=False)
+
+    def plumbing_retry(self) -> ReadRetry:
+        """The policy of the reads a check makes to set itself up (the root it writes under), never of a read it
+        measures: three attempts, 2 s and 5 s apart, on this context's clock and sleep (O29)."""
+        if self._retry is None:
+            self._retry = ReadRetry(clock=self.clock, sleep=self.sleep)
+        return self._retry
 
     def provisioner(self, space: str | None = None) -> Provisioner:
         """Return this run's provisioner in a space, named by its label (the only space by default), with its change

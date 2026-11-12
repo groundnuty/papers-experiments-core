@@ -269,6 +269,32 @@ def test_R02_the_target_fields_are_absent_when_there_is_none_never_null_or_empty
     assert untargeted["outcome"]["treatment"] is True
 
 
+def test_c31_the_fourth_fixture_pins_an_instruments_refusal_after_the_run_and_the_first_turn_reading_in_the_clock():
+    """C31 and R03: the fourth merge point added the optional `instrument_refusal` of a record, and a clock reading the
+    executor takes for an instrument's first-turn hook before the loop starts its clock. The fixture was written by the
+    code of that merge: a finished attempt whose instrument then refused it with a kind no condition can declare. It
+    replays to its own bytes, with the executor's reading and the refusal served back as recorded, and it holds none
+    of the target fields of the third merge point, which the condition did not declare."""
+    fourth = [p for p in FIXTURES if p.name.startswith("04-")]
+    assert [p.name for p in fourth] == ["04-instrument-refusal.json"]
+    record = load_record(fourth[0])
+    assert record.outcome["name"] == "finished"  # what the loop saw; the refusal came after the run
+    assert record.instrument_refusal == {
+        "namespace": "manipulation",
+        "infra_kind": "tool_plane_integrity",
+        "detail": "the arriving files were not in their declared start state",
+    }
+    assert record.set_aside is True
+    assert [label for label, _ in record.clock][:2] == ["instrument_first_turn", "start"]
+    assert record.instruments["manipulation"]["start_state_clock_s"] == record.clock[0][1]
+    data = decode(fourth[0].read_bytes())
+    assert list(data)[-1] == "instrument_refusal"
+    assert "treatment_targets" not in data
+    assert "infra_target" not in data["outcome"]
+    for earlier in FIXTURES[:3]:  # earlier records stay without it
+        assert "instrument_refusal" not in decode(earlier.read_bytes())
+
+
 @pytest.mark.parametrize(
     "entry",
     [{}, dict.fromkeys(RETRY_FIELDS)],
