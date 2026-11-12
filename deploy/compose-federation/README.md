@@ -203,6 +203,72 @@ EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_SLOW=1 uv run pytest tests/live/test_contract
 uv run python -m expcore_onedata.day0 /mnt/volume2/expcore-federation/platform.toml --out <directory>
 ```
 
+## The day-0 outage check against it
+
+`provider_outage` (#108, O27) takes a provider down, so it runs against a platform file the root's is not: one whose
+space has a data provider that is not the agent's local provider, with a third provider beside them, and a sanctioned
+`[faults]` table. In the default layout `pine` owns the study space and is the local provider, so the root's file makes
+the check unknown, saying so. Derive a file as the mount test derives its own, with `birch` local, `pine` taken down and
+`cedar` the mirror (no value below is a secret; every path in `[faults]` is relative to the file):
+
+```toml
+support = { providers = ["pine", "birch", "cedar"], local = "birch" }
+placement = { holder = "pine" }
+
+[faults]
+sanctioned = true
+compose_file = "outage.compose.yaml"   # federation.py compose > <root>/outage.compose.yaml, beside this file
+project = "expcore-fed"
+command = ["docker", "compose", "--project-directory", "<absolute path of deploy/compose-federation>"]
+settle_timeout_s = 600                 # a provider takes minutes to answer again
+command_timeout_s = 300                # a stop waits for its grace period, 120 s
+
+[faults.services]
+pine = "pine"                          # provider name -> Compose service
+```
+
+```sh
+EXPCORE_FED_ROOT=/mnt/volume2/expcore-federation EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_FAULTS=1 \
+  uv run python -m expcore_onedata.day0 <derived platform.toml> --only provider_outage --out <directory>
+```
+
+Run it outside any sandbox, after `up`, with nothing else using the federation. It stops `pine`, so every run, tool
+server and mount that reaches it stops answering until the check restores it, which it does in a `finally` and shows by
+the container's new identity and `pine` answering REST again. A process killed in between leaves it stopped:
+`federation.py up` starts what is stopped. The check keeps no journal and takes no lock (it is the mechanism of the
+fault injector of #17 without them, see `day0/outage_driver.py`). The live test is `tests/live/test_contract.py -k
+provider_outage` with `EXPCORE_LIVE_PLATFORM` naming the derived file and `EXPCORE_LIVE_FAULTS=1` beside
+`EXPCORE_LIVE_MUTATE=1`. The mount is read only where the file declares a mount data path (the root's file declares
+none) and the run hands in a reader of it (`Context.mount`). No reader ships with the check: one needs the sandbox's
+mount sidecar and an agent container, as `tests/live/test_mount_path.py` starts them, so the first live run reads the
+REST path and the knowledge plane and the report says the mount was not measured; the mount reader is the next
+addition, and the issue's mount results wait for it.
+
+**What the live run must measure**, in the terms of #108. Every value is a fact of the report (`facts` of the check),
+with `seconds` against `bound_s` and an `outcome`; where a value cannot be had the report says unknown and why, and
+nothing is filled in.
+
+| Step of #108 | Where in the facts | What it must record |
+|---|---|---|
+| 1. Baseline, all providers up | `baseline.rest`, `baseline.mount` | A file read through the target, the mirror and, cold, the local provider, and through the mount: the bytes, whether the hash is the one written, the seconds; the listing of the directory. |
+| The scenario | `held_before` | By the local provider's own block map, who holds how much of each file: the target all of every file, the mirror all of the replicated ones, the local provider nothing. |
+| 2. The target stopped | `outage` | The identity before (a digest), the service seen down and in how many seconds, and that the target answers no REST call. |
+| A file with a replica at the second provider | `during.rest.replicated`, `during.mount.replicated` | Whether the read succeeds, the hash against the baseline, how slowly (against the baseline's cold read), and from where: the local provider's block map grows while the mirror's is as before (`during.knowledge.get_file_distribution`). |
+| A file with no other replica | `during.rest.owner_only`, `during.mount.owner_only` | Whether it errors (which status, error id and errno) or hangs, and for how long up to the bound. This gives a study its read-timeout setting. |
+| A directory listing | `during.rest.listing`, `during.mount.listing` | Whole, partial or different against the baseline, and the seconds. |
+| `get_file_distribution` | `during.knowledge.get_file_distribution` | For each scratch file, whether each provider is listed and what it holds, the downed provider included (listed with what it held, left out, or an error). |
+| `list_space_providers` | `during.knowledge.list_space_providers` | Onezone's online flag of each provider at the start of the outage, and the seconds until it calls the target offline, or that it did not within the bound. |
+| `schedule_file_replication`, mirror to local | `during.knowledge.schedule_file_replication` | Whether the job is accepted for a file with a replica and for one without, with its status and error id. |
+| `get_transfer` | the same, under `get_transfer` | The states the job goes through and when, whether it ends within the bound, the bytes and files it reports, and what the local provider's block map shows after. |
+| 3. The restore | `restore`, `after` | The service running again with another identity (a digest), the seconds until the target answers REST, and the reads of step 2 again, which must return what was written; the state of the transfers scheduled during the outage; the scratch gone (`cleanup_verified`). |
+
+The result feeds a study's choice between a design that relies on the platform failing over transparently and one
+that keeps a replica elsewhere, and its read-timeout setting. Not measured by this check: the tool server's own
+answers (the cells are the REST calls its tools make, with the admin credential), a mount unless a reader is handed
+in, a provider other than the data provider going down, and an outage that lasts longer than one run of the check.
+If a first live run finds that `docker compose start` alone does not bring a provider's services back, the report
+shows a restore that is not verified, and `federation.py up` brings the federation back.
+
 ## The sandbox's mount path against it
 
 The sandbox starts its containers outside this project, and inside a container `127.0.0.1` is the container itself, so

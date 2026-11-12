@@ -49,7 +49,7 @@ src/expcore_onedata/
                  compose.py, fault_journal.py, fault_recovery.py, fault_serves.py and fault_settings.py serve it
   admission.py   the federation's reader-writer lock: outage runs exclusive with every other run, and its holder record
   fault_gate.py  the fault half of the health check: recovery, the shared lock around the check, a timed-out wait told apart
-  day0/          registry of checks (reachability, health, tokens, listing, read-only, round trip) and a dated report
+  day0/          registry of checks (reachability, health, tokens, listing, read-only, round trip, provider outage) and a dated report
   testing/       fakes of the platform for a study's own tests: the REST mock, a federation with every provider's data API, a clock,
                  the default platform.toml, two stand-in MCP servers; installed with the layer, imported by no runtime module
 examples/        a toy study using only the public interfaces (#5)
