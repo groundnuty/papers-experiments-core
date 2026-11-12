@@ -320,7 +320,7 @@ def test_k13_a_database_page_the_key_file_was_deleted_from_is_found_by_its_bytes
 EMBEDDED = [  # what it is, the packaged path, the bytes with the key file's content in them
     ("without its trailing newline", "src/t.py", b"TOKEN = '" + KEY.rstrip() + b"'\n"),
     ("with its trailing newline", "notes/log.txt", b"before\n" + KEY + b"after\n"),
-    ("in bytes that are not text", "data/blob.bin", b"\xff\xfe\x00" + KEY.rstrip() + b"\x00\x80"),
+    ("in bytes that are not text", "data/blob.bin", b"\x00\xff" + KEY.rstrip() + b"\x00\x80"),
 ]
 
 
