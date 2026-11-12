@@ -24,6 +24,17 @@ def test_a_script_of_text_and_tool_calls_is_replayed_in_order():
     assert [m["role"] for m in stub.transcript()] == ["system", "user", "assistant", "tool", "assistant"]
 
 
+def test_c31_the_stub_counts_the_replies_asked_of_it_across_a_new_script():
+    """C31: `requests_sent` counts steps whatever the script says, and `use` does not reset it."""
+    stub = StubAdapter(["one"])
+    stub.begin("", "task", [])
+    assert stub.requests_sent == 0
+    step(stub)
+    stub.use(["two"])
+    step(stub)
+    assert stub.requests_sent == 2
+
+
 def test_a_used_up_script_answers_done():
     stub = StubAdapter([])
     stub.begin("", "task", [])

@@ -32,22 +32,30 @@ class FakeFederation(MockOnedata):
       GET    /api/v3/onezone/spaces/{space}                           (admin credential; the study space and more)
       GET    /api/v3/onezone/spaces/{space}/users/{user}/privileges            (direct)
       GET    /api/v3/onezone/spaces/{space}/effective_users/{user}/privileges  (effective)
+      GET    /api/v3/onezone/users/{user}/effective_privileges                 (the user's Onezone admin privileges)
+      GET    /api/v3/onezone/user/effective_clusters                           (as a token: its user's clusters)
 
     A temporary token needs a time caveat, as the real one does, and is stored with the caveats the server keeps. A
     space besides the study space is added with `add_space(id, name, provider_ids)`: Onezone knows its name and a
     token's scope shows it supported by those providers; `grant(user, privileges, space=id)` sets a user's privileges
-    in it.
+    in it. A user's Onezone admin privileges are `admin_privileges[user id]`, none unless a test sets them, and the
+    clusters a user is an effective member of are `clusters[user id]`, none unless a test sets them; they are answered
+    to a token the fake issued, for that token's subject, as the real call answers the user it is sent as.
 
     Does not model: any other Onezone call (users, groups, spaces made or changed, provider registration); the expiry
     of a token (its time caveat is stored, never enforced); the revocation of a token; how a token's other caveats
-    limit what it may read (the data API is `FakeData`'s, which enforces only the read-only caveat); the effective
-    privileges a space would derive from groups (`grant` sets both lists, and a test sets them apart to make a
-    difference); files in an added space (`FakeData`'s data API serves the study space's tree only).
+    limit what it may read (the data API is `FakeData`'s, which enforces only the read-only caveat); which spaces a
+    token's scope shows (every token's scope shows the study space and every added space, whoever its subject is and
+    whatever its caveats, so a test adds a space to make a user a member of one more); the effective privileges a space
+    would derive from groups (`grant` sets both lists, and a test sets them apart to make a difference); files in an
+    added space (`FakeData`'s data API serves the study space's tree only).
 
     A test bends it through plain attributes: `mint_hook` changes the caveats the fake stores for a token (what a
-    server that dropped or added one would do), `examine_hook` replaces an examination's answer, `status_override`
-    makes every call fail with that status, and `providers`/`supports` (from MockOnedata) change the federation's view
-    of the space. Every request is recorded in `.requests`, so a test can assert that a refused mutation sent nothing.
+    server that dropped or added one would do), `examine_hook` replaces an examination's answer, `scope_hook` replaces
+    a scope answer and `scope_status` makes the scope call alone fail with that status, `clusters_hook` and
+    `clusters_status` do the same for the clusters call, `status_override` makes every
+    call fail with that status, and `providers`/`supports` (from MockOnedata) change the federation's view of the
+    space. Every request is recorded in `.requests`, so a test can assert that a refused mutation sent nothing.
     """
 
     ADMIN = "fake-admin-credential-0001"
@@ -60,7 +68,13 @@ class FakeFederation(MockOnedata):
         self.mint_hook: Callable[[str, list[dict]], list[dict]] | None = None
         self.blank_mint_answer = False  # store the token but answer without it, as a broken server might
         self.examine_hook: Callable[[dict], Any] | None = None
+        self.scope_hook: Callable[[dict], Any] | None = None
+        self.scope_status: int | None = None
+        self.clusters_hook: Callable[[dict], Any] | None = None
+        self.clusters_status: int | None = None
         self.status_override: int | None = None
+        self.admin_privileges: dict[str, list[str]] = {}  # user id -> its effective Onezone admin privileges
+        self.clusters: dict[str, list[str]] = {}  # user id -> the ids of the clusters it is an effective member of
         self.other_spaces: dict[str, str] = {}  # id -> name of the spaces besides the study space that Onezone knows
         self.space_supports: dict[str, dict] = {}  # id -> supports of an added space, as the scope answer shows it
         self.users: dict[str, tuple[str, str]] = {}  # login name -> (password, user id)
@@ -134,14 +148,29 @@ class FakeFederation(MockOnedata):
             return self._error(404, "notFound")
         sent = json.loads(body) if body else {}
         if request.method == "POST" and route == "/tokens/infer_access_token_scope":
+            if self.scope_status is not None:
+                return self._error(self.scope_status, "internalServerError")
             if not self._accepts(sent.get("token")):
                 return self._error(401, "unauthorized")
-            return httpx.Response(200, json=self._scope())
+            return httpx.Response(200, json=self.scope_hook(self._scope()) if self.scope_hook else self._scope())
         if request.method == "POST" and route == "/user/tokens/temporary":
             return self._mint(request.headers.get("Authorization"), sent)
+        if request.method == "GET" and route == "/user/effective_clusters":
+            return self._user_clusters(request.headers.get("X-Auth-Token"))
         if request.headers.get("X-Auth-Token") != self.admin_token:
             return self._error(401, "unauthorized")
         return self._admin_route(request.method, route, sent)
+
+    def _user_clusters(self, token: str | None) -> httpx.Response:
+        """Answer the clusters of the user a token issued here belongs to; the call is the current user's, so it takes
+        no admin credential and answers no other."""
+        if self.clusters_status is not None:
+            return self._error(self.clusters_status, "internalServerError")
+        record = self.issued.get(token) if isinstance(token, str) else None
+        if record is None:
+            return self._error(401, "unauthorized")
+        answer = {"clusters": list(self.clusters.get(record["subject"]["id"], []))}
+        return httpx.Response(200, json=self.clusters_hook(answer) if self.clusters_hook else answer)
 
     def _admin_route(self, method: str, route: str, sent: dict) -> httpx.Response:
         """Answer the calls that need the admin credential."""
@@ -160,6 +189,9 @@ class FakeFederation(MockOnedata):
                 return self._error(404, "notFound")
             kind = "direct" if found.group(2) == "users" else "effective"
             return httpx.Response(200, json={"privileges": entry[kind]})
+        admin = re.fullmatch(r"/users/([^/]+)/effective_privileges", route)
+        if admin and method == "GET":
+            return httpx.Response(200, json={"privileges": self.admin_privileges.get(admin.group(1), [])})
         return self._error(404, "notFound")
 
     def _login(self, authorization: str | None) -> str | None:
