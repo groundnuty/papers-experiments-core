@@ -215,6 +215,29 @@ def test_o25_an_upload_up_to_a_stop_leaves_that_prefix_and_a_later_one_resumes_f
     assert stored(fake, first.file_id) == BULKY
 
 
+def test_o25_an_upload_without_a_stop_of_a_local_file_that_grows_meanwhile_fails_and_is_never_cut(
+    provisioner, fake, tmp_path, monkeypatch
+):
+    """O25: without `stop` the content is the whole local file, so a file appended to after its size was taken is a
+    file that changed during the upload: it fails, and the upload is never reported done as the first bytes alone."""
+    source = local_file(tmp_path, BULKY)
+    real = type(provisioner)._write_chunks
+
+    def appending_after_the_first_block(self, file_id, blocks, media, *, truncate=False):
+        def blocks_then_append():
+            for number, block in enumerate(blocks):
+                yield block
+                if number == 0:
+                    with open(source, "ab") as handle:
+                        handle.write(b"appended" * CHUNK)
+
+        return real(self, file_id, blocks_then_append(), media, truncate=truncate)
+
+    monkeypatch.setattr(type(provisioner), "_write_chunks", appending_after_the_first_block)
+    with pytest.raises(ProvisionError, match="changed size"):
+        provisioner.upload(TARGET, source)
+
+
 @pytest.mark.parametrize("stop", [0, -1, len(BULKY) + 1, 2.5, True])
 def test_o25_a_stop_outside_the_local_file_is_refused_before_anything_is_sent(provisioner, fake, tmp_path, stop):
     """O25: a stop is a whole number of bytes, at least one and at most the local file's size."""

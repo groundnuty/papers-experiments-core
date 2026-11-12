@@ -517,7 +517,9 @@ class Provisioner:
             file_id = existing.file_id
             if action == "skipped":
                 return Upload(file_id, Digest(size, hasher.hexdigest()), action, 0)
-        blocks = _hashing(chunks(source, self._settings.chunk_bytes, start=start, stop=size), hasher)
+        # The caller's stop, never the size taken above: without one, a local file appended to meanwhile is read to its
+        # new end and fails the size check below instead of being cut to its first bytes and reported done.
+        blocks = _hashing(chunks(source, self._settings.chunk_bytes, start=start, stop=stop), hasher)
         sent = self._write_chunks(file_id, blocks, media, truncate=action == "restarted")
         expected = Digest(start + sent, hasher.hexdigest())
         if expected.size != size:
