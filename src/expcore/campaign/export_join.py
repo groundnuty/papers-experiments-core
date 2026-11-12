@@ -13,7 +13,9 @@ snapshot and this module joins the results:
   every other kind any shard used, sorted;
 - `deployment_shares` (B18), when the campaign has it: per model and fingerprint the runs and turns are summed and
   every share is computed again from the sums; a fingerprint is confirmed when any shard confirmed it, by the witness
-  of the first shard, in index order, that did;
+  of the first shard, in index order, that did. Each shard serves one model under `expcore-shard/3`, and a store keeps
+  a record of accepted fingerprints only when the models of its plan declare a set, so a shard's export may lack the
+  key that another's has: it counts as no entries, and the joined export has the key exactly when any shard's does;
 - `shards` is merge.json's list of shards, as it is.
 
 The joined run lists must hold every run of the whole plan exactly once, and the planned runs must add up to it: a
@@ -46,6 +48,7 @@ _TABLES = {
 DEPLOYMENTS = "deployment_shares"
 _MODEL_SUMS = ("analysed_runs", "runs_without_mix", "mixed_runs", "turns")
 _FINGERPRINT_SUMS = ("turns", "runs")
+_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS)  # keys that one shard's export may have and another's lack
 
 
 def join_exports(
@@ -64,8 +67,9 @@ def join_exports(
     for index in order[1:]:
         _same_shape(first, exports[index], order[0], index)
     joined: dict[str, Any] = {}
-    for key, value in first.items():
-        if key == EXPORT_KEY:
+    for key in _keys_of_the_join(exports, order):
+        if key == DEPLOYMENTS:  # a shard whose plan has no model with a set exports none: it has no entries
+            joined[key] = _join_deployments([exports[index].get(key, ()) for index in order])
             continue
         parts = [exports[index][key] for index in order]
         if key in LISTS:
@@ -79,9 +83,8 @@ def join_exports(
         elif key == "kinds":
             seen = {kind for part in parts for kind in part}
             joined[key] = [*CORE_KINDS, *sorted(seen - set(CORE_KINDS))]
-        elif key == DEPLOYMENTS:
-            joined[key] = _join_deployments(parts)
         else:  # the format and the factors: every shard says the same
+            value = first[key]
             if any(part != value for part in parts):
                 raise ExportError(f"the shards' exports disagree on {key!r}")
             joined[key] = value
@@ -107,10 +110,20 @@ def _require_the_plan(joined: Mapping[str, Any], seq_of: Mapping[str, int]) -> N
         raise ExportError(f"the shards' exports plan {joined['planned_runs']} runs, but the plan has {len(seq_of)}")
 
 
+def _keys_of_the_join(exports: Mapping[int, Mapping[str, Any]], order: Sequence[int]) -> list[str]:
+    """The keys of the joined export, in the first shard's order, without the shard's own key. `deployment_shares`
+    is in when any shard's export has it, where `export_run_state` puts it, after `kinds`."""
+    keys = [key for key in exports[order[0]] if key != EXPORT_KEY]
+    if DEPLOYMENTS not in keys and any(DEPLOYMENTS in exports[index] for index in order):
+        keys.insert(keys.index("kinds") + 1 if "kinds" in keys else len(keys), DEPLOYMENTS)
+    return keys
+
+
 def _same_shape(first: Mapping[str, Any], other: Mapping[str, Any], at: int, index: int) -> None:
-    """Refuse an export whose keys are not the first one's (a shard's own `shard` key aside)."""
-    keys = {key for key in first if key != EXPORT_KEY}
-    found = {key for key in other if key != EXPORT_KEY}
+    """Refuse an export whose keys are not the first one's (a shard's own `shard` key aside, and `deployment_shares`,
+    which only an export of a plan with a model that declares a set has)."""
+    keys = {key for key in first if key not in _MAY_DIFFER}
+    found = {key for key in other if key not in _MAY_DIFFER}
     if keys != found:
         raise ExportError(
             f"shard {index}'s export has keys {sorted(found ^ keys)} that shard {at}'s does not, or lacks them"
@@ -131,7 +144,8 @@ def _in_plan_order(
 def _join_deployments(parts: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict[str, Any]]:
     """Join the shards' `deployment_shares` (B18), given in shard order, into the whole campaign's: per model, in model
     order, the sums of the runs and turns and the fingerprints of every shard, each share computed again from the
-    sums as `deployments.deployment_shares` computes it. Every shard declares the model's set the same way."""
+    sums as `deployments.deployment_shares` computes it. Every shard declares the model's set the same way. A shard
+    with no entries (it exports none) adds nothing."""
     models: dict[str, dict[str, Any]] = {}
     for part in parts:
         for entry in part:
