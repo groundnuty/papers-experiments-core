@@ -349,6 +349,33 @@ def test_o27_a_teardown_over_the_ingests_change_log_is_refused_and_the_dataset_k
     assert content(fake, DAY_PATH) == DAY
 
 
+def test_o27_a_creation_another_provisioner_logs_after_the_claim_refuses_the_next_ingest(
+    make, provisioner, client, config, placement, fake, ticker, tmp_path
+):
+    """O27 with O09: once a run's ingest claimed the log, another provisioner on the same file creates a file and logs
+    it. The claim's creations carry its role and that one does not, so the next run's ingest refuses the log, whether
+    it is built over the claiming provisioner or over a new one on the file."""
+    first = make(DAY_ROW)
+    first.start({})
+    first.finish()
+
+    def on_the_same_log():
+        return Provisioner(
+            client,
+            config,
+            placement.settings,
+            provider_ids=resolve_provider_ids(config),
+            log=tmp_path / "changes.jsonl",
+            clock=ticker.clock,
+            sleep=ticker.sleep,
+        )
+
+    on_the_same_log().put_file("records/provisioned.bin", b"another user's file")
+    for builder in (provisioner, on_the_same_log()):
+        with pytest.raises(ProvisionError, match="change log"):
+            ProgressiveIngest(builder, first._plan, journal=tmp_path / "journal.jsonl")
+
+
 def test_o27_a_file_at_a_planned_path_that_is_neither_the_ingests_nor_its_source_is_refused_and_kept(
     make, fake, tmp_path
 ):

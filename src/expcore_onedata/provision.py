@@ -239,6 +239,7 @@ class Provisioner:
         self._ids = dict(provider_ids)
         self._log = Path(log)
         self._log_lock = threading.Lock()
+        self._role: str | None = None  # the role that claimed the log through this provisioner (`claim_log`)
         self._clock, self._sleep = clock, sleep
         self._verified_name: str | None = None
         self._root: str | None = None
@@ -365,19 +366,20 @@ class Provisioner:
         takes what the log says was created for its own and whose restored files a teardown over the log would delete.
 
         The claim is a line of the log, so another provisioner on the same file, or a later process, sees it too, and
-        `teardown` refuses a claimed log. Claiming again for the same role is harmless (one study's runs, one after
-        another). ProvisionError, with nothing written, when the log holds another role's claim, or a creation made
-        before any claim, which another user made."""
+        `teardown` refuses a claimed log; each creation this provisioner logs after it carries the role. Claiming again
+        for the same role is harmless (one study's runs, one after another). ProvisionError, with nothing written, when
+        the log holds another role's claim or a creation without the role, which another user made."""
         lines = self._lines()
         claims = {line.get("role") for line in lines if line.get("action") == "claim"}
-        if claims == {role}:
-            return
-        if claims or any(line.get("action") == "create" for line in lines):
+        foreign = [line for line in lines if line.get("action") == "create" and line.get("role") != role]
+        if claims - {role} or foreign:
             raise ProvisionError(
                 f"{self._where}the change log is shared with another user; a {role} needs a provisioner and a change "
                 "log of its own"
             )
-        self._write("claim", role=role)
+        if not claims:
+            self._write("claim", role=role)
+        self._role = role
 
     def _claimed_by(self) -> str | None:
         return next((line.get("role") for line in self._lines() if line.get("action") == "claim"), None)
@@ -473,7 +475,7 @@ class Provisioner:
         file_id = answer.get("fileId") if isinstance(answer, dict) else None
         if not isinstance(file_id, str) or not file_id:
             raise PlatformError("a creation answer holds no file id")
-        self._write("create", id=file_id, kind=kind, path=path)
+        self._write("create", id=file_id, kind=kind, path=path, **({} if self._role is None else {"role": self._role}))
         return file_id
 
     def put_file(self, path: str, data: bytes, *, content_type: str = OCTET_STREAM) -> str:
