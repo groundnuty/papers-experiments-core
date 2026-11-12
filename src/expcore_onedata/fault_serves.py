@@ -21,6 +21,7 @@ from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_settings import FaultSettings
+from expcore_onedata.readretry import ONE_ATTEMPT
 
 PROBE_TIMEOUT_S = 10.0
 
@@ -43,7 +44,7 @@ def provider_serves(config: PlatformConfig, settings: FaultSettings, client: One
         if provider is None:
             raise ConfigError(f"{settings.file}: [faults.services]: the service is not one a provider is declared for")
         try:
-            client.get(_path(config, provider), provider=provider, timeout_s=PROBE_TIMEOUT_S)
+            client.get(_path(config, provider), provider=provider, timeout_s=PROBE_TIMEOUT_S, retry=ONE_ATTEMPT)
         except PlatformError:  # its message names a position, never the provider; here it only says "not yet"
             return False
         return True

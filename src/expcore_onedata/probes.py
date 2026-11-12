@@ -54,6 +54,7 @@ from typing import Any
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.placement import Range, held_bytes, merged, uncovered
 from expcore_onedata.provision import Listings, Provisioner
+from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferlog import MAX_LISTED, PAGE_LIMIT, TransferLog
 from expcore_onedata.transferwindow import Window, split_gained
 
@@ -274,7 +275,9 @@ class PlatformProbes:
     def _transfer_records(self) -> list[dict[str, Any]]:
         records = []
         for provider, tid, kind in self._transfers():
-            found = self._probe(lambda p=provider, t=tid: self._client.get(f"/transfers/{t}", provider=p))
+            found = self._probe(
+                lambda p=provider, t=tid: self._client.get(f"/transfers/{t}", provider=p, retry=ONE_ATTEMPT)
+            )
             body = found.value if found.ok and isinstance(found.value, dict) else {}
             records.append(
                 {
