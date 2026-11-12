@@ -181,11 +181,12 @@ class FakeData(FakeFederation):
     each read of the file through that provider answers `unseen_answer` until they are used up; the listing is not
     counted and shows the file.
 
-    **Pending deletes** (`delete_delay_s`; the default 0 finishes every delete at once, everywhere, so nothing changes
-    for a test that does not set it). With a delay, a DELETE of a file or a directory is answered 204 and takes that
-    many seconds of `clock` to land (`land_deletes()` lands them without waiting), so a study can test that its code
-    waits before it uses the name again. In between, by what was recorded (`DELETE_FACTS`; the 12 Nov check, on a 25.0
-    development build, is `deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md`):
+    **Pending deletes** (`delete_delay_s`; the default 0 finishes every delete at once, everywhere, so a test that does
+    not set it sees one change: a transfer of a deleted file's id is accepted, where it was refused 400). With a
+    delay, a DELETE of a file or a directory is answered 204 and takes that many seconds of `clock` to land
+    (`land_deletes()` lands them without waiting), so a study can test that its code waits before it uses the name
+    again. In between, by what was recorded (`DELETE_FACTS`; the 12 Nov check, on a 25.0 development build, is
+    `deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md`):
 
     - Recorded. The provider the DELETE went to answers a deleted file, and what is under a deleted directory, as a
       deleted entry at once (`missing_answer`), with its `parent_id` still reading when asked alone
@@ -203,19 +204,26 @@ class FakeData(FakeFederation):
       again under the same name did not lose its files when the old delete landed: `lose_recreated=True` keeps that
       loss, for testing code that waits defensively, and it was not reproduced live. The check did not cover a file
       over 64 KiB, or a delete still working through many files when the name is made again, so a loss there is not
-      ruled out. (h) A transfer for a deleted file was accepted, where the fake answered 400.
+      ruled out. (h) A transfer for a deleted file was accepted, where the fake answered 400. (f) Corrected: a
+      lagging provider shows only the old entry until the delete lands (12 Nov facts). No tick listed the old and the
+      new entry side by side, and the mirrors switched from the old entry to the new one within one tick; the fake
+      listed both, so a study that resolved a path through a mirror without waiting got the new entry, which live it
+      did not. A mirror now lists, and resolves, only the old entry; the new one, and what is under it, shows in the
+      step the old one goes. The provider the DELETE went to shows the new one at once.
     - Assumed, not seen live; a live check can confirm or correct each. (a) The providers the DELETE did not go to
       refuse the entry's name (409, as for any taken name), and a second DELETE through them changes nothing: no
       mutation was sent through them. (d) With `lose_recreated`, the loss takes files at any depth and no directory:
-      nothing was lost live. (f) A provider that still shows the old entry shows one made again beside it, once the
-      visibility delay lets it: no tick live held both, and no suffixed name appeared; the mirrors switched from the
-      old entry to the new one, or showed neither for some seconds between, so a test should not rely on seeing both.
+      nothing was lost live. (i) A provider that holds the new entry back (f) answers its id, and what is under it,
+      as an entry it does not show yet (`unseen_answer`), as it does not list it: no read of a new entry's id through
+      a mirror was made before the old one went.
     - Simplified. One `delete_delay_s` serves every provider; live, the mirrors stopped showing an entry after 3 s in
       four trials and 8 s in two. The owner answered a deleted directory's files as gone at once and the
       directory's own attributes for up to a second, under another parent and partly emptied, where the fake
       answers the directory gone at once. A new file showed on a mirror late, at size 0 or with only
       some of its directory's files, before about 8 s (lag, not loss): not modelled, since `visibility_delay_s` hides
-      a new entry whole. Directory sizes followed a delete, and an addition, 5 s to 13 s late: not modelled.
+      a new entry whole. In two trials a mirror showed neither entry of the name for some seconds between the old one
+      and the new one; the fake switches in one step. Directory sizes followed a delete, and an addition, 5 s to 13 s
+      late: not modelled.
 
     A delay needs a `clock` that moves. The default never does, so a delete would never land and a test of a name used
     again would pass for no reason: the first DELETE that would pend with it raises `ValueError` naming
@@ -499,11 +507,15 @@ class FakeData(FakeFederation):
     def _child(self, parent: str, name: str, provider: str | None = None) -> str | None:
         """The id of the entry of that name under a parent, after the deletes that are due have landed. An entry whose
         delete is under way is not found by the provider it was deleted through (nor by `None`, which is how a test's
-        helpers ask), and is found by the others, which still show it."""
+        helpers ask), and is found by the others, which still show it, and which do not show a name made again beside
+        it (`_held_back`)."""
         with self._lock:
             self._settle_deletes()
+            held = self._held_back(provider)
             found = (
-                n for n in self.nodes.values() if n.parent == parent and n.name == name and not self._left(n, provider)
+                n
+                for n in self.nodes.values()
+                if n.parent == parent and n.name == name and not self._left(n, provider) and n.file_id not in held
             )
             return next((n.file_id for n in found), None)
 
@@ -519,6 +531,41 @@ class FakeData(FakeFederation):
         current: Node | None = node
         while current is not None:
             if self._left(current, provider):
+                return True
+            current = self.nodes.get(current.parent) if current.parent is not None else None
+        return False
+
+    def _lingers(self, node: Node, provider: str) -> bool:
+        """Tell whether `provider` still shows an entry whose delete was sent through another provider and has not
+        landed: it answers the entry as it was, and lists it."""
+        pending = self._deleting.get(node.file_id)
+        return pending is not None and pending.via != provider and self._visible(node, provider)
+
+    def _held_back(self, provider: str | None) -> set[str]:
+        """The ids of the entries `provider` does not show yet, because it still shows an entry of the same name,
+        made before them, whose delete has not landed there: a name deleted through one provider and made again at
+        once is listed by another as the old entry alone until the delete lands, and then as the new entry alone, in
+        one step (seen live, `DELETE_FACTS`: old and new were never listed side by side). The provider the DELETE went
+        to answers the old entry as deleted, so it holds nothing back, and a test's helpers (`None`) hold nothing back.
+        Entries are visited in the order they were made, which is the order of `nodes`."""
+        if provider is None or not self._deleting:
+            return set()
+        shown_old: set[tuple[str | None, str]] = set()
+        held: set[str] = set()
+        for node in self.nodes.values():
+            key = (node.parent, node.name)
+            if key in shown_old:
+                held.add(node.file_id)
+            elif self._lingers(node, provider):
+                shown_old.add(key)
+        return held
+
+    def _held_above(self, node: Node, provider: str) -> bool:
+        """Tell whether an entry, or a directory above it, is held back from `provider` (`_held_back`)."""
+        held = self._held_back(provider)
+        current: Node | None = node
+        while held and current is not None:
+            if current.file_id in held:
                 return True
             current = self.nodes.get(current.parent) if current.parent is not None else None
         return False
@@ -726,7 +773,7 @@ class FakeData(FakeFederation):
             node = self.nodes.get(found.group(1))
             if node is None or self._hidden(node, provider):  # a delete through this provider that is under way: gone
                 return self._missing(found.group(1), query, method)
-            if not self._shown(node, provider):  # this provider does not see the new entry yet
+            if self._held_above(node, provider) or not self._shown(node, provider):  # it does not see the new entry yet
                 return self._answer(self.unseen_answer)
             part = found.group(2) or ""
             if part == "" and method == "GET":
@@ -800,10 +847,14 @@ class FakeData(FakeFederation):
         limit = min(int(query.get("limit", self.page_size)), self.page_size)
         if limit < 1:
             return self._error(400, "badValueNotInRange")
+        held = self._held_back(provider)
         shown = (
             n
             for n in self.nodes.values()
-            if n.parent == node.file_id and self._visible(n, provider) and not self._left(n, provider)
+            if n.parent == node.file_id
+            and self._visible(n, provider)
+            and not self._left(n, provider)
+            and n.file_id not in held
         )
         children = sorted(shown, key=lambda n: n.name)
         start = int(token or "0")
@@ -914,9 +965,12 @@ class FakeData(FakeFederation):
         return {"type": node.kind, "distributionPerProvider": per}
 
     def _schedule(self, request: httpx.Request, via: str) -> httpx.Response:
-        """Schedule a job through the provider `via`. A file that provider answers as deleted, one whose delete is under
-        way or that landed, is accepted, as seen live (`DELETE_FACTS`): the job ends at once with no file processed and
-        places or removes nothing. A file id the fake never made is refused as an entry that is not there."""
+        """Schedule a job through the provider `via`. A file that provider answers as deleted is accepted, and the job
+        ends at once with no file processed and places or removes nothing. Seen live (`DELETE_FACTS`): a replication
+        scheduled through the deleting provider for a file whose delete was under way. Extrapolated from that, not
+        seen: a file whose delete has landed, a directory's id, an eviction or a migration, and a job scheduled through
+        another provider after the delete landed there. A file id the fake never made is refused as an entry that is
+        not there."""
         sent = json.loads(request.content or b"{}")
         kind = sent.get("type")
         provider = sent.get("evictingProviderId" if kind == "eviction" else "replicatingProviderId")

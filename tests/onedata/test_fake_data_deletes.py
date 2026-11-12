@@ -453,3 +453,117 @@ def test_the_nodes_of_a_fake_still_hold_an_entry_whose_delete_is_under_way_thoug
     ticker.sleep(DELAY_S)
     fake.exists("a.bin")  # a read of the tree lands what is due
     assert file_id not in fake.nodes
+
+
+def listed_ids(fake: FakeData, provider: str, directory: str = ROOT_ID) -> dict[str, list[str]]:
+    """The ids a provider's listing gives for each name; a name listed twice has two."""
+    found: dict[str, list[str]] = {}
+    for child in call(fake, provider, "GET", f"/data/{directory}/children").json()["children"]:
+        found.setdefault(child["name"], []).append(child["file_id"])
+    return found
+
+
+def resolved(fake: FakeData, provider: str, path: str) -> str:
+    """The id a path resolves to through a provider as the core's listing does: one entry per name, the last wins
+    (`Provisioner._list_pages`)."""
+    node = ROOT_ID
+    for part in path.split("/"):
+        kids = call(fake, provider, "GET", f"/data/{node}/children").json()["children"]
+        node = {c["name"]: c["file_id"] for c in kids}[part]
+    return node
+
+
+def content_of(fake: FakeData, provider: str, file_id: str) -> bytes:
+    return call(fake, provider, "GET", f"/data/{file_id}/content").content
+
+
+def test_a_provider_that_still_shows_the_old_directory_shows_only_it_until_the_delete_lands():
+    """Seen live (12 Nov): after a directory was deleted through the owner and made again at once, a mirror showed
+    only the old entry for 3 s to 8 s and then the new one within one tick; old and new were never listed side by
+    side. A study that reads through a mirror without waiting reads the old content, not the new one."""
+    fake, ticker = delayed()
+    fake.add_file("study/f0.bin", b"OLD")
+    old, old_file = fake.id_of("study"), fake.id_of("study/f0.bin")
+    delete(fake, ALPHA_ID, old)
+    fresh = make(fake, ALPHA_ID, ROOT_ID, "study", "DIR")
+    new_file = make(fake, ALPHA_ID, fresh, "f0.bin", "REG")
+    write(fake, ALPHA_ID, new_file, b"NEW")
+    other = make(fake, ALPHA_ID, ROOT_ID, "other.bin", "REG")  # a name that is not the old one's is not held back
+    for _ in range(int(DELAY_S)):
+        assert listed_ids(fake, BETA_ID) == {"study": [old], "other.bin": [other]}  # one entry of the name, the old
+        assert resolved(fake, BETA_ID, "study") == old
+        assert resolved(fake, BETA_ID, "study/f0.bin") == old_file
+        assert content_of(fake, BETA_ID, old_file) == b"OLD"
+        ticker.sleep(1)
+    assert listed_ids(fake, BETA_ID) == {"study": [fresh], "other.bin": [other]}  # the switch, in one step
+    assert resolved(fake, BETA_ID, "study/f0.bin") == new_file
+    assert content_of(fake, BETA_ID, new_file) == b"NEW"
+    assert absent(fake, BETA_ID, old)
+
+
+def test_the_provider_that_deleted_shows_the_name_made_again_at_once_and_not_the_old_entry():
+    fake, ticker = delayed()
+    fake.add_file("study/f0.bin", b"OLD")
+    old = fake.id_of("study")
+    delete(fake, ALPHA_ID, old)
+    fresh = make(fake, ALPHA_ID, ROOT_ID, "study", "DIR")
+    new_file = make(fake, ALPHA_ID, fresh, "f0.bin", "REG")
+    write(fake, ALPHA_ID, new_file, b"NEW")
+    assert listed_ids(fake, ALPHA_ID) == {"study": [fresh]}
+    assert resolved(fake, ALPHA_ID, "study/f0.bin") == new_file
+    assert content_of(fake, ALPHA_ID, new_file) == b"NEW"
+    assert absent(fake, ALPHA_ID, old)
+    assert fake.id_of("study") == fresh  # and the test helpers, which ask as no provider, see the new one
+    ticker.sleep(DELAY_S)
+    assert listed_ids(fake, ALPHA_ID) == {"study": [fresh]}
+
+
+def test_a_file_made_again_under_its_deleted_name_shows_on_a_provider_that_lags_only_when_the_delete_lands():
+    fake, ticker = delayed()
+    old = fake.add_file("a.bin", b"OLD")
+    delete(fake, ALPHA_ID, old)
+    fresh = make(fake, ALPHA_ID, ROOT_ID, "a.bin", "REG")
+    write(fake, ALPHA_ID, fresh, b"NEW")
+    assert listed_ids(fake, ALPHA_ID) == {"a.bin": [fresh]}
+    assert listed_ids(fake, BETA_ID) == {"a.bin": [old]}
+    assert content_of(fake, BETA_ID, old) == b"OLD"
+    ticker.sleep(DELAY_S - 1)
+    assert listed_ids(fake, BETA_ID) == {"a.bin": [old]}
+    ticker.sleep(1)
+    assert listed_ids(fake, BETA_ID) == {"a.bin": [fresh]}
+    assert content_of(fake, BETA_ID, fresh) == b"NEW"
+
+
+def test_a_provider_that_lags_does_not_know_the_entry_made_again_by_its_id_nor_what_is_under_it():
+    """An assumption: a mirror lists the new entry only once the old delete lands, so it has no answer for its id
+    either, as for any entry it does not show yet (`unseen_answer`); what is under a directory made again follows."""
+    fake, ticker = delayed()
+    fake.add_file("study/f0.bin", b"OLD")
+    delete(fake, ALPHA_ID, fake.id_of("study"))
+    fresh = make(fake, ALPHA_ID, ROOT_ID, "study", "DIR")
+    new_file = make(fake, ALPHA_ID, fresh, "f0.bin", "REG")
+    write(fake, ALPHA_ID, new_file, b"NEW")
+    for new in (fresh, new_file):
+        for read in (f"/data/{new}", f"/data/{new}/content", f"/data/{new}/children"):
+            assert call(fake, BETA_ID, "GET", read).json() == GONE_25_0
+    ticker.sleep(DELAY_S)
+    assert call(fake, BETA_ID, "GET", f"/data/{fresh}").status_code == 200
+    assert content_of(fake, BETA_ID, new_file) == b"NEW"
+
+
+def test_a_name_deleted_and_made_again_twice_shows_one_entry_at_every_tick_on_a_provider_that_lags():
+    """The first entry is shown until it lands, then the second until that lands, and the third after: never two."""
+    fake, ticker = delayed()
+    first = fake.add_file("a.bin", b"ONE")
+    delete(fake, ALPHA_ID, first)  # lands at 5
+    second = make(fake, ALPHA_ID, ROOT_ID, "a.bin", "REG")
+    ticker.sleep(2)
+    delete(fake, ALPHA_ID, second)  # lands at 7
+    third = make(fake, ALPHA_ID, ROOT_ID, "a.bin", "REG")
+    seen = []
+    for _ in range(9):
+        entries = listed_ids(fake, BETA_ID)
+        assert len(entries["a.bin"]) == 1
+        seen.append(entries["a.bin"][0])
+        ticker.sleep(1)
+    assert seen == [first] * 3 + [second] * 2 + [third] * 4  # ticks 2 to 4, 5 to 6, 7 on, after the 2 s slept first
