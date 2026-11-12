@@ -1,9 +1,9 @@
 """Find every call of the platform layer that reaches a GET, and say what policy for a timeout it names (O29, #185).
 
 `scan_source` reads one module and returns a `Scan`: the reads (`(module, function, callee)` -> the expression each call
-passes as its policy), the provisioner helpers that retry by default, and every call it could not classify. The test
-that holds the table (`tests/onedata/test_read_retry_sites.py`) fails on any call in the last list, naming it, so a call
-the scanner does not understand is never a way round the table.
+passes as its policy), the provisioner helpers and layer functions that retry by default, and every call it could not
+classify. The test that holds the table (`tests/onedata/test_read_retry_sites.py`) fails on any call in the last list,
+naming it, so a call the scanner does not understand is never a way round the table.
 
 What counts as reaching a GET, and why nothing that retries can go unseen:
 
@@ -13,15 +13,32 @@ What counts as reaching a GET, and why nothing that retries can go unseen:
   that starts with a slash) is one too. The one `.get(x)` left, a single positional argument that is no path, on a
   receiver that is not named for a client, can only be a mapping or a read with no policy, which is one attempt: it can
   neither retry nor hide a retry, so it is not a site.
+- **The client's gated and space reads are found by name, on any receiver.** `mutate`, `read_range` and `read_content`
+  (`gate_retry=`) and `space_name`, `file_space_id` and `file_space_name` (`retry=`) are the client's wherever they are
+  called (`self._onezone.read_range(...)`, `oz.space_name(...)`): a call that names its keyword is a read with that
+  policy, and one that names none is `<missing>` on a receiver named for a client and unclassified on any other, since
+  `**options` may carry the policy. The provisioner's own `mutate` (no `gate_retry`) is its helper, below.
 - **The consistency waits and the occupancy read are found by name**, as `consistency.space_root(...)`, as a name
   imported from the module (an alias included) and as a name handed to `functools.partial`. A reference to one that is
   no call and no partial is unclassified.
 - **The provisioner's helpers** (`PROVISIONER_HELPERS`) retry unless told not to, so a call of one is a site: on a
   recognised provisioner, with the switch that makes it an instrument's read (`wait=False`, `retry=False`); on any other
   receiver of a module of the layer, unclassified.
+- **The layer's functions that retry** (`LAYER_RETRIES`: `place_ranges`, `evict_ids`, `evict_tree`, and a `replicate` or
+  `evict` imported by name) retry under their provisioner's policy with no switch, so a call of one, imported by name
+  (an alias included), through a module (`eviction.evict_tree(...)`) or bound by `functools.partial`, is a helper in its
+  retrying form, which a measuring module may not call. One handed on as a value is unclassified.
+- **A method got by `getattr`** under a constant name is the call it stands for (`getattr(oz, "get")(path, retry=r)` is
+  `oz.get(path, retry=r)`); under a name the scanner cannot read (`getattr(oz, name)(...)`), or a watched method got
+  that way and kept as a value, it is unclassified.
 - **The client's own internal calls** are classified in `client.py` itself: a `_send` or a `_request` of a GET names its
   `retry`, one of a method it is given passes it on, a streamed read and the transport are what they are, and every
   call into the gate names the reads it makes under.
+
+Known limits, none of which the layer has (and a reviewer sees where one would be added): a bound `.get` kept as a value
+from a receiver that is not named for a client (`g = oz.get`), since a mapping's is the same expression; a method of the
+client reached through `setattr`, `operator.methodcaller` or `__getattribute__`; a read made by a module outside the
+layer; and a layer function that retries and is not named in `LAYER_RETRIES`, which a new one must be added to.
 """
 
 import ast
@@ -67,10 +84,28 @@ PROVISIONER_HELPERS: dict[str, str | None] = {
     "verify_space": None,
     "mutate": None,
 }
+# The layer's own functions that retry under their provisioner's policy, with no switch to turn it off: called by name
+# (imported from the layer, an alias included) or through a module. `replicate` and `evict` are the provisioner's
+# methods too, found on a provisioner as helpers, so only a bare name imported from the layer is added here.
+LAYER_RETRIES = {"place_ranges", "evict_ids", "evict_tree"}
+IMPORTED_RETRIES = LAYER_RETRIES | {"replicate", "evict"}
 POLICY_HELPERS = {"blocks", "holds"}  # one attempt by default, a `retry=` policy when the caller is plumbing
 PROVISIONER_RECEIVERS = {"provisioner", "p"}  # as written, leading underscores dropped, last segment: `self._p`
 # What a call's shown policy means for a timeout: these are one attempt, everything else retries or is unnamed.
 ONE_ATTEMPT_SHOWN = {"ONE_ATTEMPT", "_ONE_ATTEMPT", "<one attempt>", "<streamed>", "<transport>", "<default>"}
+# Every attribute name a call is classified by: a method of these got by `getattr` and kept as a value is unclassified.
+WATCHED_ATTRS = (
+    {"get", "stream", "request", "_send", "_request"}
+    | WAITS
+    | OCCUPANCY
+    | GATED
+    | SPACE_READS
+    | NO_POLICY
+    | GATE_INTERNALS
+    | set(PROVISIONER_HELPERS)
+    | POLICY_HELPERS
+    | IMPORTED_RETRIES
+)
 MISSING = "<missing>"  # a read that names no policy
 NONE = "<none>"  # a client call that passes the method on and never a policy: a write, by construction
 
@@ -161,6 +196,8 @@ class _Scanner:
             where = ".".join(stack)
             if isinstance(child, ast.Call):
                 self._call(_unwrapped(child), where, classes)
+                if id(child) not in self.followed:
+                    self._getattr_value(child, where)
             elif isinstance(child, ast.Attribute | ast.Name) and id(child) not in self.followed:
                 self._reference(child, where)
             self._visit(child, stack, classes)
@@ -177,26 +214,56 @@ class _Scanner:
     def _reference(self, node: ast.Attribute | ast.Name, where: str) -> None:
         """A watched name used as a value, which no call follows: the scanner cannot see what is passed to it."""
         name = node.attr if isinstance(node, ast.Attribute) else self.aliases.get(node.id, node.id)
-        watched = WAITS | OCCUPANCY | GATED | SPACE_READS | NO_POLICY
+        watched = WAITS | OCCUPANCY | GATED | SPACE_READS | NO_POLICY | LAYER_RETRIES
+        imported_retry = isinstance(node, ast.Name) and name in IMPORTED_RETRIES and node.id in self.aliases
         client_get = isinstance(node, ast.Attribute) and name == "get" and _segment(node.value) in CLIENT_NAMES
         watched_name = name in watched and (isinstance(node, ast.Attribute) or node.id in self.aliases)
-        if client_get or watched_name:
+        if client_get or watched_name or imported_retry:
             self._unknown(node, where, f"`{ast.unparse(node)}` is used as a value, so its calls cannot be followed")
+
+    def _getattr_call(self, call: ast.Call, where: str) -> ast.Call | None:
+        """`getattr(x, "name")(...)` as the `x.name(...)` it stands for; None, and unclassified, when the name is not a
+        constant string, since it may be any method of the client."""
+        inner = call.func
+        assert isinstance(inner, ast.Call)
+        name = inner.args[1] if len(inner.args) >= 2 else None
+        if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
+            self._unknown(call, where, "a method got by `getattr` under a name the scanner cannot read is called")
+            return None
+        attribute = ast.copy_location(ast.Attribute(value=inner.args[0], attr=name.value, ctx=ast.Load()), call)
+        return ast.copy_location(ast.Call(func=attribute, args=call.args, keywords=call.keywords), call)
+
+    def _getattr_value(self, call: ast.Call, where: str) -> None:
+        """A watched method got by `getattr` and not called at once: what is done with it cannot be followed."""
+        func = call.func
+        name = call.args[1] if len(call.args) >= 2 else None
+        watched = isinstance(name, ast.Constant) and name.value in WATCHED_ATTRS
+        if isinstance(func, ast.Name) and func.id == "getattr" and watched:
+            self._unknown(call, where, f"`{ast.unparse(call)}` is kept as a value, so its calls cannot be followed")
 
     def _call(self, call: ast.Call, where: str, classes: list[str]) -> None:
         func = call.func
+        if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and func.func.id == "getattr":
+            got = self._getattr_call(call, where)
+            if got is None:
+                return
+            call, func = got, got.func
         if isinstance(func, ast.Name):
             name = self.aliases.get(func.id, func.id)
             if name in WAITS and func.id in self.aliases:
                 self._read(where, f"consistency.{name}", _keyword(call, "retry") or MISSING)
             elif name in OCCUPANCY and func.id in self.aliases:
                 self._read(where, name, _keyword(call, "retry") or MISSING)
+            elif name in IMPORTED_RETRIES and func.id in self.aliases:
+                self._helper(where, f"layer.{name}", "<default>")
             return
         if not isinstance(func, ast.Attribute):
             return
         attr, receiver = func.attr, ast.unparse(func.value)
         if attr == "get":
             self._get(call, where, func)
+        elif attr in LAYER_RETRIES:
+            self._helper(where, f"layer.{attr}", "<default>")
         elif attr in WAITS:
             self._read(where, f"consistency.{attr}", _keyword(call, "retry") or MISSING)
         elif attr in OCCUPANCY:
@@ -207,8 +274,8 @@ class _Scanner:
             self._read(where, f"http.{attr}", "<streamed>" if attr == "stream" else "<transport>")
         elif attr in GATE_INTERNALS and receiver == "self":
             self._read(where, f"self.{attr}", _reads_of(call))
-        elif attr in GATED | SPACE_READS | NO_POLICY and _segment(func.value) in CLIENT_NAMES:
-            self._client_call(call, where, attr)
+        elif attr in GATED | SPACE_READS or (attr in NO_POLICY and _segment(func.value) in CLIENT_NAMES):
+            self._client_call(call, where, func, classes)
         elif attr in set(PROVISIONER_HELPERS) | POLICY_HELPERS:
             self._provisioner(call, where, func, classes)
 
@@ -232,13 +299,22 @@ class _Scanner:
             return
         self._read(where, f"self.{attr}(<method>)", _keyword(call, "retry") or NONE)
 
-    def _client_call(self, call: ast.Call, where: str, attr: str) -> None:
+    def _client_call(self, call: ast.Call, where: str, func: ast.Attribute, classes: list[str]) -> None:
+        """A call of the client's gated or space reads, which is the client's on any receiver: it names its policy in
+        `gate_retry=` or `retry=`. Without one it is `<missing>` on a receiver named for a client; elsewhere it may be
+        the provisioner's `mutate`, which takes none, and is otherwise unclassified."""
+        attr = func.attr
         if attr in NO_POLICY:
             self._read(where, f"client.{attr}", "<one attempt>")
-        elif attr in GATED:
-            self._read(where, f"client.{attr}", _keyword(call, "gate_retry") or MISSING)
+            return
+        keyword = "gate_retry" if attr in GATED else "retry"
+        shown = _keyword(call, keyword)
+        if shown is not None or _segment(func.value) in CLIENT_NAMES:
+            self._read(where, f"client.{attr}", shown or MISSING)
+        elif attr in PROVISIONER_HELPERS:
+            self._provisioner(call, where, func, classes)
         else:
-            self._read(where, f"client.{attr}", _keyword(call, "retry") or MISSING)
+            self._unknown(call, where, f"`{ast.unparse(func)}` is a read of the client that names no `{keyword}`")
 
     def _provisioner(self, call: ast.Call, where: str, func: ast.Attribute, classes: list[str]) -> None:
         """A provisioner helper, recognised by its receiver. A call that is no provisioner's (`Path(x).resolve()`, a

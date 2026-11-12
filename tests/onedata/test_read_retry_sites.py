@@ -7,9 +7,11 @@ the expression it passes. A site added, removed or changed without this table ch
 cannot turn a measurement into a retried read, or the other way round, without a reviewer seeing it.
 
 What counts as a site is `tests/support/read_sites.py`'s: any `.get(` that takes a keyword or a path, whatever its
-receiver is called; the consistency waits and the occupancy read, whether called as `consistency.x`, imported by name
-or handed to `functools.partial`; the client's gate and its internal calls (`client.py` is scanned); and the
-provisioner's helpers that retry by default. A call the scanner cannot classify fails the test, naming it.
+receiver is called; the client's gated and space reads (`mutate`, `read_range`, `read_content`, `space_name`,
+`file_space_id`, `file_space_name`) on any receiver; the consistency waits and the occupancy read, whether called as
+`consistency.x`, imported by name or handed to `functools.partial`; the client's internal calls (`client.py` is
+scanned); the provisioner's helpers and the layer's functions that retry by default; and a method got by `getattr`
+under a constant name. A call the scanner cannot classify fails the test, naming it.
 """
 
 import functools
@@ -134,8 +136,9 @@ CLIENT_INTERNAL = {
     ("client.py", "OnezoneClient._target", "self._file_space_id"): ["reads"],
 }
 
-# The modules that call the provisioner's helpers, which retry by default, and which helpers. A module that begins to,
-# or a helper it begins to call, is a change a reviewer sees here. Each is plumbing, but for the instrument's switch.
+# The modules that call the provisioner's helpers and the layer's functions that retry (`place_ranges`, `evict_ids`,
+# `evict_tree`), which retry by default, and which they call. A module that begins to, or a helper it begins to call, is
+# a change a reviewer sees here. Each is plumbing, but for the instrument's switch.
 HELPER_USERS = {
     "day0/mutating.py": {
         "provisioner.verify_space",
@@ -144,6 +147,7 @@ HELPER_USERS = {
         "provisioner.evict",
         "provisioner.teardown",
         "provisioner.resolve",
+        "layer.place_ranges",  # the layer's functions that retry are listed with the helpers
     },
     "eviction.py": {
         "provisioner.verify_space",
@@ -183,6 +187,8 @@ HELPER_USERS = {
         "provisioner.walk",
         "provisioner.mutate",
         "provisioner.resolve_many",
+        "layer.evict_ids",
+        "layer.evict_tree",
     },
 }
 
@@ -411,3 +417,165 @@ def test_o29_a_gate_call_that_names_no_policy_is_missing():
     }
     named = scan_source("def f(client, p):\n    client.mutate('PUT', '/x', gate_retry=p)\n", "probes.py")
     assert measuring_breaches(named) != []
+
+
+# -- a gated or space read is a client call whatever its receiver is called ------------------------------------
+
+
+# Each of these reads through the client under a policy, in a module that measures, behind a receiver the old scanner
+# did not know for a client: none was a site, so none was a breach.
+RENAMED_RECEIVERS = {
+    "read_range": (
+        "def f(self, p):\n"
+        "    return self._onezone.read_range('/data/x/content', provider=p, offset=0, length=1,"
+        " gate_retry=self._provisioner.retry)\n"
+    ),
+    "space_name": "def f(oz, sid, r):\n    return oz.space_name(sid, retry=r)\n",
+    "read_content": (
+        "def f(conn, r):\n"
+        "    return conn.read_content('/data/x/content', provider='p', size=1, chunk_bytes=1, deadline_s=1,"
+        " gate_retry=r)\n"
+    ),
+    "file_space_id": "def f(oz, r):\n    return oz.file_space_id('x', 'p', retry=r)\n",
+    "file_space_name": "def f(self, r):\n    return self.zone_api.file_space_name('x', 'p', retry=r)\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(RENAMED_RECEIVERS))
+def test_o29_a_gated_read_with_a_policy_is_a_site_whatever_its_receiver_is_called(name):
+    """O29: `read_range`, `read_content`, `space_name`, `file_space_id` and `file_space_name` are the client's whatever
+    the receiver is named (`self._onezone`, `oz`, `conn`): the policy they name is read, and a measuring module that
+    names a retrying one breaches."""
+    scan = scan_source(RENAMED_RECEIVERS[name], "probes.py")
+    assert [site[2] for site in scan.reads] == [f"client.{name}"]
+    assert scan.unclassified == []
+    assert measuring_breaches(scan) != []
+
+
+@pytest.mark.parametrize("name", sorted(RENAMED_RECEIVERS))
+def test_o29_a_gated_read_of_a_renamed_receiver_that_names_one_attempt_does_not_breach(name):
+    """O29: the instrument's form, `ONE_ATTEMPT`, is no breach however the receiver is named."""
+    source = RENAMED_RECEIVERS[name]
+    quiet = source.replace("self._provisioner.retry", "ONE_ATTEMPT").replace("retry=r", "retry=ONE_ATTEMPT")
+    quiet = quiet.replace("gate_retry=r", "gate_retry=ONE_ATTEMPT")
+    assert quiet != source
+    scan = scan_source(quiet, "probes.py")
+    assert [site[2] for site in scan.reads] == [f"client.{name}"]  # seen, and named one attempt
+    assert measuring_breaches(scan) == []
+
+
+@pytest.mark.parametrize("name", sorted(RENAMED_RECEIVERS))
+def test_o29_a_gated_read_of_a_renamed_receiver_that_names_no_policy_is_unclassified(name):
+    """O29: with no `gate_retry=` or `retry=` there is nothing to read, and the receiver is no client's by name: the
+    call fails closed, named, rather than passing as no read."""
+    source = RENAMED_RECEIVERS[name]
+    bare = source.replace(", gate_retry=self._provisioner.retry", "").replace(", gate_retry=r", "")
+    bare = bare.replace(", retry=r", "")
+    assert bare != source
+    found = scan_source(bare, "probes.py").unclassified
+    assert len(found) == 1
+    assert f".{name}`" in found[0]
+
+
+def test_o29_a_gated_read_with_unpacked_keywords_names_no_policy_the_scanner_can_see():
+    """O29: `read_range(..., **options)` may carry any `gate_retry`: it is `<missing>` on a client's receiver and
+    unclassified on another, never no read."""
+    assert reads_of("def f(client, o):\n    return client.read_range('/x', **o)\n") == {
+        ("probes.py", "f", "client.read_range"): [MISSING]
+    }
+    assert scan_source("def f(oz, o):\n    return oz.read_range('/x', **o)\n", "probes.py").unclassified != []
+
+
+def test_o29_the_provisioners_mutate_is_still_its_helper_and_not_a_gated_client_call():
+    """O29: `provisioner.mutate(...)` names no `gate_retry` (the provisioner passes its own): it stays the helper the
+    table lists, and another receiver of that name is unclassified as before."""
+    scan = scan_source("def f(self, p):\n    return self._provisioner.mutate('PUT', '/x')\n", "ingestbase.py")
+    assert scan.reads == {}
+    assert list(scan.helpers) == [("ingestbase.py", "f", "provisioner.mutate")]
+    assert scan.unclassified == []
+    other = scan_source("def f(thing):\n    return thing.mutate('PUT', '/x')\n", "ingestbase.py")
+    assert other.reads == {}
+    assert other.unclassified != []
+
+
+# -- a layer function that retries, and a method got by name -------------------------------------------------
+
+
+LAYER_CALLS = [
+    "from expcore_onedata.ranges import place_ranges\n\n\ndef f(p, rows):\n    return place_ranges(p, rows)\n",
+    "from expcore_onedata.eviction import evict_ids as gone\n\n\ndef f(p, ids):\n    return gone(p, ids, 'a')\n",
+    "from expcore_onedata.eviction import evict_tree\n\n\ndef f(p, e):\n    return evict_tree(p, e, 'a')\n",
+    "from expcore_onedata import eviction\n\n\ndef f(p, e):\n    return eviction.evict_tree(p, e, 'a')\n",
+    "from expcore_onedata import ranges as r\n\n\ndef f(p, rows):\n    return r.place_ranges(p, rows)\n",
+    "from expcore_onedata.provision import replicate\n\n\ndef f(p):\n    return replicate(p, '/x', 'a')\n",
+    "from expcore_onedata.provision import evict\n\n\ndef f(p):\n    return evict(p, '/x', 'a')\n",
+]
+
+
+@pytest.mark.parametrize("source", LAYER_CALLS)
+def test_o29_a_layer_function_that_retries_is_a_site_and_breaches_in_a_measuring_module(source):
+    """O29: `place_ranges`, `evict_ids`, `evict_tree`, `replicate` and `evict` retry the reads they make under their
+    provisioner's policy, so a call of one, however imported, is a helper in its retrying form."""
+    scan = scan_source(source, "probes.py")
+    assert len(scan.helpers) == 1
+    assert scan.unclassified == []
+    assert measuring_breaches(scan) != []
+
+
+def test_o29_a_layer_function_that_retries_handed_on_as_a_value_is_unclassified():
+    """O29: `map(evict_ids, ...)` and a `functools.partial` of it that is never called here cannot be followed; the
+    partial that is called is the call it stands for."""
+    value = "from expcore_onedata.eviction import evict_ids\n\n\ndef f(xs):\n    return list(map(evict_ids, xs))\n"
+    assert scan_source(value, "probes.py").unclassified != []
+    bound = (
+        "import functools\n\nfrom expcore_onedata.eviction import evict_ids\n\n\n"
+        "def f(p, ids):\n    return functools.partial(evict_ids, p, ids)('a')\n"
+    )
+    scan = scan_source(bound, "probes.py")
+    assert (len(scan.helpers), scan.unclassified) == (1, [])
+
+
+def test_o29_a_name_that_is_no_import_of_the_layer_is_no_layer_call():
+    """O29: a function of that name defined here, or taken from the standard library, is not the layer's."""
+    local = "def evict(path):\n    return path\n\n\ndef f(p):\n    return evict(p)\n"
+    assert scan_source(local, "probes.py").helpers == {}
+
+
+GETATTR_CALLS = {
+    "get": ("def f(oz, r):\n    return getattr(oz, 'get')('/spaces/x', retry=r)\n", "client.get"),
+    "read_range": (
+        "def f(oz, p, r):\n    return getattr(oz, 'read_range')('/x', provider=p, offset=0, length=1, gate_retry=r)\n",
+        "client.read_range",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", ["get", "read_range"])
+def test_o29_a_method_got_by_getattr_under_a_constant_name_is_the_call_it_stands_for(name):
+    """O29: `getattr(oz, "get")(path, retry=r)` is `oz.get(path, retry=r)`: a site with that policy, a breach in a
+    measuring module."""
+    source, callee = GETATTR_CALLS[name]
+    scan = scan_source(source, "probes.py")
+    assert [site[2] for site in scan.reads] == [callee]
+    assert measuring_breaches(scan) != []
+
+
+def test_o29_a_method_got_by_getattr_under_a_name_the_scanner_cannot_read_is_unclassified():
+    """O29: `getattr(oz, name)(...)` may be any read of the client, and a watched method got by `getattr` and kept as
+    a value cannot be followed; both fail closed. An attribute that is none of the layer's reads is no concern."""
+    dynamic = "def f(oz, name):\n    return getattr(oz, name)('/spaces/x', retry=POLICY)\n"
+    assert scan_source(dynamic, "probes.py").unclassified != []
+    kept = "def f(oz):\n    g = getattr(oz, 'get')\n    return g('/spaces/x', retry=POLICY)\n"
+    assert scan_source(kept, "probes.py").unclassified != []
+    harmless = "def f(error):\n    return getattr(error, 'status', None), getattr(error, 'args')\n"
+    assert scan_source(harmless, "probes.py").unclassified == []
+
+
+@pytest.mark.parametrize("name", sorted(RENAMED_RECEIVERS))
+def test_o29_a_bypass_added_to_the_real_probes_module_is_caught(name):
+    """O29: the layer's own `probes.py`, a module that measures, breaches nothing; with one of the renamed-receiver
+    reads added to it, it does, so the table fails on the change a reviewer must see."""
+    real = (SRC / "probes.py").read_text(encoding="utf-8")
+    assert measuring_breaches(scan_source(real, "probes.py", NOT_THE_PROVISIONERS)) == []
+    mutated = scan_source(real + "\n\n" + RENAMED_RECEIVERS[name], "probes.py", NOT_THE_PROVISIONERS)
+    assert measuring_breaches(mutated) != []
