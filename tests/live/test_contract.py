@@ -27,6 +27,7 @@ from live_support import (  # noqa: E402 -- only once the module is known to run
     prerequisite_missing,
     require_cleaned,
     require_every_provider_refused,
+    require_measured,
     require_passed,
     require_restored,
 )
@@ -380,22 +381,27 @@ def test_a_day0_check_that_changes_state_passes_and_shows_its_cleanup(day0, name
 
 
 # -- a provider's outage (issue #108) -----------------------------------------------------------------------------
-# It takes a provider of the live federation down and brings it back: EXPCORE_LIVE_MUTATE=1 and EXPCORE_LIVE_FAULTS=1,
-# a platform.toml with a sanctioned [faults] table, and a space whose data provider is not the agent's local one, with
-# a third provider besides. Never set it on a federation another run is using.
+# It takes a provider of the live federation down and brings it back, and starts a sandbox in mount mode and the tool
+# server to read and call through as the agent does: EXPCORE_LIVE_MUTATE=1, EXPCORE_LIVE_FAULTS=1 and
+# EXPCORE_LIVE_DOCKER=1, a platform.toml with a sanctioned [faults] table, a [sandbox] table with a mount level (as
+# tests/support/mount_live.py derives one), [slots] and a [toolserver] condition allowing the four knowledge tools, and
+# a space whose data provider is not the agent's local one, with a third provider besides. Never set it on a
+# federation another run is using.
 
 FAULTS = pytest.mark.skipif(
-    os.environ.get("EXPCORE_LIVE_FAULTS") != "1",
-    reason="EXPCORE_LIVE_FAULTS=1 is not set; this test takes a provider of the federation down",
+    os.environ.get("EXPCORE_LIVE_FAULTS") != "1" or os.environ.get("EXPCORE_LIVE_DOCKER") != "1",
+    reason="EXPCORE_LIVE_FAULTS=1 and EXPCORE_LIVE_DOCKER=1 are needed: this test takes a provider of the federation "
+    "down and starts a sandbox and the tool server",
 )
 
 
 @MUTATE
 @FAULTS
 def test_a_provider_outage_is_measured_and_the_provider_is_restored(day0):
-    """O28: the check takes the data provider down, records the answers of the REST path and the knowledge plane,
-    restores the provider and shows it answering again with another identity, and removes its scratch. It is skipped
-    only when platform.toml lacks what it needs, and the skip names that."""
+    """O28: the check takes the data provider down through the fault injector, records the answers of the REST path,
+    of the mount of a real sandbox and of the agent's tools through MCP, restores the provider and shows it answering
+    again with another identity, and removes its scratch. It is skipped only when platform.toml lacks what it needs,
+    and the skip names that."""
     from expcore_onedata.day0.runner import run_checks
 
     day0.allow_mutation = day0.allow_faults = True
@@ -404,6 +410,7 @@ def test_a_provider_outage_is_measured_and_the_provider_is_restored(day0):
         pytest.skip(missing)
     entry = {e.name: e for e in run_checks(day0, ["provider_outage"])}["provider_outage"]
     require_passed(entry)
+    require_measured(entry)
     require_restored(entry)
     require_cleaned(entry)
 

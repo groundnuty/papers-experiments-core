@@ -17,7 +17,7 @@ failed before unknown before passed, and each space is named by its position, `s
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import PlatformConfig, StudySpace
@@ -26,6 +26,7 @@ from expcore_onedata.fault_recovery import FaultDriver
 from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.rangemap import Placement
+from expcore_onedata.sandbox.hostops import HostOps
 from expcore_onedata.tokens import TokenIssuer
 
 
@@ -53,30 +54,18 @@ def unknown(summary: str, **facts: Any) -> Result:
     return Result(None, summary, facts)
 
 
-class MountAccess(Protocol):
-    """Reads through the mount of a space, as the agent sees it: a mounting client on the agent's local provider.
-
-    Day-0 starts no container, so a run that declares a mount hands one in (the live run's is a mounting sidecar and an
-    agent container; a test's is a function). Both raise `TimeoutError` when the mount does not answer within
-    `timeout_s`, and any other `OSError` (with its errno) when it answers with an error."""
-
-    def read(self, space: StudySpace, path: str, *, timeout_s: float) -> bytes:
-        """Return the content of a file, `path` relative to the space's root."""
-        ...
-
-    def listdir(self, space: StudySpace, path: str, *, timeout_s: float) -> list[str]:
-        """Return the names in a directory, `path` relative to the space's root."""
-        ...
-
-
 @dataclass
 class Context:
     """Everything a check may use: the loaded configuration, the client, and the permission to change state.
 
     Taking a provider down is a second permission, `allow_faults` (`EXPCORE_LIVE_FAULTS=1`), beside `allow_mutation`
     and beside `sanctioned = true` in `[faults]` of platform.toml (`fault_settings`, `fault_settings.load_faults`).
-    `fault_driver` is the fault injector's driver (`compose.ComposeDriver` by default), `mount` a reader of the mount
-    when a run has one, and `outage_bound_s` the longest a read or a call of the outage check waits for an answer.
+    `fault_driver` is the fault injector's driver (`compose.ComposeDriver` by default), and `outage_bound_s` the
+    longest a read or a call of the outage check waits for an answer. `agent_host` is where the outage check may start
+    a sandbox and the tool server (`DockerHost` with `EXPCORE_LIVE_DOCKER=1`; None starts nothing), `agent_options` the
+    keywords its `SandboxPlatform` gets (a registry, the sandbox's options), `tool_condition` the tool-server condition
+    whose tools it calls (else the first that allows the four knowledge tools), and `outage_ceiling_s` the ceiling the
+    run's tokens are minted for.
     """
 
     config: PlatformConfig
@@ -95,8 +84,11 @@ class Context:
     allow_faults: bool = False
     fault_settings: FaultSettings | None = None
     fault_driver: FaultDriver | None = None
-    mount: MountAccess | None = None
     outage_bound_s: float = 60.0
+    agent_host: HostOps | None = None
+    agent_options: dict[str, Any] = field(default_factory=dict)
+    tool_condition: str | None = None
+    outage_ceiling_s: float = 1800.0
     _provisioners: dict[str, Provisioner] = field(default_factory=dict, repr=False)  # by the label of their space
 
     def provisioner(self, space: str | None = None) -> Provisioner:

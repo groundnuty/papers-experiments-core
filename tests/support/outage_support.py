@@ -11,20 +11,38 @@ provider that is down, so this module adds one outside the fakes, as a transport
   down, `start` brings it up, and a service's identity is its generation, which a start changes (or not, to model a
   restore that did not take effect). `WorldDaemon` is `fault_support.FakeDaemon` (the Docker daemon behind the real
   Compose driver, on the test's clock) with the world's hosts following its containers, for a stop that times out.
-- `FakeMount` reads and lists through "the mount" from the same world.
+- `AgentWorld` is what the agent meets of the same world: the mount of a sandbox on the sandbox's fake host (the
+  answer to each mount cell the check runs in the agent's container) and the four knowledge tools, which the stand-in
+  tool server (`outage_tools_server.py`, a real MCP stdio server) relays to the test through `ToolRelay`.
 
 Every name is invented, as in `expcore_onedata.testing`.
 """
 
+import ast
+import asyncio
+import hashlib
+import json
 import re
+import sys
+import threading
 from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 import httpx
+from fake_host import FakeHost
 from fault_support import FakeDaemon
+from mcp import StdioServerParameters
+from sandbox_support import FAST, SLOT_USERS, add_sandbox
 
+from expcore.tools.manifest import FrozenManifest, live_manifest
 from expcore_onedata.compose import DriverError, Observation
-from expcore_onedata.testing import FakeData, Ticker
+from expcore_onedata.config import load_platform
+from expcore_onedata.day0.outage_tools import KNOWLEDGE_TOOLS
+from expcore_onedata.sandbox.hostops import CmdResult
+from expcore_onedata.sandbox.registry import Registry
+from expcore_onedata.testing import BASELINE, CREDENTIALS_DIR, FakeData, Ticker
 
 GAMMA_ID, GAMMA_HOST = "pr-gamma", "gamma.test"
 SERVICE = "svc-alpha"
@@ -145,33 +163,6 @@ class FakeServices:
         return [verb for verb, _ in self.calls if verb != "observe"]
 
 
-class FakeMount:
-    """The mount, over the same world: it reads a scratch file by its path in the study space, as the local provider
-    would serve it, and lists a scratch directory. It stalls, as the world does, when no up provider holds the bytes."""
-
-    def __init__(self, world: OutageWorld, local_id: str) -> None:
-        self.world, self.local_id = world, local_id
-        self.error: OSError | None = None  # when set, every read fails with it
-        self.reads: list[str] = []
-
-    def read(self, space: Any, path: str, *, timeout_s: float) -> bytes:
-        self.reads.append(path)
-        if self.error is not None:
-            raise self.error
-        fake = self.world.fake
-        file_id = fake.id_of(path)
-        if not fake.blocks.get((file_id, self.local_id)) and not self.world.holders_up(file_id):
-            self.world.ticker.sleep(timeout_s)
-            raise TimeoutError("the mount did not answer")
-        fake.blocks[(file_id, self.local_id)] = [[0, len(fake.nodes[file_id].content)]]  # a read through it places
-        return bytes(fake.nodes[file_id].content)
-
-    def listdir(self, space: Any, path: str, *, timeout_s: float) -> list[str]:
-        fake = self.world.fake
-        directory = fake.id_of(path)
-        return [node.name for node in fake.nodes.values() if node.parent == directory]
-
-
 class WorldDaemon(FakeDaemon):
     """The fake Docker daemon behind the real Compose driver, whose providers' hosts are down while their containers do
     not run: `services` maps a Compose service to the host it serves. The daemon's clock is the test's `Ticker`."""
@@ -192,3 +183,176 @@ class WorldDaemon(FakeDaemon):
             return super().__call__(argv, timeout_s=timeout_s)
         finally:
             self.sync()
+
+
+# -- what the agent meets: the mount of a sandbox on the fake host, and the tool server's relay -----------------------
+
+PROVIDER_API = "/api/v3/oneprovider"
+TOOLS_SERVER = Path(__file__).resolve().parent / "outage_tools_server.py"
+REQUEST_LINE = "REQUEST = json.loads("
+
+
+class AgentWorld:
+    """What a sandbox's mount and the tool server see of the world, through the agent's local provider `local_host`.
+
+    The mount reads a scratch file as the local provider would serve it (and places its bytes there, as a read through
+    a mount does); with every provider that holds it down, it blocks to its deadline (`mount_down = "blocked"`) or
+    fails with an errno (`mount_down = ("ETIMEDOUT", 110, "TimeoutError")`, as Python reports a mount's ETIMEDOUT). The
+    tools answer from the providers' REST surface through the same transport, so a downed host is refused; while a host
+    is down `tool_errors` makes a tool answer an error with that wording, and `tool_hangs` makes one never answer (the
+    ticker moved by `hang_s` first). What each does is a stand-in's choice, not a fact about Onedata."""
+
+    def __init__(self, world: OutageWorld, local_host: str, space_root: str) -> None:
+        self.world, self.local_host, self.space_root = world, local_host, space_root.rstrip("/") + "/"
+        self.mount_down: Any = "blocked"
+        self.tool_errors: dict[str, str] = {}
+        self.tool_broken: dict[str, str] = {}  # answers an error with this wording whether or not anything is down
+        self.tool_hangs: set[str] = set()
+        self.hang_s = 0.0
+        self.tool_calls: list[tuple[str, dict]] = []
+        self.mount_ops: list[tuple[str, str]] = []
+
+    # -- the mount ----------------------------------------------------------------------------------------------
+    def exec_handler(self, container, argv, stdin):
+        """The fake host's answer to a cell: a mount cell from the world, anything else as the fake host answers."""
+        if not stdin or REQUEST_LINE not in stdin:
+            return FakeHost._default_exec(container, argv, stdin)
+        line = next(text for text in stdin.splitlines() if text.startswith(REQUEST_LINE))
+        request = json.loads(ast.literal_eval(line[len(REQUEST_LINE) : -1]))
+        rows = [self.mount_op(op, request["deadline_s"]) for op in request["ops"]]
+        return CmdResult(0, json.dumps({"results": rows}) + "\n")
+
+    def mount_op(self, op: dict, deadline_s: float) -> dict:
+        self.mount_ops.append((op["op"], op["key"]))
+        fake, row = self.world.fake, {"key": op["key"], "seconds": 0.01, "blocked": False}
+        assert op["path"].startswith(self.space_root), "a mount cell read outside the space's directory"
+        node = fake.id_of(op["path"][len(self.space_root) :])
+        if op["op"] == "list":
+            return {**row, "names": sorted(n.name for n in fake.nodes.values() if n.parent == node)}
+        local = fake.provider_of(self.local_host)
+        if not fake.blocks.get((node, local)) and not self.world.holders_up(node):
+            if self.mount_down == "blocked":
+                return {**row, "seconds": deadline_s, "blocked": True, "killed": True, "bytes": 0}
+            name, number, kind = self.mount_down
+            return {**row, "seconds": deadline_s, "error": name, "errno": number, "kind": kind, "bytes": 0}
+        content = bytes(fake.nodes[node].content)
+        fake.blocks[(node, local)] = [[0, len(content)]]
+        return {**row, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+
+    # -- the tools ----------------------------------------------------------------------------------------------
+    def _call(self, method: str, path: str, **options: Any) -> httpx.Response:
+        headers = {"X-Auth-Token": self.world.fake.admin_token}
+        request = httpx.Request(method, f"https://{self.local_host}{PROVIDER_API}{path}", headers=headers, **options)
+        return self.world.respond(request)
+
+    def tool(self, name: str, arguments: dict) -> dict:
+        self.tool_calls.append((name, arguments))
+        if self.world.down and name in self.tool_hangs:
+            self.world.ticker.sleep(self.hang_s)
+            return {"hang": True}
+        if self.world.down and name in self.tool_errors:
+            return {"error": self.tool_errors[name]}
+        if name in self.tool_broken:
+            return {"error": self.tool_broken[name]}
+        try:
+            if name == "list_space_providers":
+                fake = self.world.fake
+                rows = [
+                    {"providerId": pid, "online": provider["domain"] not in self.world.down}
+                    for pid, provider in fake.providers.items()
+                ]
+                return {"result": {"providers": rows}}
+            if name == "get_file_distribution":
+                answer = self._call("GET", f"/data/{arguments['file_id']}/distribution")
+            elif name == "schedule_file_replication":
+                body = {"type": "replication", "replicatingProviderId": arguments["provider_id"]}
+                body.update(dataSourceType="file", fileId=arguments["file_id"])
+                answer = self._call("POST", "/transfers", json=body)
+            else:
+                answer = self._call("GET", f"/transfers/{arguments['transfer_id']}")
+        except httpx.HTTPError as error:
+            return {"error": f"{type(error).__name__} talking to https://{self.local_host}"}
+        if answer.status_code >= 300:
+            return {"error": f"HTTP {answer.status_code} from https://{self.local_host}"}
+        return {"result": answer.json()}
+
+
+class ToolRelay:
+    """The test's end of the stand-in tool server: an HTTP server on the loopback, in a thread of its own, that answers
+    one relayed tool call at a time from an `AgentWorld` (the fakes are not thread-safe)."""
+
+    def __init__(self, agent: AgentWorld) -> None:
+        relay = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                asked = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                with relay.lock:
+                    reply = json.dumps(agent.tool(asked["tool"], asked["arguments"])).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(reply)))
+                self.end_headers()
+                self.wfile.write(reply)
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self.lock = threading.Lock()
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def freeze_tools_manifest(path: Path) -> None:
+    """Freeze the stand-in server's manifest (its four tools) into a file, as `expcore.tools.manifest` freezes one."""
+    params = StdioServerParameters(command=sys.executable, args=[str(TOOLS_SERVER), "--relay", "http://127.0.0.1:9"])
+    path.write_text(FrozenManifest.from_live(asyncio.run(live_manifest(params))).dump(), encoding="utf-8")
+
+
+KNOWLEDGE_RIGHTS = ["space_view", "space_read_data", "space_view_transfers", "space_schedule_replication"]
+KNOWLEDGE_MANIFEST = "knowledge.manifest.json"
+
+
+def with_agent(data: dict[str, Any], relay_url: str, *, allow: tuple[str, ...] = KNOWLEDGE_TOOLS) -> None:
+    """An `edit` for `write_platform`: the default `[sandbox]` (its level `mounted` maps to the mount) and `[slots]`,
+    and a `[toolserver]` that runs the stand-in tool server against `relay_url`, with a condition `knowledge` that
+    allows the tools in `allow` (the four knowledge tools by default)."""
+    add_sandbox(data)
+    data["toolserver"]["args"] = [str(TOOLS_SERVER), "--relay", relay_url]
+    condition = {"allow": list(allow), "rights": KNOWLEDGE_RIGHTS, "manifest": KNOWLEDGE_MANIFEST}
+    data["toolserver"]["conditions"]["knowledge"] = condition
+
+
+def add_slot_users(fake: Any, directory: Path, spaces: tuple[str | None, ...] = (None,)) -> None:
+    """The slots' users, known to the fake with their credential files beside the platform file: each data-path user
+    with the baseline rights, each tool-server user with the knowledge condition's, in each space of `spaces`."""
+    for login, (password, user_id) in SLOT_USERS.items():
+        file = directory / CREDENTIALS_DIR / f"{login}.pass"
+        file.write_text(password + "\n", encoding="utf-8")
+        file.chmod(0o600)
+        fake.add_user(login, password, user_id)
+        for space in spaces:
+            fake.grant(user_id, KNOWLEDGE_RIGHTS if login.endswith("-tools") else BASELINE, space=space)
+
+
+def agent_host(platform: Path, agent: AgentWorld) -> FakeHost:
+    """The sandbox's fake host, knowing the configured images, whose cells the agent world answers."""
+    settings = load_platform(platform, require_secrets=False).sandbox
+    host = FakeHost()
+    for ref in (settings.agent, settings.gate, settings.oneclient):
+        host.add_image(ref.name, ref.id)
+    host.oneclient_images.add(settings.oneclient.id)
+    host.exec_handler = agent.exec_handler
+    return host
+
+
+def agent_options() -> dict[str, Any]:
+    """The platform's options for a fast sandbox on the fake host: its own registry, no sampler, no real waits."""
+    fast = {"waits": FAST, "sample_period_s": None, "sleep": lambda seconds: None}
+    return {"registry": Registry(), "sandbox_options": fast}

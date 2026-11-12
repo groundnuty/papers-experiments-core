@@ -99,6 +99,15 @@ def require_restored(entry: Entry) -> None:
         )
 
 
+def require_measured(entry: Entry) -> None:
+    """Fail unless the outage check measured, in every space, the mount (the platform must declare one) and the
+    agent's knowledge tools: the issue asks for both, and a pass without them would be the REST path's alone."""
+    for facts in per_space_facts(entry):
+        assert (facts.get("mount") or {}).get("measured") is True, f"the {entry.name} check did not read the mount"
+        knowledge = facts.get("knowledge") or {}
+        assert knowledge.get("measured") is True, f"the {entry.name} check did not call the knowledge tools"
+
+
 def require_cleaned(entry: Entry) -> None:
     """Fail unless the check reports, explicitly, in every space it ran in, that what it created is gone: an absent
     result is not a true one."""

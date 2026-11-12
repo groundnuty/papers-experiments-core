@@ -6,17 +6,35 @@ while a provider is down is a stand-in's choice (a read with every holder down w
 assert what the check recorded of it, never that Onedata behaves so."""
 
 import json
+import shutil
 
 import pytest
 from fake_reset import FakeReset
 from fault_support import faults_table
-from outage_support import GAMMA_HOST, GAMMA_ID, SERVICE, FakeMount, FakeServices, OutageWorld, WorldDaemon
+from outage_support import (
+    GAMMA_HOST,
+    GAMMA_ID,
+    KNOWLEDGE_MANIFEST,
+    SERVICE,
+    AgentWorld,
+    FakeServices,
+    OutageWorld,
+    ToolRelay,
+    WorldDaemon,
+    add_slot_users,
+    agent_host,
+    agent_options,
+    freeze_tools_manifest,
+    with_agent,
+)
+from sandbox_support import MOUNT_PATH
 
 from expcore_onedata.admission import OUTAGE_RUN
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
-from expcore_onedata.day0 import outage, outage_cells
+from expcore_onedata.day0 import outage_cells, outage_run
 from expcore_onedata.day0.outage_cells import Cells
+from expcore_onedata.day0.outage_tools import KNOWLEDGE_TOOLS
 from expcore_onedata.day0.runner import EXIT_FAIL, EXIT_UNKNOWN, build_context, run, run_checks
 from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.fault_settings import compose_driver, load_faults
@@ -25,6 +43,7 @@ from expcore_onedata.testing import (
     ALPHA_ID,
     BASELINE,
     BETA_ID,
+    NOW,
     SPACE_NAME,
     USERS,
     with_placement,
@@ -33,6 +52,7 @@ from expcore_onedata.testing import (
 from expcore_onedata.testing.world import SPACE_IDS, SPACE_LABELS, SPACE_NAMES, with_spaces
 
 BOUND_S = 20.0
+SPACE_ROOT = f"{MOUNT_PATH}/{SPACE_NAME}"  # the study space's directory as the agent sees it through the mount
 
 
 def edit(data):
@@ -40,6 +60,14 @@ def edit(data):
     data["providers"]["gamma"] = {"url": f"https://{GAMMA_HOST}", "id": GAMMA_ID}
     data["support"] = {"providers": ["alpha", "beta", "gamma"], "local": "beta"}
     data["faults"] = faults_table(services={"alpha": SERVICE}, settle_timeout_s=30)
+
+
+@pytest.fixture(scope="module")
+def tools_manifest(tmp_path_factory):
+    """The stand-in tool server's frozen manifest, frozen once for the module (a server takes a second to start)."""
+    path = tmp_path_factory.mktemp("manifest") / KNOWLEDGE_MANIFEST
+    freeze_tools_manifest(path)
+    return path
 
 
 @pytest.fixture
@@ -50,37 +78,49 @@ def world(fake, ticker) -> OutageWorld:
 
 
 @pytest.fixture
+def agent(world) -> AgentWorld:
+    """What the agent meets: the mount of the sandbox on the fake host, and the tools, through beta, the local one."""
+    return AgentWorld(world, "beta.test", SPACE_ROOT)
+
+
+@pytest.fixture
+def relay(agent):
+    relay = ToolRelay(agent)
+    yield relay
+    relay.close()
+
+
+@pytest.fixture
 def services(world) -> FakeServices:
-    def onezone_notices(service: str) -> None:
-        if world.onezone_notices:
-            world.fake.providers[ALPHA_ID]["online"] = False
-
-    def onezone_forgets(service: str) -> None:
-        world.fake.providers[ALPHA_ID]["online"] = True
-
-    driver = FakeServices(world, {SERVICE: "alpha.test"}, on_stop=onezone_notices)
-    start = driver.start
-
-    def starting(service: str) -> None:
-        start(service)
-        if not driver.stays_down:
-            onezone_forgets(service)
-
-    driver.start = starting  # type: ignore[method-assign]
-    return driver
+    return FakeServices(world, {SERVICE: "alpha.test"})
 
 
-@pytest.fixture
-def platform(tmp_path):
-    directory = tmp_path / "target"
+def write_target(directory, fake, relay, tools_manifest, extra=None):
+    """A platform.toml for the outage with the agent's plane: the sandbox, the slots and the stand-in tool server."""
     directory.mkdir()
-    return write_platform(directory, edit)
+
+    def full(data):
+        edit(data)
+        with_agent(data, relay.url)
+        if extra is not None:
+            extra(data)
+
+    platform = write_platform(directory, full)
+    shutil.copy(tools_manifest, directory / KNOWLEDGE_MANIFEST)
+    add_slot_users(fake, directory)
+    return platform
 
 
 @pytest.fixture
-def context(platform, world, services, ticker, tmp_path):
-    def make(**options):
-        client = OnezoneClient(load_platform(platform), http=world.client_http())
+def platform(tmp_path, fake, relay, tools_manifest):
+    return write_target(tmp_path / "target", fake, relay, tools_manifest)
+
+
+@pytest.fixture
+def context(platform, world, agent, services, ticker, tmp_path):
+    def make(target=None, **options):
+        path = target or platform
+        client = OnezoneClient(load_platform(path), http=world.client_http())
         settings = {
             "client": client,
             "driver": services,
@@ -89,10 +129,12 @@ def context(platform, world, services, ticker, tmp_path):
             "outage_bound_s": BOUND_S,
             "clock": ticker.clock,
             "sleep": ticker.sleep,
-            "now": lambda: 1_800_000_000.0,
+            "now": lambda: NOW,
             "tcp": None,
+            "agent_host": agent_host(path, agent),
+            "agent_options": agent_options(),
         }
-        return build_context(platform, tmp_path / "out", **{**settings, **options})
+        return build_context(path, tmp_path / "out", **{**settings, **options})
 
     return make
 
@@ -207,7 +249,7 @@ def test_o28_the_answers_of_each_path_are_recorded_with_status_latency_and_outco
     rest = entry.facts["during"]["rest"]
     assert rest["replicated"]["outcome"] == "served"
     assert rest["replicated"]["hash_matches"] is True
-    assert rest["replicated"]["bytes"] == rest["replicated"]["expected_bytes"] == outage.FILE_BYTES
+    assert rest["replicated"]["bytes"] == rest["replicated"]["expected_bytes"] == outage_run.FILE_BYTES
     assert rest["owner_only"]["outcome"] == "blocked"  # no provider that is up holds the bytes: it waited its bound
     assert rest["owner_only"]["seconds"] == BOUND_S
     assert rest["owner_only"]["bound_s"] == BOUND_S
@@ -215,7 +257,7 @@ def test_o28_the_answers_of_each_path_are_recorded_with_status_latency_and_outco
     assert rest["owner_only"]["bytes"] == 0
     assert rest["listing"]["outcome"] == "served"
     assert rest["listing"]["entries"] == rest["listing"]["expected_entries"]
-    assert entry.facts["during"]["knowledge"]["get_file_distribution"]["rest/replicated"]["outcome"] == "served"
+    assert entry.facts["during"]["knowledge"]["get_file_distribution"]["replicated"]["outcome"] == "served"
 
 
 def test_o28_a_read_the_platform_refuses_records_its_status_and_error_id(context, world):
@@ -233,35 +275,71 @@ def test_o28_a_read_the_platform_refuses_records_its_status_and_error_id(context
     assert entry.ok is True  # what a read answered is a fact, not a failure
 
 
-def test_o28_the_knowledge_plane_is_recorded_per_tool_and_the_blocked_transfer_is_told_from_the_finished_one(context):
-    """O28: the knowledge plane is recorded per tool and the blocked transfer is told from the finished one."""
+def test_o28_the_knowledge_plane_is_the_agents_own_tools_called_through_mcp_all_up_and_during_the_outage(
+    context, agent
+):
+    """O28: the knowledge plane is measured through the condition's tool server, started as the sandbox starts it (the
+    leased slot's tool-server user and token), its four tools called through MCP with everything up and while the
+    provider is down; each call records its outcome, seconds against the bound, whether it timed out and its attempts,
+    and the transfer of a file no up provider holds is told from the one that finished."""
     entry = outage_check(context)
-    knowledge = entry.facts["during"]["knowledge"]
-    labels = entry.facts["roles"]
-    rows = knowledge["get_file_distribution"]["knowledge/owner_only"]["providers"]
-    assert rows[labels["target"]] == {"listed": True, "held_bytes": outage.FILE_BYTES}
-    assert rows[labels["mirror"]]["held_bytes"] == 0
-    providers = knowledge["list_space_providers"]
-    assert providers["first"]["online"][labels["target"]] is False
-    assert providers["until_target_offline"]["target_offline_after_s"] == 0.0
+    assert entry.ok is True, entry.summary
+    assert entry.facts["agent"]["tool_server"]["started"] is True
+    assert {name for name, _ in agent.tool_calls} == set(KNOWLEDGE_TOOLS)  # every call came through the server
+    baseline = entry.facts["baseline"]["knowledge"]
+    assert baseline["get_file_distribution"]["outcome"] == "served"
+    assert baseline["schedule_file_replication"]["get_transfer"]["ended"] is True
+    knowledge, labels = entry.facts["during"]["knowledge"], entry.facts["roles"]
+    owner_only = knowledge["get_file_distribution"]["owner_only"]
+    assert (owner_only["outcome"], owner_only["timed_out"], owner_only["attempts"]) == ("served", False, 1)
+    assert owner_only["bound_s"] == BOUND_S
+    assert owner_only["providers"][labels["target"]] == {"listed": True, "held_bytes": outage_run.FILE_BYTES}
+    assert owner_only["providers"][labels["mirror"]]["held_bytes"] == 0
+    assert knowledge["list_space_providers"]["listed"] == dict.fromkeys(labels.values(), True)
     scheduled = knowledge["schedule_file_replication"]
     assert scheduled["replicated"]["schedule_file_replication"]["outcome"] == "served"
     assert scheduled["replicated"]["get_transfer"]["ended"] is True
     assert scheduled["replicated"]["get_transfer"]["states"][-1][1] == "completed"
-    assert scheduled["replicated"]["local_held_bytes"] == outage.FILE_BYTES
     assert scheduled["owner_only"]["get_transfer"]["ended"] is False
     assert scheduled["owner_only"]["get_transfer"]["outcome"] == "blocked"
-    assert scheduled["owner_only"]["local_held_bytes"] == 0
+    assert scheduled["owner_only"]["get_transfer"]["calls"] > 1
+    assert entry.facts["after"]["transfers"]["owner_only"]["outcome"] == "served"
 
 
-def test_o28_the_wait_for_onezone_to_call_the_provider_offline_is_bounded_and_unknown_is_not_a_time(context, world):
-    """O28: the wait for onezone to call the provider offline is bounded and unknown is not a time."""
-    world.onezone_notices = False
+def test_o28_a_tool_that_answers_an_error_keeps_its_wording_scrubbed_and_its_attempts(context, agent):
+    """O28: a read-only tool that answers an error while the provider is down is called again, at most three times,
+    and each error's wording is recorded with every name and id the check knows replaced by its label."""
+    agent.tool_errors = {"get_file_distribution": f"cannot reach https://alpha.test ({ALPHA_ID}) for {SPACE_NAME}"}
     entry = outage_check(context)
-    later = entry.facts["during"]["knowledge"]["list_space_providers"]["until_target_offline"]
-    assert later["target_offline_after_s"] is None
-    assert later["seconds"] >= BOUND_S
-    assert entry.ok is True
+    cell = entry.facts["during"]["knowledge"]["get_file_distribution"]["owner_only"]
+    assert (cell["outcome"], cell["attempts"], len(cell["errors"])) == ("refused", 3, 3)
+    assert "providers[0]" in cell["error"]
+    assert "spaces[0]" in cell["error"]
+    for needle in ("alpha.test", ALPHA_ID, SPACE_NAME):
+        assert needle not in json.dumps(entry.facts), needle
+    assert entry.ok is True  # what a tool answered is a fact, not a failure
+
+
+def test_o28_a_tool_that_never_answers_is_blocked_at_the_bound(context, agent):
+    """O28: a tool call that does not return within the bound is given up on and recorded as blocked and timed out,
+    never as an answer; the server stays usable for the calls after it."""
+    agent.tool_hangs = {"list_space_providers"}
+    agent.hang_s = 1.0
+    entry = outage_check(context, outage_bound_s=1.0)
+    cell = entry.facts["during"]["knowledge"]["list_space_providers"]
+    assert (cell["outcome"], cell["timed_out"], cell["attempts"]) == ("blocked", True, 1)
+    assert cell["seconds"] >= 1.0
+    assert entry.facts["during"]["knowledge"]["schedule_file_replication"]["replicated"]["get_transfer"]["ended"]
+
+
+def test_o28_tools_that_fail_with_everything_up_stop_nothing(context, agent, services):
+    """O28: a tool that answers an error with every provider up says nothing about an outage, so the scenario stops
+    no provider and the check is unknown."""
+    agent.tool_broken = {"schedule_file_replication": "refused: the user may not schedule a replication"}
+    entry = outage_check(context)
+    assert entry.ok is None
+    assert "knowledge tools did not serve with everything up" in entry.summary
+    assert services.verbs() == []
 
 
 def test_o28_a_listing_that_lost_entries_while_the_provider_was_down_is_partial(context, world):
@@ -499,17 +577,18 @@ def test_o28_the_scenario_is_proved_by_the_local_providers_own_block_map_before_
     entry = outage_check(context)
     held = entry.facts["held_before"]
     labels = entry.facts["roles"]
-    size = outage.FILE_BYTES
+    size = outage_run.FILE_BYTES
     assert held["rest/owner_only"] == {labels["target"]: size, labels["mirror"]: 0, labels["local"]: 0}
     assert held["rest/replicated"] == {labels["target"]: size, labels["mirror"]: size, labels["local"]: 0}
-    assert set(held) == {f"{pair}/{kind}" for pair in outage.BASE_PAIRS for kind in outage.KINDS}
+    pairs = (*outage_run.BASE_PAIRS, *outage_run.MOUNT_PAIRS)  # the platform declares a mount: its pairs too
+    assert set(held) == {f"{pair}/{kind}" for pair in pairs for kind in outage_run.KINDS}
 
 
 def test_o28_a_file_that_the_local_provider_already_holds_is_not_one_held_only_by_the_target(
     context, world, services, monkeypatch
 ):
     """O28: a file that the local provider already holds is not one held only by the target."""
-    real = outage.Run.prepare
+    real = outage_run.Run.prepare
 
     def local_holds_one(self):
         real_blocks = self.provisioner.blocks
@@ -517,13 +596,13 @@ def test_o28_a_file_that_the_local_provider_already_holds_is_not_one_held_only_b
         def blocks(file_id, provider, *, reader=None):
             found = real_blocks(file_id, provider, reader=reader)
             if provider == self.roles.local and file_id == self.files[("rest", "owner_only")].file_id:
-                return [(0, outage.FILE_BYTES)]
+                return [(0, outage_run.FILE_BYTES)]
             return found
 
         self.provisioner.blocks = blocks  # the local provider is shown holding a file it must not
         real(self)
 
-    monkeypatch.setattr(outage.Run, "prepare", local_holds_one)
+    monkeypatch.setattr(outage_run.Run, "prepare", local_holds_one)
     entry = outage_check(context)
     assert entry.ok is None
     assert "not held as the scenario needs" in entry.summary
@@ -562,14 +641,15 @@ def test_o28_providers_and_spaces_are_named_by_position_and_nothing_identifying_
 
 
 def test_o28_the_report_of_a_whole_run_holds_the_check_and_none_of_the_names(
-    platform, world, services, tmp_path, ticker
+    platform, world, agent, services, tmp_path, ticker
 ):
     """O28: the report of a whole run holds the check and none of the names."""
     client = OnezoneClient(load_platform(platform), http=world.client_http())
     code, json_path, md_path = run(
         platform, tmp_path / "reports", client=client, driver=services, allow_mutation=True, allow_faults=True,
-        clock=ticker.clock, sleep=ticker.sleep, now=lambda: 1_800_000_000.0, tcp=lambda *a: 1.0,
-        outage_bound_s=BOUND_S, names=["provider_outage"],
+        clock=ticker.clock, sleep=ticker.sleep, now=lambda: NOW, tcp=lambda *a: 1.0,
+        outage_bound_s=BOUND_S, names=["provider_outage"], agent_host=agent_host(platform, agent),
+        agent_options=agent_options(),
     )  # fmt: skip
     text = json_path.read_text(encoding="utf-8") + md_path.read_text(encoding="utf-8")
     report = json.loads(json_path.read_text(encoding="utf-8"))
@@ -594,61 +674,86 @@ def test_o28_a_failed_restore_gives_the_failing_exit_status(platform, world, ser
 # -- the mount -------------------------------------------------------------------------------------
 
 
-def test_o28_a_mount_the_platform_declares_but_the_run_lacks_is_unknown_not_skipped(context, monkeypatch):
-    """O28: a mount the platform declares but the run lacks is unknown not skipped."""
-    monkeypatch.setattr(outage, "mount_declared", lambda ctx: True)
+def test_o28_the_mount_is_read_through_a_real_sandbox_in_mount_mode_all_up_and_during_the_outage(context, agent):
+    """O28: the mount is read in the agent's container of the sandbox package's sandbox in mount mode (its sidecar
+    owning the mount): the replicated file, the file only the downed provider holds and a listing, each with its
+    outcome, seconds and whether it blocked, with everything up and while the provider is down."""
     entry = outage_check(context)
+    assert entry.ok is True, entry.summary
+    assert entry.facts["mount"] == {"declared": True, "measured": True}
+    assert entry.facts["agent"]["sandbox"] == {**entry.facts["agent"]["sandbox"], "started": True, "data_path": "mount"}
+    baseline = entry.facts["baseline"]["mount"]
+    assert {name: row["outcome"] for name, row in baseline.items()} == dict.fromkeys(
+        ("replicated", "owner_only", "listing"), "served"
+    )
+    during = entry.facts["during"]["mount"]
+    assert (during["replicated"]["outcome"], during["replicated"]["blocked"]) == ("served", False)
+    assert during["replicated"]["hash_matches"] is True
+    owner_only = during["owner_only"]
+    assert (owner_only["outcome"], owner_only["blocked"], owner_only["seconds"]) == ("blocked", True, BOUND_S)
+    assert during["listing"]["outcome"] == "served"
+    assert entry.facts["after"]["mount_owner_only"]["outcome"] == "served"
+    assert ("read", "owner_only") in agent.mount_ops
+
+
+def test_o28_a_mount_read_that_fails_records_its_errno_by_name_and_number(context, agent):
+    """O28: a read through the mount that fails is refused with its errno: Python reports a mount's ETIMEDOUT as
+    TimeoutError, and the cell keeps the errno's name and number and the exception's class."""
+    agent.mount_down = ("ETIMEDOUT", 110, "TimeoutError")
+    entry = outage_check(context)
+    owner_only = entry.facts["during"]["mount"]["owner_only"]
+    assert (owner_only["outcome"], owner_only["errno"], owner_only["errno_number"]) == ("refused", "ETIMEDOUT", 110)
+    assert (owner_only["error_kind"], owner_only["blocked"]) == ("TimeoutError", False)
+    assert entry.ok is True
+
+
+def test_o28_a_declared_mount_left_unmeasured_makes_the_check_unknown_never_passed(context):
+    """O28: without a host to start the sandbox on (EXPCORE_LIVE_DOCKER unset), a mount the platform declares is not
+    read and the tools are not called: the REST part runs, and the check is unknown, with both reasons, never passed."""
+    entry = outage_check(context, agent_host=None)
     assert entry.ok is None
-    assert entry.facts["mount"] == {
-        "declared": True,
-        "measured": False,
-        "reason": "this run has no reader of the mount",
-    }
-    assert entry.facts["restore"]["verified"] is True  # the rest of the scenario ran and the provider is back
+    assert entry.facts["mount"]["declared"] is True
+    assert entry.facts["mount"]["measured"] is False
+    assert "EXPCORE_LIVE_DOCKER=1" in entry.facts["mount"]["reason"]
+    assert entry.facts["knowledge"]["measured"] is False
+    assert "mount data path and it was not measured" in entry.summary
     assert entry.facts["during"]["rest"]["replicated"]["outcome"] == "served"
+    assert entry.facts["restore"]["verified"] is True
 
 
-def test_o28_without_a_declared_mount_the_mount_is_absent_not_unknown(context):
-    """O28: without a declared mount the mount is absent not unknown."""
-    entry = outage_check(context)
+def test_o28_a_sandbox_that_does_not_start_leaves_the_mount_unmeasured_and_the_check_unknown(context, platform, agent):
+    """O28: a sandbox whose start fails (its images are not on the host) leaves the mount and the tools unmeasured,
+    named with the reason, and the check unknown."""
+    host = agent_host(platform, agent)
+    host.images.clear()
+    entry = outage_check(context, agent_host=host)
+    assert entry.ok is None
+    assert entry.facts["agent"]["sandbox"]["reason"].startswith("the sandbox did not start")
+    assert entry.facts["mount"]["measured"] is False
+
+
+def test_o28_without_a_declared_mount_the_mount_is_absent_not_unknown(tmp_path, fake, relay, tools_manifest, context):
+    """O28: a platform whose data paths have no mount level has no mount to measure: absent, not unknown, and the
+    tools are still called from a sandbox with no data path."""
+
+    def no_mount(data):
+        data["sandbox"]["data_paths"] = {"isolated": "none"}
+
+    target = write_target(tmp_path / "plain", fake, relay, tools_manifest, no_mount)
+    entry = outage_check(context, target=target)
     assert entry.facts["mount"] == {"declared": False}
     assert "mount" not in entry.facts["during"]
-    assert entry.ok is True
-
-
-def test_o28_the_mount_is_read_when_the_run_has_one_and_its_answers_are_recorded(context, world, monkeypatch):
-    """O28: the mount is read when the run has one and its answers are recorded."""
-    monkeypatch.setattr(outage, "mount_declared", lambda ctx: True)
-    mount = FakeMount(world, BETA_ID)
-    entry = outage_check(context, mount=mount)
+    assert entry.facts["agent"]["sandbox"]["data_path"] == "none"
     assert entry.ok is True, entry.summary
-    during = entry.facts["during"]["mount"]
-    assert during["replicated"]["outcome"] == "served"
-    assert during["owner_only"]["outcome"] == "blocked"  # the mount waited as long as it was allowed to
-    assert during["owner_only"]["seconds"] == BOUND_S
-    assert during["listing"]["outcome"] == "served"
-    assert entry.facts["baseline"]["mount"]["local_owner_only"]["outcome"] == "served"
-    assert entry.facts["after"]["mount_owner_only"]["outcome"] == "served"
-
-
-def test_o28_a_mount_that_answers_with_an_errno_is_recorded_with_it(context, world, monkeypatch):
-    """O28: a mount that answers with an errno is recorded with it."""
-    monkeypatch.setattr(outage, "mount_declared", lambda ctx: True)
-    mount = FakeMount(world, BETA_ID)
-    entry = outage_check(context, mount=mount)  # first, a run on which it works, so the baseline can hold
-    assert entry.ok is True
-    mount.error = OSError(5, "input/output error")
-    again = outage_check(context, mount=mount)  # now every read fails, the baseline included
-    assert again.ok is None  # a baseline that does not read back stops the scenario before anything is stopped
-    assert "baseline" in again.summary
 
 
 # -- several spaces --------------------------------------------------------------------------------
 
 
 @pytest.fixture
-def two_spaces(tmp_path, ticker, monkeypatch):
-    """Two spaces on the three providers, each with alpha as its data provider and beta local, and their world."""
+def two_spaces(tmp_path, ticker, monkeypatch, tools_manifest):
+    """Two spaces on the three providers, each with alpha as its data provider and beta local, and their world; the
+    agent's plane has the tool server and a sandbox with no data path (the fake mounts one space's directory only)."""
     federation = FakeReset(space_name=SPACE_NAME)
     federation.clock = ticker.clock
     federation.add_provider(BETA_ID, "beta.test")
@@ -665,18 +770,26 @@ def two_spaces(tmp_path, ticker, monkeypatch):
         data["providers"]["gamma"] = {"url": f"https://{GAMMA_HOST}", "id": GAMMA_ID}
         with_spaces(data, 2, providers=["alpha", "beta", "gamma"], local="beta", holder="alpha")
         data["faults"] = faults_table(services={"alpha": SERVICE})
+        with_agent(data, relay.url)
+        data["sandbox"]["data_paths"] = {"isolated": "none"}
 
+    world = OutageWorld(federation, ticker)
+    agent = AgentWorld(world, "beta.test", SPACE_ROOT)
+    relay = ToolRelay(agent)
     directory = tmp_path / "several"
     directory.mkdir()
     platform = write_platform(directory, several)
-    world = OutageWorld(federation, ticker)
+    shutil.copy(tools_manifest, directory / KNOWLEDGE_MANIFEST)
+    add_slot_users(federation, directory, spaces=SPACE_IDS[:2])
     services = FakeServices(world, {SERVICE: "alpha.test"})
     client = OnezoneClient(load_platform(platform), http=world.client_http())
     ctx = build_context(
         platform, tmp_path / "o", client=client, driver=services, allow_mutation=True, allow_faults=True,
-        clock=ticker.clock, sleep=ticker.sleep, outage_bound_s=BOUND_S,
+        clock=ticker.clock, sleep=ticker.sleep, outage_bound_s=BOUND_S, now=lambda: NOW,
+        agent_host=agent_host(platform, agent), agent_options=agent_options(),
     )  # fmt: skip
-    return ctx, services, world
+    yield ctx, services, world
+    relay.close()
 
 
 def test_o28_in_each_of_several_spaces_the_provider_is_taken_down_and_restored_and_spaces_are_named_by_position(

@@ -4,7 +4,8 @@
 The target must be named: there is no default configuration and nothing is read from the environment to find one. The
 report (JSON and Markdown) goes into the directory the caller names. The checks that change state run only with
 `EXPCORE_LIVE_MUTATE=1` in the environment; without it they report unknown and send nothing. The outage check, which
-takes a provider down, also needs `EXPCORE_LIVE_FAULTS=1` and `sanctioned = true` in `[faults]` of platform.toml.
+takes a provider down, also needs `EXPCORE_LIVE_FAULTS=1` and `sanctioned = true` in `[faults]` of platform.toml, and
+starts the sandbox and the tool server whose reads and tools it measures only with `EXPCORE_LIVE_DOCKER=1`.
 
 Exit status: 0 every check passed, 1 a check failed, 3 nothing failed but something could not be measured, 2 a usage
 or configuration error.
@@ -32,6 +33,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="SECONDS",
         help="the longest the outage check waits for one answer while a provider is down (default 60)",
     )
+    parser.add_argument(
+        "--tool-condition",
+        metavar="CONDITION",
+        help="the [toolserver] condition whose tools the outage check calls (default: the first allowing all four)",
+    )
     parser.add_argument("--list", action="store_true", help="list the registered checks and exit")
     args = parser.parse_args(argv)
     if args.list:
@@ -43,7 +49,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("error: name the platform.toml to check and the directory for the report (--out)", file=sys.stderr)
         return EXIT_USAGE
     try:
-        code, json_path, md_path = run(args.platform, args.out, names=args.only, outage_bound_s=args.outage_bound_s)
+        code, json_path, md_path = run(
+            args.platform,
+            args.out,
+            names=args.only,
+            outage_bound_s=args.outage_bound_s,
+            tool_condition=args.tool_condition,
+        )
     except ConfigError as error:
         print(f"error: {error}", file=sys.stderr)
         return EXIT_USAGE

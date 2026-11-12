@@ -9,6 +9,7 @@ from live_support import (
     prerequisite_missing,
     require_cleaned,
     require_every_provider_refused,
+    require_measured,
     require_passed,
     require_restored,
 )
@@ -92,6 +93,20 @@ def test_o28_with_several_spaces_the_restore_and_the_cleanup_are_read_in_every_s
         require_cleaned(entry(True, spaces=uncleaned))
     with pytest.raises(AssertionError, match="no space"):
         require_restored(entry(True, spaces={}))
+
+
+def test_o28_the_live_outage_test_requires_the_mount_and_the_tools_measured_in_every_space():
+    """O28: the live outage run passes only with the mount read and the four tools called in every space; a platform
+    without a mount level, or a tool server that did not start, is no pass of it."""
+    good = {"mount": {"declared": True, "measured": True}, "knowledge": {"measured": True, "missing_tools": []}}
+    require_measured(entry(True, **good))
+    require_measured(entry(True, spaces={"spaces[0]": good, "spaces[1]": good}))
+    with pytest.raises(AssertionError, match="mount"):
+        require_measured(entry(True, **{**good, "mount": {"declared": False}}))
+    with pytest.raises(AssertionError, match="knowledge tools"):
+        require_measured(
+            entry(True, spaces={"spaces[0]": good, "spaces[1]": {**good, "knowledge": {"measured": False}}})
+        )
 
 
 def with_outage(data):
