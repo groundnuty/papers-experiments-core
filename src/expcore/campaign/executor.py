@@ -19,7 +19,7 @@ from typing import Any, Protocol
 from expcore.campaign.lease import Lease
 from expcore.campaign.markers import AttemptResult
 from expcore.config.models import Limits, ModelSpec, ModelTable
-from expcore.errors import InfraError
+from expcore.errors import FirstTurnRefusal, InfraError
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome, harness_defect_of
 from expcore.loop.timer import AgentTimer
@@ -213,6 +213,17 @@ def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | Non
     )
 
 
+def sent_no_request(error: BaseException, backend: Any) -> bool:
+    """Tell whether an executor's failure is known to have sent no model request (C31).
+
+    True for a first-turn refusal, which the hook raises before the loop's first request, unless the backend says it
+    started one (`requests_sent`, an optional attribute of a backend: a request an executor sent before the hook ran
+    may have been billed). A backend that keeps no count is taken at the refusal's word. Any other failure may have
+    sent requests, so its usage stays unknown.
+    """
+    return isinstance(error, FirstTurnRefusal) and getattr(backend, "requests_sent", None) in (None, 0)
+
+
 def failure_result(
     error: BaseException,
     *,
@@ -220,15 +231,22 @@ def failure_result(
     wall_s: float,
     treatment_kinds: Sequence[str] = (),
     treatment_targets: Mapping[str, str] | None = None,
+    sent_nothing: bool = False,
 ) -> AttemptResult:
     """Return the result of an executor that raised instead of returning a record; no usage is known.
 
     An `InfraError` is infrastructure of its kind, naming its target. Anything else is a crash in our own code: a
     harness defect, named by its class and a line-free stack hash, never by the exception's text, which may carry a
-    secret. With no record there is no completed turn, so neither is treatment.
+    secret. With no record there is no completed turn, so neither is treatment. With `sent_nothing` the caller knows
+    no model request was sent (`sent_no_request`), so the usage is known to be none: zero tokens and no turn, which
+    costs 0 at any price (C24) and is never charged the bound of an attempt whose usage is unknown, as the attempt of
+    a run that found an outage before it began is not.
     """
+    usage: dict[str, Any] = (
+        {"input_tokens": 0, "output_tokens": 0, "turn_usage": ()} if sent_nothing else {"usage_complete": False}
+    )
     unknown = {
-        "usage_complete": False,
+        **usage,
         "treatment_kinds": tuple(treatment_kinds),
         "treatment_targets": dict(treatment_targets or {}),
     }
