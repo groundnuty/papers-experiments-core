@@ -7,7 +7,9 @@ a scientific wheel's test data), which no check can read: it goes in attested by
 `PACKAGE.json` (`binaries`). Text is read with the study-token list, and in an anonymised package with the terms of
 the anonymisation list and the identity it must not hold (`identity.find_identity`'s commits and URLs). The one
 exception is the study-token list for a wheel proven to be a pypi.org release, whose bytes the study's `uv.lock`
-records (`lockfile`): the anonymisation list and the identity still apply to it.
+records (`lockfile`): the anonymisation list and the identity still apply to it. Apart from these checks, every member
+of every wheel is walked whole for a copy of a key file the study declares (`keycopies`), whatever its kind and
+wherever its wheel came from.
 
 How deep a member is read depends on where its wheel came from. A wheel of a distribution installed from a direct
 URL, or supplied by the author, can be the author's own code, so its text members get every view the package's
@@ -33,16 +35,22 @@ import zlib
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
+from expcore.config.key_locations import NO_LOCATIONS, KeyFinders
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term, term_lines
 from expcore.package.identity import FOUND_COMMIT, FOUND_URL, commit_lines, find_identity, url_lines
-from expcore.package.leaks import describe_hit, scan_tokens
+from expcore.package.leaks import describe_hit, find_copies, find_locations, path_holds, scan_tokens
 from expcore.package.spec import Opaque, PackageError
 from expcore.package.wheels import Wheel
+from expcore.provenance.environment import CORE_DISTRIBUTION, canonical
 from expcore.provenance.hashfile import Hashes
 from expcore.provenance.redact import Redactor
 from expcore.provenance.scanner import scan_source
 
 DIRECT_URL = "direct_url.json"
+CLEARED = (
+    "code you did not write can name a key location by chance (a generic variable's name): once you have read this "
+    "member, attest it as below; in your own code, remove it"
+)
 
 
 @dataclass(frozen=True)
@@ -98,11 +106,23 @@ def _plain(
 
 
 def _deep(
-    label: str, data: bytes, tokens: Hashes, terms: Anonymisation | None, hidden, redactor: Redactor
+    label: str,
+    data: bytes,
+    tokens: Hashes,
+    terms: Anonymisation | None,
+    hidden,
+    redactor: Redactor,
+    locations: KeyFinders = NO_LOCATIONS,
 ) -> list[str]:
-    """Read a member of the author's own code with every view the checks use for a file."""
+    """Read a member of what can be the author's own code with every view the checks use for a file: the key
+    locations the study's models declare (K13), saying how a member that names one by chance, in a distribution the
+    author did not write, is cleared; the study tokens; and in an anonymised package the terms and the identity. A
+    copy of a key file is not looked for here: `scan_wheels` refuses it before, with no way to clear it."""
     one = {label: data}
-    found = scan_tokens(one, tokens, redactor=redactor)
+    found = find_locations(one, locations, redactor=redactor, copies=False)
+    if found:
+        found.append(f"{redactor.name(label, hide=path_holds(label, locations))}: {CLEARED}")
+    found += scan_tokens(one, tokens, redactor=redactor)
     if terms is not None:
         found += find_terms(one, terms, redactor=redactor) + find_identity(one, *hidden, opaque=(), redactor=redactor)
     return found
@@ -117,8 +137,19 @@ def scan_wheels(
     attested: Mapping[str, Opaque],
     exempt: Collection[str] = frozenset(),
     redactor: Redactor | None = None,
+    locations: KeyFinders = NO_LOCATIONS,
 ) -> WheelScan:
     """Read every text member of every wheel; list the members that are not text; refuse nothing on its own.
+
+    The key locations the study's models declare (`locations`) are looked for, with every view, in every wheel read
+    with every view but the core's: whatever it was installed from, a repository, a local wheel, a URL or a directory,
+    it can be the author's own code (K13). A member that names one is refused with how a distribution the author did
+    not write, which can name a generic variable a study also uses as its `key_env`, is cleared: attested once read.
+    The core's own code names such variables (its redaction names API_KEY), and holds nothing of the author's. Every
+    member of every wheel, from an index or not, the core's included, is walked whole for a copy of a declared key file
+    (`leaks.find_copies`): a member that is one, or holds one at any depth (archived, compressed, decoded), is refused
+    whether attested or not, naming its path and saying to remove it, and so is one the walk could not finish; it gets
+    no attestation hint and no entry in `binaries`, and nothing prints its SHA-256.
 
     A wheel in `exempt` (`lockfile.token_exempt`: a pypi.org release whose bytes the study's lock records) is read as
     a release, without the study-token list; the terms and identity of an anonymised package still apply to it. Every
@@ -130,12 +161,19 @@ def scan_wheels(
     findings: list[str] = []
     binaries: dict[str, list[dict[str, str]]] = {}
     seen: set[str] = set()
+    core = canonical(CORE_DISTRIBUTION)
     for wheel in wheels:
         binaries[wheel.path] = []
+        searched = locations if _is_authors(wheel, exempt, core) else NO_LOCATIONS
         for member, data in members(wheel, redactor):
             label = f"{wheel.path}/{member}"
             seen.add(label)
+            copies = find_copies({label: data}, locations, redactor=redactor)  # every wheel's, walked whole
+            if copies:  # removed, never attested: no hint or binaries entry, which would carry its digest
+                findings += copies
+                continue
             digest = hashlib.sha256(data).hexdigest()
+            text = as_text(data)
             if label in attested:
                 if attested[label].sha256 != digest:
                     findings.append(
@@ -147,7 +185,6 @@ def scan_wheels(
                     f"{redactor.name(label)}: names where the distribution came from; an anonymised package refuses it"
                 )
                 continue
-            text = as_text(data)
             if text is None:
                 binaries[wheel.path].append({"path": member, "sha256": digest})
                 continue
@@ -156,7 +193,7 @@ def scan_wheels(
             elif wheel.from_index:
                 found = _plain(label, text, tokens, terms, hidden, redactor)
             else:
-                found = _deep(label, data, tokens, terms, hidden, redactor)
+                found = _deep(label, data, tokens, terms, hidden, redactor, searched)
             if found:
                 findings += found
                 findings.append(_attest_hint(label, digest, redactor))
@@ -166,8 +203,14 @@ def scan_wheels(
     return WheelScan(findings, binaries)
 
 
+def _is_authors(wheel: Wheel, exempt: Collection[str], core: str) -> bool:
+    """Whether a wheel can be the author's own code, so that it is searched for key locations: not a release (from an
+    index, or one the lock proves) and not the core (`core`, its canonical name), which has nothing of the author's."""
+    return not (wheel.path in exempt or wheel.from_index or canonical(wheel.name) == core)
+
+
 def _attest_hint(label: str, digest: str, redactor: Redactor) -> str:
-    shown = redactor.name(label)
+    shown = redactor.name(label, hide=label in redactor.hidden.values())  # hidden by a finding, it stays hidden
     if shown != label:
         return (
             f"to attest {shown} once read by hand: [[opaque]] with its path (which --show-private-paths prints), "

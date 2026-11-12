@@ -61,7 +61,7 @@ class FakeProviders:
         if method == "GET" and parts[1] == "spaces":
             return {"fileId": "root-" + parts[2].removeprefix("sid-")}
         if method == "GET" and path.endswith("/children"):
-            return {"children": self.children[parts[2]], "isLast": True}
+            return {"nextPageToken": "end-of-listing-token", "isLast": True, "children": self.children[parts[2]]}
         if method == "GET" and path.endswith("/distribution"):
             listed = {pid: blocks for pid, blocks in self.maps[parts[2]].items() if pid not in self.unlisted}
             return {

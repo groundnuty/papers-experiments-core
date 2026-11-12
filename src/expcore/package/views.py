@@ -24,7 +24,9 @@ fails to decompress (a bad CRC, a stream cut short) refuses the file at once. Ne
 stream larger than `MAX_STREAM_BYTES`, an archive of more than `MAX_MEMBERS` members, and decompressing more than
 `MAX_TOTAL_BYTES` for one file are refused too; every byte a decompressor produces counts against that total budget,
 the walk stops the moment it runs out, and no read asks for more than what is left of it. A file a package attests by
-hash (`[[opaque]]` in package.toml) is never given to this module.
+hash (`[[opaque]]` in package.toml) is never given to `streams`. The walk for copies of a key file (`keycopies`) is
+another one, over every file, attested or not, which shares this module's classifiers and limits but refuses nothing
+for its kind.
 
 `views(stream)` is what the scans read in a stream. Text is read as it is and decoded: continuations (a backslash, the
 newline and the indentation after it) joined and backslash escapes (`\\xHH`, `\\uXXXX`, `\\UXXXXXXXX`) undone, HTML
@@ -97,7 +99,15 @@ MIN_RUN = 16  # base64 and hex runs from this many characters are decoded
 MAX_HEADINGS = 8  # the most leading lines a joined run is also decoded without
 LONG_RUN = 40  # a run this long that looks compressed but fails to decompress refuses its file
 _SEGMENT = re.compile(r"[A-Za-z0-9+/_-]+(?:={1,2})?")  # one maximal run of the base64 alphabet; no backtracking
-_LINE_BREAK = re.compile(r"[ \t]*\r?\n[ \t]*")  # what may join two lines of one wrapped run
+# One run, whole, from its first segment: segments joined by single line breaks (spaces and tabs around them allowed),
+# each but the last without padding; or one segment alone, only when it is `MIN_RUN` characters or more with its
+# padding, so that the words of ordinary text are passed over without a match.
+_WRAPPED = re.compile(
+    r"(?<![A-Za-z0-9+/_-])"
+    r"(?:(?:[A-Za-z0-9+/_-]++[ \t]*+\r?\n[ \t]*+)+[A-Za-z0-9+/_-]++(?:={1,2})?"
+    rf"|[A-Za-z0-9+/_-]{{{MIN_RUN},}}+(?:={{1,2}})?|[A-Za-z0-9+/_-]{{{MIN_RUN - 1}}}={{1,2}}"
+    rf"|[A-Za-z0-9+/_-]{{{MIN_RUN - 2}}}==)"
+)
 _HEX_SUB = re.compile(r"[0-9a-fA-F]{16,}")
 # The strings of bytes that are probably random, as `strings` finds them but only of the characters a name can be
 # made of (letters, digits, `_ . -`, a space, and any non-ASCII letter in UTF-8), in UTF-8 and in UTF-16 either way.
@@ -307,7 +317,8 @@ def _decode_base64(run: str) -> bytes | None:
 def _runs(text: str) -> Iterator[tuple[int, str]]:
     """Maximal runs of the base64 alphabet, in one linear pass; a run wrapped over lines (single line breaks, each
     after a line without padding) is joined into one. A joined run is also given from each line whose width differs
-    from the line before it, up to `MAX_HEADINGS` (caption lines above an encoded block would shift its alignment)."""
+    from the line before it, up to `MAX_HEADINGS` (caption lines above an encoded block would shift its alignment).
+    A run that spans fewer than `MIN_RUN` characters, line breaks included, is not given: nothing in it is decoded."""
 
     def flush(parts: list[tuple[int, str]]) -> Iterator[tuple[int, str]]:
         yield parts[0][0], "".join(part for _, part in parts)
@@ -318,18 +329,9 @@ def _runs(text: str) -> Iterator[tuple[int, str]]:
         for skip in skips:
             yield parts[skip][0], "".join(part for _, part in parts[skip:])
 
-    parts: list[tuple[int, str]] = []
-    end = 0
-    for match in _SEGMENT.finditer(text):
-        if parts and not parts[-1][1].endswith("=") and _LINE_BREAK.fullmatch(text, end, match.start()):
-            parts.append((match.start(), match.group(0)))
-        else:
-            if parts:
-                yield from flush(parts)
-            parts = [(match.start(), match.group(0))]
-        end = match.end()
-    if parts:
-        yield from flush(parts)
+    for wrapped in _WRAPPED.finditer(text):  # most are one short word: only a long one is split into its lines
+        if wrapped.end() - wrapped.start() >= MIN_RUN:
+            yield from flush([(m.start(), m.group(0)) for m in _SEGMENT.finditer(text, *wrapped.span())])
 
 
 def payloads(text: str, seen: dict[bytes, int] | None = None) -> Iterator[tuple[str, bytes, bool]]:

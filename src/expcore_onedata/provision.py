@@ -11,6 +11,10 @@
 before it first acts the provisioner reads the space's live name from Onezone and refuses one that differs from the
 configured name or lies outside the prefixes. On top of that gate:
 
+- **A large file is never held whole** (O25). `upload` sends a local file a chunk at a time, skips a target that
+  already holds its bytes, resumes one that holds a prefix, and reports success only once the size and SHA-256 read
+  back match; `read_file` reads a file back by streamed ranges, hashing as it goes. Every write carries a content type.
+- **A listing ends only on its last-page marker** (O26, `next_page_token`): a page without one is refused.
 - **Placement is what the block map says** (O01). A replication job that reports `completed` is a report; `replicate`
   returns only when `GET /data/{id}/distribution` on the receiving provider covers the whole file on consecutive polls,
   and raises `NotPlaced` with the shortfall otherwise. An eviction is confirmed the same way, by the block map showing
@@ -27,7 +31,10 @@ no token and no credential.
 """
 
 import dataclasses
+import functools
+import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -41,6 +48,7 @@ from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, ans
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncovered
 from expcore_onedata.rangemap import PlacementSettings, safe_path
+from expcore_onedata.streamed import OCTET_STREAM, Digest, Upload, chunks, media_type
 
 LISTING_LIMIT = 1000
 _SEGMENT = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # the charset of a file id the client accepts
@@ -161,6 +169,39 @@ def listing_entry(item: Any) -> Entry:
     if not fid or not isinstance(item.get("name"), str) or item.get("size") is None:
         raise PlatformError("a listing entry has no file id, name or size")
     return Entry(str(fid), item["name"], int(item["size"]), str(item.get("type") or ""))
+
+
+def _hashing(blocks: Iterable[tuple[int, bytes]], hasher: Any) -> Iterator[tuple[int, bytes]]:
+    """Pass `(offset, bytes)` blocks on, adding each to `hasher` first, so the bytes sent are the bytes hashed."""
+    for offset, block in blocks:
+        hasher.update(block)
+        yield offset, block
+
+
+def next_page_token(page: Any) -> str | None:
+    """Read a children page's paging (O26): None when it is the listing's last page, else the next page's token.
+
+    Onedata's API says a page may be shorter than its limit and still not be the last, and that `isLast` is the only
+    valid sign that every entry has been listed. On 25.0 that was measured, in
+    `deploy/compose-federation/day0/2026-11-12-federation-facts-listing-end.md`: every page carries `nextPageToken`,
+    `isLast` and `children`; `isLast` is a boolean, false before the last page and true on it; the token is a non-empty
+    string on every page, the last included; a page the directory's last entries fill is followed by an empty page with
+    `isLast` true; and the page after a last page answers 400 `posix` `eagain`. So the end is `isLast` true alone,
+    whatever the token, and an empty last page is no error. A page without `children`, without a boolean `isLast`, or not the last and without a token,
+    is refused (PlatformError), never taken for the end of the listing: a listing cut there would pass for a whole
+    directory, and a file on a later page for a missing one.
+    """
+    if not isinstance(page, dict) or not isinstance(page.get("children"), list):
+        raise PlatformError("a listing answer holds no 'children'")
+    last = page.get("isLast")
+    if not isinstance(last, bool):
+        raise PlatformError("a listing page has no last-page marker (a boolean isLast), so it may be cut: refused")
+    if last:
+        return None
+    token = page.get("nextPageToken")
+    if not isinstance(token, str) or not token:
+        raise PlatformError("a listing is not on its last page but names no next page")
+    return token
 
 
 class Provisioner:
@@ -341,16 +382,12 @@ class Provisioner:
         params: dict[str, Any] = {"limit": LISTING_LIMIT, "attribute": LISTING_ATTRIBUTES}
         while True:
             page = self._client.get(f"/data/{_segment(directory_id)}/children", provider=provider, params=params)
-            if not isinstance(page, dict) or not isinstance(page.get("children"), list):
-                raise PlatformError("a listing answer holds no 'children'")
+            token = next_page_token(page)
             for item in page["children"]:
                 entry = listing_entry(item)
                 entries[entry.name] = entry
-            if page.get("isLast", True):
+            if token is None:
                 return entries
-            token = page.get("nextPageToken")
-            if not token:
-                raise PlatformError("a listing is not on its last page but names no next page")
             params = {**params, "token": token}
 
     def resolve(
@@ -417,12 +454,14 @@ class Provisioner:
         self._write("create", id=file_id, kind=kind, path=path)
         return file_id
 
-    def put_file(self, path: str, data: bytes) -> str:
+    def put_file(self, path: str, data: bytes, *, content_type: str = OCTET_STREAM) -> str:
         """Create a file with this content on the data provider, in blocks, and verify its size; return its id.
 
         A file already there is refused, since replacing it would break the rule that teardown touches only what the
-        log says was created.
+        log says was created. Every write carries `content_type`, since Onedata 25.0 answers 415 to one without. A
+        file too large to hold in memory goes through `upload`, which also skips, resumes and verifies by hash.
         """
+        media = media_type(content_type)
         *directory, name = safe_path(path)
         parent = self.make_dir("/".join(directory)) if directory else self.root()
         if name in self.children(parent):
@@ -430,20 +469,171 @@ class Provisioner:
                 f"{self._where}the file already exists; this provisioner will not overwrite or adopt it"
             )
         file_id = self._create(parent, name, "REG", path)
-        self._verified()
-        for offset in range(0, len(data), self._settings.chunk_bytes):
-            self.mutate(
-                "PUT",
-                f"/data/{_segment(file_id)}/content",
-                provider=self._settings.holder,
-                params={"offset": offset},
-                content=data[offset : offset + self._settings.chunk_bytes],
-                timeout_s=self._settings.request_timeout_s,
-            )
-        size = self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder).get("size")
-        if size != len(data):
+        step = self._settings.chunk_bytes
+        self._write_chunks(file_id, ((at, data[at : at + step]) for at in range(0, len(data), step)), media)
+        if self._size_of(file_id) != len(data):
             raise ProvisionError(f"{self._where}the size read back after an upload is not the size uploaded")
         return file_id
+
+    def upload(self, path: str, source: Path | str, *, content_type: str = OCTET_STREAM) -> Upload:
+        """Upload a local file to a path of the space on the data provider, never holding it whole; return what was
+        done (O25).
+
+        The file is read and sent `chunk_bytes` at a time, each chunk a PUT at its offset through the client's mutation
+        gate (the space's name is checked first, and the file's space before every write), carrying `content_type`.
+        What the target already holds decides what is sent; its bytes are read back by `read_file`, hashed as they
+        come:
+
+        - nothing: the file is created, logged, and sent whole (`created`);
+        - the same size and SHA-256 as the local file: nothing is sent (`skipped`). Nothing changes, so a file another
+          made is skipped too, and stays out of the log;
+        - a strict prefix of the local file, in a file the log says this provisioner created: the rest is sent from
+          where the target ends, by offset writes (`resumed`);
+        - anything else in a file it created: the file is written again from its first byte, the first write without
+          an offset, which truncates it (`restarted`);
+        - anything else in a file it did not create: refused before anything is written, as `put_file` refuses (O09).
+
+        Success is reported only once the size and the SHA-256 read back equal those of the bytes read from the local
+        file; otherwise ProvisionError. A file that changes while it is uploaded fails that check.
+        """
+        media, source = media_type(content_type), Path(source)
+        size = source.stat().st_size  # a local file that is not there is refused before anything is asked
+        self._verified()
+        *directory, name = safe_path(path)
+        parent = self.make_dir("/".join(directory)) if directory else self.root()
+        existing = self.children(parent).get(name)
+        if existing is None:
+            action, start, hasher = "created", 0, hashlib.sha256()
+            file_id = self._create(parent, name, "REG", path)
+        else:
+            action, start, hasher = self._compare(existing, source, size)
+            file_id = existing.file_id
+            if action == "skipped":
+                return Upload(file_id, Digest(size, hasher.hexdigest()), action, 0)
+        blocks = _hashing(chunks(source, self._settings.chunk_bytes, start=start), hasher)
+        sent = self._write_chunks(file_id, blocks, media, truncate=action == "restarted")
+        expected = Digest(start + sent, hasher.hexdigest())
+        if expected.size != size:
+            raise ProvisionError(f"{self._where}the local file changed size while it was uploaded")
+        if self._size_of(file_id) != size:
+            raise ProvisionError(f"{self._where}the size read back after an upload is not the size of the bytes sent")
+        if self.read_file(file_id, size=size) != expected:
+            raise ProvisionError(
+                f"{self._where}the content read back after an upload does not have the SHA-256 of the bytes sent"
+            )
+        return Upload(file_id, expected, action, sent)
+
+    def _compare(self, existing: Entry, source: Path, size: int) -> tuple[str, int, Any]:
+        """Decide how an upload treats a target that exists: return the action, the offset to send from, and the hash of
+        the local bytes before that offset. Resuming or restarting writes into the file, so it needs the log to say
+        this provisioner created it."""
+        if existing.kind != "REG":
+            raise ProvisionError(f"{self._where}the path exists and is not a regular file; nothing was written")
+        hasher = hashlib.sha256()
+        if existing.size <= size:
+            held = self.read_file(existing.file_id, size=existing.size)
+            for _, block in chunks(source, self._settings.chunk_bytes, stop=existing.size):
+                hasher.update(block)
+            if held.sha256 == hasher.hexdigest():
+                if existing.size == size:
+                    return "skipped", size, hasher
+                self._require_created(existing.file_id)
+                return "resumed", existing.size, hasher
+        self._require_created(existing.file_id)
+        return "restarted", 0, hashlib.sha256()
+
+    def _require_created(self, file_id: str) -> None:
+        if file_id not in {line["id"] for line in self.logged()}:
+            raise ProvisionError(
+                f"{self._where}the file exists with other content and this provisioner did not create it; it will not "
+                "overwrite or adopt it, and nothing was written"
+            )
+
+    def _write_chunks(
+        self, file_id: str, blocks: Iterable[tuple[int, bytes]], media: str, *, truncate: bool = False
+    ) -> int:
+        """Write `(offset, bytes)` blocks to a file's content on the data provider, each a PUT through the gate; return
+        the bytes sent. With `truncate`, the first write goes without an offset, which truncates the file (with an
+        empty body when there is no block)."""
+        self._verified()
+        sent = 0
+        for offset, block in blocks:
+            if truncate and sent == 0 and offset != 0:
+                raise ProvisionError(f"{self._where}a truncating write starts at the file's first byte")
+            self._put(file_id, block, None if truncate and sent == 0 else offset, media)
+            sent += len(block)
+        if truncate and sent == 0:
+            self._put(file_id, b"", None, media)
+        return sent
+
+    def _put(self, file_id: str, block: bytes, offset: int | None, media: str) -> None:
+        """One write of content, bound to this provisioner's space: at `offset`, or without one, which truncates the file
+        first."""
+        self.mutate(
+            "PUT",
+            f"/data/{_segment(file_id)}/content",
+            provider=self._settings.holder,
+            params=None if offset is None else {"offset": offset},
+            content=block,
+            timeout_s=self._settings.request_timeout_s,
+            content_type=media,
+        )
+
+    def _size_of(self, file_id: str) -> Any:
+        """The size a file's attributes on the data provider give now."""
+        answer = self._client.get(f"/data/{_segment(file_id)}", provider=self._settings.holder)
+        return answer.get("size") if isinstance(answer, dict) else None
+
+    def read_file(
+        self,
+        file_id: str,
+        *,
+        provider: str | None = None,
+        dest: Path | str | None = None,
+        size: int | None = None,
+        deadline_s: float | None = None,
+    ) -> Digest:
+        """Read a file's whole content through a provider (the data provider unless named), hashing it as it comes,
+        and write it to `dest` when one is given; return its size and SHA-256 (O25).
+
+        The read is the client's `read_content`: by ranges of `chunk_bytes`, each gated as a range read and streamed,
+        so the file is never held. It is bounded in bytes by `size`, or else by the size the file's attributes give,
+        which the content must match exactly; and in time by `deadline_s` (the placement's `transfer_timeout_s` unless
+        given), no wait for the platform lasting longer than `request_timeout_s`. Every range is bound to this
+        provisioner's space, as a mutation is. Through a provider other than the data provider it first waits until the
+        file is visible there (`await_visible`). With `dest`, the bytes go to `<dest>.part`, which replaces `dest` only
+        once the read is whole and is removed when it fails.
+        """
+        self._verified()
+        provider = provider or self._settings.holder
+        self.await_visible(provider, [file_id])
+        if size is None:
+            answer = self._client.get(f"/data/{_segment(file_id)}", provider=provider)
+            size = answer.get("size") if isinstance(answer, dict) else None
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise PlatformError("a file's attributes hold no size, so its read has no bound")
+        read = functools.partial(
+            self._client.read_content,
+            f"/data/{_segment(file_id)}/content",
+            provider=provider,
+            size=size,
+            chunk_bytes=self._settings.chunk_bytes,
+            deadline_s=self._settings.transfer_timeout_s if deadline_s is None else deadline_s,
+            timeout_s=self._settings.request_timeout_s,
+            space=self._entry.space,
+        )
+        if dest is None:
+            return read()
+        target = Path(dest)
+        partial = target.with_name(target.name + ".part")
+        try:
+            with open(partial, "wb") as handle:
+                found = read(sink=handle.write)
+            os.replace(partial, target)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+        return found
 
     # -- visibility ------------------------------------------------------------
     def await_visible(self, provider: str, file_ids: Iterable[str]) -> float:

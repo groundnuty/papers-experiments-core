@@ -6,9 +6,10 @@
 
 At run end `TransferLog` observes every tracked provider: it lists the space's transfers there, `GET
 /spaces/{space}/transfers` with `state` waiting, ongoing and ended in that order (a job only moves forward, so one that
-moves on while the lists are read is found in a later one) and `limit`, following `nextPageToken` until it is empty,
-and reads each id it listed with `GET /transfers/{id}` on that same provider. Every request goes through the probes'
-own probe (`probes.run_probe`): a real answer is final and only a missing one is retried, a bounded number of times.
+moves on while the lists are read is found in a later one) and `limit`, following `nextPageToken` until it is null
+(a page without it is refused, O26), and reads each id it listed with `GET /transfers/{id}` on that same provider.
+Every request goes through the probes' own probe (`probes.run_probe`): a real answer is final and only a missing one
+is retried, a bounded number of times.
 `transferrecord.py` reads the answers and says which of their fields are confirmed.
 
 **One provider's observation at a time.** A job's state and counters are always taken from one provider's listing and

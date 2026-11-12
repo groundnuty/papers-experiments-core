@@ -84,7 +84,12 @@ class Probe:
         while True:
             page = self.call(name, "GET", f"/data/{directory}/children", params=params).json()
             out += page["children"]
-            if page.get("isLast", True):
+            last = page.get("isLast")
+            if not isinstance(
+                last, bool
+            ):  # 25.0 marks every page; a page without the marker is no end (listing-end facts)
+                raise RuntimeError(f"{name}: a children page without a boolean isLast")
+            if last:
                 return out
             params = {**params, "token": page["nextPageToken"]}
 

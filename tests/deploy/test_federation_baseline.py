@@ -85,7 +85,7 @@ class FakeWriter:
                 for i, n in list(self.nodes.items())
                 if n["parent"] == parts[2]
             ]
-            return {"children": children, "isLast": True}
+            return {"nextPageToken": "end-of-listing-token", "isLast": True, "children": children}  # 25.0's last page
         if method == "POST" and path.endswith("/children"):
             parent = self.nodes[parts[2]]
             name, kind = options["params"]["name"], options["params"]["type"]
