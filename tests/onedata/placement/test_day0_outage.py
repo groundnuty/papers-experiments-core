@@ -33,13 +33,14 @@ from sandbox_support import MOUNT_PATH
 from expcore_onedata.admission import OUTAGE_RUN
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
-from expcore_onedata.day0 import outage_cells, outage_run, outage_tools
+from expcore_onedata.day0 import outage_budget, outage_cells, outage_run, outage_tools
 from expcore_onedata.day0.outage_cells import Cells
 from expcore_onedata.day0.outage_tools import KNOWLEDGE_TOOLS
 from expcore_onedata.day0.runner import EXIT_FAIL, EXIT_UNKNOWN, build_context, run, run_checks
 from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import compose_driver, load_faults
+from expcore_onedata.sandbox.provider import SandboxPlatform
 from expcore_onedata.testing import (
     ADMIN_ENV,
     ALPHA_ID,
@@ -839,6 +840,63 @@ def test_o28_a_mount_read_that_fails_with_another_errno_is_refused_with_it(conte
     entry = outage_check(context)
     owner_only = entry.facts["during"]["mount"]["owner_only"]
     assert (owner_only["outcome"], owner_only["errno"], owner_only["errno_number"]) == ("refused", "EIO", 5)
+
+
+def test_o28_the_agents_tokens_are_minted_for_the_scenarios_worst_case(
+    tmp_path, fake, relay, tools_manifest, context, monkeypatch
+):
+    """O28: the sandbox's and the tool server's tokens are minted for the longest the scenario can need them (the
+    injector's waits, and a settle of 600 s for the wait for the target and for each re-read among them) plus a margin,
+    never for a fixed 1800 s that a slow restore outlasts."""
+    target = write_target(
+        tmp_path / "slow", fake, relay, tools_manifest, lambda data: data["faults"].update(settle_timeout_s=600)
+    )
+    seen = []
+    real_launch, real_server = SandboxPlatform.launch, SandboxPlatform.tool_server
+
+    def launch(self, *args, ceiling_s, **options):
+        seen.append(ceiling_s)
+        return real_launch(self, *args, ceiling_s=ceiling_s, **options)
+
+    def tool_server(self, *args, ceiling_s, **options):
+        seen.append(ceiling_s)
+        return real_server(self, *args, ceiling_s=ceiling_s, **options)
+
+    monkeypatch.setattr(SandboxPlatform, "launch", launch)
+    monkeypatch.setattr(SandboxPlatform, "tool_server", tool_server)
+    ctx = context(target=target)
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    assert entry.ok is True, entry.summary
+    assert len(seen) == 2
+    assert seen[0] == seen[1] == outage_budget.scenario_s(ctx, mount=True)
+    assert seen[0] >= 5 * 600 + 1800  # the wait and the four re-reads at the settle, and more
+    assert entry.facts["agent"]["tokens"]["ceiling_s"] == seen[0]
+
+
+def test_o28_tokens_that_ended_before_a_reread_are_the_checks_own_failure_never_the_providers(
+    context, services, ticker
+):
+    """O28: when the agent's tokens have ended before a step that uses them (a restore slower than the lifetime they
+    were minted for), the step is not measured and the check fails with its own reason, naming the tokens; the
+    provider is never blamed for a read the tokens could not make. REST reads use no slot token and are measured."""
+    real_start = services.start
+
+    def slow_start(service):
+        ticker.sleep(10_000.0)  # a restore slower than the tokens' lifetime
+        real_start(service)
+
+    services.start = slow_start  # type: ignore[method-assign]
+    ctx = context()
+    ctx.outage_ceiling_s = 2_000.0
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    assert entry.ok is False
+    assert "the agent's tokens had ended before the re-read through the mount" in entry.summary
+    assert "did not return what was written" not in entry.summary
+    after = entry.facts["after"]
+    assert after["mount_owner_only"]["tokens_ended"] is True
+    assert after["owner_only"]["outcome"] == "served"
+    assert "transfers" not in after
+    assert entry.facts["restore"]["verified"] is True
 
 
 def test_o28_a_declared_mount_left_unmeasured_makes_the_check_unknown_never_passed(context):

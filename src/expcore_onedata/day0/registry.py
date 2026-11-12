@@ -65,7 +65,8 @@ class Context:
     a sandbox and the tool server (`DockerHost` with `EXPCORE_LIVE_DOCKER=1`; None starts nothing), `agent_options` the
     keywords its `SandboxPlatform` gets (a registry, the sandbox's options), `tool_condition` the tool-server condition
     whose tools it calls (else the first that allows the four knowledge tools), and `outage_ceiling_s` the ceiling the
-    run's tokens are minted for.
+    agent's tokens are minted for (None, the default, mints them for the scenario's worst case,
+    `outage_budget.scenario_s`).
     """
 
     config: PlatformConfig
@@ -88,7 +89,7 @@ class Context:
     agent_host: HostOps | None = None
     agent_options: dict[str, Any] = field(default_factory=dict)
     tool_condition: str | None = None
-    outage_ceiling_s: float = 1800.0
+    outage_ceiling_s: float | None = None
     _provisioners: dict[str, Provisioner] = field(default_factory=dict, repr=False)  # by the label of their space
 
     def provisioner(self, space: str | None = None) -> Provisioner:

@@ -18,6 +18,11 @@ Starting containers is the caller's consent: the check is given a host (`Context
 and the scenario goes on without it: what it would have measured is then unmeasured, which makes the check unknown.
 A teardown that cannot show the sandbox gone, or a tool plane that cannot be re-verified at its stop, is a problem of
 the check (`problems`). The lease's journal and the token journal are in the report's directory (`day0-leases`).
+
+**Tokens.** Both tokens are minted for `ceiling_s`: `Context.outage_ceiling_s` when the caller names one, else the
+longest the scenario can need them (`outage_budget.scenario_s`). `tokens_until` is when, on the check's clock, they
+surely still hold (the sandbox's start plus the ceiling; each is minted later, for at least that), so `outage_run` can
+tell a step the tokens could no longer make from one the provider failed.
 """
 
 import contextlib
@@ -29,6 +34,7 @@ from expcore.config.loading import ConfigError, load_toml
 from expcore.errors import InfraError
 from expcore.plugin import NO_WAITS
 from expcore_onedata.config import StudySpace
+from expcore_onedata.day0.outage_budget import scenario_s
 from expcore_onedata.day0.outage_tools import KNOWLEDGE_TOOLS
 from expcore_onedata.day0.registry import Context
 from expcore_onedata.sandbox.api import DataPathMode
@@ -97,6 +103,8 @@ class AgentPlane:
         self.sandbox: Any = None
         self.tools: Any = None
         self.mount_path: str | None = None  # the space's directory as the agent sees it through the mount
+        self.ceiling_s = ctx.outage_ceiling_s  # what the tokens are minted for, the scenario's worst case by default
+        self.tokens_until: float | None = None  # on the check's clock, the latest moment the tokens surely hold
         self.facts: dict[str, Any] = {"sandbox": {"started": False}, "tool_server": {"started": False}}
         self.problems: list[str] = []
         self.events: list[tuple[str, str]] = []
@@ -132,6 +140,9 @@ class AgentPlane:
             yield self
             return
         ctx, condition = self._ctx, knowledge_condition(self._ctx)
+        if self.ceiling_s is None:
+            self.ceiling_s = scenario_s(ctx, mount=bool(mount_levels(ctx)))
+        self.facts["tokens"] = {"ceiling_s": self.ceiling_s}
         try:
             platform = self._platform()
             pool = LeasePool(
@@ -154,9 +165,10 @@ class AgentPlane:
         ctx, level = self._ctx, _level(self._ctx)
         mode = platform.mode({"data_path": level})
         self.facts["sandbox"]["data_path"] = mode.value
+        assert self.ceiling_s is not None
+        self.tokens_until = ctx.clock() + self.ceiling_s  # minted after this, for at least the ceiling (O06)
         launch = platform.launch(
-            NO_WAITS, run_key=self._run_key, level=level, ceiling_s=ctx.outage_ceiling_s, lease=lease,
-            condition=condition,
+            NO_WAITS, run_key=self._run_key, level=level, ceiling_s=self.ceiling_s, lease=lease, condition=condition,
         )  # fmt: skip
         try:
             self.sandbox = await launch.__aenter__()
@@ -179,7 +191,8 @@ class AgentPlane:
         if self.sandbox is None:
             yield
             return
-        server = platform.tool_server(NO_WAITS, self.sandbox, ceiling_s=self._ctx.outage_ceiling_s)
+        assert self.ceiling_s is not None
+        server = platform.tool_server(NO_WAITS, self.sandbox, ceiling_s=self.ceiling_s)
         try:
             self.tools = await server.__aenter__()
         except Exception as error:  # refused before the start (its plane), or a server that did not start

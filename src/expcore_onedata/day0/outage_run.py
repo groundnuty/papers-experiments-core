@@ -21,6 +21,7 @@ from expcore_onedata.client import PlatformError
 from expcore_onedata.config import StudySpace
 from expcore_onedata.day0 import outage_mount
 from expcore_onedata.day0.outage_agent import AgentPlane, mount_levels
+from expcore_onedata.day0.outage_budget import DOWN_PROBE_S
 from expcore_onedata.day0.outage_cells import ROLES, Cells, Roles, ScratchFile
 from expcore_onedata.day0.outage_fault import RESTORED, Outage
 from expcore_onedata.day0.outage_tools import Scrubber, Tools, baseline_gaps
@@ -34,7 +35,6 @@ FILE_BYTES = 16384
 KINDS = ("replicated", "owner_only")
 BASE_PAIRS = ("baseline", "rest", "knowledge")
 MOUNT_PAIRS = ("baseline_mount", "mount")
-DOWN_PROBE_S = 10.0  # the longest the check waits to see that the target does not answer
 
 
 class Unprepared(RuntimeError):
@@ -77,6 +77,7 @@ class Run:
         self.pairs = [*BASE_PAIRS, *(MOUNT_PAIRS if mount_levels(ctx) else ())]
         self.problems: list[str] = []  # what failed
         self.gaps: list[str] = []  # what could not be measured
+        self.tokens_ended: str | None = None  # the first step the agent's tokens had ended before
         self.facts: dict[str, Any] = {"roles": dict(roles.labels), "bound_s": self.bound_s, "bytes": FILE_BYTES}
         self.cells = Cells(
             ctx.client, entry, self.provisioner, roles, bound_s=self.bound_s, clock=ctx.clock, sleep=ctx.sleep
@@ -283,9 +284,9 @@ class Run:
 
         during: dict[str, Any] = {"rest": await asyncio.to_thread(rest)}
         self.facts["during"] = during
-        if self.plane.mount_path is not None:
+        if self.plane.mount_path is not None and self.tokens_hold("the reads through the mount during the outage"):
             during["mount"] = await asyncio.to_thread(self.mount_cells, "mount")
-        if self.tools is not None:
+        if self.tools is not None and self.tokens_hold("the tools' calls during the outage"):
             tools = self.tools
             knowledge: dict[str, Any] = {"get_file_distribution": {}, "schedule_file_replication": {}}
             for kind in KINDS:
@@ -339,10 +340,11 @@ class Run:
         if not went_down:
             return
         after = await asyncio.to_thread(self.rereads)
-        if self.tools is not None:
+        if self.tools is not None and self.tokens_hold("the transfers' reading after the restore"):
             after["transfers"] = {kind: await self.tools.transfer_now(f"knowledge/{kind}") for kind in KINDS}
         self.facts["after"] = after
-        wrong = [name for name, row in after.items() if name != "transfers" and row["outcome"] != "served"]
+        reads = {name: row for name, row in after.items() if name != "transfers" and not row.get("tokens_ended")}
+        wrong = [name for name, row in reads.items() if row["outcome"] != "served"]
         if wrong:
             self.problems.append(f"after the restore {len(wrong)} read(s) did not return what was written")
 
@@ -356,7 +358,8 @@ class Run:
         }
         if self.plane.mount_path is not None:
             after["mount_owner_only"] = self.reread(
-                lambda: self.mount_cells("mount", listing=False)["owner_only"] or {"outcome": None}
+                lambda: self.mount_cells("mount", listing=False)["owner_only"] or {"outcome": None},
+                tokens="the re-read through the mount",
             )
         return after
 
@@ -376,17 +379,36 @@ class Run:
                 return False
             self.ctx.sleep(settings.poll_s)
 
-    def reread(self, read: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-        """Read again until the read is served, within the settle timeout (a provider is slow to take up its peers)."""
+    def reread(self, read: Callable[[], dict[str, Any]], *, tokens: str | None = None) -> dict[str, Any]:
+        """Read again until the read is served, within the settle timeout (a provider is slow to take up its peers).
+        A read made with the agent's tokens (`tokens` names it) is not made once they have ended: it is then
+        `tokens_ended`, the check's own failure, never the provider's."""
         settings = self.ctx.fault_settings
         assert settings is not None
         began, tries = self.ctx.clock(), 0
         while True:
+            if tokens is not None and not self.tokens_hold(tokens):
+                return {"outcome": None, "tokens_ended": True, "attempts": tries}
             tries += 1
             row = read()
             if row["outcome"] == "served" or self.ctx.clock() - began >= settings.settle_timeout_s:
                 return {**row, "attempts": tries}
             self.ctx.sleep(settings.poll_s)
+
+    def tokens_hold(self, step: str) -> bool:
+        """Whether the agent's tokens surely still hold for a step that uses them (`AgentPlane.tokens_until`). When
+        they have ended the step is not made, and the first such step is the check's own failure, named: a step the
+        tokens could not make says nothing about the provider."""
+        until = self.plane.tokens_until
+        if until is None or self.ctx.clock() < until:
+            return True
+        if self.tokens_ended is None:
+            self.tokens_ended = step
+            self.problems.append(
+                f"the agent's tokens had ended before {step}, so it was not made (the check's own failure: the "
+                "lifetime they were minted for did not cover the scenario)"
+            )
+        return False
 
     # -- the verdict ----------------------------------------------------------------------------------------------
     def verdict(self) -> Result:
