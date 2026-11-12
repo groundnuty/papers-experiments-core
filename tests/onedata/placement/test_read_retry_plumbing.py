@@ -14,9 +14,12 @@ from fake_reset import FakeReset
 from sandbox_support import add_sandbox
 
 from expcore.campaign.healthgate import read_health
-from expcore_onedata.client import OnezoneClient, PlatformError
+from expcore_onedata.client import OnezoneClient, PlatformError, ScopeUnread
+from expcore_onedata.eviction import evict_ids
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.probes import PlatformProbes
+from expcore_onedata.rangemap import RangeRow
+from expcore_onedata.ranges import place_ranges
 from expcore_onedata.reset import ResetFailed, SpaceReset
 from expcore_onedata.testing import (
     ADMIN_ENV,
@@ -87,6 +90,25 @@ CONTENT = reads(r"/data/[^/]+/content")
 DISTRIBUTION = reads(r"/data/[^/]+/distribution")
 TRANSFERS = reads(r"/spaces/[^/]+/transfers")
 EVERY_GET = reads(r".*")
+PARENT_ID = reads(
+    r"/data/[^/]+", attribute="parent_id"
+)  # the gate's read of a file's parent, never cached for a new one
+SPACE_NAME_READ = reads(r"/spaces/[^/]+", host="zone.test", plain=True)  # the gate's read of a space's name, on Onezone
+RECORD = reads(r"/transfers/[^/]+")  # one transfer's record: what a poll reads
+BETA_DISTRIBUTION = reads(r"/data/[^/]+/distribution", host="beta.test")
+
+
+def nth(matches, number):
+    """A matcher of the `number`th request `matches` accepts, counted from the first, and of no other."""
+    seen = []
+
+    def which(request):
+        if not matches(request):
+            return False
+        seen.append(request)
+        return len(seen) == number
+
+    return which
 
 
 @pytest.fixture
@@ -188,6 +210,184 @@ def test_o29_the_visibility_wait_is_asked_again_on_both_providers(provisioner, s
     flaky.hang(reads(r"/data/[^/]+", host="beta.test", attribute="size"))
     provisioner.await_visible("beta", [file_id])
     assert (len(flaky.timed_out), provisioner.reads_retried, ticker.slept) == (2, 2, [2.0, 2.0])
+
+
+# -- the mutation gate's reads --------------------------------------------------------------------------------
+
+
+def test_o29_the_gate_read_before_the_first_chunk_of_a_new_file_is_asked_again_and_each_chunk_is_written_once(
+    provisioner, seeded, flaky, ticker, tmp_path
+):
+    """O29: the first chunk of a new file's upload reads the new file's parent from the data provider before its PUT,
+    and that is no cached answer; it hangs once, is asked again, and the upload finishes: no chunk is sent twice, and
+    the file is created once."""
+    source = tmp_path / "new.bin"
+    source.write_bytes(DATA)
+    flaky.hang(nth(PARENT_ID, 2))  # the first is the directory's, for the creation; the second is the new file's
+    done = provisioner.upload("study/new.bin", source)
+    assert (done.action, done.digest.size) == ("created", len(DATA))
+    (stalled,) = flaky.timed_out
+    assert stalled.url.path.endswith(provisioner.logged()[-1]["id"])
+    assert provisioner.reads_retried == 1
+    writes = [r.method for r in flaky.sent if r.method != "GET"]
+    assert (writes.count("POST"), writes.count("PUT")) == (1, len(DATA) // 1024)
+
+
+def test_o29_a_gate_read_that_times_out_three_times_ends_the_upload_with_nothing_sent(
+    provisioner, seeded, flaky, ticker, tmp_path
+):
+    """O29: the gate stays closed: three attempts at the read that finds the target's space, 2 s and 5 s apart, then
+    ScopeUnread, a transport failure, and not one request that changes anything left."""
+    source = tmp_path / "new.bin"
+    source.write_bytes(DATA)
+    flaky.hang(PARENT_ID, times=None)
+    with pytest.raises(ScopeUnread) as caught:
+        provisioner.upload("study/new.bin", source)
+    assert (caught.value.transport, caught.value.status) == (True, None)
+    assert [r for r in flaky.sent if r.method != "GET"] == []
+    assert (len(flaky.timed_out), provisioner.reads_retried, ticker.slept) == (3, 2, [2.0, 5.0])
+
+
+def test_o29_the_space_name_read_of_a_verification_is_asked_again(provisioner, seeded, flaky, ticker):
+    """O29: `verify_space` reads the space's name from Onezone; the read hangs once, is asked again, and the name is
+    the one it answered."""
+    flaky.hang(SPACE_NAME_READ)
+    assert provisioner.verify_space() == SPACE_NAME
+    retried_once(provisioner, flaky, ticker)
+
+
+def test_o29_the_gate_read_of_a_range_read_is_asked_again_and_the_range_is_read_once(
+    provisioner, seeded, flaky, ticker
+):
+    """O29: `fetch` is a read that makes a provider fetch bytes, so it passes the gate; the gate's read of the file's
+    parent through that provider hangs once and is asked again, and the range read itself, which could have fetched,
+    is one request."""
+    flaky.hang(reads(r"/data/[^/]+", host="beta.test", attribute="parent_id"))
+    assert len(provisioner.fetch("beta", seeded.id_of(PATH), 0, 100)) == 100
+    assert provisioner.reads_retried == 1
+    assert flaky.count(CONTENT) == 1
+
+
+def test_o29_the_gate_read_of_a_streamed_read_is_asked_again_and_each_range_is_streamed_once(
+    provisioner, seeded, flaky, ticker
+):
+    """O29: `read_file` passes the gate before each range; a gate read that hangs once is asked again, and the ranges
+    that were streamed are one request each."""
+    flaky.hang(PARENT_ID)
+    assert provisioner.read_file(seeded.id_of(PATH), size=len(DATA)).size == len(DATA)
+    retried_once(provisioner, flaky, ticker)
+    assert flaky.count(CONTENT) == len(DATA) // 1024
+
+
+def test_o29_the_gate_reads_of_a_streamed_read_are_not_retried_past_its_deadline(provisioner, seeded, flaky, ticker):
+    """O29: a gate read that hangs for 15 s under a deadline of 16 s leaves no room for the 2 s pause and a second, so
+    the read is not asked again, and the streamed read fails closed with nothing streamed; with a deadline of 100 s the
+    same stall is asked again and the file is read."""
+    file_id = seeded.id_of(PATH)
+    flaky.hang(PARENT_ID)
+    with pytest.raises(ScopeUnread):
+        provisioner.read_file(file_id, size=len(DATA), deadline_s=16.0)
+    assert (provisioner.reads_retried, flaky.count(CONTENT)) == (0, 0)
+    flaky.hang(PARENT_ID)
+    assert provisioner.read_file(file_id, size=len(DATA), deadline_s=100.0).size == len(DATA)
+    assert provisioner.reads_retried == 1
+
+
+# -- the polls whose failure ends the operation, and the placement's first block-map read -------------------------
+
+
+def on_beta(seeded):
+    """The seeded file, held whole by beta as well as by the data provider."""
+    file_id = seeded.id_of(PATH)
+    seeded.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
+    return file_id
+
+
+def test_o29_the_poll_of_a_replication_that_times_out_is_asked_again(provisioner, seeded, flaky, ticker):
+    """O29: `replicate` polls the transfer's record until it ends; a poll that hangs once is asked again, as the
+    reset's own polls are, and the replication is confirmed by the block map as before."""
+    flaky.hang(RECORD)
+    record = provisioner.replicate(PATH, "beta")
+    assert record["placement"]["fully_placed"] is True
+    assert (len(flaky.timed_out), provisioner.reads_retried) == (1, 1)
+
+
+def test_o29_the_poll_of_an_eviction_that_times_out_is_asked_again(provisioner, seeded, flaky, ticker):
+    """O29: `evict` polls the eviction's record; a poll that hangs once is asked again and the eviction is judged by
+    the block map."""
+    on_beta(seeded)
+    flaky.hang(RECORD)
+    assert provisioner.evict(PATH, "beta")["empty"] is True
+    assert (len(flaky.timed_out), provisioner.reads_retried) == (1, 1)
+
+
+def test_o29_the_bulk_evictions_wait_for_its_transfers_is_asked_again(provisioner, seeded, flaky, ticker):
+    """O29: `evict_ids` waits for its transfers to end with polls of their records; the first hangs once and is asked
+    again, so a stall of one poll does not fail the eviction."""
+    flaky.hang(RECORD)
+    record = evict_ids(provisioner, [on_beta(seeded)], "beta")
+    assert record["empty"] is True
+    assert (len(flaky.timed_out), provisioner.reads_retried) == (1, 1)
+
+
+def test_o29_a_poll_of_the_resets_eviction_stage_that_times_out_does_not_fail_the_reset(
+    provisioner, seeded, flaky, ticker
+):
+    """O29: the reset's eviction stage waits for its eviction through the same polls; one that hangs once is asked
+    again, the reset passes, and its record counts the retry."""
+    on_beta(seeded)
+    flaky.hang(RECORD)
+    record = SpaceReset(provisioner).run(evict={"beta": [PATH]})
+    assert record["ok"] is True
+    assert (record["reads_retried"], len(flaky.timed_out)) == (1, 1)
+
+
+def test_o29_the_retries_of_a_transfer_poll_stay_within_the_waits_own_bound(provisioner, seeded, flaky, ticker):
+    """O29: the transfer wait's bound is 30 s here and each stall takes the 15 s of the client's timeout: the first
+    attempt ends at 15 s, the pause leaves 13 s for the one retry, and a third attempt and its 5 s pause do not fit, so
+    the wait ends as a transport failure that says two attempts were made, never after the bound."""
+    on_beta(seeded)
+    flaky.hang(RECORD, times=None)
+    began = ticker.now
+    with pytest.raises(PlatformError, match=r"providers\[1\]: GET failed \(ReadTimeout\) after 2 attempts"):
+        provisioner.evict(PATH, "beta")
+    assert (len(flaky.timed_out), provisioner.reads_retried) == (2, 1)
+    assert ticker.now - began <= provisioner.settings.transfer_timeout_s
+
+
+def test_o29_a_block_map_read_is_one_attempt_unless_its_caller_names_a_policy(provisioner, seeded, flaky, ticker):
+    """O29: `blocks` is the probes' read and the polls' read, one attempt by default; a caller that is plumbing hands it
+    the provisioner's policy, and the read that hangs once is asked again and counted."""
+    file_id = seeded.id_of(PATH)
+    flaky.hang(DISTRIBUTION, times=2)
+    with pytest.raises(PlatformError, match=r"^providers\[0\]: GET failed \(ReadTimeout\)$"):
+        provisioner.blocks(file_id, "alpha")
+    assert (len(flaky.timed_out), provisioner.reads_retried) == (1, 0)
+    assert provisioner.blocks(file_id, "alpha", retry=provisioner.retry)
+    assert (len(flaky.timed_out), provisioner.reads_retried) == (2, 1)
+
+
+def test_o29_the_block_map_read_before_a_placement_is_asked_again(provisioner, seeded, flaky, ticker):
+    """O29: `place_ranges` reads what the receiver holds before it places anything, outside any poll that would absorb
+    a failed read; the read hangs once and is asked again, and the placement goes on."""
+    flaky.hang(nth(BETA_DISTRIBUTION, 1))
+    record = place_ranges(provisioner, [RangeRow(PATH, "beta", ((0, 100),))])
+    assert record["providers"]["providers[1]"]["placement"]["fully_placed"] is True
+    assert (len(flaky.timed_out), provisioner.reads_retried) == (1, 1)
+
+
+def test_o29_the_block_map_read_after_a_placement_is_asked_again_too(provisioner, seeded, flaky, ticker):
+    """O29: the last read of `place_ranges` records what the receiver holds of each file, after the placement settled,
+    and is no part of a poll either: its stall is asked again. The placement runs twice on a receiver emptied between,
+    and the second run's last block-map read of beta is the one that hangs."""
+    row = RangeRow(PATH, "beta", ((0, 100),))
+    place_ranges(provisioner, [row])
+    reads_of_a_placement = flaky.count(BETA_DISTRIBUTION)
+    seeded.blocks.pop((seeded.id_of(PATH), BETA_ID))
+    flaky.hang(nth(BETA_DISTRIBUTION, reads_of_a_placement))
+    record = place_ranges(provisioner, [row])
+    assert record["providers"]["providers[1]"]["per_file"][PATH]["held_bytes"] > 0
+    assert (len(flaky.timed_out), provisioner.reads_retried) == (1, 1)
 
 
 # -- what is never asked again ---------------------------------------------------------------------------------

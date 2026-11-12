@@ -15,7 +15,7 @@ import httpx
 import pytest
 from platform_support import leaked_values
 
-from expcore_onedata.client import OnezoneClient, PlatformError
+from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, ScopeUnread
 from expcore_onedata.config import load_platform
 from expcore_onedata.readretry import (
     ONE_ATTEMPT,
@@ -239,13 +239,115 @@ def test_o29_a_reading_post_is_never_retried(config, fake, ticker):
     assert ticker.slept == []
 
 
-def test_o29_only_get_can_be_handed_a_policy():
-    """O29: by construction: `get` takes `retry`, and no other call of the client does, so a PUT, a POST (reading POSTs
-    included), a PATCH, a DELETE, a range read, a streamed read, the head of a content read and a dated read cannot be
-    retried by a caller that is later added."""
+def test_o29_only_a_read_and_the_gate_of_a_mutation_or_a_range_read_can_be_handed_a_policy():
+    """O29: by construction: `get` and the reads that find a target's space (`space_name`, `file_space_id`,
+    `file_space_name`) take `retry`; `mutate`, `read_range` and `read_content` take `gate_retry`, the policy of their
+    gate's reads alone; and no other call does, so a PUT, a POST (reading POSTs included), a PATCH, a DELETE, a range
+    read, a streamed read, the head of a content read and a dated read cannot be retried by a caller that is later
+    added."""
     public = {name: f for name, f in inspect.getmembers(OnezoneClient, inspect.isfunction) if not name.startswith("_")}
-    takes = sorted(name for name, f in public.items() if "retry" in inspect.signature(f).parameters)
-    assert takes == ["get"]
+
+    def taking(parameter):
+        return sorted(name for name, f in public.items() if parameter in inspect.signature(f).parameters)
+
+    assert taking("retry") == ["file_space_id", "file_space_name", "get", "space_name"]
+    assert taking("gate_retry") == ["mutate", "read_content", "read_range"]
+
+
+class Gate:
+    """A client whose Onezone answers from the fake and whose GETs can be made to time out: a step is an exception
+    class (raised with the ticker moved by the timeout the request carried) or a function that runs before the fake
+    answers. Every request that is not a GET is recorded in `sent` and answered 200."""
+
+    def __init__(self, config, fake, ticker, *steps):
+        fake.other_spaces["sp-run-1"] = SPACE_PREFIX + "run-1"
+        self.fake, self.ticker, self.steps = fake, ticker, list(steps)
+        self.sent, self.gets = [], []
+        self.client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(self.respond)))
+
+    def respond(self, request):
+        if request.method != "GET":
+            self.sent.append(request)
+            return httpx.Response(200, json={})
+        self.gets.append(request)
+        step = self.steps.pop(0) if self.steps else None
+        if isinstance(step, type):
+            self.ticker.now += request.extensions["timeout"]["read"]
+            raise step("simulated", request=request)
+        if step is not None:
+            step()
+        return self.fake.respond(request)
+
+
+def test_o29_a_gate_read_that_times_out_is_asked_again_and_the_mutation_is_sent_once(config, fake, ticker, policy):
+    """O29: the read of the target space's name hangs once under the policy the caller gave the gate: it is asked
+    again after 2 s, the name is in the study's prefixes, and the PUT is sent, once."""
+    gate = Gate(config, fake, ticker, httpx.ReadTimeout)
+    gate.client.mutate("PUT", "/spaces/sp-run-1/x", json={"a": 1}, gate_retry=policy)
+    assert [r.method for r in gate.sent] == ["PUT"]
+    assert len(gate.gets) == 2
+    assert (policy.retries, ticker.slept) == (1, [2.0])
+
+
+def test_o29_a_gate_that_cannot_read_after_three_attempts_stays_closed_and_sends_nothing(config, fake, ticker, policy):
+    """O29: every attempt of the gate's read times out: the mutation is refused as not sent (`ScopeUnread`, a
+    transport failure), three requests were made, both pauses were taken, and nothing that changes state left."""
+    gate = Gate(config, fake, ticker, *[httpx.ReadTimeout] * 3)
+    with pytest.raises(ScopeUnread) as caught:
+        gate.client.mutate("DELETE", "/spaces/sp-run-1/x", gate_retry=policy)
+    assert (caught.value.transport, caught.value.status) == (True, None)
+    assert "after 3 attempts" in str(caught.value)
+    assert (gate.sent, len(gate.gets)) == ([], 3)
+    assert (policy.retries, ticker.slept) == (2, [2.0, 5.0])
+
+
+def test_o29_a_retried_gate_read_decides_from_the_answer_it_got_and_nothing_earlier(config, fake, ticker, policy):
+    """O29 (O09): the space is renamed out of the study's prefixes while the gate's read hangs; the attempt that is
+    answered reads the new name, and the mutation is refused, unsent, though the name read before it was inside."""
+    gate = Gate(config, fake, ticker)
+    gate.client.mutate("PUT", "/spaces/sp-run-1/x", json={}, gate_retry=policy)  # the name is inside: sent
+    gate.steps[:] = [httpx.ReadTimeout, lambda: fake.other_spaces.update({"sp-run-1": "elsewhere-1"})]
+    with pytest.raises(OutOfScope):
+        gate.client.mutate("PUT", "/spaces/sp-run-1/x", json={}, gate_retry=policy)
+    assert [r.method for r in gate.sent] == ["PUT"]  # only the first
+    assert (len(gate.gets), policy.retries) == (3, 1)  # one read for the first, and the stall and its retry
+
+
+def test_o29_a_gate_without_a_policy_is_one_attempt(config, fake, ticker):
+    """O29: a caller that names no policy for the gate's reads (a measurement) is one attempt: the stall is the
+    refusal, no pause is taken and nothing is sent."""
+    gate = Gate(config, fake, ticker, httpx.ReadTimeout, httpx.ReadTimeout)
+    with pytest.raises(ScopeUnread, match=r"GET failed \(ReadTimeout\)\); nothing was sent"):
+        gate.client.mutate("PUT", "/spaces/sp-run-1/x", json={})
+    assert (gate.sent, len(gate.gets), ticker.slept) == ([], 1, [])
+
+
+def test_o29_the_mutation_itself_is_sent_once_whatever_policy_its_gate_has(config, fake, ticker, policy):
+    """O29: the PUT that times out is not asked again, though its gate was given the plumbing policy, which did
+    nothing for it: one PUT, no pause, no retry counted."""
+    fake.other_spaces["sp-run-1"] = SPACE_PREFIX + "run-1"
+    sent = []
+
+    def respond(request):
+        if request.method == "GET":
+            return fake.respond(request)
+        sent.append(request.method)
+        raise httpx.ReadTimeout("simulated", request=request)
+
+    client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(respond)))
+    with pytest.raises(PlatformError, match=r"^zone: PUT failed \(ReadTimeout\)$"):
+        client.mutate("PUT", "/spaces/sp-run-1/x", json={}, gate_retry=policy)
+    assert (sent, ticker.slept, policy.retries) == (["PUT"], [], 0)
+
+
+def test_o29_the_space_name_read_takes_a_policy_and_is_one_attempt_without_one(config, fake, ticker, policy):
+    """O29: `space_name` read under a policy asks again after a stall; without one it fails on the first."""
+    gate = Gate(config, fake, ticker, httpx.ReadTimeout)
+    assert gate.client.space_name("sp-run-1", retry=policy) == SPACE_PREFIX + "run-1"
+    assert (len(gate.gets), policy.retries) == (2, 1)
+    gate.steps[:] = [httpx.ReadTimeout]
+    with pytest.raises(PlatformError, match=r"^zone: GET failed \(ReadTimeout\)$"):
+        gate.client.space_name("sp-run-1")
 
 
 def test_o29_the_deadline_holds_a_retry_that_would_pass_it_is_not_made(config, fake, ticker, policy, caplog):

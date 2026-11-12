@@ -14,11 +14,19 @@ two, and the client (`OnezoneClient.get`) applies it:
   that owns its connection pool sends each retry through a one-shot client of the same settings: its own new
   connection, closed when the answer is in. Tests against a real socket hold both.
 - **What is never retried:** any answer (an error status included), a connection error (a provider that is down must
-  look down), a write timeout, a PUT, POST, PATCH or DELETE (reading POSTs included) and a streamed read. The client
-  takes `retry` on `get` alone, so no other call can be handed a policy.
-- **Who asks:** every call site names its choice (`retry=`). The harness's own plumbing passes a `ReadRetry`; whatever
-  measures the platform passes `ONE_ATTEMPT`, so that a timeout stays the recorded timeout it is. A test holds the
-  choice of every call site (`tests/onedata/test_read_retry_sites.py`).
+  look down), a write timeout, a PUT, POST, PATCH or DELETE (reading POSTs included), a range read and a streamed
+  read. The client takes `retry` on `get` and on the reads that find a target's space (`space_name`, `file_space_id`),
+  and `gate_retry` on `mutate`, `read_range` and `read_content`, which applies to their gate's reads alone, so no write,
+  no range read and no streamed read can be handed a policy for itself.
+- **Who asks:** every call site names its choice (`retry=`, or `gate_retry=` for a mutation's or a range read's gate).
+  The harness's own plumbing passes a `ReadRetry`; whatever measures the platform passes `ONE_ATTEMPT`, so that a
+  timeout stays the recorded timeout it is. A test holds the choice of every call site
+  (`tests/onedata/test_read_retry_sites.py`).
+- **The gate:** every mutation and range read first reads the space of its target (`OnezoneClient.mutate`), and a stall
+  there would end an upload or a reset as surely as one in the read the caller asked for. The plumbing's `gate_retry`
+  tries those reads again, and fails closed all the same: each attempt that is answered decides from its own answer,
+  nothing an earlier attempt or call saw is reused (O09), and after the last timeout the target is unread
+  (`ScopeUnread`) and nothing was sent.
 - **Bounded:** with a `deadline_s` the whole call, its pauses included, stays within it: no retry starts unless its
   pause and `MIN_RETRY_S` more fit in what remains, and a retry's timeout is cut to what remains. The first attempt is
   the caller's own and is made as it always was.

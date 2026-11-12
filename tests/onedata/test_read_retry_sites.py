@@ -27,6 +27,9 @@ PLUMBING = {
     ("reset.py", "SpaceReset._finish", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._requirements", "consistency.space_root"): ["self._p.retry"],
     ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
+    ("provision.py", "Provisioner.replicate", "consistency.wait_transfers"): ["self._retry"],
+    ("provision.py", "Provisioner.evict", "consistency.wait_transfers"): ["self._retry"],
+    ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["provisioner.retry"],
     ("reset.py", "SpaceReset._occupancy", "physical_sizes"): ["self._p.retry"],
     ("day0/mutating.py", "_attempt_write", "consistency.space_root"): ["ctx.plumbing_retry()"],  # the setup read
 }
@@ -38,6 +41,7 @@ CALLER_CHOOSES = {
     ("consistency.py", "wait_visible", "client.get"): ["retry"],
     ("occupancy.py", "physical_sizes", "client.get"): ["retry"],
     ("provision.py", "Provisioner._list_pages", "client.get"): ["reads"],  # `children` decides, below
+    ("provision.py", "Provisioner.blocks", "client.get"): ["retry"],  # one attempt unless the caller says: place_ranges
 }
 
 # Plumbing unless it is an instrument's read: `children` and `root` say so by their own arguments.
@@ -58,16 +62,11 @@ ONE_ATTEMPT_SITES = {
     # the placement probes: the transfer records they record, the transfer log, the block map
     ("probes.py", "PlatformProbes._transfer_records", "client.get"): ["ONE_ATTEMPT"],
     ("transferlog.py", "TransferLog._observe", "client.get"): ["ONE_ATTEMPT"],
-    ("provision.py", "Provisioner.blocks", "client.get"): ["ONE_ATTEMPT"],  # the probes' and the placement polls' read
     # day-0's checks, which record what each provider does
     ("day0/checks.py", "reachability", "client.get"): ["ONE_ATTEMPT", "ONE_ATTEMPT"],
     ("day0/checks.py", "_names", "client.get"): ["ONE_ATTEMPT"],
     ("day0/checks.py", "_space_listing", "consistency.space_root"): ["ONE_ATTEMPT"],
     ("day0/mutating.py", "_remove_and_verify", "client.get"): ["ONE_ATTEMPT"],
-    # transfers' records, polled to their end: not in the plumbing the rule names
-    ("provision.py", "Provisioner.replicate", "consistency.wait_transfers"): ["ONE_ATTEMPT"],
-    ("provision.py", "Provisioner.evict", "consistency.wait_transfers"): ["ONE_ATTEMPT"],
-    ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["ONE_ATTEMPT"],
     # a read inside a poll that counts a failed read as one that did not match: the poll is the retry
     ("provision.py", "Provisioner._gone", "client.get"): ["ONE_ATTEMPT"],
     ("ingestbase.py", "Baseline._absent_everywhere", "client.get"): ["ONE_ATTEMPT"],

@@ -26,10 +26,13 @@ configured name or lies outside the prefixes. On top of that gate:
   the report's `ok` is False. Nothing outside the log is touched, and no token or user is revoked.
 - **The waits are bounded** (O07, `consistency.py`) and happen before or after a run, never in the agent's time.
 - **A plumbing read that timed out is tried again, boundedly and in the log** (O29, `readretry.py`): the listings, the
-  size and attribute reads, `read_file`'s metadata read and the visibility wait, three attempts with pauses of 2 s and
-  5 s. `reads_retried` counts the retries. Never retried: a mutation, a streamed or range read, a block map (what the
-  probes record and the placement polls judge), a transfer's record, and what is read inside a poll that already counts
-  a failed read as a poll that did not match. An instrument's own read (`resolve(wait=False)`) is one attempt.
+  size and attribute reads, `read_file`'s metadata read, the visibility wait, the polls of a transfer's record that end
+  an operation (`replicate`, `evict`), the mutation gate's reads and a range read's or a streamed read's gate, which
+  find the target's space (`verify_space` too), and the block-map reads outside a poll (`blocks(retry=)`, which the
+  placement's own reads pass), three attempts with pauses of 2 s and 5 s. `reads_retried` counts the retries. Never
+  retried: a mutation, a streamed or range read itself, a block map read as a probe reads it (one attempt unless the
+  caller names a policy), and what is read inside a poll that already counts a failed read as a poll that did not match.
+  An instrument's own read (`resolve(wait=False)`) is one attempt.
 
 The change log is a JSON-lines file: one line per creation and per deletion with the path, the id and the time. It holds
 no token and no credential.
@@ -274,8 +277,10 @@ class Provisioner:
 
     def mutate(self, method: str, path: str, **options: Any) -> Any:
         """Send a mutation through the client's gate, bound to this provisioner's space: one whose target lies in any
-        other declared space is refused before it is sent, even under a shared prefix (O09)."""
-        return self._client.mutate(method, path, space=self._entry.space, **options)
+        other declared space is refused before it is sent, even under a shared prefix (O09). The gate's own reads, which
+        find the target's space, are tried again when they time out, under this provisioner's policy (O29); the mutation
+        is sent once."""
+        return self._client.mutate(method, path, space=self._entry.space, gate_retry=self._retry, **options)
 
     @property
     def retry(self) -> ReadRetry:
@@ -300,12 +305,13 @@ class Provisioner:
     def verify_space(self) -> str:
         """Read the space's live name and refuse one that differs from the configuration or lies outside the prefixes.
 
-        The name is Onezone's, read by the client (`space_name`, read again on every call). The client's own gate refuses every
-        mutation whose target space lies outside the prefixes; this adds that the space is the configured one.
+        The name is Onezone's, read by the client (`space_name`, read again on every call, and again when it timed out,
+        under this provisioner's policy: O29). The client's own gate refuses every mutation whose target space lies
+        outside the prefixes; this adds that the space is the configured one.
         """
         space = self._entry.space
         try:
-            name = self._client.space_name(space.id)
+            name = self._client.space_name(space.id, retry=self._retry)
         except OutOfScope:
             raise Refused(f"{self._where}the configured space is unknown to Onezone; nothing was changed") from None
         if not name.startswith(space.prefixes):
@@ -681,6 +687,7 @@ class Provisioner:
             deadline_s=deadline,
             timeout_s=self._settings.request_timeout_s,
             space=self._entry.space,
+            gate_retry=self._retry,
         )
         if dest is None:
             return read()
@@ -731,11 +738,16 @@ class Provisioner:
         return round(waited, 3)
 
     # -- block maps ------------------------------------------------------------
-    def blocks(self, file_id: str, provider: str, *, reader: str | None = None) -> list[Range]:
-        """Return the blocks a provider holds of a file, read from the block map as the `reader` provider sees it."""
-        answer = self._client.get(
-            f"/data/{_segment(file_id)}/distribution", provider=reader or provider, retry=ONE_ATTEMPT
-        )
+    def blocks(
+        self, file_id: str, provider: str, *, reader: str | None = None, retry: ReadRetry = ONE_ATTEMPT
+    ) -> list[Range]:
+        """Return the blocks a provider holds of a file, read from the block map as the `reader` provider sees it.
+
+        One attempt unless the caller names a policy: the probes record what the map shows and the polls that judge a
+        placement count a failed read as a poll that did not match, so a stall there stays the stall it is. A caller
+        whose failure would end its operation (the placement's read before it begins) passes the provisioner's
+        (`retry`), and a read that timed out is tried again (O29)."""
+        answer = self._client.get(f"/data/{_segment(file_id)}/distribution", provider=reader or provider, retry=retry)
         try:
             return provider_blocks(answer, self.provider_id(provider))
         except ValueError as error:
@@ -774,11 +786,13 @@ class Provisioner:
             length=length,
             timeout_s=self._settings.request_timeout_s,
             space=self._entry.space,
+            gate_retry=self._retry,
         )
 
-    def holds(self, provider: str, file_ids: Iterable[str]) -> int:
-        """Return how many bytes `provider` holds of these files together, by the block map."""
-        return sum(held_bytes(self.blocks(fid, provider)) for fid in file_ids)
+    def holds(self, provider: str, file_ids: Iterable[str], *, retry: ReadRetry = ONE_ATTEMPT) -> int:
+        """Return how many bytes `provider` holds of these files together, by the block map, each read as `blocks`
+        reads it under `retry`."""
+        return sum(held_bytes(self.blocks(fid, provider, retry=retry)) for fid in file_ids)
 
     def confirm_placed(self, provider: str, wanted: Mapping[str, list[Range]]) -> Confirmation:
         """Wait, within the bound, for the block map to show every wanted range on `provider` on consecutive polls."""
@@ -865,7 +879,7 @@ class Provisioner:
                 poll_s=self._settings.poll_s,
                 clock=self._clock,
                 sleep=self._sleep,
-                retry=ONE_ATTEMPT,
+                retry=self._retry,
             ),
             "replication",
         )
@@ -926,7 +940,7 @@ class Provisioner:
                     poll_s=self._settings.poll_s,
                     clock=self._clock,
                     sleep=self._sleep,
-                    retry=ONE_ATTEMPT,
+                    retry=self._retry,
                 ),
                 "eviction",
             )

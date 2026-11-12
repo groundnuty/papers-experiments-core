@@ -40,11 +40,12 @@ read and every check is made on each provider that supports the space, since eac
 name or id, or one that does not support the space) and the space's live name is verified (`verify_space`).
 
 **Reads that time out are tried again, boundedly and in the log** (O29, `readretry.py`): the reset's own reads (the
-walks' listings, the summaries, the transfer listings, records and waits, the occupancy and a space's root) go under the
-provisioner's policy, three attempts with pauses of 2 s and 5 s, and the record says how many were retried
-(`reads_retried`). A read inside a poll that counts a failed read as one that did not match (the requirements' removal
-check) is one attempt: the poll is the retry. Nothing but a read that timed out is tried again: an error answer, a
-connection error and every mutation stand as before.
+walks' listings, the summaries, the transfer listings, records and waits, the eviction stage's waits for its transfers,
+the occupancy, a space's root and the gate's reads before each cancel and removal) go under the provisioner's policy,
+three attempts with pauses of 2 s and 5 s, and the record says how many were retried (`reads_retried`). A read inside
+a poll that counts a failed read as one that did not match (the requirements' removal check) is one attempt: the poll is
+the retry. Nothing but a read that timed out is tried again: an error answer, a connection error and every mutation
+stand as before.
 
 **Fail closed.** A stage that cannot verify what it did, a read that fails, an answer in another shape, a bound
 reached, leaves the reset failed: `run` raises `ResetFailed` naming the stage, with the record of the stages so far

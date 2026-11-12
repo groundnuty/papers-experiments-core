@@ -56,7 +56,7 @@ def _remove_and_verify(ctx: Context, provider: str, entry_id: str) -> dict[str, 
     Any other outcome is `cleaned` False with a `cleanup_reason`. The absence is that provider's (#114).
     """
     try:
-        ctx.client.mutate("DELETE", f"/data/{entry_id}", provider=provider)
+        ctx.client.mutate("DELETE", f"/data/{entry_id}", provider=provider, gate_retry=ctx.plumbing_retry())
     except PlatformError as error:
         if not answered_absent(error):  # already gone is confirmed by the reads below
             return {"cleaned": False, "cleanup_reason": "the delete was refused or failed"}
@@ -104,6 +104,7 @@ def _attempt_write(ctx: Context, name: str, space_id: str, token: str) -> dict[s
             provider=name,
             params={"name": _scratch_name(), "type": "DIR"},
             token=token,
+            gate_retry=ctx.plumbing_retry(),
         )
         created = answer.get("fileId") if isinstance(answer, dict) else None
         row: dict[str, Any] = {"enforced": False, "sent": True, "status": "accepted"}

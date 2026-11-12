@@ -148,6 +148,13 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   provisioner's own) has every target checked against that space alone, its id, its name and its own prefixes.
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
+The gate's own reads, the ones that find a target's space, are plumbing: a caller that is the harness's own passes its
+policy (`gate_retry` of `mutate`, `read_range` and `read_content`; `retry` of `space_name`, `file_space_id` and
+`file_space_name`), and a read that timed out is tried again, boundedly and in the log (`readretry.py`, O29), while a
+caller that measures the platform leaves the default, one attempt. The request the gate guards is never retried. The
+gate stays closed: each attempt that is answered is read afresh and decides, and after the last timeout the mutation
+or the range read is refused as not sent (`ScopeUnread`).
+
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
 which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
 [L1] confirms: only the reset's QoS calls and its cancel, the truncation by a write of content without an offset, and
@@ -165,6 +172,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -256,6 +264,18 @@ DEFAULT_TIMEOUT_S = 15.0
 # of the pool. A write timeout, an error answer and every other transport failure are final.
 RETRIED_TIMEOUTS = (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout)
 ERROR_BODY_BYTES = 64 * 1024  # the most of a streamed answer's error body read to find Onedata's error id
+
+
+@dataclass(frozen=True)
+class _GateReads:
+    """How the gate's own reads are made: the policy for a read that timed out, and the `deadline_s` that bounds each
+    read's retries (`readretry.py`). Every internal call of the gate names it, so none can be made without a choice."""
+
+    retry: ReadRetry = ONE_ATTEMPT
+    deadline_s: float | None = None
+
+
+_ONE_ATTEMPT = _GateReads()  # the choice of whatever measures the platform, and the default of every caller
 
 
 _REQUEST_COUNT = re.compile(r"Request Count: (\d+)$")  # the end of httpcore's `ConnectionInterface.info()`
@@ -615,7 +635,7 @@ class OnezoneClient:
     ) -> tuple[Any, str | None]:
         """GET as `get` does with the admin credential, and return with the decoded answer its `Date` header as sent,
         or None when it has none. The transfer log estimates a provider's clock offset from it (`transferlog.py`)."""
-        response = self._request("GET", path, provider=provider, headers=self._admin, params=params)
+        response = self._request("GET", path, provider=provider, headers=self._admin, params=params, retry=ONE_ATTEMPT)
         return self._decoded(response, "GET", provider), response.headers.get("date")
 
     def get(
@@ -657,16 +677,28 @@ class OnezoneClient:
         headers = self._admin if READING_POSTS[path] else {}
         return self._send("POST", path, provider=None, headers=headers, json=dict(body))
 
-    def space_name(self, space_id: str) -> str:
+    def space_name(self, space_id: str, *, retry: ReadRetry = ONE_ATTEMPT, deadline_s: float | None = None) -> str:
         """Read the name Onezone gives a space now; the answer is never kept, so none can authorise a later request.
 
         A space Onezone does not know, or an answer without a name, raises OutOfScope; any other failure of the read
-        raises PlatformError. Neither message holds the id or a name.
+        raises PlatformError. Neither message holds the id or a name. A read that timed out is tried again under
+        `retry`, within `deadline_s` (`readretry.py`), and what decides is the answer of the attempt that was answered.
         """
+        return self._space_name(space_id, _GateReads(retry, deadline_s))
+
+    def _space_name(self, space_id: str, reads: _GateReads) -> str:
+        """`space_name`, its reads made as `reads` says."""
         if not isinstance(space_id, str) or not _SPACE_ID.fullmatch(space_id):
             raise OutOfScope("the target space id is not a plain id, so it resolves to no space")
         try:
-            answer = self._send("GET", f"/spaces/{space_id}", provider=None, headers=self._admin)
+            answer = self._send(
+                "GET",
+                f"/spaces/{space_id}",
+                provider=None,
+                headers=self._admin,
+                retry=reads.retry,
+                deadline_s=reads.deadline_s,
+            )
         except PlatformError as error:
             if error.status == 404:
                 raise OutOfScope("the target space is unknown to Onezone, so it resolves to no space") from None
@@ -676,7 +708,7 @@ class OnezoneClient:
             raise OutOfScope("Onezone's answer for the target space holds no name, so it resolves to no space")
         return name
 
-    def _space_roots(self, provider: str) -> dict[str, str]:
+    def _space_roots(self, provider: str, reads: _GateReads) -> dict[str, str]:
         """Return root file id -> space id for the spaces the configuration knows, their roots as `provider` gives them.
 
         The provider is asked for each declared space whose support set names it (`[[spaces]]`, or the one `[space]`
@@ -693,21 +725,28 @@ class OnezoneClient:
         declared = self._config.spaces
         supported = [entry for entry in declared if provider in entry.support.providers] or declared
         for space_id in dict.fromkeys(entry.space.id for entry in supported):
-            root = self._space_root(provider, space_id)
+            root = self._space_root(provider, space_id, reads)
             if root is not None:
                 roots[root] = space_id
         if not roots:
             raise OutOfScope("the configured space is unknown to that provider, so the target resolves to no space")
         return roots
 
-    def _space_root(self, provider: str, space_id: str) -> str | None:
+    def _space_root(self, provider: str, space_id: str, reads: _GateReads) -> str | None:
         """Return one declared space's root file id on a provider, kept once answered; None when it answers absent."""
         with self._walk_lock:
             root = self._roots.get((provider, space_id))
         if root is not None:
             return root
         try:
-            answer = self._send("GET", f"/spaces/{space_id}", provider=provider, headers=self._admin)
+            answer = self._send(
+                "GET",
+                f"/spaces/{space_id}",
+                provider=provider,
+                headers=self._admin,
+                retry=reads.retry,
+                deadline_s=reads.deadline_s,
+            )
         except PlatformError as error:
             if answered_absent(error):
                 return None
@@ -742,7 +781,7 @@ class OnezoneClient:
             for node in nodes:
                 self._parents.pop((provider, node), None)
 
-    def _parent_of(self, node: str, provider: str, read: dict[str, str]) -> str | None:
+    def _parent_of(self, node: str, provider: str, read: dict[str, str], reads: _GateReads) -> str | None:
         """Return a file's parent id, from what this walk read or a read now; None at the top of a tree.
 
         The read is `GET /data/{id}?attribute=parent_id` with the admin credential. An absence (`answered_absent`) is
@@ -753,7 +792,13 @@ class OnezoneClient:
             return read[node]
         try:
             answer = self._send(
-                "GET", f"/data/{node}", provider=provider, headers=self._admin, params={"attribute": "parent_id"}
+                "GET",
+                f"/data/{node}",
+                provider=provider,
+                headers=self._admin,
+                params={"attribute": "parent_id"},
+                retry=reads.retry,
+                deadline_s=reads.deadline_s,
             )
         except PlatformError as error:
             if answered_absent(error):
@@ -769,21 +814,28 @@ class OnezoneClient:
             read[node] = parent
         return parent
 
-    def file_space_id(self, file_id: str, provider: str) -> str:
+    def file_space_id(
+        self, file_id: str, provider: str, *, retry: ReadRetry = ONE_ATTEMPT, deadline_s: float | None = None
+    ) -> str:
         """Return the id of the configured space a file lies in, found by walking its parent links up to its root.
 
         See "The space of a file" in this module's docstring. A file id that is not plain, a file or directory on the
         way that the provider does not know, a walk that ends above every known root, and one longer than
         `MAX_SPACE_DEPTH` raise OutOfScope; a read that fails or is answered with something unreadable raises
-        PlatformError. No message holds an id, a path or a name.
+        PlatformError. No message holds an id, a path or a name. A read of the walk that timed out is tried again under
+        `retry`, within `deadline_s` (`readretry.py`).
         """
+        return self._file_space_id(file_id, provider, _GateReads(retry, deadline_s))
+
+    def _file_space_id(self, file_id: str, provider: str, reads: _GateReads) -> str:
+        """`file_space_id`, its reads made as `reads` says."""
         if not isinstance(file_id, str) or not _FILE_ID.fullmatch(file_id):
             raise OutOfScope("the target file id is not a plain id, so it resolves to no space")
-        roots = self._space_roots(provider)
-        found = self._walk(file_id, provider, roots, use_kept=True)
+        roots = self._space_roots(provider, reads)
+        found = self._walk(file_id, provider, roots, reads, use_kept=True)
         if isinstance(found, list) and found:  # past the bound over links kept from earlier walks, which may be stale:
             self._forget(provider, found)  # a directory moved up since keeps its old ancestry; walk once more, fresh
-            found = self._walk(file_id, provider, roots, use_kept=False)
+            found = self._walk(file_id, provider, roots, reads, use_kept=False)
         if isinstance(found, list):
             raise OutOfScope(
                 f"the target file lies more than {MAX_SPACE_DEPTH} directories below a known space's root, or its "
@@ -791,7 +843,9 @@ class OnezoneClient:
             )
         return found
 
-    def _walk(self, file_id: str, provider: str, roots: Mapping[str, str], *, use_kept: bool) -> str | list[str]:
+    def _walk(
+        self, file_id: str, provider: str, roots: Mapping[str, str], reads: _GateReads, *, use_kept: bool
+    ) -> str | list[str]:
         """Follow a file's parent links up to a known root and return its space's id, keeping the links it read.
 
         Past `MAX_SPACE_DEPTH` links it returns the files of the chain whose kept links it used, so the caller can drop
@@ -810,7 +864,7 @@ class OnezoneClient:
             if parent is not None:
                 used.append(node)
             else:
-                parent = self._parent_of(node, provider, read)
+                parent = self._parent_of(node, provider, read, reads)
             if parent is None:
                 raise OutOfScope(
                     "the target file lies in no space this configuration knows, so it resolves to no space"
@@ -818,12 +872,16 @@ class OnezoneClient:
             node = parent
         return used
 
-    def file_space_name(self, file_id: str, provider: str) -> str:
+    def file_space_name(
+        self, file_id: str, provider: str, *, retry: ReadRetry = ONE_ATTEMPT, deadline_s: float | None = None
+    ) -> str:
         """Return the name Onezone gives, now, the space a file lies in: its space's id (`file_space_id`), then that
-        space's name, read afresh (`space_name`), so a space renamed since an earlier call changes the answer (O09)."""
-        return self.space_name(self.file_space_id(file_id, provider))
+        space's name, read afresh (`space_name`), so a space renamed since an earlier call changes the answer (O09).
+        A read that timed out is tried again under `retry`, within `deadline_s` for each."""
+        reads = _GateReads(retry, deadline_s)
+        return self._space_name(self._file_space_id(file_id, provider, reads), reads)
 
-    def _record_space(self, kind: str, record_id: str, provider: str | None) -> tuple[str, str]:
+    def _record_space(self, kind: str, record_id: str, provider: str | None, reads: _GateReads) -> tuple[str, str]:
         """Return the id and the name of the space a transfer or a QoS requirement acts in, read now from its record
         through the provider the request goes to: a transfer's `spaceId`, named by Onezone, or the space of a
         requirement's `fileId`, found by its parent links (`file_space_id`). The record is never kept. A record the
@@ -835,7 +893,14 @@ class OnezoneClient:
                 "the mutation names a record but no provider, so it resolves to no space; nothing was sent"
             )
         try:
-            record = self._send("GET", f"/{kind}/{record_id}", provider=provider, headers=self._admin)
+            record = self._send(
+                "GET",
+                f"/{kind}/{record_id}",
+                provider=provider,
+                headers=self._admin,
+                retry=reads.retry,
+                deadline_s=reads.deadline_s,
+            )
         except PlatformError as error:
             if answered_absent(error):
                 raise OutOfScope("the target record is unknown to its provider, so it resolves to no space") from None
@@ -844,30 +909,32 @@ class OnezoneClient:
         value = record.get(key) if isinstance(record, dict) else None
         if not isinstance(value, str) or not value:
             raise OutOfScope(f"the target record holds no {key}, so it resolves to no space; nothing was sent")
-        space_id = value if kind == "transfers" else self.file_space_id(value, provider)
-        return space_id, self.space_name(space_id)
+        space_id = value if kind == "transfers" else self._file_space_id(value, provider, reads)
+        return space_id, self._space_name(space_id, reads)
 
-    def _target(self, method: str, path: str, provider: str | None, body: Any) -> tuple[str, str]:
+    def _target(self, method: str, path: str, provider: str | None, body: Any, reads: _GateReads) -> tuple[str, str]:
         """Return the id and the name of the space a request acts on: the space in its path, the space of the file it
         names (`file_space_id`), or the space its transfer's or QoS requirement's record names (`_record_space`).
 
         A read made for it that fails is refused as not sent (ScopeUnread), keeping that read's status, error id and
-        transport flag; a target that resolves to no space stays OutOfScope."""
+        transport flag; a target that resolves to no space stays OutOfScope. A read that timed out is tried again as
+        `reads` says, the gate's reads alone, and each attempt that is answered is the answer that decides: nothing an
+        earlier attempt or call saw is reused, and after the last timeout the target is unread and nothing is sent."""
         parts = _plain(path)
         try:
             if len(parts) >= 3 and parts[1] == "spaces":
                 space_id = _target_space_id(path)
-                return space_id, self.space_name(space_id)
+                return space_id, self._space_name(space_id, reads)
             record = _record_target(method, path)
             if record is not None:
-                return self._record_space(*record, provider)
+                return self._record_space(*record, provider, reads)
             file_id = _file_target(method, path, body)
             if file_id is None or provider is None:
                 raise OutOfScope(
                     "the mutation names no space and no file, so it resolves to no space; nothing was sent"
                 )
-            space_id = self.file_space_id(file_id, provider)
-            return space_id, self.space_name(space_id)
+            space_id = self._file_space_id(file_id, provider, reads)
+            return space_id, self._space_name(space_id, reads)
         except NotSent:
             raise
         except PlatformError as error:
@@ -902,6 +969,7 @@ class OnezoneClient:
         token: str | None = None,
         space: Space | None = None,
         content_type: str | None = None,
+        gate_retry: ReadRetry = ONE_ATTEMPT,
     ) -> Any:
         """Send a request that can change state; refuse it, before it is sent, unless it acts on a study space.
 
@@ -916,13 +984,18 @@ class OnezoneClient:
         (`content`) is sent as `content_type`, a plain `type/subtype`, or as `UPLOAD_CONTENT_TYPE` when none is named,
         since Onedata 25.0 requires one of a content write ([L1]: 415 without it). With `space` (a provisioner's, or its
         reset's, own space) the target must be that space alone: its id, its name, and its own prefixes.
+
+        `gate_retry` is the policy of the gate's own reads, the ones that find the target's space, and of those alone:
+        a read that timed out is tried again under it (`readretry.py`), each attempt answered is read afresh, and after
+        the last timeout the target is unread and nothing is sent (`ScopeUnread`). The request itself is sent once,
+        whatever the policy, and a caller that measures the platform leaves the default, one attempt.
         """
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
         media = UPLOAD_CONTENT_TYPE if content_type is None else media_type(content_type)
         self._base(provider)  # an undeclared provider is refused before anything is read
-        self._require_in_scope(self._target(method, path, provider, json), space)
+        self._require_in_scope(self._target(method, path, provider, json, _GateReads(gate_retry)), space)
         headers = {AUTH_HEADER: token} if token is not None else dict(self._admin)
         if content is not None:
             headers["Content-Type"] = media
@@ -946,6 +1019,7 @@ class OnezoneClient:
         length: int,
         timeout_s: float | None = None,
         space: Space | None = None,
+        gate_retry: ReadRetry = ONE_ATTEMPT,
     ) -> bytes:
         """Read `length` bytes from `offset` of a file's content through a declared provider; return the bytes.
 
@@ -955,6 +1029,9 @@ class OnezoneClient:
         or nothing is sent; with `space`, that space alone, as for `mutate`. The answer must be a 206 whose
         `Content-Range` starts at `offset` and matches the body, and the body must be `length` bytes unless the range
         ends at the end of the file; anything else is refused. [S8]
+
+        `gate_retry` is the policy of the gate's reads alone, as for `mutate`; the range read itself is one request,
+        since it may have made the provider fetch bytes.
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
@@ -963,9 +1040,11 @@ class OnezoneClient:
             raise OutOfScope("a range read needs a non-negative offset and a positive length")
         path = _check_path(path)
         self._base(provider)
-        self._require_in_scope(self._target("GET", path, provider, None), space)
+        self._require_in_scope(self._target("GET", path, provider, None, _GateReads(gate_retry)), space)
         headers = {**self._admin, "Range": f"bytes={offset}-{offset + length - 1}"}
-        response = self._request("GET", path, provider=provider, headers=headers, timeout_s=timeout_s)
+        response = self._request(
+            "GET", path, provider=provider, headers=headers, timeout_s=timeout_s, retry=ONE_ATTEMPT
+        )
         label = self._base(provider)[1]
         found = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
         if response.status_code != 206 or found is None:
@@ -993,6 +1072,7 @@ class OnezoneClient:
         timeout_s: float | None = None,
         clock: Callable[[], float] = time.monotonic,
         space: Space | None = None,
+        gate_retry: ReadRetry = ONE_ATTEMPT,
     ) -> Digest:
         """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
         size and the SHA-256 of what was read (O25).
@@ -1009,6 +1089,9 @@ class OnezoneClient:
         ends within twice the deadline whatever the platform does. A refusal raises PlatformError (OutOfScope before
         anything is sent); what `sink` received by then is not the file. A file of no bytes needs no range, and its
         space is still checked, so a read of a file outside the study never succeeds.
+
+        `gate_retry` is the policy of the gate's reads alone, as for `mutate`, and the retries of each stay within what
+        remains of the deadline when the range's gate began; a range is streamed once, whatever the policy.
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
@@ -1028,9 +1111,11 @@ class OnezoneClient:
                 raise PlatformError(late)
 
         if size == 0:
-            self._require_in_scope(self._target("GET", path, provider, None), space)
+            gate = _GateReads(gate_retry, deadline_s - (clock() - began))
+            self._require_in_scope(self._target("GET", path, provider, None, gate), space)
         for first in range(0, size, chunk_bytes):
-            self._require_in_scope(self._target("GET", path, provider, None), space)
+            gate = _GateReads(gate_retry, deadline_s - (clock() - began))
+            self._require_in_scope(self._target("GET", path, provider, None, gate), space)
             remaining = deadline_s - (clock() - began)
             if remaining <= 0:
                 raise PlatformError(late)
@@ -1086,7 +1171,7 @@ class OnezoneClient:
             raise OutOfScope("a content read is of /data/{id}/content only")
         path = _check_path(path)
         base, label = self._base(provider)
-        self._require_in_scope(self._target("GET", path, provider, None), None)
+        self._require_in_scope(self._target("GET", path, provider, None, _ONE_ATTEMPT), None)
         headers = {**self._admin, **({"Range": "bytes=0-0"} if first_byte else {})}
         try:
             with self._http.stream(
