@@ -179,6 +179,9 @@ Not fields of the report:
 
 - All five services of the federation healthy; the target's container started again at 17:59:14 UTC, through the
   injector; every provider answered REST.
+- A CPU-only test run of another project on the same host, meant to pause during this step, started at 17:59:24 UTC:
+  10 s after the target's container was started, before the injector found it serving. The time to ready, the
+  re-reads and the scratch's removal overlapped it; every read and tool call during the outage came before it.
 - The fault journal's last entry for the injection is `cleared`, `restored`; no injection open.
 - The sandbox's own teardown record: the mount unmounted on the first attempt, no reader left and no process in
   uninterruptible sleep, the sidecar and the agent removed, 1.4 s in all. By then the blocked mount read had ended.
