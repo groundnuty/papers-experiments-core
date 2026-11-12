@@ -12,10 +12,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
+from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, answered_absent
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.streamed import OCTET_STREAM, Digest
-from expcore_onedata.testing import DATA, PROVIDER, SETTINGS
+from expcore_onedata.testing import BETA_ID, DATA, PROVIDER, SETTINGS
 from expcore_onedata.testing.fake_federation import ZONE
 
 CHUNK = SETTINGS["chunk_bytes"]
@@ -292,6 +292,29 @@ def test_o25_a_read_of_a_file_outside_the_prefixes_sends_no_range(provisioner, s
         with pytest.raises(OutOfScope, match="configured prefixes"):
             client.read_content(f"/data/{target}/content", provider="alpha", size=size, chunk_bytes=CHUNK, deadline_s=5)
     assert [r for r in seeded.requests if r.range] == []
+
+
+def test_o25_a_read_through_another_provider_waits_until_it_sees_the_file(provisioner, seeded, ticker):
+    """O25 with O07: a provider other than the data provider sees a file some seconds after it was written, answering
+    400 `posix` `enoent` meanwhile. `read_file` through it waits, bounded, until it reports the file at its size, as
+    every provisioning read does, and then reads the whole file."""
+    file_id = seeded.id_of(SEEDED)
+    seeded.unseen[(BETA_ID, file_id)] = 3
+    assert provisioner.read_file(file_id, provider="beta") == digest(DATA)
+    assert seeded.unseen[(BETA_ID, file_id)] == 0
+    assert len(ticker.slept) >= 3
+
+
+def test_o25_a_streamed_read_of_a_deleted_file_keeps_the_errno_so_it_reads_as_absent(provisioner, client, tmp_path):
+    """O25: a range of a file deleted after its size was read is answered as Onedata 25.0 answers a deleted entry, 400
+    `posix` `enoent`. The streamed read's error keeps the error id and the errno, as every other answer's does, so
+    `answered_absent` tells it from another failure."""
+    uploaded = provisioner.upload(TARGET, local_file(tmp_path, DATA))
+    client.mutate("DELETE", f"/data/{uploaded.file_id}", provider="alpha")
+    with pytest.raises(PlatformError) as gone:
+        provisioner.read_file(uploaded.file_id, size=len(DATA))
+    assert (gone.value.status, gone.value.code, gone.value.errno) == (400, "posix", "enoent")
+    assert answered_absent(gone.value)
 
 
 def test_o25_a_read_that_fails_part_way_leaves_no_file_at_its_destination(config, placement, seeded, tmp_path, ticker):
