@@ -777,6 +777,74 @@ else:
 
 [`interfaces.md`](interfaces.md#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check) says when each runs, what it may do and how a failure is classified.
 
+### Data that arrives during a run
+
+To test whether an agent notices that its data are incomplete before it computes, a condition can make part of a dataset arrive while the agent works, as if its owner were still ingesting it. The Onedata layer's `ProgressiveIngest` (from `expcore_onedata.ingest`, namespace `progressive_ingest`) is the instrument that does it. Declare the plan in a TOML file of your own, one per condition, and load it with `load_ingest_plan(path, config)` from `expcore_onedata.ingestplan`. The plan names a staging directory of sources you keep and, for each file, a label (how the record names it, never by its path), its path in the space, its source, when it arrives (`at_s`, seconds after the instrument's start), whether it is written whole or in `parts` over `over_s` seconds, and its `baseline`. Use `"complete"` for a file your other conditions read: it is removed before the run and written back from its staged source after. Use `"absent"` for new data: it is removed again after the run. Put `ingestplan.fingerprint({condition: plan})` into the platform half of the campaign fingerprint, so a resume after the schedule or a staged source changed is refused.
+
+Give the instrument a provisioner of its own, whose change log is the ingest's and never goes to a teardown, and a journal file that lasts across runs. Start it with your other instruments and finish it with them, and once the record is written call `raise_if_failed()`. A part that could not be written or confirmed, or a baseline that could not be restored, raises `InfraError("ingest_failure")`, a kind no condition may declare, so the attempt is set aside. A file that has not arrived when the run ends is the manipulation, never a failure. A start that cannot set the start state raises the same kind before the agent runs. The snapshot gives each part's planned, written and confirmed times on the loop's clock (`steps`) and every file id the ingest removed, created or restored, with the old and new id (`ids`), so a scorer can compare the agent's reads with the arrivals from the record alone, and you can map a data gate's errors to files after the run. Until the core admits such conditions exclusively (#27), keep the runs that use an ingest apart from any other run on the same owner's space.
+
+The block runs a plan of one file in two parts against the fakes. The run ends after the first part, so the day is half there, and the finish writes it back whole from the staged copy.
+
+```python
+import time
+
+from expcore_onedata.ingest import ProgressiveIngest
+from expcore_onedata.ingestplan import load_ingest_plan
+from expcore_onedata.testing import ALPHA_ID, with_placement, write_platform
+
+DAY = b"13,ok\n" * 100
+ticker = Ticker()
+fake = make_federation(clock=ticker.clock)
+fake.add_provider(BETA_ID, "beta.test")  # beta supports the space too, so each arrival is confirmed there
+fake.add_file("records/day-12.csv", b"12,ok\n" * 100)
+fake.add_file("records/day-13.csv", DAY)
+
+
+def both_providers(document):
+    with_placement(document)
+    document["support"]["providers"] = ["alpha", "beta"]
+
+
+workdir = Path(tempfile.mkdtemp())
+os.environ[ADMIN_ENV] = fake.admin_token
+platform = write_platform(workdir, both_providers)
+config = load_platform(platform)
+client = OnezoneClient(config, http=fake.client_http())
+own = Provisioner(  # the ingest's own provisioner and change log
+    client,
+    config,
+    load_placement(platform, config).settings,
+    provider_ids=resolve_provider_ids(config),
+    log=workdir / "ingest-changes.jsonl",
+    clock=ticker.clock,
+    sleep=ticker.sleep,
+)
+(workdir / "staged").mkdir()
+(workdir / "staged" / "day-13.csv").write_bytes(DAY)  # the copy the study keeps
+(workdir / "ingest.toml").write_text(
+    '[ingest]\nstaging = "staged"\n\n[[ingest.files]]\nlabel = "day-13"\npath = "records/day-13.csv"\n'
+    'source = "day-13.csv"\nat_s = 60\nbaseline = "complete"\nparts = 2\nover_s = 60\n',
+    encoding="utf-8",
+)
+plan = load_ingest_plan(workdir / "ingest.toml", config)
+ingest = ProgressiveIngest(own, plan, journal=workdir / "ingest-journal.jsonl", max_wait_s=0.001)
+
+ingest.start({})  # the day is removed: the agent starts without it
+assert not fake.exists("records/day-13.csv")
+ticker.sleep(60)  # a Ticker moves only when told; on the real clock the schedule runs by itself
+while ingest.progress < 1:
+    time.sleep(0.001)
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 300]]  # half of the day has arrived
+snapshot = ingest.finish()  # the run ended before the second half
+ingest.raise_if_failed()
+assert [s["step"] for s in snapshot["steps"] if s["step"] != "planned"] == ["written", "confirmed", "not_due"]
+assert [e["event"] for e in snapshot["ids"]] == ["restored", "removed", "created", "restored"]
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, len(DAY)]]  # whole again, from the staged copy
+
+del os.environ[ADMIN_ENV]
+shutil.rmtree(workdir)
+```
+
 ## 6. What a conclusion may say
 
 Every contrast ends in one of five words, `difference`, `trivial_difference`, `equivalent`, `not_detected` or `untestable`, and never in "no difference". Only `equivalent` may be read as no difference, and only a contrast with an `equivalence_margin` in the preregistration can reach it: the interval at 1 - 2 alpha lies inside plus or minus the margin and the test is not significant. `not_detected` is the absence of evidence, never evidence of absence; without a margin, it is the most a non-significant result can say. Both contrast tables of the report show the margin and the interval at 1 - 2 alpha beside the conclusion, so a reader can check `equivalent` and `trivial_difference` without `analysis.json`.
