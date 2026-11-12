@@ -5,7 +5,7 @@ import pytest
 from campaign_support import make_manifest, make_schema, treatment_schema
 from loop_support import FakeProvider
 from record_support import CODE, make_config
-from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, key_of
+from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, key_of, settings_for
 
 from expcore.campaign.executor import record_run
 from expcore.campaign.healthgate import Health
@@ -188,3 +188,54 @@ def test_c31_an_instrument_that_raises_a_kind_a_condition_could_declare_is_a_har
         first = attempt_rows(scheduler.store, key)[0]
         assert first["state"] == "harness_error"
         assert "InstrumentRefusalError" in first["detail"]
+
+
+class ClosesTheGateOnce:
+    """Healthy, except the one check made after the run the executor armed it in, when another run has found an outage
+    and the gate is closed: the check fails with the gate closed, so the finished attempt overlapped an outage."""
+
+    armed = False
+    scheduler = None
+
+    def __call__(self):
+        if not self.armed:
+            return Health(True, "fine")
+        self.armed = False
+        self.scheduler.gate._close("another-run", "platform unreachable")
+        return Health(False, "platform unreachable")
+
+
+def test_c31_a_refused_treatment_attempt_is_not_scored_when_the_health_gate_reports_an_outage_too(tmp_path):
+    """C31 and C01: a treatment attempt is scored whatever an outage flag says, because the treatment rule comes first.
+    When the instrument refuses it, the attempt is no longer scored whether or not an outage overlapped it: it is
+    rewritten to the refusal's kind, which is never treatment, so it is discarded as the outage's, not charged, and
+    run again. The store and the record agree that it is set aside, and the run's final attempt is the rerun's."""
+    probe = make_schema()
+    first = make_manifest(probe, **SMALL).rows[0]
+    schema = treatment_schema(("knowledge",), condition=probe.condition_of(first.key))
+    key = first.key.text  # the run the scheduler dispatches first, whose post-run check the executor arms
+    check, records = ClosesTheGateOnce(), []
+    script = [[("look", {})], InfraError("knowledge", "the tool server went down")]
+    behave = run_with(refusing("the outage was not the planned one"), script, records)
+
+    async def refuse_then_arm_the_health_check(request):
+        record = await behave(request)
+        check.armed = True
+        return record
+
+    executor = FakeExecutor({key: [refuse_then_arm_the_health_check, ("infra_after_turn", "knowledge")]})
+    settings = settings_for(recheck_s=0.01, health_timeout_s=5)
+    with build(tmp_path, schema=schema, executor=executor, plan=SMALL, health=check, settings=settings) as scheduler:
+        check.scheduler = scheduler
+        assert scheduler.run().statuses == {"done": 3}
+        store = scheduler.store
+        columns = "state, charged, treatment, infra_kind, outage_kind, detail"
+        first_try, second = store.q(f"SELECT {columns} FROM attempts WHERE run_key=? ORDER BY id", (key,))
+        assert records[0].outcome["treatment"] is True  # what the loop saw
+        assert records[0].set_aside is True  # and the record says the attempt was refused
+        assert (first_try["state"], first_try["charged"], first_try["treatment"]) == ("outage_discarded", 0, 0)
+        assert (first_try["infra_kind"], first_try["outage_kind"]) == (REFUSED, "sandbox")
+        assert "manipulation" in first_try["detail"]
+        assert (second["state"], second["treatment"], second["infra_kind"]) == ("done", 1, "knowledge")
+        assert executor.calls_of(key) == 2
+        assert "instrument_refused" in event_kinds(store)

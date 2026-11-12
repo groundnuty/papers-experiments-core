@@ -313,19 +313,25 @@ class AttemptRunner:
         """Apply the refusal an instrument's post-run check put in the record (C31): the third way a finished attempt is
         set aside here, after the health check, which decides first, and before the endpoint's identity.
 
-        An attempt that was scored, a cap or an answer, or a fault the condition declares as its treatment, becomes
-        infrastructure of the instrument's kind, a kind no condition can have as its treatment, so it is charged and run
-        again like any infrastructure failure. The record keeps what the loop saw; the result is what the store decides
-        on, so it no longer claims the treatment the record flagged. An attempt already set aside, by the health check,
-        an outage or its own infrastructure or defect, keeps its outcome and the refusal is noted.
+        The refusal applies to an attempt the store would score, which is what `classify` says: a cap or an answer, or
+        a fault the condition declares as its treatment, whether or not an outage flag is on it (the treatment rule is
+        checked first, C01). Such an attempt becomes infrastructure of the instrument's kind, a kind no condition can
+        have as its treatment, so it is never scored: it is run again like any infrastructure failure. The record keeps
+        what the loop saw; the result is what the store decides on, so it no longer claims the treatment the record
+        flagged. A result that still carries an `outage_kind` is then classified as an attempt an outage overlapped,
+        `outage_discarded` and not charged, as the health check's outcome would be; any other is `infra_fail` and
+        charged. Either way it is not scored and its run is tried again.
+
+        An attempt the store would not score, one set aside by the health check, an outage, or its own infrastructure
+        failure or defect, keeps its outcome and the refusal is noted.
         """
         p, refusal = self.p, record.instrument_refusal
         if refusal is None:
             return result
         who = f"instrument {refusal['namespace']!r} refused the attempt"
         text = f"{key}: {who}: {refusal['infra_kind']}: {refusal['detail']}"
-        scored = classify(result, result.treatment_kinds).treatment
-        if result.outage_kind is not None or (result.outcome.set_aside and not scored):
+        scored = classify(result, result.treatment_kinds).state == "done"
+        if not scored and (result.outage_kind is not None or result.outcome.set_aside):
             p.store.event(p.stamp(), "instrument_refused", model, f"{text}; the outcome stands")
             return result
         p.store.event(p.stamp(), "instrument_refused", model, text)
