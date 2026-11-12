@@ -153,7 +153,7 @@ Two planes per run, each with its own principal and its own token, never shared.
 |---|---|---|
 | Principal | the run's leased platform user (C19), who mints its own token with its own credential | a separate leased platform user per run, distinct from the data-path user, who likewise mints its own token |
 | Platform privileges | exactly view and read on the study's space, read back direct and effective, refused otherwise | exactly the privileges the condition declares: view and read, plus named write rights such as QoS management or replication scheduling |
-| Token caveats | exactly four: an expiry, read-only, path-scoped to the space, and one interface | the same, but read-only only when the condition declares no write right, so three without it |
+| Token caveats | exactly four: an expiry, read-only, path-scoped to the space, and one interface | the same when the condition declares no write right; with one, only the expiry and the `rest` interface, since on Onedata 25.0 any data-access caveat limits a token to data access (#177), so its reach is its principal's rights |
 | Examination before use | fail-closed: refused unless the caveats are exactly the data-path set (ICSA `tokencheck.py:40-60`) | fail-closed: refused unless the caveats and the principal's effective privileges equal the condition's declared set, no more and no less |
 | Further enforcement | data gate allows only read calls; read-only mount and root filesystem | server-side tool allow-list per condition; frozen manifest |
 
