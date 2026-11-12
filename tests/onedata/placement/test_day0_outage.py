@@ -916,6 +916,23 @@ def test_o28_the_agents_tokens_are_minted_for_the_scenarios_worst_case(
     assert entry.facts["agent"]["tokens"]["ceiling_s"] == seen[0]
 
 
+def test_o28_a_platform_that_grants_no_token_as_long_as_the_scenario_needs_runs_no_sandbox(
+    tmp_path, fake, relay, tools_manifest, context, services
+):
+    """O28: a platform whose `[tokens]` limit is below the lifetime the scenario needs refuses the mint, so no sandbox
+    and no tool server start: the check is unknown with that reason, never run on tokens that may end midway."""
+
+    def short_tokens(data):
+        data.setdefault("tokens", {})["max_ttl_s"] = 3600
+
+    target = write_target(tmp_path / "short", fake, relay, tools_manifest, short_tokens)
+    entry = outage_check(context, target=target)
+    assert entry.ok is None
+    assert entry.facts["agent"]["sandbox"]["reason"].startswith("the sandbox did not start")
+    assert entry.facts["mount"]["measured"] is False
+    assert entry.facts["knowledge"]["measured"] is False
+
+
 def test_o28_tokens_that_ended_before_a_reread_are_the_checks_own_failure_never_the_providers(
     context, services, ticker
 ):

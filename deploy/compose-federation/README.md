@@ -266,7 +266,7 @@ nothing is filled in.
 | `list_space_providers` | `during.knowledge.list_space_providers` | The same, and which of the three providers the answer names. |
 | `schedule_file_replication`, to local | `during.knowledge.schedule_file_replication` | Whether the job is accepted for a file with a replica and for one without, or the digest and error terms of the tool's wording when it is not. |
 | `get_transfer` | the same, under `get_transfer` | The states the job goes through and when, whether it ends within the bound, and the number of calls; each call classified by its own timing. |
-| 3. The restore | `restore`, `after` | The injection cleared and the restore verified (`how` in the injector's words, the new identity's digest), the seconds until the target answers REST, the reads of step 2 again through REST and the mount, which must return what was written; the transfers scheduled during the outage; the scratch gone (`cleanup_verified`). |
+| 3. The restore | `restore`, `after` | The injection cleared and the restore verified (`how` in the injector's words, the new identity's digest, `ready_after_s` until the injector found it serving), the seconds until the target answers REST, the reads of step 2 again through REST and the mount, which must return what was written; the transfers scheduled during the outage; the scratch gone (`cleanup_verified`). |
 
 The result feeds a study's choice between a design that relies on the platform failing over transparently and one
 that keeps a replica elsewhere, and its read-timeout setting. Not measured by this check: a provider other than the

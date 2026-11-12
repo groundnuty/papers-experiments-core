@@ -7,8 +7,9 @@ target, the re-reads, the transfers' reading and the tool plane's check at its s
 re-read through the mount would fail it, and the failure would be blamed on the provider. So unless the caller names a
 ceiling (`Context.outage_ceiling_s`), the tokens are minted for `scenario_s`: the longest all of that can take with
 every bound of the check and of `[faults]` spent, plus `MARGIN_S` for the steps that have no bound here (starting the
-sandbox and the tool server, their stop). A platform whose `[tokens]` limit is below it refuses the mint, and the check
-is then unknown with the tool server's reason, never run on tokens that may end midway.
+sandbox and the tool server, their stop). A platform whose `[tokens]` limit is below it refuses the mint (the
+sandbox's data-path token is minted first, as the sandbox starts), and the check is then unknown with the sandbox's
+reason, never run on tokens that may end midway.
 
 Each bound below is the longest its step may take in `outage_run`, `outage_tools` and `outage_mount`; the injector's
 start and its clear are each bounded as `FaultInjector.cancel_wait_s` bounds a start (every settling round's settle
