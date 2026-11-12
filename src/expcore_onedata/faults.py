@@ -56,7 +56,16 @@ does not start the service or read its identity at once, because a `start` of a 
 and the old identity then read is the container on its way down, not one that never went down. It waits, for at most
 `settle_timeout_s`, for the service to show not running, and only then starts it and judges the restore by the changed
 identity. A service not seen down within that bound leaves the restore `stop_unsettled`: unverified, the injection
-open and pending, never cleared. `settle_timeout_s` must therefore exceed the providers' `stop_grace_period` with a
+open and pending, never cleared. A process killed while the stop command blocks cannot journal `stop_unknown`, so the
+journal says it before the stop instead: a `stopping` line, written durably right before the command (a journal that
+fails there stops the start before anything is taken down). Recovery treats an open injection that was never seen down
+as of unknown outcome, `stop_unknown` for one that has the `stopping` line or the `stop_unknown` line, and
+`stop_unrecorded` for one that has neither (killed before the command, or journalled before the `stopping` line
+existed): it waits,
+for at most `settle_timeout_s`, for the service to show not running or running with a changed identity, and then
+restores it and requires it to serve, as for any restore. Only a service that every reading of the whole bound showed
+running with the identity it had, after a journal that never says the stop was asked for, is `never_down`; after a
+`stopping` line it is `stop_unsettled` instead. `settle_timeout_s` must therefore exceed the providers' `stop_grace_period` with a
 margin; its default, 180 s, does for the federation's 120 s, and platform.toml does not know the grace, so a federation
 that raises it raises this too (`expcore_onedata.fault_settings`). `clear`
 never raises: a failed restore is in the snapshot (`verified: false`), stays open in the journal and stays pending,
@@ -272,6 +281,8 @@ class FaultInjector:
         self._pending, self._went_down = (entry, digest), False
         self._injection = {"target": self.target, "injected": False, "cleared": False, "verified": False}
         try:
+            # durable before the command, so a process killed while it blocks leaves the line (a failing journal stops here)
+            self._journal.append({"event": "stopping", "id": entry})
             self._stop_unknown = True  # until the command returns, the daemon may be stopping the target all the same
             self._driver.stop(self._service)
             self._stop_unknown = False

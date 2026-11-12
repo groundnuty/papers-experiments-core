@@ -159,7 +159,13 @@ def test_o11_a_torn_final_line_is_cut_before_the_next_append_and_the_journal_sta
     assert injector.finish()["ok"] is True
     text = path.read_text(encoding="utf-8")
     assert text.endswith("\n")
-    assert [json.loads(line)["event"] for line in text.splitlines()] == ["cleared", "injecting", "injected", "cleared"]
+    assert [json.loads(line)["event"] for line in text.splitlines()] == [
+        "cleared",
+        "injecting",
+        "stopping",
+        "injected",
+        "cleared",
+    ]
     assert InjectionJournal(path.parent).open_entries() == []
     later = injector_for(platform, services)
     later.start({**RUN, "attempt": 2})

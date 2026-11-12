@@ -4,8 +4,9 @@
 A line is appended, flushed and fsynced before the call returns, and every directory and file the journal creates is
 made durable in its parent (the journal's directory and its missing parents, by `try_lock` or by `append`, whichever
 comes first), so neither a crash nor a power cut after `append` can lose the line. The injector appends `injecting`
-before it stops a service, `injected` once the service was seen down and `cleared` once it is up again with a new
-identity, so an injection without its `cleared` line is open and the next start settles it.
+before it stops a service, `stopping` right before the stop command, `injected` once the service was seen down and
+`cleared` once it is up again with a new identity, so an injection without its `cleared` line is open and the next
+start settles it.
 
 A crash in the middle of an append can leave a last line without its newline. The reader ignores such an incomplete
 final line, and never anything else: a complete line that is not an injection event makes the journal unreadable. The
@@ -27,8 +28,14 @@ lock is then skipped as a live one; the boot id rules out a holder from before a
 
 A restore that failed is journalled too (`clear_failed`, with how it failed), so an injection that is still open after
 a failed clear can be told from one in progress. A stop command that raised (it timed out, so its CLI was killed while
-the Docker daemon goes on stopping the container) is journalled as `stop_unknown`: whoever settles that injection,
-this process or a later one, waits for the container to show down before it judges the restore. Beside the journal,
+the Docker daemon goes on stopping the container) is journalled as `stop_unknown`. A process killed while the stop
+command blocks has no time to journal anything, so the `stopping` line before the command stands for it: an open
+injection that was never seen down (no `injected` line) is one whose stop may still be running, and whoever settles it,
+this process or a later one, waits for the container to show down before it judges the restore. A journal that ends at
+`stopping` or `stop_unknown` says the stop was asked for. One that ends at `injecting` says nothing about it
+(`stop_unrecorded`): the process died before the command, or its journal predates the `stopping` line. A container that
+never shows down is `stop_unsettled` after the first, and `never_down` after the second only when every reading of the
+whole bound showed it running with its identity. Beside the journal,
 whoever holds the federation exclusively keeps a holder record (`federation.holder`, written whole and fsynced by
 `write_holder`; `expcore_onedata.admission`): its pid and boot id, its purpose, the target's label and the time it took
 the lock.
@@ -152,9 +159,10 @@ class InjectionJournal:
     """Append-only record of every injection and its clear: the target's label, its service, its identity's digest and
     its holder.
 
-    Lines: `injecting` (before the stop command), `stop_unknown` (once the stop command raised, so what it did is not
-    known), `injected` (once the target was seen down) and `cleared` (once a restore was verified, or recovery found
-    the target up). An `injecting` line no `cleared` line settles is open.
+    Lines: `injecting` (before the stop command), `stopping` (right before it, so a process killed while it blocks
+    leaves the line), `stop_unknown` (once the stop command raised, so what it did is not known), `injected` (once the
+    target was seen down) and `cleared` (once a restore was verified, or recovery found the target up). An `injecting`
+    line no `cleared` line settles is open.
     """
 
     def __init__(self, directory: Path) -> None:
@@ -204,9 +212,11 @@ class InjectionJournal:
             os.fsync(handle.fileno())
 
     def open_entries(self) -> list[dict[str, Any]]:
-        """Return the open injections, each with `injected` set when it was seen down and `stop_unknown` when its stop
-        command raised; raise ValueError when a complete line is not an injection event. Only an incomplete final line
-        is ignored: it was never acted on."""
+        """Return the open injections, each with `injected` set when it was seen down, `stop_unknown` when the stop was
+        asked for (`stopping`, or a stop command that raised) and the target was not then seen down, and
+        `stop_unrecorded` when no line says the stop was asked for and the target was not seen down either; raise
+        ValueError when a complete line is not an injection event. Only an incomplete final line is ignored: it was
+        never acted on."""
         if not self.path.exists():
             return []
         with self._section(fcntl.LOCK_SH):
@@ -227,14 +237,17 @@ class InjectionJournal:
                 entries[key] = {**line, "injected": False}
             elif event == "injected" and key in entries:
                 entries[key]["injected"] = True
-            elif event == "stop_unknown" and key in entries:
-                entries[key]["stop_unknown"] = True  # the stop raised: the daemon may still be stopping the target
+            elif event in ("stopping", "stop_unknown") and key in entries:
+                entries[key]["stop_unknown"] = True  # the stop was asked for: the daemon may still be stopping it
             elif event == "clear_failed" and key in entries:
                 entries[key]["clear_failed"] = str(line.get("how"))  # still open: its restore failed
             elif event == "cleared":
                 entries.pop(key, None)
             else:
                 raise ValueError(f"line {number} of the injection journal is not an injection event")
+        for entry in entries.values():  # a target seen down has nothing left to wait for
+            entry["stop_unknown"] = entry.get("stop_unknown", False) and not entry["injected"]
+            entry["stop_unrecorded"] = not entry["injected"] and not entry["stop_unknown"]
         return list(entries.values())
 
     # --- the federation's holder record ---------------------------------------------------------------------------

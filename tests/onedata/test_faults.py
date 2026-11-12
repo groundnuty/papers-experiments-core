@@ -113,7 +113,7 @@ def test_o11_the_injection_is_journalled_durably_before_the_service_is_stopped(t
     assert (line["target"], line["service"]) == (OUTAGE_TARGET, OUTAGE_SERVICE)
     assert len(synced) >= 3  # the line, the new journal file's directory, and the new directory's parent
     assert services.running(OUTAGE_SERVICE) is False
-    assert [line["event"] for line in journal_lines(tmp_path)] == ["injecting", "injected"]
+    assert [line["event"] for line in journal_lines(tmp_path)] == ["injecting", "stopping", "injected"]
     injector.finish()
 
 

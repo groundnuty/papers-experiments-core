@@ -17,6 +17,15 @@ the service to show not running, and only then restores it and judges the restor
 that never shows down within the bound is `stop_unsettled`, not cleared, never verified. The settle timeout must
 therefore exceed the providers' `stop_grace_period` with a margin (180 s against the federation's 120 s, by default).
 
+A process killed while its stop command blocks journals nothing about it, so an open injection that was never seen down
+is of unknown outcome whatever its journal says (`InjectionJournal.open_entries`): `stop_unknown` when a `stopping` line
+or a `stop_unknown` line says the stop was asked for, `stop_unrecorded` when neither does (the process died before the
+command, or the journal predates the `stopping` line). Both wait as above. They differ only when the service never shows
+down: after `stopping` that is `stop_unsettled`, as the daemon was asked for a stop that outlasts the bound; after
+`injecting` alone, a service that every reading of the bound showed running with the identity it had is `never_down`,
+and one that was unreadable, or ran with no identity, is `stop_unsettled`. A restore after either then requires that the
+provider serves, as for any restore.
+
 A restore whose identity changed is not yet a provider that serves: the live run of 12 Nov 2026 found the restarted
 provider's REST endpoint refusing connections right after the restart and its health check passing 48 to 52 s later.
 `settle` therefore waits, once the identity is verified, for the driver to say the service serves
@@ -99,6 +108,7 @@ class Recovery:
         self._settings, self._driver, self._clock, self._sleep = settings, driver, clock, sleep
         self.journal = InjectionJournal(settings.journal)
         self.last: Observation | None = None  # the latest reading `wait` took
+        self.unreadable = 0  # the readings of the latest `wait` that failed and counted as no answer
 
     def entries(self, target: str | None = None) -> list[dict[str, Any]]:
         """The journal's open injections; raise InfraError of kind `injector_failure` when it cannot be read."""
@@ -156,12 +166,16 @@ class Recovery:
 
     def _settle(self, entry: Mapping[str, Any]) -> Settled:
         before, injected = entry["identity_sha256"], entry["injected"]
+        asked, unrecorded = bool(entry.get("stop_unknown")), bool(entry.get("stop_unrecorded"))
         seen: Observation | None
-        if entry.get("stop_unknown"):  # the daemon may still be stopping it: a reading now proves nothing
-            seen = self._await_down(entry["service"], before)
-            if seen is None:
+        if asked or unrecorded:  # the daemon may still be stopping it: a reading now proves nothing
+            seen, steady = self._await_down(entry["service"], before)
+            if seen is not None:
+                injected = True  # it was seen not running (or running anew): it did go down
+            elif asked or not steady:
                 return Settled(False, "stop_unsettled")  # never seen down within the bound: fail closed
-            injected = True  # it was seen not running (or running anew): it did go down
+            else:  # the stop may never have been asked for, and every reading of the bound showed it up as it was
+                seen = self.last
         else:
             try:
                 seen = self._driver.observe(entry["service"])
@@ -211,15 +225,22 @@ class Recovery:
                 break
         return None
 
-    def _await_down(self, service: str, before: str) -> Observation | None:
+    def _await_down(self, service: str, before: str) -> tuple[Observation | None, bool]:
         """After a stop of unknown outcome: read the service until it shows not running, or running with another
         identity (which only a restart gives), bounded by the settle timeout. A reading that fails is no answer, so it
-        is read again. None when it never showed either."""
+        is read again. Return the reading that showed it, or None when none did, and whether every reading of the wait
+        showed it running with the identity it had: only such a wait says the stop took no effect."""
+        steady = True
 
         def down(seen: Observation) -> bool:
-            return not seen.running or (seen.identity is not None and digest(seen.identity) != before)
+            nonlocal steady
+            if not seen.running or (seen.identity is not None and digest(seen.identity) != before):
+                return True
+            steady = steady and seen.identity is not None
+            return False
 
-        return self.wait(down, service, unreadable_ok=True)
+        seen = self.wait(down, service, unreadable_ok=True)
+        return seen, steady and self.unreadable == 0
 
     def _restore(self, service: str, before: str) -> tuple[bool, str | None, str]:
         """Start the service and wait for it to run with an identity whose digest is not `before`, a bounded number of
@@ -256,7 +277,7 @@ class Recovery:
         """
         polls = max(1, math.ceil(self._settings.settle_timeout_s / self._settings.poll_s)) + 1
         started = self._clock()
-        self.last = None
+        self.last, self.unreadable = None, 0
         for poll in range(polls):
             if poll:
                 self._sleep(self._settings.poll_s)
@@ -265,7 +286,7 @@ class Recovery:
             except DriverError:
                 if not unreadable_ok:
                     raise
-                self.last = None
+                self.last, self.unreadable = None, self.unreadable + 1
             else:
                 if done(self.last):
                     return self.last
