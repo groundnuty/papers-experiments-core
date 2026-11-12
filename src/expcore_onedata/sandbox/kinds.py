@@ -10,8 +10,8 @@ never from an exit code. Their categories map to the core's vocabulary of infras
 - `unknown`: counters unreadable, evidence conflicting, or a kill nothing attributes. Infrastructure kind
   `unattributed_kill`, retried within the attempt limit.
 
-Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). Two kinds are the platform's own, registered
-here, when this module is first imported, and neither is treatable:
+Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). Three kinds are the platform's own,
+registered here, when this module is first imported, and none is treatable:
 
 - `data_gate_integrity`: the data gate's refusal of an answer it cannot pass to the agent (a redirect, an encoded body,
   its token in a header or a body, an answer larger than it checks whole, a complete listing larger than it serves
@@ -26,6 +26,12 @@ here, when this module is first imported, and neither is treatable:
   about the agent or the manipulation: set aside and run again within the attempt limit, and no condition may declare
   it (O19). An object the agent made in its outputs (a link, a special file, more than its disk holds) is not this
   kind: it is the agent's own doing, recorded for the study's scorers, and the attempt is not set aside.
+- `ingest_failure`: a progressive ingest (`expcore_onedata.ingest`) could not do what its plan declares: set the start
+  state, write or confirm an arrival, or restore the dataset's baseline after the run (O27). Data missing or partial
+  because the plan has not finished is the condition's manipulation and the agent's outcome, never this kind; an
+  ingest that fails on its own says nothing about the agent, so the run is set aside and no condition may declare it.
+
+The layer's kinds are all registered here, in the one module a study lists in `[study] platforms`.
 """
 
 from collections.abc import Iterable, Mapping
@@ -49,6 +55,14 @@ register_infra_kind(
     "not be frozen, a copy command or the disk failed, a copy was not what was listed, the gate's log was not a plain "
     "file, or a read-only input's copy lost its hash): the run's evidence is missing or not what it should be, so it "
     "says nothing about the agent or the manipulation",
+    treatable=False,
+)
+INGEST_FAILURE = "ingest_failure"
+register_infra_kind(
+    INGEST_FAILURE,
+    "a progressive ingest failed on its own (its start state, a write or confirmation of an arrival, or the restore "
+    "of the dataset's baseline): data the plan had not delivered yet is the manipulation, but a plan the harness could "
+    "not carry out says nothing about the agent",
     treatable=False,
 )
 
@@ -117,6 +131,7 @@ def collection_error(what: str, reason: str) -> InfraError:
 
 __all__ = [
     "DATA_GATE_INTEGRITY",
+    "INGEST_FAILURE",
     "KIND_OF_CATEGORY",
     "OUTPUT_COLLECTION",
     "collection_error",
