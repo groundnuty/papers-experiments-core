@@ -234,7 +234,7 @@ class FakeReset(FakeData):
         ]
         start = int(query.get("page_token") or "0")
         end = start + int(query.get("limit", "100"))
-        token = str(end) if end < len(ids) else None
+        token = str(end) if end <= len(ids) else None  # a full page gets a token, so an empty last page can follow
         return httpx.Response(200, json={"transfers": ids[start:end], "nextPageToken": token})
 
     def _finish(self, transfer: Transfer) -> None:

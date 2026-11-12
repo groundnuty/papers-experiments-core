@@ -43,6 +43,26 @@ def top_directories(files: Iterable[BaselineFile]) -> list[str]:
     return names
 
 
+def next_page_token(page: Any) -> str | None:
+    """A children page's token for the next page, or None on the last page.
+
+    The end of a listing is `isLast` true, and only that: on Onedata 25.0 the last page still carries a token, and a
+    page the directory's last entries fill says `isLast` false and is followed by an empty last page
+    (`day0/2026-11-12-federation-facts-listing-end.md`). A page without a list of children or a boolean `isLast`, or
+    one that is not the last and gives no token, may be cut, so it is refused, never taken as the end."""
+    if not isinstance(page, dict) or not isinstance(page.get("children"), list):
+        raise RuntimeError("a listing page holds no list of children")
+    last = page.get("isLast")
+    if not isinstance(last, bool):
+        raise RuntimeError("a listing page has no boolean isLast, its last-page marker, so it may be cut")
+    if last:
+        return None
+    token = page.get("nextPageToken")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("a listing page that is not the last names no next page")
+    return token
+
+
 def writer_of(spec: Spec, space: str) -> Service:
     """The provider a space's baseline is written through: its owner."""
     return spec.provider(spec.space(space).owner)
@@ -68,15 +88,16 @@ class Content:
         return self.boot.provider(service, "GET", f"/spaces/{sid}", "space")["fileId"]
 
     def children(self, service: Service, directory: str) -> list[dict[str, Any]]:
-        """Every entry of a directory, page by page."""
+        """Every entry of a directory, page by page to the page that says it is the last (`next_page_token`)."""
         entries: list[dict[str, Any]] = []
         params: dict[str, Any] = {"limit": PAGE, "attribute": ["file_id", "name", "type", "size"]}
         while True:
             page = self.boot.provider(service, "GET", f"/data/{directory}/children", "children", params=params)
+            token = next_page_token(page)
             entries += page["children"]
-            if page.get("isLast", True):
+            if token is None:
                 return entries
-            params = {**params, "token": page["nextPageToken"]}
+            params = {**params, "token": token}
 
     def remove(self, service: Service, file_ids: Sequence[str]) -> None:
         with ThreadPoolExecutor(WORKERS) as pool:
