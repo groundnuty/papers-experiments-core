@@ -54,6 +54,9 @@ from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
+from expcore.campaign.merge import SHARDS_DIR, MergeRefused, read_merge
+from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.config.key_locations import location_finders, withhold_key_locations
 from expcore.config.loading import ConfigError
@@ -69,6 +72,7 @@ from expcore.package.identity import (
     replayed_records,
     stamp_bytes,
     verify_inputs,
+    verify_merged_inputs,
 )
 from expcore.package.leaks import default_hashes, findings_in, private_hashes, scan_tokens
 from expcore.package.lockfile import PYPI, lock_hashes, token_exempt
@@ -119,7 +123,22 @@ def _read_json(files: Mapping[str, bytes], path: str, what: str) -> dict:
     return data
 
 
-def _required(study: StudyConfig, check: Mapping[str, object]) -> list[str]:
+def _snapshot_files(check: Mapping[str, object], files: Mapping[str, bytes]) -> set[str]:
+    """The snapshot of the campaign store the analysis reads: one in the batch, or, for a merged batch (the check
+    names a merge), merge.json and the snapshot of each shard it lists, which the package must hold as well."""
+    if MERGE_KEY not in check:
+        return {f"{OUT_DIR}/{RUNS_DIR}/{SNAPSHOT_FILE}"}
+    merge = f"{OUT_DIR}/{MERGE_FILE}"
+    if merge not in files:
+        return {merge}
+    try:
+        shards = read_merge(files[merge], merge)["shards"]
+    except MergeRefused as error:
+        raise PackageError(str(error)) from None
+    return {merge, *(f"{OUT_DIR}/{SHARDS_DIR}/{shard['index']}/{SNAPSHOT_FILE}" for shard in shards)}
+
+
+def _required(study: StudyConfig, check: Mapping[str, object], files: Mapping[str, bytes]) -> list[str]:
     """Every file the package's check needs: configuration, plugin, code, the check's inputs and the outputs."""
     root = study.root.resolve()
     try:
@@ -131,7 +150,8 @@ def _required(study: StudyConfig, check: Mapping[str, object]) -> list[str]:
     if not isinstance(inputs, dict) or not inputs:
         raise PackageError(f"{batch}/{CHECK_FILE}: names no input; run `python -m expcore check {batch}` first")
     return sorted(
-        {*CONFIG_FILES, plugin, *covered_files(root, study.scope), f"{batch}/{CHECK_FILE}", f"{batch}/{SNAPSHOT_FILE}"}
+        {*CONFIG_FILES, plugin, *covered_files(root, study.scope), f"{batch}/{CHECK_FILE}"}
+        | _snapshot_files(check, files)
         | {f"{batch}/{name}" for name in inputs}
         | {f"{OUT_DIR}/{name}" for name in OUTPUT_FILES}
     )
@@ -341,6 +361,7 @@ def _collect(
     warn: Callable[[str], None],
 ) -> tuple[PackageSpec, dict[str, bytes]]:
     study, spec, files, check = _selection(study_root)
+    verify_merged_inputs(files, check)  # before merge.json or a snapshot is read or rewritten, in every build
     files[MODELS_FILE] = withhold_key_locations(files[MODELS_FILE])  # in every build; the identity agrees (K13)
     other = sorted(path for path in files if PurePosixPath(path).name == MODELS_FILE and path != MODELS_FILE)
     if other:
@@ -438,7 +459,7 @@ def _selection(study_root: Path) -> tuple[StudyConfig, PackageSpec, dict[str, by
     spec = load_spec(study.root)
     files = {path: (study.root / path).read_bytes() for path in select(study.root, spec)}
     check = _read_json(files, f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}", "the replay check")
-    missing = [path for path in _required(study, check) if path not in files]
+    missing = [path for path in _required(study, check, files) if path not in files]
     if missing:
         more = f" and {len(missing) - 1} more" if len(missing) > 1 else ""
         raise PackageError(f"{SPEC_FILE}: the package's check needs {missing[0]}{more}; add it to [package] include")

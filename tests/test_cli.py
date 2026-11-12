@@ -7,9 +7,11 @@ from pathlib import Path
 import pytest
 from record_support import no_secrets_in_the_environment
 
+from expcore.campaign.export import ExportError
 from expcore.campaign.holds import Hold
+from expcore.campaign.merge import MergeRefused
 from expcore.campaign.scheduler import RunSummary
-from expcore.campaign.shard import ShardSpec
+from expcore.campaign.shard import ShardError, ShardSpec
 from expcore.cli import EXIT_PENDING, main
 from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
@@ -90,6 +92,21 @@ def test_r04_a_refusal_names_the_command_that_refused_and_says_refused_once(stud
     assert err.startswith(f"{command} refused: STUDY/out/runs: ")
     assert err.count("refus") == 1
     assert "python -m expcore check" in err  # what to do
+
+
+@pytest.mark.parametrize("refusal", [ExportError, MergeRefused, ShardError])
+def test_c29_a_merged_batch_that_cannot_be_joined_is_refused_with_a_message_not_a_traceback(
+    refusal, monkeypatch, capsys
+):
+    """C29: the export of a merged batch joins the shards' exports, and a join that refuses (or the merge's own
+    refusals) ends the command with its message and the refused status."""
+
+    def refuse(*args, **kwargs):
+        raise refusal("the shards' exports disagree on 'factors'")
+
+    monkeypatch.setattr("expcore.cli.analyse_study", refuse)
+    assert main(["analyze", "a-study"]) == 1
+    assert capsys.readouterr().err == "analyze refused: the shards' exports disagree on 'factors'\n"
 
 
 def test_c12_run_says_a_hold_on_stderr_as_it_begins_once_with_whether_it_ends_by_itself(study, capsys):
