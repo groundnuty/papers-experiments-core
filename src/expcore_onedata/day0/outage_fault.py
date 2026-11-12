@@ -17,14 +17,20 @@ reads what the injector did from its snapshot, so the check has the injector's g
 - **The federation held (O11).** The check holds the federation's lock exclusively around a whole space's scenario
   (`outage.py`); the injector takes that admission as its own and names its target in the holder record.
 
-`take_down` and `restore` turn the injector's outcome into the check's facts: whether the provider was seen down, and
+**The outage is the injector's `running` (#27).** `down` takes the provider down for the body of an `async with`
+through `FaultInjector.running`: the start runs in a worker thread whose future is kept, so a cancellation waits for it
+(a thread cannot be stopped) instead of leaving it stopping the provider while nothing restores it, and the clear runs
+in `finally`, shielded. The check never awaits the injector's start or clear in a bare `asyncio.to_thread`.
+
+`down` and `restored` turn the injector's outcome into the check's facts: whether the provider was seen down, and
 whether it is back (`cleared`: nothing is left down) and restored (`verified`: back with a changed identity, and
 serving), with the injector's own word for how (`restored`, `found_restored`, `never_down`, `identity_unchanged`,
 `not_running`, `not_serving`, `start_failed`, `restore_unverified`, `stop_unsettled`). The provider is named by its
 label and an identity by its digest, as the injector names them (O12).
 """
 
-from collections.abc import Mapping
+import contextlib
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from expcore.config.loading import ConfigError
@@ -40,25 +46,31 @@ def _last(steps: list[Mapping[str, Any]], name: str) -> Mapping[str, Any] | None
 
 
 class Outage:
-    """One provider taken down through the injector and brought back; `restore` never raises."""
+    """One provider taken down through the injector for the body of `down` and brought back as it ends."""
 
     def __init__(self, injector: FaultInjector, run_key: str) -> None:
         self._injector, self._identity = injector, {"run_key": run_key, "attempt": 1}
 
-    def take_down(self) -> dict[str, Any]:
-        """Start the injector: the provider journalled, stopped and seen down. On failure the injector has already
-        tried to bring it back; `started` is then false, with the injector's reason, which names only the label."""
+    @contextlib.asynccontextmanager
+    async def down(self) -> AsyncIterator[dict[str, Any]]:
+        """The provider journalled, stopped and seen down for the body, and cleared as it ends (`running`). Yields the
+        start's facts: `started` and `seen_down`, or, when the start failed, `started` false with the injector's
+        reason, which names only the label (the injector has then tried to bring the provider back, and cleared)."""
+        entered = False
         try:
-            self._injector.start(self._identity)
+            async with self._injector.running(self._identity):
+                entered = True
+                yield {"started": True, "seen_down": True, **self._injected()}
+                return
         except InfraError as error:
-            return {"started": False, "reason": error.detail, **self._injected()}
+            if entered:
+                raise
+            reason = error.detail
         except ConfigError as error:  # refused before anything was stopped; its message names the file, so not kept
-            return {
-                "started": False,
-                "reason": f"the injector refused to start ({type(error).__name__})",
-                **self._injected(),
-            }
-        return {"started": True, "seen_down": True, **self._injected()}
+            if entered:
+                raise
+            reason = f"the injector refused to start ({type(error).__name__})"
+        yield {"started": False, "reason": reason, **self._injected()}
 
     def _injected(self) -> dict[str, Any]:
         step = _last(self._injector.snapshot()["steps"], "injected")
@@ -69,16 +81,16 @@ class Outage:
             facts["seen_down"] = bool(step.get("seen_down"))
         return facts
 
-    def restore(self) -> dict[str, Any]:
-        """Clear the injection (the injector settles it and verifies the identity), then read how it went from its
-        snapshot. With nothing stopped, nothing needed restoring: `not_injected`."""
-        cleared_now = self._injector.clear()
+    def restored(self) -> dict[str, Any]:
+        """How the restore went, read from the injector's snapshot once `down` has ended (its clear settled the
+        injection and verified the identity and the serving). With nothing stopped, nothing needed restoring:
+        `not_injected`."""
         snapshot = self._injector.snapshot()
         cleared, verified = _last(snapshot["steps"], "cleared"), _last(snapshot["steps"], "verified")
         if cleared is None:
-            return {"cleared": cleared_now, "verified": False, "how": "not_injected"}
+            return {"cleared": True, "verified": False, "how": "not_injected"}
         facts: dict[str, Any] = {
-            "cleared": bool(cleared.get("ok")) and cleared_now,
+            "cleared": bool(cleared.get("ok")),
             "verified": bool(verified and verified.get("ok")),
             "how": cleared.get("how"),
             "identity_changed": bool(verified and verified.get("identity_changed")),

@@ -138,14 +138,28 @@ class Run:
         outage = Outage(injector, self.directory)
         went_down = False
         try:
-            went_down = await asyncio.to_thread(self.take_down, outage)
+            async with outage.down() as down:  # the injector's `running`: never its start in a bare thread (#27)
+                self.facts["outage"] = down
+                if not down["started"]:
+                    self.gaps.append(f"the provider could not be taken down and seen down ({down['reason']})")
+                else:
+                    went_down = await self.measured()
+        except Exception as error:  # the injector's own failure past its handling: recorded, its restore read below
+            self.problems.append(f"the outage raised {type(error).__name__}")
+        self.facts["restore"] = outage.restored()
+        await self.after_restore(went_down)
+
+    async def measured(self) -> bool:
+        """See the target down over REST and measure; True when it was seen down. A measurement that breaks is a
+        failure, never an escape past the restore."""
+        went_down = False
+        try:
+            went_down = await asyncio.to_thread(self.seen_down)
             if went_down:
                 await self.during()
-        except Exception as error:  # a measurement that breaks is a failure, never an escape past the restore
+        except Exception as error:
             self.problems.append(f"a measurement raised {type(error).__name__}")
-        finally:
-            self.facts["restore"] = await asyncio.to_thread(outage.restore)
-        await self.after_restore(went_down)
+        return went_down
 
     # -- before ---------------------------------------------------------------------------------------------------
     def prepare(self) -> None:
@@ -255,16 +269,11 @@ class Run:
         return out
 
     # -- during ---------------------------------------------------------------------------------------------------
-    def take_down(self, outage: Outage) -> bool:
-        """Stop the target through the injector and see it down; True when it was seen down. The target must not
-        answer REST either."""
-        down = outage.take_down()
-        if not down["started"]:
-            self.facts["outage"] = down
-            self.gaps.append(f"the provider could not be taken down and seen down ({down['reason']})")
-            return False
+    def seen_down(self) -> bool:
+        """Whether the target, its service seen down by the injector, answers no REST call either; a target that
+        answers is no observed outage, and a problem."""
         probe = self.cells.target_answers(min(self.bound_s, DOWN_PROBE_S))
-        self.facts["outage"] = {**down, "rest_answers_while_down": probe["answers"], "rest": probe}
+        self.facts["outage"].update(rest_answers_while_down=probe["answers"], rest=probe)
         if probe["answers"]:
             self.problems.append(
                 "the provider answered REST while its service was seen down, so no outage was observed"

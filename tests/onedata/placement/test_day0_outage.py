@@ -5,6 +5,7 @@ The fakes model no provider that is down, so `outage_support.OutageWorld` puts o
 while a provider is down is a stand-in's choice (a read with every holder down waits out its timeout), and these tests
 assert what the check recorded of it, never that Onedata behaves so."""
 
+import asyncio
 import json
 import shutil
 
@@ -221,6 +222,28 @@ def test_o28_a_stop_whose_outcome_is_unknown_is_waited_out_and_restored_by_the_i
     assert daemon.running(SERVICE)
     assert world.down == set()
     assert InjectionJournal(settings.journal).open_entries() == []
+
+
+def test_o28_a_run_cancelled_while_the_provider_is_stopped_waits_for_the_stop_and_restores_it(
+    context, platform, services, world, monkeypatch
+):
+    """O28: the outage is the injector's `running` (#27): the start runs in a worker thread a cancellation cannot stop,
+    so a run cancelled while its provider is being stopped waits for the stop, restores the provider in `finally` and
+    only then ends with the cancellation, leaving nothing down and nothing open in the injector's journal."""
+    held = {}
+    real_main = outage_run.Run.main
+
+    async def main(self):
+        held["task"], held["loop"] = asyncio.current_task(), asyncio.get_running_loop()
+        await real_main(self)
+
+    monkeypatch.setattr(outage_run.Run, "main", main)
+    services.on_stop = lambda service: held["loop"].call_soon_threadsafe(held["task"].cancel)
+    with pytest.raises(asyncio.CancelledError):
+        outage_check(context)
+    assert services.verbs() == ["stop", "start"]
+    assert world.down == set()
+    assert InjectionJournal(load_faults(platform, load_platform(platform)).journal).open_entries() == []
 
 
 def test_o28_a_provider_that_still_answers_while_its_service_is_stopped_is_no_observed_outage(context, services):
