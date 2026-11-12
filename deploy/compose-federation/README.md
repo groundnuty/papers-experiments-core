@@ -253,3 +253,12 @@ distribution read. `measure_granularity_and_eviction.py` records what one range 
 mirror places there, and whether an eviction empties it again; `measure_read_windows.py`, built on it, what a read
 places when it starts inside bytes already held, is longer than 1 MiB, or follows another. Each takes `--layout PATH`,
 works in the study space and leaves it as it found it, and prints one JSON line per step.
+
+`rehearse_shards.py --out DIR [--layout PATH]` rehearses a sharded campaign (#154) on a federation that is up: it
+ingests a small dataset into the study space through the platform layer and reads it back, runs shard 1 of 2 of the
+example study, runs `reset --clean`, ingests the same data again and runs shard 2, then merges the two shards, which
+must accept. It then runs `reset --clean` once more, ingests the data with one file changed by one byte, runs shard 2
+again, and merges that with shard 1, which must refuse for the environment identity. The identity is names mapped to
+digests (the platform's configuration, the layout file, the study space's ingest manifest); the script never runs `up`
+or `down`, writes only below `DIR` and into the study space, prints no secret, and ends with `reset --clean`. `--help`
+lists the steps.
