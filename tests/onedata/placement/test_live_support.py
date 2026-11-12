@@ -4,12 +4,17 @@ platform is contacted here)."""
 from pathlib import Path
 
 import pytest
+from fake_host import FakeHost
+from fault_support import faults_table
 from live_support import (
     prerequisite_missing,
     require_cleaned,
     require_every_provider_refused,
+    require_measured,
     require_passed,
+    require_restored,
 )
+from outage_support import GAMMA_ID, KNOWLEDGE_MANIFEST, SERVICE, with_agent
 
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
@@ -18,6 +23,7 @@ from expcore_onedata.day0.runner import build_context
 from expcore_onedata.testing import with_placement, write_platform
 
 LIVE = Path(__file__).resolve().parents[2] / "live" / "test_contract.py"
+RELAY = "http://127.0.0.1:9"  # never called: these tests only read what the platform file declares
 
 
 def entry(ok, **facts):
@@ -26,6 +32,7 @@ def entry(ok, **facts):
 
 def context(tmp_path, fake, edit):
     tmp_path.mkdir(exist_ok=True)
+    (tmp_path / KNOWLEDGE_MANIFEST).write_text("{}", encoding="utf-8")  # a condition's manifest must exist to load
     path = write_platform(tmp_path, edit)
     client = OnezoneClient(load_platform(path), http=fake.client_http())
     return build_context(path, tmp_path / "out", client=client, allow_mutation=True)
@@ -52,6 +59,105 @@ def test_a_cleanup_result_that_is_absent_or_not_true_is_not_a_cleanup():
     for value in (False, None, 1, "yes"):
         with pytest.raises(AssertionError, match="did not show"):
             require_cleaned(entry(True, cleanup_verified=value))
+
+
+def test_o28_a_provider_that_was_not_shown_restored_does_not_pass_the_live_outage_test():
+    """O28: the outage check's pass must carry a restore cleared and verified by the injector, by a changed identity,
+    and the provider's REST answering again."""
+    good = {"cleared": True, "verified": True, "how": "restored", "rest_answers_again": True}
+    require_restored(entry(True, restore=good))
+    with pytest.raises(AssertionError, match="no restore"):
+        require_restored(entry(True))
+    for bad in (
+        {**good, "cleared": False},
+        {**good, "verified": False},
+        {**good, "verified": None},
+        {**good, "how": "never_down"},
+        {**good, "rest_answers_again": False},
+        {key: value for key, value in good.items() if key != "rest_answers_again"},
+    ):
+        with pytest.raises(AssertionError, match=r"back|restore|never down|answer again"):
+            require_restored(entry(True, restore=bad))
+
+
+def test_o28_with_several_spaces_the_restore_and_the_cleanup_are_read_in_every_space():
+    """O28: with several spaces the facts sit under `spaces`, so the live helpers read each space's: a run whose spaces
+    were all restored and cleaned passes them, and one space without either fails them, never a false failure from
+    reading the top level."""
+    good = {"restore": {"cleared": True, "verified": True, "how": "restored", "rest_answers_again": True}}
+    both = {"spaces[0]": {**good, "cleanup_verified": True}, "spaces[1]": {**good, "cleanup_verified": True}}
+    require_restored(entry(True, spaces=both))
+    require_cleaned(entry(True, spaces=both))
+    unrestored = {**both, "spaces[1]": {"restore": {**good["restore"], "verified": False}, "cleanup_verified": True}}
+    with pytest.raises(AssertionError, match="did not verify the restore"):
+        require_restored(entry(True, spaces=unrestored))
+    uncleaned = {**both, "spaces[1]": {**good, "cleanup_verified": False}}
+    with pytest.raises(AssertionError, match="scratch entry gone"):
+        require_cleaned(entry(True, spaces=uncleaned))
+    with pytest.raises(AssertionError, match="no space"):
+        require_restored(entry(True, spaces={}))
+
+
+def test_o28_the_live_outage_test_requires_the_mount_and_the_tools_measured_in_every_space():
+    """O28: the live outage run passes only with the mount read and the four tools called in every space; a platform
+    without a mount level, or a tool server that did not start, is no pass of it."""
+    good = {"mount": {"declared": True, "measured": True}, "knowledge": {"measured": True, "missing_tools": []}}
+    require_measured(entry(True, **good))
+    require_measured(entry(True, spaces={"spaces[0]": good, "spaces[1]": good}))
+    with pytest.raises(AssertionError, match="mount"):
+        require_measured(entry(True, **{**good, "mount": {"declared": False}}))
+    with pytest.raises(AssertionError, match="knowledge tools"):
+        require_measured(
+            entry(True, spaces={"spaces[0]": good, "spaces[1]": {**good, "knowledge": {"measured": False}}})
+        )
+
+
+def with_outage(data):
+    with_placement(data)
+    data["providers"]["gamma"] = {"url": "https://gamma.test", "id": GAMMA_ID}
+    data["support"] = {"providers": ["alpha", "beta", "gamma"], "local": "beta"}
+    data["faults"] = faults_table(services={"alpha": SERVICE})
+
+
+def test_o28_the_outage_check_names_what_the_platform_file_lacks(tmp_path, fake, monkeypatch):
+    """O28: no sanctioned [faults] table, a data provider that is the local one, no consent to start containers, no
+    knowledge condition, no [slots] and no mount level are each named, so the live test skips before it takes a
+    provider down; a platform with all of them and a host has nothing missing."""
+    monkeypatch.delenv("EXPCORE_LIVE_DOCKER", raising=False)
+    fake.add_provider(GAMMA_ID, "gamma.test")
+    ctx = context(tmp_path / "one", fake, both_supporting)
+    ctx.allow_faults = True
+    assert "sanctioned = true" in prerequisite_missing("provider_outage", ctx)
+    ctx = context(tmp_path / "two", fake, lambda data: (with_outage(data), with_agent(data, RELAY)))
+    ctx.allow_faults, ctx.agent_host = True, FakeHost()
+    assert prerequisite_missing("provider_outage", ctx) is None
+    ctx.allow_faults = False
+    assert "EXPCORE_LIVE_FAULTS=1" in prerequisite_missing("provider_outage", ctx)
+    ctx.allow_faults, ctx.agent_host = True, None
+    assert "EXPCORE_LIVE_DOCKER=1" in prerequisite_missing("provider_outage", ctx)
+    ctx.agent_host, ctx.tool_condition = FakeHost(), "read"
+    assert "4 of the four knowledge tools" in prerequisite_missing("provider_outage", ctx)
+    ctx = context(tmp_path / "three", fake, lambda data: (with_outage(data), data["support"].update(local="alpha")))
+    ctx.allow_faults = True
+    assert "local provider" in prerequisite_missing("provider_outage", ctx)
+
+    def without(table):
+        def edit(data):
+            with_outage(data)
+            with_agent(data, RELAY)
+            if table == "slots":
+                del data["slots"]
+            else:
+                data["sandbox"]["data_paths"] = {"isolated": "none"}
+
+        return edit
+
+    ctx = context(tmp_path / "four", fake, without("slots"))
+    ctx.allow_faults, ctx.agent_host = True, FakeHost()
+    assert "[slots]" in prerequisite_missing("provider_outage", ctx)
+    ctx = context(tmp_path / "five", fake, without("mount"))
+    ctx.allow_faults, ctx.agent_host = True, FakeHost()
+    assert "maps to the mount" in prerequisite_missing("provider_outage", ctx)
 
 
 def test_a_read_only_check_that_ran_on_no_provider_or_left_something_behind_does_not_pass():
@@ -83,7 +189,7 @@ def test_the_round_trip_names_what_the_platform_file_lacks(tmp_path, fake):
     assert prerequisite_missing("read_only", ctx) is None
     ctx.provider_ids = {}
     assert "id of the data provider" in prerequisite_missing("round_trip", ctx)
-    with pytest.raises(ValueError, match="read_only and round_trip"):
+    with pytest.raises(ValueError, match="read_only, round_trip and provider_outage"):
         prerequisite_missing("listing", ctx)
 
 
