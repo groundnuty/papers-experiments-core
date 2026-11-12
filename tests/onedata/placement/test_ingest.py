@@ -6,6 +6,7 @@ import json
 import threading
 import time
 
+import httpx
 import pytest
 from campaign_support import make_schema
 from loop_support import FakeProvider
@@ -766,3 +767,32 @@ def test_o27_an_empty_plan_records_the_same_steps(make, fake, ticker):
     assert (snapshot["ok"], snapshot["steps"], snapshot["ids"], snapshot["files"]) == (True, [], [], {})
     assert snapshot["restore"]["ok"] is True
     assert snapshot["plan"]["files"] == []
+    assert snapshot["reads_retried"] == 0
+
+
+def test_o29_the_snapshot_says_how_many_reads_the_ingest_retried(make, client, provisioner, ticker):
+    """O29: one of the ingest's plumbing reads (a file's attributes, which the journal and the upload's read-back
+    take) hangs past its timeout; it is asked again, the ingest goes on and succeeds, and its snapshot says that one
+    read was retried, the count of the provisioner it works through."""
+    answer = client._http._transport.handler
+    hung = []
+
+    def hang_once(request):
+        plain = request.url.path.startswith("/api/v3/oneprovider/data/") and request.url.path.count("/") == 5
+        if request.method == "GET" and plain and not request.url.params and not hung:
+            hung.append(request)
+            ticker.now += request.extensions["timeout"]["read"]
+            raise httpx.ReadTimeout("simulated", request=request)
+        return answer(request)
+
+    client._http._transport.handler = hang_once
+    ingest = make(DAY_ROW)
+    ingest.start({})
+    snapshot = ingest.finish()
+    assert hung
+    assert snapshot["ok"] is True
+    assert snapshot["reads_retried"] == provisioner.reads_retried == 1
+    later = make()  # the next run's ingest over the same provisioner counts its own run's retries only
+    later.start({})
+    assert later.finish()["reads_retried"] == 0
+    assert provisioner.reads_retried == 1

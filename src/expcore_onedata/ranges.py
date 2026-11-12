@@ -21,6 +21,10 @@ is always what the block map shows, never the request.
 
 The wait for the block map to show the placement is a consistency wait of provisioning (O07). Call `place_ranges`
 before a run starts or after it ends, never inside the agent's time.
+
+The block-map reads outside that wait, what the receiver holds before the first read and of each file afterwards, end
+the placement when they fail, since no poll absorbs them: they are the harness's own reads and go under the
+provisioner's policy, so a read that timed out is tried again, boundedly and in the log (O29, `readretry.py`).
 """
 
 from collections.abc import Iterable
@@ -42,7 +46,7 @@ def _chunks(ranges: Iterable[Range], limit: int) -> Iterable[Range]:
 
 def _held(provisioner: Provisioner, provider: str, file_id: str, row: RangeRow) -> dict[str, Any]:
     """One file's ranges asked for beside what the provider's block map holds of it now, as the probes read it."""
-    held = merged(provisioner.blocks(file_id, provider))
+    held = merged(provisioner.blocks(file_id, provider, retry=provisioner.retry))
     return {
         "asked": [list(r) for r in row.ranges],
         "asked_bytes": sum(length for _, length in row.ranges),
@@ -78,7 +82,9 @@ def place_ranges(provisioner: Provisioner, rows: Iterable[RangeRow], *, start_em
         wanted = {entries[row.file].file_id: list(row.ranges) for row in mine}
         # the receiver must see each file before anything is read through it
         provisioner.await_visible(provider, wanted)
-        before = provisioner.holds(provider, wanted)
+        before = provisioner.holds(
+            provider, wanted, retry=provisioner.retry
+        )  # outside any poll: a stall ends the placement
         if start_empty and before:
             raise NotPlaced(f"{where}the provider already holds {before} B of the files, so it does not start empty")
         read = 0
