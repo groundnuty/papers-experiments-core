@@ -17,6 +17,7 @@ Behaviours measured live on 25.0 (dated facts in `deploy/compose-federation/day0
 - An eviction scheduled within about a second of a placement settling can complete with `filesEvicted` 0: judge eviction only by the block map, and retry, bounded.
 - A range read places a 1 MiB window from the read's own offset, clipped to the file's end, aligned to nothing. Record held bytes from the block map, never the request.
 - Deleting a directory is asynchronous: never reuse a name at once.
+- A dated facts file in `deploy/compose-federation/day0/` is **sealed once its PR merges**: studies pin their evidence by each file's SHA-256. A later finding or correction goes in a new dated file that names the file it amends; never edit a merged one.
 - A children listing ends only on `isLast: true` (a JSON boolean, false on every earlier page); `nextPageToken` is a string on every page, the last included, and an exactly full last page is followed by an empty one. A transfers listing has no `isLast`: it ends on `nextPageToken: null`. Never treat a missing marker as the end (facts: `2026-11-12-federation-facts-listing-end.md`).
 - Through the mount, oneclient 25.0 names no file in its logs, and `--io-trace-log` crashes it on the first read: per-file served bytes exist only on the REST path (the gate).
 
