@@ -17,6 +17,7 @@ from expcore.errors import InfraError, is_treatable
 from expcore.records.instruments import finish_instruments, start_instruments
 from expcore_onedata.ingest import NAMESPACE, ProgressiveIngest
 from expcore_onedata.ingestplan import load_ingest_plan
+from expcore_onedata.provision import Provisioner, ProvisionError, resolve_provider_ids
 from expcore_onedata.sandbox.kinds import INGEST_FAILURE
 from expcore_onedata.testing import BETA_ID, PROVIDER, SPACE_NAME, with_placement, write_platform
 
@@ -301,6 +302,47 @@ def test_o27_a_failed_arrival_is_charged_infrastructure_and_rerun_though_the_exe
         assert first["infra_kind"] == INGEST_FAILURE
         assert NAMESPACE in first["detail"] and "arrival" in first["detail"]
         assert "instrument_refused" in event_kinds(store)
+    assert content(fake, DAY_PATH) == DAY
+
+
+def test_o27_a_provisioner_whose_change_log_another_user_wrote_is_refused_before_anything_is_sent(
+    provisioner, config, fake, tmp_path
+):
+    """O27 with O09: the restore takes the files the change log says were created for the ingest's own, so a log that
+    already holds another user's creation (here a provisioning step's file) would let it remove that user's data. The
+    ingest refuses such a provisioner when it is built, and sends nothing."""
+    provisioner.put_file("records/provisioned.bin", b"another user's file")
+    plan = load_ingest_plan(write_plan(tmp_path, [DAY_ROW]), config)
+    calls = len(fake.provider_calls)
+    with pytest.raises(ProvisionError, match="change log"):
+        ProgressiveIngest(provisioner, plan, journal=tmp_path / "journal.jsonl")
+    assert not [call for call in fake.provider_calls[calls:] if call[1] in ("POST", "PUT", "DELETE")]
+
+
+def test_o27_a_teardown_over_the_ingests_change_log_is_refused_and_the_dataset_kept(
+    make, provisioner, client, config, placement, fake, ticker, tmp_path
+):
+    """O27 with O09: a teardown over the ingest's change log would delete every file the ingest wrote back. It is
+    refused, through the ingest's own provisioner and through another one on the same log alike, and the restored day
+    stays; several ingests over one provisioner, one run after another, are still allowed."""
+    first = make(DAY_ROW)
+    first.start({})
+    first.finish()
+    second = make(DAY_ROW)  # the next run's ingest, over the same provisioner and log
+    second.start({})
+    second.finish()
+    other = Provisioner(
+        client,
+        config,
+        placement.settings,
+        provider_ids=resolve_provider_ids(config),
+        log=tmp_path / "changes.jsonl",
+        clock=ticker.clock,
+        sleep=ticker.sleep,
+    )
+    for teardown in (provisioner.teardown, other.teardown):
+        with pytest.raises(ProvisionError, match="change log"):
+            teardown()
     assert content(fake, DAY_PATH) == DAY
 
 

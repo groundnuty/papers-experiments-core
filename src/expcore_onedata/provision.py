@@ -345,20 +345,42 @@ class Provisioner:
             handle.write(json.dumps(line, sort_keys=True) + "\n")
             handle.flush()
 
-    def logged(self) -> list[dict[str, Any]]:
-        """Return the creations the log holds that no later deletion line cancels, oldest first."""
+    def _lines(self) -> list[dict[str, Any]]:
         if not self._log.exists():
             return []
+        return [json.loads(text) for text in self._log.read_text(encoding="utf-8").splitlines() if text.strip()]
+
+    def logged(self) -> list[dict[str, Any]]:
+        """Return the creations the log holds that no later deletion line cancels, oldest first."""
         created: dict[str, dict[str, Any]] = {}
-        for text in self._log.read_text(encoding="utf-8").splitlines():
-            if not text.strip():
-                continue
-            line = json.loads(text)
+        for line in self._lines():
             if line.get("action") == "create":
                 created[line["id"]] = line
             elif line.get("action") == "delete":
                 created.pop(line["id"], None)
         return list(created.values())
+
+    def claim_log(self, role: str) -> None:
+        """Reserve the change log for one role that needs a log of its own, such as a progressive ingest, whose restore
+        takes what the log says was created for its own and whose restored files a teardown over the log would delete.
+
+        The claim is a line of the log, so another provisioner on the same file, or a later process, sees it too, and
+        `teardown` refuses a claimed log. Claiming again for the same role is harmless (one study's runs, one after
+        another). ProvisionError, with nothing written, when the log holds another role's claim, or a creation made
+        before any claim, which another user made."""
+        lines = self._lines()
+        claims = {line.get("role") for line in lines if line.get("action") == "claim"}
+        if claims == {role}:
+            return
+        if claims or any(line.get("action") == "create" for line in lines):
+            raise ProvisionError(
+                f"{self._where}the change log is shared with another user; a {role} needs a provisioner and a change "
+                "log of its own"
+            )
+        self._write("claim", role=role)
+
+    def _claimed_by(self) -> str | None:
+        return next((line.get("role") for line in self._lines() if line.get("action") == "claim"), None)
 
     # -- listing and creation --------------------------------------------------
     def children(
@@ -910,8 +932,15 @@ class Provisioner:
 
         A deletion is logged only once the entry's absence is confirmed, so an entry whose DELETE answered success and
         that is still there keeps its creation record and a later teardown deletes and checks it again. A directory
-        is deleted only when everything in it is an entry this teardown has confirmed gone.
+        is deleted only when everything in it is an entry this teardown has confirmed gone. A change log a role has
+        claimed (`claim_log`) is refused with nothing sent: it holds files that role restores, not files to remove.
         """
+        claimed = self._claimed_by()
+        if claimed is not None:
+            raise ProvisionError(
+                f"{self._where}the change log is a {claimed}'s; a teardown over it would delete the files it restores, "
+                "so nothing was deleted"
+            )
         self._verified()
         deleted: list[str] = []
         left: list[dict[str, Any]] = []

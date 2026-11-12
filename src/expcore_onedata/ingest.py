@@ -33,7 +33,10 @@ the file's label, so a study can map a gate's errors to files after the run. Pro
 files by their label, never by a name or a path (O12).
 
 The provisioner given to the instrument must be its own: its change log tells the restore which files the ingest made,
-and must never be given to a teardown, which would delete the dataset's restored files.
+and must never be given to a teardown, which would delete the dataset's restored files. The instrument claims the log
+(`Provisioner.claim_log`) when it is built: a log that already holds another user's creation, or another role's
+claim, is refused with ProvisionError, and a teardown over a claimed log is refused with nothing sent. Several
+instruments over one provisioner, one run after another, share the claim.
 """
 
 import contextlib
@@ -75,6 +78,7 @@ class ProgressiveIngest:
         unless given) for a part being written. `now` is the epoch clock of the readings' `utc`."""
         if plan.space != provisioner.space.label:
             raise ValueError("the plan's space is not the space the provisioner is bound to")
+        provisioner.claim_log(NAMESPACE)  # its change log is the ingest's alone: refused when another user wrote it
         several = bool(provisioner.where)
         index = provisioner.space.position.removeprefix("spaces[").removesuffix("]")
         self.namespace = f"{NAMESPACE}_space{index}" if several else NAMESPACE
